@@ -98,6 +98,48 @@ pub fn marked(comptime T: type) bool {
     };
 }
 
+/// The declaration a type writes to say it is exactly another type, held
+/// under `.value` — a **document**
+/// ([ADR 0202](../docs/adr/0202-a-document-is-its-value.md)).
+pub const document_marker = "nilo_json_of";
+
+/// What `T` is a document of: `pub const nilo_json_of = Inner;` beside
+/// `value: Inner`, or null when `T` says no such thing.
+///
+/// `sql.Json(T)` is one — a `jsonb` column parsed into a struct of the
+/// caller's own — and its `jsonStringify` is one line, `jw.write(self.value)`.
+/// That is a type saying *I am exactly a `T`* in the sense a `Uuid` says *I am
+/// exactly a string*, and for a writer it is the stronger promise: a scalar is
+/// handed to `std.json` whole because nothing can be walked inside it, while a
+/// `T` is a shape the generated writer can walk itself — and honour a
+/// `rename_all` inside. So `json.write` writes a document as its value, and
+/// `openapi.schemaWithin` describes it as one, rather than either treating the
+/// wrapper as a wall the way ADR 0182 drew the line for a type that writes
+/// itself and says nothing.
+///
+/// Read by name rather than by type for the reason every marker here is: the
+/// type declaring it lives in a module `http/` may not import (ADR 0042).
+pub fn documentOf(comptime T: type) ?type {
+    comptime {
+        if (@typeInfo(T) != .@"struct") return null;
+        if (!@hasDecl(T, document_marker)) return null;
+        const said = @field(T, document_marker);
+        if (@TypeOf(said) != type) @compileError(
+            "nilo: `" ++ naming.of(T) ++ "`'s `" ++ document_marker ++ "` is not a type.\n" ++
+                "  A document says which type it holds: `pub const " ++ document_marker ++
+                " = Payload;` beside `value: Payload`.",
+        );
+        if (!@hasField(T, "value") or @FieldType(T, "value") != said) @compileError(
+            "nilo: `" ++ naming.of(T) ++ "` says it is a `" ++ naming.of(said) ++ "` (`" ++
+                document_marker ++ "`) and has no `value: " ++ naming.of(said) ++ "` to be " ++
+                "written as.\n" ++
+                "  A document is written as its `value`, so the field has to be there and " ++
+                "has to be that type.",
+        );
+        return said;
+    }
+}
+
 /// `T.nilo_json`, read field by field and checked, or null if there is none.
 ///
 /// Every way of writing this wrong gets a sentence here rather than a compiler

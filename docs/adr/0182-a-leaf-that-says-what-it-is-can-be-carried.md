@@ -108,3 +108,8 @@ paid for by every string beside it.
   union, a type that writes itself and says nothing, anything past eight deep.
 - A type outside nilo gets this by writing the same two declarations, which is
   the contract ADR 0046 already offers and this is its second reader.
+
+**Amended by [ADR 0202](0202-a-document-is-its-value.md):** the second thing
+a self-writing type can say. `nilo_openapi` names a scalar and makes a leaf;
+`nilo_json_of` names a type and makes a document, written as its value.
+`sql.Json(T)` is the case this line left out, and the last DTO in the port.

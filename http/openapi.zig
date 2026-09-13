@@ -311,6 +311,11 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
         // touch, asked here for the same reason. What a type says about itself
         // wins; a type that says nothing gets `{}` and a note, because being
         // visibly silent beats being confidently wrong.
+        // **A document is its value** (ADR 0202): `sql.Json(Theme)` sends a
+        // `Theme` and is described as one, and `Json(std.json.Value)` falls
+        // through to whatever the value says of itself — which for that one
+        // is nothing, and `untold` below is the honest answer.
+        if (mark.documentOf(T)) |Inner| return schemaWithin(Inner, depth + 1);
         if (writesItsOwnJson(T)) {
             if (@hasDecl(T, "nilo_openapi")) return held(.{ .told = toldOf(T) });
             return held(.untold);
@@ -1651,6 +1656,35 @@ test "a custom writer inside a struct does not describe the struct's fields eith
     try expectSchema(Account,
         \\{"type":"object","properties":{"public":{"type":"string","format":"uuid"},"email":{"type":"string"}},"required":["public","email"]}
     );
+}
+
+test "a document is described as its value, and a value that says nothing stays silent" {
+    // The shape of `sql.Json(T)`, written out here so this test does not need
+    // the module: exactly a `T` under `.value` (ADR 0202).
+    const Theme = struct { theme: []const u8 };
+    const Settings = struct {
+        value: Theme,
+        pub const nilo_json_of = Theme;
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.write(self.value);
+        }
+    };
+    try expectSchema(struct { settings: Settings },
+        \\{"type":"object","properties":{"settings":{"type":"object","properties":{"theme":{"type":"string"}},"required":["theme"]}},"required":["settings"]}
+    );
+
+    // A document of `std.json.Value` is a document of a type that writes
+    // itself and says nothing, which is `untold` exactly as it was.
+    const Payload = struct {
+        value: std.json.Value,
+        pub const nilo_json_of = std.json.Value;
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.write(self.value);
+        }
+    };
+    const json = try schemaJson(Payload);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "nilo_openapi") != null);
 }
 
 test "text that would break the JSON is escaped" {

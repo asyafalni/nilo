@@ -158,9 +158,9 @@ const http_core = [_][]const u8{
 /// nothing in the core names any of them back, which is why they are not in
 /// the component.
 const http_above_core = [_][]const u8{
-    "logger", "cors",      "allowance", "deadline",  "maxbody",
-    "http",   "behaviour", "live",      "profile",
-    "fuzz",   "fuzz_main", "test_root",
+    "logger",    "cors",      "allowance", "deadline", "maxbody",
+    "http",      "behaviour", "live",      "profile",  "fuzz",
+    "fuzz_main", "test_root",
 };
 
 const Layer = struct {
@@ -997,6 +997,10 @@ const refusals = [_]Refusal{
     .{
         .name = "json_marker_field_not_recognised",
         .says = "`json_marker_field_not_recognised.Condition`'s `nilo_json` has a field `tagged`, which is not something it can say.",
+    },
+    .{
+        .name = "json_document_without_a_value",
+        .says = "`json_document_without_a_value.Settings` says it is a `json_document_without_a_value.Payload` (`nilo_json_of`) and has no `value: json_document_without_a_value.Payload` to be written as.",
     },
     .{
         .name = "json_marker_is_not_a_struct",

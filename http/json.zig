@@ -136,6 +136,18 @@ fn coversWithin(comptime T: type, comptime depth: usize) bool {
     // is written by `std.json` whole, so what its fields look like is not this
     // walk's business (ADR 0182).
     if (writesItsOwnScalar(T)) return true;
+    // A document is its value ([ADR 0202](../docs/adr/0202-a-document-is-its-value.md)):
+    // covered when the value is a shape this writer walks — and when it is
+    // not, the value is a leaf handed to `std.json` whole with the object
+    // around it still this writer's, on the promise every `jsonStringify`
+    // makes anyway, that it writes one JSON value. `sql.Json(std.json.Value)`
+    // is that case. What is still refused is a marker inside the value that
+    // `std.json` would not read, which is the fallback's own rule (ADR 0181)
+    // applied one level down.
+    if (comptime mark.documentOf(T)) |Inner| {
+        if (coversWithin(Inner, depth + 1)) return true;
+        return mark.renamedFieldsWithin(Inner) == null;
+    }
     // Reading the marker is what checks it, and this is the line that makes the
     // check happen at all: a `.tag` on a struct describes nothing and would
     // otherwise sit there doing nothing in silence.
@@ -209,6 +221,12 @@ fn writeValue(comptime T: type, w: *std.Io.Writer, value: T) std.Io.Writer.Error
     // the ones this file's contract promises, and the object around it stays
     // this file's to write (ADR 0182).
     if (comptime writesItsOwnScalar(T)) return std.json.Stringify.value(value, .{}, w);
+    // A document as its value — walked here when it can be, and otherwise the
+    // same bytes its own `jsonStringify` would have written (ADR 0202).
+    if (comptime mark.documentOf(T)) |Inner| {
+        if (comptime covers(Inner)) return writeValue(Inner, w, value.value);
+        return std.json.Stringify.value(value.value, .{}, w);
+    }
     if (T == Str) return writeText(w, value.view());
     if (comptime isByteSlice(T)) return writeText(w, value);
 
@@ -932,6 +950,86 @@ test "a type that writes its own JSON and says what it looks like is a leaf, not
         .name = "wati",
     });
     try expectSame(struct { id: ?Key, name: []const u8 }{ .id = null, .name = "wati" });
+}
+
+/// A stand-in for `sql.Json(T)`, which `http/` may not import: a document,
+/// exactly a `T` under `.value`, whose own writer says so in one line.
+fn Doc(comptime T: type) type {
+    return struct {
+        value: T,
+        pub const nilo_json_of = T;
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.write(self.value);
+        }
+    };
+}
+
+test "a document is written as its value, inside a struct that renames its fields" {
+    // Item 63: a Row with a `jsonb` column could not rename its fields, because
+    // `Json(T)` writes itself and does not say it is a scalar — it is not one.
+    // It says something stronger, which type it is exactly (ADR 0202).
+    const Theme = struct { theme: []const u8, contrast: u8 };
+    const Row = struct {
+        pub const nilo_json = .{ .rename_all = .camelCase };
+        row_id: u32,
+        settings: Doc(Theme),
+        spare: ?Doc(Theme),
+    };
+    comptime std.debug.assert(covers(Row));
+    try expectJson(
+        \\{"rowId":7,"settings":{"theme":"dark","contrast":3},"spare":null}
+    , Row{ .row_id = 7, .settings = .{ .value = .{ .theme = "dark", .contrast = 3 } }, .spare = null });
+
+    // And a plain document is byte-for-byte what its own writer sends.
+    try expectSame(Doc(Theme){ .value = .{ .theme = "light", .contrast = 1 } });
+    try expectSame(struct { a: Doc(u32), b: []const Doc(bool) }{
+        .a = .{ .value = 9 },
+        .b = &.{ .{ .value = true }, .{ .value = false } },
+    });
+}
+
+test "a document of a shape this writer cannot walk is a leaf, and its neighbours are still renamed" {
+    // `sql.Json(std.json.Value)` — the port's event payload. `std.json.Value`
+    // writes itself and is not a scalar, so it is `std.json`'s to write; the
+    // object around it is this writer's, which is what lets the Row rename.
+    const Row = struct {
+        pub const nilo_json = .{ .rename_all = .camelCase };
+        event_id: u32,
+        payload: Doc(std.json.Value),
+    };
+    comptime std.debug.assert(covers(Row));
+    comptime std.debug.assert(!covers(std.json.Value));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"who":"wati","n":[1,2,3],"nested":{"ok":true}}
+    , .{});
+    try expectJson(
+        \\{"eventId":4,"payload":{"who":"wati","n":[1,2,3],"nested":{"ok":true}}}
+    , Row{ .event_id = 4, .payload = .{ .value = parsed } });
+}
+
+test "a document whose value renames its own fields is walked, and one std.json would misspell is refused" {
+    // Inside a document the value's own marker is honoured, because the
+    // generated writer is what walks it.
+    const Inner = struct {
+        pub const nilo_json = .{ .rename_all = .camelCase };
+        full_name: []const u8,
+    };
+    try expectJson(
+        \\{"card":{"fullName":"Wati"}}
+    , struct { card: Doc(Inner) }{ .card = .{ .value = .{ .full_name = "Wati" } } });
+
+    // A value the writer cannot walk, holding a renamed struct: the leaf path
+    // would hand it to `std.json`, which writes `full_name` — so `covers` says
+    // no and the ordinary fallback refusal (ADR 0181) is what the caller sees.
+    const Wall = struct {
+        inner: Inner,
+        raw: [3]u8,
+    };
+    comptime std.debug.assert(!covers(Doc(Wall)));
+    comptime std.debug.assert(!covers(struct { d: Doc(Wall) }));
 }
 
 test "a leaf that says nothing about its JSON still takes the value with it" {

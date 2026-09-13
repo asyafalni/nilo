@@ -329,6 +329,19 @@ rows — which turned out to be four gaps that only close together.
   every one of them — correctly, and it made the feature unusable. `jsonStringify`
   with no `nilo_openapi` beside it is still a wall, and still refused.
 
+- **A `sql.Json(T)` in a response is written and described as the `T` it holds**
+  ([ADR 0202](./docs/adr/0202-a-document-is-its-value.md)). The one column
+  type the leaf rule above left out, because it is not a scalar: a Row with a
+  `jsonb` column on it still could not rename its fields, so the last DTO in
+  the port was the timeline that carries the event log's payload. `Json(T)`
+  already says what it is — `nilo_json_of = T`, one line of `jsonStringify` —
+  so a type declaring that beside a `value: T` is a **document**, written as
+  its value through the generated writer, or as a leaf when the value is
+  `std.json.Value`; and the API description says `T` where it said `{}`. A
+  type of your own can say the same two things. One refusal, for the marker
+  with no `value` beside it. Nothing to change — the bytes are the ones the
+  wrapper's own writer sent.
+
 - **A value can reach the bottom of the call stack**
   ([ADR 0165](./docs/adr/0165-a-value-that-reaches-the-bottom.md)).
   `nilo_resolve` arrives as a handler argument, which is the top; an audit row

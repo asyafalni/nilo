@@ -3054,3 +3054,15 @@ one to insist on. Two smaller things from the same pair:
   already learned this ([ADR 0157](./adr/0157-a-check-pays-for-its-own-branches.md))
   and `checkRenames` had not, for the same shape of reason: the check was
   written on the small case and the real case is wider.
+
+## The marker was already on the type, and only one module read it
+
+**`sql.Json(T)` had said `nilo_json_of = T` since it landed, and `http/` never
+asked.** ADR 0182 drew the leaf line at `nilo_openapi` — a type that names a
+scalar can be handed to `std.json` whole — and a `jsonb` column names no
+scalar, so a Row with one on it fell back to `std.json` and could not rename
+its fields. The type had been saying exactly what it was the whole time, in a
+declaration the schema check and the Wire read and the writer did not. **When
+a feature refuses a type, read what the type already declares before adding a
+declaration**; the answer was one function that both `json.zig` and
+`openapi.zig` now ask ([ADR 0202](./adr/0202-a-document-is-its-value.md)).
