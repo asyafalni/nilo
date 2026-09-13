@@ -195,7 +195,7 @@ pub fn writeOpenApi(self: *const App, w: *std.Io.Writer) !void {
         .version = opts.version,
         .description = opts.description,
     } else .{};
-    try openapi.write(w, self.operations.items, info);
+    try openapi.write(self.gpa, w, self.operations.items, info);
 }
 
 /// Turn the collected operations into the document and its reader page.

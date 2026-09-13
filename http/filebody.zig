@@ -463,7 +463,7 @@ test "the document describes a FileBody as bytes, and `?` as the 404" {
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try openapi.write(&out.writer, &ops, .{});
+    try openapi.write(testing.allocator, &out.writer, &ops, .{});
     const document = out.written();
 
     // `application/octet-stream` and not `application/pdf`: the content type

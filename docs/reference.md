@@ -2539,6 +2539,7 @@ stops a checked-in file and a running server describing two different APIs.
 | `answer.text(&buf)` | the body with chunk framing undone, into a buffer you sized |
 | `answer.bytes(arena)` | the same, into memory the arena owns |
 | `answer.json(T, arena)` | `!T` — the body read back as a value ([ADR 0180](./adr/0180-a-response-is-read-back-the-way-it-was-written.md)) |
+| `error.AnswerStale` | what the three above answer once the client has answered a later request: `.body` borrows the client's one buffer, `.status` is a value, and the two would otherwise disagree in silence ([ADR 0210](./adr/0210-an-answer-knows-which-request-it-was.md)) |
 
 **`answer.json` is there because nilo already decided how the value was
 written**, so a test asking what came back should not have to reach for
@@ -2549,7 +2550,9 @@ const made = try answer.json(struct { id: []const u8 }, arena);
 ```
 
 It de-chunks first, and everything is copied into `arena` so what comes back
-outlives the client's response buffer and the next request on it. **Unknown
+outlives the client's response buffer and the next request on it — so read it
+*before* that request: an answer asked for its body afterwards is
+`error.AnswerStale`, not the later request's bytes. **Unknown
 fields are ignored**, which is the opposite of the rule on the way in and
 deliberately: an unknown field in a *request* is the client's typo and is a 400
 naming it, while a response with more fields than the test asked about is the

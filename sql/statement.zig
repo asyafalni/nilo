@@ -212,6 +212,7 @@ fn rowsOf(
 ) Statement {
     return comptime blk: {
         dialect_mod.assertDialect(D);
+        budget(Row, O);
 
         // Said before `assertOptions`, so that a `.limit` written on a `one`
         // gets the sentence about `one` rather than the generic list of what
@@ -593,6 +594,7 @@ fn deleting(
 ) Statement {
     return comptime blk: {
         dialect_mod.assertDialect(D);
+        budget(Row, O);
         assertOptions(Row, O, &[_][]const u8{"where"}, "a delete");
 
         var sql: []const u8 = "DELETE FROM " ++ relation(D, Row);
@@ -654,6 +656,29 @@ fn assertNothingDroppable(
     }
 }
 
+/// The branch budget a builder needs, raised where the work is asked for
+/// ([ADR 0157](../docs/adr/0157-a-check-pays-for-its-own-branches.md)).
+///
+/// Every loop below walks the columns written against the Row's columns —
+/// `hasColumn` and `ColumnType` scan the Row per value, `quote` walks each
+/// name, `columnList` spells the whole Row for the `RETURNING` — so a wide
+/// Row multiplies them, and a twenty-column table with seventeen written
+/// did not compile on the default
+/// ([ADR 0208](../docs/adr/0208-a-statement-pays-for-the-width-of-its-row.md)).
+/// Generous rather than exact, for the reason ADR 0157 gives: the budget is
+/// the caller's whole evaluation, and a larger one set by them still wins.
+fn budget(comptime Row: type, comptime Written: type) void {
+    const rows = switch (@typeInfo(Row)) {
+        .@"struct" => |s| s.fields.len,
+        else => 0,
+    };
+    const written = switch (@typeInfo(Written)) {
+        .@"struct" => |s| s.fields.len,
+        else => 0,
+    };
+    @setEvalBranchQuota(20_000 + 4_000 * (rows + written));
+}
+
 /// `INSERT`, with the Row's own column list as the `RETURNING` clause.
 ///
 /// `V` is the type of a struct naming the columns being written, and it is
@@ -671,6 +696,7 @@ pub fn insert(comptime D: type, comptime Row: type, comptime V: type) Statement 
     return comptime blk: {
         dialect_mod.assertDialect(D);
         row_mod.assertRow(Row);
+        budget(Row, V);
 
         const info = switch (@typeInfo(V)) {
             .@"struct" => |s| s,
@@ -744,6 +770,7 @@ pub fn insertMany(comptime D: type, comptime Row: type, comptime V: type) Statem
     return comptime blk: {
         dialect_mod.assertDialect(D);
         row_mod.assertRow(Row);
+        budget(Row, V);
 
         const info = switch (@typeInfo(V)) {
             .@"struct" => |s| s,
@@ -828,6 +855,7 @@ pub fn updateMany(comptime D: type, comptime Row: type, comptime V: type) Statem
     return comptime blk: {
         dialect_mod.assertDialect(D);
         row_mod.assertRow(Row);
+        budget(Row, V);
 
         const info = switch (@typeInfo(V)) {
             .@"struct" => |s| s,
@@ -1301,6 +1329,7 @@ fn updating(
 ) Statement {
     return comptime blk: {
         dialect_mod.assertDialect(D);
+        budget(Row, O);
         assertOptions(Row, O, &update_known, "an update");
 
         if (!@hasField(O, "set")) @compileError(
@@ -2541,4 +2570,95 @@ test "a Row whose key is one column conflicts on that column" {
             " RETURNING \"id\", \"email\", \"age\", \"created_at\"",
         comptime insertOrIgnore(Pg, User, values, .key).sql,
     );
+}
+
+/// A Row as wide as a real table — `rab_lines` in the port that hit this is
+/// twenty columns, and a save writes seventeen of them.
+const RabLine = struct {
+    pub const nilo_table = .{ .name = "rab_lines", .key = .id };
+
+    id: i64,
+    rab_id: i64,
+    section_id: ?i64,
+    position: i32,
+    kind: []const u8,
+    commitment_id: ?i64,
+    sku_id: ?i64,
+    description: []const u8,
+    quantity: types_mod.Decimal,
+    unit: []const u8,
+    unit_cost_currency: ?[]const u8,
+    unit_cost_amount_minor: ?i64,
+    cost_source: []const u8,
+    notes: ?[]const u8,
+    partner_id: ?i64,
+    lead_days: ?i32,
+    risk: ?[]const u8,
+    reference: ?[]const u8,
+    created_at: types_mod.Timestamp,
+    updated_at: types_mod.Timestamp,
+};
+
+const Saved = struct {
+    rab_id: i64,
+    section_id: ?i64,
+    position: i32,
+    kind: []const u8,
+    commitment_id: ?i64,
+    sku_id: ?i64,
+    description: []const u8,
+    quantity: types_mod.Decimal,
+    unit: []const u8,
+    unit_cost_currency: ?[]const u8,
+    unit_cost_amount_minor: ?i64,
+    cost_source: []const u8,
+    notes: ?[]const u8,
+    partner_id: ?i64,
+    lead_days: ?i32,
+    risk: ?[]const u8,
+    reference: ?[]const u8,
+};
+
+test "a write seventeen columns wide on a twenty-column Row compiles, and its text is what a narrow one's would be" {
+    // Every builder that walks the values against the Row multiplies its
+    // branches by both widths, and none of them had a quota of its own until
+    // a real table would not compile (ADR 0208).
+    const single = comptime insert(Pg, RabLine, Saved);
+    try testing.expect(std.mem.startsWith(u8, single.sql, "INSERT INTO \"rab_lines\" (\"rab_id\", \"section_id\","));
+    try testing.expect(std.mem.containsAtLeast(u8, single.sql, 1, "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9,"));
+    try testing.expect(std.mem.endsWith(u8, single.sql, ", \"reference\", \"created_at\", \"updated_at\""));
+    try testing.expectEqual(@as(usize, 17), single.params.len);
+
+    const many = comptime insertMany(Pg, RabLine, Saved);
+    try testing.expect(std.mem.containsAtLeast(u8, many.sql, 1, "SELECT * FROM unnest($1::int8[], $2::int8[], $3::int4[],"));
+    try testing.expect(std.mem.containsAtLeast(u8, many.sql, 1, "$17::text[])"));
+    try testing.expectEqual(@as(usize, 17), many.params.len);
+
+    const Changed = struct {
+        id: i64,
+        section_id: ?i64,
+        position: i32,
+        kind: []const u8,
+        commitment_id: ?i64,
+        sku_id: ?i64,
+        description: []const u8,
+        quantity: types_mod.Decimal,
+        unit: []const u8,
+        unit_cost_currency: ?[]const u8,
+        unit_cost_amount_minor: ?i64,
+        cost_source: []const u8,
+        notes: ?[]const u8,
+        partner_id: ?i64,
+        lead_days: ?i32,
+        risk: ?[]const u8,
+        updated_at: types_mod.Timestamp,
+    };
+    const batch = comptime updateMany(Pg, RabLine, Changed);
+    try testing.expect(std.mem.startsWith(u8, batch.sql, "UPDATE \"rab_lines\" AS t SET \"section_id\" = v.\"section_id\","));
+    try testing.expectEqual(@as(usize, 17), batch.params.len);
+
+    const ignored = comptime insertOrIgnore(Pg, RabLine, Saved, .key);
+    try testing.expect(std.mem.containsAtLeast(u8, ignored.sql, 1, "ON CONFLICT (\"id\") DO NOTHING"));
+    const upserted = comptime insertOrUpdate(Pg, RabLine, Saved, .key);
+    try testing.expect(std.mem.containsAtLeast(u8, upserted.sql, 1, "ON CONFLICT (\"id\") DO UPDATE SET \"rab_id\" = EXCLUDED.\"rab_id\","));
 }

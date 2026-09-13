@@ -342,6 +342,22 @@ an answer a client gets.
 
 ### Changed
 
+- **`answer.text`, `.bytes` and `.json` refuse a stale answer with
+  `error.AnswerStale`**
+  ([ADR 0210](./docs/adr/0210-an-answer-knows-which-request-it-was.md)).
+  `Answer.body` borrows the client's response buffer and the next request
+  writes over it, while `.status` is a value — so a test could read one
+  answer's status and another's body. Each answer now knows which request it
+  was; read the body before the next request on that client, or copy it with
+  `.json`/`.bytes` first. `.raw`, `.head`, `.body` and the header readers
+  still borrow.
+
+- **`openapi.write` takes an allocator**, because the document's named shapes
+  are a list that grows rather than an array of sixty-four
+  ([ADR 0209](./docs/adr/0209-a-document-names-every-shape-it-has.md)). Past
+  sixty-four a shape was written out in place and a generated client lost its
+  name. `app.writeOpenApi(w)` is unchanged.
+
 - **An unsigned integer in the document says `minimum: 0`**
   ([ADR 0206](./docs/adr/0206-a-whole-number-inside-a-range-is-a-type.md)),
   in a path param, a query field and a body. A byte-for-byte document test has
@@ -386,6 +402,14 @@ an answer a client gets.
   entry against 132 and 149 ([`bench/result/cache.md`](./bench/result/cache.md)).
 
 ### Fixed
+
+- **`insert`, `insertMany`, `updateMany` and the upserts compile on a Row as
+  wide as a real table**
+  ([ADR 0208](./docs/adr/0208-a-statement-pays-for-the-width-of-its-row.md)).
+  Seventeen columns written on a twenty-column Row ran out of comptime
+  branches inside nilo, where a caller cannot raise them. Every statement
+  builder sizes its own budget now, the way `ddl.zig` does; a comptime test
+  and a live one hold it at that width.
 
 - **A text column type set into a nullable column from a non-optional value**
   ([ADR 0203](./docs/adr/0203-a-value-coerces-into-a-nullable-column-and-an-error-union-does-not.md)).

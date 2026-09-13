@@ -3107,3 +3107,33 @@ language was already in use: an unsigned integer refuses `-1` and nobody
 calls it validation. The document now says `minimum: 0` for every one of
 them, which is a promise the signature had been making silently since 0.1.0
 ([ADR 0206](./adr/0206-a-whole-number-inside-a-range-is-a-type.md)).
+
+## Two ceilings nobody had measured, found by the first table wide enough to hit them
+
+The pricing round of the same port was picked for one write shape — a
+document replaced whole, forty rows at a time — and what it found was two
+numbers nilo had guessed and never tested against a real width.
+
+**A comptime budget nobody had sized is a ceiling somebody else finds.**
+ADR 0157 said a check pays for its own branches and applied it to the
+framework and to `ddl.zig`; the statement builders were left on the default,
+and every loop in them multiplies by the Row's width. Nine columns compiled
+and seventeen did not, and the caller could not raise the quota because the
+block is inside nilo's function. **A rule applied to one module and not its
+neighbour is a rule the neighbour will re-learn from a bug report**
+([ADR 0208](./adr/0208-a-statement-pays-for-the-width-of-its-row.md)).
+
+**A fixed array in a function that already allocates is a ceiling that buys
+nothing.** `Components` held sixty-four named shapes on the stack, in a
+writer that runs once at startup into an allocating buffer. A product of six
+contexts sat exactly on it, and the only sign was a `$ref` that was not there.
+The comment said the document was still correct, and it was; what it did not
+say is that a generated client had lost the name
+([ADR 0209](./adr/0209-a-document-names-every-shape-it-has.md)).
+
+**And a value beside a borrow is a trap with a passing assertion in it.**
+`Answer.status` was a `u16` and `Answer.body` a slice into the client's one
+buffer, so a status read after the next request was still right and the body
+beside it was the other request's. The test that found it failed inside
+`std.json`; the one it warns about passes. An answer now knows which request
+it was ([ADR 0210](./adr/0210-an-answer-knows-which-request-it-was.md)).

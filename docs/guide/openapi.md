@@ -102,7 +102,9 @@ are written out in place. Two types that share a short name — an `a.User` and 
 `b.User` — both keep their full names, because a generator handed one `User`
 meaning two shapes produces code that does not compile; and where two *generics*
 render to the same name and are not the same shape, neither gets it and both are
-written out in place.
+written out in place. There is no ceiling on how many shapes a document names:
+there was one, at sixty-four, and a product of six contexts reached it
+([ADR 0209](../adr/0209-a-document-names-every-shape-it-has.md)).
 
 `Failure` is the shape every error body takes
 ([ADR 0025](../adr/0025-every-failure-answers-with-the-same-json-body.md)).

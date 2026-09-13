@@ -102,6 +102,7 @@ const list_table = "nilo_live_tickets_" ++ mode_suffix;
 const adults_view = "nilo_live_adults_" ++ mode_suffix;
 const totals_view = "nilo_live_totals_" ++ mode_suffix;
 const auto_table = "nilo_live_auto_" ++ mode_suffix;
+const lines_table = "nilo_live_lines_" ++ mode_suffix;
 
 /// A schema of its own, so that a qualified name is tested against a table
 /// that **only** exists there. A table in `public` with the same name would
@@ -223,7 +224,33 @@ const setup =
     "  id bigint PRIMARY KEY," ++
     "  label text NOT NULL" ++
     ");" ++
-    "INSERT INTO " ++ scoped_table ++ " (id, label) VALUES (1, 'in another schema');";
+    "INSERT INTO " ++ scoped_table ++ " (id, label) VALUES (1, 'in another schema');" ++
+    // A table as wide as a real one — twenty columns, of which a save
+    // writes seventeen — because a batch that compiled at nine columns and
+    // not at seventeen was found by a port and not by a test (ADR 0208).
+    "DROP TABLE IF EXISTS " ++ lines_table ++ ";" ++
+    "CREATE TABLE " ++ lines_table ++ " (" ++
+    "  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY," ++
+    "  rab_id bigint NOT NULL," ++
+    "  section_id bigint," ++
+    "  position integer NOT NULL," ++
+    "  kind text NOT NULL," ++
+    "  commitment_id bigint," ++
+    "  sku_id bigint," ++
+    "  description text NOT NULL," ++
+    "  quantity numeric(14,3) NOT NULL," ++
+    "  unit text NOT NULL," ++
+    "  unit_cost_currency text," ++
+    "  unit_cost_amount_minor bigint," ++
+    "  cost_source text NOT NULL," ++
+    "  notes text," ++
+    "  partner_id bigint," ++
+    "  lead_days integer," ++
+    "  risk text," ++
+    "  reference text," ++
+    "  created_at timestamptz NOT NULL DEFAULT now()," ++
+    "  updated_at timestamptz NOT NULL DEFAULT now()" ++
+    ");";
 
 const Person = struct {
     pub const nilo_table = .{ .name = table, .key = .id };
@@ -3156,4 +3183,113 @@ test "a Db told to keep no plans still answers, one Parse at a time" {
         try testing.expectEqual(@as(usize, 3), try db.count(Person, &run, .{}));
         run.reset();
     }
+}
+
+// -- a Row as wide as a real table -----------------------------------------
+
+/// Twenty columns, the width `rab_lines` has in the port that found the
+/// builders running out of branches at seventeen written (ADR 0208).
+const Line = struct {
+    pub const nilo_table = .{ .name = lines_table, .key = .id };
+
+    id: i64,
+    rab_id: i64,
+    section_id: ?i64,
+    position: i32,
+    kind: []const u8,
+    commitment_id: ?i64,
+    sku_id: ?i64,
+    description: []const u8,
+    quantity: types.Decimal,
+    unit: []const u8,
+    unit_cost_currency: ?[]const u8,
+    unit_cost_amount_minor: ?i64,
+    cost_source: []const u8,
+    notes: ?[]const u8,
+    partner_id: ?i64,
+    lead_days: ?i32,
+    risk: ?[]const u8,
+    reference: ?[]const u8,
+    created_at: types.Timestamp,
+    updated_at: types.Timestamp,
+};
+
+/// What a save writes: everything but the key and the two the database fills.
+const SavedLine = struct {
+    rab_id: i64,
+    section_id: ?i64,
+    position: i32,
+    kind: []const u8,
+    commitment_id: ?i64,
+    sku_id: ?i64,
+    description: []const u8,
+    quantity: types.Decimal,
+    unit: []const u8,
+    unit_cost_currency: ?[]const u8,
+    unit_cost_amount_minor: ?i64,
+    cost_source: []const u8,
+    notes: ?[]const u8,
+    partner_id: ?i64,
+    lead_days: ?i32,
+    risk: ?[]const u8,
+    reference: ?[]const u8,
+};
+
+fn savedLine(rab: i64, position: i32, description: []const u8) SavedLine {
+    return .{
+        .rab_id = rab,
+        .section_id = if (@rem(position, 2) == 0) 7 else null,
+        .position = position,
+        .kind = "sku",
+        .commitment_id = null,
+        .sku_id = 1_000 + position,
+        .description = description,
+        .quantity = .{ .text = "2.500" },
+        .unit = "day",
+        .unit_cost_currency = "IDR",
+        .unit_cost_amount_minor = 150_000_00,
+        .cost_source = "catalogue",
+        .notes = null,
+        .partner_id = null,
+        .lead_days = 14,
+        .risk = null,
+        .reference = null,
+    };
+}
+
+test "a batch seventeen columns wide goes into a twenty-column table in one statement" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // The document, forty rows at a time, which is the shape the port saves
+    // on a timer and had fallen back to one `INSERT` per row for.
+    var lines: [40]SavedLine = undefined;
+    for (&lines, 0..) |*line, i| line.* = savedLine(1, @intCast(i), "a line of the document");
+    const stored = try stack.db.insertMany(Line, &run, &lines);
+    try testing.expectEqual(@as(usize, 40), stored.len);
+    try testing.expectEqual(@as(i32, 39), stored[39].position);
+    try testing.expectEqual(@as(?i64, 7), stored[38].section_id);
+    try testing.expectEqual(@as(?i64, null), stored[39].section_id);
+    try testing.expectEqualStrings("2.500", stored[0].quantity.text);
+    try testing.expect(stored[0].created_at.micros > 0);
+
+    // One row the same way, and the upsert over it, on the same width.
+    const one = try stack.db.insert(Line, &run, savedLine(2, 0, "a single line"));
+    try testing.expectEqualStrings("a single line", one.description);
+    try testing.expectEqual(@as(?i64, 1_000), one.sku_id);
+
+    // A batched update carrying the key and every column a save may move.
+    const Moved = struct { id: i64, position: i32, notes: ?[]const u8, quantity: types.Decimal };
+    const moved = try stack.db.updateMany(Line, &run, &[_]Moved{
+        .{ .id = stored[0].id, .position = 100, .notes = "moved", .quantity = .{ .text = "1.000" } },
+        .{ .id = stored[1].id, .position = 101, .notes = null, .quantity = .{ .text = "0.250" } },
+    });
+    try testing.expectEqual(@as(usize, 2), moved.len);
+
+    const total = try stack.db.count(Line, &run, .{ .where = .{ .rab_id = @as(i64, 1) } });
+    try testing.expectEqual(@as(usize, 40), total);
 }

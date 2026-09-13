@@ -641,40 +641,59 @@ fn shortNameOf(full: []const u8) []const u8 {
 /// name a user type may well already have taken.
 const error_schema_name = "Failure";
 
-/// How many named shapes one document can hold. Past this a shape is written
-/// out in place, exactly as it used to be everywhere — the document is
-/// bigger and still correct.
-const max_components = 64;
-
-/// The named shapes a document refers to rather than repeating. Collected in
-/// one pass over the routes before anything is written, because the
-/// `components` section and the `$ref`s pointing into it have to agree and
-/// only one of them can be written first.
-const Components = struct {
-    names: [max_components][]const u8 = undefined,
-    schemas: [max_components]*const Schema = undefined,
+/// One named shape in the document.
+const Slot = struct {
+    name: []const u8,
+    schema: *const Schema,
     /// Whether two shapes turned out to answer to this name. A declared type
     /// cannot collide with another — its full name has its module in it — but
     /// a *rendered* one can: `a.Page(b.Order)` and `c.Page(d.Order)` are both
     /// `Page_Order`. When that happens neither gets the name, and both are
     /// written out where they appear. Bigger document, still a true one.
-    contested: [max_components]bool = @splat(false),
+    contested: bool = false,
     /// The other name this slot answers to, when a shape arrived twice
     /// because its `Str` half and its `Text` half are separate Zig types
     /// (ADR 0077). Empty for every other slot, which is most of them.
-    twin: [max_components][]const u8 = @splat(""),
-    count: usize = 0,
+    twin: []const u8 = "",
+};
 
-    fn gather(self: *Components, ops: []const Operation) void {
+/// The named shapes a document refers to rather than repeating. Collected in
+/// one pass over the routes before anything is written, because the
+/// `components` section and the `$ref`s pointing into it have to agree and
+/// only one of them can be written first.
+///
+/// A list that grows rather than an array of sixty-four: a product of six
+/// contexts reached the fixed ceiling, and past it a shape was written out
+/// in place — a true document whose generated client had lost the name
+/// ([ADR 0209](../docs/adr/0209-a-document-names-every-shape-it-has.md)).
+/// The document is written once, before the server listens, so the list is
+/// the one allocation that is free to make here.
+const Components = struct {
+    gpa: std.mem.Allocator,
+    slots: std.ArrayList(Slot) = .empty,
+
+    fn init(gpa: std.mem.Allocator) Components {
+        return .{ .gpa = gpa };
+    }
+
+    fn deinit(self: *Components) void {
+        self.slots.deinit(self.gpa);
+    }
+
+    fn count(self: *const Components) usize {
+        return self.slots.items.len;
+    }
+
+    fn gather(self: *Components, ops: []const Operation) !void {
         for (ops) |op| {
-            for (op.params) |p| self.add(p.schema);
-            for (op.query) |f| self.add(f.schema);
-            if (op.body) |b| self.add(b);
-            if (op.answer.schema) |s| self.add(s);
+            for (op.params) |p| try self.add(p.schema);
+            for (op.query) |f| try self.add(f.schema);
+            if (op.body) |b| try self.add(b);
+            if (op.answer.schema) |s| try self.add(s);
         }
     }
 
-    fn add(self: *Components, schema: *const Schema) void {
+    fn add(self: *Components, schema: *const Schema) !void {
         switch (schema.*) {
             .object => |o| {
                 if (o.name) |full| {
@@ -683,30 +702,28 @@ const Components = struct {
                         // were walked when it was first seen. This is also
                         // what stops a type holding one of its own from
                         // recursing for ever.
-                        if (sameShape(self.schemas[i], schema)) return;
+                        if (sameShape(self.slots.items[i].schema, schema)) return;
                         // A second shape wanting the same name. Once is
                         // enough to settle it; returning on the second visit
                         // is what keeps a self-referential one from looping.
-                        if (self.contested[i]) return;
-                        self.contested[i] = true;
+                        if (self.slots.items[i].contested) return;
+                        self.slots.items[i].contested = true;
                     } else if (self.lifetimeTwinOf(full, schema)) |i| {
                         // The same shape, once with `Str` in it and once with
                         // `Text` — one JSON shape wearing two Zig lifetimes
                         // (ADR 0077). Its fields were walked when the first
                         // half was seen.
-                        self.twin[i] = full;
+                        self.slots.items[i].twin = full;
                         return;
-                    } else if (self.count < max_components) {
-                        self.names[self.count] = full;
-                        self.schemas[self.count] = schema;
-                        self.count += 1;
+                    } else {
+                        try self.slots.append(self.gpa, .{ .name = full, .schema = schema });
                     }
                 }
-                for (o.fields) |f| self.add(f.schema);
+                for (o.fields) |f| try self.add(f.schema);
             },
-            .array => |item| self.add(item),
-            .nullable => |inner| self.add(inner),
-            .one_of => |o| for (o.cases) |case| self.add(case.schema),
+            .array => |item| try self.add(item),
+            .nullable => |inner| try self.add(inner),
+            .one_of => |o| for (o.cases) |case| try self.add(case.schema),
             else => {},
         }
     }
@@ -748,12 +765,12 @@ const Components = struct {
     /// names and are not the same shape.
     fn lifetimeTwinOf(self: *const Components, full: []const u8, schema: *const Schema) ?usize {
         const stem = stemOf(full) orelse return null;
-        for (self.names[0..self.count], 0..) |other, i| {
-            if (self.twin[i].len > 0) continue;
-            const other_stem = stemOf(other) orelse continue;
+        for (self.slots.items, 0..) |slot, i| {
+            if (slot.twin.len > 0) continue;
+            const other_stem = stemOf(slot.name) orelse continue;
             if (!std.mem.eql(u8, stem, other_stem)) continue;
-            if (std.mem.eql(u8, other, full)) continue;
-            if (rendersTheSame(self.schemas[i], schema)) return i;
+            if (std.mem.eql(u8, slot.name, full)) continue;
+            if (rendersTheSame(slot.schema, schema)) return i;
         }
         return null;
     }
@@ -773,13 +790,13 @@ const Components = struct {
     /// the same one.
     fn slotFor(self: *const Components, full: []const u8) ?usize {
         const i = self.indexOf(full) orelse return null;
-        return if (self.contested[i]) null else i;
+        return if (self.slots.items[i].contested) null else i;
     }
 
     fn indexOf(self: *const Components, full: []const u8) ?usize {
-        for (self.names[0..self.count], 0..) |name, i| {
-            if (std.mem.eql(u8, name, full)) return i;
-            if (self.twin[i].len > 0 and std.mem.eql(u8, self.twin[i], full)) return i;
+        for (self.slots.items, 0..) |slot, i| {
+            if (std.mem.eql(u8, slot.name, full)) return i;
+            if (slot.twin.len > 0 and std.mem.eql(u8, slot.twin, full)) return i;
         }
         return null;
     }
@@ -797,22 +814,22 @@ const Components = struct {
     /// gets `Meta` rather than one of `Meta_Str` and `Meta_Text` standing in
     /// for both.
     fn nameAt(self: *const Components, i: usize) []const u8 {
-        const full = self.names[i];
-        if (self.twin[i].len > 0) return stemOf(full) orelse full;
+        const full = self.slots.items[i].name;
+        if (self.slots.items[i].twin.len > 0) return stemOf(full) orelse full;
         const short = shortNameOf(full);
         return if (self.shortIsFree(i, short)) short else full;
     }
 
     fn shortIsFree(self: *const Components, i: usize, short: []const u8) bool {
         if (std.mem.eql(u8, short, error_schema_name)) return false;
-        for (self.names[0..self.count], 0..) |other, j| {
+        for (self.slots.items, 0..) |other, j| {
             // A contested slot is written nowhere, so it is not competing
             // for the short name it would otherwise have taken.
-            if (self.contested[j]) continue;
-            const other_short = if (self.twin[j].len > 0)
-                (stemOf(other) orelse other)
+            if (other.contested) continue;
+            const other_short = if (other.twin.len > 0)
+                (stemOf(other.name) orelse other.name)
             else
-                shortNameOf(other);
+                shortNameOf(other.name);
             if (j != i and std.mem.eql(u8, other_short, short)) return false;
         }
         return true;
@@ -899,9 +916,10 @@ const Components = struct {
 /// served from memory. Nothing here runs while a request is in flight, so it
 /// is written for clarity rather than for speed — the quadratic grouping
 /// below included, over a route list that is dozens long at most.
-pub fn write(w: *std.Io.Writer, ops: []const Operation, info: Info) !void {
-    var components: Components = .{};
-    components.gather(ops);
+pub fn write(gpa: std.mem.Allocator, w: *std.Io.Writer, ops: []const Operation, info: Info) !void {
+    var components = Components.init(gpa);
+    defer components.deinit();
+    try components.gather(ops);
 
     try w.writeAll("{\"openapi\":\"3.1.0\",\"info\":{\"title\":");
     try writeString(w, info.title);
@@ -944,16 +962,16 @@ pub fn write(w: *std.Io.Writer, ops: []const Operation, info: Info) !void {
         try w.writeAll("\"" ++ error_schema_name ++ "\":" ++ error_schema);
         wrote_schema = true;
     }
-    for (components.schemas[0..components.count], 0..) |schema, i| {
+    for (components.slots.items, 0..) |slot, i| {
         // A name two shapes wanted belongs to neither, and both were written
         // out where they appear rather than referred to here.
-        if (components.contested[i]) continue;
+        if (slot.contested) continue;
         if (wrote_schema) try w.writeByte(',');
         wrote_schema = true;
         try w.writeByte('"');
         try components.writeName(w, i);
         try w.writeAll("\":");
-        try writeObject(w, &components, schema.object);
+        try writeObject(w, &components, slot.schema.object);
     }
     try w.writeByte('}');
 
@@ -1450,7 +1468,7 @@ fn schemaJson(comptime T: type) ![]const u8 {
     errdefer out.deinit();
     // Nothing collected, so nothing is a reference and every shape is
     // written out — which is what these tests are about.
-    const none: Components = .{};
+    const none = Components.init(testing.allocator);
     // `comptime` here rather than inside `schemaOf`: the whole point of a
     // Schema is that it exists before the program runs, and a call from a
     // runtime context would be asking for one that does not.
@@ -1630,14 +1648,15 @@ test "one shape split only by a lifetime is one component" {
     const Body = struct { meta: Meta.of(Str) };
     const Row = struct { meta: Meta.of([]const u8) };
 
-    var components: Components = .{};
-    components.add(comptime schemaOf(Body));
-    components.add(comptime schemaOf(Row));
+    var components = Components.init(testing.allocator);
+    defer components.deinit();
+    try components.add(comptime schemaOf(Body));
+    try components.add(comptime schemaOf(Row));
 
     // One slot, answering to both names, written without the half that was
     // only a lifetime. Three components rather than four: `Body`, `Row`, and
     // the one `Meta`.
-    try testing.expectEqual(@as(usize, 3), components.count);
+    try testing.expectEqual(@as(usize, 3), components.count());
     const meta = components.indexOf(comptime nameOf(Meta.of(Str)).?).?;
     try testing.expectEqual(meta, components.indexOf(comptime nameOf(Meta.of([]const u8)).?).?);
 
@@ -1645,6 +1664,49 @@ test "one shape split only by a lifetime is one component" {
     try testing.expect(std.mem.endsWith(u8, written, "_of"));
     try testing.expect(std.mem.indexOf(u8, written, "_Str") == null);
     try testing.expect(std.mem.indexOf(u8, written, "_Text") == null);
+}
+
+test "a document past sixty-four named shapes still refers to every one of them by name" {
+    // Seventy shapes with a name each, on seventy routes. Six contexts of a
+    // real product reached the old ceiling of sixty-four, and the shapes past
+    // it were written out in place — a true document whose generated client
+    // had lost their names (ADR 0209).
+    const Shape = struct {
+        fn of(comptime n: usize) type {
+            return struct { id: u32, digits: [n]u8 };
+        }
+    };
+    const many = 70;
+    const ops = comptime blk: {
+        // Seventy shapes named in one evaluation, where an app names one per
+        // route registered; the budget is this test's, not a caller's.
+        @setEvalBranchQuota(400_000);
+        var built: [many]Operation = undefined;
+        for (&built, 0..) |*op, i| {
+            op.* = .{
+                .method = .GET,
+                .pattern = std.fmt.comptimePrint("/shapes/{d}", .{i}),
+                .params = &.{},
+                .query = &.{},
+                .body = null,
+                .answer = .{ .status = 200, .content_type = "application/json", .schema = schemaOf(Shape.of(i + 1)) },
+                .can_reject = false,
+            };
+        }
+        break :blk built;
+    };
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try write(testing.allocator, &out.writer, &ops, .{});
+    const doc = out.written();
+
+    // Every answer is a reference, and every reference has a shape under
+    // `components` to point at.
+    try testing.expectEqual(@as(usize, many), std.mem.count(u8, doc, "\"$ref\":"));
+    try testing.expectEqual(@as(usize, many), std.mem.count(u8, doc, "\"digits\":"));
+    // The seventieth is referred to, not written into its route.
+    try testing.expect(std.mem.indexOf(u8, doc, "_of_70\"}") != null);
 }
 
 test "two shapes that only look alike keep their own names" {
@@ -1656,13 +1718,14 @@ test "two shapes that only look alike keep their own names" {
         }
     };
 
-    var components: Components = .{};
-    components.add(comptime schemaOf(Page.of(Order)));
-    components.add(comptime schemaOf(Page.of(User)));
+    var components = Components.init(testing.allocator);
+    defer components.deinit();
+    try components.add(comptime schemaOf(Page.of(Order)));
+    try components.add(comptime schemaOf(Page.of(User)));
 
     // `Page_of_Order` and `Page_of_User` are neither a `_Str`/`_Text` pair nor
     // the same shape, so nothing is merged: two pages, two item types.
-    try testing.expectEqual(@as(usize, 4), components.count);
+    try testing.expectEqual(@as(usize, 4), components.count());
 }
 
 test "a type that writes its own JSON is described by what it says, not by its fields" {

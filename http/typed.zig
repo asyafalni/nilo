@@ -1791,7 +1791,7 @@ test "a path param that parses itself is described by what the type says, not by
 
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try openapi.write(&w, &.{op}, .{});
+    try openapi.write(testing.allocator, &w, &.{op}, .{});
     const doc = buf[0..w.end];
 
     // `number: u32` is what reflecting the struct would have published, and
@@ -1817,7 +1817,7 @@ test "a Str path param is still a bare string, so nothing was widened by acciden
 
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try openapi.write(&w, &.{op}, .{});
+    try openapi.write(testing.allocator, &w, &.{op}, .{});
     const doc = buf[0..w.end];
 
     try testing.expect(std.mem.indexOf(u8, doc, "\"name\":\"name\",\"in\":\"path\"," ++

@@ -122,6 +122,27 @@ pub const Answer = struct {
     /// arrived. This is here so a test can assert the interim was sent, and so
     /// that one arriving cannot be mistaken for the answer (ADR 0094).
     interim: ?[]const u8 = null,
+    /// Which request on the client this answered, and where the client keeps
+    /// its count — so a body read after a later request on the same client
+    /// is refused rather than read as that request's bytes
+    /// ([ADR 0210](../docs/adr/0210-an-answer-knows-which-request-it-was.md)).
+    /// `raw`, `head` and `body` point into the client's one response buffer,
+    /// which the next request writes over; `status` is a value and goes on
+    /// reading as it did. Null for an answer parsed with no client behind it,
+    /// which has no next request to go stale under.
+    made: u32 = 0,
+    counter: ?*const u32 = null,
+
+    /// Refuse a body that is no longer this answer's.
+    ///
+    /// `made.status == 201` was true and `made.json(…)` was reading the 403
+    /// the request after it had answered, three frames down in `std.json`.
+    /// The version that costs more is the assertion that *passes* because the
+    /// later body happened to carry the same key.
+    fn fresh(self: Answer) error{AnswerStale}!void {
+        const counter = self.counter orelse return;
+        if (counter.* != self.made) return error.AnswerStale;
+    }
 
     /// The value of a response header, or null if it is not there.
     pub fn header(self: Answer, name: []const u8) ?[]const u8 {
@@ -178,6 +199,7 @@ pub const Answer = struct {
     /// The body as the client sees it: chunk framing removed if there was
     /// any, and the bytes as they are otherwise.
     pub fn text(self: Answer, into: []u8) ![]const u8 {
+        try self.fresh();
         if (!self.chunked) {
             if (self.body.len > into.len) return error.NoRoom;
             @memcpy(into[0..self.body.len], self.body);
@@ -206,6 +228,7 @@ pub const Answer = struct {
     /// allocation the size of the framed body is always enough and there is no
     /// growing.
     pub fn bytes(self: Answer, arena: std.mem.Allocator) ![]const u8 {
+        try self.fresh();
         return self.text(try arena.alloc(u8, self.body.len));
     }
 
@@ -225,8 +248,11 @@ pub const Answer = struct {
     /// asked about is the ordinary case.
     ///
     /// Everything is copied into `arena`, so what comes back outlives the
-    /// client's response buffer and the next request on it.
+    /// client's response buffer and the next request on it. **Read it before
+    /// that request**: an answer asked for its body after the client has
+    /// answered another is `error.AnswerStale`, not the other one's body.
     pub fn json(self: Answer, comptime T: type, arena: std.mem.Allocator) !T {
+        try self.fresh();
         return std.json.parseFromSliceLeaky(T, arena, try self.bytes(arena), .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
@@ -368,6 +394,9 @@ pub const Client = struct {
     /// The cookies the answers have set, when `Options.cookies` is on.
     jar: std.ArrayList(Header) = .empty,
     keep_cookies: bool = false,
+    /// How many requests this client has answered. Each `Answer` carries the
+    /// number it was, and refuses its body once the two differ (ADR 0210).
+    made: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, options: Options) !Client {
         // The one warning `listen()` gives that a test can also earn, and the
@@ -567,7 +596,10 @@ pub const Client = struct {
         self.lifetime.end();
         defer _ = self.arena.reset(.retain_capacity);
 
-        const answer = try parse(out.buffered(), keep_alive);
+        var answer = try parse(out.buffered(), keep_alive);
+        self.made += 1;
+        answer.made = self.made;
+        answer.counter = &self.made;
         if (self.keep_cookies) try self.takeCookies(answer);
         return answer;
     }
@@ -1387,6 +1419,42 @@ test "what json hands back outlives the next request on the same client" {
     try testing.expectEqualStrings("Wati", held.name);
 }
 
+test "an answer asked for its body after the next request says so, rather than reading that one's" {
+    // `first.status` is a value and keeps reading 201; `first.body` points
+    // into the buffer the second request wrote over. A test that read one and
+    // then the other failed three frames down in `std.json`, and the version
+    // that costs more passes because the second body has the same key
+    // (ADR 0210).
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/partners", created);
+    try app.get("/thing", plain);
+
+    var client = try Client.init(testing.allocator, .{});
+    defer client.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const first = try client.post(&app, "/partners", "");
+    try testing.expectEqual(@as(u16, 201), first.status);
+    const second = try client.get(&app, "/thing");
+
+    try testing.expectEqual(@as(u16, 201), first.status);
+    try testing.expectError(error.AnswerStale, first.json(Made, arena.allocator()));
+    try testing.expectError(error.AnswerStale, first.bytes(arena.allocator()));
+    var room: [64]u8 = undefined;
+    try testing.expectError(error.AnswerStale, first.text(&room));
+
+    // The one that is current reads as it always did.
+    try testing.expectEqualStrings("body text", try second.bytes(arena.allocator()));
+
+    // An answer parsed on its own has no client behind it and no next request
+    // to go stale under, so it reads whenever it is asked.
+    const alone = try parse("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", true);
+    try testing.expectEqualStrings("ok", try alone.bytes(arena.allocator()));
+}
+
 test "an App and a Client wired together drive the same requests" {
     var wired = try Wired.init(testing.allocator, .{});
     defer wired.deinit();
@@ -1596,7 +1664,6 @@ test "the slot goes back to whatever held it, so one test cannot leak into the n
 
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(&outer)), bulkhead.slot());
 }
-
 
 test "show calls a type's own rendering where {any} refuses to" {
     // Stands in for `Uuid`, which this module may not import — `http/` sees
