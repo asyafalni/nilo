@@ -84,7 +84,7 @@ const across_columns = "columns";
 const reserved = [_][]const u8{ any_field, exists_field, not_exists_field, across_field };
 
 /// The names an `.exists` entry may carry.
-const exists_known = [_][]const u8{ "in", "on", "where" };
+const exists_known = [_][]const u8{ "in", "on", "via", "where" };
 
 /// A value a condition only has *sometimes* — the term is in the statement
 /// when there is one, and out of it when there is not
@@ -561,8 +561,10 @@ fn anyOf(
 /// and that is what is still refused — the boundary did not blur, it moved to
 /// where those two properties actually hold.
 ///
-/// **The correlation is read out of the child's own `.references`**, which is
-/// already checked harder than anything else in this repository:
+/// **The correlation is read out of a `.references` one of the two Rows
+/// declared** — the child's, pointing at this table, or this Row's own,
+/// pointing at the child's ([ADR 0214](../docs/adr/0214-an-exists-reads-the-reference-from-either-side.md))
+/// — which is already checked harder than anything else in this repository:
 /// `table.oneReference` makes the target be a Row, the target column be one of
 /// its columns, and the two Zig types be the same. So joining on it costs no
 /// new vocabulary at the call site and no new check — the fact was already
@@ -629,7 +631,8 @@ fn oneExists(
 ) []const u8 {
     comptime {
         const shape = "  Write `.{ .in = OtherRow, .where = .{ … } }`, and `.on = .<column>` " ++
-            "when the two tables are joined by a column no `.references` names.";
+            "(or `.via = .<column>` for a column of this Row) when the two tables are " ++
+            "joined by a column no `.references` names.";
 
         if (@typeInfo(T) != .@"struct" or @typeInfo(T).@"struct".is_tuple) @compileError(
             "nilo: an entry of `." ++ word ++ "` is a " ++ @typeName(T) ++ ".\n" ++ shape,
@@ -640,8 +643,8 @@ fn oneExists(
             } else @compileError(
                 "nilo: an entry of `." ++ word ++ "` sets `." ++ f.name ++
                     "`, which is not part of it.\n" ++
-                    "  It takes `.in`, `.where`, and `.on` when the join column is not " ++
-                    "one a `.references` already names.",
+                    "  It takes `.in`, `.where`, and `.on` or `.via` when the join column " ++
+                    "is not one a `.references` already names.",
             );
         }
         if (!@hasField(T, "in")) @compileError(
@@ -666,8 +669,8 @@ fn oneExists(
         const Inner = fieldValue(T, "in");
         row_mod.assertRow(Inner);
 
-        const link = correlation(Outer, Inner, T, word);
-
+        // Before the join is looked for, because a self-reference is a
+        // reference in both directions and would be refused as that instead.
         const outer_rel = relationOf(D, Outer);
         const inner_rel = relationOf(D, Inner);
         if (std.mem.eql(u8, outer_rel, inner_rel)) @compileError(
@@ -677,6 +680,8 @@ fn oneExists(
                 "the subquery would be ambiguous. A test against the same table needs an " ++
                 "alias, which is `db.raw`.",
         );
+
+        const link = correlation(Outer, Inner, T, word);
 
         // The walk inside the subquery names the other table and the other
         // Row. Saved and put back, so a second entry beside this one is walked
@@ -966,15 +971,21 @@ const Link = struct {
     outer: []const u8,
 };
 
-/// The join, taken from the child's `.references` — or from `.on` plus the
-/// outer Row's key when the schema does not declare one.
+/// The join, taken from a `.references` on either Row — the child's, pointing
+/// at the outer table, or the outer Row's own, pointing at the inner one —
+/// or from `.on` / `.via` plus the far side's key when the schema does not
+/// declare one.
 ///
 /// **Zero matches and two matches are both Refusals**, and they are different
 /// mistakes: nothing to join on is a schema that has not said how the tables
 /// relate, and two ways to join is a schema that has said it twice — a table
 /// with `.created_by` and `.updated_by` both pointing at `staff` is the
 /// ordinary shape of the second, and guessing between them would be a query
-/// that reads correctly and answers the wrong question.
+/// that reads correctly and answers the wrong question. Two tables that point
+/// at each other are the second mistake in a different coat: which direction
+/// the query means is the same question, and `.on` names the inner column
+/// while `.via` names the outer one, so an answer cannot be read as the other
+/// ([ADR 0214](../docs/adr/0214-an-exists-reads-the-reference-from-either-side.md)).
 fn correlation(
     comptime Outer: type,
     comptime Inner: type,
@@ -983,15 +994,33 @@ fn correlation(
 ) Link {
     comptime {
         const outer_q = row_mod.qualifiedOf(Outer);
+        const inner_q = row_mod.qualifiedOf(Inner);
+        // The child direction: a column of Inner that points at Outer.
         var found: []const Link = &.{};
         var named: []const u8 = "";
-
         for (table_mod.foreignKeysOf(Inner)) |ref| {
             if (!std.mem.eql(u8, ref.table, outer_q.table)) continue;
             if (!table_mod.sameSchema(ref.schema, outer_q.schema)) continue;
             named = named ++ (if (found.len == 0) "" else ", ") ++ "`" ++ ref.column ++ "`";
             found = found ++ &[_]Link{.{ .inner = ref.column, .outer = ref.target }};
         }
+        // The parent direction: a column of Outer that points at Inner.
+        var back: []const Link = &.{};
+        var back_named: []const u8 = "";
+        for (table_mod.foreignKeysOf(Outer)) |ref| {
+            if (!std.mem.eql(u8, ref.table, inner_q.table)) continue;
+            if (!table_mod.sameSchema(ref.schema, inner_q.schema)) continue;
+            back_named = back_named ++ (if (back.len == 0) "" else ", ") ++ "`" ++ ref.column ++ "`";
+            back = back ++ &[_]Link{.{ .inner = ref.target, .outer = ref.column }};
+        }
+
+        if (@hasField(T, "on") and @hasField(T, "via")) @compileError(
+            "nilo: an entry of `." ++ word ++ "` says both `.on` and `.via`.\n" ++
+                "  They are the two ends of one join: `.on` is the column of " ++
+                @typeName(Inner) ++ " that points at " ++ @typeName(Outer) ++ ", and `.via` " ++
+                "is the column of " ++ @typeName(Outer) ++ " that points at " ++
+                @typeName(Inner) ++ ". Write whichever side holds the key, and only that one.",
+        );
 
         if (@hasField(T, "on")) {
             const On = @FieldType(T, "on");
@@ -1022,14 +1051,54 @@ fn correlation(
             return .{ .inner = wanted, .outer = outer_keys[0] };
         }
 
-        if (found.len == 0) @compileError(
+        if (@hasField(T, "via")) {
+            const Via = @FieldType(T, "via");
+            if (Via != @TypeOf(.enum_literal)) @compileError(
+                "nilo: `." ++ word ++ "`'s `.via` is a " ++ @typeName(Via) ++ ".\n" ++
+                    "  It is the column of " ++ @typeName(Outer) ++ " that points at " ++
+                    @typeName(Inner) ++ ", written as a name: `.via = .department_id`.",
+            );
+            const wanted = @tagName(fieldValue(T, "via"));
+            if (!row_mod.hasColumn(Outer, wanted)) {
+                row_mod.noSuchColumn(Outer, wanted, "`." ++ word ++ "`'s `.via`");
+            }
+            for (back) |link| {
+                if (std.mem.eql(u8, link.outer, wanted)) return link;
+            }
+            const inner_keys = row_mod.keysOf(Inner);
+            if (inner_keys.len != 1) @compileError(
+                "nilo: `." ++ word ++ "`'s `.via = ." ++ wanted ++ "` has nothing to join to.\n" ++
+                    "  " ++ @typeName(Outer) ++ " declares no `.references` from that column, " ++
+                    "so the other side would be " ++ @typeName(Inner) ++ "'s key — and that " ++
+                    "key is " ++ row_mod.keyList(Inner) ++ ", which one column cannot match.\n" ++
+                    "  Declare the foreign key: `.references = .{ ." ++ wanted ++ " = .{ " ++
+                    @typeName(Inner) ++ ", .<column> } }`.",
+            );
+            return .{ .inner = inner_keys[0], .outer = wanted };
+        }
+
+        if (found.len == 0 and back.len == 0) @compileError(
             "nilo: `." ++ word ++ "` names " ++ @typeName(Inner) ++ ", which declares no " ++
                 "`.references` to " ++ @typeName(Outer) ++ "'s table `" ++ outer_q.table ++
                 "`.\n" ++
-                "  The join is read out of the schema rather than written at the call site, " ++
-                "so there has to be one. Add `.references = .{ .<column> = .{ " ++
+                "  And " ++ @typeName(Outer) ++ " declares none to " ++ @typeName(Inner) ++
+                "'s table `" ++ inner_q.table ++ "`, so neither side says how the two " ++
+                "relate. The join is read out of the schema rather than written at the " ++
+                "call site, so there has to be one. Add `.references = .{ .<column> = .{ " ++
                 @typeName(Outer) ++ ", .<column> } }` to " ++ @typeName(Inner) ++ "'s " ++
-                row_mod.marker ++ ", or say which column joins with `.on = .<column>`.",
+                row_mod.marker ++ " (or the reverse to " ++ @typeName(Outer) ++ "'s), or say " ++
+                "which column joins: `.on = .<column>` of " ++ @typeName(Inner) ++ ", or " ++
+                "`.via = .<column>` of " ++ @typeName(Outer) ++ ".",
+        );
+        if (found.len > 0 and back.len > 0) @compileError(
+            "nilo: `." ++ word ++ "` names " ++ @typeName(Inner) ++ ", and the two tables " ++
+                "point at each other: " ++ @typeName(Inner) ++ " at " ++ @typeName(Outer) ++
+                "'s table from " ++ named ++ ", and " ++ @typeName(Outer) ++ " at " ++
+                @typeName(Inner) ++ "'s from " ++ back_named ++ ".\n" ++
+                "  Which direction the query means is a question about what it asks, and " ++
+                "guessing would answer the other one. Write `.on = .<column>` for a column " ++
+                "of " ++ @typeName(Inner) ++ ", or `.via = .<column>` for a column of " ++
+                @typeName(Outer) ++ ".",
         );
         if (found.len > 1) @compileError(
             "nilo: `." ++ word ++ "` names " ++ @typeName(Inner) ++ ", which points at " ++
@@ -1037,7 +1106,15 @@ fn correlation(
                 "  Which of them joins is a question about what the query means, and " ++
                 "guessing would answer a different one. Write `.on = .<column>`.",
         );
-        return found[0];
+        if (back.len > 1) @compileError(
+            "nilo: `." ++ word ++ "` names " ++ @typeName(Inner) ++ ", which " ++
+                @typeName(Outer) ++ " points at from more than one column: " ++ back_named ++
+                ".\n" ++
+                "  Which of them joins is a question about what the query means, and " ++
+                "guessing would answer a different one. Write `.via = .<column>`.",
+        );
+        if (found.len == 1) return found[0];
+        return back[0];
     }
 }
 
@@ -1668,6 +1745,43 @@ fn partnerSql(comptime w: anytype) []const u8 {
     return comptime plan(Pg, Partner, @TypeOf(w), 1).sql;
 }
 
+/// The other direction: a Row that points at the one an `.exists` is over.
+const Department = struct {
+    pub const nilo_table = .{ .name = "departments", .key = .id };
+
+    id: i64,
+    name: []const u8,
+};
+
+const Region = struct {
+    pub const nilo_table = .{ .name = "regions", .key = .id };
+
+    id: i64,
+    name: []const u8,
+};
+
+const Staff = struct {
+    pub const nilo_table = .{
+        .name = "staff",
+        .key = .id,
+        .references = .{
+            .department_id = .{ Department, .id },
+            .home_region = .{ Region, .id },
+            .work_region = .{ Region, .id },
+        },
+    };
+
+    id: i64,
+    department_id: i64,
+    home_region: i64,
+    work_region: i64,
+    team_id: i64,
+};
+
+fn staffSql(comptime w: anytype) []const u8 {
+    return comptime plan(Pg, Staff, @TypeOf(w), 1).sql;
+}
+
 test "an exists joins on the reference the child already declared" {
     try testing.expectEqualStrings(
         "EXISTS (SELECT 1 FROM \"partner_capabilities\"" ++
@@ -1772,6 +1886,59 @@ test "an explicit on wins where the schema declares nothing" {
             .{ .in = Loose, .on = .partner_id, .where = .{ .body = @as([]const u8, "x") } },
         } }),
         "\"notes\".\"partner_id\" = \"partners\".\"id\"",
+    ) != null);
+}
+
+test "an exists reads the reference from the outer Row too, so a child can ask about its parent" {
+    // Item 75 of the port: `staff WHERE EXISTS (department WHERE name …)`.
+    // The key is `staff.department_id`, declared on the *outer* Row, and the
+    // subquery correlates `departments.id = staff.department_id` (ADR 0214).
+    try testing.expectEqualStrings(
+        "EXISTS (SELECT 1 FROM \"departments\"" ++
+            " WHERE \"departments\".\"id\" = \"staff\".\"department_id\"" ++
+            " AND \"departments\".\"name\" = $1)",
+        staffSql(.{ .exists = .{
+            .{ .in = Department, .where = .{ .name = @as([]const u8, "vision") } },
+        } }),
+    );
+    // And the parameter is typed against the parent, the way a child's is.
+    const p = comptime plan(Pg, Staff, @TypeOf(.{ .exists = .{
+        .{ .in = Department, .where = .{ .name = @as([]const u8, "vision") } },
+    } }), 1);
+    try testing.expectEqual(Department, p.params[0].of.?);
+}
+
+test "via names the outer column, so two references at the same parent are told apart" {
+    // `.on` is a column of the inner Row and `.via` a column of the outer one:
+    // the two directions cannot be read as each other by mistake.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        staffSql(.{ .exists = .{
+            .{ .in = Region, .via = .home_region, .where = .{ .name = @as([]const u8, "west") } },
+        } }),
+        "\"regions\".\"id\" = \"staff\".\"home_region\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        staffSql(.{ .exists = .{
+            .{ .in = Region, .via = .work_region, .where = .{ .name = @as([]const u8, "west") } },
+        } }),
+        "\"regions\".\"id\" = \"staff\".\"work_region\"",
+    ) != null);
+}
+
+test "an explicit via joins to the inner key where the schema declares nothing" {
+    const Team = struct {
+        pub const nilo_table = .{ .name = "teams", .key = .id };
+        id: i64,
+        name: []const u8,
+    };
+    try testing.expect(std.mem.indexOf(
+        u8,
+        staffSql(.{ .exists = .{
+            .{ .in = Team, .via = .team_id, .where = .{ .name = @as([]const u8, "x") } },
+        } }),
+        "\"teams\".\"id\" = \"staff\".\"team_id\"",
     ) != null);
 }
 

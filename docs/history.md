@@ -3160,3 +3160,13 @@ answer a handler can give — bytes under a label learned per request — was
 missing for the same reason `FileBody` once was: every other answer's label
 is a fact about a type
 ([ADR 0212](./adr/0212-bytes-handed-on-are-an-answer.md)).
+
+**A fact read from one side of a relation is half a fact.** `.exists` read
+the join out of the child's `.references` and refused a schema that declared
+none — a Refusal that was true and beside the point when the key sat on the
+outer Row, because a parent never points at its children. The declaration
+was there the whole time, one Row over. The ambiguity that came with reading
+both sides was met with a second word rather than a smarter first one: `.on`
+names a column of the Row inside and `.via` a column of the Row outside, so
+neither can be read as the other by a Row that happens to share a name
+([ADR 0214](./adr/0214-an-exists-reads-the-reference-from-either-side.md)).

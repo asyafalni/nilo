@@ -3174,6 +3174,51 @@ test "a search over several columns is one statement on Postgres, with the box e
     try testing.expectEqualStrings("ada@example.dev", found.rows[0].email);
 }
 
+test "an exists from the child's side reads the parent's key off the child's own reference" {
+    // Item 75: `staff WHERE EXISTS (departments WHERE …)`, where the key is on
+    // the outer Row. Here the session points at the person, and the query is
+    // over sessions asking about the person (ADR 0214).
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const given = @import("where.zig").given;
+
+    inline for (.{
+        .{ 10, @as(?i64, 1) },
+        .{ 11, @as(?i64, 2) },
+        .{ 12, @as(?i64, null) },
+    }) |row| {
+        _ = try stack.db.insert(Session, &run, .{
+            .id = @as(i64, row[0]),
+            .token_hash = types.Bytes.of("t"),
+            .device = @as(?types.Bytes, null),
+            .person_id = row[1],
+        });
+    }
+
+    // The session whose person is grace, and the two that are not — the
+    // one with no person at all is one of them, which is what NOT EXISTS
+    // over a nullable key means.
+    try testing.expectEqual(@as(usize, 1), try stack.db.count(Session, &run, .{ .where = .{
+        .exists = .{ .{ .in = Person, .where = .{ .email = .{ .icontains = @as([]const u8, "grace") } } } },
+    } }));
+    try testing.expectEqual(@as(usize, 2), try stack.db.count(Session, &run, .{ .where = .{
+        .not_exists = .{ .{ .in = Person, .where = .{ .email = .{ .icontains = @as([]const u8, "grace") } } } },
+    } }));
+    // And the guard drops the whole subquery, the way it does from the other
+    // side: every session, the orphan included.
+    try testing.expectEqual(@as(usize, 3), try stack.db.count(Session, &run, .{ .where = .{
+        .exists = .{ .{ .in = Person, .where = .{ .email = .{ .icontains = given(@as(?[]const u8, null)) } } } },
+    } }));
+    try testing.expectEqual(@as(usize, 1), try stack.db.count(Session, &run, .{ .where = .{
+        .exists = .{ .{ .in = Person, .where = .{ .email = .{ .icontains = given(@as(?[]const u8, "ada")) } } } },
+    } }));
+}
+
 comptime {
     _ = wire_mod;
 }

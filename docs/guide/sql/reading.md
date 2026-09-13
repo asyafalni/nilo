@@ -169,6 +169,25 @@ With the term dropped instead, the subquery would ask whether the partner has
 the same reason a `sql.given` cannot sit beside a condition that is always there
 in one `.exists`; write a second entry.
 
+The join came out of `PartnerCapability`'s `.references`. It is read off
+either Row, so the same question from the other side — the capability rows
+whose partner matches, where the key is `partner_id` on the Row the statement
+is over — is the same line with the two swapped
+([ADR 0214](../../adr/0214-an-exists-reads-the-reference-from-either-side.md)):
+
+<!-- compiles: body -->
+```zig
+const of_partner = try db.select(PartnerCapability, c, .{
+    .where = .{ .exists = .{
+        .{ .in = Partner, .where = .{ .name = .{ .icontains = name } } },
+    } },
+});
+```
+
+A Row that points at the same parent from two columns says which with
+`.via = .<column>` — a column of *this* Row, where `.on` is a column of the
+one inside.
+
 It is refused inside `.any` (OR reverses what dropping a term means), on `.in`
 and `not_distinct_from`, on a value that is not optional, and **in the condition
 of an `UPDATE` or a `DELETE`** — there a term that may not be there is the whole

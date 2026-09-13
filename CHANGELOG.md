@@ -95,6 +95,18 @@ missing — plus the fixes it found underneath them, two of which are the reason
   read as one Zig type. `across` is a reserved column name now, beside `any`
   and `exists`. Four refusals.
 
+- **`.exists` reads the reference from either side, and `.via` names the
+  outer column**
+  ([ADR 0214](./docs/adr/0214-an-exists-reads-the-reference-from-either-side.md)).
+  `staff WHERE EXISTS (departments WHERE …)` has its key on the outer Row,
+  `staff.department_id`, and the join is now read off that `.references` the
+  way it is read off a child's: `.exists = .{ .{ .in = Department, .where =
+  .{ .name = q } } }` from `Staff` compiles with no word at the call site. A
+  Row that points at the same parent from two columns says which with `.via
+  = .<column of the outer Row>`; `.on` is still a column of the inner Row,
+  so the two directions cannot be read as each other. Tables that point at
+  each other are refused until one is named. Four refusals.
+
 - **`sql.Ordering(Row, keys)` — an `ORDER BY` chosen per request, from a
   closed set declared while compiling**
   ([ADR 0204](./docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).

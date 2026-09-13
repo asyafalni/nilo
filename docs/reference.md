@@ -3180,7 +3180,7 @@ Different fields are ANDed. Several operators on one field are ANDed too.
 | `.handle = .{ .not_distinct_from = maybe }` | `IS NOT DISTINCT FROM $1` — `=` with null treated as a value. **The one operator an optional may reach**; `.distinct_from` is its negation |
 | `.status = sql.given(maybe)` | `("status" = $1 OR $1 IS NULL)` — the term is in the statement when the filter carried a value and out of it when it did not. See below |
 | `.any = .{ .{ … }, .{ … } }` | OR, bracketed. Not `.or`, which is a keyword — so `any` is a reserved column name |
-| `.exists = .{ .{ .in = Other, .where = .{ … } } }` | `EXISTS (SELECT 1 FROM …)`, joined on the `.references` `Other` declares. `.not_exists` negates; both are reserved column names, and both nest inside `.any` |
+| `.exists = .{ .{ .in = Other, .where = .{ … } } }` | `EXISTS (SELECT 1 FROM …)`, joined on the `.references` either Row declares — `Other`'s pointing at this table, or this Row's pointing at `Other`'s. `.on = .<column of Other>` or `.via = .<column of this Row>` says which when the schema says it twice. `.not_exists` negates; both are reserved column names, and both nest inside `.any` |
 | `.across = .{ .columns = .{ .code, .name }, .icontains = q }` | `("code" ILIKE … $1 … OR "name" ILIKE … $1 …)` — one condition, whichever of the columns meets it, and **one parameter** named on each. A tuple of entries is several, ANDed; `across` is a reserved column name too |
 
 A column that does not exist is a compile error naming the near miss.
@@ -3343,13 +3343,31 @@ db.select(Partner, c, .{ .where = .{
 } });
 ```
 
-**The join is read out of the schema, not written here.** It comes from the
-`.references` the other Row declares, which is already checked while compiling —
-the target has to be a Row, the target column one of its columns, and the two
-Zig types the same. A Row that declares none is a compile error saying so, and
-one that points at this table from **two** columns is a compile error naming
-both: which of them joins is a question about what the query means.
-`.on = .<column>` says which, and is also the way in for a Row over a view.
+**The join is read out of the schema, not written here.** It comes from a
+`.references` one of the two Rows declares — the other Row's, pointing at this
+table, or this Row's own, pointing at the other's — which is already checked
+while compiling: the target has to be a Row, the target column one of its
+columns, and the two Zig types the same. So the query the other way round,
+from the child asking about its parent, is the same line with the Rows
+swapped
+([ADR 0214](./adr/0214-an-exists-reads-the-reference-from-either-side.md)):
+
+```zig
+db.select(Staff, c, .{ .where = .{
+    .exists = .{ .{ .in = Department, .where = .{ .name = .{ .icontains = q } } } },
+} });
+// EXISTS (SELECT 1 FROM "departments"
+//         WHERE "departments"."id" = "staff"."department_id" AND …)
+```
+
+Neither Row declaring one is a compile error saying so, and a schema that
+says it **twice** is a compile error naming the columns: which of them joins
+is a question about what the query means. `.on = .<column>` names a column of
+the Row inside, and `.via = .<column>` a column of the Row the statement is
+over — two words so the two directions cannot be read as each other, and both
+at once is refused. Two tables that point at each other are the twice case
+too. `.on` is also the way in for a Row over a view, and `.via` for a parent
+that is one.
 
 The entries are a list because a struct cannot carry the same field twice, and
 narrowing on two capabilities is the ordinary case. They are ANDed.

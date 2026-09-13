@@ -625,6 +625,31 @@ const sql_refusals = [_]Refusal{
             " exists_with_two_references.Staff's table from more than one column:" ++
             " `created_by`, `updated_by`.",
     },
+    // The reference read from the outer Row's side, and the two words that
+    // tell the directions apart (ADR 0214).
+    .{
+        .name = "exists_with_two_references_back",
+        .says = "`.exists` names exists_with_two_references_back.Region, which" ++
+            " exists_with_two_references_back.Staff points at from more than one column:" ++
+            " `home_region`, `work_region`.",
+    },
+    .{
+        .name = "exists_in_both_directions",
+        .says = "`.exists` names exists_in_both_directions.Department, and the two tables" ++
+            " point at each other: exists_in_both_directions.Department at" ++
+            " exists_in_both_directions.Staff's table from `head_id`, and" ++
+            " exists_in_both_directions.Staff at exists_in_both_directions.Department's" ++
+            " from `department_id`.",
+    },
+    .{
+        .name = "exists_via_beside_on",
+        .says = "an entry of `.exists` says both `.on` and `.via`.",
+    },
+    .{
+        .name = "exists_via_on_unknown_column",
+        .says = "exists_via_on_unknown_column.Staff has no column `dept_id`, asked for in" ++
+            " `.exists`'s `.via`.",
+    },
     .{
         .name = "exists_not_a_list",
         .says = "`.exists` holds a list of tests and this one is a single test.",
