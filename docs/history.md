@@ -3137,3 +3137,13 @@ buffer, so a status read after the next request was still right and the body
 beside it was the other request's. The test that found it failed inside
 `std.json`; the one it warns about passes. An answer now knows which request
 it was ([ADR 0210](./adr/0210-an-answer-knows-which-request-it-was.md)).
+
+**A refusal written for one shape caught a second one that only looked like
+it.** The `given`-inside-`.any` refusal names an absent alternative among
+present ones, and that argument is right. The shape a list screen actually
+has is the same absent value on *every* alternative, and the two are told
+apart by nothing in the walker — three fields holding one optional are three
+parameters. The answer was a word for the second shape rather than a smarter
+reading of the first, because one parameter named three times is a fact the
+statement can settle and three values compared at run time is not
+([ADR 0211](./adr/0211-one-condition-over-several-columns-is-one-parameter.md)).

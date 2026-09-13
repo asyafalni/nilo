@@ -3122,6 +3122,58 @@ test "a filter that is absent runs on Postgres in every shape a guard takes" {
     try testing.expectEqual(@as(usize, 3), everyone.rows.len);
 }
 
+test "a search over several columns is one statement on Postgres, with the box empty and with it filled" {
+    // Item 72: the fourth most common WHERE a list screen has is
+    // `(q IS NULL OR code ILIKE q OR name ILIKE q OR …)` beside a handful of
+    // guarded filters, and on nilo it was two `db.select` calls with the
+    // filters written twice (ADR 0211). One parameter named on every column;
+    // Postgres is what says the shared placeholder types once and reads
+    // three times.
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const given = @import("where.zig").given;
+
+    // `handle` is nullable and `email` is not; both are text, which is what
+    // the parameter binds as.
+    const Search = struct {
+        q: ?[]const u8,
+        least_age: ?i32,
+        fn count(db: *db_mod.Db, scope: *nilo.Run, self: @This()) !usize {
+            return db.count(Person, scope, .{ .where = .{
+                .age = .{ .gte = given(self.least_age) },
+                .across = .{ .columns = .{ .email, .handle }, .icontains = given(self.q) },
+            } });
+        }
+    };
+
+    // The box empty: every row the other filter allows.
+    try testing.expectEqual(@as(usize, 3), try Search.count(&stack.db, &run, .{ .q = null, .least_age = null }));
+    try testing.expectEqual(@as(usize, 2), try Search.count(&stack.db, &run, .{ .q = null, .least_age = 18 }));
+    // Filled: matched on either column, and a NULL handle is no match rather
+    // than an error.
+    try testing.expectEqual(@as(usize, 1), try Search.count(&stack.db, &run, .{ .q = "KID", .least_age = null }));
+    try testing.expectEqual(@as(usize, 1), try Search.count(&stack.db, &run, .{ .q = "grace", .least_age = null }));
+    try testing.expectEqual(@as(usize, 3), try Search.count(&stack.db, &run, .{ .q = "a", .least_age = null }));
+    try testing.expectEqual(@as(usize, 0), try Search.count(&stack.db, &run, .{ .q = "kid", .least_age = 18 }));
+
+    // And the rows themselves, on a page, with the same condition.
+    const found = try stack.db.page(Person, &run, .{
+        .where = .{
+            .age = .{ .gte = given(@as(?i32, null)) },
+            .across = .{ .columns = .{ .email, .handle }, .icontains = given(@as(?[]const u8, "ada")) },
+        },
+        .order = .{ .id = .asc },
+        .limit = 20,
+    });
+    try testing.expectEqual(@as(i64, 1), found.total);
+    try testing.expectEqualStrings("ada@example.dev", found.rows[0].email);
+}
+
 comptime {
     _ = wire_mod;
 }

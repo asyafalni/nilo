@@ -66,6 +66,17 @@ missing — plus the fixes it found underneath them, two of which are the reason
   ([ADR 0200](./docs/adr/0200-a-hyphen-is-a-spelling-a-generator-can-carry.md)).
   A name may hold `-`; a space, a dot and a leading digit are still refused.
 
+- **`.across` — one condition over several columns, and one parameter**
+  ([ADR 0211](./docs/adr/0211-one-condition-over-several-columns-is-one-parameter.md)).
+  A search box over the code, the name and the trademark beside a handful of
+  `sql.given` filters was two `db.select` calls, because a `sql.given` inside
+  `.any` is refused. `.across = .{ .columns = .{ .code, .name, .trademark },
+  .icontains = sql.given(q) }` is one: the parameter is taken once and named
+  on every column, and the `sql.given` guards the whole bracket the way it
+  does in `.exists`. The operators are a column's own; the columns have to
+  read as one Zig type. `across` is a reserved column name now, beside `any`
+  and `exists`. Four refusals.
+
 - **`sql.Ordering(Row, keys)` — an `ORDER BY` chosen per request, from a
   closed set declared while compiling**
   ([ADR 0204](./docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).

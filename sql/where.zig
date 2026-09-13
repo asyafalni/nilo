@@ -27,6 +27,10 @@
 //!   `any` becomes a reserved column name, refused by name rather than
 //!   silently misread.
 //!
+//! And one condition over several columns — `.across = .{ .columns = .{ .code,
+//! .name }, .icontains = q }` — which is the three shapes again with one
+//! parameter named on every column (ADR 0211).
+//!
 //! Everything past that — joins, aggregates, subqueries, `HAVING` — is
 //! `db.raw`. The boundary is one sentence, *one table, conditions that filter
 //! rows*, and a boundary that can be stated is worth more than one that is
@@ -65,10 +69,19 @@ pub const any_field = "any";
 pub const exists_field = "exists";
 pub const not_exists_field = "not_exists";
 
+/// The field name that means *one condition, whichever of these columns meets
+/// it* — a search box over the code, the name and the trademark
+/// ([ADR 0211](../docs/adr/0211-one-condition-over-several-columns-is-one-parameter.md)).
+/// Reserved the same way `any` is.
+pub const across_field = "across";
+
+/// The one name an `.across` entry carries beside its operators.
+const across_columns = "columns";
+
 /// Every word a condition reserves. One list, because `assertNoReservedColumn`
 /// and the message it writes both read it and a word allowed in one and
 /// refused in the other is the mistake this arrangement exists to prevent.
-const reserved = [_][]const u8{ any_field, exists_field, not_exists_field };
+const reserved = [_][]const u8{ any_field, exists_field, not_exists_field, across_field };
 
 /// The names an `.exists` entry may carry.
 const exists_known = [_][]const u8{ "in", "on", "where" };
@@ -381,8 +394,22 @@ const State = struct {
     /// whole subquery rather than one term of it — so the term writes no guard
     /// of its own and `oneExists` writes one around the lot.
     in_group: bool = false,
+    /// Placeholders being written a second time, for another column of an
+    /// `.across` (ADR 0211). `take` hands them back in order and records
+    /// nothing: the value was recorded, once, when the first column took it,
+    /// and the statement names the same `$n` on every column.
+    replay: []const usize = &.{},
+    replayed: usize = 0,
 
     fn take(self: *State, comptime path: Path, comptime param: Param) usize {
+        if (self.replay.len > 0) {
+            if (self.replayed == self.replay.len) @compileError(
+                "nilo: an `.across` column took more parameters than the first column did.",
+            );
+            const n = self.replay[self.replayed];
+            self.replayed += 1;
+            return n;
+        }
         if (self.count == max_params) @compileError(
             "nilo: a condition with more than " ++
                 std.fmt.comptimePrint("{d}", .{max_params}) ++ " values.\n" ++
@@ -444,6 +471,10 @@ fn walk(
             }
             if (std.mem.eql(u8, f.name, not_exists_field)) {
                 out = out ++ existsOf(D, Row, f.type, path, state, true);
+                continue;
+            }
+            if (std.mem.eql(u8, f.name, across_field)) {
+                out = out ++ acrossOf(D, Row, f.type, path, state);
                 continue;
             }
             if (!row_mod.hasColumn(Row, f.name)) {
@@ -713,6 +744,189 @@ fn oneExists(
         if (was_group) return test_sql;
         return guarded(D, test_sql, guard);
     }
+}
+
+/// `.across = .{ .columns = .{ .code, .name }, .icontains = q }` — one
+/// condition, and the row matches when any of the columns meets it
+/// ([ADR 0211](../docs/adr/0211-one-condition-over-several-columns-is-one-parameter.md)).
+/// A tuple of entries is several, ANDed, the way `.exists` takes several.
+fn acrossOf(
+    comptime D: type,
+    comptime Row: type,
+    comptime T: type,
+    comptime path: Path,
+    comptime state: *State,
+) []const u8 {
+    comptime {
+        const info = switch (@typeInfo(T)) {
+            .@"struct" => |s| s,
+            else => @compileError(
+                "nilo: `.across` is a " ++ @typeName(T) ++ ".\n" ++ across_shape,
+            ),
+        };
+        if (!info.is_tuple) return oneAcross(D, Row, T, path, state);
+        if (info.fields.len == 0) @compileError(
+            "nilo: `.across` is empty.\n  Leave it out instead.",
+        );
+        var out: []const u8 = "";
+        for (info.fields, 0..) |f, i| {
+            if (i > 0) out = out ++ " AND ";
+            out = out ++ oneAcross(D, Row, f.type, path ++ &[_][]const u8{f.name}, state);
+        }
+        return out;
+    }
+}
+
+const across_shape = "  Write `.across = .{ .columns = .{ .code, .name, .trademark }, .icontains = q }`: " ++
+    "the columns, then the condition every one of them is tested against.";
+
+/// One `.across` entry: the operators walked once against the first column,
+/// taking their parameters, and once more against each other column with
+/// the same placeholders handed back — so `$3` is bound once and named three
+/// times, and a `sql.given` on it guards the whole bracket.
+fn oneAcross(
+    comptime D: type,
+    comptime Row: type,
+    comptime T: type,
+    comptime path: Path,
+    comptime state: *State,
+) []const u8 {
+    comptime {
+        const info = switch (@typeInfo(T)) {
+            .@"struct" => |s| if (s.is_tuple) @compileError(
+                "nilo: an entry of `.across` is a tuple.\n" ++ across_shape,
+            ) else s,
+            else => @compileError(
+                "nilo: an entry of `.across` is a " ++ @typeName(T) ++ ".\n" ++ across_shape,
+            ),
+        };
+        if (!@hasField(T, across_columns)) @compileError(
+            "nilo: an entry of `.across` does not say `.columns`.\n" ++ across_shape,
+        );
+
+        // The columns: a tuple of enum literals, two or more, each a column
+        // of the Row, and all of them read as one Zig type — the parameter is
+        // bound once, as the first column's type, and a second type would be
+        // a cast nobody wrote.
+        const Columns = @FieldType(T, across_columns);
+        const columns_info = switch (@typeInfo(Columns)) {
+            .@"struct" => |s| if (s.is_tuple) s else @compileError(
+                "nilo: `.across`'s `.columns` is not a list.\n" ++ across_shape,
+            ),
+            else => @compileError(
+                "nilo: `.across`'s `.columns` is a " ++ @typeName(Columns) ++ ".\n" ++ across_shape,
+            ),
+        };
+        if (columns_info.fields.len < 2) @compileError(
+            "nilo: `.across` names " ++ (if (columns_info.fields.len == 0) "no column" else "one column") ++
+                ".\n  One column is an ordinary condition: write `." ++
+                (if (columns_info.fields.len == 1) @tagName(fieldValue(Columns, "0")) else "code") ++
+                " = …`. `.across` is for a value tested against several.",
+        );
+        var columns: [columns_info.fields.len][]const u8 = undefined;
+        for (columns_info.fields, 0..) |f, i| {
+            if (f.type != @TypeOf(.enum_literal)) @compileError(
+                "nilo: `.across`'s `.columns` holds a " ++ @typeName(f.type) ++
+                    ".\n  A column is named as it is in a condition: `.code`.",
+            );
+            const name = @tagName(fieldValue(Columns, f.name));
+            if (!row_mod.hasColumn(Row, name)) row_mod.noSuchColumn(Row, name, "an `.across`");
+            columns[i] = name;
+        }
+        const First = bareOf(row_mod.ColumnType(Row, columns[0]));
+        for (columns[1..]) |name| {
+            const Other = bareOf(row_mod.ColumnType(Row, name));
+            if (Other != First) @compileError(
+                "nilo: `.across` on " ++ @typeName(Row) ++ " names `" ++ columns[0] ++ "`, which is " ++
+                    @typeName(row_mod.ColumnType(Row, columns[0])) ++ ", and `" ++ name ++ "`, which is " ++
+                    @typeName(row_mod.ColumnType(Row, name)) ++ ".\n" ++
+                    "  One parameter is bound as one type and tested against every column, " ++
+                    "so the columns have to read as one. Two types is two conditions, in `.any`.",
+            );
+        }
+
+        // The operators: everything else in the entry, ANDed per column the
+        // way a column's own operators are.
+        var ops: []const Operator = &.{};
+        for (info.fields) |f| {
+            if (std.mem.eql(u8, f.name, across_columns)) continue;
+            if (spelling(f.name) == null and patternSpelling(f.name) == null and
+                listSpelling(f.name) == null and nullSafeSpelling(f.name) == null)
+            {
+                @compileError(
+                    "nilo: an entry of `.across` sets `." ++ f.name ++ "`, which is not an operator.\n" ++
+                        "  Beside `.columns` it takes what a column takes: `.eq`, `.icontains`, " ++
+                        "`.gt` and the rest, each with its value.",
+                );
+            }
+            ops = ops ++ &[_]Operator{.{ .name = f.name, .T = f.type }};
+        }
+        if (ops.len == 0) @compileError(
+            "nilo: an entry of `.across` names its columns and no condition.\n" ++ across_shape,
+        );
+
+        const was_group = state.in_group;
+        const before = state.count;
+        const guard = state.next;
+        // The terms write no guard of their own: one goes around the whole
+        // bracket below, for the reason `oneExists` gives.
+        state.in_group = true;
+
+        var out: []const u8 = "(";
+        for (columns, 0..) |column, i| {
+            if (i > 0) out = out ++ " OR ";
+            const quoted = state.qualifier ++ D.quote(column);
+            // The first column takes the parameters; every other column is
+            // handed the same numbers back.
+            var numbers: [max_params]usize = undefined;
+            if (i > 0) {
+                for (guard..state.next, 0..) |n, j| numbers[j] = n;
+                state.replay = numbers[0 .. state.next - guard];
+                state.replayed = 0;
+            }
+            var term: []const u8 = "";
+            for (ops, 0..) |op, j| {
+                if (j > 0) term = term ++ " AND ";
+                term = term ++ operator(D, Row, column, quoted, op, path, state);
+            }
+            if (i > 0) {
+                if (state.replayed != state.replay.len) @compileError(
+                    "nilo: an `.across` column took fewer parameters than the first column did.",
+                );
+                state.replay = &.{};
+                state.replayed = 0;
+            }
+            out = out ++ (if (ops.len > 1) "(" ++ term ++ ")" else term);
+        }
+        out = out ++ ")";
+        state.in_group = was_group;
+
+        // A `sql.given` here is the whole bracket, or it is a Refusal — the
+        // rule `oneExists` has, for the same reason: dropping one operator
+        // of several would leave the others deciding on their own.
+        var droppable = 0;
+        for (state.params[before..state.count]) |p| {
+            if (p.droppable) droppable += 1;
+        }
+        if (droppable > 0 and state.count - before > 1) @compileError(
+            "nilo: an entry of `.across` holds a `sql.given` beside another condition.\n" ++
+                "  The `sql.given` is what makes the whole bracket drop, and dropping one " ++
+                "condition of it would leave the others deciding on their own.\n" ++
+                "  Write a second `.across` entry for the condition that is always there.",
+        );
+        if (droppable == 0) return out;
+        if (was_group) return out;
+        return guarded(D, out, guard);
+    }
+}
+
+/// The column's type without its optional, for saying whether two columns
+/// bind as one: a nullable `trademark` and a `name` are both text.
+fn bareOf(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .optional => |o| o.child,
+        else => T,
+    };
 }
 
 /// A term that is only there when its parameter is: `(term OR $n IS NULL)`.
@@ -1274,14 +1488,17 @@ fn assertNotOptional(
     }
 }
 
-/// A Row cannot have a column named `any`, `exists` or `not_exists`, because
-/// each already means something inside a condition and one word cannot be both.
+/// A Row cannot have a column named `any`, `exists`, `not_exists` or
+/// `across`, because each already means something inside a condition and one
+/// word cannot be both.
 fn assertNoReservedColumn(comptime Row: type) void {
     comptime {
         for (reserved) |word| {
             if (!row_mod.hasColumn(Row, word)) continue;
             const means = if (std.mem.eql(u8, word, any_field))
                 "OR"
+            else if (std.mem.eql(u8, word, across_field))
+                "one condition over several columns"
             else
                 "a matching row in another table";
             @compileError(
@@ -1805,6 +2022,43 @@ test "an operator takes one too, and the fixed terms beside it are untouched" {
     try testing.expect(p.params[0].droppable);
     try testing.expect(!p.params[1].droppable);
     try testing.expectEqualStrings("value", p.paths[0][p.paths[0].len - 1]);
+}
+
+test "one condition over several columns is one parameter, and the guard goes around the bracket" {
+    // Item 72: a search box over the code, the name and the trademark was two
+    // statements, one with the `.any` and one without, with every other
+    // `sql.given` filter written twice (ADR 0211).
+    const p = comptime plan(Pg, User, @TypeOf(.{
+        .age = given(@as(?i32, null)),
+        .across = .{ .columns = .{ .email, .role }, .icontains = given(@as(?[]const u8, null)) },
+    }), 1);
+    const escaped_two = "replace(replace(replace($2, '\\', '\\\\'), '%', '\\%'), '_', '\\_')";
+    try testing.expectEqualStrings(
+        "(\"age\" = $1 OR $1 IS NULL) AND " ++
+            "((\"email\" ILIKE '%' || " ++ escaped_two ++ " || '%' ESCAPE '\\'" ++
+            " OR \"role\" ILIKE '%' || " ++ escaped_two ++ " || '%' ESCAPE '\\') OR $2 IS NULL)",
+        p.sql,
+    );
+    // Two parameters for three terms: the search is bound once and named
+    // twice, so the plan and the parameter list are the same however the
+    // screen is set.
+    try testing.expectEqual(@as(usize, 2), p.paths.len);
+    try testing.expect(p.params[1].droppable);
+    try testing.expectEqualStrings("across", p.paths[1][0]);
+    try testing.expectEqualStrings("icontains", p.paths[1][1]);
+    try testing.expectEqualStrings("value", p.paths[1][2]);
+
+    // A value that is always there is the bracket with no guard, and several
+    // operators AND inside each alternative.
+    try testing.expectEqualStrings(
+        "(\"email\" = $1 OR \"role\" = $1) AND ((\"id\" > $2 AND \"id\" < $3) OR (\"deleted_at\" > $2 AND \"deleted_at\" < $3))",
+        sqlOf(.{
+            .across = .{
+                .{ .columns = .{ .email, .role }, .eq = "x" },
+                .{ .columns = .{ .id, .deleted_at }, .gt = @as(i64, 1), .lt = @as(i64, 9) },
+            },
+        }),
+    );
 }
 
 test "a filter inside an exists drops the subquery rather than a term of it" {

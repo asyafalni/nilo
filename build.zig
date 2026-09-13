@@ -250,6 +250,22 @@ const sql_refusals = [_]Refusal{
         .says = "an entry of `.exists` over given_beside_a_condition_in_an_exists.Capability holds a `sql.given` beside another condition.",
     },
     .{
+        .name = "across_given_beside_a_condition",
+        .says = "an entry of `.across` holds a `sql.given` beside another condition.",
+    },
+    .{
+        .name = "across_on_one_column",
+        .says = "`.across` names one column.",
+    },
+    .{
+        .name = "across_columns_of_two_types",
+        .says = "`.across` on across_columns_of_two_types.Sku names `code`, which is []const u8, and `weight`, which is i32.",
+    },
+    .{
+        .name = "across_on_unknown_column",
+        .says = "across_on_unknown_column.Sku has no column `trade_mark`, asked for in an `.across`.",
+    },
+    .{
         .name = "given_inside_an_any",
         .says = "an alternative of `.any` holds a `sql.given`.",
     },

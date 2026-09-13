@@ -174,6 +174,30 @@ and `not_distinct_from`, on a value that is not optional, and **in the condition
 of an `UPDATE` or a `DELETE`** — there a term that may not be there is the whole
 table.
 
+**A search box over several columns is not the `.any` case.** There the same
+absent value sits on every column, and the whole bracket should drop as one —
+which is `.across`, one condition tested against each column it names, with
+**one parameter** taken once and named on every column
+([ADR 0211](../../adr/0211-one-condition-over-several-columns-is-one-parameter.md)):
+
+<!-- compiles: body -->
+```zig
+// search: ?[]const u8 — the box, over the email and the name.
+const matched = try db.select(User, c, .{ .where = .{
+    .age = .{ .gte = sql.given(least_age) },
+    .across = .{ .columns = .{ .email, .name }, .icontains = sql.given(search) },
+} });
+```
+
+```sql
+("age" >= $1 OR $1 IS NULL)
+AND (("email" ILIKE … $2 … OR "name" ILIKE … $2 …) OR $2 IS NULL)
+```
+
+The columns have to read as one Zig type — a nullable column beside one that
+is not is fine, a number beside text is two conditions in `.any` — and a
+`sql.given` beside a fixed operator in one entry is refused the way it is in
+`.exists`: write a second entry.
 
 ## All of them, one of them, or one by key
 

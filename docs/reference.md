@@ -3160,6 +3160,7 @@ Different fields are ANDed. Several operators on one field are ANDed too.
 | `.status = sql.given(maybe)` | `("status" = $1 OR $1 IS NULL)` — the term is in the statement when the filter carried a value and out of it when it did not. See below |
 | `.any = .{ .{ … }, .{ … } }` | OR, bracketed. Not `.or`, which is a keyword — so `any` is a reserved column name |
 | `.exists = .{ .{ .in = Other, .where = .{ … } } }` | `EXISTS (SELECT 1 FROM …)`, joined on the `.references` `Other` declares. `.not_exists` negates; both are reserved column names, and both nest inside `.any` |
+| `.across = .{ .columns = .{ .code, .name }, .icontains = q }` | `("code" ILIKE … $1 … OR "name" ILIKE … $1 …)` — one condition, whichever of the columns meets it, and **one parameter** named on each. A tuple of entries is several, ANDed; `across` is a reserved column name too |
 
 A column that does not exist is a compile error naming the near miss.
 
@@ -3217,6 +3218,32 @@ the empty list, which `.in` already reads), on `not_distinct_from` (which takes
 an optional already), on a value that is not optional, beside a fixed condition
 in one `.exists`, and in the condition of an `UPDATE` or a `DELETE` — where a
 term that may not be there is the whole table.
+
+**A search box over several columns is `.across`, and a `sql.given` on it
+guards the bracket** ([ADR 0211](./adr/0211-one-condition-over-several-columns-is-one-parameter.md)).
+The refusal inside `.any` is about one absent alternative among present ones;
+the same absent value on every column is one condition, and it is written as
+one:
+
+```zig
+.where = .{
+    .product_id = sql.given(f.product_id),
+    .across = .{ .columns = .{ .code, .name, .trademark }, .icontains = sql.given(q) },
+},
+```
+
+```sql
+("product_id" = $1 OR $1 IS NULL)
+AND (("code" ILIKE … $2 … OR "name" ILIKE … $2 … OR "trademark" ILIKE … $2 …) OR $2 IS NULL)
+```
+
+The parameter is taken once and named on every column, so the plan and the
+parameter list are the same however the box is set. The operators are a
+column's own — `.eq`, `.gt`, `.icontains`, several ANDed — and the columns
+have to read as one Zig type, optional or not. Four things are Refusals: a
+`sql.given` beside a fixed operator in one entry (write a second entry), one
+column (an ordinary condition), columns of two types (two conditions, in
+`.any`), and a column the Row lacks.
 
 ### An order chosen at run time
 
