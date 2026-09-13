@@ -146,9 +146,9 @@ const layers = [_]Layer{
 /// naming nothing in the core. That is the whole of the work, and the list
 /// getting shorter is the point of writing it down.
 const http_core = [_][]const u8{
-    "app",        "bound",   "ctx",      "filebody", "form",   "metrics",
-    "middleware", "openapi", "password", "resolve",  "router", "sendfile",
-    "serve",      "session", "testing",  "typed",    "wiring",
+    "app",      "bound",      "bytebody", "ctx",      "filebody", "form",
+    "metrics",  "middleware", "openapi",  "password", "resolve",  "router",
+    "sendfile", "serve",      "session",  "testing",  "typed",    "wiring",
 };
 
 /// Files that sit **above** the core rather than below it, and so may name it.
@@ -976,6 +976,10 @@ const refusals = [_]Refusal{
     .{
         .name = "ownbody_write_wrong_signature",
         .says = "ownbody_write_wrong_signature.Invoice's `nilo_write` is not `fn (self: ownbody_write_wrong_signature.Invoice, w: *std.Io.Writer) !void`.",
+    },
+    .{
+        .name = "bytes_as_an_argument",
+        .says = "argument 1 of the handler for route \"/bundles\" is a `nilo.Bytes`, which is what a handler answers *with* rather than something it is given.",
     },
     .{
         .name = "filebody_as_an_argument",

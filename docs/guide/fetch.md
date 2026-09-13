@@ -297,6 +297,17 @@ module's own tests stand a real socket up on `std.Io.Threaded` with no
 Engine anywhere — which is the entry condition for its layer, and the shape
 to copy for a test that wants a real exchange.
 
+**The shape, for a suite of your own.** `fetch/live.zig`'s `Canned` is the
+whole of it: a `std.Io.net.Server` bound to a loopback port, walked from a
+range rather than fixed (a closed port sits in `TIME-WAIT` for a minute), a
+`serveOne` that reads one head and writes one canned answer, run with
+`io.async(Canned.serveOne, .{&canned})` beside the call and `await`ed after
+it; and the client finished with `client.nilo_start(io, .off)` as `listen()`
+would have done. `s3/canned.zig` is the same shape with more answers. Give
+your suite a port range of its own — those two have 39,200–40,199 and
+40,200–41,199, and `zig build test-all` runs two binaries at once — and put a
+comment on it saying so, because nothing else keeps the ranges apart.
+
 ## See also
 
 - [The reference](../reference.md#nilo_fetch) — the surface as a list.

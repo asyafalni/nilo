@@ -66,6 +66,24 @@ missing — plus the fixes it found underneath them, two of which are the reason
   ([ADR 0200](./docs/adr/0200-a-hyphen-is-a-spelling-a-generator-can-carry.md)).
   A name may hold `-`; a space, a dot and a leading digit are still refused.
 
+- **`nilo.Bytes` — bytes already in hand, under a content type chosen per
+  request** ([ADR 0212](./docs/adr/0212-bytes-handed-on-are-an-answer.md)).
+  A proxy handing on another service's download with *its* `Content-Type` and
+  a `Content-Disposition` had no typed answer and took a `*Ctx`, which the
+  document could not see. `!?nilo.Bytes` is `FileBody`'s shape with the bytes
+  in memory: `.body`, `.content_type`, `.headers`; `?` is the 404, a wrapper's
+  status is taken, nothing is copied, and the document says `format: binary`.
+  One refusal.
+
+- **`fetch` sends what it was given, whatever the method**
+  ([ADR 0213](./docs/adr/0213-the-body-decides-not-the-method.md)). A DELETE
+  with a body and a PATCH without one each tripped an assert inside
+  `std.http.Client` — a panic in a worker thread. Now a body given is sent
+  under its `content-length` on any method, and none given is `content-length:
+  0` on a method std expects one from. `client.patch(c, url, body_or_null,
+  .{})` beside the other four; `error.HeadTooLong` for the one head the trick
+  cannot frame.
+
 - **`.across` — one condition over several columns, and one parameter**
   ([ADR 0211](./docs/adr/0211-one-condition-over-several-columns-is-one-parameter.md)).
   A search box over the code, the name and the trademark beside a handful of

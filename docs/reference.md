@@ -456,6 +456,7 @@ builds one and pays nothing
 | `Response(T)` | a status chosen at runtime; the description says `default` |
 | `Redirect(code)` | that status and a `Location`, no body |
 | `FileBody` | a file on disk, opened and sent without being held in memory |
+| `Bytes` | bytes already in hand, under a content type chosen per request — somebody else's download passed on ([ADR 0212](./adr/0212-bytes-handed-on-are-an-answer.md)) |
 | a type with `nilo_content_type` and `nilo_write` | 200, the bytes `nilo_write` wrote, under that content type — [below](#a-type-that-writes-its-own-answer) |
 
 ```zig
@@ -465,6 +466,7 @@ Response(User){ .status = if (made) 201 else 200, .value = user }
 Redirect(303).to("/welcome")                               // written `return .to(…)`
 Redirect(303).with("/welcome", .of(&.{…}))                 // …with headers of its own
 FileBody{ .dir = files.dir, .name = name }                 // `?FileBody` — null is a 404
+Bytes{ .body = got.body, .content_type = got.content_type } // `?Bytes` likewise; takes a wrapper's status
 ```
 
 **A handler that also takes a `*Ctx` and returns `void` is the one case the
@@ -487,6 +489,16 @@ file does. `Range`, `If-Range`, `If-None-Match` and `HEAD` work as they do for a
 static file; the API description says the body is `application/octet-stream`
 with `format: binary` whatever the content type is at run time. See
 [Responses](./guide/responses.md#files).
+
+`Bytes` fields: `body`, `content_type` (`"application/octet-stream"`) and
+`headers`, the same way. Nothing is copied: the body is the handler's — the
+request arena, or a response it still holds — and goes out as it is. The
+document says `format: binary` for the reason it does for a `FileBody`: the
+label is decided while the request runs, and a document that guessed
+`application/zip` would be wrong the first time upstream sent something else.
+It is the answer for a proxy that downloads from one service and hands the
+bytes to the browser with *their* `Content-Type` and a `Content-Disposition`,
+where a `*Ctx` handler calling `c.send` was undescribed.
 
 `Headers` holds up to 8 by value; a ninth is a compile error.
 
@@ -1130,7 +1142,8 @@ fn charge(api: *fetch.Client, c: *nilo.Ctx) !Receipt {
 | `client.post(c, url, body, .{})` | `Response` |
 | `client.put(c, url, body, .{})` | `Response` |
 | `client.delete(c, url, .{})` | `Response` |
-| `client.send(c, method, url, body_or_null, .{})` | for a method the four above do not name |
+| `client.patch(c, url, body_or_null, .{})` | `Response` — `null` for the verb endpoint whose whole request is its path |
+| `client.send(c, method, url, body_or_null, .{})` | for a method the five above do not name. **The body decides the framing, not the method** ([ADR 0213](./adr/0213-the-body-decides-not-the-method.md)): a DELETE with a body sends it under its `content-length`, a POST with `null` sends `content-length: 0`. `error.HeadTooLong` is a body on a method std frames none for whose head did not fit the connection's buffer |
 | `res.ok()` | `bool` — 2xx |
 | `res.status` | `std.http.Status` |
 | `res.body` | `Str`, in the Scope you passed. Goes when the request does |

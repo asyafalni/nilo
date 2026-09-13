@@ -126,3 +126,14 @@ pub const Jobs = job.Jobs(.{
     .store = job.Table(Db),
     .deps = struct { db: *Db },
 });
+
+/// The upstream service the responses guide proxies a download from: what
+/// it hands back is bytes and the label they came with, learned per request.
+pub const Licences = struct {
+    pub fn download(self: *Licences, scope: *nilo.Ctx, number: u32) !?struct { body: []const u8, content_type: []const u8 } {
+        _ = self;
+        _ = scope;
+        if (number == 0) return null;
+        return .{ .body = "PK", .content_type = "application/zip" };
+    }
+};

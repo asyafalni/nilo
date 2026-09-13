@@ -3147,3 +3147,16 @@ parameters. The answer was a word for the second shape rather than a smarter
 reading of the first, because one parameter named three times is a fact the
 statement can settle and three values compared at run time is not
 ([ADR 0211](./adr/0211-one-condition-over-several-columns-is-one-parameter.md)).
+
+**An assert in a dependency is a rule the dependency made up, and the wire
+does not have it.** `std.http.Client` refuses a DELETE with a body and a
+PATCH without one, both of which real services take and Go sends without
+comment. The fix was not a copy of std's head writer but the one door std
+leaves open for each method, plus two bytes taken back and a length written
+where they were — with a check that the two bytes are still there, which is
+what makes a trick an implementation
+([ADR 0213](./adr/0213-the-body-decides-not-the-method.md)). And the fourth
+answer a handler can give — bytes under a label learned per request — was
+missing for the same reason `FileBody` once was: every other answer's label
+is a fact about a type
+([ADR 0212](./adr/0212-bytes-handed-on-are-an-answer.md)).

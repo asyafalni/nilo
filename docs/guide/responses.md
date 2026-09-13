@@ -171,6 +171,33 @@ guess.
 `*Ctx`, for a handler that already holds an open file and has its own `etag`,
 `size` or `cache_control` to give it. It closes the file, on every way out.
 
+### Bytes already in hand
+
+A proxy that downloads a bundle from another service and hands it to the
+browser with *that* service's `Content-Type` has no file and no `Dir`, and
+its content type is a value it learns per request. `nilo.Bytes` is
+`FileBody`'s shape with the bytes in memory
+([ADR 0212](../adr/0212-bytes-handed-on-are-an-answer.md)):
+
+<!-- compiles -->
+```zig
+fn bundle(licences: *Licences, c: *nilo.Ctx, number: u32) !?nilo.Bytes {
+    const got = try licences.download(c, number) orelse return null;
+    return .{
+        .body = got.body,
+        .content_type = got.content_type,
+        .headers = .of(&.{.{ .name = "Content-Disposition", .value = "attachment" }}),
+    };
+}
+```
+
+Nothing is copied — the body is the handler's, in the request arena or a
+response it still holds — and `?Bytes` is the 404 it is everywhere else. Unlike
+a `FileBody` it takes a wrapper's status, so `Status(201, Bytes)` is what it
+says. The document describes it as `format: binary`, for `FileBody`'s reason.
+Before this the choices were `c.send` from a `*Ctx` handler, which the document
+could not see, or a `nilo_write` type naming a content type it did not know.
+
 ## JSON shapes of your own
 
 A struct is its JSON and an enum is its tag name, and that covers nearly

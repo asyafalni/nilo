@@ -968,6 +968,70 @@ test "a streamed body sends exactly the length it announced" {
     }.run);
 }
 
+test "a body decides the framing, not the method: a DELETE with one and a PATCH without" {
+    // Item 73: `std.http.Client` asserts that a DELETE has no body and a
+    // PATCH has one, and a real API does both the other way — a bulk delete
+    // with `{ids:[…]}`, a `PATCH /users/1/full-suspend` whose whole request
+    // is its path. Either tripped a panic in a worker thread (ADR 0213).
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = io.async(Canned.serveWithBody, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const gone = try client.send(&scope, .DELETE, try canned.url(&buf), "{\"ids\":[1,2,3]}", .{
+                .headers = &.{.{ .name = "X-Reason", .value = "expired" }},
+            });
+            try testing.expectEqual(std.http.Status.ok, gone.status);
+
+            served.await(io) catch {};
+            const sent = canned.seen[0..canned.seen_len];
+            try testing.expect(std.mem.startsWith(u8, sent, "DELETE /"));
+            // The length is written where std left the head's blank line, so
+            // it sits after the caller's own headers rather than before them.
+            try testing.expect(std.mem.indexOf(u8, sent, "X-Reason: expired\ncontent-length: 15") != null);
+            try testing.expectEqualStrings("{\"ids\":[1,2,3]}", canned.body_seen[0..canned.body_seen_len]);
+        }
+    }.run);
+
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = io.async(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const suspended = try client.send(&scope, .PATCH, try canned.url(&buf), null, .{});
+            try testing.expectEqual(std.http.Status.ok, suspended.status);
+
+            served.await(io) catch {};
+            const sent = canned.seen[0..canned.seen_len];
+            try testing.expect(std.mem.startsWith(u8, sent, "PATCH /"));
+            // Bodiless the way a body-taking method says it: a length of
+            // zero, and nothing chunked.
+            try testing.expect(std.mem.indexOf(u8, sent, "content-length: 0") != null);
+            try testing.expect(std.mem.indexOf(u8, sent, "chunked") == null);
+        }
+    }.run);
+}
+
 test "a signed call says its own host and authorization, verbatim" {
     try withIo(struct {
         fn run(io: std.Io) !void {
@@ -1168,4 +1232,3 @@ test "a pooled connection the peer reset costs one retry too" {
         }
     }.run);
 }
-

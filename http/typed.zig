@@ -54,6 +54,7 @@ const openapi = @import("openapi.zig");
 const patch_mod = @import("patch.zig");
 const bound_mod = @import("bound.zig");
 const filebody = @import("filebody.zig");
+const bytebody = @import("bytebody.zig");
 const json_mod = @import("json.zig");
 const mark = @import("jsonmark.zig");
 const ownbody = @import("ownbody.zig");
@@ -564,6 +565,14 @@ fn idempotentFinish(comptime P: type, c: *Ctx, begun: Begun, result: anytype) !v
         kind = .own;
         content_type = B.nilo_content_type;
         body = out.written();
+    } else if (comptime bytebody.isBytes(B)) {
+        // Bytes in hand are kept the way a written answer is: the label is
+        // the value's, and its headers go into the record beside the
+        // wrapper's, so a replay carries the `Content-Disposition` too.
+        kind = .own;
+        content_type = present.content_type;
+        body = present.body;
+        own_headers = try joinedHeaders(c._arena, own_headers, present.headers.view());
     } else if (B == Str) {
         kind = .text;
         body = present.view();
@@ -598,6 +607,17 @@ fn idempotentFinish(comptime P: type, c: *Ctx, begun: Begun, result: anytype) !v
         },
     };
     return sendKept(c, own_headers, status, kind, content_type, body);
+}
+
+/// Two header lists as one, allocating only when both have something in
+/// them — the ordinary `Bytes` answer has no wrapper and costs nothing here.
+fn joinedHeaders(arena: std.mem.Allocator, a: []const http1.Header, b: []const http1.Header) ![]const http1.Header {
+    if (a.len == 0) return b;
+    if (b.len == 0) return a;
+    const both = try arena.alloc(http1.Header, a.len + b.len);
+    @memcpy(both[0..a.len], a);
+    @memcpy(both[a.len..], b);
+    return both;
 }
 
 fn sendKept(c: *Ctx, own_headers: []const http1.Header, status: u16, kind: idempotent_mod.Kind, content_type: []const u8, body: []const u8) !void {
@@ -873,7 +893,7 @@ fn answerWith(comptime status: ?u16, comptime V: type) openapi.Answer {
         // — a file, and a 404 — and reading it before would lose one of them.
         // The body is described as bytes rather than as the struct's fields,
         // which are a descriptor and a name and belong to the server.
-        if (filebody.isFileBody(Present)) return .{
+        if (filebody.isFileBody(Present) or bytebody.isBytes(Present)) return .{
             .status = status,
             .content_type = "",
             .schema = null,
@@ -1192,6 +1212,14 @@ fn roleOf(comptime pattern: []const u8, comptime P: type, comptime i: usize) Rol
     // directions. Read as the request body — which is what a struct by value
     // is — this would land somewhere inside `std.json` being asked to parse a
     // directory descriptor, which is a message nilo did not write (ADR 0015).
+    if (comptime bytebody.isBytes(P)) @compileError(
+        "nilo: argument " ++ num(i + 1) ++ " of the handler for route \"" ++ pattern ++
+            "\" is a `nilo.Bytes`, which is what a handler answers *with* rather than " ++
+            "something it is given.\n" ++
+            "  The request body as bytes is `nilo.Body`; bytes going to the client are " ++
+            "the return type:\n" ++
+            "    fn bundle(licences: *Licences, c: *nilo.Ctx, id: u32) !?nilo.Bytes { … }",
+    );
     if (comptime filebody.isFileBody(P)) @compileError(
         "nilo: argument " ++ num(i + 1) ++ " of the handler for route \"" ++ pattern ++
             "\" is a `nilo.FileBody`, which is what a handler answers *with* rather than " ++
@@ -1705,6 +1733,9 @@ fn sendValue(c: *Ctx, status: u16, value: anytype) !void {
     // `sendfile.send` — a 200, a 206, a 304 or a 416 — and no field on a
     // `Response(FileBody)` could be right about which.
     if (comptime filebody.isFileBody(T)) return filebody.send(c, value);
+    // Bytes in hand under a label decided per request (ADR 0212): the same
+    // place, for the same `?` reason, and this one takes the status.
+    if (comptime bytebody.isBytes(T)) return bytebody.send(c, status, value);
     // A type that writes its own answer, under its own label (ADR 0195).
     // Dispatched here, after every wrapper is taken apart, so `?T`,
     // `Status(201, T)` and `Response(T)` all reach it the way they reach

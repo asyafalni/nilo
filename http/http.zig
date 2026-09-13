@@ -473,6 +473,10 @@ pub const Redirect = @import("redirect.zig").Redirect;
 /// this process, and `Range`, `If-Range` and `If-None-Match` are answered
 /// exactly as they are for a static file.
 pub const FileBody = @import("filebody.zig").FileBody;
+/// An answer that is bytes already in hand, under a label decided per
+/// request — somebody else's download passed on with their `Content-Type`
+/// ([ADR 0212](../docs/adr/0212-bytes-handed-on-are-an-answer.md)).
+pub const Bytes = @import("bytebody.zig").Bytes;
 
 /// A directory, opened once and held open — what a Service hands a
 /// `FileBody` (ADR 0037).
@@ -821,6 +825,7 @@ test {
     _ = @import("bound.zig");
     _ = @import("redirect.zig");
     _ = @import("filebody.zig");
+    _ = @import("bytebody.zig");
     _ = @import("http1.zig");
     _ = @import("bulkhead.zig");
     _ = @import("watchdog.zig");

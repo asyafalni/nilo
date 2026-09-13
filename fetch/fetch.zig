@@ -152,6 +152,11 @@ pub const Client = struct {
         /// startup like any other service; a unit test that calls a handler
         /// directly without an App gets this.
         NotStarted,
+        /// A body on a method std frames no body for — a DELETE with one —
+        /// and the head was too long for its length to be written after it
+        /// (ADR 0213). The connection buffers a head of several kilobytes;
+        /// this is a request carrying more headers than that.
+        HeadTooLong,
         OutOfMemory,
     } || std.Uri.ParseError || std.http.Client.RequestError ||
         std.http.Client.Request.ReceiveHeadError ||
@@ -197,6 +202,13 @@ pub const Client = struct {
     pub fn delete(self: *Client, c: anytype, url: []const u8, call: Call) Error!Response {
         comptime core.checkScope(@TypeOf(c), "fetch.delete");
         return self.send(c, .DELETE, url, null, call);
+    }
+
+    /// A PATCH; `null` for the verb endpoint whose whole request is its path
+    /// (ADR 0213). A DELETE with a body is `send(c, .DELETE, url, body, call)`.
+    pub fn patch(self: *Client, c: anytype, url: []const u8, body: ?[]const u8, call: Call) Error!Response {
+        comptime core.checkScope(@TypeOf(c), "fetch.patch");
+        return self.send(c, .PATCH, url, body, call);
     }
 
     /// The whole of what the four above do, for a method they do not name.
@@ -584,15 +596,35 @@ pub const Exchange = struct {
         self.req.accept_encoding = @splat(false);
         self.req.accept_encoding[@intFromEnum(std.http.ContentEncoding.identity)] = true;
 
+        // **The body decides, not the method**
+        // ([ADR 0213](../docs/adr/0213-the-body-decides-not-the-method.md)).
+        // `std.http.Client` asserts that a POST, PUT or PATCH sends a body
+        // and that anything else sends none, and a real API does both the
+        // other way: a bulk DELETE with `{ids:[…]}` in it, a PATCH whose
+        // whole request is its path. Given a body, it is sent whatever the
+        // method; given none, none is, whatever the method — and the two
+        // asserts are stepped around rather than tripped, since either would
+        // be a panic in a worker thread.
+        const framed = opts.method.requestHasBody();
         switch (opts.body) {
-            .none => try self.req.sendBodiless(),
-            .slice => |bytes| {
+            .none => if (framed) {
+                // `content-length: 0` is the bodiless request said the way
+                // std lets a body-taking method say it.
+                self.req.transfer_encoding = .{ .content_length = 0 };
+                var w = try self.req.sendBody(&.{});
+                try w.end();
+            } else try self.req.sendBodiless(),
+            .slice => |bytes| if (framed) {
                 self.req.transfer_encoding = .{ .content_length = bytes.len };
                 var w = try self.req.sendBody(&.{});
                 try w.writer.writeAll(bytes);
                 try w.end();
+            } else {
+                const w = try self.sendHeadWithLength(bytes.len);
+                try w.writeAll(bytes);
+                try self.req.connection.?.flush();
             },
-            .stream => |src| {
+            .stream => |src| if (framed) {
                 self.req.transfer_encoding = .{ .content_length = src.len };
                 var w = try self.req.sendBody(&.{});
                 // Exactly the length that was announced, and nothing else. A
@@ -600,10 +632,36 @@ pub const Exchange = struct {
                 // body that disagrees with the head describing it.
                 try src.reader.streamExact64(&w.writer, src.len);
                 try w.end();
+            } else {
+                const w = try self.sendHeadWithLength(src.len);
+                try src.reader.streamExact64(w, src.len);
+                try self.req.connection.?.flush();
             },
         }
 
         self.res = try self.req.receiveHead(opts.redirect_buffer);
+    }
+
+    /// The head for a body on a method std frames no body for — a DELETE
+    /// with `{ids:[…]}` — and the connection's writer to put the body on.
+    ///
+    /// std writes the head itself and only itself: `sendBodilessUnflushed`
+    /// is the one door a DELETE may go through, and it writes no
+    /// `content-length` because it was told there is nothing to measure. So
+    /// the head is written unflushed, its closing blank line is taken back
+    /// off the connection's buffer, and the length goes where the blank line
+    /// was — the same `undo` std's own `sendHead` uses on the
+    /// `accept-encoding` list. The check that the blank line is still in the
+    /// buffer is what keeps this honest: a head too long to be buffered
+    /// whole is refused rather than sent with a length in the wrong place.
+    fn sendHeadWithLength(self: *Exchange, len: u64) !*std.Io.Writer {
+        self.req.transfer_encoding = .none;
+        try self.req.sendBodilessUnflushed();
+        const w = self.req.connection.?.writer();
+        if (!std.mem.endsWith(u8, w.buffered(), "\r\n\r\n")) return error.HeadTooLong;
+        w.undo(2);
+        try w.print("content-length: {d}\r\n\r\n", .{len});
+        return w;
     }
 
     /// Whether this attempt ended with **not one byte of a response**, which
