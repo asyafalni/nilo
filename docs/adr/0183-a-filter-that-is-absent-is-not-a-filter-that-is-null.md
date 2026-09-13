@@ -51,8 +51,23 @@ is deliberately not a request to make `.eq` take an optional."*
 It compiles to the guard a hand-written statement uses:
 
 ```sql
-($1 IS NULL OR "name" ILIKE '%' || $1 || '%')
+("name" ILIKE '%' || $1 || '%' OR $1 IS NULL)
 ```
+
+**Amended: the term comes first, and as first written it did not.** This ADR
+shipped `($1 IS NULL OR "name" ILIKE …)`, with comptime tests asserting that
+string and no live test running one. pg.zig sends a `Parse` with no parameter
+types, so Postgres types each parameter at its first use — and `$1 IS NULL` is
+a null test on an unknown, which fixes nothing. Every guard shape was *could
+not determine data type of parameter $1* (`42P08`) from the database on the
+first request, found by the port whose list endpoint is the example above. The
+port's own hand-written guard had always been `$2::text IS NULL`, and a cast
+was the fix it proposed; the order is the better one, because it needs no type
+name — an enum column has none this module can write — and means the same
+thing, `OR` being commutative in three-valued logic. `sql/live.zig` runs each
+shape against Postgres now: text, a number, a pattern, a `timestamptz`, a
+`uuid`, an enum and an `EXISTS`. The lesson is in
+[`history.md`](../history.md#a-design-closed-on-a-comptime-assertion-is-closed-on-paper).
 
 ## One statement, and the alternative that was rejected
 
@@ -66,7 +81,8 @@ dropdowns.
 
 The guard is one statement, one parameter list, one prepared name, one plan
 entry, and **the same SQL the port already writes by hand** — its `db.raw` has a
-`$2::text IS NULL OR` in front of it. Nothing about `Statement` changes, so no
+`$2::text IS NULL OR` in front of it (the cast is what a hand-written guard
+needs on Postgres; the amendment above is how the generated one does without). Nothing about `Statement` changes, so no
 consumer of one has to learn that it might be a set of statements.
 
 **What the guard costs is the planner, and it is smaller than it looks.**
@@ -89,7 +105,7 @@ The port's capability filter is an `.exists` over a second table
 *inside* it is wrong:
 
 ```sql
-EXISTS (SELECT 1 FROM pc WHERE pc.partner_id = p.id AND ($2 IS NULL OR pc.capability = $2))
+EXISTS (SELECT 1 FROM pc WHERE pc.partner_id = p.id AND (pc.capability = $2 OR $2 IS NULL))
 ```
 
 With `$2` null that asks whether the partner has **any** capability row, which

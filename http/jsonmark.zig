@@ -239,6 +239,20 @@ fn checkTag(comptime T: type, comptime key: []const u8) void {
 /// `O(n²)` over the names the type already produces, all of it while
 /// compiling, on a path that never reaches a binary. A union of eight variants
 /// is 28 comparisons of short literals, once.
+///
+/// **Each name is spelled once, and the check sizes its own branch budget**
+/// ([ADR 0157](../docs/adr/0157-a-check-pays-for-its-own-branches.md)). As
+/// first written the inner loop called `wire` on both names of every pair —
+/// `n(n−1)/2` pairs, two names, a loop over every character building a
+/// comptime string — and a Row of **ten** snake_case fields was `evaluation
+/// exceeded 1000 backwards branches` pointing at `std.ascii`, before the
+/// writer had run at all. Ten is not a wide table: the port that hit it had
+/// `staff` at ten and `deals` past that, and `rename_all` covered its small
+/// responses and not the ones a list screen is made of. Spelling each name
+/// once takes it from `n²·len` to `n·len + n²`, and the quota below is
+/// generous rather than exact for the reason `app.zig`'s `checkName` gives:
+/// it is a ceiling on the caller's whole evaluation, and nilo's own walk
+/// must never be the thing that runs out.
 fn checkRenames(comptime T: type, comptime c: Case) void {
     comptime {
         const fields = switch (@typeInfo(T)) {
@@ -250,20 +264,29 @@ fn checkRenames(comptime T: type, comptime c: Case) void {
             .@"struct" => |s| s.fields,
             else => return,
         };
+        var bytes: usize = 0;
+        var longest: usize = 0;
+        for (fields) |f| {
+            bytes += f.name.len;
+            if (f.name.len > longest) longest = f.name.len;
+        }
+        @setEvalBranchQuota(10_000 + 4 * (bytes + fields.len * fields.len * (longest + 1)));
+
         const m = Mark{ .rename_all = c };
         const what = switch (@typeInfo(T)) {
             .@"enum" => "value",
             .@"union" => "variant",
             else => "field",
         };
+        var spelled: [fields.len][]const u8 = undefined;
+        for (fields, 0..) |f, i| spelled[i] = wire(f.name, m);
         for (fields, 0..) |a, i| {
-            const spelled = wire(a.name, m);
-            for (fields[i + 1 ..]) |b| {
-                if (!std.mem.eql(u8, spelled, wire(b.name, m))) continue;
+            for (fields[i + 1 ..], i + 1..) |b, j| {
+                if (!std.mem.eql(u8, spelled[i], spelled[j])) continue;
                 @compileError(
                     "nilo: `" ++ naming.of(T) ++ "` asks for `.rename_all = ." ++ @tagName(c) ++
                         "`, and its " ++ what ++ "s `" ++ a.name ++ "` and `" ++ b.name ++
-                        "` both come out as \"" ++ spelled ++ "\".\n" ++
+                        "` both come out as \"" ++ spelled[i] ++ "\".\n" ++
                         "  Two of them under one name on the wire is not a spelling problem: a reader " ++
                         "takes whichever it meets first, which is declaration order, and nothing says so.\n" ++
                         "  Rename one of them, or choose a case that keeps them apart — " ++
@@ -324,6 +347,11 @@ pub fn wireNames(comptime T: type) []const []const u8 {
             .@"struct" => |s| s.fields,
             else => @compileError("nilo: `" ++ naming.of(T) ++ "` has no fields to name."),
         };
+        // One evaluation spelling every name, so the budget is the bytes of
+        // all of them — sized here for the reason `checkRenames` gives.
+        var bytes: usize = 0;
+        for (fields) |f| bytes += f.name.len;
+        @setEvalBranchQuota(10_000 + 4 * (bytes + fields.len));
         for (fields) |f| names = names ++ [_][]const u8{wire(f.name, mark)};
         return names;
     }
@@ -722,6 +750,40 @@ test "the case that would collide two names is the only one refused" {
     try testing.expectEqualStrings("notfound", comptime wireNames(One)[0]);
 }
 
+/// A Row as wide as a real table: thirteen snake_case columns of a dozen
+/// characters, which is the `projects` row of the port that reported it.
+const WideRow = struct {
+    pub const nilo_json = .{ .rename_all = .camelCase };
+
+    project_id: u32,
+    customer_name: []const u8,
+    customer_code: []const u8,
+    started_on_date: []const u8,
+    finished_on_date: ?[]const u8,
+    contract_value: u64,
+    contract_currency: []const u8,
+    owner_staff_id: u32,
+    owner_full_name: []const u8,
+    department_name: []const u8,
+    status_label: []const u8,
+    created_at_time: []const u8,
+    updated_at_time: []const u8,
+};
+
+test "a renamed struct thirteen fields wide is a struct, not a branch budget" {
+    // Ten fields was `evaluation exceeded 1000 backwards branches` pointing at
+    // `std.ascii`, from the pair loop calling `wire` on both names of every
+    // pair. Each name is spelled once now and the check sizes its own quota;
+    // this is wide enough that the old shape would not compile.
+    const names = comptime wireNames(WideRow);
+    try testing.expectEqual(@as(usize, 13), names.len);
+    try testing.expectEqualStrings("projectId", names[0]);
+    try testing.expectEqualStrings("finishedOnDate", names[4]);
+    try testing.expectEqualStrings("updatedAtTime", names[12]);
+    // And `of` — which is what runs the collision check — is reached.
+    try testing.expectEqual(Case.camelCase, comptime of(WideRow).?.rename_all.?);
+}
+
 test "an enum's choices come out renamed" {
     const Agg = enum {
         pub const nilo_json = .{ .rename_all = .SCREAMING_SNAKE_CASE };
@@ -756,8 +818,7 @@ test "an internally tagged union is read back into the variant its tag names" {
     defer arena.deinit();
     const gpa = arena.allocator();
 
-    const got = try read(Condition,
-        gpa,
+    const got = try read(Condition, gpa,
         \\{"signal":"metrics","metric_name":"system.cpu.utilization","threshold":0.9}
     );
     try testing.expectEqualStrings("metrics", @tagName(got));
@@ -773,8 +834,7 @@ test "the tag does not have to come first" {
     // This is the case that decides the whole shape of the reader: the variant
     // is not known until the discriminator turns up, and here two of its own
     // fields come before it.
-    const got = try read(Condition,
-        gpa,
+    const got = try read(Condition, gpa,
         \\{"query":"level:error","count_over":5,"signal":"logs"}
     );
     try testing.expectEqualStrings("logs", @tagName(got));

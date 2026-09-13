@@ -212,7 +212,10 @@ const setup =
     "CREATE TABLE " ++ session_table ++ " (" ++
     "  id bigint PRIMARY KEY," ++
     "  token_hash bytea NOT NULL," ++
-    "  device bytea" ++
+    "  device bytea," ++
+    // Who the session belongs to, so a `.exists` over this table has a join
+    // to come out of — the guard-around-a-subquery shape needs one.
+    "  person_id bigint" ++
     ");" ++
     "DROP SCHEMA IF EXISTS " ++ other_schema ++ " CASCADE;" ++
     "CREATE SCHEMA " ++ other_schema ++ ";" ++
@@ -2848,11 +2851,16 @@ test "a batch carries the column types that bind as something else" {
 // -- bytes, written -----------------------------------------------------------
 
 const Session = struct {
-    pub const nilo_table = .{ .name = session_table, .key = .id };
+    pub const nilo_table = .{
+        .name = session_table,
+        .key = .id,
+        .references = .{ .person_id = .{ Person, .id } },
+    };
 
     id: i64,
     token_hash: types.Bytes,
     device: ?types.Bytes,
+    person_id: ?i64,
 };
 
 /// One row of a batch of them, with the nullable column null in one row and
@@ -2916,7 +2924,7 @@ test "bytes go out to a bytea through every statement that binds one" {
     const raw = try stack.db.raw(
         Session,
         &run,
-        "SELECT \"id\", \"token_hash\", \"device\" FROM \"" ++ session_table ++
+        "SELECT \"id\", \"token_hash\", \"device\", \"person_id\" FROM \"" ++ session_table ++
             "\" WHERE \"token_hash\" = $1::bytea",
         .{types.Bytes.of(&digest)},
     );
@@ -2961,6 +2969,119 @@ test "bytes go out to a bytea through every statement that binds one" {
         .where = .{ .token_hash = types.Bytes.of(&other) },
     });
     try testing.expectEqual(@as(usize, 2), gone);
+}
+
+// -- a filter that is absent, against a database that types its parameters --
+
+/// The four column types a guard has to work over, on one Row: text, a
+/// number, a `timestamptz`, a `uuid` and an enum. Every one is the shape a
+/// list screen filters on.
+const Filtered = struct {
+    pub const nilo_table = .{ .name = table, .key = .id };
+
+    id: i64,
+    email: []const u8,
+    age: i32,
+    seen_at: types.Timestamp,
+    token: ?types.Uuid,
+    role: Role,
+
+    const Role = enum { admin, member, moderator };
+};
+
+test "a filter that is absent runs on Postgres in every shape a guard takes" {
+    // ADR 0183's guard was `($1 IS NULL OR "name" = $1)`, and every comptime
+    // test asserted that string and passed. pg.zig sends a `Parse` with no
+    // parameter types, so Postgres works each one out from its first use —
+    // and `$1 IS NULL` is a null test on an unknown, which is `could not
+    // determine data type of parameter $1` (42P08) from the database on the
+    // first request. The port whose list endpoint was the ADR's own example
+    // found it; `where.guarded` writes the term first now. This is the test
+    // that would have caught it: one of each guard shape, set and unset,
+    // against the real thing.
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const given = @import("where.zig").given;
+
+    // `=` on text, unset and set.
+    try testing.expectEqual(@as(usize, 3), try stack.db.count(Filtered, &run, .{
+        .where = .{ .email = given(@as(?[]const u8, null)) },
+    }));
+    try testing.expectEqual(@as(usize, 1), try stack.db.count(Filtered, &run, .{
+        .where = .{ .email = given(@as(?[]const u8, "ada@example.dev")) },
+    }));
+
+    // An operator on a number.
+    try testing.expectEqual(@as(usize, 2), try stack.db.count(Filtered, &run, .{
+        .where = .{ .age = .{ .gte = given(@as(?i32, 18)) } },
+    }));
+    try testing.expectEqual(@as(usize, 3), try stack.db.count(Filtered, &run, .{
+        .where = .{ .age = .{ .gte = given(@as(?i32, null)) } },
+    }));
+
+    // A pattern, whose parameter is inside three `replace` calls before it
+    // reaches `ILIKE` — the deepest first use a guard has.
+    try testing.expectEqual(@as(usize, 3), try stack.db.count(Filtered, &run, .{
+        .where = .{ .email = .{ .icontains = given(@as(?[]const u8, "EXAMPLE")) } },
+    }));
+    try testing.expectEqual(@as(usize, 1), try stack.db.count(Filtered, &run, .{
+        .where = .{ .email = .{ .icontains = given(@as(?[]const u8, "grace")) } },
+    }));
+
+    // A `timestamptz`, a `uuid` and an enum: the three where a cast on the
+    // guard would have needed a type name this module does not always have
+    // (`accepts` declines to name an enum), and the term-first order needs
+    // nothing.
+    try testing.expectEqual(@as(usize, 3), try stack.db.count(Filtered, &run, .{
+        .where = .{ .seen_at = .{ .gt = given(@as(?types.Timestamp, types.Timestamp.fromSeconds(0))) } },
+    }));
+    try testing.expectEqual(@as(usize, 1), try stack.db.count(Filtered, &run, .{
+        .where = .{ .token = given(@as(?types.Uuid, try types.Uuid.parse("550e8400-e29b-41d4-a716-446655440000"))) },
+    }));
+    try testing.expectEqual(@as(usize, 1), try stack.db.count(Filtered, &run, .{
+        .where = .{ .role = given(@as(?Filtered.Role, .admin)) },
+    }));
+    try testing.expectEqual(@as(usize, 3), try stack.db.count(Filtered, &run, .{
+        .where = .{ .role = given(@as(?Filtered.Role, null)) },
+    }));
+
+    // The guard around a whole `EXISTS`, which is the port's list endpoint:
+    // a session for person 1 and none for the others.
+    _ = try stack.db.insert(Session, &run, .{
+        .id = @as(i64, 10),
+        .token_hash = types.Bytes.of("t"),
+        .device = @as(?types.Bytes, null),
+        .person_id = @as(?i64, 1),
+    });
+    const with_session = try stack.db.page(Filtered, &run, .{
+        .where = .{
+            .email = .{ .icontains = given(@as(?[]const u8, null)) },
+            .exists = .{
+                .{ .in = Session, .where = .{ .id = given(@as(?i64, 10)) } },
+            },
+        },
+        .order = .{ .id = .asc },
+        .limit = 20,
+    });
+    try testing.expectEqual(@as(i64, 1), with_session.total);
+    try testing.expectEqual(@as(i64, 1), with_session.rows[0].id);
+    const everyone = try stack.db.page(Filtered, &run, .{
+        .where = .{
+            .email = .{ .icontains = given(@as(?[]const u8, null)) },
+            .exists = .{
+                .{ .in = Session, .where = .{ .id = given(@as(?i64, null)) } },
+            },
+        },
+        .order = .{ .id = .asc },
+        .limit = 20,
+    });
+    try testing.expectEqual(@as(i64, 3), everyone.total);
+    try testing.expectEqual(@as(usize, 3), everyone.rows.len);
 }
 
 comptime {

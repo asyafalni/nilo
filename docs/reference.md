@@ -3097,7 +3097,7 @@ Different fields are ANDed. Several operators on one field are ANDed too.
 | `.deleted_at = null` | `IS NULL` |
 | `.deleted_at = .{ .ne = null }` | `IS NOT NULL` |
 | `.handle = .{ .not_distinct_from = maybe }` | `IS NOT DISTINCT FROM $1` — `=` with null treated as a value. **The one operator an optional may reach**; `.distinct_from` is its negation |
-| `.status = sql.given(maybe)` | `($1 IS NULL OR "status" = $1)` — the term is in the statement when the filter carried a value and out of it when it did not. See below |
+| `.status = sql.given(maybe)` | `("status" = $1 OR $1 IS NULL)` — the term is in the statement when the filter carried a value and out of it when it did not. See below |
 | `.any = .{ .{ … }, .{ … } }` | OR, bracketed. Not `.or`, which is a keyword — so `any` is a reserved column name |
 | `.exists = .{ .{ .in = Other, .where = .{ … } } }` | `EXISTS (SELECT 1 FROM …)`, joined on the `.references` `Other` declares. `.not_exists` negates; both are reserved column names, and both nest inside `.any` |
 
@@ -3136,7 +3136,7 @@ const found = try db.page(Partner, c, .{
 ```
 
 ```sql
-($1 IS NULL OR "name" ILIKE …) AND ($2 IS NULL OR EXISTS (SELECT 1 FROM …))
+("name" ILIKE … OR $1 IS NULL) AND (EXISTS (SELECT 1 FROM …) OR $2 IS NULL)
 ```
 
 **One statement, one parameter list and one prepared plan however the screen is

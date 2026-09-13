@@ -492,7 +492,7 @@ rows — which turned out to be four gaps that only close together.
   ```
 
   ```sql
-  ($1 IS NULL OR "name" ILIKE '%' || $1 || '%') AND ($2 IS NULL OR "status" = $2)
+  ("name" ILIKE '%' || $1 || '%' OR $1 IS NULL) AND ("status" = $2 OR $2 IS NULL)
   ```
 
   **One statement, one parameter list, one prepared plan**, however the screen is
@@ -786,6 +786,30 @@ else above changes an answer a client gets.
   [`bench/result/cache.md`](./bench/result/cache.md).
 
 ### Fixed
+
+- **`sql.given` runs on Postgres.** The guard was written `($1 IS NULL OR
+  "name" = $1)`, and pg.zig sends no parameter types, so Postgres met `$1`
+  first in a null test and answered *could not determine data type of
+  parameter $1* (`42P08`) on the first request — for every guard shape, on a
+  statement that compiled and passed the schema check. The term comes first
+  now: `("name" = $1 OR $1 IS NULL)`, which means the same thing and needs no
+  cast, so it works on an enum column too, where there is no type name to
+  cast to. Found by the port whose list endpoint is ADR 0183's own example;
+  the comptime tests asserted the string and no live test ran one. One does
+  now, per shape. Nothing to change — the SQL in the reference and the guide
+  is respelled to match
+  ([ADR 0183](./docs/adr/0183-a-filter-that-is-absent-is-not-a-filter-that-is-null.md),
+  amended).
+
+- **`rename_all` on a struct ten fields wide compiles.** The collision check
+  respelled both names of every pair inside its `n²` loop, so a Row of ten
+  snake_case columns was `evaluation exceeded 1000 backwards branches`
+  pointing at `std.ascii` — before the writer had run. Ten is not wide; it is
+  `staff`. Each name is spelled once now and the check sizes its own quota
+  off the field count and the names' lengths, the way `checkName` does
+  ([ADR 0157](./docs/adr/0157-a-check-pays-for-its-own-branches.md)). A
+  thirteen-field Row is a test. Nothing to change — delete the DTO you kept
+  for the wide ones.
 
 - **`sql.Bytes` can be written to Postgres, not only read from it.** The
   release notes above say a `bytea` and a `BLOB`; until this it was a `BLOB`.

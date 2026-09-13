@@ -139,7 +139,7 @@ const found = try db.page(User, c, .{
 ```
 
 ```sql
-($1 IS NULL OR "email" ILIKE …) AND ($2 IS NULL OR "age" >= $2)
+("email" ILIKE … OR $1 IS NULL) AND ("age" >= $2 OR $2 IS NULL)
 ```
 
 **One statement whatever the screen is set to**, so one parameter list and one

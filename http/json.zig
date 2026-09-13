@@ -784,6 +784,45 @@ test "a renamed struct nested inside another is renamed where it sits" {
     } });
 }
 
+test "a renamed struct as wide as a table is written, with every key respelled" {
+    // Thirteen fields: the width at which the collision check used to run out
+    // of comptime branches before the writer ran (item 62 of the port that
+    // reported it; `jsonmark.checkRenames` sizes its own now).
+    const Wide = struct {
+        pub const nilo_json = .{ .rename_all = .camelCase };
+        project_id: u32,
+        customer_name: []const u8,
+        customer_code: []const u8,
+        started_on_date: []const u8,
+        finished_on_date: ?[]const u8,
+        contract_value: u64,
+        contract_currency: []const u8,
+        owner_staff_id: u32,
+        owner_full_name: []const u8,
+        department_name: []const u8,
+        status_label: []const u8,
+        created_at_time: []const u8,
+        updated_at_time: []const u8,
+    };
+    try expectJson(
+        \\{"projectId":7,"customerName":"PT Maju","customerCode":"MJ","startedOnDate":"2026-01-02","finishedOnDate":null,"contractValue":1250000,"contractCurrency":"IDR","ownerStaffId":3,"ownerFullName":"Wati Sari","departmentName":"Engineering","statusLabel":"active","createdAtTime":"2026-01-02T00:00:00Z","updatedAtTime":"2026-01-03T00:00:00Z"}
+    , Wide{
+        .project_id = 7,
+        .customer_name = "PT Maju",
+        .customer_code = "MJ",
+        .started_on_date = "2026-01-02",
+        .finished_on_date = null,
+        .contract_value = 1_250_000,
+        .contract_currency = "IDR",
+        .owner_staff_id = 3,
+        .owner_full_name = "Wati Sari",
+        .department_name = "Engineering",
+        .status_label = "active",
+        .created_at_time = "2026-01-02T00:00:00Z",
+        .updated_at_time = "2026-01-03T00:00:00Z",
+    });
+}
+
 test "every case a struct can ask for, on one field" {
     const Lower = struct {
         pub const nilo_json = .{ .rename_all = .lowercase };

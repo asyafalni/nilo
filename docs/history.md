@@ -3026,3 +3026,31 @@ been closed four days earlier** — 46, 54, 55, 56 and 57, against a pin at whic
 ADR 0182 through 0186 already existed. Nothing wrong was built; what it cost
 was the reading needed to notice. A file that holds only what is open holds it
 against a commit, and the commit has to be the one the items were re-tested at.
+
+## A design closed on a comptime assertion is closed on paper
+
+**Two features shipped with tests of the string they produce and no test that
+ran it, and both failed on the first real request.** `sql.given` compiled to
+`($1 IS NULL OR "name" = $1)`, four comptime tests asserted exactly that, and
+Postgres refused every one of them: pg.zig sends a `Parse` with no parameter
+types, the server types a parameter at its first use, and a null test on an
+unknown is *could not determine data type of parameter $1*. `rename_all` on a
+struct had tests on structs of two and three fields and ran out of comptime
+branches at ten, because the collision check respelled both names of every
+pair inside its `n²` loop. The port that took both up named the pattern, and
+it is the one worth keeping: **a test that reads the SQL is a test of the
+string, and a test on a three-field struct is a test of three fields.** Both
+now run — every guard shape against Postgres, and a thirteen-field Row through
+the writer — and the port was right that the second half of the fix was the
+one to insist on. Two smaller things from the same pair:
+
+- **The cast the port proposed was the wrong fix and the right diagnosis.** A
+  `::text` on the guard placeholder would have needed a type name per column,
+  and `accepts` declines to name an enum. Writing the term first
+  (`("role" = $1 OR $1 IS NULL)`) needs nothing, works on every column type,
+  and means the same thing — `OR` is commutative in three-valued logic. The
+  fix that needs no table is usually the one that was missing.
+- **A quota is sized off the input, or the input finds it.** `checkName` had
+  already learned this ([ADR 0157](./adr/0157-a-check-pays-for-its-own-branches.md))
+  and `checkRenames` had not, for the same shape of reason: the check was
+  written on the small case and the real case is wider.

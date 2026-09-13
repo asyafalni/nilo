@@ -91,10 +91,12 @@ const exists_known = [_][]const u8{ "in", "on", "where" };
 /// ADR 0044 is why the second could not be spelled: an optional reaching `=`
 /// sends `= NULL`, which runs, matches nothing, and says nothing.
 ///
-/// What it compiles to is the guard a hand-written statement uses:
+/// What it compiles to is the guard a hand-written statement uses, with the
+/// term first so that Postgres has typed the parameter before the null test
+/// reads it (`guarded` says why):
 ///
 /// ```sql
-/// ($1::text IS NULL OR "name" ILIKE '%' || $1 || '%')
+/// ("name" ILIKE '%' || $1 || '%' OR $1 IS NULL)
 /// ```
 ///
 /// One statement rather than one per combination of filters, so the plan cache
@@ -706,10 +708,32 @@ fn oneExists(
         if (droppable == 0) return test_sql;
         // The guard the terms inside did not write, around the whole test.
         // Nested inside another `.exists` it belongs to that one instead, and
-        // the outer walk is what writes it.
+        // the outer walk is what writes it. The subquery goes first, for the
+        // reason `guarded` gives.
         if (was_group) return test_sql;
-        return "(" ++ D.placeholder(guard) ++ " IS NULL OR " ++ test_sql ++ ")";
+        return guarded(D, test_sql, guard);
     }
+}
+
+/// A term that is only there when its parameter is: `(term OR $n IS NULL)`.
+///
+/// **The term comes first, and on Postgres that is the whole of what makes
+/// this run.** pg.zig sends a `Parse` with no parameter types, so the server
+/// works each one out from its first use — and `$1 IS NULL` is a null test on
+/// a value of unknown type, which fixes nothing. Written guard-first, the
+/// statement compiles here, passes the schema check, and is *could not
+/// determine data type of parameter $1* (`42P08`) from the database on the
+/// first request. Written term-first, `"name" = $1` or `'%' || $1` or
+/// `EXISTS (… = $1)` has already given the parameter its type by the time the
+/// null test reads it, for every column type there is — an enum and a `uuid`
+/// included, which is what a cast on the guard could not have done, since
+/// `accepts` declines to name an enum. The two orders mean the same thing:
+/// `OR` is commutative in SQL's three-valued logic and the planner does not
+/// care which side it read first. Found by the port whose list endpoint was
+/// the ADR's own example; the comptime tests asserted the guard-first string
+/// and passed, and `live.zig` now runs each shape against Postgres.
+fn guarded(comptime D: type, comptime term: []const u8, comptime n: usize) []const u8 {
+    return "(" ++ term ++ " OR " ++ D.placeholder(n) ++ " IS NULL)";
 }
 
 /// The relation a Row reads, quoted and schema-qualified — the same text
@@ -858,7 +882,7 @@ fn condition(
             // subquery asking whether *any* joined row exists. `oneExists`
             // writes that one.
             if (state.in_group) return term;
-            return "(" ++ D.placeholder(n) ++ " IS NULL OR " ++ term ++ ")";
+            return guarded(D, term, n);
         }
 
         assertNotOptional(column, null, T);
@@ -1136,7 +1160,7 @@ fn operator(
             }, prefix, state);
             state.dropping = was;
             if (state.in_group) return term;
-            return "(" ++ D.placeholder(n) ++ " IS NULL OR " ++ term ++ ")";
+            return guarded(D, term, n);
         }
 
         assertNotOptional(column, op.name, op.T);
@@ -1755,7 +1779,7 @@ test "a filter that may be absent guards its own term" {
     const p = comptime plan(Pg, User, @TypeOf(.{
         .age = given(@as(?i32, null)),
     }), 1);
-    try testing.expectEqualStrings("($1 IS NULL OR \"age\" = $1)", p.sql);
+    try testing.expectEqualStrings("(\"age\" = $1 OR $1 IS NULL)", p.sql);
     // One parameter, whichever way the filter goes — which is what makes this
     // one statement rather than one per combination of filters.
     try testing.expectEqual(@as(usize, 1), p.paths.len);
@@ -1774,7 +1798,7 @@ test "an operator takes one too, and the fixed terms beside it are untouched" {
         .age = .{ .gt = @as(i32, 18) },
     }), 1);
     try testing.expectEqualStrings(
-        "($1 IS NULL OR \"email\" ILIKE '%' || " ++ escaped_one ++ " || '%' ESCAPE '\\')" ++
+        "(\"email\" ILIKE '%' || " ++ escaped_one ++ " || '%' ESCAPE '\\' OR $1 IS NULL)" ++
             " AND \"age\" > $2",
         p.sql,
     );
@@ -1788,9 +1812,9 @@ test "a filter inside an exists drops the subquery rather than a term of it" {
     // exists at all, which excludes every partner with no capabilities — the
     // opposite of no filter, and it compiles (ADR 0183).
     try testing.expectEqualStrings(
-        "($1 IS NULL OR EXISTS (SELECT 1 FROM \"partner_capabilities\"" ++
+        "(EXISTS (SELECT 1 FROM \"partner_capabilities\"" ++
             " WHERE \"partner_capabilities\".\"partner_id\" = \"partners\".\"id\"" ++
-            " AND \"partner_capabilities\".\"capability\" = $1))",
+            " AND \"partner_capabilities\".\"capability\" = $1) OR $1 IS NULL)",
         partnerSql(.{ .exists = .{
             .{ .in = Capability, .where = .{ .capability = given(@as(?[]const u8, null)) } },
         } }),
@@ -1809,10 +1833,10 @@ test "the whole of the reporting product's list endpoint is one statement" {
     }), 1);
     try testing.expectEqual(@as(usize, 2), p.paths.len);
     try testing.expectEqualStrings(
-        "($1 IS NULL OR \"name\" ILIKE '%' || " ++ escaped_one ++ " || '%' ESCAPE '\\')" ++
-            " AND ($2 IS NULL OR EXISTS (SELECT 1 FROM \"partner_capabilities\"" ++
+        "(\"name\" ILIKE '%' || " ++ escaped_one ++ " || '%' ESCAPE '\\' OR $1 IS NULL)" ++
+            " AND (EXISTS (SELECT 1 FROM \"partner_capabilities\"" ++
             " WHERE \"partner_capabilities\".\"partner_id\" = \"partners\".\"id\"" ++
-            " AND \"partner_capabilities\".\"capability\" = $2))",
+            " AND \"partner_capabilities\".\"capability\" = $2) OR $2 IS NULL)",
         p.sql,
     );
 }
