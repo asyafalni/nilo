@@ -106,7 +106,52 @@ pub const Outcome = struct {
 /// declaration nobody writes by accident is what keeps that from happening —
 /// the same reason `nilo_resolve` and `nilo_form` are spelled the way they
 /// are.
-pub const parse_marker = "nilo_parse";
+pub const parse_marker = @import("jsonmark.zig").parse_marker;
+
+/// The declaration a type that parses itself may add to say what a 400
+/// should ask for in place of its name (ADR 0205):
+///
+/// ```zig
+/// pub const nilo_expects = "a whole number from 1 to 200";
+/// ```
+///
+/// Without it the sentence names the type — `has to be a Uuid` — which is
+/// the whole of what nilo is entitled to say about a type it did not write
+/// (ADR 0142). A type that can say more says it here, with its article, and
+/// the sentence reads `?limit has to be a whole number from 1 to 200, not
+/// "500"`.
+pub const expects_marker = "nilo_expects";
+
+/// What a message says a `P` has to be: what the type said with
+/// `nilo_expects`, or `a` and its name.
+pub fn expects(comptime P: type) []const u8 {
+    comptime {
+        const says = switch (@typeInfo(P)) {
+            .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(P, expects_marker),
+            else => false,
+        };
+        if (!says) return "a " ++ naming.of(P);
+        const words = @field(P, expects_marker);
+        if (!isText(@TypeOf(words))) @compileError(
+            "nilo: `" ++ naming.of(P) ++ "`'s `" ++ expects_marker ++ "` is a " ++
+                naming.of(@TypeOf(words)) ++ ", and it is the words a 400 uses for what this " ++
+                "type has to be.\n" ++
+                "    pub const " ++ expects_marker ++ " = \"a whole number from 1 to 200\";",
+        );
+        return words;
+    }
+}
+
+fn isText(comptime S: type) bool {
+    return switch (@typeInfo(S)) {
+        .pointer => |p| switch (p.size) {
+            .slice => p.child == u8,
+            .one => @typeInfo(p.child) == .array and @typeInfo(p.child).array.child == u8,
+            else => false,
+        },
+        else => false,
+    };
+}
 
 /// Whether `T` says it can turn request text into itself.
 ///
@@ -286,7 +331,7 @@ pub fn sayWhy(
     // import line in front of the name rather than a file of nilo's
     // (ADR 0122).
     if (comptime parsesItself(P)) {
-        return w.print(label ++ " has to be a " ++ naming.of(P) ++ ", not \"{s}\"", .{text});
+        return w.print(label ++ " has to be " ++ expects(P) ++ ", not \"{s}\"", .{text});
     }
     switch (@typeInfo(P)) {
         .int => try w.print(label ++ " has to be a whole number, not \"{s}\"", .{text}),
@@ -379,7 +424,7 @@ fn boolFrom(text: []const u8, comptime slot: Slot) ?bool {
 /// request nobody disagrees about into a 400. A `+` in an *exponent* is allowed
 /// for the same reason — `1e+3` is how every JSON writer spells it — while a
 /// leading one is not, since nothing produces `+7`.
-fn spelledAsNumber(text: []const u8, signed: bool, real: bool) bool {
+pub fn spelledAsNumber(text: []const u8, signed: bool, real: bool) bool {
     var rest = text;
     if (signed and rest.len > 0 and rest[0] == '-') rest = rest[1..];
 
@@ -472,6 +517,30 @@ test "the sentence for a type that parses itself names the type and quotes the t
     // Failing with the sentence and handing it back word it the same way,
     // exactly as every other reason does.
     try testing.expectEqualStrings(said(Sku, .query, "abc", ":sku"), in_flight.failure.message());
+}
+
+test "a type that says what it expects is asked for in those words rather than by its name" {
+    var in_flight = fail.InFlight{};
+    in_flight.startRequest("GET", "/x");
+    const previous = bulkhead.setFallbackSlot(&in_flight);
+    defer _ = bulkhead.setFallbackSlot(previous);
+
+    const Ticket = struct {
+        n: u32,
+        pub const nilo_expects = "a ticket number like T-1234";
+        pub fn nilo_parse(text: []const u8) ?@This() {
+            if (!std.mem.startsWith(u8, text, "T-")) return null;
+            return .{ .n = std.fmt.parseInt(u32, text[2..], 10) catch return null };
+        }
+    };
+
+    try testing.expectError(error.Failed, convert(Ticket, .query, given("1234"), "?ticket"));
+    try testing.expectEqualStrings(
+        "?ticket has to be a ticket number like T-1234, not \"1234\"",
+        in_flight.failure.message(),
+    );
+    // And one that says nothing is still named, which is what it was.
+    try testing.expectEqualStrings("a " ++ @typeName(Sku), comptime expects(Sku));
 }
 
 test "a marker on an enum wins over what the enum would have meant" {

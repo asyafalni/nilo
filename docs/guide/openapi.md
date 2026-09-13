@@ -173,6 +173,35 @@ your own that writes itself.
 **A custom writer that says nothing gets `{}` and a note** saying the writer is
 custom and how to describe it. Visibly silent, rather than confidently wrong.
 
+## A type that parses itself
+
+A type with `nilo_parse` and a `nilo_openapi` is described as what it said,
+whether or not it writes its own JSON — an `sql.Ordering` reads from
+`?order=due:desc` and is `{"type":"string"}`, not the struct of terms it holds
+([ADR 0205](../adr/0205-a-body-field-that-parses-itself.md)). A `nilo_expects`
+beside it — `"a ticket number like T-1234"` — is what every 400 for the field
+asks for, in place of the type's name.
+
+## What a number promises
+
+An unsigned integer says `{"type":"integer","minimum":0}`: it refuses `-1`
+with a 400, so the document may promise it. A signed one is any integer. And
+`nilo.Within(1, 200)` says both ends —
+`{"type":"integer","minimum":1,"maximum":200}` — read off the type that holds
+the range, so a generated client refuses `500` before sending it
+([ADR 0206](../adr/0206-a-whole-number-inside-a-range-is-a-type.md)):
+
+<!-- compiles -->
+```zig
+const ListQuery = struct {
+    limit: nilo.Within(1, 200) = .of(50),
+    offset: u32 = 0,
+};
+```
+
+`minimum` and `maximum` are not keys of `nilo_openapi`, on purpose: a marker is
+a claim, and a range the document promises is one the type enforces.
+
 ## A type that writes its own answer
 
 The same rule, one step further out. A type carrying `nilo_content_type` and

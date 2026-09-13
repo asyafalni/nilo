@@ -3066,3 +3066,44 @@ declaration the schema check and the Wire read and the writer did not. **When
 a feature refuses a type, read what the type already declares before adding a
 declaration**; the answer was one function that both `json.zig` and
 `openapi.zig` now ask ([ADR 0202](./adr/0202-a-document-is-its-value.md)).
+
+## A rule about the text protected a property the text was not needed for
+
+**"A sort chosen at run time is two statements" was a sentence about the SQL,
+and what it protected was that no run-time string reaches it.** The port took
+the sentence at its word and wrote the only thing it allows — one constant
+with the choice inside, a ninety-six-term `CASE` ladder with three parameters
+saying which terms are live — and then filed it as the item it most wanted
+taken, because a page of SQL nobody reads is a cost too. Read as the property
+rather than the mechanism, the constant is not what matters: a statement
+assembled from comptime fragments, chosen by index, keeps every guarantee the
+constant had except its plan name, and that name is worth 12 µs on the widest
+read in the program ([ADR 0204](./adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+This is the third time a requirement written as a mechanism read as a limit
+([ADR 0063](./adr/0063-a-handlers-stack-is-per-connection.md) and
+[ADR 0158](./adr/0158-one-arrival-one-answer.md) are the first two), and the
+tell was the same: the sentence was true about the code and said nothing
+about the caller.
+
+**The third arrival was named in the ADR that closed the second, as the
+thing it did not touch.** ADR 0158 said the JSON body was `std.json`'s
+question and `jsonParse` the answer, and left it. The port reached it one
+round later, with the helper that ADR deleted written back one slot over.
+A sentence that names what a decision leaves out is a roadmap entry with no
+`Waiting on:` line — worth writing the entry instead
+([ADR 0205](./adr/0205-a-body-field-that-parses-itself.md)).
+
+**A missing `try` looked like a missing branch.** `forWire` handled `?AsText`
+into `?column` and `AsText` into `column`, and the report read the third case
+as falling between them. It was one keyword: the branch that had it coerced
+its payload and the branch without it did not, because an error union does
+not coerce into an error union of an optional. When two branches differ by
+one word and one of them works, look at the word before adding a third
+([ADR 0203](./adr/0203-a-value-coerces-into-a-nullable-column-and-an-error-union-does-not.md)).
+
+**And a bound is a type, once a `u8` is admitted to be one.** The argument
+against a validation language stands, and it was answered by noticing the
+language was already in use: an unsigned integer refuses `-1` and nobody
+calls it validation. The document now says `minimum: 0` for every one of
+them, which is a promise the signature had been making silently since 0.1.0
+([ADR 0206](./adr/0206-a-whole-number-inside-a-range-is-a-type.md)).

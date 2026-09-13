@@ -181,6 +181,7 @@ series at all. See [Metrics](./guide/metrics.md).
 | `*Db`, `*const Config` | a service, by type |
 | `u32`, `f64`, `Str`, `bool`, an enum | a path param, positionally |
 | a type with `nilo_parse` | a path param too — `sql.Uuid` is one |
+| `Within(1, 200)` | a whole number inside a range; `.value` is the number |
 | `Query(T)` | the query string as a struct |
 | `FromHeader("X-Staff-Id", T)` | one request header, converted like a path param |
 | `Authorization(.bearer)`, `Authorization(.{ .basic = "realm" })` | the `Authorization` header as one scheme — absent or another scheme is a 401 with the challenge on it |
@@ -222,6 +223,37 @@ type two different ways
 number, a `bool`, an enum, **or a type with `nilo_parse`** — `sql.Uuid` and
 `sql.Timestamp` both are — optionally in a `?`, and a `Form(T)` field may also
 be an `Upload`.
+
+**A body field takes one as well** — the third arrival
+([ADR 0205](./adr/0205-a-body-field-that-parses-itself.md)). `std.json` reads a
+body, and it picks the reader by looking for `jsonParse` on the type; `sql.Uuid`
+and `sql.Timestamp` carry one, and a `[]const sql.Uuid` reads a list of them. A
+type of your own that parses itself writes one line beside `nilo_parse`:
+
+```zig
+pub const jsonParse = nilo.jsonParseFor(@This());
+```
+
+A body holding a type that parses itself and has no reader is a compile error
+naming the route. The 400 for text the type refused quotes it back, the way a
+query value's does — `"sku" has to be a Sku, not "abc"` — and a type that can
+say more than its name says it with `pub const nilo_expects = "a ticket number
+like T-1234"`, which every slot then asks for in those words.
+
+**`Within(min, max)` is a whole number inside a range**
+([ADR 0206](./adr/0206-a-whole-number-inside-a-range-is-a-type.md)): a type that
+parses itself, so it is read wherever a `u8` is, refused outside the range with
+`?limit has to be a whole number from 1 to 200, not "500"`, and described in
+the document with `minimum` and `maximum`. The number is `.value`; the default
+goes through `.of`, which checks it against the range while compiling:
+
+<!-- compiles -->
+```zig
+const ListQuery = struct {
+    limit: nilo.Within(1, 200) = .of(50),
+    offset: u32 = 0,   // refuses -1 already, and the document says `minimum: 0`
+};
+```
 
 `Form(T)` and a plain struct are the same slot — a form *is* the body — so
 asking for both is a compile error. A `Form(T)` field is a `Str`, a number, a
@@ -523,6 +555,7 @@ const Condition = union(enum) {
 |---|---|
 | `.tag` | the discriminator's key. A `union(enum)` only: the variant's name goes under it, and the variant's own fields go beside it in the same object |
 | `.rename_all` | how a name is spelled on the wire — an enum's tag, a union's variant, or **a struct's field names** |
+| `.rename` | the names spelled one at a time — `.{ .amount_minor = "amountMinor" }` — which win over `.rename_all` ([ADR 0207](./adr/0207-one-field-can-be-spelled-on-its-own.md)) |
 
 `.rename_all` takes `.lowercase`, `.UPPERCASE`, `.camelCase`, `.PascalCase`,
 `.SCREAMING_SNAKE_CASE` and `.@"kebab-case"`. The first two join the words
@@ -552,6 +585,27 @@ const Contact = struct {
 The API description says the same keys, so a generated client reads what the
 server sends. It costs nothing per request: the name is a comptime string either
 way, written as part of the same call the punctuation is in.
+
+**One field that no case reaches is spelled on its own**, beside the case, and
+the entry wins ([ADR 0207](./adr/0207-one-field-can-be-spelled-on-its-own.md)):
+
+<!-- compiles -->
+```zig
+const Summary = struct {
+    pub const nilo_json = .{
+        .rename_all = .camelCase,
+        .rename = .{ .estimated_cost_amount_minor = "estimatedCostMinor" },
+    };
+
+    id: u32,
+    estimated_cost_amount_minor: i64,   // "estimatedCostMinor"
+    due_at: []const u8,                 // "dueAt", by the case
+};
+```
+
+An entry naming a field the struct does not have, one that spells a field as it
+is already written, and one that lands on another field's key are each a
+compile error.
 
 **It is a spelling for what goes *out*, and using one for what comes in is a
 Refusal.** `std.json` chooses the parser for a body and reads it into the field
@@ -598,7 +652,9 @@ struct's own marker; a nested struct that says nothing keeps its own spelling.
 `nilo.jsonParseFor(@This())` is the reader, and it is a second line because
 `std.json` picks the parser for a type and nothing can add a declaration to a
 type you wrote. Only needed if the type arrives in a request; sending needs
-nothing. Adding it to a type with no `nilo_json` is a compile error, and so is
+nothing. On a type with `nilo_parse` it is the reader that hands the string to
+that ([ADR 0205](./adr/0205-a-body-field-that-parses-itself.md)). Adding it to a
+type with neither a `nilo_json` nor a `nilo_parse` is a compile error, and so is
 adding it to a struct that only renames — there is nothing for the reader to do
 differently.
 
@@ -2934,6 +2990,7 @@ request ([ADR 0041](./adr/0041-a-module-sits-where-the-loop-puts-it.md)).
 | `db.stream(User, c, .{ … })` | rows one at a time; see below |
 | `db.raw(User, c, sql, .{ … })` | `![]User` — a statement this module will not write. `sql` is **comptime**: the `SELECT` list is counted against the Row's fields and each column that plainly has a name is checked against the field in its position, and the statement is kept prepared like every other ([ADR 0148](./adr/0148-a-raw-statement-is-counted-while-compiling.md)) |
 | `db.rawOne(User, c, sql, .{ … })` | `!?User` — the same, for a statement whose `WHERE` holds a key. **No `LIMIT 1` is added**; see below |
+| `db.rawOrdered(User, c, sql, .{ … }, order)` | `![]User` — a raw statement with `{order}` in it, where the whole `ORDER BY` an `sql.Ordering` chose at run time is written. See *An order chosen at run time* below |
 | `db.exec(c, sql, .{ … })` | `!usize` — a statement that answers with *nothing*, and the rows it changed. `CREATE TABLE`, `CREATE INDEX`, `PRAGMA`, `VACUUM`. No Row, because none is being filled ([ADR 0078](./adr/0078-a-uuid-is-whatever-the-database-stores.md)) |
 | `db.begin(c, .{})` | `!Tx`. `.{ .isolation = …, .read_only = … }` rides on the `BEGIN`; see below |
 
@@ -3077,7 +3134,7 @@ pointing at `insertOrIgnore`.
 | | |
 |---|---|
 | `.where` | a condition; see below |
-| `.order` | `.{ .created_at = .desc }`, one column per field. `.asc_nulls_last` and its three siblings say where NULLs go, which the two databases otherwise disagree about |
+| `.order` | `.{ .created_at = .desc }`, one column per field. `.asc_nulls_last` and its three siblings say where NULLs go, which the two databases otherwise disagree about. Or a value of an `sql.Ordering` for an order the request chose; see below |
 | `.limit` / `.offset` | a literal is baked into the SQL; a variable becomes a parameter. A literal limit is also the row ceiling, so the result list is allocated once |
 | `.set` | update only: columns to new values, or `.{ .views = .{ .plus = 1 } }` for arithmetic on the column's own value |
 
@@ -3157,6 +3214,69 @@ the empty list, which `.in` already reads), on `not_distinct_from` (which takes
 an optional already), on a value that is not optional, beside a fixed condition
 in one `.exists`, and in the condition of an `UPDATE` or a `DELETE` — where a
 term that may not be there is the whole table.
+
+### An order chosen at run time
+
+`.order = .{ .created_at = .desc }` is settled while compiling. A list screen
+sorted from its headings — `?order=due:desc,title` — chooses at run time, and
+the choice is from a set the server declares
+([ADR 0204](./adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)):
+
+```zig
+const Sort = sql.Ordering(Commitment, .{
+    .due = .{ .column = .due_at, .nulls = .last },
+    .title = .title,
+});
+
+fn list(db: *sql.Db, c: *nilo.Ctx, q: nilo.Query(struct {
+    order: Sort = Sort.by(&.{.{ .key = .due }}),
+})) !sql.Page(Commitment) {
+    return db.page(Commitment, c, .{ .order = q.value.order, .limit = 20 });
+}
+```
+
+```sql
+SELECT … FROM "commitments" ORDER BY "due_at" DESC NULLS LAST, "title" ASC LIMIT 20
+```
+
+**No run-time string reaches the statement.** Each key is a column of the Row,
+checked and quoted while compiling, and the type holds one fragment per key per
+direction; a value is a list of at most `keys` terms, and writing the clause is
+writing those fragments in order. The request decides *which*, never *what*. A
+key is an enum literal for a column, `.{ .column = …, .nulls = .first | .last }`
+for one that says where NULLs go, or a string for SQL of the caller's own.
+
+**It parses itself.** `?order=due:desc,title` reads straight into a query field
+(`key[:asc|:desc]`, comma-separated). A key not declared, a direction that is
+neither, an empty term or more terms than keys is a 400 in the type's own
+words — `?order has to be an ordering by due or title, each with an optional
+:asc or :desc, comma-separated, not "height"` — and the document says the
+field is text. Absent is the field's default, which is the list's own order.
+
+**A column key orders a typed statement; an expression is for a raw one.**
+`db.select`, `db.one`, `db.page` and `db.stream` take one in `.order` when
+every key names a column, and refuse one with a string key — a statement nilo
+writes orders by columns it checked. `db.rawOrdered` takes the caller's
+statement with `{order}` where the whole clause goes, and either kind of key:
+
+```zig
+const rows = try db.rawOrdered(CommitmentRow, c,
+    \SELECT … FROM commitments c WHERE c.state = $1 {order} LIMIT $2 OFFSET $3
+, .{ state, limit, offset }, q.value.order);
+```
+
+The hole is yours, for the reason `rawOne` adds no `LIMIT 1`: appending to
+somebody else's SQL is what `db.raw` exists not to do. Both exist on a `Tx`.
+
+**What it costs.** The text is assembled per request, so an ordered statement
+runs **unnamed** — Parse, Bind and Execute on every call, the ~12 µs a prepared
+name is worth ([ADR 0057](./adr/0057-a-statement-that-is-a-constant-can-be-prepared-once.md))
+— and one arena allocation for the text, sized while compiling. A statement
+whose `.order` is a literal is exactly what it was.
+
+Four things are Refusals: a key naming a column the Row lacks, an ordering
+declared for another Row, an expression key handed to a typed statement, and a
+raw statement with no `{order}` in it.
 
 ### A row in another table
 

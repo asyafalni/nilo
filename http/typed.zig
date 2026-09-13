@@ -1006,6 +1006,7 @@ fn rolesOf(
                     );
                     body_at = i;
                     checkNotRenamed(pattern, readInto(roles[i], P), "request body");
+                    checkReadable(pattern, readInto(roles[i], P));
                 },
                 // A form *is* the body — the same bytes, read by a different
                 // rule — so the two are one slot and asking for both is the
@@ -1111,6 +1112,29 @@ fn checkNotRenamed(comptime pattern: []const u8, comptime T: type, comptime what
                 "naming every field.\n" ++
                 "  Keep this type for the response, and give what comes in a struct of its own, " ++
                 "spelled the way the wire spells it.",
+        );
+    }
+}
+
+/// Refuse a body holding a type that parses itself and has not handed
+/// `std.json` a reader ([ADR 0205](../docs/adr/0205-a-body-field-that-parses-itself.md)).
+///
+/// A path param and a query value of the type are read by nilo through
+/// `nilo_parse`; a body is `std.json`'s, and `std.json` reads a struct into
+/// its fields unless the type says otherwise — so the same type would take
+/// `"…"` on the path and demand `{"bytes":[…]}` in a body, and nothing would
+/// say so until the first client sent one.
+fn checkReadable(comptime pattern: []const u8, comptime T: type) void {
+    comptime {
+        const Unread = mark.unreadableWithin(T) orelse return;
+        @compileError(
+            "nilo: the request body on route \"" ++ pattern ++ "\" holds a `" ++ naming.of(Unread) ++
+                "`, which parses itself from text (`nilo_parse`) and has not told `std.json` so.\n" ++
+                "  A body is read by `std.json`, which reads a struct into its fields unless the " ++
+                "type carries `jsonParse` — so a client sending the text the type parses would be " ++
+                "told the field has to be an object.\n" ++
+                "  Hand the reader over, beside `nilo_parse`:\n" ++
+                "    pub const jsonParse = nilo.jsonParseFor(@This());",
         );
     }
 }

@@ -255,9 +255,33 @@ The API description says the same keys, so a generated client reads what the
 server sends. It costs nothing per request: the name is settled while compiling
 either way.
 
+**One field that no case reaches is spelled on its own.** A column called
+`estimated_cost_amount_minor` that the frontend knows as `estimatedCostMinor`
+is one `.rename` entry, and the entry wins over the case for that field alone
+([ADR 0207](../adr/0207-one-field-can-be-spelled-on-its-own.md)):
+
+<!-- compiles -->
+```zig
+const Summary = struct {
+    pub const nilo_json = .{
+        .rename_all = .camelCase,
+        .rename = .{ .estimated_cost_amount_minor = "estimatedCostMinor" },
+    };
+
+    id: u32,
+    estimated_cost_amount_minor: i64,   // goes out as "estimatedCostMinor"
+    due_at: ?[]const u8,                // and "dueAt", by the case
+};
+```
+
+`.rename` on its own, with no case, is fine too. A name that is not a field, a
+spelling that is the field's own name, and an entry that lands on the key
+another field already takes are each a compile error where the marker is
+written.
+
 **It is a spelling for what goes *out*.** `std.json` picks the parser for a body
 and reads it into the field names as they are written, so a struct with
-`rename_all` used as a request body, a form or a query string is a compile error
+`rename_all` or `.rename` used as a request body, a form or a query string is a compile error
 naming the route — that route would document `fullName` and answer 400 to a
 client that sent it. Give what comes in a struct of its own, spelled the way the
 wire spells it. One direction that works beats two that can disagree about one

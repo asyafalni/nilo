@@ -1659,6 +1659,17 @@ test "an interval and an inet round-trip as the text postgres prints" {
 
     try testing.expectEqualStrings("2 days 01:00:00", made.stay.?.text);
     try testing.expectEqualStrings("172.16.0.9/32", made.origin.?.text);
+
+    // A value that is not optional, set into the column that is: the ordinary
+    // act of filling in a date that was empty. It used to stop as a type
+    // error inside `forWire`, and `@as(?Interval, …)` at every site was the
+    // workaround (ADR 0203).
+    const filled = try stack.db.updateReturning(Booking, &run, .{
+        .set = .{ .stay = types.Interval{ .text = "5 days" } },
+        .where = .{ .id = @as(i64, 720) },
+    });
+    try testing.expectEqual(@as(usize, 1), filled.len);
+    try testing.expectEqualStrings("5 days", filled[0].stay.?.text);
 }
 
 test "an interval column is judged at startup like any other" {

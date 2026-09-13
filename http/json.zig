@@ -1079,3 +1079,39 @@ test "a struct of keys can say how its fields are spelled" {
         },
     );
 }
+
+test "one field can be spelled on its own, and the entry wins over the case" {
+    // Item 67: `estimated_cost_amount_minor` is `estimatedCostMinor` on the
+    // wire — the frontend's schema, three screens and the generated client
+    // all say so — and `rename_all` cannot get there from the column name
+    // (ADR 0207).
+    const Summary = struct {
+        pub const nilo_json = .{
+            .rename_all = .camelCase,
+            .rename = .{ .estimated_cost_amount_minor = "estimatedCostMinor" },
+        };
+
+        id: Key,
+        estimated_cost_amount_minor: i64,
+        due_at: []const u8,
+    };
+
+    try expectJson(
+        "{\"id\":\"01020304\",\"estimatedCostMinor\":125000,\"dueAt\":\"2026-10-01\"}",
+        Summary{
+            .id = .{ .bytes = .{ 1, 2, 3, 4 } },
+            .estimated_cost_amount_minor = 125_000,
+            .due_at = "2026-10-01",
+        },
+    );
+
+    // And on its own, with no case beside it: the one field moves and the
+    // rest go out as they are written.
+    const Bare = struct {
+        pub const nilo_json = .{ .rename = .{ .kind_of = "type" } };
+
+        kind_of: []const u8,
+        other_one: u8,
+    };
+    try expectJson("{\"type\":\"note\",\"other_one\":1}", Bare{ .kind_of = "note", .other_one = 1 });
+}

@@ -121,6 +121,7 @@ pub const dialect = @import("dialect.zig");
 pub const wire = @import("wire.zig");
 pub const where = @import("where.zig");
 pub const statement = @import("statement.zig");
+pub const ordering = @import("ordering.zig");
 pub const schema = @import("schema.zig");
 pub const types = @import("types.zig");
 pub const postgres = @import("postgres.zig");
@@ -321,6 +322,30 @@ pub const given = where.given;
 /// their own.
 pub const Given = where.Given;
 
+/// An `ORDER BY` chosen per request from a closed set declared while
+/// compiling ([ADR 0204](../docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+///
+/// ```zig
+/// const Sort = sql.Ordering(Commitment, .{
+///     .due = .{ .column = .due_at, .nulls = .last },
+///     .title = .title,
+/// });
+///
+/// // `?order=due:desc,title` reads straight into the field
+/// fn list(db: *sql.Db, c: *nilo.Ctx, q: nilo.Query(struct {
+///     order: Sort = Sort.by(&.{.{ .key = .due }}),
+/// })) !sql.Page(Commitment) {
+///     return db.page(Commitment, c, .{ .order = q.value.order, .limit = 20 });
+/// }
+/// ```
+///
+/// A key that is a column orders `db.select`, `db.one` and `db.page`; one
+/// that is the caller's own SQL is for `db.rawOrdered`, which writes the
+/// clause where the statement says `{order}`. No run-time string reaches
+/// the statement either way — a term picks a fragment settled while
+/// compiling. What an ordered statement gives up is its plan name.
+pub const Ordering = ordering.Ordering;
+
 pub const Begin = wire.Begin;
 pub const Isolation = wire.Isolation;
 pub const Lock = dialect.Lock;
@@ -442,6 +467,7 @@ test {
     _ = wire;
     _ = where;
     _ = statement;
+    _ = ordering;
     _ = schema;
     _ = types;
     _ = postgres;

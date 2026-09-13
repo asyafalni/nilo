@@ -117,6 +117,76 @@ feature. The other two are a character and a missing unwrap.
   renamed operations and a test that the rename stayed five. A space, a dot and
   a leading digit are still refused.
 
+Five came from the port's `commitment` round — the context the product exists
+for, and the one whose reads are furthest from CRUD. Three are features, one is
+a spelling, one is a missing `try`.
+
+- **`sql.Ordering(Row, keys)` — an `ORDER BY` chosen per request, from a
+  closed set declared while compiling**
+  ([ADR 0204](./docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+  `.order = .{ .created_at = .desc }` is settled while compiling, and a list
+  screen ordered from its headings — fifteen columns, three tiers — is twenty
+  thousand statements. The port wrote a ninety-six-term `CASE` ladder to keep
+  one. This is the other reading of "two statements": the *fragments* are
+  constants, and the request picks which.
+
+  ```zig
+  const Sort = sql.Ordering(Commitment, .{
+      .due = .{ .column = .due_at, .nulls = .last },
+      .title = .title,
+      .value = "c.value_currency, c.value_minor",   // your own SQL, for db.rawOrdered
+  });
+
+  fn list(db: *sql.Db, c: *nilo.Ctx, q: nilo.Query(struct {
+      order: Sort = Sort.by(&.{.{ .key = .due }}),
+  })) !sql.Page(Commitment) {
+      return db.page(Commitment, c, .{ .order = q.value.order, .limit = 20 });
+  }
+  ```
+
+  `?order=due:desc,title` reads straight into the field — the type parses
+  itself, so a key that is not declared is a 400 naming the ones that are —
+  and absent is the default. A column key orders `db.select`, `db.one`,
+  `db.page` and `db.stream`; an expression key is for `db.rawOrdered`, which
+  writes the whole clause where your statement says `{order}`. **No run-time
+  string reaches the statement either way.** What an ordered statement gives
+  up is its plan name: the text differs per request, so it runs unnamed, the
+  12 µs ADR 0057 measured — and costs one arena allocation for the text.
+  Four refusals.
+
+- **`nilo.Within(min, max)` — a whole number inside a range, as a type**
+  ([ADR 0206](./docs/adr/0206-a-whole-number-inside-a-range-is-a-type.md)).
+  `limit: nilo.Within(1, 200) = .of(50)` on a query struct: `?limit=500` is
+  `?limit has to be a whole number from 1 to 200, not "500"`, and the document
+  says `minimum: 1, maximum: 200`, so a client generated from it refuses the
+  same value before sending it. Read wherever a `u8` is read — path, query,
+  form and JSON body — and the number is `.value`. The default goes through
+  `.of`, which checks it against the range while compiling. Two refusals.
+
+- **A body field that parses itself is read from the text a response writes
+  it as** ([ADR 0205](./docs/adr/0205-a-body-field-that-parses-itself.md)).
+  `sql.Uuid` in a JSON body was handed to `std.json`, which read it as the
+  `{bytes: …}` struct it is and answered `"dealId" has to be an object or
+  null, not text` to the 36 characters the same server writes in every
+  response. `sql.Uuid` and `sql.Timestamp` carry `jsonParse` now — a list of
+  them too — and a type of your own that parses itself writes one line
+  beside `nilo_parse`: `pub const jsonParse = nilo.jsonParseFor(@This());`.
+  One that forgets is refused where the body is registered. The 400 quotes
+  what arrived, the way a query value's does — `"sku" has to be a Sku, not
+  "abc"` — and a type that can say more than its name says it with
+  `pub const nilo_expects = "a ticket number like T-1234"`. The document
+  describes such a field as what the type said (`format: uuid`), not as its
+  fields.
+
+- **`.rename = .{ .estimated_cost_amount_minor = "estimatedCostMinor" }` —
+  one field spelled on its own**
+  ([ADR 0207](./docs/adr/0207-one-field-can-be-spelled-on-its-own.md)).
+  Beside `rename_all` in `nilo_json`, and the entry wins. Works on an enum's
+  values and a union's variants too. A field the type lacks, a spelling that
+  changes nothing, and an entry that lands on another field's key are
+  refused. ADR 0181's rule is unchanged: a struct that renames is a write
+  spelling.
+
 Six of them came from the same port a week later, once it had used the first
 eleven and reached its first hard seam — an event bus. One more it reported —
 five places where it wrote the untyped call while a typed one existed, with no
@@ -719,6 +789,14 @@ else above changes an answer a client gets.
 
 ### Changed
 
+- **An unsigned integer in the document says `minimum: 0`**
+  ([ADR 0206](./docs/adr/0206-a-whole-number-inside-a-range-is-a-type.md)).
+  A `u32` field refuses `-1` with a 400, so the document promises it: every
+  `{"type":"integer"}` written for an unsigned Zig integer is
+  `{"type":"integer","minimum":0}` now, in a path param, a query field and a
+  body. A signed integer is unchanged. A test that compared the document byte
+  for byte on such a field has one more key in it.
+
 - **A `Db` that cannot dial warns rather than errs**
   ([ADR 0178](./docs/adr/0178-a-suite-whose-database-is-down-is-not-a-suite-that-failed.md)).
   The Zig test runner counts a logged `err` as a failed test, so a suite that
@@ -799,6 +877,14 @@ else above changes an answer a client gets.
   [`bench/result/cache.md`](./bench/result/cache.md).
 
 ### Fixed
+
+- **A text column type is set into a nullable column from a value that is
+  not optional.** `.set = .{ .due_date = due }` with `due: Date` into
+  `due_date: ?Date` was a type error naming a line of `forWire`, because
+  `nilo_write` answers an error union and an error union does not coerce into
+  an error union of an optional the way a value coerces into an optional.
+  One `try`, where it was on the branch beside it. `@as(?Date, due)` can go
+  ([ADR 0203](./docs/adr/0203-a-value-coerces-into-a-nullable-column-and-an-error-union-does-not.md)).
 
 - **`sql.given` runs on Postgres.** The guard was written `($1 IS NULL OR
   "name" = $1)`, and pg.zig sends no parameter types, so Postgres met `$1`

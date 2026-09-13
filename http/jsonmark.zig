@@ -54,6 +54,13 @@ const naming = @import("names.zig");
 /// The declaration a type writes to say how its JSON is spelled.
 pub const marker = "nilo_json";
 
+/// The declaration a type writes to say it parses itself from request text
+/// (ADR 0142). `convert.zig` is the reader of it for a path param and a
+/// query value, and re-exports this name; it is declared here because this
+/// file is the one that hands `std.json` a reader, and `convert.zig` imports
+/// the fail path, which this file may not.
+pub const parse_marker = "nilo_parse";
+
 /// The case a name is written in on the wire.
 ///
 /// The list is shorter than serde's, and deliberately: these are the transforms
@@ -87,6 +94,20 @@ pub const Mark = struct {
     tag: ?[]const u8 = null,
     /// How a name is spelled on the wire.
     rename_all: ?Case = null,
+    /// The names spelled one at a time, which win over `rename_all`
+    /// ([ADR 0207](../docs/adr/0207-one-field-can-be-spelled-on-its-own.md)).
+    renames: []const Rename = &.{},
+
+    /// Whether the marker changes how any field is spelled.
+    pub fn renamesFields(self: Mark) bool {
+        return self.rename_all != null or self.renames.len > 0;
+    }
+};
+
+/// One name and the spelling it goes out under.
+pub const Rename = struct {
+    field: []const u8,
+    wire: []const u8,
 };
 
 /// Whether `T` carries the marker at all. Cheap enough to ask first, and it is
@@ -164,16 +185,20 @@ pub fn of(comptime T: type) ?Mark {
                 mark.tag = said.tag;
             } else if (std.mem.eql(u8, f.name, "rename_all")) {
                 mark.rename_all = caseOf(T, said.rename_all);
+            } else if (std.mem.eql(u8, f.name, "rename")) {
+                mark.renames = renamesOf(T, said.rename);
             } else @compileError(
                 "nilo: `" ++ naming.of(T) ++ "`'s `" ++ marker ++ "` has a field `" ++ f.name ++
                     "`, which is not something it can say.\n" ++
-                    "  A marker says two things: `tag`, the key the variant's name goes under, " ++
-                    "and `rename_all`, how a name is spelled on the wire.\n" ++
-                    "    pub const " ++ marker ++ " = .{ .tag = \"signal\", .rename_all = .camelCase };",
+                    "  A marker says three things: `tag`, the key the variant's name goes under; " ++
+                    "`rename_all`, how every name is spelled on the wire; and `rename`, the ones " ++
+                    "spelled on their own.\n" ++
+                    "    pub const " ++ marker ++ " = .{ .tag = \"signal\", .rename_all = .camelCase, " ++
+                    ".rename = .{ .amount_minor = \"amountMinor\" } };",
             );
         }
 
-        if (mark.tag == null and mark.rename_all == null) @compileError(
+        if (mark.tag == null and !mark.renamesFields()) @compileError(
             "nilo: `" ++ naming.of(T) ++ "`'s `" ++ marker ++ "` is empty, so it says nothing " ++
                 "about this type's JSON and nothing changes.\n" ++
                 "  Either say what it is for, or take the declaration off:\n" ++
@@ -182,7 +207,7 @@ pub fn of(comptime T: type) ?Mark {
         );
 
         if (mark.tag) |key| checkTag(T, key);
-        if (mark.rename_all) |c| checkRenames(T, c);
+        if (mark.renamesFields()) checkRenames(T, mark);
         return mark;
     }
 }
@@ -211,6 +236,70 @@ fn caseOf(comptime T: type, comptime said: anytype) Case {
         }
         return @field(Case, name);
     }
+}
+
+/// `said.rename` — a struct of names, each the field it renames, read and
+/// checked against the type: every name has to be one of its fields, every
+/// spelling has to be text, and a spelling that is the name itself changes
+/// nothing and is refused the way `.snake_case` is
+/// ([ADR 0207](../docs/adr/0207-one-field-can-be-spelled-on-its-own.md)).
+fn renamesOf(comptime T: type, comptime said: anytype) []const Rename {
+    comptime {
+        const Said = @TypeOf(said);
+        if (@typeInfo(Said) != .@"struct" or @typeInfo(Said).@"struct".is_tuple) @compileError(
+            "nilo: `" ++ naming.of(T) ++ "`'s `.rename` is a " ++ naming.of(Said) ++ ", and it " ++
+                "names the fields that are spelled on their own, so it is written as a struct " ++
+                "of them.\n" ++
+                "    pub const " ++ marker ++ " = .{ .rename = .{ .amount_minor = \"amountMinor\" } };",
+        );
+        const what = switch (@typeInfo(T)) {
+            .@"enum" => "value",
+            .@"union" => "variant",
+            .@"struct" => "field",
+            else => @compileError(
+                "nilo: `" ++ naming.of(T) ++ "` says `.rename`, and it is a " ++ @tagName(@typeInfo(T)) ++
+                    ", which has no fields to spell.",
+            ),
+        };
+        var out: []const Rename = &.{};
+        for (@typeInfo(Said).@"struct".fields) |f| {
+            if (!@hasField(T, f.name)) @compileError(
+                "nilo: `" ++ naming.of(T) ++ "` renames a " ++ what ++ " `" ++ f.name ++ "` it does " ++
+                    "not have.\n" ++
+                    "  `.rename` names this type's own " ++ what ++ "s, spelled as they are written: " ++
+                    "`.{ .amount_minor = \"amountMinor\" }`.",
+            );
+            const spelling = @field(said, f.name);
+            if (!isText(@TypeOf(spelling))) @compileError(
+                "nilo: `" ++ naming.of(T) ++ "` renames `" ++ f.name ++ "` to a " ++
+                    naming.of(@TypeOf(spelling)) ++ ", and a spelling is text.\n" ++
+                    "    .rename = .{ ." ++ f.name ++ " = \"amountMinor\" }",
+            );
+            const wire_name: []const u8 = spelling;
+            if (wire_name.len == 0) @compileError(
+                "nilo: `" ++ naming.of(T) ++ "` renames `" ++ f.name ++ "` to the empty string, " ++
+                    "so the value would go out under a key with no name.",
+            );
+            if (std.mem.eql(u8, wire_name, f.name)) @compileError(
+                "nilo: `" ++ naming.of(T) ++ "` renames `" ++ f.name ++ "` to \"" ++ f.name ++
+                    "\", which is what it is already called, so it would change nothing.\n" ++
+                    "  Take the entry off, or spell it differently.",
+            );
+            out = out ++ [_]Rename{.{ .field = f.name, .wire = wire_name }};
+        }
+        return out;
+    }
+}
+
+fn isText(comptime S: type) bool {
+    return switch (@typeInfo(S)) {
+        .pointer => |p| switch (p.size) {
+            .slice => p.child == u8,
+            .one => @typeInfo(p.child) == .array and @typeInfo(p.child).array.child == u8,
+            else => false,
+        },
+        else => false,
+    };
 }
 
 /// A `tag` is a claim about a union, so it is checked against one.
@@ -295,7 +384,7 @@ fn checkTag(comptime T: type, comptime key: []const u8) void {
 /// generous rather than exact for the reason `app.zig`'s `checkName` gives:
 /// it is a ceiling on the caller's whole evaluation, and nilo's own walk
 /// must never be the thing that runs out.
-fn checkRenames(comptime T: type, comptime c: Case) void {
+fn checkRenames(comptime T: type, comptime m: Mark) void {
     comptime {
         const fields = switch (@typeInfo(T)) {
             .@"enum" => |e| e.fields,
@@ -312,9 +401,8 @@ fn checkRenames(comptime T: type, comptime c: Case) void {
             bytes += f.name.len;
             if (f.name.len > longest) longest = f.name.len;
         }
-        @setEvalBranchQuota(10_000 + 4 * (bytes + fields.len * fields.len * (longest + 1)));
+        @setEvalBranchQuota(10_000 + 4 * (bytes + fields.len * fields.len * (longest + 1) + m.renames.len * fields.len));
 
-        const m = Mark{ .rename_all = c };
         const what = switch (@typeInfo(T)) {
             .@"enum" => "value",
             .@"union" => "variant",
@@ -325,8 +413,20 @@ fn checkRenames(comptime T: type, comptime c: Case) void {
         for (fields, 0..) |a, i| {
             for (fields[i + 1 ..], i + 1..) |b, j| {
                 if (!std.mem.eql(u8, spelled[i], spelled[j])) continue;
+                // Which of the two markers put them there decides the advice.
+                // A collision under `rename_all` alone is answered with the
+                // cases that keep names apart; one a `.rename` entry caused is
+                // answered by pointing at the entry.
+                if (renamedOnItsOwn(m, a.name) or renamedOnItsOwn(m, b.name)) @compileError(
+                    "nilo: `" ++ naming.of(T) ++ "` spells its " ++ what ++ "s `" ++ a.name ++
+                        "` and `" ++ b.name ++ "` both as \"" ++ spelled[i] ++ "\" — one of them by " ++
+                        "a `.rename` entry.\n" ++
+                        "  Two of them under one name on the wire is not a spelling problem: a reader " ++
+                        "takes whichever it meets first, which is declaration order, and nothing says so.\n" ++
+                        "  Spell the entry differently, or rename the other one too.",
+                );
                 @compileError(
-                    "nilo: `" ++ naming.of(T) ++ "` asks for `.rename_all = ." ++ @tagName(c) ++
+                    "nilo: `" ++ naming.of(T) ++ "` asks for `.rename_all = ." ++ @tagName(m.rename_all.?) ++
                         "`, and its " ++ what ++ "s `" ++ a.name ++ "` and `" ++ b.name ++
                         "` both come out as \"" ++ spelled[i] ++ "\".\n" ++
                         "  Two of them under one name on the wire is not a spelling problem: a reader " ++
@@ -340,12 +440,22 @@ fn checkRenames(comptime T: type, comptime c: Case) void {
     }
 }
 
+fn renamedOnItsOwn(comptime m: Mark, comptime name: []const u8) bool {
+    comptime {
+        for (m.renames) |r| if (std.mem.eql(u8, r.field, name)) return true;
+        return false;
+    }
+}
+
 /// How `name` is spelled on the wire under `mark`. A comptime string, so it
 /// costs a literal rather than a conversion (`json.zig` writes it as part of
 /// the same `writeAll` the punctuation is in).
 pub fn wire(comptime name: []const u8, comptime mark: ?Mark) []const u8 {
     comptime {
-        const c = (mark orelse return name).rename_all orelse return name;
+        const m = mark orelse return name;
+        // A name spelled on its own wins over the case (ADR 0207).
+        for (m.renames) |r| if (std.mem.eql(u8, r.field, name)) return r.wire;
+        const c = m.rename_all orelse return name;
         var out: []const u8 = "";
         switch (c) {
             // Joined rather than separated — see the note on `Case`.
@@ -417,6 +527,12 @@ pub fn wireNames(comptime T: type) []const []const u8 {
 /// same reason — a type holding a list of its own type has no bottom.
 pub fn renamedFieldsWithin(comptime T: type) ?type {
     comptime {
+        // This walk and `unreadableWithin` run inside the body slot's own
+        // evaluation, and `of` reading `.rename` on every struct they pass
+        // took a plain body over the default 1,000. Raised here because this
+        // is where the work is asked for (ADR 0157): eight deep over every
+        // field is bounded by the type, and 20,000 is `typed.wrap`'s figure.
+        @setEvalBranchQuota(20_000);
         return renamedWithin(T, 0);
     }
 }
@@ -427,7 +543,7 @@ fn renamedWithin(comptime T: type, comptime depth: usize) ?type {
         switch (@typeInfo(T)) {
             .@"struct" => |s| {
                 if (of(T)) |m| {
-                    if (m.rename_all != null) return T;
+                    if (m.renamesFields()) return T;
                 }
                 for (s.fields) |f| {
                     if (renamedWithin(f.type, depth + 1)) |found| return found;
@@ -451,6 +567,59 @@ fn renamedWithin(comptime T: type, comptime depth: usize) ?type {
     }
 }
 
+/// The first type at or inside `T` that parses itself and has not handed
+/// `std.json` a reader, or null ([ADR 0205](../docs/adr/0205-a-body-field-that-parses-itself.md)).
+///
+/// A path param and a query value are read through `nilo_parse` by nilo; a
+/// body is read by `std.json`, which reads a struct into its fields unless
+/// the type carries `jsonParse`. A type that says it parses itself and does
+/// not carry one would be read as its fields, which is the mistake this is
+/// asked in order to refuse. Eight deep, for `renamedFieldsWithin`'s reason.
+pub fn unreadableWithin(comptime T: type) ?type {
+    comptime {
+        // Sized for `renamedFieldsWithin`'s reason.
+        @setEvalBranchQuota(20_000);
+        return unreadable(T, 0);
+    }
+}
+
+fn unreadable(comptime T: type, comptime depth: usize) ?type {
+    comptime {
+        if (depth >= 8) return null;
+        switch (@typeInfo(T)) {
+            .@"struct", .@"union", .@"enum", .@"opaque" => {
+                // A type that parses itself is one value, so the walk stops
+                // at it whether or not it has a reader; what is inside it is
+                // its own. A `Patch(T)` and a tagged union are walked into,
+                // because their readers hand the payload back to `std.json`.
+                if (parsesItself(T)) return if (std.meta.hasFn(T, "jsonParse")) null else T;
+            },
+            else => {},
+        }
+        switch (@typeInfo(T)) {
+            .@"struct" => |s| {
+                for (s.fields) |f| {
+                    if (unreadable(f.type, depth + 1)) |found| return found;
+                }
+                return null;
+            },
+            .@"union" => |u| {
+                for (u.fields) |f| {
+                    if (unreadable(f.type, depth + 1)) |found| return found;
+                }
+                return null;
+            },
+            .optional => |o| return unreadable(o.child, depth + 1),
+            .array => |a| return unreadable(a.child, depth + 1),
+            .pointer => |p| return switch (p.size) {
+                .slice, .one => unreadable(p.child, depth + 1),
+                else => null,
+            },
+            else => return null,
+        }
+    }
+}
+
 /// The reader a marked type hands to `std.json`:
 ///
 /// ```zig
@@ -463,8 +632,12 @@ fn renamedWithin(comptime T: type, comptime depth: usize) ?type {
 /// over rather than driving the parse from nilo's side is what keeps `std.json`
 /// the only JSON parser in the process — nesting, escapes, surrogate pairs and
 /// number edges all stay theirs.
-pub fn parseFor(comptime T: type) @TypeOf(Reader(T).parse) {
+pub fn parseFor(comptime T: type) ParserFor(T) {
     comptime {
+        // A type that parses itself from text has said how it is read, and
+        // it is the same reading a path param gets: the one string, handed
+        // to `nilo_parse` ([ADR 0205](../docs/adr/0205-a-body-field-that-parses-itself.md)).
+        if (parsesItself(T) and !marked(T)) return Parsed(T).parse;
         const m = of(T) orelse @compileError(
             "nilo: `" ++ naming.of(T) ++ "` asks for nilo's JSON reader and has no `" ++ marker ++
                 "`, so there is nothing for the reader to do differently from `std.json`.\n" ++
@@ -481,7 +654,7 @@ pub fn parseFor(comptime T: type) @TypeOf(Reader(T).parse) {
         if (m.tag == null and @typeInfo(T) == .@"struct") @compileError(
             "nilo: `" ++ naming.of(T) ++ "` hands nilo's JSON reader a `" ++ marker ++
                 "` that only renames its fields, and renaming a struct's fields is a **write**" ++
-                " spelling (ADR 0181).\n" ++
+                " spelling (ADR 0181, ADR 0207).\n" ++
                 "  There is nothing for the reader to do differently: nilo writes the renamed" ++
                 " keys and `std.json` reads the body into the field names as they are written.\n" ++
                 "  Take the `jsonParse` line off, and keep this type for what goes out. A body" ++
@@ -489,13 +662,58 @@ pub fn parseFor(comptime T: type) @TypeOf(Reader(T).parse) {
         );
         if (m.tag == null and @typeInfo(T) != .@"enum") @compileError(
             "nilo: `" ++ naming.of(T) ++ "` hands nilo's JSON reader a `" ++ marker ++
-                "` with only `rename_all` on it, and it is a " ++ @tagName(@typeInfo(T)) ++ ".\n" ++
+                "` that only renames, and it is a " ++ @tagName(@typeInfo(T)) ++ ".\n" ++
                 "  Renaming a variant changes the key `std.json` looks for, which nilo cannot read " ++
                 "back without a tag to find it by. Add one:\n" ++
                 "    pub const " ++ marker ++ " = .{ .tag = \"kind\", .rename_all = … };",
         );
     }
     return Reader(T).parse;
+}
+
+/// The reader `parseFor` hands over: the marker's, or — for a type that
+/// parses itself and carries no marker — the one that reads a string.
+fn ParserFor(comptime T: type) type {
+    comptime {
+        if (parsesItself(T) and !marked(T)) return @TypeOf(Parsed(T).parse);
+        return @TypeOf(Reader(T).parse);
+    }
+}
+
+/// Whether `T` declares `nilo_parse`. The shape of the declaration is checked
+/// where a path param or a query value is read (`convert.parsesItself`); by
+/// the time a body is read the type has been through that.
+fn parsesItself(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(T, parse_marker),
+        else => false,
+    };
+}
+
+/// The reader for a type that parses itself: one token, which is text or a
+/// number — a bounded integer arrives as a JSON number and is still the
+/// digits — handed to `nilo_parse`. Null from the type is `InvalidCharacter`,
+/// which is what `std.fmt` answers for a digit that is not one; any other
+/// kind of token is the wrong kind.
+fn Parsed(comptime T: type) type {
+    return struct {
+        pub fn parse(
+            gpa: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) std.json.ParseError(@TypeOf(source.*))!T {
+            const token = try source.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?);
+            const text = switch (token) {
+                inline .string, .allocated_string, .number, .allocated_number => |slice| slice,
+                else => return error.UnexpectedToken,
+            };
+            defer switch (token) {
+                .allocated_string, .allocated_number => gpa.free(text),
+                else => {},
+            };
+            return T.nilo_parse(text) orelse error.InvalidCharacter;
+        }
+    };
 }
 
 fn Reader(comptime T: type) type {
@@ -681,6 +899,58 @@ fn Reader(comptime T: type) type {
 // ---- tests ----
 
 const testing = std.testing;
+
+test "a type that parses itself hands std.json the reading a path param gets" {
+    const Sku = struct {
+        letters: [3]u8,
+        pub fn nilo_parse(text: []const u8) ?@This() {
+            if (text.len != 3) return null;
+            return .{ .letters = text[0..3].* };
+        }
+        pub const jsonParse = parseFor(@This());
+    };
+    const Bounded = struct {
+        value: u8,
+        pub fn nilo_parse(text: []const u8) ?@This() {
+            const n = std.fmt.parseInt(u8, text, 10) catch return null;
+            return if (n >= 1 and n <= 200) .{ .value = n } else null;
+        }
+        pub const jsonParse = parseFor(@This());
+    };
+    const Body = struct { sku: Sku, limit: Bounded, parent: ?Sku = null };
+
+    const parsed = try std.json.parseFromSlice(Body, testing.allocator, "{\"sku\":\"ABC\",\"limit\":50}", .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ABC", &parsed.value.sku.letters);
+    try testing.expectEqual(@as(u8, 50), parsed.value.limit.value);
+    try testing.expectEqual(@as(?Sku, null), parsed.value.parent);
+
+    // Text the type refuses, a number out of its range, and the wrong kind
+    // of value altogether — three refusals, and `ctx.zig` words each.
+    try testing.expectError(error.InvalidCharacter, std.json.parseFromSlice(Body, testing.allocator, "{\"sku\":\"ABCD\",\"limit\":50}", .{}));
+    try testing.expectError(error.InvalidCharacter, std.json.parseFromSlice(Body, testing.allocator, "{\"sku\":\"ABC\",\"limit\":500}", .{}));
+    try testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(Body, testing.allocator, "{\"sku\":[\"A\"],\"limit\":50}", .{}));
+}
+
+test "a name spelled on its own is spelled that way, whatever the case says" {
+    const m = Mark{
+        .rename_all = .camelCase,
+        .renames = &.{.{ .field = "amount_minor", .wire = "amountMinorValue" }},
+    };
+    try testing.expectEqualStrings("amountMinorValue", comptime wire("amount_minor", m));
+    try testing.expectEqualStrings("dueAt", comptime wire("due_at", m));
+
+    // Read off a type, the entry and the case land in the same Mark, and an
+    // enum's values are names too.
+    const Level = enum {
+        pub const nilo_json = .{ .rename_all = .UPPERCASE, .rename = .{ .very_high = "critical" } };
+        low,
+        very_high,
+    };
+    try testing.expectEqualStrings("LOW", comptime wireNames(Level)[0]);
+    try testing.expectEqualStrings("critical", comptime wireNames(Level)[1]);
+    try testing.expect(comptime of(Level).?.renamesFields());
+}
 
 test "a name is spelled the way the case says" {
     try testing.expectEqualStrings("notfound", comptime wire("not_found", .{ .rename_all = .lowercase }));

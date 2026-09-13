@@ -4249,7 +4249,7 @@ test "the document describes what the signatures say" {
     try testing.expect(std.mem.indexOf(
         u8,
         json,
-        "\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"integer\"}",
+        "\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"integer\",\"minimum\":0}",
     ) != null);
 
     // A catch-all has no OpenAPI spelling, so it is `{path}` in both places.
@@ -4360,7 +4360,7 @@ test "a shape used by more than one route is written once and referred to" {
     // one — three references and one copy, where there used to be three
     // copies.
     try testing.expectEqual(@as(usize, 3), found);
-    try testing.expectEqual(@as(usize, 1), countOccurrences(json, "\"id\":{\"type\":\"integer\"}"));
+    try testing.expectEqual(@as(usize, 1), countOccurrences(json, "\"id\":{\"type\":\"integer\",\"minimum\":0}"));
 }
 
 /// Handlers that write their own answer, and one that merely reads the
@@ -4479,8 +4479,8 @@ test "a name two different generics both answer to belongs to neither" {
     // either way round would describe one endpoint as the other, so neither
     // gets the name and both are written out where they appear.
     try testing.expect(std.mem.indexOf(u8, json, "Box_u32") == null);
-    try testing.expect(std.mem.indexOf(u8, json, "\"held\":{\"type\":\"integer\"}") != null);
-    try testing.expect(std.mem.indexOf(u8, json, "\"thrown\":{\"type\":\"integer\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"held\":{\"type\":\"integer\",\"minimum\":0}") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"thrown\":{\"type\":\"integer\",\"minimum\":0}") != null);
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
@@ -7758,4 +7758,157 @@ test "the arm the suite never builds in is checked anyway" {
     // ReleaseFast program, which fires the warning at somebody who did it
     // right. These two must not agree.
     try testing.expect(wiring.modeFrom(.info, false) != wiring.modeFrom(.info, true));
+}
+
+// ---- a body field that parses itself (ADR 0205), and a bounded integer (ADR 0206) ----
+
+/// A stand-in for `sql.Uuid`: `http/` may not import `nilo_id`, and the
+/// protocol is read by name so that it need not. Three capital letters.
+const Sku = struct {
+    letters: [3]u8,
+
+    pub const nilo_type_name = "Sku";
+    pub const nilo_openapi = .{ .type = "string", .format = "sku" };
+
+    pub fn nilo_parse(text: []const u8) ?Sku {
+        if (text.len != 3) return null;
+        for (text) |ch| if (!std.ascii.isUpper(ch)) return null;
+        return .{ .letters = text[0..3].* };
+    }
+
+    pub const jsonParse = @import("jsonmark.zig").parseFor(@This());
+
+    pub fn jsonStringify(self: Sku, jw: anytype) !void {
+        try jw.write(&self.letters);
+    }
+};
+
+const NewLine = struct {
+    sku: Sku,
+    parent: ?Sku = null,
+    also: []const Sku = &.{},
+    limit: @import("within.zig").Within(1, 200) = .of(50),
+};
+
+fn addLine(body: NewLine) !struct { sku: Sku, parent: ?Sku, count: usize, limit: u8 } {
+    return .{ .sku = body.sku, .parent = body.parent, .count = body.also.len, .limit = body.limit.value };
+}
+
+fn addBoundLine(b: bound_mod.Bound(NewLine)) ![]const u8 {
+    const line = b.value() orelse return b.fail();
+    return &line.sku.letters;
+}
+
+fn postLine(h: *Harness, app: *App, body: []const u8) []const u8 {
+    var head_buf: [128]u8 = undefined;
+    const head = std.fmt.bufPrint(&head_buf, "POST /lines HTTP/1.1\r\nHost: t\r\n" ++
+        "Content-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{body.len}) catch unreachable;
+    var request_buf: [512]u8 = undefined;
+    const request = std.fmt.bufPrint(&request_buf, "{s}{s}", .{ head, body }) catch unreachable;
+    return h.send(app, request).response;
+}
+
+test "a body field that parses itself is read from the text a response writes it as" {
+    // Item 64: `sql.Uuid` in a body was handed to `std.json`, which read it
+    // as the `{bytes: …}` struct it is and answered 400 to the 36 characters
+    // the same server writes in every response (ADR 0205).
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/lines", addLine);
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const ok = postLine(&h, &app, "{\"sku\":\"ABC\",\"parent\":\"XYZ\",\"also\":[\"DEF\",\"GHI\"],\"limit\":20}");
+    try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
+    try testing.expect(std.mem.endsWith(u8, ok, "{\"sku\":\"ABC\",\"parent\":\"XYZ\",\"count\":2,\"limit\":20}"));
+
+    // Absent takes the defaults; null is null.
+    const bare = postLine(&h, &app, "{\"sku\":\"ABC\",\"parent\":null}");
+    try testing.expect(std.mem.endsWith(u8, bare, "{\"sku\":\"ABC\",\"parent\":null,\"count\":0,\"limit\":50}"));
+
+    // Text the type refuses is quoted back in the sentence a query value of
+    // the same type gets; the wrong kind of value is named by its kind.
+    const wrong_text = postLine(&h, &app, "{\"sku\":\"abc\"}");
+    try testing.expect(std.mem.startsWith(u8, wrong_text, "HTTP/1.1 400"));
+    try testing.expect(try Harness.saysFailure(wrong_text, "\"sku\" has to be a Sku, not \"abc\""));
+
+    const wrong_kind = postLine(&h, &app, "{\"sku\":{\"letters\":[65,66,67]}}");
+    try testing.expect(try Harness.saysFailure(wrong_kind, "\"sku\" has to be a Sku, not an object"));
+
+    const inside_a_list = postLine(&h, &app, "{\"sku\":\"ABC\",\"also\":[\"DEF\",\"nope\"]}");
+    try testing.expect(try Harness.saysFailure(inside_a_list, "\"also[1]\" has to be a Sku, not \"nope\""));
+
+    const missing = postLine(&h, &app, "{}");
+    try testing.expect(try Harness.saysFailure(missing, "the request body is missing \"sku\" (a Sku)"));
+
+    // A bounded integer arrives as a number, and the bound is the sentence.
+    const too_many = postLine(&h, &app, "{\"sku\":\"ABC\",\"limit\":500}");
+    try testing.expect(std.mem.startsWith(u8, too_many, "HTTP/1.1 400"));
+    try testing.expect(try Harness.saysFailure(too_many, "\"limit\" has to be a whole number from 1 to 200, not \"500\""));
+}
+
+test "a binding records a field that parses itself in the same words" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/lines", addBoundLine);
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const answer = postLine(&h, &app, "{\"sku\":\"abc\",\"limit\":0}");
+    try testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 422"));
+    try testing.expect(try Harness.saysFailure(answer, "2 fields did not fit"));
+    try testing.expect(try Harness.saysFailure(answer, "\"sku\" has to be a Sku, not \"abc\""));
+    try testing.expect(try Harness.saysFailure(answer, "\"limit\" has to be a whole number from 1 to 200, not \"0\""));
+}
+
+const ListQuery = struct {
+    limit: @import("within.zig").Within(1, 200) = .of(50),
+    offset: u32 = 0,
+};
+
+fn listLines(q: typed.Query(ListQuery)) !struct { limit: u8, offset: u32 } {
+    return .{ .limit = q.value.limit.value, .offset = q.value.offset };
+}
+
+test "a query field carries its bounds, and the document says them" {
+    // Item 68: `limit` between 1 and 200 was two lines at the top of every
+    // list handler, and the document said nothing about either (ADR 0206).
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.docs(.{});
+    try app.get("/lines", listLines);
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const ok = h.send(&app, "GET /lines?limit=200&offset=40 HTTP/1.1\r\nHost: t\r\n\r\n").response;
+    try testing.expect(std.mem.endsWith(u8, ok, "{\"limit\":200,\"offset\":40}"));
+
+    const absent = h.send(&app, "GET /lines HTTP/1.1\r\nHost: t\r\n\r\n").response;
+    try testing.expect(std.mem.endsWith(u8, absent, "{\"limit\":50,\"offset\":0}"));
+
+    const over = h.send(&app, "GET /lines?limit=500 HTTP/1.1\r\nHost: t\r\n\r\n").response;
+    try testing.expect(std.mem.startsWith(u8, over, "HTTP/1.1 400"));
+    try testing.expect(try Harness.saysFailure(over, "?limit has to be a whole number from 1 to 200, not \"500\""));
+
+    // A `u32` is already refused below zero, which is the other line every
+    // list handler carried.
+    const below = h.send(&app, "GET /lines?offset=-1 HTTP/1.1\r\nHost: t\r\n\r\n").response;
+    try testing.expect(std.mem.startsWith(u8, below, "HTTP/1.1 400"));
+
+    const json = try docsFor(&app);
+    try testing.expect(std.mem.indexOf(u8, json, "{\"name\":\"limit\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200}}") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "{\"name\":\"offset\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"integer\",\"minimum\":0}}") != null);
+}
+
+test "a body field that parses itself is described as what it said, and so is a bounded one" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.docs(.{});
+    try app.post("/lines", addLine);
+    const json = try docsFor(&app);
+    try testing.expect(std.mem.indexOf(u8, json, "\"sku\":{\"type\":\"string\",\"format\":\"sku\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200}") != null);
 }

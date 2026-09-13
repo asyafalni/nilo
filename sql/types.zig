@@ -241,6 +241,41 @@ pub const Timestamp = struct {
         self.writeRfc3339(&w) catch return jw.write(null);
         try jw.write(w.buffered());
     }
+
+    /// The third arrival, read the way `nilo_parse` reads the other two:
+    /// `std.json` picks a reader by this name, so a body field of this type
+    /// was read as `{micros: …}` until it existed (ADR 0205). Text that is
+    /// not a moment is `InvalidCharacter`, which `std.fmt` answers for a
+    /// digit that is not one; anything that is not text is the wrong kind.
+    pub fn jsonParse(
+        gpa: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) std.json.ParseError(@TypeOf(source.*))!Timestamp {
+        const token = try source.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?);
+        const text = switch (token) {
+            inline .string, .allocated_string => |slice| slice,
+            else => return error.UnexpectedToken,
+        };
+        defer switch (token) {
+            .allocated_string => gpa.free(text),
+            else => {},
+        };
+        return nilo_parse(text) orelse error.InvalidCharacter;
+    }
+
+    pub fn jsonParseFromValue(
+        gpa: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!Timestamp {
+        _ = gpa;
+        _ = options;
+        return switch (source) {
+            .string => |text| nilo_parse(text) orelse error.InvalidCharacter,
+            else => error.UnexpectedToken,
+        };
+    }
 };
 
 /// Sixteen bytes, in the order Postgres stores them — `nilo_id`'s type
@@ -650,6 +685,30 @@ test "a timestamp with no zone is refused, because there is no right reading of 
 
     // A leap day in a year that has one still reads.
     try testing.expect(Timestamp.nilo_parse("2024-02-29T12:00:00Z") != null);
+}
+
+test "a Timestamp in a JSON body is read from the text a response writes it as" {
+    const Body = struct { due_at: Timestamp, seen_at: ?Timestamp = null };
+    const parsed = try std.json.parseFromSlice(
+        Body,
+        testing.allocator,
+        "{\"due_at\":\"2026-08-16T16:30:00+07:00\"}",
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expectEqual(Timestamp.nilo_parse("2026-08-16T09:30:00Z").?.micros, parsed.value.due_at.micros);
+    try testing.expectEqual(@as(?Timestamp, null), parsed.value.seen_at);
+
+    // The wrong kind, and text with no zone in it — the reading `nilo_parse`
+    // refuses on a query value is refused in a body the same way.
+    try testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(Body, testing.allocator, "{\"due_at\":1723800600}", .{}));
+    try testing.expectError(error.InvalidCharacter, std.json.parseFromSlice(Body, testing.allocator, "{\"due_at\":\"2026-08-16T09:30:00\"}", .{}));
+
+    const held = try std.json.parseFromSlice(std.json.Value, testing.allocator, "\"2026-08-16T09:30:00Z\"", .{});
+    defer held.deinit();
+    const from_value = try std.json.parseFromValue(Timestamp, testing.allocator, held.value, .{});
+    defer from_value.deinit();
+    try testing.expectEqual(Timestamp.nilo_parse("2026-08-16T09:30:00Z").?.micros, from_value.value.micros);
 }
 
 test "a uuid column and a generated key are the same type" {

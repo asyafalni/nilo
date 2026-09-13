@@ -44,6 +44,7 @@ const row_mod = @import("row.zig");
 const where_mod = @import("where.zig");
 const dialect_mod = @import("dialect.zig");
 const types_mod = @import("types.zig");
+const ordering = @import("ordering.zig");
 
 /// The direction an order term reads. Always comptime — which way a sort runs
 /// is shape, and a sort direction chosen at runtime is two statements.
@@ -140,6 +141,14 @@ pub const Statement = struct {
     /// rows go into but never says how many arrive, which is the sentence
     /// ADR 0039 originally got wrong. `fill` in `db.zig` is the only reader.
     reserve: ?usize = null,
+    /// Whether `.order` is chosen per request rather than settled here
+    /// ([ADR 0204](../docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+    /// When it is, `sql` stops where the clause goes and `tail` is the rest
+    /// — the `LIMIT`, the `OFFSET`, the lock — and `db.zig` writes the three
+    /// out per request, unnamed. Everything else about the statement is
+    /// exactly what it would have been.
+    ordered: bool = false,
+    tail: []const u8 = "",
 
     pub fn paramCount(self: Statement) usize {
         return self.paths.len;
@@ -280,8 +289,25 @@ fn rowsOf(
             }
         }
 
+        // An ordering chosen at run time splits the statement here: what
+        // was built so far is the head, and everything from here on is the
+        // tail (ADR 0204). The clause between them is the request's.
+        var ordered = false;
+        var head: []const u8 = "";
         if (@hasField(O, "order")) {
-            sql = sql ++ orderBy(D, Row, @FieldType(O, "order"));
+            const Order = @FieldType(O, "order");
+            if (ordering.orderingOf(Order) != null) {
+                ordering.assertFor(Order, Row, switch (answers) {
+                    .first => "`db.one`",
+                    .page => "`db.page`",
+                    .many => "`db.select`",
+                }, true);
+                ordered = true;
+                head = sql;
+                sql = "";
+            } else {
+                sql = sql ++ orderBy(D, Row, Order);
+            }
         }
 
         if (@hasField(O, "limit")) {
@@ -315,6 +341,14 @@ fn rowsOf(
         // which those are.
         if (@hasField(O, "lock")) sql = sql ++ lockedBy(D, Row, O);
 
+        if (ordered) break :blk .{
+            .sql = head,
+            .paths = paths,
+            .params = params,
+            .reserve = reserve,
+            .ordered = true,
+            .tail = sql,
+        };
         break :blk .{ .sql = sql, .paths = paths, .params = params, .reserve = reserve };
     };
 }
@@ -590,7 +624,6 @@ fn deleting(
         break :blk .{ .sql = sql, .paths = paths, .params = params };
     };
 }
-
 
 /// **A condition that may not be there is not a condition an `UPDATE` or a
 /// `DELETE` may narrow itself with**
@@ -2350,7 +2383,6 @@ test "a plan name is an identifier Postgres will accept" {
     try testing.expect(std.mem.startsWith(u8, name, "nilo_"));
     for (name) |ch| try testing.expect(std.ascii.isAlphanumeric(ch) or ch == '_');
 }
-
 
 // -- the second Dialect ----------------------------------------------------
 //

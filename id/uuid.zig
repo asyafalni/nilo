@@ -238,6 +238,49 @@ pub const Uuid = struct {
         try jw.write(&text);
     }
 
+    /// The third arrival. A path param and a query value are read through
+    /// `nilo_parse` by the HTTP module; a JSON body is read by `std.json`,
+    /// which picks the reader itself by looking for this name — so a body
+    /// field of this type was read as the `{bytes: …}` struct it is and
+    /// refused the 36 characters the server writes in every response
+    /// ([ADR 0205](../docs/adr/0205-a-body-field-that-parses-itself.md)).
+    ///
+    /// The same reading `nilo_parse` makes, from the one string token a
+    /// uuid is. Anything that is not a string is the wrong kind of value,
+    /// and a string that is not a uuid is `InvalidCharacter` — the error
+    /// `std.fmt` answers for a digit that is not one, which is what this is.
+    pub fn jsonParse(
+        gpa: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) std.json.ParseError(@TypeOf(source.*))!Uuid {
+        const token = try source.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?);
+        const text = switch (token) {
+            inline .string, .allocated_string => |slice| slice,
+            else => return error.UnexpectedToken,
+        };
+        defer switch (token) {
+            .allocated_string => gpa.free(text),
+            else => {},
+        };
+        return parse(text) catch error.InvalidCharacter;
+    }
+
+    /// The same, for a body that was held as a `std.json.Value` first —
+    /// which is how a binding that records every field's outcome reads one.
+    pub fn jsonParseFromValue(
+        gpa: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!Uuid {
+        _ = gpa;
+        _ = options;
+        return switch (source) {
+            .string => |text| parse(text) catch error.InvalidCharacter,
+            else => error.UnexpectedToken,
+        };
+    }
+
     /// What the line above sends, said in a form that needs no import.
     ///
     /// `jsonStringify` is the whole reason `nilo_http` needs no knowledge of
@@ -434,6 +477,52 @@ test "a Uuid reads itself from request text, and says no rather than erroring" {
     try testing.expectEqual(@as(?Uuid, null), Uuid.nilo_parse("550e8400"));
     try testing.expectEqual(@as(?Uuid, null), Uuid.nilo_parse("not-a-uuid"));
     try testing.expectEqual(@as(?Uuid, null), Uuid.nilo_parse(""));
+}
+
+test "a Uuid in a JSON body is read from the text a response writes it as" {
+    const Body = struct { deal_id: Uuid, parent: ?Uuid = null };
+    const parsed = try std.json.parseFromSlice(
+        Body,
+        testing.allocator,
+        "{\"deal_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"parent\":null}",
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440000", &parsed.value.deal_id.toText());
+    try testing.expectEqual(@as(?Uuid, null), parsed.value.parent);
+
+    // The wrong kind of value, and text that is not one, are two different
+    // refusals — the HTTP module words each from what `std.json` answered.
+    try testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(
+        Body,
+        testing.allocator,
+        "{\"deal_id\":{\"bytes\":[]}}",
+        .{},
+    ));
+    try testing.expectError(error.InvalidCharacter, std.json.parseFromSlice(
+        Body,
+        testing.allocator,
+        "{\"deal_id\":\"not-a-uuid\"}",
+        .{},
+    ));
+
+    // And a list of them, which is what a body that names several carries.
+    const many = try std.json.parseFromSlice(
+        []const Uuid,
+        testing.allocator,
+        "[\"550e8400-e29b-41d4-a716-446655440000\",\"550e8400e29b41d4a716446655440001\"]",
+        .{},
+    );
+    defer many.deinit();
+    try testing.expectEqual(@as(usize, 2), many.value.len);
+    try testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440001", &many.value[1].toText());
+
+    // Held as a `std.json.Value` first, the reading is the same.
+    const held = try std.json.parseFromSlice(std.json.Value, testing.allocator, "\"550e8400-e29b-41d4-a716-446655440000\"", .{});
+    defer held.deinit();
+    const from_value = try std.json.parseFromValue(Uuid, testing.allocator, held.value, .{});
+    defer from_value.deinit();
+    try testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440000", &from_value.value.toText());
 }
 
 test "a Uuid prints with {f}, which is what a refusal naming a record needs" {

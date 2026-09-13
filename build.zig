@@ -441,6 +441,25 @@ const sql_refusals = [_]Refusal{
         .name = "order_on_unknown_column",
         .says = "order_on_unknown_column.User has no column `creted_at`, asked for in `.order`.",
     },
+    // An `ORDER BY` chosen per request from a closed set (ADR 0204). The
+    // keys are checked where they are declared, and an ordering carries the
+    // Row it was checked against.
+    .{
+        .name = "ordering_key_on_unknown_column",
+        .says = "ordering_key_on_unknown_column.Ticket has no column `creted_at`, asked for in the ordering key `created`.",
+    },
+    .{
+        .name = "ordering_for_another_row",
+        .says = "`db.select` on ordering_for_another_row.Person was given an ordering declared for ordering_for_another_row.Ticket.",
+    },
+    .{
+        .name = "ordering_expression_on_a_typed_select",
+        .says = "`db.select` on ordering_expression_on_a_typed_select.Ticket was given an ordering whose key `title` is an expression, and a statement nilo writes orders by columns.",
+    },
+    .{
+        .name = "raw_ordered_without_a_hole",
+        .says = "the statement handed to `db.rawOrdered` has no `{order}` in it, so there is nowhere to write the ordering.",
+    },
     .{
         .name = "reserved_column_any",
         .says = "reserved_column_any.Answer has a column named `any`, which is the word a condition uses for OR.",
@@ -1012,7 +1031,7 @@ const refusals = [_]Refusal{
     },
     .{
         .name = "json_reader_for_a_renamed_union",
-        .says = "`json_reader_for_a_renamed_union.Channel` hands nilo's JSON reader a `nilo_json` with only `rename_all` on it, and it is a union.",
+        .says = "`json_reader_for_a_renamed_union.Channel` hands nilo's JSON reader a `nilo_json` that only renames, and it is a union.",
     },
     .{
         .name = "json_reader_with_no_marker",
@@ -1026,9 +1045,37 @@ const refusals = [_]Refusal{
         .name = "json_rename_all_collides_on_a_struct",
         .says = "`json_rename_all_collides_on_a_struct.Contact` asks for `.rename_all = .lowercase`, and its fields `full_name` and `fullname` both come out as \"fullname\".",
     },
+    // A whole number inside a range (ADR 0206): the range has to be one, and
+    // the default has to be inside it.
+    .{
+        .name = "within_bounds_reversed",
+        .says = "`Within(200, 1)` has its bounds the wrong way round: nothing is at least 200 and at most 1.",
+    },
+    .{
+        .name = "within_default_outside_its_range",
+        .says = "`Within(1, 200).of(500)` is outside its own range.",
+    },
+    // One field spelled on its own (ADR 0207): the entry has to name a field,
+    // has to change it, and must not land it on another field's spelling.
+    .{
+        .name = "json_rename_of_a_field_it_does_not_have",
+        .says = "`json_rename_of_a_field_it_does_not_have.Summary` renames a field `estimated_cost` it does not have.",
+    },
+    .{
+        .name = "json_rename_lands_on_another_field",
+        .says = "`json_rename_lands_on_another_field.Summary` spells its fields `amount_minor` and `due_at` both as \"dueAt\" — one of them by a `.rename` entry.",
+    },
+    .{
+        .name = "json_rename_to_its_own_name",
+        .says = "`json_rename_to_its_own_name.Summary` renames `amount` to \"amount\", which is what it is already called, so it would change nothing.",
+    },
     .{
         .name = "json_rename_all_collides_on_a_union",
         .says = "`json_rename_all_collides_on_a_union.Channel` asks for `.rename_all = .UPPERCASE`, and its variants `web_hook` and `webhook` both come out as \"WEBHOOK\".",
+    },
+    .{
+        .name = "body_field_that_parses_itself_without_a_reader",
+        .says = "the request body on route \"/lines\" holds a `body_field_that_parses_itself_without_a_reader.Sku`, which parses itself from text (`nilo_parse`) and has not told `std.json` so.",
     },
     .{
         .name = "json_rename_all_on_a_request_body",

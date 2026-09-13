@@ -80,6 +80,7 @@ const core = @import("nilo_core");
 const nilo = @import("nilo_http");
 
 const dialect = @import("dialect.zig");
+const ordering = @import("ordering.zig");
 const postgres = @import("postgres.zig");
 const rawcheck = @import("rawcheck.zig");
 const row_mod = @import("row.zig");
@@ -458,7 +459,33 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// is what a 12 µs saving is being bought with.
         fn planOf(self: *Self, comptime stmt: statement.Statement) ?[]const u8 {
             if (!self.opts.prepared) return null;
+            // A statement whose `ORDER BY` is chosen per request is not one
+            // text, so there is no one name to keep it under (ADR 0204).
+            if (comptime stmt.ordered) return null;
             return comptime statement.planName(stmt.sql);
+        }
+
+        /// The text of a statement as it goes to the Wire: the constant, or —
+        /// for one whose `ORDER BY` is chosen per request — the head, the
+        /// clause the request chose, and the tail, written into the arena
+        /// once at a size settled while compiling (ADR 0204).
+        fn textOf(comptime stmt: statement.Statement, options: anytype, c: anytype) ![]const u8 {
+            if (comptime !stmt.ordered) return stmt.sql;
+            return spliced(stmt.sql, options.order, stmt.tail, c);
+        }
+
+        /// `head`, the ordering's clause, `tail` — one arena allocation, no
+        /// larger than the widest clause the ordering can write.
+        fn spliced(comptime head: []const u8, order: anytype, comptime tail: []const u8, c: anytype) ![]const u8 {
+            const Order = @TypeOf(order);
+            const room = comptime head.len + Order.most(D) + tail.len;
+            const buf = try c.arena().alloc(u8, room);
+            var w = std.Io.Writer.fixed(buf);
+            // Sized for the widest clause, so none of these can run out.
+            w.writeAll(head) catch unreachable;
+            order.write(D, &w) catch unreachable;
+            w.writeAll(tail) catch unreachable;
+            return w.buffered();
         }
 
         /// The same, for a statement this module did not write.
@@ -779,7 +806,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             comptime assertUnlocked(Row, @TypeOf(options), "db.select", "Begin one and ask there: `var tx = try db.begin(c, .{}); defer tx.deinit();` " ++
                 "and then `tx.select(…)`.");
             const stmt = comptime statement.select(D, Row, @TypeOf(options));
-            return fill(Row, stmt.reserve, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
+            return fill(Row, stmt.reserve, self, null, c, try textOf(stmt, options, c), self.planOf(stmt), try valuesOf(stmt, Row, options, c));
         }
 
         /// The first row matching `options`, or null.
@@ -795,7 +822,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             comptime assertUnlocked(Row, @TypeOf(options), "db.one", "Begin one and ask there: `var tx = try db.begin(c, .{}); defer tx.deinit();` " ++
                 "and then `tx.one(…)`.");
             const stmt = comptime statement.one(D, Row, @TypeOf(options));
-            const found = try fill(Row, stmt.reserve, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
+            const found = try fill(Row, stmt.reserve, self, null, c, try textOf(stmt, options, c), self.planOf(stmt), try valuesOf(stmt, Row, options, c));
             return if (found.len == 0) null else found[0];
         }
 
@@ -890,7 +917,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 self,
                 null,
                 c,
-                stmt.sql,
+                try textOf(stmt, options, c),
                 self.planOf(stmt),
                 try valuesOf(stmt, Row, options, c),
                 &total,
@@ -934,17 +961,18 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 "what comes back.");
             const stmt = comptime statement.select(D, Row, @TypeOf(options));
             const arena = c.arena();
+            const text = try textOf(stmt, options, c);
             const w = try self.wireOf();
             const started = self.timing();
             var problem: ?wire_mod.Problem = null;
             const rows = w.run(
                 arena,
-                stmt.sql,
+                text,
                 try valuesOf(stmt, Row, options, c),
                 self.planOf(stmt),
                 &problem,
             ) catch |err| {
-                self.told(arena, started, stmt.sql, self.planOf(stmt), null, true, problem);
+                self.told(arena, started, text, self.planOf(stmt), null, true, problem);
                 return err;
             };
             // **What a watcher is told here is the statement opening**, with
@@ -952,7 +980,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // nothing in this call sees the last one. A stream that is slow to
             // *open* is the half worth reporting, and it is the half this can
             // report honestly (ADR 0137).
-            self.told(arena, started, stmt.sql, self.planOf(stmt), null, false, null);
+            self.told(arena, started, text, self.planOf(stmt), null, false, null);
             // Counted only once the statement is away, so a `stream` that
             // never opened is not a `stream` that was never closed.
             if (traps_enabled) self.hold(&self.open_streams, .Add);
@@ -1001,6 +1029,48 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // parameter that meant something different here than in
             // `db.select` would be two rules for one type.
             return fill(Row, null, self, null, c, sql, self.rawPlanOf(sql), try rawValuesOf(values, c));
+        }
+
+        /// `db.raw` with its `ORDER BY` chosen per request, from a closed set
+        /// declared while compiling
+        /// ([ADR 0204](../docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+        ///
+        /// ```zig
+        /// const Sort = sql.Ordering(CommitmentRow, .{
+        ///     .due = "c.due_date",
+        ///     .title = .{ .expr = "c.title", .nulls = .last },
+        /// });
+        ///
+        /// const rows = try db.rawOrdered(CommitmentRow, c,
+        ///     \\SELECT c.id, c.title, c.due_date FROM commitments c
+        ///     \\WHERE c.state = $1 {order} LIMIT $2 OFFSET $3
+        /// , .{ state, limit, offset }, q.value.order);
+        /// ```
+        ///
+        /// The statement is the caller's, `{order}` marks where the whole
+        /// clause goes, and the ordering is one of the `Sort` values — from
+        /// a query field of that type, or `Sort.by(…)`. What is written
+        /// there is a fragment settled while compiling; the request chose
+        /// which. A statement with no `{order}`, or two, is a Refusal.
+        ///
+        /// Everything else is `db.raw`: the `SELECT` list counted and named
+        /// against the Row, the values converted the way a Row's are. What it
+        /// gives up is the plan name — the text differs per request, so it
+        /// runs unnamed, which is the 12 µs ADR 0057 measured.
+        pub fn rawOrdered(
+            self: *Self,
+            comptime Row: type,
+            c: anytype,
+            comptime sql: []const u8,
+            values: anytype,
+            order: anytype,
+        ) ![]Row {
+            comptime core.checkScope(@TypeOf(c), "db.rawOrdered");
+            comptime rawcheck.assertList(D, Row, sql, "db.rawOrdered");
+            comptime ordering.assertFor(@TypeOf(order), Row, "`db.rawOrdered`", false);
+            const parts = comptime ordering.split(sql, "`db.rawOrdered`");
+            const text = try spliced(parts.head, order, parts.tail, c);
+            return fill(Row, null, self, null, c, text, null, try rawValuesOf(values, c));
         }
 
         /// `db.raw` for a statement whose `WHERE` holds a key: the first row,
@@ -1552,13 +1622,13 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             pub fn select(self: *Tx, comptime Row: type, c: anytype, options: anytype) ![]Row {
                 comptime core.checkScope(@TypeOf(c), "tx.select");
                 const stmt = comptime statement.select(D, Row, @TypeOf(options));
-                return fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
+                return fill(Row, stmt.reserve, self.db, &self.inner, c, try textOf(stmt, options, c), self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
             }
 
             pub fn one(self: *Tx, comptime Row: type, c: anytype, options: anytype) !?Row {
                 comptime core.checkScope(@TypeOf(c), "tx.one");
                 const stmt = comptime statement.one(D, Row, @TypeOf(options));
-                const found = try fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
+                const found = try fill(Row, stmt.reserve, self.db, &self.inner, c, try textOf(stmt, options, c), self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
                 return if (found.len == 0) null else found[0];
             }
 
@@ -1642,7 +1712,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                     self.db,
                     &self.inner,
                     c,
-                    stmt.sql,
+                    try textOf(stmt, options, c),
                     self.db.planOf(stmt),
                     try valuesOf(stmt, Row, options, c),
                     &total,
@@ -1724,6 +1794,24 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 comptime core.checkScope(@TypeOf(c), "tx.raw");
                 comptime rawcheck.assertList(D, Row, sql, "tx.raw");
                 return fill(Row, null, self.db, &self.inner, c, sql, self.db.rawPlanOf(sql), try rawValuesOf(values, c));
+            }
+
+            /// `db.rawOrdered` inside the transaction: the caller's statement
+            /// with its `ORDER BY` chosen per request (ADR 0204).
+            pub fn rawOrdered(
+                self: *Tx,
+                comptime Row: type,
+                c: anytype,
+                comptime sql: []const u8,
+                values: anytype,
+                order: anytype,
+            ) ![]Row {
+                comptime core.checkScope(@TypeOf(c), "tx.rawOrdered");
+                comptime rawcheck.assertList(D, Row, sql, "tx.rawOrdered");
+                comptime ordering.assertFor(@TypeOf(order), Row, "`tx.rawOrdered`", false);
+                const parts = comptime ordering.split(sql, "`tx.rawOrdered`");
+                const text = try spliced(parts.head, order, parts.tail, c);
+                return fill(Row, null, self.db, &self.inner, c, text, null, try rawValuesOf(values, c));
             }
 
             /// `db.rawOne` inside the transaction: the first row of a statement
@@ -3001,12 +3089,19 @@ fn forWire(comptime To: type, value: anytype, c: anytype) !To {
     // build its text rather than hold it; the ones this module ships hold it
     // and never touch the allocator, which is why nothing extra is allocated
     // by a statement that does not carry such a column (ADR 0055).
+    //
+    // `try` on both, and the second one is load-bearing: `nilo_write` answers
+    // `![]const u8`, and an error union does not coerce to `!?[]const u8` the
+    // way a bare value coerces to an optional. So a `Date` set into a
+    // `?Date` column — the ordinary act of filling a date that was empty —
+    // was a type error naming this line, and the workaround at every site was
+    // `@as(?Date, due)` (ADR 0203).
     if (comptime types.asText(V) != null) {
         if (comptime @typeInfo(V) == .optional) {
             const Inner = comptime @typeInfo(V).optional.child;
             return if (value) |held| try Inner.nilo_write(held, c.arena()) else null;
         }
-        return V.nilo_write(value, c.arena());
+        return try V.nilo_write(value, c.arena());
     }
     // A document and a tag, when the Dialect asked for them as text. Which of
     // the two `To` is was `WireWrite`'s decision, read back off the type here
@@ -3256,6 +3351,77 @@ test "a handler's select runs the whole path, with no database anywhere" {
         "SELECT \"id\", \"email\", \"nickname\", \"age\" FROM \"people\" WHERE \"age\" > $1",
         db.wire.?.last_sql,
     );
+}
+
+const PersonSort = ordering.Ordering(Person, .{
+    .age = .{ .column = .age, .nulls = .last },
+    .email = .email,
+});
+
+const ListQuery = struct {
+    order: PersonSort = PersonSort.by(&.{.{ .key = .email }}),
+};
+
+fn listPeopleOrdered(db: *FakeDb, c: *nilo.Ctx, q: nilo.Query(ListQuery)) ![]Person {
+    return db.select(Person, c, .{ .order = q.value.order });
+}
+
+test "the order a request chose reads into a query field, and the document says the field is text" {
+    // `?order=age:desc,email` is the type reading itself (ADR 0142), so a key
+    // that is not one of the two is the same 400 a bad number gets, in the
+    // words the type chose (ADR 0204).
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer db.deinit();
+    db.wire = .{ .answers = 1 };
+
+    var app = nilo.App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&db);
+    try app.get("/people", listPeopleOrdered);
+
+    var client = try nilo.testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+
+    const chosen = try client.get(&app, "/people?order=age:desc,email");
+    try testing.expectEqual(@as(u16, 200), chosen.status);
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"email\", \"nickname\", \"age\" FROM \"people\"" ++
+            " ORDER BY \"age\" DESC NULLS LAST, \"email\" ASC",
+        db.wire.?.last_sql,
+    );
+    try testing.expect(db.wire.?.last_plan == null);
+
+    // Absent is the field's default, which is the list's own order.
+    const absent = try client.get(&app, "/people");
+    try testing.expectEqual(@as(u16, 200), absent.status);
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"email\", \"nickname\", \"age\" FROM \"people\" ORDER BY \"email\" ASC",
+        db.wire.?.last_sql,
+    );
+
+    const wrong = try client.get(&app, "/people?order=height");
+    try testing.expectEqual(@as(u16, 400), wrong.status);
+    try testing.expectEqualStrings(
+        "{\"error\":\"?order has to be an ordering by age or email, each with an optional " ++
+            ":asc or :desc, comma-separated, not \\\"height\\\"\",\"status\":400}",
+        wrong.body,
+    );
+
+    // And in the document the field is a string, not the struct behind it.
+    var described = nilo.App.init(testing.allocator);
+    defer described.deinit();
+    try described.provide(&db);
+    described.docs(.{});
+    try described.get("/people", listPeopleOrdered);
+    try described.resolveChains();
+    const document = for (described.docs_set.?.files) |f| {
+        if (std.mem.eql(u8, f.url, "/openapi.json")) break f.contents.held.bytes;
+    } else return error.NoDocument;
+    try testing.expect(std.mem.indexOf(
+        u8,
+        document,
+        "{\"name\":\"order\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"string\"}}",
+    ) != null);
 }
 
 test "a select before the pool exists fails as an error, not as a crash" {
@@ -5589,6 +5755,114 @@ test "a page carries the total the condition matched, in one statement" {
     });
     try testing.expectEqual(@as(usize, 0), none.rows.len);
     try testing.expectEqual(@as(i64, 0), none.total);
+}
+
+const AccountSort = ordering.Ordering(SqliteAccount, .{
+    .id = .id,
+    .email = .{ .column = .email, .nulls = .last },
+});
+
+test "an ordering chosen at run time leaves the statement in two constant halves" {
+    // The head and the tail are settled while compiling, and there is no plan
+    // name: the text between them differs per request (ADR 0204).
+    const stmt = comptime statement.page(dialect.Postgres, SqliteAccount, @TypeOf(.{
+        .where = .{ .email = "x" },
+        .order = AccountSort.by(&.{.{ .key = .id }}),
+        .limit = 20,
+        .offset = 40,
+    }));
+    try testing.expect(stmt.ordered);
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"public\", \"email\", count(*) OVER () FROM \"accounts\" WHERE \"email\" = $1",
+        stmt.sql,
+    );
+    try testing.expectEqualStrings(" LIMIT 20 OFFSET 40", stmt.tail);
+    // The parameters are exactly the ones a settled order would have had:
+    // the ordering is not one of them.
+    try testing.expectEqual(@as(usize, 1), stmt.paramCount());
+}
+
+test "the order a request chose is the order the rows come back in, on a page and on a raw statement" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:ordered-list?mode=memory&cache=shared",
+        .{ .size = 2 },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    watched = .{};
+    db.watching(recordSent);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, accounts_ddl, .{});
+
+    for ([_][]const u8{ "carol@example.dev", "ada@example.dev", "bob@example.dev" }) |mail| {
+        _ = try db.insert(SqliteAccount, &run, .{ .public = types.Uuid.nil, .email = mail });
+    }
+
+    // What `?order=email:desc` reads into, handed straight to the page.
+    const by_mail = try db.page(SqliteAccount, &run, .{
+        .order = AccountSort.nilo_parse("email:desc").?,
+        .limit = 2,
+    });
+    try testing.expectEqual(@as(usize, 2), by_mail.rows.len);
+    try testing.expectEqual(@as(i64, 3), by_mail.total);
+    try testing.expectEqualStrings("carol@example.dev", by_mail.rows[0].email.view());
+    try testing.expectEqualStrings("bob@example.dev", by_mail.rows[1].email.view());
+    // The watcher sees the text as it went, and no plan name to go with it.
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"public\", \"email\", count(*) OVER () FROM \"accounts\"" ++
+            " ORDER BY \"email\" DESC NULLS LAST LIMIT 2",
+        watched.sql,
+    );
+    try testing.expect(watched.plan == null);
+
+    // Two tiers, on a select, the other way round.
+    const by_id = try db.select(SqliteAccount, &run, .{
+        .order = AccountSort.by(&.{ .{ .key = .email, .direction = .asc }, .{ .key = .id, .direction = .desc } }),
+    });
+    try testing.expectEqualStrings("ada@example.dev", by_id[0].email.view());
+    try testing.expectEqualStrings("carol@example.dev", by_id[2].email.view());
+
+    // The caller's own statement, with the clause written where it said.
+    const Card = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        email: nilo.Str,
+    };
+    const CardSort = ordering.Ordering(Card, .{ .mail = "lower(email)", .id = .id });
+    const cards = try db.rawOrdered(
+        Card,
+        &run,
+        "SELECT id, email FROM accounts WHERE id > ?1 {order} LIMIT ?2",
+        .{ @as(i64, 0), @as(i64, 5) },
+        CardSort.nilo_parse("mail").?,
+    );
+    try testing.expectEqual(@as(usize, 3), cards.len);
+    try testing.expectEqualStrings("ada@example.dev", cards[0].email.view());
+    try testing.expectEqualStrings(
+        "SELECT id, email FROM accounts WHERE id > ?1 ORDER BY lower(email) ASC LIMIT ?2",
+        watched.sql,
+    );
+    try testing.expect(watched.plan == null);
+
+    // And inside a transaction, which is the other call site.
+    var tx = try db.begin(&run, .{});
+    errdefer tx.rollback();
+    const in_tx = try tx.rawOrdered(
+        Card,
+        &run,
+        "SELECT id, email FROM accounts WHERE id > ?1 {order}",
+        .{@as(i64, 0)},
+        CardSort.by(&.{.{ .key = .id, .direction = .desc }}),
+    );
+    try testing.expectEqual(@as(usize, 3), in_tx.len);
+    try testing.expectEqual(@as(i64, 3), in_tx[0].id);
+    try tx.commit();
 }
 
 test "a page reads the same columns a select does, and one more" {

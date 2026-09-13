@@ -1883,24 +1883,53 @@ fn collectBadBody(
             // described by its kind instead, which is what `kind` is for.
             if (given == .string) outcomes[i].given = Str.fromRequest(given.string, lifetime);
 
-            if (std.json.parseFromValueLeaky(f.type, arena, given, .{})) |value| {
-                @field(out, f.name) = value;
-            } else |_| if (!fits(f.type, given)) {
-                // A word that is not one of the choices is the one wrong
-                // value that is the right *kind*, and it gets the sentence a
-                // bad `?stage=` gets rather than one arguing with itself.
-                if (given == .string and comptime choicesOf(f.type) != null) {
-                    outcomes[i].reason = .not_a_choice;
+            // A field that parses itself is read the way a query value is:
+            // the text handed to `nilo_parse`, and null the same `.not_that_type`
+            // ([ADR 0205](../docs/adr/0205-a-body-field-that-parses-itself.md)).
+            // Read here rather than through `std.json` so that a type which
+            // hands over a `jsonParse` and nothing more is still one outcome
+            // among the others, in the same words.
+            if (comptime parsedOf(f.type)) |P| {
+                var buf: [64]u8 = undefined;
+                if (given == .null and @typeInfo(f.type) == .optional) {
+                    @field(out, f.name) = null;
+                } else if (textOf(given, &buf)) |text| {
+                    if (P.nilo_parse(text)) |value| {
+                        @field(out, f.name) = value;
+                    } else {
+                        outcomes[i].reason = .not_that_type;
+                        // A number has digits to quote back too, and they
+                        // are in a stack buffer, so they are copied out.
+                        if (given != .string) outcomes[i].given = Str.fromRequest(try arena.dupe(u8, text), lifetime);
+                        any = true;
+                        if (f.defaultValue()) |default| @field(out, f.name) = default;
+                    }
                 } else {
                     outcomes[i].reason = .wrong_kind;
                     outcomes[i].kind = kindOf(given);
+                    any = true;
+                    if (f.defaultValue()) |default| @field(out, f.name) = default;
                 }
-                any = true;
-                if (f.defaultValue()) |default| @field(out, f.name) = default;
             } else {
-                var deeper = false;
-                if (describeField(f.type, arena, given, f.name, max_body_depth, &deeper)) |found| return found;
-                return if (deeper) tooDeep() else err;
+                if (std.json.parseFromValueLeaky(f.type, arena, given, .{})) |value| {
+                    @field(out, f.name) = value;
+                } else |_| if (!fits(f.type, given)) {
+                    // A word that is not one of the choices is the one wrong
+                    // value that is the right *kind*, and it gets the sentence a
+                    // bad `?stage=` gets rather than one arguing with itself.
+                    if (given == .string and comptime choicesOf(f.type) != null) {
+                        outcomes[i].reason = .not_a_choice;
+                    } else {
+                        outcomes[i].reason = .wrong_kind;
+                        outcomes[i].kind = kindOf(given);
+                    }
+                    any = true;
+                    if (f.defaultValue()) |default| @field(out, f.name) = default;
+                } else {
+                    var deeper = false;
+                    if (describeField(f.type, arena, given, f.name, max_body_depth, &deeper)) |found| return found;
+                    return if (deeper) tooDeep() else err;
+                }
             }
         } else if (f.default_value_ptr == null) {
             outcomes[i].reason = .missing;
@@ -1998,6 +2027,16 @@ fn describeField(
                 .{ name, choices, given.string },
             );
         }
+        // The same for a type that parses itself and said no: what arrived
+        // was the right kind and the wrong text, and the sentence is the one
+        // a query value of that type gets, quoting it (ADR 0205).
+        if (comptime parsedOf(T) != null) {
+            var buf: [64]u8 = undefined;
+            if (textOf(given, &buf)) |text| return fail.badRequest(
+                "\"{s}\" has to be {s}, not \"{s}\"",
+                .{ name, comptime expectedOf(T), text },
+            );
+        }
         return fail.badRequest(
             "\"{s}\" has to be {s}, not {s}",
             .{ name, comptime expectedOf(T), kindOf(given) },
@@ -2022,6 +2061,10 @@ fn describeField(
         .optional => |o| o.child,
         else => T,
     };
+
+    // A value that parsed itself is one value, whatever its kind of type:
+    // a `Uuid` is a struct with nothing inside it to point at.
+    if (comptime convert.parsesItself(Inner)) return null;
 
     if (Inner != Str) switch (@typeInfo(Inner)) {
         .@"struct" => return describeObject(Inner, arena, given.object, name, depth - 1, deeper),
@@ -2048,6 +2091,7 @@ fn hasInsides(comptime T: type, given: std.json.Value) bool {
         else => T,
     };
     if (Inner == Str) return false;
+    if (comptime convert.parsesItself(Inner)) return false;
     return switch (@typeInfo(Inner)) {
         .@"struct" => given == .object,
         .pointer => |p| p.size == .slice and p.child != u8 and given == .array and
@@ -2103,6 +2147,9 @@ pub fn expectedOf(comptime T: type) []const u8 {
         // A `Patch(T)` takes the value or null; leaving it out is the third
         // thing it can be, and that is not a value to describe.
         if (patch_mod.isPatch(T)) return expectedOf(T.nilo_patch) ++ " or null";
+        // What the type said it expects, or its name — the words a query
+        // value of the same type is asked for in (ADR 0205).
+        if (convert.parsesItself(T)) return convert.expects(T);
         return switch (@typeInfo(T)) {
             .optional => |o| expectedOf(o.child) ++ " or null",
             .bool => "true or false",
@@ -2204,12 +2251,44 @@ fn hasField(comptime T: type, name: []const u8) bool {
     return false;
 }
 
+/// The type that parses itself inside `T` — `T` itself, or the child of an
+/// optional — or null when `T` is not one of those.
+fn parsedOf(comptime T: type) ?type {
+    comptime {
+        const Inner = switch (@typeInfo(T)) {
+            .optional => |o| o.child,
+            else => T,
+        };
+        return if (convert.parsesItself(Inner)) Inner else null;
+    }
+}
+
+/// The text a JSON value is, for a type that reads text: a string as it is,
+/// a number as its digits, and nothing for anything else. `buf` is where a
+/// number that arrived as an integer or a float is printed.
+fn textOf(value: std.json.Value, buf: []u8) ?[]const u8 {
+    return switch (value) {
+        .string, .number_string => |s| s,
+        .integer => |n| std.fmt.bufPrint(buf, "{d}", .{n}) catch null,
+        .float => |n| std.fmt.bufPrint(buf, "{d}", .{n}) catch null,
+        else => null,
+    };
+}
+
 /// Whether a JSON value could have become a `T`. Loose on purpose: it is
 /// only ever asked about a parse std.json has already refused, so its job is
 /// to find the field that explains the refusal, not to re-decide it.
 fn fits(comptime T: type, value: std.json.Value) bool {
     if (T == Str) return value == .string;
     if (comptime patch_mod.isPatch(T)) return value == .null or fits(T.nilo_patch, value);
+    // A type that parses itself decides, from the text — a string, or a
+    // number read as its digits, since a bounded integer is one of these
+    // and arrives as a JSON number (ADR 0205).
+    if (comptime convert.parsesItself(T)) {
+        var buf: [64]u8 = undefined;
+        const text = textOf(value, &buf) orelse return false;
+        return T.nilo_parse(text) != null;
+    }
     return switch (@typeInfo(T)) {
         .optional => |o| value == .null or fits(o.child, value),
         .bool => value == .bool,

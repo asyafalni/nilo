@@ -321,6 +321,19 @@ pub const testing = @import("testing.zig");
 /// ```
 pub const Query = @import("typed.zig").Query;
 
+/// A whole number inside a range, as a type — for the `limit` every list
+/// endpoint bounds and every document should say it bounds
+/// ([ADR 0206](../docs/adr/0206-a-whole-number-inside-a-range-is-a-type.md)).
+///
+/// ```zig
+/// const ListQuery = struct { limit: nilo.Within(1, 200) = .of(50), offset: u32 = 0 };
+/// ```
+///
+/// `?limit=500` is a 400 naming the range, the document says `minimum` and
+/// `maximum`, and the value is `q.value.limit.value`. Read wherever a `u8`
+/// is: a path param, a query value, a form field, a JSON body.
+pub const Within = @import("within.zig").Within;
+
 /// One request header, as a typed argument — the same family as `Query(T)`
 /// and `Form(T)`, on a header
 /// ([ADR 0163](../docs/adr/0163-a-header-a-handler-can-be-given.md)).
@@ -835,6 +848,7 @@ test {
     _ = @import("testing.zig");
     _ = @import("middleware.zig");
     _ = @import("typed.zig");
+    _ = @import("within.zig");
     _ = @import("authorization.zig");
     _ = @import("idempotent.zig");
     _ = @import("health.zig");

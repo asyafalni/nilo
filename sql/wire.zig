@@ -418,6 +418,10 @@ pub const Fake = struct {
     /// SQL that actually reached the database rather than on the constant
     /// the comptime half produced.
     last_sql: []const u8 = "",
+    /// Where that text is kept. A statement nilo wrote is a constant, but one
+    /// an `Ordering` chose is assembled in the request's arena and gone with
+    /// it (ADR 0204), so the Fake copies rather than points.
+    copied: [1024]u8 = undefined,
     /// The name the last statement asked to be kept under, or null when it
     /// asked not to be. `db.raw` is the one that asks not to be, and a test
     /// that could not see the difference would not be testing the rule.
@@ -480,6 +484,12 @@ pub const Fake = struct {
         _ = self;
     }
 
+    fn keep(self: *Fake, sql: []const u8) []const u8 {
+        const n = @min(sql.len, self.copied.len);
+        @memcpy(self.copied[0..n], sql[0..n]);
+        return self.copied[0..n];
+    }
+
     pub fn run(
         self: *Fake,
         arena: std.mem.Allocator,
@@ -490,7 +500,7 @@ pub const Fake = struct {
     ) Error!Rows {
         _ = arena;
         _ = values;
-        self.last_sql = sql;
+        self.last_sql = self.keep(sql);
         self.last_plan = plan;
         if (self.refuses) |said| {
             if (problem) |slot| slot.* = said;
@@ -570,7 +580,7 @@ pub const Fake = struct {
     ) Error!usize {
         _ = arena;
         _ = values;
-        self.last_sql = sql;
+        self.last_sql = self.keep(sql);
         self.last_plan = plan;
         if (self.refuses) |said| {
             if (problem) |slot| slot.* = said;

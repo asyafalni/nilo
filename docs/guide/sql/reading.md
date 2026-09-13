@@ -267,6 +267,40 @@ one statement. `tx.page` is the same call inside a transaction.
 
 `db.count` is still the call when you want a total and no rows.
 
+## An order the request chose
+
+`.order = .{ .id = .asc }` is settled while compiling. A list sorted from its
+column headings is not, and the way to let a request choose without letting a
+request write SQL is to declare the set it chooses from
+([ADR 0204](../../adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)):
+
+<!-- compiles -->
+```zig
+const Sort = sql.Ordering(Order, .{
+    .id = .id,
+    .status = .{ .column = .status, .nulls = .last },
+});
+
+fn list(db: *sql.Db, c: *nilo.Ctx, q: nilo.Query(struct {
+    order: Sort = Sort.by(&.{.{ .key = .id }}),
+})) !sql.Page(Order) {
+    return db.page(Order, c, .{ .order = q.value.order, .limit = 20 });
+}
+```
+
+`?order=status:desc,id` reads straight into the field — `key[:asc|:desc]`,
+comma-separated — and a key that is not declared is a 400 in the type's own
+words: *?order has to be an ordering by id or status, each with an optional
+:asc or :desc, comma-separated, not "height"*. Each key is a column of the
+Row, checked while compiling, and the clause is written from fragments the
+type built then; nothing the request sent reaches the statement. What it costs
+is the prepared name: a statement whose order is chosen per request runs
+unnamed, about 12 µs a call, and one arena allocation for its text.
+
+A key that is a string — `.value = "value_currency, value_minor"` — is SQL of
+your own, and only `db.rawOrdered` takes it, with `{order}` in your statement
+where the whole clause goes ([Raw SQL](./raw.md)).
+
 ## Why writing the limit out is worth it
 
 A `.limit` written as a literal is baked into the SQL, and that buys two

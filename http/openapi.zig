@@ -32,6 +32,7 @@ const http1 = @import("http1.zig");
 const str_mod = @import("nilo_core");
 const patch_mod = @import("patch.zig");
 const mark = @import("jsonmark.zig");
+const convert = @import("convert.zig");
 
 const Str = str_mod.Str;
 
@@ -42,6 +43,10 @@ const Str = str_mod.Str;
 pub const Schema = union(enum) {
     string,
     integer,
+    /// An integer with a bound the server holds: `minimum` for an unsigned
+    /// Zig integer, both for a `nilo.Within(min, max)`
+    /// ([ADR 0206](../docs/adr/0206-a-whole-number-inside-a-range-is-a-type.md)).
+    bounded: Bounds,
     number,
     boolean,
     /// A string from a fixed set — what an enum becomes.
@@ -68,6 +73,17 @@ pub const Schema = union(enum) {
     /// — true, and better than a wrong claim.
     unknown,
 };
+
+/// The bounds on an integer the server refuses outside of — so they are a
+/// promise the document may make. Wide enough for any Zig integer up to 128
+/// bits, which is the widest a request text is read into.
+pub const Bounds = struct {
+    min: ?i128 = null,
+    max: ?i128 = null,
+};
+
+/// The declaration a bounded integer carries (`nilo.Within`), read by name.
+const within_marker = "nilo_within";
 
 /// What a `pub const nilo_openapi` says, and the whole of what it may say.
 ///
@@ -300,6 +316,11 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
             return held(.{ .nullable = schemaWithin(T.nilo_patch, depth + 1) });
         }
 
+        // A whole number inside a range says its range (ADR 0206). Before
+        // the writer check below, because it writes itself as the number and
+        // the number's bounds are the thing worth telling a client.
+        if (withinOf(T)) |bounds| return held(.{ .bounded = bounds });
+
         // **A type that writes its own JSON is not described by its fields**
         // (ADR 0076). `std.json` calls `jsonStringify` and never looks at the
         // struct, so reflecting the struct describes something the server does
@@ -320,6 +341,13 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
             if (@hasDecl(T, "nilo_openapi")) return held(.{ .told = toldOf(T) });
             return held(.untold);
         }
+        // **A type that parses itself arrives as text, and its fields are
+        // not what arrives** (ADR 0205). One that said what it looks like is
+        // described as that; `sql.Ordering` is one, and so is a bounded
+        // integer, which says its bounds.
+        if (convert.parsesItself(T)) {
+            if (@hasDecl(T, "nilo_openapi")) return held(.{ .told = toldOf(T) });
+        }
         // **And a type that writes its own body is not JSON at all**
         // (ADR 0195): the bytes under its label are whatever `nilo_write`
         // put there, and the only thing this document can say about them
@@ -332,7 +360,11 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
 
         return switch (@typeInfo(T)) {
             .bool => held(.boolean),
-            .int, .comptime_int => held(.integer),
+            // An unsigned integer refuses `-1` with a 400, so the document
+            // may say so: `minimum: 0` is a promise the signature makes
+            // (ADR 0206).
+            .int => |i| if (i.signedness == .unsigned) held(.{ .bounded = .{ .min = 0 } }) else held(.integer),
+            .comptime_int => held(.integer),
             .float, .comptime_float => held(.number),
 
             // The choices are the names that go out, which is not the same as
@@ -411,6 +443,27 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
 
             else => held(.unknown),
         };
+    }
+}
+
+/// `T.nilo_within`, or null for a type that carries none. Read by name for
+/// the reason every marker is, and checked here so a marker written wrong is
+/// a sentence rather than a `has no member named 'min'` inside this file.
+fn withinOf(comptime T: type) ?Bounds {
+    comptime {
+        const holds = switch (@typeInfo(T)) {
+            .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(T, within_marker),
+            else => false,
+        };
+        if (!holds) return null;
+        const said = @field(T, within_marker);
+        const Said = @TypeOf(said);
+        if (@typeInfo(Said) != .@"struct" or !@hasField(Said, "min") or !@hasField(Said, "max")) @compileError(
+            "nilo: " ++ @typeName(T) ++ "'s `" ++ within_marker ++ "` does not say both a `min` " ++
+                "and a `max`, which is what a bounded integer's document carries.\n" ++
+                "  Write `pub const " ++ within_marker ++ " = .{ .min = 1, .max = 200 };`, or use `nilo.Within(1, 200)`.",
+        );
+        return .{ .min = said.min, .max = said.max };
     }
 }
 
@@ -780,6 +833,7 @@ const Components = struct {
         if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
         return switch (a.*) {
             .string, .integer, .number, .boolean, .binary, .untold, .unknown => true,
+            .bounded => |x| x.min == b.bounded.min and x.max == b.bounded.max,
             .told => |t| std.mem.eql(u8, t.type, b.told.type) and
                 ((t.format == null and b.told.format == null) or
                     (t.format != null and b.told.format != null and
@@ -1178,6 +1232,12 @@ fn writeSchema(
     switch (schema.*) {
         .string => try w.writeAll("{\"type\":\"string\"}"),
         .integer => try w.writeAll("{\"type\":\"integer\"}"),
+        .bounded => |b| {
+            try w.writeAll("{\"type\":\"integer\"");
+            if (b.min) |min| try w.print(",\"minimum\":{d}", .{min});
+            if (b.max) |max| try w.print(",\"maximum\":{d}", .{max});
+            try w.writeByte('}');
+        },
         .number => try w.writeAll("{\"type\":\"number\"}"),
         .boolean => try w.writeAll("{\"type\":\"boolean\"}"),
         .binary => try w.writeAll("{\"type\":\"string\",\"format\":\"binary\"}"),
@@ -1405,7 +1465,9 @@ fn expectSchema(comptime T: type, expected: []const u8) !void {
 }
 
 test "the plain types map to what JSON Schema calls them" {
-    try expectSchema(u32, "{\"type\":\"integer\"}");
+    // An unsigned integer is refused below zero, and the document says so
+    // (ADR 0206). A signed one is any integer.
+    try expectSchema(u32, "{\"type\":\"integer\",\"minimum\":0}");
     try expectSchema(i8, "{\"type\":\"integer\"}");
     try expectSchema(f64, "{\"type\":\"number\"}");
     try expectSchema(bool, "{\"type\":\"boolean\"}");
@@ -1426,27 +1488,27 @@ test "a struct lists its fields, and a default is what makes one optional" {
         admin: bool = false,
     };
     try expectSchema(NewUser,
-        \\{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"},"admin":{"type":"boolean"}},"required":["name","age"]}
+        \\{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer","minimum":0},"admin":{"type":"boolean"}},"required":["name","age"]}
     );
 }
 
 test "a struct where nothing is required says so by leaving the list out" {
     const AllOptional = struct { page: u32 = 1 };
     try expectSchema(AllOptional,
-        \\{"type":"object","properties":{"page":{"type":"integer"}}}
+        \\{"type":"object","properties":{"page":{"type":"integer","minimum":0}}}
     );
 }
 
 test "an optional is the value or null, the 3.1 way" {
     try expectSchema(?u32,
-        \\{"anyOf":[{"type":"integer"},{"type":"null"}]}
+        \\{"anyOf":[{"type":"integer","minimum":0},{"type":"null"}]}
     );
 }
 
 test "a list carries the shape of what is in it" {
     const Item = struct { id: u32 };
     try expectSchema([]const Item,
-        \\{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}
+        \\{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","minimum":0}},"required":["id"]}}
     );
 }
 
@@ -1470,7 +1532,7 @@ test "a tagged union is the alternatives it can be, one key each" {
         count: u32,
     };
     try expectSchema(Target,
-        \\{"oneOf":[{"type":"object","properties":{"link":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},"required":["link"]},{"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]}]}
+        \\{"oneOf":[{"type":"object","properties":{"link":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},"required":["link"]},{"type":"object","properties":{"count":{"type":"integer","minimum":0}},"required":["count"]}]}
     );
 }
 
@@ -1501,7 +1563,7 @@ test "a variant carrying nothing is the discriminator on its own" {
         running: struct { pid: u32 },
     };
     try expectSchema(Step,
-        \\{"oneOf":[{"type":"object","properties":{"step":{"type":"string","enum":["queued"]}},"required":["step"]},{"allOf":[{"type":"object","properties":{"pid":{"type":"integer"}},"required":["pid"]},{"type":"object","properties":{"step":{"type":"string","enum":["running"]}},"required":["step"]}]}],"discriminator":{"propertyName":"step"}}
+        \\{"oneOf":[{"type":"object","properties":{"step":{"type":"string","enum":["queued"]}},"required":["step"]},{"allOf":[{"type":"object","properties":{"pid":{"type":"integer","minimum":0}},"required":["pid"]},{"type":"object","properties":{"step":{"type":"string","enum":["running"]}},"required":["step"]}]}],"discriminator":{"propertyName":"step"}}
     );
 }
 
@@ -1529,7 +1591,7 @@ test "a renamed struct is described by the keys it actually sends" {
         email_address: ?Str = null,
     };
     try expectSchema(Contact,
-        \\{"type":"object","properties":{"id":{"type":"integer"},"fullName":{"type":"string"},"emailAddress":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["id","fullName"]}
+        \\{"type":"object","properties":{"id":{"type":"integer","minimum":0},"fullName":{"type":"string"},"emailAddress":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["id","fullName"]}
     );
 }
 
