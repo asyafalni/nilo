@@ -1044,6 +1044,14 @@ It passes the Scope check, so `db.select(Row, &erased, …)` works — a reactio
 query. `resolve` is not here: it is generic over the type asked for, so it cannot
 cross a function pointer either.
 
+**The same seam serves two modules that must not import each other.** A context
+that opens work on another's behalf declares the function it needs as a pointer
+type — `OpenWork = struct { open: *const fn (tx: *sql.Db.Tx, c: *nilo.AnyScope,
+in: OpenWorkInput) anyerror!sql.Uuid }` — and the wiring file, which imports
+both, fills it with a function the other context wrote against a generic Scope.
+One body then runs under a `Run` in a test, a `Ctx` on the server and the erased
+one across the pointer, and neither context names the other.
+
 **It borrows.** The pointer inside is the Scope's own, so an `AnyScope` may not
 outlive the `Ctx` or `Run` it was made from — in practice it is a local beside the
 call. **And the ordinary Scope is unchanged**: every call in nilo and in
@@ -3139,7 +3147,7 @@ pointing at `insertOrIgnore`.
 | `.where` | a condition; see below |
 | `.order` | `.{ .created_at = .desc }`, one column per field. `.asc_nulls_last` and its three siblings say where NULLs go, which the two databases otherwise disagree about. Or a value of an `sql.Ordering` for an order the request chose; see below |
 | `.limit` / `.offset` | a literal is baked into the SQL; a variable becomes a parameter. A literal limit is also the row ceiling, so the result list is allocated once |
-| `.set` | update only: columns to new values, or `.{ .views = .{ .plus = 1 } }` for arithmetic on the column's own value |
+| `.set` | update only: columns to new values, or `.{ .views = .{ .plus = 1 } }` for arithmetic on the column's own value. A bare `null` on a nullable column is `= NULL` — no `@as(?T, null)` needed — where in `.where` the same null is `IS NULL` |
 
 ### Conditions
 
@@ -3476,7 +3484,7 @@ than asking the server to release a mark it no longer has.
 |---|---|
 | `sql.Timestamp` | microseconds since the epoch, written as RFC 3339 in JSON. `timestamptz`. `.now()`, `.fromSeconds(s)`, `.seconds()`, `.nilo_parse(text)` |
 | `sql.Uuid` | `nilo_id`'s [`Uuid`](#nilo_id), re-exported — the same type either import gives you. `uuid` |
-| `sql.Json(T)` | a `T` stored as `jsonb`, parsed per row into the request arena. Not available in `db.stream`, which allocates nothing. In a response it is written and described as the `T` — a **document**, `nilo_json_of = T` beside `value: T` — so a Row with one can still `rename_all` ([ADR 0202](./adr/0202-a-document-is-its-value.md)) |
+| `sql.Json(T)` | a `T` stored as `jsonb`, parsed per row into the request arena. Not available in `db.stream`, which allocates nothing. In a response it is written and described as the `T` — a **document**, `nilo_json_of = T` beside `value: T` — so a Row with one can still `rename_all` ([ADR 0202](./adr/0202-a-document-is-its-value.md)). **It is also the intended shape for a list on a row**: a `db.raw` projection with `COALESCE(jsonb_agg(jsonb_build_object(…)), '[]'::jsonb) AS labels` read into `labels: sql.Json([]const Label)` is one statement where a list of labels per row was a round trip per row, and the document says `Label` |
 | `sql.Decimal` | a `numeric`, held as its digits. `.text` is the value; there is no arithmetic. Writes itself into JSON as a **string**, so a consumer's `JSON.parse` cannot round it into an `f64` ([ADR 0050](./adr/0050-a-numeric-is-digits-and-a-string-in-json.md)) |
 | `sql.Interval`, `sql.Inet` | an `interval` and an `inet`, held as the text Postgres prints. `.text` is the value |
 | `sql.Bytes` | bytes rather than text: `bytea` on Postgres, `BLOB` on SQLite. `.bytes` is the value, `sql.Bytes.of(hash)` writes one. The slice a read hands back lives in the request arena, the way a `Str` does. This is what to reach for instead of `sql.AsText("bytea")`, which goes through hex printing and costs a conversion each way ([ADR 0174](./adr/0174-bytes-are-a-type-not-a-second-protocol.md)) |
