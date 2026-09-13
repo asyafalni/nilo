@@ -3296,7 +3296,10 @@ const rows = try db.rawOrdered(CommitmentRow, c,
 ```
 
 The hole is yours, for the reason `rawOne` adds no `LIMIT 1`: appending to
-somebody else's SQL is what `db.raw` exists not to do. Both exist on a `Tx`.
+somebody else's SQL is what `db.raw` exists not to do. It goes anywhere an
+`ORDER BY` clause is legal — inside an `OVER (PARTITION BY … {order})` as
+well as at the end, which is how a grouped and capped list ranks by the order
+the request chose with the one hole. Both exist on a `Tx`.
 
 **What it costs.** The text is assembled per request, so an ordered statement
 runs **unnamed** — Parse, Bind and Execute on every call, the ~12 µs a prepared
