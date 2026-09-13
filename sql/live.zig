@@ -110,6 +110,17 @@ const auto_table = "nilo_live_auto_" ++ mode_suffix;
 const other_schema = "nilo_live_other_" ++ mode_suffix;
 const scoped_table = other_schema ++ ".widgets";
 
+/// A table shaped like a session store: a `bytea` that is looked up by, and
+/// a `bytea` that may be null.
+///
+/// Its own table for the reason `list_table` has one: the column that goes
+/// wrong is the point of it. `bytea` was the one column type this module
+/// could declare, check at startup and read, and **not write** — every
+/// statement that bound one stopped inside the driver, on the first sign-in
+/// of the port that found it. Nothing in the suite had a `bytea` to write
+/// into, so nothing in the suite could have said so.
+const session_table = "nilo_live_sessions_" ++ mode_suffix;
+
 /// Created and dropped by `Live.open`, so a run leaves nothing behind and
 /// does not care what else is in the database.
 ///
@@ -197,6 +208,12 @@ const setup =
     "  (2, ARRAY[]::text[], NULL, ARRAY[]::uuid[])," ++
     "  (3, ARRAY['solo',NULL], NULL, NULL)," ++
     "  (4, ARRAY['deep'], ARRAY[[1,2],[3,4]], NULL);" ++
+    "DROP TABLE IF EXISTS " ++ session_table ++ ";" ++
+    "CREATE TABLE " ++ session_table ++ " (" ++
+    "  id bigint PRIMARY KEY," ++
+    "  token_hash bytea NOT NULL," ++
+    "  device bytea" ++
+    ");" ++
     "DROP SCHEMA IF EXISTS " ++ other_schema ++ " CASCADE;" ++
     "CREATE SCHEMA " ++ other_schema ++ ";" ++
     "CREATE TABLE " ++ scoped_table ++ " (" ++
@@ -2826,6 +2843,124 @@ test "a batch carries the column types that bind as something else" {
     // encodes a `jsonb[]` element from bytes.
     try testing.expectEqualStrings("midnight", back[0].settings.?.value.theme);
     try testing.expectEqualStrings("12345678901234567890.123456789", back[1].balance.text);
+}
+
+// -- bytes, written -----------------------------------------------------------
+
+const Session = struct {
+    pub const nilo_table = .{ .name = session_table, .key = .id };
+
+    id: i64,
+    token_hash: types.Bytes,
+    device: ?types.Bytes,
+};
+
+/// One row of a batch of them, with the nullable column null in one row and
+/// not the other — the case an array parameter has and a single insert does
+/// not.
+const NewSession = struct {
+    id: i64,
+    token_hash: types.Bytes,
+    device: ?types.Bytes,
+};
+
+test "bytes go out to a bytea through every statement that binds one" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // A NUL, a byte no UTF-8 decoder accepts, and a `%` — what a text
+    // parameter would truncate at, mangle, and mean something else by. The
+    // read half was known to be right; every call below used to be
+    // `CannotBindStruct` from inside pg.zig before the statement left the
+    // process, because the Wire handed the driver a struct it has no encoder
+    // for (`postgres.zig`, `opened`).
+    const digest = [_]u8{ 0xff, 0x00, 0x25, 0x41, 0xfe, 0x00 };
+    const other = [_]u8{ 0x00, 0x01, 0x02 };
+
+    // `db.insert`: the tuple carries a `Bytes` and a null `?Bytes`.
+    const made = try stack.db.insert(Session, &run, .{
+        .id = @as(i64, 1),
+        .token_hash = types.Bytes.of(&digest),
+        .device = @as(?types.Bytes, null),
+    });
+    try testing.expectEqualSlices(u8, &digest, made.token_hash.bytes);
+    try testing.expectEqual(@as(?types.Bytes, null), made.device);
+
+    // `.where` on the column, which is the lookup a session store is: the
+    // parameter has to arrive as `bytea` for `=` to compare bytes to bytes.
+    const found = try stack.db.select(Session, &run, .{
+        .where = .{ .token_hash = types.Bytes.of(&digest) },
+    });
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqual(@as(i64, 1), found[0].id);
+    const none = try stack.db.select(Session, &run, .{
+        .where = .{ .token_hash = types.Bytes.of(&other) },
+    });
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    // `db.update` with a `?Bytes` that is present, then read back as itself.
+    const changed = try stack.db.update(Session, &run, .{
+        .set = .{ .device = @as(?types.Bytes, types.Bytes.of(&other)) },
+        .where = .{ .id = @as(i64, 1) },
+    });
+    try testing.expectEqual(@as(usize, 1), changed);
+    const after = (try stack.db.find(Session, &run, @as(i64, 1))).?;
+    try testing.expectEqualSlices(u8, &other, after.device.?.bytes);
+
+    // `db.raw`, where the caller wrote the cast and the tuple is mapped
+    // through the same rule (ADR 0145).
+    const raw = try stack.db.raw(
+        Session,
+        &run,
+        "SELECT \"id\", \"token_hash\", \"device\" FROM \"" ++ session_table ++
+            "\" WHERE \"token_hash\" = $1::bytea",
+        .{types.Bytes.of(&digest)},
+    );
+    try testing.expectEqual(@as(usize, 1), raw.len);
+    try testing.expectEqualSlices(u8, &digest, raw[0].token_hash.bytes);
+
+    // Inside a transaction, which is the other Wire path — `Tx.run` and
+    // `Tx.exec` hand the driver their own tuple, one connection held.
+    {
+        var tx = try stack.db.begin(&run, .{});
+        defer tx.deinit();
+        _ = try tx.insert(Session, &run, .{
+            .id = @as(i64, 2),
+            .token_hash = types.Bytes.of(&other),
+            .device = @as(?types.Bytes, types.Bytes.of(&digest)),
+        });
+        const deleted = try tx.delete(Session, &run, .{
+            .where = .{ .token_hash = types.Bytes.of(&digest) },
+        });
+        try testing.expectEqual(@as(usize, 1), deleted);
+        try tx.commit();
+    }
+    try testing.expectEqual(@as(?Session, null), try stack.db.find(Session, &run, @as(i64, 1)));
+    const second = (try stack.db.find(Session, &run, @as(i64, 2))).?;
+    try testing.expectEqualSlices(u8, &other, second.token_hash.bytes);
+    try testing.expectEqualSlices(u8, &digest, second.device.?.bytes);
+
+    // A batch, where the column is one `bytea[]` parameter and each element
+    // is the slice inside the caller's row (`ArrayElement`).
+    const stored = try stack.db.insertMany(Session, &run, &[_]NewSession{
+        .{ .id = 3, .token_hash = types.Bytes.of(&digest), .device = types.Bytes.of(&other) },
+        .{ .id = 4, .token_hash = types.Bytes.of(&other), .device = null },
+    });
+    try testing.expectEqual(@as(usize, 2), stored.len);
+    try testing.expectEqualSlices(u8, &digest, stored[0].token_hash.bytes);
+    try testing.expectEqualSlices(u8, &other, stored[0].device.?.bytes);
+    try testing.expectEqual(@as(?types.Bytes, null), stored[1].device);
+    try testing.expectEqual(@as(usize, 3), try stack.db.count(Session, &run, .{}));
+
+    // And `db.delete` outside a transaction, matched by the bytes.
+    const gone = try stack.db.delete(Session, &run, .{
+        .where = .{ .token_hash = types.Bytes.of(&other) },
+    });
+    try testing.expectEqual(@as(usize, 2), gone);
 }
 
 comptime {

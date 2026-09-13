@@ -4547,6 +4547,10 @@ test "a route that says its own name gets it as the operationId" {
     // And it composes with a group's prefix and with `with`.
     const api = app.group("/api");
     try api.named("createUser").post("/users", docCreateUser);
+    // A hyphen, which is how the generator on the other side of a port
+    // spelled five of its names; the document carries it as written
+    // (ADR 0200).
+    try api.named("auth-login").post("/auth/login", docCreateUser);
 
     const json = try docsFor(&app);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
@@ -4558,6 +4562,10 @@ test "a route that says its own name gets it as the operationId" {
         paths.get("/users/{id}").?.object.get("get").?.object.get("operationId").?.string,
     );
     try testing.expectEqualStrings(
+        "auth-login",
+        paths.get("/api/auth/login").?.object.get("post").?.object.get("operationId").?.string,
+    );
+    try testing.expectEqualStrings(
         "getUsers",
         paths.get("/users").?.object.get("get").?.object.get("operationId").?.string,
     );
@@ -4565,6 +4573,79 @@ test "a route that says its own name gets it as the operationId" {
         "createUser",
         paths.get("/api/users").?.object.get("post").?.object.get("operationId").?.string,
     );
+}
+
+/// One middleware and one table, which is the shape ADR 0046 of the port
+/// that asked for this argued for: a check per handler leaves the
+/// ninety-first endpoint open with no error and no failing test, and a table
+/// consulted from one place does not. Default-deny — a route the table does
+/// not name is refused for everybody.
+const permission_table = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "showUser", "read" },
+    .{ "createUser", "write" },
+    // A route that said nothing is keyed by the name the document prints.
+    .{ "getUsers", "read" },
+});
+
+fn tableGuard(c: *Ctx, next: mw.Next) anyerror!void {
+    const name = c.routeName() orelse return next.run(c);
+    const needed = permission_table.get(name) orelse
+        return fail.forbidden("{s} is not in the permission table", .{name});
+    try c.setHeader("X-Needed", needed);
+    try next.run(c);
+}
+
+fn echoRouteName(c: *Ctx) anyerror!void {
+    try c.sendText(200, c.routeName() orelse "none");
+}
+
+test "a middleware can read the name of the route it is in front of" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.use(tableGuard);
+
+    try app.named("showUser").get("/users/:id", echoRouteName);
+    try app.get("/users", echoRouteName);
+    const api = app.group("/api");
+    try api.named("createUser").post("/users", echoRouteName);
+    // Registered and named, and in the table under nothing: the write the
+    // table forgot.
+    try api.named("deleteUser").delete("/users/:id", echoRouteName);
+
+    var client = try @import("testing.zig").Client.init(testing.allocator, .{});
+    defer client.deinit();
+
+    // Given, and derived, both as the document spells them — and the
+    // handler sees the same word the middleware did.
+    const one = try client.get(&app, "/users/7");
+    try testing.expectEqual(@as(u16, 200), one.status);
+    try testing.expectEqualStrings("read", one.header("X-Needed").?);
+    try testing.expectEqualStrings("showUser", one.body);
+    const listed = try client.get(&app, "/users");
+    try testing.expectEqualStrings("read", listed.header("X-Needed").?);
+    try testing.expectEqualStrings("getUsers", listed.body);
+    const created = try client.post(&app, "/api/users", "");
+    try testing.expectEqualStrings("write", created.header("X-Needed").?);
+    try testing.expectEqualStrings("createUser", created.body);
+
+    // A `HEAD` answered by the `GET` route carries the `GET`'s name, because
+    // that is the operation that ran.
+    const head = try client.send(&app, "HEAD /users/7 HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expectEqual(@as(u16, 200), head.status);
+    try testing.expectEqualStrings("read", head.header("X-Needed").?);
+
+    // Default-deny: a 403 with the name in it, not a handler that ran.
+    const deleted = try client.send(&app, "DELETE /api/users/7 HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expectEqual(@as(u16, 403), deleted.status);
+    try testing.expect(std.mem.indexOf(u8, deleted.body, "deleteUser is not in the permission table") != null);
+
+    // Nothing matched: null, and the middleware still runs (ADR 0009).
+    const missing = try client.get(&app, "/nothing-here");
+    try testing.expectEqual(@as(u16, 404), missing.status);
+    try testing.expect(missing.header("X-Needed") == null);
+    const wrong_verb = try client.post(&app, "/users/7", "");
+    try testing.expectEqual(@as(u16, 405), wrong_verb.status);
+    try testing.expect(wrong_verb.header("X-Needed") == null);
 }
 
 test "twenty named routes on one group is a program, not a branch budget" {
@@ -7575,7 +7656,7 @@ test "the route table can be read from outside, and printed" {
     try app.get("/users/:id", shown);
     try app.post("/users", signUp);
     const v1 = app.group("/v1");
-    try v1.delete("/users/:id", removed);
+    try v1.named("removeUser").delete("/users/:id", removed);
 
     // In registration order, with the joined pattern a group produced — the
     // same literal an error message would quote.
@@ -7585,6 +7666,12 @@ test "the route table can be read from outside, and printed" {
     try testing.expectEqualStrings("/users", app.routes().at(1).pattern);
     try testing.expectEqualStrings("/v1/users/:id", app.routes().at(2).pattern);
     try testing.expectEqual(http1.Method.DELETE, app.routes().at(2).method);
+    // And the name each answers to — derived where the route said nothing,
+    // given where it did — so a table keyed by it can be held against the
+    // route table (ADR 0201).
+    try testing.expectEqualStrings("getUsersId", app.routes().at(0).name);
+    try testing.expectEqualStrings("postUsers", app.routes().at(1).name);
+    try testing.expectEqualStrings("removeUser", app.routes().at(2).name);
 
     // One log call prints the lot, which is the whole question this answers.
     var buf: [256]u8 = undefined;

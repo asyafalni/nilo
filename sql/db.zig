@@ -2406,6 +2406,9 @@ fn BatchValues(comptime D: type, comptime Row: type, comptime stmt: statement.St
 ///   is one allocation per row for that column** — the same cost reading one
 ///   already has, and the only place a batch pays per row rather than per
 ///   column.
+/// - A `Bytes` binds as the slice inside it, pointing at the caller's row the
+///   way a `Uuid` does. `dialect.arrayOf` has named `bytea[]` for the column
+///   since the type landed; this is the element that cast applies to.
 ///
 /// **Two callers, and the second is why it is not called `BatchWrite` any
 /// more** (ADR 0145). A batch sends one array per column; an `.in` sends one
@@ -2418,6 +2421,13 @@ fn ArrayElement(comptime D: type, comptime F: type) type {
     comptime {
         if (F == types.Uuid) return []const u8;
         if (F == ?types.Uuid) return ?[]const u8;
+        // A `Bytes` opens to the slice it holds, for the reason a `Uuid`
+        // does: the array has the caller's own rows to point into, and
+        // pg.zig encodes a `bytea[]` from `[]const u8` elements and has no
+        // word for the wrapper — the batch half of what `postgres.zig`'s
+        // `opened` does for a scalar.
+        if (F == types.Bytes) return []const u8;
+        if (F == ?types.Bytes) return ?[]const u8;
         if (types.jsonPayload(F) != null) return []const u8;
         if (@typeInfo(F) == .optional and types.jsonPayload(@typeInfo(F).optional.child) != null) {
             return ?[]const u8;
@@ -2439,6 +2449,8 @@ fn forBatch(comptime To: type, value: anytype, c: anytype) !To {
         if (value.* == null) return null;
         return &value.*.?.bytes;
     }
+    if (V == types.Bytes) return value.bytes;
+    if (V == ?types.Bytes) return if (value.*) |b| b.bytes else null;
     if (comptime types.jsonPayload(V) != null) return jsonBytes(value.*, c);
     if (comptime @typeInfo(V) == .optional and
         types.jsonPayload(@typeInfo(V).optional.child) != null)
@@ -4248,7 +4260,7 @@ test "the batch tuple is a slice per column, not a value per row" {
     try testing.expectEqual([]const i32, fields[1].type);
 }
 
-test "the two column types that travel differently in a batch say so" {
+test "the three column types that travel differently in a batch say so" {
     // A `Uuid` alone is the array of its bytes, because a slice would point at
     // a temporary; in a batch it points at the caller's row, which lives for
     // the whole call — and pg.zig has no encoder for an array of `[16]u8`.
@@ -4263,6 +4275,13 @@ test "the two column types that travel differently in a batch say so" {
     try testing.expectEqual(Settings, WireWrite(dialect.Postgres, Settings));
     try testing.expectEqual([]const u8, ArrayElement(dialect.Postgres, Settings));
     try testing.expectEqual(?[]const u8, ArrayElement(dialect.Postgres, ?Settings));
+
+    // A `Bytes` travels as itself when alone — the Wire opens it, because
+    // only `sqlite.zig` may name the blob wrapper zqlite wants — and as the
+    // slice inside when in a batch, which pg.zig encodes a `bytea[]` from.
+    try testing.expectEqual(types.Bytes, WireWrite(dialect.Postgres, types.Bytes));
+    try testing.expectEqual([]const u8, ArrayElement(dialect.Postgres, types.Bytes));
+    try testing.expectEqual(?[]const u8, ArrayElement(dialect.Postgres, ?types.Bytes));
 
     // Everything else is the same both ways.
     try testing.expectEqual(i64, ArrayElement(dialect.Postgres, i64));

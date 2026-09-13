@@ -860,16 +860,26 @@ measured, paid per connection instead of per request.
 [ADR 0004](./adr/0004-request-arena-and-the-str-type.md)'s territory and is a
 harder question than the cache. Nobody has drawn one.
 
-**The API description is silent about authentication.** A handler taking a
-`CurrentUser` needs an `Authorization` header and the document does not say so,
-because the header is a line of Zig inside the resolver rather than something
-in a type.
+**The API description is silent about a session cookie.** A handler taking a
+`CurrentUser` that a resolver reads out of a cookie is documented as open,
+because the cookie is a line of Zig inside the resolver rather than something
+in a type. The `Authorization` half of this closed with
+[ADR 0191](./adr/0191-an-authorization-header-a-handler-can-ask-for.md): a
+handler that asks for `nilo.Authorization(.bearer)` gets a `security` entry and
+a `securitySchemes` block, and the resolver's own read of the header appears
+nowhere — which is the line, and the cookie is on the other side of it.
 
 **Waiting on: a design** that does not become a second thing to keep in step
-with the resolver. That drift is what the generated document exists to avoid. A
-consumer has now turned up who generates a frontend client from the document
-and is not blocked by the omission, which is worth knowing: this is a gap in
-what the document says rather than in what it is usable for.
+with the resolver. The consumer who generates a frontend client from the
+document has now hit it for real: every route under `/api` is behind a session
+cookie and four are not, and the document says nothing about either. Their
+proposal is a cookie scheme under `securitySchemes` and `without()` unsetting
+it per route, which is the group-and-exception vocabulary the guard already
+uses — and with `c.routeName()` ([ADR 0201](./adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md))
+that guard is one middleware on the group rather than a thing per handler,
+so the fact to document has moved from the signature to the group. What has
+not been settled is how a middleware says which scheme it enforces without
+the document taking a middleware's word for something it cannot check.
 
 **The API description names one failure, and endpoints have several.** `!?T`
 puts a 404 in the document because the signature settles it

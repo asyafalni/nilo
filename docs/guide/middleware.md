@@ -321,6 +321,41 @@ handler's argument are the same one lookup.
 
 See [ADR 0016](../adr/0016-resolved-values-are-declared-by-their-type.md).
 
+## One table over every route
+
+A check per handler leaves the ninety-first endpoint open with no error and no
+failing test. A table consulted from one place does not — as long as that place
+can tell which route it is in front of. `c.routeName()` is the route's
+`operationId`, the same word the API description prints, so a middleware can
+key a default-deny table by it and a test can hold the table against the
+document in both directions:
+
+```zig
+const required = std.StaticStringMap(Capability).initComptime(.{
+    .{ "createPartner", .manage_partners },
+    .{ "addPartnerCapability", .manage_partners },
+    // …every write in the product, or it is refused for everybody
+});
+
+fn authorize(c: *nilo.Ctx, next: nilo.Next) !void {
+    const name = c.routeName() orelse return next.run(c);   // a 404 is not ours to refuse
+    if (c.method == .GET or c.method == .HEAD) return next.run(c);
+    const needed = required.get(name) orelse
+        return fail.forbidden("{s} is not in the permission table", .{name});
+    const user = try c.resolve(CurrentUser);
+    if (!user.can(needed)) return fail.forbidden("{s} needs {s}", .{ name, @tagName(needed) });
+    try next.run(c);
+}
+
+try app.useOn("/api", authorize);
+```
+
+A route registered without `named` still has a name — the derived one, so
+`getApiPartners` is what the table sees and what the document says. `app.routes()`
+publishes the same name per entry, for the test that checks every key is a
+route and every route is a key without going through the document
+([ADR 0201](../adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
+
 ## Writing your own middleware
 
 The signature is `fn (c: *nilo.Ctx, next: nilo.Next) !void`. There is no

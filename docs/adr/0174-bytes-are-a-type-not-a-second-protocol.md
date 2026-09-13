@@ -98,11 +98,19 @@ decoder accepts, and a `%` goes in and comes back byte for byte — through
 `RETURNING` and through a separate `find` — and the generated `BLOB` column
 passes the startup check against itself.
 
-**Not verified against a real database**: the Postgres half. The read is
-pg.zig's own `[]const u8` for a `bytea` column, which its test suite covers,
-and the write is the `::bytea` cast. Both are the same shape `Uuid` already
-takes. It is written down here rather than left implied, because a claim with
-no run behind it is what this repository has been wrong about four times.
+**Not verified against a real database, as first written**: the Postgres
+half. The read was pg.zig's own `[]const u8` for a `bytea` column, and the
+write was the `::bytea` cast. It was written down here rather than left
+implied, because a claim with no run behind it is what this repository has
+been wrong about four times — **and this was the fifth.** The read was right.
+The write was not: the cast applied to a slice `postgres.zig` was not handing
+over, because the Wire passed nilo's wrapper to the driver untouched where
+`sqlite.zig` opened it, and the first `db.insert` of a `bytea` was
+`CannotBindStruct` from inside pg.zig. Found by a port's session table.
+`postgres.zig` opens the tuple now the way `sqlite.zig` does (`opened`), a
+batch element opens to the slice inside the caller's row (`ArrayElement`),
+and `sql/live.zig` writes one through every statement shape that binds one.
+The account is in [`history.md`](../history.md#a-type-both-wires-name-was-tested-on-one-of-them).
 
 ## Consequences
 

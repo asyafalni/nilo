@@ -87,6 +87,13 @@ pub const Route = struct {
     pattern: []const u8,
     handler: CtxHandler,
     chain: []const Middleware = &.{},
+    /// The `operationId` — what `app.named` gave the route, or the name
+    /// derived from the method and the pattern, exactly as the API
+    /// description prints it. `Ctx.routeName` hands it to a middleware, which
+    /// is what lets one authorisation table sit in front of every route
+    /// ([ADR 0201](../docs/adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
+    /// Owned by whoever registered the route; the Router only points at it.
+    name: []const u8 = "",
     /// `pattern`, split up once at registration. Owned by the Router.
     segments: []const Segment,
 
@@ -187,6 +194,18 @@ pub const Router = struct {
     /// through it first, so the asserts here are internal invariants
     /// rather than the user's error message.
     pub fn add(self: *Router, method: http1.Method, pattern: []const u8, handler: CtxHandler) !void {
+        return self.addNamed(method, pattern, handler, "");
+    }
+
+    /// `add`, with the route's `operationId`. `name` must outlive the Router,
+    /// the way `pattern` must; `App` is what owns both.
+    pub fn addNamed(
+        self: *Router,
+        method: http1.Method,
+        pattern: []const u8,
+        handler: CtxHandler,
+        name: []const u8,
+    ) !void {
         std.debug.assert(pattern.len > 0 and pattern[0] == '/');
 
         var buf: [max_segments][]const u8 = undefined;
@@ -231,6 +250,7 @@ pub const Router = struct {
             .method = method,
             .pattern = pattern,
             .handler = handler,
+            .name = name,
             .segments = segments,
             .score = Route.specificity(segments),
             .wildcard_tail = tail_is_wildcard,
@@ -865,7 +885,7 @@ test "the key tells apart the words a route table actually holds" {
     // it looks. These are the shapes that turn up in a real table, and the
     // benchmark's `/thingN/...`, which differs only at the end.
     const words = [_][]const u8{
-        "users", "uploads", "user", "usage", "health", "healthz",
+        "users", "uploads", "user", "usage",  "health", "healthz",
         "api",   "admin",   "auth", "thing0", "thing1", "thing99",
     };
     var collisions: usize = 0;

@@ -142,7 +142,7 @@ pub const Wire = struct {
         ) wire.Error!Rows {
             if (self.done) return error.QueryFailed;
             self.fresh();
-            const result = self.conn.queryOpts(sql, values, .{
+            const result = self.conn.queryOpts(sql, opened(values), .{
                 .allocator = arena,
                 .cache_name = plan,
             }) catch |err| {
@@ -161,7 +161,7 @@ pub const Wire = struct {
         ) wire.Error!usize {
             if (self.done) return error.QueryFailed;
             self.fresh();
-            const count = self.conn.execOpts(sql, values, .{
+            const count = self.conn.execOpts(sql, opened(values), .{
                 .allocator = arena,
                 .cache_name = plan,
             }) catch |err| {
@@ -426,7 +426,7 @@ pub const Wire = struct {
         var conn = self.pool.acquire() catch return error.Disconnected;
         errdefer conn.release();
 
-        const result = conn.queryOpts(sql, values, .{
+        const result = conn.queryOpts(sql, opened(values), .{
             .allocator = arena,
             .cache_name = plan,
         }) catch |err| {
@@ -470,9 +470,10 @@ pub const Wire = struct {
         const row = rows.current orelse return error.QueryFailed;
         // pg.zig has no word for nilo's `Bytes`, and needs none: a `bytea`
         // column comes back as the bytes themselves, so this unwraps to the
-        // slice pg.zig does understand and wraps the answer again. The
-        // `::bytea` on the write side is what makes the column that type in
-        // the first place (`dialect.bindAs`).
+        // slice pg.zig does understand and wraps the answer again. `opened`
+        // is the same step the other way, on the parameter tuple, and the
+        // `::bytea` the Dialect writes around the placeholder is what makes
+        // the slice that type at the server (`dialect.bindAs`).
         if (comptime T == wire.Bytes) {
             const got = row.get([]const u8, col) catch return error.QueryFailed;
             return .{ .bytes = got };
@@ -589,7 +590,7 @@ pub const Wire = struct {
     ) wire.Error!usize {
         var conn = self.pool.acquire() catch return error.Disconnected;
         defer conn.release();
-        const count = conn.execOpts(sql, values, .{
+        const count = conn.execOpts(sql, opened(values), .{
             .allocator = arena,
             .cache_name = plan,
         }) catch |err| {
@@ -635,6 +636,61 @@ pub const Wire = struct {
         return found.toOwnedSlice(arena) catch return error.QueryFailed;
     }
 };
+
+/// The parameter tuple with every `wire.Bytes` in it opened to the slice
+/// inside, which is the one shape pg.zig has an encoder for.
+///
+/// **The half of `sql.Bytes` this file did not have.** `WireWrite` in
+/// `db.zig` hands a `Bytes` down as itself so that *the Wire unwraps it* —
+/// SQLite has to, because only `sqlite.zig` may name `zqlite.Blob` — and
+/// `sqlite.zig` did (`blobbed`), while this file handed the tuple to
+/// `queryOpts` untouched. So a `bytea` column could be declared, checked at
+/// startup and read, and every statement that wrote or matched one was
+/// `CannotBindStruct` from inside the driver on the first sign-in. The cast
+/// was already right (`$3::bytea`, from `dialect.bindAs`): what was missing
+/// was the slice for it to apply to. Found by a port whose session table is
+/// the first `bytea` anything here wrote through the typed path; the test in
+/// `live.zig` that would have caught it is the one that now exists.
+///
+/// It answers the caller's own tuple type when nothing needs opening, which
+/// is every statement with no binary column in it — so this costs nothing to
+/// the programs that do not use one. The same shape `sqlite.zig`'s `blobbed`
+/// and `db.rawValuesOf` have, for the same reason.
+fn Opened(comptime V: type) type {
+    comptime {
+        if (@typeInfo(V) != .@"struct") return V;
+        const fields = @typeInfo(V).@"struct".fields;
+        var out: [fields.len]type = undefined;
+        var changed = false;
+        for (fields, 0..) |f, i| {
+            out[i] = switch (f.type) {
+                wire.Bytes => []const u8,
+                ?wire.Bytes => ?[]const u8,
+                else => f.type,
+            };
+            if (out[i] != f.type) changed = true;
+        }
+        if (!changed) return V;
+        const frozen = out;
+        return std.meta.Tuple(&frozen);
+    }
+}
+
+fn opened(values: anytype) Opened(@TypeOf(values)) {
+    const V = @TypeOf(values);
+    if (comptime Opened(V) == V) return values;
+
+    var out: Opened(V) = undefined;
+    inline for (@typeInfo(V).@"struct".fields, 0..) |f, i| {
+        const held = @field(values, f.name);
+        out[i] = switch (f.type) {
+            wire.Bytes => held.bytes,
+            ?wire.Bytes => if (held) |b| b.bytes else null,
+            else => held,
+        };
+    }
+    return out;
+}
 
 /// A pg.zig error, plus whatever the server said about it, as one of the
 /// four this module admits to (ADR 0039).

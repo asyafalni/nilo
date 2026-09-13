@@ -1090,17 +1090,27 @@ fn writeAnswer(w: *std.Io.Writer, components: *const Components, answer: Answer)
 /// of those the other way round, so `app.named("addPartnerCapability")` puts
 /// the name in the route's own hands.
 fn writeOperationId(w: *std.Io.Writer, op: Operation) !void {
-    if (op.name) |given| {
-        try w.writeByte('"');
-        try w.writeAll(given);
-        try w.writeByte('"');
-        return;
-    }
-
     try w.writeByte('"');
-    for (@tagName(op.method)) |ch| try w.writeByte(std.ascii.toLower(ch));
+    if (op.name) |given| {
+        try w.writeAll(given);
+    } else {
+        try writeDerivedName(w, op.method, op.pattern);
+    }
+    try w.writeByte('"');
+}
 
-    var segments = std.mem.splitScalar(u8, op.pattern, '/');
+/// The `operationId` a route that said nothing gets: `getUsersId` for
+/// `GET /users/:id`, with a catch-all read as `path`.
+///
+/// Public because it is written twice — into the document here, and onto
+/// the `Route` at registration so that `Ctx.routeName` answers the same word
+/// the document prints ([ADR 0201](../docs/adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
+/// One copy of the derivation is what keeps those two from drifting, which
+/// is the property an authorisation table keyed by the name depends on.
+pub fn writeDerivedName(w: *std.Io.Writer, method: http1.Method, pattern: []const u8) !void {
+    for (@tagName(method)) |ch| try w.writeByte(std.ascii.toLower(ch));
+
+    var segments = std.mem.splitScalar(u8, pattern, '/');
     while (segments.next()) |seg| {
         const text = if (seg.len > 1 and seg[0] == ':')
             seg[1..]
@@ -1118,7 +1128,6 @@ fn writeOperationId(w: *std.Io.Writer, op: Operation) !void {
             start_of_word = false;
         }
     }
-    try w.writeByte('"');
 }
 
 /// `/users/:id` → `"/users/{id}"`, and a catch-all `*` → `{path}`, which is

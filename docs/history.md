@@ -2986,3 +2986,43 @@ The numbers are in [`bench/result/job.md`](../bench/result/job.md): a claim is
 box, which is what `poll_ms = 1_000` rests on, and a claim that takes a row on
 Postgres is 1.2 ms — the number that makes batching the module's Next 1
 rather than a default.
+
+## A type both Wires name was tested on one of them
+
+**`sql.Bytes` shipped as "a `bytea` and a `BLOB`" and was a `BLOB`.** The read
+half was right on both databases and the write half on one: `sqlite.zig`
+opened the wrapper to the blob zqlite binds from, `postgres.zig` handed the
+driver the wrapper itself, and every statement that wrote or matched a
+`bytea` through the typed path was `CannotBindStruct` from inside pg.zig — on
+the first sign-in of the port whose session table was the first `bytea`
+anything had written that way. The test that existed inserted a blob through
+`db.insert` and read it back, against SQLite, in `migrate_live.zig`; the
+Postgres fixture had no `bytea` column, so nothing on that side ever bound one.
+**A type that two files have to name by contract is two tests, not one that
+happens to run on the easier database** — the same fixture lesson as
+[the types that were only ever tested against themselves](#the-types-that-were-only-ever-tested-against-themselves),
+one column type later. The Postgres fixture carries a session-shaped table
+now, and the live test writes through every statement shape that binds one:
+insert, `.where`, update, delete, raw, inside a transaction, and a batch.
+
+Two smaller things from the same round, kept as sentences:
+
+- **A refusal that was right in its reasoning was wrong in its character
+  class.** `checkName` refused a hyphen in an `operationId` on the grounds
+  that a generator has to turn the name into a method — and every generator
+  folds `auth-login` to `authLogin` on its own, so the port was carrying five
+  renames and a test that the count stayed five, for a check that protected
+  nothing ([ADR 0200](./adr/0200-a-hyphen-is-a-spelling-a-generator-can-carry.md)).
+- **The answer to "may a middleware know which route it is in front of" was
+  decided by which name it should see.** Only the given one would have left an
+  unnamed route described in the document and invisible to the table; so the
+  derived name is worked out once at registration by the function the
+  document calls, and the `Ctx` carries a pointer to the route rather than a
+  copy of anything — eight bytes, paid only by a handler that parks
+  ([ADR 0201](./adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
+
+**And the feedback file that reported these listed five items as open that had
+been closed four days earlier** — 46, 54, 55, 56 and 57, against a pin at which
+ADR 0182 through 0186 already existed. Nothing wrong was built; what it cost
+was the reading needed to notice. A file that holds only what is open holds it
+against a commit, and the commit has to be the one the items were re-tested at.

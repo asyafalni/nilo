@@ -159,6 +159,12 @@ pub const Ctx = struct {
     /// so the duplication cannot drift silently.
     _session_key: ?*const [32]u8 = null,
     _params: []const router.Param,
+    /// The route that matched, or null when none did. A pointer into the
+    /// App's own table rather than a copy of anything on it — eight bytes on
+    /// a Ctx, which is the number a handler that parks its frame pays per
+    /// connection for this (ADR 0201). The table does not move while the
+    /// server runs: registration is over before the first request.
+    _route: ?*const router.Route = null,
     _services: *const service_mod.Registry,
     /// Set by App when the path names a file in a static set, so the
     /// terminal handler does not have to look it up a second time.
@@ -326,6 +332,36 @@ pub const Ctx = struct {
             if (std.mem.eql(u8, p.name, name)) return Str.fromRequest(p.value, self._lifetime);
         }
         return null;
+    }
+
+    /// The `operationId` of the route this request matched — what
+    /// `app.named` gave it, or the name derived from the method and the
+    /// pattern, exactly as the API description prints it
+    /// ([ADR 0201](../docs/adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
+    ///
+    /// ```zig
+    /// fn authorize(c: *nilo.Ctx, next: nilo.Next) !void {
+    ///     const name = c.routeName() orelse return next.run(c);
+    ///     const needed = table.get(name) orelse return nilo.fail.forbidden("{s} is not in the permission table", .{name});
+    ///     …
+    /// }
+    /// ```
+    ///
+    /// This is what lets one middleware hold a default-deny table over every
+    /// route: the name is the one identifier a route has that the contract
+    /// also has, so a table keyed by it can be checked against the document
+    /// in both directions, and a route the table does not name is refused
+    /// rather than open. Null when nothing matched — a 404, a 405, a static
+    /// file — and for a `Ctx` built by hand in a test. A `HEAD` answered by
+    /// a `GET` route carries the `GET`'s name, because that is the operation
+    /// that ran.
+    ///
+    /// A `[]const u8` rather than a `Str`, because nothing about it ends with
+    /// the request: it points at a comptime literal or at a name the App
+    /// derived at registration and owns for its whole life.
+    pub fn routeName(self: *const Ctx) ?[]const u8 {
+        const route = self._route orelse return null;
+        return route.name;
     }
 
     /// The URL of one of this server's routes, built out of the pattern it was

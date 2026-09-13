@@ -349,6 +349,7 @@ pub noinline fn serveRequest(
         const params = match.params[0..match.n_params];
         ctx_mod.decodeParams(arena, params) catch return .{ .keep_alive = false };
         c._params = params;
+        c._route = &self.router.routes.items[match.index];
         chain = match.chain;
         terminal = match.handler;
         record.at(metrics_mod.fixed_slots + match.index);

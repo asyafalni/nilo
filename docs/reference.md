@@ -64,7 +64,7 @@ pub const panic = nilo.panic;                     // optional: name the request 
 | `app.useOn(prefix, mw)` | middleware, under a path prefix |
 | `app.without(mw)` | the same App with `mw` off for the routes registered through what comes back — how a sign-up route sits inside a guarded prefix ([ADR 0080](./adr/0080-a-route-can-say-it-is-not-covered.md)) |
 | `app.with(mw)` | the other direction: the same App with `mw` **on** for the routes registered through what comes back, so one endpoint can be guarded where its neighbours are not ([ADR 0126](./adr/0126-a-route-can-say-what-covers-it.md)) |
-| `app.named("listPartners")` | the same App with the next route registered through what comes back carrying that as its `operationId`, instead of the one derived from the method and the path ([ADR 0149](./adr/0149-a-route-can-say-its-own-name.md)) |
+| `app.named("listPartners")` | the same App with the next route registered through what comes back carrying that as its `operationId`, instead of the one derived from the method and the path ([ADR 0149](./adr/0149-a-route-can-say-its-own-name.md)). Letters, digits, `_` and `-`, starting with a letter or `_` — `auth-login` is a name a generator can carry ([ADR 0200](./adr/0200-a-hyphen-is-a-spelling-a-generator-can-carry.md)) |
 | `app.group(prefix)` | a group — see below |
 | `app.get / post / put / delete / patch / head / options (pattern, handler)` | a route |
 | `app.route(method, pattern, handler)` | any other method |
@@ -79,7 +79,7 @@ pub const panic = nilo.panic;                     // optional: name the request 
 | `app.shutdown()` | stop, from any thread or from inside a handler |
 | `app.tryListen / tryRoute / tryStatic / tryStaticWith` | the same calls, error returned rather than reported |
 | `app.checkServices()` | `error.MissingService` if a route needs one nobody provided |
-| `app.routes()` | every route, in registration order — a view rather than a copy. `.len()`, `.at(i)` and `{f}` ([ADR 0127](./adr/0127-a-route-pattern-is-the-name-of-its-url.md)) |
+| `app.routes()` | every route, in registration order — a view rather than a copy. `.len()`, `.at(i)` and `{f}` ([ADR 0127](./adr/0127-a-route-pattern-is-the-name-of-its-url.md)). `.at(i)` is `.method`, `.pattern` and `.name` — the `operationId`, given or derived, so a table keyed by it can be held against the route table ([ADR 0201](./adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)) |
 
 `pattern` and `handler` are `comptime`. Registration order never matters.
 
@@ -630,6 +630,7 @@ value is not.
 | `c.method` | `.GET`, `.POST`, … |
 | `c.path()` | `Str` — the path, without the query string |
 | `c.param(name)` | `?Str`, percent-decoded. `"*"` for a catch-all |
+| `c.routeName()` | `?[]const u8` — the `operationId` of the route that matched, as the API description prints it: what `app.named` gave it, or the derived `getUsersId`. Null when nothing matched — a 404, a 405, a static file. For a middleware holding one authorisation table over every route ([ADR 0201](./adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)) |
 | `c.query(name)` | `?Str`, percent-decoded, `+` as space |
 | `c.queries()` | an iterator over every query parameter, in arrival order — `while (it.next()) \|q\|`, `q.name` and `q.value` are `Str`. A name sent twice appears twice |
 | `c.queryString()` | `Str` — the query as it arrived, still encoded, no `?` on the front. `""` when there was none |

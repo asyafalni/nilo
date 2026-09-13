@@ -93,6 +93,13 @@ pub const App = struct {
     /// registered and turned into an OpenAPI document by `listen()` if
     /// `docs()` asked for one (ADR 0017).
     operations: std.ArrayList(openapi.Operation) = .empty,
+    /// The `operationId` of every route that did not say its own, worked
+    /// out once at registration so that `Ctx.routeName` can hand it to a
+    /// middleware without a request paying to spell it (ADR 0201). One
+    /// allocation per unnamed route at boot, and nothing per request; a
+    /// route registered through `named` points at its comptime literal and
+    /// takes no slot here.
+    derived_names: std.ArrayList([]const u8) = .empty,
     docs_options: ?openapi.Options = null,
     /// Every counter in the process, or null on a server that never called
     /// `metrics()` — which is what makes the whole feature one branch on the
@@ -193,6 +200,8 @@ pub const App = struct {
         wiring.freeChains(self);
         if (self.docs_set) |*set| set.deinit();
         self.operations.deinit(self.gpa);
+        for (self.derived_names.items) |name| self.gpa.free(name);
+        self.derived_names.deinit(self.gpa);
         if (self.metrics_table) |*t| t.free(self.gpa);
         self.exposed.deinit(self.gpa);
         for (self.static_sets.items) |*s| s.deinit();
@@ -585,7 +594,21 @@ pub const App = struct {
         }
 
         try self.requirements.appendSlice(self.gpa, comptime typed.requirements(pattern, handler));
-        try self.router.add(method, pattern, comptime typed.wrap(pattern, handler));
+        // The name the route answers to at run time is the one the document
+        // prints — given, or derived by the same function the document
+        // calls — so a middleware keyed by `operationId` and a contract
+        // held against the document cannot disagree about a route
+        // (ADR 0201).
+        const route_name: []const u8 = name orelse blk: {
+            var out: std.Io.Writer.Allocating = .init(self.gpa);
+            errdefer out.deinit();
+            try openapi.writeDerivedName(&out.writer, method, pattern);
+            const derived = try out.toOwnedSlice();
+            errdefer self.gpa.free(derived);
+            try self.derived_names.append(self.gpa, derived);
+            break :blk derived;
+        };
+        try self.router.addNamed(method, pattern, comptime typed.wrap(pattern, handler), route_name);
 
         // Read from the same argument list `wrap` just read, so the
         // description of an endpoint and the code that serves it cannot
@@ -979,6 +1002,11 @@ pub const Registered = struct {
     /// The joined pattern the route was registered under — the same literal
     /// `Ctx.url` takes and every error message quotes.
     pattern: []const u8,
+    /// The route's `operationId`, given or derived — the word `Ctx.routeName`
+    /// answers and the document prints, so a test can hold an authorisation
+    /// table against the route table without going through the document
+    /// (ADR 0201).
+    name: []const u8,
 
     pub fn format(self: Registered, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("{s} {s}", .{ @tagName(self.method), self.pattern });
@@ -1003,7 +1031,7 @@ pub const Routes = struct {
 
     pub fn at(self: Routes, i: usize) Registered {
         const r = self._inner[i];
-        return .{ .method = r.method, .pattern = r.pattern };
+        return .{ .method = r.method, .pattern = r.pattern, .name = r.name };
     }
 
     /// One route a line, so a whole table goes into one log call.
@@ -1250,8 +1278,16 @@ pub fn GroupWith(
 }
 
 /// A route's own `operationId` is a word a client generator turns into a
-/// method name, so it has to be one (ADR 0149). Letters, digits and `_`,
-/// starting with a letter or `_`.
+/// method name, so it has to be one (ADR 0149). Letters, digits, `_` and
+/// `-`, starting with a letter or `_`.
+///
+/// **The hyphen is allowed because the document on the other side of a port
+/// may already have it**
+/// ([ADR 0200](../docs/adr/0200-a-hyphen-is-a-spelling-a-generator-can-carry.md)).
+/// OpenAPI permits one, every client generator in use folds `auth-login` to
+/// `authLogin`, and a contract spelled by somebody else's generator is not a
+/// contract this framework gets to respell. A space, a dot or a slash is
+/// still refused: those are not a name under any convention.
 fn checkName(comptime name: []const u8) void {
     comptime {
         // **A framework spending a caller's comptime budget is the
@@ -1280,13 +1316,13 @@ fn checkName(comptime name: []const u8) void {
                 "will use: `app.named(\"addPartnerCapability\")`.",
         );
         for (name, 0..) |ch, i| {
-            const ok = std.ascii.isAlphanumeric(ch) or ch == '_';
+            const ok = std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-';
             const starts = std.ascii.isAlphabetic(ch) or ch == '_';
             if (!ok or (i == 0 and !starts)) @compileError(
                 "nilo: the route name \"" ++ name ++ "\" is not something a client generator " ++
                     "can turn into a method.\n" ++
-                    "  An operationId is letters, digits and `_`, starting with a letter or " ++
-                    "`_`: `addPartnerCapability`, not \"" ++ name ++ "\".",
+                    "  An operationId is letters, digits, `_` and `-`, starting with a letter or " ++
+                    "`_`: `addPartnerCapability` or `auth-login`, not \"" ++ name ++ "\".",
             );
         }
     }
