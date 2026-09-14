@@ -59,7 +59,10 @@ for (lines) |*line| line.attachments = try attachmentsOf(c, line.id);
 ```
 
 A list the **database** can build is still `sql.Json(T)` with `jsonb_agg`
-in the statement — one round trip, and the document says `T`.
+in the statement — one round trip, and the document says `T`. The column is
+parsed by `std.json` into `T`'s field names **as written**: a `rename_all`
+on `T` spells the response and not the column, so the `jsonb_build_object`
+names `content_type` and the wire says `contentType`, from one type.
 
 ## A statement that answers with nothing
 
