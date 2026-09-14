@@ -200,6 +200,12 @@ pub const Postgres = struct {
 
     pub const list_form: ListForm = .any_array;
 
+    /// Whether this database's plain `LIKE` already folds ASCII case. Postgres
+    /// has two words for the two behaviours; a Dialect whose one word folds
+    /// answers `.ilike` with it, since `ILIKE` would be a syntax error there
+    /// (`where.zig`, ADR 0061).
+    pub const like_folds = false;
+
     /// `LIMIT`/`OFFSET`, which most dialects agree on and one day one will not.
     pub fn limit(comptime placeholder_text: []const u8) []const u8 {
         return " LIMIT " ++ placeholder_text;
@@ -738,6 +744,12 @@ pub const SQLite = struct {
     /// parameter, constant text, whatever the length.
     pub const list_form: ListForm = .json_each;
 
+    /// SQLite's `LIKE` folds ASCII case and has no `ILIKE`, so `.ilike` is
+    /// spelled `LIKE` here — the one-word swap `pattern` below makes for
+    /// `icontains`. Until it did, the operator table wrote `ILIKE` on both
+    /// Dialects and this one answered with a syntax error at run time.
+    pub const like_folds = true;
+
     pub fn limit(comptime placeholder_text: []const u8) []const u8 {
         return " LIMIT " ++ placeholder_text;
     }
@@ -1072,7 +1084,7 @@ pub fn assertDialect(comptime D: type) void {
             "lock",       "uuid_form",   "json_form", "enum_form",
             "columnType", "keyColumn",   "foldedColumn",
             "can_alter_column",             "advisoryLock",
-            "nulls",      "pattern",
+            "nulls",      "pattern",       "like_folds",
         };
         for (owed) |decl| {
             if (!@hasDecl(D, decl)) @compileError(

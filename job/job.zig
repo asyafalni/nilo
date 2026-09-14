@@ -605,7 +605,7 @@ pub fn Jobs(comptime options: anytype) type {
                 if (K.overlap == .queue) self.pushNext(K, scope, now);
             }
 
-            const value = std.json.parseFromSliceLeaky(K, scope.arena(), claimed.payload, .{
+            var value = std.json.parseFromSliceLeaky(K, scope.arena(), claimed.payload, .{
                 .ignore_unknown_fields = true,
             }) catch |err| {
                 // A payload this binary cannot read is not going to become
@@ -613,6 +613,13 @@ pub fn Jobs(comptime options: anytype) type {
                 self.finishDead(scope, claimed.id, K, @errorName(err), claimed.attempts);
                 return;
             };
+            // `Str.jsonParse` answers `static`, because a parser has no idea
+            // which piece of work is running — so a payload `Str` held past
+            // its tick would pass the Debug trap that catches the same
+            // mistake in a handler. Stamped through the Scope here, the way
+            // `Ctx.json` stamps a body, and it goes stale when the tick's
+            // Scope is reset.
+            core.stampWith(&value, scope);
 
             var bound: core.Limits.Bound = .idle;
             defer bound.release();
@@ -1103,8 +1110,25 @@ const Strict = struct {
     }
 };
 
+/// Keeps its payload `Str` past the tick, which is the mistake the trap is
+/// for. `stashed` is where it goes, so the test can ask whether it is alive.
+const Hoarder = struct {
+    pub const nilo_job = "hoarder";
+    pub const retry: Retry = .none;
+
+    who: core.Str,
+
+    var stashed: ?core.Str = null;
+
+    pub fn run(self: Hoarder, scope: *core.Run, ledger: *Ledger) !void {
+        _ = scope;
+        _ = ledger;
+        stashed = self.who;
+    }
+};
+
 const TestJobs = Jobs(.{
-    .kinds = .{ Greet, Flaky, Picky, Tick, Strict },
+    .kinds = .{ Greet, Flaky, Picky, Tick, Strict, Hoarder },
     .store = Memory,
     .deps = struct { ledger: *Ledger },
 });
@@ -1130,6 +1154,27 @@ test "a pushed job runs under drain with its payload parsed back, Str included" 
     try testing.expectEqual(@as(usize, 2), ledger.lines.items.len);
     try testing.expectEqualStrings("hello wati", ledger.lines.items[0]);
     try testing.expectEqual(@as(u64, 0), (try jobs.stats(&run)).queued);
+}
+
+test "a payload Str held past its tick goes stale, the way a body's does" {
+    if (!core.trap_enabled) return;
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var ledger: Ledger = .{ .gpa = testing.allocator };
+    defer ledger.deinit();
+    var jobs: TestJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{});
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    _ = try jobs.push(&run, Hoarder{ .who = .static("wati") }, .{});
+    try testing.expectEqual(@as(usize, 1), try jobs.drain(&run));
+
+    // Alive while the tick's Scope is, and stale once it is reset — which is
+    // what `Str.jsonParse` answering `static` could never do on its own.
+    try testing.expect(Hoarder.stashed.?.alive());
+    run.reset();
+    try testing.expect(!Hoarder.stashed.?.alive());
+    Hoarder.stashed = null;
 }
 
 test "a job that is not in the list is refused before it is stored" {

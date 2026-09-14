@@ -95,7 +95,7 @@ surprise:
 
 | | |
 |---|---|
-| `db.insertMany` | SQLite has no array parameter, and the batch form it does have grows the statement text with the batch — which stops it being a constant. Write a row at a time inside one `db.begin`; there is no round trip to pay per statement, so it is cheaper than it sounds |
+| `db.insertMany`, `db.updateMany` | SQLite has no array parameter, and the batch form it does have grows the statement text with the batch — which stops it being a constant. Write a row at a time inside one `db.begin`; there is no round trip to pay per statement, so it is cheaper than it sounds |
 | `.lock = .update` | writers are serialised by a lock over the whole database. There is no row to hold against anybody |
 | `tx.deadline(ms)` | a deadline has to be enforced by the database, and there is no server. `busy_timeout_ms` covers the case that actually happens |
 | a `[]const T` column | no array type. A list belongs in its own table, or in a TEXT column your own code encodes |
@@ -105,6 +105,11 @@ surprise:
 refusing rather than quietly doing something else, and it is worth knowing
 before you plan a migration on the assumption that swapping the line at the top
 is free.
+
+One operator moves the other way. `.ilike` is Postgres's word for what SQLite's
+`LIKE` already does — fold ASCII case — so on SQLite it is spelled `LIKE`, the
+same one-word swap `icontains` makes. It used to be written `ILIKE` on both and
+came back a syntax error here; nothing could have depended on that.
 
 A `sql.Uuid` is **not** on that list. SQLite has no uuid type, so one travels as
 the thirty-six hyphenated characters into a TEXT column — which is what

@@ -41,47 +41,28 @@ const Canned = struct {
     /// How many connections have been accepted — see `serveEach`.
     accepted: usize = 0,
 
-    /// `Io.net.Server` cannot report the port it was given, so asking for 0
-    /// and reading it back is not available — walk a range instead.
+    /// Port 0, and the kernel's answer read back.
     ///
-    /// **The walk starts at the process id and wraps**, and both halves of
-    /// that matter. A server that closes a connection leaves its local port
-    /// in `TIME-WAIT` for a minute, and a port in `TIME-WAIT` cannot be bound
-    /// again, so a fixed start walks back over the ports the last run just
-    /// finished with. Two hundred ports and a fixed start ran out after three
-    /// consecutive `zig build test-all` runs, and the failure arrives as
-    /// `error.NoFreePort` inside whichever test happened to be next — a
-    /// message pointing at the wrong thing entirely. A thousand ports and a
-    /// different start per process is enough that the two test binaries
-    /// `test-all` runs at once do not tread on each other either.
+    /// **This used to walk a range of a thousand ports from a start derived
+    /// from the thread id**, on the belief that `std.Io.net.Server` could not
+    /// report the port it was given — and it could the whole time.
+    /// `Threaded.netListenIpPosix` calls `getsockname` after `listen` and
+    /// hands the result back as `Server.socket.address`, whose own doc says
+    /// "the resolved ephemeral port number". The belief was written down in
+    /// three files as re-checked rather than believed, and the walk it
+    /// justified needed `s3/canned.zig` and `http/live.zig` to keep their
+    /// ranges apart from this one by comment: ten consecutive `zig build
+    /// test-all` runs failed from the sixth on when two of them overlapped.
     ///
-    /// **39,200–40,199 is this file's, and `s3/canned.zig` has 40,200–41,199.**
-    /// They used to overlap, s3 taking 200 ports from a fixed 39,600 inside
-    /// this range, so a thousand ports walked from here rolled over all two
-    /// hundred of them and s3 ran out first. Ten consecutive `zig build
-    /// test-all` runs failed from the sixth on, in whichever s3 test came
-    /// next. Nothing but these two comments keeps the ranges apart.
-    ///
-    /// `reuse_address` would fix the `TIME-WAIT` half in one line and is
-    /// refused: std sets `SO_REUSEPORT` alongside `SO_REUSEADDR`, so two test
-    /// binaries would both bind the same port and the kernel would hand each
-    /// of them some of the connections. Failing to bind is the signal that
-    /// keeps them apart.
+    /// An ephemeral port is one nothing else is walking, and a port the
+    /// kernel just handed out is not one in `TIME-WAIT`, so both halves of
+    /// what the walk was for are the kernel's job again. `reuse_address` is
+    /// still not set, for the reason it never was: std sets `SO_REUSEPORT`
+    /// with it, and two test binaries would share one port.
     fn open(io: std.Io) !Canned {
-        const first: u16 = 39_200;
-        const count: u16 = 1_000;
-        // The thread id rather than the pid, because `getpid` is per-OS and
-        // nothing else in this file is. Either would do: what is wanted is a
-        // number that differs between two runs and between the two binaries.
-        const start: u16 = @intCast(@as(u64, std.Thread.getCurrentId()) % count);
-        var tried: u16 = 0;
-        while (tried < count) : (tried += 1) {
-            const candidate = first + (start + tried) % count;
-            const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(candidate) };
-            const server = address.listen(io, .{}) catch continue;
-            return .{ .server = server, .io = io, .port = candidate };
-        }
-        return error.NoFreePort;
+        const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const server = try address.listen(io, .{});
+        return .{ .server = server, .io = io, .port = server.socket.address.getPort() };
     }
 
     fn url(self: *Canned, buf: []u8) ![]const u8 {

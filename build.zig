@@ -360,6 +360,10 @@ const sql_refusals = [_]Refusal{
         .says = "`.any` holds a list of conditions and this one is a single condition.",
     },
     .{
+        .name = "row_column_no_dialect_can_decode",
+        .says = "row_column_no_dialect_can_decode.User reads `address` as row_column_no_dialect_can_decode.Address, which no Dialect can decode.",
+    },
+    .{
         .name = "streamed_json",
         .says = "streamed_json.Account reads `settings` as a Json column, and a streamed row cannot hold one.",
     },
@@ -434,6 +438,16 @@ const sql_refusals = [_]Refusal{
     .{
         .name = "batch_of_an_unnamed_enum",
         .says = "a batch insert into batch_of_an_unnamed_enum.Staff cannot send `role`, which it reads as batch_of_an_unnamed_enum.Role.",
+    },
+    // The dialect is judged before the column is, and the verb is the
+    // caller's: this used to say "a batch insert" from both and blame `i64`.
+    .{
+        .name = "sqlite_batch_insert",
+        .says = "a batch insert into sqlite_batch_insert.User is not available on the sqlite dialect.",
+    },
+    .{
+        .name = "sqlite_batch_update",
+        .says = "a batch update of sqlite_batch_update.User is not available on the sqlite dialect.",
     },
     .{
         .name = "borrowed_column_not_in_base",
@@ -1514,6 +1528,9 @@ const Snippets = struct {
         .{ .path = "docs/guide/fetch.md" },
         .{ .path = "docs/guide/s3.md" },
         .{ .path = "docs/guide/jobs.md" },
+        // Marked on 13 September and read by nothing until the roadmap's own
+        // standing risk about exactly this was checked against the tree.
+        .{ .path = "docs/guide/openapi.md" },
         // The SQL guide is a folder, and its front page and every page after
         // the first read the `User` its tables page declares — so each one
         // carries that page's declarations in front of its own, which is

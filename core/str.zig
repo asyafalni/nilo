@@ -214,27 +214,47 @@ pub fn stamp(value: anytype, lifetime: *const Lifetime) void {
     stampInner(value, lifetime, 8);
 }
 
-fn stampInner(value: anytype, lifetime: *const Lifetime, comptime depth: u8) void {
+/// The same walk, for a caller holding a Scope rather than its Lifetime.
+///
+/// A Fitting is handed its Scope as `anytype` and the two shipped ones keep
+/// the Lifetime differently — a value on a `Run`, a pointer on a `Ctx` — so
+/// reaching the field is a branch per Scope and a fourth thing a new Scope
+/// would have to match. `str()` is the one call the Scope contract already
+/// has for "text that lives as long as this work does" (`scope.zig`), so
+/// each `Str` found is re-made through it, over the same bytes. `nilo_job`
+/// is the caller: a payload parsed for a tick has to go stale at the tick's
+/// end the way a body goes stale at the request's.
+pub fn stampWith(value: anytype, scope: anytype) void {
+    if (!trap_enabled) return;
+    stampInner(value, scope, 8);
+}
+
+/// `by` is a `*const Lifetime` or a Scope; only the leaf tells them apart.
+fn stampInner(value: anytype, by: anytype, comptime depth: u8) void {
     if (depth == 0) return;
     const T = @typeInfo(@TypeOf(value)).pointer.child;
     if (comptime !containsStr(T, depth)) return;
 
     if (T == Str) {
-        value._marker = .{ .gen_ptr = &lifetime.gen, .gen = lifetime.gen };
+        if (comptime @TypeOf(by) == *const Lifetime) {
+            value._marker = .{ .gen_ptr = &by.gen, .gen = by.gen };
+        } else {
+            value.* = by.str(value._bytes);
+        }
         return;
     }
     switch (@typeInfo(T)) {
         .@"struct" => |s| inline for (s.fields) |f| {
-            stampInner(&@field(value, f.name), lifetime, depth - 1);
+            stampInner(&@field(value, f.name), by, depth - 1);
         },
-        .optional => if (value.*) |*payload| stampInner(payload, lifetime, depth - 1),
+        .optional => if (value.*) |*payload| stampInner(payload, by, depth - 1),
         // Only the arm that is actually set: the others hold nothing.
         .@"union" => |u| if (u.tag_type != null) switch (value.*) {
-            inline else => |_, tag| stampInner(&@field(value, @tagName(tag)), lifetime, depth - 1),
+            inline else => |_, tag| stampInner(&@field(value, @tagName(tag)), by, depth - 1),
         },
-        .array => for (value) |*item| stampInner(item, lifetime, depth - 1),
+        .array => for (value) |*item| stampInner(item, by, depth - 1),
         .pointer => |p| switch (p.size) {
-            .slice => if (!p.is_const) for (value.*) |*item| stampInner(item, lifetime, depth - 1),
+            .slice => if (!p.is_const) for (value.*) |*item| stampInner(item, by, depth - 1),
             else => {},
         },
         else => {},
@@ -417,6 +437,28 @@ test "Str comes in from JSON and gets stamped with the request lifetime" {
     lifetime.end();
     try testing.expect(!value.name.alive());
     try testing.expect(!value.tags[1].alive()); // goes stale inside the slice too
+}
+
+test "stampWith reaches the same Strs through a Scope's own str()" {
+    if (!trap_enabled) return;
+    var lifetime = Lifetime{};
+    const Scope = struct {
+        lifetime: *const Lifetime,
+        pub fn str(self: *@This(), bytes: []const u8) Str {
+            return .fromRequest(bytes, self.lifetime);
+        }
+    };
+    var scope: Scope = .{ .lifetime = &lifetime };
+
+    const Incoming = struct { name: Str, tags: [2]Str };
+    var value: Incoming = .{ .name = .static("wati"), .tags = .{ .static("a"), .static("b") } };
+    stampWith(&value, &scope);
+
+    try testing.expectEqualStrings("wati", value.name.view());
+    try testing.expect(value.name.alive());
+    lifetime.end();
+    try testing.expect(!value.name.alive());
+    try testing.expect(!value.tags[1].alive());
 }
 
 test "stamp leaves types without a Str alone" {

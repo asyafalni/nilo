@@ -1498,7 +1498,17 @@ fn operator(
             };
         }
 
-        const spelled = spelling(op.name).?;
+        // `ILIKE` is Postgres's word for what SQLite's `LIKE` already does, so
+        // on a Dialect whose `LIKE` folds the folding spelling drops the `I` —
+        // the same swap `dialect.SQLite.pattern` makes for `icontains`
+        // (ADR 0061). The table below predates the second Dialect and wrote
+        // `ILIKE` on both, which compiled and came back a syntax error.
+        const spelled = if (D.like_folds and std.mem.eql(u8, op.name, "ilike"))
+            "LIKE"
+        else if (D.like_folds and std.mem.eql(u8, op.name, "not_ilike"))
+            "NOT LIKE"
+        else
+            spelling(op.name).?;
 
         // `.ne = null` is `IS NOT NULL`, for the same reason `= null` is
         // `IS NULL`: `<> NULL` is never true either.
@@ -1719,6 +1729,23 @@ test "sqlite writes LIKE where postgres writes ILIKE, because that is what its L
     // And the escaping survives the swap, which is the half that would be easy
     // to lose in a string splice.
     try testing.expect(std.mem.endsWith(u8, written, "ESCAPE '\\'"));
+}
+
+test "ilike on sqlite is spelled LIKE, and not_ilike NOT LIKE, for the same reason" {
+    // The pattern operators went through the Dialect from the day they were
+    // written; `.ilike` predates the second Dialect and wrote `ILIKE` on both,
+    // which SQLite refused at run time. Nothing could depend on that.
+    const Lite = dialect_mod.SQLite;
+    try testing.expectEqualStrings(
+        "\"email\" LIKE ?1",
+        comptime plan(Lite, User, @TypeOf(.{ .email = .{ .ilike = @as([]const u8, "%@b.com") } }), 1).sql,
+    );
+    try testing.expectEqualStrings(
+        "\"email\" NOT LIKE ?1",
+        comptime plan(Lite, User, @TypeOf(.{ .email = .{ .not_ilike = @as([]const u8, "%@b.com") } }), 1).sql,
+    );
+    // And Postgres keeps its own word.
+    try testing.expectEqualStrings("\"email\" ILIKE $1", sqlOf(.{ .email = .{ .ilike = "%@B.com" } }));
 }
 
 // -- a row over there ----------------------------------------------------

@@ -29,13 +29,15 @@
 //! is the same standing as a guard only ever seen to pass. A real socket is the
 //! only thing that reaches it.
 //!
-//! **41,200–42,199 is this file's port range.** `fetch/live.zig` has
-//! 39,200–40,199 and `s3/canned.zig` has 40,200–41,199, and nothing but these
-//! three comments keeps them apart — `std.Io.net.Server` cannot report the port
-//! it was given, so binding zero and reading it back is not available. The walk
-//! starts at the thread id and wraps, for the reason `fetch/live.zig` spells
-//! out at length: a fixed start walks back over the ports the last run left in
-//! `TIME-WAIT`.
+//! **41,200–42,199 is this file's port range, and it is the last one.**
+//! `fetch/live.zig` and `s3/canned.zig` bind port 0 and read the kernel's
+//! answer back — `Server.socket.address` has carried it all along, which this
+//! comment used to say the opposite of — so nothing else walks a range. This
+//! file still does, because `App.listen` opens the socket itself and does not
+//! hand the bound port back out; the roadmap has the entry. The walk starts at
+//! the thread id and wraps, for the reason `fetch/live.zig`'s `open` used to
+//! spell out at length: a fixed start walks back over the ports the last run
+//! left in `TIME-WAIT`.
 
 const std = @import("std");
 const nilo = @import("http.zig");

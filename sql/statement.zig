@@ -797,7 +797,7 @@ pub fn insertMany(comptime D: type, comptime Row: type, comptime V: type) Statem
                 row_mod.noSuchColumn(Row, f.name, "a batch insert");
             }
             const F = row_mod.ColumnType(Row, f.name);
-            const cast = D.arrayOf(F) orelse noArrayForm(D, Row, f.name, F);
+            const cast = D.arrayOf(F) orelse noArrayForm(D, Row, f.name, F, "a batch insert into");
             if (i > 0) {
                 names = names ++ ", ";
                 arrays = arrays ++ ", ";
@@ -904,7 +904,7 @@ pub fn updateMany(comptime D: type, comptime Row: type, comptime V: type) Statem
                 row_mod.noSuchColumn(Row, f.name, "a batch update");
             }
             const F = row_mod.ColumnType(Row, f.name);
-            const cast = D.arrayOf(F) orelse noArrayForm(D, Row, f.name, F);
+            const cast = D.arrayOf(F) orelse noArrayForm(D, Row, f.name, F, "a batch update of");
             if (i > 0) {
                 arrays = arrays ++ ", ";
                 aliases = aliases ++ ", ";
@@ -948,18 +948,39 @@ pub fn updateMany(comptime D: type, comptime Row: type, comptime V: type) Statem
     };
 }
 
-/// The Refusal for a column a batch cannot send as one parameter. Two
+/// The Refusal for a column a batch cannot send as one parameter. Three
 /// different mistakes reach it and each gets its own sentence, because the
-/// fix is different: a list column cannot be batched at all, and an enum
-/// only needs to be told what it is called.
+/// fix is different: a Dialect with no arrays cannot batch anything, a list
+/// column cannot be batched at all, and an enum only needs to be told what it
+/// is called.
+///
+/// `what` is the caller's verb — "a batch insert into", "a batch update of" —
+/// because the first line used to say *insert* from both and blame the column
+/// type from SQLite, where the true reason is that the database has no array
+/// parameter at all (ADR 0061). A message that sends the reader to
+/// `dialect.accepts` to find the sentence was false is worse than no message.
 fn noArrayForm(
     comptime D: type,
     comptime Row: type,
     comptime column: []const u8,
     comptime F: type,
+    comptime what: []const u8,
 ) noreturn {
-    const head = "nilo: a batch insert into " ++ @typeName(Row) ++ " cannot send `" ++
+    const head = "nilo: " ++ what ++ " " ++ @typeName(Row) ++ " cannot send `" ++
         column ++ "`, which it reads as " ++ @typeName(F) ++ ".";
+
+    // Judged first, before the column is: on a Dialect that cannot name an
+    // array of integers nothing is batchable, and the column is not the
+    // reason. `i64` is the probe because every Dialect with arrays has one.
+    if (D.arrayOf(i64) == null) @compileError(
+        "nilo: " ++ what ++ " " ++ @typeName(Row) ++ " is not available on the " ++
+            D.name ++ " dialect.\n" ++
+            "  A batch sends one array per column and the database takes it apart with " ++
+            "`unnest`; this one has no array parameter and no `unnest`, and the batch " ++
+            "form it does have grows its statement text with the batch (ADR 0061).\n" ++
+            "  Write the rows one at a time inside one transaction — there is no round " ++
+            "trip to pay per statement here.",
+    );
 
     if (types_mod.listElement(F) != null) @compileError(
         head ++ "\n  A batch sends one array per column and `unnest` flattens what it " ++

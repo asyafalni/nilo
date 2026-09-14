@@ -2989,7 +2989,7 @@ build pinned rather than what the machine had.
 
 | | why |
 |---|---|
-| `insertMany` | no `unnest` and no array parameter. The batch form SQLite has grows its own statement text, which is the rule this module is built on. Write a row at a time inside one transaction — cheap here, because there is no round trip to pay per statement |
+| `insertMany`, `updateMany` | no `unnest` and no array parameter. The batch form SQLite has grows its own statement text, which is the rule this module is built on. Write a row at a time inside one transaction — cheap here, because there is no round trip to pay per statement |
 | `.lock` | writers are serialised by a lock over the whole database, so there is no row to hold against anybody |
 | `tx.deadline` | needs the database to enforce it, and there is no server. `sqlite3_interrupt` aborts the whole connection rather than one statement. `busy_timeout_ms` covers the case that actually happens |
 | a list column | no array type. A list belongs in its own table, or in a TEXT column your own code encodes |
@@ -3212,7 +3212,7 @@ Different fields are ANDed. Several operators on one field are ANDed too.
 | `.id = 7` | `"id" = $1` |
 | `.age = .{ .gt = 18, .lt = 65 }` | `"age" > $1 AND "age" < $2` |
 | `.eq` `.ne` `.gt` `.gte` `.lt` `.lte` | |
-| `.like` / `.ilike` | and `.not_like` / `.not_ilike`. **These do not escape the text you give them**; the row below is the one to reach for |
+| `.like` / `.ilike` | and `.not_like` / `.not_ilike`. **These do not escape the text you give them**; the row below is the one to reach for. On SQLite `.ilike` is spelled `LIKE`, because that database's `LIKE` already folds ASCII case |
 | `.contains` `.starts_with` `.ends_with` | the pattern is built *and* escaped by the statement, so `%` and `_` in a search term match themselves. `i` in front folds case (`.icontains`), `not_` in front negates — twelve in all. On SQLite the case-sensitive half is a Refusal: its `LIKE` folds ASCII case and cannot be told not to |
 | `.in = &.{ 1, 2, 3 }` | `= ANY($1)` — one parameter, so the statement stays a constant |
 | `.not_in = &.{ 1, 2, 3 }` | `<> ALL($1)` — one parameter likewise |

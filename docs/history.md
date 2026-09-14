@@ -955,6 +955,14 @@ still has no way to read back the port it was given, which was re-checked
 rather than believed, so binding zero is not available and two files picking
 loopback ports remains an agreement held by two comments pointing at each other.
 
+**The sentence above was false when it was written.** `std.Io.Threaded` calls
+`getsockname` after `listen` and returns the result as `Server.socket.address`
+— the field's own doc says "the resolved ephemeral port number" — and zio's
+`Socket.bind` does the same. Whatever "re-checked" meant, it did not mean
+opening `Threaded.zig`. It is the fifth blocker here that was not one, and the
+first from inside the pinned standard library; the roadmap's entry now says
+what is actually left, which is `App.listen` handing a port back out.
+
 ## The comment that was already the argument for the next check
 
 `rename_all` mapped names one at a time and nothing looked at the set, so
@@ -3217,3 +3225,36 @@ call crosses the way `entropy` does — by name in the table, the type on the
 near side — and what it answers is only what was already resolved, which is
 the loud `NotGiven` rather than a resolver run without its services
 ([ADR 0219](./adr/0219-an-erased-scope-answers-what-was-resolved.md)).
+
+## Five things the roadmap said were ready, read against the tree
+
+The first pass over the roadmap after 0.4.0 was a check rather than a build:
+every entry that named a file, a line or a number was opened. Five were
+stale — one closed four days after it was written and never removed, one
+resting on a premise about the standard library that a look at `Threaded.zig`
+overturned — and one standing risk had a live instance (`docs/guide/openapi.md`
+carried a `<!-- compiles -->` mark no build step read). What a check like that
+costs is an afternoon; what the five entries would have cost is a cycle planned
+against them. The five items marked *ready* were then built in one pass.
+
+**A Dialect's `null` meant "I decline to judge" and was read as two other
+things.** `accepts` answers `null` for an enum whose type name lives in the
+database — the honest answer — and for a struct nothing can ever decode, and
+`schema.Expectation.accepted` read both as *accept anything*. The same
+`null`, from `arrayOf`, fell through to a sentence blaming the column type on
+a Dialect that has no array of anything. Both refusals now judge the Dialect
+before the column, and the second names the caller's own verb: a batch
+update used to be refused as "a batch insert". A message that sends the
+reader to a table to discover the sentence was false is worse than no
+message, which is the whole of ADR 0027 read from the other side.
+
+**`.ilike` predated the second Dialect by a year and nobody ran it there.**
+The pattern family went through the Dialect from the day it was written; the
+comparison table beside it did not, and wrote `ILIKE` for SQLite, which has
+no such word. Nothing could depend on a spelling that was a syntax error, so
+the fix went the way `icontains` already had — `LIKE`, since that database's
+`LIKE` folds — rather than to the Refusal the roadmap had proposed. What that
+leaves is `.like` on SQLite folding case silently, which is the same lie
+`contains` is refused there for; refusing it breaks working code, so it is a
+decision rather than a fix.
+

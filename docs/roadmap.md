@@ -46,9 +46,11 @@ because an open question is not blocked. It is unanswered, and what a reader
 wants to know is which evidence would end the argument.
 
 **A `Waiting on: upstream` is the line to distrust.** This repository has
-been wrong about a blocker four times, and three of those were somebody else's
+been wrong about a blocker five times, and four of those were somebody else's
 code that turned out to already do the thing
-([history](./history.md)). Nothing downstream ever re-tests a blocker, so
+([history](./history.md)) — the latest being the standard library it pins,
+which had been reading a bound port back the whole time (see
+[the standing risks](#open)). Nothing downstream ever re-tests a blocker, so
 re-test it before repeating it.
 
 ## The modules
@@ -63,16 +65,16 @@ other module's.
 
 | Module | Layer | Where its work is |
 |---|---|---|
-| [`nilo_core`](#nilo_core-the-vocabulary) | needs no loop | one deadline that never got its second caller, and where `convert` belongs |
+| [`nilo_core`](#nilo_core-the-vocabulary) | needs no loop | an entropy pool nobody has needed, a layering step that trusts its test-import list, and where `convert` belongs |
 | [`nilo_id`](#nilo_id-identifiers) | needs no loop | quiet. Two questions about scope, one gap nobody has hit |
 | [`nilo_config`](#nilo_config-settings) | needs no loop | reading a name the field is not called |
 | [`nilo_pw`](#nilo_pw-hashing-a-password) | needs no loop | a Cost floor that weighs the wrong half, and a patch `std` should have |
-| [`nilo_cache`](#nilo_cache-an-expiring-cache-in-this-process) | needs no loop | a read that writes, so readers queue, and an evicted-key record nothing reads |
+| [`nilo_cache`](#nilo_cache-an-expiring-cache-in-this-process) | needs no loop | 60% still between it and quick_cache on eight threads, unattributed, and no `getOrPut` |
 | [`nilo_jwt`](#nilo_jwt-checking-somebody-elses-token) | needs no loop | no number against a verification, and only RS256 |
 | [`nilo_fetch`](#nilo_fetch-calling-somebody-elses-api) | borrows the loop | 4,139 bytes of stack per idle connection, and nothing measured through TLS |
 | [`nilo_job`](#nilo_job-work-that-runs-later-again-or-on-a-schedule) | borrows the loop | workers on the wrong `Io` under one startup order, a claim per row, and UTC only |
 | [`nilo_http`](#nilo_http-the-server) | owns the loop | a megabyte of request arena held per connection, nothing that reads a `Forwarded` header, and a long tail |
-| [`nilo_sql`](#nilo_sql-postgres-and-sqlite) | borrows the loop | a migration library with no command that runs it, a `Timestamp` the two halves of SQLite disagree about, and a pool option dropped without a word |
+| [`nilo_sql`](#nilo_sql-postgres-and-sqlite) | borrows the loop | `reset` and `squash` for the migrations, a plain query with no deadline, and a connection URL a managed Postgres hands out that stops the server |
 | [`nilo_s3`](#nilo_s3-object-storage) | borrows the loop | nothing measured through TLS, and no `LIST`, `COPY` or multipart |
 
 Everything that is about the repository rather than one module stays whole at
@@ -102,23 +104,6 @@ priced rather than missed.
 **Waiting on: a caller.** Nobody has a workload that needs it.
 
 ### Known gaps
-
-**A query outside a transaction cannot be bounded by time.** `core.Limits`
-bounds an operation that is not a read or write of a connection nilo holds
-([ADR 0065](./adr/0065-the-way-out-was-open-the-clock-was-not.md)), and
-`nilo_fetch` uses it. `nilo_sql` does not: a plain `db.select` still has no
-deadline, and the mechanism it would use exists.
-
-This entry used to say a Service had no supported way to dial out at all, and
-it was wrong in every detail it gave. pg.zig names no zio, and `std.Io` is
-handed to a Service by `ready(state, io)`
-([ADR 0040](./adr/0040-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md)).
-The way out was already open. The paragraph that said otherwise was written
-from the shape of the Bulkhead rather than from reading either dependency,
-which is the reason the note above about upstream blockers is in this file.
-
-**Waiting on: ready.** The remaining half is [`nilo_sql`'s](#nilo_sql-postgres-and-sqlite),
-and it is a design question there rather than a missing mechanism here.
 
 **The layering step cannot tell a test import from a real one.** `zig build
 layering` refuses an import that is not in that module's row of the `layers`
@@ -561,15 +546,6 @@ for; a heap would be 200 ns and an allocation-free heap somebody writes.
 
 **Waiting on: a caller** with a memory queue big enough to notice.
 
-**A `Str` parsed out of a payload carries no lifetime marker.** `Str.jsonParse`
-answers `static`, so the debug trap that catches a `Str` held past its
-request cannot catch one held past its tick. A job that copies a payload
-`Str` into something longer-lived compiles and runs; it would in a handler
-too, and there the trap fires in Debug. Stamping the parsed value with the
-Run's lifetime is one call, in the place `App` makes it for a body.
-
-**Waiting on: ready.**
-
 **Nothing sweeps finished rows.** `Table.sweep(scope, before)` deletes `done`
 rows older than a moment, and nothing calls it: a program that wants the
 table small runs it from a scheduled job of its own. Written down so nobody
@@ -705,20 +681,20 @@ nothing, and `zig build profile`'s `room: say to 8 of 1,000 seats` is one fiber
 with nobody contending for the lock.
 
 **The two arms of static-file serving live in two files, and the rule they share
-lives in a third.** `App.serveHeldFile` answers a file read at startup,
-`sendfile.send` answers one that spilled, and `static.etagMatches` and
+lives in a third.** `serveHeldFile` in `http/serve.zig` answers a file read at
+startup, `sendfile.send` answers one that spilled, and `static.etagMatches` and
 `range.parse` are what they have in common. `serveHeldFile` carries a twenty-line
 doc explaining which lines are shared and which cannot be, which is the sign
-that the seam is in the wrong place: it is the only part of `app.zig` that is
-about static files rather than about serving requests, and it is where both
-`If-Range` gaps above diverged.
+that the seam is in the wrong place: it is the only part of the request path
+that is about static files rather than about serving requests, and it is where
+both `If-Range` gaps above diverged.
 
-`app.zig` is 8,027 lines, of which 2,250 are code and the rest are tests, so the
-file is smaller than it looks. The code half still holds the App builder, route
-registration, groups, `listen`, the connection loop, the request path, static
-file serving and failure assembly. Lifting the static arm out next to
-`sendfile.zig` is the one cut with an obvious line. `headerValue(c, name)` is
-copied into both files as it stands, four lines each.
+This entry used to say the arm was the one static thing left in an 8,027-line
+`app.zig`. That file has since been cut to 1,442 lines, with the request path
+in `serve.zig` and startup in `wiring.zig` — and the arm moved with the request
+path rather than out next to `sendfile.zig`, so the seam is exactly where it
+was. `headerValue(c, name)` is still copied into `serve.zig` and
+`sendfile.zig`, four lines each.
 
 **Waiting on: a caller.** Nothing is wrong today, and moving code that works has
 to be worth the diff. The next change to either `If-Range` arm is the caller.
@@ -1293,35 +1269,6 @@ half it was waiting on is there:
 RFC 3339 parser this needs, so what is left is the Dialect choice rather than
 the arithmetic.
 
-**A Row column of a type no Dialect knows fails in pg.zig's words, not nilo's.**
-`dialect.accepts` answers `null` for any struct it does not recognise, and
-`schema.Expectation.accepted` reads an empty list as *accept anything* — so
-such a column passes the startup check, and the first read reaches pg.zig:
-
-```
-zig-pkg/pg-…/src/types.zig:1580:21: error: cannot decode value of type pg_only.User__struct_3276
-referenced by: get__anon → read__anon: sql/postgres.zig:456
-```
-
-The type name is a mangled anonymous struct and the file is a dependency the
-reader did not write. `dialect.listAccepts` already carries a comment saying
-this exact failure "is what a Row reading an array used to get" and that
-catching it is why arrays are judged — the same fix was never applied to the
-scalar case, which is the one a first-time reader hits by writing a plain struct
-field.
-
-One of these was closed the hard way rather than by the general fix: `uuid[]`
-had no case in `listAccepts` at all, so a Row reading one passed the check and
-failed on the first read. It answers `_uuid` now
-([ADR 0145](./adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)), and
-the gap that let it through is untouched.
-
-**Waiting on: ready.** `assertStreamable` is the shape: a comptime walk over the
-Row's fields at the top of `fill`, refusing a type that is neither a Dialect's
-nor one of the protocols in `types.zig`, naming the field and the four ways to
-make it readable (`AsText`, `Json`, an enum with `nilo_column`, or leaving it
-out of the Row).
-
 **A fiber that queues for the SQLite writer it already holds is told it might
 be, rather than that it is.** The wait is bounded now
 ([ADR 0135](./adr/0135-a-wait-for-a-connection-has-a-bound.md)), so the
@@ -1334,51 +1281,6 @@ database, which needs to know *which fiber* holds the writer.
 without it. `std.Io` hands a Service no fiber identity, and a flag on the Wire
 cannot stand in: two fibers, one holding the `Tx` and one calling `db.exec`,
 set the same flag and only one of them is a mistake.
-
-**The batch Refusal on SQLite blames the column type, and a batch update calls
-itself an insert.** `noArrayForm` in `sql/statement.zig` is reached from both
-`insertMany` and `updateMany` and its first line always says "a batch insert".
-Its third branch is the one SQLite always takes, and it is wrong about why:
-
-```
-error: nilo: a batch insert into sqlite_only.User cannot send `id`, which it reads as i64.
-  The sqlite dialect has no column type for it, so there is no array of it to send either.
-  `dialect.accepts` is the list of what it knows.
-```
-
-`acceptsSqlite(i64)` answers `INTEGER, INT, BIGINT, NUMERIC`, so the sentence is
-false and the reader it sends to `dialect.accepts` will find it is false. The
-true reason is the one the guide and ADR 0061 give — SQLite has no `unnest` and
-no array parameter, so a batch is not available at all there — and the message
-never says it. Error messages are a feature here with a build step behind them
-([ADR 0027](./adr/0027-the-rule-about-error-messages-is-held-by-a-build-step.md)),
-and `sql/refusals/` has no file for this path.
-
-**Waiting on: ready.** A fourth branch keyed on the Dialect having no `arrayOf`
-at all, a `what` argument so the verb matches the call, and two rows in
-`sql_refusals`.
-
-**A `[]const Str` cannot be written back into the column it came out of.**
-`db.select` fills a `[]const Str` list column by walking the slice a second time
-to attach the lifetime marker — that is `keptList`'s stated cost — and there is
-no way back. `forWire` handles a scalar `Str` and falls off the end for a slice
-of them:
-
-```
-sql/db.zig:1945:12: error: expected type '…![]const []const u8', found '[]const str.Str'
-  note: pointer type child 'str.Str' cannot cast into pointer type child '[]const u8'
-```
-
-So reading a row, changing one field and inserting it again does not compile for
-a list-of-text column, and the message is Zig's, pointing inside `db.zig`. That
-is the same shape as the scalar `Str` case the snippet check found and
-[ADR 0083](./adr/0083-the-guide-is-the-source-of-its-own-snippets.md) fixed —
-`.where = .{ .email = form.email }` used to fail here too. The list half was
-missed because no snippet writes one.
-
-**Waiting on: ready.** It is one allocation in `forWire`, the mirror of the one
-`keptList` already pays, and a marked snippet in the guide's *Lists* section so
-it cannot silently break again.
 
 **The schema check is opt-in, and forgetting it is silent.** `db.checking(&.{ … })`
 takes the Row list by hand and nothing warns when it is never called or when a
@@ -1411,21 +1313,17 @@ Row plus a conflict target without giving up the column check.
 to take on trust, which is the one place it takes nothing on trust, so the
 design question is real rather than clerical.
 
-**`.ilike` writes the word `ILIKE` on both Dialects, and SQLite has no such
-word.** The operator table in `where.zig` spells its own SQL and predates the
-second Dialect, so `.email = .{ .ilike = text }` compiles against
-`sql.Sqlite` and comes back a syntax error from the database. Nobody is using it
-successfully, because it has never worked there.
+**`.like` on SQLite folds ASCII case and says nothing.** `.ilike` is spelled
+`LIKE` there now, the swap `icontains` already made, and the case-sensitive
+half of the pattern family is a Refusal on that Dialect for exactly this
+fact ([ADR 0061](./adr/0061-the-second-dialect-is-the-test-of-the-seam.md)).
+`.like` predates that rule and still compiles, matching more than it was
+asked to and only on one database — the lie the seam exists not to tell.
+Refusing it is the consistent answer and breaks code that runs today.
 
-Found while building the pattern operators, which go through `dialect.pattern`
-precisely so they do not inherit this
-([ADR 0173](./adr/0173-the-database-escapes-the-pattern-it-is-going-to-match.md)).
-It was left alone rather than changed under cover of another feature.
-
-**Waiting on: ready.** The fix is a Refusal naming the dialect, the way `.lock`
-and `insertMany` already refuse there — turning a runtime syntax error into a
-compile error, which is strictly better because no working code can depend on
-it. `.like` is unaffected: both databases have that word.
+**Waiting on: a decision** about whether the break is worth the consistency,
+since a program on SQLite that wrote `.like` and wanted folding has been
+getting it.
 
 **`selectFor` and its six siblings are Postgres-only.** `sql.selectFor(Row,
 Options)` and the rest hard-code `dialect.Postgres`, so a program on
@@ -1503,11 +1401,17 @@ port and drive a real socket at it. What is left is writing the case.
 
 **A query outside a transaction still has no deadline.** `tx.deadline(ms)`
 covers the operation that holds a connection
-([ADR 0047](./adr/0047-a-deadline-needs-a-connection-you-hold.md)). A plain
-`db.select` takes whichever connection is free and gives it straight back, so
-there is nowhere to put one that is not a second round trip per query. What
-would close it is a pool-wide floor handed over in the startup packet, which
-costs nothing per statement.
+([ADR 0047](./adr/0047-a-deadline-needs-a-connection-you-hold.md)), and the
+wait *for* a connection is bounded by `core.Limits` since
+[ADR 0135](./adr/0135-a-wait-for-a-connection-has-a-bound.md) — `Db.nilo_start`
+takes one the way `nilo_fetch` does. A plain `db.select` takes whichever
+connection is free and gives it straight back, so there is nowhere to put one
+that is not a second round trip per query. What would close it is a pool-wide
+floor handed over in the startup packet, which costs nothing per statement.
+
+`nilo_core` used to carry the other half of this as an entry of its own, saying
+the mechanism existed and `nilo_sql` did not use it. It does now, for the wait;
+what is left is only the statement, and only here.
 
 **Waiting on: upstream (pg.zig).** `auth.zig` builds its startup message
 without the `startup_parameters` map it accepts, so the field goes nowhere. One
@@ -2007,24 +1911,26 @@ the case that trap cannot watch.
 
 ### Open
 
-**Three test files pick loopback ports and nothing makes their ranges agree.**
-`fetch/live.zig` walks 39,200-40,199, `s3/canned.zig` walks 40,200-41,199 and
-`http/live.zig` walks 41,200-42,199, each from a start derived from the thread
-id so a rerun does not walk back over the ports its own `TIME-WAIT` still holds.
-Two of them used to overlap, s3 taking 200 ports from a fixed 39,600 inside
-`fetch`'s thousand, and ten consecutive `zig build test-all` runs failed from
-the sixth on with `error.NoFreePort` in whichever s3 test came next.
+**One test file still walks a range of loopback ports.** `http/live.zig`
+walks 41,200–42,199 from a start derived from the thread id, so a rerun does
+not walk back over the ports its own `TIME-WAIT` still holds. `fetch/live.zig`
+and `s3/canned.zig` used to walk ranges beside it, held apart by three
+comments naming each other, and the comments once failed: ten consecutive
+`zig build test-all` runs hit `error.NoFreePort` from the sixth on when two
+ranges overlapped. Both bind port 0 now and read the kernel's answer out of
+`Server.socket.address` — which `std.Io.Threaded` has filled after `listen`
+the whole time, and which this entry said for a cycle it could not, "re-checked
+against Zig 0.16 rather than believed". The fifth blocker here that was not
+one, and the first from inside the pinned standard library.
 
-What holds it is a comment in each file naming the others, and **the third file
-arriving is the evidence that the comment is the wrong mechanism**: nothing
-checked the new range, nothing could have failed loudly if it had collided, and
-the only reason it does not is that somebody read three files first. Binding
-zero and reading the port back would end the whole class, and it is not
-available: `std.Io.net.Server` cannot report the port it was given, re-checked
-against Zig 0.16 rather than believed. `docs/history.md` has the run.
+What is left is the file that does not open its own socket: `App.listen` binds
+inside the Engine and hands nothing back, so a test cannot ask it for port 0.
+zio reads the bound address back too (`Socket.bind`), and the Engine already
+logs it — the missing piece is one field or one callback on the App, and
+whether the port a server is listening on is something the App should say.
 
-**Waiting on: a design** that makes it a rule rather than two comments, or an
-upstream way to read a bound port.
+**Waiting on: a design** for how `App.listen` says which port it got, which
+is a question about the App's surface rather than about sockets.
 
 **A `<!-- compiles -->` on a page nobody added to a list is silent, and it looks
 exactly like one that is checked.** `zig build snippets` does not scan the

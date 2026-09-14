@@ -1864,6 +1864,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// Rows pulled one at a time, each borrowed from the read buffer.
         pub fn Streamed(comptime Row: type) type {
             comptime row_mod.assertRow(Row);
+            comptime assertReadable(Row);
             comptime assertStreamable(Row);
             return struct {
                 db: *Self,
@@ -2049,6 +2050,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             total: ?*i64,
         ) ![]Row {
             comptime row_mod.assertRow(Row);
+            comptime assertReadable(Row);
             const arena = c.arena();
             // The Db rather than the Wire, so that the one funnel every read
             // goes through is also the one place a watcher is told about it
@@ -2894,6 +2896,69 @@ fn enumOf(comptime E: type, raw: []const u8) !E {
             .{ raw, @typeName(E) },
         );
         return error.QueryFailed;
+    };
+}
+
+/// Every column a Row reads is a type the Wire can decode, or the first read
+/// fails in the driver's words:
+///
+/// ```
+/// zig-pkg/pg-…/src/types.zig:1580:21: error: cannot decode value of type pg_only.User__struct_3276
+/// ```
+///
+/// A mangled anonymous name, in a file the reader did not write. The startup
+/// check does not catch it either: `dialect.accepts` answers `null` for a
+/// struct it does not know and `schema.Expectation.accepted` reads an empty
+/// list as *accept anything* — the Dialect declining to judge is the right
+/// answer for an enum whose type name lives in the database, and the wrong
+/// one for a struct nothing can ever read. `listAccepts` closed the array
+/// half of this and said so; this is the scalar half, judged where the Row
+/// is first read rather than where the column is (ADR 0027).
+///
+/// The list of what reads is `kept`'s, in the same order, with the three
+/// families a value falls through to at the end. A list column is judged by
+/// its element.
+fn assertReadable(comptime Row: type) void {
+    comptime {
+        for (@typeInfo(Row).@"struct".fields) |f| {
+            if (row_mod.isBeside(Row, f.name)) continue;
+            const Column = switch (@typeInfo(f.type)) {
+                .optional => |o| o.child,
+                else => f.type,
+            };
+            const Item = if (types.listElement(Column)) |I| switch (@typeInfo(I)) {
+                .optional => |o| o.child,
+                else => I,
+            } else Column;
+            if (readable(Item)) continue;
+            @compileError(
+                "nilo: " ++ @typeName(Row) ++ " reads `" ++ f.name ++ "` as " ++
+                    @typeName(f.type) ++ ", which no Dialect can decode.\n" ++
+                    "  A column is a number, a bool, text (`[]const u8` or `Str`), " ++
+                    "`sql.Bytes`, `sql.Uuid`, `sql.Timestamp`, an enum, a type that " ++
+                    "carries `nilo_read` and `nilo_write` (`sql.AsText(\"…\")` is the " ++
+                    "ready-made one), or `sql.Json(T)` for a document — or a list of one " ++
+                    "of those.\n" ++
+                    "  Read it as `sql.Json(" ++ @typeName(Item) ++ ")` if the column is " ++
+                    "`jsonb`, as `sql.AsText(\"<type>\")` if Postgres can print it, or leave " ++
+                    "it out of the Row and carry it beside the columns with `nilo_beside`.",
+            );
+        }
+    }
+}
+
+/// What `kept` and `WireRead` between them know how to read. Kept next to
+/// `assertReadable` rather than derived from those two, because a type that
+/// reaches `WireRead`'s last line is by definition one they have no opinion
+/// about — the driver decides, and this is the list of what it decides for.
+fn readable(comptime T: type) bool {
+    if (T == core.Str or T == []const u8) return true;
+    if (T == types.Bytes or T == types.Timestamp or T == types.Uuid) return true;
+    if (types.jsonPayload(T) != null) return true;
+    if (types.asText(T) != null) return true;
+    return switch (@typeInfo(T)) {
+        .bool, .int, .float, .@"enum" => true,
+        else => false,
     };
 }
 
