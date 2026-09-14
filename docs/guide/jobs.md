@@ -134,6 +134,23 @@ A row past its last retry is **dead**: it stays in the table with the name of
 the error that killed it, `stats` counts it, `deadOnes` lists it, and
 `retryDead` is the one way it runs again. Nothing is deleted for you.
 
+**Some failures are final on the first attempt.** A reset socket or a 429
+is different in ten seconds; a 4xx saying *invalid from address* is the same
+4xx in an hour, and both come back through the same error set. `final` is
+the error set a `run` can fail with and be dead at once, whatever `retry`
+says
+([ADR 0218](../adr/0218-a-run-can-say-its-failure-is-final.md)):
+
+```zig
+pub const retry: job.Retry = .{ .times = 5, .backoff = .{ .exponential = .{ .from_ms = 10_000, .to_ms = 3_600_000 } } };
+pub const final = error{ Rejected, NoSuchAddress };
+```
+
+The row keeps the error's own name, so `deadOnes` says `Rejected` rather
+than a queue word. A timeout is never final, because the next attempt may
+finish. On a kind whose `retry` is `.none` the set would decide nothing, and
+it is refused.
+
 **`run` takes the value, a `*nilo.Run`, and pointers.** The value is the
 struct as it was pushed. The Run is the tick's Scope — an arena reset when
 the tick ends, and the thing you hand to `db` and `fetch`. Every parameter

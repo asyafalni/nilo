@@ -50,7 +50,7 @@ missing — plus the fixes it found underneath them, two of which are the reason
   running it twice is safe. `job.Memory` is the same contract in-process;
   `jobs.drain(&run)` runs everything due on the calling thread, which is the
   whole of a test. `app.provide(&jobs)` + `app.spawn(Jobs.serve, .{&jobs})`
-  under a server, `jobs.serveOn(io)` for a worker process. Twelve refusals,
+  under a server, `jobs.serveOn(io)` for a worker process. Fourteen refusals,
   [`docs/guide/jobs.md`](./docs/guide/jobs.md). Nothing changes for a program
   that does not import it.
 
@@ -106,6 +106,13 @@ missing — plus the fixes it found underneath them, two of which are the reason
   = .<column of the outer Row>`; `.on` is still a column of the inner Row,
   so the two directions cannot be read as each other. Tables that point at
   each other are refused until one is named. Four refusals.
+
+- **`final` — a job can say which failures are final**
+  ([ADR 0218](./docs/adr/0218-a-run-can-say-its-failure-is-final.md)).
+  `pub const final = error{ Rejected };` beside `retry`: a `run` failing with
+  one of them is dead on that attempt whatever `retry.times` says, and the
+  row keeps the error's name. Everything else retries as before; a timeout is
+  never final. Two refusals.
 
 - **`nilo_beside` — a Row can carry a field no column holds**
   ([ADR 0217](./docs/adr/0217-a-row-can-carry-a-field-no-column-holds.md)).

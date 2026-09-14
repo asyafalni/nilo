@@ -634,7 +634,11 @@ pub fn Jobs(comptime options: anytype) type {
                     return;
                 }
                 const name = if (bound.fired()) "TimedOut" else @errorName(err);
-                if (claimed.attempts > retry.times) {
+                // A failure the kind said is final is dead on this attempt,
+                // whatever the count says; a timeout never is, because the
+                // next attempt may finish
+                // ([ADR 0218](../docs/adr/0218-a-run-can-say-its-failure-is-final.md)).
+                if (claimed.attempts > retry.times or (!bound.fired() and isFinal(K, err))) {
                     self.finishDead(scope, claimed.id, K, name, claimed.attempts);
                     return;
                 }
@@ -645,6 +649,16 @@ pub fn Jobs(comptime options: anytype) type {
                 self.store.retry(scope, claimed.id, again, name) catch |e| log.err("row {d}: {t}", .{ claimed.id, e });
                 self.note(claimed.id, .queued, claimed.attempts);
             }
+        }
+
+        /// Whether `err` is one the kind declared final. An `inline for` over
+        /// the set's names, so a kind with no `final` costs nothing here.
+        fn isFinal(comptime K: type, err: anyerror) bool {
+            if (comptime !@hasDecl(K, "final")) return false;
+            inline for (comptime @typeInfo(K.final).error_set.?) |e| {
+                if (err == @field(anyerror, e.name)) return true;
+            }
+            return false;
         }
 
         /// `warn` rather than `err`, and not because a dead row is minor: the
@@ -800,6 +814,18 @@ fn checkKinds(comptime kinds: []const type, comptime Deps: type) void {
             "nilo: the job " ++ name ++ "'s `retry` is " ++ @typeName(@TypeOf(K.retry)) ++ " rather than a `job.Retry`.\n" ++
                 "  `pub const retry: job.Retry = …` — the type on the declaration is what makes it one.",
         );
+        if (@hasDecl(K, "final")) {
+            if (@TypeOf(K.final) != type or @typeInfo(K.final) != .error_set or @typeInfo(K.final).error_set == null) @compileError(
+                "nilo: the job " ++ name ++ "'s `final` is not an error set.\n" ++
+                    "  It names the failures that are final: `pub const final = error{ Rejected };` — " ++
+                    "a `run` that fails with one of them is dead on that attempt, whatever `retry` says (ADR 0218).",
+            );
+            if (@as(Retry, K.retry).times == 0) @compileError(
+                "nilo: the job " ++ name ++ " declares `final`, and its `retry` is `.none`.\n" ++
+                    "  With one attempt every failure is final already, so the set decides nothing. " ++
+                    "Take it out, or give `retry` some `times` for the failures that are not in it.",
+            );
+        }
         if (@hasDecl(K, "timeout_ms")) {
             if (K.timeout_ms == 0) @compileError(
                 "nilo: the job " ++ name ++ "'s `timeout_ms` is 0, which is no deadline and no lease.\n" ++
@@ -1033,6 +1059,21 @@ const Flaky = struct {
     }
 };
 
+/// Retries on one failure and is dead at once on the other (ADR 0218).
+const Picky = struct {
+    pub const nilo_job = "picky";
+    pub const retry: Retry = .{ .times = 5, .backoff = .{ .fixed_ms = 0 } };
+    pub const final = error{Rejected};
+
+    pub fn run(self: Picky, scope: *core.Run, ledger: *Ledger) !void {
+        _ = self;
+        _ = scope;
+        ledger.seen += 1;
+        if (ledger.seen <= ledger.fail_first) return error.NotYet;
+        return error.Rejected;
+    }
+};
+
 const Tick = struct {
     pub const nilo_job = "tick";
     pub const retry: Retry = .none;
@@ -1063,7 +1104,7 @@ const Strict = struct {
 };
 
 const TestJobs = Jobs(.{
-    .kinds = .{ Greet, Flaky, Tick, Strict },
+    .kinds = .{ Greet, Flaky, Picky, Tick, Strict },
     .store = Memory,
     .deps = struct { ledger: *Ledger },
 });
@@ -1138,6 +1179,36 @@ test "a failing job is retried as many times as it said, then is dead" {
     try testing.expect(try jobs.retryDead(&run, id));
     try testing.expectEqual(@as(usize, 1), try jobs.drain(&run));
     try testing.expectEqual(@as(usize, 2), ledger.lines.items.len);
+}
+
+test "a failure the kind said is final is dead on that attempt, and the others still retry" {
+    // Item 79: a 4xx is the same 4xx in an hour, and a reset socket is not.
+    // The kind keeps its five retries for the second and stops on the first.
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var ledger: Ledger = .{ .gpa = testing.allocator, .fail_first = 2 };
+    defer ledger.deinit();
+    var jobs: TestJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{});
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    // Two transient failures, then the final one: three attempts of the six
+    // allowed, and the row keeps the error's own name.
+    const id = try jobs.push(&run, Picky{}, .{});
+    try testing.expectEqual(@as(usize, 3), try jobs.drain(&run));
+    try testing.expectEqual(@as(u64, 1), (try jobs.stats(&run)).dead);
+    const dead_rows = try jobs.deadOnes(&run);
+    try testing.expectEqual(@as(usize, 1), dead_rows.len);
+    try testing.expectEqual(id, dead_rows[0].id);
+    try testing.expectEqualStrings("Rejected", dead_rows[0].err);
+    try testing.expectEqual(@as(u32, 3), dead_rows[0].attempts);
+
+    // And a kind with no `final` is untouched: `Flaky` still uses its count.
+    ledger.seen = 0;
+    ledger.fail_first = 3;
+    _ = try jobs.push(&run, Flaky{}, .{});
+    try testing.expectEqual(@as(usize, 3), try jobs.drain(&run));
+    try testing.expectEqual(@as(u64, 2), (try jobs.stats(&run)).dead);
 }
 
 test "a unique key queues one and answers null for the second" {

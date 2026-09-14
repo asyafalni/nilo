@@ -885,6 +885,15 @@ const job_refusals = [_]Refusal{
         .name = "job_scheduled_field_without_default",
         .says = "the scheduled job Nightly has a field `day` with no default, and nobody pushes a scheduled job.",
     },
+    // A failure the kind says is final (ADR 0218).
+    .{
+        .name = "job_final_not_an_error_set",
+        .says = "the job SendWelcome's `final` is not an error set.",
+    },
+    .{
+        .name = "job_final_with_no_retry",
+        .says = "the job SendWelcome declares `final`, and its `retry` is `.none`.",
+    },
 };
 
 /// One entry per file in `refusals/`: a program written wrong on purpose, and

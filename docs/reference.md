@@ -1275,6 +1275,7 @@ is copied rather than carried. Three declarations are read while compiling:
 | `pub const nilo_job = "…"` | the name the row carries. Required; at most 64 bytes; unique across the `kinds` |
 | `pub const retry: job.Retry` | required, no default: `.none`, or `.{ .times, .backoff }` with `.{ .fixed_ms }` or `.{ .exponential = .{ .from_ms, .to_ms } }` |
 | `pub fn run(self, scope: *nilo.Run, …) !void` | the work: the job by value, the Run, then any service by pointer, found in `.deps` by type |
+| `pub const final = error{ … }` | optional: the failures that are **final**. A `run` failing with one is dead on that attempt whatever `retry` says, and the row keeps the error's name; a timeout never is. Refused on a kind whose `retry` is `.none` ([ADR 0218](./adr/0218-a-run-can-say-its-failure-is-final.md)) |
 | `pub const timeout_ms` | optional, over the queue's. Also the lease |
 | `pub const schedule`, `overlap`, `missed` | for a job that runs on the clock — below |
 

@@ -3200,3 +3200,11 @@ own, read by every column list in the module rather than by the writer
 ([ADR 0217](./adr/0217-a-row-can-carry-a-field-no-column-holds.md)). Six
 field walks in `sql/` had to learn it, and `schema.zig`'s was the one the
 live test found.
+
+**A retry count decided per kind cannot see which failure it is retrying.**
+The queue's first real caller ran its tick with `retry = .none` and kept
+an attempt ledger of its own, because a 4xx retried five times is five
+identical dead attempts. The kind now names the failures that are final,
+as an error set beside `retry`, and the row keeps the error's name — the
+one-word `error.Unretryable` would have lost it
+([ADR 0218](./adr/0218-a-run-can-say-its-failure-is-final.md)).
