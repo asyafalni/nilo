@@ -37,6 +37,14 @@ reaction wants is the one a middleware or the handler's own argument list
 resolved on the way in, which is before anybody erased anything; and a
 value nobody set has to be louder than a value nobody read.
 
+**So resolve it in the middleware that proves it, not at the bottom.** The
+natural first draft declares the type with `nilo_resolve` and lets the bus
+ask for it — and a type only the bus ever asks for is `NotGiven` behind the
+pointer, because nobody up the stack asked first. The line that holds the
+property is `_ = try c.resolve(Attribution);` before `next.run` in the
+middleware that authenticated the caller, and a test that reads the actor
+off an event written behind the seam is what fails without it.
+
 ## What was not done
 
 **Running the resolver through the erasure.** It would need the table to
