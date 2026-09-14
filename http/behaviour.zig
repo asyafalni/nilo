@@ -6939,6 +6939,47 @@ test "an erased Scope made from a request carries the request's id" {
     for (body) |ch| try testing.expect(std.ascii.isHex(ch));
 }
 
+/// The far side of a function pointer: what `TokenHolder` the request
+/// resolved, or `NotGiven` (ADR 0219).
+const Reaction = *const fn (scope: *str_mod.AnyScope) anyerror![]const u8;
+fn tokenBehindThePointer(scope: *str_mod.AnyScope) anyerror![]const u8 {
+    const holder = scope.resolve(TokenHolder) catch |err| return @errorName(err);
+    return holder.token.view();
+}
+
+fn resolvedThenErased(holder: TokenHolder, c: *Ctx) ![]const u8 {
+    // A handler that took the value already resolved it; the erasure reads
+    // it through by name, and hands it to a reaction that holds no `*Ctx`.
+    _ = holder;
+    var erased = str_mod.AnyScope.of(c);
+    const react: Reaction = tokenBehindThePointer;
+    return react(&erased);
+}
+
+fn erasedBeforeResolving(c: *Ctx) ![]const u8 {
+    // Nothing asked for the value, so the erasure has nothing to answer:
+    // an erased Scope cannot run a resolver, and says so.
+    var erased = str_mod.AnyScope.of(c);
+    const react: Reaction = tokenBehindThePointer;
+    return react(&erased);
+}
+
+test "an erased Scope made from a request answers what the request resolved, and NotGiven otherwise" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/who", resolvedThenErased);
+    try app.get("/nobody", erasedBeforeResolving);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const resolved = h.send(&app, "GET /who HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer t0k3n\r\n\r\n");
+    try testing.expect(std.mem.endsWith(u8, resolved.response, "t0k3n"));
+    const unasked = h.send(&app, "GET /nobody HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer t0k3n\r\n\r\n");
+    try testing.expect(std.mem.endsWith(u8, unasked.response, "NotGiven"));
+}
+
 test "a request nobody asks about is given no id at all" {
     // The option costs a header on every response, so it is off by default
     // and `c.requestId()` is what a handler reaches for when it wants one.

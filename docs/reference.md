@@ -1051,10 +1051,10 @@ try reaction(&erased, payload);
 | `erased.entropy(n)` | `![n]u8` |
 | `erased.entropyInto(buf)` | `!void`, and the one the vtable actually carries |
 | `erased.requestId()` | `?Str` — the request's id when it was made from a `*Ctx`, `null` from a `Run` ([ADR 0196](./adr/0196-a-request-id-goes-out-with-the-call.md)) |
+| `erased.resolve(V)` | `!V` — what the Scope behind it **already holds**: given to the `Run`, or resolved for the request before it was erased. `error.NotGiven` otherwise; an erased Scope never runs a resolver ([ADR 0219](./adr/0219-an-erased-scope-answers-what-was-resolved.md)) |
 
 It passes the Scope check, so `db.select(Row, &erased, …)` works — a reaction can
-query. `resolve` is not here: it is generic over the type asked for, so it cannot
-cross a function pointer either.
+query, and can ask who is acting.
 
 **The same seam serves two modules that must not import each other.** A context
 that opens work on another's behalf declares the function it needs as a pointer

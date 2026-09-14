@@ -291,11 +291,20 @@ pub const Ctx = struct {
     /// The resolved value of type `V` if this request has already worked one
     /// out. nilo's own; users go through `resolve`.
     pub fn cachedResolved(self: *const Ctx, comptime V: type) ?V {
-        const wanted = @typeName(V);
+        const p = self.resolvedNamed(@typeName(V)) orelse return null;
+        return @as(*const V, @ptrCast(@alignCast(p))).*;
+    }
+
+    /// The resolved value under that type name, untyped — what an erased
+    /// Scope reads through its table, where the type cannot be said
+    /// ([ADR 0219](../docs/adr/0219-an-erased-scope-answers-what-was-resolved.md)).
+    /// Only what has *already* been worked out: an erased Scope cannot run a
+    /// resolver. nilo's own; users go through `resolve`.
+    pub fn resolvedNamed(self: *const Ctx, type_name: []const u8) ?*const anyopaque {
         for (self._resolved.items) |entry| {
-            if (entry.type_name.ptr != wanted.ptr and !std.mem.eql(u8, entry.type_name, wanted))
+            if (entry.type_name.ptr != type_name.ptr and !std.mem.eql(u8, entry.type_name, type_name))
                 continue;
-            return @as(*const V, @ptrCast(@alignCast(entry.value))).*;
+            return entry.value;
         }
         return null;
     }

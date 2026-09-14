@@ -3208,3 +3208,12 @@ identical dead attempts. The kind now names the failures that are final,
 as an error set beside `retry`, and the row keeps the error's name — the
 one-word `error.Unretryable` would have lost it
 ([ADR 0218](./adr/0218-a-run-can-say-its-failure-is-final.md)).
+
+**"Cannot cross a function pointer" was about the mechanism, and the need
+crossed anyway.** ADR 0177 left `resolve` off the erased Scope because it is
+generic, and the first erased seam in a port that stamps every event with
+who is acting would have stamped a person's name on an agent's. The typed
+call crosses the way `entropy` does — by name in the table, the type on the
+near side — and what it answers is only what was already resolved, which is
+the loud `NotGiven` rather than a resolver run without its services
+([ADR 0219](./adr/0219-an-erased-scope-answers-what-was-resolved.md)).

@@ -41,9 +41,10 @@ a buffer. `AnyScope.entropy(n)` is written on top of it, so a function body
 written against a `*Ctx` compiles against this unchanged — which is the whole
 point of the erasure and would be lost if the only call here were the buffer one.
 
-`resolve` is deliberately absent. It is generic over the type asked for, so it
-cannot cross a function pointer either, and there is no `resolveInto` that would
-mean anything.
+`resolve` was deliberately absent here: generic over the type asked for, so it
+could not cross a function pointer either. [ADR 0219](0219-an-erased-scope-answers-what-was-resolved.md)
+carries it the way `entropy` is carried — a lookup by type name in the table,
+the typed call on top — answering what the Scope behind it already holds.
 
 ## What this is not
 

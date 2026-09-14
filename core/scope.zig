@@ -240,12 +240,20 @@ pub const Run = struct {
     /// column is the failure this was reported over: a value nobody set has
     /// to be louder than a value nobody read.
     pub fn resolve(self: *Run, comptime V: type) !V {
-        const wanted = @typeName(V);
+        const p = self.resolvedNamed(@typeName(V)) orelse return error.NotGiven;
+        return @as(*const V, @ptrCast(@alignCast(p))).*;
+    }
+
+    /// The value given under that type name, untyped — what an erased Scope
+    /// reads through its table, where the type cannot be said
+    /// ([ADR 0219](../docs/adr/0219-an-erased-scope-answers-what-was-resolved.md)).
+    /// nilo's own; callers go through `resolve`.
+    pub fn resolvedNamed(self: *const Run, type_name: []const u8) ?*const anyopaque {
         for (self._given.items) |entry| {
-            if (!sameType(entry.type_name, wanted)) continue;
-            return @as(*const V, @ptrCast(@alignCast(entry.value))).*;
+            if (!sameType(entry.type_name, type_name)) continue;
+            return entry.value;
         }
-        return error.NotGiven;
+        return null;
     }
 
     /// Throw this tick's memory away and start the next one, keeping the
@@ -301,9 +309,15 @@ pub const Run = struct {
 /// practice it is a local beside the call, which is the only shape that is
 /// obviously right.
 ///
-/// `resolve` is deliberately not here: it is generic over the type asked for,
-/// so it cannot cross a function pointer any more than `entropy` could — which
-/// is why `entropyInto` exists and is what this carries instead.
+/// `resolve` crosses the same way `entropy` does: the table carries the call
+/// that can be named — a lookup by type name — and the typed `resolve` is
+/// written on top of it here. What it answers is **what the Scope behind it
+/// already holds**: a `Run`'s given values, a request's already-resolved
+/// ones. An erased Scope cannot run a resolver, because a resolver may need
+/// services and a function pointer cannot carry a type to look them up by;
+/// by the time a Scope is erased the middleware that needed the value has
+/// resolved it, and a value nobody resolved is `error.NotGiven`
+/// ([ADR 0219](../docs/adr/0219-an-erased-scope-answers-what-was-resolved.md)).
 pub const AnyScope = struct {
     /// What a nilo compile error calls this type, which is the name the
     /// reader's own import line gives it (ADR 0122).
@@ -312,7 +326,7 @@ pub const AnyScope = struct {
     _scope: *anyopaque,
     _table: *const Table,
 
-    /// The four calls a Scope makes across a function pointer. `arena` and
+    /// The five calls a Scope makes across a function pointer. `arena` and
     /// `str` are what `check` above asks of every Scope; `entropyInto` is the
     /// third because minting a key is what a reaction does that a query does
     /// not, and it is spelled `Into` rather than `entropy` because a function
@@ -321,11 +335,15 @@ pub const AnyScope = struct {
     /// on the Scope behind it: a `Ctx` has one and a `Run` has none, and a
     /// reaction that dials out wants to name the request that fired it
     /// ([ADR 0196](../docs/adr/0196-a-request-id-goes-out-with-the-call.md)).
+    /// `resolved` is the fifth, by type name for the reason `entropyInto` is
+    /// by buffer: the value a request resolved or a tick was given, so that
+    /// who is acting reaches the far side of the pointer (ADR 0219).
     pub const Table = struct {
         arena: *const fn (*anyopaque) std.mem.Allocator,
         str: *const fn (*anyopaque, []const u8) Str,
         entropyInto: *const fn (*anyopaque, []u8) anyerror!void,
         requestId: *const fn (*anyopaque) ?Str,
+        resolved: *const fn (*anyopaque, []const u8) ?*const anyopaque,
     };
 
     /// Erase `scope`, which is a `*Ctx` or a `*Run`.
@@ -358,6 +376,7 @@ pub const AnyScope = struct {
                 .str = takeStr,
                 .entropyInto = takeEntropy,
                 .requestId = takeRequestId,
+                .resolved = takeResolved,
             };
             fn takeArena(p: *anyopaque) std.mem.Allocator {
                 return S.arena(@ptrCast(@alignCast(p)));
@@ -373,6 +392,12 @@ pub const AnyScope = struct {
             // no request to name.
             fn takeRequestId(p: *anyopaque) ?Str {
                 return requestIdOf(S, @ptrCast(@alignCast(p)));
+            }
+            // A Scope that keeps no resolved values answers null for every
+            // name, which `resolve` below reads as `NotGiven`.
+            fn takeResolved(p: *anyopaque, type_name: []const u8) ?*const anyopaque {
+                if (comptime !@hasDecl(S, "resolvedNamed")) return null;
+                return S.resolvedNamed(@ptrCast(@alignCast(p)), type_name);
             }
         };
         return .{ ._scope = @ptrCast(@constCast(scope)), ._table = &erased.table };
@@ -407,6 +432,22 @@ pub const AnyScope = struct {
     /// actually carries (ADR 0166).
     pub fn entropyInto(self: *AnyScope, buf: []u8) !void {
         return self._table.entropyInto(self._scope, buf);
+    }
+
+    /// The value of type `V` the Scope behind this one already holds — given
+    /// to a `Run`, or resolved for a request before it was erased — or
+    /// `error.NotGiven` ([ADR 0219](../docs/adr/0219-an-erased-scope-answers-what-was-resolved.md)).
+    ///
+    /// The same spelling `Ctx.resolve` and `Run.resolve` have, so a function
+    /// body written against either compiles here. What differs is that this
+    /// one never *works a value out*: a resolver may need services, and a
+    /// function pointer has no type to find them by. A `nilo_resolve` type the
+    /// request never asked for before the erasure is `NotGiven` here, which is
+    /// the same answer a `Run` nobody told gives, and for the same reason —
+    /// a value nobody set has to be louder than a value nobody read.
+    pub fn resolve(self: *AnyScope, comptime V: type) !V {
+        const p = self._table.resolved(self._scope, @typeName(V)) orelse return error.NotGiven;
+        return @as(*const V, @ptrCast(@alignCast(p))).*;
     }
 };
 
@@ -690,6 +731,44 @@ test "an erased Scope carries the request id of the Scope it was made from, and 
     var erased = AnyScope.of(&named);
     try testing.expectEqualStrings("req-7f3a", erased.requestId().?.view());
     try testing.expectEqualStrings("req-7f3a", requestIdOf(Named, &named).?.view());
+}
+
+test "an erased Scope answers what the Run behind it was given, and NotGiven for the rest" {
+    // Item 80: an event written on the far side of a function pointer has
+    // to know who is acting, and the value was given (or resolved) on the
+    // near side. It reaches across by type name (ADR 0219).
+    const Actor = struct { agent: []const u8 };
+    const Other = struct { n: u8 };
+
+    var run = Run.init(testing.allocator);
+    defer run.deinit();
+    try run.give(Actor, .{ .agent = "nightly-import" });
+
+    var erased = AnyScope.of(&run);
+    try testing.expectEqualStrings("nightly-import", (try erased.resolve(Actor)).agent);
+    try testing.expectError(error.NotGiven, erased.resolve(Other));
+
+    // Given again, the erasure sees the replacement: it reads through to the
+    // Run rather than copying at `of`.
+    try run.give(Actor, .{ .agent = "second" });
+    try testing.expectEqualStrings("second", (try erased.resolve(Actor)).agent);
+
+    // A Scope that keeps nothing resolved answers NotGiven for everything.
+    const Bare = struct {
+        run: *Run,
+        pub fn arena(self: *@This()) std.mem.Allocator {
+            return self.run.arena();
+        }
+        pub fn str(self: *@This(), bytes: []const u8) Str {
+            return self.run.str(bytes);
+        }
+        pub fn entropyInto(self: *@This(), buf: []u8) !void {
+            return self.run.entropyInto(buf);
+        }
+    };
+    var bare: Bare = .{ .run = &run };
+    var blind = AnyScope.of(&bare);
+    try testing.expectError(error.NotGiven, blind.resolve(Actor));
 }
 
 test "a callback stored as a function pointer runs under whichever Scope it is handed" {

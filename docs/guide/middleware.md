@@ -34,6 +34,14 @@ fn requireToken(c: *nilo.Ctx, next: nilo.Next) !void {
 
 Returning an error goes down exactly the same path a failing handler does.
 
+**To learn the status after `next.run(c)`**, read it the way the logger does:
+`c.answered()` is the status once something has been written, and when
+`next.run` returned an error before anything was, `fail.resolveStatus(failure,
+err)` with `fail.current()` — or `fail.statusFor(err)` when there is no
+failure set — is the status App is about to send. Asking `fail` rather than
+mapping the error again is what keeps what you record and what was sent from
+drifting apart.
+
 Registration order between `use` and `get` doesn't matter — chains are resolved
 when `listen()` is called, so middleware registered after a route still applies
 to it. Middleware also runs when nothing matched, so your logger sees 404s and

@@ -9,7 +9,7 @@
   <a href="./CHANGELOG.md"><img alt="version 0.3.0" src="https://img.shields.io/badge/version-0.3.0-3b82f6?style=flat-square"></a>
   <a href="./docs/reference.md"><img alt="11 modules" src="https://img.shields.io/badge/modules-11-8957e5?style=flat-square"></a>
   <a href="./refusals/README.md"><img alt="283 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-283-e05d44?style=flat-square"></a>
-  <a href="./docs/adr/"><img alt="218 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-218-6b7280?style=flat-square"></a>
+  <a href="./docs/adr/"><img alt="219 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-219-6b7280?style=flat-square"></a>
   <a href="./LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-16a34a?style=flat-square"></a>
 </p>
 

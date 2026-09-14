@@ -107,6 +107,13 @@ missing — plus the fixes it found underneath them, two of which are the reason
   so the two directions cannot be read as each other. Tables that point at
   each other are refused until one is named. Four refusals.
 
+- **`AnyScope.resolve(V)` — an erased Scope answers what was resolved**
+  ([ADR 0219](./docs/adr/0219-an-erased-scope-answers-what-was-resolved.md)).
+  What the Scope behind it already holds — given to the `Run`, or resolved
+  for the request before it was erased — and `error.NotGiven` otherwise; an
+  erased Scope never runs a resolver. A reaction behind a function pointer
+  can ask who is acting without the seam carrying it.
+
 - **`final` — a job can say which failures are final**
   ([ADR 0218](./docs/adr/0218-a-run-can-say-its-failure-is-final.md)).
   `pub const final = error{ Rejected };` beside `retry`: a `run` failing with
