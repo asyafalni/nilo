@@ -3765,11 +3765,23 @@ pub fn build(b: *std.Build) void {
     // compile (ADR 0083). Only built when `nilo_sql` is — the running example
     // has a database in it, and `-Dsql=false` is a project that has not asked
     // for one.
+    //
+    // And only in this repository. `Snippets.collect` reads `docs/` at
+    // configure time, with `readFileAlloc` rather than `b.path`, so unlike
+    // the refusals above it runs whether or not anybody asks for the step —
+    // and `docs/` is not in the manifest's `.paths`, so a dependent has none.
+    // Behind `want_sql` alone, the first project to pass `.sql = true` against
+    // a *fetched* nilo panicked in `zig build` before compiling a line, and
+    // it went unfound until 0.4.0 was cut because the one dependent building
+    // against nilo was a path dependency with the working tree's `docs/` next
+    // door.
+    // `b.pkg_hash` is the same test `want_sql`'s default makes: empty for the
+    // package being built, the hash when somebody else is building it.
     const snippets_step = b.step(
         "snippets",
         "Compile the snippets the documentation publishes",
     );
-    if (want_sql) {
+    if (want_sql and b.pkg_hash.len == 0) {
         // Written into the cache rather than into the tree: the snippet's
         // one copy is the one in the page.
         const written = b.addWriteFiles();
