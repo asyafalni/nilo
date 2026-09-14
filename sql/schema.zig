@@ -106,16 +106,21 @@ pub fn expectationsOf(comptime D: type, comptime Row: type) []const Expectation 
     return comptime blk: {
         const fields = @typeInfo(Row).@"struct".fields;
         var out: [fields.len]Expectation = undefined;
-        for (fields, 0..) |f, i| {
+        var n: usize = 0;
+        for (fields) |f| {
+            // Carried beside the columns, so there is nothing in the table
+            // to expect (ADR 0217).
+            if (row_mod.isBeside(Row, f.name)) continue;
             const accepts = D.accepts(f.type) orelse &.{};
-            out[i] = .{
+            out[n] = .{
                 .column = f.name,
                 .accepts = accepts,
                 .expected = list(accepts),
                 .optional = @typeInfo(f.type) == .optional,
             };
+            n += 1;
         }
-        const frozen = out;
+        const frozen = out[0..n].*;
         break :blk &frozen;
     };
 }

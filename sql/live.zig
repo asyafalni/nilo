@@ -3219,6 +3219,87 @@ test "an exists from the child's side reads the parent's key off the child's own
     } }));
 }
 
+/// A person carrying the ids of their sessions — which no column holds, and
+/// the handler fills after the read (ADR 0217).
+const Carried = struct {
+    pub const nilo_table = Person;
+    pub const nilo_beside = .{.sessions};
+
+    id: i64,
+    email: []const u8,
+    sessions: []const i64 = &.{},
+};
+
+/// The timeline shape: a projection over a `UNION ALL`, carrying a field the
+/// statement does not select (item 78).
+const TimelineLine = struct {
+    pub const nilo_table = .projection;
+    pub const nilo_beside = .{.attachments};
+
+    kind: []const u8,
+    who: i64,
+    attachments: []const []const u8 = &.{},
+};
+
+test "a field beside the columns is left for the caller, by select, by raw and by a stream" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    _ = try stack.db.insert(Session, &run, .{
+        .id = @as(i64, 10),
+        .token_hash = types.Bytes.of("t"),
+        .device = @as(?types.Bytes, null),
+        .person_id = @as(?i64, 1),
+    });
+
+    // `select` writes a SELECT list of the columns and leaves the rest at
+    // its default; the caller fills it from a second read, which is the
+    // shape a page's line has.
+    const people = try stack.db.select(Carried, &run, .{ .order = .{ .id = .asc } });
+    try testing.expectEqual(@as(usize, 3), people.len);
+    for (people) |*p| {
+        try testing.expectEqual(@as(usize, 0), p.sessions.len);
+        const theirs = try stack.db.select(Session, &run, .{ .where = .{ .person_id = p.id } });
+        const ids = try run.arena().alloc(i64, theirs.len);
+        for (theirs, 0..) |t, i| ids[i] = t.id;
+        p.sessions = ids;
+    }
+    try testing.expectEqual(@as(usize, 1), people[0].sessions.len);
+    try testing.expectEqual(@as(i64, 10), people[0].sessions[0]);
+    try testing.expectEqual(@as(usize, 0), people[1].sessions.len);
+
+    // `raw` counts the statement's columns against the Row's *columns*, so a
+    // two-column list fills a three-field projection.
+    const lines = try stack.db.raw(
+        TimelineLine,
+        &run,
+        "SELECT 'person'::text AS kind, id AS who FROM \"" ++ table ++ "\"" ++
+            " UNION ALL SELECT 'session', person_id FROM " ++ session_table ++
+            " ORDER BY 2, 1",
+        .{},
+    );
+    try testing.expectEqual(@as(usize, 4), lines.len);
+    try testing.expectEqualStrings("person", lines[0].kind);
+    try testing.expectEqualStrings("session", lines[1].kind);
+    try testing.expectEqual(@as(usize, 0), lines[1].attachments.len);
+
+    // A streamed row keeps the field at its own type and its default.
+    var rows = try stack.db.stream(Carried, &run, .{ .order = .{ .id = .asc } });
+    defer rows.close();
+    var seen: usize = 0;
+    while (try rows.next()) |p| : (seen += 1) {
+        try testing.expectEqual(@as(usize, 0), p.sessions.len);
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+
+    // And the schema check does not go looking for the column.
+    try testing.expectEqual(@as(usize, 0), try stack.db.checkSchema(&.{Carried}));
+}
+
 comptime {
     _ = wire_mod;
 }

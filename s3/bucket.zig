@@ -147,6 +147,11 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// `https://avatars.s3.amazonaws.com`, so a request appends the key
         /// and nothing else.
         base: []const u8,
+        /// The same two built from the Store's `public_endpoint`, for a URL
+        /// handed to a browser — or the two above when there is none. What
+        /// `presign` signs and `presignPost` posts to (ADR 0216).
+        public_host: []const u8,
+        public_base: []const u8,
         owned: []u8,
 
         /// The longest URL this bucket can build, which is what sizes the
@@ -156,34 +161,71 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         const prefix_max = 1 + 63;
 
         pub fn open(s: *Store) !Self {
-            const host_len = switch (settings.style) {
-                .virtual => name.len + 1 + s.authority.len,
-                .path => s.authority.len,
-            };
+            const host_len = hostLen(s.authority);
             const prefix_len = switch (settings.style) {
                 .virtual => 0,
                 .path => 1 + name.len,
             };
-            const scheme = @tagName(s.scheme);
-            const base_len = scheme.len + "://".len + host_len;
+            const base_len = baseLen(s.scheme, host_len);
+            // A second host and base only when the browser's endpoint is not
+            // the dialled one; otherwise the public pair aliases the first.
+            const two = s.public_authority.ptr != s.authority.ptr;
+            const public_host_len = if (two) hostLen(s.public_authority) else 0;
+            const public_base_len = if (two) baseLen(s.public_scheme, public_host_len) else 0;
 
-            const owned = try s.gpa.alloc(u8, host_len + prefix_len + base_len);
+            const owned = try s.gpa.alloc(
+                u8,
+                host_len + prefix_len + base_len + public_host_len + public_base_len,
+            );
             errdefer s.gpa.free(owned);
 
             var w = std.Io.Writer.fixed(owned);
-            switch (settings.style) {
-                .virtual => w.print("{s}.{s}", .{ name, s.authority }) catch unreachable,
-                .path => w.writeAll(s.authority) catch unreachable,
-            }
+            writeHost(&w, s.authority);
             const host = owned[0..host_len];
 
             if (settings.style == .path) w.print("/{s}", .{name}) catch unreachable;
             const prefix = owned[host_len..][0..prefix_len];
 
-            w.print("{s}://{s}", .{ scheme, host }) catch unreachable;
+            w.print("{s}://{s}", .{ @tagName(s.scheme), host }) catch unreachable;
             const base = owned[host_len + prefix_len ..][0..base_len];
 
-            return .{ .store = s, .host = host, .prefix = prefix, .base = base, .owned = owned };
+            var public_host = host;
+            var public_base = base;
+            if (two) {
+                const from = host_len + prefix_len + base_len;
+                writeHost(&w, s.public_authority);
+                public_host = owned[from..][0..public_host_len];
+                w.print("{s}://{s}", .{ @tagName(s.public_scheme), public_host }) catch unreachable;
+                public_base = owned[from + public_host_len ..][0..public_base_len];
+            }
+
+            return .{
+                .store = s,
+                .host = host,
+                .prefix = prefix,
+                .base = base,
+                .public_host = public_host,
+                .public_base = public_base,
+                .owned = owned,
+            };
+        }
+
+        fn hostLen(authority: []const u8) usize {
+            return switch (settings.style) {
+                .virtual => name.len + 1 + authority.len,
+                .path => authority.len,
+            };
+        }
+
+        fn baseLen(scheme: Store.Scheme, host_len: usize) usize {
+            return @tagName(scheme).len + "://".len + host_len;
+        }
+
+        fn writeHost(w: *std.Io.Writer, authority: []const u8) void {
+            switch (settings.style) {
+                .virtual => w.print("{s}.{s}", .{ name, authority }) catch unreachable,
+                .path => w.writeAll(authority) catch unreachable,
+            }
         }
 
         pub fn deinit(self: *Self) void {
@@ -538,7 +580,9 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .key = key,
                 .query = query,
                 .payload = sign.unsigned_payload,
-                .headers = .{ .host = self.host },
+                // The host the browser will send, which is the public one
+                // when there is one: it is inside the signature (ADR 0216).
+                .headers = .{ .host = self.public_host },
             }, "host");
 
             var sts_buf: [sign.string_to_sign_max]u8 = undefined;
@@ -554,7 +598,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             const room = try c.arena().alloc(u8, url_max + query.len + "?&X-Amz-Signature=".len + 64);
             var w = std.Io.Writer.fixed(room);
 
-            w.writeAll(self.base) catch unreachable;
+            w.writeAll(self.public_base) catch unreachable;
             w.writeAll(self.prefix) catch unreachable;
             w.writeByte('/') catch unreachable;
             core.percent.encodeWrite(&w, key, .path) catch unreachable;
@@ -648,7 +692,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             const doc_room = sign.policySize(policy);
             const encoder = std.base64.standard.Encoder;
             const total = doc_room + encoder.calcSize(doc_room) + 64 +
-                self.base.len + self.prefix.len + credential.len +
+                self.public_base.len + self.prefix.len + credential.len +
                 stamp.iso().len + key.len +
                 sign.textLen(post.content_type) + sign.textLen(signing.token);
 
@@ -673,7 +717,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             // The form's action is the bucket, not the key: a POST policy
             // posts to the bucket and says the key in a field.
             var uw = std.Io.Writer.fixed(room[at..]);
-            uw.writeAll(self.base) catch unreachable;
+            uw.writeAll(self.public_base) catch unreachable;
             uw.writeAll(self.prefix) catch unreachable;
             const url = uw.buffered();
             at += url.len;
@@ -681,8 +725,15 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             // The order is fixed, because a form is written against it. The
             // file input goes after all of these: S3 ignores whatever follows
             // the file part, so a `policy` sent after it is one S3 never reads.
-            var fields: [8]Field = undefined;
+            var fields: [9]Field = undefined;
             var n: usize = 0;
+            // The policy's first condition, as a field. AWS reads the bucket
+            // off the URL and ignores the field; Garage refuses the form
+            // without it — *Key 'bucket' is required in policy, but no value
+            // was provided* — and the value is a constant in the binary, so
+            // it is sent everywhere (ADR 0216).
+            fields[n] = .{ .name = "bucket", .value = name };
+            n += 1;
             fields[n] = .{ .name = "key", .value = cut(room, &at, key) };
             n += 1;
             // The one value that needs no copy, because it is a constant in the
@@ -1250,6 +1301,54 @@ test "a bucket's host and prefix are built once, and by the style" {
 
     try testing.expectEqualStrings("s3.ap-southeast-1.amazonaws.com", invoices.host);
     try testing.expectEqualStrings("/invoices", invoices.prefix);
+}
+
+test "a public endpoint gives a bucket a second host and base, and none gives it the first" {
+    // The process dials the store on a Docker network; the browser reaches
+    // it through a proxy on a name. Both are built once at `open`, the way
+    // the dialled pair is (ADR 0216).
+    var store = try Store.open(testing.allocator, .{
+        .endpoint = "http://garage:3900",
+        .public_endpoint = "https://files.example.com/",
+        .credentials = .{ .static = .{ .access_key_id = "A", .secret_access_key = "B" } },
+    });
+    defer store.deinit();
+
+    const Files = Bucket("files", .{ .style = .path });
+    var files = try Files.open(&store);
+    defer files.deinit();
+
+    try testing.expectEqualStrings("garage:3900", files.host);
+    try testing.expectEqualStrings("http://garage:3900", files.base);
+    try testing.expectEqualStrings("files.example.com", files.public_host);
+    try testing.expectEqualStrings("https://files.example.com", files.public_base);
+    try testing.expectEqualStrings("/files", files.prefix);
+
+    // Virtual-host style puts the bucket in front of the public name too.
+    const Avatars = Bucket("avatars", .{});
+    var avatars = try Avatars.open(&store);
+    defer avatars.deinit();
+    try testing.expectEqualStrings("avatars.files.example.com", avatars.public_host);
+    try testing.expectEqualStrings("https://avatars.files.example.com", avatars.public_base);
+
+    // And with none, the public pair *is* the dialled pair: same bytes, so a
+    // presigned URL under an ordinary store is exactly what it was.
+    var plain = try Store.open(testing.allocator, .{
+        .endpoint = "http://127.0.0.1:9000",
+        .credentials = .{ .static = .{ .access_key_id = "A", .secret_access_key = "B" } },
+    });
+    defer plain.deinit();
+    var local = try Files.open(&plain);
+    defer local.deinit();
+    try testing.expectEqual(local.host.ptr, local.public_host.ptr);
+    try testing.expectEqual(local.base.ptr, local.public_base.ptr);
+
+    // A public endpoint that is not one is refused the way the endpoint is.
+    try testing.expectError(error.BadEndpoint, Store.open(testing.allocator, .{
+        .endpoint = "http://127.0.0.1:9000",
+        .public_endpoint = "files.example.com",
+        .credentials = .{ .static = .{ .access_key_id = "A", .secret_access_key = "B" } },
+    }));
 }
 
 test "a URL is the base, the prefix and the key encoded once" {

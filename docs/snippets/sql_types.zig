@@ -115,3 +115,13 @@ pub const PartnerCapability = struct {
     partner_id: i64,
     capability: Str,
 };
+
+/// For the `nilo_beside` snippet in the raw guide: the second read that
+/// fills the field no column holds (ADR 0217).
+pub const Attachment = struct { id: i64, filename: Str };
+
+pub fn attachmentsOf(scope: *nilo.Ctx, comment_id: i64) ![]const Attachment {
+    _ = scope;
+    _ = comment_id;
+    return &.{};
+}

@@ -265,6 +265,32 @@ const sql_refusals = [_]Refusal{
         .name = "across_on_unknown_column",
         .says = "across_on_unknown_column.Sku has no column `trade_mark`, asked for in an `.across`.",
     },
+    // A field beside the columns: on the Row, in no statement (ADR 0217).
+    .{
+        .name = "beside_in_a_where",
+        .says = "beside_in_a_where.Comment carries `attachments` beside its columns, and a" ++
+            " condition asks for it as one.",
+    },
+    .{
+        .name = "beside_written",
+        .says = "beside_written.Comment carries `attachments` beside its columns, and an" ++
+            " insert asks for it as one.",
+    },
+    .{
+        .name = "beside_names_no_field",
+        .says = "beside_names_no_field.Comment's nilo_beside names `attachment`, which is" ++
+            " not one of its fields.",
+    },
+    .{
+        .name = "beside_without_a_default",
+        .says = "beside_without_a_default.Comment carries `attachments` beside its columns," ++
+            " and the field has no default.",
+    },
+    .{
+        .name = "beside_as_the_key",
+        .says = "beside_as_the_key.Comment's key names `token`, which it carries beside" ++
+            " its columns.",
+    },
     .{
         .name = "given_inside_an_any",
         .says = "an alternative of `.any` holds a `sql.given`.",

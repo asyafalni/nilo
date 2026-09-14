@@ -28,6 +28,9 @@ const std = @import("std");
 /// For `asText` alone: which Row fields are read as the text the database
 /// printed, and therefore have to be asked for that way (ADR 0154).
 const types = @import("types.zig");
+/// For `columnsOf`: which of the Row's fields a statement fills, which is
+/// every one but those carried beside the columns (ADR 0217).
+const row_mod = @import("row.zig");
 
 /// What one pass over a statement found.
 pub const List = struct {
@@ -131,7 +134,7 @@ pub fn assertList(
         const list = scan(sql);
         assertCasts(D, Row, list, call);
         const count = list.count orelse return;
-        const fields = @typeInfo(Row).@"struct".fields;
+        const fields = columnFields(Row);
 
         if (count != fields.len) @compileError(std.fmt.comptimePrint(
             "nilo: the statement handed to `{s}` selects {d} column{s}, and {s} has {d} field{s}.\n" ++
@@ -154,6 +157,23 @@ pub fn assertList(
                 .{ at, call, name, at, @typeName(Row), field.name, at, at, field.name },
             ));
         }
+    }
+}
+
+/// The Row's fields a statement fills, in order: every one but those carried
+/// beside the columns (ADR 0217).
+fn columnFields(comptime Row: type) []const std.builtin.Type.StructField {
+    comptime {
+        const all = @typeInfo(Row).@"struct".fields;
+        var out: [all.len]std.builtin.Type.StructField = undefined;
+        var n: usize = 0;
+        for (all) |f| {
+            if (row_mod.isBeside(Row, f.name)) continue;
+            out[n] = f;
+            n += 1;
+        }
+        const frozen = out[0..n].*;
+        return &frozen;
     }
 }
 
@@ -184,7 +204,7 @@ fn assertCasts(
 ) void {
     comptime {
         if (@typeInfo(Row) != .@"struct") return;
-        const fields = @typeInfo(Row).@"struct".fields;
+        const fields = columnFields(Row);
 
         // A `*` stands for columns nobody named, so no cast reached any of
         // them. Refused for the Row that has a text column in it and for no

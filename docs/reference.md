@@ -1157,13 +1157,18 @@ no request. Handing over something that is neither is a Refusal naming the call.
 | Field | Default | |
 |---|---|---|
 | `max_in_flight` | 32 | calls at once, across every host. Past it a caller waits for a permit rather than opening another connection — an HTTPS one holds 59,151 bytes |
-| `timeout_ms` | 30,000 | how long one whole call may take. `0` is no limit |
+| `timeout_ms` | 30,000 | how long one whole call may take. `0` is no limit — and so is a client started with `nilo_start(io, .off)`, which has nothing to fire it |
 | `max_body` | 8 MiB | a longer body is `error.BodyTooLarge`, enforced while reading |
 | `max_drain` | 64 KiB | how much of an unread body is worth reading to keep a pooled connection. Past it the connection is dropped |
 | `forward_request_id` | true | a call made under a `*Ctx` sends the request's id as `X-Request-Id`, so the other side's log lines up with this one. A `Run` has no id and sends none; a call naming its own `X-Request-Id` in `headers` keeps it ([ADR 0196](./adr/0196-a-request-id-goes-out-with-the-call.md)) |
 
 **`Client.Call`**, given per call: `headers`, and `timeout_ms` / `max_body` to
 override the settings above for one call.
+
+**An answer with no body by rule ends at its head.** A HEAD's answer, a 1xx,
+a 204 and a 304 are complete at the blank line whatever `content-length` or
+`transfer-encoding` say, so `send` returns an empty body at once and the
+connection is kept ([ADR 0215](./adr/0215-an-answer-with-no-body-ends-at-its-head.md)).
 
 **Errors worth naming.** `error.TimedOut` is this call's own deadline;
 `error.Canceled` is the server shutting down underneath it, and the two are
@@ -1418,7 +1423,9 @@ Store twice is a no-op.
 to fetch; `presignPost` gives a browser everything it needs to upload without the
 bytes passing through your server. `url` is the bucket, not the key, and `fields`
 go into the form in the order they come back, with the file input **last**. S3
-ignores whatever follows the file part.
+ignores whatever follows the file part. The first field is `bucket`: Garage
+refuses the form without it, and AWS reads the bucket off the URL and ignores
+it.
 
 | `s3.Post` | Default | |
 |---|---|---|
@@ -1445,6 +1452,7 @@ rotation. They disagree at 00:00 UTC, and the symptom is uploads failing with a
 | Field | Default | |
 |---|---|---|
 | `endpoint` | — | `https://host[:port]`, no path. **The scheme decides whether payloads are hashed**: `UNSIGNED-PAYLOAD` over TLS, a real SHA-256 over plaintext |
+| `public_endpoint` | null | the endpoint a **browser** reaches, when it is not the one this process dials. The host in every presigned URL and POST form, and **signed as that host** — rewriting the URL after signing is a 403 ([ADR 0216](./adr/0216-a-presigned-url-names-the-host-the-browser-reaches.md)) |
 | `region` | `us-east-1` | |
 | `credentials` | — | `.static` or `.fetch` |
 | `max_in_flight` | 32 | calls at once. An HTTPS connection holds 59,151 bytes, so this times that is the ceiling |
@@ -2732,6 +2740,7 @@ const User = struct {
 | `.managed = false` | this program reads the table and does not build it; the migrator leaves it alone. See [Migrations](#migrations) |
 | `pub const nilo_table = Other` | a narrower Row: the same table as `Other`, fewer columns, checked against it while compiling |
 | `pub const nilo_table = .projection` | a Row that owns no table at all — the shape `db.raw` fills. See below |
+| `pub const nilo_beside = .{ .attachments }` | the fields **beside** the columns: on the Row, in its JSON and its document, and in no statement. See below |
 
 #### A Row that owns no table
 
@@ -2755,6 +2764,37 @@ it while compiling, naming the type and saying it is a projection. `db.raw` and
 `db.exec` are what it is for. Before this the only way to spell such a shape was
 to give it a `.name` that pointed at a real table it did not match, which
 compiled and then said nothing when somebody wrote `db.select` against it.
+
+#### A field beside the columns
+
+A Row that is the response sometimes carries what the program adds to it —
+a comment line and its files, read in a second statement or handed over by
+a service. `nilo_beside` names those fields
+([ADR 0217](./adr/0217-a-row-can-carry-a-field-no-column-holds.md)):
+
+<!-- compiles -->
+```zig
+const Attachment = struct { id: i64, filename: Str };
+
+const CommentLine = struct {
+    pub const nilo_table = .projection;
+    pub const nilo_beside = .{.attachments};
+
+    id: i64,
+    body: Str,
+    attachments: []const Attachment = &.{},
+};
+```
+
+The field is an ordinary typed field to the JSON writer and the document, and
+it is in no statement: no `SELECT` list reads it and `db.raw` counts the
+statement's columns against the columns; every read leaves it at the default
+it declares, for the caller to fill; `db.checking` does not look for it; a
+Row borrowing a table need not find it there. A `.where`, an `.order`, a
+`.set`, an insert or a `.key` naming it is refused by name, and so is a name
+the Row lacks or a field with no default. **For a list the database can
+build, `sql.Json(T)` is still the shape** — `jsonb_agg` in the statement,
+one round trip, and the document says `T`.
 
 ### `Db`
 

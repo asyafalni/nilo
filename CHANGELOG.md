@@ -107,6 +107,24 @@ missing — plus the fixes it found underneath them, two of which are the reason
   so the two directions cannot be read as each other. Tables that point at
   each other are refused until one is named. Four refusals.
 
+- **`nilo_beside` — a Row can carry a field no column holds**
+  ([ADR 0217](./docs/adr/0217-a-row-can-carry-a-field-no-column-holds.md)).
+  `pub const nilo_beside = .{ .attachments };` beside `attachments: []const
+  Attachment = &.{}`: the field is on the Row, in its JSON and in its
+  document, and in no statement — no `SELECT` reads it, a read leaves it at
+  its default for the caller to fill, `db.checking` does not look for it,
+  and a `.where`, a `.set`, an insert or a `.key` naming it is refused.
+  For a list the database can build, `sql.Json(T)` is still the shape.
+  Five refusals.
+
+- **`s3.Options.public_endpoint` — the host a browser reaches, signed as
+  such** ([ADR 0216](./docs/adr/0216-a-presigned-url-names-the-host-the-browser-reaches.md)).
+  A process that dials the store on a Docker network hands out presigned
+  URLs and POST forms on the public name instead, and `presign` signs that
+  host — rewriting the URL after signing is a 403. **`Posted.fields` now
+  opens with `bucket`**: Garage refuses the form without it and AWS ignores
+  it. A form written against field positions has one more in front of `key`.
+
 - **`sql.Ordering(Row, keys)` — an `ORDER BY` chosen per request, from a
   closed set declared while compiling**
   ([ADR 0204](./docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
@@ -443,6 +461,15 @@ an answer a client gets.
   entry against 132 and 149 ([`bench/result/cache.md`](./bench/result/cache.md)).
 
 ### Fixed
+
+- **A 204 with no `content-length` comes back at once rather than when the
+  server hangs up**
+  ([ADR 0215](./docs/adr/0215-an-answer-with-no-body-ends-at-its-head.md)).
+  A HEAD's answer, a 1xx, a 204 and a 304 end at the header block whatever
+  their headers say; std's reader framed them as read-to-EOF, so `client.send`
+  against Garage's answer to a presigned POST sat for 120 s. And a client
+  started with `nilo_start(io, .off)` has nothing to fire `timeout_ms` — the
+  guide says so now.
 
 - **`insert`, `insertMany`, `updateMany` and the upserts compile on a Row as
   wide as a real table**

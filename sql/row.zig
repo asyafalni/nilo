@@ -92,6 +92,117 @@ pub fn isRow(comptime T: type) bool {
 /// The one word the marker may be instead of a table or another Row.
 pub const projection_word = "projection";
 
+/// The second declaration a Row may carry: the fields **beside** its columns
+/// ([ADR 0217](../docs/adr/0217-a-row-can-carry-a-field-no-column-holds.md)).
+///
+/// ```zig
+/// const Line = struct {
+///     pub const nilo_table = .projection;
+///     pub const nilo_beside = .{ .attachments };
+///
+///     id: i64,
+///     body: Str,
+///     attachments: []const Attachment = &.{},
+/// };
+/// ```
+///
+/// A field named here is on the Row, in its JSON and in its document, and in
+/// **no statement**: no `SELECT` list reads it, no insert or update writes
+/// it, no `WHERE` or `ORDER BY` may name it, `db.checking` does not look for
+/// it, and a read leaves it at its default for the caller to fill. It is the
+/// one place a Row that is the response could not be the response before
+/// this: a comment line carrying its files, which no column holds and a
+/// second struct copying the Row's fields would have carried instead.
+pub const beside_marker = "nilo_beside";
+
+/// The fields `Row` carries beside its columns, in the order the marker
+/// names them; empty for a Row that carries none. Every name is checked here
+/// — a field the Row has, with a default for a read to leave it at — so a
+/// caller reading the list reads a true one.
+pub fn besideOf(comptime Row: type) []const []const u8 {
+    return comptime blk: {
+        if (!@hasDecl(Row, beside_marker)) break :blk &.{};
+        @setEvalBranchQuota(20_000);
+        const decl = @field(Row, beside_marker);
+        const D = @TypeOf(decl);
+        const shape = "\n  It is the fields beside the columns, written as names: " ++
+            "`pub const " ++ beside_marker ++ " = .{ .attachments };`.";
+        if (@typeInfo(D) != .@"struct" or !@typeInfo(D).@"struct".is_tuple) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s " ++ beside_marker ++ " is a " ++ @typeName(D) ++ "." ++ shape,
+        );
+        const entries = @typeInfo(D).@"struct".fields;
+        if (entries.len == 0) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s " ++ beside_marker ++ " names nothing.\n" ++
+                "  A line that does nothing is a line somebody will read as doing " ++
+                "something. Name a field, or take the declaration out.",
+        );
+        var out: [entries.len][]const u8 = undefined;
+        for (entries, 0..) |e, i| {
+            if (e.type != @TypeOf(.enum_literal)) @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s " ++ beside_marker ++ " holds a " ++
+                    @typeName(e.type) ++ "." ++ shape,
+            );
+            const name = @tagName(decl[i]);
+            const field = for (@typeInfo(Row).@"struct".fields) |f| {
+                if (std.mem.eql(u8, f.name, name)) break f;
+            } else {
+                const head = "nilo: " ++ @typeName(Row) ++ "'s " ++ beside_marker ++ " names `" ++
+                    name ++ "`, which is not one of its fields.";
+                if (nearest(Row, name)) |near| @compileError(head ++ "\n  Did you mean `" ++ near ++ "`?");
+                @compileError(head ++ "\n  Its fields are: " ++ fieldList(Row) ++ ".");
+            };
+            if (field.default_value_ptr == null) @compileError(
+                "nilo: " ++ @typeName(Row) ++ " carries `" ++ name ++ "` beside its columns, " ++
+                    "and the field has no default.\n" ++
+                    "  No statement fills it, so a read has to leave it at something: " ++
+                    "write `" ++ name ++ ": " ++ @typeName(field.type) ++ " = …` — an " ++
+                    "empty list, a null, whatever \"not filled yet\" is for it.",
+            );
+            for (out[0..i]) |seen| {
+                if (std.mem.eql(u8, seen, name)) @compileError(
+                    "nilo: " ++ @typeName(Row) ++ "'s " ++ beside_marker ++ " names `" ++
+                        name ++ "` twice.",
+                );
+            }
+            out[i] = name;
+        }
+        const frozen = out;
+        break :blk &frozen;
+    };
+}
+
+/// Whether `name` is a field `Row` carries beside its columns.
+pub fn isBeside(comptime Row: type, comptime name: []const u8) bool {
+    return comptime blk: {
+        for (besideOf(Row)) |b| {
+            if (std.mem.eql(u8, b, name)) break :blk true;
+        }
+        break :blk false;
+    };
+}
+
+/// The value a read leaves a beside field at: the default the field declares,
+/// which `besideOf` has made sure it has.
+pub fn besideDefault(comptime Row: type, comptime name: []const u8) @FieldType(Row, name) {
+    comptime {
+        for (@typeInfo(Row).@"struct".fields) |f| {
+            if (std.mem.eql(u8, f.name, name)) return f.defaultValue().?;
+        }
+        unreachable; // `besideOf` checked the name
+    }
+}
+
+/// Every field of `Row`, columns and beside alike, as one readable line.
+fn fieldList(comptime Row: type) []const u8 {
+    return comptime blk: {
+        var out: []const u8 = "";
+        for (@typeInfo(Row).@"struct".fields, 0..) |f, i| {
+            out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ f.name ++ "`";
+        }
+        break :blk out;
+    };
+}
+
 /// Whether `T` is a **projection**: a Row that reads and owns no table
 /// ([ADR 0155](../docs/adr/0155-a-row-that-owns-no-table.md)).
 ///
@@ -189,6 +300,12 @@ pub fn keysOf(comptime Row: type) []const []const u8 {
             break :blk &[_][]const u8{"id"};
         };
         for (named) |column| {
+            if (isBeside(Row, column)) @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s key names `" ++ column ++ "`, which it " ++
+                    "carries beside its columns.\n" ++
+                    "  A field in " ++ beside_marker ++ " is in no column and no statement, " ++
+                    "and a key is what a statement finds a row by. Name a column.",
+            );
             if (!hasColumn(Row, column)) @compileError(
                 "nilo: " ++ @typeName(Row) ++ "'s key names the column `" ++ column ++
                     "`, which is not one of its columns.\n" ++
@@ -264,8 +381,14 @@ pub fn columnsOf(comptime Row: type) []const []const u8 {
         assertRow(Row);
         const fields = @typeInfo(Row).@"struct".fields;
         var out: [fields.len][]const u8 = undefined;
-        for (fields, 0..) |f, i| out[i] = f.name;
-        const frozen = out;
+        var n: usize = 0;
+        for (fields) |f| {
+            // A field beside the columns is not one (ADR 0217).
+            if (isBeside(Row, f.name)) continue;
+            out[n] = f.name;
+            n += 1;
+        }
+        const frozen = out[0..n].*;
         break :blk &frozen;
     };
 }
@@ -293,7 +416,9 @@ pub fn Borrowed(comptime Row: type) type {
         var types: [fields.len]type = undefined;
         for (fields, 0..) |f, i| {
             names[i] = f.name;
-            types[i] = borrowedType(f.type);
+            // A field beside the columns is never read out of the buffer,
+            // so it keeps its own type and its default fills it (ADR 0217).
+            types[i] = if (isBeside(Row, f.name)) f.type else borrowedType(f.type);
         }
         const frozen_names = names;
         const frozen_types = types;
@@ -324,6 +449,7 @@ fn borrowedType(comptime T: type) type {
 /// walker asks, and the one that turns a typo into a Refusal.
 pub fn hasColumn(comptime Row: type, comptime column: []const u8) bool {
     return comptime blk: {
+        if (isBeside(Row, column)) break :blk false;
         for (@typeInfo(Row).@"struct".fields) |f| {
             if (std.mem.eql(u8, f.name, column)) break :blk true;
         }
@@ -371,6 +497,13 @@ pub fn noSuchColumn(
     comptime what: []const u8,
 ) noreturn {
     comptime {
+        if (isBeside(Row, wrong)) @compileError(
+            "nilo: " ++ @typeName(Row) ++ " carries `" ++ wrong ++ "` beside its columns, " ++
+                "and " ++ what ++ " asks for it as one.\n" ++
+                "  A field named in " ++ beside_marker ++ " is filled by the caller after " ++
+                "the read, and no statement reads or writes it. Take it out of " ++ what ++
+                ", or out of " ++ beside_marker ++ " if it is a column after all.",
+        );
         const head = "nilo: " ++ @typeName(Row) ++ " has no column `" ++ wrong ++
             "`, asked for in " ++ what ++ ".";
         if (nearest(Row, wrong)) |near| {
@@ -583,6 +716,9 @@ fn notAKey(comptime Row: type, comptime K: type) noreturn {
 fn assertSubset(comptime Narrow: type, comptime Wide: type) void {
     comptime {
         for (@typeInfo(Narrow).@"struct".fields) |f| {
+            // Carried beside the columns rather than read, so the table it
+            // borrows need not have it (ADR 0217).
+            if (isBeside(Narrow, f.name)) continue;
             if (!hasColumn(Wide, f.name)) {
                 const head = "nilo: " ++ @typeName(Narrow) ++ " reads `" ++ f.name ++
                     "`, which " ++ @typeName(Wide) ++ " does not have.";
@@ -769,6 +905,69 @@ test "the columns come out in the order the Row declares them" {
 test "a borrowed Row keeps its own column list rather than the wider one" {
     try testing.expectEqual(@as(usize, 2), columnsOf(UserCard).len);
     try testing.expectEqual(@as(usize, 3), columnsOf(User).len);
+}
+
+const Attachment = struct { id: i64, filename: []const u8 };
+
+/// A comment line on a timeline, carrying its files — which no column holds
+/// and the caller fills after the read (ADR 0217).
+const CommentLine = struct {
+    pub const nilo_table = .{ .name = "comments", .key = .id };
+    pub const nilo_beside = .{ .attachments, .mine };
+
+    id: i64,
+    body: []const u8,
+    attachments: []const Attachment = &.{},
+    mine: bool = false,
+};
+
+/// The same idea on a Row that borrows a table: the field beside the columns
+/// need not be one the wider Row has.
+const CommentCard = struct {
+    pub const nilo_table = CommentLine;
+    pub const nilo_beside = .{.attachments};
+
+    id: i64,
+    attachments: []const Attachment = &.{},
+};
+
+test "a field beside the columns is on the Row and in no column list" {
+    const beside = comptime besideOf(CommentLine);
+    try testing.expectEqual(@as(usize, 2), beside.len);
+    try testing.expectEqualStrings("attachments", beside[0]);
+    try testing.expectEqualStrings("mine", beside[1]);
+    try testing.expectEqual(@as(usize, 0), comptime besideOf(User).len);
+
+    // The SELECT list, and therefore what a read fills by position, is the
+    // columns only — in the Row's order, with the beside ones stepped over.
+    const columns = comptime columnsOf(CommentLine);
+    try testing.expectEqual(@as(usize, 2), columns.len);
+    try testing.expectEqualStrings("id", columns[0]);
+    try testing.expectEqualStrings("body", columns[1]);
+    try testing.expectEqualStrings("`id`, `body`", columnList(CommentLine));
+
+    // Not a column, so a `.where` or a `.set` naming it is a Refusal rather
+    // than a statement asking Postgres for a column it has never had.
+    try testing.expect(!hasColumn(CommentLine, "attachments"));
+    try testing.expect(comptime isBeside(CommentLine, "mine"));
+    try testing.expect(!comptime isBeside(CommentLine, "body"));
+
+    // And a read leaves it at the default the field declares.
+    try testing.expectEqual(@as(usize, 0), comptime besideDefault(CommentLine, "attachments").len);
+    try testing.expectEqual(false, comptime besideDefault(CommentLine, "mine"));
+}
+
+test "a borrowed Row may carry a field beside the columns its table lacks" {
+    try testing.expectEqualStrings("comments", tableOf(CommentCard));
+    try testing.expectEqual(@as(usize, 1), comptime columnsOf(CommentCard).len);
+}
+
+test "a streamed row keeps a beside field's own type rather than borrowing it" {
+    // `body` is text and moves to the read buffer's `[]const u8`; the field
+    // beside the columns is never in that buffer, so it stays what it is.
+    const B = Borrowed(CommentLine);
+    try testing.expectEqual([]const Attachment, @FieldType(B, "attachments"));
+    try testing.expectEqual(bool, @FieldType(B, "mine"));
 }
 
 test "a column is looked up by name and by type" {

@@ -8,8 +8,8 @@
   <a href="https://ziglang.org/"><img alt="Zig 0.16" src="https://img.shields.io/badge/zig-0.16-f7a41d?style=flat-square&logo=zig&logoColor=white"></a>
   <a href="./CHANGELOG.md"><img alt="version 0.3.0" src="https://img.shields.io/badge/version-0.3.0-3b82f6?style=flat-square"></a>
   <a href="./docs/reference.md"><img alt="11 modules" src="https://img.shields.io/badge/modules-11-8957e5?style=flat-square"></a>
-  <a href="./refusals/README.md"><img alt="276 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-276-e05d44?style=flat-square"></a>
-  <a href="./docs/adr/"><img alt="214 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-214-6b7280?style=flat-square"></a>
+  <a href="./refusals/README.md"><img alt="281 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-281-e05d44?style=flat-square"></a>
+  <a href="./docs/adr/"><img alt="217 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-217-6b7280?style=flat-square"></a>
   <a href="./LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-16a34a?style=flat-square"></a>
 </p>
 
@@ -39,7 +39,7 @@ rest.
 |---|---|
 | **One rule** | a pointer is a service, a value is request data. There is no second rule. |
 | **One allocation** | per request. A test fails if it ever becomes two. |
-| **276 refusals** | mistakes that stop the build with a sentence nilo wrote, held by seven build steps. |
+| **281 refusals** | mistakes that stop the build with a sentence nilo wrote, held by seven build steps. |
 | **Zero glue** | routing, the 400, the 404, the OpenAPI document and the SQL all read the same struct. |
 
 ## ⚡ Quickstart
@@ -409,13 +409,13 @@ allocate-per-request version shipped in the meantime.
 ## 🙂 What happens when you get it wrong
 
 An error message is a feature right up until somebody refactors it into mush.
-So this repository has **276 programs that are supposed to fail to compile**,
+So this repository has **281 programs that are supposed to fail to compile**,
 and seven build steps checking the wording of every failure:
 
 | Step | Programs | Over |
 |---|---|---|
 | `zig build refusals` | 137 | the framework |
-| `zig build refusals-sql` | 100 | queries, rows and schemas |
+| `zig build refusals-sql` | 105 | queries, rows and schemas |
 | `zig build refusals-job` | 12 | jobs and schedules |
 | `zig build refusals-s3` | 10 | buckets and keys |
 | `zig build refusals-config` | 9 | settings |

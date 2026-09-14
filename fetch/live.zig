@@ -392,6 +392,46 @@ const Canned = struct {
         try w.flush();
     }
 
+    /// A `204 No Content` with no `content-length` — the way hyper answers a
+    /// presigned POST, and S3 answers a DELETE — on a connection kept open
+    /// for a second request, which is answered with a body. What a peer
+    /// reaping an idle keep-alive looks like is `serveThenReap`; this is the
+    /// peer *not* reaping it, which is what turned a complete answer into a
+    /// wait for EOF (ADR 0215).
+    fn serveNoContentThenOne(self: *Canned) !void {
+        var stream = try self.server.accept(self.io);
+        defer stream.close(self.io);
+        self.accepted += 1;
+
+        var in_buf: [64 << 10]u8 = undefined;
+        var out_buf: [4 << 10]u8 = undefined;
+        var reader = stream.reader(self.io, &in_buf);
+        var writer = stream.writer(self.io, &out_buf);
+        const w = &writer.interface;
+
+        for (0..2) |n| {
+            var body_len: usize = 0;
+            while (true) {
+                const line = try reader.interface.takeDelimiterInclusive('\n');
+                const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+                if (trimmed.len == 0) break;
+                if (std.ascii.startsWithIgnoreCase(trimmed, "content-length:")) {
+                    const value = std.mem.trim(u8, trimmed["content-length:".len..], " \t");
+                    body_len = try std.fmt.parseInt(usize, value, 10);
+                }
+            }
+            if (body_len > 0) _ = try reader.interface.discard(.limited(body_len));
+
+            if (n == 0) {
+                try w.writeAll("HTTP/1.1 204 No Content\r\nlocation: /bucket/key\r\netag: \"1\"\r\n\r\n");
+            } else {
+                try w.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{self.body_len});
+                try w.splatByteAll('x', self.body_len);
+            }
+            try w.flush();
+        }
+    }
+
     fn close(self: *Canned) void {
         self.server.socket.close(self.io);
     }
@@ -1028,6 +1068,47 @@ test "a body decides the framing, not the method: a DELETE with one and a PATCH 
             // zero, and nothing chunked.
             try testing.expect(std.mem.indexOf(u8, sent, "content-length: 0") != null);
             try testing.expect(std.mem.indexOf(u8, sent, "chunked") == null);
+        }
+    }.run);
+}
+
+test "a 204 with no content-length ends at its head, and the connection is still good" {
+    // Item 76: Garage (hyper) answers a presigned POST with a 204 and no
+    // `content-length`, and std's reader framed that as read-to-EOF — so
+    // `client.send` sat until the server reaped the idle socket, 120 s for
+    // an answer complete in 30 ms. S3's own DELETE is a 204 too (ADR 0215).
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 3;
+
+            var served = io.async(Canned.serveNoContentThenOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const url = try canned.url(&buf);
+            // A POST with a body, the shape of the form, and the answer
+            // arrives empty rather than after the socket dies.
+            const posted = try client.post(&scope, url, "a=b", .{});
+            try testing.expectEqual(std.http.Status.no_content, posted.status);
+            try testing.expectEqualStrings("", posted.body.view());
+
+            // The same connection, because nothing was left in it to drain:
+            // one accept, and the second answer is the second answer rather
+            // than three bytes read as the first one's body.
+            const next = try client.get(&scope, url, .{});
+            try testing.expectEqual(std.http.Status.ok, next.status);
+            try testing.expectEqualStrings("xxx", next.body.view());
+
+            served.await(io) catch {};
+            try testing.expectEqual(@as(usize, 1), canned.accepted);
         }
     }.run);
 }

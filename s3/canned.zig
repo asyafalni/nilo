@@ -1011,19 +1011,23 @@ test "a presigned POST is a form, and its policy decodes to the document that wa
             try testing.expectEqual(@divFloor(core.nowMillis(), 1000) + 900, posted.expires_at);
 
             // The fields, in the order a form is written against. No token,
-            // because these credentials are a static pair.
-            try testing.expectEqual(@as(usize, 7), posted.fields.len);
-            try testing.expectEqualStrings("key", posted.fields[0].name);
-            try testing.expectEqualStrings("receipts/2026/09.pdf", posted.fields[0].value);
-            try testing.expectEqualStrings("x-amz-algorithm", posted.fields[1].name);
-            try testing.expectEqualStrings("AWS4-HMAC-SHA256", posted.fields[1].value);
-            try testing.expectEqualStrings("x-amz-credential", posted.fields[2].name);
-            try testing.expectEqualStrings("x-amz-date", posted.fields[3].name);
-            try testing.expectEqualStrings("Content-Type", posted.fields[4].name);
-            try testing.expectEqualStrings("application/pdf", posted.fields[4].value);
-            try testing.expectEqualStrings("policy", posted.fields[5].name);
+            // because these credentials are a static pair. The bucket first,
+            // as it is in the policy: Garage refuses a form without the field
+            // and AWS reads it off the URL (ADR 0216).
+            try testing.expectEqual(@as(usize, 8), posted.fields.len);
+            try testing.expectEqualStrings("bucket", posted.fields[0].name);
+            try testing.expectEqualStrings("files", posted.fields[0].value);
+            try testing.expectEqualStrings("key", posted.fields[1].name);
+            try testing.expectEqualStrings("receipts/2026/09.pdf", posted.fields[1].value);
+            try testing.expectEqualStrings("x-amz-algorithm", posted.fields[2].name);
+            try testing.expectEqualStrings("AWS4-HMAC-SHA256", posted.fields[2].value);
+            try testing.expectEqualStrings("x-amz-credential", posted.fields[3].name);
+            try testing.expectEqualStrings("x-amz-date", posted.fields[4].name);
+            try testing.expectEqualStrings("Content-Type", posted.fields[5].name);
+            try testing.expectEqualStrings("application/pdf", posted.fields[5].value);
+            try testing.expectEqualStrings("policy", posted.fields[6].name);
             // Last, because everything before it is what the signature covers.
-            try testing.expectEqualStrings("x-amz-signature", posted.fields[6].name);
+            try testing.expectEqualStrings("x-amz-signature", posted.fields[7].name);
 
             // A credential is the key id and the day's scope, joined the way
             // S3 reads it back.
@@ -1033,6 +1037,64 @@ test "a presigned POST is a form, and its policy decodes to the document that wa
                 akid ++ "/{s}/us-east-1/s3/aws4_request",
                 .{date[0..8]},
             ), credential);
+        }
+    }.run);
+}
+
+test "a public endpoint is the host in a presigned URL, and the host that is signed" {
+    // Item 77: the process dials a store the browser cannot reach, and a
+    // URL rewritten after signing is a 403, because the host is inside the
+    // signature. The oracle is a second store that *dials* the public name:
+    // the two must sign byte for byte the same (ADR 0216).
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var buf: [64]u8 = undefined;
+            var behind = try Store.open(testing.allocator, .{
+                .endpoint = try canned.endpoint(&buf),
+                .public_endpoint = "https://files.example.com",
+                .region = "us-east-1",
+                .credentials = .{ .static = .{ .access_key_id = akid, .secret_access_key = secret } },
+            });
+            defer behind.deinit();
+            try behind.nilo_start(io, .off);
+
+            var direct = try Store.open(testing.allocator, .{
+                .endpoint = "https://files.example.com",
+                .region = "us-east-1",
+                .credentials = .{ .static = .{ .access_key_id = akid, .secret_access_key = secret } },
+            });
+            defer direct.deinit();
+            try direct.nilo_start(io, .off);
+
+            var files = try Files.open(&behind);
+            defer files.deinit();
+            var same = try Files.open(&direct);
+            defer same.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            // Both in the same second, or again: the stamp is in the URL and
+            // a boundary between the two calls is not what is being tested.
+            var tries: usize = 0;
+            while (tries < 5) : (tries += 1) {
+                const link = try files.presign(&scope, "photos/wati.png", 900);
+                const oracle = try same.presign(&scope, "photos/wati.png", 900);
+                if (link.expires_at != oracle.expires_at) continue;
+                try testing.expectEqualStrings(oracle.url.view(), link.url.view());
+                try testing.expect(std.mem.startsWith(u8, link.url.view(), "https://files.example.com/files/photos/wati.png?"));
+                break;
+            } else return error.ClockNeverSettled;
+
+            // The form posts to the public name too. Nothing else in it
+            // changes: a policy names no host.
+            const posted = try files.presignPost(&scope, "receipts/09.pdf", .{ .seconds = 900 });
+            try testing.expectEqualStrings("https://files.example.com/files", posted.url);
+            const oracle = try same.presignPost(&scope, "receipts/09.pdf", .{ .seconds = 900 });
+            try testing.expectEqualStrings(oracle.url, posted.url);
         }
     }.run);
 }

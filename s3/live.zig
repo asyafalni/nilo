@@ -372,25 +372,18 @@ test "a presigned POST is a form a real server accepts" {
                 .{"a browser put this here"},
             );
 
-            // A plain client carrying no credentials at all, which is the
-            // whole claim a POST policy makes.
-            var plain: std.http.Client = .{
-                .allocator = testing.allocator,
-                .io = store.client.inner.io,
-            };
-            defer plain.deinit();
-
-            var answer: std.Io.Writer.Allocating = .init(testing.allocator);
-            defer answer.deinit();
-
-            const result = try plain.fetch(.{
-                .location = .{ .url = posted.url },
-                .method = .POST,
-                .payload = body.written(),
-                .headers = .{ .content_type = .{
-                    .override = "multipart/form-data; boundary=" ++ boundary,
-                } },
-                .response_writer = &answer.writer,
+            // The Store's own Fitting, which signs nothing by itself — the
+            // whole claim a POST policy makes — rather than `std.http.Client`
+            // directly: Garage answers the form with a 204 and no
+            // `content-length`, which std's own reader waits on until the
+            // server reaps the socket, and `nilo_fetch` is where that is
+            // closed (ADR 0215). The test found it the moment the form was
+            // accepted.
+            const result = try store.client.send(&scope, .POST, posted.url, body.written(), .{
+                .headers = &.{.{
+                    .name = "Content-Type",
+                    .value = "multipart/form-data; boundary=" ++ boundary,
+                }},
             });
 
             // S3 answers 204 to a POST with no `success_action_status`.

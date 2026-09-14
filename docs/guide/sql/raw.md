@@ -34,6 +34,33 @@ the name, because it did not write the statement, but the type is the same one
 every other call takes and there is no second kind of struct to learn. A join
 that answers with a shape no table has is what a view is for.
 
+**And the Row can carry what the program adds to it.** A line on a page
+sometimes holds a field no column has — a comment and its files, read in a
+second statement or handed over by a service. `nilo_beside` names such
+fields: they are on the Row, in its JSON and in its document, and in no
+statement, so the `SELECT` list is counted against the columns and a read
+leaves them at their default for you to fill
+([ADR 0217](../../adr/0217-a-row-can-carry-a-field-no-column-holds.md)):
+
+<!-- compiles: body -->
+```zig
+// Attachment: the file's Row, and attachmentsOf(c, id) the second read.
+const Line = struct {
+    pub const nilo_table = .projection;
+    pub const nilo_beside = .{.attachments};
+
+    id: i64,
+    body: nilo.Str,
+    attachments: []const Attachment = &.{},
+};
+
+const lines = try db.raw(Line, c, "SELECT id, body FROM comments ORDER BY id", .{});
+for (lines) |*line| line.attachments = try attachmentsOf(c, line.id);
+```
+
+A list the **database** can build is still `sql.Json(T)` with `jsonb_agg`
+in the statement — one round trip, and the document says `T`.
+
 ## A statement that answers with nothing
 
 `CREATE TABLE`, `CREATE INDEX`, `PRAGMA`, `VACUUM`, `ANALYZE`, a `DELETE` you

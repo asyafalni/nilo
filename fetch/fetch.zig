@@ -541,9 +541,35 @@ pub const Exchange = struct {
             .bytes = self.res.head.bytes,
         };
 
+        // **A HEAD's answer, a 1xx, a 204 and a 304 end at the header block,
+        // whatever the headers say** (RFC 9112 §6.3). std's `receiveHead`
+        // knows the rule — its comment says so — and records it nowhere the
+        // reader reads, so `Response.reader` frames a 204 with no
+        // `content-length` as read-to-EOF, and on a keep-alive connection EOF
+        // is whenever the server reaps the idle socket: 120 seconds against
+        // Garage, for an answer that was complete in 30 ms. Marked read here,
+        // so `take` returns empty and `deinit` drains nothing
+        // ([ADR 0215](../docs/adr/0215-an-answer-with-no-body-ends-at-its-head.md)).
+        if (bodiless(opts.method, head.status)) {
+            self.req.reader.state = .ready;
+            self.announced = 0;
+            self.reader = std.Io.Reader.ending;
+            return head;
+        }
+
         self.announced = head.content_length;
         self.reader = self.res.reader(opts.transfer_buffer);
         return head;
+    }
+
+    /// Whether the answer to this request has no body by rule, rather than
+    /// by header — the four cases RFC 9112 §6.3 lists ahead of
+    /// `transfer-encoding` and `content-length`.
+    fn bodiless(method: std.http.Method, status: std.http.Status) bool {
+        return !method.responseHasBody() or
+            status.class() == .informational or
+            status == .no_content or
+            status == .not_modified;
     }
 
     /// One send and one head read, with no opinion about what a failure means.
@@ -897,6 +923,16 @@ test "a client that was never started refuses rather than dialling undefined" {
     defer run.deinit();
 
     try testing.expectError(error.NotStarted, client.get(&run, "http://example.invalid/", .{}));
+}
+
+test "an answer with no body by rule is bodiless whatever its headers say" {
+    // The four the RFC lists, and a 200 beside them as the control.
+    try testing.expect(Exchange.bodiless(.HEAD, .ok));
+    try testing.expect(Exchange.bodiless(.GET, .@"continue"));
+    try testing.expect(Exchange.bodiless(.POST, .no_content));
+    try testing.expect(Exchange.bodiless(.GET, .not_modified));
+    try testing.expect(!Exchange.bodiless(.GET, .ok));
+    try testing.expect(!Exchange.bodiless(.DELETE, .ok));
 }
 
 test "the gate hands out no more permits than it was given" {

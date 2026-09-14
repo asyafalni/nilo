@@ -259,7 +259,12 @@ fn columnsOf(
     comptime {
         const fields = @typeInfo(Row).@"struct".fields;
         var out: [fields.len]Column = undefined;
-        for (fields, 0..) |f, i| {
+        var n: usize = 0;
+        for (fields) |f| {
+            // A field beside the columns has no column to describe (ADR 0217).
+            if (row_mod.isBeside(Row, f.name)) continue;
+            defer n += 1;
+            const i = n;
             var is_key = false;
             for (keys) |key| {
                 if (std.mem.eql(u8, f.name, key)) is_key = true;
@@ -285,7 +290,7 @@ fn columnsOf(
                 .generated = is_key and keys.len == 1 and generatedKey(f.type),
             };
         }
-        const frozen = out;
+        const frozen = out[0..n].*;
         return &frozen;
     }
 }

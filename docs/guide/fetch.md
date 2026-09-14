@@ -160,6 +160,13 @@ server sending one byte a second satisfies any per-read limit you care to
 name and never finishes. It is the same reasoning the server's own
 [deadlines](./deploying.md#deadlines) follow from the other side.
 
+**And it is the Engine that fires it.** The deadline is armed on the fiber
+([ADR 0065](../adr/0065-the-way-out-was-open-the-clock-was-not.md)), so a
+client started with `nilo_start(io, .off)` — a test, a CLI, a worker with no
+server around it — has `timeout_ms` and the per-call `.timeout_ms` written
+down and nothing to fire them: a call that hangs there hangs. `app.provide`
+under a server is what hands the client the Engine's `Limits`.
+
 ## What it answers instead
 
 | Error | |

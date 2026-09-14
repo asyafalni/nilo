@@ -55,6 +55,17 @@ pub const Options = struct {
     /// over TLS, a real SHA-256 over plaintext. There is nothing to configure
     /// and the reasoning is in ADR 0069.
     endpoint: []const u8,
+    /// The endpoint a *browser* reaches, when it is not the one this process
+    /// dials — a store on a Docker network or a Tailscale address behind a
+    /// reverse proxy the outside world sees. Null means the two are the same.
+    ///
+    /// It is the host in every presigned URL and every POST form, and it is
+    /// **signed as that host**, which is why rewriting `url` after the fact
+    /// cannot do this job: the host is inside the signature, and a presigned
+    /// GET with a rewritten host is a 403 that reads like a signing bug
+    /// ([ADR 0216](../docs/adr/0216-a-presigned-url-names-the-host-the-browser-reaches.md)).
+    /// The scheme, host and port, like `endpoint`; no path.
+    public_endpoint: ?[]const u8 = null,
     region: []const u8 = "us-east-1",
     credentials: Source,
 
@@ -92,6 +103,11 @@ pub const Store = struct {
     /// The authority out of the endpoint — `s3.amazonaws.com`, or
     /// `127.0.0.1:9000`. A Bucket builds its own host from this.
     authority: []const u8,
+    /// The same two out of `public_endpoint`, or the dialled pair when there
+    /// is none — so a Bucket reads these for a presigned URL and never asks
+    /// which case it is in.
+    public_scheme: Scheme,
+    public_authority: []const u8,
     /// Owned copies, because `Options` is a literal at a call site and the
     /// strings in it may be a `Config`'s that outlive nothing.
     owned: []u8 = &.{},
@@ -122,22 +138,30 @@ pub const Store = struct {
     /// `nilo_start` is where the first fetch happens.
     pub fn open(gpa: std.mem.Allocator, options: Options) OpenError!Store {
         const parsed = try parseEndpoint(options.endpoint);
+        const public: ?Endpoint = if (options.public_endpoint) |e| try parseEndpoint(e) else null;
         if (options.region.len == 0 or options.region.len > 64) return error.BadRegion;
 
         // One allocation for every string this holds for the life of the
         // process, sliced up rather than allocated one at a time.
-        const total = parsed.authority.len + options.region.len + options.endpoint.len;
+        const total = parsed.authority.len + (if (public) |p| p.authority.len else 0) +
+            options.region.len + options.endpoint.len;
         const owned = try gpa.alloc(u8, total);
         errdefer gpa.free(owned);
 
         var at: usize = 0;
         const authority = copyInto(owned, &at, parsed.authority);
+        // The very same slice when there is no public endpoint, so a Bucket
+        // can tell the two cases apart by the pointer and build one pair.
+        const public_authority = if (public) |p| copyInto(owned, &at, p.authority) else authority;
         const region = copyInto(owned, &at, options.region);
         const endpoint = copyInto(owned, &at, options.endpoint);
 
         var kept = options;
         kept.region = region;
         kept.endpoint = endpoint;
+        // Read once, above; not held past `open`, so a literal at the call
+        // site is fine the way `endpoint` is.
+        kept.public_endpoint = null;
 
         return .{
             .gpa = gpa,
@@ -154,6 +178,8 @@ pub const Store = struct {
             .options = kept,
             .scheme = parsed.scheme,
             .authority = authority,
+            .public_scheme = if (public) |p| p.scheme else parsed.scheme,
+            .public_authority = public_authority,
             .owned = owned,
         };
     }

@@ -1906,6 +1906,9 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                         const B = comptime row_mod.ColumnType(row_mod.Borrowed(Row), column);
                         @field(out, column) = try borrowColumn(self.w, &self.rows, B, i);
                     }
+                    inline for (comptime row_mod.besideOf(Row)) |beside| {
+                        @field(out, beside) = comptime row_mod.besideDefault(Row, beside);
+                    }
                     return out;
                 }
 
@@ -2102,6 +2105,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                             db.told(arena, started, sql, plan, null, true, null);
                             return err;
                         };
+                    }
+                    // A field beside the columns is left at its default for
+                    // the caller to fill (ADR 0217).
+                    inline for (comptime row_mod.besideOf(Row)) |beside| {
+                        @field(filled, beside) = comptime row_mod.besideDefault(Row, beside);
                     }
                     try out.append(arena, filled);
                     if (!try w.next(&rows)) break;
@@ -2908,6 +2916,8 @@ fn enumOf(comptime E: type, raw: []const u8) !E {
 fn assertStreamable(comptime Row: type) void {
     comptime {
         for (@typeInfo(Row).@"struct".fields) |f| {
+            // Never read out of the buffer, so it may hold anything.
+            if (row_mod.isBeside(Row, f.name)) continue;
             const Inner = switch (@typeInfo(f.type)) {
                 .optional => |o| o.child,
                 else => f.type,

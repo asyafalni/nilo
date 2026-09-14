@@ -3170,3 +3170,33 @@ both sides was met with a second word rather than a smarter first one: `.on`
 names a column of the Row inside and `.via` a column of the Row outside, so
 neither can be read as the other by a Row that happens to share a name
 ([ADR 0214](./adr/0214-an-exists-reads-the-reference-from-either-side.md)).
+
+## The first browser in front of nilo_s3
+
+**A rule the dependency wrote down and did not apply is a rule the wire
+still has.** std's `receiveHead` comments that a 204 ends at its header
+block and frames it as read-to-EOF anyway, so a complete answer from Garage
+became a wait for hyper's idle timeout — found only because the port's
+client ran with `Limits.off`, where nothing fires. The same finding then
+took `s3/live.zig`'s own `std.http.Client` down the moment the form it was
+posting was accepted ([ADR 0215](./adr/0215-an-answer-with-no-body-ends-at-its-head.md)).
+And a knob that disarms another knob gets a sentence beside the second
+one: `.off` turns off `timeout_ms`, and the guide never said.
+
+**A URL rewritten after it was signed is a URL that works until the host is
+in the signature.** The port's public-endpoint rewrite was right for a POST
+form and wrong for a presigned GET, with nothing at the call site to say
+which. The endpoint a browser reaches is a fact about the deployment, so it
+is decided where the endpoint is and signed as such
+([ADR 0216](./adr/0216-a-presigned-url-names-the-host-the-browser-reaches.md)).
+Garage also refuses a form without a `bucket` field the policy already
+names; the value is a constant, so it is sent everywhere.
+
+**The Row was the response everywhere but the one place the program adds
+to it.** A comment line's files, read in a second statement, had a DTO or a
+`jsonb_agg` as their only homes. `sql.Json(T)` was the right half of that —
+the document says `T` — and a field the program fills got a marker of its
+own, read by every column list in the module rather than by the writer
+([ADR 0217](./adr/0217-a-row-can-carry-a-field-no-column-holds.md)). Six
+field walks in `sql/` had to learn it, and `schema.zig`'s was the one the
+live test found.
