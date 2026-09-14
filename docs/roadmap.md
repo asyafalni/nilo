@@ -1888,7 +1888,7 @@ go hunting for the right branch. The consequence is that every new Zig release
 brings a few awkward weeks, made worse by zio following a branch-per-version
 pattern too.
 
-**0.3.0 needs Zig 0.16.**
+**0.4.0 needs Zig 0.16.**
 
 ---
 

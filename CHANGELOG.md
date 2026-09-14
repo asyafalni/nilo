@@ -7,7 +7,7 @@ that have, one page each. What was measured and what was got wrong on the way is
 in [`docs/history.md`](./docs/history.md); what is coming is in
 [`docs/roadmap.md`](./docs/roadmap.md).
 
-## Unreleased
+## 0.4.0
 
 Needs Zig 0.16, as 0.3.0 does. Each entry says what you have to change; the
 account of why is in the ADR it links.
