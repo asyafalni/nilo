@@ -77,6 +77,7 @@ pub const panic = nilo.panic;                     // optional: name the request 
 | `app.listen(options)` | run until stopped. Stops the process on a startup error |
 | `app.start(io)` | everything `listen()` does before it accepts anything — services checked, chains resolved, pools opened, schemas checked. For a migration, a script or a test; `listen()` does not repeat it ([ADR 0079](./adr/0079-there-is-a-phase-before-the-server.md)). What it does *not* start is `spawn`, which needs a server |
 | `app.shutdown()` | stop, from any thread or from inside a handler |
+| `app.boundPort()` | `?u16` — the port the server is listening on, from any thread. Null before `listen()` has bound, and for a unix socket. `.port = 0` asks the kernel for a free one and this is its answer |
 | `app.tryListen / tryRoute / tryStatic / tryStaticWith` | the same calls, error returned rather than reported |
 | `app.checkServices()` | `error.MissingService` if a route needs one nobody provided |
 | `app.routes()` | every route, in registration order — a view rather than a copy. `.len()`, `.at(i)` and `{f}` ([ADR 0127](./adr/0127-a-route-pattern-is-the-name-of-its-url.md)). `.at(i)` is `.method`, `.pattern` and `.name` — the `operationId`, given or derived, so a table keyed by it can be held against the route table ([ADR 0201](./adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)) |
@@ -2858,6 +2859,21 @@ full socket path with the slashes percent-encoded. Same server and same query:
 197k req/s across a Docker published port, 359k over loopback TCP, 458k over
 the socket, with p99 halved ([`bench/result/sql.md`](../bench/result/sql.md)).
 
+**The URL is read the way libpq reads it, and a parameter the driver would
+not act on is refused by name.** Carried: `user`, `password`, `dbname`, `host`
+and `port` as query forms, `sslmode` (`disable`, `require`, `verify-full`),
+`sslrootcert` beside `verify-full` (`system` for the platform's store),
+`application_name` and `fallback_application_name`, `connect_timeout` in
+seconds, `tcp_user_timeout` in milliseconds, and `keepalives`,
+`keepalives_idle`, `keepalives_interval`, `keepalives_count`. Dropped with one
+`warn` line, because the driver does it already or nothing observable changes:
+`pgbouncer`, `pool_mode`, `sslsni=1`, `gssencmode=disable`,
+`channel_binding=prefer`, `target_session_attrs=any`. Everything else is
+refused with a line naming the parameter, why, and that list — `sslmode=prefer`
+first among them, because it would fall back to plaintext and pg.zig does not.
+A query string is split before it is percent-decoded, so `password=p%26w` is
+`p&w`.
+
 | `Opts` | |
 |---|---|
 | `size` | connections held open. Default 10. The knob with a real curve behind it: 8 → 133k req/s, 16 → 148k, 32 → 180k, 64 → 206k, with p99 best at 32. Each one is a Postgres backend and a slot against `max_connections` |
@@ -3562,7 +3578,7 @@ than asking the server to release a mark it no longer has.
 | `sql.Bytes` | bytes rather than text: `bytea` on Postgres, `BLOB` on SQLite. `.bytes` is the value, `sql.Bytes.of(hash)` writes one. The slice a read hands back lives in the request arena, the way a `Str` does. This is what to reach for instead of `sql.AsText("bytea")`, which goes through hex printing and costs a conversion each way ([ADR 0174](./adr/0174-bytes-are-a-type-not-a-second-protocol.md)) |
 | `sql.AsText("money")` | any Postgres type at all, held as its text — the door out of this table. A column type of your own is any struct or enum with `nilo_column`, `nilo_read(text, arena)` and `nilo_write(arena)`; see below |
 | a slice | an array column, with no wrapper: `[]const Str` is `text[]`, `[]const i32` is `int4[]`, `?[]const i32` a nullable one, `[]const ?i32` one whose elements may be NULL ([ADR 0051](./adr/0051-an-array-is-a-slice-and-a-slice-is-one-deep.md)). `[]const u8` is text, so a list of text is `[]const Str` or `[]const []const u8`. `[]const sql.Uuid` is `uuid[]`, in both directions and as an `.in` list ([ADR 0145](./adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)). Not available in `db.stream` |
-| an enum | read out of `text`, a `varchar` or a Postgres enum. A value the Zig enum does not have fails the request. Add `pub const nilo_column = "user_role"` to it and the column is checked at startup — and can be batched |
+| an enum | read out of `text`, a `varchar` or a Postgres enum. A value the Zig enum does not have fails the request. Add `pub const nilo_column = "user_role"` to it and the column is checked at startup — its type name, and on Postgres its values too, so a label the Zig enum lacks or a tag the type lacks is reported before the first request rather than by it — and can be batched |
 
 #### A column type of your own
 

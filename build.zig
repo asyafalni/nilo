@@ -1697,6 +1697,50 @@ const Snippets = struct {
         ) catch @panic("cannot read a documentation page or its prelude");
     }
 
+    /// Every page under `docs/` and the README that carries a mark at the
+    /// start of a line and is not in `pages` — which is a mark nothing reads,
+    /// and from the page it looks exactly like one a build step checked.
+    ///
+    /// The list stays a list, for the reason its comment gives; what this
+    /// adds is that a mark cannot be written where the list does not reach.
+    /// `docs/guide/openapi.md` carried one for two days before anybody
+    /// noticed, found by reading the roadmap's own entry about this against
+    /// the tree rather than by anything failing. A mark quoted in prose —
+    /// an ADR saying what the mark is — has text in front of it on the line
+    /// and is not one.
+    fn unlisted(b: *std.Build) []const []const u8 {
+        var found: std.ArrayList([]const u8) = .empty;
+        var candidates: std.ArrayList([]const u8) = .empty;
+        candidates.append(b.allocator, "README.md") catch @panic("OOM");
+
+        var docs = b.build_root.handle.openDir(b.graph.io, "docs", .{ .iterate = true }) catch
+            @panic("cannot open docs/");
+        defer docs.close(b.graph.io);
+        var walker = docs.walk(b.allocator) catch @panic("OOM");
+        defer walker.deinit();
+        while (walker.next(b.graph.io) catch @panic("cannot walk docs/")) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.path, ".md")) continue;
+            candidates.append(b.allocator, b.fmt("docs/{s}", .{entry.path})) catch @panic("OOM");
+        }
+
+        for (candidates.items) |path| {
+            var listed = false;
+            for (pages) |page| {
+                if (std.mem.eql(u8, page.path, path)) listed = true;
+            }
+            if (listed) continue;
+            var lines = std.mem.splitScalar(u8, read(b, path), '\n');
+            while (lines.next()) |line| {
+                if (std.mem.startsWith(u8, std.mem.trim(u8, line, " \t\r"), opens)) {
+                    found.append(b.allocator, path) catch @panic("OOM");
+                    break;
+                }
+            }
+        }
+        return found.items;
+    }
+
     /// Whether this block introduces a function of its own — which is what
     /// keeps it out of `shapes`. Column 0 is the whole test: a `pub fn` that
     /// is indented is a method inside a struct, and a method's parameters
@@ -3801,6 +3845,18 @@ pub fn build(b: *std.Build) void {
     if (want_sql and b.pkg_hash.len == 0) {
         // Written into the cache rather than into the tree: the snippet's
         // one copy is the one in the page.
+        // A marked page the list does not name is the step lying by
+        // omission, and it stops here rather than passing silently.
+        const unlisted = Snippets.unlisted(b);
+        if (unlisted.len != 0) {
+            for (unlisted) |path| std.debug.print(
+                "nilo: {s} carries a `<!-- compiles -->` mark and is not in `pages` in build.zig, " ++
+                    "so nothing compiles it\n",
+                .{path},
+            );
+            @panic("a documentation page is marked and never checked — add it to `pages`");
+        }
+
         const written = b.addWriteFiles();
         for (Snippets.collect(b)) |snippet| {
             const module = b.createModule(.{

@@ -1325,16 +1325,6 @@ Refusing it is the consistent answer and breaks code that runs today.
 since a program on SQLite that wrote `.like` and wanted folding has been
 getting it.
 
-**`selectFor` and its six siblings are Postgres-only.** `sql.selectFor(Row,
-Options)` and the rest hard-code `dialect.Postgres`, so a program on
-`sql.Sqlite` cannot ask what SQL its own query compiles to — which is the one
-call in the module that exists purely so a reader can see the constant ADR 0039
-is about. `statement.select(D, Row, O)` takes the Dialect and is the module's
-own spelling; only the re-export in `sql.zig` fixes it.
-
-**Waiting on: ready.** Either a Dialect parameter on each, or `sql.dialect` and
-`sql.statement` being enough now that both are already exported.
-
 **Nothing reports how the pool is doing.** `app.metrics` counts requests,
 statuses and durations
 ([ADR 0100](./adr/0100-the-route-table-is-the-registry.md)); a `Db` counts
@@ -1348,19 +1338,16 @@ marked test-facing because nothing else reveals it.
 `app.metrics` is the shape and a `Db` is a Service, which knows nothing about an
 App — so where the numbers meet is the question, not how to count them.
 
-**A connection URL carrying an ordinary parameter stops the server.**
-`postgres.dialOpts` understands `sslmode` and `tcp_user_timeout` and refuses
-everything else — `sslmode=prefer`, `allow` and `verify-ca` included. The
-refusal is right about the risk, since an `sslmode` nobody read is a plaintext
-connection whose URL says otherwise, and wrong about how often it fires: the URL
-a managed Postgres hands out carries `channel_binding`, `application_name`,
-`options` or a pooler's own parameter, so pasting one in is a server that will
-not start. What the operator gets is `UnsupportedConnectionParam` and no list of
-what *is* understood, and `nilo_start`'s message then sends them to re-read a
-URL that is correct.
+**`options=` and `client_encoding` in a connection URL are refused because
+pg.zig never sends what they would set.** `AuthOpts.startup_parameters` exists
+upstream and `auth.zig` builds the startup message without it, so the two
+libpq parameters that ride on the startup message have nowhere to go, and
+`dialOpts` says so rather than dropping them. `channel_binding=require`,
+`gssencmode=require` and a client certificate are refused for the plainer
+reason that the driver does none of those.
 
-**Waiting on: a design** — which parameters are safe to drop, which are worth
-carrying, and whether the refusal names the two it knows.
+**Waiting on: upstream (pg.zig)**, for the first two — one field is already
+declared, and the message writer already has a `params` slot for it.
 
 **A deep page is still `OFFSET`, and nothing writes down the keyset form.**
 The database counts past every row it is not going to answer with, which is the
@@ -1431,13 +1418,28 @@ multiplication.
 **A pool connection carries result state for 32 columns whatever the Row has.**
 pg.zig's `result_state_size` defaults to 32 and nilo takes the default, so a
 two-column Row pays for thirty it will never fill. A few hundred bytes a
-connection, held for the life of the pool. This module is the one place that
-can size it honestly, because every statement is a comptime constant, so the
-widest Row a `Db` can ever read is known before the program runs.
+connection, held for the life of the pool. It looked free to size from the
+widest Row a `Db` reads, since every statement is a comptime constant. It is
+not: the same number sizes the parameter-OID array a prepared statement is
+described with, and a statement wider than it allocates per call rather than
+failing — so a value chosen from the Rows would be silently paid for again by
+the first `insertMany` whose tuple is wider than any Row.
 
-**Waiting on: ready.** It is small next to the stack finding
-([ADR 0063](./adr/0063-a-handlers-stack-is-per-connection.md)) and it is free,
-which is the only reason it is written down.
+**Waiting on: accepted.** The default is the safe one, and the saving is a few
+hundred bytes a connection against a stack that costs kilobytes
+([ADR 0063](./adr/0063-a-handlers-stack-is-per-connection.md)).
+
+**A Row over an attached SQLite database has nowhere to `ATTACH` it.** A
+schema in `nilo_table` means an attached database there
+([ADR 0061](./adr/0061-the-second-dialect-is-the-test-of-the-seam.md)), and
+`ATTACH` is per connection — but the Wire holds a writer and a pool of
+readers, opens them itself, and `db.exec("ATTACH …")` reaches the writer
+alone. The introspection then asks a reader that has never heard the name,
+which is how the test for the schema-qualified `sqlite_master` found this: it
+attaches on every `conns[i].handle` by hand, and a program cannot.
+
+**Waiting on: a design** for a statement list run on every connection at open
+— which is also where a `PRAGMA` of the caller's own would go.
 
 **`db.raw` is routed by its first keyword.** Exact for everything the module
 generates, because the module wrote the text. A guess for `db.raw`, where the
@@ -1461,31 +1463,6 @@ same applies to `.lock` and `tx.deadline`.
 **Waiting on: accepted.** This is the seam refusing rather than lying, and it
 is worth knowing before somebody plans a migration on the assumption that
 swapping the Dialect is free.
-
-**An enum column that has not named its type is not checked at startup.** An
-enum carrying `pub const nilo_column = "user_role"` is judged like any other
-column. One that does not is not, because a Postgres enum's type name lives in
-the database and guessing it would fail honest schemas. What is still open
-either way is the *values*: nothing compares the Zig enum's tags against the
-type's, so a Zig enum that has fallen behind its table is found by the first
-request that reads such a row.
-
-**Waiting on: ready.** It means asking the database which values the type has,
-which is a second introspection query and a Dialect that can spell it.
-
-**`sqlite_master` in the introspection query is not schema-qualified.**
-`columnsOf` in `sql/sqlite.zig` rewrites `pragma_table_info` to
-`"archive".pragma_table_info` when a Row names a schema, and leaves the
-`LEFT JOIN sqlite_master` beside it alone — so a Row over a table in an attached
-database asks `main.sqlite_master` whether that name is a view. It finds
-nothing, `m.type` is null, and the `UNKNOWN` answer that exists so a view's
-columns are not all reported as nullable
-([ADR 0056](./adr/0056-a-view-is-a-table-that-cannot-say-what-is-not-null.md))
-is unreachable there. A Row over a view in an attached database gets exactly the
-failure ADR 0056 was written to remove.
-
-**Waiting on: ready.** The same rewrite `columnsOf` already does, applied to the
-second relation in the query.
 
 **pg.zig spends a whole round trip it does not need on every prepared
 statement.** `conn.zig:243` writes a standalone `Sync` on the cache-hit path and
@@ -1888,6 +1865,15 @@ unusable for exactly the large downloads that need resuming. It is the tag
 nginx has served by default for twenty years, and a held file is unaffected,
 because it keeps its content hash.
 
+**A `<!-- compiles -->` on a page nobody listed would be silent, and would look
+exactly like one that is checked.** `zig build snippets` compiles what the
+`pages` list in `build.zig` names, and it also walks `README.md` and `docs/`
+for the mark itself, refusing a marked page the list has left out. So a mark
+cannot be written anywhere the step will not read it, which is what made this
+a class rather than an oversight: the way to learn how a block is marked is to
+copy a neighbouring page, and a dead mark used to copy as readily as a live
+one. The instance that surfaced it, `docs/guide/openapi.md`, is on the list.
+
 ### Cannot be held, and said out loud instead
 
 **A panic in any handler takes the whole process down, and Go people will
@@ -1910,61 +1896,6 @@ write. A `Str` that escapes this way is the staleness trap's problem, and it is
 the case that trap cannot watch.
 
 ### Open
-
-**One test file still walks a range of loopback ports.** `http/live.zig`
-walks 41,200–42,199 from a start derived from the thread id, so a rerun does
-not walk back over the ports its own `TIME-WAIT` still holds. `fetch/live.zig`
-and `s3/canned.zig` used to walk ranges beside it, held apart by three
-comments naming each other, and the comments once failed: ten consecutive
-`zig build test-all` runs hit `error.NoFreePort` from the sixth on when two
-ranges overlapped. Both bind port 0 now and read the kernel's answer out of
-`Server.socket.address` — which `std.Io.Threaded` has filled after `listen`
-the whole time, and which this entry said for a cycle it could not, "re-checked
-against Zig 0.16 rather than believed". The fifth blocker here that was not
-one, and the first from inside the pinned standard library.
-
-What is left is the file that does not open its own socket: `App.listen` binds
-inside the Engine and hands nothing back, so a test cannot ask it for port 0.
-zio reads the bound address back too (`Socket.bind`), and the Engine already
-logs it — the missing piece is one field or one callback on the App, and
-whether the port a server is listening on is something the App should say.
-
-**Waiting on: a design** for how `App.listen` says which port it got, which
-is a question about the App's surface rather than about sockets.
-
-**A `<!-- compiles -->` on a page nobody added to a list is silent, and it looks
-exactly like one that is checked.** `zig build snippets` does not scan the
-documentation; it reads a `pages` list in `build.zig`. A block marked on a page
-that is not in that list is never compiled and never complained about, so the
-mark means "somebody believed this" rather than "a build step read this" — and
-the two are indistinguishable from the page.
-
-That is this repository's own stated failure, a rule nobody runs wearing the
-costume of a rule that does. **What makes it a class rather than an oversight is
-that it propagates by being read.** The way to find out how a block is marked
-here is to open a neighbouring guide page and copy what is above the fence — and
-a dead mark is copied exactly as readily as a live one, because from the page
-they are the same three words. So the defect reproduces through the ordinary,
-correct habit of matching the surrounding code, and "somebody forgot to join the
-list" understates it: more care does not help a reader who cannot tell the two
-apart.
-
-What would end it is **the step finding its pages by looking for marks** rather
-than reading a list. Then a mark cannot be written anywhere the step will not
-read it, and imitation stops being able to carry a dead one. The cost is a
-directory walk at build time, on a step that already caches.
-
-`docs/guide/sql/` is where this matters most: nine pages and 49 marked blocks,
-more than the README and the reference together, every one of them live only
-because its page was joined to the list by hand.
-
-**Waiting on: ready** for the instance, which is an afternoon rather than a
-line — adding a page to `pages` compiles nothing until a block on it is marked,
-and the marking is the work.
-[ADR 0083](./adr/0083-the-guide-is-the-source-of-its-own-snippets.md) records
-that doing it to one five-line example found seven mistakes. **The class is
-`Waiting on: a design`**, and it is the half worth keeping when the instance
-closes.
 
 **A fail function in spawned work is safe only because of where a threadlocal
 gets written.** `bulkhead.slot()` falls back to a threadlocal when a fiber has

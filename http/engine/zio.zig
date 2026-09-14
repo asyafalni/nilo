@@ -881,12 +881,14 @@ fn removeSocket(gpa: std.mem.Allocator, path: []const u8) void {
 /// there is a socket behind them. `handler` must be
 /// `fn (@TypeOf(state), *std.Io.Reader, *std.Io.Writer, *Clocks, *Wake, Peer) void`.
 ///
-/// `ready(state, io)` runs once, after the loop exists and the port is
+/// `ready(state, io, port)` runs once, after the loop exists and the port is
 /// taken, before the first connection is accepted. It is how something
 /// that needs the event loop to exist gets built at all — a connection pool
 /// is the case it was added for, and the loop is not there to hand out
-/// until this function has started it (ADR 0040). `ready` must be
-/// `fn (@TypeOf(state), std.Io) anyerror!void`.
+/// until this function has started it (ADR 0040). `port` is the one the
+/// kernel answered with, which is the only way to learn it when `options.port`
+/// was 0, and null for a unix socket. `ready` must be
+/// `fn (@TypeOf(state), std.Io, ?u16) anyerror!void`.
 ///
 /// Returns when `stop` is set — by a signal, or by somebody calling
 /// `App.shutdown()` — once the connections still being served have
@@ -979,7 +981,9 @@ pub fn serve(
     // request that needed it (ADR 0040). This runs on the thread that
     // called `serve`, which is already inside the loop: `accept` below is
     // waited on the same way, so anything `ready` does can wait too.
-    try ready(state, rt.io());
+    // The port is read back from the socket rather than from `options`,
+    // because 0 asks the kernel to choose and a test is the caller that does.
+    try ready(state, rt.io(), if (unix_path != null) null else server.socket.address.ip.getPort());
 
     std.log.info("nilo listening on {f} across {d} thread(s)", .{ server.socket.address, threads });
 

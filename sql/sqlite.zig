@@ -943,6 +943,33 @@ pub fn Wire(comptime opts_in: Options) type {
             );
         }
 
+        /// `name` with `"db".` in front of every occurrence, or `QueryFailed`
+        /// when there is none — a query that has stopped naming the relation
+        /// this expects to qualify is a query this function no longer
+        /// understands, and saying so beats asking the wrong database.
+        fn qualifyEvery(
+            buf: []u8,
+            query: []const u8,
+            comptime name: []const u8,
+            db_name: []const u8,
+        ) wire.Error![]const u8 {
+            var written: usize = 0;
+            var rest = query;
+            var qualified = false;
+            while (std.mem.indexOf(u8, rest, name)) |at| {
+                const piece = std.fmt.bufPrint(buf[written..], "{s}\"{s}\".{s}", .{
+                    rest[0..at], db_name, name,
+                }) catch return error.QueryFailed;
+                written += piece.len;
+                rest = rest[at + name.len ..];
+                qualified = true;
+            }
+            if (!qualified) return error.QueryFailed;
+            const tail = std.fmt.bufPrint(buf[written..], "{s}", .{rest}) catch
+                return error.QueryFailed;
+            return buf[0 .. written + tail.len];
+        }
+
         /// The columns the database says a table has.
         ///
         /// **The schema goes into the text rather than into a parameter**, and
@@ -971,24 +998,18 @@ pub fn Wire(comptime opts_in: Options) type {
             // is a comptime constant of this module's own and the schema comes
             // from a Row's `nilo_table`, so nothing here is the client's — but
             // `bufPrint` still answers `QueryFailed` rather than truncating.
-            var buf: [1024]u8 = undefined;
+            //
+            // **Two names, not one.** `sqlite_master` is the second relation
+            // in the query — the `LEFT JOIN` that says whether the name is a
+            // view — and it went unqualified for a cycle after the first
+            // rewrite, so a Row over a view in an attached database asked
+            // `main.sqlite_master`, found nothing, and got exactly the
+            // failure ADR 0056 was written to remove.
+            var pragma_buf: [1024]u8 = undefined;
+            var master_buf: [1024]u8 = undefined;
             const text = if (schema) |db_name| blk: {
-                const fn_name = "pragma_table_info";
-                var written: usize = 0;
-                var rest = query;
-                var qualified = false;
-                while (std.mem.indexOf(u8, rest, fn_name)) |at| {
-                    const piece = std.fmt.bufPrint(buf[written..], "{s}\"{s}\".{s}", .{
-                        rest[0..at], db_name, fn_name,
-                    }) catch return error.QueryFailed;
-                    written += piece.len;
-                    rest = rest[at + fn_name.len ..];
-                    qualified = true;
-                }
-                if (!qualified) return error.QueryFailed;
-                const tail = std.fmt.bufPrint(buf[written..], "{s}", .{rest}) catch
-                    return error.QueryFailed;
-                break :blk buf[0 .. written + tail.len];
+                const with_pragma = try qualifyEvery(&pragma_buf, query, "pragma_table_info", db_name);
+                break :blk try qualifyEvery(&master_buf, with_pragma, "sqlite_master", db_name);
             } else query;
 
             // No problem slot: this runs once per Row while the server is
@@ -1014,6 +1035,22 @@ pub fn Wire(comptime opts_in: Options) type {
                 }) catch return error.QueryFailed;
             }
             return found.toOwnedSlice(arena) catch return error.QueryFailed;
+        }
+
+        /// Never called: `dialect.SQLite.enum_values` is null, because SQLite
+        /// has no enum type to hold a Zig enum against. Here so the Wire
+        /// contract is one list rather than one with an exception in it.
+        pub fn labelsOf(
+            self: *Self,
+            arena: std.mem.Allocator,
+            query: []const u8,
+            type_name: []const u8,
+        ) wire.Error![]const []const u8 {
+            _ = self;
+            _ = arena;
+            _ = query;
+            _ = type_name;
+            return &.{};
         }
     };
 }

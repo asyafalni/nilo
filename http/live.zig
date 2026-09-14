@@ -29,15 +29,13 @@
 //! is the same standing as a guard only ever seen to pass. A real socket is the
 //! only thing that reaches it.
 //!
-//! **41,200–42,199 is this file's port range, and it is the last one.**
-//! `fetch/live.zig` and `s3/canned.zig` bind port 0 and read the kernel's
-//! answer back — `Server.socket.address` has carried it all along, which this
-//! comment used to say the opposite of — so nothing else walks a range. This
-//! file still does, because `App.listen` opens the socket itself and does not
-//! hand the bound port back out; the roadmap has the entry. The walk starts at
-//! the thread id and wraps, for the reason `fetch/live.zig`'s `open` used to
-//! spell out at length: a fixed start walks back over the ports the last run
-//! left in `TIME-WAIT`.
+//! **Every port here is 0 and read back.** `App.listen` hands the port the
+//! kernel chose to `ready`, and `app.boundPort()` is where a test reads it —
+//! so nothing in the suite walks a range of loopback ports any more. Three
+//! files did, held apart by comments naming each other, on the belief that a
+//! bound port could not be read back; it could all along, in std and in zio
+//! both, and the comments once failed (`error.NoFreePort` from the sixth of
+//! ten consecutive `test-all` runs).
 
 const std = @import("std");
 const nilo = @import("http.zig");
@@ -215,15 +213,16 @@ test "the shutdown reaches a fiber that is not serving anybody" {
 // ---- a file leaving by the route the rest of the suite never takes ----
 
 /// The server for the `sendfile` tests: a real port, because that is the whole
-/// point (see the header).
+/// point (see the header). Port 0, and the kernel's answer read back through
+/// `app.boundPort()` — the way `fetch/live.zig` and `s3/canned.zig` already
+/// get theirs, and the last of the three files that used to walk a range.
 const ServingAt = struct {
     app: *nilo.App,
-    port: u16,
     bound: std.atomic.Value(bool) = .init(true),
 
     fn run(self: *ServingAt) void {
         self.app.tryListen(.{
-            .port = self.port,
+            .port = 0,
             .threads = 1,
             .stop_on_signal = false,
         }) catch {
@@ -232,28 +231,20 @@ const ServingAt = struct {
     }
 };
 
-/// A free port in this file's range. See the header for why it is a walk.
-fn freePort() !u16 {
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+/// The port the server took, once it has. Bounded, for the reason
+/// `waitForServer` is: a server that never binds fails here rather than
+/// leaving the suite waiting (`CLAUDE.md`).
+fn waitForPort(gpa: std.mem.Allocator, serving: *const ServingAt) !u16 {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const first: u16 = 41_200;
-    const count: u16 = 1_000;
-    const start: u16 = @intCast(@as(u64, std.Thread.getCurrentId()) % count);
-    var tried: u16 = 0;
-    while (tried < count) : (tried += 1) {
-        const candidate = first + (start + tried) % count;
-        const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(candidate) };
-        // Bound and closed again rather than held: the App does its own
-        // binding, and holding this one would guarantee the collision it is
-        // being asked about. A racing binder between the two is possible and
-        // is what `bound` below reports.
-        var server = address.listen(io, .{}) catch continue;
-        server.socket.close(io);
-        return candidate;
+    for (0..300) |_| {
+        if (serving.app.boundPort()) |port| return port;
+        if (!serving.bound.load(.acquire)) return error.ServerNeverCameUp;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
     }
-    return error.NoFreePort;
+    return error.ServerNeverCameUp;
 }
 
 /// One request over a real socket, head and body kept apart.
@@ -393,15 +384,15 @@ test "a spilled file's bytes reach a real socket, by the route only a real socke
         .compress = false,
     });
 
-    var serving: ServingAt = .{ .app = &app, .port = try freePort() };
+    var serving: ServingAt = .{ .app = &app };
     const thread = try std.Thread.spawn(.{}, ServingAt.run, .{&serving});
     defer {
         if (serving.bound.load(.acquire)) app.shutdown();
         thread.join();
     }
+    const port = try waitForPort(gpa, &serving);
 
-    const whole = try ask(gpa, serving.port,
-        "GET /files/big.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    const whole = try ask(gpa, port, "GET /files/big.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     defer whole.deinit(gpa);
 
     try testing.expect(std.mem.startsWith(u8, whole.head, "HTTP/1.1 200 "));
@@ -409,9 +400,8 @@ test "a spilled file's bytes reach a real socket, by the route only a real socke
 
     // The other arm of `sendfile.send`, and the one a resumed download takes:
     // a seek, a shorter length, and a 206 saying which bytes these are.
-    const part = try ask(gpa, serving.port,
-        "GET /files/big.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=10-19\r\n" ++
-            "Connection: close\r\n\r\n");
+    const part = try ask(gpa, port, "GET /files/big.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=10-19\r\n" ++
+        "Connection: close\r\n\r\n");
     defer part.deinit(gpa);
 
     try testing.expect(std.mem.startsWith(u8, part.head, "HTTP/1.1 206 "));
@@ -541,17 +531,15 @@ test "a server on a path answers over it, reads the proxy's header, and gives th
     };
     try waitForServer(gpa, &serving);
 
-    const forwarded = try askOverPath(gpa, where.path,
-        "GET /who HTTP/1.1\r\nHost: nilo\r\nX-Forwarded-For: 203.0.113.9\r\n" ++
-            "Connection: close\r\n\r\n");
+    const forwarded = try askOverPath(gpa, where.path, "GET /who HTTP/1.1\r\nHost: nilo\r\nX-Forwarded-For: 203.0.113.9\r\n" ++
+        "Connection: close\r\n\r\n");
     defer forwarded.deinit(gpa);
     try testing.expect(std.mem.startsWith(u8, forwarded.head, "HTTP/1.1 200 "));
     try testing.expectEqualStrings("203.0.113.9", forwarded.body);
 
     // Nothing forwarded, so there is nobody to name: a unix connection has no
     // address of its own to fall back to.
-    const bare = try askOverPath(gpa, where.path,
-        "GET /who HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n");
+    const bare = try askOverPath(gpa, where.path, "GET /who HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n");
     defer bare.deinit(gpa);
     try testing.expect(std.mem.startsWith(u8, bare.head, "HTTP/1.1 200 "));
     try testing.expectEqualStrings("", bare.body);
@@ -597,8 +585,7 @@ test "a socket left behind by a server that is gone does not stop the next one" 
     }
 
     try waitForServer(gpa, &serving);
-    const answer = try askOverPath(gpa, where.path,
-        "GET /who HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n");
+    const answer = try askOverPath(gpa, where.path, "GET /who HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n");
     defer answer.deinit(gpa);
     try testing.expect(std.mem.startsWith(u8, answer.head, "HTTP/1.1 200 "));
 }

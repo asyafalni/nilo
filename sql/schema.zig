@@ -44,6 +44,13 @@ pub const Mismatch = enum {
     wrong_type,
     /// The column may be null and the Row does not allow for it.
     unexpected_null,
+    /// The database's enum has a value the Zig enum does not. The dangerous
+    /// direction: a row holding it reads as an error on the first request,
+    /// which is what `ALTER TYPE … ADD VALUE` leaves behind.
+    value_zig_lacks,
+    /// The Zig enum has a value the database's enum does not. A write of it
+    /// is refused by the database; said here rather than there.
+    value_type_lacks,
 };
 
 pub const Problem = struct {
@@ -74,6 +81,16 @@ pub const Problem = struct {
             .unexpected_null => try w.print(
                 "nilo: {s}.{s} is not optional, but {s}.{s} may be null",
                 .{ self.row, self.column, self.table, self.column },
+            ),
+            // For the three below `expected` is the enum type's name and
+            // `found` the value in question.
+            .value_zig_lacks => try w.print(
+                "nilo: {s}.{s} has no `{s}`, which enum type \"{s}\" has — a row holding it will not read",
+                .{ self.row, self.column, self.found, self.expected },
+            ),
+            .value_type_lacks => try w.print(
+                "nilo: {s}.{s} has `{s}`, which enum type \"{s}\" does not — a row holding it will not write",
+                .{ self.row, self.column, self.found, self.expected },
             ),
         }
     }
@@ -206,6 +223,90 @@ fn problemFor(
         return out;
     }
     return null;
+}
+
+/// The enum columns of `Row` that named their type — the only ones whose
+/// values can be held against the database's, because a Postgres enum's
+/// type name lives there and a Zig enum that did not say it is judged like
+/// text. Each is the column name and the type name, worked out while
+/// compiling so the check is a loop over a list.
+pub const EnumColumn = struct { column: []const u8, type_name: []const u8, E: type };
+
+pub fn enumColumnsOf(comptime Row: type) []const EnumColumn {
+    return comptime blk: {
+        const fields = @typeInfo(Row).@"struct".fields;
+        var out: [fields.len]EnumColumn = undefined;
+        var n: usize = 0;
+        for (fields) |f| {
+            if (row_mod.isBeside(Row, f.name)) continue;
+            const Inner = switch (@typeInfo(f.type)) {
+                .optional => |o| o.child,
+                else => f.type,
+            };
+            if (@typeInfo(Inner) != .@"enum") continue;
+            if (!@hasDecl(Inner, "nilo_column")) continue;
+            out[n] = .{ .column = f.name, .type_name = Inner.nilo_column, .E = Inner };
+            n += 1;
+        }
+        const frozen = out[0..n].*;
+        break :blk &frozen;
+    };
+}
+
+/// Hold a Zig enum against the values the database's type has, appending
+/// what does not line up. Returns how many problems were found.
+///
+/// Both directions are reported, because they fail differently and both
+/// fail at run time otherwise: a value the Zig enum lacks is an error on the
+/// first row that holds it (`enumOf` in `db.zig`), and a value the type
+/// lacks is a database error on the first write of it. No labels at all is
+/// nothing to compare rather than a problem: an enum whose `nilo_column`
+/// names `text` or `varchar` is held as text, and the type name itself was
+/// already judged by `compare`, column by column.
+pub fn compareEnum(
+    comptime E: type,
+    row: []const u8,
+    table: []const u8,
+    column: []const u8,
+    type_name: []const u8,
+    labels: []const []const u8,
+    out: *std.ArrayList(Problem),
+    gpa: std.mem.Allocator,
+) !usize {
+    if (labels.len == 0) return 0;
+    const base = Problem{
+        .row = row,
+        .table = table,
+        .column = column,
+        .kind = .value_zig_lacks,
+        .expected = type_name,
+        .found = "",
+    };
+
+    var found: usize = 0;
+    for (labels) |label| {
+        if (std.meta.stringToEnum(E, label) == null) {
+            var problem = base;
+            problem.kind = .value_zig_lacks;
+            problem.found = label;
+            try out.append(gpa, problem);
+            found += 1;
+        }
+    }
+    inline for (@typeInfo(E).@"enum".fields) |f| {
+        var present = false;
+        for (labels) |label| {
+            if (std.mem.eql(u8, label, f.name)) present = true;
+        }
+        if (!present) {
+            var problem = base;
+            problem.kind = .value_type_lacks;
+            problem.found = f.name;
+            try out.append(gpa, problem);
+            found += 1;
+        }
+    }
+    return found;
 }
 
 fn findColumn(actual: []const wire_mod.Column, name: []const u8) ?wire_mod.Column {
@@ -388,4 +489,59 @@ test "the columns are read out of the table a narrower Row borrows" {
     var problems = try problemsFor(UserCard, &good);
     defer problems.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), problems.items.len);
+}
+
+test "an enum column is judged in both directions, and text is not judged" {
+    const Role = enum {
+        admin,
+        member,
+        pub const nilo_column = "staff_role";
+    };
+    var problems: std.ArrayList(Problem) = .empty;
+    defer problems.deinit(testing.allocator);
+
+    // The database gained `moderator`; the Zig enum has `member` the type lacks.
+    const labels = [_][]const u8{ "admin", "moderator" };
+    try testing.expectEqual(@as(usize, 2), try compareEnum(Role, "Staff", "staff", "role", "staff_role", &labels, &problems, testing.allocator));
+    try testing.expectEqual(Mismatch.value_zig_lacks, problems.items[0].kind);
+    try testing.expectEqualStrings("moderator", problems.items[0].found);
+    try testing.expectEqual(Mismatch.value_type_lacks, problems.items[1].kind);
+    try testing.expectEqualStrings("member", problems.items[1].found);
+
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try problems.items[0].write(&w);
+    try testing.expectEqualStrings(
+        "nilo: Staff.role has no `moderator`, which enum type \"staff_role\" has — a row holding it will not read",
+        w.buffered(),
+    );
+
+    // Agreement is silence.
+    problems.clearRetainingCapacity();
+    const same = [_][]const u8{ "admin", "member" };
+    try testing.expectEqual(@as(usize, 0), try compareEnum(Role, "Staff", "staff", "role", "staff_role", &same, &problems, testing.allocator));
+
+    // And no labels is a column held as text, which `compare` has judged
+    // already: nothing to say.
+    try testing.expectEqual(@as(usize, 0), try compareEnum(Role, "Staff", "staff", "role", "staff_role", &.{}, &problems, testing.allocator));
+}
+
+test "only an enum that named its type is held against the database" {
+    const Named = enum {
+        a,
+        pub const nilo_column = "t";
+    };
+    const Bare = enum { a };
+    const Row = struct {
+        pub const nilo_table = .{ .name = "r", .key = .id };
+        id: i64,
+        named: Named,
+        maybe: ?Named,
+        bare: Bare,
+    };
+    const cols = comptime enumColumnsOf(Row);
+    try testing.expectEqual(@as(usize, 2), cols.len);
+    try testing.expectEqualStrings("named", cols[0].column);
+    try testing.expectEqualStrings("maybe", cols[1].column);
+    try testing.expectEqualStrings("t", cols[1].type_name);
 }

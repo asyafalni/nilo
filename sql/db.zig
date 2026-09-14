@@ -700,8 +700,8 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 if (isUrlProblem(err)) std.log.warn(
                     "nilo could not read the database URL \"{s}\" ({s}). This is the URL " ++
                         "itself rather than the database: the scheme has to be `postgres://` " ++
-                        "or `postgresql://`, and the only parameters understood are `sslmode` " ++
-                        "and `tcp_user_timeout`.",
+                        "or `postgresql://`, and a parameter the driver would not act on is " ++
+                        "refused — the line above names it and lists the ones understood.",
                     .{ redacted(self.url), @errorName(err) },
                 ) else std.log.warn(
                     "nilo could not open {d} of the {d} connections to \"{s}\" ({s}). " ++
@@ -2324,6 +2324,27 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 const q = comptime row_mod.qualifiedOf(Row);
                 const actual = try w.columnsOf(arena, D.introspect, q.schema, q.table);
                 _ = try schema.compare(D, Row, actual, &problems, arena);
+
+                // The half of an enum column the type name does not settle:
+                // its values. A Zig enum that has fallen behind an `ALTER
+                // TYPE … ADD VALUE` used to pass here and fail on the first
+                // row holding the new value. One query per named enum
+                // column, at startup, on a Dialect that has enum types.
+                if (comptime D.enum_values) |query| {
+                    inline for (comptime schema.enumColumnsOf(Row)) |col| {
+                        const labels = try w.labelsOf(arena, query, col.type_name);
+                        _ = try schema.compareEnum(
+                            col.E,
+                            @typeName(Row),
+                            comptime row_mod.tableOf(Row),
+                            col.column,
+                            col.type_name,
+                            labels,
+                            &problems,
+                            arena,
+                        );
+                    }
+                }
             }
 
             for (problems.items) |problem| {
@@ -3352,10 +3373,13 @@ fn isUrlProblem(err: anyerror) bool {
     const name = @errorName(err);
     for ([_][]const u8{
         // nilo's own, from `dialOpts`.
-        "InvalidUriScheme",    "UnsupportedSSLModeValue", "UnsupportedConnectionParam",
-        // `std.Uri.parse`, and the integer parse behind `tcp_user_timeout`.
-        "UnexpectedCharacter", "InvalidFormat",           "InvalidPort",
-        "InvalidCharacter",    "Overflow",
+        "InvalidUriScheme",                "UnsupportedSSLModeValue",    "UnsupportedConnectionParam",
+        "UnsupportedConnectionParamValue", "ConflictingConnectionParam",
+        // `std.Uri.parse`, and the integer parses behind `connect_timeout`
+        // and its kin.
+        "UnexpectedCharacter",
+        "InvalidFormat",                   "InvalidPort",                "InvalidCharacter",
+        "Overflow",
     }) |known| {
         if (std.mem.eql(u8, name, known)) return true;
     }
@@ -4990,6 +5014,8 @@ test "a bad URL and a database that is down get different sentences" {
     try testing.expect(isUrlProblem(error.InvalidUriScheme));
     try testing.expect(isUrlProblem(error.UnsupportedConnectionParam));
     try testing.expect(isUrlProblem(error.UnsupportedSSLModeValue));
+    try testing.expect(isUrlProblem(error.UnsupportedConnectionParamValue));
+    try testing.expect(isUrlProblem(error.ConflictingConnectionParam));
     try testing.expect(isUrlProblem(error.InvalidPort));
 
     // The ones that mean the database, which are the ones the old message
@@ -5183,6 +5209,53 @@ test "the schema check agrees with the wire about a uuid column" {
     _ = try db.exec(&run, accounts_ddl, .{});
 
     try testing.expectEqual(@as(usize, 0), try db.checkSchema(&.{SqliteAccount}));
+}
+
+/// A view in an attached database. `UNKNOWN` nullability is the whole
+/// point: a view cannot say what is not null (ADR 0056), so a Row reading
+/// its column as non-optional has to pass the check rather than be told the
+/// column is nullable.
+const ArchivedNote = struct {
+    pub const nilo_table = .{ .name = "archive.recent_notes", .key = .id };
+
+    id: i64,
+    body: []const u8,
+};
+
+test "the introspection asks the attached database whether the name is a view" {
+    // `columnsOf` qualified `pragma_table_info` with the schema and left
+    // `sqlite_master` alone, so a view in an attached database was looked up
+    // in `main`, found nothing, and its columns were judged as a table's —
+    // exactly the failure ADR 0056 was written to remove, one schema over.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:attached-view-check?mode=memory&cache=shared",
+        .{ .size = 1 },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+
+    // `ATTACH` is per connection, and the introspection is a `SELECT` that
+    // goes to a reader while `db.exec` goes to the writer — so every
+    // connection attaches the one shared in-memory database, which is
+    // what a program with an attached schema has to do at open as well.
+    for (db.wire.?.conns) |conn| try conn.handle.exec(
+        "ATTACH DATABASE 'file:attached-archive?mode=memory&cache=shared' AS archive",
+        .{},
+    );
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, "CREATE TABLE archive.notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)", .{});
+    _ = try db.exec(&run, "CREATE VIEW archive.recent_notes AS SELECT id, body FROM archive.notes", .{});
+
+    // A view's columns are all nullable as far as `pragma_table_info` can
+    // tell, so this only passes if `m.type = 'view'` was answered by the
+    // attached database's `sqlite_master`.
+    try testing.expectEqual(@as(usize, 0), try db.checkSchema(&.{ArchivedNote}));
 }
 
 // -- every call, against the SQLite Wire ----------------------------------

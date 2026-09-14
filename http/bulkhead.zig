@@ -12,14 +12,17 @@
 //!   connections, and run `handler(state, in, out, deadlines, waker, peer)`
 //!   for each one concurrently until that connection is done. `state` is
 //!   carried through as-is (normally `*App`). Returns when `stop` is set.
-//! - `ready(state, io, limits)` inside that call — run once, after the port
-//!   is taken and before the first connection is accepted, and hand over the
-//!   `std.Io` the Engine runs on. This is the one thing here that exists
+//! - `ready(state, io, limits, port)` inside that call — run once, after the
+//!   port is taken and before the first connection is accepted, and hand over
+//!   the `std.Io` the Engine runs on. This is the one thing here that exists
 //!   for a caller rather than for nilo: a connection pool cannot be built
 //!   before `listen()`, because the event loop it has to dial through does
 //!   not exist yet, and a pool built without one blocks the thread every
 //!   request shares (ADR 0040). The type is std's, not zio's, so this hands
-//!   out nothing that names the Engine.
+//!   out nothing that names the Engine. `port` is the one actually bound —
+//!   the kernel's answer when `Options.port` was 0 — and null for a unix
+//!   socket; it is how a test asks for any free port instead of walking a
+//!   range of them.
 //! - `stopping(state)` inside that call — run once on the way out, after
 //!   the last connection has been cut off and before the Engine's loop is
 //!   torn down. The mirror of `ready`, and it exists for the same caller: a
@@ -541,8 +544,8 @@ pub fn serve(
         /// and there is no connection yet, so only the state goes through —
         /// along with the one clock that is not a connection's, which is what
         /// a Service bounds an outbound call with (ADR 0065).
-        fn start(carried: Carried, io: std.Io) anyerror!void {
-            return ready(carried.state, io, engine_limits_value);
+        fn start(carried: Carried, io: std.Io, port: ?u16) anyerror!void {
+            return ready(carried.state, io, engine_limits_value, port);
         }
 
         /// The shutdown hook, unwrapped the same way. No `io` and no error:

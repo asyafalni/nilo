@@ -231,11 +231,13 @@ pub fn SqliteNamed(comptime name: []const u8, comptime opts: sqlite.Options) typ
     return db.DbOf(sqlite.Wire(opts), dialect.SQLite, name);
 }
 
-/// The Dialect used unless something says otherwise — and the only one with
-/// a Wire behind it. `sql.dialect.SQLite` is the second, SQL half only, and
-/// what it found is in
+/// The Dialect used unless something says otherwise. `sql.SQLite` is the
+/// second, and what building it found is in
 /// [ADR 0061](../docs/adr/0061-the-second-dialect-is-the-test-of-the-seam.md).
+/// This comment said for a year that SQLite was "SQL half only"; it has had
+/// a Wire since ADR 0073.
 pub const Postgres = dialect.Postgres;
+pub const SQLite = dialect.SQLite;
 
 pub const Timestamp = types.Timestamp;
 pub const Uuid = types.Uuid;
@@ -432,23 +434,84 @@ pub fn updateManyFor(comptime Row: type, comptime Values: type) statement.Statem
 pub fn insertOrIgnoreFor(
     comptime Row: type,
     comptime Values: type,
-    comptime on: anytype,
+    comptime conflict: anytype,
 ) statement.Statement {
-    return comptime statement.insertOrIgnore(Postgres, Row, Values, on);
+    return comptime statement.insertOrIgnore(Postgres, Row, Values, conflict);
 }
 
 pub fn insertOrUpdateFor(
     comptime Row: type,
     comptime Values: type,
-    comptime on: anytype,
+    comptime conflict: anytype,
 ) statement.Statement {
-    return comptime statement.insertOrUpdate(Postgres, Row, Values, on);
+    return comptime statement.insertOrUpdate(Postgres, Row, Values, conflict);
 }
 
 /// The `UPDATE`. Both `.set` and `.where` are required, and the numbering
 /// runs through them in that order.
 pub fn updateFor(comptime Row: type, comptime Options: type) statement.Statement {
     return comptime statement.update(Postgres, Row, Options);
+}
+
+/// The fifteen `…For` functions above, bound to a Dialect of the caller's
+/// choosing: `sql.on(sql.SQLite).selectFor(User, Options)` is what a program
+/// on SQLite compiles to, spelled with `?1` and `LIKE` where the Postgres
+/// version says `$1` and `ILIKE`. The bare `selectFor` is `on(Postgres)`,
+/// which is the default Dialect and was, until this existed, the only one a
+/// reader could ask — so a program on SQLite could not see the constant
+/// ADR 0039 is about.
+///
+/// A namespace rather than a Dialect parameter on each of the fifteen,
+/// because every existing call and every refusal names them with two
+/// arguments and nothing about the Postgres default was wrong.
+pub fn on(comptime D: type) type {
+    return struct {
+        pub fn selectFor(comptime Row: type, comptime Options: type) statement.Statement {
+            return comptime statement.select(D, Row, Options);
+        }
+        pub fn oneFor(comptime Row: type, comptime Options: type) statement.Statement {
+            return comptime statement.one(D, Row, Options);
+        }
+        pub fn pageFor(comptime Row: type, comptime Options: type) statement.Statement {
+            return comptime statement.page(D, Row, Options);
+        }
+        pub fn countFor(comptime Row: type, comptime Options: type) statement.Statement {
+            return comptime statement.count(D, Row, Options);
+        }
+        pub fn existsFor(comptime Row: type, comptime Options: type) statement.Statement {
+            return comptime statement.exists(D, Row, Options);
+        }
+        pub fn findFor(comptime Row: type, comptime Key: type) statement.Statement {
+            return comptime statement.find(D, Row, Key);
+        }
+        pub fn deleteFor(comptime Row: type, comptime Options: type) statement.Statement {
+            return comptime statement.delete(D, Row, Options);
+        }
+        pub fn updateReturningFor(comptime Row: type, comptime Options: type) statement.Statement {
+            return comptime statement.updateReturning(D, Row, Options);
+        }
+        pub fn deleteReturningFor(comptime Row: type, comptime Options: type) statement.Statement {
+            return comptime statement.deleteReturning(D, Row, Options);
+        }
+        pub fn insertFor(comptime Row: type, comptime Values: type) statement.Statement {
+            return comptime statement.insert(D, Row, Values);
+        }
+        pub fn insertManyFor(comptime Row: type, comptime Values: type) statement.Statement {
+            return comptime statement.insertMany(D, Row, Values);
+        }
+        pub fn updateManyFor(comptime Row: type, comptime Values: type) statement.Statement {
+            return comptime statement.updateMany(D, Row, Values);
+        }
+        pub fn insertOrIgnoreFor(comptime Row: type, comptime Values: type, comptime conflict: anytype) statement.Statement {
+            return comptime statement.insertOrIgnore(D, Row, Values, conflict);
+        }
+        pub fn insertOrUpdateFor(comptime Row: type, comptime Values: type, comptime conflict: anytype) statement.Statement {
+            return comptime statement.insertOrUpdate(D, Row, Values, conflict);
+        }
+        pub fn updateFor(comptime Row: type, comptime Options: type) statement.Statement {
+            return comptime statement.update(D, Row, Options);
+        }
+    };
 }
 
 /// A Row with every `Str` replaced by `[]const u8` — what `db.stream` hands
@@ -527,6 +590,18 @@ test "the statement text is comptime-known, not merely computed early" {
     comptime std.debug.assert(found.sql.len > 0);
     const in_binary: [found.sql.len]u8 = found.sql[0..found.sql.len].*;
     try testing.expectEqualStrings(found.sql, &in_binary);
+}
+
+test "on(SQLite) spells the same statement the way that database reads it" {
+    const options = @TypeOf(.{ .where = .{ .email = .{ .ilike = @as([]const u8, "%@b.com") } }, .limit = 10 });
+    const pg = comptime selectFor(User, options);
+    const lite = comptime on(SQLite).selectFor(User, options);
+    try testing.expectEqualStrings(pg.sql, comptime on(Postgres).selectFor(User, options).sql);
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"email\", \"age\", \"created_at\" FROM \"users\" WHERE \"email\" LIKE ?1 LIMIT 10",
+        lite.sql,
+    );
+    try testing.expect(std.mem.indexOf(u8, pg.sql, "ILIKE $1") != null);
 }
 
 test "a delete shares the walker rather than having a second one" {

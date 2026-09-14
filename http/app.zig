@@ -134,6 +134,10 @@ pub const App = struct {
     /// Set when the server should stop. Read by the Engine's accept loop
     /// and by every connection between requests.
     stop: bulkhead.Stop = .{},
+    /// The port the Engine bound, written once by `serverStarting` and read
+    /// by `boundPort()` from whichever thread asks. 0 is "not yet", and a
+    /// unix socket.
+    bound_port: std.atomic.Value(u16) = .init(0),
     /// The part of `listen()`'s options a request reads rather than the
     /// socket, copied out once when the server starts. Defaults stand for
     /// an App a test drives directly, which never calls `listen()`.
@@ -921,9 +925,23 @@ pub const App = struct {
     /// `startServices` is skipped when `app.start(io)` already ran, and
     /// skipping the background with it is exactly the bug this exists to
     /// close.
-    fn serverStarting(self: *App, io: std.Io, limits: bulkhead.Limits) anyerror!void {
+    fn serverStarting(self: *App, io: std.Io, limits: bulkhead.Limits, port: ?u16) anyerror!void {
+        self.bound_port.store(port orelse 0, .release);
         try self.startServices(io, limits);
         try self.startBackground();
+    }
+
+    /// The port the server is listening on, once it is: null before
+    /// `listen()` has bound its socket, and null for a unix socket, which has
+    /// none. Ask for `.port = 0` and this is the kernel's answer — the way a
+    /// test gets a free port without walking a range of them and hoping, and
+    /// the way a supervisor that was handed 0 learns what to write down.
+    ///
+    /// Atomic because `listen()` does not return, so whoever asks is on
+    /// another thread.
+    pub fn boundPort(self: *const App) ?u16 {
+        const port = self.bound_port.load(.acquire);
+        return if (port == 0) null else port;
     }
 
     /// The mirror of `serverStarting`, run on the way out of `listen()`

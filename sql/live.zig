@@ -2100,6 +2100,66 @@ test "an enum column comes back as the Zig value of the same name" {
     );
 }
 
+/// The same Row with the type named, which is what lets the check hold the
+/// values against the database instead of only the type's name.
+const NamedStaff = struct {
+    pub const nilo_table = .{ .name = table, .key = .id };
+
+    id: i64,
+    role: Role,
+
+    const Role = enum {
+        admin,
+        member,
+
+        pub const nilo_column = role_type;
+    };
+};
+
+test "an enum that has fallen behind its type is named at startup, not on the first row" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    const arena = live.arena.allocator();
+    const labels = try live.wire.labelsOf(arena, dialect.Postgres.enum_values.?, role_type);
+    try testing.expectEqual(@as(usize, 3), labels.len);
+    try testing.expectEqualStrings("moderator", labels[2]);
+
+    // `Role` lacks `moderator` on purpose (see `Staff`). Until this existed
+    // the check passed and the third fixture row was a 500.
+    var problems: std.ArrayList(schema.Problem) = .empty;
+    const found = try schema.compareEnum(NamedStaff.Role, "NamedStaff", table, "role", role_type, labels, &problems, arena);
+    try testing.expectEqual(@as(usize, 1), found);
+    try testing.expectEqual(schema.Mismatch.value_zig_lacks, problems.items[0].kind);
+    try testing.expectEqualStrings("moderator", problems.items[0].found);
+
+    // And through the Db, which is the door a program uses — with the enum
+    // that matches its type, since `checkSchema` reports a problem with
+    // `std.log.err` and the test runner counts that as a failure. The
+    // problem itself is asserted above, one layer down.
+    var db = db_mod.Db.init(gpa, "already open", .{});
+    db.wire = live.wire;
+    try testing.expectEqual(@as(usize, 0), try db.checkSchema(&.{ WholeStaff, Staff }));
+}
+
+/// The Row whose enum has kept up with its type: every label, and the type
+/// named, so the startup check reads the values and finds nothing to say.
+const WholeStaff = struct {
+    pub const nilo_table = .{ .name = table, .key = .id };
+
+    id: i64,
+    role: Role,
+
+    const Role = enum {
+        admin,
+        member,
+        moderator,
+
+        pub const nilo_column = role_type;
+    };
+};
+
 fn allStaff(db: *db_mod.Db, c: *nilo.Ctx) ![]Staff {
     return db.select(Staff, c, .{ .order = .{ .id = .asc } });
 }
@@ -3204,18 +3264,18 @@ test "an exists from the child's side reads the parent's key off the child's own
     // one with no person at all is one of them, which is what NOT EXISTS
     // over a nullable key means.
     try testing.expectEqual(@as(usize, 1), try stack.db.count(Session, &run, .{ .where = .{
-        .exists = .{ .{ .in = Person, .where = .{ .email = .{ .icontains = @as([]const u8, "grace") } } } },
+        .exists = .{.{ .in = Person, .where = .{ .email = .{ .icontains = @as([]const u8, "grace") } } }},
     } }));
     try testing.expectEqual(@as(usize, 2), try stack.db.count(Session, &run, .{ .where = .{
-        .not_exists = .{ .{ .in = Person, .where = .{ .email = .{ .icontains = @as([]const u8, "grace") } } } },
+        .not_exists = .{.{ .in = Person, .where = .{ .email = .{ .icontains = @as([]const u8, "grace") } } }},
     } }));
     // And the guard drops the whole subquery, the way it does from the other
     // side: every session, the orphan included.
     try testing.expectEqual(@as(usize, 3), try stack.db.count(Session, &run, .{ .where = .{
-        .exists = .{ .{ .in = Person, .where = .{ .email = .{ .icontains = given(@as(?[]const u8, null)) } } } },
+        .exists = .{.{ .in = Person, .where = .{ .email = .{ .icontains = given(@as(?[]const u8, null)) } } }},
     } }));
     try testing.expectEqual(@as(usize, 1), try stack.db.count(Session, &run, .{ .where = .{
-        .exists = .{ .{ .in = Person, .where = .{ .email = .{ .icontains = given(@as(?[]const u8, "ada")) } } } },
+        .exists = .{.{ .in = Person, .where = .{ .email = .{ .icontains = given(@as(?[]const u8, "ada")) } } }},
     } }));
 }
 

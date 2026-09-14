@@ -3258,3 +3258,55 @@ leaves is `.like` on SQLite folding case silently, which is the same lie
 `contains` is refused there for; refusing it breaks working code, so it is a
 decision rather than a fix.
 
+## The second five, and the one that was not free
+
+The next five entries marked *ready* went the same way, and the accounting
+is what is worth keeping.
+
+**An entry that says a saving is "free" has named the one thing to check
+first.** `result_state_size` looked like a number this module alone could size
+honestly, because every statement is a comptime constant. The pg.zig source
+says the same number sizes the parameter-OID array a statement is described
+with, and a statement wider than it allocates per call rather than failing — so
+a value chosen from the Rows would be paid for again by the first `insertMany`
+wider than any Row. Thirty minutes reading the field's uses, against a cycle
+carrying an entry that called itself free. The roadmap keeps the number as
+accepted.
+
+**A refusal written to mirror a library mirrored its narrowness too.**
+`dialOpts` copied pg.zig's `parseOpts` — two parameters understood, a third
+refused — and the reason for the refusal was right: an `sslmode` nobody read
+is a plaintext connection whose URL says otherwise. But the URL a hosted
+Postgres hands out carries six parameters, and every one of them was a server
+that would not start. Sorting all of libpq's into carried, dropped and
+refused was a reading of pg.zig's fields rather than a design, and two
+findings came out of the reading: the driver honours four keepalive settings
+nothing in nilo had ever set, and `AuthOpts.startup_parameters` is declared
+upstream and never written into the startup message, which is why
+`client_encoding` and `options=` stay refused. A second reader asked to
+attack the sort moved four parameters — `verify-ca` from carried to refused,
+since rounding it to `verify-full` would fail a certificate the operator
+expected to pass; `sslrootcert` from carried-alone to carried-beside-
+`verify-full`; `target_session_attrs=read-write` and `client_encoding` from
+dropped to refused, since both are a promise the connection cannot keep.
+
+**A check that qualifies one relation and not the other is a check that
+lies in exactly one place.** `columnsOf` on SQLite rewrote `pragma_table_info`
+to the attached schema and left `sqlite_master` beside it, so a view in an
+attached database was introspected as a table with every column nullable —
+the failure ADR 0056 removed for `main`. The test that found it is the test
+that should have been written with ADR 0056: one `ATTACH`, one view, one
+`checkSchema`.
+
+**The App's surface had the port all along, one hook down.** `App.listen`
+could not say which port it got, and the roadmap called that a question about
+the App's surface. It was a parameter: the Engine reads the bound address
+back after `listen` and calls `ready`, so the port rides on the hook it
+already makes, and `app.boundPort()` is an atomic the hook stores into.
+`http/live.zig` binds port 0 and nothing in the suite walks a port range now.
+
+**A mark that only a list makes real stops being real the moment it is
+copied.** `zig build snippets` walks the documentation for `<!-- compiles`
+now and refuses a marked page absent from `pages`, which is the shape ADR 0027
+gave the error messages: a rule that a build step runs rather than a
+paragraph that a reader is trusted with.

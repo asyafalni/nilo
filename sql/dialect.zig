@@ -540,6 +540,20 @@ pub const Postgres = struct {
         \\ORDER BY a.attnum
     ;
 
+    /// The values an enum type has, one row each and in the type's own order,
+    /// for `checkSchema` to hold a Zig enum against. `$1` is the type name a
+    /// column declared with `nilo_column`. The name alone rather than
+    /// schema-qualified: a type is looked up the way the column's own
+    /// `typname` above is, and a program with two enums of one name in two
+    /// schemas has a problem this check is not the first to have.
+    pub const enum_values: ?[]const u8 =
+        \\SELECT e.enumlabel
+        \\FROM pg_catalog.pg_enum e
+        \\JOIN pg_catalog.pg_type t ON t.oid = e.enumtypid
+        \\WHERE t.typname = $1
+        \\ORDER BY e.enumsortorder
+    ;
+
     /// The column types this Dialect will read `T` out of.
     ///
     /// Deliberately a list rather than one name: `text` and `varchar` are the
@@ -749,6 +763,10 @@ pub const SQLite = struct {
     /// `icontains`. Until it did, the operator table wrote `ILIKE` on both
     /// Dialects and this one answered with a syntax error at run time.
     pub const like_folds = true;
+
+    /// None. SQLite has no enum type — a Zig enum is stored as its name in a
+    /// TEXT column, and there is no list in the database to hold it against.
+    pub const enum_values: ?[]const u8 = null;
 
     pub fn limit(comptime placeholder_text: []const u8) []const u8 {
         return " LIMIT " ++ placeholder_text;
@@ -1078,13 +1096,13 @@ pub const SQLite = struct {
 pub fn assertDialect(comptime D: type) void {
     comptime {
         const owed = [_][]const u8{
-            "name",       "placeholder", "quote",     "list_form",
-            "limit",      "offset",      "accepts",   "introspect",
-            "readAs",     "bindAs",      "arrayOf",   "qualify",
-            "lock",       "uuid_form",   "json_form", "enum_form",
-            "columnType", "keyColumn",   "foldedColumn",
-            "can_alter_column",             "advisoryLock",
-            "nulls",      "pattern",       "like_folds",
+            "name",         "placeholder", "quote",        "list_form",
+            "limit",        "offset",      "accepts",      "introspect",
+            "readAs",       "bindAs",      "arrayOf",      "qualify",
+            "lock",         "uuid_form",   "json_form",    "enum_form",
+            "columnType",   "keyColumn",   "foldedColumn", "can_alter_column",
+            "advisoryLock", "nulls",       "pattern",      "like_folds",
+            "enum_values",
         };
         for (owed) |decl| {
             if (!@hasDecl(D, decl)) @compileError(
@@ -1400,10 +1418,10 @@ test "a column nilo creates is a column nilo will read" {
     // these ever disagree, `generate` writes a table that `db.checking` then
     // refuses at startup, which is the worst failure this module could ship.
     const judged = .{
-        bool,          i16,          i32,             i64,
-        u16,           u32,          f32,             f64,
-        []const u8,    core.Str,     types.Timestamp, types.Uuid,
-        types.Decimal, types.Inet,   types.Interval,  ?i64,
+        bool,          i16,         i32,             i64,
+        u16,           u32,         f32,             f64,
+        []const u8,    core.Str,    types.Timestamp, types.Uuid,
+        types.Decimal, types.Inet,  types.Interval,  ?i64,
         ?core.Str,     ?types.Uuid,
     };
     inline for (judged) |T| {

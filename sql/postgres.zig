@@ -349,43 +349,47 @@ pub const Wire = struct {
         return out;
     }
 
+    /// What a URL may carry, as the refusal lists it. One string, so the
+    /// message and the branches in `dialOpts` cannot drift apart.
+    const understood_params =
+        "user, password, dbname, host, port, sslmode (disable, require or " ++
+        "verify-full), sslrootcert (beside sslmode=verify-full), application_name, " ++
+        "fallback_application_name, connect_timeout, tcp_user_timeout, keepalives, " ++
+        "keepalives_idle, keepalives_interval and keepalives_count";
+
     /// A URI taken apart into what pg.zig needs to dial with.
     ///
-    /// This mirrors pg.zig's own `parseOpts`, which is not reachable through
-    /// its module root — the same two query parameters, the same defaults,
-    /// and the same refusal of a third. **A parameter this does not know is
-    /// an error rather than a shrug**, because a `sslmode` nobody read is a
-    /// connection that is plaintext while the URL says otherwise.
+    /// pg.zig's own `parseOpts` — not reachable through its module root —
+    /// understands two query parameters and refuses a third, and the
+    /// refusal is right for the reason it gives: a `sslmode` nobody read is
+    /// a connection that is plaintext while the URL says otherwise. What it
+    /// gets wrong is how much is refused. The URL a hosted database hands
+    /// out carries `application_name`, `connect_timeout`, `pgbouncer=true`
+    /// and `sslrootcert`, none of them a third meaning and every one of
+    /// them a server that would not start. So every libpq parameter goes
+    /// in one of three places:
+    ///
+    /// - **carried** — pg.zig has a field for it, and the field is set.
+    /// - **dropped** — it asks for what the driver does anyway, or for what
+    ///   the driver never does and nothing the caller can see changes:
+    ///   `pgbouncer=true`, `sslsni=1`, `channel_binding=prefer`. One `warn`
+    ///   line names them all, once, at startup.
+    /// - **refused** — the connection would not do what the URL says, and
+    ///   the line before the error names the parameter, the reason and
+    ///   `understood_params`. `sslmode=prefer` is the one to keep in mind:
+    ///   it would fall back to plaintext, and pg.zig does not.
+    ///
+    /// The refusals log at `warn` rather than `err` for the reason `wireOf`
+    /// in `db.zig` does: the error is returned and is what the caller acts
+    /// on, and `std.log.err` fails the test runner for every test that
+    /// provokes it (ADR 0178).
     fn dialOpts(uri: std.Uri, arena: std.mem.Allocator) !pg.Pool.Opts {
         if (!std.mem.eql(u8, uri.scheme, "postgresql") and
             !std.mem.eql(u8, uri.scheme, "postgres")) return error.InvalidUriScheme;
 
-        var tls: pg.Conn.Opts.TLS = .off;
-        var tcp_user_timeout: ?u32 = null;
-
-        if (uri.query) |query| {
-            var it = std.mem.splitScalar(u8, try query.toRawMaybeAlloc(arena), '&');
-            while (it.next()) |param| {
-                var pair = std.mem.splitScalar(u8, param, '=');
-                const key = pair.first();
-                const value = pair.rest();
-                if (std.mem.eql(u8, key, "tcp_user_timeout")) {
-                    tcp_user_timeout = try std.fmt.parseInt(u32, value, 10);
-                } else if (std.mem.eql(u8, key, "sslmode")) {
-                    if (std.mem.eql(u8, value, "require")) {
-                        tls = .require;
-                    } else if (std.mem.eql(u8, value, "verify-full")) {
-                        tls = .{ .verify_full = null };
-                    } else if (!std.mem.eql(u8, value, "disable")) {
-                        return error.UnsupportedSSLModeValue;
-                    }
-                } else return error.UnsupportedConnectionParam;
-            }
-        }
-
         const path = std.mem.trimStart(u8, try uri.path.toRawMaybeAlloc(arena), "/");
 
-        return .{
+        var out: pg.Pool.Opts = .{
             // Both overwritten by the caller; named here so that a field
             // added to `Pool.Opts` upstream is a compile error rather than a
             // default nobody chose.
@@ -396,14 +400,194 @@ pub const Wire = struct {
                 .username = if (uri.user) |u| try u.toRawMaybeAlloc(arena) else "postgres",
                 .password = if (uri.password) |pw| try pw.toRawMaybeAlloc(arena) else null,
                 .database = if (path.len == 0) null else path,
-                .timeout = tcp_user_timeout orelse 10_000,
+                .timeout = 10_000,
             },
             .connect = .{
-                .tls = tls,
+                .tls = .off,
                 .port = uri.port,
                 .host = if (uri.host) |h| try h.toRawMaybeAlloc(arena) else null,
             },
         };
+        const query = uri.query orelse return out;
+
+        // Split before decoding: a `password=` whose value holds `&` or `=`
+        // arrives percent-encoded, and decoding the whole query first would
+        // cut it in two.
+        const encoded = query == .percent_encoded;
+        const raw = switch (query) {
+            .raw, .percent_encoded => |text| text,
+        };
+
+        var sslmode: []const u8 = "disable";
+        var sslrootcert: ?[]const u8 = null;
+        var fallback_name: ?[]const u8 = null;
+        var dropped: std.Io.Writer.Allocating = .init(arena);
+
+        var it = std.mem.splitScalar(u8, raw, '&');
+        while (it.next()) |param| {
+            if (param.len == 0) continue;
+            var pair = std.mem.splitScalar(u8, param, '=');
+            const key = try decodeParam(arena, pair.first(), encoded);
+            const value = try decodeParam(arena, pair.rest(), encoded);
+
+            // Carried. The five that double the authority part are checked
+            // against it: a URL that says two users is a URL nobody can
+            // read, not one whose second half wins.
+            if (eql(key, "user")) {
+                if (uri.user != null and !eql(out.auth.username, value)) return twice(key);
+                out.auth.username = value;
+            } else if (eql(key, "password")) {
+                try carry(key, &out.auth.password, value);
+            } else if (eql(key, "dbname")) {
+                try carry(key, &out.auth.database, value);
+            } else if (eql(key, "host")) {
+                try carry(key, &out.connect.host, value);
+            } else if (eql(key, "port")) {
+                const port = try std.fmt.parseInt(u16, value, 10);
+                if (uri.port != null and uri.port.? != port) return twice(key);
+                out.connect.port = port;
+            } else if (eql(key, "sslmode")) {
+                if (eql(value, "disable") or eql(value, "require") or eql(value, "verify-full")) {
+                    sslmode = value;
+                } else if (eql(value, "prefer") or eql(value, "allow")) {
+                    return refuse(key, value, "would fall back to plaintext when TLS " ++
+                        "fails, which pg.zig does not do. Say `require` for TLS or " ++
+                        "`disable` for none", error.UnsupportedSSLModeValue);
+                } else if (eql(value, "verify-ca")) {
+                    return refuse(key, value, "asks for the certificate chain to be " ++
+                        "checked and the host name not to be, which pg.zig cannot do by " ++
+                        "halves: `verify-full` checks both and `require` checks " ++
+                        "neither. Say which", error.UnsupportedSSLModeValue);
+                } else return refuse(key, value, "is not a `sslmode`", error.UnsupportedSSLModeValue);
+            } else if (eql(key, "sslrootcert")) {
+                sslrootcert = value;
+            } else if (eql(key, "application_name")) {
+                out.auth.application_name = value;
+            } else if (eql(key, "fallback_application_name")) {
+                fallback_name = value;
+            } else if (eql(key, "connect_timeout")) {
+                // libpq counts seconds; pg.zig's auth timeout counts
+                // milliseconds. `tcp_user_timeout` below is already in ms,
+                // which is pg.zig's own reading of it.
+                out.auth.timeout = try std.math.mul(u32, try std.fmt.parseInt(u32, value, 10), 1000);
+            } else if (eql(key, "tcp_user_timeout")) {
+                out.auth.timeout = try std.fmt.parseInt(u32, value, 10);
+            } else if (eql(key, "keepalives")) {
+                out.connect.keepalive = !eql(value, "0");
+            } else if (eql(key, "keepalives_idle")) {
+                out.connect.keepalive_idle = try std.fmt.parseInt(u32, value, 10);
+            } else if (eql(key, "keepalives_interval")) {
+                out.connect.keepalive_interval = try std.fmt.parseInt(u32, value, 10);
+            } else if (eql(key, "keepalives_count")) {
+                out.connect.keepalive_count = try std.fmt.parseInt(u32, value, 10);
+
+                // Dropped. `pgbouncer=true` and `pool_mode` are a pooler's
+                // notes to a client library that prepares statements by
+                // name; nilo's are prepared per connection either way.
+            } else if (eql(key, "pgbouncer") or eql(key, "pool_mode") or
+                (eql(key, "sslsni") and eql(value, "1")) or
+                (eql(key, "gssencmode") and (eql(value, "disable") or eql(value, "prefer"))) or
+                (eql(key, "channel_binding") and (eql(value, "prefer") or eql(value, "disable"))) or
+                (eql(key, "target_session_attrs") and eql(value, "any")))
+            {
+                dropped.writer.print("{s}{s}={s}", .{
+                    if (dropped.written().len == 0) "" else ", ", key, value,
+                }) catch return error.OutOfMemory;
+
+                // Refused.
+            } else if (eql(key, "sslcert") or eql(key, "sslkey")) {
+                return refuse(key, value, "names a client certificate, and pg.zig " ++
+                    "presents none", error.UnsupportedConnectionParam);
+            } else if (eql(key, "options")) {
+                return refuse(key, value, "would set server-side settings at connect " ++
+                    "time, and pg.zig's startup message has no room for them. Run " ++
+                    "the `SET` after connecting, or put the setting on the role", error.UnsupportedConnectionParam);
+            } else if (eql(key, "channel_binding")) {
+                return refuse(key, value, "asks for SCRAM channel binding, which pg.zig " ++
+                    "does not do; the server would take the connection without it " ++
+                    "and the URL would be lying", error.UnsupportedConnectionParamValue);
+            } else if (eql(key, "gssencmode")) {
+                return refuse(key, value, "asks for GSSAPI encryption, which pg.zig " ++
+                    "does not do", error.UnsupportedConnectionParamValue);
+            } else if (eql(key, "target_session_attrs")) {
+                return refuse(key, value, "asks for a session pg.zig does not check " ++
+                    "for: it dials the one host and takes whatever answers", error.UnsupportedConnectionParamValue);
+            } else if (eql(key, "sslsni")) {
+                return refuse(key, value, "would leave the host name out of the TLS " ++
+                    "handshake, and pg.zig always sends it", error.UnsupportedConnectionParamValue);
+            } else if (eql(key, "client_encoding")) {
+                return refuse(key, value, "is never sent: pg.zig's startup message " ++
+                    "names the user, the database and the application name, so the " ++
+                    "session takes the database's own encoding. Drop it, or make " ++
+                    "the database UTF8", error.UnsupportedConnectionParamValue);
+            } else {
+                return refuse(key, value, "is not a parameter nilo_sql understands", error.UnsupportedConnectionParam);
+            }
+        }
+
+        // `sslrootcert` names a CA, and only `verify-full` reads one:
+        // carried beside anything else it would be a file the connection
+        // never opens while the URL says it was checked against.
+        if (sslrootcert != null and !eql(sslmode, "verify-full")) {
+            return refuse("sslrootcert", sslrootcert.?, "names a CA the connection " ++
+                "would never check, because `sslmode` is not `verify-full`. Add " ++
+                "`sslmode=verify-full`, or drop it", error.UnsupportedConnectionParam);
+        }
+        out.connect.tls = if (eql(sslmode, "require"))
+            .require
+        else if (eql(sslmode, "verify-full"))
+            // libpq reads `sslrootcert=system` as the platform's store,
+            // which is what pg.zig does with no path at all.
+            .{ .verify_full = if (sslrootcert) |ca| (if (eql(ca, "system")) null else ca) else null }
+        else
+            .off;
+        if (out.auth.application_name == null) out.auth.application_name = fallback_name;
+
+        if (dropped.written().len > 0) std.log.warn(
+            "nilo_sql: the database URL carries {s}, which the driver does " ++
+                "already or could not act on; dropped.",
+            .{dropped.written()},
+        );
+        return out;
+    }
+
+    fn eql(a: []const u8, b: []const u8) bool {
+        return std.mem.eql(u8, a, b);
+    }
+
+    /// One piece of a query string, percent-decoded into the arena when
+    /// the URI came in encoded — which `std.Uri.parse` always leaves it.
+    fn decodeParam(arena: std.mem.Allocator, piece: []const u8, encoded: bool) ![]const u8 {
+        if (!encoded) return piece;
+        const buf = try arena.alloc(u8, piece.len);
+        return std.Uri.percentDecodeBackwards(buf, piece);
+    }
+
+    /// A query-form parameter onto the slot the authority part may already
+    /// have filled: the same value twice is fine, two values is `twice`.
+    fn carry(key: []const u8, slot: *?[]const u8, value: []const u8) !void {
+        if (slot.*) |had| if (!eql(had, value)) return twice(key);
+        slot.* = value;
+    }
+
+    fn twice(key: []const u8) error{ConflictingConnectionParam} {
+        std.log.warn(
+            "nilo_sql: the database URL gives `{s}` twice — once before the `?` " ++
+                "and once as `{s}=` — and the two disagree. Say it once.",
+            .{ key, key },
+        );
+        return error.ConflictingConnectionParam;
+    }
+
+    /// The one sentence a refused parameter gets: which, why, and what
+    /// would have been read.
+    fn refuse(key: []const u8, value: []const u8, why: []const u8, comptime err: anytype) @TypeOf(err) {
+        std.log.warn(
+            "nilo_sql: the database URL carries `{s}={s}`, which {s}. The " ++
+                "parameters understood are {s}.",
+            .{ key, value, why, understood_params },
+        );
+        return err;
     }
 
     pub fn close(self: *Wire) void {
@@ -632,6 +816,27 @@ pub const Wire = struct {
                 else
                     null,
             }) catch return error.QueryFailed;
+        }
+        return found.toOwnedSlice(arena) catch return error.QueryFailed;
+    }
+
+    /// The values an enum type has, for the same comparison. The query is
+    /// `dialect.Postgres.enum_values`; an empty answer is a type that is not
+    /// there, and `checkSchema` says so.
+    pub fn labelsOf(
+        self: *Wire,
+        arena: std.mem.Allocator,
+        query: []const u8,
+        type_name: []const u8,
+    ) wire.Error![]const []const u8 {
+        var rows = try self.run(arena, query, .{type_name}, null, null);
+        defer rows.close();
+
+        var found: std.ArrayList([]const u8) = .empty;
+        while (try self.next(&rows)) {
+            const label = try self.read(&rows, []const u8, 0);
+            found.append(arena, arena.dupe(u8, label) catch return error.QueryFailed) catch
+                return error.QueryFailed;
         }
         return found.toOwnedSlice(arena) catch return error.QueryFailed;
     }
@@ -913,8 +1118,8 @@ test "a URL is taken apart the way pg.zig would have taken it apart" {
     try testing.expect(bare.connect.tls == .off);
     try testing.expectEqual(@as(u32, 10_000), bare.auth.timeout);
 
-    // `tcp_user_timeout` is the other parameter, and it lands on the auth
-    // timeout rather than anywhere that sounds like it.
+    // `tcp_user_timeout` is pg.zig's other parameter, and it lands on the
+    // auth timeout rather than anywhere that sounds like it.
     const timed = try Wire.dialOpts(
         try std.Uri.parse("postgres://h/db?tcp_user_timeout=5678"),
         aa,
@@ -922,25 +1127,136 @@ test "a URL is taken apart the way pg.zig would have taken it apart" {
     try testing.expectEqual(@as(u32, 5678), timed.auth.timeout);
 }
 
+test "a parameter pg.zig has a field for is carried onto it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // The URL a hosted database hands out: a name for `pg_stat_activity`,
+    // a connect timeout in seconds, keepalives, and a CA to verify against.
+    const hosted = try Wire.dialOpts(try std.Uri.parse(
+        "postgres://app:pw@h/shop?application_name=nilo&connect_timeout=5" ++
+            "&keepalives=1&keepalives_idle=60&keepalives_interval=5&keepalives_count=2" ++
+            "&sslmode=verify-full&sslrootcert=/etc/ssl/db.crt",
+    ), aa);
+    try testing.expectEqualStrings("nilo", hosted.auth.application_name.?);
+    try testing.expectEqual(@as(u32, 5_000), hosted.auth.timeout);
+    try testing.expect(hosted.connect.keepalive);
+    try testing.expectEqual(@as(?u32, 60), hosted.connect.keepalive_idle);
+    try testing.expectEqual(@as(?u32, 5), hosted.connect.keepalive_interval);
+    try testing.expectEqual(@as(?u32, 2), hosted.connect.keepalive_count);
+    try testing.expectEqualStrings("/etc/ssl/db.crt", hosted.connect.tls.verify_full.?);
+
+    // `sslrootcert=system` is libpq for the platform's store, which is
+    // pg.zig with no path; `fallback_application_name` yields to the
+    // real one; `keepalives=0` switches them off.
+    const system = try Wire.dialOpts(try std.Uri.parse(
+        "postgres://h/db?sslrootcert=system&sslmode=verify-full" ++
+            "&fallback_application_name=fallback&application_name=named&keepalives=0",
+    ), aa);
+    try testing.expectEqual(@as(?[]const u8, null), system.connect.tls.verify_full);
+    try testing.expectEqualStrings("named", system.auth.application_name.?);
+    try testing.expect(!system.connect.keepalive);
+    const fallback = try Wire.dialOpts(
+        try std.Uri.parse("postgres://h/db?fallback_application_name=fallback"),
+        aa,
+    );
+    try testing.expectEqualStrings("fallback", fallback.auth.application_name.?);
+
+    // The query forms of the authority part, for a password the URL could
+    // not otherwise hold: split before decoding, so the `&` inside it
+    // stays inside it.
+    const query_form = try Wire.dialOpts(try std.Uri.parse(
+        "postgres:///?user=app&password=p%26w%3D1&dbname=shop&host=db.internal&port=5433",
+    ), aa);
+    try testing.expectEqualStrings("app", query_form.auth.username);
+    try testing.expectEqualStrings("p&w=1", query_form.auth.password.?);
+    try testing.expectEqualStrings("shop", query_form.auth.database.?);
+    try testing.expectEqualStrings("db.internal", query_form.connect.host.?);
+    try testing.expectEqual(@as(?u16, 5433), query_form.connect.port);
+
+    // Said twice and the same, fine; said twice and different, refused.
+    _ = try Wire.dialOpts(try std.Uri.parse("postgres://app@h:5433/shop?user=app&port=5433"), aa);
+    try testing.expectError(
+        error.ConflictingConnectionParam,
+        Wire.dialOpts(try std.Uri.parse("postgres://app@h/shop?user=other"), aa),
+    );
+    try testing.expectError(
+        error.ConflictingConnectionParam,
+        Wire.dialOpts(try std.Uri.parse("postgres://h:5432/shop?port=5433"), aa),
+    );
+}
+
+test "a parameter the driver does already or could never act on is dropped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Every one of these is what Supabase, Neon or a pooler appends, and
+    // none of them changes what the connection does. One warn line, and
+    // the rest of the URL is read.
+    const pooled = try Wire.dialOpts(try std.Uri.parse(
+        "postgres://app@h/shop?pgbouncer=true&pool_mode=transaction&sslsni=1" ++
+            "&gssencmode=disable&channel_binding=prefer&target_session_attrs=any&sslmode=require",
+    ), aa);
+    try testing.expectEqualStrings("shop", pooled.auth.database.?);
+    try testing.expect(pooled.connect.tls == .require);
+}
+
 test "a URL nobody can read is refused rather than half understood" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
 
-    // A scheme that is not Postgres, a `sslmode` nobody has heard of, and a
-    // parameter nobody has heard of. The third is the one worth refusing:
-    // a URL carrying a setting the driver ignores is a deployment that
-    // believes something the connection does not do.
+    // A scheme that is not Postgres, and a parameter nobody has heard of.
+    // The second is the one worth refusing: a URL carrying a setting the
+    // driver ignores is a deployment that believes something the
+    // connection does not do.
     try testing.expectError(
         error.InvalidUriScheme,
         Wire.dialOpts(try std.Uri.parse("mysql://h/db"), aa),
     );
     try testing.expectError(
-        error.UnsupportedSSLModeValue,
-        Wire.dialOpts(try std.Uri.parse("postgres://h/db?sslmode=prefer"), aa),
+        error.UnsupportedConnectionParam,
+        Wire.dialOpts(try std.Uri.parse("postgres://h/db?statement_timeout=5"), aa),
     );
+
+    // The `sslmode`s that would fall back to plaintext, or check half of
+    // what `verify-full` checks. Both are a connection that is not what the
+    // URL says, and neither is quietly rounded to the nearest one pg.zig has.
+    for ([_][]const u8{ "prefer", "allow", "verify-ca", "yes" }) |mode| {
+        const url = try std.fmt.allocPrint(aa, "postgres://h/db?sslmode={s}", .{mode});
+        try testing.expectError(
+            error.UnsupportedSSLModeValue,
+            Wire.dialOpts(try std.Uri.parse(url), aa),
+        );
+    }
+
+    // A CA beside a mode that never opens it.
     try testing.expectError(
         error.UnsupportedConnectionParam,
-        Wire.dialOpts(try std.Uri.parse("postgres://h/db?application_name=nilo"), aa),
+        Wire.dialOpts(try std.Uri.parse("postgres://h/db?sslmode=require&sslrootcert=/ca.crt"), aa),
     );
+
+    // Known parameters asking for what pg.zig does not do: a client
+    // certificate, connect-time settings, channel binding, GSSAPI, a
+    // read-write check, SNI off, an encoding the startup message never
+    // carries.
+    for ([_][]const u8{ "sslcert=/c.crt", "sslkey=/c.key", "options=-c%20statement_timeout%3D5" }) |param| {
+        const url = try std.fmt.allocPrint(aa, "postgres://h/db?{s}", .{param});
+        try testing.expectError(
+            error.UnsupportedConnectionParam,
+            Wire.dialOpts(try std.Uri.parse(url), aa),
+        );
+    }
+    for ([_][]const u8{
+        "channel_binding=require", "gssencmode=require",   "target_session_attrs=read-write",
+        "sslsni=0",                "client_encoding=UTF8",
+    }) |param| {
+        const url = try std.fmt.allocPrint(aa, "postgres://h/db?{s}", .{param});
+        try testing.expectError(
+            error.UnsupportedConnectionParamValue,
+            Wire.dialOpts(try std.Uri.parse(url), aa),
+        );
+    }
 }

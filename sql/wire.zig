@@ -391,9 +391,10 @@ pub const Column = struct {
 pub fn assertWire(comptime W: type) void {
     comptime {
         const owed = [_][]const u8{
-            "open", "close",     "run",      "exec",
-            "next", "read",      "drain",    "begin",
-            "Tx",   "columnsOf", "readList", "width",
+            "open",     "close",     "run",      "exec",
+            "next",     "read",      "drain",    "begin",
+            "Tx",       "columnsOf", "readList", "width",
+            "labelsOf",
         };
         for (owed) |decl| {
             if (!@hasDecl(W, decl)) @compileError(
@@ -414,6 +415,9 @@ const testing = std.testing;
 /// it — and it is what the schema tests compare against.
 pub const Fake = struct {
     columns: []const Column = &.{},
+    /// What `labelsOf` answers for any enum type, the way `columns` answers
+    /// for any table.
+    labels: []const []const u8 = &.{},
     /// The statement the last `run` was given, so a test can assert on the
     /// SQL that actually reached the database rather than on the constant
     /// the comptime half produced.
@@ -667,6 +671,18 @@ pub const Fake = struct {
         _ = schema;
         _ = table;
         return self.columns;
+    }
+
+    pub fn labelsOf(
+        self: *Fake,
+        arena: std.mem.Allocator,
+        query: []const u8,
+        type_name: []const u8,
+    ) Error![]const []const u8 {
+        _ = arena;
+        _ = query;
+        _ = type_name;
+        return self.labels;
     }
 };
 

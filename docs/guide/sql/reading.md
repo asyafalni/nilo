@@ -28,7 +28,11 @@ WHERE "age" > $1 ORDER BY "created_at" DESC LIMIT 10
 
 Exactly one thing reaches run time and it is the `18`. Which table, which
 columns, which operators, how many parameters — all settled while compiling,
-and all a compile error when wrong:
+and all a compile error when wrong. The constant is readable, too:
+`sql.selectFor(User, @TypeOf(options)).sql` is the text above, and
+`sql.on(sql.SQLite).selectFor(User, @TypeOf(options)).sql` is the same
+statement spelled with `?1` — `sql.on(D)` binds `selectFor` and the fourteen
+beside it to a Dialect of your choosing.
 
 ```
 $ zig build
