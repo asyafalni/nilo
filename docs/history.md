@@ -3217,3 +3217,26 @@ call crosses the way `entropy` does — by name in the table, the type on the
 near side — and what it answers is only what was already resolved, which is
 the loud `NotGiven` rather than a resolver run without its services
 ([ADR 0219](./adr/0219-an-erased-scope-answers-what-was-resolved.md)).
+
+## A phase recommended in three guides had never run beside a worker
+
+**A shape that works for the one service it was tested with is not a
+shape.** ADR 0079's `app.start(threaded.io())` then `listen()` was tested
+with a `Db` alone and recommended everywhere; the first port to run a job
+worker beside a pool through it got a server that took SIGINT and never
+exited. The repro took an afternoon: a service keeps the `Io` it was
+started on, `listen()` builds a loop of its own, and a worker parked on the
+caller's `Threaded` is a general protection fault once that `Threaded` is
+freed and a hang while it is not. The plain `listen()` exits cleanly in the
+same repro. The fix is a refusal at the moment the two loops meet, and the
+phase moved inside `listen()` as `app.before`
+([ADR 0220](./adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+
+**An option that reads nicer than a call can cost every program the
+module.** `.expect = manifest.head` on `Db.Opts` measured 17,296 bytes on
+`zig build size-sql` — the ledger's DDL, the head query and its sentences,
+linked whether anybody set the option or not, because an option is read on
+every boot. As `db.expecting(version)`, a call storing a function with the
+guard inside it, the same two binaries move by 16 and 48 bytes. The
+`checking` precedent was the same trade for a different reason (its list is
+comptime), and the fourth axis is what settled this one.

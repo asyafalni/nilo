@@ -161,12 +161,12 @@ test "work registered before the server still runs when the services were starte
     defer app.deinit();
     try app.spawn(Ticker.run, .{&ticker});
 
-    // The order `guide/sql/` recommends and ADR 0079 built: the services
-    // are finished with an `Io` of the caller's own so that a migration can
-    // run, and only then does the server start. `startServices` is skipped
-    // the second time round, and **this is the case that used to take the
-    // background work down with it** — the whole reason the two guards in
-    // `App` are separate flags (ADR 0086).
+    // `start(io)` and then `listen()`, the order ADR 0079 built and ADR 0220
+    // refuses once a service has kept the `Io`. This App has none, so the
+    // boot goes ahead: `startServices` is skipped the second time round, and
+    // **this is the case that used to take the background work down with
+    // it** — the whole reason the two guards in `App` are separate flags
+    // (ADR 0086).
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     try app.start(threaded.io());
@@ -180,6 +180,74 @@ test "work registered before the server still runs when the services were starte
 
     try waitForATick(&ticker);
     try testing.expect(serving.bound.load(.acquire));
+}
+
+/// A service in the shape `nilo_sql`'s `Db` has: `nilo_start` is where the
+/// pool would be built, on the loop it is handed.
+const Booted = struct {
+    started: std.atomic.Value(bool) = .init(false),
+
+    pub fn nilo_start(self: *Booted, _: std.Io) !void {
+        self.started.store(true, .release);
+    }
+};
+
+/// What `before` work saw when it ran inside `listen()`, and what a fiber
+/// started by `spawn` saw when it began.
+const Boot = struct {
+    /// The service was up when the `before` work ran.
+    service_was_up: std.atomic.Value(bool) = .init(false),
+    /// The Run the work was handed could reach the loop.
+    had_io: std.atomic.Value(bool) = .init(false),
+    /// How many times the `before` work ran; the assertion is exactly one.
+    ran: std.atomic.Value(u32) = .init(0),
+    /// The `before` work had finished when the spawned fiber began.
+    before_first: std.atomic.Value(bool) = .init(false),
+    ticker: Ticker = .{},
+
+    fn migrate(run: *nilo.Run, booted: *Booted, self: *Boot) !void {
+        self.service_was_up.store(booted.started.load(.acquire), .release);
+        _ = try run.entropy(4);
+        self.had_io.store(true, .release);
+        _ = self.ran.fetchAdd(1, .monotonic);
+    }
+
+    fn tick(self: *Boot) void {
+        self.before_first.store(self.ran.load(.acquire) == 1, .release);
+        self.ticker.run();
+    }
+};
+
+test "work registered with before runs inside listen, after the services and before the rest" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var booted: Booted = .{};
+    var boot: Boot = .{};
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.provide(&booted);
+    try app.before(Boot.migrate, .{ &booted, &boot });
+    try app.spawn(Boot.tick, .{&boot});
+
+    var serving: Serving = .{ .app = &app };
+    const thread = try std.Thread.spawn(.{}, Serving.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+
+    try waitForATick(&boot.ticker);
+    try testing.expect(serving.bound.load(.acquire));
+
+    // The order ADR 0220 fixes: the service, then the work that needs it,
+    // then the fibers — and the Run that work was handed is on the loop the
+    // service was started on, which is what a migration needs from it.
+    try testing.expectEqual(@as(u32, 1), boot.ran.load(.acquire));
+    try testing.expect(boot.service_was_up.load(.acquire));
+    try testing.expect(boot.had_io.load(.acquire));
+    try testing.expect(boot.before_first.load(.acquire));
 }
 
 test "the shutdown reaches a fiber that is not serving anybody" {
@@ -398,8 +466,7 @@ test "a spilled file's bytes reach a real socket, by the route only a real socke
         thread.join();
     }
 
-    const whole = try ask(gpa, serving.port,
-        "GET /files/big.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    const whole = try ask(gpa, serving.port, "GET /files/big.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     defer whole.deinit(gpa);
 
     try testing.expect(std.mem.startsWith(u8, whole.head, "HTTP/1.1 200 "));
@@ -407,9 +474,8 @@ test "a spilled file's bytes reach a real socket, by the route only a real socke
 
     // The other arm of `sendfile.send`, and the one a resumed download takes:
     // a seek, a shorter length, and a 206 saying which bytes these are.
-    const part = try ask(gpa, serving.port,
-        "GET /files/big.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=10-19\r\n" ++
-            "Connection: close\r\n\r\n");
+    const part = try ask(gpa, serving.port, "GET /files/big.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=10-19\r\n" ++
+        "Connection: close\r\n\r\n");
     defer part.deinit(gpa);
 
     try testing.expect(std.mem.startsWith(u8, part.head, "HTTP/1.1 206 "));
@@ -539,17 +605,15 @@ test "a server on a path answers over it, reads the proxy's header, and gives th
     };
     try waitForServer(gpa, &serving);
 
-    const forwarded = try askOverPath(gpa, where.path,
-        "GET /who HTTP/1.1\r\nHost: nilo\r\nX-Forwarded-For: 203.0.113.9\r\n" ++
-            "Connection: close\r\n\r\n");
+    const forwarded = try askOverPath(gpa, where.path, "GET /who HTTP/1.1\r\nHost: nilo\r\nX-Forwarded-For: 203.0.113.9\r\n" ++
+        "Connection: close\r\n\r\n");
     defer forwarded.deinit(gpa);
     try testing.expect(std.mem.startsWith(u8, forwarded.head, "HTTP/1.1 200 "));
     try testing.expectEqualStrings("203.0.113.9", forwarded.body);
 
     // Nothing forwarded, so there is nobody to name: a unix connection has no
     // address of its own to fall back to.
-    const bare = try askOverPath(gpa, where.path,
-        "GET /who HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n");
+    const bare = try askOverPath(gpa, where.path, "GET /who HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n");
     defer bare.deinit(gpa);
     try testing.expect(std.mem.startsWith(u8, bare.head, "HTTP/1.1 200 "));
     try testing.expectEqualStrings("", bare.body);
@@ -595,8 +659,7 @@ test "a socket left behind by a server that is gone does not stop the next one" 
     }
 
     try waitForServer(gpa, &serving);
-    const answer = try askOverPath(gpa, where.path,
-        "GET /who HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n");
+    const answer = try askOverPath(gpa, where.path, "GET /who HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n");
     defer answer.deinit(gpa);
     try testing.expect(std.mem.startsWith(u8, answer.head, "HTTP/1.1 200 "));
 }

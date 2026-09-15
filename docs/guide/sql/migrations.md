@@ -67,6 +67,25 @@ Run it again and nothing happens, which is what a boot needs. This is for a
 test, a fixture, or a single-file SQLite application — it creates what is
 missing and never alters what is there.
 
+In a program that serves, the boot is where it goes, and the boot is inside
+`listen()`: register it with `app.before` and it runs once the pool is open,
+on the server's own loop, before the first request
+([ADR 0220](../../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+
+<!-- compiles -->
+```zig
+fn makeTables(run: *nilo.Run, db: *sql.Db) !void {
+    try sql.migrate.createMissing(db, run, &.{User});
+}
+```
+
+<!-- compiles: body -->
+```zig
+try app.provide(&db);
+try app.before(makeTables, .{&db});
+try app.listen(.{ .port = 8080 });
+```
+
 ## Changing them
 
 The other half is a diff, and **it needs no database on either side**:
@@ -147,20 +166,33 @@ undone by a statement written before anybody knew what the data was: dropping
 the column you just added does not bring back what was in it. Forward-only, and
 `reset` for a laptop.
 
+A program that applies its own migrations at boot puts the three lines above
+in a function and hands it to `app.before`, the way `makeTables` is above. If
+it fails, the server does not start: a migration that could not run is a
+database this binary must not serve. Do not open the pool yourself with
+`app.start(io)` and then call `listen()` — that hands the pool one loop and
+the requests another, and it is refused
+([ADR 0220](../../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+
 ## Refusing to serve a database that is behind
 
 <!-- compiles: body -->
 ```zig
-try sql.migrate.expect(&db, &run, 7);
+db.expecting(7);
 ```
 
-One query, before `listen()`. This catches one incident shape and it is a common
-one: the code went out before the migration did, and every request touching the
-new column answers 500 until somebody notices.
+One query, run by `listen()` on the pool it just opened. This catches one
+incident shape and it is a common one: the code went out before the migration
+did, and every request touching the new column answers 500 until somebody
+notices. The number is the generated manifest's head — `manifest.head` — so
+the guard moves with the migrations and nobody types it.
 
 A database *ahead* of the binary is allowed and only logged — that is the
-ordinary middle of a two-stage deploy. `sql.migrate.standing` is the same
-question as a value if you would rather decide yourself.
+ordinary middle of a two-stage deploy. A database that cannot be asked starts
+with a warning, the way `db.checking` does. `sql.migrate.expect(&db, &run, 7)`
+is the same check as a call, for a script that has a `Run` in hand, and
+`sql.migrate.standing` is the same question as a value if you would rather
+decide yourself.
 
 ## Your own `db` command
 

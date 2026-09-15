@@ -274,6 +274,38 @@ pub const Registry = struct {
         }
     }
 
+    /// How many services declared `nilo_start` — which is how many kept the
+    /// `Io` they were started on as their loop, and therefore how many are
+    /// wrong once a second loop appears (ADR 0220).
+    pub fn startedCount(self: *const Registry) usize {
+        var n: usize = 0;
+        for (self.entries.items) |e| {
+            if (e.start != null) n += 1;
+        }
+        return n;
+    }
+
+    /// Those services by name, for the line that refuses a `listen()` after
+    /// `start(io)`. A formatter rather than a string so nothing is allocated
+    /// on a path that is about to stop the process.
+    pub fn startedNames(self: *const Registry) StartedNames {
+        return .{ .entries = self.entries.items };
+    }
+
+    pub const StartedNames = struct {
+        entries: []const Entry,
+
+        pub fn format(self: StartedNames, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            var first = true;
+            for (self.entries) |e| {
+                if (e.start == null) continue;
+                if (!first) try w.writeAll(", ");
+                try w.writeAll(e.name);
+                first = false;
+            }
+        }
+    };
+
     /// Let every service that asked put down what it is holding, **in the
     /// reverse of the order they were provided** — the ordinary unwinding
     /// order, so a service built on top of another is taken down first.

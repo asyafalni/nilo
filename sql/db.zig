@@ -80,6 +80,9 @@ const core = @import("nilo_core");
 const nilo = @import("nilo_http");
 
 const dialect = @import("dialect.zig");
+/// Reached only through `expecting`, so a program that never calls it links
+/// none of the migration module — `expectVersion` is the one line that names it.
+const migrate = @import("migrate.zig");
 const ordering = @import("ordering.zig");
 const postgres = @import("postgres.zig");
 const rawcheck = @import("rawcheck.zig");
@@ -329,6 +332,14 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// fires costs nothing to have worded well.
         const whoami = if (name.len == 0) "the database" else "`sql.Named(\"" ++ name ++ "\")`";
 
+        /// What a nilo message calls this type (ADR 0122): the call the
+        /// reader wrote, rather than the `db.DbOf(postgres.Wire,…)` that
+        /// `@typeName` spells with three of this module's files in it.
+        pub const nilo_type_name = if (D == dialect.SQLite)
+            (if (name.len == 0) "sql.Sqlite(…)" else "sql.SqliteNamed(\"" ++ name ++ "\", …)")
+        else
+            (if (name.len == 0) "sql.Db" else "sql.Named(\"" ++ name ++ "\")");
+
         gpa: std.mem.Allocator,
         url: []const u8,
         opts: Opts,
@@ -338,6 +349,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// The schema check, with the Row list baked in by `checking`. Null
         /// when nobody asked for one.
         check: ?*const fn (*Self) anyerror!usize = null,
+        /// The version guard `expecting` installed, or null for none. The
+        /// number and the function that reads the ledger travel together,
+        /// so that a program which never calls `expecting` links nothing
+        /// of the migration module.
+        expect: ?Guard = null,
         /// Who to tell about each statement, or null for nobody — which is
         /// the default and costs one null test per statement
         /// ([ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)).
@@ -535,6 +551,51 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }.run;
         }
 
+        /// Refuse to serve a database whose ledger is behind `want`, checked
+        /// once, while the server is starting
+        /// ([ADR 0220](../docs/adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+        ///
+        /// ```zig
+        /// var db = sql.Db.init(gpa, url, .{});
+        /// db.expecting(manifest.head);
+        /// ```
+        ///
+        /// `migrate.expect`, run by `nilo_start` on the pool it just opened:
+        /// one query, and the sentence that says which migration is missing.
+        /// The number is the generated manifest's head, so the guard moves
+        /// with the migrations and nobody types it. A database *ahead* of
+        /// the binary is allowed and noted, because that is the middle of a
+        /// two-stage deploy. A database that cannot be asked — down, or
+        /// `connect_on_init = 0` and the dial for it failed — starts with a
+        /// warning, the way the schema check does (ADR 0039).
+        ///
+        /// **A call rather than a field on `Opts`, and the reason is 17,296
+        /// bytes.** An `.expect = …` option is read on every boot, so the
+        /// ledger's DDL, the query that reads its head and the sentences
+        /// round them are in every program with a `Db` in it, wanted or
+        /// not — measured with `zig build size-sql`, that was the cost. What
+        /// this stores is a function with the guard already inside it, and
+        /// a program that never calls this links none of it, the way
+        /// `checking` works.
+        ///
+        /// Like `checking`, this dials one connection on a `Db` written with
+        /// `connect_on_init = 0`, for the reason ADR 0144 gives: a guard
+        /// with nothing to ask never guarded anything.
+        pub fn expecting(self: *Self, want: i64) void {
+            self.expect = .{ .want = want, .run = &struct {
+                fn run(me: *Self, io: std.Io, version: i64) anyerror!void {
+                    return me.expectVersion(io, version);
+                }
+            }.run };
+        }
+
+        /// What `expecting` stores: the version, and the one function that
+        /// names the migration module.
+        const Guard = struct {
+            want: i64,
+            run: *const fn (*Self, std.Io, i64) anyerror!void,
+        };
+
         /// Be told about every statement this `Db` sends
         /// ([ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)).
         ///
@@ -646,11 +707,13 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // stopped nothing, and the deploy was green.
             //
             // So a `Db` that has a check to run dials one connection for
-            // it. What does not change is ADR 0039's promise that a
-            // database which is merely down does not stop the server: a
-            // dial that fails here falls back to the pool the caller asked
-            // for and says in one line that the check is not happening.
-            const dialing_for_check = self.check != null and self.opts.connect_on_init == 0;
+            // it — and a version guard is a check (ADR 0220). What does not
+            // change is ADR 0039's promise that a database which is merely
+            // down does not stop the server: a dial that fails here falls
+            // back to the pool the caller asked for and says in one line
+            // that the check is not happening.
+            const has_check = self.check != null or self.expect != null;
+            const dialing_for_check = has_check and self.opts.connect_on_init == 0;
             var check_dial_failed = false;
 
             var opened = W.open(io, self.gpa, self.url, .{
@@ -723,6 +786,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // Already said above, in the sentence that names the dial.
             if (check_dial_failed) return;
 
+            try self.checkAtBoot();
+            try self.expectAtBoot(io);
+        }
+
+        /// The `checking` list against the database, once, at boot.
+        fn checkAtBoot(self: *Self) !void {
             const check = self.check orelse return;
             // A schema check needs a connection, and a caller who set
             // `connect_on_init` themselves may have set it to 0. A database
@@ -754,6 +823,37 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 );
                 return error.SchemaMismatch;
             }
+        }
+
+        /// What `expecting` installed, run once at boot; nothing when
+        /// nobody called it.
+        fn expectAtBoot(self: *Self, io: std.Io) !void {
+            const guard = self.expect orelse return;
+            try guard.run(self, io, guard.want);
+        }
+
+        /// The guard itself, reached only through `expecting`
+        /// ([ADR 0220](../docs/adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+        ///
+        /// The one thing `migrate.expect` needs is a Scope, and the boot has
+        /// none — so one is made here on the loop the pool was just opened
+        /// on and thrown away after the query, which is what `app.before`
+        /// does for work of the caller's. Behind is refused, with the
+        /// sentence `expect` writes; a ledger that cannot be read is the
+        /// database being down, and that is a warning for the reason the
+        /// schema check's is.
+        fn expectVersion(self: *Self, io: std.Io, want: i64) !void {
+            var run: core.Run = .initIo(self.gpa, io);
+            defer run.deinit();
+            migrate.expect(self, &run, want) catch |err| switch (err) {
+                error.SchemaBehind => return err,
+                else => std.log.warn(
+                    "nilo could not read the schema version ({s}), so `expecting({d})` is not " ++
+                        "being checked. The first request that reads a column the database " ++
+                        "does not have is how this gets found instead.",
+                    .{ @errorName(err), want },
+                ),
+            };
         }
 
         /// Put the pool down, on the loop it was built on
@@ -1982,8 +2082,9 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             std.log.warn(
                 "nilo_sql: {s} has no pool, so this query has nothing to run on. " ++
                     "The pool is opened by `nilo_start`, which `app.listen()` calls for every " ++
-                    "provided service — outside a server, or before one, `app.start(io)` does " ++
-                    "it, and `db.nilo_start(io, .off)` does it for a `Db` no App holds. " ++
+                    "provided service — work that needs it before the first request goes in " ++
+                    "`app.before(f, args)`; in a program that never listens, `app.start(io)` " ++
+                    "opens it, and `db.nilo_start(io, .off)` does for a `Db` no App holds. " ++
                     "A `nilo.Run` is an arena and a lifetime; it is not a connection.",
                 .{whoami},
             );

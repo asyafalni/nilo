@@ -79,19 +79,33 @@ so there is no "after the server started" to write a line in. Registered
 beside the routes, it starts after the port is taken and before the first
 connection is accepted.
 
-**It does not matter which order you start things in.** A program with a
-database does this ([Making the tables](./sql/migrations.md)):
+**Work that has to finish before the first request is `app.before`.** A
+migration, a version guard, a key set fetched once: it needs the services, so
+it runs inside `listen()`, after they have started and before anything
+`app.spawn` registered ([Applying](./sql/migrations.md#applying)):
 
 ```zig
-try app.start(threaded.io());        // the pool is open from here
-try migrate(&db);
+fn migrate(run: *nilo.Run, db: *sql.Db) !void {
+    try sql.migrate.applyPending(db, run, try manifest.chain(run.arena()));
+}
+
+try app.provide(&db);
+try app.before(migrate, .{&db});     // runs once, on the server's loop
+try app.spawn(flushEvery, .{&exporter});
 try app.listen(.{ .port = 8080 });
 ```
 
-That first phase has no server in it — the `Io` is yours, not the Engine's — so
-anything spawned *there* would have nothing to be owned by. Registering with
-`app.spawn` sidesteps the question: it is started by `listen()`, whichever of
-the two ran first ([ADR 0086](../adr/0086-work-that-is-not-a-request-belongs-to-the-server.md)).
+The function takes the boot's `nilo.Run` first and then whatever it was
+registered with. If it fails, the server does not start: a migration that
+could not run is a database this binary must not serve. The order between
+`before` and `spawn` is fixed rather than a matter of which line comes first:
+the services, then `before`, then the fibers
+([ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+
+`app.start(io)` is for a program that never listens — a test, a script, a
+worker on `jobs.serveOn(io)`. Followed by `listen()` it is refused, because a
+service keeps the `Io` it was started on and `listen()` runs on a loop of its
+own (ADR 0220).
 
 ## Two things must not travel in
 

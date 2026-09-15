@@ -9,8 +9,50 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ## Unreleased
 
-Nothing yet. 0.4.0 was tagged on 14 September 2026; what it holds is on
-[its page](https://github.com/nevindra/nilo/releases/tag/v0.4.0).
+### Breaking
+
+- **`app.start(io)` followed by `listen()` is refused** when any provided
+  service declares `nilo_start`. The shape ADR 0079 recommended handed the
+  pool one loop and the requests another: a job worker started that way
+  crashed at boot, and a server took SIGINT and never exited. `listen()`
+  now says which services took the caller's `Io` and stops, with
+  `error.StartedOnAnotherLoop` from `tryListen`. `app.start(io)` stays for
+  a program that never listens — a test through `testing.Client`, a script,
+  a worker on `jobs.serveOn(io)`
+  ([ADR 0220](./docs/adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+
+  What to change: move the work between `start` and `listen` into a
+  function taking `*nilo.Run` first, and register it with `app.before`:
+
+  ```zig
+  fn migrate(run: *nilo.Run, db: *sql.Db) !void {
+      try sql.migrate.applyPending(db, run, try manifest.chain(run.arena()));
+  }
+
+  try app.provide(&db);
+  try app.before(migrate, .{&db});
+  try app.listen(.{ .port = 8080 });
+  ```
+
+  A `sql.migrate.expect(&db, &run, manifest.head)` on its own becomes
+  `db.expecting(manifest.head)` beside `db.checking`, and needs no phase.
+
+### Added
+
+- **`app.before(f, args)`** — work that needs the services and has to finish
+  before the first request. Runs once inside `listen()`, after the services
+  have started and before what `spawn` registered, on the server's loop,
+  with a `nilo.Run` made there. If it fails, the server does not start.
+  Three shapes are refused while compiling: a value rather than a function,
+  a first parameter that is not `*nilo.Run`, a function answering with a
+  value.
+- **`db.expecting(version)`** — refuse to serve a database whose migration
+  ledger is behind the binary, checked at boot on the pool `listen()` just
+  opened. A call rather than an option on `Db.Opts`, because the option
+  measured 17,296 bytes in every program with a `Db` in it and the call
+  measures 16.
+- `sql.Db`, `sql.Named`, `sql.Sqlite` and `sql.SqliteNamed` say their own
+  name in a nilo message, rather than `db.DbOf(postgres.Wire,…)`.
 
 ## Released
 

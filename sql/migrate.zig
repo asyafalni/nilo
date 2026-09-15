@@ -800,10 +800,16 @@ fn DialectOf(comptime Db: type) type {
 /// [ADR 0079](../docs/adr/0079-there-is-a-phase-before-the-server.md) found:
 ///
 /// ```zig
-/// try app.start(io);
-/// try sql.migrate.createMissing(&db, &run, &.{ Account, Document });
+/// fn makeTables(run: *nilo.Run, db: *sql.Db) !void {
+///     try sql.migrate.createMissing(db, run, &.{ Account, Document });
+/// }
+///
+/// try app.before(makeTables, .{&db});
 /// try app.listen(.{ .port = 8080 });
 /// ```
+///
+/// Inside `listen()` rather than before it, because the pool is dialled
+/// through the loop `listen()` builds (ADR 0220).
 ///
 /// **It is not a migration runner and does not pretend to be one.** It creates
 /// what is missing and never alters what is there, so a table whose shape has
@@ -963,7 +969,7 @@ pub fn apply(
 
 /// Every version the database has not got, in order. Answers how many ran.
 ///
-/// **This is the in-process runner**, called between `app.start(io)` and
+/// **This is the in-process runner**, called from `app.before` inside
 /// `listen()` by a program that has nowhere else to run its DDL — which is
 /// every single-file SQLite application, and plenty of Postgres ones. One
 /// transaction per version, each behind the same advisory lock, so ten

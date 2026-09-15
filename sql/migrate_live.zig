@@ -60,6 +60,12 @@ const Fixture = struct {
     run: core.Run,
 
     fn init(gpa: std.mem.Allocator, name: []const u8) !*Fixture {
+        return initWith(gpa, name, .{ .size = 2 }, null);
+    }
+
+    /// `expect` is what `expecting` would be told before the boot, or null
+    /// for a `Db` with no version guard.
+    fn initWith(gpa: std.mem.Allocator, name: []const u8, opts: Db.Opts, expect: ?i64) !*Fixture {
         const self = try gpa.create(Fixture);
         errdefer gpa.destroy(self);
 
@@ -80,9 +86,10 @@ const Fixture = struct {
             // The `Io` has to outlive every query, not just the open: it is
             // what the pool was opened with. So it is a field.
             .threaded = .init(gpa, .{}),
-            .db = Db.init(gpa, path, .{ .size = 2 }),
+            .db = Db.init(gpa, path, opts),
             .run = .init(gpa),
         };
+        if (expect) |want| self.db.expecting(want);
         try self.db.nilo_start(self.threaded.io(), .off);
         return self;
     }
@@ -610,6 +617,40 @@ test "a binary built for a version the database has not reached refuses to serve
         (try migrate.standing(&fx.db, &fx.run, 8)).verdict(),
     );
     try migrate.expect(&fx.db, &fx.run, 8);
+}
+
+test "a Db told what to expect asks the ledger at boot, on the pool it just opened" {
+    // ADR 0220: the version guard is a call on the `Db`, so it runs inside
+    // `listen()` on the server's own loop with nothing for the caller to
+    // sequence. What is pinned here is that boot *reaches* the ledger — a
+    // fresh file has none, and after this `nilo_start` it has one — and that
+    // level and ahead go through. Behind is `migrate.expect`'s own refusal,
+    // pinned above through `standing` for the reason given there.
+    const gpa = testing.allocator;
+    var fx = try Fixture.initWith(gpa, "expect_at_boot", .{ .size = 2 }, 0);
+    defer fx.deinit(gpa);
+
+    // No `ensureLedger` here: boot made it, or this query has no table.
+    try testing.expectEqual(@as(i64, 0), try migrate.headVersion(&fx.db, &fx.run));
+
+    var d3: [64]u8 = undefined;
+    const three, const three_hash = lone(3, "three", &.{
+        .{ .kind = .create_table, .sql = "CREATE TABLE \"three\" (\"id\" INTEGER)", .why = "" },
+    }, &d3);
+    _ = try migrate.apply(&fx.db, &fx.run, three, three_hash);
+
+    // A second `Db` on the same file, booted the way a deploy would be.
+    var level = Db.init(gpa, fx.path, .{ .size = 1 });
+    defer level.deinit();
+    level.expecting(3);
+    try level.nilo_start(fx.threaded.io(), .off);
+
+    // And one built before the migration that is already in: the middle of
+    // a two-stage deploy, allowed.
+    var ahead = Db.init(gpa, fx.path, .{ .size = 1 });
+    defer ahead.deinit();
+    ahead.expecting(2);
+    try ahead.nilo_start(fx.threaded.io(), .off);
 }
 
 test "the plan a diff produces is the plan that runs, end to end" {

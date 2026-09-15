@@ -533,21 +533,6 @@ several workers on it.
 
 ### Known gaps
 
-**Under `app.start(io)` followed by `listen()`, the workers run on the
-caller's `Io`.** `nilo_start` runs once, in whichever phase came first
-(ADR 0079, ADR 0086), and a `Jobs` keeps the `Io` it was handed there. Under
-the published migrate-then-listen order that is the program's own
-`std.Io.Threaded`, and a worker's `sleep` on it holds an OS thread for
-`poll_ms` — inside a server whose fibers share that thread. Every Service has
-this property under that order; this is the first module where the thing
-started is a loop that sleeps, so it is the first where it costs something
-visible. The fix is repository-level rather than this module's: a second
-hook, or `listen()` re-handing the Engine's `Io` to services that were
-started under another.
-
-**Waiting on: a design** that does not become the second `nilo_start`
-ADR 0086 refused.
-
 **A schedule is UTC.** `0 3 * * *` is three in the morning in Greenwich, and
 a program in Jakarta writes `0 20 * * *` with a comment. A time zone is a
 table of rules that changes twice a year and a dependency to carry it.

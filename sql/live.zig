@@ -37,11 +37,13 @@
 //! the point of it taking a `std.Io` rather than a runtime.
 
 const std = @import("std");
+const core = @import("nilo_core");
 const nilo = @import("nilo_http");
 const live_config = @import("live_config");
 
 const db_mod = @import("db.zig");
 const dialect = @import("dialect.zig");
+const migrate = @import("migrate.zig");
 const postgres = @import("postgres.zig");
 const schema = @import("schema.zig");
 const types = @import("types.zig");
@@ -517,6 +519,30 @@ test "a request goes in as HTTP and comes back as rows from Postgres" {
             "{\"id\":2,\"email\":\"grace@example.dev\",\"handle\":null,\"age\":45}]",
         answer.body,
     );
+}
+
+test "a Db told what to expect boots against a real Postgres and asks its ledger" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    // The boot a deploy runs, minus the server: `nilo_start` dials the pool
+    // and then asks the ledger, on that pool (ADR 0220). The whole pool is
+    // dialled up front for the reason `Live.open` gives. `expecting(0)` is
+    // level or ahead on any database, so the guard goes through; behind is
+    // pinned on SQLite in `migrate_live.zig`, where the file is fresh.
+    var db = db_mod.Db.init(gpa, url, .{ .size = 2, .connect_on_init = 2 });
+    defer db.deinit();
+    db.expecting(0);
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    // Boot made the ledger, or this query has no table to read.
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+    try testing.expect((try migrate.headVersion(&db, &run)) >= 0);
 }
 
 // -- the write half, and the things built on it ---------------------------
@@ -3204,18 +3230,18 @@ test "an exists from the child's side reads the parent's key off the child's own
     // one with no person at all is one of them, which is what NOT EXISTS
     // over a nullable key means.
     try testing.expectEqual(@as(usize, 1), try stack.db.count(Session, &run, .{ .where = .{
-        .exists = .{ .{ .in = Person, .where = .{ .email = .{ .icontains = @as([]const u8, "grace") } } } },
+        .exists = .{.{ .in = Person, .where = .{ .email = .{ .icontains = @as([]const u8, "grace") } } }},
     } }));
     try testing.expectEqual(@as(usize, 2), try stack.db.count(Session, &run, .{ .where = .{
-        .not_exists = .{ .{ .in = Person, .where = .{ .email = .{ .icontains = @as([]const u8, "grace") } } } },
+        .not_exists = .{.{ .in = Person, .where = .{ .email = .{ .icontains = @as([]const u8, "grace") } } }},
     } }));
     // And the guard drops the whole subquery, the way it does from the other
     // side: every session, the orphan included.
     try testing.expectEqual(@as(usize, 3), try stack.db.count(Session, &run, .{ .where = .{
-        .exists = .{ .{ .in = Person, .where = .{ .email = .{ .icontains = given(@as(?[]const u8, null)) } } } },
+        .exists = .{.{ .in = Person, .where = .{ .email = .{ .icontains = given(@as(?[]const u8, null)) } } }},
     } }));
     try testing.expectEqual(@as(usize, 1), try stack.db.count(Session, &run, .{ .where = .{
-        .exists = .{ .{ .in = Person, .where = .{ .email = .{ .icontains = given(@as(?[]const u8, "ada")) } } } },
+        .exists = .{.{ .in = Person, .where = .{ .email = .{ .icontains = given(@as(?[]const u8, "ada")) } } }},
     } }));
 }
 

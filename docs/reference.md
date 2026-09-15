@@ -60,6 +60,7 @@ pub const panic = nilo.panic;                     // optional: name the request 
 | `app.deinit()` | |
 | `app.provide(&thing)` | register a service, looked up later by its pointer type. A service may declare `pub fn nilo_start(self: *T, io: std.Io) !void` to finish building itself once there is an event loop ([ADR 0040](./adr/0040-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md)) and `pub fn nilo_stop(self: *T) void` to put it down again before the loop goes ([ADR 0151](./adr/0151-a-service-is-stopped-before-the-loop-is.md)). **A service that put work on the loop needs the second one**, or the loop cannot be torn down. A third, `pub fn nilo_ready(self: *T, scope: *nilo_core.AnyScope) ?[]const u8`, is what `app.health` asks ([ADR 0192](./adr/0192-a-health-route-asks-the-services.md)) |
 | `app.spawn(f, args)` | work that is not a request, started once the server is up ([ADR 0086](./adr/0086-work-that-is-not-a-request-belongs-to-the-server.md)) |
+| `app.before(f, args)` | work that needs the services and has to finish before the first request — a migration, a version guard, a key set fetched once. `f` is `fn (run: *nilo.Run, …) !void`, run once inside `listen()` after the services have started and before what `spawn` registered, on the server's loop; if it fails the server does not start ([ADR 0220](./adr/0220-work-that-needs-the-services-runs-on-their-loop.md)) |
 | `app.use(mw)` | middleware, everywhere |
 | `app.useOn(prefix, mw)` | middleware, under a path prefix |
 | `app.without(mw)` | the same App with `mw` off for the routes registered through what comes back — how a sign-up route sits inside a guarded prefix ([ADR 0080](./adr/0080-a-route-can-say-it-is-not-covered.md)) |
@@ -75,7 +76,7 @@ pub const panic = nilo.panic;                     // optional: name the request 
 | `app.metrics(options)` | count every request and serve the numbers at `/metrics`, Prometheus format ([Metrics](./guide/metrics.md), [ADR 0100](./adr/0100-the-route-table-is-the-registry.md)) |
 | `app.expose(name, kind, &atomic)` | publish a `std.atomic.Value(u64)` of your own on that page. `kind` is `.counter` or `.gauge` |
 | `app.listen(options)` | run until stopped. Stops the process on a startup error |
-| `app.start(io)` | everything `listen()` does before it accepts anything — services checked, chains resolved, pools opened, schemas checked. For a migration, a script or a test; `listen()` does not repeat it ([ADR 0079](./adr/0079-there-is-a-phase-before-the-server.md)). What it does *not* start is `spawn`, which needs a server |
+| `app.start(io)` | everything `listen()` does before it accepts anything — services checked, chains resolved, pools opened, schemas checked — for a program that never listens: a test through `testing.Client`, a script, a worker on `jobs.serveOn(io)` ([ADR 0079](./adr/0079-there-is-a-phase-before-the-server.md)). **Not before `listen()`**: a service keeps the `Io` it was started on, so `start(io)` followed by `listen()` is refused when any service took one; the phase between the pool and the server is `app.before` ([ADR 0220](./adr/0220-work-that-needs-the-services-runs-on-their-loop.md)). What it does *not* start is `spawn`, which needs a server |
 | `app.shutdown()` | stop, from any thread or from inside a handler |
 | `app.tryListen / tryRoute / tryStatic / tryStaticWith` | the same calls, error returned rather than reported |
 | `app.checkServices()` | `error.MissingService` if a route needs one nobody provided |
@@ -2203,9 +2204,10 @@ try nilo.spawn(flushMetrics, .{&exporter});
 
 **From `main` there is no such moment**, because `listen()` does not return.
 `app.spawn` registers the same work before the server and starts it once there
-is one — after the port is taken, before the first connection is accepted, and
-whichever of ADR 0079's two startup orders the program used
+is one — after the port is taken, after the services and whatever `app.before`
+registered, before the first connection is accepted
 ([ADR 0086](./adr/0086-work-that-is-not-a-request-belongs-to-the-server.md),
+[ADR 0220](./adr/0220-work-that-needs-the-services-runs-on-their-loop.md),
 [the guide](./guide/background.md)):
 
 ```zig
@@ -2803,9 +2805,17 @@ one round trip, and the document says `T`.
 var db = sql.Db.init(gpa, "postgres://…", .{});
 defer db.deinit();
 db.checking(&.{ User, Order });   // optional
+db.expecting(manifest.head);      // optional
 db.watching(sql.logging);         // optional
 try app.provide(&db);
 ```
+
+`db.expecting(version)` refuses to serve a database whose migration ledger is
+behind `version`, checked once at boot on the pool `listen()` just opened
+([ADR 0220](./adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+A call rather than an option because an option is read on every boot and
+links the migration module into every program with a `Db`, measured at
+17,296 bytes; a program that never calls this links none of it.
 
 `db.watching(f)` calls `f` with a `sql.Sent` after every statement — the text,
 the plan name it is kept under, how long the database took, how many rows moved
@@ -3819,7 +3829,7 @@ together get.
 
 `migrate.applyPending(&db, &run, chain)` is the whole list, in order, one
 transaction each, answering how many ran. That is the in-process runner a
-single-file SQLite application calls between `app.start(io)` and `listen()`.
+single-file SQLite application calls from `app.before`, inside `listen()`.
 `migrate.drift(&db, &run, chain)` answers which applied versions have been
 edited since — a `Drift` per version with what the ledger recorded and what the
 steps hash to now.
@@ -3837,12 +3847,15 @@ tightens it, in one transaction, in one version.
 #### Refusing to serve a database that is behind
 
 ```zig
-try sql.migrate.expect(&db, &run, manifest.head);
+db.expecting(manifest.head);
 ```
 
-One query, before `listen()`. **This is the check almost nothing has**, and it
-catches one incident shape: the code went out before the migration did, and
-every request that touches the new column answers 500 until somebody notices.
+One query, run by `listen()` on the pool it just opened. **This is the check
+almost nothing has**, and it catches one incident shape: the code went out
+before the migration did, and every request that touches the new column
+answers 500 until somebody notices. `sql.migrate.expect(&db, &run,
+manifest.head)` is the same check as a call, for a script with a `Run` in
+hand.
 
 A database *ahead* of the binary is allowed and only logged. That is the
 ordinary middle of a two-stage deploy, and refusing it would make expand and

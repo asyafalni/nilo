@@ -900,6 +900,19 @@ const job_refusals = [_]Refusal{
 /// the first line of the error it has to stop with. `says` leaves out the
 /// `nilo: ` prefix because the build step adds it — see the loop in `build`.
 const refusals = [_]Refusal{
+    // The three shapes `app.before` will not run (ADR 0220).
+    .{
+        .name = "before_not_a_function",
+        .says = "app.before() takes a function, not bool.",
+    },
+    .{
+        .name = "before_without_a_run",
+        .says = "app.before() was given a function whose first parameter is *before_without_a_run.Db, and it has to be `*nilo.Run`.",
+    },
+    .{
+        .name = "before_returns_a_value",
+        .says = "app.before() was given a function that answers with usize, and there is nobody to hand the value to.",
+    },
     // The four ways to ask for an answer nilo cannot keep (ADR 0193).
     .{
         .name = "idempotent_not_a_bytes_space",
