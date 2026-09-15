@@ -49,7 +49,8 @@ up, and the cheap half of it can be had back.
 | Item | Status |
 |---|---|
 | 8 | Done at `09cb02c`, ADR 0220. |
-| 1, 2, 3, 4, 5, 6, 7, 9 | Next, as one change to the marker under one ADR amending 0153 with the principle in "The shape to aim for". The snapshot format may break, as it did for `.key` → `.keys`. |
+| 5, 9, 1, 2, 3 | Next, as one change: the words that live inside one Row. `.name` and the 63-byte guard, `sql.Date` and `sql.Decimal(p, s)`, `.default`, an enum column's `CHECK`, partial and ordered `.index`. One ADR amending 0153, because all five are checked while compiling and the line was drawn short of them. The snapshot only gains fields with defaults, so an older file still parses. |
+| 4, 6, 7 | After that: the words that cross tables, and the tool. Composite `.references`, `.references` by table name with the type check moved to the list every Row is in, `generate --baseline` and the `generated ++ by_hand` version file. `Reference.column` becomes `columns`, which breaks the snapshot the way `.key` → `.keys` did. One ADR for the references, one short one for the version file. |
 | `.check`, `.trigger`, `sql.Schema` | After that, under an ADR of its own. |
 | 10 | Not decided. |
 
