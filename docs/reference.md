@@ -3399,8 +3399,11 @@ db.select(Partner, c, .{ .where = .{
 **The join is read out of the schema, not written here.** It comes from a
 `.references` one of the two Rows declares — the other Row's, pointing at this
 table, or this Row's own, pointing at the other's — which is already checked
-while compiling: the target has to be a Row, the target column one of its
-columns, and the two Zig types the same. So the query the other way round,
+while compiling: the target has to be a Row the tool knows, the target column
+one of its columns, and the two Zig types the same. A key over two columns
+joins on both of them, because joining on the first alone would run, read
+correctly and answer a wider question than the schema asked. So the query the
+other way round,
 from the child asking about its parent, is the same line with the Rows
 swapped
 ([ADR 0214](./adr/0214-an-exists-reads-the-reference-from-either-side.md)):
@@ -3739,6 +3742,8 @@ const User = struct {
 | `.{ .created_at = .desc }` | one column of an index read downwards. `.asc` is the default and needs no saying; a direction on a `.unique` is a Refusal, since a unique index is not read in order |
 | `.where = .{ .deleted_at = null }` | a partial index. The same grammar a `db.select` condition uses, not a string: `null` is `IS NULL`, `.{ .ne = null }` is `IS NOT NULL`, a literal is `=` and `.{ .ne = lit }` is `<>`. A name that is not a column is a Refusal and a literal of the wrong type does not compile. An index over an expression — `lower(btrim(site))` — is still a step |
 | `.references = .{ .org_id = .{ Org, .id } }` | keyed by the column doing the pointing, and it names the **Row** rather than a table, so renaming the table moves the key with it. A third entry says what happens on delete: `.cascade`, `.restrict` or `.set_null` |
+| `.{ "orgs", .id, .cascade }` | the same key with the table named as text, for a program whose files may not import each other's Rows. **The type check is not given up**: it runs against the Row list the tool was given, and a table no Row in that list claims is a Refusal ([ADR 0222](./adr/0222-a-foreign-key-is-columns-and-a-table-name.md)) |
+| `.epic = .{ .columns = .{ .epic_id, .department_id }, .to = .{ WorkEpic, .{ .id, .department_id } } }` | a foreign key over two columns, which is how "the Epic has to be on the same board" gets said once instead of in a `.data` step and two `.unique` entries. Keyed by a label rather than a column, because a Zig field name cannot be a tuple. `.to` takes a Row or a name, and `.on_delete` and `.name` belong in the same entry. A composite key is written as a table constraint; a one-column key stays inline, so nothing generated before this changed |
 | `.was = .{ .email = "handle" }` | this column used to be called that. The old name is text, because it is not a column any more |
 | `.managed = false` | somebody else builds this table. `plan`, `createMissing` and `generate` skip it entirely |
 
@@ -3751,11 +3756,12 @@ the database's: its words are added with `ALTER TYPE`, and nilo neither writes
 them nor judges them at startup.
 
 **`.managed = false` is for the table this program reads and does not own.** A
-foreign key names the *Row* that owns the table it points at, so
-`comments.author_staff_id` cannot say it points at `staff` without a `Staff`
-Row — and a `Staff` Row is part of the schema the diff sees, so the tool emits
-`CREATE TABLE staff` for a table that has existed for a year and whose real
-definition has twenty columns this program never needed. One word settles it:
+foreign key is checked against the Rows the tool was given, whether it names a
+Row or the table as text, so `comments.author_staff_id` cannot say it points at
+`staff` without a `Staff` Row in that list — and a Row in the list is part of
+the schema the diff sees, so the tool emits `CREATE TABLE staff` for a table
+that has existed for a year and whose real definition has twenty columns this
+program never needed. One word settles it:
 
 <!-- compiles -->
 ```zig
@@ -3942,6 +3948,7 @@ else wrote the file named in `.file`.
 | `migrations.generate(gpa, io, dir, D, desired, opts)` | the `Plan`, written out |
 | `migrations.renderVersion(gpa, n, name, steps, opts)` | one version file, as text |
 | `migrations.renderManifest(gpa, entries, opts)` | the manifest, as text |
+| `migrations.spliceGenerated(gpa, old, steps)` | the same file with only its generated block replaced |
 | `migrations.checkName(name)` | `a-z`, `0-9` and `_`, or `error.BadName` |
 
 A version file is **one `.zig` file holding a list of steps**, because a
@@ -3951,6 +3958,31 @@ about `;` inside a string literal and inside `$$…$$`, and getting it subtly
 wrong runs three quarters of a migration. The list is already split.
 [ADR 0153](adr/0153-a-migration-is-a-diff-against-a-snapshot.md) is the
 argument, including what the layout costs.
+
+**Only one declaration in that file is generated.** The rest is the caller's,
+and it survives a rerun
+([ADR 0223](adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)):
+
+```zig
+pub const before: []const migrate.Step = &.{};   // yours, runs first
+pub const after: []const migrate.Step = &.{};    // yours, runs last
+
+pub const version: migrate.Version = .{
+    .number = 1,
+    .name = "schema",
+    .steps = before ++ generated ++ after,
+};
+
+// nilo:generated begin
+const generated: []const migrate.Step = &.{ … };
+// nilo:generated end
+```
+
+`before` exists as well as `after` because a generated step can *need* a
+hand-written object: a `CREATE EXTENSION citext` has to run before the column
+whose type comes from it. `migrations.generated_begin` and `generated_end` are
+the two marker lines, matched whole; a file that has lost one is refused with
+`error.NoGeneratedBlock` rather than rewritten.
 
 #### The commands
 
@@ -3967,7 +3999,7 @@ rather than calling `std.process.exit`.
 
 | Command | What it does |
 |---|---|
-| `generate --name <snake_case> [--drop]` | diff the Rows against the snapshot and write the next version. No database |
+| `generate --name <snake_case> [--drop] [--baseline]` | diff the Rows against the snapshot and write the next version. No database |
 | `check` | the same diff, written nowhere. Exit 1 when they disagree. No database |
 | `status [--sql]` | which versions this database has. `--sql` prints the waiting statements |
 | `migrate` | apply what is waiting, one transaction per version, behind the lock |
@@ -3991,6 +4023,15 @@ with `--drop` and the generated file records that you did, as
 `status` marks a version `edited` rather than `applied` when its file no longer
 hashes to what ran. It is the command people type first, so it is the one that
 has to stop saying everything is fine.
+
+**`--baseline` is for porting a schema**, which is one version written over and
+over rather than many versions. It ignores the snapshot, diffs the Rows against
+nothing, and rewrites version 1 in place along with the manifest and the
+snapshot, keeping everything outside the file's generated block. It is the only
+thing here that writes over a file that already exists, so it refuses three
+ways: a version it is not re-deriving is in the directory, `--name` disagrees
+with the version 1 already there, or the file has no generated block. Each
+message names the files, and nothing is written.
 
 #### Starting a migrations directory
 

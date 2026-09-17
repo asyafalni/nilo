@@ -37,6 +37,31 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
   A `sql.migrate.expect(&db, &run, manifest.head)` on its own becomes
   `db.expecting(manifest.head)` beside `db.checking`, and needs no phase.
 
+- **`migrations/snapshot.zon` written before this release is refused, not
+  read.** A foreign key holds a list of columns now rather than one, so
+  `Reference.column` is `columns` and `target` is `targets`. `std.zon` fills a
+  *missing* field from its default and has nothing to say about a renamed one,
+  so an older snapshot comes back as `error.ParseZon` with a diagnostic naming
+  `column`
+  ([ADR 0222](./docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+
+  What to change: `db generate --name <what you changed>` rewrites it. The
+  tables themselves are unaffected — a one-column foreign key is still written
+  inline and byte for byte as before — so the diff against a live database is
+  empty and the regenerated snapshot is the whole of the change.
+
+- **A version file now has a generated block rather than being one.** `generate`
+  writes a `before`, an `after`, a `version` whose `.steps` is
+  `before ++ generated ++ after`, and the generated list between two
+  `// nilo:generated` marker lines. Files written by an earlier release still
+  compile and still apply, and their hashes do not move, because the hash is
+  taken over the steps and not over the file
+  ([ADR 0223](./docs/adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)).
+
+  What to change: nothing, unless you want `--baseline` to be able to rewrite
+  version 1 in place. That needs the two marker lines around the generated
+  steps, and the refusal says so with the line to paste.
+
 ### Added
 
 - **A Row can say its columns' defaults**, `.default = .{ .created_at = .now,
@@ -90,6 +115,34 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
   opened. A call rather than an option on `Db.Opts`, because the option
   measured 17,296 bytes in every program with a `Db` in it and the call
   measures 16.
+- **A `.references` can name its table as text**, `.{ "orgs", .id, .cascade }`,
+  for a program whose files may not import each other's Rows — a context per
+  directory, where contexts never import each other. **The type check is not
+  given up**: it runs against the Row list `sql.cli.Tool` and `db.checking` are
+  given, where every Row is in one place, and a table no Row in that list claims
+  is a compile error naming both spellings. That is what lets a context own its
+  Row once instead of declaring every table twice
+  ([ADR 0222](./docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+- **A `.references` can span several columns**, which is how "the Epic has to be
+  on the same board" gets said in the schema:
+
+  ```zig
+  .references = .{
+      .epic = .{ .columns = .{ .epic_id, .department_id },
+                 .to = .{ WorkEpic, .{ .id, .department_id } } },
+  },
+  ```
+
+  Keyed by a label rather than a column, because a Zig field name cannot be a
+  tuple. A composite key is written as a table constraint and a one-column key
+  stays inline, so every table generated before this is unchanged. `.exists`
+  joins on every column of it.
+- **`db generate --baseline`** — forget the snapshot, diff the Rows against
+  nothing and rewrite version 1 where it stands, keeping everything outside its
+  generated block. What porting a schema needs, where the loop is one version
+  derived over and over. Refused once there is a version 2, when `--name`
+  disagrees with the version 1 on disk, or when the file has no generated block;
+  each message names the files and nothing is written.
 - `sql.Db`, `sql.Named`, `sql.Sqlite` and `sql.SqliteNamed` say their own
   name in a nilo message, rather than `db.DbOf(postgres.Wire,…)`.
 

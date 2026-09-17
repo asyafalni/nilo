@@ -551,7 +551,7 @@ const sql_refusals = [_]Refusal{
     .{
         .name = "table_references_not_a_row",
         .says = "table_references_not_a_row.User's `.references.org_id` points at" ++
-            " something that is not a Row.",
+            " table_references_not_a_row.Org, which is not a Row.",
     },
     .{
         .name = "table_reference_type_mismatch",
@@ -581,6 +581,35 @@ const sql_refusals = [_]Refusal{
         .name = "table_references_in_a_ring",
         .says = "these tables point at each other in a ring, so none of them can be" ++
             " created first:",
+    },
+    // The five the words that cross tables add (ADR 0222). Four of them are a
+    // foreign key that lines up in the Row and not with the table it points
+    // at, which is the mistake the type check exists to catch — and the fifth
+    // is the check itself, refusing the name it was given nowhere to resolve.
+    .{
+        .name = "table_references_a_table_nobody_declares",
+        .says = "table_references_a_table_nobody_declares.User's `.references.org_id`" ++
+            " points at the table `orgs`, and no Row in this list names it.",
+    },
+    .{
+        .name = "table_references_by_name_type_mismatch",
+        .says = "table_references_by_name_type_mismatch.User.org_id is []const u8 and" ++
+            " points at table_references_by_name_type_mismatch.Org.id, which is i64.",
+    },
+    .{
+        .name = "table_references_uneven_columns",
+        .says = "table_references_uneven_columns.Card's `.references.board` points 2" ++
+            " column(s) at 1 of `boards`.",
+    },
+    .{
+        .name = "table_references_long_form_without_to",
+        .says = "table_references_long_form_without_to.Card's `.references.board` says" ++
+            " no table.",
+    },
+    .{
+        .name = "table_references_unknown_word",
+        .says = "table_references_unknown_word.Card's `.references` sets `.on_dlete`," ++
+            " which is not part of an entry.",
     },
     // The fifteen the words inside one Row add (ADR 0221): a default, an enum
     // column's CHECK, a partial and ordered index, and a constraint that can

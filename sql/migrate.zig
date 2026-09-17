@@ -94,6 +94,16 @@ pub fn orderOf(comptime D: type, comptime Rows: []const type) []const type {
         var descs: [Rows.len]Desc = undefined;
         for (Rows, 0..) |R, i| descs[i] = table_mod.descOf(D, R);
 
+        // **The one place every Row is in one list**, which is why the check
+        // for a foreign key that named its table as text runs here rather than
+        // inside the Row that wrote it
+        // ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+        // After the `Desc`s, so that an entry written wrong stops with what
+        // `table.zig` says about its shape rather than with a missing field;
+        // before the sort, because a name that resolves to nothing would
+        // otherwise come back as a ring.
+        table_mod.assertTargetsResolve(Rows);
+
         var out: [Rows.len]type = undefined;
         var placed: [Rows.len]bool = @splat(false);
         var n: usize = 0;
@@ -719,18 +729,20 @@ fn diffReferences(
     for (t.desc.references) |r| {
         const before = findReference(old.references, r.name);
         if (before != null and before.?.sameAs(r)) continue;
+        const mine = try quotedList(gpa, r.columns);
+        const theirs = try quotedList(gpa, r.targets);
         try problems.append(gpa, .{
             .table = t.desc.table,
-            .column = r.column,
+            .column = try plainList(gpa, r.columns),
             .text = try std.fmt.allocPrint(
                 gpa,
                 "the foreign key {s} is new or changed, and the table already exists. " ++
                     "Adding one in a single statement locks the table and scans every row " ++
                     "in it. Write it as a step, in two: `ALTER TABLE \"{s}\" ADD CONSTRAINT " ++
-                    "\"{s}\" FOREIGN KEY (\"{s}\") REFERENCES \"{s}\" (\"{s}\") NOT VALID`, " ++
+                    "\"{s}\" FOREIGN KEY ({s}) REFERENCES \"{s}\" ({s}) NOT VALID`, " ++
                     "then `ALTER TABLE \"{s}\" VALIDATE CONSTRAINT \"{s}\"`. SQLite has " ++
                     "neither statement and needs the table rebuilt.",
-                .{ r.name, t.desc.table, r.name, r.column, r.table, r.target, t.desc.table, r.name },
+                .{ r.name, t.desc.table, r.name, mine, r.table, theirs, t.desc.table, r.name },
             ),
         });
     }
@@ -738,7 +750,7 @@ fn diffReferences(
         if (findReference(t.desc.references, o.name) != null) continue;
         try problems.append(gpa, .{
             .table = t.desc.table,
-            .column = o.column,
+            .column = try plainList(gpa, o.columns),
             .text = try std.fmt.allocPrint(
                 gpa,
                 "the foreign key {s} is gone from the types and is still on the table. " ++
@@ -748,6 +760,29 @@ fn diffReferences(
             ),
         });
     }
+}
+
+/// `"a", "b"` — the columns of a foreign key as they go inside a statement.
+fn quotedList(gpa: std.mem.Allocator, columns: []const []const u8) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    for (columns, 0..) |c, i| {
+        if (i > 0) try aw.writer.writeAll(", ");
+        try aw.writer.print("\"{s}\"", .{c});
+    }
+    return aw.toOwnedSlice();
+}
+
+/// The same list unquoted, for the `column` a `Problem` is reported against.
+fn plainList(gpa: std.mem.Allocator, columns: []const []const u8) ![]const u8 {
+    if (columns.len == 1) return columns[0];
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    for (columns, 0..) |c, i| {
+        if (i > 0) try aw.writer.writeAll(", ");
+        try aw.writer.writeAll(c);
+    }
+    return aw.toOwnedSlice();
 }
 
 fn findUnique(list: []const table_mod.Unique, name: []const u8) ?table_mod.Unique {

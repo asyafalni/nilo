@@ -330,6 +330,92 @@ test "a default, a column's words and a partial index survive the round trip" {
     try testing.expect(std.mem.indexOf(u8, text, ".descending = .{}") == null);
 }
 
+test "a foreign key of two columns is written down as two, and read back as two" {
+    const gpa = testing.allocator;
+
+    const Board = struct {
+        pub const nilo_table = .{ .name = "boards", .key = .{ .id, .org_id } };
+        id: i64,
+        org_id: i64,
+    };
+    const Card = struct {
+        pub const nilo_table = .{
+            .name = "cards",
+            .key = .id,
+            .references = .{
+                .board = .{
+                    .columns = .{ .board_id, .org_id },
+                    .to = .{ Board, .{ .id, .org_id } },
+                    .on_delete = .cascade,
+                },
+            },
+        };
+        id: i64,
+        board_id: i64,
+        org_id: i64,
+    };
+
+    var desc = comptime table_mod.descOf(Pg, Card);
+    desc.row = "";
+    const tables = try gpa.dupe(Desc, &.{desc});
+    defer gpa.free(tables);
+
+    const text = try render(gpa, .{ .version = 5, .dialect = Pg.name, .tables = tables });
+    defer gpa.free(text);
+    const zeroed = try gpa.dupeZ(u8, text);
+    defer gpa.free(zeroed);
+    const back = try parse(gpa, zeroed, null);
+    defer free(gpa, back);
+
+    const fk = back.table(null, "cards").?.references[0];
+    try testing.expectEqualStrings("cards_board_id_org_id_fkey", fk.name);
+    try testing.expectEqualStrings("board_id", fk.columns[0]);
+    try testing.expectEqualStrings("org_id", fk.columns[1]);
+    try testing.expectEqualStrings("id", fk.targets[0]);
+    try testing.expectEqualStrings("org_id", fk.targets[1]);
+    try testing.expectEqual(table_mod.OnDelete.cascade, fk.on_delete);
+}
+
+test "a snapshot whose foreign keys are the older single-column shape is refused, not read" {
+    // **The break this round makes, as a test rather than as a paragraph.**
+    // `Reference.column` became `columns` and `target` became `targets`, which
+    // is what a foreign key of two columns needs, and `std.zon` has no way to
+    // read the old spelling into the new field. So an older file stops with
+    // the field name in the message, the way `.key` → `.keys` did, and
+    // `db generate` rewrites it from the types
+    // ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+    const gpa = testing.allocator;
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(gpa);
+
+    const older =
+        \\.{
+        \\    .version = 4,
+        \\    .dialect = "postgres",
+        \\    .tables = .{
+        \\        .{
+        \\            .table = "users",
+        \\            .keys = .{"id"},
+        \\            .columns = .{ .{ .name = "id", .sql_type = "int8", .key = true } },
+        \\            .references = .{
+        \\                .{
+        \\                    .name = "users_org_id_fkey",
+        \\                    .column = "org_id",
+        \\                    .table = "orgs",
+        \\                    .target = "id",
+        \\                },
+        \\            },
+        \\        },
+        \\    },
+        \\}
+    ;
+    try testing.expectError(error.ParseZon, parse(gpa, older, &diag));
+
+    var buf: [512]u8 = undefined;
+    const said = try std.fmt.bufPrint(&buf, "{f}", .{diag});
+    try testing.expect(std.mem.indexOf(u8, said, "column") != null);
+}
+
 test "a snapshot written before these fields existed still parses as the schema it was" {
     // **Every field the marker gained has a default**, which is what lets
     // round one land without rewriting anybody's file: `std.zon` fills a

@@ -66,6 +66,22 @@ pub const manifest_file = "manifest.zig";
 /// kilobytes, and anything past this is a file somebody else wrote.
 pub const max_snapshot = 8 * 1024 * 1024;
 
+/// The most a version file may be, for `--baseline`, which is the one thing
+/// here that reads one back. A ported schema of sixty tables is a few hundred
+/// kilobytes of `CREATE TABLE`.
+pub const max_version = 8 * 1024 * 1024;
+
+/// The two lines around the steps `generate` wrote
+/// ([ADR 0223](../docs/adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)).
+///
+/// `--baseline` replaces what is between them and keeps every byte outside, so
+/// a port can re-derive version 1 forty times without losing the hand-written
+/// half of the file. They are matched as whole lines, and a file that has lost
+/// one is refused rather than rewritten: the alternative is throwing somebody's
+/// work away and reporting success.
+pub const generated_begin = "// nilo:generated begin";
+pub const generated_end = "// nilo:generated end";
+
 pub const Error = error{
     /// A version name with something other than `a-z`, `0-9` or `_` in it. The
     /// name becomes a path and a Zig identifier, so it is checked before it is
@@ -76,6 +92,18 @@ pub const Error = error{
     /// Two version files with the same number, which is what two branches that
     /// both generated look like after a bad merge.
     DuplicateVersion,
+    /// `--baseline` in a directory that holds a version it is not re-deriving.
+    /// Version 2 is a diff against what version 1 left behind, so a re-derived
+    /// version 1 makes version 2 describe a schema that never existed.
+    BaselineHasOthers,
+    /// `--baseline --name initial` where version 1 on disk is called something
+    /// else. Writing the new name would leave both files in the directory, and
+    /// the next `read` refuses a directory with two version 1s.
+    BaselineRenames,
+    /// A version file being rewritten in place that has no `generated_begin`
+    /// and `generated_end` around its steps, so nothing can tell which half of
+    /// it `generate` wrote.
+    NoGeneratedBlock,
 };
 
 // -- what the directory holds --------------------------------------------
@@ -191,6 +219,16 @@ pub const Options = struct {
     allow_destructive: bool = false,
     /// What the generated files call the SQL module in their `@import`.
     module: []const u8 = default_module,
+    /// Forget the snapshot and derive version 1 from nothing, rewriting the
+    /// file that is already there.
+    ///
+    /// **Porting a schema is one version written forty times**, not forty
+    /// versions. Without this the loop is a shell script that deletes the
+    /// snapshot, deletes the version file and resets the manifest by hand,
+    /// which is what the nodeflux port wrote and what
+    /// [ADR 0223](../docs/adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)
+    /// is about. Everything outside the version file's generated block is kept.
+    baseline: bool = false,
 };
 
 /// What `generate` did, and why it did not do more.
@@ -202,6 +240,10 @@ pub const Outcome = struct {
     file: ?[]const u8 = null,
     /// Its number, or zero.
     number: u32 = 0,
+    /// The file was already there and its generated block was replaced. Only
+    /// `--baseline` does this, and it is worth saying out loud because the
+    /// word on screen is the difference between "wrote" and "kept your half".
+    rewrote: bool = false,
 
     /// The schema and the types already agree.
     pub fn isEmpty(self: Outcome) bool {
@@ -249,6 +291,8 @@ pub fn generate(
     try checkName(opts.name);
 
     const state = try read(gpa, io, dir, D);
+    if (opts.baseline) return baseline(gpa, io, dir, D, desired, opts, state);
+
     const change = try migrate.plan(gpa, D, desired, state.before);
 
     if (change.isEmpty()) return .{ .plan = change };
@@ -267,23 +311,92 @@ pub fn generate(
     @memcpy(with_new[0..state.entries.len], state.entries);
     with_new[state.entries.len] = .{ .number = number, .name = opts.name, .file = file };
 
+    try writeManifestAndSnapshot(gpa, io, dir, D, desired, opts, with_new, number);
+    return .{ .plan = change, .file = file, .number = number };
+}
+
+/// `--baseline`: diff against nothing and rewrite version 1 where it stands.
+///
+/// **The snapshot is not read at all**, which is the whole point — a port is
+/// the same version derived again and again, and the snapshot is exactly what
+/// makes the second run say "nothing to do". What it will not do is touch a
+/// directory that has moved past version 1: everything after the first is a
+/// diff against what the first left behind, so re-deriving the first quietly
+/// turns the rest into a description of a schema that never existed.
+fn baseline(
+    gpa: std.mem.Allocator,
+    io: Io,
+    dir: Dir,
+    comptime D: type,
+    desired: []const Table,
+    opts: Options,
+    state: State,
+) !Outcome {
+    var here: ?Entry = null;
+    for (state.entries) |e| {
+        if (e.number != 1) return Error.BaselineHasOthers;
+        here = e;
+    }
+    if (here) |e| {
+        if (!std.mem.eql(u8, e.name, opts.name)) return Error.BaselineRenames;
+    }
+
+    const change = try migrate.plan(gpa, D, desired, snapshot.empty(D));
+    if (change.isEmpty()) return .{ .plan = change };
+    if (change.problems.len > 0) return .{ .plan = change };
+    // A diff against nothing is every `CREATE TABLE` and no `DROP`, so this
+    // cannot fire today. It is here so that the day the baseline diff learns to
+    // write something destructive, `--drop` still guards it.
+    if (change.destructive() and !opts.allow_destructive) return .{ .plan = change };
+
+    const file = try std.fmt.allocPrint(gpa, "0001_{s}.zig", .{opts.name});
+    const rewrote = here != null;
+
+    const text = if (rewrote) blk: {
+        const old = try dir.readFileAlloc(io, file, gpa, .limited(max_version));
+        break :blk try spliceGenerated(gpa, old, change.steps);
+    } else try renderVersion(gpa, 1, opts.name, change.steps, opts);
+
+    try dir.writeFile(io, .{ .sub_path = file, .data = text });
+
+    const only: []const Entry = &.{.{ .number = 1, .name = opts.name, .file = file }};
+    try writeManifestAndSnapshot(gpa, io, dir, D, desired, opts, only, 1);
+    return .{ .plan = change, .file = file, .number = 1, .rewrote = rewrote };
+}
+
+/// The two files that follow a version file, in the order that survives a run
+/// that dies halfway: the manifest that names the version, then the snapshot
+/// that says the schema has moved.
+fn writeManifestAndSnapshot(
+    gpa: std.mem.Allocator,
+    io: Io,
+    dir: Dir,
+    comptime D: type,
+    desired: []const Table,
+    opts: Options,
+    entries: []const Entry,
+    version: u32,
+) !void {
     try dir.writeFile(io, .{
         .sub_path = manifest_file,
-        .data = try renderManifest(gpa, with_new, opts),
+        .data = try renderManifest(gpa, entries, opts),
     });
 
-    const doc = try migrate.snapshotOf(gpa, D, number, desired);
+    const doc = try migrate.snapshotOf(gpa, D, version, desired);
     try dir.writeFile(io, .{
         .sub_path = snapshot_file,
         .data = try snapshot.render(gpa, doc),
     });
-
-    return .{ .plan = change, .file = file, .number = number };
 }
 
 // -- what a generated file looks like -------------------------------------
 
 /// One version, as the text of its file. Caller frees.
+///
+/// **The half a person edits is at the top and the generated half is at the
+/// bottom**, which is the other way round from how it reads. A ported schema
+/// puts four thousand lines of `CREATE TABLE` in this file, and a `version`
+/// under them is a `version` nobody ever sees.
 pub fn renderVersion(
     gpa: std.mem.Allocator,
     number: u32,
@@ -299,37 +412,102 @@ pub fn renderVersion(
         \\// Written by `db generate` from the Rows in this repository, and committed.
         \\//
         \\// Read it like code, because it is exactly what will run: these steps, in
-        \\// this order, inside one transaction. A step you write yourself goes in the
-        \\// same list with `.kind = .data`, and `generate` never produces one of
-        \\// those, so it will not be taken away again.
+        \\// this order, inside one transaction.
+        \\//
+        \\// The generated block at the bottom belongs to `db generate`, and
+        \\// `--baseline` replaces it. Everything above it is yours and is kept, so a
+        \\// step of your own goes in `before` or `after` and survives the next run.
         \\//
         \\// Editing this after it has been applied changes the version's hash, and
         \\// `migrate.drift` reports it against every database that has run it.
         \\
         \\const migrate = @import("{s}").migrate;
         \\
+        \\/// Steps of your own that have to run *before* the generated ones: the
+        \\/// extension a generated column's type comes from, a function a default
+        \\/// calls. Nothing generated ever lands here.
+        \\pub const before: []const migrate.Step = &.{{}};
+        \\
+        \\/// And the ones that run after: a backfill, a seed row, a `create_hypertable`.
+        \\pub const after: []const migrate.Step = &.{{}};
+        \\
         \\pub const version: migrate.Version = .{{
         \\    .number = {d},
         \\    .name = "{s}",
-        \\    .steps = &.{{
+        \\    .steps = before ++ generated ++ after,
+        \\}};
+        \\
         \\
     , .{ opts.module, number, name });
 
+    try writeGenerated(w, steps);
+    return aw.toOwnedSlice();
+}
+
+/// Replace a version file's generated block and keep every byte outside it.
+///
+/// Whole-line matching on both markers, and `Error.NoGeneratedBlock` when
+/// either is missing. **Refusing beats guessing**: the only other reading of a
+/// file with no markers is "all of it is generated", and acting on that throws
+/// away the hand-written steps this shape exists to hold.
+pub fn spliceGenerated(gpa: std.mem.Allocator, old: []const u8, steps: []const Step) ![]u8 {
+    const begin = lineWith(old, generated_begin) orelse return Error.NoGeneratedBlock;
+    const after_begin = old[begin.end..];
+    const end = lineWith(after_begin, generated_end) orelse return Error.NoGeneratedBlock;
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try w.writeAll(old[0..begin.start]);
+    try writeGenerated(w, steps);
+    try w.writeAll(after_begin[end.end..]);
+    return aw.toOwnedSlice();
+}
+
+const Line = struct { start: usize, end: usize };
+
+/// The line that *is* `marker`, ignoring what is around it. `end` is past the
+/// newline, so the two halves either side of a line splice cleanly.
+fn lineWith(text: []const u8, marker: []const u8) ?Line {
+    var start: usize = 0;
+    while (start < text.len) {
+        const nl = std.mem.indexOfScalarPos(u8, text, start, '\n');
+        const stop = nl orelse text.len;
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, text[start..stop], "\r"), marker)) {
+            return .{ .start = start, .end = if (nl) |n| n + 1 else text.len };
+        }
+        if (nl == null) break;
+        start = stop + 1;
+    }
+    return null;
+}
+
+/// The block between the two markers, markers included.
+fn writeGenerated(w: *std.Io.Writer, steps: []const Step) !void {
+    try w.print(
+        \\{s}
+        \\// Everything to the closing line is `db generate`'s, and a run with
+        \\// `--baseline` writes it again from the Rows. Nothing of yours belongs in
+        \\// here: it will not be here next time. Do not move or edit either marker.
+        \\const generated: []const migrate.Step = &.{{
+        \\
+    , .{generated_begin});
+
     for (steps) |s| {
-        try w.print("        .{{\n            .kind = .{t},\n", .{s.kind});
-        try w.writeAll("            .why = \"");
+        try w.print("    .{{\n        .kind = .{t},\n", .{s.kind});
+        try w.writeAll("        .why = \"");
         try writeEscaped(w, s.why);
         try w.writeAll("\",\n");
-        if (s.destructive) try w.writeAll("            .destructive = true,\n");
-        if (s.needs_backfill) try w.writeAll("            .needs_backfill = true,\n");
-        try w.writeAll("            .sql =\n");
+        if (s.destructive) try w.writeAll("        .destructive = true,\n");
+        if (s.needs_backfill) try w.writeAll("        .needs_backfill = true,\n");
+        try w.writeAll("        .sql =\n");
         var lines = std.mem.splitScalar(u8, s.sql, '\n');
-        while (lines.next()) |line| try w.print("            \\\\{s}\n", .{line});
-        try w.writeAll("            ,\n        },\n");
+        while (lines.next()) |line| try w.print("        \\\\{s}\n", .{line});
+        try w.writeAll("        ,\n    },\n");
     }
 
-    try w.writeAll("    },\n};\n");
-    return aw.toOwnedSlice();
+    try w.print("}};\n{s}\n", .{generated_end});
 }
 
 /// The manifest, as the text of its file. Caller frees.
@@ -452,6 +630,19 @@ const Sandbox = struct {
     fn slurp(self: *Sandbox, name: []const u8) ![]u8 {
         return self.dir().readFileAlloc(self.io(), name, self.a(), .limited(max_snapshot));
     }
+
+    /// What a person does to a generated file between two runs.
+    fn overwrite(self: *Sandbox, name: []const u8, data: []const u8) !void {
+        try self.dir().writeFile(self.io(), .{ .sub_path = name, .data = data });
+    }
+};
+
+/// `orgs` with one more column, for the tests that move the schema.
+const Noted = struct {
+    pub const nilo_table = .{ .name = "orgs", .key = .id };
+    id: i64,
+    name: []const u8,
+    note: ?[]const u8,
 };
 
 test "an empty directory generates every table, and says which file it wrote" {
@@ -652,31 +843,67 @@ test "the rendered version is what a person would have written by hand" {
         \\// Written by `db generate` from the Rows in this repository, and committed.
         \\//
         \\// Read it like code, because it is exactly what will run: these steps, in
-        \\// this order, inside one transaction. A step you write yourself goes in the
-        \\// same list with `.kind = .data`, and `generate` never produces one of
-        \\// those, so it will not be taken away again.
+        \\// this order, inside one transaction.
+        \\//
+        \\// The generated block at the bottom belongs to `db generate`, and
+        \\// `--baseline` replaces it. Everything above it is yours and is kept, so a
+        \\// step of your own goes in `before` or `after` and survives the next run.
         \\//
         \\// Editing this after it has been applied changes the version's hash, and
         \\// `migrate.drift` reports it against every database that has run it.
         \\
         \\const migrate = @import("nilo_sql").migrate;
         \\
+        \\/// Steps of your own that have to run *before* the generated ones: the
+        \\/// extension a generated column's type comes from, a function a default
+        \\/// calls. Nothing generated ever lands here.
+        \\pub const before: []const migrate.Step = &.{};
+        \\
+        \\/// And the ones that run after: a backfill, a seed row, a `create_hypertable`.
+        \\pub const after: []const migrate.Step = &.{};
+        \\
         \\pub const version: migrate.Version = .{
         \\    .number = 7,
         \\    .name = "add_nickname",
-        \\    .steps = &.{
-        \\        .{
-        \\            .kind = .add_column,
-        \\            .why = "User.nickname",
-        \\            .needs_backfill = true,
-        \\            .sql =
-        \\            \\ALTER TABLE "users" ADD COLUMN "nickname" text
-        \\            ,
-        \\        },
-        \\    },
+        \\    .steps = before ++ generated ++ after,
         \\};
         \\
+        \\// nilo:generated begin
+        \\// Everything to the closing line is `db generate`'s, and a run with
+        \\// `--baseline` writes it again from the Rows. Nothing of yours belongs in
+        \\// here: it will not be here next time. Do not move or edit either marker.
+        \\const generated: []const migrate.Step = &.{
+        \\    .{
+        \\        .kind = .add_column,
+        \\        .why = "User.nickname",
+        \\        .needs_backfill = true,
+        \\        .sql =
+        \\        \\ALTER TABLE "users" ADD COLUMN "nickname" text
+        \\        ,
+        \\    },
+        \\};
+        \\// nilo:generated end
+        \\
     , text);
+}
+
+test "the shape the file is written in is a shape that compiles" {
+    // The generated file is written into a directory and read back as text;
+    // nothing in this suite ever hands one to the compiler. So the one thing in
+    // it the compiler has to agree with — three slices concatenated into the
+    // `.steps` of a `Version` — is written out here, where it does.
+    const before: []const Step = &.{};
+    const generated: []const Step = &.{
+        .{ .kind = .create_table, .why = "create orgs", .sql = "CREATE TABLE \"orgs\" ()" },
+    };
+    const after: []const Step = &.{
+        .{ .kind = .data, .why = "the first org", .sql = "INSERT INTO \"orgs\" DEFAULT VALUES" },
+    };
+
+    const v: Version = .{ .number = 1, .name = "schema", .steps = before ++ generated ++ after };
+    try testing.expectEqual(@as(usize, 2), v.steps.len);
+    try testing.expectEqual(migrate.Kind.create_table, v.steps[0].kind);
+    try testing.expectEqual(migrate.Kind.data, v.steps[1].kind);
 }
 
 test "a statement of several lines keeps its shape in the file" {
@@ -694,9 +921,9 @@ test "a statement of several lines keeps its shape in the file" {
 
     // Every line of it is its own `\\` line, so the file reads as SQL rather
     // than as one long escaped string.
-    try testing.expect(std.mem.indexOf(u8, text, "            \\\\CREATE TABLE \"orgs\" (\n") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "            \\\\  \"id\" int8 PRIMARY KEY,\n") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "            \\\\)\n            ,\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "        \\\\CREATE TABLE \"orgs\" (\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "        \\\\  \"id\" int8 PRIMARY KEY,\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "        \\\\)\n        ,\n") != null);
 }
 
 test "a manifest with nothing in it still says what its head is" {
@@ -745,4 +972,192 @@ test "two branches that both generated version 2 are a merge that does not build
     try box.dir().writeFile(box.io(), .{ .sub_path = "0002_ours.zig", .data = "" });
 
     try testing.expectError(Error.DuplicateVersion, read(box.a(), box.io(), box.dir(), Pg));
+}
+
+// -- `--baseline` ---------------------------------------------------------
+
+test "a baseline derives version 1 again and keeps the half somebody wrote" {
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    const first = try generate(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        comptime migrate.tablesOf(Pg, &.{Org}),
+        .{ .name = "schema", .baseline = true },
+    );
+    // An empty directory is the case where a baseline is just the first
+    // generate, and it says so rather than claiming it kept anything.
+    try testing.expectEqualStrings("0001_schema.zig", first.file.?);
+    try testing.expect(!first.rewrote);
+
+    // What the port does to the file it was handed: its own steps beside the
+    // generated ones, outside the block.
+    const mine =
+        \\pub const after: []const migrate.Step = &.{
+        \\    .{ .kind = .data, .why = "the first org", .sql = "INSERT INTO \"orgs\" ..." },
+        \\};
+    ;
+    try box.overwrite("0001_schema.zig", try std.mem.replaceOwned(
+        u8,
+        box.a(),
+        try box.slurp("0001_schema.zig"),
+        "pub const after: []const migrate.Step = &.{};",
+        mine,
+    ));
+
+    // A column arrives. The port does not want an `ALTER`; it wants the same
+    // version derived again, which is the whole of what `--baseline` is.
+    const out = try generate(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        comptime migrate.tablesOf(Pg, &.{Noted}),
+        .{ .name = "schema", .baseline = true },
+    );
+
+    try testing.expectEqualStrings("0001_schema.zig", out.file.?);
+    try testing.expectEqual(@as(u32, 1), out.number);
+    try testing.expect(out.rewrote);
+    try testing.expectEqual(@as(usize, 1), out.plan.steps.len);
+    try testing.expectEqual(migrate.Kind.create_table, out.plan.steps[0].kind);
+
+    const text = try box.slurp("0001_schema.zig");
+    try testing.expect(std.mem.indexOf(u8, text, "the first org") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"note\" text") != null);
+    // One block, not two: a splice that lost a marker would leave both.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, generated_begin));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, generated_end));
+
+    // And the directory is still one version at head 1, with a snapshot that
+    // matches it — so `check` right after a baseline is green.
+    const state = try read(box.a(), box.io(), box.dir(), Pg);
+    try testing.expectEqual(@as(usize, 1), state.entries.len);
+    try testing.expectEqual(@as(u32, 1), state.before.version);
+    try testing.expect((try check(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        comptime migrate.tablesOf(Pg, &.{Noted}),
+    )).isEmpty());
+}
+
+test "a baseline in a directory that has moved past version 1 is refused" {
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    _ = try generate(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        comptime migrate.tablesOf(Pg, &.{Org}),
+        .{ .name = "orgs" },
+    );
+    _ = try generate(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        comptime migrate.tablesOf(Pg, &.{Noted}),
+        .{ .name = "add_note" },
+    );
+
+    // Version 2 is a diff against what version 1 left behind. Re-deriving
+    // version 1 would leave version 2 describing a schema nothing ever had.
+    try testing.expectError(Error.BaselineHasOthers, generate(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        comptime migrate.tablesOf(Pg, &.{Noted}),
+        .{ .name = "orgs", .baseline = true },
+    ));
+
+    const manifest = try box.slurp(manifest_file);
+    try testing.expect(std.mem.indexOf(u8, manifest, "pub const head: i64 = 2;") != null);
+}
+
+test "a baseline under another name is refused rather than leaving two version 1s" {
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    const desired = comptime migrate.tablesOf(Pg, &.{Org});
+    _ = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "schema", .baseline = true });
+
+    try testing.expectError(Error.BaselineRenames, generate(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        desired,
+        .{ .name = "initial", .baseline = true },
+    ));
+
+    // The rename is refused because writing it is not undoable: both files
+    // would sit there, and `read` refuses a directory with two version 1s.
+    try testing.expectError(error.FileNotFound, box.slurp("0001_initial.zig"));
+}
+
+test "a version file that lost its markers is refused, not overwritten" {
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    const desired = comptime migrate.tablesOf(Pg, &.{Org});
+    _ = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "schema", .baseline = true });
+
+    const hand_written = "// all of this is mine now\npub const version = 1;\n";
+    try box.overwrite("0001_schema.zig", hand_written);
+
+    try testing.expectError(Error.NoGeneratedBlock, generate(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        comptime migrate.tablesOf(Pg, &.{Noted}),
+        .{ .name = "schema", .baseline = true },
+    ));
+
+    // Nothing was written. The other reading of a file with no markers is
+    // "all of it is generated", and acting on that throws the file away.
+    try testing.expectEqualStrings(hand_written, try box.slurp("0001_schema.zig"));
+}
+
+test "the splice keeps every byte outside the two markers, and only those" {
+    const gpa = testing.allocator;
+    const old =
+        \\const mine = 1;
+        \\// nilo:generated begin
+        \\const generated: []const migrate.Step = &.{
+        \\    what was there before
+        \\};
+        \\// nilo:generated end
+        \\const also_mine = 2;
+        \\
+    ;
+
+    const text = try spliceGenerated(gpa, old, &.{
+        .{ .kind = .data, .why = "new", .sql = "SELECT 1" },
+    });
+    defer gpa.free(text);
+
+    try testing.expect(std.mem.startsWith(u8, text, "const mine = 1;\n"));
+    try testing.expect(std.mem.endsWith(u8, text, "// nilo:generated end\nconst also_mine = 2;\n"));
+    try testing.expect(std.mem.indexOf(u8, text, "what was there before") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "SELECT 1") != null);
+
+    // Both markers have to be there, and in that order.
+    try testing.expectError(Error.NoGeneratedBlock, spliceGenerated(gpa, "nothing\n", &.{}));
+    try testing.expectError(
+        Error.NoGeneratedBlock,
+        spliceGenerated(gpa, "// nilo:generated begin\nand no end\n", &.{}),
+    );
 }

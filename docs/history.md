@@ -3274,3 +3274,52 @@ Writing the inverse walk out then hit a second one: **zero-padding a *signed*
 integer in Zig writes the sign**, so `{d:0>4}` on an `i64` year is `+1945`. The
 old code never met it because the year `std.time.epoch` hands back is unsigned.
 A round trip through a real SQLite column is what printed `+1945-08-17`.
+
+**And the repository already knew.** `sql/cli.zig:310` carries a comment saying
+exactly that, written when `status` printed `00+3` for version 3. It did not
+protect `types.zig`, one directory away, six months later. A gotcha in one
+file's comment is a note to whoever next reads *that file*; the thing that
+would have caught this is a test with a pre-epoch date in it, which is what
+there is now.
+
+## The way out a port proposed cost a check it did not have to cost
+
+**A requirement written as one mechanism reads as a blocker; written as what it
+has to catch, it reads as a choice about where.** The same 59-table port
+reported that `.references` needs the target Row's *type* in scope, which its
+context-per-directory layout forbids, and offered two ways out: name the table
+as text and replace the compile-time type check with a boot-time read of
+`pg_constraint`, or accept declaring all 59 tables twice — 3,876 lines no query
+names, beside the 68 Rows the contexts actually use. Both were stated as trades
+against the check. Neither had to be: the check is "the two sides hold the same
+value, so they are the same Zig type", and **one level up, every Row in the
+program is already in one comptime list** — `sql.cli.Tool(Db, Rows)`,
+`db.checking`, `migrate.tablesOf`, all three reaching `orderOf`, which had to
+walk every reference anyway to sort the `CREATE TABLE`s. The name resolves
+there, the types are compared there, and nothing is given up
+([ADR 0222](./adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+
+**Where a comptime check is called from decides whose error message a person
+sees.** `assertTargetsResolve` called before the `Desc`s are built reads
+`entry.to` on an entry that has none, and a `.references` written wrong fails
+with Zig's "no field named 'to'" instead of nilo's sentence about it. One line
+later in `orderOf` and the refusal is the one the build step holds. A refusal
+file is what found it.
+
+**A `<!-- compiles -->` block that only declares types proves that it parses.**
+Two new guide blocks were written to show a `.references` naming its table as
+text and one spanning two columns, and both "passed" `zig build snippets` with a
+table name no Row in the block declares. Zig analyses a container-level
+declaration lazily, and the step compiles each block as an object with nothing
+referencing it, so `pub const nilo_table` is read by nobody and every comptime
+check the marker is made of is skipped. Adding `comptime { _ = tablesOf(…) }` to
+the block turned the same text into nilo's refusal. The guide is full of blocks
+of exactly that shape; the standing risk in `roadmap.md` is the general form.
+
+**A generated file nothing compiles is a file whose shape is unchecked.** The
+migrations tests write version files into a temporary directory and read them
+back as text, so `.steps = before ++ generated ++ after` — three comptime slices
+concatenated — would have shipped having never been handed to a compiler. It
+does work. Nothing in the suite said so until a test wrote the line out where
+the compiler sees it
+([ADR 0223](./adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)).

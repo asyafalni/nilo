@@ -8,7 +8,7 @@
   <a href="https://ziglang.org/"><img alt="Zig 0.16" src="https://img.shields.io/badge/zig-0.16-f7a41d?style=flat-square&logo=zig&logoColor=white"></a>
   <a href="./CHANGELOG.md"><img alt="version 0.4.0" src="https://img.shields.io/badge/version-0.4.0-3b82f6?style=flat-square"></a>
   <a href="./docs/reference.md"><img alt="11 modules" src="https://img.shields.io/badge/modules-11-8957e5?style=flat-square"></a>
-  <a href="./refusals/README.md"><img alt="301 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-301-e05d44?style=flat-square"></a>
+  <a href="./refusals/README.md"><img alt="306 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-306-e05d44?style=flat-square"></a>
   <a href="./docs/adr/"><img alt="220 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-220-6b7280?style=flat-square"></a>
   <a href="./LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-16a34a?style=flat-square"></a>
 </p>
@@ -39,7 +39,7 @@ rest.
 |---|---|
 | **One rule** | a pointer is a service, a value is request data. There is no second rule. |
 | **One allocation** | per request. A test fails if it ever becomes two. |
-| **301 refusals** | mistakes that stop the build with a sentence nilo wrote, held by seven build steps. |
+| **306 refusals** | mistakes that stop the build with a sentence nilo wrote, held by seven build steps. |
 | **Zero glue** | routing, the 400, the 404, the OpenAPI document and the SQL all read the same struct. |
 
 ## ⚡ Quickstart
@@ -411,13 +411,13 @@ allocate-per-request version shipped in the meantime.
 ## 🙂 What happens when you get it wrong
 
 An error message is a feature right up until somebody refactors it into mush.
-So this repository has **301 programs that are supposed to fail to compile**,
+So this repository has **306 programs that are supposed to fail to compile**,
 and seven build steps checking the wording of every failure:
 
 | Step | Programs | Over |
 |---|---|---|
 | `zig build refusals` | 140 | the framework |
-| `zig build refusals-sql` | 120 | queries, rows and schemas |
+| `zig build refusals-sql` | 125 | queries, rows and schemas |
 | `zig build refusals-job` | 14 | jobs and schedules |
 | `zig build refusals-s3` | 10 | buckets and keys |
 | `zig build refusals-config` | 9 | settings |

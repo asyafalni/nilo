@@ -11,6 +11,23 @@
 > including the refusal of
 > `.where = "deleted_at IS NULL"` as a string.
 
+> **Amended by [ADR 0222](./0222-a-foreign-key-is-columns-and-a-table-name.md).**
+> §"The line" says `.references` is checked harder than the rest, and that
+> "`Org` has to be a Row". It no longer has to be: a reference may name its
+> table as text, for a program whose contexts may not import each other, and a
+> reference may span several columns. The check that sentence defended — the two
+> sides hold the same value, so they are the same Zig type — is kept in full and
+> runs one level up, where every Row is in one list.
+
+> **Amended by [ADR 0223](./0223-a-version-file-is-a-generated-block-and-the-rest.md).**
+> §"What a generated file looks like" describes a file that is one `Version` and
+> nothing else. It is now a generated block between two markers plus a `before`,
+> an `after` and a `version` that concatenates them, so the steps somebody wrote
+> by hand survive a rerun. It also adds `generate --baseline`, which derives
+> version 1 again from nothing. That is not the `reset` §"Forward only" sketches
+> and does not replace it: `reset` drops what the database holds, `--baseline`
+> touches three files and no database at all.
+
 **Status:** accepted
 **Amends:** the refusal recorded in the Rows section of
 [`docs/reference.md`](../reference.md), that a Row may not declare an index or a

@@ -68,6 +68,10 @@ pub const Request = struct {
     dir: []const u8 = "migrations",
     /// `--sql`, for `status`: print the statements rather than a summary.
     sql_only: bool = false,
+    /// `--baseline`, for `generate`: forget the snapshot, derive version 1 from
+    /// nothing and rewrite it where it stands. What porting a schema needs, and
+    /// the only thing here that writes over a file that is already there.
+    baseline: bool = false,
 };
 
 pub const ParseError = error{
@@ -95,6 +99,8 @@ pub fn parse(args: []const []const u8) ParseError!Request {
             req.allow_destructive = true;
         } else if (std.mem.eql(u8, arg, "--sql")) {
             req.sql_only = true;
+        } else if (std.mem.eql(u8, arg, "--baseline")) {
+            req.baseline = true;
         } else if (std.mem.eql(u8, arg, "--name") or std.mem.eql(u8, arg, "--dir")) {
             i += 1;
             if (i == args.len) return ParseError.MissingValue;
@@ -129,10 +135,16 @@ pub fn usage(w: *std.Io.Writer) !void {
         \\Migrations for this project. The schema is the Rows; these move a
         \\database to match them.
         \\
-        \\  generate --name <snake_case> [--drop]
+        \\  generate --name <snake_case> [--drop] [--baseline]
         \\        Diff the Rows against migrations/snapshot.zon and write the
         \\        next version. Needs no database. `--drop` is required before
         \\        anything that loses data is written.
+        \\
+        \\        `--baseline` ignores the snapshot, derives version 1 from
+        \\        nothing and rewrites it in place. It keeps everything outside
+        \\        the file's generated block, so the steps you wrote by hand
+        \\        survive. Refused once there is a version 2, which is a diff
+        \\        against what version 1 left behind.
         \\
         \\  check
         \\        The same diff, written nowhere. Exits 1 when the Rows and the
@@ -221,25 +233,62 @@ pub fn Tool(comptime Db: type, comptime Rows: []const type) type {
             var dir = try openDir(io, req.dir, true);
             defer dir.close(io);
 
-            const out = try migrations.generate(a, io, dir, D, desired, .{
+            const out = migrations.generate(a, io, dir, D, desired, .{
                 .name = req.name,
                 .allow_destructive = req.allow_destructive,
-            });
+                .baseline = req.baseline,
+            }) catch |err| switch (err) {
+                migrations.Error.BaselineHasOthers,
+                migrations.Error.BaselineRenames,
+                migrations.Error.NoGeneratedBlock,
+                => return try baselineRefused(a, io, dir, w, req, err),
+                else => return err,
+            };
 
             if (out.isEmpty()) {
                 try w.writeAll("Nothing to do: the Rows and the snapshot already agree.\n");
                 return ok;
             }
             if (out.file) |file| {
-                try w.print("Wrote {s}/{s}, {d} step(s):\n\n", .{ req.dir, file, out.plan.steps.len });
+                try w.print("{s} {s}/{s}, {d} step(s):\n\n", .{
+                    if (out.rewrote) "Rewrote" else "Wrote",
+                    req.dir,
+                    file,
+                    out.plan.steps.len,
+                });
                 try writeSteps(w, out.plan.steps);
-                try w.writeAll(
-                    "\nRead it before you commit it. `migrations/snapshot.zon` moved with " ++
-                        "it, and both belong in the same commit.\n",
-                );
+                if (out.rewrote) {
+                    try w.writeAll(
+                        "\nThe generated block is new; everything else in the file is as " ++
+                            "you left it. `migrations/snapshot.zon` moved with it, and both " ++
+                            "belong in the same commit.\n",
+                    );
+                } else {
+                    try w.writeAll(
+                        "\nRead it before you commit it. `migrations/snapshot.zon` moved " ++
+                            "with it, and both belong in the same commit.\n",
+                    );
+                }
                 return ok;
             }
             return try held(w, out.plan, req.dir);
+        }
+
+        /// The three ways `--baseline` refuses, each naming the file it is
+        /// about. The directory is read a second time for that: an error value
+        /// carries nothing, and "there is a version 2" is not a sentence
+        /// anybody can act on without its number.
+        fn baselineRefused(
+            a: std.mem.Allocator,
+            io: Io,
+            dir: std.Io.Dir,
+            w: *std.Io.Writer,
+            req: Request,
+            err: anyerror,
+        ) !u8 {
+            const state = try migrations.read(a, io, dir, D);
+            try writeBaselineRefusal(w, err, req, state.entries);
+            return acted;
         }
 
         fn doCheck(a: std.mem.Allocator, io: Io, w: *std.Io.Writer, req: Request) !u8 {
@@ -450,6 +499,59 @@ fn writeProblems(w: *std.Io.Writer, problems: []const migrate.Problem) !void {
     }
 }
 
+/// The three ways `--baseline` refuses, each naming the file it is about.
+///
+/// Free rather than inside `Tool` so that the wording is reachable without a
+/// `Db`, which is how the rest of this file's sentences are held in place.
+fn writeBaselineRefusal(
+    w: *std.Io.Writer,
+    err: anyerror,
+    req: Request,
+    entries: []const migrations.Entry,
+) !void {
+    switch (err) {
+        migrations.Error.BaselineHasOthers => {
+            try w.writeAll(
+                "db: `--baseline` re-derives version 1, and it is not the only version " ++
+                    "here:\n\n",
+            );
+            for (entries) |e| {
+                if (e.number == 1) continue;
+                try w.print("  {s}/{s}\n", .{ req.dir, e.file });
+            }
+            try w.writeAll(
+                "\nEach of those is a diff against what the version before it left " ++
+                    "behind, so a re-derived version 1 would leave them describing a " ++
+                    "schema nothing ever had. Nothing was written. Delete the ones you " ++
+                    "are re-deriving, or drop `--baseline` and let this write the next " ++
+                    "version instead.\n",
+            );
+        },
+        migrations.Error.BaselineRenames => {
+            const was = if (entries.len > 0) entries[0].name else "";
+            try w.print(
+                "db: version 1 here is called `{s}`, and `--name {s}` would write a " ++
+                    "second one beside it. Two files numbered 0001 is a directory " ++
+                    "nothing can read. Nothing was written: pass `--name {s}`, or delete " ++
+                    "{s}/0001_{s}.zig first if the new name is the one you want.\n",
+                .{ was, req.name, was, req.dir, was },
+            );
+        },
+        migrations.Error.NoGeneratedBlock => {
+            try w.print(
+                "db: {s}/0001_{s}.zig has no `{s}` line, so there is no telling which " ++
+                    "half of it `db generate` wrote. Nothing was written, because the " ++
+                    "other reading is that all of it is generated and acting on that " ++
+                    "throws your steps away. Put the two marker lines back around the " ++
+                    "generated steps, or move the file aside and let this write a new " ++
+                    "one.\n",
+                .{ req.dir, req.name, migrations.generated_begin },
+            );
+        },
+        else => unreachable,
+    }
+}
+
 fn writeDrift(w: *std.Io.Writer, moved: []const migrate.Drift) !void {
     try w.print(
         "{d} version(s) have been edited since they were applied here.\n" ++
@@ -489,6 +591,10 @@ test "the command line reads into a request, and a bad one says which part" {
 
     try testing.expectEqual(Command.status, (try parse(&.{ "status", "--sql" })).command);
     try testing.expect((try parse(&.{ "status", "--sql" })).sql_only);
+
+    const rederived = try parse(&.{ "generate", "--name", "schema", "--baseline" });
+    try testing.expect(rederived.baseline);
+    try testing.expect(!gen.baseline);
 
     try testing.expectError(ParseError.NoCommand, parse(&.{}));
     try testing.expectError(ParseError.UnknownCommand, parse(&.{"rollback"}));
@@ -578,6 +684,62 @@ test "drift is reported as history that cannot be un-run" {
     try testing.expect(std.mem.indexOf(u8, text, "now says bbbbbbbbbbbbbbbb") != null);
     // And what to do, which is not "edit it back and hope".
     try testing.expect(std.mem.indexOf(u8, text, "write what you meant as a new one") != null);
+}
+
+test "a refused baseline names the versions it would have made nonsense of" {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try writeBaselineRefusal(
+        &w,
+        migrations.Error.BaselineHasOthers,
+        .{ .command = .generate, .name = "schema", .baseline = true },
+        &.{
+            .{ .number = 1, .name = "schema", .file = "0001_schema.zig" },
+            .{ .number = 2, .name = "add_note", .file = "0002_add_note.zig" },
+        },
+    );
+
+    const text = w.buffered();
+    // The one it would rewrite is not in the list; the ones that would be left
+    // wrong are, with the path to each.
+    try testing.expect(std.mem.indexOf(u8, text, "  migrations/0002_add_note.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "0001_schema.zig") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "Nothing was written") != null);
+}
+
+test "a refused rename says both names, because the fix is one of them" {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try writeBaselineRefusal(
+        &w,
+        migrations.Error.BaselineRenames,
+        .{ .command = .generate, .name = "initial", .baseline = true },
+        &.{.{ .number = 1, .name = "schema", .file = "0001_schema.zig" }},
+    );
+
+    const text = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, text, "called `schema`") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "`--name initial`") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "pass `--name schema`") != null);
+}
+
+test "a version file with no markers is refused with the line it is missing" {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try writeBaselineRefusal(
+        &w,
+        migrations.Error.NoGeneratedBlock,
+        .{ .command = .generate, .name = "schema", .dir = "db/versions", .baseline = true },
+        &.{.{ .number = 1, .name = "schema", .file = "0001_schema.zig" }},
+    );
+
+    const text = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, text, "db/versions/0001_schema.zig") != null);
+    // The exact line to put back, not a description of it.
+    try testing.expect(std.mem.indexOf(u8, text, migrations.generated_begin) != null);
 }
 
 test "a version number is padded without its sign getting in the way" {

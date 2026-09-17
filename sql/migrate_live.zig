@@ -491,6 +491,71 @@ test "createMissing creates every table the types describe, in reference order" 
     try testing.expectEqualStrings("wati@example.dev", user.email);
 }
 
+/// The rule a composite foreign key exists to hold: a Card belongs to a Board,
+/// and both belong to the same org. One column cannot say that, and the
+/// alternative is a `.data` step beside the `.unique` it needs — one rule in
+/// two files and a string ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+const Board = struct {
+    pub const nilo_table = .{ .name = "boards", .key = .{ .org_id, .id } };
+
+    org_id: i64,
+    id: i64,
+    title: []const u8,
+};
+
+/// And the other half of the round: this one points at `boards` by **name**,
+/// which is what a program whose contexts may not import each other has to
+/// write. The type check runs against the list `createMissing` is given.
+const Card = struct {
+    pub const nilo_table = .{
+        .name = "cards",
+        .key = .id,
+        .references = .{
+            .board = .{
+                .columns = .{ .org_id, .board_id },
+                .to = .{ "boards", .{ .org_id, .id } },
+                .on_delete = .cascade,
+            },
+        },
+    };
+
+    id: i64,
+    org_id: i64,
+    board_id: i64,
+    label: []const u8,
+};
+
+test "a foreign key of two columns is a constraint the database enforces, not a clause" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "compositefk");
+    defer fx.deinit(gpa);
+
+    // Cards before boards in the list, and boards created first anyway: the
+    // order comes from the reference, and a reference written as text orders
+    // exactly as one written as a type.
+    try migrate.createMissing(&fx.db, &fx.run, &.{ Card, Board });
+    // SQLite checks foreign keys only when it is told to, per connection.
+    _ = try fx.db.exec(&fx.run, "PRAGMA foreign_keys = ON", .{});
+
+    _ = try fx.db.insert(Board, &fx.run, .{ .org_id = 1, .id = 10, .title = "roadmap" });
+
+    const card = try fx.db.insert(Card, &fx.run, .{
+        .org_id = 1,
+        .board_id = 10,
+        .label = "port the schema",
+    });
+    try testing.expectEqual(@as(i64, 10), card.board_id);
+
+    // The whole point, and the thing one column could not have refused: board
+    // 10 exists, org 2 exists, and the pair does not. A single-column key on
+    // `board_id` would have taken this row.
+    try testing.expectError(error.ForeignKeyViolated, fx.db.insert(Card, &fx.run, .{
+        .org_id = 2,
+        .board_id = 10,
+        .label = "somebody else's board",
+    }));
+}
+
 test "a table nilo created is a table nilo's own check accepts" {
     // **The loop this whole thing turns on.** `columnType` writes the first
     // entry of `accepts`, so a generated table has to pass the comparison

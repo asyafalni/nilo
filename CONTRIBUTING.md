@@ -42,7 +42,7 @@ zig build test --watch # the same, left running, rebuilding on save. Not faster,
 zig build test-all     # the above plus the same suite in ReleaseSafe. This is what CI runs
 zig build layering     # check that no module imports upward or sideways
 zig build refusals     # the framework's 140 compile-error checks — NOT the others
-zig build refusals-sql # nilo_sql's 120; refusals-config, -pw, -cache and -s3 for the rest
+zig build refusals-sql # nilo_sql's 125; refusals-config, -pw, -cache and -s3 for the rest
 zig build snippets     # the documentation's marked snippets, which must compile
 zig build examples     # build all nine examples
 
@@ -68,7 +68,7 @@ Two things worth knowing before they surprise you:
 
 **The refusals never cache.** The compiler keeps nothing from a compilation that
 failed, so they get re-analysed on every run: 150 of the 238 on `zig build
-test`, and the SQL table's 120 on top of that for `test-all`. They stay there on
+test`, and the SQL table's 125 on top of that for `test-all`. They stay there on
 purpose.
 
 They're the *floor* rather than the slow part, and the difference matters if

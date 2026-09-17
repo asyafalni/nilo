@@ -206,22 +206,32 @@ pub const Index = struct {
 
 pub const Reference = struct {
     name: []const u8,
-    column: []const u8,
-    /// The table pointed at, split the same way the Row's own name is. Taken
-    /// from the target Row rather than from a string, so renaming that table
-    /// moves this with it — and split rather than written whole so that the
-    /// create order can be worked out by comparing two names rather than by
+    /// The columns doing the pointing, in the order they were written — which
+    /// is the order they line up with `targets`.
+    ///
+    /// **A list rather than a name, and it is not an edge case**: "an Epic has
+    /// to be on the same board" is `(epic_id, department_id)` pointing at
+    /// `work_epics (id, department_id)`, and a rule like that has nowhere else
+    /// as cheap to live ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+    columns: []const []const u8,
+    /// The table pointed at, split the same way the Row's own name is, so that
+    /// the create order is worked out by comparing two names rather than by
     /// parsing one.
+    ///
+    /// Written from the target Row when the marker named a type, and from the
+    /// text when it named the table — the two spellings answer here the same
+    /// way, which is what keeps everything downstream of this field the same.
     schema: ?[]const u8 = null,
     table: []const u8,
-    target: []const u8,
+    /// The columns pointed at, one for each of `columns`.
+    targets: []const []const u8,
     on_delete: OnDelete = .no_action,
 
     pub fn sameAs(self: Reference, other: Reference) bool {
-        return std.mem.eql(u8, self.column, other.column) and
+        return sameColumns(self.columns, other.columns) and
             std.mem.eql(u8, self.table, other.table) and
             sameSchema(self.schema, other.schema) and
-            std.mem.eql(u8, self.target, other.target) and
+            sameColumns(self.targets, other.targets) and
             self.on_delete == other.on_delete;
     }
 };
@@ -1120,6 +1130,9 @@ fn whereTerm(
     }
 }
 
+/// What an entry of `.references` may say beside its columns.
+const reference_words = [_][]const u8{ "columns", "to", "on_delete", "name" };
+
 fn referencesOf(
     comptime Row: type,
     comptime table: []const u8,
@@ -1138,7 +1151,6 @@ fn referencesOf(
 
         var out: [entries.len]Reference = undefined;
         for (entries, 0..) |f, i| {
-            checkColumn(Row, "references", f.name);
             out[i] = oneReference(Row, table, f.name, @field(decl.references, f.name));
         }
         const frozen = out;
@@ -1146,86 +1158,349 @@ fn referencesOf(
     }
 }
 
+/// Which table an entry points at, and how it said so.
+///
+/// **The two spellings answer here**, so that everything downstream of this
+/// reads one shape. `row` is the Row when the marker named a type and null
+/// when it named the table as text, and it is the only field the difference
+/// survives into: what the type check needs, and nothing else
+/// ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+const Target = struct {
+    row: ?type,
+    schema: ?[]const u8,
+    table: []const u8,
+    columns: []const []const u8,
+};
+
+/// One reference's target, out of `.{ Org, .id }`, `.{ "orgs", .id }` or the
+/// pair of column lists a composite key needs.
+fn targetOf(
+    comptime Row: type,
+    comptime mine: []const u8,
+    comptime named: anytype,
+    comptime column_list: anytype,
+) Target {
+    comptime {
+        const N = @TypeOf(named);
+        const spelling = "  A foreign key names the Row that owns the table — " ++
+            "`.{ Org, .id }` — or that table's own name when the Row cannot be " ++
+            "imported — `.{ \"orgs\", .id }`.";
+
+        const q: row_mod.Qualified, const target_row: ?type = blk: {
+            if (N == type) {
+                if (!row_mod.isRow(named)) @compileError(
+                    "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ mine ++
+                        "` points at " ++ @typeName(named) ++ ", which is not a Row.\n" ++
+                        spelling,
+                );
+                break :blk .{ row_mod.qualifiedOf(named), named };
+            }
+            if (isTextLiteral(N)) {
+                const written: []const u8 = named;
+                if (written.len == 0) @compileError(
+                    "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ mine ++
+                        "` points at a table with no name.\n" ++ spelling,
+                );
+                break :blk .{
+                    row_mod.qualifiedName(
+                        written,
+                        @typeName(Row) ++ "'s `.references." ++ mine ++ "` points at",
+                    ),
+                    null,
+                };
+            }
+            @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ mine ++
+                    "` points at a " ++ @typeName(N) ++ ", which is not a table.\n" ++
+                    spelling,
+            );
+        };
+
+        // One column or several, the way `.key` takes either. A tuple here is
+        // the composite; a bare name is the ordinary one.
+        const C = @TypeOf(column_list);
+        const columns: []const []const u8 = if (@typeInfo(C) == .enum_literal)
+            &.{@tagName(column_list)}
+        else cols: {
+            if (@typeInfo(C) != .@"struct" or !@typeInfo(C).@"struct".is_tuple) @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ mine ++
+                    "` names the column it points at as a " ++ @typeName(C) ++ ".\n" ++
+                    "  It is a column of the other table — `.id` — or several of them " ++
+                    "as one key: `.{ .id, .department_id }`.",
+            );
+            var out: [@typeInfo(C).@"struct".fields.len][]const u8 = undefined;
+            for (@typeInfo(C).@"struct".fields, 0..) |f, i| {
+                const written = @field(column_list, f.name);
+                if (@typeInfo(@TypeOf(written)) != .enum_literal) @compileError(
+                    "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ mine ++
+                        "` names a column it points at as text.\n" ++
+                        "  A column over there is written the way a column is: " ++
+                        "`.{ .id, .department_id }`.",
+                );
+                out[i] = @tagName(written);
+            }
+            const frozen = out;
+            break :cols &frozen;
+        };
+        if (columns.len == 0) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ mine ++
+                "` names no column of `" ++ q.table ++ "`.\n" ++
+                "  A foreign key points at the columns that identify a row over there.",
+        );
+
+        return .{ .row = target_row, .schema = q.schema, .table = q.table, .columns = columns };
+    }
+}
+
+/// One entry of `.references`, in either of its two shapes.
+///
+/// - `.org_id = .{ Org, .id, .cascade }` — keyed by the column doing the
+///   pointing, which is every foreign key of one column.
+/// - `.epic = .{ .columns = .{ .epic_id, .department_id }, .to = .{ WorkEpic, .{ .id, .department_id } } }`
+///   — the long form, whose key is a **label** rather than a column, because a
+///   Zig field name cannot be a tuple. It is also where a `.name` goes.
 fn oneReference(
     comptime Row: type,
     comptime table: []const u8,
-    comptime column: []const u8,
+    comptime key: []const u8,
     comptime entry: anytype,
 ) Reference {
     comptime {
         const E = @TypeOf(entry);
-        const shape = "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ column ++
+        const shape = "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ key ++
             "` is not a table and a column.\n" ++
             "  It is written `.{ <Row>, .<column> }`, with `.cascade`, `.restrict` " ++
-            "or `.set_null` after it when the delete should do something.";
+            "or `.set_null` after it when the delete should do something. A key of " ++
+            "several columns is the long form: `.{ .columns = .{ .a, .b }, " ++
+            ".to = .{ <Row>, .{ .a, .b } } }`.";
         if (@typeInfo(E) != .@"struct") @compileError(shape);
-        const parts = @typeInfo(E).@"struct".fields;
-        if (parts.len < 2 or parts.len > 3) @compileError(shape);
 
-        const Target = entry[0];
-        if (@TypeOf(Target) != type or !row_mod.isRow(Target)) @compileError(
-            "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ column ++
-                "` points at something that is not a Row.\n" ++
-                "  A foreign key names the Row that owns the table, so that renaming " ++
-                "that table moves this with it. A string would not.",
+        const long = isNamedForm(E);
+        if (long) {
+            assertKnownWords(Row, "references", &reference_words, E);
+            if (!@hasField(E, "columns")) @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ key ++
+                    "` names no columns of its own.\n" ++
+                    "  The long form says which do the pointing: " ++
+                    "`.{ .columns = .{ .epic_id, .department_id }, .to = … }`.",
+            );
+            if (!@hasField(E, "to")) @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ key ++
+                    "` says no table.\n" ++
+                    "  The long form points with `.to`: " ++
+                    "`.to = .{ WorkEpic, .{ .id, .department_id } }`.",
+            );
+            const To = @TypeOf(entry.to);
+            if (@typeInfo(To) != .@"struct" or !@typeInfo(To).@"struct".is_tuple or
+                @typeInfo(To).@"struct".fields.len != 2) @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ key ++
+                    "`'s `.to` is not a table and its columns.\n" ++
+                    "  It is the pair: `.to = .{ WorkEpic, .{ .id, .department_id } }`.",
+            );
+        } else {
+            if (!@typeInfo(E).@"struct".is_tuple) @compileError(shape);
+            const parts = @typeInfo(E).@"struct".fields.len;
+            if (parts < 2 or parts > 3) @compileError(shape);
+            checkColumn(Row, "references", key);
+        }
+
+        const columns: []const []const u8 = if (long)
+            readColumns(Row, "references", &reference_words, false, entry.columns).names
+        else
+            &.{key};
+        const target: Target = if (long)
+            targetOf(Row, key, entry.to[0], entry.to[1])
+        else
+            targetOf(Row, key, entry[0], entry[1]);
+
+        if (columns.len != target.columns.len) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ key ++ "` points " ++
+                std.fmt.comptimePrint("{d}", .{columns.len}) ++ " column(s) at " ++
+                std.fmt.comptimePrint("{d}", .{target.columns.len}) ++ " of `" ++
+                target.table ++ "`.\n" ++
+                "  The two sides of a foreign key line up one for one, in the order " ++
+                "they are written.",
         );
-        if (@typeInfo(@TypeOf(entry[1])) != .enum_literal) @compileError(shape);
-        const target = @tagName(entry[1]);
-        if (!row_mod.hasColumn(Target, target))
-            row_mod.noSuchColumn(Target, target, "`.references." ++ column ++ "`");
 
         // The check the whole word is worth having. Two sides of a foreign key
         // that hold different types is a bug the database finds at the first
-        // insert, in a message about a cast rather than about a design.
-        const mine = row_mod.ColumnType(Row, column);
-        const theirs = row_mod.ColumnType(Target, target);
-        const bare = switch (@typeInfo(mine)) {
-            .optional => |o| o.child,
-            else => mine,
+        // insert, in a message about a cast rather than about a design. It runs
+        // here when the target is a type, and in `assertTargetsResolve` when it
+        // is a name — the same check, one level up, where every Row is in one
+        // list (ADR 0222).
+        if (target.row) |Pointed| {
+            for (columns, target.columns) |c, t| {
+                if (!row_mod.hasColumn(Pointed, t))
+                    row_mod.noSuchColumn(Pointed, t, "`.references." ++ key ++ "`");
+                assertSidesAgree(Row, c, Pointed, t);
+            }
+        }
+
+        // The long form says it by name; the short one says it by being three
+        // long, `.{ Org, .id, .cascade }`.
+        const said_on_delete = if (long)
+            @hasField(E, "on_delete")
+        else
+            @typeInfo(E).@"struct".fields.len == 3;
+        const on_delete: OnDelete = if (!said_on_delete) .no_action else read: {
+            const written = if (long) entry.on_delete else entry[2];
+            if (@typeInfo(@TypeOf(written)) != .enum_literal) @compileError(shape);
+            break :read std.meta.stringToEnum(OnDelete, @tagName(written)) orelse @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ key ++ "` says `." ++
+                    @tagName(written) ++ "` happens on delete.\n" ++
+                    "  The three it can say are `.cascade`, `.restrict` and `.set_null`.",
+            );
         };
-        if (bare != theirs) @compileError(
+
+        if (on_delete == .set_null) {
+            for (columns) |c| {
+                const held = row_mod.ColumnType(Row, c);
+                if (@typeInfo(held) != .optional) @compileError(
+                    "nilo: " ++ @typeName(Row) ++ "." ++ c ++ " is set to null on delete, " ++
+                        "and it is " ++ @typeName(held) ++ ".\n" ++
+                        "  A column the database will write a null into is optional in " ++
+                        "the Row, or the first cascading delete is a row nothing can read.",
+                );
+            }
+        }
+
+        return .{
+            .name = entryName(Row, "references", table, columns, "fkey", entry),
+            .columns = columns,
+            .schema = target.schema,
+            .table = target.table,
+            .targets = target.columns,
+            .on_delete = on_delete,
+        };
+    }
+}
+
+/// Two sides of one foreign key hold the same value, so they are the same type.
+fn assertSidesAgree(
+    comptime Row: type,
+    comptime column: []const u8,
+    comptime Pointed: type,
+    comptime target: []const u8,
+) void {
+    comptime {
+        const mine = row_mod.ColumnType(Row, column);
+        const theirs = row_mod.ColumnType(Pointed, target);
+        if (unwrap(mine) == theirs) return;
+        @compileError(
             "nilo: " ++ @typeName(Row) ++ "." ++ column ++ " is " ++ @typeName(mine) ++
-                " and points at " ++ @typeName(Target) ++ "." ++ target ++ ", which is " ++
+                " and points at " ++ @typeName(Pointed) ++ "." ++ target ++ ", which is " ++
                 @typeName(theirs) ++ ".\n" ++
                 "  Two sides of a foreign key hold the same value, so they are the " ++
                 "same type. One of the two is wrong about its column.",
         );
+    }
+}
 
-        const on_delete: OnDelete = if (parts.len == 3) named: {
-            if (@typeInfo(@TypeOf(entry[2])) != .enum_literal) @compileError(shape);
-            break :named std.meta.stringToEnum(OnDelete, @tagName(entry[2])) orelse @compileError(
-                "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ column ++ "` says `." ++
-                    @tagName(entry[2]) ++ "` happens on delete.\n" ++
-                    "  The three it can say are `.cascade`, `.restrict` and `.set_null`.",
-            );
-        } else .no_action;
+/// A list of columns as one piece of text, for a message.
+fn columnList(comptime columns: []const []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (columns, 0..) |c, i| out = out ++ (if (i == 0) "" else ", ") ++ c;
+        return out;
+    }
+}
 
-        if (on_delete == .set_null and @typeInfo(mine) != .optional) @compileError(
-            "nilo: " ++ @typeName(Row) ++ "." ++ column ++ " is set to null on delete, " ++
-                "and it is " ++ @typeName(mine) ++ ".\n" ++
-                "  A column the database will write a null into is optional in the Row, " ++
-                "or the first cascading delete is a row nothing can read.",
-        );
+/// The references whose target was written as **text**, for the one check that
+/// cannot run inside the Row.
+pub const NamedTarget = struct {
+    /// What the marker keyed the entry by, for the message.
+    key: []const u8,
+    columns: []const []const u8,
+    schema: ?[]const u8,
+    table: []const u8,
+    targets: []const []const u8,
+};
 
-        const pointed = row_mod.qualifiedOf(Target);
-        const derived = constraintName(table, &.{column}, "fkey");
-        // A foreign key has no `.name` to fall back on, so the fix is the
-        // shorter name or the step. `.references` grows a long form of its own
-        // when composite keys arrive; until then this says what there is.
-        checkIdentifier(
-            derived,
-            "the name nilo derives for " ++ @typeName(Row) ++ "'s `.references." ++ column ++
-                "` is `" ++ derived ++ "`, which",
-            "Shorten the table or the column, or write that foreign key as a step.",
-        );
-        return .{
-            .name = derived,
-            .column = column,
-            .schema = pointed.schema,
-            .table = pointed.table,
-            .target = target,
-            .on_delete = on_delete,
-        };
+/// Those entries of `Row`'s `.references` that named a table rather than a Row.
+///
+/// **Not a field on `Reference`**, and that is deliberate: how the Zig source
+/// spelled a target is not a fact about the schema, and `Reference` is what the
+/// snapshot holds. So it is asked for separately, by the one caller that has
+/// every Row in one list (ADR 0222).
+pub fn namedTargetsOf(comptime Row: type) []const NamedTarget {
+    return comptime blk: {
+        if (row_mod.isProjection(Row)) break :blk &.{};
+        // The owner, the way `descOf` and `foreignKeysOf` do it: a borrowing
+        // Row's marker is a type, and the references belong to the Row that
+        // names the table.
+        const owner = row_mod.ownerOf(Row);
+        const decl = @field(owner, row_mod.marker);
+        if (!@hasField(@TypeOf(decl), "references")) break :blk &.{};
+
+        const entries = @typeInfo(@TypeOf(decl.references)).@"struct".fields;
+        var out: [entries.len]NamedTarget = undefined;
+        var n: usize = 0;
+        for (entries) |f| {
+            const entry = @field(decl.references, f.name);
+            const long = isNamedForm(@TypeOf(entry));
+            const spec = if (long)
+                targetOf(owner, f.name, entry.to[0], entry.to[1])
+            else
+                targetOf(owner, f.name, entry[0], entry[1]);
+            if (spec.row != null) continue;
+            out[n] = .{
+                .key = f.name,
+                .columns = if (long)
+                    readColumns(owner, "references", &reference_words, false, entry.columns).names
+                else
+                    &.{f.name},
+                .schema = spec.schema,
+                .table = spec.table,
+                .targets = spec.columns,
+            };
+            n += 1;
+        }
+        const frozen = out[0..n].*;
+        break :blk &frozen;
+    };
+}
+
+/// Every `.references` that named its table as text, resolved against the list
+/// of Rows the migrator was given.
+///
+/// **This is the check that moved rather than the check that was dropped**
+/// (ADR 0222). A foreign key naming a Zig type is checked inside the Row,
+/// because the type is right there. A program whose contexts may not import
+/// each other cannot write that type, and the answer is not to give the check
+/// up: every Row is in one comptime list one level up, so the name is resolved
+/// there and the two sides' types are compared exactly as they were.
+pub fn assertTargetsResolve(comptime Rows: []const type) void {
+    comptime {
+        @setEvalBranchQuota(20_000 + 4_000 * Rows.len * Rows.len);
+        for (Rows) |Row| {
+            for (namedTargetsOf(Row)) |want| {
+                var found: ?type = null;
+                for (Rows) |Other| {
+                    const q = row_mod.qualifiedOf(Other);
+                    if (!std.mem.eql(u8, q.table, want.table)) continue;
+                    if (!sameSchema(q.schema, want.schema)) continue;
+                    found = row_mod.ownerOf(Other);
+                }
+                const Pointed = found orelse @compileError(
+                    "nilo: " ++ @typeName(Row) ++ "'s `.references." ++ want.key ++
+                        "` points at the table `" ++ want.table ++ "`, and no Row in " ++
+                        "this list names it.\n" ++
+                        "  A foreign key written as text is checked against the Rows the " ++
+                        "tool was given, because that is where every Row is in one place. " ++
+                        "Put the Row for `" ++ want.table ++ "` in the list — with " ++
+                        "`.managed = false` if this program only reads that table — or " ++
+                        "point at its type.",
+                );
+                for (want.columns, want.targets) |c, t| {
+                    if (!row_mod.hasColumn(Pointed, t)) row_mod.noSuchColumn(
+                        Pointed,
+                        t,
+                        @typeName(Row) ++ "'s `.references." ++ want.key ++ "`",
+                    );
+                    assertSidesAgree(Row, c, Pointed, t);
+                }
+            }
+        }
     }
 }
 
@@ -1393,11 +1668,104 @@ test "a foreign key names the Row it points at, so the table comes from the type
 
     const fk = desc.references[0];
     try testing.expectEqualStrings("users_org_id_fkey", fk.name);
-    try testing.expectEqualStrings("org_id", fk.column);
+    try testing.expectEqualStrings("org_id", fk.columns[0]);
     try testing.expectEqualStrings("orgs", fk.table);
-    try testing.expectEqualStrings("id", fk.target);
+    try testing.expectEqualStrings("id", fk.targets[0]);
     try testing.expectEqual(OnDelete.cascade, fk.on_delete);
     try testing.expectEqualStrings(" ON DELETE CASCADE", fk.on_delete.clause());
+}
+
+test "a foreign key over two columns lines them up with the two it points at" {
+    const Board = struct {
+        pub const nilo_table = .{ .name = "boards", .key = .{ .id, .org_id } };
+        id: i64,
+        org_id: i64,
+    };
+    const Card = struct {
+        pub const nilo_table = .{
+            .name = "cards",
+            .key = .id,
+            .references = .{
+                .board = .{
+                    .columns = .{ .board_id, .org_id },
+                    .to = .{ Board, .{ .id, .org_id } },
+                    .on_delete = .cascade,
+                },
+            },
+        };
+        id: i64,
+        board_id: i64,
+        org_id: i64,
+    };
+    const desc = comptime descOf(Pg, Card);
+    const fk = desc.references[0];
+
+    // The key of the entry is a label rather than a column — a Zig field name
+    // cannot be a tuple — and the name still comes from the columns, so a
+    // `pull` from a database somebody else made lines up.
+    try testing.expectEqualStrings("cards_board_id_org_id_fkey", fk.name);
+    try testing.expectEqual(@as(usize, 2), fk.columns.len);
+    try testing.expectEqualStrings("board_id", fk.columns[0]);
+    try testing.expectEqualStrings("org_id", fk.columns[1]);
+    try testing.expectEqualStrings("id", fk.targets[0]);
+    try testing.expectEqualStrings("org_id", fk.targets[1]);
+    try testing.expectEqual(OnDelete.cascade, fk.on_delete);
+}
+
+test "a foreign key can name its table, and it is the same reference either way" {
+    const ByName = struct {
+        pub const nilo_table = .{
+            .name = "users",
+            .key = .id,
+            .references = .{ .org_id = .{ "orgs", .id, .cascade } },
+        };
+        id: i64,
+        org_id: i64,
+    };
+    const named = comptime descOf(Pg, ByName).references[0];
+    const typed = comptime descOf(Pg, User).references[0];
+
+    // The whole property the text spelling has to hold: what comes out is the
+    // same `Reference`, so the DDL, the diff and the snapshot cannot tell the
+    // two apart. Only the type check knows, and it runs one level up.
+    try testing.expect(named.sameAs(typed));
+    try testing.expectEqualStrings(typed.name, named.name);
+}
+
+test "a table named with its schema is split the way a Row's own name is" {
+    const Scoped = struct {
+        pub const nilo_table = .{
+            .name = "app.members",
+            .key = .id,
+            .references = .{ .org_id = .{ "other.orgs", .id } },
+        };
+        id: i64,
+        org_id: i64,
+    };
+    const fk = comptime descOf(Pg, Scoped).references[0];
+    try testing.expectEqualStrings("other", fk.schema.?);
+    try testing.expectEqualStrings("orgs", fk.table);
+}
+
+test "the long form is also where a foreign key of one column gets a name" {
+    const Member = struct {
+        pub const nilo_table = .{
+            .name = "members",
+            .key = .id,
+            .references = .{
+                .home = .{
+                    .columns = .{.org_id},
+                    .to = .{ Org, .id },
+                    .name = "members_belong_to_one_org",
+                },
+            },
+        };
+        id: i64,
+        org_id: i64,
+    };
+    const fk = comptime descOf(Pg, Member).references[0];
+    try testing.expectEqualStrings("members_belong_to_one_org", fk.name);
+    try testing.expectEqual(@as(usize, 1), fk.columns.len);
 }
 
 test "no delete behaviour written is no clause, rather than a guess at one" {

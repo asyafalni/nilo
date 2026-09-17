@@ -736,11 +736,14 @@ fn oneExists(
                 "column answers without a subquery.",
         );
 
+        var joined: []const u8 = "";
+        for (link.inner, link.outer) |mine, theirs| {
+            joined = joined ++ (if (joined.len == 0) "" else " AND ") ++
+                inner_rel ++ "." ++ D.quote(mine) ++ " = " ++
+                outer_rel ++ "." ++ D.quote(theirs);
+        }
         const test_sql = (if (negate) "NOT EXISTS (SELECT 1 FROM " else "EXISTS (SELECT 1 FROM ") ++
-            inner_rel ++ " WHERE " ++
-            inner_rel ++ "." ++ D.quote(link.inner) ++ " = " ++
-            outer_rel ++ "." ++ D.quote(link.outer) ++
-            " AND " ++ inside ++ ")";
+            inner_rel ++ " WHERE " ++ joined ++ " AND " ++ inside ++ ")";
         if (droppable == 0) return test_sql;
         // The guard the terms inside did not write, around the whole test.
         // Nested inside another `.exists` it belongs to that one instead, and
@@ -965,10 +968,24 @@ fn relationOf(comptime D: type, comptime Row: type) []const u8 {
     }
 }
 
-/// Which column of each side the two tables are joined by.
+/// A column list for a message: `` `epic_id`, `department_id` ``.
+fn nameList(comptime columns: []const []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (columns, 0..) |c, i| out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ c ++ "`";
+        return out;
+    }
+}
+
+/// Which columns of each side the two tables are joined by, one for one.
+///
+/// **A list rather than a name since a foreign key can span two columns**
+/// (ADR 0222). Joining a composite key on its first column alone is the shape
+/// of mistake this module exists to refuse: the query runs, reads correctly and
+/// answers a wider question than the schema asked.
 const Link = struct {
-    inner: []const u8,
-    outer: []const u8,
+    inner: []const []const u8,
+    outer: []const []const u8,
 };
 
 /// The join, taken from a `.references` on either Row — the child's, pointing
@@ -1001,8 +1018,8 @@ fn correlation(
         for (table_mod.foreignKeysOf(Inner)) |ref| {
             if (!std.mem.eql(u8, ref.table, outer_q.table)) continue;
             if (!table_mod.sameSchema(ref.schema, outer_q.schema)) continue;
-            named = named ++ (if (found.len == 0) "" else ", ") ++ "`" ++ ref.column ++ "`";
-            found = found ++ &[_]Link{.{ .inner = ref.column, .outer = ref.target }};
+            named = named ++ (if (found.len == 0) "" else ", ") ++ nameList(ref.columns);
+            found = found ++ &[_]Link{.{ .inner = ref.columns, .outer = ref.targets }};
         }
         // The parent direction: a column of Outer that points at Inner.
         var back: []const Link = &.{};
@@ -1010,8 +1027,8 @@ fn correlation(
         for (table_mod.foreignKeysOf(Outer)) |ref| {
             if (!std.mem.eql(u8, ref.table, inner_q.table)) continue;
             if (!table_mod.sameSchema(ref.schema, inner_q.schema)) continue;
-            back_named = back_named ++ (if (back.len == 0) "" else ", ") ++ "`" ++ ref.column ++ "`";
-            back = back ++ &[_]Link{.{ .inner = ref.target, .outer = ref.column }};
+            back_named = back_named ++ (if (back.len == 0) "" else ", ") ++ nameList(ref.columns);
+            back = back ++ &[_]Link{.{ .inner = ref.targets, .outer = ref.columns }};
         }
 
         if (@hasField(T, "on") and @hasField(T, "via")) @compileError(
@@ -1035,9 +1052,12 @@ fn correlation(
             }
             // A declared foreign key on that column still wins, because it
             // names the column on the *other* side exactly rather than
-            // assuming the key.
+            // assuming the key. A composite one counts: `.on` picks which
+            // foreign key is meant, and the join is still all of its columns.
             for (found) |link| {
-                if (std.mem.eql(u8, link.inner, wanted)) return link;
+                for (link.inner) |c| {
+                    if (std.mem.eql(u8, c, wanted)) return link;
+                }
             }
             const outer_keys = row_mod.keysOf(Outer);
             if (outer_keys.len != 1) @compileError(
@@ -1048,7 +1068,7 @@ fn correlation(
                     "  Declare the foreign key: `.references = .{ ." ++ wanted ++ " = .{ " ++
                     @typeName(Outer) ++ ", .<column> } }`.",
             );
-            return .{ .inner = wanted, .outer = outer_keys[0] };
+            return .{ .inner = &.{wanted}, .outer = &.{outer_keys[0]} };
         }
 
         if (@hasField(T, "via")) {
@@ -1063,7 +1083,9 @@ fn correlation(
                 row_mod.noSuchColumn(Outer, wanted, "`." ++ word ++ "`'s `.via`");
             }
             for (back) |link| {
-                if (std.mem.eql(u8, link.outer, wanted)) return link;
+                for (link.outer) |c| {
+                    if (std.mem.eql(u8, c, wanted)) return link;
+                }
             }
             const inner_keys = row_mod.keysOf(Inner);
             if (inner_keys.len != 1) @compileError(
@@ -1074,7 +1096,7 @@ fn correlation(
                     "  Declare the foreign key: `.references = .{ ." ++ wanted ++ " = .{ " ++
                     @typeName(Inner) ++ ", .<column> } }`.",
             );
-            return .{ .inner = inner_keys[0], .outer = wanted };
+            return .{ .inner = &.{inner_keys[0]}, .outer = &.{wanted} };
         }
 
         if (found.len == 0 and back.len == 0) @compileError(
@@ -1790,6 +1812,47 @@ test "an exists joins on the reference the child already declared" {
         partnerSql(.{ .exists = .{
             .{ .in = Capability, .where = .{ .capability = @as([]const u8, "vision") } },
         } }),
+    );
+}
+
+const Epic = struct {
+    pub const nilo_table = .{ .name = "work_epics", .key = .{ .id, .department_id } };
+
+    id: i64,
+    department_id: i64,
+    title: []const u8,
+};
+
+const WorkItem = struct {
+    pub const nilo_table = .{
+        .name = "work_items",
+        .key = .id,
+        .references = .{
+            .epic = .{
+                .columns = .{ .epic_id, .department_id },
+                .to = .{ Epic, .{ .id, .department_id } },
+            },
+        },
+    };
+
+    id: i64,
+    epic_id: i64,
+    department_id: i64,
+    state: []const u8,
+};
+
+test "an exists over a foreign key of two columns joins on both of them" {
+    // **Joining on the first column alone would run, read correctly and answer
+    // a wider question**: every item whose epic id matches, on any board. The
+    // schema said the pair, so the subquery says the pair (ADR 0222).
+    try testing.expectEqualStrings(
+        "EXISTS (SELECT 1 FROM \"work_items\"" ++
+            " WHERE \"work_items\".\"epic_id\" = \"work_epics\".\"id\"" ++
+            " AND \"work_items\".\"department_id\" = \"work_epics\".\"department_id\"" ++
+            " AND \"work_items\".\"state\" = $1)",
+        comptime plan(Pg, Epic, @TypeOf(.{ .exists = .{
+            .{ .in = WorkItem, .where = .{ .state = @as([]const u8, "open") } },
+        } }), 1).sql,
     );
 }
 

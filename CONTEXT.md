@@ -237,7 +237,7 @@ A struct of the caller's own, one field per column, carrying the marker that nam
 _Avoid_: ORM, model, entity, record, schema, DTO
 
 **Marker**:
-The `pub const nilo_table` on a Row: what the type says about its **table** rather than about a query. Its words are checked while compiling, which is the condition for being a word at all — the name, the key, a column's default, a unique, an index and its predicate, a foreign key and its two sides. A word whose body only a database can read is a second kind, checked by the database and diffed by name and hash (ADR 0221); anything that is neither is SQL in a step, and the snapshot marks it as an object nilo does not own.
+The `pub const nilo_table` on a Row: what the type says about its **table** rather than about a query. Its words are checked while compiling, which is the condition for being a word at all — the name, the key, a column's default, a unique, an index and its predicate, a foreign key and its two sides. A foreign key may name the other table as text rather than its Row, and the check on the two sides then runs against the list every Row is in rather than being given up (ADR 0222). A word whose body only a database can read is a second kind, checked by the database and diffed by name and hash (ADR 0221); anything that is neither is SQL in a step, and the snapshot marks it as an object nilo does not own.
 _Avoid_: annotation, decorator, attribute, tag, metadata, schema DSL
 
 **Borrowed row**:

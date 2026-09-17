@@ -256,8 +256,15 @@ pub const Qualified = struct {
 /// `"app."` — is a mistake with a plausible cause and no plausible meaning, so
 /// it stops here rather than reaching Postgres as a relation nobody named.
 pub fn qualifiedOf(comptime Row: type) Qualified {
+    return comptime qualifiedName(tableOf(Row), @typeName(Row) ++ " names");
+}
+
+/// The same split, for a table named as text rather than by a Row — which a
+/// `.references` may do when the Row that owns it cannot be imported
+/// ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+/// `whose` is what the message calls the thing that wrote the name.
+pub fn qualifiedName(comptime written: []const u8, comptime whose: []const u8) Qualified {
     return comptime blk: {
-        const written = tableOf(Row);
         const dot = std.mem.indexOfScalar(u8, written, '.') orelse
             break :blk .{ .schema = null, .table = written };
 
@@ -265,7 +272,7 @@ pub fn qualifiedOf(comptime Row: type) Qualified {
         const table = written[dot + 1 ..];
         if (schema.len == 0 or table.len == 0 or
             std.mem.indexOfScalar(u8, table, '.') != null) @compileError(
-            "nilo: " ++ @typeName(Row) ++ " names the table `" ++ written ++
+            "nilo: " ++ whose ++ " the table `" ++ written ++
                 "`, which is not a schema and a table.\n" ++
                 "  A qualified name is `schema.table` — one dot, and something on " ++
                 "either side of it. A table whose name really contains a dot is out " ++

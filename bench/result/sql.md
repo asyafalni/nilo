@@ -754,6 +754,36 @@ reasoned. The two absolutes moved again since 10 above, `pg_only` +14,960 and
 `sqlite_only` +13,888 over what shipped between, which is the same standing
 reason to build the before.
 
+### 10c. The words that cross tables, and the version file, cost nothing either
+
+**What it answers.** ADR 0222 made a foreign key a *list* of columns and let it
+name its table as text; ADR 0223 reshaped the generated version file and added
+`generate --baseline`. The first of those is the one worth measuring: unlike
+ADR 0221's words, it changes a runtime comparison — `Reference.sameAs` now walks
+two lists where it used to compare two names — and `where.zig` builds a join
+fragment in a loop. The second touches `migrations.zig`, which is the half of
+the module that opens files.
+
+**How.** The same way, and against the same commit as 10b so the two are
+directly comparable: `git archive HEAD | tar -x`, `zig build size-sql` on both
+sides, stripped `ReleaseFast`, `cmp` rather than a size comparison.
+
+| | before | after | Δ |
+|---|---|---|---|
+| names `sql.Db` (Postgres) | 1,800,600 | 1,800,600 | **0** |
+| names `sql.Sqlite` | 2,305,584 | 2,305,584 | **0** |
+
+`cmp` reports both pairs identical byte for byte, and this time **the two
+absolutes did not move either** — the first pair in this file's history that is
+unchanged on both counts, because nothing shipped between 10b and here.
+
+**What it changed.** Nothing, and the reason is worth keeping rather than
+re-deriving: the `Reference` diff and the version-file writer are both reachable
+only from `migrate` and `migrations`, which a server that serves never names.
+The only part of this work that *is* on a request path is `where.zig`'s join
+loop, and it runs at comptime — the fragment is a constant in the binary, so a
+composite `.exists` costs a longer string literal and no instructions.
+
 ## Reproducing this
 
 ```bash

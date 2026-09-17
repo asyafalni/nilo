@@ -1202,44 +1202,7 @@ rather than the list being adopted as a list.
 
 ### Next
 
-**1. The marker's words stop at the edge of one Row, and a program organised by
-context pays for it twice.** Three things from the same port, and they are one
-change because they move the same check to the same place
-([`input_from_nodeflux.md`](./input_from_nodeflux.md), items 4, 6 and 7):
-
-- **A foreign key cannot span two columns.** `FOREIGN KEY (epic_id,
-  department_id) REFERENCES work_epics (id, department_id)` is what "an Epic
-  has to be on the same board" costs, and it is a `.data` step beside the
-  `.unique` it needs, so one rule sits in two files and a string. The type
-  check ADR 0153 prizes is exactly as computable for two columns as for one:
-  `.epic = .{ .columns = .{ .epic_id, .department_id }, .to = .{ WorkEpic, .{ .id, .department_id } } }`.
-  `Reference.column` becomes `columns`, which breaks the snapshot the way
-  `.key` → `.keys` did.
-- **`.references` names a Zig type, so a table nobody may import is a table
-  nobody may point at.** A program whose contexts never import each other has
-  one way out: a second module declaring all 59 tables in full, 3,876 lines,
-  beside the 68 Rows the contexts already had. Every column is then declared
-  twice and only the boot check notices when the two disagree. Naming the
-  table as text keeps the check by moving it one level up, to
-  `sql.cli.Tool(Db, tables)` and `snapshot`, where every Row is already in one
-  comptime list: resolve the name in that list, find the column, compare the
-  types. Still `@compileError`, still before any database exists.
-- **`generate` cannot re-derive a baseline, and the file it writes has no slot
-  for a hand-written step.** Porting a schema is the same fourteen files
-  generated over and over, and each round is a shell script: delete the
-  snapshot, reset the manifest, generate, then rewrap the version file so
-  `.steps = generated ++ schema.steps`. That wrap should be what `generate`
-  writes — a `generated` decl and a `version` that concatenates, with
-  everything below the generated block preserved on a rerun — and `--baseline`
-  is what makes the loop a command.
-
-**Waiting on: ready.** One ADR for the references and a short one for the
-version file. The ordering note goes with them: generated steps run first and
-hand-written second, so a hand-written object a generated step needs (an
-extension a column type comes from) has nowhere to go, which bites the first
-program whose column is `citext`.
-
-**2. The marker's second kind of word is decided and not built.**
+**1. The marker's second kind of word is decided and not built.**
 [ADR 0221](./adr/0221-the-marker-has-two-kinds-of-word.md) says a diff can own
 a *named text* — same name and hash, nothing to do; new hash, replace; name
 gone, drop — and that this is a second kind of word rather than a refusal. What
@@ -1256,7 +1219,7 @@ that stops being checked starts growing" comes true after all. A generated
 column, a collation, a rule and a policy stay `.data` steps under the same
 rule.
 
-**3. Four migration commands are missing, and two of them are the debt that
+**2. Four migration commands are missing, and two of them are the debt that
 forward-only creates.** `generate`, `check`, `status`, `migrate` and `verify`
 ship ([ADR 0153](./adr/0153-a-migration-is-a-diff-against-a-snapshot.md)). The
 four that do not are `push` and `pull`, which are the SQLite and the rescue
@@ -1275,7 +1238,7 @@ has applied nothing.
 that is already past it. Rewriting rows is out — that is the thing `verify`
 exists to catch.
 
-**4. Decide whether a SQLite statement hops or runs in the fiber.** The Wire
+**3. Decide whether a SQLite statement hops or runs in the fiber.** The Wire
 ships with the choice as a field that has no default, so every program says
 which it wants and neither is a guess
 ([ADR 0073](./adr/0073-a-file-has-no-socket-to-wait-on.md)). What nobody has is
@@ -1298,7 +1261,7 @@ is the smaller of the two jobs.
 have been ([§9](../bench/result/sql.md),
 [`spike/sqlite_facts`](../spike/sqlite_facts/)). This is the one that cannot.
 
-**5. A watched statement cannot say which request it came from.**
+**4. A watched statement cannot say which request it came from.**
 `db.watching` shows the text, the plan, the duration and the rows
 ([ADR 0137](./adr/0137-a-statement-can-be-watched.md)), so *which statement is
 slow* is answerable. *Slow on which page* is not: a `Sent` carries no request
@@ -1714,7 +1677,7 @@ What is left splits three ways.
 - **Waiting on the one-table line**: joins, nested rows and aggregates.
   Subqueries came off this list — `.exists` is a condition and ships
   ([ADR 0171](./adr/0171-a-row-over-there-is-a-condition.md)). The tooling
-  commands wait on Next 3 rather than on a decision:
+  commands wait on Next 2 rather than on a decision:
   [ADR 0153](./adr/0153-a-migration-is-a-diff-against-a-snapshot.md) made it and
   the library under them is built.
 - **Nobody has looked**: row-level security, and Postgres extensions.
@@ -2099,6 +2062,30 @@ and the marking is the work.
 that doing it to one five-line example found seven mistakes. **The class is
 `Waiting on: a design`**, and it is the half worth keeping when the instance
 closes.
+
+**A live `<!-- compiles -->` block that only declares types is checked for
+syntax and almost nothing else.** Zig analyses a container-level declaration
+lazily, and `zig build snippets` compiles each block as an object with nothing
+referencing it — so a block that declares a Row and stops has its
+`pub const nilo_table` read by no one. Every comptime check the marker is made
+of is skipped, and the block passes. Demonstrated rather than reasoned: a
+`.references` pointing at a table no Row in the block declares compiled clean,
+and only grew nilo's refusal once a `comptime { _ = … }` in the same block used
+the Rows.
+
+This is the second way the mark can mean less than it looks like it means, and
+it is worse than the first: the page *is* in the list, the step *does* compile
+the block, and what it proves is that the text parses. The guide's Row examples
+are where it bites, because a Row example that declares and stops is the natural
+shape to write.
+
+**Waiting on: ready.** The fix is a convention rather than a mechanism — a
+block declaring Rows ends with a `comptime` block that names them — and the
+place to write it down is `docs/snippets/`'s own README beside the
+`<!-- compiles: body -->` note. A stricter version is possible and costs a
+design: have the extractor append a reference to every `pub` declaration it
+finds, which would check every block of this shape whether or not its author
+remembered.
 
 **A fail function in spawned work is safe only because of where a threadlocal
 gets written.** `bulkhead.slot()` falls back to a threadlocal when a fiber has

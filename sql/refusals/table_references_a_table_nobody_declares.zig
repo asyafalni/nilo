@@ -1,18 +1,14 @@
-//! A foreign key pointing at a type that is not a Row. A table's own name as
-//! text is the other spelling and is allowed; a plain struct is neither.
+//! A foreign key naming its table as text, pointing at a table no Row in the
+//! list names. The type check moved one level up rather than away, so the list
+//! is where the name has to resolve (ADR 0222).
 
 const sql = @import("nilo_sql");
-
-const Org = struct {
-    id: i64,
-    name: []const u8,
-};
 
 const User = struct {
     pub const nilo_table = .{
         .name = "users",
         .key = .id,
-        .references = .{ .org_id = .{ Org, .id } },
+        .references = .{ .org_id = .{ "orgs", .id } },
     };
 
     id: i64,
