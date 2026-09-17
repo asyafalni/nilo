@@ -58,6 +58,14 @@ Until it exists, a check constraint written by hand and a trigger are what they
 have always been: SQL in a step, marked in the snapshot as an object nilo does
 not own.
 
+> **Closed by
+> [ADR 0226](./0226-the-marker-has-a-word-the-database-checks.md).** The list is
+> five — a `CHECK`, a trigger, a function, a view, an extension — and ADR 0226
+> builds the two that hang off a table, as `.check` and `.trigger`. The other
+> three hang off a schema and wait on a `sql.Schema` that does not exist yet.
+> An enum column's `CHECK` can be named there too, with
+> `.check = .{ .<name> = .{ .words_of = .<column> } }`.
+
 ### The five typed words, and what each is checked against
 
 ```zig
@@ -93,8 +101,10 @@ default.
 
 **An enum column's `CHECK`.** A Zig enum the Row reads as a column is a `text`
 column with `CHECK ("col" IN ('urgent', 'normal'))` on it, named
-`<table>_<column>_check`. The words go in the snapshot, so adding a tag to the
-enum is a migration rather than an insert the database refuses at run time.
+`<table>_<column>_check` — or whatever `.check`'s `.words_of` calls it
+([ADR 0226](./0226-the-marker-has-a-word-the-database-checks.md)). The words go
+in the snapshot, so adding a tag to the enum is a migration rather than an
+insert the database refuses at run time.
 
 **An enum that says which database type it is keeps its silence.**
 `pub const nilo_column = "user_role"` names a Postgres `ENUM` whose words are

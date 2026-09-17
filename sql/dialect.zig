@@ -498,6 +498,24 @@ pub const Postgres = struct {
     /// place. Postgres can, and answers so plainly.
     pub const can_alter_column = true;
 
+    /// `DROP TRIGGER "touch_updated_at" ON "work_items"`. Postgres keeps
+    /// trigger names per table, so dropping one needs the table; SQLite keeps
+    /// them per database and refuses the clause.
+    pub const trigger_drop_names_table = true;
+
+    /// The head of a `CREATE TRIGGER` that may already have run, which is what
+    /// `createMissing` sends.
+    ///
+    /// **Postgres 14 is the floor this puts under the module**, and it is worth
+    /// stating rather than discovering: `CREATE OR REPLACE TRIGGER` arrived in
+    /// 14 (2021) and there is no `CREATE TRIGGER IF NOT EXISTS` in any version.
+    /// The alternative is a `DROP` and a `CREATE` as two statements, which is
+    /// what the diff writes anyway — but `createMissing` sends one statement
+    /// per object and a second one there would be a second thing to keep in
+    /// step for the one path that exists so a program can have no migrations
+    /// at all.
+    pub const trigger_repeatable_head = "CREATE OR REPLACE TRIGGER ";
+
     /// The whole column clause for the key, which is where the two databases
     /// disagree most and disagree structurally rather than in spelling.
     ///
@@ -927,6 +945,14 @@ pub const SQLite = struct {
     /// ([ADR 0061](../docs/adr/0061-the-second-dialect-is-the-test-of-the-seam.md)).
     pub const can_alter_column = false;
 
+    /// SQLite keeps trigger names per database rather than per table, so
+    /// `DROP TRIGGER` takes the name alone and refuses `ON`.
+    pub const trigger_drop_names_table = false;
+
+    /// And it has had `IF NOT EXISTS` on `CREATE TRIGGER` since 3.3, so the
+    /// repeatable form costs nothing here.
+    pub const trigger_repeatable_head = "CREATE TRIGGER IF NOT EXISTS ";
+
     /// **No either**, and for the same reason: a table constraint here is
     /// written at creation and is part of the table from then on. A changed
     /// word on an enum column is the four-statement rebuild, which the diff
@@ -1124,17 +1150,21 @@ pub const SQLite = struct {
 pub fn assertDialect(comptime D: type) void {
     comptime {
         const owed = [_][]const u8{
-            "name",       "placeholder", "quote",     "list_form",
-            "limit",      "offset",      "accepts",   "introspect",
-            "readAs",     "bindAs",      "arrayOf",   "qualify",
-            "lock",       "uuid_form",   "json_form", "enum_form",
-            "columnType", "keyColumn",   "foldedColumn",
-            "can_alter_column",             "advisoryLock",
-            "nulls",      "pattern",
+            "name",                 "placeholder",  "quote",                    "list_form",
+            "limit",                "offset",       "accepts",                  "introspect",
+            "readAs",               "bindAs",       "arrayOf",                  "qualify",
+            "lock",                 "uuid_form",    "json_form",                "enum_form",
+            "columnType",           "keyColumn",    "foldedColumn",             "can_alter_column",
+            "advisoryLock",         "nulls",        "pattern",
             // The three the schema half added (ADR 0221): what `.now` writes,
             // whether a table constraint can be replaced in place, and the
             // text list `columnType` and the startup check both read.
-            "now_default", "can_alter_constraint", "text_accepts",
+                             "now_default",
+            "can_alter_constraint", "text_accepts",
+            // And the two the second kind of word added (ADR 0226), both about
+            // a trigger: whether dropping one names the table, and how one is
+            // written when it may already be there.
+            "trigger_drop_names_table", "trigger_repeatable_head",
         };
         for (owed) |decl| {
             if (!@hasDecl(D, decl)) @compileError(
@@ -1476,10 +1506,10 @@ test "a column nilo creates is a column nilo will read" {
     // these ever disagree, `generate` writes a table that `db.checking` then
     // refuses at startup, which is the worst failure this module could ship.
     const judged = .{
-        bool,          i16,          i32,             i64,
-        u16,           u32,          f32,             f64,
-        []const u8,    core.Str,     types.Timestamp, types.Uuid,
-        types.Decimal, types.Inet,   types.Interval,  ?i64,
+        bool,          i16,         i32,             i64,
+        u16,           u32,         f32,             f64,
+        []const u8,    core.Str,    types.Timestamp, types.Uuid,
+        types.Decimal, types.Inet,  types.Interval,  ?i64,
         ?core.Str,     ?types.Uuid,
     };
     inline for (judged) |T| {

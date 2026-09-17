@@ -237,8 +237,16 @@ A struct of the caller's own, one field per column, carrying the marker that nam
 _Avoid_: ORM, model, entity, record, schema, DTO
 
 **Marker**:
-The `pub const nilo_table` on a Row: what the type says about its **table** rather than about a query. Its words are checked while compiling, which is the condition for being a word at all — the name, the key, a column's default, a unique, an index and its predicate, a foreign key and its two sides. A foreign key may name the other table as text rather than its Row, and the check on the two sides then runs against the list every Row is in rather than being given up (ADR 0222). A word whose body only a database can read is a second kind, checked by the database and diffed by name and hash (ADR 0221); anything that is neither is SQL in a step, and the snapshot marks it as an object nilo does not own.
+The `pub const nilo_table` on a Row: what the type says about its **table** rather than about a query. Its words are checked while compiling, which is the condition for being a word at all — the name, the key, a column's default, a unique, an index and its predicate, a foreign key and its two sides. A foreign key may name the other table as text rather than its Row, and the check on the two sides then runs against the list every Row is in rather than being given up (ADR 0222). A word whose body only a database can read is a second kind — a **named text** — checked by the database and diffed by name and hash (ADR 0221, ADR 0226); anything that is neither is SQL in a step, and the snapshot marks it as an object nilo does not own.
 _Avoid_: annotation, decorator, attribute, tag, metadata, schema DSL
+
+**Named text**:
+The second kind of word: an object whose **name** the compiler checks and whose **body** only the database can read. `.check` and `.trigger` are the two a table has. nilo writes the body, hashes it and never parses it, so a diff is three cases and no fourth — same name and same hash, nothing; a new hash, drop and create; a name the types no longer have, drop. The snapshot records the name and sixteen hex characters, not the body (ADR 0226).
+_Avoid_: raw SQL, escape hatch, opaque blob, passthrough
+
+**Twin**:
+The `.sql` file `generate` writes beside every version file: the same steps, wrapped in a transaction, with the ledger row on the end, for a database no Zig toolchain can reach. An **output** — nilo reads the `.zig` and never this, and a version written in SQL by somebody else is not picked up (ADR 0227).
+_Avoid_: export, dump, migration file, plain SQL migration
 
 **Borrowed row**:
 One Row read on its own rather than with the rest, its text pointing into the buffer the rows arrive in and valid only until the next one is pulled. That text is a plain slice and not a Str, which is what keeps the Str guarantee free of exceptions.

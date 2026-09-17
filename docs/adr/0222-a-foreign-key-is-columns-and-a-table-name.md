@@ -135,11 +135,19 @@ matched on `ref.table`, which is text on both sides.
 `Reference.column` is now `columns` and `Reference.target` is now `targets`,
 both lists. **That breaks `snapshot.zon`**, the same way `.key` → `.keys` did in
 ADR 0221 and for the same reason: `std.zon` fills a *missing* field from its
-default, so a new field with a default is free, and a renamed one is not. A
-snapshot written before this is refused with a parse diagnostic naming `column`
-rather than read as something it is not. The fix is `db generate`, and
-`sql/snapshot.zig`'s `test "a snapshot whose foreign keys are the older
-single-column shape is refused, not read"` is what says so out loud.
+default, so a new field with a default is free, and a renamed one is not.
+
+> **Amended by
+> [ADR 0224](./0224-a-snapshot-an-older-nilo-wrote-is-still-read.md).** This
+> section said a snapshot in the older shape "is refused with a parse diagnostic
+> naming `column`" and that the fix is `db generate`. Neither was true from the
+> command line: no caller passed a `Diagnostics`, so what arrived was
+> `error.ParseZon` and forty lines of stack, and `generate` reads the snapshot
+> before writing one — so the instruction was impossible to follow in any
+> repository past version 1. An older snapshot is now read through a mirror
+> struct and upgraded in memory, so a `generate` against it is an ordinary diff.
+> The test that stood here was one layer under the bug: it called
+> `snapshot.parse` directly with a `Diagnostics` nothing else supplied.
 
 ## Alternatives rejected
 

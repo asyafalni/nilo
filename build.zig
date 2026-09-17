@@ -636,6 +636,66 @@ const sql_refusals = [_]Refusal{
             " `skus_are_unique_per_product_and_per_term_and_per_platform_and_per_region`," ++
             " which is 72 bytes, and 63 is all Postgres keeps.",
     },
+    // The second kind of word (ADR 0226): a `.check` and a `.trigger`, whose
+    // body the database reads and the compiler does not. What is checked here
+    // is the shape around the body — that it is text, that there is some, and
+    // that the name it goes in under fits.
+    .{
+        .name = "table_check_written_as_a_tuple",
+        .says = "table_check_written_as_a_tuple.Ledger's `.check` is a list.",
+    },
+    .{
+        .name = "table_check_body_is_not_text",
+        .says = "table_check_body_is_not_text.Ledger's" ++
+            " `.check.ledgers_amount_is_positive` is a comptime_int.",
+    },
+    .{
+        .name = "table_check_body_is_empty",
+        .says = "table_check_body_is_empty.Ledger's `.check.ledgers_amount_is_positive`" ++
+            " is empty.",
+    },
+    .{
+        .name = "table_check_name_too_long",
+        .says = "table_check_name_too_long.Ledger's check is named" ++
+            " `ledgers_amount_is_positive_and_the_currency_is_one_we_actually_settle_in`," ++
+            " which is 72 bytes, and 63 is all Postgres keeps.",
+    },
+    .{
+        .name = "table_check_written_as_a_struct",
+        .says = "table_check_written_as_a_struct.Ledger's" ++
+            " `.check.ledgers_amount_is_positive` is written as a struct.",
+    },
+    .{
+        .name = "table_check_words_of_not_a_column",
+        .says = "table_check_words_of_not_a_column.Ticket has no column `levell`, asked" ++
+            " for in `.check`.",
+    },
+    .{
+        .name = "table_check_words_of_a_column_with_none",
+        .says = "table_check_words_of_a_column_with_none.Ticket's" ++
+            " `.check.tickets_title_is_known` names the words of `title`, and that" ++
+            " column has none.",
+    },
+    .{
+        .name = "table_check_words_of_one_column_twice",
+        .says = "table_check_words_of_one_column_twice.Ticket names the check over" ++
+            " `level`'s words twice, as `tickets_level_is_known` and as" ++
+            " `tickets_level_is_one_of_two`.",
+    },
+    .{
+        .name = "table_trigger_written_as_one_string",
+        .says = "table_trigger_written_as_one_string.Ledger's `.trigger.ledgers_touch`" ++
+            " is not two halves.",
+    },
+    .{
+        .name = "table_trigger_unknown_word",
+        .says = "table_trigger_unknown_word.Ledger's `.trigger.ledgers_touch` sets" ++
+            " `.on`, which is not part of an entry.",
+    },
+    .{
+        .name = "table_trigger_half_is_empty",
+        .says = "table_trigger_half_is_empty.Ledger's `.trigger.ledgers_touch.run` is empty.",
+    },
     .{
         .name = "table_two_constraints_one_name",
         .says = "table_two_constraints_one_name.Outbox names two constraints" ++

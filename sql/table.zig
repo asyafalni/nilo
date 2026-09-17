@@ -138,6 +138,15 @@ pub const Column = struct {
     /// they are in the snapshot so that adding a word to the enum is a
     /// migration rather than an insert the database refuses.
     values: []const []const u8 = &.{},
+    /// The name that check goes in under, when `.check` gave it one. Empty
+    /// means the derived `<table>_<column>_check`, which is also what Postgres
+    /// would have called it
+    /// ([ADR 0226](../docs/adr/0226-the-marker-has-a-word-the-database-checks.md)).
+    ///
+    /// In the snapshot, so that renaming it is a migration: the constraint in
+    /// the database still has the old name, and dropping it by the new one
+    /// would find nothing.
+    check: []const u8 = "",
 
     /// Whether two columns describe the same thing. The name is matched by the
     /// caller, so this is the part that decides whether an `ALTER` is needed.
@@ -147,7 +156,15 @@ pub const Column = struct {
             self.key == other.key and
             self.generated == other.generated and
             sameOptionalText(self.default, other.default) and
-            sameColumns(self.values, other.values);
+            sameColumns(self.values, other.values) and
+            std.mem.eql(u8, self.check, other.check);
+    }
+
+    /// What the check over this column's words is called, given the table it is
+    /// on. The comptime half of `ddl.checkName` and the runtime half of
+    /// `ddl.writeCheckIdent` both answer through here.
+    pub fn checkNamed(self: Column) bool {
+        return self.check.len > 0;
     }
 };
 
@@ -247,6 +264,80 @@ pub fn sameOptionalText(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
+/// An object whose **name** the compiler checks and whose **body** only the
+/// database can read
+/// ([ADR 0226](../docs/adr/0226-the-marker-has-a-word-the-database-checks.md)).
+///
+/// This is the second kind of word ADR 0221 named and did not build. A `CHECK`
+/// body is a string nilo will not parse, and it is also a named object with a
+/// text — which a diff owns completely: same name and same hash, nothing to do;
+/// same name and a new hash, replace; name gone, drop. The compiler holds the
+/// name and where it hangs, the database holds the body, and it checks it
+/// inside the version's transaction, which is the same moment a `.data` step is
+/// checked today.
+///
+/// `NamedText` rather than `Named`, which `ddl.zig` already uses for a
+/// statement with a name on it. Two of one word in one module is how a reader
+/// ends up sure they know which one they are looking at.
+pub const NamedText = struct {
+    name: []const u8,
+    /// The text the database will hold, as it will be written.
+    ///
+    /// **Empty in a snapshot**, where `hash` is what a diff compares: a view is
+    /// sixty lines, and a `.zon` file carrying them stops being readable, which
+    /// is the property the format was chosen for.
+    body: []const u8 = "",
+    /// The second half of a trigger — everything after the `ON "table"` nilo
+    /// writes in the middle — and empty for every other kind. A trigger is the
+    /// one named text with a hole in it, because the table it hangs on is the
+    /// thing the marker already knows and must not be written twice.
+    tail: []const u8 = "",
+    /// Hex SHA-256 of the text, sixteen characters of it.
+    ///
+    /// **Empty in a `Desc` built from types**, where the body is right there.
+    /// `digest` is what asks either side for a comparable value, so nothing
+    /// downstream has to know which half it is holding.
+    hash: []const u8 = "",
+
+    pub fn sameAs(self: NamedText, other: NamedText) bool {
+        var mine: [16]u8 = undefined;
+        var theirs: [16]u8 = undefined;
+        return std.mem.eql(u8, self.digest(&mine), other.digest(&theirs));
+    }
+
+    /// What this object compares as, from whichever half it has.
+    pub fn digest(self: NamedText, out: *[16]u8) []const u8 {
+        if (self.hash.len > 0) {
+            const n = @min(self.hash.len, out.len);
+            @memcpy(out[0..n], self.hash[0..n]);
+            return out[0..n];
+        }
+        return digestOf(self.body, self.tail, out);
+    }
+};
+
+/// Sixteen hex characters of the text's SHA-256.
+///
+/// Sixteen rather than sixty-four because this goes in a file a person reads
+/// and what it has to do is notice an edit, not resist an adversary. The
+/// version chain in `migrate.zig` keeps all sixty-four, because that one is
+/// what `verify` holds a deployed database to.
+///
+/// The `\x00` between the halves is why `.when = "A", .run = "BC"` and
+/// `.when = "AB", .run = "C"` are two different triggers rather than one.
+pub fn digestOf(body: []const u8, tail: []const u8, out: *[16]u8) []const u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(body);
+    h.update("\x00");
+    h.update(tail);
+    var full: [32]u8 = undefined;
+    h.final(&full);
+    var hex: [64]u8 = undefined;
+    const written = std.fmt.bufPrint(&hex, "{x}", .{&full}) catch unreachable;
+    @memcpy(out, written[0..16]);
+    return out[0..16];
+}
+
 pub const Rename = struct {
     /// What the column used to be called, and what the database still has.
     from: []const u8,
@@ -279,6 +370,12 @@ pub const Desc = struct {
     uniques: []const Unique = &.{},
     indexes: []const Index = &.{},
     references: []const Reference = &.{},
+    /// `CHECK` constraints the marker named, plus the one an enum column
+    /// generates when `.check` gave it a name (ADR 0226).
+    checks: []const NamedText = &.{},
+    /// `CREATE TRIGGER` clauses, by trigger name. The two halves are what goes
+    /// either side of the `ON "table"` nilo writes in the middle.
+    triggers: []const NamedText = &.{},
     /// Never written to a snapshot. A rename is how a schema got somewhere,
     /// not part of where it is.
     renames: []const Rename = &.{},
@@ -318,6 +415,8 @@ pub fn descOf(comptime D: type, comptime Row: type) Desc {
             .uniques = uniquesOf(owner, qualified.table, decl),
             .indexes = indexesOf(D, owner, qualified.table, decl),
             .references = referencesOf(owner, qualified.table, decl),
+            .checks = checksOf(owner, decl),
+            .triggers = triggersOf(owner, decl),
             .renames = renamesOf(owner, decl),
             .managed = row_mod.managedOf(owner),
         };
@@ -335,7 +434,8 @@ pub fn descOf(comptime D: type, comptime Row: type) Desc {
 /// the first one had already run. Here it is a Refusal naming both.
 fn assertNamesDistinct(comptime Row: type, comptime desc: Desc) void {
     comptime {
-        const total = desc.uniques.len + desc.indexes.len + desc.references.len;
+        const total = desc.uniques.len + desc.indexes.len + desc.references.len +
+            desc.checks.len + desc.columns.len;
         @setEvalBranchQuota(10_000 + 500 * total * total);
 
         var seen: [total][]const u8 = undefined;
@@ -348,6 +448,23 @@ fn assertNamesDistinct(comptime Row: type, comptime desc: Desc) void {
         }
         for (desc.references) |r| {
             claim(Row, &seen, &n, r.name, "`.references`");
+        }
+        for (desc.checks) |c| {
+            claim(Row, &seen, &n, c.name, "`.check`");
+        }
+        // And the one an enum column generates, under whichever name it ends
+        // up with. It is a table constraint like the rest, and it is the one
+        // nobody writes down — so a `.check` that happens to spell
+        // `<table>_<column>_check` collides with it and nothing else would say
+        // so until the second `ALTER TABLE` ran.
+        for (desc.columns) |c| {
+            if (c.values.len == 0) continue;
+            const named = if (c.checkNamed()) c.check else constraintName(
+                desc.table,
+                &.{c.name},
+                "check",
+            );
+            claim(Row, &seen, &n, named, "the check over `" ++ c.name ++ "`'s words");
         }
     }
 }
@@ -363,9 +480,11 @@ fn claim(
         for (seen[0..n.*]) |already| {
             if (std.mem.eql(u8, already, name)) @compileError(
                 "nilo: " ++ @typeName(Row) ++ " names two constraints `" ++ name ++ "`.\n" ++
-                    "  One of them is in " ++ what ++ ". The name is derived from the table " ++
-                    "and the columns, so two entries over the same columns collide — give " ++
-                    "one of them a `.name` that says what it is for.",
+                    "  One of them is in " ++ what ++ ", and two constraints on one table " ++
+                    "cannot share a name. A `.unique` or an `.index` derives one from the " ++
+                    "table and the columns, so two entries over the same columns collide — " ++
+                    "give one of them a `.name` that says what it is for, or rename the " ++
+                    "entry that already carries its own.",
             );
         }
         seen[n.*] = name;
@@ -433,6 +552,7 @@ fn columnsOf(
                 .generated = is_key and keys.len == 1 and generatedKey(f.type),
                 .default = defaultOf(D, Row, f.name, f.type, decl),
                 .values = enumValues(f.type),
+                .check = wordsCheckName(Row, decl, f.name),
             };
             // A key the database fills in from a sequence has a default
             // already, and it is the sequence. Writing a second one beside it
@@ -443,13 +563,16 @@ fn columnsOf(
                     "  An integer key of one column comes from a sequence, which is the " ++
                     "default it already has. Take the entry out, or give the row its key.",
             );
-            if (out[i].values.len > 0) checkIdentifier(
+            if (out[i].values.len > 0 and !out[i].checkNamed()) checkIdentifier(
                 constraintName(table, &.{f.name}, "check"),
                 "the name nilo derives for the check over " ++ @typeName(Row) ++ "." ++
                     f.name ++ "'s words is `" ++ constraintName(table, &.{f.name}, "check") ++
                     "`, which",
-                "Shorten the table or the column.",
+                "Shorten the table or the column, or name the check with `.check`.",
             );
+            // A column whose check was given a name has had it checked in
+            // `wordsCheckName`, where the entry that wrote it is what the
+            // message can point at.
         }
         const frozen = out[0..n].*;
         return &frozen;
@@ -607,13 +730,149 @@ fn literalText(
             return quoteLiteral(text);
         }
 
+        // An array column, whose default is the one thing a schema written by
+        // hand nearly always gives it: the empty array
+        // ([ADR 0225](../docs/adr/0225-an-array-column-has-a-default-like-any-other.md)).
+        // `&.{}` rather than `"{}"`, because a value written into the schema is
+        // of the column's own type everywhere else in this word.
+        if (types.listElement(Inner)) |Item| return quoteLiteral(arrayLiteral(what, mine, T, Item, written));
+
         @compileError(
             "nilo: " ++ what ++ " gives " ++ mine ++ " a value, and the column is " ++
                 @typeName(T) ++ ".\n" ++
                 "  What nilo writes into a schema is text, a whole number, a fraction, a " ++
-                "bool, or one of a Zig enum's words. Anything else the database has to " ++
-                "work out, so it is a step.",
+                "bool, one of a Zig enum's words, or a list of those. Anything else the " ++
+                "database has to work out, so it is a step.",
         );
+    }
+}
+
+/// `{}`, `{1,2}`, `{"ops","read"}` — the array literal both databases read,
+/// before `quoteLiteral` makes it an SQL string.
+///
+/// **The element quoting is the whole of the risk here**, which is why it is
+/// one function with a live test behind it rather than a `++` at the call
+/// site. An element goes in double quotes with `\` and `"` escaped, which is
+/// what makes a tag containing a comma, a brace or a quote come back as the
+/// one element it went in as. `NULL` in an array literal is the unquoted word,
+/// so a quoted `"NULL"` is the four letters and that is what a Zig string
+/// means here.
+fn arrayLiteral(
+    comptime what: []const u8,
+    comptime mine: []const u8,
+    comptime T: type,
+    comptime Item: type,
+    comptime written: anytype,
+) []const u8 {
+    comptime {
+        const W = @TypeOf(written);
+        // `&.{ "a", "b" }` is a *pointer to an anonymous tuple struct*, not a
+        // pointer to an array, which is the shape that has to be allowed here
+        // and the one a first draft of this missed.
+        const is_list = isListLiteral(W);
+        if (!is_list) @compileError(
+            "nilo: " ++ what ++ " gives " ++ mine ++ " a " ++ @typeName(W) ++ ", and the " ++
+                "column holds a list of " ++ @typeName(Item) ++ ".\n" ++
+                "  A list is written as one: `&.{}` for the empty array every " ++
+                "`NOT NULL` array column wants, or `&.{ \"one\", \"two\" }`.",
+        );
+
+        var out: []const u8 = "{";
+        var first = true;
+        for (written) |element| {
+            out = out ++ (if (first) "" else ",") ++ arrayElement(what, mine, T, Item, element);
+            first = false;
+        }
+        return out ++ "}";
+    }
+}
+
+fn arrayElement(
+    comptime what: []const u8,
+    comptime mine: []const u8,
+    comptime T: type,
+    comptime Item: type,
+    comptime written: anytype,
+) []const u8 {
+    comptime {
+        const Bare = unwrap(Item);
+        const W = @TypeOf(written);
+
+        const words = enumValues(Item);
+        if (words.len > 0) {
+            if (@typeInfo(W) != .enum_literal) wrongLiteral(what, mine, T, W);
+            for (words) |w| {
+                if (std.mem.eql(u8, w, @tagName(written))) return quoteArrayElement(w);
+            }
+            @compileError(
+                "nilo: " ++ what ++ " gives " ++ mine ++ " a list holding `." ++
+                    @tagName(written) ++ "`, which is not one of " ++ @typeName(Bare) ++
+                    "'s words.\n  They are " ++ namedList(words) ++ ".",
+            );
+        }
+        if (Bare == bool) {
+            if (W != bool) wrongLiteral(what, mine, T, W);
+            return if (written) "true" else "false";
+        }
+        if (@typeInfo(Bare) == .int) {
+            if (@typeInfo(W) != .int and @typeInfo(W) != .comptime_int) wrongLiteral(what, mine, T, W);
+            const fits: Bare = written;
+            return std.fmt.comptimePrint("{d}", .{fits});
+        }
+        if (@typeInfo(Bare) == .float) {
+            if (@typeInfo(W) != .float and @typeInfo(W) != .comptime_float and
+                @typeInfo(W) != .int and @typeInfo(W) != .comptime_int) wrongLiteral(what, mine, T, W);
+            const fits: Bare = written;
+            return std.fmt.comptimePrint("{d}", .{fits});
+        }
+        if (isTextColumn(Bare)) {
+            if (!isTextLiteral(W)) wrongLiteral(what, mine, T, W);
+            const text: []const u8 = written;
+            return quoteArrayElement(text);
+        }
+
+        @compileError(
+            "nilo: " ++ what ++ " gives " ++ mine ++ " a list of " ++ @typeName(Item) ++
+                ", and nilo does not write one of those into a schema.\n" ++
+                "  A list default holds text, whole numbers, fractions, bools or a Zig " ++
+                "enum's words. Anything else the database has to work out, so it is a step.",
+        );
+    }
+}
+
+/// Whether a value can be walked as a list: `&.{…}`, `.{…}`, an array, or a
+/// slice. The first is the spelling everything in this repository uses and is
+/// a pointer to a tuple *struct* rather than to an array, which is the case a
+/// `@typeInfo(p.child) == .array` test quietly misses.
+fn isListLiteral(comptime W: type) bool {
+    comptime {
+        return switch (@typeInfo(W)) {
+            .@"struct" => |st| st.is_tuple,
+            .array => true,
+            .pointer => |p| switch (p.size) {
+                .slice => true,
+                .one => switch (@typeInfo(p.child)) {
+                    .array => true,
+                    .@"struct" => |st| st.is_tuple,
+                    else => false,
+                },
+                else => false,
+            },
+            else => false,
+        };
+    }
+}
+
+/// One element, in the double quotes an array literal separates on.
+fn quoteArrayElement(comptime text: []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "\"";
+        for (text) |ch| out = out ++ switch (ch) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            else => &[_]u8{ch},
+        };
+        return out ++ "\"";
     }
 }
 
@@ -1551,6 +1810,237 @@ pub fn constraintName(
     }
 }
 
+// -- the objects only the database reads ---------------------------------
+
+/// What an entry of `.trigger` says.
+const trigger_words = [_][]const u8{ "when", "run" };
+
+/// The entries of a word keyed by name rather than written as a tuple.
+///
+/// `.unique` and `.index` derive a name from their columns, so their entries
+/// are anonymous and `.name` is the override. A check and a trigger have no
+/// columns to derive one from, so the key **is** the name — which puts both
+/// under the same 63-byte guard and the same two-entries-one-name Refusal
+/// without a second spelling for either, and makes two entries of one name a
+/// duplicate struct field, which Zig refuses before this file is reached.
+fn namedEntries(
+    comptime Row: type,
+    comptime what: []const u8,
+    comptime written: anytype,
+) []const std.builtin.Type.StructField {
+    comptime {
+        const W = @TypeOf(written);
+        const info = @typeInfo(W);
+        // `.{}` is a tuple with no fields, and it is the honest way to write
+        // "none of these" — so it is the one tuple that gets in.
+        const shaped = info == .@"struct" and
+            (!info.@"struct".is_tuple or info.@"struct".fields.len == 0);
+        // A tuple's `@typeName` is the whole of its contents, which makes a
+        // one-line message four lines of literal. What the reader needs is
+        // that it was written as a list.
+        const shown = if (info == .@"struct") "a list" else "a " ++ @typeName(W);
+        if (!shaped) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s `." ++ what ++ "` is " ++ shown ++ ".\n" ++
+                "  It is keyed by the name the object goes into the database under: " ++
+                "`." ++ what ++ " = .{ .the_name_it_gets = … }`. There are no columns to " ++
+                "derive one from, and an object nobody named is reported by the database " ++
+                "under a name it made up.",
+        );
+        return info.@"struct".fields;
+    }
+}
+
+/// The text of a named object, as it will be written.
+///
+/// **This is the word the database checks rather than the compiler**, which is
+/// the whole of the second kind ADR 0221 named and ADR 0226 built. nilo does
+/// not read it: it writes it, hashes it, and notices when the hash moves. What
+/// it does check is that it is text and that there is some.
+fn namedBody(
+    comptime Row: type,
+    comptime what: []const u8,
+    comptime written: anytype,
+) []const u8 {
+    comptime {
+        const W = @TypeOf(written);
+        if (!isTextLiteral(W)) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s `." ++ what ++ "` is a " ++ @typeName(W) ++ ".\n" ++
+                "  It is SQL the database reads and nilo does not, so it is written as " ++
+                "text. nilo compares it by hash: a body that changes is a drop and a " ++
+                "create, in the version where it changed.",
+        );
+        const text: []const u8 = written;
+        if (text.len == 0) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s `." ++ what ++ "` is empty.\n" ++
+                "  An object with no text is nothing, and writing one is more likely a " ++
+                "half-finished line than a decision. Take the entry out.",
+        );
+        return text;
+    }
+}
+
+/// The `CHECK` constraints the marker names.
+///
+/// ```zig
+/// .check = .{
+///     .work_items_range_runs_forwards =
+///         "start_date IS NULL OR target_date IS NULL OR start_date <= target_date",
+/// }
+/// ```
+///
+/// The key is the name, because the name is the whole of what Postgres says
+/// when a row breaks it, and a check has no column list to derive one from.
+/// The second spelling, `.{ .words_of = .kind }`, is not a check of its own: it
+/// names the one an enum column already generates, which `columnsOf` reads off
+/// this same word and this function steps over.
+fn checksOf(comptime Row: type, comptime decl: anytype) []const NamedText {
+    comptime {
+        if (!@hasField(@TypeOf(decl), "check")) return &.{};
+        const entries = namedEntries(Row, "check", decl.check);
+        var out: [entries.len]NamedText = undefined;
+        var n: usize = 0;
+        for (entries) |f| {
+            const entry = @field(decl.check, f.name);
+            if (wordsOf(Row, f.name, entry) != null) continue;
+            checkIdentifier(
+                f.name,
+                @typeName(Row) ++ "'s check is named `" ++ f.name ++ "`, which",
+                "Make it shorter.",
+            );
+            out[n] = .{ .name = f.name, .body = namedBody(Row, "check." ++ f.name, entry) };
+            n += 1;
+        }
+        const frozen = out[0..n].*;
+        return &frozen;
+    }
+}
+
+/// Whether a `.check` entry names an enum column's own check rather than
+/// writing one, and which column if so.
+///
+/// `.check = .{ .sku_product_types_kind_is_known = .{ .words_of = .kind } }`. A
+/// column the Row reads as a Zig enum already generates
+/// `CHECK ("kind" IN ('product', 'other'))` under a derived name, and this is
+/// how that name is chosen instead.
+///
+/// **Keyed by the constraint's name like every other entry of `.check`**, not
+/// by the column beside `.default`. One word with two key rules is how a reader
+/// ends up sure they know which one they are looking at, and the name is what
+/// both spellings are actually about.
+fn wordsOf(comptime Row: type, comptime name: []const u8, comptime entry: anytype) ?[]const u8 {
+    comptime {
+        const E = @TypeOf(entry);
+        if (!isNamedForm(E)) return null;
+        const fields = @typeInfo(E).@"struct".fields;
+        if (fields.len != 1 or !std.mem.eql(u8, fields[0].name, "words_of")) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s `.check." ++ name ++ "` is written as a " ++
+                "struct.\n" ++
+                "  A check is SQL, as text. The one other shape is " ++
+                "`.{ .words_of = .<column> }`, which gives this name to the check a column " ++
+                "that reads as a Zig enum already generates.",
+        );
+        const written = entry.words_of;
+        if (@typeInfo(@TypeOf(written)) != .enum_literal) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s `.check." ++ name ++ "` reads `.words_of` as " ++
+                @typeName(@TypeOf(written)) ++ ".\n" ++
+                "  It names a column, written the way a column is written everywhere else " ++
+                "here: `.{ .words_of = .kind }`.",
+        );
+        const column = @tagName(written);
+        checkColumn(Row, "check", column);
+        if (enumValues(row_mod.ColumnType(Row, column)).len == 0) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s `.check." ++ name ++ "` names the words of `" ++
+                column ++ "`, and that column has none.\n" ++
+                "  Only a column the Row reads as a Zig enum generates a check to name. An " ++
+                "enum carrying `pub const nilo_column` says the database owns its words, " ++
+                "so nilo writes no check for that one either.",
+        );
+        checkIdentifier(
+            name,
+            @typeName(Row) ++ "'s check over `" ++ column ++ "`'s words is named `" ++
+                name ++ "`, which",
+            "Make it shorter.",
+        );
+        return column;
+    }
+}
+
+/// The name the check over this column's words goes in under, or empty for the
+/// derived one.
+fn wordsCheckName(
+    comptime Row: type,
+    comptime decl: anytype,
+    comptime column: []const u8,
+) []const u8 {
+    comptime {
+        if (!@hasField(@TypeOf(decl), "check")) return "";
+        const entries = namedEntries(Row, "check", decl.check);
+        var found: []const u8 = "";
+        for (entries) |f| {
+            const named = wordsOf(Row, f.name, @field(decl.check, f.name)) orelse continue;
+            if (!std.mem.eql(u8, named, column)) continue;
+            if (found.len > 0) @compileError(
+                "nilo: " ++ @typeName(Row) ++ " names the check over `" ++ column ++
+                    "`'s words twice, as `" ++ found ++ "` and as `" ++ f.name ++ "`.\n" ++
+                    "  A column has one check over the words its type has, so one of the " ++
+                    "two entries would be a constraint the database never gets. Keep one.",
+            );
+            found = f.name;
+        }
+        return found;
+    }
+}
+
+/// The triggers the marker names.
+///
+/// ```zig
+/// .trigger = .{
+///     .work_items_updated_at = .{
+///         .when = "BEFORE UPDATE",
+///         .run = "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+///     },
+/// }
+/// ```
+///
+/// **Two halves rather than the one string this was proposed as**, and the
+/// table is why. nilo writes `ON "work_items"` between them, because the table
+/// is the one thing the marker already knows and writing it a second time is
+/// how the two fall out of step — a trigger left on the old table after a
+/// rename is a trigger that silently stops running. Finding where `ON` goes
+/// inside one string is parsing SQL, which is what this word exists to avoid.
+fn triggersOf(comptime Row: type, comptime decl: anytype) []const NamedText {
+    comptime {
+        if (!@hasField(@TypeOf(decl), "trigger")) return &.{};
+        const entries = namedEntries(Row, "trigger", decl.trigger);
+        var out: [entries.len]NamedText = undefined;
+        for (entries, 0..) |f, i| {
+            const entry = @field(decl.trigger, f.name);
+            const E = @TypeOf(entry);
+            const halves = isNamedForm(E) and @hasField(E, "when") and @hasField(E, "run");
+            if (!halves) @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s `.trigger." ++ f.name ++ "` is not two " ++
+                    "halves.\n" ++
+                    "  nilo writes `ON \"<table>\"` between them, so it needs both: " ++
+                    "`.{ .when = \"BEFORE UPDATE\", .run = \"FOR EACH ROW EXECUTE FUNCTION " ++
+                    "set_updated_at()\" }`.",
+            );
+            assertKnownWords(Row, "trigger." ++ f.name, &trigger_words, E);
+            checkIdentifier(
+                f.name,
+                @typeName(Row) ++ "'s trigger is named `" ++ f.name ++ "`, which",
+                "Make it shorter.",
+            );
+            out[i] = .{
+                .name = f.name,
+                .body = namedBody(Row, "trigger." ++ f.name ++ ".when", entry.when),
+                .tail = namedBody(Row, "trigger." ++ f.name ++ ".run", entry.run),
+            };
+        }
+        const frozen = out;
+        return &frozen;
+    }
+}
+
 // -- tests ---------------------------------------------------------------
 
 const testing = std.testing;
@@ -1870,6 +2360,16 @@ const WorkItem = struct {
                 .name = "work_items_urgent_and_open",
             },
         },
+        .check = .{
+            .work_items_range_runs_forwards = "archived_at IS NULL OR created_at <= archived_at",
+            .work_items_priority_is_known = .{ .words_of = .priority },
+        },
+        .trigger = .{
+            .work_items_updated_at = .{
+                .when = "BEFORE UPDATE",
+                .run = "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+            },
+        },
     };
 
     id: types.Uuid,
@@ -1883,6 +2383,58 @@ const WorkItem = struct {
     archived_at: ?types.Timestamp,
     created_at: types.Timestamp,
 };
+
+const Agent = struct {
+    pub const nilo_table = .{
+        .name = "agents",
+        .key = .id,
+        .default = .{
+            .read_tags = &.{},
+            .write_capabilities = &.{ "deals", "work" },
+            .weights = &.{ 1, 2, 3 },
+        },
+    };
+
+    id: i64,
+    read_tags: []const []const u8,
+    write_capabilities: []const []const u8,
+    weights: []const i32,
+};
+
+test "an array column takes a list where every other column takes a value" {
+    const desc = comptime descOf(Pg, Agent);
+
+    // The one every `NOT NULL` array column in a hand-written schema has, and
+    // the two `SET DEFAULT` clauses a 59-table port was still writing by hand.
+    try testing.expectEqualStrings("'{}'", desc.column("read_tags").?.default.?);
+    try testing.expectEqualStrings(
+        "'{\"deals\",\"work\"}'",
+        desc.column("write_capabilities").?.default.?,
+    );
+    try testing.expectEqualStrings("'{1,2,3}'", desc.column("weights").?.default.?);
+}
+
+test "an element that would otherwise end the array is quoted, not lost" {
+    const Tagged = struct {
+        pub const nilo_table = .{
+            .name = "tagged",
+            .key = .id,
+            // A comma, a brace, a double quote, a backslash and an apostrophe,
+            // which are the five ways an array literal can be read as more or
+            // fewer elements than it holds.
+            .default = .{ .tags = &.{ "a,b", "{c}", "say \"hi\"", "back\\slash", "it's" } },
+        };
+
+        id: i64,
+        tags: []const []const u8,
+    };
+
+    const desc = comptime descOf(Pg, Tagged);
+    try testing.expectEqualStrings(
+        "'{\"a,b\",\"{c}\",\"say \\\"hi\\\"\",\"back\\\\slash\",\"it''s\"}'",
+        desc.column("tags").?.default.?,
+    );
+}
 
 test "a column says what the database writes when an insert leaves it out" {
     const desc = comptime descOf(Pg, WorkItem);
@@ -1978,4 +2530,75 @@ test "a schema-qualified table keeps the schema out of its constraint names" {
     try testing.expectEqualStrings("app", desc.schema.?);
     try testing.expectEqualStrings("audit", desc.table);
     try testing.expectEqualStrings("audit_at_idx", desc.indexes[0].name);
+}
+
+// -- the second kind of word (ADR 0226) ----------------------------------
+
+test "a check the marker names is a name and a body, and nilo reads neither half of the body" {
+    const desc = comptime descOf(Pg, WorkItem);
+
+    // One entry, not two: `.work_items_priority_is_known` is a name for the
+    // check `priority` already generates rather than a check of its own.
+    try testing.expectEqual(@as(usize, 1), desc.checks.len);
+    try testing.expectEqualStrings("work_items_range_runs_forwards", desc.checks[0].name);
+    try testing.expectEqualStrings(
+        "archived_at IS NULL OR created_at <= archived_at",
+        desc.checks[0].body,
+    );
+    // Verbatim. The body is the one word in the marker nilo does not parse, so
+    // what comes out is byte for byte what went in.
+    try testing.expectEqualStrings("", desc.checks[0].hash);
+}
+
+test "a trigger is two halves, because the table goes between them" {
+    const desc = comptime descOf(Pg, WorkItem);
+
+    try testing.expectEqual(@as(usize, 1), desc.triggers.len);
+    try testing.expectEqualStrings("work_items_updated_at", desc.triggers[0].name);
+    try testing.expectEqualStrings("BEFORE UPDATE", desc.triggers[0].body);
+    try testing.expectEqualStrings(
+        "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+        desc.triggers[0].tail,
+    );
+}
+
+test "an enum column's check takes the name `.check` gave it, and keeps its words" {
+    const desc = comptime descOf(Pg, WorkItem);
+    const priority = desc.column("priority").?;
+
+    try testing.expectEqualStrings("work_items_priority_is_known", priority.check);
+    // The words are still the type's. Naming the constraint says nothing about
+    // what it holds ([ADR 0226](../docs/adr/0226-the-marker-has-a-word-the-database-checks.md)).
+    try testing.expectEqual(@as(usize, 4), priority.values.len);
+
+    // And a column nobody named keeps the derived one, which is empty here and
+    // worked out where it is written.
+    try testing.expectEqualStrings("", desc.column("title").?.check);
+}
+
+test "two bodies that differ hash differently, and a snapshot's hash compares against a body" {
+    const one: NamedText = .{ .name = "c", .body = "amount > 0" };
+    const two: NamedText = .{ .name = "c", .body = "amount >= 0" };
+    try testing.expect(!one.sameAs(two));
+
+    // What a snapshot holds: the name and sixteen hex characters, no body.
+    var buf: [16]u8 = undefined;
+    const recorded: NamedText = .{ .name = "c", .hash = one.digest(&buf) };
+    try testing.expectEqual(@as(usize, 16), recorded.hash.len);
+    try testing.expect(recorded.sameAs(one));
+    try testing.expect(!recorded.sameAs(two));
+}
+
+test "a trigger's two halves hash as two, so moving a word across the gap is a change" {
+    const split: NamedText = .{ .name = "t", .body = "BEFORE UPDATE", .tail = "FOR EACH ROW" };
+    const moved: NamedText = .{ .name = "t", .body = "BEFORE UPDATE FOR", .tail = "EACH ROW" };
+    // Concatenating the halves would make these one text. The separator is
+    // what keeps them two.
+    try testing.expect(!split.sameAs(moved));
+}
+
+test "a Row that names neither word has neither, so a table with nothing on it stays empty" {
+    const desc = comptime descOf(Pg, User);
+    try testing.expectEqual(@as(usize, 0), desc.checks.len);
+    try testing.expectEqual(@as(usize, 0), desc.triggers.len);
 }

@@ -126,6 +126,11 @@ pub const State = struct {
     /// files and no snapshot is a broken checkout rather than a fresh start,
     /// and `generate` says so rather than writing every table again.
     had_snapshot: bool,
+    /// Which shape the snapshot turned out to be in. `.upgraded` means an
+    /// older nilo wrote it and this one read it anyway, which is worth saying
+    /// once on screen because the file is still the old one until the next
+    /// `generate` rewrites it.
+    origin: snapshot.Origin = .current,
     /// Every version file, by number ascending.
     entries: []const Entry,
 
@@ -135,9 +140,38 @@ pub const State = struct {
     }
 };
 
+/// What `readWith` is allowed to do, for the two callers that want less than
+/// everything.
+pub const Read = struct {
+    /// Read `snapshot.zon` as well as the version files.
+    ///
+    /// **`--baseline` sets this false**, and that is a fix rather than an
+    /// optimisation: it derives from nothing, and the file it would otherwise
+    /// parse is exactly the one a shape change has just invalidated. Reading
+    /// it first made the one command that exists to get out of that state the
+    /// one command that could not run
+    /// ([ADR 0224](../docs/adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
+    snapshot: bool = true,
+    /// Where `std.zon` writes the line, the column and the offending text of a
+    /// parse failure. Worth passing wherever a person will read the result.
+    diag: ?*std.zon.parse.Diagnostics = null,
+};
+
 /// Read the directory. Everything is allocated out of `gpa`, which is an arena
 /// in every caller worth having.
 pub fn read(gpa: std.mem.Allocator, io: Io, dir: Dir, comptime D: type) !State {
+    return readWith(gpa, io, dir, D, .{});
+}
+
+/// The same, for a caller that does not want the snapshot or does want the
+/// diagnostics.
+pub fn readWith(
+    gpa: std.mem.Allocator,
+    io: Io,
+    dir: Dir,
+    comptime D: type,
+    opts: Read,
+) !State {
     var entries: std.ArrayList(Entry) = .empty;
 
     var it = dir.iterate();
@@ -153,6 +187,13 @@ pub fn read(gpa: std.mem.Allocator, io: Io, dir: Dir, comptime D: type) !State {
         if (e.number == entries.items[i].number) return Error.DuplicateVersion;
     }
 
+    const nothing: State = .{
+        .before = snapshot.empty(D),
+        .had_snapshot = false,
+        .entries = entries.items,
+    };
+    if (!opts.snapshot) return nothing;
+
     const text = dir.readFileAllocOptions(
         io,
         snapshot_file,
@@ -161,17 +202,15 @@ pub fn read(gpa: std.mem.Allocator, io: Io, dir: Dir, comptime D: type) !State {
         .of(u8),
         0,
     ) catch |err| switch (err) {
-        error.FileNotFound => return .{
-            .before = snapshot.empty(D),
-            .had_snapshot = false,
-            .entries = entries.items,
-        },
+        error.FileNotFound => return nothing,
         else => return err,
     };
 
+    var origin: snapshot.Origin = .current;
     return .{
-        .before = try snapshot.parse(gpa, text, null),
+        .before = try snapshot.parseWith(gpa, text, opts.diag, &origin),
         .had_snapshot = true,
+        .origin = origin,
         .entries = entries.items,
     };
 }
@@ -229,6 +268,15 @@ pub const Options = struct {
     /// [ADR 0223](../docs/adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)
     /// is about. Everything outside the version file's generated block is kept.
     baseline: bool = false,
+    /// The versions this binary was built with, from the generated manifest.
+    ///
+    /// **Only the `.sql` twins read it**, and it is what makes them possible at
+    /// all: a version's hash is chained onto the one before it, and the file
+    /// being written is the one version not yet compiled into anything. Empty
+    /// means no twin is written, which is what a library caller with no
+    /// manifest to hand gets
+    /// ([ADR 0227](../docs/adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).
+    versions: []const Version = &.{},
 };
 
 /// What `generate` did, and why it did not do more.
@@ -244,6 +292,15 @@ pub const Outcome = struct {
     /// `--baseline` does this, and it is worth saying out loud because the
     /// word on screen is the difference between "wrote" and "kept your half".
     rewrote: bool = false,
+    /// How many `.sql` twins were written or brought back into line.
+    twins: usize = 0,
+    /// The twins could not be written, because this binary holds a version file
+    /// it did not compile: `--baseline` replaced a generated block, and the
+    /// hand-written steps either side of it are in the new `.zig` and not in
+    /// anything running. One rebuild and one more `db generate` or `db check`
+    /// closes it, and `check` refuses until then
+    /// ([ADR 0227](../docs/adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).
+    twins_deferred: bool = false,
 
     /// The schema and the types already agree.
     pub fn isEmpty(self: Outcome) bool {
@@ -290,14 +347,27 @@ pub fn generate(
 ) !Outcome {
     try checkName(opts.name);
 
-    const state = try read(gpa, io, dir, D);
+    // **The snapshot is not read at all under `--baseline`**, and reading it
+    // first was the whole of the bug: the one command that gets a repository
+    // out of a snapshot it can no longer parse was the one command that
+    // stopped on it (ADR 0224).
+    const state = try readWith(gpa, io, dir, D, .{ .snapshot = !opts.baseline });
     if (opts.baseline) return baseline(gpa, io, dir, D, desired, opts, state);
 
     const change = try migrate.plan(gpa, D, desired, state.before);
 
-    if (change.isEmpty()) return .{ .plan = change };
-    if (change.problems.len > 0) return .{ .plan = change };
-    if (change.destructive() and !opts.allow_destructive) return .{ .plan = change };
+    // **The twins are refreshed whether or not there is a new version**, which
+    // is what makes `check`'s "any `db generate` writes them" true. A schema
+    // that has not moved is exactly when a stale `.sql` is easiest to leave
+    // behind: nothing else in this command has anything to do.
+    if (change.isEmpty() or change.problems.len > 0 or
+        (change.destructive() and !opts.allow_destructive))
+    {
+        return .{
+            .plan = change,
+            .twins = try writeSql(gpa, io, dir, D, opts.versions, state.entries),
+        };
+    }
 
     const number = state.head() + 1;
     const file = try std.fmt.allocPrint(gpa, "{d:0>4}_{s}.zig", .{ number, opts.name });
@@ -312,7 +382,46 @@ pub fn generate(
     with_new[state.entries.len] = .{ .number = number, .name = opts.name, .file = file };
 
     try writeManifestAndSnapshot(gpa, io, dir, D, desired, opts, with_new, number);
-    return .{ .plan = change, .file = file, .number = number };
+
+    // **The version just written is the one version no binary has compiled**,
+    // and its twin is still exact: `renderVersion` writes `before` and `after`
+    // empty, so its steps are the ones in hand. Everything before it comes out
+    // of the manifest this binary was built with.
+    const all = try withNew(gpa, opts.versions, number, opts.name, change.steps);
+    const twins = if (all) |list|
+        try writeSql(gpa, io, dir, D, list, with_new)
+    else
+        0;
+    return .{
+        .plan = change,
+        .file = file,
+        .number = number,
+        .twins = twins,
+        .twins_deferred = all == null and opts.versions.len > 0,
+    };
+}
+
+/// The compiled versions plus the one `generate` has just written, or null when
+/// the two do not line up.
+///
+/// They fail to line up when the binary is behind the directory — somebody
+/// generated, did not rebuild, and generated again. Chaining a hash onto a
+/// parent that is not the real parent would put a wrong hash in a file people
+/// apply by hand, so the honest answer is to write no twin and say so.
+fn withNew(
+    gpa: std.mem.Allocator,
+    versions: []const Version,
+    number: u32,
+    name: []const u8,
+    steps: []const Step,
+) !?[]const Version {
+    if (versions.len != number - 1) return null;
+    if (versions.len > 0 and versions[versions.len - 1].number != @as(i64, number) - 1) return null;
+
+    const out = try gpa.alloc(Version, versions.len + 1);
+    @memcpy(out[0..versions.len], versions);
+    out[versions.len] = .{ .number = number, .name = name, .steps = steps };
+    return out;
 }
 
 /// `--baseline`: diff against nothing and rewrite version 1 where it stands.
@@ -361,7 +470,27 @@ fn baseline(
 
     const only: []const Entry = &.{.{ .number = 1, .name = opts.name, .file = file }};
     try writeManifestAndSnapshot(gpa, io, dir, D, desired, opts, only, 1);
-    return .{ .plan = change, .file = file, .number = 1, .rewrote = rewrote };
+
+    // A rewrite keeps whatever is in `before` and `after`, and those are Zig
+    // this binary cannot read and did not compile — so the version's real steps
+    // are not in hand and its twin would be a file that says the wrong thing.
+    // A first derivation has neither half, so that one is exact.
+    const twins = if (rewrote) 0 else try writeSql(
+        gpa,
+        io,
+        dir,
+        D,
+        &.{.{ .number = 1, .name = opts.name, .steps = change.steps }},
+        only,
+    );
+    return .{
+        .plan = change,
+        .file = file,
+        .number = 1,
+        .rewrote = rewrote,
+        .twins = twins,
+        .twins_deferred = rewrote,
+    };
 }
 
 /// The two files that follow a version file, in the order that survives a run
@@ -387,6 +516,166 @@ fn writeManifestAndSnapshot(
         .sub_path = snapshot_file,
         .data = try snapshot.render(gpa, doc),
     });
+}
+
+// -- the twin a database gets without a compiler --------------------------
+
+/// The `.sql` beside `NNNN_name.zig`, as text. Caller frees.
+///
+/// **An output and never an input**
+/// ([ADR 0227](../docs/adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).
+/// Authoring stays Zig, for every reason ADR 0153 gives; what does not have to
+/// be Zig is *applying* a version, and today it is — `status --sql` opens a
+/// database to work out which versions are waiting, so somebody with `psql` and
+/// no toolchain cannot get the statements at all.
+///
+/// Three things go in that `status --sql` leaves out, and each of them is what
+/// makes the file usable on its own: the ledger table, created if it is not
+/// there, so a fresh database takes version 1; `BEGIN`/`COMMIT`, so a version
+/// that fails halfway leaves nothing; and the ledger row, so a database brought
+/// to head by hand satisfies `db.expecting(manifest.head)` on the next boot
+/// rather than refusing to serve.
+pub fn renderSql(
+    gpa: std.mem.Allocator,
+    comptime D: type,
+    version: Version,
+    name: []const u8,
+    hash: []const u8,
+    source: []const u8,
+) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try w.print(
+        \\-- Written by `db generate` from {s}, and committed.
+        \\--
+        \\-- The same steps that file runs, for a database no Zig toolchain can
+        \\-- reach: `psql -f`, a CI job with no compiler, somebody on a jump host.
+        \\-- nilo reads the `.zig` and never this; `db check` fails when the two
+        \\-- have come apart, so they cannot quietly disagree.
+        \\--
+        \\-- It carries its own ledger row, so a database brought to head this way
+        \\-- is a database `db.expecting(manifest.head)` will serve.
+        \\
+        \\BEGIN;
+        \\
+        \\
+    , .{source});
+
+    try w.print("{s};\n\n", .{comptime ddl.createIfMissing(D, migrate.Applied)});
+
+    for (version.steps) |step| {
+        var lines = std.mem.splitScalar(u8, step.why, '\n');
+        while (lines.next()) |line| try w.print("-- {s}\n", .{line});
+        if (step.destructive) try w.writeAll("-- This one loses data that nothing brings back.\n");
+        if (step.needs_backfill) try w.writeAll(
+            "-- This one can fail on a table that already has rows.\n",
+        );
+        try w.print("{s};\n\n", .{step.sql});
+    }
+
+    const ledger = comptime D.qualify(null, @import("row.zig").tableOf(migrate.Applied));
+    try w.print("INSERT INTO {s} (", .{ledger});
+    inline for (@typeInfo(migrate.Applied).@"struct".fields, 0..) |f, i| {
+        if (i > 0) try w.writeAll(", ");
+        try w.writeAll(comptime D.quote(f.name));
+    }
+    try w.print(")\nVALUES ({d}, '", .{version.number});
+    try writeSqlLiteral(w, name);
+    try w.writeAll("', '");
+    try writeSqlLiteral(w, hash);
+    // Zero milliseconds, because nobody timed it. The column is what an
+    // operator reads when they ask which migration is the slow one, and a
+    // number invented here would be a worse answer than none.
+    try w.print("', {s}, 0);\n\nCOMMIT;\n", .{D.now_default});
+    return aw.toOwnedSlice();
+}
+
+/// One piece of text inside a SQL literal, with a quote doubled — the same rule
+/// `ddl.zig` applies to a word out of a snapshot.
+fn writeSqlLiteral(w: *std.Io.Writer, text: []const u8) !void {
+    for (text) |ch| {
+        if (ch == '\'') try w.writeAll("'");
+        try w.writeByte(ch);
+    }
+}
+
+/// `0007_name.zig` becomes `0007_name.sql`.
+pub fn sqlTwin(gpa: std.mem.Allocator, file: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}.sql", .{file[0 .. file.len - ".zig".len]});
+}
+
+/// Write the twin for every version this binary holds, and say how many files
+/// changed.
+///
+/// Every version rather than the new one: a twin is regenerated whenever the
+/// `.zig` beside it is, and the cheapest way to hold that is to write them all
+/// and compare. Sixty versions of a ported schema is a few hundred kilobytes,
+/// once, at the command line.
+pub fn writeSql(
+    gpa: std.mem.Allocator,
+    io: Io,
+    dir: Dir,
+    comptime D: type,
+    versions: []const Version,
+    entries: []const Entry,
+) !usize {
+    const chain = try migrate.chainOf(gpa, versions);
+    var written: usize = 0;
+    for (chain.versions, chain.hashes) |v, hash| {
+        const entry = entryFor(entries, v.number) orelse continue;
+        const twin = try sqlTwin(gpa, entry.file);
+        const text = try renderSql(gpa, D, v, entry.name, hash, entry.file);
+        if (try sameOnDisk(gpa, io, dir, twin, text)) continue;
+        try dir.writeFile(io, .{ .sub_path = twin, .data = text });
+        written += 1;
+    }
+    return written;
+}
+
+/// The twins that are missing or no longer say what their version says, by file
+/// name. What `check` reports, so that a stale `.sql` is a red build rather
+/// than something somebody applies by hand six months later.
+pub fn staleSql(
+    gpa: std.mem.Allocator,
+    io: Io,
+    dir: Dir,
+    comptime D: type,
+    versions: []const Version,
+    entries: []const Entry,
+) ![]const []const u8 {
+    const chain = try migrate.chainOf(gpa, versions);
+    var out: std.ArrayList([]const u8) = .empty;
+    for (chain.versions, chain.hashes) |v, hash| {
+        const entry = entryFor(entries, v.number) orelse continue;
+        const twin = try sqlTwin(gpa, entry.file);
+        const text = try renderSql(gpa, D, v, entry.name, hash, entry.file);
+        if (try sameOnDisk(gpa, io, dir, twin, text)) continue;
+        try out.append(gpa, twin);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn entryFor(entries: []const Entry, number: i64) ?Entry {
+    for (entries) |e| {
+        if (e.number == number) return e;
+    }
+    return null;
+}
+
+fn sameOnDisk(
+    gpa: std.mem.Allocator,
+    io: Io,
+    dir: Dir,
+    file: []const u8,
+    text: []const u8,
+) !bool {
+    const old = dir.readFileAlloc(io, file, gpa, .limited(max_version)) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return std.mem.eql(u8, old, text);
 }
 
 // -- what a generated file looks like -------------------------------------
@@ -1047,6 +1336,148 @@ test "a baseline derives version 1 again and keeps the half somebody wrote" {
     )).isEmpty());
 }
 
+/// A Row with a foreign key, because a foreign key is the whole of what the
+/// older snapshot shape spelled differently.
+const Member = struct {
+    pub const nilo_table = .{
+        .name = "members",
+        .key = .id,
+        .references = .{ .org_id = .{ Org, .id } },
+    };
+
+    id: i64,
+    org_id: i64,
+};
+
+const MemberNoted = struct {
+    pub const nilo_table = .{
+        .name = "members",
+        .key = .id,
+        .references = .{ .org_id = .{ Org, .id } },
+    };
+
+    id: i64,
+    org_id: i64,
+    note: ?[]const u8,
+};
+
+/// The same two tables as v0.4.0 wrote them: `.column` and `.target` on the
+/// reference, one name each rather than a list.
+const older_snapshot =
+    \\.{
+    \\    .version = 1,
+    \\    .dialect = "postgres",
+    \\    .tables = .{
+    \\        .{
+    \\            .table = "orgs",
+    \\            .keys = .{"id"},
+    \\            .columns = .{
+    \\                .{ .name = "id", .sql_type = "int8", .key = true, .generated = true },
+    \\                .{ .name = "name", .sql_type = "text" },
+    \\            },
+    \\        },
+    \\        .{
+    \\            .table = "members",
+    \\            .keys = .{"id"},
+    \\            .columns = .{
+    \\                .{ .name = "id", .sql_type = "int8", .key = true, .generated = true },
+    \\                .{ .name = "org_id", .sql_type = "int8" },
+    \\            },
+    \\            .references = .{
+    \\                .{
+    \\                    .name = "members_org_id_fkey",
+    \\                    .column = "org_id",
+    \\                    .table = "orgs",
+    \\                    .target = "id",
+    \\                },
+    \\            },
+    \\        },
+    \\    },
+    \\}
+    \\
+;
+
+test "a baseline does not read the snapshot it is there to replace" {
+    // **The bug this is the regression test for.** `generate` read the
+    // snapshot before it looked at `opts.baseline`, so the one command that
+    // gets a repository out of a snapshot it can no longer parse was the one
+    // command that stopped on it — and it stopped with forty lines of stack
+    // trace, because nothing handed `std.zon` a `Diagnostics` either.
+    //
+    // It is tested here, through `generate`, rather than against
+    // `snapshot.parse`. A test one layer under the bug is what let this ship:
+    // `snapshot.zig` proved the parse refused an older file and stayed green
+    // while no caller could act on the refusal
+    // ([ADR 0224](../docs/adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    try box.overwrite(snapshot_file, "this is not zon at all {{{\n");
+
+    const out = try generate(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        comptime migrate.tablesOf(Pg, &.{Org}),
+        .{ .name = "schema", .baseline = true },
+    );
+    try testing.expectEqualStrings("0001_schema.zig", out.file.?);
+
+    // And the file it could not read is gone, replaced by one it wrote.
+    const state = try read(box.a(), box.io(), box.dir(), Pg);
+    try testing.expectEqual(@as(u32, 1), state.before.version);
+    try testing.expectEqual(snapshot.Origin.current, state.origin);
+}
+
+test "an older snapshot is understood, so a generate against it is a diff and not a rewrite" {
+    // Not a baseline: an ordinary `generate` in a repository whose snapshot a
+    // previous release wrote. Every page says `db generate` is the answer to
+    // "your snapshot is older", and that has to be true at any version,
+    // because `--baseline` refuses to re-derive once there is a version 2.
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    try box.overwrite(snapshot_file, older_snapshot);
+    try box.overwrite("0001_orgs_and_members.zig", "");
+
+    const state = try read(box.a(), box.io(), box.dir(), Pg);
+    try testing.expectEqual(snapshot.Origin.upgraded, state.origin);
+    try testing.expectEqual(@as(u32, 1), state.before.version);
+
+    // **The strong assertion**: against the Rows that file describes, the
+    // upgraded document says there is nothing to do. A foreign key read into
+    // the wrong shape would show up here as a reference that changed.
+    try testing.expect((try check(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        comptime migrate.tablesOf(Pg, &.{ Member, Org }),
+    )).isEmpty());
+
+    // So one new column is one step, rather than a `CREATE TABLE` for a table
+    // that has been there since version 1.
+    const out = try generate(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        comptime migrate.tablesOf(Pg, &.{ MemberNoted, Org }),
+        .{ .name = "add_note" },
+    );
+    try testing.expectEqualStrings("0002_add_note.zig", out.file.?);
+    try testing.expectEqual(@as(usize, 1), out.plan.steps.len);
+    try testing.expectEqual(migrate.Kind.add_column, out.plan.steps[0].kind);
+
+    // And what it wrote is in the current shape, so the upgrade happens once
+    // rather than on every run from here on.
+    const after = try read(box.a(), box.io(), box.dir(), Pg);
+    try testing.expectEqual(snapshot.Origin.current, after.origin);
+}
+
 test "a baseline in a directory that has moved past version 1 is refused" {
     const gpa = testing.allocator;
     var box = try Sandbox.init(gpa);
@@ -1159,5 +1590,179 @@ test "the splice keeps every byte outside the two markers, and only those" {
     try testing.expectError(
         Error.NoGeneratedBlock,
         spliceGenerated(gpa, "// nilo:generated begin\nand no end\n", &.{}),
+    );
+}
+
+// -- the `.sql` twin (ADR 0227) -------------------------------------------
+
+test "a version written with no manifest to hand gets no twin, and says nothing about one" {
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    const desired = comptime migrate.tablesOf(Pg, &.{ User, Org });
+    const out = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "initial" });
+
+    // `versions` is empty, which is what a library caller with no generated
+    // manifest has. Version 1's parent is `""` either way, so the twin is still
+    // exact — `withNew` lets it through on `versions.len == number - 1`.
+    try testing.expectEqual(@as(usize, 1), out.twins);
+    try testing.expect(!out.twins_deferred);
+    _ = try box.slurp("0001_initial.sql");
+}
+
+test "the twin is the version's statements, the ledger table and the ledger row" {
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    const desired = comptime migrate.tablesOf(Pg, &.{Org});
+    _ = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "initial" });
+
+    const text = try box.slurp("0001_initial.sql");
+
+    // Wrapped, so a version that fails halfway leaves nothing behind.
+    try testing.expect(std.mem.indexOf(u8, text, "\nBEGIN;\n") != null);
+    try testing.expect(std.mem.endsWith(u8, text, "COMMIT;\n"));
+
+    // The ledger, made if it is not there, or a fresh database cannot take
+    // version 1 at all.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        text,
+        "CREATE TABLE IF NOT EXISTS \"nilo_migrations\"",
+    ) != null);
+
+    // The statement itself, with its `why` above it as a comment.
+    try testing.expect(std.mem.indexOf(u8, text, "-- create orgs\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "CREATE TABLE \"orgs\" (") != null);
+
+    // And the row that makes applying it by hand enough.
+    var chained: [64]u8 = undefined;
+    const hash = migrate.hashOf("", (try migrate.plan(
+        box.a(),
+        Pg,
+        desired,
+        snapshot.empty(Pg),
+    )).steps, &chained);
+    const row = try std.fmt.allocPrint(
+        box.a(),
+        "INSERT INTO \"nilo_migrations\" (\"version\", \"name\", \"hash\", " ++
+            "\"applied_at\", \"ms\")\nVALUES (1, 'initial', '{s}', now(), 0);",
+        .{hash},
+    );
+    try testing.expect(std.mem.indexOf(u8, text, row) != null);
+}
+
+test "a twin somebody edited is written again by the next generate, and named by check" {
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    const desired = comptime migrate.tablesOf(Pg, &.{Org});
+    _ = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "initial" });
+
+    const version: Version = .{
+        .number = 1,
+        .name = "initial",
+        .steps = (try migrate.plan(box.a(), Pg, desired, snapshot.empty(Pg))).steps,
+    };
+    const state = try read(box.a(), box.io(), box.dir(), Pg);
+
+    // Nothing wrong with it yet.
+    try testing.expectEqual(@as(usize, 0), (try staleSql(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        &.{version},
+        state.entries,
+    )).len);
+
+    try box.overwrite("0001_initial.sql", "DROP TABLE \"orgs\";\n");
+    const stale = try staleSql(box.a(), box.io(), box.dir(), Pg, &.{version}, state.entries);
+    try testing.expectEqual(@as(usize, 1), stale.len);
+    try testing.expectEqualStrings("0001_initial.sql", stale[0]);
+
+    // And any `generate` puts it back, including one with nothing to generate —
+    // which is exactly when a stale twin is easiest to leave behind.
+    const again = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{
+        .name = "initial",
+        .versions = &.{version},
+    });
+    try testing.expect(again.isEmpty());
+    try testing.expectEqual(@as(usize, 1), again.twins);
+    try testing.expectEqual(@as(usize, 0), (try staleSql(
+        box.a(),
+        box.io(),
+        box.dir(),
+        Pg,
+        &.{version},
+        state.entries,
+    )).len);
+}
+
+test "a second version's twin is chained onto the first, so the hash is the one verify holds" {
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    const first = comptime migrate.tablesOf(Pg, &.{Org});
+    _ = try generate(box.a(), box.io(), box.dir(), Pg, first, .{ .name = "initial" });
+
+    const one: Version = .{
+        .number = 1,
+        .name = "initial",
+        .steps = (try migrate.plan(box.a(), Pg, first, snapshot.empty(Pg))).steps,
+    };
+
+    const second = comptime migrate.tablesOf(Pg, &.{Noted});
+    const out = try generate(box.a(), box.io(), box.dir(), Pg, second, .{
+        .name = "orgs_get_a_note",
+        .versions = &.{one},
+    });
+    try testing.expectEqual(@as(u32, 2), out.number);
+    // Both twins: the one that was already right is compared and left alone,
+    // and the new one is written.
+    try testing.expectEqual(@as(usize, 1), out.twins);
+
+    const chain = try migrate.chainOf(box.a(), &.{
+        one,
+        .{ .number = 2, .name = "orgs_get_a_note", .steps = out.plan.steps },
+    });
+    const text = try box.slurp("0002_orgs_get_a_note.sql");
+    try testing.expect(std.mem.indexOf(u8, text, chain.hashes[1]) != null);
+    // Not the unchained one, which is what a twin written in isolation would
+    // have carried.
+    var alone: [64]u8 = undefined;
+    try testing.expect(std.mem.indexOf(
+        u8,
+        text,
+        migrate.hashOf("", out.plan.steps, &alone),
+    ) == null);
+}
+
+test "a binary behind the directory writes no twin rather than one with a wrong hash" {
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    const first = comptime migrate.tablesOf(Pg, &.{Org});
+    const one = try generate(box.a(), box.io(), box.dir(), Pg, first, .{ .name = "initial" });
+    try testing.expectEqual(@as(u32, 1), one.number);
+
+    // Version 2 generated by a binary that still holds no manifest at all: its
+    // parent hash is unknown, so chaining would invent one.
+    const second = comptime migrate.tablesOf(Pg, &.{Noted});
+    const two = try generate(box.a(), box.io(), box.dir(), Pg, second, .{
+        .name = "orgs_get_a_note",
+        .versions = &.{},
+    });
+    try testing.expectEqual(@as(u32, 2), two.number);
+    try testing.expectEqual(@as(usize, 0), two.twins);
+    try testing.expect(two.twins_deferred == false);
+    try testing.expectError(
+        error.FileNotFound,
+        box.dir().readFileAlloc(box.io(), "0002_orgs_get_a_note.sql", box.a(), .limited(1024)),
     );
 }

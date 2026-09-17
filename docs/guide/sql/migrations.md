@@ -174,6 +174,102 @@ You do not say whether the key is generated. An integer key is
 slug — is a key your insert fills. That is a rule rather than a word, because
 there is no case where you want the other one.
 
+**An array column takes a default like any other**, and `&.{}` is the one every
+`NOT NULL` array column in a hand-written schema has:
+
+<!-- compiles -->
+```zig
+const Agent = struct {
+    pub const nilo_table = .{
+        .name = "agents",
+        .key = .id,
+        .default = .{ .read_tags = &.{}, .write_capabilities = &.{ "deals", "work" } },
+    };
+
+    id: i64,
+    read_tags: []const Str,
+    write_capabilities: []const Str,
+};
+
+comptime {
+    _ = sql.migrate.tablesOf(sql.Postgres, &.{Agent});
+}
+```
+
+Each element goes through the column's own element type, so a number where a
+word goes does not compile. A comma, a brace, a quote, a backslash or an
+apostrophe inside an element is escaped, so the array Postgres stores has as
+many elements as you wrote
+([ADR 0225](../../adr/0225-an-array-column-has-a-default-like-any-other.md)).
+
+## The two words nilo does not read
+
+Everything above is checked by the compiler. Two words are not, on purpose: a
+`CHECK` body and a trigger are SQL, and reading them means shipping a SQL
+parser. What nilo does instead is **own the name and hash the body**
+([ADR 0226](../../adr/0226-the-marker-has-a-word-the-database-checks.md)):
+
+<!-- compiles -->
+```zig
+const Invoice = struct {
+    pub const nilo_table = .{
+        .name = "invoices",
+        .key = .id,
+        .check = .{
+            .invoices_amount_is_positive = "amount > 0",
+            .invoices_dates_run_forwards =
+                "sent_on IS NULL OR paid_on IS NULL OR sent_on <= paid_on",
+            .invoices_kind_is_known = .{ .words_of = .kind },
+        },
+        .trigger = .{
+            .invoices_touch = .{
+                .when = "BEFORE UPDATE",
+                .run = "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+            },
+        },
+    };
+
+    id: i64,
+    amount: i64,
+    kind: enum { sale, refund },
+    sent_on: ?sql.Date,
+    paid_on: ?sql.Date,
+};
+
+comptime {
+    _ = sql.migrate.tablesOf(sql.Postgres, &.{Invoice});
+}
+```
+
+**The key is the name the object goes into the database under.** A `.unique` can
+derive one from its columns; a check has no columns, and a constraint nobody
+named is reported by Postgres under a name it made up. It is also the whole of
+what Postgres says when a row breaks it, so it is worth writing.
+
+The diff has three cases and no fourth: same name and same hash, nothing to do;
+same name and a different hash, drop and create; a name your Rows no longer
+have, drop. The snapshot records the name and sixteen hex characters, not the
+body — a view is sixty lines, and a `.zon` file carrying them stops being
+readable.
+
+**A trigger is two halves because nilo writes `ON "invoices"` between them.**
+The table is the one thing the marker already knows, and a second copy of it
+stops matching the day you rename the table — a trigger left on the old table is
+a trigger that quietly stops running. `.when` is what goes before, `.run` is
+what goes after.
+
+`.{ .words_of = .kind }` is the same `.check` word doing a different job: it
+names the `CHECK` an enum column already generates, instead of letting it be
+`invoices_kind_check`. Moving that name is a migration, because the constraint
+in your database still has the old one.
+
+What this does not do is check your SQL. The database does, inside the version's
+transaction, which is the same moment a `.data` step is checked. A `CHECK` rides
+inside the `CREATE TABLE`, so SQLite takes it too; *changing* one there is the
+four-statement rebuild every other table constraint needs, and the diff spells
+it out. A trigger is a statement of its own and both databases do all three
+cases.
+
 ## Creating them
 
 <!-- compiles: body -->
@@ -359,7 +455,7 @@ three things nilo cannot guess.
 Add it to your `build.zig` as an executable and you have five commands:
 
 ```console
-$ db check                       # do the Rows and the migrations agree? Exit 1 if not
+$ db check                       # do the Rows, the migrations and the .sql twins agree?
 $ db generate --name add_nickname
 $ db generate --name schema --baseline   # re-derive version 1, keeping your own steps
 $ db status                      # what this database has, and what is waiting
@@ -431,6 +527,52 @@ written again. Do not move or edit either line: a version file that has lost one
 is refused rather than rewritten, because the only other reading is that all of
 it is generated.
 
+### The `.sql` beside it, for a database no Zig can reach
+
+Every version file has a twin, written by the same `generate` and committed
+beside it:
+
+```
+migrations/0007_work_items_get_a_priority.zig
+migrations/0007_work_items_get_a_priority.sql
+```
+
+It is the same steps in the same order, each with its `why` above it as a
+comment, wrapped in `BEGIN`/`COMMIT`, with the ledger table created if it is not
+there and the ledger row on the end:
+
+```sql
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS "nilo_migrations" ( … );
+
+-- add work_items.priority
+ALTER TABLE "work_items" ADD COLUMN "priority" text NOT NULL DEFAULT 'normal';
+
+INSERT INTO "nilo_migrations" ("version", "name", "hash", "applied_at", "ms")
+VALUES (7, 'work_items_get_a_priority', '9f3c…', now(), 0);
+
+COMMIT;
+```
+
+That last row is what makes it worth having. `psql -f`, a CI job with no
+toolchain, dbmate, or somebody on a jump host can bring a database to head, and
+`db.expecting(manifest.head)` still serves it and `db verify` still holds it to
+the hash. Without the row the database is at 7 and the ledger says 6, and the
+next boot refuses to serve.
+
+**It is an output.** nilo reads the `.zig` and never this, and a version written
+in SQL by somebody else is not picked up — authoring stays Zig, for the reasons
+[ADR 0153](../../adr/0153-a-migration-is-a-diff-against-a-snapshot.md) gives.
+`db check` fails when a twin no longer matches the version beside it, so it
+cannot go stale in a branch nobody rebuilt, and any `db generate` writes it
+again ([ADR 0227](../../adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).
+
+One case writes nothing and says so: `--baseline` rewriting a version 1 whose
+`before` or `after` hold steps of your own. Those are Zig nothing has compiled
+yet, so the twin's hash cannot be worked out. Build, then run `db check`, which
+names the file, and any `db generate` writes it.
+
 ### Porting an existing schema
 
 Porting is not "add a column". It is one version written over and over until it
@@ -446,8 +588,16 @@ The generated block is new; everything else in the file is as you left it.
 
 It ignores `snapshot.zon` entirely, diffs your Rows against nothing, and
 rewrites version 1 where it stands, along with the manifest and the snapshot —
-so `db check` straight afterwards is green. Run it as many times as the port
-takes.
+so `db check` straight afterwards is green, once the `.sql` twin has caught up.
+Run it as many times as the port takes.
+
+**A snapshot an older nilo wrote is read, not refused.** If you upgrade nilo and
+the file is in a shape this version no longer writes, `generate` says one line
+about it, diffs against it anyway and writes the current shape out. You do not
+have to delete anything, which matters because deleting the snapshot at version
+7 makes the next `generate` write a version 8 that creates every table you
+already have
+([ADR 0224](../../adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
 
 It refuses in three places rather than doing something you cannot undo: when the
 directory holds a version it is not re-deriving (version 2 is a diff against

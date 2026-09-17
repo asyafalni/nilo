@@ -28,6 +28,21 @@
 > and does not replace it: `reset` drops what the database holds, `--baseline`
 > touches three files and no database at all.
 
+> **Amended by
+> [ADR 0226](./0226-the-marker-has-a-word-the-database-checks.md).** §"The line"
+> keeps its bar and gains a second kind of word beside it: an object whose
+> **name** the compiler checks and whose **body** only the database can read,
+> compared by hash and never parsed. `.check` and `.trigger` are the two that
+> hang off a table. The refusal of SQL-as-a-string for anything the compiler
+> *could* check is untouched.
+
+> **Amended by
+> [ADR 0227](./0227-a-version-has-a-sql-twin-nobody-reads-back.md).**
+> §"Forward only" is kept and §"A version is Zig" gains a boundary: *authoring*
+> a version stays Zig, and *applying* one no longer has to be. `db generate`
+> writes a `.sql` twin beside each version, ledger row and all, and `db check`
+> fails when one goes stale. It is an output; nilo never reads one back.
+
 **Status:** accepted
 **Amends:** the refusal recorded in the Rows section of
 [`docs/reference.md`](../reference.md), that a Row may not declare an index or a

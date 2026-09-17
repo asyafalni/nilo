@@ -784,6 +784,42 @@ The only part of this work that *is* on a request path is `where.zig`'s join
 loop, and it runs at comptime — the fragment is a constant in the binary, so a
 composite `.exists` costs a longer string literal and no instructions.
 
+### 10d. The second kind of word, an array default and the `.sql` twin: nothing again
+
+**What it answers.** ADR 0226 put `.check` and `.trigger` in the marker, which
+adds two lists to `Desc` and two new diff functions to `migrate.zig`; ADR 0225
+made an array column's default a list; ADR 0227 has `generate` write a `.sql`
+file beside every version and `check` compare the two. ADR 0224 added a mirror
+struct to `snapshot.zig` for an older file. The question is the same one 10b and
+10c asked, and the reason to ask it again is that this round is the first to
+put new code in the *runtime* half of the diff rather than only in `table.zig`.
+
+**How.** The same way, against the same commit as 10c so all four are directly
+comparable: `git archive HEAD | tar -x` into a scratch directory,
+`zig build size-sql` on both sides, stripped `ReleaseFast`, and `cmp` rather
+than a size comparison.
+
+| | before | after | Δ |
+|---|---|---|---|
+| names `sql.Db` (Postgres) | 1,800,600 | 1,800,600 | **0** |
+| names `sql.Sqlite` | 2,305,584 | 2,305,584 | **0** |
+
+`cmp` reports both pairs identical byte for byte, and the absolutes have not
+moved since 10b — the second round in a row where nothing shipped in between.
+
+**What it changed.** Nothing, and the reason is the layering rather than luck.
+`diffChecks`, `diffTriggers`, `renderSql` and `snapshot.upgraded` are all
+reachable from `migrate.plan` and `migrations.generate`, and a server reaches
+`migrate` through `apply`, `expect` and `createMissing` — never through `plan`.
+The two new Dialect declarations, `trigger_drop_names_table` and
+`trigger_repeatable_head`, are a `bool` and a string literal that a program
+naming no trigger never references.
+
+**What it does cost is disk, and it is worth writing down because it is the
+first axis in this file that is not the binary.** The `.sql` twin is roughly the
+size of the version file beside it, once per version, committed. A ported schema
+of sixty tables is a few hundred kilobytes of `CREATE TABLE` written twice.
+
 ## Reproducing this
 
 ```bash

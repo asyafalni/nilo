@@ -3323,3 +3323,49 @@ concatenated — would have shipped having never been handed to a compiler. It
 does work. Nothing in the suite said so until a test wrote the line out where
 the compiler sees it
 ([ADR 0223](./adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)).
+
+## A test one layer under the bug stays green while nobody can reach it
+
+**`snapshot.zig` had a green test for a refusal no caller could produce.** It
+called `snapshot.parse` directly, handed it a `Diagnostics`, and asserted the
+sentence. Every layer between it and a person — `read`, `generate`,
+`doGenerate` — passed `null`, so what a user got was `error.ParseZon` and forty
+lines of stack. The fix is not a better assertion; it is choosing the layer. The
+replacement tests write a file into a temporary directory and call `generate`,
+which is the path a person takes
+([ADR 0224](./adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
+
+**Two bugs hid behind that one, and both were in shipped documentation.** ADR
+0222 said an older snapshot "is refused with a parse diagnostic naming
+`column`" — true of the function, false of the tool. The CHANGELOG said
+"`db generate` rewrites it" — false for every repository past version 1, because
+`generate` reads the snapshot before writing one and `--baseline` is refused
+under a version 2. Both were written by somebody who had read the code. **An
+instruction in a release note is a claim with no run behind it**, which is the
+same decay `bench/result/` exists to stop for numbers.
+
+**A rename is the one snapshot change that costs a mirror struct forever.**
+`std.zon` fills a *missing* field from its default, so every word the marker has
+gained since ADR 0153 was free. `.column` → `.columns` was not, and the price is
+an `Older` struct that is read, never written, and lives until 1.0. That is now
+the visible bar for the next rename.
+
+**`std.zon.parse.fromSliceAlloc` leaks on a failing parse when `diag` is
+null.** It owns the ast and the zoir either way; with `null` it frees the two it
+can see and not what `fromZoirAlloc` made. Four lines of std and no nilo
+reproduce it — worth isolating that way before believing a leak is yours. The
+workaround is a local `Diagnostics` nobody reads, deinit'd, which is also what
+the rest of this change wanted anyway.
+
+**`&.{ "a", "b" }` is a pointer to an anonymous tuple *struct*, not to an
+array.** A predicate written to recognise a list looked for `.array` behind a
+`.one` pointer and matched `&.{}` and nothing else, so every non-empty array
+default fell through to the "this is not a literal" refusal
+([ADR 0225](./adr/0225-an-array-column-has-a-default-like-any-other.md)).
+
+**The test that runs the generated file is the one that finds the generated
+file's bugs.** The `.sql` twin had four tests comparing its text against
+expected text, all green, and an `INSERT` whose column list was opened and never
+closed. What found it was the fifth: hand the statements to a real database in
+order and then ask `migrate.expect`, which is what a server does at boot
+([ADR 0227](./adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).

@@ -102,18 +102,130 @@ pub fn render(gpa: std.mem.Allocator, doc: Doc) ![]u8 {
     return aw.toOwnedSlice();
 }
 
+/// Where the `Doc` that came back was written in the shape this version
+/// writes, or in one an older nilo wrote and this one still reads.
+pub const Origin = enum { current, upgraded };
+
 /// Read one back.
 ///
 /// `diag` is optional and worth passing: `std.zon` formats a parse failure with
 /// the line, the column and the offending text, which is a better sentence than
-/// anything this file would write about a file somebody edited.
+/// anything this file would write about a file somebody edited. **Every caller
+/// that shows a person the failure passes one** — `sql/cli.zig` does, and a
+/// `null` there is how a stack trace reached a user once.
 pub fn parse(
     gpa: std.mem.Allocator,
     text: [:0]const u8,
     diag: ?*std.zon.parse.Diagnostics,
 ) !Doc {
-    return std.zon.parse.fromSliceAlloc(Doc, gpa, text, diag, .{});
+    return parseWith(gpa, text, diag, null);
 }
+
+/// The same, saying which shape the file turned out to be in.
+pub fn parseWith(
+    gpa: std.mem.Allocator,
+    text: [:0]const u8,
+    diag: ?*std.zon.parse.Diagnostics,
+    origin: ?*Origin,
+) !Doc {
+    if (std.zon.parse.fromSliceAlloc(Doc, gpa, text, diag, .{})) |doc| {
+        if (origin) |o| o.* = .current;
+        return doc;
+    } else |err| {
+        if (err != error.ParseZon) return err;
+        // The older shape, tried second and with no `diag` of its own: the
+        // caller's is already full of what is wrong with the file read as the
+        // current shape, which is the message they want when this fails too.
+        const older = upgraded(gpa, text) catch return err;
+        if (origin) |o| o.* = .upgraded;
+        return older;
+    }
+}
+
+/// v0.4.0's shape, which is the one field rename this module has made
+/// ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+///
+/// **Read, never written**, and it is here because the alternative is a dead
+/// end rather than an inconvenience. `db generate` is what every page tells
+/// somebody to run when their snapshot is older, and `generate` reads the
+/// snapshot before it writes one — so without this the instruction is false
+/// for any repository past version 1, where `--baseline` cannot stand in
+/// because it refuses to re-derive under a version 2.
+///
+/// One mirror struct per shape that renamed a field, and they go at 1.0 with a
+/// line in the CHANGELOG. Nothing else from v0.4.0 needs one: every other word
+/// the marker gained since arrived as a field with a default, and `std.zon`
+/// fills a missing field from its default, which is the property ADR 0221 was
+/// careful to keep and ADR 0222 was not.
+fn upgraded(gpa: std.mem.Allocator, text: [:0]const u8) !Doc {
+    // A `Diagnostics` nobody reads, because `std.zon.parse.fromSliceAlloc`
+    // **leaks on a failing parse when it is handed none** — `zig test` on four
+    // lines of std and no nilo says so. It owns the ast and the zoir either
+    // way; with null it frees the two it can see and not what `fromZoirAlloc`
+    // made. A local one, deinit'd here, gives the allocation an owner.
+    var scratch: std.zon.parse.Diagnostics = .{};
+    defer scratch.deinit(gpa);
+
+    const old = try std.zon.parse.fromSliceAlloc(Older, gpa, text, &scratch, .{});
+
+    const tables = try gpa.alloc(Desc, old.tables.len);
+    for (old.tables, 0..) |t, i| {
+        const refs = try gpa.alloc(table_mod.Reference, t.references.len);
+        for (t.references, 0..) |r, j| {
+            const columns = try gpa.alloc([]const u8, 1);
+            columns[0] = r.column;
+            const targets = try gpa.alloc([]const u8, 1);
+            targets[0] = r.target;
+            refs[j] = .{
+                .name = r.name,
+                .columns = columns,
+                .schema = r.schema,
+                .table = r.table,
+                .targets = targets,
+                .on_delete = r.on_delete,
+            };
+        }
+        tables[i] = .{
+            .schema = t.schema,
+            .table = t.table,
+            .keys = t.keys,
+            .columns = t.columns,
+            .uniques = t.uniques,
+            .indexes = t.indexes,
+            .references = refs,
+            .managed = t.managed,
+        };
+    }
+    return .{ .version = old.version, .dialect = old.dialect, .tables = tables };
+}
+
+const Older = struct {
+    version: u32 = 0,
+    dialect: []const u8,
+    tables: []const Table = &.{},
+
+    const Table = struct {
+        row: []const u8 = "",
+        schema: ?[]const u8 = null,
+        table: []const u8,
+        keys: []const []const u8,
+        columns: []const table_mod.Column,
+        uniques: []const table_mod.Unique = &.{},
+        indexes: []const table_mod.Index = &.{},
+        references: []const Reference = &.{},
+        managed: bool = true,
+    };
+
+    /// The whole of the difference: one column each side rather than a list.
+    const Reference = struct {
+        name: []const u8,
+        column: []const u8,
+        schema: ?[]const u8 = null,
+        table: []const u8,
+        target: []const u8,
+        on_delete: table_mod.OnDelete = .no_action,
+    };
+};
 
 /// Give back what `parse` took. Unnecessary when the allocator was an arena,
 /// which is how a `Run` holds one, and that is the shape to prefer.
@@ -376,17 +488,18 @@ test "a foreign key of two columns is written down as two, and read back as two"
     try testing.expectEqual(table_mod.OnDelete.cascade, fk.on_delete);
 }
 
-test "a snapshot whose foreign keys are the older single-column shape is refused, not read" {
-    // **The break this round makes, as a test rather than as a paragraph.**
+test "a snapshot whose foreign keys are the older single-column shape is upgraded, not refused" {
+    // **The break this round makes, and the way back from it.**
     // `Reference.column` became `columns` and `target` became `targets`, which
-    // is what a foreign key of two columns needs, and `std.zon` has no way to
-    // read the old spelling into the new field. So an older file stops with
-    // the field name in the message, the way `.key` → `.keys` did, and
-    // `db generate` rewrites it from the types
-    // ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+    // is what a foreign key of two columns needs. `std.zon` fills a *missing*
+    // field from its default and has nothing to say about a renamed one, so
+    // the current shape cannot read the old spelling — and the answer every
+    // page gives, `db generate`, reads the snapshot before it writes one. So
+    // the older shape is read by a mirror struct and handed back as the
+    // current one, and the file is rewritten by the generate that follows
+    // ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md),
+    // [ADR 0224](../docs/adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
     const gpa = testing.allocator;
-    var diag: std.zon.parse.Diagnostics = .{};
-    defer diag.deinit(gpa);
 
     const older =
         \\.{
@@ -403,17 +516,52 @@ test "a snapshot whose foreign keys are the older single-column shape is refused
         \\                    .column = "org_id",
         \\                    .table = "orgs",
         \\                    .target = "id",
+        \\                    .on_delete = .cascade,
         \\                },
         \\            },
         \\        },
         \\    },
         \\}
     ;
-    try testing.expectError(error.ParseZon, parse(gpa, older, &diag));
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    var origin: Origin = .current;
+    const doc = try parseWith(arena.allocator(), older, null, &origin);
+    try testing.expectEqual(Origin.upgraded, origin);
+    try testing.expectEqual(@as(u32, 4), doc.version);
+
+    // The one field that moved, read into the list it became — and everything
+    // beside it carried across rather than defaulted.
+    const users = doc.table(null, "users").?;
+    try testing.expectEqual(@as(usize, 1), users.references.len);
+    const fk = users.references[0];
+    try testing.expectEqualStrings("users_org_id_fkey", fk.name);
+    try testing.expectEqual(@as(usize, 1), fk.columns.len);
+    try testing.expectEqualStrings("org_id", fk.columns[0]);
+    try testing.expectEqualStrings("orgs", fk.table);
+    try testing.expectEqual(@as(usize, 1), fk.targets.len);
+    try testing.expectEqualStrings("id", fk.targets[0]);
+    try testing.expectEqual(table_mod.OnDelete.cascade, fk.on_delete);
+}
+
+test "a file that is in neither shape fails with what is wrong about the current one" {
+    // The older shape is tried second and with no diagnostics of its own, so
+    // what a person is shown is still about the file they have rather than
+    // about a struct this module no longer writes.
+    const gpa = testing.allocator;
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(gpa);
+
+    const broken =
+        \\.{ .version = 1, .dialect = "postgres", .tables = .{ .{ .tabel = "users" } } }
+    ;
+    try testing.expectError(error.ParseZon, parse(gpa, broken, &diag));
 
     var buf: [512]u8 = undefined;
     const said = try std.fmt.bufPrint(&buf, "{f}", .{diag});
-    try testing.expect(std.mem.indexOf(u8, said, "column") != null);
+    try testing.expect(std.mem.indexOf(u8, said, "tabel") != null);
 }
 
 test "a snapshot written before these fields existed still parses as the schema it was" {
@@ -466,4 +614,81 @@ test "a snapshot somebody broke says where, rather than failing silently" {
     var w = std.Io.Writer.fixed(&buf);
     try w.print("{f}", .{diag});
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "key") != null);
+}
+
+test "a check and a trigger go into the file as a name and a hash, and no SQL at all" {
+    const gpa = testing.allocator;
+
+    const Ledger = struct {
+        pub const nilo_table = .{
+            .name = "ledgers",
+            .key = .id,
+            .check = .{ .ledgers_amount_is_positive = "amount > 0" },
+            .trigger = .{
+                .ledgers_touch = .{
+                    .when = "BEFORE UPDATE",
+                    .run = "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+                },
+            },
+        };
+
+        id: i64,
+        amount: i64,
+    };
+
+    const migrate = @import("migrate.zig");
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const doc = try migrate.snapshotOf(arena.allocator(), Pg, 1, comptime migrate.tablesOf(
+        Pg,
+        &.{Ledger},
+    ));
+
+    const text = try render(gpa, doc);
+    defer gpa.free(text);
+
+    // **The body is not in the file**, which is the property that keeps a
+    // `.zon` snapshot readable once a schema has sixty-line views in it.
+    try testing.expect(std.mem.indexOf(u8, text, "amount > 0") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "EXECUTE FUNCTION") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "ledgers_amount_is_positive") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "ledgers_touch") != null);
+
+    const zeroed = try gpa.dupeZ(u8, text);
+    defer gpa.free(zeroed);
+    const back = try parse(gpa, zeroed, null);
+    defer free(gpa, back);
+    const t = back.table(null, "ledgers").?;
+    try testing.expectEqual(@as(usize, 1), t.checks.len);
+    try testing.expectEqualStrings("ledgers_amount_is_positive", t.checks[0].name);
+    try testing.expectEqual(@as(usize, 16), t.checks[0].hash.len);
+    try testing.expectEqualStrings("", t.checks[0].body);
+    try testing.expectEqual(@as(usize, 1), t.triggers.len);
+    try testing.expectEqualStrings("ledgers_touch", t.triggers[0].name);
+}
+
+test "a snapshot written before a table could carry a check reads back as one with none" {
+    const gpa = testing.allocator;
+    const text =
+        \\.{
+        \\    .version = 3,
+        \\    .dialect = "postgres",
+        \\    .tables = .{
+        \\        .{
+        \\            .table = "ledgers",
+        \\            .keys = .{"id"},
+        \\            .columns = .{ .{ .name = "id", .sql_type = "int8", .key = true } },
+        \\        },
+        \\    },
+        \\}
+    ;
+
+    const doc = try parse(gpa, text, null);
+    defer free(gpa, doc);
+    // `std.zon` fills a missing field from its default, which is the property
+    // ADR 0221 was careful to keep — so a word added to the marker never needs
+    // a mirror struct the way the `.references` rename did.
+    const t = doc.table(null, "ledgers").?;
+    try testing.expectEqual(@as(usize, 0), t.checks.len);
+    try testing.expectEqual(@as(usize, 0), t.triggers.len);
 }

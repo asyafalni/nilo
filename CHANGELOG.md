@@ -37,18 +37,20 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
   A `sql.migrate.expect(&db, &run, manifest.head)` on its own becomes
   `db.expecting(manifest.head)` beside `db.checking`, and needs no phase.
 
-- **`migrations/snapshot.zon` written before this release is refused, not
-  read.** A foreign key holds a list of columns now rather than one, so
-  `Reference.column` is `columns` and `target` is `targets`. `std.zon` fills a
-  *missing* field from its default and has nothing to say about a renamed one,
-  so an older snapshot comes back as `error.ParseZon` with a diagnostic naming
-  `column`
-  ([ADR 0222](./docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+- **`migrations/snapshot.zon` written before this release is read and
+  upgraded, not refused.** A foreign key holds a list of columns now rather than
+  one, so `Reference.column` is `columns` and `target` is `targets`. `std.zon`
+  fills a *missing* field from its default and has nothing to say about a
+  renamed one, so nilo keeps a mirror of the older shape, tries it when the
+  current one does not parse, and diffs against what comes back
+  ([ADR 0222](./docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md),
+  [ADR 0224](./docs/adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
 
-  What to change: `db generate --name <what you changed>` rewrites it. The
-  tables themselves are unaffected — a one-column foreign key is still written
-  inline and byte for byte as before — so the diff against a live database is
-  empty and the regenerated snapshot is the whole of the change.
+  What to change: nothing. `db generate` says one line noting the file is in
+  the older shape and writes the current one out. The tables themselves are
+  unaffected — a one-column foreign key is still written inline and byte for
+  byte as before — so the diff against a live database is empty and the
+  regenerated snapshot is the whole of the change.
 
 - **A version file now has a generated block rather than being one.** `generate`
   writes a `before`, an `after`, a `version` whose `.steps` is
@@ -143,6 +145,73 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
   derived over and over. Refused once there is a version 2, when `--name`
   disagrees with the version 1 on disk, or when the file has no generated block;
   each message names the files and nothing is written.
+- **A Row can name a `CHECK` and a trigger**, which is the second kind of word
+  ADR 0221 described and did not build
+  ([ADR 0226](./docs/adr/0226-the-marker-has-a-word-the-database-checks.md)):
+
+  ```zig
+  .check = .{
+      .work_items_range_runs_forwards =
+          "start_date IS NULL OR target_date IS NULL OR start_date <= target_date",
+      .work_items_priority_is_known = .{ .words_of = .priority },
+  },
+  .trigger = .{
+      .work_items_updated_at = .{
+          .when = "BEFORE UPDATE",
+          .run = "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+      },
+  },
+  ```
+
+  The key is the name the object goes into the database under, because a check
+  has no column list to derive one from and the name is the whole of what
+  Postgres says when a row breaks it. nilo does not read the body: it writes it,
+  hashes it, and notices when the hash moves — so a changed body is one drop and
+  one create in the version where it changed, and a name the types no longer
+  have is a drop.
+
+  A trigger is two halves because nilo writes `ON "<table>"` between them. The
+  table is the one thing the marker already knows, and a second copy of it is a
+  copy that stops matching the day the table is renamed.
+
+  `.{ .words_of = .<column> }` is how an enum column's generated `CHECK` gets a
+  name of its own instead of `<table>_<column>_check`. Moving that name is a
+  migration: the constraint in the database still has the old one.
+
+  A `CHECK` is written inside the `CREATE TABLE`, so SQLite takes it; changing
+  one there is the four-statement rebuild the diff already spells out for every
+  other table constraint. A trigger is a statement of its own and both databases
+  do all three cases.
+
+  **Postgres 14 is now the floor**, because `createMissing` writes
+  `CREATE OR REPLACE TRIGGER` and no version of Postgres has
+  `CREATE TRIGGER IF NOT EXISTS`. Nothing else in the module needs it.
+- **An array column takes a default like any other**, `.read_tags = &.{}` or
+  `.write_capabilities = &.{ "deals", "work" }`. Each element goes through the
+  column's own element type, and the Postgres array literal is escaped so a
+  comma, a brace, a quote, a backslash or an apostrophe inside an element does
+  not change how many elements there are
+  ([ADR 0225](./docs/adr/0225-an-array-column-has-a-default-like-any-other.md)).
+- **`db generate` writes a `.sql` twin beside every version file**, and
+  `db check` fails when one no longer says what the version beside it says
+  ([ADR 0227](./docs/adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)):
+
+  ```
+  migrations/0007_work_items_get_a_priority.zig
+  migrations/0007_work_items_get_a_priority.sql
+  ```
+
+  The same statements in the same order, wrapped in `BEGIN`/`COMMIT`, with the
+  ledger table created if it is not there and the ledger row on the end — so
+  `psql -f`, a CI job with no toolchain or somebody on a jump host can bring a
+  database to head, and `db.expecting(manifest.head)` still serves it and
+  `verify` still holds the hash. It is an output: nilo reads the `.zig` and
+  never this.
+
+  One case writes nothing and says so. `--baseline` rewriting a version 1 that
+  has hand-written steps in it produces a file whose `before` and `after` are
+  Zig nothing has compiled yet, so the twin's hash cannot be worked out. Build,
+  then run `db check` or any `db generate`.
 - `sql.Db`, `sql.Named`, `sql.Sqlite` and `sql.SqliteNamed` say their own
   name in a nilo message, rather than `db.DbOf(postgres.Wire,…)`.
 

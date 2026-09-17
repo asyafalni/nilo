@@ -793,7 +793,7 @@ fn customerOrders(
 /// only this request ([ADR 0014]) — and outside a server it simply calls the
 /// function, so the test at the bottom is an ordinary call.
 ///
-/// [ADR 0014]: ../../docs/adr/0014-blocking-calls-go-to-a-thread-pool.md
+/// [ADR 0014]: ../../docs/adr/0014-handlers-must-not-block-the-thread.md
 fn daily(orders: *Orders) !Summary {
     return nilo.blocking(Orders.summarise, .{orders});
 }

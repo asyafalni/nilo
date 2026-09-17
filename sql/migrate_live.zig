@@ -970,3 +970,73 @@ test "`status` says `edited` for a version whose file no longer matches what ran
     // And it points at the command that says which, rather than at nothing.
     try testing.expect(std.mem.indexOf(u8, text, "`db verify`") != null);
 }
+
+// -- the `.sql` twin, applied by something that is not nilo (ADR 0227) -----
+
+test "a twin brings a database to head on its own, ledger row and all" {
+    // **The one test that makes the twin a file rather than a claim.** Every
+    // other check on it compares text against text; this one hands the
+    // statements to a database in order and then asks `expect`, which is what a
+    // server does at boot. A twin that does not satisfy that is a twin nobody
+    // should apply.
+    const gpa = testing.allocator;
+    // One connection, so `BEGIN` and `COMMIT` in the file are the same
+    // transaction rather than two connections out of a pool.
+    var fx = try Fixture.initWith(gpa, "twin", .{ .size = 1 }, null);
+    defer fx.deinit(gpa);
+
+    const migrations = @import("migrations.zig");
+    const D = Db.Dialect;
+
+    const tables = comptime migrate.tablesOf(D, &.{ User, Org });
+    const change = try migrate.plan(fx.run.arena(), D, tables, migrate.snapshot.empty(D));
+
+    var hash: [64]u8 = undefined;
+    const text = try migrations.renderSql(
+        fx.run.arena(),
+        D,
+        .{ .number = 1, .name = "initial", .steps = change.steps },
+        "initial",
+        migrate.hashOf("", change.steps, &hash),
+        "0001_initial.zig",
+    );
+
+    // The split is the test's, not nilo's: the file is meant for `psql -f` and
+    // friends, which read a script. What is under test is the statements and
+    // their order.
+    var it = std.mem.splitSequence(u8, text, ";\n");
+    while (it.next()) |chunk| {
+        const statement = std.mem.trim(u8, stripComments(chunk), " \n");
+        if (statement.len == 0) continue;
+        _ = try fx.db.exec(&fx.run, statement, .{});
+    }
+
+    // The tables are there, and so is the row that says so.
+    try testing.expectEqual(@as(i64, 1), try migrate.headVersion(&fx.db, &fx.run));
+    try migrate.expect(&fx.db, &fx.run, 1);
+
+    const applied = (try fx.db.find(migrate.Applied, &fx.run, @as(i64, 1))).?;
+    try testing.expectEqualStrings("initial", applied.name);
+    try testing.expectEqualStrings(&hash, applied.hash);
+    try testing.expectEqual(@as(i64, 0), applied.ms);
+
+    // And the schema the twin built is one nilo's own check accepts, which is
+    // the loop `createMissing` is held to as well.
+    try testing.expectEqual(
+        @as(usize, 0),
+        try fx.db.checkSchema(&.{ User, Org, migrate.Applied }),
+    );
+}
+
+/// The leading `--` lines of one chunk, dropped. A comment is part of the file
+/// and not part of the statement, and only this test ever separates them.
+fn stripComments(chunk: []const u8) []const u8 {
+    var rest = chunk;
+    while (true) {
+        const start = std.mem.indexOfNone(u8, rest, " \n") orelse return "";
+        rest = rest[start..];
+        if (!std.mem.startsWith(u8, rest, "--")) return rest;
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return "";
+        rest = rest[nl + 1 ..];
+    }
+}

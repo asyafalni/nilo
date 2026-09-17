@@ -1202,22 +1202,34 @@ rather than the list being adopted as a list.
 
 ### Next
 
-**1. The marker's second kind of word is decided and not built.**
-[ADR 0221](./adr/0221-the-marker-has-two-kinds-of-word.md) says a diff can own
-a *named text* — same name and hash, nothing to do; new hash, replace; name
-gone, drop — and that this is a second kind of word rather than a refusal. What
-it does not do is build one. `.check` and `.trigger` on a Row, and `functions`,
-`views` and `extensions` on a `sql.Schema` beside the table list, are the five
-the port wanted: 85 CHECKs of which 56 are not an enum's, 31 triggers, one
-view, one extension.
+**1. Three of the five named texts have nowhere to be written, because there is
+no `sql.Schema`.** `.check` and `.trigger` hang off a table and ship
+([ADR 0226](./adr/0226-the-marker-has-a-word-the-database-checks.md)). A
+function, a view and an extension hang off a schema, and the only place to put
+them today is a version file's `before` slot — which works, and which means a
+`CREATE OR REPLACE FUNCTION` is a hand-written step that no diff owns. The
+shape a 59-table port wanted:
 
-**Waiting on: a design.** Not the spelling, which is above: what closes the
-kind. The list has to be object kinds whose replace is *mechanical* — a CHECK
-is drop then add, a trigger is drop then create, a function and a view are
-`CREATE OR REPLACE`, an extension is `CREATE IF NOT EXISTS` — or "a vocabulary
-that stops being checked starts growing" comes true after all. A generated
-column, a collation, a rule and a policy stay `.data` steps under the same
-rule.
+```zig
+pub const schema = sql.Schema{
+    .extensions = &.{"timescaledb"},
+    .functions = .{ .set_updated_at = @embedFile("sql/set_updated_at.sql") },
+    .tables = &.{ org.Department, org.Staff, work.WorkItem },
+    .views = .{ .sku_catalogue = @embedFile("sql/sku_catalogue.sql") },
+};
+```
+
+`@embedFile` is the point of it: a sixty-line view belongs in a `.sql` file with
+highlighting rather than in sixty `\\` lines. Order is fixed by kind and the
+tool owns it — extensions, functions, tables in reference order, each table's
+checks and triggers, views, then the version file's `after`.
+
+**Waiting on: a design.** The vocabulary is settled; what is not is the seam.
+`sql.Schema` replaces the `&.{ Row, Row }` list that `cli.Tool`, `db.checking`
+and `migrate.tablesOf` all take, so it changes the signature every program in
+the guide writes. Either it is a second spelling beside the list, which is two
+ways to say one thing, or it is the only spelling, which is a break. That
+choice is the ADR.
 
 **2. Four migration commands are missing, and two of them are the debt that
 forward-only creates.** `generate`, `check`, `status`, `migrate` and `verify`

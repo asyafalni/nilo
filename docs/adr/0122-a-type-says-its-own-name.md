@@ -67,7 +67,7 @@ pub const nilo_type_name = "nilo.Query(" ++ naming.of(T) ++ ")";
 The table, `replaced`, and the branch quota that had to be sized from the
 table's length times the name's length — a quota that had already broken three
 callers that had not changed a character, when `ours` grew from 20 rows to 35
-([ADR 0095](./0095-a-rule-instead-of-a-table-nobody-reads.md)). None of that
+([ADR 0095](./0095-the-name-table-is-checked-against-the-exports.md)). None of that
 has anywhere to go now: reading a declaration costs no scanning.
 
 It also deleted two rows that could never have matched anything, which is the
@@ -104,7 +104,7 @@ it costs at compile time is less than the table did — one `@hasDecl` where the
 were up to 35 substring scans of the whole name.
 
 The check that a new export has a name is the same shape as before
-([ADR 0095](./0095-a-rule-instead-of-a-table-nobody-reads.md)): `http.zig`'s
+([ADR 0095](./0095-the-name-table-is-checked-against-the-exports.md)): `http.zig`'s
 suite walks every type the module exports and refuses one that cannot name
 itself. What changed is that it now asks the type rather than a table, so it
 cannot be satisfied by a row that happens to match.

@@ -549,14 +549,14 @@ const Spec = struct {
 };
 
 /// What may be written in the marker. `.name` and `.key` are read here;
-/// `sql/table.zig` reads the other four, and this list is what stops a typo in
+/// `sql/table.zig` reads the rest, and this list is what stops a typo in
 /// one of them being silently ignored. One list rather than a check in each
 /// file, because a word allowed in one place and refused in another is the
 /// mistake this whole arrangement exists to make impossible.
 const allowed = [_][]const u8{
-    "name",    "key", "unique", "index",
-    "default", "references",    "was",
-    "managed",
+    "name",    "key",        "unique", "index",
+    "default", "references", "was",    "managed",
+    "check",   "trigger",
 };
 
 /// The table spec `Row` resolves to, following `nilo_table = OtherRow` until
@@ -660,9 +660,10 @@ fn readSpec(comptime Row: type, comptime decl: anytype) Spec {
                 "nilo: " ++ @typeName(Row) ++ "'s " ++ marker ++ " sets `." ++ f.name ++
                     "`, which is not part of it.\n" ++
                     "  It takes `.name`, and `.key` when the identity column is not " ++
-                    "`id`. The five a migration reads are `.unique`, `.index`, " ++
-                    "`.default`, `.references` and `.was`; everything else about the " ++
-                    "table is SQL in a step, which nilo will not touch.",
+                    "`id`. The words a migration reads are `.unique`, `.index`, " ++
+                    "`.default`, `.references`, `.was`, `.check` and `.trigger`; " ++
+                    "everything else about the table is SQL in a step, which nilo " ++
+                    "will not touch.",
             );
         }
         const key: ?[]const []const u8 = if (@hasField(D, "key")) keyNames(Row, decl.key) else null;

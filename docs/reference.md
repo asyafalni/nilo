@@ -3707,7 +3707,7 @@ const User = struct {
     pub const nilo_table = .{
         .name = "users",
         .key = .id,
-        .default = .{ .created_at = .now, .state = .draft, .seats = 1 },
+        .default = .{ .created_at = .now, .state = .draft, .seats = 1, .tags = &.{} },
         .unique = .{
             .{ .columns = .{.email}, .ignoring_case = true,
                .name = "users_one_account_per_address" },
@@ -3718,6 +3718,16 @@ const User = struct {
                .where = .{ .deleted_at = null } },
         },
         .references = .{ .org_id = .{ Org, .id, .cascade } },
+        .check = .{
+            .users_seats_are_positive = "seats > 0",
+            .users_state_is_known = .{ .words_of = .state },
+        },
+        .trigger = .{
+            .users_touch = .{
+                .when = "BEFORE UPDATE",
+                .run = "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+            },
+        },
         .was = .{ .email = "handle" },
     };
 
@@ -3727,6 +3737,7 @@ const User = struct {
     nickname: ?[]const u8,
     state: State,
     seats: i32,
+    tags: []const []const u8,
     created_at: sql.Timestamp,
     deleted_at: ?sql.Timestamp,
 };
@@ -3744,13 +3755,18 @@ const User = struct {
 | `.references = .{ .org_id = .{ Org, .id } }` | keyed by the column doing the pointing, and it names the **Row** rather than a table, so renaming the table moves the key with it. A third entry says what happens on delete: `.cascade`, `.restrict` or `.set_null` |
 | `.{ "orgs", .id, .cascade }` | the same key with the table named as text, for a program whose files may not import each other's Rows. **The type check is not given up**: it runs against the Row list the tool was given, and a table no Row in that list claims is a Refusal ([ADR 0222](./adr/0222-a-foreign-key-is-columns-and-a-table-name.md)) |
 | `.epic = .{ .columns = .{ .epic_id, .department_id }, .to = .{ WorkEpic, .{ .id, .department_id } } }` | a foreign key over two columns, which is how "the Epic has to be on the same board" gets said once instead of in a `.data` step and two `.unique` entries. Keyed by a label rather than a column, because a Zig field name cannot be a tuple. `.to` takes a Row or a name, and `.on_delete` and `.name` belong in the same entry. A composite key is written as a table constraint; a one-column key stays inline, so nothing generated before this changed |
+| `.tags = &.{ "a", "b" }` | an array column's default, written as a list. Each element goes through the column's own element type, and a comma, a brace, a quote, a backslash or an apostrophe inside one is escaped so it does not change how many elements there are ([ADR 0225](./adr/0225-an-array-column-has-a-default-like-any-other.md)) |
+| `.check = .{ .users_seats_are_positive = "seats > 0" }` | a `CHECK`, keyed by the name it goes into the database under. **nilo does not read the body**: it writes it, hashes it, and notices when the hash moves — so a changed body is one drop and one create, and a name the types no longer have is a drop. Written inside the `CREATE TABLE`, so SQLite takes it; changing one there is the same rebuild every other table constraint needs ([ADR 0226](./adr/0226-the-marker-has-a-word-the-database-checks.md)) |
+| `.users_state_is_known = .{ .words_of = .state }` | the same word, naming the `CHECK` an enum column already generates, instead of `users_state_check`. Moving that name is a migration: the constraint in the database still has the old one |
+| `.trigger = .{ .users_touch = .{ .when = …, .run = … } }` | a trigger, in two halves, because nilo writes `ON "users"` between them. The table is the one thing the marker already knows, and a second copy of it stops matching the day the table is renamed. Both databases create, replace and drop one |
 | `.was = .{ .email = "handle" }` | this column used to be called that. The old name is text, because it is not a column any more |
 | `.managed = false` | somebody else builds this table. `plan`, `createMissing` and `generate` skip it entirely |
 
 A column the Row reads as a **Zig enum** needs nothing said about it: it is a
 `text` column with `CHECK ("state" IN ('draft', 'live', 'archived'))` beside it,
-named `users_state_check`, and the words are in the snapshot — so adding a tag
-to the enum is a migration rather than an insert the database refuses. An enum
+named `users_state_check` unless `.check` gave it another, and the words are in
+the snapshot — so adding a tag to the enum is a migration rather than an insert
+the database refuses. An enum
 that names its own database type with `pub const nilo_column = "user_role"` is
 the database's: its words are added with `ALTER TYPE`, and nilo neither writes
 them nor judges them at startup.
@@ -3872,8 +3888,21 @@ finds the edit by looking at the head rather than by walking the lot. It is over
 the SQL rather than over the file bytes, so reformatting a generated file does
 not read as tampering and changing a statement does.
 
-`nilo_migrations` is an ordinary Row — `migrate.Applied` — with the version, the
-name, that hash, when it was applied and how many milliseconds it took. `apply`
+`nilo_migrations` is an ordinary Row — `migrate.Applied` — and **its columns are
+a contract**, because a program in another language may have to write a row into
+it ([ADR 0227](./adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)):
+
+| Column | Postgres | SQLite | What it holds |
+|---|---|---|---|
+| `version` | `int8 PRIMARY KEY` | `INTEGER PRIMARY KEY` | the number in the file name. Supplied, never generated |
+| `name` | `text NOT NULL` | `TEXT NOT NULL` | the rest of the file name, `a-z`, `0-9` and `_` |
+| `hash` | `text NOT NULL` | `TEXT NOT NULL` | 64 hex characters: SHA-256 of the steps, chained onto the version before |
+| `applied_at` | `timestamptz NOT NULL` | `INTEGER NOT NULL` | when. SQLite holds microseconds since the epoch (ADR 0136) |
+| `ms` | `int8 NOT NULL` | `INTEGER NOT NULL` | how long it took. `0` is allowed and means nobody timed it |
+
+`migrate.expect` reads the highest `version`; `migrate.drift` compares `hash`
+against what the steps hash to now. A row with the right `version` and a wrong
+`hash` is what `verify` is for. `apply`
 is one transaction: take the advisory lock, check whether this version is
 already there, run every step, insert the row, commit. It answers `false` when
 the version had already been applied, which is what nine of ten replicas booting
@@ -3934,7 +3963,33 @@ still behind, and the next run generates the same version again rather than
 skipping it.
 
 `check` is `generate` with nothing written: the same `Plan`, so CI and the
-person at the keyboard are looking at one answer.
+person at the keyboard are looking at one answer. It also names any `.sql` twin
+that has gone stale, which is the one thing it reports that is not in the
+`Plan`.
+
+**Every version file has a `.sql` twin beside it**, written by the same
+`generate` and regenerated whenever the `.zig` is
+([ADR 0227](./adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)):
+
+```
+migrations/0007_work_items_get_a_priority.zig
+migrations/0007_work_items_get_a_priority.sql
+```
+
+It is the version's statements in order, each with its `why` above it as a
+comment, wrapped in `BEGIN`/`COMMIT`, with the ledger table created if it is not
+there and the ledger row on the end. `psql -f`, a CI job with no toolchain or
+somebody on a jump host can bring a database to head with it, and
+`db.expecting(manifest.head)` still serves the result and `verify` still holds
+the hash. **It is an output**: nilo reads the `.zig` and never this, and a
+version written in SQL by somebody else is not picked up.
+
+The twin's hash is chained onto the version before it, so it is written from the
+compiled manifest — `Options.versions`, which `db generate` passes from what
+`Tool.run` was given. One case cannot be written: `--baseline` rewriting a
+version 1 whose `before` or `after` hold hand-written steps, because those are
+Zig nothing has compiled yet. The `Outcome` says so with `twins_deferred`, and
+`db check` asks for the file after the rebuild.
 
 An `Outcome` says which of three things happened. `isEmpty()` means the Rows and
 the migrations already agree. `wasHeld()` means the version was not written
@@ -3949,6 +4004,10 @@ else wrote the file named in `.file`.
 | `migrations.renderVersion(gpa, n, name, steps, opts)` | one version file, as text |
 | `migrations.renderManifest(gpa, entries, opts)` | the manifest, as text |
 | `migrations.spliceGenerated(gpa, old, steps)` | the same file with only its generated block replaced |
+| `migrations.renderSql(gpa, D, version, name, hash, source)` | one `.sql` twin, as text |
+| `migrations.writeSql(gpa, io, dir, D, versions, entries)` | every twin, written; how many changed |
+| `migrations.staleSql(gpa, io, dir, D, versions, entries)` | the twins that are missing or out of date, by name |
+| `migrations.sqlTwin(gpa, file)` | `0007_name.zig` → `0007_name.sql` |
 | `migrations.checkName(name)` | `a-z`, `0-9` and `_`, or `error.BadName` |
 
 A version file is **one `.zig` file holding a list of steps**, because a
@@ -4000,7 +4059,7 @@ rather than calling `std.process.exit`.
 | Command | What it does |
 |---|---|
 | `generate --name <snake_case> [--drop] [--baseline]` | diff the Rows against the snapshot and write the next version. No database |
-| `check` | the same diff, written nowhere. Exit 1 when they disagree. No database |
+| `check` | the same diff, written nowhere, plus any stale `.sql` twin. Exit 1 when they disagree. No database |
 | `status [--sql]` | which versions this database has. `--sql` prints the waiting statements |
 | `migrate` | apply what is waiting, one transaction per version, behind the lock |
 | `verify` | has an applied version been edited since it ran? |

@@ -17,14 +17,14 @@ found '?[]const str.Str'
 ```
 
 That is a type error naming a line of nilo's, two types, and no call site — the
-shape [ADR 0015](./0015-error-messages-are-a-feature.md) exists to prevent. A
+shape [ADR 0015](./0015-what-nilo-borrows-and-from-whom.md) exists to prevent. A
 reader who followed the reference got told nilo was broken.
 
 ## What was actually missing
 
 `forWire` handles a scalar `Str` — added when the guide's own sign-in snippet
 turned out not to compile (ADR 0083) — and it handles a list of `Uuid`, added by
-[ADR 0145](./0145-a-value-nilo-holds-is-a-value-nilo-converts.md). A list of
+[ADR 0145](./0145-a-raw-parameter-is-converted-the-way-a-rows-is.md). A list of
 `Str` fell between them and reached `return value;` unconverted.
 
 The wire type was never the missing half. `WireList([]const core.Str)` has
