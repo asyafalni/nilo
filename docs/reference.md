@@ -1223,7 +1223,7 @@ _ = try ex.pipe(&body.writer);   // straight out, allocating nothing
 | `ex.pipe(w)` | the rest into a `*std.Io.Writer`, and how many bytes |
 | `ex.end()` | required, and safe twice |
 
-`Begin` takes `headers`, `host`, `authorization`, `content_type`, `timeout_ms`,
+`Begin` takes `headers`, `host`, `authorization`, `content_type`, `user_agent`, `timeout_ms`,
 a `body` of `.none` / `.slice` / `.stream`, and the two buffers — an empty
 `redirect_buffer` means redirects are not followed, which is what a signed
 request wants. **The buffers are the caller's because their cost is the

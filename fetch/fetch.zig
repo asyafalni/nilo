@@ -376,13 +376,16 @@ pub const Exchange = struct {
         headers: []const std.http.Header = &.{},
         body: Body = .none,
 
-        /// Three headers std writes for itself unless told otherwise. A signed
+        /// Four headers std writes for itself unless told otherwise. A signed
         /// request has to say exactly what it signed, down to the port in the
         /// authority, so it overrides rather than trusting two spellings to
-        /// agree.
+        /// agree. The same name in `headers` would go out twice, once from
+        /// std and once verbatim — which is what a `User-Agent` copied off a
+        /// browser did before it had a slot of its own.
         host: ?[]const u8 = null,
         authorization: ?[]const u8 = null,
         content_type: ?[]const u8 = null,
+        user_agent: ?[]const u8 = null,
 
         timeout_ms: ?u32 = null,
 
@@ -587,6 +590,7 @@ pub const Exchange = struct {
                 .host = if (opts.host) |h| .{ .override = h } else .default,
                 .authorization = if (opts.authorization) |a| .{ .override = a } else .default,
                 .content_type = if (opts.content_type) |t| .{ .override = t } else .default,
+                .user_agent = if (opts.user_agent) |u| .{ .override = u } else .default,
             },
         });
         self.open = true;

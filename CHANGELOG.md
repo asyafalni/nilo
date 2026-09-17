@@ -72,6 +72,12 @@ where it was made.
 
 ### Added
 
+- **`Exchange.Begin` takes a `user_agent`**, beside `host`, `authorization`
+  and `content_type`: the fourth header `std.http.Client` writes for itself.
+  A `User-Agent` put in `headers` went out twice — std's `zig/0.16.0
+  (std.http)` and then the caller's — which is what a download manager
+  sending the header a browser's "Copy as cURL" carries found the first time
+  a host looked at it.
 - **`nilo_core` reads the clock on Windows.** `nowMicros` and `monotonicMicros`
   were a `@compileError` there; a program on `nilo_fetch`, `nilo_sql` and
   `nilo_job` with no Engine now cross-compiles for `x86_64-windows`
