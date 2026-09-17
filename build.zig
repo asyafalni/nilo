@@ -582,6 +582,96 @@ const sql_refusals = [_]Refusal{
         .says = "these tables point at each other in a ring, so none of them can be" ++
             " created first:",
     },
+    // The fifteen the words inside one Row add (ADR 0221): a default, an enum
+    // column's CHECK, a partial and ordered index, and a constraint that can
+    // be named. Every one of them is a schema that would compile and then be
+    // wrong about itself — a default the column's own CHECK refuses, two
+    // indexes whose names collide at the second CREATE, a name Postgres cuts
+    // at 63 and nothing reads the NOTICE for.
+    .{
+        .name = "table_unique_name_as_a_column",
+        .says = "table_unique_name_as_a_column.User's `.unique` is named" ++
+            " `.one_per_board`.",
+    },
+    .{
+        .name = "table_constraint_name_too_long",
+        .says = "the name nilo derives for table_constraint_name_too_long.Sku's" ++
+            " `.unique` over `product_type_id`, `platform_id`, `acquisition_id`," ++
+            " `product_id`, `term_id` is" ++
+            " `skus_product_type_id_platform_id_acquisition_id_product_id_term_id_key`," ++
+            " which is 70 bytes, and 63 is all Postgres keeps.",
+    },
+    .{
+        .name = "table_name_given_too_long",
+        .says = "table_name_given_too_long.Sku's `.unique` is named" ++
+            " `skus_are_unique_per_product_and_per_term_and_per_platform_and_per_region`," ++
+            " which is 72 bytes, and 63 is all Postgres keeps.",
+    },
+    .{
+        .name = "table_two_constraints_one_name",
+        .says = "table_two_constraints_one_name.Outbox names two constraints" ++
+            " `outbox_sent_at_idx`.",
+    },
+    .{
+        .name = "table_unknown_word_in_an_entry",
+        .says = "table_unknown_word_in_an_entry.User's `.unique` sets `.ignorng_case`," ++
+            " which is not part of an entry.",
+    },
+    .{
+        .name = "table_direction_on_a_unique",
+        .says = "table_direction_on_a_unique.User's `.unique` reads `created_at` in a" ++
+            " direction.",
+    },
+    .{
+        .name = "table_direction_that_is_not_one",
+        .says = "table_direction_that_is_not_one.User's `.index` reads `created_at` in" ++
+            " a direction that is not one.",
+    },
+    .{
+        .name = "table_default_now_on_a_number",
+        .says = "table_default_now_on_a_number.User's `.default.age` is `.now` and the" ++
+            " column is i64.",
+    },
+    .{
+        .name = "table_default_unknown_word",
+        .says = "table_default_unknown_word.User's `.default.token` is `.gen_uuid`," ++
+            " which is not a word `.default` takes.",
+    },
+    // The two that name a Zig type stop before the compiler's rendering of it:
+    // `*const [3:0]u8` is a detail that changes when the rendering does, and a
+    // check whose text ends in one breaks for no reason anybody cares about.
+    .{
+        .name = "table_default_of_another_type",
+        .says = "`.default` gives table_default_of_another_type.User.age a" ++
+            " *const [2:0]u8, and the column is i64.",
+    },
+    .{
+        .name = "table_default_not_one_of_the_words",
+        .says = "`.default` gives table_default_not_one_of_the_words.Task.priority" ++
+            " `.blocker`, which is not one of" ++
+            " table_default_not_one_of_the_words.Priority's words.",
+    },
+    .{
+        .name = "table_default_word_written_as_text",
+        .says = "`.default` gives table_default_word_written_as_text.Task.priority a" ++
+            " *const [6:0]u8, and the column holds one of" ++
+            " table_default_word_written_as_text.Priority's words.",
+    },
+    .{
+        .name = "table_default_on_a_generated_key",
+        .says = "table_default_on_a_generated_key.User's `.default.id` is on the key," ++
+            " and the database fills that in itself.",
+    },
+    .{
+        .name = "table_index_where_unknown_term",
+        .says = "table_index_where_unknown_term.Task's `.index` tests `weight` with" ++
+            " something that is not one of the four terms.",
+    },
+    .{
+        .name = "table_index_where_of_another_type",
+        .says = "`.index`'s `.where` gives table_index_where_of_another_type.Task.weight" ++
+            " a *const [5:0]u8, and the column is i64.",
+    },
     // A key spanning several columns. Every one of these is a statement that
     // would have compiled, run, and answered with the wrong row — which is why
     // the composite key arrived with four Refusals rather than one.

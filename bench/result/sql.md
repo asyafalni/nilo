@@ -727,6 +727,33 @@ twenty-findings pass above — `pg_only` 1,694,344 → 1,785,640 and `sqlite_onl
 Neither is migration's. That is the standing reason this file insists a before
 is built rather than quoted.
 
+### 10b. The marker's new words cost the same nothing, re-measured
+
+**What it answers.** ADR 0221 put `.default`, an enum column's `CHECK`, a
+partial and ordered `.index`, a `.name` on any constraint and `sql.Date` into
+the marker. The first four are comptime and reachable only from `migrate`; the
+fifth is a type, and both Wires gained a branch for it. The question is whether
+any of that reaches a server that never names them.
+
+**How.** Exactly as above: `git archive HEAD | tar -x` into a scratch
+directory, `zig build size-sql` on both sides, stripped `ReleaseFast`, and
+`cmp` rather than a size comparison.
+
+| | before | after | Δ |
+|---|---|---|---|
+| names `sql.Db` (Postgres) | 1,800,600 | 1,800,600 | **0** |
+| names `sql.Sqlite` | 2,305,584 | 2,305,584 | **0** |
+
+`cmp` reports both pairs identical byte for byte. The `date` branches in
+`postgres.read` and `sqlite.read` are inside a `comptime` test, so a Row with no
+`sql.Date` in it never compiles them, and the rest never leaves `table.zig`.
+
+**What it changed.** Nothing, which is the answer that was wanted: the cost
+table in ADR 0221 says 0 on all four axes and the fourth is measured rather than
+reasoned. The two absolutes moved again since 10 above, `pg_only` +14,960 and
+`sqlite_only` +13,888 over what shipped between, which is the same standing
+reason to build the before.
+
 ## Reproducing this
 
 ```bash

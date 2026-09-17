@@ -149,6 +149,11 @@
 
 const std = @import("std");
 const core = @import("nilo_core");
+/// Only the Fake below names it, and only to answer the two types a Wire
+/// decodes itself. `types.zig` names `Bytes` out of this file, so the two
+/// import each other — which Zig resolves lazily and which is why the use is
+/// inside a function rather than at the top level.
+const types_mod = @import("types.zig");
 
 /// What a Wire may fail with. Deliberately short: this module turns these
 /// into errors a handler can read, and a long list here would be a long list
@@ -533,6 +538,11 @@ pub const Fake = struct {
         _ = rows;
         _ = col;
         if (T == []const u8 or T == ?[]const u8) return self.text;
+        // The two types a Wire decodes itself rather than handing to its
+        // driver, so a Fake has to name them too or a Row carrying one cannot
+        // be read with no database in the room.
+        if (comptime T == Bytes or T == ?Bytes) return .{ .bytes = self.text };
+        if (comptime types_mod.isDate(T)) return .{ .days = 0 };
         return switch (@typeInfo(T)) {
             .int, .float => 0,
             .bool => false,

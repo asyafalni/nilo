@@ -49,9 +49,10 @@ up, and the cheap half of it can be had back.
 | Item | Status |
 |---|---|
 | 8 | Done at `09cb02c`, ADR 0220. |
-| 5, 9, 1, 2, 3 | Next, as one change: the words that live inside one Row. `.name` and the 63-byte guard, `sql.Date` and `sql.Decimal(p, s)`, `.default`, an enum column's `CHECK`, partial and ordered `.index`. One ADR amending 0153, because all five are checked while compiling and the line was drawn short of them. The snapshot only gains fields with defaults, so an older file still parses. |
-| 4, 6, 7 | After that: the words that cross tables, and the tool. Composite `.references`, `.references` by table name with the type check moved to the list every Row is in, `generate --baseline` and the `generated ++ by_hand` version file. `Reference.column` becomes `columns`, which breaks the snapshot the way `.key` → `.keys` did. One ADR for the references, one short one for the version file. |
-| `.check`, `.trigger`, `sql.Schema` | After that, under an ADR of its own. |
+| 1, 2, 3, 5 | Done, [ADR 0221](./adr/0221-the-marker-has-two-kinds-of-word.md), which amends 0153 in the two places it drew the line short of its own bar. `.default` with `.now` and a literal of the column's type, an enum column's `CHECK` in the marker and in the boot check, `.index` with a direction and a typed `.where`, `.name` on any constraint and the 63-byte guard on both databases. Fifteen new Refusals. The snapshot only gained fields with defaults, so a file written before them still parses, and a test holds that against a hand-written older one. |
+| 9 | Done for the half that was asked for: `sql.Date` is a type, read as the column on both databases rather than through a `::text`. **`Decimal` stays `sql.AsText`, deliberately** — `numeric`'s binary form is a base-10000 digit vector rather than a shift, the text round-trips every digit, and a column wanting its precision in the DDL writes `sql.AsText("numeric(14,3)")`, which is the one declaration the item asked for. `Json(T)` was already a type. |
+| 4, 6, 7 | Next, as one change: the words that cross tables, and the tool. Composite `.references`, `.references` by table name with the type check moved to the list every Row is in, `generate --baseline` and the `generated ++ by_hand` version file. `Reference.column` becomes `columns`, which breaks the snapshot the way `.key` → `.keys` did. One ADR for the references, one short one for the version file. It is `nilo_sql`'s Next 1 in [`roadmap.md`](./roadmap.md). |
+| `.check`, `.trigger`, `sql.Schema` | Decided in principle by ADR 0221, which names the second kind of word and builds none of it. What is outstanding is the list of object kinds whose replace is mechanical, which is what closes the kind. `nilo_sql`'s Next 2. |
 | 10 | Not decided. |
 
 ---

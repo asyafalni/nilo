@@ -2867,6 +2867,12 @@ fn WireRead(comptime F: type) type {
         // reads are `sqlite3_column_text` and `sqlite3_column_blob`, which are
         // not the same call. Keeping the type is what lets each Wire pick.
         if (F == types.Bytes) return types.Bytes;
+        // **And a `Date` for the same reason, one type over.** pg.zig has no
+        // decoder for the `date` OID at all — `Int32.decode` refuses it — and
+        // zqlite hands back the ISO text, so the two Wires read one
+        // differently and neither reads it as a number. Keeping the type is
+        // what lets each pick (ADR 0221).
+        if (types.isDate(F)) return F;
         if (F == core.Str) return []const u8;
         if (F == types.Timestamp) return i64;
         if (F == types.Uuid) return []const u8;
@@ -2960,6 +2966,16 @@ fn uuidOf(raw: []const u8) !types.Uuid {
 fn uuidText(value: types.Uuid, c: anytype) ![]const u8 {
     const text = value.toText();
     return c.arena().dupe(u8, &text) catch error.QueryFailed;
+}
+
+/// A `Date` as the ten characters both databases take, kept where the query can
+/// read them. The same arrangement `uuidText` makes, and for the same reason:
+/// the tuple this feeds is handed to the driver after this has returned.
+fn dateText(value: types.Date, c: anytype) ![]const u8 {
+    var buf: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    value.writeIso(&w) catch return error.QueryFailed;
+    return c.arena().dupe(u8, w.buffered()) catch error.QueryFailed;
 }
 
 /// The tag whose name the column held, or a refusal naming the value.
@@ -3111,6 +3127,14 @@ fn WireWrite(comptime D: type, comptime F: type) type {
         // what travels this far is nilo's own type and the Wire unwraps it.
         if (F == types.Bytes) return types.Bytes;
         if (F == ?types.Bytes) return ?types.Bytes;
+        // **A `Date` is read as the column and written as its text**, and the
+        // asymmetry is the driver's rather than a choice: pg.zig has no `date`
+        // encoder, so the only way to send one is the ten characters plus the
+        // `::date` the Dialect writes around the placeholder (`bindAs`).
+        // SQLite wants exactly the same ten characters, so one answer serves
+        // both (ADR 0221).
+        if (F == types.Date) return []const u8;
+        if (F == ?types.Date) return ?[]const u8;
         if (F == core.Str) return []const u8;
         if (F == ?core.Str) return ?[]const u8;
         if (F == types.Timestamp) return i64;
@@ -3169,6 +3193,14 @@ fn forWire(comptime To: type, value: anytype, c: anytype) !To {
     if (V == ?core.Str) return if (value) |text| text.view() else null;
     if (V == types.Timestamp) return value.micros;
     if (V == ?types.Timestamp) return if (value) |t| t.micros else null;
+    // The ten characters, in the Scope's arena for the reason a `Uuid`'s text
+    // is: the tuple this fills is what the driver reads from, and a pointer
+    // into this frame would not outlive the call.
+    if (V == types.Date) return try dateText(value, c);
+    if (V == ?types.Date) {
+        const held = value orelse return null;
+        return try dateText(held, c);
+    }
     // Which of the two a `Uuid` becomes is `WireWrite`'s decision, made from
     // the Dialect; this reads it back off the type it was asked for, which is
     // how the conversion stays in one place (ADR 0078). The text is kept in the
@@ -3654,6 +3686,21 @@ test "the three types Zig has no word for are taken apart for the wire" {
     // And a type the driver already understands is left alone.
     try testing.expectEqual(i32, WireRead(i32));
     try testing.expectEqual(i32, WireWrite(dialect.Postgres, i32));
+}
+
+test "a Date is read as itself and written as its ten characters" {
+    // **The one type here whose two halves disagree**, and the disagreement
+    // is the driver's (ADR 0221). pg.zig has no `date` decoder and no `date`
+    // encoder: the read is the column's own four bytes, taken apart by the
+    // Wire, and the write is the text plus the `::date` the Dialect puts
+    // around the placeholder.
+    try testing.expectEqual(types.Date, WireRead(types.Date));
+    try testing.expectEqual(?types.Date, WireRead(?types.Date));
+    try testing.expectEqual([]const u8, WireWrite(dialect.Postgres, types.Date));
+    try testing.expectEqual(?[]const u8, WireWrite(dialect.Postgres, ?types.Date));
+    // And the same on the other database, which stores the same ten
+    // characters and needs no cast to read them back.
+    try testing.expectEqual([]const u8, WireWrite(dialect.SQLite, types.Date));
 }
 
 test "a list of uuids travels as slices, because an array of them is not a shape the driver takes" {

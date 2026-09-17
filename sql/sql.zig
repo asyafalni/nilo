@@ -75,9 +75,9 @@
 //! | **Dialect** | `dialect.zig` | comptime, writes the SQL, may refuse |
 //! | **where** | `where.zig` | a condition into a fragment and a value list |
 //! | **statements** | `statement.zig` | every one of them, each as a constant |
-//! | **types** | `types.zig` | Timestamp and Json — value, not arithmetic. `Uuid` is `nilo_id`'s, and `AsText` is the door out |
+//! | **types** | `types.zig` | Timestamp, Date and Json — value, not arithmetic. `Uuid` is `nilo_id`'s, and `AsText` is the door out |
 //! | **schema** | `schema.zig` | Row against table, while the server starts |
-//! | **table** | `table.zig` | what a Row says about the *table*: the three marker words |
+//! | **table** | `table.zig` | what a Row says about the *table*: the marker's words |
 //! | **ddl** | `ddl.zig` | the SQL that changes a table's shape. `CREATE` is a constant |
 //! | **snapshot** | `snapshot.zig` | what the last generate believed, as a `.zon` file |
 //! | **migrate** | `migrate.zig` | the diff, the plan, and the record of what ran |
@@ -238,6 +238,9 @@ pub fn SqliteNamed(comptime name: []const u8, comptime opts: sqlite.Options) typ
 pub const Postgres = dialect.Postgres;
 
 pub const Timestamp = types.Timestamp;
+/// A calendar day, read out of the column rather than out of a `::text`
+/// ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+pub const Date = types.Date;
 pub const Uuid = types.Uuid;
 pub const Json = types.Json;
 pub const Decimal = types.Decimal;

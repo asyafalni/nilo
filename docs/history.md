@@ -3240,3 +3240,37 @@ every boot. As `db.expecting(version)`, a call storing a function with the
 guard inside it, the same two binaries move by 16 and 48 bytes. The
 `checking` precedent was the same trade for a different reason (its list is
 comptime), and the fourth axis is what settled this one.
+
+## A line drawn to keep a vocabulary checked pushed the words into strings
+
+**ADR 0153 refused `.default`, an enum's `CHECK` and a partial index on the
+grounds that "nothing about them can be checked while compiling", and a
+59-table port proved the opposite of the property the refusal was protecting.**
+The words did not go away. They went into `.data` steps as SQL text, where the
+compiler cannot see them at all: 126 defaults, 29 `IN (…)` lists each sitting
+beside a Zig enum with the same tags in it, and 34 partial indexes. The schema
+ended up **less** checked than the vocabulary would have been, and `work_items`
+went from one `CREATE TABLE` a reader could read top to bottom to a Row at line
+138 and eight steps starting at line 418. Every one of those is decidable while
+compiling, so the ADR's own bar let them in and the line had simply been drawn
+short of it ([ADR 0221](./adr/0221-the-marker-has-two-kinds-of-word.md)).
+
+Two things about the check made it safe to move the line, and both are worth
+carrying to the next vocabulary argument. **A value is checked and then
+rendered to text, and the text is what the snapshot holds** — so the string the
+`CREATE` writes is the string the diff compares, and the two cannot fall out of
+step the way a value and its spelling can. And **the second kind of word is the
+one the compiler cannot check and a diff can**: a `CHECK` body is a named text,
+and same-name-same-hash-do-nothing is a complete answer without the compiler.
+The bar "checked while compiling" was right for one kind of word and was being
+applied as though it were the only kind.
+
+**A type whose headline case is a date of birth was built on a walk that stops
+at 1970.** `sql.Date.writeIso` went through `std.time.epoch`, which is the one
+direction std has, and answered `error.BeforeEpoch` for every day before the
+epoch — correct for `Timestamp`, useless for the first thing anybody puts in a
+`date` column. Nothing said so because every date in the tests was after 1970.
+Writing the inverse walk out then hit a second one: **zero-padding a *signed*
+integer in Zig writes the sign**, so `{d:0>4}` on an `i64` year is `+1945`. The
+old code never met it because the year `std.time.epoch` hands back is unsigned.
+A round trip through a real SQLite column is what printed `+1945-08-17`.

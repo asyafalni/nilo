@@ -135,14 +135,31 @@ pub fn uniqueStatement(comptime D: type, comptime desc: Desc, comptime u: Unique
     }
 }
 
+/// One index, with its directions and its predicate if it has them.
+///
+/// **The `WHERE` goes in as the `Desc` already spelled it.** `table.zig`
+/// rendered it while the caller's types were still in reach, which is the only
+/// place a column name and a literal's type can be checked; by here it is text,
+/// the same way `sql_type` is.
 pub fn indexStatement(comptime D: type, comptime desc: Desc, comptime x: Index) []const u8 {
     comptime {
         var out: []const u8 = "CREATE INDEX " ++ D.quote(x.name) ++
             " ON " ++ D.qualify(desc.schema, desc.table) ++ " (";
         for (x.columns, 0..) |c, i| {
-            out = out ++ (if (i == 0) "" else ", ") ++ D.quote(c);
+            out = out ++ (if (i == 0) "" else ", ") ++ D.quote(c) ++ direction(x, c);
         }
-        return out ++ ")";
+        out = out ++ ")";
+        if (x.where.len > 0) out = out ++ " WHERE " ++ x.where;
+        return out;
+    }
+}
+
+fn direction(comptime x: Index, comptime column: []const u8) []const u8 {
+    comptime {
+        for (x.descending) |d| {
+            if (std.mem.eql(u8, d, column)) return " DESC";
+        }
+        return "";
     }
 }
 
@@ -197,7 +214,13 @@ pub fn dropTable(comptime D: type, comptime Row: type) []const u8 {
 }
 
 /// One column, with everything that can be said about it inline: its type, its
-/// nullability, whether it is the key, and what it points at.
+/// nullability, whether it is the key, what it defaults to, which words it may
+/// hold, and what it points at.
+///
+/// **All of it inline rather than added afterwards**, which is the same
+/// decision `referenceClause` already forced: SQLite has no
+/// `ALTER TABLE … ADD CONSTRAINT`, so a `CHECK` that is not written at creation
+/// cannot be written at all. Postgres takes the same text.
 fn columnClause(comptime D: type, comptime desc: Desc, comptime c: Column) []const u8 {
     comptime {
         const quoted = D.quote(c.name);
@@ -208,7 +231,43 @@ fn columnClause(comptime D: type, comptime desc: Desc, comptime c: Column) []con
             D.keyColumn(quoted, c.sql_type, c.generated)
         else
             quoted ++ " " ++ c.sql_type ++ (if (c.nullable) "" else " NOT NULL");
-        return head ++ referenceClause(D, desc, c.name);
+        return head ++ defaultClause(c) ++ checkClause(D, desc, c) ++
+            referenceClause(D, desc, c.name);
+    }
+}
+
+fn defaultClause(comptime c: Column) []const u8 {
+    comptime {
+        return if (c.default) |text| " DEFAULT " ++ text else "";
+    }
+}
+
+/// `CONSTRAINT "t_col_check" CHECK ("col" IN ('a', 'b'))`, for a column the Row
+/// reads as a Zig enum.
+///
+/// Named rather than anonymous, because the name is what the diff drops when a
+/// word is added to the enum — and because an anonymous constraint is reported
+/// by Postgres under a name it made up, which nothing on this side can predict.
+fn checkClause(comptime D: type, comptime desc: Desc, comptime c: Column) []const u8 {
+    comptime {
+        if (c.values.len == 0) return "";
+        return " CONSTRAINT " ++ D.quote(checkName(desc, c.name)) ++
+            " CHECK (" ++ D.quote(c.name) ++ " IN (" ++ valueList(c.values) ++ "))";
+    }
+}
+
+/// The name the check over a column's words goes in under.
+pub fn checkName(comptime desc: Desc, comptime column: []const u8) []const u8 {
+    comptime {
+        return table_mod.constraintName(desc.table, &.{column}, "check");
+    }
+}
+
+fn valueList(comptime values: []const []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (values, 0..) |v, i| out = out ++ (if (i == 0) "" else ", ") ++ "'" ++ v ++ "'";
+        return out;
     }
 }
 
@@ -243,10 +302,14 @@ fn referenceClause(comptime D: type, comptime desc: Desc, comptime name: []const
 
 /// `ALTER TABLE … ADD COLUMN`.
 ///
-/// **A column that may not be null is the one statement here that can fail on a
-/// table with rows in it**, and it fails loudly rather than quietly. The diff
-/// says so before it writes the step, because the answer is a default in the
-/// step or a backfill beside it, and neither is something to guess.
+/// **A column that may not be null and has no default is the one statement here
+/// that can fail on a table with rows in it**, and it fails loudly rather than
+/// quietly. The diff says so before it writes the step.
+///
+/// A `.default` in the marker closes that case rather than flagging it: the
+/// clause goes in here, the rows already there get the value, and there is
+/// nothing left to backfill. That is the case ADR 0153 named as the one where a
+/// default is load-bearing, answered by the word rather than by a warning.
 pub fn addColumn(comptime D: type, gpa: std.mem.Allocator, desc: Desc, c: Column) Error![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
@@ -257,6 +320,19 @@ pub fn addColumn(comptime D: type, gpa: std.mem.Allocator, desc: Desc, c: Column
     try writeIdent(w, c.name);
     try w.print(" {s}", .{c.sql_type});
     if (!c.nullable) try w.writeAll(" NOT NULL");
+    if (c.default) |text| try w.print(" DEFAULT {s}", .{text});
+    if (c.values.len > 0) {
+        try w.writeAll(" CONSTRAINT ");
+        try writeCheckIdent(w, desc.table, c.name);
+        try w.writeAll(" CHECK (");
+        try writeIdent(w, c.name);
+        try w.writeAll(" IN (");
+        for (c.values, 0..) |v, i| {
+            if (i > 0) try w.writeAll(", ");
+            try writeLiteral(w, v);
+        }
+        try w.writeAll("))");
+    }
     _ = D;
     return aw.toOwnedSlice();
 }
@@ -342,6 +418,101 @@ pub fn alterNullability(
     try writeIdent(w, c.name);
     try w.writeAll(if (c.nullable) " DROP NOT NULL" else " SET NOT NULL");
     return aw.toOwnedSlice();
+}
+
+/// `SET DEFAULT` or `DROP DEFAULT`.
+///
+/// Neither can fail on a table with rows in it: a default is what the *next*
+/// insert gets, and the rows already there keep whatever they were written
+/// with. That is the difference between this and `SET NOT NULL`, and it is why
+/// a column added with a default is no longer a backfill waiting to happen.
+pub fn alterDefault(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    desc: Desc,
+    c: Column,
+) Error![]const u8 {
+    comptime std.debug.assert(D.can_alter_column);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try alterHead(w, desc);
+    try w.writeAll(" ALTER COLUMN ");
+    try writeIdent(w, c.name);
+    if (c.default) |text| {
+        try w.print(" SET DEFAULT {s}", .{text});
+    } else {
+        try w.writeAll(" DROP DEFAULT");
+    }
+    return aw.toOwnedSlice();
+}
+
+/// `ALTER TABLE … DROP CONSTRAINT`, for the check over a column's words.
+pub fn dropCheck(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    desc: Desc,
+    column: []const u8,
+) Error![]const u8 {
+    comptime std.debug.assert(D.can_alter_constraint);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try alterHead(w, desc);
+    try w.writeAll(" DROP CONSTRAINT ");
+    try writeCheckIdent(w, desc.table, column);
+    return aw.toOwnedSlice();
+}
+
+/// `ALTER TABLE … ADD CONSTRAINT … CHECK (… IN (…))`, from the words the Row's
+/// enum has now.
+pub fn addCheck(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    desc: Desc,
+    c: Column,
+) Error![]const u8 {
+    comptime std.debug.assert(D.can_alter_constraint);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try alterHead(w, desc);
+    try w.writeAll(" ADD CONSTRAINT ");
+    try writeCheckIdent(w, desc.table, c.name);
+    try w.writeAll(" CHECK (");
+    try writeIdent(w, c.name);
+    try w.writeAll(" IN (");
+    for (c.values, 0..) |v, i| {
+        if (i > 0) try w.writeAll(", ");
+        try writeLiteral(w, v);
+    }
+    try w.writeAll("))");
+    return aw.toOwnedSlice();
+}
+
+/// `"<table>_<column>_check"`, built where the two halves are runtime text.
+///
+/// The comptime half of this is `checkName`, and the two have to agree: one
+/// writes the constraint at `CREATE` and the other drops it at `ALTER`.
+fn writeCheckIdent(w: *std.Io.Writer, table: []const u8, column: []const u8) Error!void {
+    if (table.len == 0 or column.len == 0) return error.BadIdentifier;
+    if (std.mem.indexOfScalar(u8, table, '"') != null) return error.BadIdentifier;
+    if (std.mem.indexOfScalar(u8, column, '"') != null) return error.BadIdentifier;
+    try w.print("\"{s}_{s}_check\"", .{ table, column });
+}
+
+/// One word as a SQL literal, with a quote inside it doubled — the same rule
+/// `table.zig` applies while compiling, applied here to text out of a snapshot.
+fn writeLiteral(w: *std.Io.Writer, text: []const u8) Error!void {
+    try w.writeAll("'");
+    for (text) |ch| {
+        if (ch == '\'') try w.writeAll("'");
+        try w.writeByte(ch);
+    }
+    try w.writeAll("'");
 }
 
 /// `DROP INDEX`, by the name the snapshot recorded.
@@ -634,6 +805,139 @@ test "an identifier that would end its own quoting is refused rather than concat
     var w = std.Io.Writer.fixed(&buf);
     try testing.expectError(error.BadIdentifier, writeIdent(&w, "ev\"il"));
     try testing.expectError(error.BadIdentifier, writeIdent(&w, ""));
+}
+
+// -- the words that live inside one Row (ADR 0221) ------------------------
+
+const Priority = enum { urgent, normal };
+
+const Task = struct {
+    pub const nilo_table = .{
+        .name = "tasks",
+        .key = .id,
+        .default = .{ .created_at = .now, .priority = .normal, .done = false },
+        .index = .{
+            .{ .columns = .{.assignee_id}, .where = .{ .assignee_id = .{ .ne = null } } },
+            .{ .columns = .{ .org_id, .{ .created_at = .desc } }, .name = "tasks_newest_first" },
+        },
+    };
+
+    id: i64,
+    org_id: i64,
+    priority: Priority,
+    done: bool,
+    assignee_id: ?i64,
+    created_at: types.Timestamp,
+};
+
+test "a default and a column's words are written inline, beside the type and the reference" {
+    // Inline rather than added afterwards, and that is SQLite's constraint
+    // rather than tidiness: it has no `ALTER TABLE … ADD CONSTRAINT`, so a
+    // CHECK not written at creation cannot be written at all.
+    try testing.expectEqualStrings(
+        \\CREATE TABLE "tasks" (
+        \\  "id" int8 GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+        \\  "org_id" int8 NOT NULL,
+        \\  "priority" text NOT NULL DEFAULT 'normal' CONSTRAINT "tasks_priority_check" CHECK ("priority" IN ('urgent', 'normal')),
+        \\  "done" bool NOT NULL DEFAULT FALSE,
+        \\  "assignee_id" int8,
+        \\  "created_at" timestamptz NOT NULL DEFAULT now()
+        \\)
+    , comptime createTable(Pg, Task));
+}
+
+test "the same table on SQLite moves only what SQLite spells differently" {
+    // The literal defaults are the same text. `now()` is not: a Timestamp
+    // there is microseconds in an INTEGER column (ADR 0136), so the Dialect
+    // spells the clock.
+    const sql = comptime createTable(Lite, Task);
+    try testing.expect(std.mem.indexOf(u8, sql, "\"done\" INTEGER NOT NULL DEFAULT FALSE") != null);
+    try testing.expect(std.mem.indexOf(u8, sql, "DEFAULT " ++ Lite.now_default) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        sql,
+        "CONSTRAINT \"tasks_priority_check\" CHECK (\"priority\" IN ('urgent', 'normal'))",
+    ) != null);
+}
+
+test "a partial index carries its WHERE, and an ordered one its DESC" {
+    const made = comptime createdFor(Pg, Task);
+    try testing.expectEqualStrings(
+        "CREATE INDEX \"tasks_assignee_id_idx\" ON \"tasks\" (\"assignee_id\") " ++
+            "WHERE \"assignee_id\" IS NOT NULL",
+        made.indexes[0].sql,
+    );
+    try testing.expectEqualStrings(
+        "CREATE INDEX \"tasks_newest_first\" ON \"tasks\" (\"org_id\", \"created_at\" DESC)",
+        made.indexes[1].sql,
+    );
+
+    // And the `IF NOT EXISTS` form is still the same statement with four words
+    // moved into the front of it, predicate and all.
+    const guarded = comptime createdIfMissing(Pg, Task);
+    try testing.expect(std.mem.endsWith(u8, guarded.indexes[0].sql, "WHERE \"assignee_id\" IS NOT NULL"));
+    try testing.expect(std.mem.startsWith(u8, guarded.indexes[0].sql, "CREATE INDEX IF NOT EXISTS "));
+}
+
+test "a column added to a table that already has rows takes its default with it" {
+    const gpa = testing.allocator;
+    const desc = comptime table_mod.descOf(Pg, Task);
+
+    const added = try addColumn(Pg, gpa, desc, desc.column("done").?);
+    defer gpa.free(added);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"tasks\" ADD COLUMN \"done\" bool NOT NULL DEFAULT FALSE",
+        added,
+    );
+
+    // And a column with words brings its check, which is the one nilo can
+    // write here: SQLite refuses the whole change one layer up.
+    const worded = try addColumn(Pg, gpa, desc, desc.column("priority").?);
+    defer gpa.free(worded);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"tasks\" ADD COLUMN \"priority\" text NOT NULL DEFAULT 'normal' " ++
+            "CONSTRAINT \"tasks_priority_check\" CHECK (\"priority\" IN ('urgent', 'normal'))",
+        worded,
+    );
+}
+
+test "a default is set and dropped by name, and a check is replaced by dropping it" {
+    const gpa = testing.allocator;
+    const desc = comptime table_mod.descOf(Pg, Task);
+
+    const set = try alterDefault(Pg, gpa, desc, desc.column("created_at").?);
+    defer gpa.free(set);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"tasks\" ALTER COLUMN \"created_at\" SET DEFAULT now()",
+        set,
+    );
+
+    var gone = desc.column("created_at").?;
+    gone.default = null;
+    const dropped = try alterDefault(Pg, gpa, desc, gone);
+    defer gpa.free(dropped);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"tasks\" ALTER COLUMN \"created_at\" DROP DEFAULT",
+        dropped,
+    );
+
+    const off = try dropCheck(Pg, gpa, desc, "priority");
+    defer gpa.free(off);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"tasks\" DROP CONSTRAINT \"tasks_priority_check\"",
+        off,
+    );
+
+    const on = try addCheck(Pg, gpa, desc, desc.column("priority").?);
+    defer gpa.free(on);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"tasks\" ADD CONSTRAINT \"tasks_priority_check\" " ++
+            "CHECK (\"priority\" IN ('urgent', 'normal'))",
+        on,
+    );
+    // The name the `ALTER` drops is the name the `CREATE` wrote, which is the
+    // one thing these two have to agree about.
+    try testing.expect(std.mem.indexOf(u8, comptime createTable(Pg, Task), comptime checkName(desc, "priority")) != null);
 }
 
 test "the IF NOT EXISTS form is the same statement with four words moved in" {

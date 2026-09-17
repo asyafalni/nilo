@@ -44,6 +44,7 @@ const wire = @import("wire.zig");
 /// opinion about a Dialect anywhere else, which is what keeps the seam a seam
 /// (ADR 0061).
 const dialect = @import("dialect.zig");
+const types = @import("types.zig");
 
 /// The SQLite that is compiled in, as its own version string — `3.53.0`.
 ///
@@ -860,6 +861,14 @@ pub fn Wire(comptime opts_in: Options) type {
             // interchangeable, which is why `WireRead` keeps the type this far
             // instead of flattening it to `[]const u8` like everything else.
             if (comptime Inner == wire.Bytes) return .{ .bytes = stmt.blob(col) };
+
+            // **A `Date` is the ten characters here**, which is what SQLite
+            // stores for it and what `sqlite3_strftime` and friends read. The
+            // Postgres Wire reads the same column as four bytes, and neither
+            // reads it as a number — which is why `WireRead` keeps the type
+            // this far (ADR 0221).
+            if (comptime Inner == types.Date) return types.Date.nilo_parse(stmt.text(col)) orelse
+                error.QueryFailed;
 
             return switch (@typeInfo(Inner)) {
                 .bool => stmt.boolean(col),

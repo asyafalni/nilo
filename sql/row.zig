@@ -546,7 +546,11 @@ const Spec = struct {
 /// one of them being silently ignored. One list rather than a check in each
 /// file, because a word allowed in one place and refused in another is the
 /// mistake this whole arrangement exists to make impossible.
-const allowed = [_][]const u8{ "name", "key", "unique", "index", "references", "was", "managed" };
+const allowed = [_][]const u8{
+    "name",    "key", "unique", "index",
+    "default", "references",    "was",
+    "managed",
+};
 
 /// The table spec `Row` resolves to, following `nilo_table = OtherRow` until
 /// a spec that names a table is reached. Every borrowed Row is checked against
@@ -649,9 +653,9 @@ fn readSpec(comptime Row: type, comptime decl: anytype) Spec {
                 "nilo: " ++ @typeName(Row) ++ "'s " ++ marker ++ " sets `." ++ f.name ++
                     "`, which is not part of it.\n" ++
                     "  It takes `.name`, and `.key` when the identity column is not " ++
-                    "`id`. The four a migration reads are `.unique`, `.index`, " ++
-                    "`.references` and `.was`; everything else about the table is SQL " ++
-                    "in a step, which nilo will not touch.",
+                    "`id`. The five a migration reads are `.unique`, `.index`, " ++
+                    "`.default`, `.references` and `.was`; everything else about the " ++
+                    "table is SQL in a step, which nilo will not touch.",
             );
         }
         const key: ?[]const []const u8 = if (@hasField(D, "key")) keyNames(Row, decl.key) else null;

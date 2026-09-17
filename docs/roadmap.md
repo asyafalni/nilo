@@ -1202,7 +1202,61 @@ rather than the list being adopted as a list.
 
 ### Next
 
-**1. Four migration commands are missing, and two of them are the debt that
+**1. The marker's words stop at the edge of one Row, and a program organised by
+context pays for it twice.** Three things from the same port, and they are one
+change because they move the same check to the same place
+([`input_from_nodeflux.md`](./input_from_nodeflux.md), items 4, 6 and 7):
+
+- **A foreign key cannot span two columns.** `FOREIGN KEY (epic_id,
+  department_id) REFERENCES work_epics (id, department_id)` is what "an Epic
+  has to be on the same board" costs, and it is a `.data` step beside the
+  `.unique` it needs, so one rule sits in two files and a string. The type
+  check ADR 0153 prizes is exactly as computable for two columns as for one:
+  `.epic = .{ .columns = .{ .epic_id, .department_id }, .to = .{ WorkEpic, .{ .id, .department_id } } }`.
+  `Reference.column` becomes `columns`, which breaks the snapshot the way
+  `.key` → `.keys` did.
+- **`.references` names a Zig type, so a table nobody may import is a table
+  nobody may point at.** A program whose contexts never import each other has
+  one way out: a second module declaring all 59 tables in full, 3,876 lines,
+  beside the 68 Rows the contexts already had. Every column is then declared
+  twice and only the boot check notices when the two disagree. Naming the
+  table as text keeps the check by moving it one level up, to
+  `sql.cli.Tool(Db, tables)` and `snapshot`, where every Row is already in one
+  comptime list: resolve the name in that list, find the column, compare the
+  types. Still `@compileError`, still before any database exists.
+- **`generate` cannot re-derive a baseline, and the file it writes has no slot
+  for a hand-written step.** Porting a schema is the same fourteen files
+  generated over and over, and each round is a shell script: delete the
+  snapshot, reset the manifest, generate, then rewrap the version file so
+  `.steps = generated ++ schema.steps`. That wrap should be what `generate`
+  writes — a `generated` decl and a `version` that concatenates, with
+  everything below the generated block preserved on a rerun — and `--baseline`
+  is what makes the loop a command.
+
+**Waiting on: ready.** One ADR for the references and a short one for the
+version file. The ordering note goes with them: generated steps run first and
+hand-written second, so a hand-written object a generated step needs (an
+extension a column type comes from) has nowhere to go, which bites the first
+program whose column is `citext`.
+
+**2. The marker's second kind of word is decided and not built.**
+[ADR 0221](./adr/0221-the-marker-has-two-kinds-of-word.md) says a diff can own
+a *named text* — same name and hash, nothing to do; new hash, replace; name
+gone, drop — and that this is a second kind of word rather than a refusal. What
+it does not do is build one. `.check` and `.trigger` on a Row, and `functions`,
+`views` and `extensions` on a `sql.Schema` beside the table list, are the five
+the port wanted: 85 CHECKs of which 56 are not an enum's, 31 triggers, one
+view, one extension.
+
+**Waiting on: a design.** Not the spelling, which is above: what closes the
+kind. The list has to be object kinds whose replace is *mechanical* — a CHECK
+is drop then add, a trigger is drop then create, a function and a view are
+`CREATE OR REPLACE`, an extension is `CREATE IF NOT EXISTS` — or "a vocabulary
+that stops being checked starts growing" comes true after all. A generated
+column, a collation, a rule and a policy stay `.data` steps under the same
+rule.
+
+**3. Four migration commands are missing, and two of them are the debt that
 forward-only creates.** `generate`, `check`, `status`, `migrate` and `verify`
 ship ([ADR 0153](./adr/0153-a-migration-is-a-diff-against-a-snapshot.md)). The
 four that do not are `push` and `pull`, which are the SQLite and the rescue
@@ -1221,7 +1275,7 @@ has applied nothing.
 that is already past it. Rewriting rows is out — that is the thing `verify`
 exists to catch.
 
-**2. Decide whether a SQLite statement hops or runs in the fiber.** The Wire
+**4. Decide whether a SQLite statement hops or runs in the fiber.** The Wire
 ships with the choice as a field that has no default, so every program says
 which it wants and neither is a guess
 ([ADR 0073](./adr/0073-a-file-has-no-socket-to-wait-on.md)). What nobody has is
@@ -1244,7 +1298,7 @@ is the smaller of the two jobs.
 have been ([§9](../bench/result/sql.md),
 [`spike/sqlite_facts`](../spike/sqlite_facts/)). This is the one that cannot.
 
-**3. A watched statement cannot say which request it came from.**
+**5. A watched statement cannot say which request it came from.**
 `db.watching` shows the text, the plan, the duration and the rows
 ([ADR 0137](./adr/0137-a-statement-can-be-watched.md)), so *which statement is
 slow* is answerable. *Slow on which page* is not: a `Sent` carries no request
@@ -1543,16 +1597,20 @@ same applies to `.lock` and `tx.deadline`.
 is worth knowing before somebody plans a migration on the assumption that
 swapping the Dialect is free.
 
-**An enum column that has not named its type is not checked at startup.** An
-enum carrying `pub const nilo_column = "user_role"` is judged like any other
-column. One that does not is not, because a Postgres enum's type name lives in
-the database and guessing it would fail honest schemas. What is still open
-either way is the *values*: nothing compares the Zig enum's tags against the
-type's, so a Zig enum that has fallen behind its table is found by the first
-request that reads such a row.
+**Nothing at startup compares a Zig enum's tags against the words the column
+actually allows.** The column type is judged now, on both kinds of enum: one
+carrying `pub const nilo_column = "user_role"` like any other column, and a
+plain one on a table this program builds as the `text` nilo wrote
+([ADR 0221](./adr/0221-the-marker-has-two-kinds-of-word.md)). A plain enum on a
+`.managed = false` Row is still declined, because the column under it may be a
+real Postgres `ENUM` and guessing its type name would fail honest schemas. The
+*values* are open in every case: a Zig enum that has fallen behind its table is
+found by the first request that reads such a row.
 
-**Waiting on: ready.** It means asking the database which values the type has,
-which is a second introspection query and a Dialect that can spell it.
+**Waiting on: ready.** It means reading `pg_constraint.conbin` for the check
+nilo wrote and `pg_enum` for the type it did not — two introspection queries, a
+Dialect that can spell them, and a normalised expression parsed back into a
+list of words.
 
 **`sqlite_master` in the introspection query is not schema-qualified.**
 `columnsOf` in `sql/sqlite.zig` rewrites `pragma_table_info` to
@@ -1647,10 +1705,7 @@ Two whole areas come off before the list starts.
 
 What is left splits three ways.
 
-- **Refused on the record**, each with its ADR: indexes, unique constraints,
-  foreign keys and check constraints
-  ([0056](./adr/0056-a-view-is-a-table-that-cannot-say-what-is-not-null.md));
-  set operations and CTEs
+- **Refused on the record**, each with its ADR: set operations and CTEs
   ([0058](./adr/0058-a-set-operation-over-one-table-is-a-condition.md));
   several statements in one round trip
   ([0059](./adr/0059-a-round-trip-is-not-the-cost-worth-chasing.md)); automatic
@@ -1659,7 +1714,7 @@ What is left splits three ways.
 - **Waiting on the one-table line**: joins, nested rows and aggregates.
   Subqueries came off this list — `.exists` is a condition and ships
   ([ADR 0171](./adr/0171-a-row-over-there-is-a-condition.md)). The tooling
-  commands wait on Next 1 rather than on a decision:
+  commands wait on Next 3 rather than on a decision:
   [ADR 0153](./adr/0153-a-migration-is-a-diff-against-a-snapshot.md) made it and
   the library under them is built.
 - **Nobody has looked**: row-level security, and Postgres extensions.

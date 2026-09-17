@@ -39,6 +39,45 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ### Added
 
+- **A Row can say its columns' defaults**, `.default = .{ .created_at = .now,
+  .state = .draft, .seats = 1 }`. `.now` is the one word and is refused off a
+  `sql.Timestamp`; everything else is a literal of the column's own Zig type,
+  and a column with words of its own takes one of them written the way a column
+  is (`.draft`, not `"draft"`). The snapshot carries it, so changing a default
+  is a migration, and a `NOT NULL` column added with one needs no backfill
+  ([ADR 0221](./docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+- **A Zig enum column writes its own `CHECK`.** A column read as a plain Zig
+  enum is `text` with `CHECK ("state" IN ('draft', 'live', 'archived'))` beside
+  it, and the words are in the snapshot — so adding a tag is a migration rather
+  than an insert the database refuses. `db.checking` now judges such a column at
+  boot, but only on a table this program builds. An enum naming its own database
+  type (`pub const nilo_column = "user_role"`) is unchanged: its words are the
+  database's, added with `ALTER TYPE`.
+
+  What to expect on an existing schema: the next `generate` writes one
+  `ADD CONSTRAINT … CHECK` per enum column, because the snapshot did not record
+  the words before. Applying it is the point — the rows already agree with the
+  enum or the program was already failing on them — and a table whose data does
+  not agree is what the failing `migrate` is telling you.
+- **`.index` takes a direction and a `.where`** —
+  `.{ .columns = .{ .org_id, .{ .created_at = .desc } }, .where = .{ .deleted_at = null } }`.
+  The predicate is the grammar a `db.select` condition already uses, not a
+  string: `null`, `.{ .ne = null }`, a literal, `.{ .ne = lit }`. A name that is
+  not a column is a Refusal and a literal of the wrong type does not compile.
+- **A constraint can be named**, `.name = "users_one_account_per_address"` on a
+  `.unique`, an `.index` or a `.references`. Postgres reports a violation by
+  constraint name and nothing else, so this is what makes the violation a
+  sentence.
+- **Every constraint name is checked at 63 bytes on both databases.** Postgres
+  cuts a longer one down in a `NOTICE` nothing reads, which left the snapshot
+  holding a name the database did not have. Two entries that end up with one
+  name are refused too.
+- **`sql.Date`** — a calendar day, `date` on Postgres and `TEXT` on SQLite,
+  **read out of the column rather than out of a `::text`**, so a `db.raw`
+  reading one needs no cast. `2026-09-17` in JSON, `format: date` in the
+  document. A day is not a moment: a due date read into a `timestamptz` gets a
+  midnight, and a midnight has a zone. A day before 1970 is ordinary, which is
+  where `sql.Timestamp` stops.
 - **`app.before(f, args)`** — work that needs the services and has to finish
   before the first request. Runs once inside `listen()`, after the services
   have started and before what `spawn` registered, on the server's loop,

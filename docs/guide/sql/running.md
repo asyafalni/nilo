@@ -214,11 +214,12 @@ A batch is the same: the arrays hold only the columns that were written. Note
 that a generated column carries no `NOT NULL` unless one was written, so the
 Row reads it as an optional.
 
-A Row can say three more things about its table, and they are the subject of
-[Making the tables](./migrations.md). Everything past those three — a check
-constraint, a partial index, a trigger — is written where you write the rest of
-your DDL. The half that reaches a handler is already done either way: a unique
-violation is `error.AlreadyExists` and a 409.
+A Row can say more about its table than its columns — a default, a unique, an
+index and its predicate, a foreign key — and that is the subject of
+[Making the tables](./migrations.md). What is past those words, a check
+constraint you wrote yourself or a trigger, is written where you write the rest
+of your DDL. The half that reaches a handler is already done either way: a
+unique violation is `error.AlreadyExists` and a 409.
 
 
 ## Errors

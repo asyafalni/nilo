@@ -186,7 +186,7 @@ test "a snapshot written and read back describes the same table" {
     try testing.expect(!t.column("email").?.nullable);
 }
 
-test "the three words survive the round trip, because they are what a diff compares" {
+test "what a Row says about its table survives the round trip, because that is what a diff compares" {
     const gpa = testing.allocator;
 
     const doc = try docOf(gpa);
@@ -270,6 +270,99 @@ test "a table is found by its schema as well as its name" {
     try testing.expectEqual(@as(?[]const u8, null), doc.table(null, "audit").?.schema);
     try testing.expectEqualStrings("app", doc.table("app", "audit").?.schema.?);
     try testing.expectEqual(@as(?Desc, null), doc.table("other", "audit"));
+}
+
+// -- the words that live inside one Row (ADR 0221) ------------------------
+
+const Level = enum { low, high };
+
+const Ticket = struct {
+    pub const nilo_table = .{
+        .name = "tickets",
+        .key = .id,
+        .default = .{ .level = .low, .opened_at = .now },
+        .index = .{.{
+            .columns = .{ .org_id, .{ .opened_at = .desc } },
+            .where = .{ .closed_at = null },
+            .name = "tickets_open_newest_first",
+        }},
+    };
+
+    id: i64,
+    org_id: i64,
+    level: Level,
+    opened_at: types.Timestamp,
+    closed_at: ?types.Timestamp,
+};
+
+test "a default, a column's words and a partial index survive the round trip" {
+    const gpa = testing.allocator;
+
+    var desc = comptime table_mod.descOf(Pg, Ticket);
+    desc.row = "";
+    const tables = try gpa.dupe(Desc, &.{desc});
+    defer gpa.free(tables);
+
+    const text = try render(gpa, .{ .version = 3, .dialect = Pg.name, .tables = tables });
+    defer gpa.free(text);
+    const zeroed = try gpa.dupeZ(u8, text);
+    defer gpa.free(zeroed);
+    const back = try parse(gpa, zeroed, null);
+    defer free(gpa, back);
+
+    const t = back.table(null, "tickets").?;
+    try testing.expectEqualStrings("now()", t.column("opened_at").?.default.?);
+    try testing.expectEqualStrings("'low'", t.column("level").?.default.?);
+    try testing.expectEqual(@as(?[]const u8, null), t.column("org_id").?.default);
+
+    try testing.expectEqual(@as(usize, 2), t.column("level").?.values.len);
+    try testing.expectEqualStrings("low", t.column("level").?.values[0]);
+    try testing.expectEqual(@as(usize, 0), t.column("org_id").?.values.len);
+
+    const idx = t.indexes[0];
+    try testing.expectEqualStrings("tickets_open_newest_first", idx.name);
+    try testing.expectEqualStrings("\"closed_at\" IS NULL", idx.where);
+    try testing.expectEqualStrings("opened_at", idx.descending[0]);
+
+    // And a column the marker said nothing about says nothing in the file,
+    // which is what keeps a diff small.
+    try testing.expect(std.mem.indexOf(u8, text, ".values = .{}") == null);
+    try testing.expect(std.mem.indexOf(u8, text, ".descending = .{}") == null);
+}
+
+test "a snapshot written before these fields existed still parses as the schema it was" {
+    // **Every field the marker gained has a default**, which is what lets
+    // round one land without rewriting anybody's file: `std.zon` fills a
+    // missing field from its default, so an older snapshot reads as a schema
+    // with no defaults, no enum words and no partial indexes — which is what
+    // it was. The round that reshapes `Reference` does not have that property
+    // and says so.
+    const gpa = testing.allocator;
+    const older =
+        \\.{
+        \\    .version = 4,
+        \\    .dialect = "postgres",
+        \\    .tables = .{
+        \\        .{
+        \\            .table = "tickets",
+        \\            .keys = .{"id"},
+        \\            .columns = .{
+        \\                .{ .name = "id", .sql_type = "int8", .key = true, .generated = true },
+        \\                .{ .name = "level", .sql_type = "text" },
+        \\            },
+        \\            .indexes = .{ .{ .name = "tickets_level_idx", .columns = .{"level"} } },
+        \\        },
+        \\    },
+        \\}
+    ;
+    const back = try parse(gpa, older, null);
+    defer free(gpa, back);
+
+    const t = back.table(null, "tickets").?;
+    try testing.expectEqual(@as(?[]const u8, null), t.column("level").?.default);
+    try testing.expectEqual(@as(usize, 0), t.column("level").?.values.len);
+    try testing.expectEqualStrings("", t.indexes[0].where);
+    try testing.expectEqual(@as(usize, 0), t.indexes[0].descending.len);
 }
 
 test "a snapshot somebody broke says where, rather than failing silently" {

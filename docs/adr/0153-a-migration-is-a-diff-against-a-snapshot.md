@@ -1,5 +1,16 @@
 # 0153 — a migration is a diff against a snapshot, not a database
 
+> **Amended by [ADR 0221](./0221-the-marker-has-two-kinds-of-word.md).** The bar
+> below — a word gets into the marker if the compiler can check it — is kept,
+> and the line drawn from it was short: `.default`, an enum column's `CHECK`
+> and a typed partial index are all decidable while compiling, and a 59-table
+> port put 126 defaults, 29 `IN (…)` lists and 34 partial indexes into strings
+> the compiler cannot read instead. So §"A default belongs to the step, not to
+> the type" is reversed, and §"The line" now reads four words rather than
+> three, each of them with more inside it. Everything else here stands,
+> including the refusal of
+> `.where = "deleted_at IS NULL"` as a string.
+
 **Status:** accepted
 **Amends:** the refusal recorded in the Rows section of
 [`docs/reference.md`](../reference.md), that a Row may not declare an index or a

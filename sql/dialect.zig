@@ -342,6 +342,14 @@ pub const Postgres = struct {
             // from the database, about a statement that looks right.
             if (types.isBytes(T)) break :blk placeholder_text ++
                 "::bytea" ++ if (list) "[]" else "";
+            // **A `Date` is sent as its ten characters and cast back**, which
+            // is the one place this file has to know what the driver cannot
+            // do: pg.zig has no `date` encoder, so without the cast Postgres
+            // infers `text` for the parameter and refuses the insert
+            // (ADR 0221). The read half needs no cast at all, which is the
+            // whole difference from `sql.AsText("date")`.
+            if (types.isDate(T)) break :blk placeholder_text ++
+                "::date" ++ if (list) "[]" else "";
             const named = types.asText(T) orelse break :blk placeholder_text;
             break :blk placeholder_text ++ "::" ++ named ++ if (list) "[]" else "";
         };
@@ -367,6 +375,9 @@ pub const Postgres = struct {
         return comptime blk: {
             if (types.listElement(T) != null) break :blk null;
             if (types.isBytes(T)) break :blk "bytea[]";
+            // A whole column of days, cast the way a single one is and for
+            // the same reason: what is on the wire is text.
+            if (types.isDate(T)) break :blk "text[]::date[]";
             // Digits, cast twice — the array form of what `bindAs` does to a
             // single `numeric`, and for the same reason. `$1::numeric[]`
             // alone would have the driver encode the text as binary numeric
@@ -423,10 +434,33 @@ pub const Postgres = struct {
                 const elem = acceptsInner(Item) orelse break :blk null;
                 break :blk elem[0] ++ "[]";
             }
+            // **A Zig enum that has not named a database type is a `text`
+            // column**, and the words it may hold become a `CHECK` beside it
+            // ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+            // `accepts` still declines for one, and the two are not in
+            // disagreement: creating a column is a decision nilo makes, and
+            // reading one is a judgement about a column somebody else may have
+            // made a Postgres `ENUM`.
+            if (@typeInfo(Inner) == .@"enum" and types.declaredColumn(Inner) == null)
+                break :blk text_accepts[0];
             const named = acceptsInner(Inner) orelse break :blk null;
             break :blk named[0];
         };
     }
+
+    /// The column types text reads out of, named once because three callers
+    /// want the same list: `acceptsInner` for a `Str` and for a byte slice,
+    /// `columnType` for the first of them, and `schema.expectationsOf` for an
+    /// enum column that this program built and therefore knows is `text`.
+    pub const text_accepts: []const []const u8 = &.{ "text", "varchar", "bpchar", "char", "name" };
+
+    /// What a `.default` of `.now` writes.
+    pub const now_default = "now()";
+
+    /// Whether this database can drop a table constraint and add another in
+    /// its place. Postgres can, in one `ALTER TABLE`, which is what makes a
+    /// changed word on an enum column a diff rather than a rebuild.
+    pub const can_alter_constraint = true;
 
     /// How a column is named inside an index when the comparison should ignore
     /// case, which is the one thing `.unique`'s named form asks for and the one
@@ -559,7 +593,7 @@ pub const Postgres = struct {
         // which knows nothing about databases, so the answer for it is here
         // rather than on the type — the same arrangement `declaredColumn`
         // makes for `Uuid`, and for the same reason (ADR 0042).
-        if (Inner == core.Str) return &.{ "text", "varchar", "bpchar", "char", "name" };
+        if (Inner == core.Str) return text_accepts;
 
         // Bytes, which is the one type here that is neither text nor a
         // number and has to say so before `declaredColumn` and the pointer
@@ -596,7 +630,7 @@ pub const Postgres = struct {
             // schemas, so this declines rather than guesses.
             .@"enum" => null,
             .pointer => |p| if (p.size == .slice and p.child == u8)
-                &.{ "text", "varchar", "bpchar", "char", "name" }
+                text_accepts
             else
                 null,
             .@"struct" => null,
@@ -893,6 +927,30 @@ pub const SQLite = struct {
     /// ([ADR 0061](../docs/adr/0061-the-second-dialect-is-the-test-of-the-seam.md)).
     pub const can_alter_column = false;
 
+    /// **No either**, and for the same reason: a table constraint here is
+    /// written at creation and is part of the table from then on. A changed
+    /// word on an enum column is the four-statement rebuild, which the diff
+    /// spells out rather than attempting.
+    pub const can_alter_constraint = false;
+
+    /// The column types text reads out of, named for the three callers that
+    /// want the same list — the same arrangement the Postgres Dialect has.
+    pub const text_accepts: []const []const u8 = &.{ "TEXT", "VARCHAR", "CLOB", "CHARACTER" };
+
+    /// What a `.default` of `.now` writes.
+    ///
+    /// **Milliseconds, and the three zeros on the end are the cost being
+    /// stated.** A `Timestamp` is microseconds since the epoch in an `INTEGER`
+    /// column (ADR 0136), and SQLite has no clock that reads finer than a
+    /// millisecond in an expression every version of it has: `unixepoch('subsec')`
+    /// arrived in 3.42 and `julianday` is a double, which loses digits long
+    /// before it reaches microseconds. So this counts milliseconds in a double
+    /// — 1.8e12, well inside what one holds exactly — and multiplies after the
+    /// cast. A row that wants the other three digits passes `Timestamp.now()`
+    /// rather than leaving the column out.
+    pub const now_default =
+        "(CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) * 1000)";
+
     /// **The clause that is a different shape rather than a different word.**
     ///
     /// `INTEGER PRIMARY KEY` is an alias for the rowid here, so the type and
@@ -1001,7 +1059,7 @@ pub const SQLite = struct {
             else => T,
         };
 
-        if (Inner == core.Str) return &.{ "TEXT", "VARCHAR", "CLOB", "CHARACTER" };
+        if (Inner == core.Str) return text_accepts;
 
         // **A `Timestamp` is bound as an integer, so it is checked against
         // one** (ADR 0136). It declares `timestamptz` like the rest and is the
@@ -1073,6 +1131,10 @@ pub fn assertDialect(comptime D: type) void {
             "columnType", "keyColumn",   "foldedColumn",
             "can_alter_column",             "advisoryLock",
             "nulls",      "pattern",
+            // The three the schema half added (ADR 0221): what `.now` writes,
+            // whether a table constraint can be replaced in place, and the
+            // text list `columnType` and the startup check both read.
+            "now_default", "can_alter_constraint", "text_accepts",
         };
         for (owed) |decl| {
             if (!@hasDecl(D, decl)) @compileError(
@@ -1306,6 +1368,32 @@ test "a numeric is bound as digits and cast back, so nothing goes through a floa
     try testing.expectEqualStrings("$1", Postgres.bindAs(Postgres.placeholder(1), i64, true));
 }
 
+test "a date is read as the column and written as text, which is the driver's shape" {
+    // **The read half carries no cast**, which is the whole difference from
+    // `sql.AsText("date")` and the reason `sql.Date` exists (ADR 0221): a
+    // `db.raw` statement over one needs nothing written around the column.
+    try testing.expectEqualStrings("\"due\"", Postgres.readAs(Postgres.quote("due"), types.Date));
+    try testing.expectEqualStrings("\"due\"", Postgres.readAs(Postgres.quote("due"), ?types.Date));
+
+    // The write half does, and it is load-bearing: pg.zig has no `date`
+    // encoder, so without the cast Postgres infers `text` for the parameter
+    // and refuses the insert.
+    try testing.expectEqualStrings(
+        "$1::date",
+        Postgres.bindAs(Postgres.placeholder(1), types.Date, false),
+    );
+    try testing.expectEqualStrings(
+        "$2::date[]",
+        Postgres.bindAs(Postgres.placeholder(2), types.Date, true),
+    );
+    try testing.expectEqualStrings("text[]::date[]", Postgres.arrayOf(types.Date).?);
+
+    // And the column each database creates for one.
+    try testing.expectEqualStrings("date", Postgres.columnType(types.Date).?);
+    try testing.expectEqualStrings("date", Postgres.accepts(types.Date).?[0]);
+    try testing.expectEqualStrings("TEXT", SQLite.columnType(types.Date).?);
+}
+
 test "a list column reads out of the array of what it holds" {
     try testing.expectEqualStrings("_text", Postgres.accepts([]const core.Str).?[0]);
     try testing.expectEqualStrings("_varchar", Postgres.accepts([]const core.Str).?[1]);
@@ -1412,13 +1500,32 @@ test "a list column is created with brackets, and read out of the catalog's name
     try testing.expectEqualStrings("int8[]", Postgres.columnType(?[]const i64).?);
 }
 
-test "a type no dialect will name has no column to create, rather than a guessed one" {
-    // An enum's type name lives in the database, so neither half will guess it
-    // on Postgres. SQLite has no enum at all and stores the tag as text, which
-    // is why the two answer differently here and agree everywhere else.
-    try testing.expectEqual(@as(?[]const u8, null), Postgres.columnType(enum { a, b }));
+test "an enum is a text column to create, and a column no dialect will judge to read" {
+    // **The two halves answer differently on purpose** (ADR 0221). Creating a
+    // column is a decision nilo makes: an enum with nothing to say about its
+    // column is `text`, and the words it may hold become a CHECK beside it.
+    // Reading one is a judgement about a column somebody else may have made a
+    // Postgres `ENUM`, whose type name lives in the database — so `accepts`
+    // still declines, and `schema.expectationsOf` is where the two are told
+    // apart by whether this program built the table.
+    try testing.expectEqualStrings("text", Postgres.columnType(enum { a, b }).?);
     try testing.expectEqualStrings("TEXT", SQLite.columnType(enum { a, b }).?);
+    try testing.expectEqual(@as(Accepts, null), Postgres.accepts(enum { a, b }));
 
+    // An enum that named its own database type is that type on both halves,
+    // and gets no CHECK: its words are the database's to add.
+    try testing.expectEqualStrings("user_role", Postgres.columnType(Declared).?);
+    try testing.expectEqualStrings("user_role", Postgres.accepts(Declared).?[0]);
+}
+
+const Declared = enum {
+    admin,
+    member,
+
+    pub const nilo_column = "user_role";
+};
+
+test "a type no dialect will name has no column to create, rather than a guessed one" {
     // A width Postgres has no integer for, and a list on a database with no
     // array type.
     try testing.expectEqual(@as(?[]const u8, null), Postgres.columnType(u64));

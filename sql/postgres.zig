@@ -36,6 +36,7 @@
 const std = @import("std");
 const pg = @import("pg");
 
+const types = @import("types.zig");
 const wire = @import("wire.zig");
 
 /// A pool of connections, behind the contract in `wire.zig`.
@@ -481,6 +482,26 @@ pub const Wire = struct {
         if (comptime T == ?wire.Bytes) {
             const got = row.get(?[]const u8, col) catch return error.QueryFailed;
             return if (got) |b| .{ .bytes = b } else null;
+        }
+        // **A `date` read out of the column's own four bytes**, and it is done
+        // here rather than through `row.get` because pg.zig has no decoder for
+        // the type: `Int32.decode` verifies the OID is `int4` and refuses
+        // `date` (1082). The bytes are a big-endian day count from 2000-01-01,
+        // which is the same conversion its `Timestamp` makes for micros, so
+        // this is one shift rather than a parse (ADR 0221).
+        //
+        // `row.values[col]` is the raw slice, which `readList` already reads
+        // the same way — so this is a seam the driver has rather than a hole
+        // being poked in it.
+        if (comptime types.isDate(T)) {
+            const raw = row.values[col];
+            if (raw.is_null) {
+                if (comptime @typeInfo(T) == .optional) return null;
+                return error.QueryFailed;
+            }
+            if (raw.data.len != 4) return error.QueryFailed;
+            const since_y2k = std.mem.readInt(i32, raw.data[0..4], .big);
+            return .{ .days = since_y2k + types.Date.days_from_epoch_to_y2k };
         }
         return row.get(T, col) catch return error.QueryFailed;
     }

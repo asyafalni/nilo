@@ -172,12 +172,17 @@ const setup =
     // through the same protocol a project's own column type uses, so a test
     // that they round-trip is a test that the protocol does (ADR 0055).
     "  stay interval," ++
-    "  origin inet" ++
+    "  origin inet," ++
+    // A real `date`, written by Postgres and never by nilo, so the four bytes
+    // the read below takes apart are the four bytes the server chose. Ada's
+    // is before 1970 and Grace's is NULL, which are the two the arithmetic
+    // gets wrong.
+    "  born date" ++
     ");" ++
-    "INSERT INTO " ++ table ++ " (id, email, handle, age, token, settings, role, stay, origin) VALUES" ++
-    "  (1, 'ada@example.dev', 'ada', 36, '550e8400-e29b-41d4-a716-446655440000', '{\"theme\":\"dark\"}', 'admin', '3 days 04:05:06', '192.168.0.1')," ++
-    "  (2, 'grace@example.dev', NULL, 45, NULL, NULL, 'member', NULL, NULL)," ++
-    "  (3, 'kid@example.dev', 'kid', 11, '550e8400-e29b-41d4-a716-446655440001', '{\"theme\":\"light\"}', 'moderator', '1 mon', '10.0.0.7/24');" ++
+    "INSERT INTO " ++ table ++ " (id, email, handle, age, token, settings, role, stay, origin, born) VALUES" ++
+    "  (1, 'ada@example.dev', 'ada', 36, '550e8400-e29b-41d4-a716-446655440000', '{\"theme\":\"dark\"}', 'admin', '3 days 04:05:06', '192.168.0.1', '1815-12-10')," ++
+    "  (2, 'grace@example.dev', NULL, 45, NULL, NULL, 'member', NULL, NULL, NULL)," ++
+    "  (3, 'kid@example.dev', 'kid', 11, '550e8400-e29b-41d4-a716-446655440001', '{\"theme\":\"light\"}', 'moderator', '1 mon', '10.0.0.7/24', '2015-03-01');" ++
     "CREATE VIEW " ++ adults_view ++ " AS SELECT id, email, age FROM " ++ table ++
     "  WHERE age >= 18;" ++
     // `role::text` so the matview's column is a `text` rather than the enum,
@@ -1304,6 +1309,127 @@ test "a streamed numeric borrows its digits, and the type says so" {
     // nothing, which `Json(T)` could not manage.
     try testing.expectEqual([]const u8, @TypeOf(first.balance));
     try testing.expectEqualStrings("42.42", first.balance);
+}
+
+// -- a date ---------------------------------------------------------------
+
+/// `email` and `age` are here for the reason they are on `Account`: the table
+/// requires both.
+const Birthday = struct {
+    pub const nilo_table = .{ .name = table, .key = .id };
+
+    id: i64,
+    email: []const u8,
+    age: i32,
+    born: ?types.Date,
+};
+
+test "a date the database wrote comes back as the day, out of the column's own bytes" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // Nothing in this test wrote these three, which is the point of reading
+    // them: the bytes came off the wire as Postgres stores a `date`, four of
+    // them counting from 2000-01-01, and the shift back to 1970 is nilo's.
+    const ada = (try stack.db.find(Birthday, &run, @as(i64, 1))).?;
+    try testing.expectEqual(@as(i32, -56_270), ada.born.?.days);
+
+    // A day before the epoch, which is where a `u32` or a `std.time.epoch`
+    // walk would have gone wrong rather than failed.
+    var buf: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try ada.born.?.writeIso(&w);
+    try testing.expectEqualStrings("1815-12-10", w.buffered());
+
+    const grace = (try stack.db.find(Birthday, &run, @as(i64, 2))).?;
+    try testing.expectEqual(@as(?types.Date, null), grace.born);
+
+    const kid = (try stack.db.find(Birthday, &run, @as(i64, 3))).?;
+    try testing.expectEqual(@as(i32, 16_495), kid.born.?.days);
+}
+
+test "a date goes out as ten characters and comes back as the same day" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // The asymmetry, written down: pg.zig has no `date` codec to bind, so the
+    // value leaves as text with the `::date` the Dialect puts on the
+    // placeholder, and arrives back as the four bytes. A write that silently
+    // landed a day out would pass an echo test and fail this one, because the
+    // read is Postgres's own answer.
+    const made = try stack.db.insert(Birthday, &run, .{
+        .id = @as(i64, 710),
+        .email = "born@example.dev",
+        .age = @as(i32, 61),
+        .born = @as(?types.Date, types.Date.nilo_parse("1965-08-09").?),
+    });
+    try testing.expectEqual(@as(i32, -1606), made.born.?.days);
+
+    const back = (try stack.db.find(Birthday, &run, @as(i64, 710))).?;
+    try testing.expectEqual(@as(i32, -1606), back.born.?.days);
+
+    // And null both ways, which is a different branch in both Wires.
+    _ = try stack.db.update(Birthday, &run, .{
+        .set = .{ .born = @as(?types.Date, null) },
+        .where = .{ .id = @as(i64, 710) },
+    });
+    try testing.expectEqual(
+        @as(?types.Date, null),
+        (try stack.db.find(Birthday, &run, @as(i64, 710))).?.born,
+    );
+}
+
+test "a date compares as a day rather than as the text it is carried in" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // The `::date` on the placeholder is what decides this. Without it the
+    // parameter arrives as an unknown type beside a `date` column, and what
+    // Postgres does with that is its business rather than something nilo
+    // should be finding out per statement.
+    const old = try stack.db.select(Birthday, &run, .{
+        .where = .{ .born = .{ .lt = types.Date.nilo_parse("1900-01-01").? } },
+        .order = .{ .id = .asc },
+    });
+    try testing.expectEqual(@as(usize, 1), old.len);
+    try testing.expectEqual(@as(i64, 1), old[0].id);
+}
+
+fn bornDays(db: *db_mod.Db, c: *nilo.Ctx) ![]Birthday {
+    return db.select(Birthday, c, .{
+        .where = .{ .id = .{ .lte = @as(i64, 2) } },
+        .order = .{ .id = .asc },
+    });
+}
+
+test "a date leaves as the ten characters, and a null leaves as null" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    // Both halves at once, the way the three types above are asserted: what
+    // came out of the column, and what `jsonStringify` then wrote.
+    try stack.app.get("/born", bornDays);
+    const answer = try stack.client.get(&stack.app, "/born");
+
+    try testing.expectEqual(@as(u16, 200), answer.status);
+    try testing.expectEqualStrings(
+        "[{\"id\":1,\"email\":\"ada@example.dev\",\"age\":36,\"born\":\"1815-12-10\"}," ++
+            "{\"id\":2,\"email\":\"grace@example.dev\",\"age\":45,\"born\":null}]",
+        answer.body,
+    );
 }
 
 // -- upserts --------------------------------------------------------------

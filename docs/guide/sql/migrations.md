@@ -4,7 +4,8 @@ The same Row that reads a table can create it, change it, and say whether
 the database it is about to serve is behind. Migrations are the one thing in
 [Talking to a database](./README.md) that is not a query.
 
-Three words in the marker, and no more:
+Everything the marker says, it says in one place, and every word of it is
+checked while you compile:
 
 <!-- compiles -->
 ```zig
@@ -15,27 +16,67 @@ const Org = struct {
     name: nilo.Str,
 };
 
+const Plan = enum { free, team, enterprise };
+
 const Member = struct {
     pub const nilo_table = .{
         .name = "members",
         .key = .id,
-        .unique = .{.{ .columns = .{.email}, .ignoring_case = true }},
-        .index = .{ .created_at, .{ .org_id, .created_at } },
+        .default = .{ .created_at = .now, .plan = .free, .seats = 1 },
+        .unique = .{
+            .{ .columns = .{.email}, .ignoring_case = true,
+               .name = "members_one_account_per_address" },
+        },
+        .index = .{
+            .created_at,
+            .{ .columns = .{ .org_id, .{ .created_at = .desc } },
+               .where = .{ .left_on = null } },
+        },
         .references = .{ .org_id = .{ Org, .id, .cascade } },
     };
 
     id: i64,
     org_id: i64,
     email: nilo.Str,
+    plan: Plan,
+    seats: i32,
     created_at: sql.Timestamp,
+    left_on: ?sql.Date,
 };
 ```
 
+`.default` is what the database writes when your insert leaves the column out.
+`.now` is the one word it has and it only goes on a `sql.Timestamp`; everything
+else is a literal your column's own Zig type can hold. A column that holds one
+of an enum's words takes one of them written the way a column is — `.free`, not
+`"free"`. A default the database has to work out, `DEFAULT (lower(x))`, is SQL
+you write in a step.
+
+`plan: Plan` needs nothing said about it: it is a `text` column with
+`CHECK ("plan" IN ('free', 'team', 'enterprise'))` beside it, and the words are
+in the snapshot — so adding a word to the enum is a migration, rather than an
+insert your database refuses. (An enum that names its own database type with
+`pub const nilo_column = "user_role"` is the database's, and nilo leaves its
+words alone.)
+
 `.unique` and `.index` take one column (`.email`), several as one constraint
 (`.{ .org_id, .created_at }`), or the named form when there is something to say
-about it. `.ignoring_case` is the one modifier, and it is `lower("email")` on
-Postgres and `COLLATE NOCASE` on SQLite — the case where two people sign up as
-`Wati@` and `wati@` and the plain unique takes both.
+about it. `.ignoring_case` is `lower("email")` on Postgres and `COLLATE NOCASE`
+on SQLite — the case where two people sign up as `Wati@` and `wati@` and the
+plain unique takes both.
+
+**Give a constraint a `.name` when the violation is a sentence somebody has to
+read.** Postgres reports one by name and nothing else, so
+`members_one_account_per_address` is something your support engineer can act on
+where `members_email_key` is a column list they have to go and look up. Any
+name over 63 bytes is a compile error on both databases, because Postgres cuts
+a longer one down in a `NOTICE` nobody reads.
+
+An index can read a column downwards (`.{ .created_at = .desc }`) and can cover
+part of the table (`.where`). The predicate is the same grammar a `db.select`
+condition uses, not a string: `null` is `IS NULL`, `.{ .ne = null }` is
+`IS NOT NULL`, a literal is `=` and `.{ .ne = lit }` is `<>`. An index over an
+expression — `lower(btrim(site))` — is SQL you write in a step.
 
 `.references` is keyed by the column doing the pointing and it names the **Row**
 rather than a table, so renaming the table moves the key with it. A third entry
@@ -105,11 +146,14 @@ which is a conflict worth having, rather than at deploy.
 
 `change.steps` is what to run, each with its `sql` and a line of `why`.
 `change.problems` is what the diff will not write, and **all of them come back
-rather than the first**: a type change on SQLite, which has no `ALTER COLUMN`,
-and any foreign-key change on a table that already exists, because the
-one-statement form takes an `ACCESS EXCLUSIVE` lock and scans the table. The
-problem spells out the `ADD CONSTRAINT … NOT VALID` then `VALIDATE CONSTRAINT`
-pair to write instead.
+rather than the first**: a column that moved in a way SQLite cannot follow — its
+type, its nullability, its default or an enum's words, since SQLite has neither
+`ALTER COLUMN` nor a way to replace a constraint — and any foreign-key change on
+a table that already exists, because the one-statement form takes an
+`ACCESS EXCLUSIVE` lock and scans the table. The problem spells out the
+`ADD CONSTRAINT … NOT VALID` then `VALIDATE CONSTRAINT` pair to write instead. A
+column that moved three ways gets one problem naming all three, because what it
+needs is one rewrite.
 
 A renamed column is written in the type, not asked at a prompt:
 

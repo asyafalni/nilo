@@ -167,6 +167,73 @@ const Slot = struct {
     rank: ?i64,
 };
 
+/// The other Wire's answer to a `date`, and it is a different answer: SQLite
+/// has no date type at all, so the column is `TEXT` and the ten characters
+/// are what is stored. Both halves are `Date`'s own — `writeIso` on the way
+/// in, `nilo_parse` on the way out — which is what makes the round trip a
+/// test of the pair rather than of SQLite.
+const Holiday = struct {
+    pub const nilo_table = .{ .name = "holidays", .key = .id };
+
+    id: i64,
+    name: []const u8,
+    falls_on: types.Date,
+    observed_on: ?types.Date,
+};
+
+test "a date is TEXT on SQLite, and the day that went in is the day that comes out" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "dates");
+    defer fx.deinit(gpa);
+
+    try migrate.createMissing(&fx.db, &fx.run, &.{Holiday});
+
+    // Before the epoch, which the ISO text spells the same way as any other
+    // day and the `days` field holds as a negative.
+    const made = try fx.db.insert(Holiday, &fx.run, .{
+        .name = "proklamasi",
+        .falls_on = types.Date.nilo_parse("1945-08-17").?,
+        .observed_on = @as(?types.Date, null),
+    });
+    try testing.expectEqual(@as(i32, -8903), made.falls_on.days);
+
+    const found = (try fx.db.find(Holiday, &fx.run, made.id)).?;
+    try testing.expectEqual(@as(i32, -8903), found.falls_on.days);
+    try testing.expectEqual(@as(?types.Date, null), found.observed_on);
+
+    // The same loop every column type here has to close: `columnType` writes
+    // what `accepts` reads out of, or a generated schema stops the server it
+    // was generated for.
+    try testing.expectEqual(@as(usize, 0), try fx.db.checkSchema(&.{Holiday}));
+}
+
+test "the ten characters sort as days, which is why the text is ISO and not local" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "datesort");
+    defer fx.deinit(gpa);
+
+    try migrate.createMissing(&fx.db, &fx.run, &.{Holiday});
+
+    // `17/08/1945` would compare as text in whatever order the day of the
+    // month happened to fall in. This is the whole reason the stored spelling
+    // is the one `date` prints.
+    for ([_][]const u8{ "2026-01-01", "1945-08-17", "2025-12-31" }) |iso| {
+        _ = try fx.db.insert(Holiday, &fx.run, .{
+            .name = iso,
+            .falls_on = types.Date.nilo_parse(iso).?,
+            .observed_on = @as(?types.Date, null),
+        });
+    }
+
+    const after = try fx.db.select(Holiday, &fx.run, .{
+        .where = .{ .falls_on = .{ .gte = types.Date.nilo_parse("2025-01-01").? } },
+        .order = .{ .falls_on = .asc },
+    });
+    try testing.expectEqual(@as(usize, 2), after.len);
+    try testing.expectEqualStrings("2025-12-31", after[0].name);
+    try testing.expectEqualStrings("2026-01-01", after[1].name);
+}
+
 test "bytes go into a BLOB and come back the same bytes" {
     const gpa = testing.allocator;
     var fx = try Fixture.init(gpa, "bytes");

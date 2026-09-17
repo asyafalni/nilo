@@ -2924,15 +2924,17 @@ An identity key, a sequence default and a generated column need nothing said
 about them — an insert names a subset of the Row's columns and `RETURNING`
 brings the rest back.
 
-A Row says three things about its schema and no more: `.unique`, `.index` and
+A Row says four things about its schema: `.default`, `.unique`, `.index` and
 `.references` ([ADR 0153](./adr/0153-a-migration-is-a-diff-against-a-snapshot.md),
-which amends the older refusal that it may say none). Only the Row that names a
-table may say them, and nothing enforces that because the language does — a
-borrowed Row's marker is a `type`, and there is nowhere on a type to write
-`.unique`. Where the line falls is where the compiler stops being able to
-check: `CHECK (age > 18)` is text nilo cannot read, so it is written by hand in
-a step, and **nilo never touches what it did not create**. See
-[Migrations](#migrations).
+which amends the older refusal that it may say none, and
+[ADR 0221](./adr/0221-the-marker-has-two-kinds-of-word.md), which adds the
+first). Only the Row that names a table may say them, and nothing enforces that
+because the language does — a borrowed Row's marker is a `type`, and there is
+nowhere on a type to write `.unique`. Where the line falls is where the compiler
+stops being able to check: `CHECK (age > 18)` is a text nilo cannot read, so it
+is written by hand in a step, and **nilo never touches what it did not create**.
+A column the Row reads as a Zig enum is the one check constraint the marker does
+write, because the words are the type's. See [Migrations](#migrations).
 
 ### SQLite
 
@@ -2959,8 +2961,8 @@ is no wait for the event loop to park on and the choice cannot be made for you
 | `.{ .hop = nilo }` | hand each statement to the Engine's thread pool and park the fiber. Costs a few microseconds per statement; **no statement can stall an executor thread**. The payload is `nilo` itself, passed in because `sql/` may not import `nilo_http` |
 | `.in_fiber` | run it on the fiber that asked. Faster when every statement is a cached lookup; a slow one holds a thread that serves other connections |
 
-Which is the better default is unmeasured and is `docs/roadmap.md`'s Next 1 for
-this module. When in doubt take `.hop`: its bad case is a few microseconds and
+Which is the better default is unmeasured and is an open question in
+[`docs/roadmap.md`](./roadmap.md) for this module. When in doubt take `.hop`: its bad case is a few microseconds and
 `.in_fiber`'s is a stalled thread.
 
 | `sqlite.Options` | |
@@ -3565,6 +3567,7 @@ than asking the server to release a mark it no longer has.
 | | |
 |---|---|
 | `sql.Timestamp` | microseconds since the epoch, written as RFC 3339 in JSON. `timestamptz`. `.now()`, `.fromSeconds(s)`, `.seconds()`, `.nilo_parse(text)` |
+| `sql.Date` | a calendar day: `days` since 1970-01-01, written as `2026-09-17` in JSON and described as `format: date`. `date` on Postgres, `TEXT` on SQLite, and **read out of the column rather than out of a `::text`**, so a `db.raw` reading one needs no cast. `.fromDays(n)`, `.nilo_parse(text)`, `.utcOf(ts)`, `.atMidnightUtc()`. A day is not a moment: a due date read into a `timestamptz` gets a midnight, a midnight has a zone, and the date then moves by a day for a reader in Jakarta ([ADR 0221](./adr/0221-the-marker-has-two-kinds-of-word.md)). It carries a value and does not calculate — no `.addDays`, no `.weekday` — and the two conversions it does offer are named for the zone they assume. A day before 1970 is ordinary and prints normally; the range is year 0 to 9999, which is what four digits spell and what `nilo_parse` reads back |
 | `sql.Uuid` | `nilo_id`'s [`Uuid`](#nilo_id), re-exported — the same type either import gives you. `uuid` |
 | `sql.Json(T)` | a `T` stored as `jsonb`, parsed per row into the request arena. Not available in `db.stream`, which allocates nothing. In a response it is written and described as the `T` — a **document**, `nilo_json_of = T` beside `value: T` — so a Row with one can still `rename_all` ([ADR 0202](./adr/0202-a-document-is-its-value.md)). **It is also the intended shape for a list on a row**: a `db.raw` projection with `COALESCE(jsonb_agg(jsonb_build_object(…)), '[]'::jsonb) AS labels` read into `labels: sql.Json([]const Label)` is one statement where a list of labels per row was a round trip per row, and the document says `Label`. **The column is parsed by `std.json` into the field names as written** — a `rename_all` on `T` spells the response, not the column, so a `jsonb_build_object` names `content_type` and the wire says `contentType` |
 | `sql.Decimal` | a `numeric`, held as its digits. `.text` is the value; there is no arithmetic. Writes itself into JSON as a **string**, so a consumer's `JSON.parse` cannot round it into an `f64` ([ADR 0050](./adr/0050-a-numeric-is-digits-and-a-string-in-json.md)) |
@@ -3572,7 +3575,7 @@ than asking the server to release a mark it no longer has.
 | `sql.Bytes` | bytes rather than text: `bytea` on Postgres, `BLOB` on SQLite. `.bytes` is the value, `sql.Bytes.of(hash)` writes one. The slice a read hands back lives in the request arena, the way a `Str` does. This is what to reach for instead of `sql.AsText("bytea")`, which goes through hex printing and costs a conversion each way ([ADR 0174](./adr/0174-bytes-are-a-type-not-a-second-protocol.md)) |
 | `sql.AsText("money")` | any Postgres type at all, held as its text — the door out of this table. A column type of your own is any struct or enum with `nilo_column`, `nilo_read(text, arena)` and `nilo_write(arena)`; see below |
 | a slice | an array column, with no wrapper: `[]const Str` is `text[]`, `[]const i32` is `int4[]`, `?[]const i32` a nullable one, `[]const ?i32` one whose elements may be NULL ([ADR 0051](./adr/0051-an-array-is-a-slice-and-a-slice-is-one-deep.md)). `[]const u8` is text, so a list of text is `[]const Str` or `[]const []const u8`. `[]const sql.Uuid` is `uuid[]`, in both directions and as an `.in` list ([ADR 0145](./adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)). Not available in `db.stream` |
-| an enum | read out of `text`, a `varchar` or a Postgres enum. A value the Zig enum does not have fails the request. Add `pub const nilo_column = "user_role"` to it and the column is checked at startup — and can be batched |
+| an enum | read out of `text`, a `varchar` or a Postgres enum. A value the Zig enum does not have fails the request. Add `pub const nilo_column = "user_role"` to it and the column is checked at startup — and can be batched. On a table this program builds, a plain enum is a `text` column and its tags become that column's `CHECK`; one that names its own type is the database's to grow with `ALTER TYPE`, and nilo neither writes its words nor judges them |
 
 #### A column type of your own
 
@@ -3598,7 +3601,10 @@ The column is judged at startup like any other, and the type works everywhere
 a column type does: conditions, `.set`, `insert`, a batch.
 
 `sql.AsText(name)` is the whole of that for a type that is just the text, and
-`sql.Decimal`, `sql.Interval` and `sql.Inet` are three instances of it.
+`sql.Decimal`, `sql.Interval` and `sql.Inet` are three instances of it. A column
+that wants its precision in the DDL writes `sql.AsText("numeric(14,3)")`: the
+digits round-trip either way, and `numeric`'s binary form is a base-10000 digit
+vector this module has no reason to parse.
 
 **A `Timestamp` reads back what it prints.** `Timestamp.nilo_parse(text)` is
 `?Timestamp`, and it is the same declaration that makes a type a path param
@@ -3679,7 +3685,7 @@ answer different questions.
 
 ### Migrations
 
-The three marker words above are the schema half; this is what reads them. It
+The marker words above are the schema half; this is what reads them. It
 is `sql.migrate`, `sql.table`, `sql.ddl` and `sql.snapshot`, and a program that
 never names one links none of it — 0 bytes on `zig build size-sql`, both probes
 ([`bench/result/sql.md` §10](../bench/result/sql.md)).
@@ -3692,12 +3698,22 @@ const Org = struct {
     name: []const u8,
 };
 
+const State = enum { draft, live, archived };
+
 const User = struct {
     pub const nilo_table = .{
         .name = "users",
         .key = .id,
-        .unique = .{.{ .columns = .{.email}, .ignoring_case = true }},
-        .index = .{ .created_at, .{ .org_id, .created_at } },
+        .default = .{ .created_at = .now, .state = .draft, .seats = 1 },
+        .unique = .{
+            .{ .columns = .{.email}, .ignoring_case = true,
+               .name = "users_one_account_per_address" },
+        },
+        .index = .{
+            .created_at,
+            .{ .columns = .{ .org_id, .{ .created_at = .desc } },
+               .where = .{ .deleted_at = null } },
+        },
         .references = .{ .org_id = .{ Org, .id, .cascade } },
         .was = .{ .email = "handle" },
     };
@@ -3706,18 +3722,33 @@ const User = struct {
     org_id: i64,
     email: []const u8,
     nickname: ?[]const u8,
+    state: State,
+    seats: i32,
     created_at: sql.Timestamp,
+    deleted_at: ?sql.Timestamp,
 };
 ```
 
 | in the marker | what it says |
 |---|---|
+| `.default = .{ .created_at = .now }` | what the database writes when an insert leaves the column out. `.now` is the one word, and only on a `sql.Timestamp`; everything else is a literal of the column's own Zig type, which has to coerce or it does not compile. A column with words of its own takes one of them the way a column is written: `.draft`, not `"draft"`. A default the database has to work out — `DEFAULT (lower(x))` — is still a step, and one on a generated key is a Refusal |
 | `.unique = .{ .email }` | one column. `.{ .{ .tenant_id, .name } }` is one constraint over two |
 | `.{ .columns = .{.email}, .ignoring_case = true }` | the named form. `.ignoring_case` is `lower(...)` on Postgres and `COLLATE NOCASE` on SQLite, and it is a Refusal on a column that is not text |
+| `.name = "users_one_account_per_address"` | what the constraint is called, on a `.unique`, an `.index` or a `.references`. **The name is the error message**: Postgres reports a violation by constraint name and nothing else, so this is the difference between a sentence and a column list. Text rather than `.a_word`, because that is what the database prints |
 | `.index = .{ .created_at }` | the same three shapes, without the uniqueness |
+| `.{ .created_at = .desc }` | one column of an index read downwards. `.asc` is the default and needs no saying; a direction on a `.unique` is a Refusal, since a unique index is not read in order |
+| `.where = .{ .deleted_at = null }` | a partial index. The same grammar a `db.select` condition uses, not a string: `null` is `IS NULL`, `.{ .ne = null }` is `IS NOT NULL`, a literal is `=` and `.{ .ne = lit }` is `<>`. A name that is not a column is a Refusal and a literal of the wrong type does not compile. An index over an expression — `lower(btrim(site))` — is still a step |
 | `.references = .{ .org_id = .{ Org, .id } }` | keyed by the column doing the pointing, and it names the **Row** rather than a table, so renaming the table moves the key with it. A third entry says what happens on delete: `.cascade`, `.restrict` or `.set_null` |
 | `.was = .{ .email = "handle" }` | this column used to be called that. The old name is text, because it is not a column any more |
 | `.managed = false` | somebody else builds this table. `plan`, `createMissing` and `generate` skip it entirely |
+
+A column the Row reads as a **Zig enum** needs nothing said about it: it is a
+`text` column with `CHECK ("state" IN ('draft', 'live', 'archived'))` beside it,
+named `users_state_check`, and the words are in the snapshot — so adding a tag
+to the enum is a migration rather than an insert the database refuses. An enum
+that names its own database type with `pub const nilo_column = "user_role"` is
+the database's: its words are added with `ALTER TYPE`, and nilo neither writes
+them nor judges them at startup.
 
 **`.managed = false` is for the table this program reads and does not own.** A
 foreign key names the *Row* that owns the table it points at, so
@@ -3744,9 +3775,19 @@ word is written into `migrations/snapshot.zon`, where `managed: true` is silence
 and `managed: false` is a line, so a program that starts or stops building a
 table is a visible change in a reviewed file.
 
-Names follow Postgres' own convention, so a schema nilo generates and one
-somebody wrote by hand look the same: `users_email_key`,
-`users_org_id_created_at_idx`, `users_org_id_fkey`.
+A name nobody gives follows Postgres' own convention, so a schema nilo
+generates and one somebody wrote by hand look the same: `users_email_key`,
+`users_org_id_created_at_idx`, `users_org_id_fkey`, `users_state_check`.
+
+**Every name is checked at 63 bytes, whatever the database is.** Postgres cuts
+a longer one down on the way in and says so in a `NOTICE` nothing here reads,
+which leaves the snapshot holding a name the database does not have and two
+constraints whose first 63 bytes agree colliding on the second `CREATE`. So a
+name over the limit is a compile error — the given one says "make it shorter",
+the derived one says "give the entry a `.name`". SQLite has no limit and is
+held to the same 63, because a schema that compiles for one database and
+quietly loses a name on the other is the opposite of what one type describing
+both is for. Two entries that end up with the same name are a Refusal too.
 
 **A key that is an integer is generated and one that is not is supplied.** That
 is a rule rather than a word in the marker: `id: i64` becomes
@@ -3790,14 +3831,19 @@ conflict in git rather than at deploy.
 `Plan.steps` is what to run, in order, each with its `kind`, its `sql` and a
 line of `why`. `Plan.problems` is what the diff will not write, and **every one
 of them is collected rather than the first being returned**. Two are refused on
-purpose: a type or nullability change on SQLite, which has no
-`ALTER COLUMN`; and any foreign-key change on a table that already exists, on
-both dialects, because the one-statement form takes an `ACCESS EXCLUSIVE` lock
-and scans the table. The `Problem` spells out the `ADD CONSTRAINT … NOT VALID`
-then `VALIDATE CONSTRAINT` pair to write instead.
+purpose: a column that moved in a way SQLite cannot follow — its type, its
+nullability, its default or an enum's words, since SQLite has neither
+`ALTER COLUMN` nor a way to replace a constraint — and any foreign-key change on
+a table that already exists, on both dialects, because the one-statement form
+takes an `ACCESS EXCLUSIVE` lock and scans the table. The `Problem` spells out
+the `ADD CONSTRAINT … NOT VALID` then `VALIDATE CONSTRAINT` pair to write
+instead. **A column that moved three ways gets one `Problem` naming all three**,
+because what it needs is one rewrite and not three.
 
 `Plan.destructive()` and `Plan.needsBackfill()` are the two questions a command
-asks before writing a file out.
+asks before writing a file out. A column added `NOT NULL` **with a `.default`
+needs no backfill**, which is the case ADR 0153 named as the one moment a
+default is load-bearing.
 
 #### The ledger, and applying
 

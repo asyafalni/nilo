@@ -217,6 +217,15 @@ pub const Kind = enum {
     rename_column,
     change_type,
     change_null,
+    /// `SET DEFAULT` or `DROP DEFAULT`. Its own kind rather than part of
+    /// `change_type` because it is the one column change that cannot fail on a
+    /// table with rows in it: a default is what the next insert gets.
+    change_default,
+    /// The check over a column's words, dropped and made again. Two kinds
+    /// rather than one, because they are two statements and a reader of the
+    /// generated file should see both.
+    drop_check,
+    create_check,
     create_index,
     drop_index,
 
@@ -400,7 +409,10 @@ fn diffTable(
                 .kind = .add_column,
                 .sql = try ddl.addColumn(D, gpa, t.desc, c),
                 .why = try std.fmt.allocPrint(gpa, "add {s}.{s}", .{ t.desc.table, c.name }),
-                .needs_backfill = !c.nullable,
+                // A required column with a default fills the rows already
+                // there as it is added, which is the whole of what the flag
+                // was warning about ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+                .needs_backfill = !c.nullable and c.default == null,
             });
             continue;
         };
@@ -421,46 +433,87 @@ fn diffTable(
             continue;
         }
 
-        if (!D.can_alter_column) {
+        const shape_changed = !std.mem.eql(u8, c.sql_type, was.sql_type) or
+            c.nullable != was.nullable;
+        const default_changed = !table_mod.sameOptionalText(c.default, was.default);
+        const words_changed = !table_mod.sameColumns(c.values, was.values);
+
+        // **One Problem naming everything that moved**, rather than one per
+        // thing: a database that cannot alter a column in place cannot alter
+        // any of them in place, and the answer to all four is the same
+        // rebuild. Two Problems about one column would read as two jobs.
+        //
+        // The guard is `comptime` because the branch it skips has to go
+        // unanalysed rather than merely unrun: `ddl.alterType` asserts the
+        // Dialect can, and an assert reached while compiling is a compile
+        // error whether or not the call would ever happen.
+        const blocked = ((shape_changed or default_changed) and !D.can_alter_column) or
+            (words_changed and !D.can_alter_constraint);
+        if (blocked) {
             try problems.append(gpa, .{
                 .table = t.desc.table,
                 .column = c.name,
                 .text = try std.fmt.allocPrint(
                     gpa,
-                    "{s}.{s} is {s} and was {s}. The {s} dialect cannot change a column's " ++
-                        "type or nullability in place: `ALTER TABLE` adds, drops and renames " ++
-                        "and does nothing else. The four statements are CREATE a new table " ++
-                        "with the shape you want, INSERT INTO it SELECT from the old one, " ++
-                        "DROP the old one, ALTER TABLE RENAME the new one. Write them as a " ++
-                        "step, and recreate the indexes: they go with the table.",
-                    .{ t.desc.table, c.name, c.sql_type, was.sql_type, D.name },
+                    "{s}.{s} changed: {s}. The {s} dialect cannot change a column in " ++
+                        "place — `ALTER TABLE` adds, drops and renames and does nothing " ++
+                        "else, so a type, a NOT NULL, a default and a check are all fixed " ++
+                        "when the table is created. The four statements are CREATE a new " ++
+                        "table with the shape you want, INSERT INTO it SELECT from the old " ++
+                        "one, DROP the old one, ALTER TABLE RENAME the new one. Write them " ++
+                        "as a step, and recreate the indexes: they go with the table.",
+                    .{ t.desc.table, c.name, try whatMoved(gpa, c, was), D.name },
                 ),
             });
             continue;
         }
 
-        if (!std.mem.eql(u8, c.sql_type, was.sql_type)) {
-            try steps.append(gpa, .{
-                .kind = .change_type,
-                .sql = try ddl.alterType(D, gpa, t.desc, c),
-                .why = try std.fmt.allocPrint(
-                    gpa,
-                    "{s}.{s} becomes {s}, from {s}",
-                    .{ t.desc.table, c.name, c.sql_type, was.sql_type },
-                ),
-            });
-        }
-        if (c.nullable != was.nullable) {
-            try steps.append(gpa, .{
-                .kind = .change_null,
-                .sql = try ddl.alterNullability(D, gpa, t.desc, c),
-                .why = try std.fmt.allocPrint(
-                    gpa,
-                    "{s}.{s} {s} be null",
-                    .{ t.desc.table, c.name, if (c.nullable) "may now" else "may no longer" },
-                ),
-                .needs_backfill = !c.nullable,
-            });
+        if (comptime D.can_alter_column) if (shape_changed or default_changed) {
+            if (!std.mem.eql(u8, c.sql_type, was.sql_type)) {
+                try steps.append(gpa, .{
+                    .kind = .change_type,
+                    .sql = try ddl.alterType(D, gpa, t.desc, c),
+                    .why = try std.fmt.allocPrint(
+                        gpa,
+                        "{s}.{s} becomes {s}, from {s}",
+                        .{ t.desc.table, c.name, c.sql_type, was.sql_type },
+                    ),
+                });
+            }
+            if (c.nullable != was.nullable) {
+                try steps.append(gpa, .{
+                    .kind = .change_null,
+                    .sql = try ddl.alterNullability(D, gpa, t.desc, c),
+                    .why = try std.fmt.allocPrint(
+                        gpa,
+                        "{s}.{s} {s} be null",
+                        .{ t.desc.table, c.name, if (c.nullable) "may now" else "may no longer" },
+                    ),
+                    // A column being tightened is filled by its own default
+                    // from here on, and the rows already there are the
+                    // question the flag asks about.
+                    .needs_backfill = !c.nullable,
+                });
+            }
+            if (default_changed) {
+                try steps.append(gpa, .{
+                    .kind = .change_default,
+                    .sql = try ddl.alterDefault(D, gpa, t.desc, c),
+                    .why = if (c.default) |text| try std.fmt.allocPrint(
+                        gpa,
+                        "{s}.{s} defaults to {s}",
+                        .{ t.desc.table, c.name, text },
+                    ) else try std.fmt.allocPrint(
+                        gpa,
+                        "{s}.{s} has no default any more",
+                        .{ t.desc.table, c.name },
+                    ),
+                });
+            }
+        };
+
+        if (comptime D.can_alter_constraint) {
+            if (words_changed) try diffWords(gpa, D, t, c, was, steps);
         }
     }
 
@@ -481,6 +534,92 @@ fn diffTable(
 
     try diffIndexes(gpa, D, t, old, steps);
     try diffReferences(gpa, t, old, problems);
+}
+
+/// What about a column is not what the snapshot recorded, as one phrase for
+/// the Problem that names it. Every reason at once rather than the first, the
+/// same rule the Problem list itself follows.
+fn whatMoved(gpa: std.mem.Allocator, c: Column, was: Column) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    var first = true;
+
+    if (!std.mem.eql(u8, c.sql_type, was.sql_type)) {
+        try w.print("it is {s} and was {s}", .{ c.sql_type, was.sql_type });
+        first = false;
+    }
+    if (c.nullable != was.nullable) {
+        if (!first) try w.writeAll(", ");
+        try w.writeAll(if (c.nullable) "it may be null now" else "it may no longer be null");
+        first = false;
+    }
+    if (!table_mod.sameOptionalText(c.default, was.default)) {
+        if (!first) try w.writeAll(", ");
+        if (c.default) |text| {
+            try w.print("it defaults to {s}", .{text});
+        } else {
+            try w.writeAll("it has no default any more");
+        }
+        first = false;
+    }
+    if (!table_mod.sameColumns(c.values, was.values)) {
+        if (!first) try w.writeAll(", ");
+        try w.print("the words it may hold are {d} and were {d}", .{ c.values.len, was.values.len });
+    }
+    return aw.toOwnedSlice();
+}
+
+/// The check over a column's words, when the Zig enum behind it gained, lost or
+/// renamed one.
+///
+/// **Dropped and made again rather than altered**, because neither database
+/// alters a check constraint in place and Postgres does both in one
+/// `ALTER TABLE`. Losing a word is the case worth flagging: the rows holding it
+/// are already there, the new constraint refuses them, and the statement fails
+/// rather than removing anything — so it is a backfill rather than data loss,
+/// and the `UPDATE` that moves those rows goes in the version beside it.
+fn diffWords(
+    gpa: std.mem.Allocator,
+    comptime D: type,
+    t: Table,
+    c: Column,
+    was: Column,
+    steps: *std.ArrayList(Step),
+) !void {
+    comptime std.debug.assert(D.can_alter_constraint);
+
+    if (was.values.len > 0) try steps.append(gpa, .{
+        .kind = .drop_check,
+        .sql = try ddl.dropCheck(D, gpa, t.desc, c.name),
+        .why = try std.fmt.allocPrint(
+            gpa,
+            "{s}.{s}: the words it may hold have changed",
+            .{ t.desc.table, c.name },
+        ),
+    });
+
+    if (c.values.len > 0) try steps.append(gpa, .{
+        .kind = .create_check,
+        .sql = try ddl.addCheck(D, gpa, t.desc, c),
+        .why = try std.fmt.allocPrint(
+            gpa,
+            "{s}.{s}: the {d} word(s) its type has now",
+            .{ t.desc.table, c.name, c.values.len },
+        ),
+        .needs_backfill = anyLost(was.values, c.values),
+    });
+}
+
+/// Whether the old set holds a word the new one does not — the rows already
+/// written with it are what the new constraint would refuse.
+fn anyLost(before: []const []const u8, now: []const []const u8) bool {
+    for (before) |old| {
+        for (now) |new| {
+            if (std.mem.eql(u8, old, new)) break;
+        } else return true;
+    }
+    return false;
 }
 
 /// A column as the snapshot had it, looking through any rename that has just
@@ -1120,6 +1259,166 @@ test "a table this program only reads is not created by createMissing either" {
     const missing = comptime missingOf(Pg, &.{ Comment, Staff });
     try testing.expectEqual(@as(usize, 1), missing.len);
     try testing.expect(std.mem.indexOf(u8, missing[0].table, "comments") != null);
+}
+
+// -- the words that live inside one Row (ADR 0221) ------------------------
+
+const Level = enum { low, high };
+const WiderLevel = enum { low, mid, high };
+
+const Ticket = struct {
+    pub const nilo_table = .{
+        .name = "tickets",
+        .key = .id,
+        .default = .{ .level = .low },
+        .index = .{.{ .columns = .{.closed_at}, .where = .{ .closed_at = null } }},
+    };
+    id: i64,
+    level: Level,
+    note: []const u8,
+    closed_at: ?types.Timestamp,
+};
+
+const WiderTicket = struct {
+    pub const nilo_table = .{
+        .name = "tickets",
+        .key = .id,
+        .default = .{ .level = .high, .note = "none" },
+        .index = .{.{ .columns = .{.closed_at}, .where = .{ .closed_at = .{ .ne = null } } }},
+    };
+    id: i64,
+    level: WiderLevel,
+    note: []const u8,
+    closed_at: ?types.Timestamp,
+};
+
+test "a changed default and a changed set of words are three statements, not a rebuild" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const before = try snapshotFrom(a, Pg, &.{Ticket});
+    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{WiderTicket}), before);
+
+    try testing.expectEqual(@as(usize, 0), change.problems.len);
+    // level's default, level's words dropped and made again, note's default,
+    // then the index whose predicate turned over.
+    try testing.expectEqual(@as(usize, 6), change.steps.len);
+    try testing.expectEqual(Kind.change_default, change.steps[0].kind);
+    try testing.expect(std.mem.indexOf(u8, change.steps[0].sql, "SET DEFAULT 'high'") != null);
+    try testing.expectEqual(Kind.drop_check, change.steps[1].kind);
+    try testing.expectEqual(Kind.create_check, change.steps[2].kind);
+    try testing.expect(std.mem.indexOf(u8, change.steps[2].sql, "'mid'") != null);
+    try testing.expectEqual(Kind.change_default, change.steps[3].kind);
+
+    // Nothing here loses data, and nothing needs a backfill: every word the
+    // old type had, the new one still has.
+    try testing.expect(!change.destructive());
+    try testing.expect(!change.needsBackfill());
+}
+
+test "an index whose predicate turned over is dropped and made again" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const before = try snapshotFrom(a, Pg, &.{Ticket});
+    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{WiderTicket}), before);
+
+    // The name is the same, so the pair is a drop and a create rather than
+    // two indexes: neither database alters one in place.
+    const dropped = change.steps[4];
+    const made = change.steps[5];
+    try testing.expectEqual(Kind.drop_index, dropped.kind);
+    try testing.expectEqual(Kind.create_index, made.kind);
+    try testing.expect(std.mem.indexOf(u8, made.sql, "WHERE \"closed_at\" IS NOT NULL") != null);
+}
+
+test "a word taken off an enum is a backfill, because the rows holding it are there" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The other direction: what was three words is two, and the rows written
+    // with the third are already in the table. The new constraint refuses
+    // them, so the statement fails rather than removing anything — which is a
+    // backfill to write beside it, not data loss.
+    const before = try snapshotFrom(a, Pg, &.{WiderTicket});
+    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{Ticket}), before);
+
+    try testing.expectEqual(@as(usize, 0), change.problems.len);
+    try testing.expect(change.needsBackfill());
+    try testing.expect(!change.destructive());
+}
+
+test "SQLite names everything that moved on one column, in one Problem" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const before = try snapshotFrom(a, Lite, &.{Ticket});
+    const change = try plan(a, Lite, comptime tablesOf(Lite, &.{WiderTicket}), before);
+
+    // One Problem for `level` and one for `note`, and none of the column's
+    // three changes becomes a Problem of its own: the answer to all of them
+    // is the same rebuild, so two would read as two jobs.
+    try testing.expectEqual(@as(usize, 2), change.problems.len);
+    try testing.expectEqualStrings("level", change.problems[0].column);
+    const text = change.problems[0].text;
+    try testing.expect(std.mem.indexOf(u8, text, "it defaults to 'high'") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "the words it may hold are 3 and were 2") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "cannot change a column in place") != null);
+
+    // And no half-done plan beside them: the index is still diffed, because
+    // an index is dropped and made again on both databases.
+    for (change.steps) |s| try testing.expect(s.kind == .drop_index or s.kind == .create_index);
+}
+
+const Plain = struct {
+    pub const nilo_table = .{ .name = "notes", .key = .id };
+    id: i64,
+    body: []const u8,
+};
+
+const PlainWithCount = struct {
+    pub const nilo_table = .{ .name = "notes", .key = .id, .default = .{ .views = 0 } };
+    id: i64,
+    body: []const u8,
+    views: i64,
+};
+
+test "a required column added with a default fills the rows that are there, so it is no backfill" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const before = try snapshotFrom(a, Pg, &.{Plain});
+    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{PlainWithCount}), before);
+
+    try testing.expectEqual(@as(usize, 1), change.steps.len);
+    try testing.expectEqual(Kind.add_column, change.steps[0].kind);
+    try testing.expect(std.mem.indexOf(u8, change.steps[0].sql, "DEFAULT 0") != null);
+    // The case ADR 0153 named as the one where a default is load-bearing,
+    // answered by the word rather than by a warning.
+    try testing.expect(!change.needsBackfill());
+}
+
+test "the same column with no default is still the loud one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Bare = struct {
+        pub const nilo_table = .{ .name = "notes", .key = .id };
+        id: i64,
+        body: []const u8,
+        views: i64,
+    };
+    const before = try snapshotFrom(a, Pg, &.{Plain});
+    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{Bare}), before);
+
+    try testing.expectEqual(@as(usize, 1), change.steps.len);
+    try testing.expect(change.needsBackfill());
 }
 
 test "a table this program only reads is not dropped for not being described" {

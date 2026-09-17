@@ -236,6 +236,10 @@ _Avoid_: cookie store, session store, cookie cache
 A struct of the caller's own, one field per column, carrying the marker that names its table. A narrower one names another Row instead of a table, and is checked against it while compiling.
 _Avoid_: ORM, model, entity, record, schema, DTO
 
+**Marker**:
+The `pub const nilo_table` on a Row: what the type says about its **table** rather than about a query. Its words are checked while compiling, which is the condition for being a word at all — the name, the key, a column's default, a unique, an index and its predicate, a foreign key and its two sides. A word whose body only a database can read is a second kind, checked by the database and diffed by name and hash (ADR 0221); anything that is neither is SQL in a step, and the snapshot marks it as an object nilo does not own.
+_Avoid_: annotation, decorator, attribute, tag, metadata, schema DSL
+
 **Borrowed row**:
 One Row read on its own rather than with the rest, its text pointing into the buffer the rows arrive in and valid only until the next one is pulled. That text is a plain slice and not a Str, which is what keeps the Str guarantee free of exceptions.
 _Avoid_: view, ref, unowned, cursor row
