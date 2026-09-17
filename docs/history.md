@@ -3310,3 +3310,155 @@ copied.** `zig build snippets` walks the documentation for `<!-- compiles`
 now and refuses a marked page absent from `pages`, which is the shape ADR 0027
 gave the error messages: a rule that a build step runs rather than a
 paragraph that a reader is trusted with.
+
+## A phase recommended in three guides had never run beside a worker
+
+**A shape that works for the one service it was tested with is not a
+shape.** ADR 0079's `app.start(threaded.io())` then `listen()` was tested
+with a `Db` alone and recommended everywhere; the first port to run a job
+worker beside a pool through it got a server that took SIGINT and never
+exited. The repro took an afternoon: a service keeps the `Io` it was
+started on, `listen()` builds a loop of its own, and a worker parked on the
+caller's `Threaded` is a general protection fault once that `Threaded` is
+freed and a hang while it is not. The plain `listen()` exits cleanly in the
+same repro. The fix is a refusal at the moment the two loops meet, and the
+phase moved inside `listen()` as `app.before`
+([ADR 0220](./adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+
+**An option that reads nicer than a call can cost every program the
+module.** `.expect = manifest.head` on `Db.Opts` measured 17,296 bytes on
+`zig build size-sql` — the ledger's DDL, the head query and its sentences,
+linked whether anybody set the option or not, because an option is read on
+every boot. As `db.expecting(version)`, a call storing a function with the
+guard inside it, the same two binaries move by 16 and 48 bytes. The
+`checking` precedent was the same trade for a different reason (its list is
+comptime), and the fourth axis is what settled this one.
+
+## A line drawn to keep a vocabulary checked pushed the words into strings
+
+**ADR 0153 refused `.default`, an enum's `CHECK` and a partial index on the
+grounds that "nothing about them can be checked while compiling", and a
+59-table port proved the opposite of the property the refusal was protecting.**
+The words did not go away. They went into `.data` steps as SQL text, where the
+compiler cannot see them at all: 126 defaults, 29 `IN (…)` lists each sitting
+beside a Zig enum with the same tags in it, and 34 partial indexes. The schema
+ended up **less** checked than the vocabulary would have been, and `work_items`
+went from one `CREATE TABLE` a reader could read top to bottom to a Row at line
+138 and eight steps starting at line 418. Every one of those is decidable while
+compiling, so the ADR's own bar let them in and the line had simply been drawn
+short of it ([ADR 0221](./adr/0221-the-marker-has-two-kinds-of-word.md)).
+
+Two things about the check made it safe to move the line, and both are worth
+carrying to the next vocabulary argument. **A value is checked and then
+rendered to text, and the text is what the snapshot holds** — so the string the
+`CREATE` writes is the string the diff compares, and the two cannot fall out of
+step the way a value and its spelling can. And **the second kind of word is the
+one the compiler cannot check and a diff can**: a `CHECK` body is a named text,
+and same-name-same-hash-do-nothing is a complete answer without the compiler.
+The bar "checked while compiling" was right for one kind of word and was being
+applied as though it were the only kind.
+
+**A type whose headline case is a date of birth was built on a walk that stops
+at 1970.** `sql.Date.writeIso` went through `std.time.epoch`, which is the one
+direction std has, and answered `error.BeforeEpoch` for every day before the
+epoch — correct for `Timestamp`, useless for the first thing anybody puts in a
+`date` column. Nothing said so because every date in the tests was after 1970.
+Writing the inverse walk out then hit a second one: **zero-padding a *signed*
+integer in Zig writes the sign**, so `{d:0>4}` on an `i64` year is `+1945`. The
+old code never met it because the year `std.time.epoch` hands back is unsigned.
+A round trip through a real SQLite column is what printed `+1945-08-17`.
+
+**And the repository already knew.** `sql/cli.zig:310` carries a comment saying
+exactly that, written when `status` printed `00+3` for version 3. It did not
+protect `types.zig`, one directory away, six months later. A gotcha in one
+file's comment is a note to whoever next reads *that file*; the thing that
+would have caught this is a test with a pre-epoch date in it, which is what
+there is now.
+
+## The way out a port proposed cost a check it did not have to cost
+
+**A requirement written as one mechanism reads as a blocker; written as what it
+has to catch, it reads as a choice about where.** The same 59-table port
+reported that `.references` needs the target Row's *type* in scope, which its
+context-per-directory layout forbids, and offered two ways out: name the table
+as text and replace the compile-time type check with a boot-time read of
+`pg_constraint`, or accept declaring all 59 tables twice — 3,876 lines no query
+names, beside the 68 Rows the contexts actually use. Both were stated as trades
+against the check. Neither had to be: the check is "the two sides hold the same
+value, so they are the same Zig type", and **one level up, every Row in the
+program is already in one comptime list** — `sql.cli.Tool(Db, Rows)`,
+`db.checking`, `migrate.tablesOf`, all three reaching `orderOf`, which had to
+walk every reference anyway to sort the `CREATE TABLE`s. The name resolves
+there, the types are compared there, and nothing is given up
+([ADR 0222](./adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+
+**Where a comptime check is called from decides whose error message a person
+sees.** `assertTargetsResolve` called before the `Desc`s are built reads
+`entry.to` on an entry that has none, and a `.references` written wrong fails
+with Zig's "no field named 'to'" instead of nilo's sentence about it. One line
+later in `orderOf` and the refusal is the one the build step holds. A refusal
+file is what found it.
+
+**A `<!-- compiles -->` block that only declares types proves that it parses.**
+Two new guide blocks were written to show a `.references` naming its table as
+text and one spanning two columns, and both "passed" `zig build snippets` with a
+table name no Row in the block declares. Zig analyses a container-level
+declaration lazily, and the step compiles each block as an object with nothing
+referencing it, so `pub const nilo_table` is read by nobody and every comptime
+check the marker is made of is skipped. Adding `comptime { _ = tablesOf(…) }` to
+the block turned the same text into nilo's refusal. The guide is full of blocks
+of exactly that shape; the standing risk in `roadmap.md` is the general form.
+
+**A generated file nothing compiles is a file whose shape is unchecked.** The
+migrations tests write version files into a temporary directory and read them
+back as text, so `.steps = before ++ generated ++ after` — three comptime slices
+concatenated — would have shipped having never been handed to a compiler. It
+does work. Nothing in the suite said so until a test wrote the line out where
+the compiler sees it
+([ADR 0223](./adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)).
+
+## A test one layer under the bug stays green while nobody can reach it
+
+**`snapshot.zig` had a green test for a refusal no caller could produce.** It
+called `snapshot.parse` directly, handed it a `Diagnostics`, and asserted the
+sentence. Every layer between it and a person — `read`, `generate`,
+`doGenerate` — passed `null`, so what a user got was `error.ParseZon` and forty
+lines of stack. The fix is not a better assertion; it is choosing the layer. The
+replacement tests write a file into a temporary directory and call `generate`,
+which is the path a person takes
+([ADR 0224](./adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
+
+**Two bugs hid behind that one, and both were in shipped documentation.** ADR
+0222 said an older snapshot "is refused with a parse diagnostic naming
+`column`" — true of the function, false of the tool. The CHANGELOG said
+"`db generate` rewrites it" — false for every repository past version 1, because
+`generate` reads the snapshot before writing one and `--baseline` is refused
+under a version 2. Both were written by somebody who had read the code. **An
+instruction in a release note is a claim with no run behind it**, which is the
+same decay `bench/result/` exists to stop for numbers.
+
+**A rename is the one snapshot change that costs a mirror struct forever.**
+`std.zon` fills a *missing* field from its default, so every word the marker has
+gained since ADR 0153 was free. `.column` → `.columns` was not, and the price is
+an `Older` struct that is read, never written, and lives until 1.0. That is now
+the visible bar for the next rename.
+
+**`std.zon.parse.fromSliceAlloc` leaks on a failing parse when `diag` is
+null.** It owns the ast and the zoir either way; with `null` it frees the two it
+can see and not what `fromZoirAlloc` made. Four lines of std and no nilo
+reproduce it — worth isolating that way before believing a leak is yours. The
+workaround is a local `Diagnostics` nobody reads, deinit'd, which is also what
+the rest of this change wanted anyway.
+
+**`&.{ "a", "b" }` is a pointer to an anonymous tuple *struct*, not to an
+array.** A predicate written to recognise a list looked for `.array` behind a
+`.one` pointer and matched `&.{}` and nothing else, so every non-empty array
+default fell through to the "this is not a literal" refusal
+([ADR 0225](./adr/0225-an-array-column-has-a-default-like-any-other.md)).
+
+**The test that runs the generated file is the one that finds the generated
+file's bugs.** The `.sql` twin had four tests comparing its text against
+expected text, all green, and an `INSERT` whose column list was opened and never
+closed. What found it was the fifth: hand the statements to a real database in
+order and then ask `migrate.expect`, which is what a server does at boot
+([ADR 0227](./adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).

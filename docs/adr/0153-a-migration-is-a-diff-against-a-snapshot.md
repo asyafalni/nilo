@@ -1,5 +1,48 @@
 # 0153 — a migration is a diff against a snapshot, not a database
 
+> **Amended by [ADR 0221](./0221-the-marker-has-two-kinds-of-word.md).** The bar
+> below — a word gets into the marker if the compiler can check it — is kept,
+> and the line drawn from it was short: `.default`, an enum column's `CHECK`
+> and a typed partial index are all decidable while compiling, and a 59-table
+> port put 126 defaults, 29 `IN (…)` lists and 34 partial indexes into strings
+> the compiler cannot read instead. So §"A default belongs to the step, not to
+> the type" is reversed, and §"The line" now reads four words rather than
+> three, each of them with more inside it. Everything else here stands,
+> including the refusal of
+> `.where = "deleted_at IS NULL"` as a string.
+
+> **Amended by [ADR 0222](./0222-a-foreign-key-is-columns-and-a-table-name.md).**
+> §"The line" says `.references` is checked harder than the rest, and that
+> "`Org` has to be a Row". It no longer has to be: a reference may name its
+> table as text, for a program whose contexts may not import each other, and a
+> reference may span several columns. The check that sentence defended — the two
+> sides hold the same value, so they are the same Zig type — is kept in full and
+> runs one level up, where every Row is in one list.
+
+> **Amended by [ADR 0223](./0223-a-version-file-is-a-generated-block-and-the-rest.md).**
+> §"What a generated file looks like" describes a file that is one `Version` and
+> nothing else. It is now a generated block between two markers plus a `before`,
+> an `after` and a `version` that concatenates them, so the steps somebody wrote
+> by hand survive a rerun. It also adds `generate --baseline`, which derives
+> version 1 again from nothing. That is not the `reset` §"Forward only" sketches
+> and does not replace it: `reset` drops what the database holds, `--baseline`
+> touches three files and no database at all.
+
+> **Amended by
+> [ADR 0226](./0226-the-marker-has-a-word-the-database-checks.md).** §"The line"
+> keeps its bar and gains a second kind of word beside it: an object whose
+> **name** the compiler checks and whose **body** only the database can read,
+> compared by hash and never parsed. `.check` and `.trigger` are the two that
+> hang off a table. The refusal of SQL-as-a-string for anything the compiler
+> *could* check is untouched.
+
+> **Amended by
+> [ADR 0227](./0227-a-version-has-a-sql-twin-nobody-reads-back.md).**
+> §"Forward only" is kept and §"A version is Zig" gains a boundary: *authoring*
+> a version stays Zig, and *applying* one no longer has to be. `db generate`
+> writes a `.sql` twin beside each version, ledger row and all, and `db check`
+> fails when one goes stale. It is an output; nilo never reads one back.
+
 **Status:** accepted
 **Amends:** the refusal recorded in the Rows section of
 [`docs/reference.md`](../reference.md), that a Row may not declare an index or a

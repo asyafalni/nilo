@@ -60,6 +60,12 @@ const Fixture = struct {
     run: core.Run,
 
     fn init(gpa: std.mem.Allocator, name: []const u8) !*Fixture {
+        return initWith(gpa, name, .{ .size = 2 }, null);
+    }
+
+    /// `expect` is what `expecting` would be told before the boot, or null
+    /// for a `Db` with no version guard.
+    fn initWith(gpa: std.mem.Allocator, name: []const u8, opts: Db.Opts, expect: ?i64) !*Fixture {
         const self = try gpa.create(Fixture);
         errdefer gpa.destroy(self);
 
@@ -80,9 +86,10 @@ const Fixture = struct {
             // The `Io` has to outlive every query, not just the open: it is
             // what the pool was opened with. So it is a field.
             .threaded = .init(gpa, .{}),
-            .db = Db.init(gpa, path, .{ .size = 2 }),
+            .db = Db.init(gpa, path, opts),
             .run = .init(gpa),
         };
+        if (expect) |want| self.db.expecting(want);
         try self.db.nilo_start(self.threaded.io(), .off);
         return self;
     }
@@ -159,6 +166,73 @@ const Slot = struct {
     label: []const u8,
     rank: ?i64,
 };
+
+/// The other Wire's answer to a `date`, and it is a different answer: SQLite
+/// has no date type at all, so the column is `TEXT` and the ten characters
+/// are what is stored. Both halves are `Date`'s own — `writeIso` on the way
+/// in, `nilo_parse` on the way out — which is what makes the round trip a
+/// test of the pair rather than of SQLite.
+const Holiday = struct {
+    pub const nilo_table = .{ .name = "holidays", .key = .id };
+
+    id: i64,
+    name: []const u8,
+    falls_on: types.Date,
+    observed_on: ?types.Date,
+};
+
+test "a date is TEXT on SQLite, and the day that went in is the day that comes out" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "dates");
+    defer fx.deinit(gpa);
+
+    try migrate.createMissing(&fx.db, &fx.run, &.{Holiday});
+
+    // Before the epoch, which the ISO text spells the same way as any other
+    // day and the `days` field holds as a negative.
+    const made = try fx.db.insert(Holiday, &fx.run, .{
+        .name = "proklamasi",
+        .falls_on = types.Date.nilo_parse("1945-08-17").?,
+        .observed_on = @as(?types.Date, null),
+    });
+    try testing.expectEqual(@as(i32, -8903), made.falls_on.days);
+
+    const found = (try fx.db.find(Holiday, &fx.run, made.id)).?;
+    try testing.expectEqual(@as(i32, -8903), found.falls_on.days);
+    try testing.expectEqual(@as(?types.Date, null), found.observed_on);
+
+    // The same loop every column type here has to close: `columnType` writes
+    // what `accepts` reads out of, or a generated schema stops the server it
+    // was generated for.
+    try testing.expectEqual(@as(usize, 0), try fx.db.checkSchema(&.{Holiday}));
+}
+
+test "the ten characters sort as days, which is why the text is ISO and not local" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "datesort");
+    defer fx.deinit(gpa);
+
+    try migrate.createMissing(&fx.db, &fx.run, &.{Holiday});
+
+    // `17/08/1945` would compare as text in whatever order the day of the
+    // month happened to fall in. This is the whole reason the stored spelling
+    // is the one `date` prints.
+    for ([_][]const u8{ "2026-01-01", "1945-08-17", "2025-12-31" }) |iso| {
+        _ = try fx.db.insert(Holiday, &fx.run, .{
+            .name = iso,
+            .falls_on = types.Date.nilo_parse(iso).?,
+            .observed_on = @as(?types.Date, null),
+        });
+    }
+
+    const after = try fx.db.select(Holiday, &fx.run, .{
+        .where = .{ .falls_on = .{ .gte = types.Date.nilo_parse("2025-01-01").? } },
+        .order = .{ .falls_on = .asc },
+    });
+    try testing.expectEqual(@as(usize, 2), after.len);
+    try testing.expectEqualStrings("2025-12-31", after[0].name);
+    try testing.expectEqualStrings("2026-01-01", after[1].name);
+}
 
 test "bytes go into a BLOB and come back the same bytes" {
     const gpa = testing.allocator;
@@ -417,6 +491,71 @@ test "createMissing creates every table the types describe, in reference order" 
     try testing.expectEqualStrings("wati@example.dev", user.email);
 }
 
+/// The rule a composite foreign key exists to hold: a Card belongs to a Board,
+/// and both belong to the same org. One column cannot say that, and the
+/// alternative is a `.data` step beside the `.unique` it needs — one rule in
+/// two files and a string ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+const Board = struct {
+    pub const nilo_table = .{ .name = "boards", .key = .{ .org_id, .id } };
+
+    org_id: i64,
+    id: i64,
+    title: []const u8,
+};
+
+/// And the other half of the round: this one points at `boards` by **name**,
+/// which is what a program whose contexts may not import each other has to
+/// write. The type check runs against the list `createMissing` is given.
+const Card = struct {
+    pub const nilo_table = .{
+        .name = "cards",
+        .key = .id,
+        .references = .{
+            .board = .{
+                .columns = .{ .org_id, .board_id },
+                .to = .{ "boards", .{ .org_id, .id } },
+                .on_delete = .cascade,
+            },
+        },
+    };
+
+    id: i64,
+    org_id: i64,
+    board_id: i64,
+    label: []const u8,
+};
+
+test "a foreign key of two columns is a constraint the database enforces, not a clause" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "compositefk");
+    defer fx.deinit(gpa);
+
+    // Cards before boards in the list, and boards created first anyway: the
+    // order comes from the reference, and a reference written as text orders
+    // exactly as one written as a type.
+    try migrate.createMissing(&fx.db, &fx.run, &.{ Card, Board });
+    // SQLite checks foreign keys only when it is told to, per connection.
+    _ = try fx.db.exec(&fx.run, "PRAGMA foreign_keys = ON", .{});
+
+    _ = try fx.db.insert(Board, &fx.run, .{ .org_id = 1, .id = 10, .title = "roadmap" });
+
+    const card = try fx.db.insert(Card, &fx.run, .{
+        .org_id = 1,
+        .board_id = 10,
+        .label = "port the schema",
+    });
+    try testing.expectEqual(@as(i64, 10), card.board_id);
+
+    // The whole point, and the thing one column could not have refused: board
+    // 10 exists, org 2 exists, and the pair does not. A single-column key on
+    // `board_id` would have taken this row.
+    try testing.expectError(error.ForeignKeyViolated, fx.db.insert(Card, &fx.run, .{
+        .org_id = 2,
+        .board_id = 10,
+        .label = "somebody else's board",
+    }));
+}
+
 test "a table nilo created is a table nilo's own check accepts" {
     // **The loop this whole thing turns on.** `columnType` writes the first
     // entry of `accepts`, so a generated table has to pass the comparison
@@ -612,6 +751,40 @@ test "a binary built for a version the database has not reached refuses to serve
     try migrate.expect(&fx.db, &fx.run, 8);
 }
 
+test "a Db told what to expect asks the ledger at boot, on the pool it just opened" {
+    // ADR 0220: the version guard is a call on the `Db`, so it runs inside
+    // `listen()` on the server's own loop with nothing for the caller to
+    // sequence. What is pinned here is that boot *reaches* the ledger — a
+    // fresh file has none, and after this `nilo_start` it has one — and that
+    // level and ahead go through. Behind is `migrate.expect`'s own refusal,
+    // pinned above through `standing` for the reason given there.
+    const gpa = testing.allocator;
+    var fx = try Fixture.initWith(gpa, "expect_at_boot", .{ .size = 2 }, 0);
+    defer fx.deinit(gpa);
+
+    // No `ensureLedger` here: boot made it, or this query has no table.
+    try testing.expectEqual(@as(i64, 0), try migrate.headVersion(&fx.db, &fx.run));
+
+    var d3: [64]u8 = undefined;
+    const three, const three_hash = lone(3, "three", &.{
+        .{ .kind = .create_table, .sql = "CREATE TABLE \"three\" (\"id\" INTEGER)", .why = "" },
+    }, &d3);
+    _ = try migrate.apply(&fx.db, &fx.run, three, three_hash);
+
+    // A second `Db` on the same file, booted the way a deploy would be.
+    var level = Db.init(gpa, fx.path, .{ .size = 1 });
+    defer level.deinit();
+    level.expecting(3);
+    try level.nilo_start(fx.threaded.io(), .off);
+
+    // And one built before the migration that is already in: the middle of
+    // a two-stage deploy, allowed.
+    var ahead = Db.init(gpa, fx.path, .{ .size = 1 });
+    defer ahead.deinit();
+    ahead.expecting(2);
+    try ahead.nilo_start(fx.threaded.io(), .off);
+}
+
 test "the plan a diff produces is the plan that runs, end to end" {
     // The two halves meet here: `plan` writes statements with no database in
     // the room, and `apply` sends exactly those. Nothing in between rewrites
@@ -796,4 +969,74 @@ test "`status` says `edited` for a version whose file no longer matches what ran
     try testing.expect(std.mem.indexOf(u8, text, "2 applied version(s) no longer match") != null);
     // And it points at the command that says which, rather than at nothing.
     try testing.expect(std.mem.indexOf(u8, text, "`db verify`") != null);
+}
+
+// -- the `.sql` twin, applied by something that is not nilo (ADR 0227) -----
+
+test "a twin brings a database to head on its own, ledger row and all" {
+    // **The one test that makes the twin a file rather than a claim.** Every
+    // other check on it compares text against text; this one hands the
+    // statements to a database in order and then asks `expect`, which is what a
+    // server does at boot. A twin that does not satisfy that is a twin nobody
+    // should apply.
+    const gpa = testing.allocator;
+    // One connection, so `BEGIN` and `COMMIT` in the file are the same
+    // transaction rather than two connections out of a pool.
+    var fx = try Fixture.initWith(gpa, "twin", .{ .size = 1 }, null);
+    defer fx.deinit(gpa);
+
+    const migrations = @import("migrations.zig");
+    const D = Db.Dialect;
+
+    const tables = comptime migrate.tablesOf(D, &.{ User, Org });
+    const change = try migrate.plan(fx.run.arena(), D, tables, migrate.snapshot.empty(D));
+
+    var hash: [64]u8 = undefined;
+    const text = try migrations.renderSql(
+        fx.run.arena(),
+        D,
+        .{ .number = 1, .name = "initial", .steps = change.steps },
+        "initial",
+        migrate.hashOf("", change.steps, &hash),
+        "0001_initial.zig",
+    );
+
+    // The split is the test's, not nilo's: the file is meant for `psql -f` and
+    // friends, which read a script. What is under test is the statements and
+    // their order.
+    var it = std.mem.splitSequence(u8, text, ";\n");
+    while (it.next()) |chunk| {
+        const statement = std.mem.trim(u8, stripComments(chunk), " \n");
+        if (statement.len == 0) continue;
+        _ = try fx.db.exec(&fx.run, statement, .{});
+    }
+
+    // The tables are there, and so is the row that says so.
+    try testing.expectEqual(@as(i64, 1), try migrate.headVersion(&fx.db, &fx.run));
+    try migrate.expect(&fx.db, &fx.run, 1);
+
+    const applied = (try fx.db.find(migrate.Applied, &fx.run, @as(i64, 1))).?;
+    try testing.expectEqualStrings("initial", applied.name);
+    try testing.expectEqualStrings(&hash, applied.hash);
+    try testing.expectEqual(@as(i64, 0), applied.ms);
+
+    // And the schema the twin built is one nilo's own check accepts, which is
+    // the loop `createMissing` is held to as well.
+    try testing.expectEqual(
+        @as(usize, 0),
+        try fx.db.checkSchema(&.{ User, Org, migrate.Applied }),
+    );
+}
+
+/// The leading `--` lines of one chunk, dropped. A comment is part of the file
+/// and not part of the statement, and only this test ever separates them.
+fn stripComments(chunk: []const u8) []const u8 {
+    var rest = chunk;
+    while (true) {
+        const start = std.mem.indexOfNone(u8, rest, " \n") orelse return "";
+        rest = rest[start..];
+        if (!std.mem.startsWith(u8, rest, "--")) return rest;
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return "";
+        rest = rest[nl + 1 ..];
+    }
 }

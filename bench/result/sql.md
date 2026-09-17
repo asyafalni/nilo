@@ -31,6 +31,11 @@ paired: **a confidence interval pooled across passes is over-confident**, and it
 nearly published five differences that do not survive being asked twice. §8 has
 the rule that replaced it.
 
+[§11](#11-the-migration-module-against-everybody-else-as-an-experience) is not
+a harness. It is the one axis of `sql.migrate` that has no timing: what it is
+like to use, measured the only way that can be, by porting a real 59-table
+schema onto it three times and counting what was left to write by hand.
+
 ## The machine
 
 | | |
@@ -727,6 +732,256 @@ twenty-findings pass above — `pg_only` 1,694,344 → 1,785,640 and `sqlite_onl
 Neither is migration's. That is the standing reason this file insists a before
 is built rather than quoted.
 
+### 10b. The marker's new words cost the same nothing, re-measured
+
+**What it answers.** ADR 0221 put `.default`, an enum column's `CHECK`, a
+partial and ordered `.index`, a `.name` on any constraint and `sql.Date` into
+the marker. The first four are comptime and reachable only from `migrate`; the
+fifth is a type, and both Wires gained a branch for it. The question is whether
+any of that reaches a server that never names them.
+
+**How.** Exactly as above: `git archive HEAD | tar -x` into a scratch
+directory, `zig build size-sql` on both sides, stripped `ReleaseFast`, and
+`cmp` rather than a size comparison.
+
+| | before | after | Δ |
+|---|---|---|---|
+| names `sql.Db` (Postgres) | 1,800,600 | 1,800,600 | **0** |
+| names `sql.Sqlite` | 2,305,584 | 2,305,584 | **0** |
+
+`cmp` reports both pairs identical byte for byte. The `date` branches in
+`postgres.read` and `sqlite.read` are inside a `comptime` test, so a Row with no
+`sql.Date` in it never compiles them, and the rest never leaves `table.zig`.
+
+**What it changed.** Nothing, which is the answer that was wanted: the cost
+table in ADR 0221 says 0 on all four axes and the fourth is measured rather than
+reasoned. The two absolutes moved again since 10 above, `pg_only` +14,960 and
+`sqlite_only` +13,888 over what shipped between, which is the same standing
+reason to build the before.
+
+### 10c. The words that cross tables, and the version file, cost nothing either
+
+**What it answers.** ADR 0222 made a foreign key a *list* of columns and let it
+name its table as text; ADR 0223 reshaped the generated version file and added
+`generate --baseline`. The first of those is the one worth measuring: unlike
+ADR 0221's words, it changes a runtime comparison — `Reference.sameAs` now walks
+two lists where it used to compare two names — and `where.zig` builds a join
+fragment in a loop. The second touches `migrations.zig`, which is the half of
+the module that opens files.
+
+**How.** The same way, and against the same commit as 10b so the two are
+directly comparable: `git archive HEAD | tar -x`, `zig build size-sql` on both
+sides, stripped `ReleaseFast`, `cmp` rather than a size comparison.
+
+| | before | after | Δ |
+|---|---|---|---|
+| names `sql.Db` (Postgres) | 1,800,600 | 1,800,600 | **0** |
+| names `sql.Sqlite` | 2,305,584 | 2,305,584 | **0** |
+
+`cmp` reports both pairs identical byte for byte, and this time **the two
+absolutes did not move either** — the first pair in this file's history that is
+unchanged on both counts, because nothing shipped between 10b and here.
+
+**What it changed.** Nothing, and the reason is worth keeping rather than
+re-deriving: the `Reference` diff and the version-file writer are both reachable
+only from `migrate` and `migrations`, which a server that serves never names.
+The only part of this work that *is* on a request path is `where.zig`'s join
+loop, and it runs at comptime — the fragment is a constant in the binary, so a
+composite `.exists` costs a longer string literal and no instructions.
+
+### 10d. The second kind of word, an array default and the `.sql` twin: nothing again
+
+**What it answers.** ADR 0226 put `.check` and `.trigger` in the marker, which
+adds two lists to `Desc` and two new diff functions to `migrate.zig`; ADR 0225
+made an array column's default a list; ADR 0227 has `generate` write a `.sql`
+file beside every version and `check` compare the two. ADR 0224 added a mirror
+struct to `snapshot.zig` for an older file. The question is the same one 10b and
+10c asked, and the reason to ask it again is that this round is the first to
+put new code in the *runtime* half of the diff rather than only in `table.zig`.
+
+**How.** The same way, against the same commit as 10c so all four are directly
+comparable: `git archive HEAD | tar -x` into a scratch directory,
+`zig build size-sql` on both sides, stripped `ReleaseFast`, and `cmp` rather
+than a size comparison.
+
+| | before | after | Δ |
+|---|---|---|---|
+| names `sql.Db` (Postgres) | 1,800,600 | 1,800,600 | **0** |
+| names `sql.Sqlite` | 2,305,584 | 2,305,584 | **0** |
+
+`cmp` reports both pairs identical byte for byte, and the absolutes have not
+moved since 10b — the second round in a row where nothing shipped in between.
+
+**What it changed.** Nothing, and the reason is the layering rather than luck.
+`diffChecks`, `diffTriggers`, `renderSql` and `snapshot.upgraded` are all
+reachable from `migrate.plan` and `migrations.generate`, and a server reaches
+`migrate` through `apply`, `expect` and `createMissing` — never through `plan`.
+The two new Dialect declarations, `trigger_drop_names_table` and
+`trigger_repeatable_head`, are a `bool` and a string literal that a program
+naming no trigger never references.
+
+**What it does cost is disk, and it is worth writing down because it is the
+first axis in this file that is not the binary.** The `.sql` twin is roughly the
+size of the version file beside it, once per version, committed. A ported schema
+of sixty tables is a few hundred kilobytes of `CREATE TABLE` written twice:
+§11 measures it at 267 KB for 59 tables.
+
+## 11. The migration module against everybody else, as an experience
+
+**What it answers.** §10 to §10d say what `sql.migrate` costs a server, and
+the answer was nothing, four times. They say nothing about what it costs the
+person. This section is that, measured the only way it can be. A 59-table
+Postgres schema (nodeflux-os: 96 foreign keys, 85 `CHECK` constraints, 126
+column defaults, 92 indexes of which 34 are partial, 31 `updated_at` triggers,
+one view, one hypertable, 113 rows of reference data) was ported onto the
+module three times, once per vocabulary the module shipped, and after each
+round what still had to be written as SQL by hand was counted. The full record
+with every finding is
+[`docs/input_from_nodeflux.md`](../../docs/input_from_nodeflux.md). This is
+the comparison and the verdict.
+
+**How.** Each round: rewrite the fourteen section files under
+`backend-zig/src/schema/` onto the marker words that had landed,
+`db generate --name schema --baseline`, migrate an empty database from the
+result, `pg_dump --schema-only` it and the goose-migrated reference, split
+both dumps into facts (a column with its type, nullability and default; a
+constraint with its name and body; an index with its name, columns and
+predicate; a trigger; the view) and compare the two sets. The control is the
+goose schema, which is what the Go binary serves. Round three added a second
+control: the `.sql` twin applied by `psql -f` to a third, empty database, with
+no nilo in the loop, which has to come out identical and has to leave a ledger
+row `db verify` accepts.
+
+**The three rounds.** v0.4.0 at `eb545fa`; `636d7b6` after ADR 0220 to 0223;
+`87759b1` after ADR 0224 to 0227.
+
+| | `eb545fa` | `636d7b6` | `87759b1` |
+|---|---|---|---|
+| Facts equal to the reference | 50 names apart, nothing else | 875 of 875 | 875 of 875, on both controls |
+| Steps `generate` wrote | 149 | 186 | 217: 59 tables, 127 indexes, 31 triggers |
+| Steps written by hand | 141 | 73 | 15, of which 10 are reference data |
+| `CHECK` clauses by hand, of 85 | 85 | 60 | 0 |
+| `updated_at` triggers by hand, of 31 | 31 | 31 | 0 |
+| `SET DEFAULT` clauses by hand, of 126 | 126 | 2 | 0 |
+| `CREATE INDEX` by hand, of 92 | 39 | 1 | 1, over `lower(btrim(site))` |
+| Tables split between a Row and a step | 56 of 59 | 46 of 59 | 2 of 59 |
+| Lines in `src/schema/` | 3,876 | 3,444 | 3,183 |
+| Names differing from the reference | 50 | 0 | 0 |
+| Applicable without a Zig toolchain | no | no | yes, 1,473 lines of `.sql` |
+
+The five hand-written steps that are not reference data on `87759b1`: the
+extension, the `set_updated_at()` function, the `sku_catalogue` view,
+`create_hypertable` and the one index over an expression. The first three
+are what a `sql.Schema` would take and it does not exist yet. The last two
+are `.data` by design.
+
+**What a round cost in effort, which is the number a DX claim owes.** Round
+two converted thirteen section files in parallel, nine assistants working
+from one converted file and a one-page recipe; the first build afterwards
+compiled, and the one wrong fact in 875 was the recipe's own mistake. Round
+three was one 140-line script over the fourteen files and the first build
+compiled, zero wrong. A rebuild of the tool after editing one section file is
+1.7 s, and `check` and `generate` open no database. The other side of the
+same fact: three rounds is three `feat!` commits, and the marker changed
+shape each time.
+
+**What the diff does with the new words, checked rather than read.** On
+`87759b1`, one `.check` body was edited and one `.trigger` renamed, then
+`db check` reported four steps (drop and re-add the constraint, create the
+new trigger, drop the old one) and `db generate --name probe` wrote exactly
+those into `0002_probe.zig` and its twin. On the live database a moved
+`CHECK` refuses a row under its original name and a moved trigger moves
+`updated_at`. Both were tried inside a rolled-back transaction, not inferred
+from the dump.
+
+### Against the field
+
+The nilo column is measured on the port above. The other five are read from
+each tool's documentation, and none of them was run here; a cell in those
+columns is a claim about a feature's existence, never about its quality or
+its speed. Six tools because the question is what the *shape* buys: goose is
+what nodeflux-os runs today, Prisma and Drizzle are the two typed-schema
+tools with a diff, Django is the oldest autodetecting one, Atlas is the one
+tool that diffs and stays language-agnostic.
+
+| | nilo `87759b1` | goose | Prisma | Drizzle | Django | Atlas |
+|---|---|---|---|---|---|---|
+| Schema is a type the compiler checks | yes | no, SQL | its own DSL | yes, TS | yes, Python | HCL or SQL |
+| Diff written by the tool | yes | no | yes | yes | yes | yes |
+| Diff needs no database | yes | n/a | no, a shadow database | yes | yes | no, a dev database |
+| `CHECK` in the diff | yes | n/a | not modelled | yes | yes | yes |
+| Triggers in the diff | yes | n/a | not modelled | not modelled | not modelled | yes, part behind Pro |
+| Views, functions, extensions | hand-written step | SQL, so yes | not modelled | views only | not modelled | yes, part behind Pro |
+| Hash of an applied version, verified later | yes, `verify` | no | yes | stored, nothing verifies it | no | yes, `atlas.sum` |
+| Binary refuses to serve a database at the wrong version | yes, `db.expecting` | no | no | no | no, a warning | no |
+| Apply without the language's toolchain | yes, the twin | yes | yes, `.sql` | yes, `.sql` | no | yes, one binary |
+| Author a version without the language's toolchain | no | yes | no | no | no | yes |
+| `down` | no, by design | yes | no | no | yes | yes |
+| Age | 0.x, path dependency | mature | mature | 0.x | mature | mature |
+
+Three things to read off it rather than count.
+
+The boot guard is the row nobody else has, and it is the one that changed
+what the port is. A binary that knows its schema version at compile time and
+refuses to accept a connection before the database is there is not a
+migration feature, it is the migration feature's *consequence*, and none of
+the five have it because none of them compile the manifest into the program.
+Rails comes closest with `PendingMigrationError`, in development only.
+`db.checking` beside it, which holds every context Row against the live
+schema on the same boot, is what sqlc gives the Go side at compile time, one
+layer later and against the database that is actually there.
+
+Diffing without a database puts nilo with Django and Drizzle and against
+Prisma and Atlas, and it matters most in CI, where a shadow database is a
+second service to stand up for a check that is otherwise pure.
+
+The row nilo loses outright is authoring, and it loses it to the two SQL-first
+tools only. The twin fixes applying, and it fixes it more completely than
+Prisma's `.sql` does, because it carries the ledger row and Prisma's needs
+`migrate resolve` after a manual apply. But a DBA cannot write a version in
+SQL and have nilo pick it up, and ADR 0153 says why not on purpose. goose and
+Atlas can. That is the first question a team whose database is shared with
+another language will ask, and the answer is no. The `down` row is not a loss:
+it is refused, and §10's ADR 0153 gives the reason.
+
+### The score
+
+A score is an opinion and the rest of this file is measurements, so each
+line carries the number that produced it, and the number is the part to argue
+with. Out of five.
+
+| | | why |
+|---|---|---|
+| Writing the schema | 5 | 59 tables in 3,183 lines, 15 steps by hand. The compiler refuses a name over 63 bytes, `.words_of` on a non-enum, two entries with one name, a reference to a table no Row claims. Equal to Drizzle; Prisma needs its own language; goose checks nothing until the database does. |
+| The diff | 4.5 | 217 steps from Rows, 875 of 875, no database opened. All three cases for a `.check` and a `.trigger` hold. Off half a point for item 15 of the input doc (`--name` demanded for a run that writes only twins) and a 119.6 KB snapshot in the repository. |
+| Applying | 4.5 | One transaction per version behind an advisory lock, a chained hash, `verify`. Flyway's and Prisma's class; goose, dbmate and Django keep no hash at all. No `down`, and the refusal is right. |
+| The boot guard | 5 | `db.expecting` and `db.checking`, the row above. The message names the version the binary was built for, the version the database is at, and what the first request would do. |
+| The escape hatch | 4 | `.data` with a `why` that becomes a comment in the twin, `before` and `after` slots the generator never touches. Every tool has one. Off a point because a 60-line view is sixty `\\` lines in a Zig string until `sql.Schema` exists. |
+| Outside Zig | 3.5 | The twin: 1,473 lines, `psql -f`, 875 of 875, ledger row included. Authoring stays Zig. Django, Ecto and Alembic make the same trade; goose, dbmate, Flyway and Atlas do not. |
+| Errors and documentation | 5 | Every refusal is a sentence that says what to do. Nine assistants converted thirteen files from a one-page recipe and the first build compiled. `guide/sql/migrations.md` grew 153 lines for four ADRs. |
+| The loop | 4 | 1.7 s to rebuild after one file, no database for `check`. Off a point because `zig build db -- check` buries a non-zero exit under `failed command` and a Build Summary; that is the Zig build runner, not nilo, and it is paid daily. Calling `./zig-out/bin/db` directly is the answer. |
+| Maturity | 2.5 | Three `feat!` in three rounds; the snapshot changed shape once (ADR 0224 reads the old one). Postgres and SQLite only. No introspection of an existing database, no studio, no seed. Version 1 of this port is three committed files, 80.0 + 67.7 + 119.6 KB, where goose is one file of 1,483 lines. |
+
+**Eight of ten overall.** On the work that is most of a migration tool's
+life (writing the schema, the diff, the guard, the errors) nilo is level with
+or ahead of Prisma and Drizzle and well ahead of goose. What holds it at
+eight is the same three facts from three angles: a 0.x vocabulary that moved
+three times, authoring that needs a Zig toolchain, and three objects still
+written as strings.
+
+For a Zig program there is nothing to compare it to and it should be used.
+For a program whose database another language also writes to, it works
+since ADR 0227 and the person writing versions still needs Zig. For
+nodeflux-os the answer is yes, because the binary now knows its schema and
+the Go one never did.
+
+**What would move the score.** On nilo's side: `sql.Schema` takes the
+hand-written steps from 15 to 12, item 15 is one branch, and a vocabulary
+that stops changing is what maturity means. On the port's side, not nilo's:
+`src/schema/` declares 59 tables a second time because 8 of the 59 context
+Rows leave out `created_at` and `updated_at`, and folding the two is what
+ADR 0222's by-name `.references` was for.
+
 ## Reproducing this
 
 ```bash
@@ -778,6 +1033,28 @@ difference is resolvable — that is what `compare_runs.py` is for, and it is th
 check §8 exists because of. Ask any other session on the machine to stay off the
 cores first; a peer's `cargo build --release` with LTO inside the window is worth
 30% of the wall clock and an unknown amount of the numbers.
+
+For §11, the port lives in nodeflux-os rather than here, and the reference is
+the database its Go binary migrates:
+
+```bash
+cd nodeflux-os/backend-zig
+zig build db -- check                              # Rows, migrations and twins agree? no database
+zig build db -- generate --name schema --baseline  # re-derive version 1 from the Rows
+zig build                                          # the twin needs the compiled version file
+zig build db -- generate --name schema             # writes the .sql twin
+DATABASE_URL=postgres://…/fresh ./zig-out/bin/db migrate
+psql -v ON_ERROR_STOP=1 -d fresh_by_psql -f migrations/0001_schema.sql
+DATABASE_URL=postgres://…/fresh_by_psql ./zig-out/bin/db verify
+```
+
+Then `pg_dump --schema-only -n public` of the reference and of each fresh
+database, split into one line per column, constraint, index, trigger and view,
+and diffed as sets. Two spellings are the same fact and are normalised before
+the diff: `ADD CONSTRAINT … UNIQUE` against `CREATE UNIQUE INDEX`, and
+`DEFAULT '1'::numeric` against `DEFAULT 1`. Nothing else is. Call the binary
+rather than `zig build db --` when the exit code matters; the build runner
+reports a refusal as `failed command` with the sentence above it.
 
 ## Is this as fast as it gets?
 

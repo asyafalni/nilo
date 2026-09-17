@@ -518,21 +518,6 @@ several workers on it.
 
 ### Known gaps
 
-**Under `app.start(io)` followed by `listen()`, the workers run on the
-caller's `Io`.** `nilo_start` runs once, in whichever phase came first
-(ADR 0079, ADR 0086), and a `Jobs` keeps the `Io` it was handed there. Under
-the published migrate-then-listen order that is the program's own
-`std.Io.Threaded`, and a worker's `sleep` on it holds an OS thread for
-`poll_ms` — inside a server whose fibers share that thread. Every Service has
-this property under that order; this is the first module where the thing
-started is a loop that sleeps, so it is the first where it costs something
-visible. The fix is repository-level rather than this module's: a second
-hook, or `listen()` re-handing the Engine's `Io` to services that were
-started under another.
-
-**Waiting on: a design** that does not become the second `nilo_start`
-ADR 0086 refused.
-
 **A schedule is UTC.** `0 3 * * *` is three in the morning in Greenwich, and
 a program in Jakarta writes `0 20 * * *` with a comment. A time zone is a
 table of rules that changes twice a year and a dependency to carry it.
@@ -1193,7 +1178,36 @@ rather than the list being adopted as a list.
 
 ### Next
 
-**1. Four migration commands are missing, and two of them are the debt that
+**1. Three of the five named texts have nowhere to be written, because there is
+no `sql.Schema`.** `.check` and `.trigger` hang off a table and ship
+([ADR 0226](./adr/0226-the-marker-has-a-word-the-database-checks.md)). A
+function, a view and an extension hang off a schema, and the only place to put
+them today is a version file's `before` slot — which works, and which means a
+`CREATE OR REPLACE FUNCTION` is a hand-written step that no diff owns. The
+shape a 59-table port wanted:
+
+```zig
+pub const schema = sql.Schema{
+    .extensions = &.{"timescaledb"},
+    .functions = .{ .set_updated_at = @embedFile("sql/set_updated_at.sql") },
+    .tables = &.{ org.Department, org.Staff, work.WorkItem },
+    .views = .{ .sku_catalogue = @embedFile("sql/sku_catalogue.sql") },
+};
+```
+
+`@embedFile` is the point of it: a sixty-line view belongs in a `.sql` file with
+highlighting rather than in sixty `\\` lines. Order is fixed by kind and the
+tool owns it — extensions, functions, tables in reference order, each table's
+checks and triggers, views, then the version file's `after`.
+
+**Waiting on: a design.** The vocabulary is settled; what is not is the seam.
+`sql.Schema` replaces the `&.{ Row, Row }` list that `cli.Tool`, `db.checking`
+and `migrate.tablesOf` all take, so it changes the signature every program in
+the guide writes. Either it is a second spelling beside the list, which is two
+ways to say one thing, or it is the only spelling, which is a break. That
+choice is the ADR.
+
+**2. Four migration commands are missing, and two of them are the debt that
 forward-only creates.** `generate`, `check`, `status`, `migrate` and `verify`
 ship ([ADR 0153](./adr/0153-a-migration-is-a-diff-against-a-snapshot.md)). The
 four that do not are `push` and `pull`, which are the SQLite and the rescue
@@ -1212,7 +1226,7 @@ has applied nothing.
 that is already past it. Rewriting rows is out — that is the thing `verify`
 exists to catch.
 
-**2. Decide whether a SQLite statement hops or runs in the fiber.** The Wire
+**3. Decide whether a SQLite statement hops or runs in the fiber.** The Wire
 ships with the choice as a field that has no default, so every program says
 which it wants and neither is a guess
 ([ADR 0073](./adr/0073-a-file-has-no-socket-to-wait-on.md)). What nobody has is
@@ -1235,7 +1249,7 @@ is the smaller of the two jobs.
 have been ([§9](../bench/result/sql.md),
 [`spike/sqlite_facts`](../spike/sqlite_facts/)). This is the one that cannot.
 
-**3. A watched statement cannot say which request it came from.**
+**4. A watched statement cannot say which request it came from.**
 `db.watching` shows the text, the plan, the duration and the rows
 ([ADR 0137](./adr/0137-a-statement-can-be-watched.md)), so *which statement is
 slow* is answerable. *Slow on which page* is not: a `Sent` carries no request
@@ -1543,10 +1557,7 @@ Two whole areas come off before the list starts.
 
 What is left splits three ways.
 
-- **Refused on the record**, each with its ADR: indexes, unique constraints,
-  foreign keys and check constraints
-  ([0056](./adr/0056-a-view-is-a-table-that-cannot-say-what-is-not-null.md));
-  set operations and CTEs
+- **Refused on the record**, each with its ADR: set operations and CTEs
   ([0058](./adr/0058-a-set-operation-over-one-table-is-a-condition.md));
   several statements in one round trip
   ([0059](./adr/0059-a-round-trip-is-not-the-cost-worth-chasing.md)); automatic
@@ -1555,7 +1566,7 @@ What is left splits three ways.
 - **Waiting on the one-table line**: joins, nested rows and aggregates.
   Subqueries came off this list — `.exists` is a condition and ships
   ([ADR 0171](./adr/0171-a-row-over-there-is-a-condition.md)). The tooling
-  commands wait on Next 1 rather than on a decision:
+  commands wait on Next 2 rather than on a decision:
   [ADR 0153](./adr/0153-a-migration-is-a-diff-against-a-snapshot.md) made it and
   the library under them is built.
 - **Nobody has looked**: row-level security, and Postgres extensions.
@@ -1896,6 +1907,30 @@ write. A `Str` that escapes this way is the staleness trap's problem, and it is
 the case that trap cannot watch.
 
 ### Open
+
+**A live `<!-- compiles -->` block that only declares types is checked for
+syntax and almost nothing else.** Zig analyses a container-level declaration
+lazily, and `zig build snippets` compiles each block as an object with nothing
+referencing it — so a block that declares a Row and stops has its
+`pub const nilo_table` read by no one. Every comptime check the marker is made
+of is skipped, and the block passes. Demonstrated rather than reasoned: a
+`.references` pointing at a table no Row in the block declares compiled clean,
+and only grew nilo's refusal once a `comptime { _ = … }` in the same block used
+the Rows.
+
+A mark can mean less than it looks like it means, and this is the way that
+survives the step going and finding its own pages: the page *is* read, the step
+*does* compile the block, and what it proves is that the text parses. The
+guide's Row examples are where it bites, because a Row example that declares and
+stops is the natural shape to write.
+
+**Waiting on: ready.** The fix is a convention rather than a mechanism — a
+block declaring Rows ends with a `comptime` block that names them — and the
+place to write it down is `docs/snippets/`'s own README beside the
+`<!-- compiles: body -->` note. A stricter version is possible and costs a
+design: have the extractor append a reference to every `pub` declaration it
+finds, which would check every block of this shape whether or not its author
+remembered.
 
 **A fail function in spawned work is safe only because of where a threadlocal
 gets written.** `bulkhead.slot()` falls back to a threadlocal when a fiber has

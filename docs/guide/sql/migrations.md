@@ -4,7 +4,8 @@ The same Row that reads a table can create it, change it, and say whether
 the database it is about to serve is behind. Migrations are the one thing in
 [Talking to a database](./README.md) that is not a query.
 
-Three words in the marker, and no more:
+Everything the marker says, it says in one place, and every word of it is
+checked while you compile:
 
 <!-- compiles -->
 ```zig
@@ -15,27 +16,67 @@ const Org = struct {
     name: nilo.Str,
 };
 
+const Plan = enum { free, team, enterprise };
+
 const Member = struct {
     pub const nilo_table = .{
         .name = "members",
         .key = .id,
-        .unique = .{.{ .columns = .{.email}, .ignoring_case = true }},
-        .index = .{ .created_at, .{ .org_id, .created_at } },
+        .default = .{ .created_at = .now, .plan = .free, .seats = 1 },
+        .unique = .{
+            .{ .columns = .{.email}, .ignoring_case = true,
+               .name = "members_one_account_per_address" },
+        },
+        .index = .{
+            .created_at,
+            .{ .columns = .{ .org_id, .{ .created_at = .desc } },
+               .where = .{ .left_on = null } },
+        },
         .references = .{ .org_id = .{ Org, .id, .cascade } },
     };
 
     id: i64,
     org_id: i64,
     email: nilo.Str,
+    plan: Plan,
+    seats: i32,
     created_at: sql.Timestamp,
+    left_on: ?sql.Date,
 };
 ```
 
+`.default` is what the database writes when your insert leaves the column out.
+`.now` is the one word it has and it only goes on a `sql.Timestamp`; everything
+else is a literal your column's own Zig type can hold. A column that holds one
+of an enum's words takes one of them written the way a column is — `.free`, not
+`"free"`. A default the database has to work out, `DEFAULT (lower(x))`, is SQL
+you write in a step.
+
+`plan: Plan` needs nothing said about it: it is a `text` column with
+`CHECK ("plan" IN ('free', 'team', 'enterprise'))` beside it, and the words are
+in the snapshot — so adding a word to the enum is a migration, rather than an
+insert your database refuses. (An enum that names its own database type with
+`pub const nilo_column = "user_role"` is the database's, and nilo leaves its
+words alone.)
+
 `.unique` and `.index` take one column (`.email`), several as one constraint
 (`.{ .org_id, .created_at }`), or the named form when there is something to say
-about it. `.ignoring_case` is the one modifier, and it is `lower("email")` on
-Postgres and `COLLATE NOCASE` on SQLite — the case where two people sign up as
-`Wati@` and `wati@` and the plain unique takes both.
+about it. `.ignoring_case` is `lower("email")` on Postgres and `COLLATE NOCASE`
+on SQLite — the case where two people sign up as `Wati@` and `wati@` and the
+plain unique takes both.
+
+**Give a constraint a `.name` when the violation is a sentence somebody has to
+read.** Postgres reports one by name and nothing else, so
+`members_one_account_per_address` is something your support engineer can act on
+where `members_email_key` is a column list they have to go and look up. Any
+name over 63 bytes is a compile error on both databases, because Postgres cuts
+a longer one down in a `NOTICE` nobody reads.
+
+An index can read a column downwards (`.{ .created_at = .desc }`) and can cover
+part of the table (`.where`). The predicate is the same grammar a `db.select`
+condition uses, not a string: `null` is `IS NULL`, `.{ .ne = null }` is
+`IS NOT NULL`, a literal is `=` and `.{ .ne = lit }` is `<>`. An index over an
+expression — `lower(btrim(site))` — is SQL you write in a step.
 
 `.references` is keyed by the column doing the pointing and it names the **Row**
 rather than a table, so renaming the table moves the key with it. A third entry
@@ -44,11 +85,190 @@ sides have to hold the same type, and a `.set_null` on a column the Row cannot
 hold a null in is a compile error — both are things the database would find at
 the first insert, in a message about a cast.
 
+**Name the table as text when you cannot import its Row.** Some programs are
+laid out so that one file may not `@import` another — a context per directory,
+where contexts never import each other — and `.{ Org, .id }` needs the type in
+scope. `.{ "orgs", .id, .cascade }` says the same key without it:
+
+<!-- compiles -->
+```zig
+const Comment = struct {
+    pub const nilo_table = .{
+        .name = "comments",
+        .key = .id,
+        .references = .{ .author_staff_id = .{ "staff", .id } },
+    };
+
+    id: i64,
+    author_staff_id: i64,
+    body: Str,
+};
+
+const Staff = struct {
+    pub const nilo_table = .{ .name = "staff", .managed = false };
+
+    id: i64,
+    email: Str,
+};
+
+// The list `sql.cli.Tool` and `db.checking` are given, and the one place every
+// Row is together — so it is where `"staff"` is resolved and where the two
+// columns' types are compared. Written `comptime` here because that is what
+// makes this page's own check run; in a program it is `Tool(Db, &.{ … })`.
+comptime {
+    _ = sql.migrate.tablesOf(sql.Postgres, &.{ Comment, Staff });
+}
+```
+
+You do not lose the type check by naming the table; it moves. A table no Row in
+that list claims is a compile error naming both spellings
+([ADR 0222](../../adr/0222-a-foreign-key-is-columns-and-a-table-name.md)), and
+`.managed = false` is how a table this program only reads gets into the list
+without the tool offering to create it.
+
+**A key can span two columns**, which is how a rule like "the Epic has to be on
+the same board" gets said in the schema instead of in a comment:
+
+<!-- compiles -->
+```zig
+const Epic = struct {
+    pub const nilo_table = .{ .name = "epics", .key = .{ .id, .board_id } };
+
+    id: i64,
+    board_id: i64,
+    title: Str,
+};
+
+const Task = struct {
+    pub const nilo_table = .{
+        .name = "tasks",
+        .key = .id,
+        .references = .{
+            .epic = .{
+                .columns = .{ .epic_id, .board_id },
+                .to = .{ Epic, .{ .id, .board_id } },
+                .on_delete = .cascade,
+            },
+        },
+    };
+
+    id: i64,
+    epic_id: i64,
+    board_id: i64,
+    title: Str,
+};
+
+comptime {
+    _ = sql.migrate.tablesOf(sql.Postgres, &.{ Task, Epic });
+}
+```
+
+The entry is keyed by a label (`.epic`) rather than by a column, because a Zig
+field name cannot be a tuple. `.to` takes a Row or a name, the columns line up
+by position, and a mismatched count is a compile error. `.exists` joins on every
+column of it, not just the first.
+
 You do not say whether the key is generated. An integer key is
 `GENERATED BY DEFAULT AS IDENTITY` on Postgres and
 `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite; anything else — a `sql.Uuid`, a
 slug — is a key your insert fills. That is a rule rather than a word, because
 there is no case where you want the other one.
+
+**An array column takes a default like any other**, and `&.{}` is the one every
+`NOT NULL` array column in a hand-written schema has:
+
+<!-- compiles -->
+```zig
+const Agent = struct {
+    pub const nilo_table = .{
+        .name = "agents",
+        .key = .id,
+        .default = .{ .read_tags = &.{}, .write_capabilities = &.{ "deals", "work" } },
+    };
+
+    id: i64,
+    read_tags: []const Str,
+    write_capabilities: []const Str,
+};
+
+comptime {
+    _ = sql.migrate.tablesOf(sql.Postgres, &.{Agent});
+}
+```
+
+Each element goes through the column's own element type, so a number where a
+word goes does not compile. A comma, a brace, a quote, a backslash or an
+apostrophe inside an element is escaped, so the array Postgres stores has as
+many elements as you wrote
+([ADR 0225](../../adr/0225-an-array-column-has-a-default-like-any-other.md)).
+
+## The two words nilo does not read
+
+Everything above is checked by the compiler. Two words are not, on purpose: a
+`CHECK` body and a trigger are SQL, and reading them means shipping a SQL
+parser. What nilo does instead is **own the name and hash the body**
+([ADR 0226](../../adr/0226-the-marker-has-a-word-the-database-checks.md)):
+
+<!-- compiles -->
+```zig
+const Invoice = struct {
+    pub const nilo_table = .{
+        .name = "invoices",
+        .key = .id,
+        .check = .{
+            .invoices_amount_is_positive = "amount > 0",
+            .invoices_dates_run_forwards =
+                "sent_on IS NULL OR paid_on IS NULL OR sent_on <= paid_on",
+            .invoices_kind_is_known = .{ .words_of = .kind },
+        },
+        .trigger = .{
+            .invoices_touch = .{
+                .when = "BEFORE UPDATE",
+                .run = "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+            },
+        },
+    };
+
+    id: i64,
+    amount: i64,
+    kind: enum { sale, refund },
+    sent_on: ?sql.Date,
+    paid_on: ?sql.Date,
+};
+
+comptime {
+    _ = sql.migrate.tablesOf(sql.Postgres, &.{Invoice});
+}
+```
+
+**The key is the name the object goes into the database under.** A `.unique` can
+derive one from its columns; a check has no columns, and a constraint nobody
+named is reported by Postgres under a name it made up. It is also the whole of
+what Postgres says when a row breaks it, so it is worth writing.
+
+The diff has three cases and no fourth: same name and same hash, nothing to do;
+same name and a different hash, drop and create; a name your Rows no longer
+have, drop. The snapshot records the name and sixteen hex characters, not the
+body — a view is sixty lines, and a `.zon` file carrying them stops being
+readable.
+
+**A trigger is two halves because nilo writes `ON "invoices"` between them.**
+The table is the one thing the marker already knows, and a second copy of it
+stops matching the day you rename the table — a trigger left on the old table is
+a trigger that quietly stops running. `.when` is what goes before, `.run` is
+what goes after.
+
+`.{ .words_of = .kind }` is the same `.check` word doing a different job: it
+names the `CHECK` an enum column already generates, instead of letting it be
+`invoices_kind_check`. Moving that name is a migration, because the constraint
+in your database still has the old one.
+
+What this does not do is check your SQL. The database does, inside the version's
+transaction, which is the same moment a `.data` step is checked. A `CHECK` rides
+inside the `CREATE TABLE`, so SQLite takes it too; *changing* one there is the
+four-statement rebuild every other table constraint needs, and the diff spells
+it out. A trigger is a statement of its own and both databases do all three
+cases.
 
 ## Creating them
 
@@ -66,6 +286,25 @@ pointing at each other is a compile error naming both, with the way out in it.
 Run it again and nothing happens, which is what a boot needs. This is for a
 test, a fixture, or a single-file SQLite application — it creates what is
 missing and never alters what is there.
+
+In a program that serves, the boot is where it goes, and the boot is inside
+`listen()`: register it with `app.before` and it runs once the pool is open,
+on the server's own loop, before the first request
+([ADR 0220](../../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+
+<!-- compiles -->
+```zig
+fn makeTables(run: *nilo.Run, db: *sql.Db) !void {
+    try sql.migrate.createMissing(db, run, &.{User});
+}
+```
+
+<!-- compiles: body -->
+```zig
+try app.provide(&db);
+try app.before(makeTables, .{&db});
+try app.listen(.{ .port = 8080 });
+```
 
 ## Changing them
 
@@ -86,11 +325,14 @@ which is a conflict worth having, rather than at deploy.
 
 `change.steps` is what to run, each with its `sql` and a line of `why`.
 `change.problems` is what the diff will not write, and **all of them come back
-rather than the first**: a type change on SQLite, which has no `ALTER COLUMN`,
-and any foreign-key change on a table that already exists, because the
-one-statement form takes an `ACCESS EXCLUSIVE` lock and scans the table. The
-problem spells out the `ADD CONSTRAINT … NOT VALID` then `VALIDATE CONSTRAINT`
-pair to write instead.
+rather than the first**: a column that moved in a way SQLite cannot follow — its
+type, its nullability, its default or an enum's words, since SQLite has neither
+`ALTER COLUMN` nor a way to replace a constraint — and any foreign-key change on
+a table that already exists, because the one-statement form takes an
+`ACCESS EXCLUSIVE` lock and scans the table. The problem spells out the
+`ADD CONSTRAINT … NOT VALID` then `VALIDATE CONSTRAINT` pair to write instead. A
+column that moved three ways gets one problem naming all three, because what it
+needs is one rewrite.
 
 A renamed column is written in the type, not asked at a prompt:
 
@@ -144,23 +386,37 @@ nowhere to put the middle one.
 
 There is no `down`. A migration that has run against production data cannot be
 undone by a statement written before anybody knew what the data was: dropping
-the column you just added does not bring back what was in it. Forward-only, and
-`reset` for a laptop.
+the column you just added does not bring back what was in it. Forward-only. On a
+laptop, the way back is to drop the database and migrate again, and while you
+are still on version 1, `db generate --baseline` re-derives it in place.
+
+A program that applies its own migrations at boot puts the three lines above
+in a function and hands it to `app.before`, the way `makeTables` is above. If
+it fails, the server does not start: a migration that could not run is a
+database this binary must not serve. Do not open the pool yourself with
+`app.start(io)` and then call `listen()` — that hands the pool one loop and
+the requests another, and it is refused
+([ADR 0220](../../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
 
 ## Refusing to serve a database that is behind
 
 <!-- compiles: body -->
 ```zig
-try sql.migrate.expect(&db, &run, 7);
+db.expecting(7);
 ```
 
-One query, before `listen()`. This catches one incident shape and it is a common
-one: the code went out before the migration did, and every request touching the
-new column answers 500 until somebody notices.
+One query, run by `listen()` on the pool it just opened. This catches one
+incident shape and it is a common one: the code went out before the migration
+did, and every request touching the new column answers 500 until somebody
+notices. The number is the generated manifest's head — `manifest.head` — so
+the guard moves with the migrations and nobody types it.
 
 A database *ahead* of the binary is allowed and only logged — that is the
-ordinary middle of a two-stage deploy. `sql.migrate.standing` is the same
-question as a value if you would rather decide yourself.
+ordinary middle of a two-stage deploy. A database that cannot be asked starts
+with a warning, the way `db.checking` does. `sql.migrate.expect(&db, &run, 7)`
+is the same check as a call, for a script that has a `Run` in hand, and
+`sql.migrate.standing` is the same question as a value if you would rather
+decide yourself.
 
 ## Your own `db` command
 
@@ -199,8 +455,9 @@ three things nilo cannot guess.
 Add it to your `build.zig` as an executable and you have five commands:
 
 ```console
-$ db check                       # do the Rows and the migrations agree? Exit 1 if not
+$ db check                       # do the Rows, the migrations and the .sql twins agree?
 $ db generate --name add_nickname
+$ db generate --name schema --baseline   # re-derive version 1, keeping your own steps
 $ db status                      # what this database has, and what is waiting
 $ db migrate                     # apply it
 $ db verify                      # has an applied version been edited since?
@@ -228,8 +485,128 @@ the above, and the generated file in migrations/ will say that you did.
 ```
 
 The generated file is Zig you can read, and it is exactly what runs: those
-steps, in that order, in one transaction. Add a `.kind = .data` step by hand
-where the backfill goes, and `generate` will never take it away again.
+steps, in that order, in one transaction.
+
+### What a version file looks like, and where your own steps go
+
+Only one declaration in it is generated. The other three are yours:
+
+```zig
+const migrate = @import("nilo_sql").migrate;
+
+/// Steps of your own that have to run *before* the generated ones: the
+/// extension a generated column's type comes from, a function a default calls.
+pub const before: []const migrate.Step = &.{};
+
+/// And the ones that run after: a backfill, a seed row, a `create_hypertable`.
+pub const after: []const migrate.Step = &.{};
+
+pub const version: migrate.Version = .{
+    .number = 1,
+    .name = "schema",
+    .steps = before ++ generated ++ after,
+};
+
+// nilo:generated begin
+const generated: []const migrate.Step = &.{ … };
+// nilo:generated end
+```
+
+The generated block is at the bottom because on a ported schema it is four
+thousand lines, and a `version` under that is a `version` nobody ever reads.
+Put your own `.kind = .data` steps in `before` or `after` — or change the
+concatenation to pull them from another file, which is what a program that keeps
+its steps beside its Rows will want:
+
+```zig
+.steps = before ++ generated ++ billing.steps ++ work.steps,
+```
+
+Everything outside the two `// nilo:generated` lines is kept when the file is
+written again. Do not move or edit either line: a version file that has lost one
+is refused rather than rewritten, because the only other reading is that all of
+it is generated.
+
+### The `.sql` beside it, for a database no Zig can reach
+
+Every version file has a twin, written by the same `generate` and committed
+beside it:
+
+```
+migrations/0007_work_items_get_a_priority.zig
+migrations/0007_work_items_get_a_priority.sql
+```
+
+It is the same steps in the same order, each with its `why` above it as a
+comment, wrapped in `BEGIN`/`COMMIT`, with the ledger table created if it is not
+there and the ledger row on the end:
+
+```sql
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS "nilo_migrations" ( … );
+
+-- add work_items.priority
+ALTER TABLE "work_items" ADD COLUMN "priority" text NOT NULL DEFAULT 'normal';
+
+INSERT INTO "nilo_migrations" ("version", "name", "hash", "applied_at", "ms")
+VALUES (7, 'work_items_get_a_priority', '9f3c…', now(), 0);
+
+COMMIT;
+```
+
+That last row is what makes it worth having. `psql -f`, a CI job with no
+toolchain, dbmate, or somebody on a jump host can bring a database to head, and
+`db.expecting(manifest.head)` still serves it and `db verify` still holds it to
+the hash. Without the row the database is at 7 and the ledger says 6, and the
+next boot refuses to serve.
+
+**It is an output.** nilo reads the `.zig` and never this, and a version written
+in SQL by somebody else is not picked up — authoring stays Zig, for the reasons
+[ADR 0153](../../adr/0153-a-migration-is-a-diff-against-a-snapshot.md) gives.
+`db check` fails when a twin no longer matches the version beside it, so it
+cannot go stale in a branch nobody rebuilt, and any `db generate` writes it
+again ([ADR 0227](../../adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).
+
+One case writes nothing and says so: `--baseline` rewriting a version 1 whose
+`before` or `after` hold steps of your own. Those are Zig nothing has compiled
+yet, so the twin's hash cannot be worked out. Build, then run `db check`, which
+names the file, and any `db generate` writes it.
+
+### Porting an existing schema
+
+Porting is not "add a column". It is one version written over and over until it
+matches the reference, and `--baseline` is what makes that a loop rather than a
+shell script:
+
+```console
+$ db generate --name schema --baseline
+Rewrote migrations/0001_schema.zig, 59 step(s):
+  …
+The generated block is new; everything else in the file is as you left it.
+```
+
+It ignores `snapshot.zon` entirely, diffs your Rows against nothing, and
+rewrites version 1 where it stands, along with the manifest and the snapshot —
+so `db check` straight afterwards is green, once the `.sql` twin has caught up.
+Run it as many times as the port takes.
+
+**A snapshot an older nilo wrote is read, not refused.** If you upgrade nilo and
+the file is in a shape this version no longer writes, `generate` says one line
+about it, diffs against it anyway and writes the current shape out. You do not
+have to delete anything, which matters because deleting the snapshot at version
+7 makes the next `generate` write a version 8 that creates every table you
+already have
+([ADR 0224](../../adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
+
+It refuses in three places rather than doing something you cannot undo: when the
+directory holds a version it is not re-deriving (version 2 is a diff against
+what version 1 left behind), when `--name` disagrees with the version 1 already
+there, and when the file it would rewrite has no generated block. Each message
+names the files.
+
+[ADR 0223](../../adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)
+is why the file is shaped that way.
 
 **One file to write before the first run.** The tool imports
 `migrations/manifest.zig` and `generate` is what writes it, so it needs to exist

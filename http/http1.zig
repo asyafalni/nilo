@@ -886,7 +886,7 @@ pub fn writeResponse(
 /// being moved out of something that counted them first. It is a
 /// `Content-Length` like any other response, which is what lets a browser draw
 /// a progress bar and a client ask for a `Range`
-/// ([ADR 0128](../../docs/adr/0128-a-stream-that-knows-its-length-says-so.md)).
+/// ([ADR 0128](../docs/adr/0128-a-stream-that-knows-its-length-says-so.md)).
 ///
 /// `chunked` is the ordinary case for an HTTP/1.1 client whose handler does
 /// not know: each piece is framed with its own length and a zero-length one

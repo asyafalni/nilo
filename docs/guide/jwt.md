@@ -142,11 +142,13 @@ defer keys.deinit();
 
 `run` there is a [`nilo.Run`](../reference.md#run) — the Scope for work that
 is not a request, which a startup path is. Since `nilo_fetch` is finished by
-`listen()` like any other service, fetching before it means starting the
-services under an `Io` of your own first, exactly as a database migration
-does ([A query with no server](./sql/reading.md#a-query-with-no-server),
-[ADR 0079](../adr/0079-there-is-a-phase-before-the-server.md)):
-`app.start(threaded.io())`, the fetch, then `listen()`.
+`listen()` like any other service, the fetch goes in `app.before`, which runs
+inside `listen()` once the client is up and before the first request, exactly
+as a database migration does ([A query with no
+server](./sql/reading.md#a-query-with-no-server),
+[ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)):
+`fn fetchKeys(run: *nilo.Run, client: *fetch.Client, keys: *Keys) !void`,
+registered with `app.before(fetchKeys, .{ &client, &keys })`.
 
 ## The signed-in user
 

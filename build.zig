@@ -565,7 +565,7 @@ const sql_refusals = [_]Refusal{
     .{
         .name = "table_references_not_a_row",
         .says = "table_references_not_a_row.User's `.references.org_id` points at" ++
-            " something that is not a Row.",
+            " table_references_not_a_row.Org, which is not a Row.",
     },
     .{
         .name = "table_reference_type_mismatch",
@@ -595,6 +595,185 @@ const sql_refusals = [_]Refusal{
         .name = "table_references_in_a_ring",
         .says = "these tables point at each other in a ring, so none of them can be" ++
             " created first:",
+    },
+    // The five the words that cross tables add (ADR 0222). Four of them are a
+    // foreign key that lines up in the Row and not with the table it points
+    // at, which is the mistake the type check exists to catch — and the fifth
+    // is the check itself, refusing the name it was given nowhere to resolve.
+    .{
+        .name = "table_references_a_table_nobody_declares",
+        .says = "table_references_a_table_nobody_declares.User's `.references.org_id`" ++
+            " points at the table `orgs`, and no Row in this list names it.",
+    },
+    .{
+        .name = "table_references_by_name_type_mismatch",
+        .says = "table_references_by_name_type_mismatch.User.org_id is []const u8 and" ++
+            " points at table_references_by_name_type_mismatch.Org.id, which is i64.",
+    },
+    .{
+        .name = "table_references_uneven_columns",
+        .says = "table_references_uneven_columns.Card's `.references.board` points 2" ++
+            " column(s) at 1 of `boards`.",
+    },
+    .{
+        .name = "table_references_long_form_without_to",
+        .says = "table_references_long_form_without_to.Card's `.references.board` says" ++
+            " no table.",
+    },
+    .{
+        .name = "table_references_unknown_word",
+        .says = "table_references_unknown_word.Card's `.references` sets `.on_dlete`," ++
+            " which is not part of an entry.",
+    },
+    // The fifteen the words inside one Row add (ADR 0221): a default, an enum
+    // column's CHECK, a partial and ordered index, and a constraint that can
+    // be named. Every one of them is a schema that would compile and then be
+    // wrong about itself — a default the column's own CHECK refuses, two
+    // indexes whose names collide at the second CREATE, a name Postgres cuts
+    // at 63 and nothing reads the NOTICE for.
+    .{
+        .name = "table_unique_name_as_a_column",
+        .says = "table_unique_name_as_a_column.User's `.unique` is named" ++
+            " `.one_per_board`.",
+    },
+    .{
+        .name = "table_constraint_name_too_long",
+        .says = "the name nilo derives for table_constraint_name_too_long.Sku's" ++
+            " `.unique` over `product_type_id`, `platform_id`, `acquisition_id`," ++
+            " `product_id`, `term_id` is" ++
+            " `skus_product_type_id_platform_id_acquisition_id_product_id_term_id_key`," ++
+            " which is 70 bytes, and 63 is all Postgres keeps.",
+    },
+    .{
+        .name = "table_name_given_too_long",
+        .says = "table_name_given_too_long.Sku's `.unique` is named" ++
+            " `skus_are_unique_per_product_and_per_term_and_per_platform_and_per_region`," ++
+            " which is 72 bytes, and 63 is all Postgres keeps.",
+    },
+    // The second kind of word (ADR 0226): a `.check` and a `.trigger`, whose
+    // body the database reads and the compiler does not. What is checked here
+    // is the shape around the body — that it is text, that there is some, and
+    // that the name it goes in under fits.
+    .{
+        .name = "table_check_written_as_a_tuple",
+        .says = "table_check_written_as_a_tuple.Ledger's `.check` is a list.",
+    },
+    .{
+        .name = "table_check_body_is_not_text",
+        .says = "table_check_body_is_not_text.Ledger's" ++
+            " `.check.ledgers_amount_is_positive` is a comptime_int.",
+    },
+    .{
+        .name = "table_check_body_is_empty",
+        .says = "table_check_body_is_empty.Ledger's `.check.ledgers_amount_is_positive`" ++
+            " is empty.",
+    },
+    .{
+        .name = "table_check_name_too_long",
+        .says = "table_check_name_too_long.Ledger's check is named" ++
+            " `ledgers_amount_is_positive_and_the_currency_is_one_we_actually_settle_in`," ++
+            " which is 72 bytes, and 63 is all Postgres keeps.",
+    },
+    .{
+        .name = "table_check_written_as_a_struct",
+        .says = "table_check_written_as_a_struct.Ledger's" ++
+            " `.check.ledgers_amount_is_positive` is written as a struct.",
+    },
+    .{
+        .name = "table_check_words_of_not_a_column",
+        .says = "table_check_words_of_not_a_column.Ticket has no column `levell`, asked" ++
+            " for in `.check`.",
+    },
+    .{
+        .name = "table_check_words_of_a_column_with_none",
+        .says = "table_check_words_of_a_column_with_none.Ticket's" ++
+            " `.check.tickets_title_is_known` names the words of `title`, and that" ++
+            " column has none.",
+    },
+    .{
+        .name = "table_check_words_of_one_column_twice",
+        .says = "table_check_words_of_one_column_twice.Ticket names the check over" ++
+            " `level`'s words twice, as `tickets_level_is_known` and as" ++
+            " `tickets_level_is_one_of_two`.",
+    },
+    .{
+        .name = "table_trigger_written_as_one_string",
+        .says = "table_trigger_written_as_one_string.Ledger's `.trigger.ledgers_touch`" ++
+            " is not two halves.",
+    },
+    .{
+        .name = "table_trigger_unknown_word",
+        .says = "table_trigger_unknown_word.Ledger's `.trigger.ledgers_touch` sets" ++
+            " `.on`, which is not part of an entry.",
+    },
+    .{
+        .name = "table_trigger_half_is_empty",
+        .says = "table_trigger_half_is_empty.Ledger's `.trigger.ledgers_touch.run` is empty.",
+    },
+    .{
+        .name = "table_two_constraints_one_name",
+        .says = "table_two_constraints_one_name.Outbox names two constraints" ++
+            " `outbox_sent_at_idx`.",
+    },
+    .{
+        .name = "table_unknown_word_in_an_entry",
+        .says = "table_unknown_word_in_an_entry.User's `.unique` sets `.ignorng_case`," ++
+            " which is not part of an entry.",
+    },
+    .{
+        .name = "table_direction_on_a_unique",
+        .says = "table_direction_on_a_unique.User's `.unique` reads `created_at` in a" ++
+            " direction.",
+    },
+    .{
+        .name = "table_direction_that_is_not_one",
+        .says = "table_direction_that_is_not_one.User's `.index` reads `created_at` in" ++
+            " a direction that is not one.",
+    },
+    .{
+        .name = "table_default_now_on_a_number",
+        .says = "table_default_now_on_a_number.User's `.default.age` is `.now` and the" ++
+            " column is i64.",
+    },
+    .{
+        .name = "table_default_unknown_word",
+        .says = "table_default_unknown_word.User's `.default.token` is `.gen_uuid`," ++
+            " which is not a word `.default` takes.",
+    },
+    // The two that name a Zig type stop before the compiler's rendering of it:
+    // `*const [3:0]u8` is a detail that changes when the rendering does, and a
+    // check whose text ends in one breaks for no reason anybody cares about.
+    .{
+        .name = "table_default_of_another_type",
+        .says = "`.default` gives table_default_of_another_type.User.age a" ++
+            " *const [2:0]u8, and the column is i64.",
+    },
+    .{
+        .name = "table_default_not_one_of_the_words",
+        .says = "`.default` gives table_default_not_one_of_the_words.Task.priority" ++
+            " `.blocker`, which is not one of" ++
+            " table_default_not_one_of_the_words.Priority's words.",
+    },
+    .{
+        .name = "table_default_word_written_as_text",
+        .says = "`.default` gives table_default_word_written_as_text.Task.priority a" ++
+            " *const [6:0]u8, and the column holds one of" ++
+            " table_default_word_written_as_text.Priority's words.",
+    },
+    .{
+        .name = "table_default_on_a_generated_key",
+        .says = "table_default_on_a_generated_key.User's `.default.id` is on the key," ++
+            " and the database fills that in itself.",
+    },
+    .{
+        .name = "table_index_where_unknown_term",
+        .says = "table_index_where_unknown_term.Task's `.index` tests `weight` with" ++
+            " something that is not one of the four terms.",
+    },
+    .{
+        .name = "table_index_where_of_another_type",
+        .says = "`.index`'s `.where` gives table_index_where_of_another_type.Task.weight" ++
+            " a *const [5:0]u8, and the column is i64.",
     },
     // A key spanning several columns. Every one of these is a statement that
     // would have compiled, run, and answered with the wrong row — which is why
@@ -914,6 +1093,19 @@ const job_refusals = [_]Refusal{
 /// the first line of the error it has to stop with. `says` leaves out the
 /// `nilo: ` prefix because the build step adds it — see the loop in `build`.
 const refusals = [_]Refusal{
+    // The three shapes `app.before` will not run (ADR 0220).
+    .{
+        .name = "before_not_a_function",
+        .says = "app.before() takes a function, not bool.",
+    },
+    .{
+        .name = "before_without_a_run",
+        .says = "app.before() was given a function whose first parameter is *before_without_a_run.Db, and it has to be `*nilo.Run`.",
+    },
+    .{
+        .name = "before_returns_a_value",
+        .says = "app.before() was given a function that answers with usize, and there is nobody to hand the value to.",
+    },
     // The four ways to ask for an answer nilo cannot keep (ADR 0193).
     .{
         .name = "idempotent_not_a_bytes_space",

@@ -37,11 +37,13 @@
 //! the point of it taking a `std.Io` rather than a runtime.
 
 const std = @import("std");
+const core = @import("nilo_core");
 const nilo = @import("nilo_http");
 const live_config = @import("live_config");
 
 const db_mod = @import("db.zig");
 const dialect = @import("dialect.zig");
+const migrate = @import("migrate.zig");
 const postgres = @import("postgres.zig");
 const schema = @import("schema.zig");
 const types = @import("types.zig");
@@ -170,12 +172,17 @@ const setup =
     // through the same protocol a project's own column type uses, so a test
     // that they round-trip is a test that the protocol does (ADR 0055).
     "  stay interval," ++
-    "  origin inet" ++
+    "  origin inet," ++
+    // A real `date`, written by Postgres and never by nilo, so the four bytes
+    // the read below takes apart are the four bytes the server chose. Ada's
+    // is before 1970 and Grace's is NULL, which are the two the arithmetic
+    // gets wrong.
+    "  born date" ++
     ");" ++
-    "INSERT INTO " ++ table ++ " (id, email, handle, age, token, settings, role, stay, origin) VALUES" ++
-    "  (1, 'ada@example.dev', 'ada', 36, '550e8400-e29b-41d4-a716-446655440000', '{\"theme\":\"dark\"}', 'admin', '3 days 04:05:06', '192.168.0.1')," ++
-    "  (2, 'grace@example.dev', NULL, 45, NULL, NULL, 'member', NULL, NULL)," ++
-    "  (3, 'kid@example.dev', 'kid', 11, '550e8400-e29b-41d4-a716-446655440001', '{\"theme\":\"light\"}', 'moderator', '1 mon', '10.0.0.7/24');" ++
+    "INSERT INTO " ++ table ++ " (id, email, handle, age, token, settings, role, stay, origin, born) VALUES" ++
+    "  (1, 'ada@example.dev', 'ada', 36, '550e8400-e29b-41d4-a716-446655440000', '{\"theme\":\"dark\"}', 'admin', '3 days 04:05:06', '192.168.0.1', '1815-12-10')," ++
+    "  (2, 'grace@example.dev', NULL, 45, NULL, NULL, 'member', NULL, NULL, NULL)," ++
+    "  (3, 'kid@example.dev', 'kid', 11, '550e8400-e29b-41d4-a716-446655440001', '{\"theme\":\"light\"}', 'moderator', '1 mon', '10.0.0.7/24', '2015-03-01');" ++
     "CREATE VIEW " ++ adults_view ++ " AS SELECT id, email, age FROM " ++ table ++
     "  WHERE age >= 18;" ++
     // `role::text` so the matview's column is a `text` rather than the enum,
@@ -517,6 +524,30 @@ test "a request goes in as HTTP and comes back as rows from Postgres" {
             "{\"id\":2,\"email\":\"grace@example.dev\",\"handle\":null,\"age\":45}]",
         answer.body,
     );
+}
+
+test "a Db told what to expect boots against a real Postgres and asks its ledger" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    // The boot a deploy runs, minus the server: `nilo_start` dials the pool
+    // and then asks the ledger, on that pool (ADR 0220). The whole pool is
+    // dialled up front for the reason `Live.open` gives. `expecting(0)` is
+    // level or ahead on any database, so the guard goes through; behind is
+    // pinned on SQLite in `migrate_live.zig`, where the file is fresh.
+    var db = db_mod.Db.init(gpa, url, .{ .size = 2, .connect_on_init = 2 });
+    defer db.deinit();
+    db.expecting(0);
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    // Boot made the ledger, or this query has no table to read.
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+    try testing.expect((try migrate.headVersion(&db, &run)) >= 0);
 }
 
 // -- the write half, and the things built on it ---------------------------
@@ -1278,6 +1309,127 @@ test "a streamed numeric borrows its digits, and the type says so" {
     // nothing, which `Json(T)` could not manage.
     try testing.expectEqual([]const u8, @TypeOf(first.balance));
     try testing.expectEqualStrings("42.42", first.balance);
+}
+
+// -- a date ---------------------------------------------------------------
+
+/// `email` and `age` are here for the reason they are on `Account`: the table
+/// requires both.
+const Birthday = struct {
+    pub const nilo_table = .{ .name = table, .key = .id };
+
+    id: i64,
+    email: []const u8,
+    age: i32,
+    born: ?types.Date,
+};
+
+test "a date the database wrote comes back as the day, out of the column's own bytes" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // Nothing in this test wrote these three, which is the point of reading
+    // them: the bytes came off the wire as Postgres stores a `date`, four of
+    // them counting from 2000-01-01, and the shift back to 1970 is nilo's.
+    const ada = (try stack.db.find(Birthday, &run, @as(i64, 1))).?;
+    try testing.expectEqual(@as(i32, -56_270), ada.born.?.days);
+
+    // A day before the epoch, which is where a `u32` or a `std.time.epoch`
+    // walk would have gone wrong rather than failed.
+    var buf: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try ada.born.?.writeIso(&w);
+    try testing.expectEqualStrings("1815-12-10", w.buffered());
+
+    const grace = (try stack.db.find(Birthday, &run, @as(i64, 2))).?;
+    try testing.expectEqual(@as(?types.Date, null), grace.born);
+
+    const kid = (try stack.db.find(Birthday, &run, @as(i64, 3))).?;
+    try testing.expectEqual(@as(i32, 16_495), kid.born.?.days);
+}
+
+test "a date goes out as ten characters and comes back as the same day" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // The asymmetry, written down: pg.zig has no `date` codec to bind, so the
+    // value leaves as text with the `::date` the Dialect puts on the
+    // placeholder, and arrives back as the four bytes. A write that silently
+    // landed a day out would pass an echo test and fail this one, because the
+    // read is Postgres's own answer.
+    const made = try stack.db.insert(Birthday, &run, .{
+        .id = @as(i64, 710),
+        .email = "born@example.dev",
+        .age = @as(i32, 61),
+        .born = @as(?types.Date, types.Date.nilo_parse("1965-08-09").?),
+    });
+    try testing.expectEqual(@as(i32, -1606), made.born.?.days);
+
+    const back = (try stack.db.find(Birthday, &run, @as(i64, 710))).?;
+    try testing.expectEqual(@as(i32, -1606), back.born.?.days);
+
+    // And null both ways, which is a different branch in both Wires.
+    _ = try stack.db.update(Birthday, &run, .{
+        .set = .{ .born = @as(?types.Date, null) },
+        .where = .{ .id = @as(i64, 710) },
+    });
+    try testing.expectEqual(
+        @as(?types.Date, null),
+        (try stack.db.find(Birthday, &run, @as(i64, 710))).?.born,
+    );
+}
+
+test "a date compares as a day rather than as the text it is carried in" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // The `::date` on the placeholder is what decides this. Without it the
+    // parameter arrives as an unknown type beside a `date` column, and what
+    // Postgres does with that is its business rather than something nilo
+    // should be finding out per statement.
+    const old = try stack.db.select(Birthday, &run, .{
+        .where = .{ .born = .{ .lt = types.Date.nilo_parse("1900-01-01").? } },
+        .order = .{ .id = .asc },
+    });
+    try testing.expectEqual(@as(usize, 1), old.len);
+    try testing.expectEqual(@as(i64, 1), old[0].id);
+}
+
+fn bornDays(db: *db_mod.Db, c: *nilo.Ctx) ![]Birthday {
+    return db.select(Birthday, c, .{
+        .where = .{ .id = .{ .lte = @as(i64, 2) } },
+        .order = .{ .id = .asc },
+    });
+}
+
+test "a date leaves as the ten characters, and a null leaves as null" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    // Both halves at once, the way the three types above are asserted: what
+    // came out of the column, and what `jsonStringify` then wrote.
+    try stack.app.get("/born", bornDays);
+    const answer = try stack.client.get(&stack.app, "/born");
+
+    try testing.expectEqual(@as(u16, 200), answer.status);
+    try testing.expectEqualStrings(
+        "[{\"id\":1,\"email\":\"ada@example.dev\",\"age\":36,\"born\":\"1815-12-10\"}," ++
+            "{\"id\":2,\"email\":\"grace@example.dev\",\"age\":45,\"born\":null}]",
+        answer.body,
+    );
 }
 
 // -- upserts --------------------------------------------------------------
@@ -2069,8 +2221,13 @@ test "a savepoint rolled back takes its work with it, and released keeps it" {
 /// purpose** — the fixture's third row has it. This is a Zig enum that has
 /// fallen behind its Postgres one, which is what an `ALTER TYPE … ADD VALUE`
 /// leaves behind and the only way this column type goes wrong.
+///
+/// `.managed = false` because the fixture's `role` really is a Postgres
+/// `ENUM`, and a plain Zig enum on a Row nilo builds is a `text` column with a
+/// check over its words (ADR 0221). Saying the program only reads this table
+/// is what leaves the column type to the database, which is where it is.
 const Staff = struct {
-    pub const nilo_table = .{ .name = table, .key = .id };
+    pub const nilo_table = .{ .name = table, .key = .id, .managed = false };
 
     id: i64,
     role: Role,
@@ -2568,6 +2725,253 @@ test "the schema comparison judges an array by the array it holds" {
     const found = try schema.compare(dialect.Postgres, Wide, actual, &problems, arena);
     try testing.expectEqual(@as(usize, 1), found);
     try testing.expectEqual(schema.Mismatch.wrong_type, problems.items[0].kind);
+}
+
+/// A table whose array columns are given their defaults by the marker rather
+/// than by a hand-written `ALTER`
+/// ([ADR 0225](../docs/adr/0225-an-array-column-has-a-default-like-any-other.md)).
+///
+/// **The five elements are the five ways an array literal can be read as more
+/// or fewer elements than it holds**: a comma, a brace, a double quote, a
+/// backslash and an apostrophe. The comptime half proves nilo writes the text
+/// it means to; only Postgres can say whether that text means what nilo
+/// thinks, which is why this test exists rather than another `expectEqualStrings`.
+const Agent = struct {
+    pub const nilo_table = .{
+        .name = agent_table,
+        .key = .id,
+        .default = .{
+            .read_tags = &.{},
+            .write_capabilities = &.{ "deals", "work" },
+            .odd = &.{ "a,b", "{c}", "say \"hi\"", "back\\slash", "it's" },
+            .weights = &.{ 1, 2, 3 },
+        },
+    };
+
+    id: i64,
+    read_tags: []const []const u8,
+    write_capabilities: []const []const u8,
+    odd: []const []const u8,
+    weights: []const i32,
+};
+
+const agent_table = "nilo_live_agents_" ++ mode_suffix;
+
+test "an array column's default is an array, and the elements survive the round trip" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    const arena = live.arena.allocator();
+    var db = db_mod.Db.init(gpa, "already open", .{});
+    db.wire = live.wire;
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    for ([_][]const u8{
+        "DROP TABLE IF EXISTS " ++ agent_table,
+        // The `CREATE TABLE` the marker produces, defaults and all — not one
+        // written for the test, or this would prove nothing.
+        comptime @import("ddl.zig").createTable(dialect.Postgres, Agent),
+        "INSERT INTO " ++ agent_table ++ " (id) VALUES (1)",
+    }) |statement| {
+        var rows = try live.wire.run(arena, statement, .{}, null, null);
+        live.wire.drain(&rows);
+    }
+    defer if (live.wire.run(arena, "DROP TABLE IF EXISTS " ++ agent_table, .{}, null, null)) |dropped| {
+        var rows = dropped;
+        live.wire.drain(&rows);
+    } else |_| {};
+
+    // Nothing was inserted into any of the four columns, so what comes back is
+    // what the database wrote from the marker's own defaults.
+    const agent = (try db.find(Agent, &run, @as(i64, 1))).?;
+
+    try testing.expectEqual(@as(usize, 0), agent.read_tags.len);
+
+    try testing.expectEqual(@as(usize, 2), agent.write_capabilities.len);
+    try testing.expectEqualStrings("deals", agent.write_capabilities[0]);
+    try testing.expectEqualStrings("work", agent.write_capabilities[1]);
+
+    try testing.expectEqual(@as(usize, 3), agent.weights.len);
+    try testing.expectEqualSlices(i32, &.{ 1, 2, 3 }, agent.weights);
+
+    // The one that decides whether the escaping is right: five elements in,
+    // five out, each byte for byte what was written in Zig.
+    try testing.expectEqual(@as(usize, 5), agent.odd.len);
+    try testing.expectEqualStrings("a,b", agent.odd[0]);
+    try testing.expectEqualStrings("{c}", agent.odd[1]);
+    try testing.expectEqualStrings("say \"hi\"", agent.odd[2]);
+    try testing.expectEqualStrings("back\\slash", agent.odd[3]);
+    try testing.expectEqualStrings("it's", agent.odd[4]);
+}
+
+test "the table nilo creates for an array default is one its own check accepts" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    const arena = live.arena.allocator();
+    var db = db_mod.Db.init(gpa, "already open", .{});
+    db.wire = live.wire;
+
+    for ([_][]const u8{
+        "DROP TABLE IF EXISTS " ++ agent_table,
+        comptime @import("ddl.zig").createTable(dialect.Postgres, Agent),
+    }) |statement| {
+        var rows = try live.wire.run(arena, statement, .{}, null, null);
+        live.wire.drain(&rows);
+    }
+    defer if (live.wire.run(arena, "DROP TABLE IF EXISTS " ++ agent_table, .{}, null, null)) |dropped| {
+        var rows = dropped;
+        live.wire.drain(&rows);
+    } else |_| {};
+
+    try testing.expectEqual(@as(usize, 0), try db.checkSchema(&.{Agent}));
+}
+
+// -- the second kind of word, against a database that reads it (ADR 0226) --
+
+/// A table whose `CHECK` and whose trigger come out of the marker rather than
+/// out of a hand-written step.
+///
+/// **Only Postgres can say whether the body means what the person meant**,
+/// which is the whole point of the kind: nilo writes the text, hashes it and
+/// never reads it, so the comptime tests can only prove the text was carried
+/// through unchanged. This one proves the database took it, enforced it and
+/// ran it.
+const Invoice = struct {
+    pub const nilo_table = .{
+        .name = invoice_table,
+        .key = .id,
+        .check = .{
+            .nilo_live_invoices_amount_is_positive = "amount > 0",
+            .nilo_live_invoices_kind_is_known = .{ .words_of = .kind },
+        },
+        .trigger = .{
+            .nilo_live_invoices_touch = .{
+                .when = "BEFORE UPDATE",
+                .run = "FOR EACH ROW EXECUTE FUNCTION " ++ touch_function ++ "()",
+            },
+        },
+    };
+
+    id: i64,
+    amount: i64,
+    kind: enum { sale, refund },
+    seen: i64,
+};
+
+const invoice_table = "nilo_live_invoices_" ++ mode_suffix;
+const touch_function = "nilo_live_touch_" ++ mode_suffix;
+
+test "a check out of the marker is enforced by the database, under the name the marker gave it" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    const arena = live.arena.allocator();
+    var db = db_mod.Db.init(gpa, "already open", .{});
+    db.wire = live.wire;
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    for ([_][]const u8{
+        "DROP TABLE IF EXISTS " ++ invoice_table,
+        // The marker's own `CREATE TABLE`, checks and all.
+        comptime @import("ddl.zig").createTable(dialect.Postgres, Invoice),
+    }) |statement| {
+        var rows = try live.wire.run(arena, statement, .{}, null, null);
+        live.wire.drain(&rows);
+    }
+    defer if (live.wire.run(arena, "DROP TABLE IF EXISTS " ++ invoice_table, .{}, null, null)) |dropped| {
+        var rows = dropped;
+        live.wire.drain(&rows);
+    } else |_| {};
+
+    // A row the check allows.
+    _ = try db.insert(Invoice, &run, .{
+        .id = @as(i64, 1),
+        .amount = @as(i64, 10),
+        .kind = .sale,
+        .seen = @as(i64, 0),
+    });
+
+    // And one it does not. The insert comes back as `error.CheckViolated`,
+    // which is the database reading the body nilo never read.
+    try testing.expectError(error.CheckViolated, db.insert(Invoice, &run, .{
+        .id = @as(i64, 2),
+        .amount = @as(i64, 0),
+        .kind = .sale,
+        .seen = @as(i64, 0),
+    }));
+
+    // Both constraints are in `pg_constraint` under the names the marker gave
+    // them, including the one that renamed an enum column's own check — which
+    // is the thing a test reading `pg_constraint` by name needed (item 12).
+    //
+    // Scoped by `conrelid` rather than by name alone: the Debug and the
+    // ReleaseSafe run share a database, their tables differ by suffix and
+    // Postgres keeps a constraint name per table, so two rows of one name is
+    // the correct answer and not the one under test.
+    const Found = struct {
+        pub const nilo_table = .{ .name = "pg_constraint", .key = .conname, .managed = false };
+        conname: []const u8,
+    };
+    const found = try db.raw(
+        Found,
+        &run,
+        "SELECT conname FROM pg_constraint WHERE conrelid = $1::regclass ORDER BY conname",
+        .{@as([]const u8, invoice_table)},
+    );
+    var checks: usize = 0;
+    for (found) |c| {
+        if (std.mem.eql(u8, c.conname, "nilo_live_invoices_kind_is_known")) checks += 1;
+        if (std.mem.eql(u8, c.conname, "nilo_live_invoices_amount_is_positive")) checks += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), checks);
+}
+
+test "a trigger out of the marker runs, and nilo wrote the `ON` between its halves" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    const arena = live.arena.allocator();
+    var db = db_mod.Db.init(gpa, "already open", .{});
+    db.wire = live.wire;
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const made = comptime @import("ddl.zig").createdFor(dialect.Postgres, Invoice);
+    for ([_][]const u8{
+        "DROP TABLE IF EXISTS " ++ invoice_table,
+        "CREATE OR REPLACE FUNCTION " ++ touch_function ++ "() RETURNS trigger AS $$ " ++
+            "BEGIN NEW.seen := OLD.seen + 1; RETURN NEW; END; $$ LANGUAGE plpgsql",
+        comptime @import("ddl.zig").createTable(dialect.Postgres, Invoice),
+        made.triggers[0].sql,
+        "INSERT INTO " ++ invoice_table ++ " (id, amount, kind, seen) VALUES (1, 10, 'sale', 0)",
+    }) |statement| {
+        var rows = try live.wire.run(arena, statement, .{}, null, null);
+        live.wire.drain(&rows);
+    }
+    defer if (live.wire.run(arena, "DROP TABLE IF EXISTS " ++ invoice_table, .{}, null, null)) |dropped| {
+        var rows = dropped;
+        live.wire.drain(&rows);
+    } else |_| {};
+
+    _ = try db.update(Invoice, &run, .{
+        .where = .{ .id = @as(i64, 1) },
+        .set = .{ .amount = @as(i64, 11) },
+    });
+
+    // The trigger fired, so the table it hangs on is the one nilo wrote between
+    // `.when` and `.run` — the half the marker deliberately cannot say.
+    const after = (try db.find(Invoice, &run, @as(i64, 1))).?;
+    try testing.expectEqual(@as(i64, 1), after.seen);
 }
 
 // -- a table in a schema of its own ---------------------------------------

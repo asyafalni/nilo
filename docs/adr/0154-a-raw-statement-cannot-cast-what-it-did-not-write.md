@@ -18,7 +18,7 @@ pg.zig.
 ## Why it happened
 
 A **text column** — `Decimal`, `Interval`, `Inet`, and anything a project
-declares with `AsText` ([ADR 0055](./0055-a-column-that-travels-as-text.md)) — is
+declares with `AsText` ([ADR 0055](./0055-a-column-type-can-come-from-outside-this-module.md)) — is
 read as the text the database printed. That is true because the Dialect puts the
 cast in the `SELECT` list:
 

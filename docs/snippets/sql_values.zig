@@ -48,3 +48,14 @@ pub var capability: ?Str = undefined;
 // The one value the `.key` conflict-target block binds beside the user's id.
 // Not `tag`, which two snippets further down already use as a loop capture.
 pub var tag_name: []const u8 = undefined;
+
+// The function the `app.before` blocks register. A declaration block that
+// introduces a function is kept out of the statements below it (its
+// parameters and the file-scope names here cannot both exist), so the
+// statements see this one instead — the same shape, a body that does
+// nothing, because a snippet is compiled and never run. The parameters are
+// not called `run` and `db`, which are the file-scope names two lines up.
+pub fn makeTables(scope: *nilo.Run, database: *sql.Db) !void {
+    _ = scope;
+    _ = database;
+}

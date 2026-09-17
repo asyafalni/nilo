@@ -60,6 +60,7 @@ pub const panic = nilo.panic;                     // optional: name the request 
 | `app.deinit()` | |
 | `app.provide(&thing)` | register a service, looked up later by its pointer type. A service may declare `pub fn nilo_start(self: *T, io: std.Io) !void` to finish building itself once there is an event loop ([ADR 0040](./adr/0040-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md)) and `pub fn nilo_stop(self: *T) void` to put it down again before the loop goes ([ADR 0151](./adr/0151-a-service-is-stopped-before-the-loop-is.md)). **A service that put work on the loop needs the second one**, or the loop cannot be torn down. A third, `pub fn nilo_ready(self: *T, scope: *nilo_core.AnyScope) ?[]const u8`, is what `app.health` asks ([ADR 0192](./adr/0192-a-health-route-asks-the-services.md)) |
 | `app.spawn(f, args)` | work that is not a request, started once the server is up ([ADR 0086](./adr/0086-work-that-is-not-a-request-belongs-to-the-server.md)) |
+| `app.before(f, args)` | work that needs the services and has to finish before the first request — a migration, a version guard, a key set fetched once. `f` is `fn (run: *nilo.Run, …) !void`, run once inside `listen()` after the services have started and before what `spawn` registered, on the server's loop; if it fails the server does not start ([ADR 0220](./adr/0220-work-that-needs-the-services-runs-on-their-loop.md)) |
 | `app.use(mw)` | middleware, everywhere |
 | `app.useOn(prefix, mw)` | middleware, under a path prefix |
 | `app.without(mw)` | the same App with `mw` off for the routes registered through what comes back — how a sign-up route sits inside a guarded prefix ([ADR 0080](./adr/0080-a-route-can-say-it-is-not-covered.md)) |
@@ -75,7 +76,7 @@ pub const panic = nilo.panic;                     // optional: name the request 
 | `app.metrics(options)` | count every request and serve the numbers at `/metrics`, Prometheus format ([Metrics](./guide/metrics.md), [ADR 0100](./adr/0100-the-route-table-is-the-registry.md)) |
 | `app.expose(name, kind, &atomic)` | publish a `std.atomic.Value(u64)` of your own on that page. `kind` is `.counter` or `.gauge` |
 | `app.listen(options)` | run until stopped. Stops the process on a startup error |
-| `app.start(io)` | everything `listen()` does before it accepts anything — services checked, chains resolved, pools opened, schemas checked. For a migration, a script or a test; `listen()` does not repeat it ([ADR 0079](./adr/0079-there-is-a-phase-before-the-server.md)). What it does *not* start is `spawn`, which needs a server |
+| `app.start(io)` | everything `listen()` does before it accepts anything — services checked, chains resolved, pools opened, schemas checked — for a program that never listens: a test through `testing.Client`, a script, a worker on `jobs.serveOn(io)` ([ADR 0079](./adr/0079-there-is-a-phase-before-the-server.md)). **Not before `listen()`**: a service keeps the `Io` it was started on, so `start(io)` followed by `listen()` is refused when any service took one; the phase between the pool and the server is `app.before` ([ADR 0220](./adr/0220-work-that-needs-the-services-runs-on-their-loop.md)). What it does *not* start is `spawn`, which needs a server |
 | `app.shutdown()` | stop, from any thread or from inside a handler |
 | `app.boundPort()` | `?u16` — the port the server is listening on, from any thread. Null before `listen()` has bound, and for a unix socket. `.port = 0` asks the kernel for a free one and this is its answer |
 | `app.tryListen / tryRoute / tryStatic / tryStaticWith` | the same calls, error returned rather than reported |
@@ -2204,9 +2205,10 @@ try nilo.spawn(flushMetrics, .{&exporter});
 
 **From `main` there is no such moment**, because `listen()` does not return.
 `app.spawn` registers the same work before the server and starts it once there
-is one — after the port is taken, before the first connection is accepted, and
-whichever of ADR 0079's two startup orders the program used
+is one — after the port is taken, after the services and whatever `app.before`
+registered, before the first connection is accepted
 ([ADR 0086](./adr/0086-work-that-is-not-a-request-belongs-to-the-server.md),
+[ADR 0220](./adr/0220-work-that-needs-the-services-runs-on-their-loop.md),
 [the guide](./guide/background.md)):
 
 ```zig
@@ -2804,9 +2806,17 @@ one round trip, and the document says `T`.
 var db = sql.Db.init(gpa, "postgres://…", .{});
 defer db.deinit();
 db.checking(&.{ User, Order });   // optional
+db.expecting(manifest.head);      // optional
 db.watching(sql.logging);         // optional
 try app.provide(&db);
 ```
+
+`db.expecting(version)` refuses to serve a database whose migration ledger is
+behind `version`, checked once at boot on the pool `listen()` just opened
+([ADR 0220](./adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+A call rather than an option because an option is read on every boot and
+links the migration module into every program with a `Db`, measured at
+17,296 bytes; a program that never calls this links none of it.
 
 `db.watching(f)` calls `f` with a `sql.Sent` after every statement — the text,
 the plan name it is kept under, how long the database took, how many rows moved
@@ -2930,15 +2940,17 @@ An identity key, a sequence default and a generated column need nothing said
 about them — an insert names a subset of the Row's columns and `RETURNING`
 brings the rest back.
 
-A Row says three things about its schema and no more: `.unique`, `.index` and
+A Row says four things about its schema: `.default`, `.unique`, `.index` and
 `.references` ([ADR 0153](./adr/0153-a-migration-is-a-diff-against-a-snapshot.md),
-which amends the older refusal that it may say none). Only the Row that names a
-table may say them, and nothing enforces that because the language does — a
-borrowed Row's marker is a `type`, and there is nowhere on a type to write
-`.unique`. Where the line falls is where the compiler stops being able to
-check: `CHECK (age > 18)` is text nilo cannot read, so it is written by hand in
-a step, and **nilo never touches what it did not create**. See
-[Migrations](#migrations).
+which amends the older refusal that it may say none, and
+[ADR 0221](./adr/0221-the-marker-has-two-kinds-of-word.md), which adds the
+first). Only the Row that names a table may say them, and nothing enforces that
+because the language does — a borrowed Row's marker is a `type`, and there is
+nowhere on a type to write `.unique`. Where the line falls is where the compiler
+stops being able to check: `CHECK (age > 18)` is a text nilo cannot read, so it
+is written by hand in a step, and **nilo never touches what it did not create**.
+A column the Row reads as a Zig enum is the one check constraint the marker does
+write, because the words are the type's. See [Migrations](#migrations).
 
 ### SQLite
 
@@ -2965,8 +2977,8 @@ is no wait for the event loop to park on and the choice cannot be made for you
 | `.{ .hop = nilo }` | hand each statement to the Engine's thread pool and park the fiber. Costs a few microseconds per statement; **no statement can stall an executor thread**. The payload is `nilo` itself, passed in because `sql/` may not import `nilo_http` |
 | `.in_fiber` | run it on the fiber that asked. Faster when every statement is a cached lookup; a slow one holds a thread that serves other connections |
 
-Which is the better default is unmeasured and is `docs/roadmap.md`'s Next 1 for
-this module. When in doubt take `.hop`: its bad case is a few microseconds and
+Which is the better default is unmeasured and is an open question in
+[`docs/roadmap.md`](./roadmap.md) for this module. When in doubt take `.hop`: its bad case is a few microseconds and
 `.in_fiber`'s is a stalled thread.
 
 | `sqlite.Options` | |
@@ -3403,8 +3415,11 @@ db.select(Partner, c, .{ .where = .{
 **The join is read out of the schema, not written here.** It comes from a
 `.references` one of the two Rows declares — the other Row's, pointing at this
 table, or this Row's own, pointing at the other's — which is already checked
-while compiling: the target has to be a Row, the target column one of its
-columns, and the two Zig types the same. So the query the other way round,
+while compiling: the target has to be a Row the tool knows, the target column
+one of its columns, and the two Zig types the same. A key over two columns
+joins on both of them, because joining on the first alone would run, read
+correctly and answer a wider question than the schema asked. So the query the
+other way round,
 from the child asking about its parent, is the same line with the Rows
 swapped
 ([ADR 0214](./adr/0214-an-exists-reads-the-reference-from-either-side.md)):
@@ -3571,6 +3586,7 @@ than asking the server to release a mark it no longer has.
 | | |
 |---|---|
 | `sql.Timestamp` | microseconds since the epoch, written as RFC 3339 in JSON. `timestamptz`. `.now()`, `.fromSeconds(s)`, `.seconds()`, `.nilo_parse(text)` |
+| `sql.Date` | a calendar day: `days` since 1970-01-01, written as `2026-09-17` in JSON and described as `format: date`. `date` on Postgres, `TEXT` on SQLite, and **read out of the column rather than out of a `::text`**, so a `db.raw` reading one needs no cast. `.fromDays(n)`, `.nilo_parse(text)`, `.utcOf(ts)`, `.atMidnightUtc()`. A day is not a moment: a due date read into a `timestamptz` gets a midnight, a midnight has a zone, and the date then moves by a day for a reader in Jakarta ([ADR 0221](./adr/0221-the-marker-has-two-kinds-of-word.md)). It carries a value and does not calculate — no `.addDays`, no `.weekday` — and the two conversions it does offer are named for the zone they assume. A day before 1970 is ordinary and prints normally; the range is year 0 to 9999, which is what four digits spell and what `nilo_parse` reads back |
 | `sql.Uuid` | `nilo_id`'s [`Uuid`](#nilo_id), re-exported — the same type either import gives you. `uuid` |
 | `sql.Json(T)` | a `T` stored as `jsonb`, parsed per row into the request arena. Not available in `db.stream`, which allocates nothing. In a response it is written and described as the `T` — a **document**, `nilo_json_of = T` beside `value: T` — so a Row with one can still `rename_all` ([ADR 0202](./adr/0202-a-document-is-its-value.md)). **It is also the intended shape for a list on a row**: a `db.raw` projection with `COALESCE(jsonb_agg(jsonb_build_object(…)), '[]'::jsonb) AS labels` read into `labels: sql.Json([]const Label)` is one statement where a list of labels per row was a round trip per row, and the document says `Label`. **The column is parsed by `std.json` into the field names as written** — a `rename_all` on `T` spells the response, not the column, so a `jsonb_build_object` names `content_type` and the wire says `contentType` |
 | `sql.Decimal` | a `numeric`, held as its digits. `.text` is the value; there is no arithmetic. Writes itself into JSON as a **string**, so a consumer's `JSON.parse` cannot round it into an `f64` ([ADR 0050](./adr/0050-a-numeric-is-digits-and-a-string-in-json.md)) |
@@ -3578,7 +3594,7 @@ than asking the server to release a mark it no longer has.
 | `sql.Bytes` | bytes rather than text: `bytea` on Postgres, `BLOB` on SQLite. `.bytes` is the value, `sql.Bytes.of(hash)` writes one. The slice a read hands back lives in the request arena, the way a `Str` does. This is what to reach for instead of `sql.AsText("bytea")`, which goes through hex printing and costs a conversion each way ([ADR 0174](./adr/0174-bytes-are-a-type-not-a-second-protocol.md)) |
 | `sql.AsText("money")` | any Postgres type at all, held as its text — the door out of this table. A column type of your own is any struct or enum with `nilo_column`, `nilo_read(text, arena)` and `nilo_write(arena)`; see below |
 | a slice | an array column, with no wrapper: `[]const Str` is `text[]`, `[]const i32` is `int4[]`, `?[]const i32` a nullable one, `[]const ?i32` one whose elements may be NULL ([ADR 0051](./adr/0051-an-array-is-a-slice-and-a-slice-is-one-deep.md)). `[]const u8` is text, so a list of text is `[]const Str` or `[]const []const u8`. `[]const sql.Uuid` is `uuid[]`, in both directions and as an `.in` list ([ADR 0145](./adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)). Not available in `db.stream` |
-| an enum | read out of `text`, a `varchar` or a Postgres enum. A value the Zig enum does not have fails the request. Add `pub const nilo_column = "user_role"` to it and the column is checked at startup — its type name, and on Postgres its values too, so a label the Zig enum lacks or a tag the type lacks is reported before the first request rather than by it — and can be batched |
+| an enum | read out of `text`, a `varchar` or a Postgres enum. A value the Zig enum does not have fails the request. Add `pub const nilo_column = "user_role"` to it and the column is checked at startup — its type name, and on Postgres its values too, so a label the Zig enum lacks or a tag the type lacks is reported before the first request rather than by it — and can be batched. On a table this program builds, a plain enum is a `text` column and its tags become that column's `CHECK`; one that names its own type is the database's to grow with `ALTER TYPE`, and nilo writes none of its words — it only reads them back at startup and says which side is behind |
 
 #### A column type of your own
 
@@ -3604,7 +3620,10 @@ The column is judged at startup like any other, and the type works everywhere
 a column type does: conditions, `.set`, `insert`, a batch.
 
 `sql.AsText(name)` is the whole of that for a type that is just the text, and
-`sql.Decimal`, `sql.Interval` and `sql.Inet` are three instances of it.
+`sql.Decimal`, `sql.Interval` and `sql.Inet` are three instances of it. A column
+that wants its precision in the DDL writes `sql.AsText("numeric(14,3)")`: the
+digits round-trip either way, and `numeric`'s binary form is a base-10000 digit
+vector this module has no reason to parse.
 
 **A `Timestamp` reads back what it prints.** `Timestamp.nilo_parse(text)` is
 `?Timestamp`, and it is the same declaration that makes a type a path param
@@ -3685,7 +3704,7 @@ answer different questions.
 
 ### Migrations
 
-The three marker words above are the schema half; this is what reads them. It
+The marker words above are the schema half; this is what reads them. It
 is `sql.migrate`, `sql.table`, `sql.ddl` and `sql.snapshot`, and a program that
 never names one links none of it — 0 bytes on `zig build size-sql`, both probes
 ([`bench/result/sql.md` §10](../bench/result/sql.md)).
@@ -3698,13 +3717,33 @@ const Org = struct {
     name: []const u8,
 };
 
+const State = enum { draft, live, archived };
+
 const User = struct {
     pub const nilo_table = .{
         .name = "users",
         .key = .id,
-        .unique = .{.{ .columns = .{.email}, .ignoring_case = true }},
-        .index = .{ .created_at, .{ .org_id, .created_at } },
+        .default = .{ .created_at = .now, .state = .draft, .seats = 1, .tags = &.{} },
+        .unique = .{
+            .{ .columns = .{.email}, .ignoring_case = true,
+               .name = "users_one_account_per_address" },
+        },
+        .index = .{
+            .created_at,
+            .{ .columns = .{ .org_id, .{ .created_at = .desc } },
+               .where = .{ .deleted_at = null } },
+        },
         .references = .{ .org_id = .{ Org, .id, .cascade } },
+        .check = .{
+            .users_seats_are_positive = "seats > 0",
+            .users_state_is_known = .{ .words_of = .state },
+        },
+        .trigger = .{
+            .users_touch = .{
+                .when = "BEFORE UPDATE",
+                .run = "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+            },
+        },
         .was = .{ .email = "handle" },
     };
 
@@ -3712,25 +3751,49 @@ const User = struct {
     org_id: i64,
     email: []const u8,
     nickname: ?[]const u8,
+    state: State,
+    seats: i32,
+    tags: []const []const u8,
     created_at: sql.Timestamp,
+    deleted_at: ?sql.Timestamp,
 };
 ```
 
 | in the marker | what it says |
 |---|---|
+| `.default = .{ .created_at = .now }` | what the database writes when an insert leaves the column out. `.now` is the one word, and only on a `sql.Timestamp`; everything else is a literal of the column's own Zig type, which has to coerce or it does not compile. A column with words of its own takes one of them the way a column is written: `.draft`, not `"draft"`. A default the database has to work out — `DEFAULT (lower(x))` — is still a step, and one on a generated key is a Refusal |
 | `.unique = .{ .email }` | one column. `.{ .{ .tenant_id, .name } }` is one constraint over two |
 | `.{ .columns = .{.email}, .ignoring_case = true }` | the named form. `.ignoring_case` is `lower(...)` on Postgres and `COLLATE NOCASE` on SQLite, and it is a Refusal on a column that is not text |
+| `.name = "users_one_account_per_address"` | what the constraint is called, on a `.unique`, an `.index` or a `.references`. **The name is the error message**: Postgres reports a violation by constraint name and nothing else, so this is the difference between a sentence and a column list. Text rather than `.a_word`, because that is what the database prints |
 | `.index = .{ .created_at }` | the same three shapes, without the uniqueness |
+| `.{ .created_at = .desc }` | one column of an index read downwards. `.asc` is the default and needs no saying; a direction on a `.unique` is a Refusal, since a unique index is not read in order |
+| `.where = .{ .deleted_at = null }` | a partial index. The same grammar a `db.select` condition uses, not a string: `null` is `IS NULL`, `.{ .ne = null }` is `IS NOT NULL`, a literal is `=` and `.{ .ne = lit }` is `<>`. A name that is not a column is a Refusal and a literal of the wrong type does not compile. An index over an expression — `lower(btrim(site))` — is still a step |
 | `.references = .{ .org_id = .{ Org, .id } }` | keyed by the column doing the pointing, and it names the **Row** rather than a table, so renaming the table moves the key with it. A third entry says what happens on delete: `.cascade`, `.restrict` or `.set_null` |
+| `.{ "orgs", .id, .cascade }` | the same key with the table named as text, for a program whose files may not import each other's Rows. **The type check is not given up**: it runs against the Row list the tool was given, and a table no Row in that list claims is a Refusal ([ADR 0222](./adr/0222-a-foreign-key-is-columns-and-a-table-name.md)) |
+| `.epic = .{ .columns = .{ .epic_id, .department_id }, .to = .{ WorkEpic, .{ .id, .department_id } } }` | a foreign key over two columns, which is how "the Epic has to be on the same board" gets said once instead of in a `.data` step and two `.unique` entries. Keyed by a label rather than a column, because a Zig field name cannot be a tuple. `.to` takes a Row or a name, and `.on_delete` and `.name` belong in the same entry. A composite key is written as a table constraint; a one-column key stays inline, so nothing generated before this changed |
+| `.tags = &.{ "a", "b" }` | an array column's default, written as a list. Each element goes through the column's own element type, and a comma, a brace, a quote, a backslash or an apostrophe inside one is escaped so it does not change how many elements there are ([ADR 0225](./adr/0225-an-array-column-has-a-default-like-any-other.md)) |
+| `.check = .{ .users_seats_are_positive = "seats > 0" }` | a `CHECK`, keyed by the name it goes into the database under. **nilo does not read the body**: it writes it, hashes it, and notices when the hash moves — so a changed body is one drop and one create, and a name the types no longer have is a drop. Written inside the `CREATE TABLE`, so SQLite takes it; changing one there is the same rebuild every other table constraint needs ([ADR 0226](./adr/0226-the-marker-has-a-word-the-database-checks.md)) |
+| `.users_state_is_known = .{ .words_of = .state }` | the same word, naming the `CHECK` an enum column already generates, instead of `users_state_check`. Moving that name is a migration: the constraint in the database still has the old one |
+| `.trigger = .{ .users_touch = .{ .when = …, .run = … } }` | a trigger, in two halves, because nilo writes `ON "users"` between them. The table is the one thing the marker already knows, and a second copy of it stops matching the day the table is renamed. Both databases create, replace and drop one |
 | `.was = .{ .email = "handle" }` | this column used to be called that. The old name is text, because it is not a column any more |
 | `.managed = false` | somebody else builds this table. `plan`, `createMissing` and `generate` skip it entirely |
 
+A column the Row reads as a **Zig enum** needs nothing said about it: it is a
+`text` column with `CHECK ("state" IN ('draft', 'live', 'archived'))` beside it,
+named `users_state_check` unless `.check` gave it another, and the words are in
+the snapshot — so adding a tag to the enum is a migration rather than an insert
+the database refuses. An enum
+that names its own database type with `pub const nilo_column = "user_role"` is
+the database's: its words are added with `ALTER TYPE`, and nilo neither writes
+them nor judges them at startup.
+
 **`.managed = false` is for the table this program reads and does not own.** A
-foreign key names the *Row* that owns the table it points at, so
-`comments.author_staff_id` cannot say it points at `staff` without a `Staff`
-Row — and a `Staff` Row is part of the schema the diff sees, so the tool emits
-`CREATE TABLE staff` for a table that has existed for a year and whose real
-definition has twenty columns this program never needed. One word settles it:
+foreign key is checked against the Rows the tool was given, whether it names a
+Row or the table as text, so `comments.author_staff_id` cannot say it points at
+`staff` without a `Staff` Row in that list — and a Row in the list is part of
+the schema the diff sees, so the tool emits `CREATE TABLE staff` for a table
+that has existed for a year and whose real definition has twenty columns this
+program never needed. One word settles it:
 
 <!-- compiles -->
 ```zig
@@ -3750,9 +3813,19 @@ word is written into `migrations/snapshot.zon`, where `managed: true` is silence
 and `managed: false` is a line, so a program that starts or stops building a
 table is a visible change in a reviewed file.
 
-Names follow Postgres' own convention, so a schema nilo generates and one
-somebody wrote by hand look the same: `users_email_key`,
-`users_org_id_created_at_idx`, `users_org_id_fkey`.
+A name nobody gives follows Postgres' own convention, so a schema nilo
+generates and one somebody wrote by hand look the same: `users_email_key`,
+`users_org_id_created_at_idx`, `users_org_id_fkey`, `users_state_check`.
+
+**Every name is checked at 63 bytes, whatever the database is.** Postgres cuts
+a longer one down on the way in and says so in a `NOTICE` nothing here reads,
+which leaves the snapshot holding a name the database does not have and two
+constraints whose first 63 bytes agree colliding on the second `CREATE`. So a
+name over the limit is a compile error — the given one says "make it shorter",
+the derived one says "give the entry a `.name`". SQLite has no limit and is
+held to the same 63, because a schema that compiles for one database and
+quietly loses a name on the other is the opposite of what one type describing
+both is for. Two entries that end up with the same name are a Refusal too.
 
 **A key that is an integer is generated and one that is not is supplied.** That
 is a rule rather than a word in the marker: `id: i64` becomes
@@ -3796,14 +3869,19 @@ conflict in git rather than at deploy.
 `Plan.steps` is what to run, in order, each with its `kind`, its `sql` and a
 line of `why`. `Plan.problems` is what the diff will not write, and **every one
 of them is collected rather than the first being returned**. Two are refused on
-purpose: a type or nullability change on SQLite, which has no
-`ALTER COLUMN`; and any foreign-key change on a table that already exists, on
-both dialects, because the one-statement form takes an `ACCESS EXCLUSIVE` lock
-and scans the table. The `Problem` spells out the `ADD CONSTRAINT … NOT VALID`
-then `VALIDATE CONSTRAINT` pair to write instead.
+purpose: a column that moved in a way SQLite cannot follow — its type, its
+nullability, its default or an enum's words, since SQLite has neither
+`ALTER COLUMN` nor a way to replace a constraint — and any foreign-key change on
+a table that already exists, on both dialects, because the one-statement form
+takes an `ACCESS EXCLUSIVE` lock and scans the table. The `Problem` spells out
+the `ADD CONSTRAINT … NOT VALID` then `VALIDATE CONSTRAINT` pair to write
+instead. **A column that moved three ways gets one `Problem` naming all three**,
+because what it needs is one rewrite and not three.
 
 `Plan.destructive()` and `Plan.needsBackfill()` are the two questions a command
-asks before writing a file out.
+asks before writing a file out. A column added `NOT NULL` **with a `.default`
+needs no backfill**, which is the case ADR 0153 named as the one moment a
+default is load-bearing.
 
 #### The ledger, and applying
 
@@ -3826,8 +3904,21 @@ finds the edit by looking at the head rather than by walking the lot. It is over
 the SQL rather than over the file bytes, so reformatting a generated file does
 not read as tampering and changing a statement does.
 
-`nilo_migrations` is an ordinary Row — `migrate.Applied` — with the version, the
-name, that hash, when it was applied and how many milliseconds it took. `apply`
+`nilo_migrations` is an ordinary Row — `migrate.Applied` — and **its columns are
+a contract**, because a program in another language may have to write a row into
+it ([ADR 0227](./adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)):
+
+| Column | Postgres | SQLite | What it holds |
+|---|---|---|---|
+| `version` | `int8 PRIMARY KEY` | `INTEGER PRIMARY KEY` | the number in the file name. Supplied, never generated |
+| `name` | `text NOT NULL` | `TEXT NOT NULL` | the rest of the file name, `a-z`, `0-9` and `_` |
+| `hash` | `text NOT NULL` | `TEXT NOT NULL` | 64 hex characters: SHA-256 of the steps, chained onto the version before |
+| `applied_at` | `timestamptz NOT NULL` | `INTEGER NOT NULL` | when. SQLite holds microseconds since the epoch (ADR 0136) |
+| `ms` | `int8 NOT NULL` | `INTEGER NOT NULL` | how long it took. `0` is allowed and means nobody timed it |
+
+`migrate.expect` reads the highest `version`; `migrate.drift` compares `hash`
+against what the steps hash to now. A row with the right `version` and a wrong
+`hash` is what `verify` is for. `apply`
 is one transaction: take the advisory lock, check whether this version is
 already there, run every step, insert the row, commit. It answers `false` when
 the version had already been applied, which is what nine of ten replicas booting
@@ -3835,7 +3926,7 @@ together get.
 
 `migrate.applyPending(&db, &run, chain)` is the whole list, in order, one
 transaction each, answering how many ran. That is the in-process runner a
-single-file SQLite application calls between `app.start(io)` and `listen()`.
+single-file SQLite application calls from `app.before`, inside `listen()`.
 `migrate.drift(&db, &run, chain)` answers which applied versions have been
 edited since — a `Drift` per version with what the ledger recorded and what the
 steps hash to now.
@@ -3853,12 +3944,15 @@ tightens it, in one transaction, in one version.
 #### Refusing to serve a database that is behind
 
 ```zig
-try sql.migrate.expect(&db, &run, manifest.head);
+db.expecting(manifest.head);
 ```
 
-One query, before `listen()`. **This is the check almost nothing has**, and it
-catches one incident shape: the code went out before the migration did, and
-every request that touches the new column answers 500 until somebody notices.
+One query, run by `listen()` on the pool it just opened. **This is the check
+almost nothing has**, and it catches one incident shape: the code went out
+before the migration did, and every request that touches the new column
+answers 500 until somebody notices. `sql.migrate.expect(&db, &run,
+manifest.head)` is the same check as a call, for a script with a `Run` in
+hand.
 
 A database *ahead* of the binary is allowed and only logged. That is the
 ordinary middle of a two-stage deploy, and refusing it would make expand and
@@ -3885,7 +3979,33 @@ still behind, and the next run generates the same version again rather than
 skipping it.
 
 `check` is `generate` with nothing written: the same `Plan`, so CI and the
-person at the keyboard are looking at one answer.
+person at the keyboard are looking at one answer. It also names any `.sql` twin
+that has gone stale, which is the one thing it reports that is not in the
+`Plan`.
+
+**Every version file has a `.sql` twin beside it**, written by the same
+`generate` and regenerated whenever the `.zig` is
+([ADR 0227](./adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)):
+
+```
+migrations/0007_work_items_get_a_priority.zig
+migrations/0007_work_items_get_a_priority.sql
+```
+
+It is the version's statements in order, each with its `why` above it as a
+comment, wrapped in `BEGIN`/`COMMIT`, with the ledger table created if it is not
+there and the ledger row on the end. `psql -f`, a CI job with no toolchain or
+somebody on a jump host can bring a database to head with it, and
+`db.expecting(manifest.head)` still serves the result and `verify` still holds
+the hash. **It is an output**: nilo reads the `.zig` and never this, and a
+version written in SQL by somebody else is not picked up.
+
+The twin's hash is chained onto the version before it, so it is written from the
+compiled manifest — `Options.versions`, which `db generate` passes from what
+`Tool.run` was given. One case cannot be written: `--baseline` rewriting a
+version 1 whose `before` or `after` hold hand-written steps, because those are
+Zig nothing has compiled yet. The `Outcome` says so with `twins_deferred`, and
+`db check` asks for the file after the rebuild.
 
 An `Outcome` says which of three things happened. `isEmpty()` means the Rows and
 the migrations already agree. `wasHeld()` means the version was not written
@@ -3899,6 +4019,11 @@ else wrote the file named in `.file`.
 | `migrations.generate(gpa, io, dir, D, desired, opts)` | the `Plan`, written out |
 | `migrations.renderVersion(gpa, n, name, steps, opts)` | one version file, as text |
 | `migrations.renderManifest(gpa, entries, opts)` | the manifest, as text |
+| `migrations.spliceGenerated(gpa, old, steps)` | the same file with only its generated block replaced |
+| `migrations.renderSql(gpa, D, version, name, hash, source)` | one `.sql` twin, as text |
+| `migrations.writeSql(gpa, io, dir, D, versions, entries)` | every twin, written; how many changed |
+| `migrations.staleSql(gpa, io, dir, D, versions, entries)` | the twins that are missing or out of date, by name |
+| `migrations.sqlTwin(gpa, file)` | `0007_name.zig` → `0007_name.sql` |
 | `migrations.checkName(name)` | `a-z`, `0-9` and `_`, or `error.BadName` |
 
 A version file is **one `.zig` file holding a list of steps**, because a
@@ -3908,6 +4033,31 @@ about `;` inside a string literal and inside `$$…$$`, and getting it subtly
 wrong runs three quarters of a migration. The list is already split.
 [ADR 0153](adr/0153-a-migration-is-a-diff-against-a-snapshot.md) is the
 argument, including what the layout costs.
+
+**Only one declaration in that file is generated.** The rest is the caller's,
+and it survives a rerun
+([ADR 0223](adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)):
+
+```zig
+pub const before: []const migrate.Step = &.{};   // yours, runs first
+pub const after: []const migrate.Step = &.{};    // yours, runs last
+
+pub const version: migrate.Version = .{
+    .number = 1,
+    .name = "schema",
+    .steps = before ++ generated ++ after,
+};
+
+// nilo:generated begin
+const generated: []const migrate.Step = &.{ … };
+// nilo:generated end
+```
+
+`before` exists as well as `after` because a generated step can *need* a
+hand-written object: a `CREATE EXTENSION citext` has to run before the column
+whose type comes from it. `migrations.generated_begin` and `generated_end` are
+the two marker lines, matched whole; a file that has lost one is refused with
+`error.NoGeneratedBlock` rather than rewritten.
 
 #### The commands
 
@@ -3924,8 +4074,8 @@ rather than calling `std.process.exit`.
 
 | Command | What it does |
 |---|---|
-| `generate --name <snake_case> [--drop]` | diff the Rows against the snapshot and write the next version. No database |
-| `check` | the same diff, written nowhere. Exit 1 when they disagree. No database |
+| `generate --name <snake_case> [--drop] [--baseline]` | diff the Rows against the snapshot and write the next version. No database |
+| `check` | the same diff, written nowhere, plus any stale `.sql` twin. Exit 1 when they disagree. No database |
 | `status [--sql]` | which versions this database has. `--sql` prints the waiting statements |
 | `migrate` | apply what is waiting, one transaction per version, behind the lock |
 | `verify` | has an applied version been edited since it ran? |
@@ -3948,6 +4098,15 @@ with `--drop` and the generated file records that you did, as
 `status` marks a version `edited` rather than `applied` when its file no longer
 hashes to what ran. It is the command people type first, so it is the one that
 has to stop saying everything is fine.
+
+**`--baseline` is for porting a schema**, which is one version written over and
+over rather than many versions. It ignores the snapshot, diffs the Rows against
+nothing, and rewrites version 1 in place along with the manifest and the
+snapshot, keeping everything outside the file's generated block. It is the only
+thing here that writes over a file that already exists, so it refuses three
+ways: a version it is not re-deriving is in the directory, `--name` disagrees
+with the version 1 already there, or the file has no generated block. Each
+message names the files, and nothing is written.
 
 #### Starting a migrations directory
 

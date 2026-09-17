@@ -399,27 +399,37 @@ var run = nilo.Run.init(gpa);
 defer run.deinit();
 ```
 
-Inside a program that also serves, `app.start(io)` is the same thing for every
-service the App holds at once — the phase after the pool and before the server:
+Inside a program that also serves, the same work goes in `app.before`, which
+`listen()` runs on the server's own loop after the pools are open and before
+the first request
+([ADR 0220](../../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)):
+
+<!-- compiles -->
+```zig
+fn makeTables(run: *nilo.Run, db: *sql.Db) !void {
+    _ = try db.exec(run, "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)", .{});
+}
+```
 
 <!-- compiles: body -->
 ```zig
-var threaded: std.Io.Threaded = .init(gpa, .{});
-defer threaded.deinit();
-
 try app.provide(&db);
-try app.start(threaded.io());        // services checked, pools open, schema checked
-
-var run = nilo.Run.init(gpa);
-defer run.deinit();
-_ = try db.exec(&run, schema_sql, .{});
-
-try app.listen(.{ .port = 8080 });   // does not open them a second time
+try app.before(makeTables, .{&db});  // runs once, inside listen()
+try app.listen(.{ .port = 8080 });
 ```
+
+The function takes the boot's `nilo.Run` first — made by `listen()` on the
+loop the pool was dialled through, so a key can be minted from it — and then
+whatever it was registered with. If it fails, the server does not start.
 
 **A SQLite application needs this and most Postgres ones do not**: there is no
 server to have created the tables somewhere else, so `zig build run` on a fresh
 machine has to do it.
+
+`app.start(io)` — services checked, pools open on an `Io` of yours — is for a
+program that never listens: a test through `testing.Client`, a script. Followed
+by `listen()` it is refused, because a pool dialled through one loop cannot be
+driven from another (ADR 0220).
 
 
 ## Streaming a result set too big to hold

@@ -9,10 +9,217 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ## Unreleased
 
-Needs Zig 0.16, as 0.4.0 does. Ten things the roadmap had marked ready, most
-of them a failure that used to arrive somewhere other than where it was made.
+Needs Zig 0.16, as 0.4.0 does. Two halves. The schema half is what a Row can
+say about its own table — its defaults, a `CHECK`, a trigger, a foreign key
+over more than one column — and beside it the ten things the roadmap had
+marked ready, most of them a failure that used to arrive somewhere other than
+where it was made.
+
+### Breaking
+
+- **`app.start(io)` followed by `listen()` is refused** when any provided
+  service declares `nilo_start`. The shape ADR 0079 recommended handed the
+  pool one loop and the requests another: a job worker started that way
+  crashed at boot, and a server took SIGINT and never exited. `listen()`
+  now says which services took the caller's `Io` and stops, with
+  `error.StartedOnAnotherLoop` from `tryListen`. `app.start(io)` stays for
+  a program that never listens — a test through `testing.Client`, a script,
+  a worker on `jobs.serveOn(io)`
+  ([ADR 0220](./docs/adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+
+  What to change: move the work between `start` and `listen` into a
+  function taking `*nilo.Run` first, and register it with `app.before`:
+
+  ```zig
+  fn migrate(run: *nilo.Run, db: *sql.Db) !void {
+      try sql.migrate.applyPending(db, run, try manifest.chain(run.arena()));
+  }
+
+  try app.provide(&db);
+  try app.before(migrate, .{&db});
+  try app.listen(.{ .port = 8080 });
+  ```
+
+  A `sql.migrate.expect(&db, &run, manifest.head)` on its own becomes
+  `db.expecting(manifest.head)` beside `db.checking`, and needs no phase.
+
+- **`migrations/snapshot.zon` written before this release is read and
+  upgraded, not refused.** A foreign key holds a list of columns now rather than
+  one, so `Reference.column` is `columns` and `target` is `targets`. `std.zon`
+  fills a *missing* field from its default and has nothing to say about a
+  renamed one, so nilo keeps a mirror of the older shape, tries it when the
+  current one does not parse, and diffs against what comes back
+  ([ADR 0222](./docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md),
+  [ADR 0224](./docs/adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
+
+  What to change: nothing. `db generate` says one line noting the file is in
+  the older shape and writes the current one out. The tables themselves are
+  unaffected — a one-column foreign key is still written inline and byte for
+  byte as before — so the diff against a live database is empty and the
+  regenerated snapshot is the whole of the change.
+
+- **A version file now has a generated block rather than being one.** `generate`
+  writes a `before`, an `after`, a `version` whose `.steps` is
+  `before ++ generated ++ after`, and the generated list between two
+  `// nilo:generated` marker lines. Files written by an earlier release still
+  compile and still apply, and their hashes do not move, because the hash is
+  taken over the steps and not over the file
+  ([ADR 0223](./docs/adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)).
+
+  What to change: nothing, unless you want `--baseline` to be able to rewrite
+  version 1 in place. That needs the two marker lines around the generated
+  steps, and the refusal says so with the line to paste.
 
 ### Added
+
+- **A Row can say its columns' defaults**, `.default = .{ .created_at = .now,
+  .state = .draft, .seats = 1 }`. `.now` is the one word and is refused off a
+  `sql.Timestamp`; everything else is a literal of the column's own Zig type,
+  and a column with words of its own takes one of them written the way a column
+  is (`.draft`, not `"draft"`). The snapshot carries it, so changing a default
+  is a migration, and a `NOT NULL` column added with one needs no backfill
+  ([ADR 0221](./docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+- **A Zig enum column writes its own `CHECK`.** A column read as a plain Zig
+  enum is `text` with `CHECK ("state" IN ('draft', 'live', 'archived'))` beside
+  it, and the words are in the snapshot — so adding a tag is a migration rather
+  than an insert the database refuses. `db.checking` now judges such a column at
+  boot, but only on a table this program builds. An enum naming its own database
+  type (`pub const nilo_column = "user_role"`) is unchanged: its words are the
+  database's, added with `ALTER TYPE`.
+
+  What to expect on an existing schema: the next `generate` writes one
+  `ADD CONSTRAINT … CHECK` per enum column, because the snapshot did not record
+  the words before. Applying it is the point — the rows already agree with the
+  enum or the program was already failing on them — and a table whose data does
+  not agree is what the failing `migrate` is telling you.
+- **`.index` takes a direction and a `.where`** —
+  `.{ .columns = .{ .org_id, .{ .created_at = .desc } }, .where = .{ .deleted_at = null } }`.
+  The predicate is the grammar a `db.select` condition already uses, not a
+  string: `null`, `.{ .ne = null }`, a literal, `.{ .ne = lit }`. A name that is
+  not a column is a Refusal and a literal of the wrong type does not compile.
+- **A constraint can be named**, `.name = "users_one_account_per_address"` on a
+  `.unique`, an `.index` or a `.references`. Postgres reports a violation by
+  constraint name and nothing else, so this is what makes the violation a
+  sentence.
+- **Every constraint name is checked at 63 bytes on both databases.** Postgres
+  cuts a longer one down in a `NOTICE` nothing reads, which left the snapshot
+  holding a name the database did not have. Two entries that end up with one
+  name are refused too.
+- **`sql.Date`** — a calendar day, `date` on Postgres and `TEXT` on SQLite,
+  **read out of the column rather than out of a `::text`**, so a `db.raw`
+  reading one needs no cast. `2026-09-17` in JSON, `format: date` in the
+  document. A day is not a moment: a due date read into a `timestamptz` gets a
+  midnight, and a midnight has a zone. A day before 1970 is ordinary, which is
+  where `sql.Timestamp` stops.
+- **`app.before(f, args)`** — work that needs the services and has to finish
+  before the first request. Runs once inside `listen()`, after the services
+  have started and before what `spawn` registered, on the server's loop,
+  with a `nilo.Run` made there. If it fails, the server does not start.
+  Three shapes are refused while compiling: a value rather than a function,
+  a first parameter that is not `*nilo.Run`, a function answering with a
+  value.
+- **`db.expecting(version)`** — refuse to serve a database whose migration
+  ledger is behind the binary, checked at boot on the pool `listen()` just
+  opened. A call rather than an option on `Db.Opts`, because the option
+  measured 17,296 bytes in every program with a `Db` in it and the call
+  measures 16.
+- **A `.references` can name its table as text**, `.{ "orgs", .id, .cascade }`,
+  for a program whose files may not import each other's Rows — a context per
+  directory, where contexts never import each other. **The type check is not
+  given up**: it runs against the Row list `sql.cli.Tool` and `db.checking` are
+  given, where every Row is in one place, and a table no Row in that list claims
+  is a compile error naming both spellings. That is what lets a context own its
+  Row once instead of declaring every table twice
+  ([ADR 0222](./docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+- **A `.references` can span several columns**, which is how "the Epic has to be
+  on the same board" gets said in the schema:
+
+  ```zig
+  .references = .{
+      .epic = .{ .columns = .{ .epic_id, .department_id },
+                 .to = .{ WorkEpic, .{ .id, .department_id } } },
+  },
+  ```
+
+  Keyed by a label rather than a column, because a Zig field name cannot be a
+  tuple. A composite key is written as a table constraint and a one-column key
+  stays inline, so every table generated before this is unchanged. `.exists`
+  joins on every column of it.
+- **`db generate --baseline`** — forget the snapshot, diff the Rows against
+  nothing and rewrite version 1 where it stands, keeping everything outside its
+  generated block. What porting a schema needs, where the loop is one version
+  derived over and over. Refused once there is a version 2, when `--name`
+  disagrees with the version 1 on disk, or when the file has no generated block;
+  each message names the files and nothing is written.
+- **A Row can name a `CHECK` and a trigger**, which is the second kind of word
+  ADR 0221 described and did not build
+  ([ADR 0226](./docs/adr/0226-the-marker-has-a-word-the-database-checks.md)):
+
+  ```zig
+  .check = .{
+      .work_items_range_runs_forwards =
+          "start_date IS NULL OR target_date IS NULL OR start_date <= target_date",
+      .work_items_priority_is_known = .{ .words_of = .priority },
+  },
+  .trigger = .{
+      .work_items_updated_at = .{
+          .when = "BEFORE UPDATE",
+          .run = "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+      },
+  },
+  ```
+
+  The key is the name the object goes into the database under, because a check
+  has no column list to derive one from and the name is the whole of what
+  Postgres says when a row breaks it. nilo does not read the body: it writes it,
+  hashes it, and notices when the hash moves — so a changed body is one drop and
+  one create in the version where it changed, and a name the types no longer
+  have is a drop.
+
+  A trigger is two halves because nilo writes `ON "<table>"` between them. The
+  table is the one thing the marker already knows, and a second copy of it is a
+  copy that stops matching the day the table is renamed.
+
+  `.{ .words_of = .<column> }` is how an enum column's generated `CHECK` gets a
+  name of its own instead of `<table>_<column>_check`. Moving that name is a
+  migration: the constraint in the database still has the old one.
+
+  A `CHECK` is written inside the `CREATE TABLE`, so SQLite takes it; changing
+  one there is the four-statement rebuild the diff already spells out for every
+  other table constraint. A trigger is a statement of its own and both databases
+  do all three cases.
+
+  **Postgres 14 is now the floor**, because `createMissing` writes
+  `CREATE OR REPLACE TRIGGER` and no version of Postgres has
+  `CREATE TRIGGER IF NOT EXISTS`. Nothing else in the module needs it.
+- **An array column takes a default like any other**, `.read_tags = &.{}` or
+  `.write_capabilities = &.{ "deals", "work" }`. Each element goes through the
+  column's own element type, and the Postgres array literal is escaped so a
+  comma, a brace, a quote, a backslash or an apostrophe inside an element does
+  not change how many elements there are
+  ([ADR 0225](./docs/adr/0225-an-array-column-has-a-default-like-any-other.md)).
+- **`db generate` writes a `.sql` twin beside every version file**, and
+  `db check` fails when one no longer says what the version beside it says
+  ([ADR 0227](./docs/adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)):
+
+  ```
+  migrations/0007_work_items_get_a_priority.zig
+  migrations/0007_work_items_get_a_priority.sql
+  ```
+
+  The same statements in the same order, wrapped in `BEGIN`/`COMMIT`, with the
+  ledger table created if it is not there and the ledger row on the end — so
+  `psql -f`, a CI job with no toolchain or somebody on a jump host can bring a
+  database to head, and `db.expecting(manifest.head)` still serves it and
+  `verify` still holds the hash. It is an output: nilo reads the `.zig` and
+  never this.
+
+  One case writes nothing and says so. `--baseline` rewriting a version 1 that
+  has hand-written steps in it produces a file whose `before` and `after` are
+  Zig nothing has compiled yet, so the twin's hash cannot be worked out. Build,
+  then run `db check` or any `db generate`.
+- `sql.Db`, `sql.Named`, `sql.Sqlite` and `sql.SqliteNamed` say their own
+  name in a nilo message, rather than `db.DbOf(postgres.Wire,…)`.
 
 - **A connection URL is read the way libpq reads it, and a parameter the
   driver would not act on is refused by name.** `dialOpts` used to understand

@@ -256,8 +256,15 @@ pub const Qualified = struct {
 /// `"app."` — is a mistake with a plausible cause and no plausible meaning, so
 /// it stops here rather than reaching Postgres as a relation nobody named.
 pub fn qualifiedOf(comptime Row: type) Qualified {
+    return comptime qualifiedName(tableOf(Row), @typeName(Row) ++ " names");
+}
+
+/// The same split, for a table named as text rather than by a Row — which a
+/// `.references` may do when the Row that owns it cannot be imported
+/// ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+/// `whose` is what the message calls the thing that wrote the name.
+pub fn qualifiedName(comptime written: []const u8, comptime whose: []const u8) Qualified {
     return comptime blk: {
-        const written = tableOf(Row);
         const dot = std.mem.indexOfScalar(u8, written, '.') orelse
             break :blk .{ .schema = null, .table = written };
 
@@ -265,7 +272,7 @@ pub fn qualifiedOf(comptime Row: type) Qualified {
         const table = written[dot + 1 ..];
         if (schema.len == 0 or table.len == 0 or
             std.mem.indexOfScalar(u8, table, '.') != null) @compileError(
-            "nilo: " ++ @typeName(Row) ++ " names the table `" ++ written ++
+            "nilo: " ++ whose ++ " the table `" ++ written ++
                 "`, which is not a schema and a table.\n" ++
                 "  A qualified name is `schema.table` — one dot, and something on " ++
                 "either side of it. A table whose name really contains a dot is out " ++
@@ -542,11 +549,15 @@ const Spec = struct {
 };
 
 /// What may be written in the marker. `.name` and `.key` are read here;
-/// `sql/table.zig` reads the other four, and this list is what stops a typo in
+/// `sql/table.zig` reads the rest, and this list is what stops a typo in
 /// one of them being silently ignored. One list rather than a check in each
 /// file, because a word allowed in one place and refused in another is the
 /// mistake this whole arrangement exists to make impossible.
-const allowed = [_][]const u8{ "name", "key", "unique", "index", "references", "was", "managed" };
+const allowed = [_][]const u8{
+    "name",    "key",        "unique", "index",
+    "default", "references", "was",    "managed",
+    "check",   "trigger",
+};
 
 /// The table spec `Row` resolves to, following `nilo_table = OtherRow` until
 /// a spec that names a table is reached. Every borrowed Row is checked against
@@ -649,9 +660,10 @@ fn readSpec(comptime Row: type, comptime decl: anytype) Spec {
                 "nilo: " ++ @typeName(Row) ++ "'s " ++ marker ++ " sets `." ++ f.name ++
                     "`, which is not part of it.\n" ++
                     "  It takes `.name`, and `.key` when the identity column is not " ++
-                    "`id`. The four a migration reads are `.unique`, `.index`, " ++
-                    "`.references` and `.was`; everything else about the table is SQL " ++
-                    "in a step, which nilo will not touch.",
+                    "`id`. The words a migration reads are `.unique`, `.index`, " ++
+                    "`.default`, `.references`, `.was`, `.check` and `.trigger`; " ++
+                    "everything else about the table is SQL in a step, which nilo " ++
+                    "will not touch.",
             );
         }
         const key: ?[]const []const u8 = if (@hasField(D, "key")) keyNames(Row, decl.key) else null;

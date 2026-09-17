@@ -80,6 +80,9 @@ const core = @import("nilo_core");
 const nilo = @import("nilo_http");
 
 const dialect = @import("dialect.zig");
+/// Reached only through `expecting`, so a program that never calls it links
+/// none of the migration module — `expectVersion` is the one line that names it.
+const migrate = @import("migrate.zig");
 const ordering = @import("ordering.zig");
 const postgres = @import("postgres.zig");
 const rawcheck = @import("rawcheck.zig");
@@ -329,6 +332,14 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// fires costs nothing to have worded well.
         const whoami = if (name.len == 0) "the database" else "`sql.Named(\"" ++ name ++ "\")`";
 
+        /// What a nilo message calls this type (ADR 0122): the call the
+        /// reader wrote, rather than the `db.DbOf(postgres.Wire,…)` that
+        /// `@typeName` spells with three of this module's files in it.
+        pub const nilo_type_name = if (D == dialect.SQLite)
+            (if (name.len == 0) "sql.Sqlite(…)" else "sql.SqliteNamed(\"" ++ name ++ "\", …)")
+        else
+            (if (name.len == 0) "sql.Db" else "sql.Named(\"" ++ name ++ "\")");
+
         gpa: std.mem.Allocator,
         url: []const u8,
         opts: Opts,
@@ -338,6 +349,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// The schema check, with the Row list baked in by `checking`. Null
         /// when nobody asked for one.
         check: ?*const fn (*Self) anyerror!usize = null,
+        /// The version guard `expecting` installed, or null for none. The
+        /// number and the function that reads the ledger travel together,
+        /// so that a program which never calls `expecting` links nothing
+        /// of the migration module.
+        expect: ?Guard = null,
         /// Who to tell about each statement, or null for nobody — which is
         /// the default and costs one null test per statement
         /// ([ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)).
@@ -535,6 +551,51 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }.run;
         }
 
+        /// Refuse to serve a database whose ledger is behind `want`, checked
+        /// once, while the server is starting
+        /// ([ADR 0220](../docs/adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+        ///
+        /// ```zig
+        /// var db = sql.Db.init(gpa, url, .{});
+        /// db.expecting(manifest.head);
+        /// ```
+        ///
+        /// `migrate.expect`, run by `nilo_start` on the pool it just opened:
+        /// one query, and the sentence that says which migration is missing.
+        /// The number is the generated manifest's head, so the guard moves
+        /// with the migrations and nobody types it. A database *ahead* of
+        /// the binary is allowed and noted, because that is the middle of a
+        /// two-stage deploy. A database that cannot be asked — down, or
+        /// `connect_on_init = 0` and the dial for it failed — starts with a
+        /// warning, the way the schema check does (ADR 0039).
+        ///
+        /// **A call rather than a field on `Opts`, and the reason is 17,296
+        /// bytes.** An `.expect = …` option is read on every boot, so the
+        /// ledger's DDL, the query that reads its head and the sentences
+        /// round them are in every program with a `Db` in it, wanted or
+        /// not — measured with `zig build size-sql`, that was the cost. What
+        /// this stores is a function with the guard already inside it, and
+        /// a program that never calls this links none of it, the way
+        /// `checking` works.
+        ///
+        /// Like `checking`, this dials one connection on a `Db` written with
+        /// `connect_on_init = 0`, for the reason ADR 0144 gives: a guard
+        /// with nothing to ask never guarded anything.
+        pub fn expecting(self: *Self, want: i64) void {
+            self.expect = .{ .want = want, .run = &struct {
+                fn run(me: *Self, io: std.Io, version: i64) anyerror!void {
+                    return me.expectVersion(io, version);
+                }
+            }.run };
+        }
+
+        /// What `expecting` stores: the version, and the one function that
+        /// names the migration module.
+        const Guard = struct {
+            want: i64,
+            run: *const fn (*Self, std.Io, i64) anyerror!void,
+        };
+
         /// Be told about every statement this `Db` sends
         /// ([ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)).
         ///
@@ -646,11 +707,13 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // stopped nothing, and the deploy was green.
             //
             // So a `Db` that has a check to run dials one connection for
-            // it. What does not change is ADR 0039's promise that a
-            // database which is merely down does not stop the server: a
-            // dial that fails here falls back to the pool the caller asked
-            // for and says in one line that the check is not happening.
-            const dialing_for_check = self.check != null and self.opts.connect_on_init == 0;
+            // it — and a version guard is a check (ADR 0220). What does not
+            // change is ADR 0039's promise that a database which is merely
+            // down does not stop the server: a dial that fails here falls
+            // back to the pool the caller asked for and says in one line
+            // that the check is not happening.
+            const has_check = self.check != null or self.expect != null;
+            const dialing_for_check = has_check and self.opts.connect_on_init == 0;
             var check_dial_failed = false;
 
             var opened = W.open(io, self.gpa, self.url, .{
@@ -723,6 +786,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // Already said above, in the sentence that names the dial.
             if (check_dial_failed) return;
 
+            try self.checkAtBoot();
+            try self.expectAtBoot(io);
+        }
+
+        /// The `checking` list against the database, once, at boot.
+        fn checkAtBoot(self: *Self) !void {
             const check = self.check orelse return;
             // A schema check needs a connection, and a caller who set
             // `connect_on_init` themselves may have set it to 0. A database
@@ -754,6 +823,37 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 );
                 return error.SchemaMismatch;
             }
+        }
+
+        /// What `expecting` installed, run once at boot; nothing when
+        /// nobody called it.
+        fn expectAtBoot(self: *Self, io: std.Io) !void {
+            const guard = self.expect orelse return;
+            try guard.run(self, io, guard.want);
+        }
+
+        /// The guard itself, reached only through `expecting`
+        /// ([ADR 0220](../docs/adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+        ///
+        /// The one thing `migrate.expect` needs is a Scope, and the boot has
+        /// none — so one is made here on the loop the pool was just opened
+        /// on and thrown away after the query, which is what `app.before`
+        /// does for work of the caller's. Behind is refused, with the
+        /// sentence `expect` writes; a ledger that cannot be read is the
+        /// database being down, and that is a warning for the reason the
+        /// schema check's is.
+        fn expectVersion(self: *Self, io: std.Io, want: i64) !void {
+            var run: core.Run = .initIo(self.gpa, io);
+            defer run.deinit();
+            migrate.expect(self, &run, want) catch |err| switch (err) {
+                error.SchemaBehind => return err,
+                else => std.log.warn(
+                    "nilo could not read the schema version ({s}), so `expecting({d})` is not " ++
+                        "being checked. The first request that reads a column the database " ++
+                        "does not have is how this gets found instead.",
+                    .{ @errorName(err), want },
+                ),
+            };
         }
 
         /// Put the pool down, on the loop it was built on
@@ -1983,8 +2083,9 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             std.log.warn(
                 "nilo_sql: {s} has no pool, so this query has nothing to run on. " ++
                     "The pool is opened by `nilo_start`, which `app.listen()` calls for every " ++
-                    "provided service — outside a server, or before one, `app.start(io)` does " ++
-                    "it, and `db.nilo_start(io, .off)` does it for a `Db` no App holds. " ++
+                    "provided service — work that needs it before the first request goes in " ++
+                    "`app.before(f, args)`; in a program that never listens, `app.start(io)` " ++
+                    "opens it, and `db.nilo_start(io, .off)` does for a `Db` no App holds. " ++
                     "A `nilo.Run` is an arena and a lifetime; it is not a connection.",
                 .{whoami},
             );
@@ -2789,6 +2890,12 @@ fn WireRead(comptime F: type) type {
         // reads are `sqlite3_column_text` and `sqlite3_column_blob`, which are
         // not the same call. Keeping the type is what lets each Wire pick.
         if (F == types.Bytes) return types.Bytes;
+        // **And a `Date` for the same reason, one type over.** pg.zig has no
+        // decoder for the `date` OID at all — `Int32.decode` refuses it — and
+        // zqlite hands back the ISO text, so the two Wires read one
+        // differently and neither reads it as a number. Keeping the type is
+        // what lets each pick (ADR 0221).
+        if (types.isDate(F)) return F;
         if (F == core.Str) return []const u8;
         if (F == types.Timestamp) return i64;
         if (F == types.Uuid) return []const u8;
@@ -2884,6 +2991,16 @@ fn uuidText(value: types.Uuid, c: anytype) ![]const u8 {
     return c.arena().dupe(u8, &text) catch error.QueryFailed;
 }
 
+/// A `Date` as the ten characters both databases take, kept where the query can
+/// read them. The same arrangement `uuidText` makes, and for the same reason:
+/// the tuple this feeds is handed to the driver after this has returned.
+fn dateText(value: types.Date, c: anytype) ![]const u8 {
+    var buf: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    value.writeIso(&w) catch return error.QueryFailed;
+    return c.arena().dupe(u8, w.buffered()) catch error.QueryFailed;
+}
+
 /// The tag whose name the column held, or a refusal naming the value.
 ///
 /// **This is the one column type startup cannot check.** `dialect.accepts`
@@ -2956,7 +3073,7 @@ fn assertReadable(comptime Row: type) void {
                 "nilo: " ++ @typeName(Row) ++ " reads `" ++ f.name ++ "` as " ++
                     @typeName(f.type) ++ ", which no Dialect can decode.\n" ++
                     "  A column is a number, a bool, text (`[]const u8` or `Str`), " ++
-                    "`sql.Bytes`, `sql.Uuid`, `sql.Timestamp`, an enum, a type that " ++
+                    "`sql.Bytes`, `sql.Uuid`, `sql.Timestamp`, `sql.Date`, an enum, a type that " ++
                     "carries `nilo_read` and `nilo_write` (`sql.AsText(\"…\")` is the " ++
                     "ready-made one), or `sql.Json(T)` for a document — or a list of one " ++
                     "of those.\n" ++
@@ -2974,7 +3091,7 @@ fn assertReadable(comptime Row: type) void {
 /// about — the driver decides, and this is the list of what it decides for.
 fn readable(comptime T: type) bool {
     if (T == core.Str or T == []const u8) return true;
-    if (T == types.Bytes or T == types.Timestamp or T == types.Uuid) return true;
+    if (T == types.Bytes or T == types.Timestamp or T == types.Uuid or T == types.Date) return true;
     if (types.jsonPayload(T) != null) return true;
     if (types.asText(T) != null) return true;
     return switch (@typeInfo(T)) {
@@ -3096,6 +3213,14 @@ fn WireWrite(comptime D: type, comptime F: type) type {
         // what travels this far is nilo's own type and the Wire unwraps it.
         if (F == types.Bytes) return types.Bytes;
         if (F == ?types.Bytes) return ?types.Bytes;
+        // **A `Date` is read as the column and written as its text**, and the
+        // asymmetry is the driver's rather than a choice: pg.zig has no `date`
+        // encoder, so the only way to send one is the ten characters plus the
+        // `::date` the Dialect writes around the placeholder (`bindAs`).
+        // SQLite wants exactly the same ten characters, so one answer serves
+        // both (ADR 0221).
+        if (F == types.Date) return []const u8;
+        if (F == ?types.Date) return ?[]const u8;
         if (F == core.Str) return []const u8;
         if (F == ?core.Str) return ?[]const u8;
         if (F == types.Timestamp) return i64;
@@ -3154,6 +3279,14 @@ fn forWire(comptime To: type, value: anytype, c: anytype) !To {
     if (V == ?core.Str) return if (value) |text| text.view() else null;
     if (V == types.Timestamp) return value.micros;
     if (V == ?types.Timestamp) return if (value) |t| t.micros else null;
+    // The ten characters, in the Scope's arena for the reason a `Uuid`'s text
+    // is: the tuple this fills is what the driver reads from, and a pointer
+    // into this frame would not outlive the call.
+    if (V == types.Date) return try dateText(value, c);
+    if (V == ?types.Date) {
+        const held = value orelse return null;
+        return try dateText(held, c);
+    }
     // Which of the two a `Uuid` becomes is `WireWrite`'s decision, made from
     // the Dialect; this reads it back off the type it was asked for, which is
     // how the conversion stays in one place (ADR 0078). The text is kept in the
@@ -3642,6 +3775,21 @@ test "the three types Zig has no word for are taken apart for the wire" {
     // And a type the driver already understands is left alone.
     try testing.expectEqual(i32, WireRead(i32));
     try testing.expectEqual(i32, WireWrite(dialect.Postgres, i32));
+}
+
+test "a Date is read as itself and written as its ten characters" {
+    // **The one type here whose two halves disagree**, and the disagreement
+    // is the driver's (ADR 0221). pg.zig has no `date` decoder and no `date`
+    // encoder: the read is the column's own four bytes, taken apart by the
+    // Wire, and the write is the text plus the `::date` the Dialect puts
+    // around the placeholder.
+    try testing.expectEqual(types.Date, WireRead(types.Date));
+    try testing.expectEqual(?types.Date, WireRead(?types.Date));
+    try testing.expectEqual([]const u8, WireWrite(dialect.Postgres, types.Date));
+    try testing.expectEqual(?[]const u8, WireWrite(dialect.Postgres, ?types.Date));
+    // And the same on the other database, which stores the same ten
+    // characters and needs no cast to read them back.
+    try testing.expectEqual([]const u8, WireWrite(dialect.SQLite, types.Date));
 }
 
 test "a list of uuids travels as slices, because an array of them is not a shape the driver takes" {

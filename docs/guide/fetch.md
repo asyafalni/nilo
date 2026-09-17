@@ -181,8 +181,8 @@ under a server is what hands the client the Engine's `Limits`.
 `NotStarted` is the one a unit test meets: a handler called directly, with no
 App around it, has a client nobody started. The fix is the same one the
 [testing page](./testing.md#two-things-listen-does-that-the-client-does-not)
-gives for a database — `app.start(io)` — or a fake in the handler's argument
-list, which is what the signature rules are for.
+gives for a database — `app.start(io)`, in a test that never listens — or a
+fake in the handler's argument list, which is what the signature rules are for.
 
 ## The body is asked for uncompressed
 

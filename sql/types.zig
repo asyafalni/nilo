@@ -278,6 +278,180 @@ pub const Timestamp = struct {
     }
 };
 
+/// A calendar day, as days since 1970-01-01 — no hour, no zone, nothing to
+/// convert.
+///
+/// **A day is not a moment, and that is the whole reason this is a type rather
+/// than a `Timestamp` with the time thrown away.** An invoice due date, a date
+/// of birth and a public holiday are the same day everywhere on earth: reading
+/// one into a `timestamptz` gives it a midnight, and a midnight has a zone, and
+/// then a due date moves by a day for a customer in Jakarta. Postgres has a
+/// column for exactly this and so does every other database.
+///
+/// It holds the line the rest of this file holds — **a type here carries a
+/// value and knows how to write itself; it does not calculate.** There is no
+/// `.addDays` and no `.weekday`. What it owes is that the day which went in is
+/// the day that comes out, and that it can be written and read back
+/// ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+///
+/// **Read out of the column rather than out of `::text`**, which is the
+/// difference from `sql.AsText("date")` and the reason it exists. A text column
+/// is asked for as `column::text` in every `SELECT` list, so a `db.raw`
+/// statement reading one has to carry the cast and `rawcheck` refuses it when
+/// it does not. This one is asked for as itself: on Postgres the four bytes the
+/// column holds, on SQLite the ISO text SQLite's own date functions read.
+pub const Date = struct {
+    /// Days since 1970-01-01. Postgres counts a `date` from 2000-01-01 on the
+    /// wire; the Wire converts once, on the way in, so nothing above this line
+    /// has to know that — the same arrangement `Timestamp` has.
+    days: i32,
+
+    /// Days from 1970-01-01 to 2000-01-01, which is what the Postgres wire
+    /// counts from. Public because the Wire that converts is another file.
+    pub const days_from_epoch_to_y2k: i32 = 10_957;
+
+    pub const nilo_column = "date";
+
+    /// What `jsonStringify` sends, so a generated document describes a date
+    /// rather than the `days` field nobody sees (ADR 0076).
+    pub const nilo_openapi = .{ .type = "string", .format = "date" };
+
+    pub fn fromDays(days: i32) Date {
+        return .{ .days = days };
+    }
+
+    /// The day a moment falls on in UTC. Named `utc` rather than `of` because
+    /// that is the whole of what it assumes, and assuming it silently is how a
+    /// report for the 1st picks up rows from the 2nd.
+    pub fn utcOf(at: Timestamp) Date {
+        return .{ .days = @intCast(@divFloor(at.seconds(), std.time.s_per_day)) };
+    }
+
+    /// Midnight UTC on this day, for a comparison against a `timestamptz`
+    /// column. The one conversion offered, and it says which zone it made up.
+    pub fn atMidnightUtc(self: Date) Timestamp {
+        return .{ .micros = @as(i64, self.days) * std.time.s_per_day * std.time.us_per_s };
+    }
+
+    /// `2026-09-17` — ISO 8601, which is what `date` prints, what a JSON body
+    /// wants, and what sorts correctly as text.
+    ///
+    /// **A day before 1970 is the ordinary case here**, which is why this does
+    /// not go through `std.time.epoch` the way `Timestamp.writeRfc3339` does.
+    /// That walk starts at the epoch and returns `error.BeforeEpoch` for
+    /// anything earlier, and the first thing anybody puts in a `date` column
+    /// is a date of birth. The range that survives a round trip is the four
+    /// digits ISO spells without a sign, so year 0 to 9999 and nothing else.
+    pub fn writeIso(self: Date, w: *std.Io.Writer) !void {
+        const civil = civilFromDays(self.days);
+        if (civil.year < 0 or civil.year > 9999) return error.OutOfRange;
+        // `@as(u16, …)` and not the `i64` the arithmetic is in: zero-padding a
+        // *signed* integer writes the sign, so `{d:0>4}` on an `i64` 1945 is
+        // `+1945`. The year the epoch walk in std hands back is unsigned,
+        // which is why nothing here had to know that before.
+        try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{
+            @as(u16, @intCast(civil.year)),
+            civil.month,
+            civil.day,
+        });
+    }
+
+    /// Howard Hinnant's `civil_from_days`, the inverse of the
+    /// `Timestamp.daysFromCivil` the parser above uses. Written out rather
+    /// than found in std for the reason that one was: std has the one
+    /// direction, and it is the direction that stops at 1970.
+    fn civilFromDays(days: i32) struct { year: i64, month: u8, day: u8 } {
+        const shifted = @as(i64, days) + 719_468;
+        const era = @divFloor(shifted, 146_097);
+        const day_of_era = shifted - era * 146_097; // [0, 146096]
+        const year_of_era = @divTrunc(
+            day_of_era - @divTrunc(day_of_era, 1460) + @divTrunc(day_of_era, 36_524) -
+                @divTrunc(day_of_era, 146_096),
+            365,
+        ); // [0, 399]
+        const day_of_year = day_of_era -
+            (365 * year_of_era + @divTrunc(year_of_era, 4) - @divTrunc(year_of_era, 100));
+        const month_term = @divTrunc(5 * day_of_year + 2, 153); // [0, 11]
+        const month: i64 = month_term + (if (month_term < 10) @as(i64, 3) else @as(i64, -9));
+        return .{
+            .year = year_of_era + era * 400 + @intFromBool(month <= 2),
+            .month = @intCast(month),
+            .day = @intCast(day_of_year - @divTrunc(153 * month_term + 2, 5) + 1), // [1, 31]
+        };
+    }
+
+    /// The other half of `writeIso`, so a day this server printed can be
+    /// handed back to it. The same property `Timestamp.nilo_parse` holds, and
+    /// tested as a pair for the same reason.
+    ///
+    /// Narrower than the timestamp parser on purpose: `2026-09-17` and nothing
+    /// else. A date with a time on it is a moment somebody meant to send
+    /// somewhere else, and reading it by dropping the time is how a value
+    /// arrives a day out.
+    pub fn nilo_parse(text: []const u8) ?Date {
+        if (text.len != 10) return null;
+        if (text[4] != '-' or text[7] != '-') return null;
+
+        const year = Timestamp.fixed(i64, text[0..4]) orelse return null;
+        const month = Timestamp.fixed(u8, text[5..7]) orelse return null;
+        const day = Timestamp.fixed(u8, text[8..10]) orelse return null;
+
+        if (month < 1 or month > 12) return null;
+        if (day < 1 or day > Timestamp.daysInMonth(year, month)) return null;
+        return .{ .days = @intCast(Timestamp.daysFromCivil(year, month, day)) };
+    }
+
+    pub fn jsonStringify(self: Date, jw: anytype) !void {
+        var buf: [16]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        self.writeIso(&w) catch return jw.write(null);
+        try jw.write(w.buffered());
+    }
+
+    pub fn jsonParse(
+        gpa: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) std.json.ParseError(@TypeOf(source.*))!Date {
+        const token = try source.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?);
+        const text = switch (token) {
+            inline .string, .allocated_string => |slice| slice,
+            else => return error.UnexpectedToken,
+        };
+        defer switch (token) {
+            .allocated_string => gpa.free(text),
+            else => {},
+        };
+        return nilo_parse(text) orelse error.InvalidCharacter;
+    }
+
+    pub fn jsonParseFromValue(
+        gpa: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) std.json.ParseFromValueError!Date {
+        _ = gpa;
+        _ = options;
+        return switch (source) {
+            .string => |text| nilo_parse(text) orelse error.InvalidCharacter,
+            else => return error.UnexpectedToken,
+        };
+    }
+};
+
+/// Whether `T` is the calendar day, optional included. Asked by both Wires,
+/// which each decode it themselves — the same shape `isBytes` has and for the
+/// same reason.
+pub fn isDate(comptime T: type) bool {
+    return comptime blk: {
+        const Inner = switch (@typeInfo(T)) {
+            .optional => |o| o.child,
+            else => T,
+        };
+        break :blk Inner == Date;
+    };
+}
+
 /// Sixteen bytes, in the order Postgres stores them — `nilo_id`'s type
 /// rather than one of this module's own (ADR 0042).
 ///
@@ -709,6 +883,136 @@ test "a Timestamp in a JSON body is read from the text a response writes it as" 
     const from_value = try std.json.parseFromValue(Timestamp, testing.allocator, held.value, .{});
     defer from_value.deinit();
     try testing.expectEqual(Timestamp.nilo_parse("2026-08-16T09:30:00Z").?.micros, from_value.value.micros);
+}
+
+// -- a day, which is not a moment (ADR 0221) ------------------------------
+
+fn isoOf(value: Date, buf: []u8) ![]const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    try value.writeIso(&w);
+    return w.buffered();
+}
+
+test "what a Date prints, a Date reads back to the same day" {
+    // The property, as a pair rather than as two halves — the same reason
+    // `Timestamp`'s round trip is asserted that way. A day that comes back
+    // one out is a due date that moved, and nothing fails.
+    var buf: [16]u8 = undefined;
+    for ([_][]const u8{
+        "0001-01-01", // the bottom of what four digits spell
+        "1815-12-10", // a date of birth, which is the case the type is for
+        "1900-03-01", // the year 1900 is not a leap year
+        "1969-12-31", // the day before the epoch
+        "1970-01-01", // the epoch itself
+        "2000-01-01", // what the Postgres wire counts from
+        "2024-02-29", // a leap day
+        "2025-03-01", // the day after one in a year without it
+        "2026-09-17",
+        "2100-03-01", // the year 2100 is not a leap year
+        "9999-12-31", // the top of it
+    }) |iso| {
+        const read = Date.nilo_parse(iso) orelse return error.ParserRefusedItsOwnOutput;
+        try testing.expectEqualStrings(iso, try isoOf(read, &buf));
+    }
+}
+
+test "a day before 1970 is a day, because a date of birth usually is one" {
+    // `Timestamp` stops at the epoch and says `BeforeEpoch`, which is the
+    // right answer for a moment and the wrong one for a day: the first thing
+    // anybody puts in a `date` column is somebody's birthday.
+    var buf: [16]u8 = undefined;
+    const born = Date.nilo_parse("1965-08-09").?;
+    try testing.expectEqual(@as(i32, -1606), born.days);
+    try testing.expectEqualStrings("1965-08-09", try isoOf(born, &buf));
+
+    // Outside the four digits, the writer says so rather than printing
+    // something `nilo_parse` could not read back.
+    var w = std.Io.Writer.fixed(&buf);
+    try testing.expectError(error.OutOfRange, Date.fromDays(-800_000).writeIso(&w));
+}
+
+test "the wire counts from 2000 and the type counts from 1970" {
+    // One shift, in the Wire, so nothing above it has to know — the same
+    // arrangement `Timestamp` has for microseconds.
+    try testing.expectEqual(@as(i32, 0), Date.nilo_parse("1970-01-01").?.days);
+    try testing.expectEqual(
+        Date.days_from_epoch_to_y2k,
+        Date.nilo_parse("2000-01-01").?.days,
+    );
+}
+
+test "a date with a time on it is refused, because dropping the time moves the day" {
+    // The narrow parser is the decision. `2026-09-17T23:00:00+07:00` is the
+    // 18th in Jakarta and the 17th in UTC, so reading it by throwing the time
+    // away picks one of the two silently.
+    for ([_][]const u8{
+        "",
+        "2026-09-17T00:00:00Z",
+        "2026-09-17 00:00:00",
+        "2026-9-17",
+        "2026-13-01",
+        "2026-02-30",
+        "2025-02-29", // a leap day in a year without one
+        "2026-09-1O", // a letter O where a zero goes
+        "today",
+    }) |not_one| {
+        try testing.expectEqual(@as(?Date, null), Date.nilo_parse(not_one));
+    }
+}
+
+test "a Date is read out of the column rather than out of a ::text" {
+    // The whole difference from `sql.AsText("date")`, and it is one answer:
+    // `asText` is null, so the Dialect writes no cast in the SELECT list and
+    // `db.raw` needs none either.
+    try testing.expectEqual(@as(?[]const u8, null), asText(Date));
+    try testing.expectEqualStrings("date", declaredColumn(Date).?);
+    try testing.expect(isDate(Date));
+    try testing.expect(isDate(?Date));
+    try testing.expect(!isDate(Timestamp));
+    try testing.expect(!isDate(i32));
+}
+
+test "a Date writes itself into JSON as the day, and reads one back" {
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var jw = std.json.Stringify{ .writer = &w };
+    try jw.write(Date.nilo_parse("2026-09-17").?);
+    try testing.expectEqualStrings("\"2026-09-17\"", w.buffered());
+
+    const Body = struct { due: Date, closed: ?Date = null };
+    const parsed = try std.json.parseFromSlice(
+        Body,
+        testing.allocator,
+        "{\"due\":\"2026-09-17\"}",
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expectEqual(Date.nilo_parse("2026-09-17").?.days, parsed.value.due.days);
+    try testing.expectEqual(@as(?Date, null), parsed.value.closed);
+
+    // And a moment where a day goes, refused the way the query parser refuses
+    // it rather than read by dropping the time.
+    try testing.expectError(error.InvalidCharacter, std.json.parseFromSlice(
+        Body,
+        testing.allocator,
+        "{\"due\":\"2026-09-17T00:00:00Z\"}",
+        .{},
+    ));
+}
+
+test "the one conversion a Date offers says which zone it made up" {
+    // `utcOf` and `atMidnightUtc` are named for their assumption, because
+    // assuming it silently is how a report for the 1st picks up the 2nd.
+    const noon = Timestamp.nilo_parse("2026-09-17T12:00:00Z").?;
+    try testing.expectEqual(Date.nilo_parse("2026-09-17").?.days, Date.utcOf(noon).days);
+
+    const midnight = Date.nilo_parse("2026-09-17").?.atMidnightUtc();
+    try testing.expectEqual(Timestamp.nilo_parse("2026-09-17T00:00:00Z").?.micros, midnight.micros);
+
+    // Late evening in Jakarta is still the 17th in UTC, which is the whole
+    // reason the two are separate types.
+    const jakarta_evening = Timestamp.nilo_parse("2026-09-18T01:00:00+07:00").?;
+    try testing.expectEqual(Date.nilo_parse("2026-09-17").?.days, Date.utcOf(jakarta_evening).days);
 }
 
 test "a uuid column and a generated key are the same type" {

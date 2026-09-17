@@ -1,7 +1,15 @@
 # 0079 — there is a phase after the pool and before the server
 
-**Status:** accepted
+**Status:** accepted, amended by [ADR 0220](./0220-work-that-needs-the-services-runs-on-their-loop.md)
 **Amends:** [ADR 0040](./0040-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md)
+
+> **The shape below is refused now.** `app.start(io)` followed by
+> `listen()` hands every service the caller's `Io` and then runs them from
+> the Engine's, and a pool or a worker started on one loop cannot be driven
+> from another. `app.start(io)` stays for a program that never listens; the
+> phase between the pool and the server is `app.before(f, args)`, which runs
+> inside `listen()` on the server's loop, and the version guard is
+> `db.expecting(version)`. ADR 0220 has the repro and the decision.
 
 ## Context
 

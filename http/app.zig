@@ -152,30 +152,49 @@ pub const App = struct {
     /// with no sessions, and for one a test drives directly — a test that
     /// wants sessions sets this field.
     session_key: ?session_mod.Key = null,
-    /// Whether `nilo_start` has been run over the registry. `start` and
-    /// `listen` both get there and a program that migrates before it serves
-    /// does both, so this is what stops a pool being opened twice
-    /// (ADR 0079).
-    services_started: bool = false,
+    /// Who ran `nilo_start` over the registry, if anybody. `start` sets it
+    /// for a program that never listens — a test, a script — and `listen()`
+    /// sets it on the server's own loop. **`.start` and then `listen()` is
+    /// refused** when a service took that `Io`, because it was the wrong
+    /// one (ADR 0220).
+    services_started: StartedBy = .nobody,
+    /// Work that needs the services and has to finish before the first
+    /// request: a migration, a version guard, a key set fetched once.
+    /// Registered with `before`, run by `listen()` on the server's loop
+    /// after the services have started (ADR 0220). Empty for most Apps.
+    before_serving: std.ArrayList(Background) = .empty,
+    /// Whether the list above has run. A second `listen()` on the same App
+    /// — a test that restarts one — does not migrate twice.
+    before_ran: bool = false,
     /// Work that is not a request, registered before the server exists and
     /// started once it does (ADR 0086). Empty for almost every App.
     background: std.ArrayList(Background) = .empty,
     /// Whether the list above has been started. Separate from
-    /// `services_started` on purpose: that one is skipped when `start()` ran
-    /// first, and skipping this one would mean a program that migrates
-    /// before it serves silently runs nothing in the background.
+    /// `services_started` on purpose: the two are set at different moments
+    /// and a program that ran `start()` before `listen()` must still get its
+    /// background work started.
     background_started: bool = false,
 
-    /// One registration from `spawn`, with the function and its arguments
-    /// erased so the App can hold a list of them.
+    /// Which of the two callers of `startServices` got there, which is what
+    /// the refusal in `serverStarting` reads: the services are on a loop of
+    /// their own only when it was `start`.
+    const StartedBy = enum { nobody, start, listen };
+
+    /// One registration from `spawn` or `before`, with the function and its
+    /// arguments erased so the App can hold a list of them.
     ///
     /// The arguments are kept in an allocation of the App's rather than in
     /// the list, because their type differs per entry and the list holds one
     /// kind of thing. It is startup memory — one allocation per registered
     /// function, none per connection and none per request.
+    ///
+    /// `start` takes the App's allocator and the loop's `Io` as well as the
+    /// arguments. `spawn` has no use for either — the fiber it starts finds
+    /// the loop through the Bulkhead — and `before` builds the boot's `Run`
+    /// out of both, so that work which mints a key there can (ADR 0160).
     const Background = struct {
         args: *anyopaque,
-        start: *const fn (args: *anyopaque) anyerror!void,
+        start: *const fn (args: *anyopaque, gpa: std.mem.Allocator, io: std.Io) anyerror!void,
         free: *const fn (gpa: std.mem.Allocator, args: *anyopaque) void,
     };
 
@@ -201,6 +220,8 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         for (self.background.items) |b| b.free(self.gpa, b.args);
         self.background.deinit(self.gpa);
+        for (self.before_serving.items) |b| b.free(self.gpa, b.args);
+        self.before_serving.deinit(self.gpa);
         wiring.freeChains(self);
         if (self.docs_set) |*set| set.deinit();
         self.operations.deinit(self.gpa);
@@ -474,7 +495,7 @@ pub const App = struct {
         try self.background.append(self.gpa, .{
             .args = @as(*anyopaque, @ptrCast(held)),
             .start = &struct {
-                fn f(erased: *anyopaque) anyerror!void {
+                fn f(erased: *anyopaque, _: std.mem.Allocator, _: std.Io) anyerror!void {
                     const a: *Args = @ptrCast(@alignCast(erased));
                     return bulkhead.spawn(func, a.*);
                 }
@@ -486,6 +507,108 @@ pub const App = struct {
                 }
             }.f,
         });
+    }
+
+    /// Run `func` once, on the server's loop, after the services have
+    /// started and before the first connection is accepted. The place for
+    /// work that needs a pool and has to be done before anybody is served:
+    /// a migration, a version guard, a key set fetched once
+    /// ([ADR 0220](../docs/adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+    ///
+    /// ```zig
+    /// fn migrate(run: *nilo.Run, db: *sql.Db) !void {
+    ///     try sql.migrate.applyPending(db, run, try manifest.chain(run.arena()));
+    /// }
+    ///
+    /// try app.provide(&db);
+    /// try app.before(migrate, .{&db});
+    /// try app.listen(.{ .port = 8080 });
+    /// ```
+    ///
+    /// `func` takes a `*nilo.Run` first — the boot's own Scope, made here on
+    /// the server's `Io` and thrown away when `func` returns — and then
+    /// whatever `args` holds, the way a job's `run` takes its Run and then
+    /// its services. **If it fails, the server does not start**: the error
+    /// comes back out of `listen()` after one line saying so, and the
+    /// services are put down on the way. A migration that could not run is
+    /// a database this binary must not serve.
+    ///
+    /// This is the phase ADR 0079 put *before* `listen()`, as
+    /// `app.start(io)` on an `Io` of the caller's, moved inside it. What
+    /// changes is which loop the work runs on, and that is the whole
+    /// difference: a pool is dialled through the `Io` it is given and a
+    /// worker parks on it, so a service started on the caller's `Io` and
+    /// then driven from the server's fibers is the wrong pool on the right
+    /// loop, and the `Io` may already be gone. Here the services were
+    /// started by `listen()` a moment ago, on the loop the requests will
+    /// run on.
+    pub fn before(self: *App, comptime func: anytype, args: BeforeArgs(func)) !void {
+        const Args = @TypeOf(args);
+        const held = try self.gpa.create(Args);
+        errdefer self.gpa.destroy(held);
+        held.* = args;
+
+        try self.before_serving.append(self.gpa, .{
+            .args = @as(*anyopaque, @ptrCast(held)),
+            .start = &struct {
+                fn f(erased: *anyopaque, gpa: std.mem.Allocator, io: std.Io) anyerror!void {
+                    const a: *Args = @ptrCast(@alignCast(erased));
+                    var run: str_mod.Run = .initIo(gpa, io);
+                    defer run.deinit();
+                    const answer = @call(.auto, func, .{&run} ++ a.*);
+                    if (@typeInfo(@TypeOf(answer)) == .error_union) return answer;
+                }
+            }.f,
+            .free = &struct {
+                fn f(gpa: std.mem.Allocator, erased: *anyopaque) void {
+                    const a: *Args = @ptrCast(@alignCast(erased));
+                    gpa.destroy(a);
+                }
+            }.f,
+        });
+    }
+
+    /// The arguments `before` takes for `func`: everything after the
+    /// `*nilo.Run` in front, as a tuple — so `fn (run: *nilo.Run, db: *Db)`
+    /// is registered with `.{&db}`.
+    ///
+    /// The Run is nilo's to make, and a function written without one in
+    /// front is refused here rather than at the call that hands it a Run it
+    /// has no parameter for.
+    fn BeforeArgs(comptime func: anytype) type {
+        const F = @TypeOf(func);
+        const info = switch (@typeInfo(F)) {
+            .@"fn" => |f| f,
+            else => @compileError(
+                "nilo: app.before() takes a function, not " ++ @typeName(F) ++ ".\n" ++
+                    "  Its shape is `fn (run: *nilo.Run, …) !void`: the boot's Run first, " ++
+                    "then whatever the work needs, handed over as `.{ … }`.",
+            ),
+        };
+        const shape = "\n  Its shape is `fn (run: *nilo.Run, …) !void`. The Run is the boot's " ++
+            "own Scope, made by `listen()` on the server's loop and thrown away when " ++
+            "the work returns; what the work needs after it — a `*Db`, a `*Client` — " ++
+            "is handed over as `.{ &db }`.";
+        if (info.params.len == 0 or info.params[0].type != *str_mod.Run) @compileError(
+            "nilo: app.before() was given a function whose first parameter is " ++
+                (if (info.params.len == 0) "nothing" else @typeName(info.params[0].type.?)) ++
+                ", and it has to be `*nilo.Run`." ++ shape,
+        );
+        const R = info.return_type.?;
+        const payload = switch (@typeInfo(R)) {
+            .error_union => |e| e.payload,
+            else => R,
+        };
+        // The payload rather than `R`: an inferred error union has no
+        // readable name, and the value is what the reader has to take out.
+        if (payload != void) @compileError(
+            "nilo: app.before() was given a function that answers with " ++ @typeName(payload) ++
+                ", and there is nobody to hand the value to." ++ shape,
+        );
+        var types: [info.params.len - 1]type = undefined;
+        for (info.params[1..], 0..) |p, i| types[i] = p.type.?;
+        const frozen = types;
+        return std.meta.Tuple(&frozen);
     }
 
     pub fn get(self: *App, comptime pattern: []const u8, comptime handler: anytype) !void {
@@ -782,13 +905,14 @@ pub const App = struct {
     pub fn listen(self: *App, options_: bulkhead.Options) !void {
         self.tryListen(options_) catch |err| {
             // Every one of these has already said, in one line, what is
-            // wrong and what to change. `TrustedProxyNotAnAddress` and
-            // `SessionSecretWrongLength` are `tryListen`'s own; the rest are
-            // the Engine's.
+            // wrong and what to change. `TrustedProxyNotAnAddress`,
+            // `SessionSecretWrongLength` and `StartedOnAnotherLoop` are
+            // `tryListen`'s own; the rest are the Engine's.
             if (bulkhead.explained(err) or
                 err == error.MissingService or
                 err == error.TrustedProxyNotAnAddress or
-                err == error.SessionSecretWrongLength) std.process.exit(1);
+                err == error.SessionSecretWrongLength or
+                err == error.StartedOnAnotherLoop) std.process.exit(1);
             return err;
         };
     }
@@ -865,36 +989,41 @@ pub const App = struct {
     }
 
     /// Everything `listen()` does **before it accepts anything**, for a
-    /// program that is not going to listen yet.
+    /// program that is not going to listen at all.
     ///
     /// The services are checked, the middleware chains are resolved, and every
-    /// service that declared `nilo_start` is started — so a `Db` has its pool
-    /// and has had its schema checked, and a query works.
-    ///
-    /// The phase a migration runs in: before this, the pool was opened only by
-    /// `listen()`, which does not return (ADR 0079).
+    /// service that declared `nilo_start` is started on `io` — so a `Db` has
+    /// its pool and has had its schema checked, and a query works. A test
+    /// driving the App through `testing.Client`, a script, a worker process
+    /// that runs `jobs.serveOn(io)` and never takes a socket: those are what
+    /// this is for, and `std.Io.Threaded` is the `Io` they hold.
     ///
     /// ```zig
     /// var threaded: std.Io.Threaded = .init(gpa, .{});
     /// defer threaded.deinit();
     ///
     /// try app.start(threaded.io());          // the pool is open from here
-    /// try migrate(&db);
-    /// try app.listen(.{ .port = 8080 });     // does not start them twice
+    /// try client.get("/users/1");            // and a test can use it
     /// ```
     ///
-    /// Idempotent: `listen()` calls the same code and skips it if this has
-    /// already run, so the two orders above and below cost the same.
+    /// **Not before `listen()`.** ADR 0079 had it there, as the phase a
+    /// migration runs in, and that shape is refused now
+    /// ([ADR 0220](../docs/adr/0220-work-that-needs-the-services-runs-on-their-loop.md)):
+    /// a service keeps the `Io` it was started on, `listen()` runs on a loop
+    /// of its own, and a pool dialled through one cannot be driven from the
+    /// other — a job worker started that way crashes on an `Io` that has
+    /// been freed, or parks where nothing can cancel it. The phase is
+    /// `before`, which runs the same work inside `listen()` on the server's
+    /// loop, and `db.expecting(version)` for the version guard alone.
     ///
     /// **What this does not start is what `spawn` registered.** There is no
     /// server here — the `Io` is the caller's own, and a fiber owned by a
     /// server that does not exist has nothing to count it and nothing to cut
-    /// it off. `listen()` starts that, whichever of the two ran first
-    /// (ADR 0086).
+    /// it off (ADR 0086).
     pub fn start(self: *App, io: std.Io) !void {
         try self.checkServices();
         try self.resolveChains();
-        try self.startServices(io, .{});
+        try self.startServices(io, .{}, .start);
     }
 
     /// Finish building the services that could not be finished before the
@@ -906,29 +1035,87 @@ pub const App = struct {
     /// the loop after startup took a copy of it here, and the App has no use
     /// for one.
     ///
-    /// **Once, whichever of the two got here first.** Opening a pool twice
-    /// leaks the first one, and a program that migrates before it listens does
-    /// both.
-    fn startServices(self: *App, io: std.Io, limits: bulkhead.Limits) anyerror!void {
-        if (self.services_started) return;
-        self.services_started = true;
+    /// **Once.** Opening a pool twice leaks the first one, and `start` called
+    /// twice by a test reaches here twice.
+    fn startServices(self: *App, io: std.Io, limits: bulkhead.Limits, by: StartedBy) anyerror!void {
+        if (self.services_started != .nobody) return;
+        self.services_started = by;
         try self.services.start(io, limits);
+    }
+
+    /// Whether `listen()` would find the services on a loop that is not its
+    /// own: `start(io)` ran, and at least one service took that `Io`. The
+    /// refusal in `serverStarting` is this and one log line, and it is a
+    /// function of its own so a test can ask without provoking the line.
+    fn startedElsewhere(self: *const App) bool {
+        return self.services_started == .start and self.services.startedCount() > 0;
     }
 
     /// Everything that has to happen once, inside `listen()`, after the port
     /// is taken and before anything is accepted. The hook the Engine is
-    /// handed (ADR 0040), which is two steps rather than one (ADR 0086).
+    /// handed (ADR 0040), which is three steps rather than one (ADR 0086,
+    /// ADR 0220).
     ///
-    /// The order is the only one available: work registered by `spawn` may
-    /// use a service, so the services are finished first. And the two guards
-    /// are separate because they are skipped under different conditions —
-    /// `startServices` is skipped when `app.start(io)` already ran, and
-    /// skipping the background with it is exactly the bug this exists to
-    /// close.
-    fn serverStarting(self: *App, io: std.Io, limits: bulkhead.Limits, port: ?u16) anyerror!void {
+    /// The order is the only one available: the work registered by `before`
+    /// needs the services, and the work registered by `spawn` may use
+    /// either. The three guards are separate because each is skipped under
+    /// its own condition, and a program that ran `start()` for a test and
+    /// then listened must still get its background work started.
+    ///
+    /// **A service started by `start(io)` before this is refused here**, and
+    /// this is the one place that can see it: `services_started` is set and
+    /// the loop in hand is the server's, so whatever `Io` the services hold
+    /// is not this one. The alternative — stopping them and starting them
+    /// again on this loop — would work for a pool and was not taken, because
+    /// a refusal names the mistake and a restart hides it, and because the
+    /// shape it would rescue is the one `before` exists to replace.
+    fn serverStarting(
+        self: *App,
+        io: std.Io,
+        limits: bulkhead.Limits,
+        port: ?u16,
+    ) anyerror!void {
+        if (self.startedElsewhere()) {
+            std.log.err(
+                "nilo will not start: `app.start(io)` ran before `listen()`, and {d} service(s) " ++
+                    "took that `Io` as their loop: {f}. `listen()` runs on a loop of its own, " ++
+                    "and a service dialled through one `Io` cannot be driven from another — " ++
+                    "a pool blocks the wrong thread, a worker parks where nothing can cancel " ++
+                    "it, and the `Io` may be gone by the time it is used. Work that needs the " ++
+                    "services before the first request goes in `app.before(f, args)`, which " ++
+                    "runs inside `listen()` on the server's loop; a version guard alone is " ++
+                    "`db.expecting(version)`. `app.start(io)` is for a program that never " ++
+                    "listens: a test, a script, a worker on `serveOn`.",
+                .{ self.services.startedCount(), self.services.startedNames() },
+            );
+            return error.StartedOnAnotherLoop;
+        }
+        // **After the refusal and not before it.** The port is what
+        // `boundPort` answers, and a boot that is about to fail has no
+        // port anybody should write down.
         self.bound_port.store(port orelse 0, .release);
-        try self.startServices(io, limits);
-        try self.startBackground();
+        try self.startServices(io, limits, .listen);
+        try self.runBefore(io);
+        try self.startBackground(io);
+    }
+
+    /// Run what `before` registered, once, in the order it was registered.
+    ///
+    /// The first failure stops the rest and the boot with it, after a line
+    /// saying so: the work's own error is what comes back out of `listen()`,
+    /// and a migration that could not run is a database this binary must not
+    /// serve.
+    fn runBefore(self: *App, io: std.Io) !void {
+        if (self.before_ran) return;
+        self.before_ran = true;
+        for (self.before_serving.items) |b| b.start(b.args, self.gpa, io) catch |err| {
+            std.log.err(
+                "nilo will not start: work registered with `app.before` failed with {t}, " ++
+                    "and a server whose boot work did not finish must not take a request.",
+                .{err},
+            );
+            return err;
+        };
     }
 
     /// The port the server is listening on, once it is: null before
@@ -966,10 +1153,10 @@ pub const App = struct {
     /// a server that could not start the work it was told to start should say
     /// so at startup rather than serve requests while quietly doing none of
     /// it.
-    fn startBackground(self: *App) !void {
+    fn startBackground(self: *App, io: std.Io) !void {
         if (self.background_started) return;
         self.background_started = true;
-        for (self.background.items) |b| try b.start(b.args);
+        for (self.background.items) |b| try b.start(b.args, self.gpa, io);
     }
 
     /// Stop the server: `listen()` stops accepting, connections finish the
@@ -1435,10 +1622,10 @@ test "app.start refuses when a route needs a service nobody provided" {
     try testing.expectEqualStrings(@typeName(Opened), missing.type_name);
 
     // And nothing was opened, because the gate is in front of the pools.
-    try testing.expect(!app.services_started);
+    try testing.expectEqual(App.StartedBy.nobody, app.services_started);
 }
 
-test "app.start opens the services, and listen does not open them again" {
+test "app.start opens the services once, and a second call is not a second pool" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -1448,13 +1635,120 @@ test "app.start opens the services, and listen does not open them again" {
     try app.provide(&opened);
     try app.get("/thing", readsOpened);
 
-    // The phase there was not: after the pool, before the server (ADR 0079).
+    // A program that never listens: a test, a script (ADR 0079).
     try app.start(threaded.io());
     try testing.expectEqual(@as(usize, 1), opened.times);
 
-    // And a second call is not a second pool. `listen()` reaches the same
-    // code, so a program that migrates before it serves does both.
     try app.start(threaded.io());
-    try app.startServices(threaded.io(), .{});
     try testing.expectEqual(@as(usize, 1), opened.times);
+}
+
+test "listen after app.start is refused when a service took the caller's Io" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    var opened: Opened = .{};
+    try app.provide(&opened);
+
+    // Through the predicate `serverStarting` reads, for the reason the test
+    // above gives: the refusal is the predicate and one error line, and the
+    // line is the feature.
+    try testing.expect(!app.startedElsewhere());
+    try app.start(threaded.io());
+    try testing.expect(app.startedElsewhere());
+    try testing.expectEqual(App.StartedBy.start, app.services_started);
+}
+
+test "listen after app.start goes ahead when no service needed the loop" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    // A service with no `nilo_start` kept no `Io`, so there is nothing on
+    // the wrong loop: the shape `http/live.zig` drives end to end.
+    const Plain = struct { n: u8 = 0 };
+    var plain: Plain = .{};
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&plain);
+
+    try app.start(threaded.io());
+    try testing.expect(!app.startedElsewhere());
+    try app.serverStarting(threaded.io(), .{}, null);
+}
+
+/// What `before` work saw when it ran: whether the service it was handed
+/// had already been started, and whether its Run could reach the loop.
+const Witness = struct {
+    times: usize = 0,
+    service_was_up: bool = false,
+    had_io: bool = false,
+    noted: bool = false,
+
+    fn record(run: *str_mod.Run, opened: *Opened, self: *Witness) !void {
+        self.times += 1;
+        self.service_was_up = opened.times == 1;
+        // The Run is built on the loop the services were started on, so a
+        // key can be minted from it (ADR 0160); `Run.init` would say NoIo.
+        _ = try run.entropy(4);
+        self.had_io = true;
+    }
+
+    /// Work that cannot fail is registered the same way.
+    fn note(_: *str_mod.Run, self: *Witness) void {
+        self.noted = true;
+    }
+
+    fn refuse(_: *str_mod.Run, _: *Witness) !void {
+        return error.Nope;
+    }
+};
+
+test "app.before runs inside the boot, after the services, with a Run on their loop" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    var opened: Opened = .{};
+    var witness: Witness = .{};
+    try app.provide(&opened);
+    try app.before(Witness.record, .{ &opened, &witness });
+    try app.before(Witness.note, .{&witness});
+
+    // Nothing runs at registration: the loop does not exist yet.
+    try testing.expectEqual(@as(usize, 0), witness.times);
+
+    // What the Engine calls once the port is taken.
+    try app.serverStarting(threaded.io(), .{}, null);
+    try testing.expectEqual(@as(usize, 1), opened.times);
+    try testing.expectEqual(@as(usize, 1), witness.times);
+    try testing.expect(witness.service_was_up);
+    try testing.expect(witness.had_io);
+    try testing.expect(witness.noted);
+    try testing.expectEqual(App.StartedBy.listen, app.services_started);
+
+    // And not twice: a second boot on the same App is not a second migration.
+    try app.serverStarting(threaded.io(), .{}, null);
+    try testing.expectEqual(@as(usize, 1), witness.times);
+}
+
+test "app.before work that fails hands its own error to the boot" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    var witness: Witness = .{};
+    try app.before(Witness.refuse, .{&witness});
+
+    // The registration is driven directly rather than through `runBefore`,
+    // which says in one error line that the server will not start — the
+    // same reason the refusals above go through predicates. What is under
+    // test is that the error crosses the erasure unchanged, so `listen()`
+    // can hand it back as the value it was.
+    const entry = app.before_serving.items[0];
+    try testing.expectError(error.Nope, entry.start(entry.args, testing.allocator, threaded.io()));
 }

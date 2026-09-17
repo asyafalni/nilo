@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const row_mod = @import("row.zig");
+const table_mod = @import("table.zig");
 const wire_mod = @import("wire.zig");
 
 pub const Mismatch = enum {
@@ -119,16 +120,35 @@ pub const Expectation = struct {
 };
 
 /// The expectations `Row` carries, in the order it declares its columns.
+///
+/// **An enum column on a Row this program builds is judged, and on one it only
+/// reads it is not**, which is the one place the check asks whether the table is
+/// nilo's. A Dialect declines to judge a Zig enum because the column may be a
+/// Postgres `ENUM` whose type name lives in the database and cannot be derived
+/// from this side. On a managed Row it can: nilo wrote the `CREATE TABLE`, and
+/// what it wrote was `text` plus a check over the enum's words
+/// ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)). So the
+/// gap closes exactly where the answer is known, and stays open where it is not.
+///
+/// What this does *not* read is the constraint's body. Holding the enum's words
+/// against `pg_constraint` needs a second introspection query, and it is not
+/// here — so a database whose check lost a word while the type kept it is
+/// caught by the migration diff and not by the boot check.
 pub fn expectationsOf(comptime D: type, comptime Row: type) []const Expectation {
     return comptime blk: {
         const fields = @typeInfo(Row).@"struct".fields;
+        const builds = row_mod.managedOf(Row);
         var out: [fields.len]Expectation = undefined;
         var n: usize = 0;
         for (fields) |f| {
             // Carried beside the columns, so there is nothing in the table
             // to expect (ADR 0217).
             if (row_mod.isBeside(Row, f.name)) continue;
-            const accepts = D.accepts(f.type) orelse &.{};
+            const accepts: []const []const u8 = D.accepts(f.type) orelse
+                (if (builds and table_mod.enumValues(f.type).len > 0)
+                    D.text_accepts
+                else
+                    &.{});
             out[n] = .{
                 .column = f.name,
                 .accepts = accepts,
@@ -463,20 +483,47 @@ test "every mismatch is reported, not just the first" {
     try testing.expectEqual(@as(usize, 2), problems.items.len);
 }
 
-test "a type the Dialect declines to judge passes whatever the column holds" {
+test "an enum column is judged on a table this program builds and not on one it only reads" {
+    // A Dialect declines to judge a Zig enum, because the column may be a
+    // Postgres `ENUM` whose type name lives in the database. On a Row this
+    // program built the table for it does not have to guess: what nilo wrote
+    // was `text` plus a check over the enum's words (ADR 0221).
     const Role = enum { admin, user };
     const Member = struct {
         pub const nilo_table = .{ .name = "members", .key = .id };
         id: i64,
         role: Role,
     };
+    const Somebody = struct {
+        pub const nilo_table = .{ .name = "members", .key = .id, .managed = false };
+        id: i64,
+        role: Role,
+    };
 
-    var problems = try problemsFor(Member, &.{
+    const postgres_enum: []const wire_mod.Column = &.{
         .{ .name = "id", .udt = "int8", .nullable = false },
         .{ .name = "role", .udt = "member_role", .nullable = false },
+    };
+
+    // Somebody else's table, so the column may be whatever they made it.
+    var borrowed = try problemsFor(Somebody, postgres_enum);
+    defer borrowed.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), borrowed.items.len);
+
+    // This program's table, so `member_role` is a column nilo never wrote —
+    // which is a schema that drifted, and the gap the check used to have.
+    var built = try problemsFor(Member, postgres_enum);
+    defer built.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), built.items.len);
+    try testing.expectEqual(Mismatch.wrong_type, built.items[0].kind);
+
+    // And the column nilo did write passes.
+    var mine = try problemsFor(Member, &.{
+        .{ .name = "id", .udt = "int8", .nullable = false },
+        .{ .name = "role", .udt = "text", .nullable = false },
     });
-    defer problems.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 0), problems.items.len);
+    defer mine.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), mine.items.len);
 }
 
 test "the columns are read out of the table a narrower Row borrows" {

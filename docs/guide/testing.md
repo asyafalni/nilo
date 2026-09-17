@@ -223,6 +223,11 @@ try app.start(threaded.io());     // services checked, pools open, schema checke
 `app.start` also runs `db.checking`, which is worth having in a test for its own
 sake: a Row that disagrees with its table passes an entire suite otherwise.
 
+It is for a program that never listens, which a test is. In a program that
+does, the same work goes in `app.before` and `listen()` runs it on its own
+loop; `app.start` followed by `listen()` is refused
+([ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+
 ## Running the suite
 
 ```

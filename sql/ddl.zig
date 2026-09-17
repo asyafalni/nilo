@@ -32,6 +32,7 @@ const Desc = table_mod.Desc;
 const Column = table_mod.Column;
 const Unique = table_mod.Unique;
 const Index = table_mod.Index;
+const NamedText = table_mod.NamedText;
 
 pub const Error = error{
     /// An identifier carried a double quote, so quoting it would end the
@@ -57,6 +58,15 @@ pub const Created = struct {
     /// The uniques first and the plain indexes after, in the order the marker
     /// declares them.
     indexes: []const Named,
+    /// The triggers the marker named, which run after the table and its
+    /// indexes exist.
+    ///
+    /// **A list of their own rather than more `indexes`**, because a trigger is
+    /// dropped by a different statement on each database and the diff has to
+    /// tell the two apart by more than the text. The `CHECK` constraints have
+    /// no entry here at all: they are written inside the `CREATE TABLE`, for
+    /// the reason `referenceClause` gives.
+    triggers: []const Named = &.{},
 };
 
 // -- what is settled while compiling -------------------------------------
@@ -91,6 +101,21 @@ pub fn createTable(comptime D: type, comptime Row: type) []const u8 {
         // key columns are written as ordinary `NOT NULL` columns and the
         // constraint goes on the end. Both databases take the same text.
         if (desc.keys.len > 1) out = out ++ ",\n  " ++ primaryKeyClause(D, desc.keys);
+        // And a foreign key spanning several columns for exactly the same
+        // reason: `REFERENCES` on a column clause says *this column*, and a key
+        // of two has nowhere to write the second. A key of one stays inline,
+        // which is what keeps every table written before this unchanged
+        // ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+        for (desc.references) |r| {
+            if (r.columns.len == 1) continue;
+            out = out ++ ",\n  " ++ foreignKeyClause(D, r);
+        }
+        // And a `CHECK` the marker named, for the third time for the same
+        // reason: written at creation or not written at all, on SQLite
+        // ([ADR 0226](../docs/adr/0226-the-marker-has-a-word-the-database-checks.md)).
+        for (desc.checks) |ck| {
+            out = out ++ ",\n  " ++ checkConstraintClause(D, ck);
+        }
         return out ++ "\n)";
     }
 }
@@ -112,7 +137,54 @@ pub fn createdFor(comptime D: type, comptime Row: type) Created {
             out[desc.uniques.len + i] = .{ .name = x.name, .sql = indexStatement(D, desc, x) };
         }
         const frozen = out;
-        return .{ .table = createTable(D, Row), .indexes = &frozen };
+        return .{
+            .table = createTable(D, Row),
+            .indexes = &frozen,
+            .triggers = triggersFor(D, desc, "CREATE TRIGGER "),
+        };
+    }
+}
+
+/// Every trigger the marker named, under whichever `CREATE TRIGGER` head the
+/// caller wants.
+fn triggersFor(
+    comptime D: type,
+    comptime desc: Desc,
+    comptime head: []const u8,
+) []const Named {
+    comptime {
+        var out: [desc.triggers.len]Named = undefined;
+        for (desc.triggers, 0..) |t, i| {
+            out[i] = .{ .name = t.name, .sql = triggerStatement(D, desc, head, t) };
+        }
+        const frozen = out;
+        return &frozen;
+    }
+}
+
+/// `CREATE TRIGGER "n" BEFORE UPDATE ON "t" FOR EACH ROW EXECUTE FUNCTION f()`.
+///
+/// **nilo writes `ON "t"` and the marker writes neither half of it**, which is
+/// the whole reason `.trigger` is two words. The table is the one thing the
+/// marker already knows, and a trigger carrying its own copy is a copy that
+/// stops matching the day the table is renamed.
+pub fn triggerStatement(
+    comptime D: type,
+    comptime desc: Desc,
+    comptime head: []const u8,
+    comptime t: NamedText,
+) []const u8 {
+    comptime {
+        return head ++ D.quote(t.name) ++ " " ++ t.body ++
+            " ON " ++ D.qualify(desc.schema, desc.table) ++ " " ++ t.tail;
+    }
+}
+
+/// `CONSTRAINT "name" CHECK (body)` — a check the marker named, as it goes
+/// inside a `CREATE TABLE`.
+fn checkConstraintClause(comptime D: type, comptime ck: NamedText) []const u8 {
+    comptime {
+        return "CONSTRAINT " ++ D.quote(ck.name) ++ " CHECK (" ++ ck.body ++ ")";
     }
 }
 
@@ -135,14 +207,31 @@ pub fn uniqueStatement(comptime D: type, comptime desc: Desc, comptime u: Unique
     }
 }
 
+/// One index, with its directions and its predicate if it has them.
+///
+/// **The `WHERE` goes in as the `Desc` already spelled it.** `table.zig`
+/// rendered it while the caller's types were still in reach, which is the only
+/// place a column name and a literal's type can be checked; by here it is text,
+/// the same way `sql_type` is.
 pub fn indexStatement(comptime D: type, comptime desc: Desc, comptime x: Index) []const u8 {
     comptime {
         var out: []const u8 = "CREATE INDEX " ++ D.quote(x.name) ++
             " ON " ++ D.qualify(desc.schema, desc.table) ++ " (";
         for (x.columns, 0..) |c, i| {
-            out = out ++ (if (i == 0) "" else ", ") ++ D.quote(c);
+            out = out ++ (if (i == 0) "" else ", ") ++ D.quote(c) ++ direction(x, c);
         }
-        return out ++ ")";
+        out = out ++ ")";
+        if (x.where.len > 0) out = out ++ " WHERE " ++ x.where;
+        return out;
+    }
+}
+
+fn direction(comptime x: Index, comptime column: []const u8) []const u8 {
+    comptime {
+        for (x.descending) |d| {
+            if (std.mem.eql(u8, d, column)) return " DESC";
+        }
+        return "";
     }
 }
 
@@ -180,7 +269,11 @@ pub fn createdIfMissing(comptime D: type, comptime Row: type) Created {
             };
         }
         const frozen = out;
-        return .{ .table = createIfMissing(D, Row), .indexes = &frozen };
+        return .{
+            .table = createIfMissing(D, Row),
+            .indexes = &frozen,
+            .triggers = triggersFor(D, table_mod.descOf(D, Row), D.trigger_repeatable_head),
+        };
     }
 }
 
@@ -197,7 +290,13 @@ pub fn dropTable(comptime D: type, comptime Row: type) []const u8 {
 }
 
 /// One column, with everything that can be said about it inline: its type, its
-/// nullability, whether it is the key, and what it points at.
+/// nullability, whether it is the key, what it defaults to, which words it may
+/// hold, and what it points at.
+///
+/// **All of it inline rather than added afterwards**, which is the same
+/// decision `referenceClause` already forced: SQLite has no
+/// `ALTER TABLE … ADD CONSTRAINT`, so a `CHECK` that is not written at creation
+/// cannot be written at all. Postgres takes the same text.
 fn columnClause(comptime D: type, comptime desc: Desc, comptime c: Column) []const u8 {
     comptime {
         const quoted = D.quote(c.name);
@@ -208,7 +307,46 @@ fn columnClause(comptime D: type, comptime desc: Desc, comptime c: Column) []con
             D.keyColumn(quoted, c.sql_type, c.generated)
         else
             quoted ++ " " ++ c.sql_type ++ (if (c.nullable) "" else " NOT NULL");
-        return head ++ referenceClause(D, desc, c.name);
+        return head ++ defaultClause(c) ++ checkClause(D, desc, c) ++
+            referenceClause(D, desc, c.name);
+    }
+}
+
+fn defaultClause(comptime c: Column) []const u8 {
+    comptime {
+        return if (c.default) |text| " DEFAULT " ++ text else "";
+    }
+}
+
+/// `CONSTRAINT "t_col_check" CHECK ("col" IN ('a', 'b'))`, for a column the Row
+/// reads as a Zig enum.
+///
+/// Named rather than anonymous, because the name is what the diff drops when a
+/// word is added to the enum — and because an anonymous constraint is reported
+/// by Postgres under a name it made up, which nothing on this side can predict.
+fn checkClause(comptime D: type, comptime desc: Desc, comptime c: Column) []const u8 {
+    comptime {
+        if (c.values.len == 0) return "";
+        return " CONSTRAINT " ++ D.quote(checkName(desc, c)) ++
+            " CHECK (" ++ D.quote(c.name) ++ " IN (" ++ valueList(c.values) ++ "))";
+    }
+}
+
+/// The name the check over a column's words goes in under: the one `.check`
+/// gave it, or `<table>_<column>_check`, which is what Postgres would have
+/// called it anyway ([ADR 0226](../docs/adr/0226-the-marker-has-a-word-the-database-checks.md)).
+pub fn checkName(comptime desc: Desc, comptime c: Column) []const u8 {
+    comptime {
+        if (c.check.len > 0) return c.check;
+        return table_mod.constraintName(desc.table, &.{c.name}, "check");
+    }
+}
+
+fn valueList(comptime values: []const []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (values, 0..) |v, i| out = out ++ (if (i == 0) "" else ", ") ++ "'" ++ v ++ "'";
+        return out;
     }
 }
 
@@ -228,14 +366,39 @@ fn primaryKeyClause(comptime D: type, comptime keys: []const []const u8) []const
 fn referenceClause(comptime D: type, comptime desc: Desc, comptime name: []const u8) []const u8 {
     comptime {
         for (desc.references) |r| {
-            if (!std.mem.eql(u8, r.column, name)) continue;
+            if (r.columns.len != 1) continue;
+            if (!std.mem.eql(u8, r.columns[0], name)) continue;
             // The referenced table is qualified the way the Row that owns it
             // qualifies itself. Writing the bare name would resolve through
             // `search_path` instead, which is a different table on a bad day.
             return " REFERENCES " ++ D.qualify(r.schema, r.table) ++
-                " (" ++ D.quote(r.target) ++ ")" ++ r.on_delete.clause();
+                " (" ++ D.quote(r.targets[0]) ++ ")" ++ r.on_delete.clause();
         }
         return "";
+    }
+}
+
+/// `CONSTRAINT "t_a_b_fkey" FOREIGN KEY ("a", "b") REFERENCES "u" ("x", "y")`,
+/// for a key of several columns.
+///
+/// **Named, where the inline one is not**, and that is the database's doing
+/// rather than a choice: an inline `REFERENCES` gets the name Postgres derives,
+/// which is the same one `constraintName` derives, and a table constraint gets
+/// whatever Postgres feels like unless it is told. The diff drops a foreign key
+/// by name, so it has to be the name nilo wrote down.
+pub fn foreignKeyClause(comptime D: type, comptime r: table_mod.Reference) []const u8 {
+    comptime {
+        return "CONSTRAINT " ++ D.quote(r.name) ++ " FOREIGN KEY (" ++
+            quotedList(D, r.columns) ++ ") REFERENCES " ++ D.qualify(r.schema, r.table) ++
+            " (" ++ quotedList(D, r.targets) ++ ")" ++ r.on_delete.clause();
+    }
+}
+
+fn quotedList(comptime D: type, comptime columns: []const []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (columns, 0..) |c, i| out = out ++ (if (i == 0) "" else ", ") ++ D.quote(c);
+        return out;
     }
 }
 
@@ -243,10 +406,14 @@ fn referenceClause(comptime D: type, comptime desc: Desc, comptime name: []const
 
 /// `ALTER TABLE … ADD COLUMN`.
 ///
-/// **A column that may not be null is the one statement here that can fail on a
-/// table with rows in it**, and it fails loudly rather than quietly. The diff
-/// says so before it writes the step, because the answer is a default in the
-/// step or a backfill beside it, and neither is something to guess.
+/// **A column that may not be null and has no default is the one statement here
+/// that can fail on a table with rows in it**, and it fails loudly rather than
+/// quietly. The diff says so before it writes the step.
+///
+/// A `.default` in the marker closes that case rather than flagging it: the
+/// clause goes in here, the rows already there get the value, and there is
+/// nothing left to backfill. That is the case ADR 0153 named as the one where a
+/// default is load-bearing, answered by the word rather than by a warning.
 pub fn addColumn(comptime D: type, gpa: std.mem.Allocator, desc: Desc, c: Column) Error![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
@@ -257,6 +424,19 @@ pub fn addColumn(comptime D: type, gpa: std.mem.Allocator, desc: Desc, c: Column
     try writeIdent(w, c.name);
     try w.print(" {s}", .{c.sql_type});
     if (!c.nullable) try w.writeAll(" NOT NULL");
+    if (c.default) |text| try w.print(" DEFAULT {s}", .{text});
+    if (c.values.len > 0) {
+        try w.writeAll(" CONSTRAINT ");
+        try writeCheckIdent(w, desc.table, c);
+        try w.writeAll(" CHECK (");
+        try writeIdent(w, c.name);
+        try w.writeAll(" IN (");
+        for (c.values, 0..) |v, i| {
+            if (i > 0) try w.writeAll(", ");
+            try writeLiteral(w, v);
+        }
+        try w.writeAll("))");
+    }
     _ = D;
     return aw.toOwnedSlice();
 }
@@ -344,6 +524,199 @@ pub fn alterNullability(
     return aw.toOwnedSlice();
 }
 
+/// `SET DEFAULT` or `DROP DEFAULT`.
+///
+/// Neither can fail on a table with rows in it: a default is what the *next*
+/// insert gets, and the rows already there keep whatever they were written
+/// with. That is the difference between this and `SET NOT NULL`, and it is why
+/// a column added with a default is no longer a backfill waiting to happen.
+pub fn alterDefault(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    desc: Desc,
+    c: Column,
+) Error![]const u8 {
+    comptime std.debug.assert(D.can_alter_column);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try alterHead(w, desc);
+    try w.writeAll(" ALTER COLUMN ");
+    try writeIdent(w, c.name);
+    if (c.default) |text| {
+        try w.print(" SET DEFAULT {s}", .{text});
+    } else {
+        try w.writeAll(" DROP DEFAULT");
+    }
+    return aw.toOwnedSlice();
+}
+
+/// `ALTER TABLE … DROP CONSTRAINT`, for the check over a column's words.
+pub fn dropCheck(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    desc: Desc,
+    was: Column,
+) Error![]const u8 {
+    comptime std.debug.assert(D.can_alter_constraint);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try alterHead(w, desc);
+    try w.writeAll(" DROP CONSTRAINT ");
+    // **The column as the snapshot had it**, because that is the name the
+    // constraint is actually in the database under. A `.check` entry that gave
+    // it a name, or took one away, moves the name and not the constraint.
+    try writeCheckIdent(w, desc.table, was);
+    return aw.toOwnedSlice();
+}
+
+/// `ALTER TABLE … DROP CONSTRAINT "name"`, for a check the marker named and no
+/// longer does.
+pub fn dropConstraint(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    desc: Desc,
+    name: []const u8,
+) Error![]const u8 {
+    comptime std.debug.assert(D.can_alter_constraint);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try alterHead(w, desc);
+    try w.writeAll(" DROP CONSTRAINT ");
+    try writeIdent(w, name);
+    return aw.toOwnedSlice();
+}
+
+/// `ALTER TABLE … ADD CONSTRAINT "name" CHECK (…)`, for a check the marker
+/// named on a table that is already there.
+///
+/// The body goes in as it was written. nilo does not read it, and the database
+/// refuses the whole version inside its transaction if it is not SQL — which is
+/// the same moment a `.data` step is checked.
+pub fn addNamedCheck(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    desc: Desc,
+    ck: NamedText,
+) Error![]const u8 {
+    comptime std.debug.assert(D.can_alter_constraint);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try alterHead(w, desc);
+    try w.writeAll(" ADD CONSTRAINT ");
+    try writeIdent(w, ck.name);
+    try w.writeAll(" CHECK (");
+    try w.writeAll(ck.body);
+    try w.writeAll(")");
+    return aw.toOwnedSlice();
+}
+
+/// `CREATE TRIGGER "n" <when> ON "t" <run>`, built where the halves are runtime
+/// text — the diff's side of `triggerStatement`.
+pub fn createTrigger(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    desc: Desc,
+    t: NamedText,
+) Error![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try w.writeAll("CREATE TRIGGER ");
+    try writeIdent(w, t.name);
+    try w.writeAll(" ");
+    try w.writeAll(t.body);
+    try w.writeAll(" ON ");
+    try alterTail(w, desc);
+    try w.writeAll(" ");
+    try w.writeAll(t.tail);
+    _ = D;
+    return aw.toOwnedSlice();
+}
+
+/// `DROP TRIGGER "n" ON "t"` on Postgres, `DROP TRIGGER "n"` on SQLite.
+///
+/// The two databases scope a trigger name differently — per table on one, per
+/// database on the other — and each refuses the other's spelling, so this is
+/// one of the few places a Dialect answers with a `bool` rather than with text.
+pub fn dropTrigger(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    desc: Desc,
+    name: []const u8,
+) Error![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try w.writeAll("DROP TRIGGER ");
+    try writeIdent(w, name);
+    if (comptime D.trigger_drop_names_table) {
+        try w.writeAll(" ON ");
+        try alterTail(w, desc);
+    }
+    return aw.toOwnedSlice();
+}
+
+/// `ALTER TABLE … ADD CONSTRAINT … CHECK (… IN (…))`, from the words the Row's
+/// enum has now.
+pub fn addCheck(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    desc: Desc,
+    c: Column,
+) Error![]const u8 {
+    comptime std.debug.assert(D.can_alter_constraint);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try alterHead(w, desc);
+    try w.writeAll(" ADD CONSTRAINT ");
+    try writeCheckIdent(w, desc.table, c);
+    try w.writeAll(" CHECK (");
+    try writeIdent(w, c.name);
+    try w.writeAll(" IN (");
+    for (c.values, 0..) |v, i| {
+        if (i > 0) try w.writeAll(", ");
+        try writeLiteral(w, v);
+    }
+    try w.writeAll("))");
+    return aw.toOwnedSlice();
+}
+
+/// `"<table>_<column>_check"`, or the name `.check` gave it, built where the
+/// halves are runtime text.
+///
+/// The comptime half of this is `checkName`, and the two have to agree: one
+/// writes the constraint at `CREATE` and the other drops it at `ALTER`.
+fn writeCheckIdent(w: *std.Io.Writer, table: []const u8, c: Column) Error!void {
+    if (c.check.len > 0) return writeIdent(w, c.check);
+    if (table.len == 0 or c.name.len == 0) return error.BadIdentifier;
+    if (std.mem.indexOfScalar(u8, table, '"') != null) return error.BadIdentifier;
+    if (std.mem.indexOfScalar(u8, c.name, '"') != null) return error.BadIdentifier;
+    try w.print("\"{s}_{s}_check\"", .{ table, c.name });
+}
+
+/// One word as a SQL literal, with a quote inside it doubled — the same rule
+/// `table.zig` applies while compiling, applied here to text out of a snapshot.
+fn writeLiteral(w: *std.Io.Writer, text: []const u8) Error!void {
+    try w.writeAll("'");
+    for (text) |ch| {
+        if (ch == '\'') try w.writeAll("'");
+        try w.writeByte(ch);
+    }
+    try w.writeAll("'");
+}
+
 /// `DROP INDEX`, by the name the snapshot recorded.
 ///
 /// The schema goes in front of the index rather than the table, because that is
@@ -370,6 +743,11 @@ pub fn dropIndex(
 
 fn alterHead(w: *std.Io.Writer, desc: Desc) Error!void {
     try w.writeAll("ALTER TABLE ");
+    try alterTail(w, desc);
+}
+
+/// The table, qualified the way the Row qualifies itself.
+fn alterTail(w: *std.Io.Writer, desc: Desc) Error!void {
     if (desc.schema) |s| {
         try writeIdent(w, s);
         try w.writeAll(".");
@@ -442,6 +820,51 @@ test "a CREATE TABLE is a constant, which is the claim this file makes" {
         \\  "created_at" timestamptz NOT NULL
         \\)
     , sql);
+}
+
+test "a foreign key of two columns is a table constraint, and one of one stays inline" {
+    const Board = struct {
+        pub const nilo_table = .{ .name = "boards", .key = .{ .id, .org_id } };
+        id: i64,
+        org_id: i64,
+    };
+    const Card = struct {
+        pub const nilo_table = .{
+            .name = "cards",
+            .key = .id,
+            .references = .{
+                .org_id = .{ Org, .id },
+                .board = .{
+                    .columns = .{ .board_id, .org_id },
+                    .to = .{ Board, .{ .id, .org_id } },
+                    .on_delete = .cascade,
+                },
+            },
+        };
+        id: i64,
+        org_id: i64,
+        board_id: i64,
+    };
+
+    // `org_id` carries the one-column key inline and appears again inside the
+    // two-column one, which is the ordinary shape of "on the same board": the
+    // tenant column is half of every key on the table.
+    try testing.expectEqualStrings(
+        \\CREATE TABLE "cards" (
+        \\  "id" int8 GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+        \\  "org_id" int8 NOT NULL REFERENCES "orgs" ("id"),
+        \\  "board_id" int8 NOT NULL,
+        \\  CONSTRAINT "cards_board_id_org_id_fkey" FOREIGN KEY ("board_id", "org_id") REFERENCES "boards" ("id", "org_id") ON DELETE CASCADE
+        \\)
+    , comptime createTable(Pg, Card));
+
+    // SQLite takes the same text, which is the whole reason a foreign key is
+    // written at creation rather than added afterwards.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        comptime createTable(Lite, Card),
+        "CONSTRAINT \"cards_board_id_org_id_fkey\" FOREIGN KEY (\"board_id\", \"org_id\")",
+    ) != null);
 }
 
 test "the same type creates a SQLite table, and only what SQLite spells differently moves" {
@@ -636,6 +1059,140 @@ test "an identifier that would end its own quoting is refused rather than concat
     try testing.expectError(error.BadIdentifier, writeIdent(&w, ""));
 }
 
+// -- the words that live inside one Row (ADR 0221) ------------------------
+
+const Priority = enum { urgent, normal };
+
+const Task = struct {
+    pub const nilo_table = .{
+        .name = "tasks",
+        .key = .id,
+        .default = .{ .created_at = .now, .priority = .normal, .done = false },
+        .index = .{
+            .{ .columns = .{.assignee_id}, .where = .{ .assignee_id = .{ .ne = null } } },
+            .{ .columns = .{ .org_id, .{ .created_at = .desc } }, .name = "tasks_newest_first" },
+        },
+    };
+
+    id: i64,
+    org_id: i64,
+    priority: Priority,
+    done: bool,
+    assignee_id: ?i64,
+    created_at: types.Timestamp,
+};
+
+test "a default and a column's words are written inline, beside the type and the reference" {
+    // Inline rather than added afterwards, and that is SQLite's constraint
+    // rather than tidiness: it has no `ALTER TABLE … ADD CONSTRAINT`, so a
+    // CHECK not written at creation cannot be written at all.
+    try testing.expectEqualStrings(
+        \\CREATE TABLE "tasks" (
+        \\  "id" int8 GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+        \\  "org_id" int8 NOT NULL,
+        \\  "priority" text NOT NULL DEFAULT 'normal' CONSTRAINT "tasks_priority_check" CHECK ("priority" IN ('urgent', 'normal')),
+        \\  "done" bool NOT NULL DEFAULT FALSE,
+        \\  "assignee_id" int8,
+        \\  "created_at" timestamptz NOT NULL DEFAULT now()
+        \\)
+    , comptime createTable(Pg, Task));
+}
+
+test "the same table on SQLite moves only what SQLite spells differently" {
+    // The literal defaults are the same text. `now()` is not: a Timestamp
+    // there is microseconds in an INTEGER column (ADR 0136), so the Dialect
+    // spells the clock.
+    const sql = comptime createTable(Lite, Task);
+    try testing.expect(std.mem.indexOf(u8, sql, "\"done\" INTEGER NOT NULL DEFAULT FALSE") != null);
+    try testing.expect(std.mem.indexOf(u8, sql, "DEFAULT " ++ Lite.now_default) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        sql,
+        "CONSTRAINT \"tasks_priority_check\" CHECK (\"priority\" IN ('urgent', 'normal'))",
+    ) != null);
+}
+
+test "a partial index carries its WHERE, and an ordered one its DESC" {
+    const made = comptime createdFor(Pg, Task);
+    try testing.expectEqualStrings(
+        "CREATE INDEX \"tasks_assignee_id_idx\" ON \"tasks\" (\"assignee_id\") " ++
+            "WHERE \"assignee_id\" IS NOT NULL",
+        made.indexes[0].sql,
+    );
+    try testing.expectEqualStrings(
+        "CREATE INDEX \"tasks_newest_first\" ON \"tasks\" (\"org_id\", \"created_at\" DESC)",
+        made.indexes[1].sql,
+    );
+
+    // And the `IF NOT EXISTS` form is still the same statement with four words
+    // moved into the front of it, predicate and all.
+    const guarded = comptime createdIfMissing(Pg, Task);
+    try testing.expect(std.mem.endsWith(u8, guarded.indexes[0].sql, "WHERE \"assignee_id\" IS NOT NULL"));
+    try testing.expect(std.mem.startsWith(u8, guarded.indexes[0].sql, "CREATE INDEX IF NOT EXISTS "));
+}
+
+test "a column added to a table that already has rows takes its default with it" {
+    const gpa = testing.allocator;
+    const desc = comptime table_mod.descOf(Pg, Task);
+
+    const added = try addColumn(Pg, gpa, desc, desc.column("done").?);
+    defer gpa.free(added);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"tasks\" ADD COLUMN \"done\" bool NOT NULL DEFAULT FALSE",
+        added,
+    );
+
+    // And a column with words brings its check, which is the one nilo can
+    // write here: SQLite refuses the whole change one layer up.
+    const worded = try addColumn(Pg, gpa, desc, desc.column("priority").?);
+    defer gpa.free(worded);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"tasks\" ADD COLUMN \"priority\" text NOT NULL DEFAULT 'normal' " ++
+            "CONSTRAINT \"tasks_priority_check\" CHECK (\"priority\" IN ('urgent', 'normal'))",
+        worded,
+    );
+}
+
+test "a default is set and dropped by name, and a check is replaced by dropping it" {
+    const gpa = testing.allocator;
+    const desc = comptime table_mod.descOf(Pg, Task);
+
+    const set = try alterDefault(Pg, gpa, desc, desc.column("created_at").?);
+    defer gpa.free(set);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"tasks\" ALTER COLUMN \"created_at\" SET DEFAULT now()",
+        set,
+    );
+
+    var gone = desc.column("created_at").?;
+    gone.default = null;
+    const dropped = try alterDefault(Pg, gpa, desc, gone);
+    defer gpa.free(dropped);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"tasks\" ALTER COLUMN \"created_at\" DROP DEFAULT",
+        dropped,
+    );
+
+    const off = try dropCheck(Pg, gpa, desc, desc.column("priority").?);
+    defer gpa.free(off);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"tasks\" DROP CONSTRAINT \"tasks_priority_check\"",
+        off,
+    );
+
+    const on = try addCheck(Pg, gpa, desc, desc.column("priority").?);
+    defer gpa.free(on);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"tasks\" ADD CONSTRAINT \"tasks_priority_check\" " ++
+            "CHECK (\"priority\" IN ('urgent', 'normal'))",
+        on,
+    );
+    // The name the `ALTER` drops is the name the `CREATE` wrote, which is the
+    // one thing these two have to agree about.
+    const named = comptime checkName(desc, desc.column("priority").?);
+    try testing.expect(std.mem.indexOf(u8, comptime createTable(Pg, Task), named) != null);
+}
+
 test "the IF NOT EXISTS form is the same statement with four words moved in" {
     // One builder decides what a table looks like. This one splices, so a
     // column type added to `createTable` cannot go missing here.
@@ -656,4 +1213,114 @@ test "the IF NOT EXISTS form is the same statement with four words moved in" {
         "CREATE INDEX IF NOT EXISTS \"users_created_at_idx\" ON \"users\" (\"created_at\")",
         made.indexes[2].sql,
     );
+}
+
+// -- the second kind of word (ADR 0226) ----------------------------------
+
+const Audited = struct {
+    pub const nilo_table = .{
+        .name = "app.audited",
+        .key = .id,
+        .check = .{
+            .audited_amount_is_positive = "amount > 0",
+            .audited_kind_is_known = .{ .words_of = .kind },
+        },
+        .trigger = .{
+            .audited_touch = .{
+                .when = "BEFORE UPDATE",
+                .run = "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+            },
+        },
+    };
+
+    id: i64,
+    amount: i64,
+    kind: Priority,
+};
+
+test "a check the marker named is a table constraint, and a named enum check moves the name" {
+    // The body goes in as written and the name is the key: both halves of what
+    // a check is, and nilo parses neither.
+    try testing.expectEqualStrings(
+        \\CREATE TABLE "app"."audited" (
+        \\  "id" int8 GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+        \\  "amount" int8 NOT NULL,
+        \\  "kind" text NOT NULL CONSTRAINT "audited_kind_is_known" CHECK ("kind" IN ('urgent', 'normal')),
+        \\  CONSTRAINT "audited_amount_is_positive" CHECK (amount > 0)
+        \\)
+    , comptime createTable(Pg, Audited));
+}
+
+test "a trigger is one statement after the table, with the table written between the halves" {
+    const made = comptime createdFor(Pg, Audited);
+    try testing.expectEqual(@as(usize, 1), made.triggers.len);
+    try testing.expectEqualStrings("audited_touch", made.triggers[0].name);
+    try testing.expectEqualStrings(
+        "CREATE TRIGGER \"audited_touch\" BEFORE UPDATE ON \"app\".\"audited\" " ++
+            "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
+        made.triggers[0].sql,
+    );
+
+    // And nothing at all for a Row that named none.
+    try testing.expectEqual(@as(usize, 0), comptime createdFor(Pg, User).triggers.len);
+}
+
+test "the repeatable form of a trigger is each database's own, because neither has the other's" {
+    // Postgres has no `CREATE TRIGGER IF NOT EXISTS` in any version, and SQLite
+    // has no `OR REPLACE`. This is the one statement where the two spellings do
+    // not overlap at all.
+    try testing.expect(std.mem.startsWith(
+        u8,
+        comptime createdIfMissing(Pg, Audited).triggers[0].sql,
+        "CREATE OR REPLACE TRIGGER \"audited_touch\" ",
+    ));
+    try testing.expect(std.mem.startsWith(
+        u8,
+        comptime createdIfMissing(Lite, Audited).triggers[0].sql,
+        "CREATE TRIGGER IF NOT EXISTS \"audited_touch\" ",
+    ));
+}
+
+test "a check is added and dropped by the name the marker gave it, and a trigger by each database's rule" {
+    const gpa = testing.allocator;
+    const desc = comptime table_mod.descOf(Pg, Audited);
+
+    const added = try addNamedCheck(Pg, gpa, desc, desc.checks[0]);
+    defer gpa.free(added);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"app\".\"audited\" ADD CONSTRAINT \"audited_amount_is_positive\" " ++
+            "CHECK (amount > 0)",
+        added,
+    );
+
+    const gone = try dropConstraint(Pg, gpa, desc, "audited_amount_is_positive");
+    defer gpa.free(gone);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"app\".\"audited\" DROP CONSTRAINT \"audited_amount_is_positive\"",
+        gone,
+    );
+
+    // The enum column's check now drops by the name `.check` gave it rather
+    // than by `<table>_<column>_check`, which is the whole of item 12.
+    const off = try dropCheck(Pg, gpa, desc, desc.column("kind").?);
+    defer gpa.free(off);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"app\".\"audited\" DROP CONSTRAINT \"audited_kind_is_known\"",
+        off,
+    );
+
+    const made = try createTrigger(Pg, gpa, desc, desc.triggers[0]);
+    defer gpa.free(made);
+    try testing.expectEqualStrings(comptime createdFor(Pg, Audited).triggers[0].sql, made);
+
+    const pg_drop = try dropTrigger(Pg, gpa, desc, "audited_touch");
+    defer gpa.free(pg_drop);
+    try testing.expectEqualStrings(
+        "DROP TRIGGER \"audited_touch\" ON \"app\".\"audited\"",
+        pg_drop,
+    );
+
+    const lite_drop = try dropTrigger(Lite, gpa, desc, "audited_touch");
+    defer gpa.free(lite_drop);
+    try testing.expectEqualStrings("DROP TRIGGER \"audited_touch\"", lite_drop);
 }
