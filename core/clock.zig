@@ -49,12 +49,12 @@ const builtin = @import("builtin");
 /// made once or twice. If one ever turns up who reads the clock in a loop,
 /// this is the note that says where the 13ns went.
 pub fn nowMicros() i64 {
-    if (builtin.os.tag == .windows) @compileError(
-        "nilo: nilo_core cannot read the wall clock on Windows.\n" ++
-            "  The rest of this module works there; this call is the one thing that" ++
-            " needs an operating system, and Windows is not a platform nilo's Engine" ++
-            " supports either (ADR 0045).",
-    );
+    // The same page-read argument holds on Windows: `RtlGetSystemTimePrecise`
+    // reads KUSER_SHARED_DATA, in 100 ns units from 1601 (ADR 0228).
+    if (builtin.os.tag == .windows) {
+        const epoch_us: i64 = std.time.epoch.windows * std.time.us_per_s;
+        return @divFloor(@as(i64, @intCast(std.os.windows.ntdll.RtlGetSystemTimePrecise())), 10) + epoch_us;
+    }
 
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
@@ -95,12 +95,18 @@ pub fn nowMillis() i64 {
 /// and cannot import this file; that duplication is the layering, not an
 /// oversight.
 pub fn monotonicMicros() i64 {
-    if (builtin.os.tag == .windows) @compileError(
-        "nilo: nilo_core cannot read the monotonic clock on Windows.\n" ++
-            "  The rest of this module works there; this call is one of the two that" ++
-            " need an operating system, and Windows is not a platform nilo's Engine" ++
-            " supports either (ADR 0045).",
-    );
+    // QPC on Windows: the frequency is a read from the same shared page and
+    // does not change, so it is asked for each time rather than cached.
+    if (builtin.os.tag == .windows) {
+        const w = std.os.windows;
+        var qpf: w.LARGE_INTEGER = undefined;
+        var qpc: w.LARGE_INTEGER = undefined;
+        std.debug.assert(w.ntdll.RtlQueryPerformanceFrequency(&qpf).toBool());
+        std.debug.assert(w.ntdll.RtlQueryPerformanceCounter(&qpc).toBool());
+        const f: i128 = qpf;
+        const c: i128 = qpc;
+        return @intCast(@divFloor(c * std.time.us_per_s, f));
+    }
 
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {

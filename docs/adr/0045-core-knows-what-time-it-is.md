@@ -140,10 +140,9 @@ the correction that came from checking it.
   rather than a database default it has to remember to set.
 - `nilo.nowMillis()` is the second argument `id.v7` wanted, so a sortable key
   is now one expression in a handler.
-- Core has a call that names `std.posix`. It is guarded to say so on Windows
-  rather than fail obscurely, and because Zig analyses nothing that is never
-  called, a Windows program importing `nilo_core` for `Str` alone still
-  compiles.
+- Core has a call that names `std.posix`. It was guarded to say so on
+  Windows; [ADR 0228](./0228-core-reads-the-clock-on-windows.md) gives it a
+  Windows path instead, once a program with no Engine turned up there.
 - Nothing here measures a duration, and nothing should. A wall clock moves when
   an operator moves it; the monotonic one behind the Bulkhead is what
   [ADR 0034](./0034-the-thing-a-handler-holds-is-watched-at-run-time.md) uses

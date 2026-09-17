@@ -72,6 +72,10 @@ where it was made.
 
 ### Added
 
+- **`nilo_core` reads the clock on Windows.** `nowMicros` and `monotonicMicros`
+  were a `@compileError` there; a program on `nilo_fetch`, `nilo_sql` and
+  `nilo_job` with no Engine now cross-compiles for `x86_64-windows`
+  ([ADR 0228](./docs/adr/0228-core-reads-the-clock-on-windows.md)).
 - **A Row can say its columns' defaults**, `.default = .{ .created_at = .now,
   .state = .draft, .seats = 1 }`. `.now` is the one word and is refused off a
   `sql.Timestamp`; everything else is a literal of the column's own Zig type,
