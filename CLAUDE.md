@@ -89,7 +89,7 @@ goes in an ADR, a number goes in `docs/history.md`, a rule goes in a build step.
 
 Two of those rules are build steps rather than paragraphs, and they are the ones
 to lean on: `zig build layering` refuses an import that goes upward or sideways,
-and the seven `refusals` steps check the wording of 320 error messages. Prefer making
+and the seven `refusals` steps check the wording of 321 error messages. Prefer making
 a new rule enforceable that way over writing it down here — a paragraph nobody
 runs is the thing that rots.
 
@@ -122,7 +122,7 @@ zig build test-job-sql # nilo_job over a SQLite table, and Postgres if DATABASE_
 zig build test-s3      # only nilo_s3, both modes, plus its refusals
 zig build layering     # check that no module imports upward or sideways
 zig build refusals     # the framework's 140 compile-error checks — NOT the others
-zig build refusals-sql # nilo_sql's 139; also run by test-sql
+zig build refusals-sql # nilo_sql's 140; also run by test-sql
 zig build refusals-config  # nilo_config's 9, and refusals-pw for nilo_pw's 3
 zig build refusals-cache   # nilo_cache's 5; also run by test-cache
 zig build refusals-s3  # nilo_s3's 10; also run by test-s3
@@ -193,7 +193,11 @@ refusals are a documented slow path, "the suite takes a while" is always an
 available explanation and it is the perfect hiding place for a deadlock —
 `fetch/live.zig` held one for a fortnight, and `fetch/deadline.zig` held a
 second one found by this very procedure — a port scan that gave up by
-returning, leaving the test waiting on a flag nothing would ever set.
+returning, leaving the test waiting on a flag nothing would ever set. The
+third was `io.async` starting a server: `std.Io.async` may run its function
+on the calling thread, and `Threaded` does once its pool is full, so a
+listener the test is about to connect to is started with `io.concurrent`
+(ADR 0230).
 `ps -o etime,cputime -C zig` settles it in one command: seven minutes of wall
 against two seconds of CPU is not a slow build, and the tests worth suspecting
 first are the ones that open a real socket at both ends — `test-fetch`,

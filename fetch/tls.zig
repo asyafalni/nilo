@@ -64,7 +64,7 @@ fn withClient(comptime body: fn (*fetch.Client, *core.Run) anyerror!void) !void 
 
     var client: fetch.Client = .init(gpa, .{ .timeout_ms = 20_000 });
     defer client.deinit();
-    try client.nilo_start(threaded.io(), .off);
+    try client.nilo_start(threaded.io(), .none);
 
     var scope: core.Run = .init(gpa);
     defer scope.deinit();

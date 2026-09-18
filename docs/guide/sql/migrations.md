@@ -306,6 +306,36 @@ try app.before(makeTables, .{&db});
 try app.listen(.{ .port = 8080 });
 ```
 
+### A column the shipped file has not got
+
+A single-file program that shipped `downloads` with five columns and now has
+a Row with eight does not want a ledger and version files for three `ADD
+COLUMN`s, and writing the three by hand copies a type mapping that drifts
+the next time nilo's moves. `addMissingColumns` is the step after
+`createMissing` for exactly that program
+([ADR 0233](../../adr/0233-a-column-a-shipped-table-has-not-got.md)):
+
+<!-- compiles: body -->
+```zig
+try sql.migrate.createMissing(&db, &run, &.{User});
+_ = try sql.migrate.addMissingColumns(&db, &run, &.{User});
+```
+
+One `ALTER TABLE … ADD COLUMN` per field the table lacks, typed from the same
+`Desc` the create reads — `pragma_table_info` on SQLite, `pg_catalog` on
+Postgres — in one transaction, and the answer is how many were added: three
+the first time, zero at every boot after.
+
+**A required column with no default is refused**, `error.NeedsBackfill`, with
+the statement it would have sent in the log, and nothing is sent. SQLite
+refuses that `ALTER` outright and Postgres refuses it on a table with rows,
+so it is not a statement nilo can send and mean. Give the field a `.default`
+in the marker — the rows already there get it and there is nothing to
+backfill — or make it optional, or write the version. A table that is not
+there is skipped, because it is `createMissing`'s. Nothing else moves: a
+column the table has and the Row does not is left, a type that changed is
+left, and `db.checking` is what says so.
+
 ## Changing them
 
 The other half is a diff, and **it needs no database on either side**:
@@ -442,7 +472,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var db = Db.init(init.gpa, "app.db", .{ .size = 1 });
     defer db.deinit();
-    try db.nilo_start(init.io, .off);
+    try db.nilo_start(init.io, .none);
 
     return Tool.run(init.gpa, init.io, out, req, &db, manifest.versions);
 }

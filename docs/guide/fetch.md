@@ -67,9 +67,18 @@ The last argument is a `Call` — per-call overrides, every field null, so
 
 | Field | |
 |---|---|
-| `headers` | `[]const std.http.Header`, written to the wire in this order |
+| `headers` | `[]const std.http.Header`, written to the wire in this order. One that std has a slot for — `host`, `authorization`, `user-agent`, `content-type`, `connection`, `accept-encoding` — is sent once, this copy, rather than beside std's own ([ADR 0231](../adr/0231-a-header-std-owns-goes-out-once.md)) |
 | `timeout_ms` | this call's own deadline, over the client's |
 | `max_body` | this call's own body ceiling, over the client's |
+
+**Headers you did not choose.** A `headers` taken off a pasted `curl` line
+carries `user-agent`, `host` and `authorization` as strings, and std writes
+each of those for itself. Hand them over as they are: nilo tells std to leave
+its own copy out, and the list of what std owns is nilo's to know rather
+than yours. The one to know about is `accept-encoding` — the line goes as
+written, but the client still decodes nothing, so a server that obliges a
+`gzip` gets `error.HttpContentEncodingUnsupported` rather than handing you
+a `Str` full of gzip. Leave it out and the client asks for identity itself.
 
 ## Reading the answer
 
@@ -160,12 +169,18 @@ server sending one byte a second satisfies any per-read limit you care to
 name and never finishes. It is the same reasoning the server's own
 [deadlines](./deploying.md#deadlines) follow from the other side.
 
-**And it is the Engine that fires it.** The deadline is armed on the fiber
-([ADR 0065](../adr/0065-the-way-out-was-open-the-clock-was-not.md)), so a
-client started with `nilo_start(io, .off)` — a test, a CLI, a worker with no
-server around it — has `timeout_ms` and the per-call `.timeout_ms` written
-down and nothing to fire them: a call that hangs there hangs. `app.provide`
-under a server is what hands the client the Engine's `Limits`.
+**And it fires with or without an Engine.** Under a server the deadline is
+armed on the fiber
+([ADR 0065](../adr/0065-the-way-out-was-open-the-clock-was-not.md)), and
+`app.provide` is what hands the client the Engine's `Limits`. A client
+started with `nilo_start(io, .none)` — a test, a CLI, a worker with no server
+around it — has no fiber to arm, so each step of the call runs as a task of
+that `Io` and the task is what gets cancelled when the clock runs out
+([ADR 0230](../adr/0230-a-deadline-with-no-engine-cancels-a-task.md)). The
+cost is one thread hop per step, paid only there. Until 0.5 that client had
+`timeout_ms` written down and nothing to fire it, and the first CLI on nilo
+wrote its own watchdog to cover for it; `.off`, the older name for `.none`,
+is kept so that program still compiles.
 
 ## What it answers instead
 
@@ -230,16 +245,27 @@ fn mirror(api: *fetch.Client, c: *nilo.Ctx) !void {
 
 | | |
 |---|---|
-| `ex.begin(api, .{…})` | `Head` — `status`, `content_length`, `content_type`, `header(name)` case-insensitively, `ok()` |
+| `ex.begin(api, .{…})` | `Head` — `status`, `content_length`, `content_type`, `header(name)` case-insensitively, `ok()`; and `redirected`, the `std.Uri` a followed redirect ended at or null, with `location(&buf)` to write it out as one string |
 | `ex.take(c, max)` | the rest of the body as a `Str` in the Scope, refusing over `max` |
 | `ex.readInto(buf)` | exactly `buf.len` bytes, or `error.BodyTooShort` |
 | `ex.pipe(w)` | the rest into a `*std.Io.Writer`, and how many bytes |
+| `ex.discard()` | "I will not read this body; close the connection." For the probe that asked for one byte and got the file |
 | `ex.end()` | required, and safe twice |
 
-`Begin` takes what a `Call` does and more: `headers`, `host`, `authorization`
-and `content_type` — three headers std would otherwise write for itself, which
-a signed request has to control — `timeout_ms`, a `body` of `.none`,
-`.slice` or `.stream` with a length, and two buffers.
+`Begin` takes what a `Call` does and more: `headers`, `host`, `authorization`,
+`content_type` and `user_agent` — four headers std would otherwise write for
+itself, which a signed request has to control — `timeout_ms`, a `body` of
+`.none`, `.slice` or `.stream` with a length, and two buffers. The explicit
+fields are for a caller who has the value; the same name in `headers` is the
+other way to say it, and both at once is two lines on the wire.
+
+**Where a redirect ended.** A call that follows one — a `redirect_buffer`
+with room in it — comes back with `head.redirected` set to the URL the
+answer actually came from, so the connections after a probe can go straight
+there rather than walking the chain again. The text lives in your
+`redirect_buffer`, which is why `head.location(&buf)` takes a buffer to
+write it into rather than handing back a slice
+([ADR 0232](../adr/0232-a-followed-redirect-says-where-it-ended.md)).
 
 **Everything in `Head` points into the connection's read buffer, and the
 first byte of body read overwrites it.** Read what you need — or copy it —
@@ -259,7 +285,12 @@ somewhere it was never meant to go.
 `std.http.Client.Request`. Declare it, fill it where it stands, leave it
 there. `defer ex.end()` is the line that is not optional: it gives the permit
 back and returns the connection to the pool, or drops it if what was left
-unread is past `max_drain`.
+unread is past `max_drain`. When you already know the body is not wanted —
+a `Range` probe that was answered with the whole object — `ex.discard()`
+before the `end` says so, and the connection goes with the body whatever
+`max_drain` would have decided. That keeps `max_drain` a policy for every
+call rather than a lever pulled for one
+([ADR 0235](../adr/0235-a-caller-that-knows-says-discard.md)).
 
 **A body with no length cannot be sent streamed.** `.stream` takes the
 length because HTTP can frame an unknown length only as chunked, and the
@@ -309,7 +340,7 @@ whole of it: a `std.Io.net.Server` bound to a loopback port, walked from a
 range rather than fixed (a closed port sits in `TIME-WAIT` for a minute), a
 `serveOne` that reads one head and writes one canned answer, run with
 `io.async(Canned.serveOne, .{&canned})` beside the call and `await`ed after
-it; and the client finished with `client.nilo_start(io, .off)` as `listen()`
+it; and the client finished with `client.nilo_start(io, .none)` as `listen()`
 would have done. `s3/canned.zig` is the same shape with more answers. Give
 your suite a port range of its own — those two have 39,200–40,199 and
 40,200–41,199, and `zig build test-all` runs two binaries at once — and put a

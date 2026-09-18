@@ -3462,3 +3462,60 @@ expected text, all green, and an `INSERT` whose column list was opened and never
 closed. What found it was the fifth: hand the statements to a real database in
 order and then ask `migrate.expect`, which is what a server does at boot
 ([ADR 0227](./adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).
+
+## Seven items from the first CLI, and the guard that was written down and never armed
+
+The first program on nilo with no `App` in it — a download manager on
+`nilo_sql`, `nilo_job` and `nilo_fetch`, on a plain `Io.Threaded` — handed
+back seven items, each anchored to the workaround it carried. All seven
+shipped in one round ([ADR 0229](./adr/0229-a-push-wakes-a-worker.md) to
+[0235](./adr/0235-a-caller-that-knows-says-discard.md)). Four things from
+the round are worth more than the list.
+
+**A setting that arms nothing on the `Io` every CLI has was documented as a
+feature for a year.** `fetch.Settings.timeout_ms` arms a `Bound`, and a
+`Bound` on `Limits.off` arms nothing by design — right for Core, which cannot
+cancel a fiber, and wrong for the client, which said nothing about it. The
+program found it the way ADR 0033 says such things are found: by writing its
+own watchdog beside the one that did not fire, with a comment explaining why.
+The fix was not a refusal but the mechanism the guard was missing — run the
+step as a task and cancel the task — and `.off` became `.none`, because a
+value that means *there is no Engine here* should not read as a switch. The
+test that holds it is a server that never answers; before the change, that
+test cannot finish.
+
+**A test can pass through a mechanism other than the one it names.** The
+first redirect test served the `302` on one connection and the `200` on a
+second, and got the `200` — from the stale-connection retry, which found the
+pooled socket reaped and re-sent the *original* URL. `head.redirected` was
+null and the assertion on it is what caught the wrong path. One connection
+for both answers is the test; the wrong one is now a comment on it.
+
+**The cheapest place to fix a doubled header was std's own switch.** Routing
+`user-agent` and its five siblings out of `headers` looked like a filtered
+slice — an allocation, or a fixed array on the stack of every connection that
+dials out. `std.http.Client` writes `extra_headers` verbatim either way, so
+the only line that had to move was std's, and a `.omit` on the slot moves it
+for nothing. Read what the other side already does before building a copy of
+it.
+
+**`io.async` may run on the caller's thread, and a harness that starts a
+listener with it is a deadlock waiting for a full pool.** The narrow steps
+all passed and `zig build test-all` sat at twenty minutes against zero CPU —
+the shape `CLAUDE.md` says to suspect first, and the third time a real
+socket at both ends has produced it. `Threaded` allows `cpu_count - 1` tasks
+and runs an `async` inline past that; the task ADR 0230 now starts per call
+is enough to fill a two-core pool for the microsecond between a worker
+waking its awaiter and counting itself free. Test 19 of 34 then ran its
+server on the test's own thread, in `accept`, waiting for a connection that
+thread was about to make. Forty-four `io.async` calls in two harnesses became
+`io.concurrent`, which is the contract they always needed; the account is in
+[ADR 0230](./adr/0230-a-deadline-with-no-engine-cancels-a-task.md). The
+procedure that found it was `ps` for the CPU, `/proc/*/task/*/wchan` for the
+thread in `accept`, and `gdb -p` for its stack — twenty seconds, once the
+build was suspected rather than waited on.
+
+And one number: an `std.Io.Timeout` is 48 bytes, and the `Exchange` that
+would have held one sits on the stack of every handler that dials out. An
+`i64` of microseconds fits in padding the struct already had, so
+`@sizeOf(Exchange)` is 928 before and after.

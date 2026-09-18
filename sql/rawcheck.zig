@@ -160,6 +160,29 @@ pub fn assertList(
     }
 }
 
+/// `assertList` for a statement read into **one value** rather than a Row
+/// ([ADR 0234](../docs/adr/0234-a-scalar-out-of-raw.md)): the list, when it
+/// can be counted, is one column. Nothing to match a name against, and no
+/// cast to check — a scalar has no field for a `::text` to have been left
+/// off.
+pub fn assertOne(
+    comptime T: type,
+    comptime sql: []const u8,
+    comptime call: []const u8,
+) void {
+    comptime {
+        @setEvalBranchQuota(20_000 + 200 * sql.len);
+        const list = scan(sql);
+        const count = list.count orelse return;
+        if (count != 1) @compileError(std.fmt.comptimePrint(
+            "nilo: the statement handed to `{s}` selects {d} column{s}, and {s} is one value.\n" ++
+                "  A scalar reads column one and nothing else. Select one column, or read " ++
+                "into a struct with a field per column and `pub const nilo_table = .projection;`.",
+            .{ call, count, plural(count), @typeName(T) },
+        ));
+    }
+}
+
 /// The Row's fields a statement fills, in order: every one but those carried
 /// beside the columns (ADR 0217).
 fn columnFields(comptime Row: type) []const std.builtin.Type.StructField {

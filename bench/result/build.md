@@ -225,3 +225,39 @@ measured it goes here, and the first thing to check is whether
 `--summary all`'s per-step peak RSS says the test compile of `http/http.zig`
 (2.3 GB, seen once in passing) wants a `max_rss` claim so the runner stops
 scheduling eight of them on sixteen gigabytes.
+
+## What a dependent pays for `build.zig`
+
+**Not the machine in the header either.** 2 cores, 7.9 GB, x86_64 Linux, Zig
+0.16.0, commit `8c2d3be`, `build.zig` at 192,747 bytes. Taken because a
+dependent's author guessed that a consumer's cold build carries the tooling
+nilo runs on itself — `bench/`, `stress/`, `spike/`, the refusal tables — and
+said so as a hunch rather than a finding.
+
+The cost is the build runner, which is compiled from every `build.zig` in the
+dependency graph and cached by content. `zig build -h` is the configure phase
+and nothing else, run from `bench/dependent/`, which imports `nilo_http` and
+nothing more; the control is a seven-line `build.zig` with no dependencies in
+a scratch directory. Each row is the mean of three runs, and the spread was
+under 0.2 s.
+
+| | runner cached | runner rebuilt |
+|---|---|---|
+| `bench/dependent/` on nilo | 0.03 s, 39 MB | 4.4 s, 5.2 s CPU, 210 MB |
+| seven-line `build.zig`, no deps | 0.03 s, 38 MB | 3.5 s, 4.2 s CPU, 196 MB |
+
+The runner is rebuilt when the content of any `build.zig` in the graph
+changes, which for a dependent is a nilo upgrade. **So nilo's 192 KB costs a
+dependent about 0.9 s and 14 MB, once per upgrade, and nothing on any other
+build.** A `touch` does not do it — the cache is by content — and a warm build
+with nothing changed is 30 ms with or without nilo in the graph.
+
+**What it changed:** the roadmap carries the number as accepted rather than as
+a hunch. Splitting the file would win most of the 0.9 s once per upgrade, and
+a build system in two files is not worth a second a release.
+
+**Can it go further:** the 3.5 s floor is std's build system compiling
+itself, and is not nilo's to move. The 0.9 s above it is; the lever is a
+`build/` directory of `@import`ed helpers so the runner sees less of what
+`bench/` and `stress/` need. Not worth pulling until something else wants the
+file split.

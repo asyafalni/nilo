@@ -25,7 +25,12 @@
 //! - **A deadline.** An endpoint that accepts a connection and then says
 //!   nothing holds a handler until the process dies. `std.http.Client` has no
 //!   deadline field, so the bound is on the fiber
-//!   ([ADR 0065](../docs/adr/0065-the-way-out-was-open-the-clock-was-not.md)).
+//!   ([ADR 0065](../docs/adr/0065-the-way-out-was-open-the-clock-was-not.md))
+//!   — and where there is no fiber, because the `Io` is a plain
+//!   `std.Io.Threaded` with no Engine over it, the call is run as a task of
+//!   that `Io` and the task is what gets cancelled
+//!   ([ADR 0230](../docs/adr/0230-a-deadline-with-no-engine-cancels-a-task.md)).
+//!   `timeout_ms` means the same thing at either end.
 //! - **A bounded drain, and the drain itself.** `std.http.Client.Request.deinit`
 //!   does two different things depending on the state the body was left in, and
 //!   both of them are wrong for a client that refuses bodies. From
@@ -86,7 +91,7 @@ pub const request_id_header = "X-Request-Id";
 pub const Client = struct {
     inner: std.http.Client,
     gate: std.Io.Semaphore,
-    limits: core.Limits = .off,
+    limits: core.Limits = .none,
     settings: Settings,
     started: bool = false,
 
@@ -106,6 +111,14 @@ pub const Client = struct {
         /// It bounds the whole call rather than each read, because a server
         /// sending one byte a second satisfies any per-read limit you care to
         /// name and never finishes.
+        ///
+        /// **It fires without an Engine too.** Under `listen()` the Engine
+        /// cancels the fiber; on a client started with `nilo_start(io,
+        /// .none)` — a CLI, a worker, a test on `std.Io.Threaded` — each
+        /// step of the call runs as a task of that `Io`, and the task is
+        /// cancelled when the clock runs out. What that costs is one thread
+        /// hop per step, paid only by a client with no Engine and a
+        /// non-zero timeout (ADR 0230).
         timeout_ms: u32 = 30_000,
 
         /// A response body larger than this is `error.BodyTooLarge` rather
@@ -131,6 +144,10 @@ pub const Client = struct {
     /// Per-call overrides. Everything null takes the client's own setting, so
     /// `.{}` is the ordinary case.
     pub const Call = struct {
+        /// Sent verbatim, in this order. A name std writes for itself —
+        /// `host`, `authorization`, `user-agent`, `content-type`,
+        /// `connection`, `accept-encoding` — is sent **once**, the caller's
+        /// copy, rather than beside std's (ADR 0231).
         headers: []const std.http.Header = &.{},
         /// Overrides `Settings.timeout_ms` for this call — a health check that
         /// should give up in 500ms, an upload that may take a minute.
@@ -178,6 +195,10 @@ pub const Client = struct {
     /// (ADR 0040). The third parameter is what bounds a call in time
     /// (ADR 0065); a Fitting that did not take it could open a connection and
     /// never give up on it.
+    ///
+    /// `.none` for the limits is not "no deadline": it is "no Engine to arm
+    /// one on", and the client then bounds the call itself, as a task of
+    /// `io` it can cancel (ADR 0230).
     pub fn nilo_start(self: *Client, io: std.Io, limits: core.Limits) !void {
         self.inner.io = io;
         self.limits = limits;
@@ -304,8 +325,11 @@ pub const Client = struct {
     /// cancellation from somewhere else — a shutdown — leaves the bound
     /// saying no, and is passed through as itself, which is the distinction
     /// that mattered in the first place.
-    fn blame(_: *Client, bound: *core.Limits.Bound, err: anytype) Error {
-        if (bound.fired()) return error.TimedOut;
+    ///
+    /// `expired` is the same answer from the other deadline, the one an
+    /// Exchange keeps itself when there is no Engine (ADR 0230).
+    fn blame(_: *Client, bound: *core.Limits.Bound, expired: bool, err: anytype) Error {
+        if (expired or bound.fired()) return error.TimedOut;
         return err;
     }
 
@@ -352,7 +376,19 @@ pub const Client = struct {
 /// above the `begin` rather than after it.
 pub const Exchange = struct {
     client: *Client = undefined,
+    /// The Engine's deadline, when there is an Engine.
     bound: core.Limits.Bound = .idle,
+    /// The same deadline kept by the Exchange itself, when there is not:
+    /// an absolute time on Core's monotonic clock, in microseconds, that
+    /// every step of the call is run against, as a task of the `Io` that is
+    /// cancelled when the clock passes it (ADR 0230). Zero under an Engine,
+    /// and for a timeout of zero. An `i64` rather than an `std.Io.Timeout`
+    /// because the latter is 48 bytes and this struct sits on the stack of
+    /// every handler that dials out, which by ADR 0063 is per connection.
+    deadline_us: i64 = 0,
+    /// Whether `deadline` is what stopped the call. The engineless half of
+    /// what `Bound.fired` answers, and read by `blame` the same way.
+    expired: bool = false,
     req: std.http.Client.Request = undefined,
     res: std.http.Client.Response = undefined,
     reader: ?*std.Io.Reader = null,
@@ -373,15 +409,32 @@ pub const Exchange = struct {
         url: []const u8,
         /// Written to the wire verbatim and in this order — `std.http.Client`
         /// promises that, and a signature computed over them depends on it.
+        ///
+        /// **A name std writes for itself is sent once, and it is this copy.**
+        /// `std.http.Client` has slots of its own for `host`, `authorization`,
+        /// `user-agent`, `content-type`, `connection` and `accept-encoding`,
+        /// and it used to write its slot *and* the verbatim line, so a
+        /// `user-agent` pasted off a `curl` command went out twice. Now a
+        /// name here that matches a slot tells std to leave the slot out, and
+        /// the six names are known in one place, which is this file rather
+        /// than every caller with a header it did not choose (ADR 0231).
+        ///
+        /// `accept-encoding` is the one to know about: the line goes out as
+        /// written, but the client still decodes nothing, so an answer that
+        /// arrives compressed is `error.HttpContentEncodingUnsupported`
+        /// rather than a `Str` full of gzip. Leave it out to get the
+        /// identity the client asks for itself.
         headers: []const std.http.Header = &.{},
         body: Body = .none,
 
         /// Four headers std writes for itself unless told otherwise. A signed
         /// request has to say exactly what it signed, down to the port in the
         /// authority, so it overrides rather than trusting two spellings to
-        /// agree. The same name in `headers` would go out twice, once from
-        /// std and once verbatim — which is what a `User-Agent` copied off a
-        /// browser did before it had a slot of its own.
+        /// agree. The explicit form, for a caller who has the value and not a
+        /// header line; the same name in `headers` is the other way to say
+        /// it. **Not both** — a field here and the line in `headers` go out
+        /// as two lines, because the field is the caller's own word for what
+        /// the wire should carry.
         host: ?[]const u8 = null,
         authorization: ?[]const u8 = null,
         content_type: ?[]const u8 = null,
@@ -432,6 +485,13 @@ pub const Exchange = struct {
         content_length: ?u64,
         content_type: ?[]const u8,
         bytes: []const u8,
+        /// Where a followed redirect ended, or null when none was followed
+        /// — the URL this head is the answer to, resolved against every
+        /// `Location` on the way. **Its text lives in the `redirect_buffer`
+        /// the call was given**, which the caller owns, so it is good for as
+        /// long as that buffer is and not for a moment longer. `location`
+        /// writes it out as one string (ADR 0232).
+        redirected: ?std.Uri = null,
 
         /// A header by name, case-insensitively. Null when it is absent —
         /// which for `etag` is a fact about the server rather than an error.
@@ -441,6 +501,21 @@ pub const Exchange = struct {
                 if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
             }
             return null;
+        }
+
+        /// The URL a followed redirect ended at, written into `buf`, or null
+        /// when the answer came from the URL that was asked for. What a
+        /// caller that will open more connections to the same object wants:
+        /// the sixteen after the probe go to where it landed rather than
+        /// walking the chain sixteen more times (ADR 0232).
+        ///
+        /// `error.NoSpaceLeft` when `buf` is shorter than the URL, which is
+        /// a URL longer than the redirect buffer that held it.
+        pub fn location(self: Head, buf: []u8) error{NoSpaceLeft}!?[]const u8 {
+            const uri = self.redirected orelse return null;
+            var w: std.Io.Writer = .fixed(buf);
+            uri.format(&w) catch return error.NoSpaceLeft;
+            return w.buffered();
         }
 
         pub fn ok(self: Head) bool {
@@ -463,7 +538,14 @@ pub const Exchange = struct {
         try client.gate.wait(io);
         self.permit = true;
 
-        self.bound.arm(client.limits, opts.timeout_ms orelse client.settings.timeout_ms);
+        // One deadline, held by whichever of the two can enforce it. Under an
+        // Engine that is the Bound, which cancels the fiber; with none, it is
+        // an absolute time every step below is run against as a task that
+        // gets cancelled (ADR 0230). Zero is no limit either way.
+        const ms = opts.timeout_ms orelse client.settings.timeout_ms;
+        if (client.limits.engineless()) {
+            if (ms != 0) self.deadline_us = core.monotonicMicros() + @as(i64, ms) * std.time.us_per_ms;
+        } else self.bound.arm(client.limits, ms);
 
         // **One retry, and only onto a connection the peer had already
         // closed.** Not a retry policy: `std.http.Client` pools keep-alive
@@ -519,14 +601,14 @@ pub const Exchange = struct {
         const stale_limit = client.inner.connection_pool.free_size;
         var tries: usize = 0;
         while (true) : (tries += 1) {
-            self.attempt(client, uri, opts) catch |err| {
+            self.bounded(attempt, .{ self, client, uri, opts }) catch |err| {
                 if (tries < stale_limit and self.nothingCameBack(err) and
-                    replayable(opts.body) and !self.bound.fired())
+                    replayable(opts.body) and !self.expired and !self.bound.fired())
                 {
-                    self.discard();
+                    self.forget();
                     continue;
                 }
-                return client.blame(&self.bound, err);
+                return self.blame(err);
             };
             break;
         }
@@ -542,6 +624,14 @@ pub const Exchange = struct {
             .content_length = self.res.head.content_length,
             .content_type = self.res.head.content_type,
             .bytes = self.res.head.bytes,
+            // std counts the redirects it has left; fewer than it started
+            // with is a chain it walked, and `req.uri` is then the end of
+            // it, resolved into the caller's `redirect_buffer` by std's own
+            // `resolveInPlace`.
+            .redirected = if (opts.redirect_buffer.len != 0 and self.req.redirect_behavior.remaining() < max_redirects)
+                self.req.uri
+            else
+                null,
         };
 
         // **A HEAD's answer, a 1xx, a 204 and a 304 end at the header block,
@@ -580,17 +670,25 @@ pub const Exchange = struct {
     /// Split out of `begin` so the retry above can run it twice without
     /// repeating it, and so that `blame` is applied in exactly one place.
     fn attempt(self: *Exchange, client: *Client, uri: std.Uri, opts: Begin) !void {
+        // The six names std has a slot for, and whether `headers` carries
+        // each. A slot the caller wrote a line for is left out, so the line
+        // is the one copy on the wire — no allocation and no filtered slice,
+        // because std writes `extra_headers` verbatim either way and the
+        // only thing that had to move was its own (ADR 0231).
+        const given = Given.of(opts.headers);
         self.req = try client.inner.request(opts.method, uri, .{
             .extra_headers = opts.headers,
             .redirect_behavior = if (opts.redirect_buffer.len == 0)
                 .unhandled
             else
-                std.http.Client.Request.RedirectBehavior.init(3),
+                std.http.Client.Request.RedirectBehavior.init(max_redirects),
             .headers = .{
-                .host = if (opts.host) |h| .{ .override = h } else .default,
-                .authorization = if (opts.authorization) |a| .{ .override = a } else .default,
-                .content_type = if (opts.content_type) |t| .{ .override = t } else .default,
-                .user_agent = if (opts.user_agent) |u| .{ .override = u } else .default,
+                .host = slot(opts.host, given.host),
+                .authorization = slot(opts.authorization, given.authorization),
+                .content_type = slot(opts.content_type, given.content_type),
+                .user_agent = slot(opts.user_agent, given.user_agent),
+                .connection = slot(null, given.connection),
+                .accept_encoding = if (given.accept_encoding) .omit else .{ .override = "identity" },
             },
         });
         self.open = true;
@@ -622,7 +720,12 @@ pub const Exchange = struct {
         // written. The array is what `receiveHead` checks, so a server that
         // ignores the header and gzips anyway is a clean error rather than a
         // `Str` full of bytes nobody can read.
-        self.req.headers.accept_encoding = .{ .override = "identity" };
+        // The override is set with the other slots above — unless the caller
+        // wrote an `accept-encoding` line of their own, in which case the
+        // slot is left out and their line goes. The array is set here
+        // regardless: it is what decides whether an answer is *read*, and a
+        // caller who asked for gzip gets the clean error rather than the
+        // bytes.
         self.req.accept_encoding = @splat(false);
         self.req.accept_encoding[@intFromEnum(std.http.ContentEncoding.identity)] = true;
 
@@ -762,11 +865,25 @@ pub const Exchange = struct {
     ///
     /// `closing` is what stops std returning it to the pool, and without it
     /// the retry would draw the same corpse again.
-    fn discard(self: *Exchange) void {
+    fn forget(self: *Exchange) void {
         if (!self.open) return;
         if (self.req.connection) |conn| conn.closing = true;
         self.req.deinit();
         self.open = false;
+    }
+
+    /// "I will not read this body; close the connection." For the caller
+    /// who knows what `end` would otherwise have to weigh: a probe that
+    /// asked for one byte of a file and was answered with the whole file
+    /// says this rather than lowering `max_drain` for every call the client
+    /// makes, and `max_drain` stays a policy rather than a lever (ADR 0235).
+    ///
+    /// Nothing is read after it. `end` still gives the permit back, and the
+    /// connection goes with the body — one handshake, which is what the
+    /// caller decided was cheaper.
+    pub fn discard(self: *Exchange) void {
+        if (!self.open) return;
+        if (self.req.connection) |conn| conn.closing = true;
     }
 
     /// The whole body, in the Scope's memory, up to `max` bytes.
@@ -778,9 +895,9 @@ pub const Exchange = struct {
     pub fn take(self: *Exchange, c: anytype, max: usize) Client.Error!Str {
         comptime core.checkScope(@TypeOf(c), "exchange.take");
         const reader = self.reader orelse unreachable; // begin first, then take
-        const bytes = reader.allocRemaining(c.arena(), .limited(max)) catch |err| switch (err) {
+        const bytes = self.bounded(std.Io.Reader.allocRemaining, .{ reader, c.arena(), std.Io.Limit.limited(max) }) catch |err| switch (err) {
             error.StreamTooLong => return error.BodyTooLarge,
-            else => |e| return self.client.blame(&self.bound, e),
+            else => |e| return self.blame(e),
         };
         return c.str(bytes);
     }
@@ -793,9 +910,9 @@ pub const Exchange = struct {
     /// that length before reading anything at all.
     pub fn readInto(self: *Exchange, buf: []u8) Client.Error!void {
         const reader = self.reader orelse unreachable; // begin first, then read
-        return reader.readSliceAll(buf) catch |err| switch (err) {
+        return self.bounded(std.Io.Reader.readSliceAll, .{ reader, buf }) catch |err| switch (err) {
             error.EndOfStream => error.BodyTooShort,
-            else => |e| self.client.blame(&self.bound, e),
+            else => |e| self.blame(e),
         };
     }
 
@@ -804,7 +921,111 @@ pub const Exchange = struct {
     /// wants: the ceiling is the transfer buffer rather than the body.
     pub fn pipe(self: *Exchange, w: *std.Io.Writer) Client.Error!u64 {
         const reader = self.reader orelse unreachable; // begin first, then pipe
-        return reader.streamRemaining(w) catch |err| return self.client.blame(&self.bound, err);
+        return self.bounded(std.Io.Reader.streamRemaining, .{ reader, w }) catch |err| return self.blame(err);
+    }
+
+    /// `Client.blame`, asked about both deadlines at once.
+    fn blame(self: *Exchange, err: anytype) Client.Error {
+        return self.client.blame(&self.bound, self.expired, err);
+    }
+
+    /// `f(args...)`, and bounded by `deadline` when there is one.
+    ///
+    /// With no deadline of its own — an Engine holds it, or there is none —
+    /// this is the call, nothing else. With one, the call runs as a task of
+    /// the `Io` and this fiber waits on a word the task sets when it is
+    /// done, with the deadline as the wait's timeout. Past the deadline the
+    /// task is cancelled: on `std.Io.Threaded` that is a signal into the
+    /// blocking read, and `Future.cancel` returns only once the task has
+    /// come out of it, so nothing is still reading when this returns. The
+    /// error the task came back with is passed up and `blame` names it a
+    /// timeout, the way it does under an Engine (ADR 0230).
+    ///
+    /// **What it costs**: one `io.concurrent` per step — the head, the body
+    /// — which on Threaded is a thread hop each way. Paid only on the path
+    /// that asked for it.
+    ///
+    /// A cancellation of *this* task — a shutdown — comes back through the
+    /// wait, is passed to the inner task, and is put back with `recancel`
+    /// so the next `Io` call the caller makes still sees it.
+    fn bounded(self: *Exchange, comptime f: anytype, args: anytype) Returns(f, @TypeOf(args)) {
+        if (self.deadline_us == 0) return @call(.auto, f, args);
+        const io = self.client.inner.io;
+        const Task = struct {
+            fn run(done: *std.atomic.Value(u32), on: std.Io, a: @TypeOf(args)) Returns(f, @TypeOf(args)) {
+                defer {
+                    done.store(1, .release);
+                    on.futexWake(u32, &done.raw, 1);
+                }
+                return @call(.auto, f, a);
+            }
+        };
+        var done: std.atomic.Value(u32) = .init(0);
+        var future = io.concurrent(Task.run, .{ &done, io, args }) catch {
+            // Nothing to run a second task on — a single-threaded `Io`. There
+            // is then nothing that could cancel the call either, so it is
+            // unbounded, exactly as it was before this existed.
+            return @call(.auto, f, args);
+        };
+        while (done.load(.acquire) == 0) {
+            const left = self.deadline_us - core.monotonicMicros();
+            if (left <= 0) {
+                self.expired = true;
+                return future.cancel(io);
+            }
+            io.futexWaitTimeout(u32, &done.raw, 0, .{ .duration = .{
+                .raw = .fromMicroseconds(left),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Canceled => {
+                    const answer = future.cancel(io);
+                    io.recancel();
+                    return answer;
+                },
+            };
+        }
+        return future.await(io);
+    }
+
+    fn Returns(comptime f: anytype, comptime Args: type) type {
+        return @TypeOf(@call(.auto, f, @as(Args, undefined)));
+    }
+
+    /// The most redirects one call follows. std's number, kept where the
+    /// head can tell a walked chain from an unwalked one.
+    const max_redirects = 3;
+
+    /// Which of std's own six headers `Begin.headers` carries, so the slot
+    /// can be left out and the caller's line sent once (ADR 0231).
+    const Given = struct {
+        host: bool = false,
+        authorization: bool = false,
+        user_agent: bool = false,
+        content_type: bool = false,
+        connection: bool = false,
+        accept_encoding: bool = false,
+
+        fn of(headers: []const std.http.Header) Given {
+            var g: Given = .{};
+            for (headers) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "host")) g.host = true;
+                if (std.ascii.eqlIgnoreCase(h.name, "authorization")) g.authorization = true;
+                if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) g.user_agent = true;
+                if (std.ascii.eqlIgnoreCase(h.name, "content-type")) g.content_type = true;
+                if (std.ascii.eqlIgnoreCase(h.name, "connection")) g.connection = true;
+                if (std.ascii.eqlIgnoreCase(h.name, "accept-encoding")) g.accept_encoding = true;
+            }
+            return g;
+        }
+    };
+
+    /// What one of std's slots is set to: the explicit value when the
+    /// caller gave one, left out when `headers` carries the line, and
+    /// std's own default otherwise.
+    fn slot(explicit: ?[]const u8, given: bool) std.http.Client.Request.Headers.Value {
+        if (explicit) |v| return .{ .override = v };
+        if (given) return .omit;
+        return .default;
     }
 
     /// Mark the connection closing when what is left of the body costs more to
@@ -877,17 +1098,41 @@ pub const Exchange = struct {
     /// would let the next caller in while this one still holds one.
     pub fn end(self: *Exchange) void {
         if (self.open) {
-            self.dropIfDrainIsDearer();
-            self.client.close(&self.req);
+            // A call its deadline stopped has nothing left worth draining
+            // to keep the connection: the drain would be more of the wait
+            // that already ran out. Closing is what stops std from trying.
+            // And a deadline that has already fired is not armed again for
+            // the close, so the drain is skipped rather than bounded: with
+            // `closing` set, std's `deinit` reads nothing and lets the
+            // socket go. `dropIfDrainIsDearer` would still read a small
+            // leftover, and a leftover from a server that stalled is the
+            // read that never returns — which is how the first draft of
+            // this branch hung the stall test at zero CPU.
+            if (self.expired) {
+                if (self.req.connection) |conn| conn.closing = true;
+                self.client.close(&self.req);
+            } else {
+                // Under the same deadline as the rest of the call, because a
+                // drain is a read, and a server that stalls in the last
+                // 64 KiB is the server this exists for.
+                self.bounded(finish, .{self});
+            }
             self.open = false;
             self.reader = null;
             self.announced = null;
         }
         self.bound.release();
+        self.deadline_us = 0;
+        self.expired = false;
         if (self.permit) {
             self.client.gate.post(self.client.inner.io);
             self.permit = false;
         }
+    }
+
+    fn finish(self: *Exchange) void {
+        self.dropIfDrainIsDearer();
+        self.client.close(&self.req);
     }
 };
 
@@ -982,14 +1227,14 @@ test "a failure this call's own clock caused is a timeout, whatever it is called
     var mine: core.Limits.Bound = .idle;
     defer mine.release();
     mine.arm(always_fired, 1_000);
-    try testing.expectEqual(Client.Error.TimedOut, client.blame(&mine, error.Canceled));
+    try testing.expectEqual(Client.Error.TimedOut, client.blame(&mine, false, error.Canceled));
 
     // And the case a real timer actually produces. `std.Io.Reader`'s error set
     // is fixed, so a cancellation mid-body arrives as `error.ReadFailed` with
     // the cause kept in a field; `fetch/deadline.zig` is where that was seen.
     // A version of `blame` that matched on `error.Canceled` returned this
     // unchanged and every timeout looked like a broken upstream.
-    try testing.expectEqual(Client.Error.TimedOut, client.blame(&mine, error.ReadFailed));
+    try testing.expectEqual(Client.Error.TimedOut, client.blame(&mine, false, error.ReadFailed));
 
     // Armed against nothing, which is what a shutdown looks like: the
     // cancellation was somebody else's and must not be reported as a timeout,
@@ -997,13 +1242,13 @@ test "a failure this call's own clock caused is a timeout, whatever it is called
     var theirs: core.Limits.Bound = .idle;
     defer theirs.release();
     theirs.arm(.off, 1_000);
-    try testing.expectEqual(Client.Error.Canceled, client.blame(&theirs, error.Canceled));
+    try testing.expectEqual(Client.Error.Canceled, client.blame(&theirs, false, error.Canceled));
 
     // A failure with no deadline behind it is passed through as itself, which
     // is the whole reason the bound is asked rather than assumed.
     try testing.expectEqual(
         Client.Error.ConnectionRefused,
-        client.blame(&theirs, error.ConnectionRefused),
+        client.blame(&theirs, false, error.ConnectionRefused),
     );
 }
 

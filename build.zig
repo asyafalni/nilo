@@ -384,6 +384,10 @@ const sql_refusals = [_]Refusal{
         .says = "the statement handed to `db.raw` selects 2 columns, and raw_select_list_short.Person has 3 fields.",
     },
     .{
+        .name = "raw_scalar_with_two_columns",
+        .says = "the statement handed to `db.raw` selects 2 columns, and []const u8 is one value.",
+    },
+    .{
         .name = "raw_column_in_another_fields_place",
         .says = "column 1 of the statement handed to `db.raw` is named `owner_id`, and field 1 of raw_column_in_another_fields_place.Person is `id`.",
     },

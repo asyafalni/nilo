@@ -297,6 +297,12 @@ fn fieldOf(auth: []const u8, name: []const u8) ?[]const u8 {
 
 // ---- the harness ----
 
+// The servers below are started with `io.concurrent` rather than `io.async`,
+// for the reason `fetch/live.zig`'s `Canned` gives at length: `async` may run
+// the server on the test's own thread, and does on `Threaded` whenever the
+// pool is momentarily full — which every bounded call through `nilo_fetch`
+// now makes it (ADR 0230). A server on the caller's thread is an `accept`
+// nobody connects to.
 fn withIo(comptime body: fn (std.Io) anyerror!void) !void {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -342,7 +348,7 @@ test "a get is signed, and the object comes back whole" {
             defer canned.close();
             canned.answer = .{ .body = "the bytes of a very small png", .content_type = "image/png" };
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -384,7 +390,7 @@ test "a key with characters a URL cannot carry is encoded once, and verifies" {
             defer canned.close();
             canned.answer = .{ .body = "x" };
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -418,7 +424,7 @@ test "a put sends the bytes it signed, and says what they are" {
             var canned = try Canned.open(io);
             defer canned.close();
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -463,7 +469,7 @@ test "a streamed put frames its body by length rather than in chunks" {
             var canned = try Canned.open(io);
             defer canned.close();
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -506,7 +512,7 @@ test "a range is signed as a header, and asks for the slice it was given" {
             defer canned.close();
             canned.answer = .{ .status = "206 Partial Content", .body = "0123456789" };
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -547,7 +553,7 @@ test "an object over the ceiling is refused before a byte of it is read" {
             // hang rather than fail.
             canned.answer = .{ .body = "", .claim_len = 2 << 20 };
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -589,7 +595,7 @@ test "S3 saying no becomes one of the seven" {
                 ,
             };
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -616,7 +622,7 @@ test "a delete is signed with an empty payload and answers nothing" {
             defer canned.close();
             canned.answer = .{ .status = "204 No Content", .body = "" };
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -654,7 +660,7 @@ test "a head asks what an object is without asking for it" {
                 .etag = "\"abc123\"",
             };
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -687,7 +693,7 @@ test "a streamed get pipes the object out without holding it" {
             defer canned.close();
             canned.answer = .{ .body = "a body too big to want in an arena", .content_type = "video/mp4" };
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -732,7 +738,7 @@ test "a conditional get is a union, because a 304 is a success" {
             defer canned.close();
             canned.answer = .{ .status = "304 Not Modified", .body = "" };
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -766,7 +772,7 @@ test "a bucket with server-side encryption signs the header it sends" {
             var canned = try Canned.open(io);
             defer canned.close();
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -799,7 +805,7 @@ test "temporary credentials send a token, and sign it" {
             defer canned.close();
             canned.answer = .{ .body = "x" };
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
@@ -1373,7 +1379,7 @@ test "a bounded get stays inside its allocation budget" {
             };
 
             // Four rounds on one connection: three to warm, one to measure.
-            var served = io.async(Canned.serveMany, .{ &canned, @as(usize, 4) });
+            var served = try io.concurrent(Canned.serveMany, .{ &canned, @as(usize, 4) });
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;

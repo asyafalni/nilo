@@ -55,6 +55,7 @@ const core = @import("nilo_core");
 const row_mod = @import("row.zig");
 const table_mod = @import("table.zig");
 const types = @import("types.zig");
+const wire_mod = @import("wire.zig");
 
 pub const ddl = @import("ddl.zig");
 pub const snapshot = @import("snapshot.zig");
@@ -1121,6 +1122,9 @@ pub const Error = error{
     /// migration has not been run, and serving requests against that schema is
     /// how a deploy turns into an incident.
     SchemaBehind,
+    /// `addMissingColumns` found a required column with no default, which is
+    /// an `ALTER` that fails on a table with rows in it. Nothing was sent.
+    NeedsBackfill,
 };
 
 /// The key `pg_advisory_xact_lock` takes.
@@ -1185,6 +1189,83 @@ pub fn createMissing(db: anytype, scope: anytype, comptime Rows: []const type) !
         for (made.triggers) |tr| _ = try tx.exec(scope, tr.sql, .{});
     }
     try tx.commit();
+}
+
+/// The step between `createMissing` and `apply`: one `ALTER TABLE … ADD
+/// COLUMN` per field a shipped table has not got, typed the way
+/// `createMissing` would have typed it, and how many were added
+/// ([ADR 0233](../docs/adr/0233-a-column-a-shipped-table-has-not-got.md)).
+///
+/// ```zig
+/// try sql.migrate.createMissing(&db, &run, &.{ Download, Segment });
+/// _ = try sql.migrate.addMissingColumns(&db, &run, &.{ Download, Segment });
+/// ```
+///
+/// **For the program that keeps its own SQLite file and added a field.** A
+/// CLI that shipped `downloads` with five columns and now has a Row with
+/// eight does not want a ledger table and version files for three `ADD
+/// COLUMN`s, and it does not want to write them by hand either: a type
+/// mapping copied out of `createMissing`'s output is a type mapping that
+/// drifts from it the next time this module's moves. The column is
+/// described once, in the Row, and this reads the same `Desc` the create
+/// does — `pragma_table_info` on SQLite, `pg_catalog` on Postgres, and
+/// `ddl.addColumn` for each name the table lacks.
+///
+/// **A required column with no default is refused**, `error.NeedsBackfill`,
+/// with the statement it would have sent in the log. SQLite refuses that
+/// `ALTER` outright and Postgres refuses it on a table with rows, so on
+/// neither is it a statement this can send and mean. Give the field a
+/// `.default` in the marker — the rows already there get it and there is
+/// nothing to backfill — or make it optional, or write the version.
+///
+/// **A table that is not there is skipped**, because it is `createMissing`'s,
+/// and calling that first is the order the two lines above show. Nothing
+/// else is touched: a column the table has that the Row does not is left,
+/// a type that moved is left, and `db.checking` is what says so — this adds
+/// and does not alter, the same line `createMissing` draws.
+pub fn addMissingColumns(db: anytype, scope: anytype, comptime Rows: []const type) !usize {
+    const D = comptime DialectOf(@TypeOf(db));
+    comptime core.checkScope(@TypeOf(scope), "migrate.addMissingColumns");
+    const arena = scope.arena();
+
+    var tx = try db.begin(scope, .{});
+    errdefer tx.rollback();
+
+    var added: usize = 0;
+    inline for (Rows) |R| {
+        if (comptime row_mod.managedOf(R)) {
+            const t = comptime tableOf(D, R);
+            const q = comptime row_mod.qualifiedOf(R);
+            const live = try db.liveColumns(scope, q.schema, q.table);
+            if (live.len != 0) {
+                for (t.desc.columns) |c| {
+                    if (hasNamed(live, c.name)) continue;
+                    const sql = try ddl.addColumn(D, arena, t.desc, c);
+                    if (!c.nullable and c.default == null) {
+                        // A warning rather than an error, for the reason
+                        // `wireOf`'s is one: the call already fails on its
+                        // own, and `std.log.err` fails the test runner for
+                        // the test that provokes it.
+                        std.log.warn(
+                            "nilo_sql: {s} has a required column `{s}` that the table has not got, and no default to fill the rows already there. " ++
+                                "Not sent: `{s}`. Give the field a `.default` in the marker, make it optional, or write the version.",
+                            .{ @typeName(R), c.name, sql },
+                        );
+                        return Error.NeedsBackfill;
+                    }
+                    _ = try tx.exec(scope, sql, .{});
+                    added += 1;
+                }
+            }
+        }
+    }
+    try tx.commit();
+    return added;
+}
+
+fn hasNamed(columns: []const wire_mod.Column, name: []const u8) bool {
+    for (columns) |c| if (std.mem.eql(u8, c.name, name)) return true;
+    return false;
 }
 
 /// The ledger, made if it is not there. One statement, and it is the same

@@ -182,8 +182,11 @@ pub const Settings = struct {
     /// so this is paid per worker rather than per row.
     workers: u16 = 4,
     /// How long a worker with nothing to do waits before asking the store
-    /// again. One query per worker per interval, so this is the cost of an
-    /// idle queue and the latency of a busy one.
+    /// again, **when nothing wakes it first**. A `push` from this process
+    /// wakes a worker itself, so this is the latency only of a row pushed by
+    /// *another* process — a second binary on the same table — and the cost
+    /// of an idle queue: one query per worker per interval
+    /// ([ADR 0229](../docs/adr/0229-a-push-wakes-a-worker.md)).
     poll_ms: u32 = 1_000,
     /// How long one run may take, for a kind that names no `timeout_ms` of
     /// its own. Past it the run is cancelled and the row goes back to the
@@ -264,10 +267,16 @@ pub fn Jobs(comptime options: anytype) type {
         settings: Settings,
         statuses: if (StatusSpace == void) void else StatusSpace,
         io: ?std.Io = null,
-        limits: core.Limits = .off,
+        limits: core.Limits = .none,
         /// Set once the server is going, so a worker that has just finished
         /// a row does not claim another.
         stopping: std.atomic.Value(bool) = .init(false),
+        /// Bumped by every `push` and every `wake`, and what an idle worker
+        /// sleeps on. A worker reads it before it asks the store and sleeps
+        /// only while it is still that number, so a push that lands between
+        /// the empty answer and the sleep is not missed
+        /// ([ADR 0229](../docs/adr/0229-a-push-wakes-a-worker.md)).
+        wakes: std.atomic.Value(u32) = .init(0),
         /// How many worker loops are alive, for the health page.
         alive: std.atomic.Value(u32) = .init(0),
         /// Whether `serve` has been called, so `nilo_ready` can tell "no
@@ -365,17 +374,27 @@ pub fn Jobs(comptime options: anytype) type {
             const bytes = try std.json.Stringify.valueAlloc(scope.arena(), value, .{});
             const id = try self.store.push(scope, K.nilo_job, bytes, .{ .run_at = run_at, .unique = unique });
             if (o.unique) {
-                if (id) |i| self.note(i, .queued, 0);
+                if (id) |i| {
+                    self.note(i, .queued, 0);
+                    if (run_at <= now) self.wakeOne();
+                }
                 return id;
             }
             const i = id orelse unreachable;
             self.note(i, .queued, 0);
+            // A row due later is the poll's to find; waking a worker for it
+            // would be one empty claim now and the same wait after.
+            if (run_at <= now) self.wakeOne();
             return i;
         }
 
         /// `push` inside a transaction the caller holds, for a store that can
         /// join one — so the row commits with the caller's rows or not at
         /// all. `job.Memory` refuses this while compiling.
+        ///
+        /// **Nothing is woken here**, because the row is not there yet: a
+        /// worker woken now would claim before the commit and find nothing.
+        /// Call `wake` after `tx.commit()`, or let the next poll find it.
         pub fn pushIn(self: *Self, tx: anytype, scope: anytype, value: anytype, opts: anytype) !PushAnswer(@TypeOf(opts)) {
             comptime core.checkScope(@TypeOf(scope), "jobs.pushIn");
             comptime if (!@hasDecl(Store, "pushIn")) @compileError(
@@ -406,6 +425,25 @@ pub fn Jobs(comptime options: anytype) type {
 
         fn PushAnswer(comptime O: type) type {
             return if (@hasField(O, "unique")) ?Id else Id;
+        }
+
+        /// Wake every idle worker, for a row nilo did not see arrive: one
+        /// pushed by another process, or by `pushIn` under a transaction that
+        /// has since committed. A worker that is running a row is not
+        /// interrupted; it asks the store when it is done, as it always did.
+        ///
+        /// Safe before `serve` and safe with no worker at all — the bump is
+        /// kept, so the first worker to look asks the store straight away.
+        pub fn wake(self: *Self) void {
+            _ = self.wakes.fetchAdd(1, .release);
+            if (self.io) |io| io.futexWake(u32, &self.wakes.raw, std.math.maxInt(u32));
+        }
+
+        /// One worker, for one row. Waking all of them for one push would
+        /// be `workers - 1` empty claims against the store every time.
+        fn wakeOne(self: *Self) void {
+            _ = self.wakes.fetchAdd(1, .release);
+            if (self.io) |io| io.futexWake(u32, &self.wakes.raw, 1);
         }
 
         const PushOpts = struct {
@@ -486,6 +524,10 @@ pub fn Jobs(comptime options: anytype) type {
         /// no server in it. Returns when cancelled.
         pub fn serveOn(self: *Self, io: std.Io) std.Io.Cancelable!void {
             self.serving.store(true, .release);
+            // A worker process with no server never called `nilo_start`, and
+            // `wake` needs an `Io` to reach a sleeping worker through. The one
+            // the workers run on is the right one.
+            if (self.io == null) self.io = io;
             {
                 var run: core.Run = .initIo(self.gpa, io);
                 defer run.deinit();
@@ -543,24 +585,33 @@ pub fn Jobs(comptime options: anytype) type {
             var run: core.Run = .initIo(self.gpa, io);
             defer run.deinit();
 
-            const poll: std.Io.Duration = .fromMilliseconds(self.settings.poll_ms);
+            const poll: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(self.settings.poll_ms), .clock = .awake } };
             while (!self.stopping.load(.acquire)) {
                 defer run.reset();
                 // A queue that is never empty is a loop that never sleeps, and
                 // a cancellation is only seen at an `Io` call — so ask for it
                 // here, or a busy worker would outlive the shutdown.
                 try io.checkCancel();
+                // Read *before* the claim. A push that lands after the store
+                // said "nothing" and before the sleep bumps this, and the
+                // futex below then returns at once rather than waiting out
+                // the poll on a row that is already there.
+                const seen = self.wakes.load(.acquire);
                 const now = core.nowMicros();
                 const claimed = self.store.claim(&run, now, now + self.leaseMicros()) catch |err| {
                     if (err == error.Canceled) return error.Canceled;
                     std.log.scoped(.nilo_job).err("claim: {t}", .{err});
-                    try io.sleep(poll, .awake);
+                    try io.sleep(poll.duration.raw, .awake);
                     continue;
                 };
                 if (claimed) |c| {
                     self.execute(&run, c);
                 } else {
-                    try io.sleep(poll, .awake);
+                    // Until a push wakes it or the poll runs out, whichever
+                    // is first. A timeout comes back as a plain return, and
+                    // so does a spurious wake — either way the loop asks the
+                    // store, which is the only answer that counts.
+                    try io.futexWaitTimeout(u32, &self.wakes.raw, seen, poll);
                 }
             }
         }
@@ -1362,7 +1413,7 @@ test "the worker loop runs under std.Io.Threaded and stops when cancelled" {
     var ledger: Ledger = .{ .gpa = testing.allocator };
     defer ledger.deinit();
     var jobs: LoopJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{ .workers = 2, .poll_ms = 5 });
-    try jobs.nilo_start(io, .off);
+    try jobs.nilo_start(io, .none);
 
     var run: core.Run = .init(testing.allocator);
     defer run.deinit();
@@ -1388,4 +1439,78 @@ test "the worker loop runs under std.Io.Threaded and stops when cancelled" {
     const outcome = serving.cancel(io);
     try testing.expectError(error.Canceled, outcome);
     try testing.expectEqual(@as(u32, 0), jobs.alive.load(.acquire));
+}
+
+/// How long the test thread waits for a worker to run a row before it
+/// gives up. The worker's own poll is a minute, so anything that arrives
+/// inside this bound arrived because it was woken (ADR 0229).
+const wake_bound_ms = 2_000;
+
+fn waitForLine(io: std.Io, ledger: *Ledger, count: usize) !void {
+    var waited: u32 = 0;
+    while (ledger.lines.items.len < count and waited < wake_bound_ms) : (waited += 1) try io.sleep(.fromMilliseconds(1), .awake);
+    try testing.expectEqual(count, ledger.lines.items.len);
+}
+
+test "a push wakes a sleeping worker rather than waiting out the poll" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var ledger: Ledger = .{ .gpa = testing.allocator };
+    defer ledger.deinit();
+    // A poll of a minute, so the poll cannot be what runs the row.
+    var jobs: LoopJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{ .workers = 2, .poll_ms = 60_000 });
+    try jobs.nilo_start(io, .none);
+
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    var serving = try io.concurrent(LoopJobs.serveOn, .{ &jobs, io });
+    defer serving.cancel(io) catch {};
+
+    // Both workers asleep on an empty queue before anything is pushed —
+    // this is the case a poll would make the caller wait a minute for.
+    var waited: u32 = 0;
+    while (jobs.alive.load(.acquire) < 2 and waited < wake_bound_ms) : (waited += 1) try io.sleep(.fromMilliseconds(1), .awake);
+    try io.sleep(.fromMilliseconds(20), .awake);
+
+    _ = try jobs.push(&run, Greet{ .who = .static("first") }, .{});
+    try waitForLine(io, &ledger, 1);
+
+    // And again, once the worker has gone back to sleep: the wake is per
+    // push rather than a one-shot.
+    try io.sleep(.fromMilliseconds(20), .awake);
+    _ = try jobs.push(&run, Greet{ .who = .static("second") }, .{});
+    try waitForLine(io, &ledger, 2);
+}
+
+test "wake reaches a worker for a row nilo did not push" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var ledger: Ledger = .{ .gpa = testing.allocator };
+    defer ledger.deinit();
+    var jobs: LoopJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{ .workers = 1, .poll_ms = 60_000 });
+
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    // `serveOn` with no `nilo_start` first: the worker-process shape, where
+    // the `Io` the workers run on is the one a wake goes through.
+    var serving = try io.concurrent(LoopJobs.serveOn, .{ &jobs, io });
+    defer serving.cancel(io) catch {};
+    var waited: u32 = 0;
+    while (jobs.alive.load(.acquire) < 1 and waited < wake_bound_ms) : (waited += 1) try io.sleep(.fromMilliseconds(1), .awake);
+    try io.sleep(.fromMilliseconds(20), .awake);
+
+    // Straight into the store, the way another process would put it there.
+    _ = try store.push(&run, "greet", "{\"who\":\"elsewhere\"}", .{ .run_at = core.nowMicros() });
+    jobs.wake();
+    try waitForLine(io, &ledger, 1);
 }

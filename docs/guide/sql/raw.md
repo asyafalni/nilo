@@ -64,6 +64,26 @@ parsed by `std.json` into `T`'s field names **as written**: a `rename_all`
 on `T` spells the response and not the column, so the `jsonb_build_object`
 names `content_type` and the wire says `contentType`, from one type.
 
+## One column, no Row
+
+A statement that answers one column — a name off the catalogue, an id, a
+count — has no shape worth a struct. Hand `raw` the column's type instead of
+a Row and it reads column one of every row
+([ADR 0234](../../adr/0234-a-scalar-out-of-raw.md)):
+
+<!-- compiles: body -->
+```zig
+const names = try db.raw([]const u8, c, "SELECT name FROM pragma_table_info('downloads')", .{});
+const newest = try db.rawOne(i64, c, "SELECT max(id) FROM comments", .{});
+```
+
+`[]const u8`, `i64`, `?bool`, a `nilo.Str` — any one thing a column can be
+read as, or an optional of one — and the value goes through the same read a
+Row's field does, so a `Str` is the Scope's and a slice is kept in the
+arena. `rawOne` is the same with the unwrap done. A `SELECT` list of two
+into a scalar is a compile error, the way a short list into a Row is: the
+statement is still counted.
+
 ## A statement that answers with nothing
 
 `CREATE TABLE`, `CREATE INDEX`, `PRAGMA`, `VACUUM`, `ANALYZE`, a `DELETE` you

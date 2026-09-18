@@ -393,7 +393,7 @@ than the snippet above
 ```zig
 var threaded: std.Io.Threaded = .init(gpa, .{});   // std's own, not the Engine
 defer threaded.deinit();
-try db.nilo_start(threaded.io(), .off);                  // the pool is open from here
+try db.nilo_start(threaded.io(), .none);                  // the pool is open from here
 
 var run = nilo.Run.init(gpa);
 defer run.deinit();

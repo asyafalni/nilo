@@ -20,6 +20,22 @@ const testing = std.testing;
 
 /// A server that answers exactly what a test asked it to, once per
 /// connection. Not an HTTP server — just enough of one to drive a client.
+///
+/// **Every test starts one with `io.concurrent`, and `io.async` is the
+/// deadlock this file held for a day.** `std.Io.async` is allowed to run the
+/// function on the calling thread — `Threaded` does exactly that whenever
+/// its pool counts as many busy tasks as it has spare cores, which on a
+/// two-core machine is one. Until ADR 0230 nothing here ever had a task in
+/// flight while a server was being started, so the inline path was never
+/// taken. Now every bounded call runs as a task of its own, and the worker
+/// that ran it wakes the awaiter *before* it takes the pool's lock to count
+/// itself free — so the very next `io.async(serveOne)` can see the pool
+/// full, run `accept` on the test's own thread, and wait there for a
+/// connection that thread was about to make. Found at test 19 of 34 with
+/// two of these binaries running at once, at zero CPU, the way `CLAUDE.md`
+/// says to look. `concurrent` is the call whose contract is the one the
+/// harness actually needs: the server has to be on another thread, or
+/// there is no test.
 const Canned = struct {
     server: std.Io.net.Server,
     io: std.Io,
@@ -413,6 +429,87 @@ const Canned = struct {
         }
     }
 
+    /// Accept, read the head, and never answer: the endpoint that takes the
+    /// connection and then says nothing, which is the whole reason a
+    /// deadline exists. Holds the socket until the client gives up on it,
+    /// which is what closes it from the far side.
+    fn serveSilence(self: *Canned) !void {
+        var stream = try self.server.accept(self.io);
+        defer stream.close(self.io);
+        self.accepted += 1;
+
+        var in_buf: [4 << 10]u8 = undefined;
+        var reader = stream.reader(self.io, &in_buf);
+        while (true) {
+            const line = try reader.interface.takeDelimiterInclusive('\n');
+            if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
+        }
+        // Nothing more is coming from the client, so this is EOF when the
+        // client closes and nothing before that.
+        _ = reader.interface.takeByte() catch {};
+    }
+
+    /// A head that promises `body_len` bytes and sends three of them, then
+    /// stalls the way `serveSilence` does. The deadline has to cover the
+    /// body as well as the head, or a server that answers at once and then
+    /// trickles is outside it.
+    fn serveThenStall(self: *Canned) !void {
+        var stream = try self.server.accept(self.io);
+        defer stream.close(self.io);
+        self.accepted += 1;
+
+        var in_buf: [4 << 10]u8 = undefined;
+        var out_buf: [4 << 10]u8 = undefined;
+        var reader = stream.reader(self.io, &in_buf);
+        var writer = stream.writer(self.io, &out_buf);
+        while (true) {
+            const line = try reader.interface.takeDelimiterInclusive('\n');
+            if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
+        }
+        const w = &writer.interface;
+        try w.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{self.body_len});
+        try w.writeAll("xxx");
+        try w.flush();
+        _ = reader.interface.takeByte() catch {};
+    }
+
+    /// A `302` to `/moved` and then a `200`, on **one** connection: a chain
+    /// of one, for the test about where it ended. One connection because
+    /// std pools the first and comes back on it for the second — a server
+    /// that hung up after the 302 would hand the client a reaped socket,
+    /// and the stale-connection retry would then send the *original* URL
+    /// again on a fresh one, which is a different test.
+    fn serveRedirectThenOne(self: *Canned) !void {
+        var stream = try self.server.accept(self.io);
+        defer stream.close(self.io);
+        self.accepted += 1;
+
+        var in_buf: [4 << 10]u8 = undefined;
+        var out_buf: [4 << 10]u8 = undefined;
+        var reader = stream.reader(self.io, &in_buf);
+        var writer = stream.writer(self.io, &out_buf);
+        for (0..2) |n| {
+            while (true) {
+                const line = try reader.interface.takeDelimiterInclusive('\n');
+                const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+                if (trimmed.len == 0) break;
+                const room = self.seen.len - self.seen_len;
+                if (room < trimmed.len + 1) continue;
+                @memcpy(self.seen[self.seen_len..][0..trimmed.len], trimmed);
+                self.seen[self.seen_len + trimmed.len] = '\n';
+                self.seen_len += trimmed.len + 1;
+            }
+            const w = &writer.interface;
+            if (n == 0) {
+                try w.print("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{d}/moved\r\nContent-Length: 0\r\n\r\n", .{self.port});
+            } else {
+                try w.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{self.body_len});
+                try w.splatByteAll('x', self.body_len);
+            }
+            try w.flush();
+        }
+    }
+
     fn close(self: *Canned) void {
         self.server.socket.close(self.io);
     }
@@ -426,18 +523,19 @@ fn withIo(comptime body: fn (std.Io) anyerror!void) !void {
     try body(threaded.io());
 }
 
-/// A client wired the way `listen()` would wire it.
+/// A client wired the way a CLI or a worker wires it.
 ///
-/// `.off` rather than the Engine's `Limits`, because there is no Engine here
-/// and that is the whole point of the file. **So nothing below arms a real
-/// deadline**, and the timeout is the one behaviour these tests cannot reach:
-/// firing one needs something that can cancel a fiber, which is the Engine.
-/// What *can* be checked without one is the decision the timeout leads to —
-/// telling a deadline from a shutdown — and `fetch.zig` does that against a
-/// hand-made `Limits` rather than pretending this file covers it.
+/// `.none` rather than the Engine's `Limits`, because there is no Engine here
+/// and that is the whole point of the file. Until ADR 0230 that meant the
+/// timeout was the one behaviour these tests could not reach — arming one
+/// needed something that could cancel a fiber. Now it means the client bounds
+/// the call itself, as a task of this `Io`, and the two tests under "a
+/// deadline with no Engine" below are where that is seen to fire. The other
+/// half — telling a deadline from a shutdown — is still `fetch.zig`'s, against
+/// a hand-made `Limits`.
 fn started(io: std.Io, settings: fetch.Client.Settings) !fetch.Client {
     var client: fetch.Client = .init(testing.allocator, settings);
-    try client.nilo_start(io, .off);
+    try client.nilo_start(io, .none);
     return client;
 }
 
@@ -448,7 +546,7 @@ test "a body comes back as request-lifetime text" {
             defer canned.close();
             canned.body_len = 11;
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{});
@@ -478,7 +576,7 @@ test "a body over the ceiling stops at the ceiling" {
             defer canned.close();
             canned.body_len = 4096;
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{ .max_body = 1024 });
@@ -506,7 +604,7 @@ test "a server that lies about content-length does not get past the ceiling" {
             canned.body_len = 4096;
             canned.claim_len = 10;
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{ .max_body = 1024 });
@@ -534,7 +632,7 @@ test "the status a caller checks is the status that arrived" {
             canned.status = "503 Service Unavailable";
             canned.body_len = 4;
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{});
@@ -561,7 +659,7 @@ test "a body sent is a body the other end reads" {
             defer canned.close();
             canned.body_len = 2;
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{});
@@ -585,7 +683,7 @@ test "a header a caller adds is a header that arrives" {
             var canned = try Canned.open(io);
             defer canned.close();
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{});
@@ -605,6 +703,198 @@ test "a header a caller adds is a header that arrives" {
                 canned.seen[0..canned.seen_len],
                 "Bearer wati",
             ) != null);
+        }
+    }.run);
+}
+
+test "a header std has a slot for goes out once, and it is the caller's" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            // The three a pasted `curl` line carries, in the browser's own
+            // capitalisation, and one std writes a default for regardless.
+            var buf: [64]u8 = undefined;
+            _ = try client.get(&scope, try canned.url(&buf), .{
+                .headers = &.{
+                    .{ .name = "User-Agent", .value = "Mozilla/5.0 (pasted)" },
+                    .{ .name = "Host", .value = "cdn.example" },
+                    .{ .name = "Authorization", .value = "Bearer once" },
+                    .{ .name = "Accept-Encoding", .value = "br" },
+                },
+            });
+
+            served.await(io) catch {};
+            const seen = canned.seen[0..canned.seen_len];
+            try testing.expectEqual(@as(usize, 1), countLines(seen, "user-agent:"));
+            try testing.expectEqual(@as(usize, 1), countLines(seen, "host:"));
+            try testing.expectEqual(@as(usize, 1), countLines(seen, "authorization:"));
+            try testing.expectEqual(@as(usize, 1), countLines(seen, "accept-encoding:"));
+            // And the one copy is the caller's, not std's.
+            try testing.expect(std.mem.indexOf(u8, seen, "Mozilla/5.0 (pasted)") != null);
+            try testing.expect(std.mem.indexOf(u8, seen, "cdn.example") != null);
+            try testing.expect(std.mem.indexOf(u8, seen, "br") != null);
+            try testing.expect(std.mem.indexOf(u8, seen, "identity") == null);
+        }
+    }.run);
+}
+
+/// How many header lines in `head` start with `name`, case-insensitively.
+fn countLines(head: []const u8, name: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, head, '\n');
+    while (it.next()) |line| {
+        if (std.ascii.startsWithIgnoreCase(line, name)) n += 1;
+    }
+    return n;
+}
+
+// ---- a deadline with no Engine (ADR 0230) ----
+
+/// Wide enough that a slow machine passes, and an order of magnitude under
+/// what an unbounded call would take: the silent server holds until the
+/// client gives up, so a call with no working deadline never comes back.
+const deadline_slack_ms = 5_000;
+
+test "a deadline fires on std.Io.Threaded, with no Engine anywhere" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = try io.concurrent(Canned.serveSilence, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{ .timeout_ms = 200 });
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const started_at = core.monotonicMicros();
+            try testing.expectError(error.TimedOut, client.get(&scope, try canned.url(&buf), .{}));
+            const took_ms = @divFloor(core.monotonicMicros() - started_at, std.time.us_per_ms);
+            try testing.expect(took_ms >= 150);
+            try testing.expect(took_ms < deadline_slack_ms);
+
+            // And the client is still good for the next call: the permit
+            // came back and nothing is held.
+            try testing.expectEqual(@as(usize, client.settings.max_in_flight), client.gate.permits);
+        }
+    }.run);
+}
+
+test "a body that stalls after the head is a timeout too, and it is per call" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 10;
+
+            var served = try io.concurrent(Canned.serveThenStall, .{&canned});
+            defer served.cancel(io) catch {};
+
+            // The client's own timeout is generous; the call's is not.
+            var client = try started(io, .{ .timeout_ms = 60_000 });
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const started_at = core.monotonicMicros();
+            try testing.expectError(error.TimedOut, client.get(&scope, try canned.url(&buf), .{ .timeout_ms = 200 }));
+            const took_ms = @divFloor(core.monotonicMicros() - started_at, std.time.us_per_ms);
+            try testing.expect(took_ms < deadline_slack_ms);
+        }
+    }.run);
+}
+
+test "a redirect that was followed says where it ended, and one that was not says nothing" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 4;
+
+            var served = try io.concurrent(Canned.serveRedirectThenOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            var redirect: [1 << 10]u8 = undefined;
+            var transfer: [1 << 10]u8 = undefined;
+
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            const head = try ex.begin(&client, .{
+                .method = .GET,
+                .url = try canned.url(&buf),
+                .redirect_buffer = &redirect,
+                .transfer_buffer = &transfer,
+            });
+            try testing.expect(head.ok());
+
+            var where: [128]u8 = undefined;
+            const landed = (try head.location(&where)).?;
+            var want: [64]u8 = undefined;
+            try testing.expectEqualStrings(
+                try std.fmt.bufPrint(&want, "http://127.0.0.1:{d}/moved", .{canned.port}),
+                landed,
+            );
+            // The second request went to the new path, not the old one.
+            served.await(io) catch {};
+            try testing.expect(std.mem.indexOf(u8, canned.seen[0..canned.seen_len], "GET /moved ") != null);
+
+            const body = try ex.take(&scope, 1 << 10);
+            try testing.expectEqualStrings("xxxx", body.view());
+        }
+    }.run);
+
+    // The control: an answer from the URL that was asked for.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 1;
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var buf: [64]u8 = undefined;
+            var redirect: [1 << 10]u8 = undefined;
+            var transfer: [1 << 10]u8 = undefined;
+
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            const head = try ex.begin(&client, .{
+                .method = .GET,
+                .url = try canned.url(&buf),
+                .redirect_buffer = &redirect,
+                .transfer_buffer = &transfer,
+            });
+            var where: [128]u8 = undefined;
+            try testing.expect((try head.location(&where)) == null);
+            try testing.expect(head.redirected == null);
         }
     }.run);
 }
@@ -643,7 +933,7 @@ test "a call made under a request carries the request's id, and one under a Run 
             // A Run: no request, no header.
             {
                 canned.seen_len = 0;
-                var served = io.async(Canned.serveOne, .{&canned});
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
                 defer served.cancel(io) catch {};
                 _ = try client.get(&scope, try canned.url(&buf), .{});
                 served.await(io) catch {};
@@ -654,7 +944,7 @@ test "a call made under a request carries the request's id, and one under a Run 
             var named: Named = .{ .run = &scope, .id = "7f3a9c1e5b2d4086" };
             {
                 canned.seen_len = 0;
-                var served = io.async(Canned.serveOne, .{&canned});
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
                 defer served.cancel(io) catch {};
                 _ = try client.get(&named, try canned.url(&buf), .{});
                 served.await(io) catch {};
@@ -664,7 +954,7 @@ test "a call made under a request carries the request's id, and one under a Run 
             // And beside the caller's own headers, both arriving.
             {
                 canned.seen_len = 0;
-                var served = io.async(Canned.serveOne, .{&canned});
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
                 defer served.cancel(io) catch {};
                 _ = try client.get(&named, try canned.url(&buf), .{
                     .headers = &.{.{ .name = "Authorization", .value = "Bearer wati" }},
@@ -693,7 +983,7 @@ test "a caller's own X-Request-Id wins, and the setting turns the header off" {
                 var client = try started(io, .{});
                 defer client.deinit();
                 canned.seen_len = 0;
-                var served = io.async(Canned.serveOne, .{&canned});
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
                 defer served.cancel(io) catch {};
                 _ = try client.get(&named, try canned.url(&buf), .{
                     .headers = &.{.{ .name = "x-request-id", .value = "theirs" }},
@@ -708,7 +998,7 @@ test "a caller's own X-Request-Id wins, and the setting turns the header off" {
                 var client = try started(io, .{ .forward_request_id = false });
                 defer client.deinit();
                 canned.seen_len = 0;
-                var served = io.async(Canned.serveOne, .{&canned});
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
                 defer served.cancel(io) catch {};
                 _ = try client.get(&named, try canned.url(&buf), .{});
                 served.await(io) catch {};
@@ -750,7 +1040,7 @@ test "the body is asked for uncompressed, so what comes back is the body" {
             defer canned.close();
             canned.body_len = 4;
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{});
@@ -800,7 +1090,7 @@ test "a refused body costs the connection rather than the download" {
             // the body alone.
             canned.body_len = 32 << 10;
 
-            var served = io.async(Canned.serveEach, .{ &canned, @as(usize, 2) });
+            var served = try io.concurrent(Canned.serveEach, .{ &canned, @as(usize, 2) });
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{ .max_body = 1024, .max_drain = 8 << 10 });
@@ -830,7 +1120,7 @@ test "a leftover under the ceiling is read, and the connection stays" {
             defer canned.close();
             canned.body_len = 32 << 10;
 
-            var served = io.async(Canned.serveEach, .{ &canned, @as(usize, 2) });
+            var served = try io.concurrent(Canned.serveEach, .{ &canned, @as(usize, 2) });
             defer served.cancel(io) catch {};
 
             // The same body and the same refusal, with the ceiling moved above
@@ -859,6 +1149,44 @@ test "a leftover under the ceiling is read, and the connection stays" {
     }.run);
 }
 
+test "discard closes the connection whatever the drain policy would have kept" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 32 << 10;
+
+            var served = try io.concurrent(Canned.serveEach, .{ &canned, @as(usize, 2) });
+            defer served.cancel(io) catch {};
+
+            // The same ceiling as the control above, under which `end`
+            // would read the 32 KiB to keep the connection. The caller
+            // knows better — a probe that got the whole file — and says so.
+            var client = try started(io, .{ .max_drain = 1 << 20 });
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const url = try canned.url(&buf);
+            var transfer: [1 << 10]u8 = undefined;
+
+            {
+                var ex: fetch.Exchange = .idle;
+                defer ex.end();
+                const head = try ex.begin(&client, .{ .method = .GET, .url = url, .transfer_buffer = &transfer });
+                try testing.expectEqual(@as(u64, 32 << 10), head.content_length.?);
+                ex.discard();
+            }
+            _ = client.get(&scope, url, .{}) catch {};
+
+            // Two connections: the first went with the body it did not read.
+            try testing.expectEqual(@as(usize, 2), canned.accepted);
+        }
+    }.run);
+}
+
 test "a response header is readable before the body is touched" {
     try withIo(struct {
         fn run(io: std.Io) !void {
@@ -867,7 +1195,7 @@ test "a response header is readable before the body is touched" {
             canned.body_len = 5;
             canned.extra = "ETag: \"d41d8cd9\"\r\nx-amz-request-id: 8F2C\r\n";
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{});
@@ -909,7 +1237,7 @@ test "a body piped out is written rather than held" {
             defer canned.close();
             canned.body_len = 4096;
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{});
@@ -947,7 +1275,7 @@ test "a streamed body sends exactly the length it announced" {
             var canned = try Canned.open(io);
             defer canned.close();
 
-            var served = io.async(Canned.serveWithBody, .{&canned});
+            var served = try io.concurrent(Canned.serveWithBody, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{});
@@ -999,7 +1327,7 @@ test "a body decides the framing, not the method: a DELETE with one and a PATCH 
             var canned = try Canned.open(io);
             defer canned.close();
 
-            var served = io.async(Canned.serveWithBody, .{&canned});
+            var served = try io.concurrent(Canned.serveWithBody, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{});
@@ -1029,7 +1357,7 @@ test "a body decides the framing, not the method: a DELETE with one and a PATCH 
             var canned = try Canned.open(io);
             defer canned.close();
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{});
@@ -1064,7 +1392,7 @@ test "a 204 with no content-length ends at its head, and the connection is still
             defer canned.close();
             canned.body_len = 3;
 
-            var served = io.async(Canned.serveNoContentThenOne, .{&canned});
+            var served = try io.concurrent(Canned.serveNoContentThenOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{});
@@ -1100,7 +1428,7 @@ test "a signed call says its own host and authorization, verbatim" {
             var canned = try Canned.open(io);
             defer canned.close();
 
-            var served = io.async(Canned.serveOne, .{&canned});
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var client = try started(io, .{});
@@ -1198,7 +1526,7 @@ test "a call on a warm connection allocates once, and it is the body" {
             // than of a call — counting them here would report a number no
             // steady-state request ever pays. The same reason `http/app.zig`'s
             // budget test warms the arena before it counts.
-            var served = io.async(Canned.serveKeepAlive, .{ &canned, @as(usize, 2) });
+            var served = try io.concurrent(Canned.serveKeepAlive, .{ &canned, @as(usize, 2) });
             defer served.cancel(io) catch {};
 
             _ = try client.get(&scope, url, .{});
@@ -1238,7 +1566,7 @@ test "a pooled connection the peer already closed costs one retry, not a failure
             var buf: [64]u8 = undefined;
             const url = try canned.url(&buf);
 
-            var served = io.async(Canned.serveThenReap, .{&canned});
+            var served = try io.concurrent(Canned.serveThenReap, .{&canned});
             defer served.cancel(io) catch {};
 
             // The call that leaves a connection in the pool. The server has
@@ -1275,7 +1603,7 @@ test "a pooled connection the peer reset costs one retry too" {
             var buf: [64]u8 = undefined;
             const url = try canned.url(&buf);
 
-            var served = io.async(Canned.serveThenReset, .{&canned});
+            var served = try io.concurrent(Canned.serveThenReset, .{&canned});
             defer served.cancel(io) catch {};
 
             const first = try client.get(&scope, url, .{});

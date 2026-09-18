@@ -2831,6 +2831,74 @@ test "the table nilo creates for an array default is one its own check accepts" 
     try testing.expectEqual(@as(usize, 0), try db.checkSchema(&.{Agent}));
 }
 
+/// The shape `addMissingColumns` is asked about on Postgres: a table that
+/// shipped with two columns and a Row that has three more.
+const Shipped = struct {
+    pub const nilo_table = .{ .name = shipped_table, .key = .id };
+    id: i64,
+    url: []const u8,
+};
+
+const Widened = struct {
+    pub const nilo_table = .{
+        .name = shipped_table,
+        .key = .id,
+        .default = .{ .named = false, .tries = 0 },
+    };
+    id: i64,
+    url: []const u8,
+    sha256: ?[]const u8,
+    named: bool,
+    tries: i64,
+};
+
+const shipped_table = "nilo_live_shipped_" ++ mode_suffix;
+
+test "addMissingColumns widens a Postgres table the way createMissing would have made it" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    const arena = live.arena.allocator();
+    var db = db_mod.Db.init(gpa, "already open", .{});
+    db.wire = live.wire;
+    var run: nilo.Run = .init(gpa);
+    defer run.deinit();
+
+    {
+        var rows = try live.wire.run(arena, "DROP TABLE IF EXISTS " ++ shipped_table, .{}, null, null);
+        live.wire.drain(&rows);
+    }
+    defer if (live.wire.run(arena, "DROP TABLE IF EXISTS " ++ shipped_table, .{}, null, null)) |dropped| {
+        var rows = dropped;
+        live.wire.drain(&rows);
+    } else |_| {};
+
+    try migrate.createMissing(&db, &run, &.{Shipped});
+    _ = try db.insert(Shipped, &run, .{ .url = "http://a/1" });
+
+    // Through `pg_catalog` rather than `pragma_table_info`, which is the
+    // half of ADR 0233 the SQLite file cannot reach.
+    try testing.expectEqual(@as(usize, 3), try migrate.addMissingColumns(&db, &run, &.{Widened}));
+    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&db, &run, &.{Widened}));
+
+    const rows = try db.select(Widened, &run, .{});
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expect(!rows[0].named);
+    try testing.expectEqual(@as(i64, 0), rows[0].tries);
+    try testing.expectEqual(@as(?[]const u8, null), rows[0].sha256);
+    try testing.expectEqual(@as(usize, 0), try db.checkSchema(&.{Widened}));
+
+    // And a scalar read off the catalogue, the way the SQLite test reads
+    // `pragma_table_info` (ADR 0234).
+    const names = try db.raw([]const u8, &run,
+        "SELECT column_name::text FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position",
+        .{@as([]const u8, shipped_table)},
+    );
+    try testing.expectEqual(@as(usize, 5), names.len);
+    try testing.expectEqualStrings("tries", names[4]);
+}
+
 // -- the second kind of word, against a database that reads it (ADR 0226) --
 
 /// A table whose `CHECK` and whose trigger come out of the marker rather than

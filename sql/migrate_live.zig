@@ -850,6 +850,84 @@ test "an added column is one ALTER, planned with no database and applied to one"
     try testing.expectEqual(@as(?[]const u8, null), rows[0].note);
 }
 
+test "addMissingColumns adds what the Row has and the table has not, typed as createMissing would" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "widened");
+    defer fx.deinit(gpa);
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id };
+        id: i64,
+        url: []const u8,
+    };
+    // The three fdm added after its first release: text that may be null, a
+    // flag with a default, and a required count with a default.
+    const After = struct {
+        pub const nilo_table = .{
+            .name = "downloads",
+            .key = .id,
+            .default = .{ .named = false, .tries = 0 },
+        };
+        id: i64,
+        url: []const u8,
+        sha256: ?[]const u8,
+        named: bool,
+        tries: i64,
+    };
+
+    try migrate.createMissing(&fx.db, &fx.run, &.{Before});
+    _ = try fx.db.insert(Before, &fx.run, .{ .url = "http://a/1" });
+
+    // Three columns, once; then nothing, which is what a boot needs.
+    try testing.expectEqual(@as(usize, 3), try migrate.addMissingColumns(&fx.db, &fx.run, &.{After}));
+    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, &.{After}));
+
+    // The row survived, the defaults filled it, and the shape the check
+    // accepts is the shape it would have accepted from `createMissing`.
+    const rows = try fx.db.select(After, &fx.run, .{});
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqual(@as(?[]const u8, null), rows[0].sha256);
+    try testing.expect(!rows[0].named);
+    try testing.expectEqual(@as(i64, 0), rows[0].tries);
+    try testing.expectEqual(@as(usize, 0), try fx.db.checkSchema(&.{After}));
+
+    // A table that is not there is skipped, not altered.
+    const Elsewhere = struct {
+        pub const nilo_table = .{ .name = "nowhere", .key = .id };
+        id: i64,
+        note: ?[]const u8,
+    };
+    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, &.{Elsewhere}));
+}
+
+test "addMissingColumns refuses a required column with no default, and sends nothing" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "refused");
+    defer fx.deinit(gpa);
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id };
+        id: i64,
+        url: []const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id };
+        id: i64,
+        url: []const u8,
+        // Would be added first and is fine on its own …
+        note: ?[]const u8,
+        // … and this one has nothing to fill the rows already there.
+        owner: []const u8,
+    };
+
+    try migrate.createMissing(&fx.db, &fx.run, &.{Before});
+    try testing.expectError(error.NeedsBackfill, migrate.addMissingColumns(&fx.db, &fx.run, &.{After}));
+    // One transaction: the column that was fine did not land either.
+    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, &.{Before}));
+    const live = try fx.db.liveColumns(&fx.run, null, "downloads");
+    try testing.expectEqual(@as(usize, 2), live.len);
+}
+
 test "applyPending runs what is missing and leaves what is there, in order" {
     const gpa = testing.allocator;
     var fx = try Fixture.init(gpa, "pending");

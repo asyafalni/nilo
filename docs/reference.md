@@ -1159,13 +1159,16 @@ no request. Handing over something that is neither is a Refusal naming the call.
 | Field | Default | |
 |---|---|---|
 | `max_in_flight` | 32 | calls at once, across every host. Past it a caller waits for a permit rather than opening another connection — an HTTPS one holds 59,151 bytes |
-| `timeout_ms` | 30,000 | how long one whole call may take. `0` is no limit — and so is a client started with `nilo_start(io, .off)`, which has nothing to fire it |
+| `timeout_ms` | 30,000 | how long one whole call may take. `0` is no limit. It fires with or without an Engine: under `listen()` the Engine cancels the fiber; on a client started with `nilo_start(io, .none)` each step of the call runs as a task of that `Io` and the task is cancelled — one thread hop per step, paid only there ([ADR 0230](./adr/0230-a-deadline-with-no-engine-cancels-a-task.md)) |
 | `max_body` | 8 MiB | a longer body is `error.BodyTooLarge`, enforced while reading |
 | `max_drain` | 64 KiB | how much of an unread body is worth reading to keep a pooled connection. Past it the connection is dropped |
 | `forward_request_id` | true | a call made under a `*Ctx` sends the request's id as `X-Request-Id`, so the other side's log lines up with this one. A `Run` has no id and sends none; a call naming its own `X-Request-Id` in `headers` keeps it ([ADR 0196](./adr/0196-a-request-id-goes-out-with-the-call.md)) |
 
 **`Client.Call`**, given per call: `headers`, and `timeout_ms` / `max_body` to
-override the settings above for one call.
+override the settings above for one call. A header in `headers` that std has
+a slot for — `host`, `authorization`, `user-agent`, `content-type`,
+`connection`, `accept-encoding` — is sent **once**, the caller's copy, rather
+than beside std's ([ADR 0231](./adr/0231-a-header-std-owns-goes-out-once.md)).
 
 **An answer with no body by rule ends at its head.** A HEAD's answer, a 1xx,
 a 204 and a 304 are complete at the blank line whatever `content-length` or
@@ -1217,16 +1220,20 @@ _ = try ex.pipe(&body.writer);   // straight out, allocating nothing
 
 | | |
 |---|---|
-| `ex.begin(client, .{…})` | `Head` — status, `content_length`, `content_type`, `header(name)` (case-insensitive), `ok()` |
+| `ex.begin(client, .{…})` | `Head` — status, `content_length`, `content_type`, `header(name)` (case-insensitive), `ok()`, and `redirected` / `location(&buf)`: the `std.Uri` a followed redirect ended at, or null, and the same as one string. Its text lives in the `redirect_buffer` the call was given ([ADR 0232](./adr/0232-a-followed-redirect-says-where-it-ended.md)) |
 | `ex.take(c, max)` | the rest of the body as a `Str` in the Scope, refusing over `max` |
 | `ex.readInto(buf)` | exactly `buf.len` bytes, or `error.BodyTooShort` |
 | `ex.pipe(w)` | the rest into a `*std.Io.Writer`, and how many bytes |
+| `ex.discard()` | "I will not read this body; close the connection" — for the probe that got the whole file. `max_drain` stays a policy rather than a lever ([ADR 0235](./adr/0235-a-caller-that-knows-says-discard.md)) |
 | `ex.end()` | required, and safe twice |
 
 `Begin` takes `headers`, `host`, `authorization`, `content_type`, `user_agent`, `timeout_ms`,
 a `body` of `.none` / `.slice` / `.stream`, and the two buffers — an empty
 `redirect_buffer` means redirects are not followed, which is what a signed
-request wants. **The buffers are the caller's because their cost is the
+request wants. A name in `headers` that std has a slot for tells std to leave
+the slot out, so the line goes once; the explicit fields are the form for a
+caller who has the value and not a line, and a field *and* the line is two
+lines ([ADR 0231](./adr/0231-a-header-std-owns-goes-out-once.md)). **The buffers are the caller's because their cost is the
 caller's stack**, and by
 [ADR 0063](./adr/0063-a-handlers-stack-is-per-connection.md) that is per
 connection.
@@ -1298,7 +1305,8 @@ A field that is a `*T` is a Refusal naming the field; a `run` that asks for a
 | `Jobs.open(gpa, &store, deps, settings)` | the queue. `openWith(…, space)` when `.status` names a Space |
 | `Jobs.Row` | the store's table, for `createMissing` and `db.checking`; `void` for `job.Memory` |
 | `jobs.push(c, value, opts)` | `!Id`; `!?Id` when `opts` has `.unique`, null when a row already carries the key |
-| `jobs.pushIn(&tx, c, value, opts)` | the same inside a transaction you hold. A Refusal on `job.Memory`, and with `.within` |
+| `jobs.pushIn(&tx, c, value, opts)` | the same inside a transaction you hold. A Refusal on `job.Memory`, and with `.within`. Wakes nobody — the row is not there until the commit — so call `wake` after it |
+| `jobs.wake()` | wake every idle worker, for a row nilo did not see arrive: another process's, or one `pushIn` put under a transaction that has since committed. A `push` wakes one worker itself ([ADR 0229](./adr/0229-a-push-wakes-a-worker.md)) |
 | `jobs.stats(c)` | `Stats` — `queued`, `running`, `dead` |
 | `jobs.status(id)` | `?job.Status` — `state` and `attempts`, from the Space, while it remembers |
 | `jobs.deadOnes(c)` | `[]Dead` — `id`, `kind`, `attempts`, `err`, newest first |
@@ -1322,7 +1330,7 @@ A field that is a `*T` is a Refusal naming the field; a `run` that asks for a
 | Field | Default | |
 |---|---|---|
 | `workers` | 4 | rows running at once in this process. A fiber each, its stack held at the high-water mark ([ADR 0063](./adr/0063-a-handlers-stack-is-per-connection.md)) |
-| `poll_ms` | 1,000 | how long an idle worker waits before asking again. One claim per worker per interval |
+| `poll_ms` | 1,000 | how long an idle worker waits before asking again **when nothing wakes it first**. A `push` from this process wakes a worker, so this is the latency only of a row another process pushed, and the cost of an idle queue: one claim per worker per interval ([ADR 0229](./adr/0229-a-push-wakes-a-worker.md)) |
 | `timeout_ms` | 60,000 | how long one run may take, for a kind naming no `timeout_ms`. Also the lease |
 
 **A schedule** ([ADR 0199](./adr/0199-a-schedule-is-a-type-that-makes-the-caller-choose.md)):
@@ -2843,7 +2851,8 @@ call that failed rather than by an observer of every call. See
 [Errors](#errors).
 
 `db.nilo_start(io, limits)` is what `listen()` calls; a program starting a `Db`
-by hand passes `.off` and the pool's waits are bounded by nothing.
+by hand passes `.none` — `.off` is the older spelling of the same value — and
+the pool's waits are bounded by nothing.
 `db.nilo_stop()` is the other half, and `listen()` calls that too — after the
 last connection is cut off and before the Engine's loop is torn down, so the
 pool lets go of the loop it was built on
@@ -3083,6 +3092,8 @@ request ([ADR 0041](./adr/0041-a-module-sits-where-the-loop-puts-it.md)).
 | `db.stream(User, c, .{ … })` | rows one at a time; see below |
 | `db.raw(User, c, sql, .{ … })` | `![]User` — a statement this module will not write. `sql` is **comptime**: the `SELECT` list is counted against the Row's fields and each column that plainly has a name is checked against the field in its position, and the statement is kept prepared like every other ([ADR 0148](./adr/0148-a-raw-statement-is-counted-while-compiling.md)) |
 | `db.rawOne(User, c, sql, .{ … })` | `!?User` — the same, for a statement whose `WHERE` holds a key. **No `LIMIT 1` is added**; see below |
+| `db.raw([]const u8, c, sql, .{ … })` | `![][]const u8` — column one of every row, with no Row and no marker. `i64`, `?bool`, a `Str`: any one thing a column can be read as. `rawOne` the same, unwrapped. A list of two columns into a scalar is a Refusal ([ADR 0234](./adr/0234-a-scalar-out-of-raw.md)) |
+| `db.liveColumns(c, schema, table)` | `![]const sql.Column` — what the database says the table has, `name`, `udt`, `nullable`. Empty for a table that is not there. What `checkSchema` and `migrate.addMissingColumns` read |
 | `db.rawOrdered(User, c, sql, .{ … }, order)` | `![]User` — a raw statement with `{order}` in it, where the whole `ORDER BY` an `sql.Ordering` chose at run time is written. See *An order chosen at run time* below |
 | `db.exec(c, sql, .{ … })` | `!usize` — a statement that answers with *nothing*, and the rows it changed. `CREATE TABLE`, `CREATE INDEX`, `PRAGMA`, `VACUUM`. No Row, because none is being filled ([ADR 0078](./adr/0078-a-uuid-is-whatever-the-database-stores.md)) |
 | `db.begin(c, .{})` | `!Tx`. `.{ .isolation = …, .read_only = … }` rides on the `BEGIN`; see below |
@@ -3848,9 +3859,22 @@ is a compile error naming both.
 This is for a test, a fixture or a single-file SQLite application. It is not a
 migration: it creates what is missing and never alters what is there.
 
+`addMissingColumns` is the step after it, for the same program once it has
+shipped and added a field: one `ALTER TABLE … ADD COLUMN` per column a table
+lacks, from the same `Desc` the create reads, in one transaction, and how many
+were added. A required column with no default is `error.NeedsBackfill` with
+the statement in the log and nothing sent; a table that is not there is
+skipped ([ADR 0233](./adr/0233-a-column-a-shipped-table-has-not-got.md)).
+
+```zig
+try sql.migrate.createMissing(&db, &run, &.{ Download, Segment });
+_ = try sql.migrate.addMissingColumns(&db, &run, &.{ Download, Segment });
+```
+
 | | |
 |---|---|
 | `migrate.createMissing(db, scope, Rows)` | the above |
+| `migrate.addMissingColumns(db, scope, Rows)` | `!usize` — the columns added |
 | `migrate.tablesOf(D, Rows)` | comptime: every table as the types describe it, in create order |
 | `migrate.missingOf(D, Rows)` | comptime: just the statements |
 | `ddl.createTable(D, Row)` | comptime: one `CREATE TABLE`, as text |

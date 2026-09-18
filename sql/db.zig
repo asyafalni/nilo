@@ -1119,6 +1119,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             values: anytype,
         ) ![]Row {
             comptime core.checkScope(@TypeOf(c), "db.raw");
+            // One column and no Row: `db.raw([]const u8, …)`, `db.raw(i64, …)`
+            // ([ADR 0234](../docs/adr/0234-a-scalar-out-of-raw.md)).
+            if (comptime scalarColumn(Row)) {
+                comptime rawcheck.assertOne(Row, sql, "db.raw");
+                return fillScalar(Row, self, null, c, sql, self.rawPlanOf(sql), try rawValuesOf(values, c));
+            }
             comptime rawcheck.assertList(D, Row, sql, "db.raw");
             // No ceiling: this module did not write the statement and so has
             // nothing to say about how many rows it can answer with.
@@ -1204,6 +1210,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             values: anytype,
         ) !?Row {
             comptime core.checkScope(@TypeOf(c), "db.rawOne");
+            if (comptime scalarColumn(Row)) {
+                comptime rawcheck.assertOne(Row, sql, "db.rawOne");
+                const found = try fillScalar(Row, self, null, c, sql, self.rawPlanOf(sql), try rawValuesOf(values, c));
+                return if (found.len == 0) null else found[0];
+            }
             comptime rawcheck.assertList(D, Row, sql, "db.rawOne");
             const found = try fill(Row, null, self, null, c, sql, self.rawPlanOf(sql), try rawValuesOf(values, c));
             return if (found.len == 0) null else found[0];
@@ -1892,6 +1903,10 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 values: anytype,
             ) ![]Row {
                 comptime core.checkScope(@TypeOf(c), "tx.raw");
+                if (comptime scalarColumn(Row)) {
+                    comptime rawcheck.assertOne(Row, sql, "tx.raw");
+                    return fillScalar(Row, self.db, &self.inner, c, sql, self.db.rawPlanOf(sql), try rawValuesOf(values, c));
+                }
                 comptime rawcheck.assertList(D, Row, sql, "tx.raw");
                 return fill(Row, null, self.db, &self.inner, c, sql, self.db.rawPlanOf(sql), try rawValuesOf(values, c));
             }
@@ -1924,6 +1939,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 values: anytype,
             ) !?Row {
                 comptime core.checkScope(@TypeOf(c), "tx.rawOne");
+                if (comptime scalarColumn(Row)) {
+                    comptime rawcheck.assertOne(Row, sql, "tx.rawOne");
+                    const found = try fillScalar(Row, self.db, &self.inner, c, sql, self.db.rawPlanOf(sql), try rawValuesOf(values, c));
+                    return if (found.len == 0) null else found[0];
+                }
                 comptime rawcheck.assertList(D, Row, sql, "tx.rawOne");
                 const found = try fill(Row, null, self.db, &self.inner, c, sql, self.db.rawPlanOf(sql), try rawValuesOf(values, c));
                 return if (found.len == 0) null else found[0];
@@ -2085,7 +2105,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                     "The pool is opened by `nilo_start`, which `app.listen()` calls for every " ++
                     "provided service — work that needs it before the first request goes in " ++
                     "`app.before(f, args)`; in a program that never listens, `app.start(io)` " ++
-                    "opens it, and `db.nilo_start(io, .off)` does for a `Db` no App holds. " ++
+                    "opens it, and `db.nilo_start(io, .none)` does for a `Db` no App holds. " ++
                     "A `nilo.Run` is an arena and a lifetime; it is not a connection.",
                 .{whoami},
             );
@@ -2251,6 +2271,64 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             return error.QueryFailed;
         }
 
+        /// `filling` for a statement read into one value per row rather than
+        /// a Row: column one of every row, as `[]T`
+        /// ([ADR 0234](../docs/adr/0234-a-scalar-out-of-raw.md)).
+        ///
+        /// The same funnel — the Db, the watcher, the drain — and the same
+        /// `readColumn`, so a `[]const u8` is kept into the arena and a `Str`
+        /// is the Scope's, exactly as a field of a Row would be. What is
+        /// left out is the marker: there is no struct to carry one, and the
+        /// question it answers — which table is this — has no answer for a
+        /// `SELECT name FROM pragma_table_info(…)`.
+        fn fillScalar(
+            comptime T: type,
+            db: *Self,
+            tx: ?*W.Tx,
+            c: anytype,
+            sql: []const u8,
+            plan: ?[]const u8,
+            values: anytype,
+        ) ![]T {
+            const arena = c.arena();
+            const w = try db.wireOf();
+            const started = db.timing();
+            var problem: ?wire_mod.Problem = null;
+
+            var rows = if (tx) |t|
+                t.run(arena, sql, values, plan, &problem) catch |err| {
+                    db.told(arena, started, sql, plan, null, true, problem);
+                    return err;
+                }
+            else
+                w.run(arena, sql, values, plan, &problem) catch |err| {
+                    db.told(arena, started, sql, plan, null, true, problem);
+                    return err;
+                };
+            defer w.drain(&rows);
+
+            var out: std.ArrayList(T) = .empty;
+            if (try w.next(&rows)) {
+                // A statement that answered no columns at all cannot have
+                // answered rows, so this is the one width a scalar can be
+                // short of, and it is checked for the reason `wideEnough` is.
+                if (w.width(&rows) < 1) {
+                    db.told(arena, started, sql, plan, null, true, null);
+                    return error.QueryFailed;
+                }
+                while (true) {
+                    const value = readColumn(w, &rows, T, 0, c) catch |err| {
+                        db.told(arena, started, sql, plan, null, true, null);
+                        return err;
+                    };
+                    try out.append(arena, value);
+                    if (!try w.next(&rows)) break;
+                }
+            }
+            db.told(arena, started, sql, plan, out.items.len, false, null);
+            return out.toOwnedSlice(arena);
+        }
+
         /// Run a statement that answers with one row of one column, and read
         /// it. What `count` and `exists` are built on.
         ///
@@ -2405,6 +2483,17 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             const out = try c.arena().alloc(Item, bytes.len);
             for (out, bytes) |*item, b| item.* = try keptElement(Item, b, c);
             return out;
+        }
+
+        /// The columns the database says a table has, in the Scope's arena.
+        /// What `migrate.addMissingColumns` reads to find out which of a
+        /// Row's fields the shipped table has not got (ADR 0233); the same
+        /// question `checkSchema` asks, asked from outside this file. An
+        /// empty answer is a table that is not there.
+        pub fn liveColumns(self: *Self, c: anytype, schema_name: ?[]const u8, table: []const u8) ![]const wire_mod.Column {
+            comptime core.checkScope(@TypeOf(c), "db.liveColumns");
+            var w = try self.wireOf();
+            return w.columnsOf(c.arena(), D.introspect, schema_name, table);
         }
 
         /// Check every Row against the table it names, and log what does not
@@ -3083,6 +3172,22 @@ fn assertReadable(comptime Row: type) void {
             );
         }
     }
+}
+
+/// Whether `T` is one column rather than a Row: what `db.raw` reads into
+/// when its first argument is `[]const u8`, `i64`, `?bool`, a `Str` — any
+/// one thing `readable` says a column can be, or an optional of one
+/// ([ADR 0234](../docs/adr/0234-a-scalar-out-of-raw.md)). A struct carrying
+/// `nilo_table` is a Row whatever else it is, and a list column is not here:
+/// `db.raw([]i64, …)` would read as a slice of rows, which is what the
+/// answer already is.
+fn scalarColumn(comptime T: type) bool {
+    const Inner = switch (@typeInfo(T)) {
+        .optional => |o| o.child,
+        else => T,
+    };
+    if (@typeInfo(Inner) == .@"struct" and @hasDecl(Inner, row_mod.marker)) return false;
+    return readable(Inner);
 }
 
 /// What `kept` and `WireRead` between them know how to read. Kept next to
@@ -5225,7 +5330,7 @@ test "a Db answers the health page with SELECT 1, and says so before it has star
     // than answer `ok` over nothing (ADR 0192).
     try testing.expectEqualStrings("not started: `listen()` has not run", db.nilo_ready(&scope).?);
 
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
     try testing.expect(db.nilo_ready(&scope) == null);
 
     // And a Db that has been stopped is not ready again.
@@ -5243,7 +5348,7 @@ test "a uuid column is written and read back on the SQLite Wire" {
         .{ .size = 2 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();
@@ -5294,7 +5399,7 @@ test "a uuid bound bare to db.exec and db.raw reaches the database" {
         .{ .size = 2 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();
@@ -5350,7 +5455,7 @@ test "the schema check agrees with the wire about a uuid column" {
         .{ .size = 1 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();
@@ -5384,7 +5489,7 @@ test "the introspection asks the attached database whether the name is a view" {
         .{ .size = 1 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     // `ATTACH` is per connection, and the introspection is a `SELECT` that
     // goes to a reader while `db.exec` goes to the writer — so every
@@ -5502,7 +5607,7 @@ test "every call this module offers is compiled against the SQLite wire too" {
         .{ .size = 2 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();
@@ -5614,7 +5719,7 @@ test "an `in` on SQLite is the JSON array json_each reads, and it matches" {
         .{ .size = 2 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();
@@ -5690,7 +5795,7 @@ test "an INTEGER PRIMARY KEY is the rowid, so a correct table no longer stops th
         .{ .size = 1 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();
@@ -5740,7 +5845,7 @@ test "db.exec answers with the rows it changed and needs no Row to do it" {
         .{ .size = 1 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();
@@ -5800,7 +5905,7 @@ test "rawOne answers with the row or with null, so a key lookup is not an unwrap
         .{ .size = 2 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();
@@ -5838,6 +5943,60 @@ test "rawOne answers with the row or with null, so a key lookup is not an unwrap
     try tx.commit();
 }
 
+test "raw reads one column into a slice, an integer or a Str, with no Row and no marker" {
+    // The case that asked for it: `SELECT name FROM pragma_table_info(…)`,
+    // one text column, read by a program that wanted a `[][]const u8` and
+    // had to write a one-field projection to get it (ADR 0234).
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:raw-scalar?mode=memory&cache=shared",
+        .{ .size = 2 },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, accounts_ddl, .{});
+    _ = try db.insert(SqliteAccount, &run, .{ .public = types.Uuid.nil, .email = "a@example.dev" });
+    _ = try db.insert(SqliteAccount, &run, .{ .public = types.Uuid.nil, .email = "b@example.dev" });
+
+    const names = try db.raw([]const u8, &run, "SELECT name FROM pragma_table_info('accounts') ORDER BY cid", .{});
+    try testing.expectEqual(@as(usize, 3), names.len);
+    try testing.expectEqualStrings("id", names[0]);
+    try testing.expectEqualStrings("public", names[1]);
+    try testing.expectEqualStrings("email", names[2]);
+
+    // An integer, a Str, and an optional of one — the three other shapes a
+    // column is read as, through the same `readColumn` a Row's field is.
+    const ids = try db.raw(i64, &run, "SELECT id FROM accounts ORDER BY id", .{});
+    try testing.expectEqual(@as(usize, 2), ids.len);
+    try testing.expectEqual(@as(i64, 1), ids[0]);
+    const emails = try db.raw(nilo.Str, &run, "SELECT email FROM accounts ORDER BY id", .{});
+    try testing.expectEqualStrings("b@example.dev", emails[1].view());
+    const maybe = try db.raw(?[]const u8, &run, "SELECT NULL FROM accounts", .{});
+    try testing.expectEqual(@as(usize, 2), maybe.len);
+    try testing.expectEqual(@as(?[]const u8, null), maybe[0]);
+
+    // `rawOne` is the same with the unwrap done: a value, or null when
+    // nothing matched.
+    const one = try db.rawOne([]const u8, &run, "SELECT email FROM accounts WHERE id = ?1", .{@as(i64, 2)});
+    try testing.expectEqualStrings("b@example.dev", one.?);
+    try testing.expectEqual(@as(?[]const u8, null), try db.rawOne([]const u8, &run, "SELECT email FROM accounts WHERE id = ?1", .{@as(i64, 9)}));
+    try testing.expectEqual(@as(?i64, 2), try db.rawOne(i64, &run, "SELECT count(*) FROM accounts", .{}));
+
+    // And inside a transaction, which is the other pair of call sites.
+    var tx = try db.begin(&run, .{});
+    errdefer tx.rollback();
+    const in_tx = try tx.raw([]const u8, &run, "SELECT email FROM accounts ORDER BY id", .{});
+    try testing.expectEqual(@as(usize, 2), in_tx.len);
+    try testing.expectEqual(@as(?i64, 1), try tx.rawOne(i64, &run, "SELECT min(id) FROM accounts", .{}));
+    try tx.commit();
+}
+
 test "rawOne hands back the first row when a statement matches several" {
     // Stated rather than left to be discovered: no `LIMIT 1` is appended,
     // because this module did not write the statement and has nowhere honest
@@ -5852,7 +6011,7 @@ test "rawOne hands back the first row when a statement matches several" {
         .{ .size = 2 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();
@@ -5881,7 +6040,7 @@ test "updateReturningOne is the PATCH shape: the row as it now is, or null" {
         .{ .size = 2 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();
@@ -5998,7 +6157,7 @@ test "a page carries the total the condition matched, in one statement" {
         .{ .size = 2 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();
@@ -6088,7 +6247,7 @@ test "the order a request chose is the order the rows come back in, on a page an
         .{ .size = 2 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
     watched = .{};
     db.watching(recordSent);
 
@@ -6187,7 +6346,7 @@ test "an optional filter narrows when it is set and drops when it is not" {
         .{ .size = 2 },
     );
     defer db.deinit();
-    try db.nilo_start(threaded.io(), .off);
+    try db.nilo_start(threaded.io(), .none);
 
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();

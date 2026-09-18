@@ -96,9 +96,30 @@ pub const Limits = struct {
     };
 
     /// No Engine underneath: arming does nothing and nothing ever fires. What
-    /// a Service built in a test with no server around it holds, and what the
-    /// `off` in `Deadlines` is for.
-    pub const off: Limits = .{};
+    /// a Service built in a test with no server around it holds, what a CLI on
+    /// a plain `std.Io.Threaded` starts its services with, and what the `off`
+    /// in `Deadlines` is for.
+    ///
+    /// **A Fitting that can bound a call some other way is expected to, when
+    /// it is handed this.** `nilo_fetch` does: with no Engine to cancel a
+    /// fiber it runs the call as a task of the `Io` it was given and cancels
+    /// *that*, so `timeout_ms` means the same thing on a Threaded `Io` as it
+    /// does under `listen()`. `engineless` is how it tells.
+    pub const none: Limits = .{};
+
+    /// The spelling `none` had until 0.5. At a call site it read as "start
+    /// with something off", and the first guess at what was logging — which
+    /// is the wrong picture of a value that says *there is no Engine here*.
+    /// The same value; kept so a `nilo_start(io, .off)` already written
+    /// still compiles.
+    pub const off: Limits = none;
+
+    /// Whether there is nothing underneath: `none`, or a `Limits` built the
+    /// same way. A caller with a bound of its own to fall back on asks this
+    /// once rather than arming a deadline that will never fire.
+    pub fn engineless(self: Limits) bool {
+        return self.vtable == &noop;
+    }
 
     const noop: VTable = .{
         .arm = struct {
@@ -188,8 +209,29 @@ const testing = std.testing;
 test "a Bound with no Engine under it arms nothing and blames nothing" {
     var bound: Limits.Bound = .idle;
     defer bound.release();
-    bound.arm(.off, 2_000);
+    bound.arm(.none, 2_000);
     try testing.expect(!bound.fired());
+}
+
+test "a Limits with no Engine says so, and one with a vtable of its own does not" {
+    try testing.expect(Limits.none.engineless());
+    // The older spelling is the same value, not a second one.
+    try testing.expect(Limits.off.engineless());
+    const armed: Limits.VTable = .{
+        .arm = struct {
+            fn f(_: ?*anyopaque, _: *anyopaque, _: u32) void {}
+        }.f,
+        .release = struct {
+            fn f(_: ?*anyopaque, _: *anyopaque) void {}
+        }.f,
+        .fired = struct {
+            fn f(_: ?*anyopaque, _: *anyopaque) bool {
+                return true;
+            }
+        }.f,
+    };
+    const with_engine: Limits = .{ .vtable = &armed };
+    try testing.expect(!with_engine.engineless());
 }
 
 test "a Bound that was never armed is safe to release and reports nothing" {

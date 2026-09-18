@@ -241,6 +241,12 @@ a table rather than a Redis
 to commit with — and so is `pushIn` with `.within`, because a cache cannot
 roll back.
 
+**A `push` wakes a worker; a `pushIn` cannot.** The row is not there until
+the commit, so a worker woken at the `pushIn` would claim nothing and go
+back to sleep. Call `jobs.wake()` after `tx.commit()` and the row starts at
+once; leave it and the next poll finds it, a second later at the default
+([ADR 0229](../adr/0229-a-push-wakes-a-worker.md)).
+
 ## At least once
 
 The claim is one statement, and the second half of its `WHERE` is the lease:
@@ -347,7 +353,7 @@ sit on `nilo_cache`. `.max_payload` (4 KiB) is the largest row it holds.
 | Field | Default | |
 |---|---|---|
 | `workers` | 4 | rows running at once in this process. Each is a fiber, and a fiber holds its stack at its high-water mark for the life of it ([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)), so this is paid per worker rather than per row |
-| `poll_ms` | 1,000 | how long a worker with nothing to do waits before asking again. One claim per worker per interval: the cost of an idle queue, and the latency of a pushed row when every worker is asleep |
+| `poll_ms` | 1,000 | how long a worker with nothing to do waits before asking again, **when nothing wakes it first**. A `push` from this process wakes a worker itself, so this is the latency only of a row *another* process pushed — and the cost of an idle queue, one claim per worker per interval ([ADR 0229](../adr/0229-a-push-wakes-a-worker.md)) |
 | `timeout_ms` | 60,000 | how long one run may take, for a kind that names no `timeout_ms` of its own. Also the lease |
 
 A third store is nine methods, listed in `job/contract.zig` for whoever
@@ -415,13 +421,20 @@ serves no HTTP calls `serveOn` with an `Io` of its own instead:
 var threaded: std.Io.Threaded = .init(gpa, .{});
 defer threaded.deinit();
 
-try db.nilo_start(threaded.io(), .off);
-try jobs.nilo_start(threaded.io(), .off);
+try db.nilo_start(threaded.io(), .none);
+try jobs.nilo_start(threaded.io(), .none);
 try jobs.serveOn(threaded.io());   // returns when cancelled
 ```
 
 Cancelling it is yours: there is no signal handler here, because the one in
 `nilo_http` belongs to the server.
+
+**This is also the shape a CLI has** — a `Db`, a `Jobs`, maybe a
+`fetch.Client`, on one `Io.Threaded` and no `App` anywhere — and a push from
+it wakes its own workers the way a server's does. What it does not get is
+a row pushed by a *second* process on the same table: that one is found by
+the poll, or by a `jobs.wake()` the second process cannot make. Two
+processes on one queue is what `poll_ms` is for.
 
 ## Testing
 
@@ -461,7 +474,10 @@ across a Docker port.
 
 **Per idle worker, one claim per `poll_ms`**: 55 µs of SQLite or 354 µs of
 Postgres a second, which is 0.035% of one connection and where the default
-comes from. A claim that takes a row is 140 µs and 1.2 ms.
+comes from. A claim that takes a row is 140 µs and 1.2 ms. **Per push, one
+atomic and one futex wake**, which is what takes the whole of `poll_ms` off
+the latency of a row this process pushed
+([ADR 0229](../adr/0229-a-push-wakes-a-worker.md)).
 
 **Per connection, nothing.** A worker is a fiber per process, and its stack
 is paid once and held at the high-water mark of whatever `run` touches.

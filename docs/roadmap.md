@@ -564,11 +564,26 @@ thing every push has to decide.
 
 **What would settle it: a queue where the emails wait behind the reports.**
 
-**`LISTEN/NOTIFY` instead of polling.** A pushed row would wake a worker in
-microseconds rather than in `poll_ms`. Postgres only, one more thing the pool
-holds open, and the latency of a second has not hurt anybody yet.
+**`LISTEN/NOTIFY` for a row another process pushed.** A push from the
+process the workers run in wakes one of them through the `Io`'s futex
+([ADR 0229](./adr/0229-a-push-wakes-a-worker.md)), so `poll_ms` is now only
+the latency of a row a *second* binary put in the table — a web server
+pushing for a separate worker process. `NOTIFY` on the push and `LISTEN` on
+a pool connection would close that too, on Postgres only, at the price of
+one more thing the pool holds open.
 
-**What would settle it: a number** — who is waiting on that second.
+**What would settle it: a number** — who is running two processes on one
+queue and waiting on that second.
+
+**A claim holds the SQLite lock sixteen times over.** With a wake per push
+the idle cost of sixteen workers is one claim per `poll_ms` each, and the
+busy cost is sixteen writers on one file's lock. A single claimer handing
+rows to workers over a channel is the shape that takes fifteen of them off
+it, and ADR 0229 chose the wake over it because nothing had measured the
+lock as a cost.
+
+**What would settle it: a number** from a queue on one SQLite file with
+more workers than cores.
 
 ## `nilo_http`: the server
 
@@ -871,6 +886,21 @@ poor one for 14 KB of binary nobody notices.
 step towards one: 14 KB does not buy a line in every dependent's `build.zig`. If
 a third build option ever lands for a reason of its own this rides along with it
 for nothing, which is a bonus and not a plan.
+
+**`build.zig` is 192 KB and a dependent compiles all of it into its build
+runner.** Measured rather than guessed
+([`bench/result/build.md`](../bench/result/build.md) §"What a dependent pays
+for `build.zig`"): the runner is rebuilt only when the file's content changes
+— a nilo upgrade, in practice — and that rebuild is 4.4 s against 3.5 s for a
+seven-line `build.zig` with no dependencies, on the two-core box. So nilo's
+share is about 0.9 s per upgrade and nothing on any other build, and a
+warm `zig build` with nothing changed is 30 ms either way. Splitting the
+tooling nilo runs on itself — `bench/`, `stress/`, the refusal tables — out
+of the file a dependent reads would win most of that 0.9 s once per
+upgrade.
+
+**Waiting on: accepted.** A second a release is not worth a build system in
+two files; the number is here so nobody measures it again.
 
 **`describeBadBody` walks eight levels and then stops.** Deeper than that the
 400 says the ceiling was reached rather than which field is wrong
