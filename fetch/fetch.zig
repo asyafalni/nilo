@@ -1144,10 +1144,18 @@ pub const Exchange = struct {
     /// read; this one is inside them (ADR 0237).
     pub fn stream(self: *Exchange, w: *std.Io.Writer, limit: std.Io.Limit) Client.Error!usize {
         const reader = self.reader orelse unreachable; // begin first, then stream
-        return self.bounded(std.Io.Reader.stream, .{ reader, w, limit }) catch |err| switch (err) {
-            error.EndOfStream => 0,
-            else => |e| self.blame(e),
-        };
+        // std's TLS reader answers zero for a record that carried no
+        // application data (a session ticket, a close alert, a record it
+        // decrypted into its own buffer for the next call to serve), so a
+        // zero from one read is not the end of anything; the end is
+        // `EndOfStream`, and only that is handed back as zero.
+        while (true) {
+            const n = self.bounded(std.Io.Reader.stream, .{ reader, w, limit }) catch |err| switch (err) {
+                error.EndOfStream => return 0,
+                else => |e| return self.blame(e),
+            };
+            if (n != 0) return n;
+        }
     }
 
     /// `Client.blame`, asked about every clock at once.

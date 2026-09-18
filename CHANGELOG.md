@@ -101,7 +101,12 @@ where it was made.
   it is the Engine's timer re-armed on every chunk; on a client with no
   Engine it is ADR 0230's cancelled task, with the wait re-read from the
   last byte. `Exchange.stream(w, limit)` is one chunk of the body inside
-  both clocks, for a body moved in pieces of the caller's own choosing
+  both clocks, for a body moved in pieces of the caller's own choosing,
+  and its zero is the end of the body and nothing else: std's TLS reader
+  answers zero for a record that carried no application data (a session
+  ticket, a record decrypted into its own buffer), and `stream` reads on
+  past those, which fdm's first run against it over TLS found as every
+  segment ending short
   ([ADR 0237](./docs/adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)).
 
 - **`head.keep(c)`** is the same `Head` copied into the Scope, so it reads

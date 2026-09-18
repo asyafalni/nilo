@@ -27,6 +27,7 @@ rather than a gap.
 | 4 | "Do not follow redirects" and "forgot the buffer" are spelled the same | `nilo_fetch` | nothing today; a class of first-week bug | No |
 | 5 | `head.keep(scope)`: a `Head` that survives the body | `nilo_fetch` | `Text`, 30 lines, and three `.from(...)` calls | No, the borrowed `Head` stays the default |
 | 6 | `addMissingColumns` introspects on a second connection while its transaction holds the first | `nilo_sql` | a test that had to move off `cache=shared` | No, a defect |
+| 7 | `Exchange.stream` said zero was the end, and over TLS it was not | `nilo_fetch` | nothing; fdm could not adopt `stream` until it was fixed | No, a defect, fixed in the same tree as this line |
 
 ---
 
@@ -301,6 +302,37 @@ cannot finish today.
 ### What it costs
 
 Nothing per call. The columns are read once either way.
+
+---
+
+## 7. `Exchange.stream` said zero was the end, and over TLS it was not
+
+### What was there
+
+ADR 0237's `Exchange.stream(w, limit)`: one chunk, and "zero is the end of
+the body", mapped from `error.EndOfStream`. The value it handed back
+otherwise was whatever `std.Io.Reader.stream` returned, and on a TLS
+connection that is zero more often than not at the start: std's
+`crypto.tls.Client` returns `0` for a record that held no application data
+(a post-handshake session ticket, a close alert), for a record that did not
+arrive whole, and for the ordinary case of a record it decrypted *into its
+own buffer* for the next call to serve. Its only test was over plain HTTP,
+where a socket read is the chunk and zero never comes.
+
+### Where fdm found it
+
+The first run of fdm's segment loop on `ex.stream` against
+`mirrors.kernel.org` over HTTPS: sixteen segments `ShortBody` inside the
+first 300 KB, every attempt, because the loop took the first zero as the
+end. The same loop on `ex.reader.stream` directly had been ignoring the
+return value and reading until `fw.pos` reached the boundary, which is why
+the zero had never been seen.
+
+### What was done
+
+`stream` loops until a read moves a byte or says `EndOfStream`; zero is
+now only the second. One line of behaviour, no cost on the path that moves
+bytes, and the reference's sentence became true.
 
 ---
 
