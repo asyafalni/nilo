@@ -285,11 +285,6 @@ where it was made.
   not read it. `docs/guide/openapi.md` was the page that had one and was not
   listed; it is now.
 
-The seven below are what the first CLI on nilo — a download manager on
-`nilo_sql`, `nilo_job` and `nilo_fetch` with no `App` and no Engine — asked
-for and did not find. Every one is anchored to a workaround that program
-carried.
-
 - **A `push` wakes a worker.** `jobs.push` from the process the workers run
   in used to wait out `poll_ms` — half a second on average at the default —
   so the first CLI set it to 100 and paid sixteen workers × ten idle claims a
@@ -298,6 +293,7 @@ carried.
   process pushed. `jobs.wake()` is for that row, or one `pushIn` put under a
   transaction that has since committed
   ([ADR 0229](./docs/adr/0229-a-push-wakes-a-worker.md)).
+
 - **`fetch.Settings.timeout_ms` fires without an Engine.** On a client
   started with `nilo_start(io, .none)` — a CLI, a worker, a test — a non-zero
   timeout used to arm nothing and say nothing, and a server that stopped
@@ -306,9 +302,11 @@ carried.
   means the same thing at either end. One thread hop per step, only on a
   client with no Engine and a non-zero timeout; under `listen()` nothing
   changes ([ADR 0230](./docs/adr/0230-a-deadline-with-no-engine-cancels-a-task.md)).
+
 - **`nilo.Limits.none`** is the name for "no Engine underneath". `.off` read
   as "start with something off" and the first guess at what was logging; it
   stays as the same value, so nothing already written breaks.
+
 - **A header std has a slot for is sent once, and it is the caller's.**
   `host`, `authorization`, `user-agent`, `content-type`, `connection` and
   `accept-encoding` in `Begin.headers` or `Call.headers` used to go out
@@ -316,15 +314,18 @@ carried.
   no longer routes them into fields by hand; the six names are known in
   `fetch.zig` and nowhere else
   ([ADR 0231](./docs/adr/0231-a-header-std-owns-goes-out-once.md)).
+
 - **`head.redirected` and `head.location(&buf)`** say where a followed
   redirect ended, so the connections after a probe go to the final URL
   rather than walking the chain again. The text lives in the
   `redirect_buffer` the call was given
   ([ADR 0232](./docs/adr/0232-a-followed-redirect-says-where-it-ended.md)).
+
 - **`ex.discard()`** — "I will not read this body; close the connection" —
   for the probe that asked for one byte and got the whole file. `max_drain`
   stays a policy for every call rather than a lever pulled for one
   ([ADR 0235](./docs/adr/0235-a-caller-that-knows-says-discard.md)).
+
 - **`sql.migrate.addMissingColumns(db, run, &.{ Rows… })`** — the step
   between `createMissing` and `apply`: one `ALTER TABLE … ADD COLUMN` per
   field a shipped table has not got, from the same `Desc` the create reads,
@@ -333,6 +334,7 @@ carried.
   default is `error.NeedsBackfill` with the statement in the log, and
   nothing is sent. `db.liveColumns` is the introspection it reads, made
   public ([ADR 0233](./docs/adr/0233-a-column-a-shipped-table-has-not-got.md)).
+
 - **`db.raw` and `db.rawOne` take a column type.** `db.raw([]const u8, run,
   "SELECT name FROM pragma_table_info('downloads')", .{})` reads column one
   of every row with no Row and no marker; `i64`, `?bool`, a `Str` the same.
