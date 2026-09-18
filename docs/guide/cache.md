@@ -255,7 +255,7 @@ own suite does it once so that yours need not.
 
 ## See also
 
-- [The reference](../reference.md#nilo_cache) — the surface as a list.
+- [The reference](../reference/cache.md#nilo_cache) — the surface as a list.
 - [Services](./services.md) — how the Space reaches a handler.
 - [`bench/result/cache.md`](../../bench/result/cache.md) — every number
   above, how it was run, and the single-threaded rows where go-cache is

@@ -135,4 +135,4 @@ that says whether the server is *ready* is not this — it is
 [`app.health`](./deploying.md#knowing-whether-it-is-ready), which asks the
 services rather than the settings.) See
 [Services](./services.md) for what else that slot takes, and
-[the reference](../reference.md#nilo_config) for the rest of the API.
+[the reference](../reference/config.md#nilo_config) for the rest of the API.

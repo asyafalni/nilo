@@ -45,7 +45,7 @@
 
 **Status:** accepted
 **Amends:** the refusal recorded in the Rows section of
-[`docs/reference.md`](../reference.md), that a Row may not declare an index or a
+[`docs/reference.md`](../reference/sql.md#a-row), that a Row may not declare an index or a
 constraint; and with it two sentences written back when there was no migration
 runner — [ADR 0039](./0039-the-shape-of-a-query-is-settled-while-compiling.md)'s
 closing "migrations are not here and are not implied", and the aside in

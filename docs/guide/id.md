@@ -33,7 +33,7 @@ _ = try db.insert(Doc, c, .{ .id = key, .title = nilo.Str.static("notes") });
 
 where `Doc.id` is a `sql.Uuid`, which is this type under another name.
 
-`v7Now` takes a Scope — the `*Ctx`, or a [`nilo.Run`](../reference.md#run)
+`v7Now` takes a Scope — the `*Ctx`, or a [`nilo.Run`](../reference/core.md#run)
 built with `initIo` — because a key needs randomness and the clock, and both
 are IO a module in the bottom layer has no Bulkhead to reach through
 ([ADR 0046](../adr/0046-entropy-belongs-to-the-loop.md)). Inside a request
@@ -141,7 +141,7 @@ A handler that takes an `id.Uuid` is an ordinary function, and
 
 ## See also
 
-- [The reference](../reference.md#nilo_id) — the surface as a list.
+- [The reference](../reference/id.md#nilo_id) — the surface as a list.
 - [Talking to a database](./sql/README.md) — the `uuid` column a `Uuid` is written
   to, and the Row that carries it.
 - [ADR 0176](../adr/0176-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)

@@ -23,7 +23,7 @@ belongs to is decided by a single question — does it need the event loop?
 | **`nilo_cache`** | an expiring cache in this process, holding no pointers | [A cache in this process](./cache.md), and the Space that [Answering once](./idempotency.md) keeps its answers in |
 | **`nilo_jwt`** | checking somebody else's signed token: RS256 and a JWKS | [Checking somebody else's token](./jwt.md) |
 | **`nilo_id`** | UUIDs, v4 and v7 | [Identifiers](./id.md) |
-| **`nilo_core`** | `Str`, the Scope and the clock the rest share | [the reference](../reference.md#scope) |
+| **`nilo_core`** | `Str`, the Scope and the clock the rest share | [the reference](../reference/core.md#scope) |
 
 There is **no module called `nilo`** — the word names the project, and the
 server is `nilo_http`. Every example here writes the alias back, which is all it
@@ -127,7 +127,7 @@ will not do.
 
 ## Also
 
-- [The reference](../reference.md) — the whole surface as a list.
+- [The reference](../reference/README.md) — the whole surface as a list.
 - [`../adr/`](../adr/) — why each decision went the way it did.
 - [`../roadmap.md`](../roadmap.md) — what's next, and what's refused.
 - [`../../CONTEXT.md`](../../CONTEXT.md) — the project's vocabulary.

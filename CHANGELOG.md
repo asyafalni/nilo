@@ -279,6 +279,13 @@ where it was made.
   has no enum type and skips the check; a Dialect says whether it can with
   `enum_values`, and a Wire answers it with `labelsOf`.
 
+- **The reference is a folder.** `docs/reference.md` was 4,154 lines, and
+  is now `docs/reference/`: one page a module, seven for the server cut
+  where the guide cuts, and every heading listed once on its `README.md`. A
+  link into the old page names the new one under the same anchor, so
+  `docs/reference.md#run` is `docs/reference/core.md#run`
+  ([ADR 0236](./docs/adr/0236-the-reference-is-a-folder-one-page-a-module.md)).
+
 - **`zig build snippets` refuses a documentation page that carries a
   `<!-- compiles -->` mark and is not on its list.** It walks `README.md` and
   `docs/` for the mark, so a mark cannot be written anywhere the step will

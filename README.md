@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://ziglang.org/"><img alt="Zig 0.16" src="https://img.shields.io/badge/zig-0.16-f7a41d?style=flat-square&logo=zig&logoColor=white"></a>
   <a href="./CHANGELOG.md"><img alt="version 0.4.0" src="https://img.shields.io/badge/version-0.4.0-3b82f6?style=flat-square"></a>
-  <a href="./docs/reference.md"><img alt="11 modules" src="https://img.shields.io/badge/modules-11-8957e5?style=flat-square"></a>
+  <a href="./docs/reference/"><img alt="11 modules" src="https://img.shields.io/badge/modules-11-8957e5?style=flat-square"></a>
   <a href="./refusals/README.md"><img alt="321 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-321-e05d44?style=flat-square"></a>
   <a href="./docs/adr/"><img alt="227 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-227-6b7280?style=flat-square"></a>
   <a href="./LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-16a34a?style=flat-square"></a>
@@ -17,7 +17,7 @@
   <a href="#-quickstart">Quickstart</a> ·
   <a href="#-philosophy">Philosophy</a> ·
   <a href="./docs/guide/">Guide</a> ·
-  <a href="./docs/reference.md">Reference</a> ·
+  <a href="./docs/reference/">Reference</a> ·
   <a href="./examples/">Examples</a> ·
   <a href="./bench/result/http.md">Benchmarks</a> ·
   <a href="./CHANGELOG.md">Changelog</a>
@@ -464,7 +464,7 @@ warning: handler GET /report held its thread for 412ms. Every other request bein
 **This is also why agents do well here.** A model needs a surface small enough
 to hold at once, no ordering to infer, and a build that says what's wrong
 instead of a server that starts anyway — the same list a person in a hurry
-needs. Point one at [`docs/reference.md`](./docs/reference.md) and
+needs. Point one at [`docs/reference/`](./docs/reference/) and
 [`CONTEXT.md`](./CONTEXT.md); both together are small enough to hand over
 whole, and the running server serves its own contract at `/openapi.json`.
 
@@ -511,7 +511,7 @@ metrics, deploying.
 
 | | |
 |---|---|
-| [`docs/reference.md`](./docs/reference.md) | the entire API surface on one page |
+| [`docs/reference/`](./docs/reference/) | the entire API surface, one page a module |
 | [`docs/adr/`](./docs/adr/) | 207 decisions, each naming the alternative it rejected |
 | [`CONTEXT.md`](./CONTEXT.md) | the vocabulary, and the words this project refuses to use |
 | [`docs/roadmap.md`](./docs/roadmap.md) | what's next, what's refused, what's undecided |

@@ -77,7 +77,8 @@ Three files carry context this one deliberately does not repeat:
   reading of 0042 under load, and ADR 0072 is the second — the first module to
   import a Fitting — so both are worth the ten minutes before adding a ninth
   module.
-- **`docs/reference.md`** — the whole public API on one page.
+- **`docs/reference/`** — the whole public API, one page a module, with every
+  heading listed once on its `README.md`.
 
 ## Who works here
 

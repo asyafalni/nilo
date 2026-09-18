@@ -49,7 +49,7 @@ The client is a [service](./services.md): registered once, asked for by type.
 host, so calls to three different APIs share it without knowing about each
 other, and a second client would load the certificate bundle a second time.
 
-`c` is a Scope: the `*Ctx` a handler holds, or a [`nilo.Run`](../reference.md#run)
+`c` is a Scope: the `*Ctx` a handler holds, or a [`nilo.Run`](../reference/core.md#run)
 where there is no request — a startup path, a ticker, a test. The body comes
 back as a `Str` in that Scope's arena, so it lives exactly as long as the
 request does and nothing is freed by hand.
@@ -348,7 +348,7 @@ comment on it saying so, because nothing else keeps the ranges apart.
 
 ## See also
 
-- [The reference](../reference.md#nilo_fetch) — the surface as a list.
+- [The reference](../reference/fetch.md#nilo_fetch) — the surface as a list.
 - [Object storage](./s3.md) — `nilo_s3` is this module with SigV4 in front of
   it, and the only module that imports a Fitting.
 - [Checking somebody else's token](./jwt.md) — the fetch that gets a JWKS

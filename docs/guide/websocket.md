@@ -188,7 +188,7 @@ fn chatLoop(socket: *nilo.Socket, room: *nilo.Room) !void {
 That loop is the one an echo server writes. Nothing in it mentions the other
 connections and nothing handles an incoming broadcast — `receive` writes those
 out on the way past, from the fiber that owns the socket. The rest of the API is
-in [the reference](../reference.md#room). `defer room.leave(socket)` is the part
+in [the reference](../reference/streaming.md#room). `defer room.leave(socket)` is the part
 that isn't optional: Zig has no destructor, and a seat nobody gives up is one the
 next connection can't have.
 
@@ -220,7 +220,7 @@ connection was 8,673 bytes against a per-connection budget that was 8,767 at the
 time, which is what kept this off the list for two stages
 ([ADR 0029](../adr/0029-a-spawned-fiber-belongs-to-the-server.md)).
 
-What else came out of that work is [`nilo.spawn`](../reference.md#concurrency),
+What else came out of that work is [`nilo.spawn`](../reference/app.md#concurrency),
 for work that is not a request at all.
 
 ## A connection that goes quiet

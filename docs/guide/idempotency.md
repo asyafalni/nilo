@@ -167,7 +167,7 @@ answer carries `Idempotent-Replayed` and the counter moved once.
 
 ## See also
 
-- [The reference](../reference.md#idempotentreplays-options) — the surface as
+- [The reference](../reference/handlers.md#idempotentreplays-options) — the surface as
   a list.
 - [A cache in this process](./cache.md) — the Space that keeps the answers,
   and how to size it.

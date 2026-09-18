@@ -349,7 +349,7 @@ build that says what's wrong.
 
 Hand it [`CLAUDE.md`](./CLAUDE.md) for the working brief,
 [`CONTEXT.md`](./CONTEXT.md) for the vocabulary,
-[`docs/reference.md`](./docs/reference.md) for the whole API on one page, and
+[`docs/reference/`](./docs/reference/) for the whole API, one page a module, and
 [`docs/adr/`](./docs/adr/) for why any of it is like that.
 
 Then let the build do the first round of reviewing. `zig build test-all` catches

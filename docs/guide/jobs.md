@@ -492,7 +492,7 @@ with what it is waiting for.
 
 ## See also
 
-- [The reference](../reference.md#nilo_job) — the surface as a list.
+- [The reference](../reference/job.md#nilo_job) — the surface as a list.
 - [Work that is not a request](./background.md) — the fiber underneath,
   for work that is a loop rather than a row.
 - [Transactions](./sql/transactions.md) — what `pushIn` joins.

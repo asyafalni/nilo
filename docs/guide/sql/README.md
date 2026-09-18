@@ -82,7 +82,7 @@ fn generous(db: *sql.Db, c: *nilo.Ctx) ![]Coupon {
 The struct is the table, the call is the statement, and a column that is not
 there is a build error rather than a 500. The `Ctx` is where the rows go —
 the request arena — so nothing is freed by hand; a query outside a request
-takes a [`nilo.Run`](../../reference.md#run) in the same slot.
+takes a [`nilo.Run`](../../reference/core.md#run) in the same slot.
 
 ## Wiring it up
 
@@ -166,6 +166,6 @@ The reasoning behind all of it is in
 [ADR 0039](../../adr/0039-the-shape-of-a-query-is-settled-while-compiling.md),
 and how it was wired to a real driver is in
 [ADR 0040](../../adr/0040-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md).
-The whole surface on one page is in [the reference](../../reference.md#nilo_sql),
+The whole surface on one page is in [the reference](../../reference/sql.md#nilo_sql),
 and what it costs — including the connection string that is the largest
 number in the module — is in [`bench/result/sql.md`](../../../bench/result/sql.md).

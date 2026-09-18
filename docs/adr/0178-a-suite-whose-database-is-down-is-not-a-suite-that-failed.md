@@ -47,7 +47,7 @@ file is never consulted**, because the root of a test build is the compiler's ow
 `test_runner.zig`, which declares `std_options` itself.
 
 So the fix here is a documentation one, and it is in
-[`docs/reference.md`](../reference.md) next to `connect_on_init`, which is where
+[`docs/reference.md`](../reference/sql.md#db) next to `connect_on_init`, which is where
 somebody setting a suite up against a real database is already reading.
 
 ## Against ADR 0018's four axes

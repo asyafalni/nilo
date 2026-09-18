@@ -140,7 +140,7 @@ var keys = try jwt.parseKeys(gpa, res.body.view());
 defer keys.deinit();
 ```
 
-`run` there is a [`nilo.Run`](../reference.md#run) — the Scope for work that
+`run` there is a [`nilo.Run`](../reference/core.md#run) — the Scope for work that
 is not a request, which a startup path is. Since `nilo_fetch` is finished by
 `listen()` like any other service, the fetch goes in `app.before`, which runs
 inside `listen()` once the client is up and before the first request, exactly
@@ -196,7 +196,7 @@ fn me(user: CurrentUser) !CurrentUser {
 ```
 
 `c.authorization(.bearer)` is the `Authorization` header read as one scheme
-([the reference](../reference.md#authorizationscheme)): the scheme matched
+([the reference](../reference/handlers.md#authorizationscheme)): the scheme matched
 case-insensitively, the blanks trimmed, and absent or another scheme answered
 with a 401 that carries `WWW-Authenticate: Bearer` — the header every 401 has
 to carry and the one a hand-written `startsWith(value, "Bearer ")` forgets.
@@ -272,7 +272,7 @@ yours.
 
 ## See also
 
-- [The reference](../reference.md#nilo_jwt) — the surface as a list.
+- [The reference](../reference/jwt.md#nilo_jwt) — the surface as a list.
 - [Sessions](./sessions.md) — what a signed-in user becomes after the first
   verified request.
 - [Calling somebody else's API](./fetch.md) — the fetch that gets the key set.

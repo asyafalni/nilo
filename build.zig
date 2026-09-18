@@ -1702,7 +1702,19 @@ const Snippets = struct {
     /// did: marking the SQL guide more than tripled the table.
     const pages = [_]Page{
         .{ .path = "README.md" },
-        .{ .path = "docs/reference.md" },
+        // The reference is a folder, one page a module and seven for the
+        // server, and only the pages that carry a marked block are rows
+        // here: a page with none would cost a read and check nothing.
+        .{ .path = "docs/reference/app.md" },
+        .{ .path = "docs/reference/handlers.md" },
+        .{ .path = "docs/reference/core.md" },
+        .{ .path = "docs/reference/middleware.md" },
+        .{ .path = "docs/reference/sql.md" },
+        .{ .path = "docs/reference/s3.md" },
+        .{ .path = "docs/reference/id.md" },
+        .{ .path = "docs/reference/pw.md" },
+        .{ .path = "docs/reference/cache.md" },
+        .{ .path = "docs/reference/jwt.md" },
         .{ .path = "docs/guide/sessions.md" },
         .{ .path = "docs/guide/config.md" },
         .{ .path = "docs/guide/forms.md" },
@@ -2060,10 +2072,19 @@ const Snippets = struct {
     /// `docs/guide/sessions.md` → `sessions`, which is what the object is
     /// called and therefore what a failure names. A page inside a folder of
     /// the guide keeps the folder — `docs/guide/sql/reading.md` →
-    /// `sql_reading` — so two pages called `README.md` are two objects.
+    /// `sql_reading` — so two pages called `README.md` are two objects. The
+    /// reference keeps its folder too — `docs/reference/cache.md` →
+    /// `reference_cache` — because the guide has a `cache.md` as well, and a
+    /// failure named `cache_1` would not say which page to open.
     fn slug(b: *std.Build, page: []const u8) []const u8 {
         const guide = "docs/guide/";
-        const within = if (std.mem.startsWith(u8, page, guide)) page[guide.len..] else std.fs.path.basename(page);
+        const docs = "docs/";
+        const within = if (std.mem.startsWith(u8, page, guide))
+            page[guide.len..]
+        else if (std.mem.startsWith(u8, page, docs))
+            page[docs.len..]
+        else
+            std.fs.path.basename(page);
         const dot = std.mem.lastIndexOfScalar(u8, within, '.') orelse within.len;
         const name = b.allocator.dupe(u8, within[0..dot]) catch @panic("OOM");
         for (name) |*ch| {
