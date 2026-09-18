@@ -706,11 +706,10 @@ test "a streamed get pipes the object out without holding it" {
             var scope: core.Run = .init(testing.allocator);
             defer scope.deinit();
 
-            var transfer: [1 << 10]u8 = undefined;
             var reading: Files.Reading = .idle;
             defer reading.close();
 
-            try files.stream(&scope, "video/one.mp4", &reading, &transfer);
+            try files.stream(&scope, "video/one.mp4", &reading);
 
             // Readable now, because the body has not been touched — which is
             // exactly what a handler needs before it writes its own head.
@@ -1191,15 +1190,17 @@ test "temporary credentials put their token in the form and in the policy" {
             var store = try Store.open(testing.allocator, .{
                 .endpoint = try canned.endpoint(&buf),
                 .region = "us-east-1",
-                .credentials = .{ .static = .{
-                    .access_key_id = akid,
-                    .secret_access_key = secret,
-                    .session_token = "FQoGZXIvYXdzEBYaDN0EXAMPLETOKEN",
-                    // Ten minutes left, against a form asking for an hour: the
-                    // credentials are the smallest of the three, so they are
-                    // what `expires_at` reports.
-                    .expires_at = @divFloor(core.nowMillis(), 1000) + 600,
-                } },
+                .credentials = .{
+                    .static = .{
+                        .access_key_id = akid,
+                        .secret_access_key = secret,
+                        .session_token = "FQoGZXIvYXdzEBYaDN0EXAMPLETOKEN",
+                        // Ten minutes left, against a form asking for an hour: the
+                        // credentials are the smallest of the three, so they are
+                        // what `expires_at` reports.
+                        .expires_at = @divFloor(core.nowMillis(), 1000) + 600,
+                    },
+                },
             });
             defer store.deinit();
             try store.nilo_start(io, .off);

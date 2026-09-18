@@ -265,13 +265,12 @@ Ranked, with the three that were already tried marked.
    worth 12,356 bytes an idle connection** — see the table above. It paid for
    every handler in the framework, exactly as this entry predicted; it is left
    here because the prediction being right is the reason to trust the next one.
-2. **Shrink the two buffers.** 2 KB of redirect buffer is generous for a service
-   calling a known endpoint, and 4 KB of transfer buffer bounds nothing that
-   `max_body` does not already bound. Now the *largest* untried lever rather
-   than the fourth, because the number it would come off is a quarter of what
-   it was — and `/arena`'s inversion says buffers on the stack are cheaper than
-   buffers anywhere else, which is an argument for making them small rather
-   than for moving them.
+2. ~~Shrink the two buffers.~~ **Run, and worth nothing: the 4 KB transfer
+   buffer came out of `send` altogether and `/call` moved by 14 bytes**; see
+   [the section below](#the-transfer-buffer-was-never-a-resident-page). A
+   stack buffer no byte touches is never faulted in, so a buffer's *size* was
+   never on this axis; only the depth of the frames that are written to is.
+   The 2 KB redirect buffer is the same kind of thing and is not worth a run.
 3. ~~Move the two client buffers into the arena.~~ *Tried twice: −66 bytes
    before the stack release and +4,096 after it.* Do not try a third time.
 4. ~~Blame the retained request arena.~~ *Tried, ruled out by `/warm`.*
@@ -279,6 +278,42 @@ Ranked, with the three that were already tried marked.
    run-to-run drift is larger. There is no signal here to chase.
 6. **Nothing on binary size.** 1,640 bytes for the module; the rest is std's and
    is not nilo's to remove.
+
+## The transfer buffer was never a resident page
+
+18 September 2026, `b743876` plus the working tree of ADR 0237 and 0238,
+`bench/fetch_server.zig` in ReleaseFast, `bench/mem.py` to 5,000, before and
+after interleaved twice, load average under 1.6. A different box again from
+the run above (AMD, 16 threads, Linux 7.2.5), so `/health` is 5,186 here
+rather than 4,679 and only the differences are comparable.
+
+| route | 500 | 1,000 | 2,000 | 5,000 |
+|---|---|---|---|---|
+| `/health`, after | 5,202 | 5,198 | 5,190 | **5,186** |
+| `/bare`, after | 10,306 | 9,789 | 9,542 | **9,383** |
+| `/call`, before, run 1 | 10,977 | 10,121 | 9,703 | **9,451** |
+| `/call`, after, run 1 | 10,830 | 10,060 | 9,671 | **9,437** |
+| `/call`, before, run 2 | 10,985 | 10,142 | 9,708 | **9,450** |
+| `/call`, after, run 2 | 10,846 | 10,064 | 9,673 | **9,437** |
+
+The diff under test takes the 4,096-byte `transfer_buffer` out of
+`Client.send` and adds 64 bytes to `@sizeOf(Exchange)` (928 → 992, ADR
+0237's tap reader). **−14 bytes, both pairs.** A 4 KiB stack array that is
+declared `undefined` and never written is never faulted in, so it was never
+in `VmRSS` and taking it out cannot move `VmRSS`; and 64 bytes of struct
+that *are* written land inside a page the frame already touches. That is
+the mechanism behind lever 2 above being worth nothing, and behind
+`bench/result/s3.md`'s "64 KB to 8 KB moved one byte", which had the same
+fact on file under "the lever is depth".
+
+What the buffer cost was the claim: three documents said it was the body's
+window, and a download manager planned a mebibyte against it
+([ADR 0238](../../docs/adr/0238-the-transfer-buffer-serves-nothing-here.md)).
+
+`/call` over `/bare` is +54 here, where the September run had them equal;
+the two are one run each on a box with 1.5 of load, and the difference is
+under the spread between the two `/call` pairs at 500 connections (147
+bytes), so it is quoted as noise rather than as a cost.
 
 ## Reproducing this
 

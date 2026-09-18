@@ -70,7 +70,52 @@ where it was made.
   version 1 in place. That needs the two marker lines around the generated
   steps, and the refusal says so with the line to paste.
 
+- **`Exchange.Begin.redirect_buffer` is `redirects`**, a union with a name
+  for each intent: `.refuse` (the default: a 3xx with a `Location` is
+  `error.RedirectRefused`), `.follow = &buf`, or `.expose` (the 3xx as
+  itself). An empty buffer used to mean "not followed" and "not thought
+  about" in the same spelling, and the second read as a broken server
+  ([ADR 0239](./docs/adr/0239-a-redirect-is-a-decision-with-a-name.md)).
+
+  What to change: `.redirect_buffer = &buf` becomes
+  `.redirects = .{ .follow = &buf }`. An `Exchange` that wants a 302 handed
+  over as itself (a signed request, a client that reads the body of a 301)
+  says `.redirects = .expose`; one that left the field out and never met a
+  3xx changes nothing.
+
+- **`Bucket.stream(c, key, &reading)` takes no buffer.** The one it took was
+  documented as what the body moved through, and no byte ever crossed it:
+  the body goes from the connection's own read buffer to the writer `pipe`
+  is given ([ADR 0238](./docs/adr/0238-the-transfer-buffer-serves-nothing-here.md)).
+
+  What to change: drop the fourth argument and the `var transfer` above it.
+
 ### Added
+
+- **`stall_ms`**, on `fetch.Client.Settings`, `Call` and `Exchange.Begin`:
+  the call is `error.Stalled` when nothing has arrived for that long,
+  counted from the last byte rather than from the start. The other shape
+  of bound, for the call whose whole point is the transfer and whose only
+  honest `timeout_ms` is `0`: a peer that goes quiet and holds the socket
+  now ends, and a slow one that keeps moving never fires it. Under a server
+  it is the Engine's timer re-armed on every chunk; on a client with no
+  Engine it is ADR 0230's cancelled task, with the wait re-read from the
+  last byte. `Exchange.stream(w, limit)` is one chunk of the body inside
+  both clocks, for a body moved in pieces of the caller's own choosing
+  ([ADR 0237](./docs/adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)).
+
+- **`head.keep(c)`** is the same `Head` copied into the Scope, so it reads
+  the same after the body has been through: the `etag` taken before a
+  download and compared against after it, without a `[512]u8` of the
+  caller's own ([ADR 0240](./docs/adr/0240-a-head-that-outlives-its-body.md)).
+
+- **`fetch.Client.Settings.read_buffer_size`**, std's 8 KiB passed through:
+  the buffer each connection reads the socket through, and so the number
+  that decides how much one read brings in. `Begin.transfer_buffer` never
+  did, and its comment now says what it is for: a caller reading buffered
+  off `ex.reader`, and nothing else. `Client.send` no longer declares 4 KiB
+  of it ([ADR 0238](./docs/adr/0238-the-transfer-buffer-serves-nothing-here.md)).
+
 
 - **`Exchange.Begin` takes a `user_agent`**, beside `host`, `authorization`
   and `content_type`: the fourth header `std.http.Client` writes for itself.
@@ -350,6 +395,14 @@ where it was made.
   ([ADR 0234](./docs/adr/0234-a-scalar-out-of-raw.md)).
 
 ### Fixed
+
+- **A call the Engine's own deadline stopped no longer drains the body it
+  stopped waiting for.** `end` skipped the drain when the engineless clock
+  had fired and not when the Engine's had, so a body that stalled after its
+  head under `listen()` was given up on and then read to keep the
+  connection, which on a server that went quiet is the read that never
+  returns. Found by the first stall test under the Engine, at zero CPU
+  ([ADR 0237](./docs/adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)).
 
 - **A Row over a view in an attached SQLite database is introspected as a
   view.** `columnsOf` rewrote `pragma_table_info` to the attached schema and

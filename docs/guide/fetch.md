@@ -69,6 +69,7 @@ The last argument is a `Call` — per-call overrides, every field null, so
 |---|---|
 | `headers` | `[]const std.http.Header`, written to the wire in this order. One that std has a slot for — `host`, `authorization`, `user-agent`, `content-type`, `connection`, `accept-encoding` — is sent once, this copy, rather than beside std's own ([ADR 0231](../adr/0231-a-header-std-owns-goes-out-once.md)) |
 | `timeout_ms` | this call's own deadline, over the client's |
+| `stall_ms` | this call's own ceiling on silence, over the client's |
 | `max_body` | this call's own body ceiling, over the client's |
 
 **Headers you did not choose.** A `headers` taken off a pasted `curl` line
@@ -152,8 +153,10 @@ Given to `init`, once:
 |---|---|---|
 | `max_in_flight` | 32 | calls at once, across every host. Past it a caller waits for a permit rather than opening another connection |
 | `timeout_ms` | 30,000 | how long one whole call may take — connect, send, head and body. `0` is no limit |
+| `stall_ms` | 0 | how long the far end may say **nothing**: time since the last byte, not since the call began. `0` is no such bound. The other shape of clock, for the call whose whole point is the transfer ([below](#a-bound-on-silence-not-on-the-call)) |
 | `max_body` | 8 MiB | a longer body is `error.BodyTooLarge`, enforced while reading, so a `content-length` that lies cannot get past it |
 | `max_drain` | 64 KiB | how much of an unread body is worth reading to keep a pooled connection. Past it the connection is dropped instead |
+| `read_buffer_size` | 8 KiB | the buffer each connection reads the socket through, and so how much one read brings in. std's own default, passed through; per connection, on the heap beside it |
 | `forward_request_id` | true | a call made under a `*Ctx` carries the request's id as `X-Request-Id`, so the service you called can log the same id you did. Under a `nilo.Run` there is no request and nothing is sent; a call that names its own `X-Request-Id` keeps it ([ADR 0196](../adr/0196-a-request-id-goes-out-with-the-call.md)) |
 
 **`max_in_flight` is the one that is not a nicety.** `std.http.Client`'s pool
@@ -182,12 +185,61 @@ cost is one thread hop per step, paid only there. Until 0.5 that client had
 wrote its own watchdog to cover for it; `.off`, the older name for `.none`,
 is kept so that program still compiles.
 
+### A bound on silence, not on the call
+
+A download may honestly take an hour, so the only honest `timeout_ms` for a
+call whose whole point is the transfer is `0`, and that leaves a peer that
+went quiet with the socket open (a CDN edge that lost its origin, a NAT that
+dropped the mapping, a Wi-Fi handover) with nothing to end it. **`stall_ms`
+is the ceiling on silence inside a call**: nothing arriving for that long is
+`error.Stalled`, counted from the last byte that reached you rather than
+from the start. The two compose (`timeout_ms` on the whole, `stall_ms` on
+the gaps) and a caller sets either or both
+([ADR 0237](../adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)).
+
+<!-- compiles -->
+```zig
+const fetch = @import("nilo_fetch");
+
+fn pull(api: *fetch.Client, c: *nilo.Ctx) !void {
+    var out = try c.stream(200, "application/octet-stream");
+    var ex: fetch.Exchange = .idle;
+    defer ex.end();
+    _ = try ex.begin(api, .{
+        .method = .GET,
+        .url = "https://mirror.example.com/large.iso",
+        .timeout_ms = 0, // however long it takes
+        .stall_ms = 10_000, // but never ten seconds of nothing
+    });
+    _ = ex.pipe(&out.writer) catch |err| switch (err) {
+        error.Stalled => return nilo.fail.status(504, "the mirror went quiet", .{}),
+        else => return err,
+    };
+    try out.finish();
+}
+```
+
+It is not a per-read timeout, which ADR 0230 refused and still refuses: a
+server sending one byte a second is *slow*, satisfies this bound, and
+whether slow is acceptable is yours to judge against your other connections.
+What this catches is a server sending nothing. `Stalled` is told apart from
+`TimedOut` because a caller does different things with them: a stalled
+transfer is restarted on a fresh connection, a call that blew its whole
+budget is given up on.
+
+Under a server it is the Engine's timer, re-armed on every chunk; on a
+client with no Engine it is the same task-and-cancel ADR 0230 built, with
+the wait re-read from the last byte. Either way a transfer that keeps moving
+never fires it.
+
 ## What it answers instead
 
 | Error | |
 |---|---|
 | `error.TimedOut` | this call's own deadline ran out |
+| `error.Stalled` | nothing arrived for `stall_ms`; the peer still holds the socket |
 | `error.Canceled` | the server is shutting down underneath the call. Told apart from `TimedOut` rather than guessed at |
+| `error.RedirectRefused` | the answer was a 3xx with a `Location`, and the call made no decision about redirects. `Client.get` and its siblings follow; an `Exchange` says `.redirects = .follow` or `.expose` ([below](#a-body-too-big-to-hold)) |
 | `error.BodyTooLarge` | the body passed `max_body`, and reading stopped there |
 | `error.BodyTooShort` | the body ended before the length its own head announced |
 | `error.NotStarted` | a call made before `listen()` — the client is finished at startup like any other service |
@@ -225,14 +277,12 @@ coming in, this is for an answer going the other way.
 const fetch = @import("nilo_fetch");
 
 fn mirror(api: *fetch.Client, c: *nilo.Ctx) !void {
-    var transfer: [16 * 1024]u8 = undefined;
     var ex: fetch.Exchange = .idle;
     defer ex.end();
 
     const head = try ex.begin(api, .{
         .method = .GET,
         .url = "https://example.com/report.csv",
-        .transfer_buffer = &transfer,
     });
     if (!head.ok()) return nilo.fail.status(502, "upstream answered {d}", .{@intFromEnum(head.status)});
     if (head.content_length) |n| if (n > 64 << 20) return nilo.fail.status(502, "report too large", .{});
@@ -246,40 +296,58 @@ fn mirror(api: *fetch.Client, c: *nilo.Ctx) !void {
 | | |
 |---|---|
 | `ex.begin(api, .{…})` | `Head` — `status`, `content_length`, `content_type`, `header(name)` case-insensitively, `ok()`; and `redirected`, the `std.Uri` a followed redirect ended at or null, with `location(&buf)` to write it out as one string |
+| `head.keep(c)` | the same head copied into the Scope, so it reads the same after the body has been through |
 | `ex.take(c, max)` | the rest of the body as a `Str` in the Scope, refusing over `max` |
 | `ex.readInto(buf)` | exactly `buf.len` bytes, or `error.BodyTooShort` |
 | `ex.pipe(w)` | the rest into a `*std.Io.Writer`, and how many bytes |
+| `ex.stream(w, limit)` | one chunk into `w`, at most `limit`, and how many bytes; `0` is the end. For a body moved in pieces of your own choosing |
 | `ex.discard()` | "I will not read this body; close the connection." For the probe that asked for one byte and got the file |
 | `ex.end()` | required, and safe twice |
 
 `Begin` takes what a `Call` does and more: `headers`, `host`, `authorization`,
 `content_type` and `user_agent` — four headers std would otherwise write for
-itself, which a signed request has to control — `timeout_ms`, a `body` of
-`.none`, `.slice` or `.stream` with a length, and two buffers. The explicit
-fields are for a caller who has the value; the same name in `headers` is the
-other way to say it, and both at once is two lines on the wire.
+itself, which a signed request has to control; `timeout_ms`, `stall_ms`, a
+`body` of `.none`, `.slice` or `.stream` with a length, and `redirects`. The
+explicit fields are for a caller who has the value; the same name in
+`headers` is the other way to say it, and both at once is two lines on the
+wire.
 
-**Where a redirect ended.** A call that follows one — a `redirect_buffer`
-with room in it — comes back with `head.redirected` set to the URL the
-answer actually came from, so the connections after a probe can go straight
-there rather than walking the chain again. The text lives in your
-`redirect_buffer`, which is why `head.location(&buf)` takes a buffer to
-write it into rather than handing back a slice
-([ADR 0232](../adr/0232-a-followed-redirect-says-where-it-ended.md)).
+**A redirect is a decision, and the call says which.** `redirects` is
+`.refuse` by default, and under it a 3xx with a `Location` is
+`error.RedirectRefused`: a caller who never thought about redirects finds
+out from the error rather than from a status 301 read as a broken server.
+`.follow = &buf` walks the chain, three deep at most, and the answer comes
+back with `head.redirected` set to the URL it actually came from, so the
+connections after a probe can go straight there rather than walking the
+chain again; the text lives in your buffer, which is why
+`head.location(&buf)` takes one to write into rather than handing back a
+slice ([ADR 0232](../adr/0232-a-followed-redirect-says-where-it-ended.md)).
+`.expose` is handed the 3xx as itself, which is what a signed request wants
+(a signature is computed over one host and one path, and following would
+send the `authorization` header somewhere it was never meant to go) and
+what a client that reads the body of a 301 wants, which is where S3 puts
+its reason ([ADR 0239](../adr/0239-a-redirect-is-a-decision-with-a-name.md)).
 
 **Everything in `Head` points into the connection's read buffer, and the
-first byte of body read overwrites it.** Read what you need — or copy it —
-before `take` or `pipe`. That is the bargain a [borrowed row](./sql/raw.md) makes,
-for the same reason: the alternative is an allocation per call for text most
-callers glance at once.
+first byte of body read overwrites it.** Read what you need before `take` or
+`pipe`, or `head.keep(c)` for a copy in the Scope that reads the same
+afterwards: the `etag` the next run compares against, taken before the body
+and needed after it
+([ADR 0240](../adr/0240-a-head-that-outlives-its-body.md)). That is the
+bargain a [borrowed row](./sql/raw.md) makes, for the same reason: the
+alternative is an allocation per call for text most callers glance at once,
+so the borrowed head is the default and the copy is one line where it is
+wanted.
 
-**The buffers are yours because their cost is yours.** `transfer_buffer` is
-what the body moves through; bigger is fewer trips into the connection and
-more stack held per connection. An empty `redirect_buffer` — the default —
-means redirects are not followed and a 302 comes back as itself, which is the
-right answer for anything signed: a signature is computed over one host and
-one path, and following a redirect would send the `authorization` header
-somewhere it was never meant to go.
+**There is no buffer to declare.** `take`, `readInto`, `pipe` and `stream`
+go from the connection's own read buffer straight to the destination, on
+every framing; the `transfer_buffer` field is for a caller who reads
+*buffered* off `ex.reader` (`take`, `peek`, a delimiter) and for nothing
+else. It does not change how much one socket read brings in, which is
+`read_buffer_size` on the client. Until 0.5 the guide said bigger was fewer
+trips, a download manager gave sixteen segments 64 KiB each on the strength
+of it, and the syscall count did not move
+([ADR 0238](../adr/0238-the-transfer-buffer-serves-nothing-here.md)).
 
 **An `Exchange` must not be copied once begun** — it holds a live
 `std.http.Client.Request`. Declare it, fill it where it stands, leave it
@@ -307,7 +375,8 @@ that has made one call holds 4,139 bytes more than one that has not, for the
 life of the connection, at the depth `std.http.Client` drives the fiber to
 ([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)). That is
 still the largest per-connection figure in the toolkit, and the levers left
-are small.
+are small: taking the 4 KiB transfer buffer out of `send` moved it by 14
+bytes, because a buffer no byte ever touched was never a resident page.
 
 Everything measured is `http://`;
 [`bench/result/fetch.md`](../../bench/result/fetch.md) has the numbers on all

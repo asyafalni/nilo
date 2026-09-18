@@ -324,15 +324,16 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             }
         };
 
-        /// Open an object for streaming. `buf` is what the body moves through,
-        /// and its size is the caller's decision because its cost is the
-        /// caller's stack (ADR 0063).
+        /// Open an object for streaming. Nothing is declared for the body to
+        /// move through: it goes from the connection's own read buffer to
+        /// the writer `pipe` is given, and the buffer this used to take was
+        /// a page of stack per connection that no byte ever crossed
+        /// (ADR 0238).
         pub fn stream(
             self: *Self,
             c: anytype,
             key: []const u8,
             out: *Reading,
-            buf: []u8,
         ) Error!void {
             comptime core.checkScope(@TypeOf(c), "bucket.stream");
 
@@ -355,7 +356,11 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .host = self.host,
                 .authorization = sig.value(),
                 .headers = headers.slice(),
-                .transfer_buffer = buf,
+                // A 301 from S3 is a bucket in another region, and the
+                // reason is in its body: handed over as itself, so
+                // `failure` reads it (ADR 0239). Never followed, because a
+                // signature is over one host.
+                .redirects = .expose,
             }) catch |err| return blame(err);
 
             if (!got.ok()) return self.failure(c, &out.ex, got);
@@ -400,7 +405,6 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             var ex: fetch.Exchange = .idle;
             defer ex.end();
 
-            var transfer: [512]u8 = undefined;
             const got = ex.begin(&self.store.client, .{
                 .method = .PUT,
                 .url = target,
@@ -409,7 +413,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .content_type = viewOf(value.content_type),
                 .headers = headers.slice(),
                 .body = .{ .slice = bytes },
-                .transfer_buffer = &transfer,
+                .redirects = .expose,
             }) catch |err| return blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
@@ -446,7 +450,6 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             var ex: fetch.Exchange = .idle;
             defer ex.end();
 
-            var transfer: [512]u8 = undefined;
             const got = ex.begin(&self.store.client, .{
                 .method = .PUT,
                 .url = target,
@@ -455,7 +458,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .content_type = viewOf(source.content_type),
                 .headers = headers.slice(),
                 .body = .{ .stream = .{ .reader = source.reader, .len = source.len } },
-                .transfer_buffer = &transfer,
+                .redirects = .expose,
             }) catch |err| return blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
@@ -483,14 +486,13 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             var ex: fetch.Exchange = .idle;
             defer ex.end();
 
-            var transfer: [512]u8 = undefined;
             const got = ex.begin(&self.store.client, .{
                 .method = .DELETE,
                 .url = target,
                 .host = self.host,
                 .authorization = sig.value(),
                 .headers = headers.slice(),
-                .transfer_buffer = &transfer,
+                .redirects = .expose,
             }) catch |err| return blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
@@ -517,14 +519,13 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             var ex: fetch.Exchange = .idle;
             defer ex.end();
 
-            var transfer: [512]u8 = undefined;
             const got = ex.begin(&self.store.client, .{
                 .method = .HEAD,
                 .url = target,
                 .host = self.host,
                 .authorization = sig.value(),
                 .headers = headers.slice(),
-                .transfer_buffer = &transfer,
+                .redirects = .expose,
             }) catch |err| return blame(err);
 
             // A HEAD carries no body, so there is no `<Code>` to read and the
@@ -875,16 +876,13 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             var ex: fetch.Exchange = .idle;
             defer ex.end();
 
-            // Small on purpose: the body goes into one allocation sized from
-            // `content-length`, so this is only the window it arrives through.
-            var transfer: [4 << 10]u8 = undefined;
             const got = ex.begin(&self.store.client, .{
                 .method = .GET,
                 .url = target,
                 .host = self.host,
                 .authorization = sig.value(),
                 .headers = headers.slice(),
-                .transfer_buffer = &transfer,
+                .redirects = .expose,
             }) catch |err| return blame(err);
 
             if (got.status == .not_modified) return error.NotModified;

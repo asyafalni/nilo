@@ -211,11 +211,10 @@ test "a streamed put is a get, and a streamed get is the same bytes" {
             });
             defer live.delete(&scope, "live/streamed.txt") catch {};
 
-            var transfer: [1 << 10]u8 = undefined;
             var reading: Live.Reading = .idle;
             defer reading.close();
 
-            try live.stream(&scope, "live/streamed.txt", &reading, &transfer);
+            try live.stream(&scope, "live/streamed.txt", &reading);
             try testing.expectEqual(@as(u64, body.len), reading.len);
 
             var out: [128]u8 = undefined;

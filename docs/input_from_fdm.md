@@ -1,255 +1,318 @@
 # Roadmap input for nilo, from fdm
 
-What building **fdm** on nilo at `8c2d3be` (0.4.0 plus what is under
-Unreleased) asked for and did not find.
+Findings from **fdm**, a download manager on `nilo_sql`, `nilo_job` and
+`nilo_fetch` with no `App` and no Engine, on a plain `std.Io.Threaded`.
+Sixteen `Range` connections per file, a steal from the longest running one,
+resume on `ETag`, one SQLite file, a TUI on a worker thread that knows nothing
+about a terminal.
 
-fdm is a download manager in Zig 0.16: a CLI and a TUI over one SQLite
-file, sixteen HTTP connections a download, resume across a kill, and a
-benchmark that puts it beside curl, aria2 and Surge. It uses `nilo_sql`
-for the file, `nilo_job` for the queue of downloads, and `nilo_fetch` for
-every connection. It has no `App` and no Engine: a `Db`, a `Client` and a
-`Jobs` on a plain `Io.Threaded`, which is the shape every CLI on nilo will
-have, and the one most of nilo's own guidance is not written for.
+This is the second round. The first was the seven items ADR 0229 to 0235
+closed, and every one of those has left fdm's source. What is here is what
+stayed behind once they were gone, plus one thing that measuring the
+workaround turned up. Each item is anchored to the lines in fdm that carry
+it, at the working tree that builds against nilo `7dfa14a`.
 
-Every item is anchored to the place in fdm that worked around it, at
-`general-improvement` commit `c6939ea`. Ordered by how much each cost fdm,
-not by how hard it is to build.
+Ordered by how much fdm's source shrinks if it ships; the last is a defect
+rather than a gap.
 
 ---
 
 ## Summary
 
-| # | Gap | Module | What fdm did instead |
-|---|-----|--------|----------------------|
-| 1 | A wake for the queue | `nilo_job` | `poll_ms = 100`, 160 idle queries a second |
-| 2 | A deadline without an Engine | `nilo_fetch` | `timeout_ms = 0` and its own stall watchdog |
-| 3 | Headers that std owns, routed once | `nilo_fetch` | A `Headers` struct that routes them per call |
-| 4 | The URL a redirect ended at | `nilo_fetch` | Formats `ex.req.uri` before the buffer dies |
-| 5 | A column a shipped table has not got | `nilo_sql` | Hand-written `ALTER TABLE` that mirrors `createMissing` |
-| 6 | A scalar out of `raw` | `nilo_sql` | A one-field struct with `nilo_table = .projection` |
-| 7 | Small things | — | — |
+| # | Gap | Module | What it takes out of fdm | Conflicts with a stated non-goal? |
+|---|-----|--------|--------------------------|-----------------------------------|
+| 1 | A bound on progress, not on the call | `nilo_fetch` | the stall half of `supervise`, ~30 lines and two fields per segment | Touches ADR 0230's rejection of per-read timeouts, but is not that |
+| 2 | `transfer_buffer` does nothing on the `stream` path, and the buffer that does is not exposed | `nilo_fetch` | 1 MiB of stack per download that buys nothing | No |
+| 3 | An `Exchange` that carries its own small transfer buffer | `nilo_fetch` | one buffer and one field on every call that is not a transfer | No, the cost stays on the caller's stack |
+| 4 | "Do not follow redirects" and "forgot the buffer" are spelled the same | `nilo_fetch` | nothing today; a class of first-week bug | No |
+| 5 | `head.keep(scope)`: a `Head` that survives the body | `nilo_fetch` | `Text`, 30 lines, and three `.from(...)` calls | No, the borrowed `Head` stays the default |
+| 6 | `addMissingColumns` introspects on a second connection while its transaction holds the first | `nilo_sql` | a test that had to move off `cache=shared` | No, a defect |
 
 ---
 
-## 1. A wake for the queue
+## 1. A bound on progress, not on the call
 
-### What's missing
+### What is there
 
-A way for the process that enqueues to wake the workers. `Jobs.serveOn`
-(`job/job.zig:546`) is one `claim` per worker per `poll_ms`, then a sleep,
-and nothing else moves it. Enqueueing from the same process — which is what
-every CLI does — has no way to say "now".
+`timeout_ms` bounds a whole call, and since ADR 0230 it fires with or
+without an Engine. For a download that is the wrong shape of bound: a
+segment's call *is* the transfer, and a transfer may take hours, so the only
+honest value is `0`. That leaves a segment whose peer went quiet with nothing
+to end it.
 
-### Why it matters
+ADR 0230 rejected per-read timeouts for the right reason: a server sending
+one byte a second satisfies any per-read limit and never finishes, so an API
+call needs an end-to-end bound. fdm agrees, for an API call. A transfer is
+the case where the end-to-end bound cannot be set and the one-byte-a-second
+server is not the failure being guarded against: that server is *slow*, and
+fdm handles slow by measuring rate against the other fifteen connections and
+reconnecting the outlier. The failure a download meets is a peer that sends
+*nothing*, and keeps the socket open: a CDN edge that lost the origin, a NAT
+that dropped the mapping, a Wi-Fi handover. What bounds that is time since
+the last byte, not time since the first.
 
-With the default `poll_ms = 1_000`, `fdm add` to the first byte was half a
-second on average. fdm set it to 100 (`src/download.zig:413`), which is
-sixteen workers × ten `UPDATE … RETURNING` a second against one SQLite
-file while there is nothing to do. It made a 100 KB file 0.7 s → 0.2 s; the
-0.06 s that still separates it from curl on the same file is the poll.
+### Where fdm carries it
 
-The default is also the wrong one for a queue that is fed from inside: a
-program that never noticed `poll_ms` exists gets a queue that feels broken.
+`src/download.zig:716-727`, in `supervise`: every 100 ms, for every running
+segment, compare `seg.have()` to `seg.last_seen`; if it moved, stamp
+`last_moved_ms`; if it has not moved for `settings.stall_ms` (10 s, `--stall`
+on the command line at `src/main.zig:80`), `future.cancel(io)`, count a
+failure, mark the segment idle so the loop restarts it. The two fields are
+`src/download.zig:960-961`. The mechanism under it is the one ADR 0230 now
+uses: `Threaded.cancel` sends a signal into the blocking `recv` and the task
+comes out with `error.Canceled`.
 
-### Possible shape
+This is the last watchdog in fdm, and it is a watchdog for the same reason
+the first one was: the thing it guards is a number nilo has and fdm has to
+recount. nilo's `stream` knows exactly when a byte reached the writer; fdm
+learns it by reading an atomic the segment task stores after every chunk.
 
-```zig
-var jobs: Jobs = .open(gpa, &table, ctx, .{ .workers = 16 });
-try jobs.enqueue(&run, .fetch, payload);   // signals the wake itself
-jobs.wake();                               // for a producer nilo did not see
-```
+### What is proposed
 
-An `Io`-level event that a sleeping worker waits on with `poll_ms` as its
-timeout, so the poll becomes the fallback for a producer in another
-process. With it, an idle backoff is safe: double the sleep to a cap when a
-`claim` came back empty, reset on a wake. Sixteen idle workers then cost
-nothing, and a fed queue answers in one scheduler hop.
+**`Begin.stall_ms: ?u32`**, beside `timeout_ms`: the call fails with
+`error.Stalled` when no byte of the body has reached the caller for that
+long. The two compose: `timeout_ms` is the ceiling on the whole call,
+`stall_ms` is the ceiling on silence inside it, and a caller sets either or
+both.
 
-If a single claimer is easier than a wake per worker, `claim(n)` handing
-rows to workers over a channel takes fifteen writers off the SQLite lock at
-the same time. fdm did not measure that lock as a cost, so it is second.
+Under an Engine the `Bound` is re-armed at `now + stall_ms` each time a chunk
+lands. Without one, ADR 0230's `bounded` already runs each step as a task and
+waits on a futex with the deadline as the timeout; for `stream`, `pipe` and
+`readInto` the step becomes a loop of chunks, and the wait's timeout is
+`stall_ms` from the last chunk rather than the call's deadline. The chunk is
+whatever `reader.in.stream` hands over in one call, which on the wire is one
+socket read, so nothing is split that was not already split.
 
----
+`error.Stalled` rather than `error.TimedOut`, because the caller does
+different things with them: a stalled segment is restarted on a fresh
+connection and does not count as a failed attempt; a timed-out probe is a
+server that cannot carry sixteen segments and the download fails. `blame`
+names it the way it names a timeout.
 
-## 2. A deadline without an Engine
+With it, fdm's segment task returns `error.Stalled`, `Segment.run` records it
+the way it records any error, and the supervisor's restart path, which
+already exists for a failed attempt, does the rest. `last_seen`,
+`last_moved_ms`, the branch at 716-727 and the `future.cancel` inside it go.
+The rate sampling stays, because that is a decision across sixteen
+connections and nilo sees one.
 
-### What's missing
+### What it costs
 
-A per-call timeout that fires on `Io.Threaded`. `fetch.Settings.timeout_ms`
-is honoured only where an Engine runs the bound
-(`fetch/fetch.zig:466`, `blame` at `:299`); on a plain `Io` it arms
-nothing, and a connection that stops sending is held forever.
+One `i64` on `Exchange` for the moment of the last chunk, which the padding
+ADR 0230 found room in may or may not still have. Without an Engine, one
+futex wait per chunk instead of one per step, on the client that has a
+`stall_ms` set and only there. Under an Engine, one `Bound.arm` per chunk.
+No allocation.
 
-### Why it matters
-
-fdm sets `.timeout_ms = 0` with a comment that says why
-(`src/download.zig:397`) and runs its own watchdog: a per-segment
-`last_moved_ms` that `supervise` checks every 50 ms against `stall_ms`
-(`src/download.zig:986`). That is a second timeout mechanism a caller wrote
-because the first one is silently off. Nothing in `Begin` or `Settings`
-refuses the non-zero value; it is just not true.
-
-### Possible shape
-
-Either of:
-
-- A bound that can be armed on `Io.Threaded` — one `io.concurrent` task per
-  in-flight call that sleeps and cancels — so `timeout_ms` means the same
-  thing everywhere.
-- A refusal, at `Client.init` or `nilo_start`, when `timeout_ms != 0` and
-  there is no Engine: "a timeout here cannot fire; pass 0 and bound the
-  call yourself". A guard that does nothing should say so
-  ([ADR 0033](./adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
-  is the argument, applied to the guard itself).
-
----
-
-## 3. Headers that std owns, routed once
-
-### What's missing
-
-`Begin.headers` goes to `extra_headers` (`fetch/fetch.zig:584`), and
-`std.http.Client` has its own slots for `host`, `authorization`,
-`user-agent`, `accept-encoding` and `connection`. A caller who puts one of
-those in `headers` gets it twice on the wire — `Begin.user_agent`, added under
-Unreleased for fdm, is one slot of five made reachable.
-
-### Why it matters
-
-fdm takes headers from a pasted `curl` line, so it sees `authorization:
-Bearer …`, `user-agent: Mozilla/…` and `host:` as strings it did not
-choose. It carries a `Headers` struct (`src/download.zig:1507`) whose only
-job is to pull those three out into `.authorization`, `.host`,
-`.user_agent` and hand the rest to `.headers`. That is routing every nilo
-user with user-supplied headers will write, and the list of what std owns
-is nilo's to know, not theirs.
-
-### Possible shape
-
-`Begin.headers` is the whole set; nilo splits it. A header whose name
-matches a std slot goes to the slot (last one wins), the rest go to
-`extra_headers`. `Begin.authorization` and the like stay as the explicit
-form for a caller who has the value and not a header line. One place
-knows the five names, and it is `fetch.zig`.
+The test is the one fdm already has: a server that sends half the body and
+holds the socket open. Before, that test cannot finish without the watchdog.
 
 ---
 
-## 4. The URL a redirect ended at
+## 2. `transfer_buffer` does nothing on the `stream` path, and the buffer that does is not exposed
 
-### What's missing
+### What is there
 
-`Head` does not say where a followed redirect landed. fdm needs it — the
-sixteen connections after the probe should hit the final URL, not repeat
-the redirect chain — and gets it by formatting `ex.req.uri` into its own
-buffer before `redirect_buffer` goes out of scope (`src/download.zig:1319`).
+The guide says of `transfer_buffer`: "bigger is fewer trips into the
+connection for a large object and more stack held per connection". fdm read
+that and gave every segment 64 KiB at `src/download.zig:1017`, sixteen
+segments, 1 MiB of stack per download.
 
-### Why it matters
+`std.http.bodyReader` (`lib/std/http.zig`) says what the buffer is for. For
+a body with a `content-length`, `contentLengthStream` is
+`reader.in.stream(w, limit)`: straight from the connection's reader into the
+caller's writer. The `transfer_buffer` is the interface's buffer, and
+`stream` never fills it. It is read through only by `take`, `peek` and the
+chunked path.
 
-It reaches into `std.http.Client.Request` through the `Exchange`, which
-nilo does not promise, and it has to happen inside `probe` because the
-buffer is a local there. The comment explaining the lifetime is longer
-than the code.
+Measured, one segment against `mirrors.kernel.org/ubuntu/ls-lR.gz`
+(38.8 MB, TLS), read syscalls counted from `/proc/<pid>/io`:
 
-### Possible shape
+| `transfer_buffer` | `syscr`, two runs |
+|---|---|
+| 64 KiB | 19,860 and 14,892 |
+| 0 | 18,758 and 19,032 |
 
-`head.location: ?[]const u8`, null when no redirect was followed, valid as
-long as the `Exchange` is — the same lifetime `head.header()` already has.
+About 2.5 KB a read either way, and the same hash. The number that decides
+the read size is `std.http.Client.read_buffer_size`, 8 KiB by default, which
+nilo's `Client.init` leaves at the default and `Settings` does not name.
 
----
+### What is proposed
 
-## 5. A column a shipped table has not got
+Two things, and the first is a sentence.
 
-### What's missing
+**The doc says which path the buffer serves.** "`transfer_buffer` is read
+through by `take` and by a chunked body; `stream` and `pipe` on a
+`content-length` body go from the connection's own buffer to your writer
+and do not touch it." That sentence would have kept 1 MiB off fdm's stack.
 
-The step between `createMissing` and `migrate.apply`. `createMissing`
-creates what is not there and, by design, alters nothing
-(`sql/migrate.zig:1170`); `apply` wants versions and steps. A single-file
-program that added a field to a Row struct wants one `ALTER TABLE … ADD
-COLUMN`, typed the way `createMissing` would have typed it, and neither
-gives it.
+**`Settings.read_buffer_size`**, passed through to `std.http.Client`. It is
+per connection and lives on the heap with the connection, which is the right
+place for a download manager's sixteen sockets and the wrong place for a
+handler's one call, so the default stays at std's 8 KiB and the field says
+so. Whether 64 KiB there cuts the syscalls in the table above is a
+measurement fdm can make the day the field exists; it cannot make it today.
 
-### Why it matters
+### What it costs
 
-fdm added `headers`, `named` and `sha256` to `downloads` after the first
-release. `addMissingColumns` (`src/store.zig:90`) reads
-`pragma_table_info`, then runs three `ALTER TABLE` strings written by hand,
-with types copied from what `createMissing` emits. If nilo's type mapping
-moves, a file made through `createMissing` and a file made through the
-ALTER path will differ, and nothing will say so. `migrate.apply` would
-have been the honest tool, but a CLI's own SQLite file does not want a
-ledger table and version files for three columns.
-
-### Possible shape
-
-```zig
-try sql.migrate.createMissing(&db, &run, &.{ Download, Segment });
-try sql.migrate.addMissingColumns(&db, &run, &.{Download});
-```
-
-Same type mapping as `createMissing`, `pragma_table_info` on SQLite and
-`information_schema.columns` on Postgres, one `ALTER` per field the table
-lacks, and a refusal for a field that is `NOT NULL` without a default. The
-same function is a natural `Step` for `apply`, so both paths emit the same
-DDL from the same struct.
+One field, one line in `init`. Nothing on any call.
 
 ---
 
-## 6. A scalar out of `raw`
+## 3. An `Exchange` that carries its own small transfer buffer
 
-### What's missing
+### What is there
 
-`db.raw(T, …)` for a `T` that is not a struct. A `SELECT name FROM
-pragma_table_info(…)` returns one text column, and reading it needs:
+`Begin.transfer_buffer` defaults to `&.{}`, and the doc comment does not say
+what an empty one does. Item 2 says: for `stream` on a `content-length`
+body, nothing at all; for `take` and a chunked body, a `Reader` with no
+buffer. So every caller declares one, and the ordinary call (a probe, a JSON
+API, `update.zig`'s three `client.get` calls) is two lines of `var buf:
+[4096]u8 = undefined;` and `.transfer_buffer = &buf` around one line of
+request. fdm's probe at `src/download.zig:890-892` is three declarations
+before the `begin`.
 
-```zig
-const Col = struct {
-    pub const nilo_table = .projection;
-    name: []const u8,
-};
-const have = try db.raw(Col, run, "SELECT name FROM pragma_table_info('downloads')", .{});
-```
+### What is proposed
 
-(`src/store.zig:96`). The marker is right for a struct that is not a table;
-for one column it is ceremony, and the first attempt without it was a
-compile error whose message pointed at the marker but not at why a
-projection needs one.
+**`Exchange` holds `[4096]u8` inline and uses it when `transfer_buffer` is
+empty.** The caller already holds `var ex: fetch.Exchange = .idle` on its
+stack for exactly the life of one call, so the cost lands where the guide
+says a buffer's cost should land, and lands only while the exchange lives.
+A call that wants more passes its own, through the same field, as now.
+`Client.send`, which uses 4 KiB today, uses the inline one.
 
-### Possible shape
+The probe becomes `var redirect` and `var ex`. `update.zig` becomes `get`
+and nothing else, which it already is; this makes what `get` does inside
+the same as what a caller can do outside.
 
-`db.raw([]const u8, …)`, `db.rawOne(u64, …)`: a slice, integer, float,
-bool or optional of those reads column one and ignores the marker. Structs
-keep the rule they have.
+### What it costs
 
----
-
-## 7. Small things
-
-- **`nilo_start(io, .off)`.** `.off` is `core.Limits` with nothing set
-  (`core/limits.zig:101`), but at the call site it reads as "start with
-  something off", and the first guess was logging. `.unlimited` or `.none`
-  says what it is.
-- **`max_drain` is not the caller's decision.** `Exchange.end` decides
-  whether to drain or drop from `max_drain` and the announced length
-  (`dropIfDrainIsDearer`, `fetch/fetch.zig:825`), which is the right
-  default. fdm's probe asks for one byte and sometimes gets 200 with the
-  whole file; it set `max_drain = 4 << 10` (`src/download.zig:400`) to be
-  sure that drops. An `ex.discard()` — "I will not read this body; close
-  the connection" — lets a caller who knows say so, and lets `max_drain`
-  stay a policy rather than a lever.
-- **`build.zig` is 188 KB.** A consumer's `zig build` reads all of it.
-  If the modules a consumer imports and the tooling nilo runs on itself
-  (`bench/`, `stress/`, `spike/`, the examples) could be split, a
-  dependent's cold build carries less it never uses. Not measured, so
-  this is a hunch, not a finding.
+`@sizeOf(Exchange)` goes from 928 to about 5 KiB. It is on the stack of a
+handler that dials out, for the duration of the call, and a handler's stack
+under the Engine is the number ADR 0230 counted. If 4 KiB is too much there,
+1 KiB covers a JSON head and the rule holds.
 
 ---
 
-## What fdm did not need
+## 4. "Do not follow redirects" and "forgot the buffer" are spelled the same
 
-For the record, so the list above is read as the whole of it: connection
-pooling and the permit gate in `Client` did exactly what sixteen
-connections a download want; `Exchange` with caller-owned buffers is why
-fdm's per-connection memory is two small stack arrays; `Io.File`
-positional writes through `nilo_core`'s `Run` needed nothing; and the job
-table's lease and `restore` after a `kill -9` recovered every download it
-was tried on. The queue's polling is the one thing a user of fdm can feel.
+### What is there
+
+An empty `redirect_buffer` means redirects are not followed and a `302`
+comes back as itself. For anything signed that is the right default, and the
+doc comment says why. But the spelling for "I do not want this followed" and
+for "I did not think about redirects" is the same absence, and the symptom
+for the second is a `Head` with status 301 that a caller reads as
+`BadStatus` and a server that is wrong. fdm did think about it, because
+`mirrors.kernel.org` made it, and `src/download.zig:1019` is the buffer. The
+next CLI on nilo will find it the same way.
+
+### What is proposed
+
+Either of two, and the first is the cleaner one:
+
+- **`redirects: union(enum) { refuse, follow: []u8 } = .refuse`** in place
+  of `redirect_buffer`. The intent has a name, the buffer goes where the
+  intent that needs it is, and `head.redirected` keeps its meaning.
+- Or the field stays and **a 3xx with an empty buffer is
+  `error.RedirectRefused`**, with `blame` naming the field. A caller who
+  wants the `302` as itself asks for it with `.redirects = .expose`, or
+  whatever the spelling is; that caller exists (a signed request checking
+  where an object moved) but is the rarer one.
+
+### What it costs
+
+The first breaks every `begin` with a `redirect_buffer` in it, which today
+is fdm and nilo's own tests. The second breaks nobody and adds one error.
+Nothing per call.
+
+---
+
+## 5. `head.keep(scope)`: a `Head` that survives the body
+
+### What is there
+
+Every slice in `Head` points into the connection's read buffer and the first
+byte of body overwrites it. The doc says so, the bargain is the same as a
+borrowed row's and it is the right default. What follows is that every
+caller who needs a header *after* the body invents a copy. fdm's is `Text`,
+`src/download.zig:50-73`: a `[512]u8` and a length, with `from` and `fmt`
+and `slice`, used at 529, 903 and everywhere a note is posted. The `903` is
+the one this item is about: `etag` or `last-modified`, taken before the body
+so the next run can compare against it.
+
+### What is proposed
+
+**`head.keep(scope) !Head`**: the same struct with every slice copied into
+the scope's arena, so a caller that needs it after `take` or `pipe` says so
+once and the type that comes back reads the same. Or the narrower
+**`head.headerOwned(scope, name) !?Str`** for the one header most callers
+keep. `sql` already has the shape: a Borrowed row and the owned one beside
+it.
+
+### What it costs
+
+One arena allocation the size of the header block, on the calls that ask.
+Nothing on the calls that do not, which is the default and stays it.
+
+---
+
+## 6. `addMissingColumns` introspects on a second connection while its transaction holds the first
+
+### What is there
+
+`sql/migrate.zig:1226`, `addMissingColumns`: `var tx = try db.begin(scope,
+.{})` takes one pooled connection, then inside the `inline for` over the
+Rows, `db.liveColumns(scope, …)` takes *another* to read
+`pragma_table_info`, and the `ALTER TABLE`s go through `tx`. Once the
+first table's `ALTER` has run, the second table's introspection reads the
+schema on a connection that is not the one holding the schema write.
+
+On a file database SQLite lets that reader through (rollback journal or
+WAL, either way), so fdm's real run, dropping `reason` from a used
+database and reopening, passed. On `file:x?mode=memory&cache=shared`,
+which is what fdm's migration test used and what a test reaches for when
+it wants two connections to one throwaway database, shared-cache locking
+answers the second connection's `prepare` with `SQLITE_LOCKED`, and
+`open` fails with `QueryFailed` out of `liveColumns`. The same test
+against a temp file passes; the diff between the two runs is the URI.
+
+And on a pool of size 1 the shape is a deadlock rather than an error:
+`liveColumns` waits for the connection `tx` holds until the call returns,
+which is after `liveColumns` returns.
+
+### Where fdm carries it
+
+`src/store.zig`, the test "a file from before `headers` and `named` gets
+both columns on open", which now makes a temp file with a comment saying
+why it does not use shared cache. fdm's `store.open` has a pool of 2, so
+the deadlock is not reached; the test is what found the lock.
+
+### What is proposed
+
+**Introspect through the transaction.** `tx` is a connection; give it
+`liveColumns`, or have `addMissingColumns` read every table's columns
+*before* it begins, which is also fewer round trips: one introspection
+per Row up front, then one transaction of `ALTER`s. The second is the
+smaller change and keeps `liveColumns` where it is. The test is the
+migration test on `cache=shared` and on a pool of size 1, both of which
+cannot finish today.
+
+### What it costs
+
+Nothing per call. The columns are read once either way.
+
+---
+
+## For the record: what the first round left as it should be
+
+Three things fdm still does by hand that nilo should not take over.
+
+- **The rate-based reconnect** (`supervise`, the 0.3× mean rule) is a
+  decision across sixteen connections. nilo sees one, and should.
+- **The steal** moves a segment's `end` while its request is in flight and
+  reads the atomic before every chunk. That is fdm's loop over `stream`
+  with a `Limit`, and the `Limit` is the right hook for it.
+- **The job lease of a day** and `releaseStale` on open are what "one
+  process owns this file" means, and nilo's lease default is right for a
+  program that is not that.

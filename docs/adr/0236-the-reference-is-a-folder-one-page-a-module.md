@@ -48,8 +48,8 @@ Three things moved with it:
   `cache`, so a failure in one would have named the other's page. A page
   under `docs/` now keeps everything under `docs/`, so the two are
   `reference_cache_1` and `cache_1`.
-- **Every link in** — fourteen from the guide, two from ADRs, and the README,
-  `CONTRIBUTING.md` and `CLAUDE.md` — names the page rather than the folder,
+- **Every link in** (fourteen from the guide, two from ADRs, and the README,
+  `CONTRIBUTING.md` and `CLAUDE.md`) names the page rather than the folder,
   so `../reference.md#run` became `../reference/core.md#run`. The twenty-eight
   links between sections became links between pages the same way.
 
@@ -61,7 +61,7 @@ eleven lines, `body.md` twelve, and a reader of the request had five tabs
 open for what is one object in their handler. The guide's pages are the
 size a reader wants to hold, and this is the same cut.
 
-**Leaving it** — on the grounds that a single page is what a model wants. A
+**Leaving it**, on the grounds that a single page is what a model wants. A
 model wants a surface it can hold, and the folder's `README.md` is a smaller
 one than the page was: every name, none of the prose. What it points at is
 the same text, one page over.

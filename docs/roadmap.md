@@ -459,11 +459,13 @@ connection's stack pages back ([ADR 0063](./adr/0063-a-handlers-stack-is-per-con
 and nothing re-ran the number, which is the fourth time this repository has
 planned against a premise that had already stopped being true.
 
-Two levers are left and both are small.
-[`bench/result/fetch.md`](../bench/result/fetch.md) ranks them, and the one at
-the top is shrinking the 2 KB redirect buffer and the 4 KB transfer buffer
-rather than moving them: moving them into the arena has now been measured twice
-and costs +4,096 bytes since the stack release.
+One lever is left and it is depth.
+[`bench/result/fetch.md`](../bench/result/fetch.md) ranks them: moving the
+buffers into the arena has been measured twice and costs +4,096 bytes since
+the stack release, and shrinking them is measured now and worth nothing,
+because a stack buffer no byte touches is never a resident page
+([ADR 0238](./adr/0238-the-transfer-buffer-serves-nothing-here.md)). What is
+left is the frame `std.http.Client` waits in.
 
 **Waiting on: a caller** who is holding enough connections for 4 KB to matter.
 

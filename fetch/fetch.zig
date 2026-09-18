@@ -30,7 +30,11 @@
 //!   `std.Io.Threaded` with no Engine over it, the call is run as a task of
 //!   that `Io` and the task is what gets cancelled
 //!   ([ADR 0230](../docs/adr/0230-a-deadline-with-no-engine-cancels-a-task.md)).
-//!   `timeout_ms` means the same thing at either end.
+//!   `timeout_ms` means the same thing at either end. And a second clock
+//!   beside it, on silence rather than on the call: `stall_ms` ends a call
+//!   whose peer has sent nothing for that long, which is the bound a
+//!   transfer can set when the only honest `timeout_ms` is zero
+//!   ([ADR 0237](../docs/adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)).
 //! - **A bounded drain, and the drain itself.** `std.http.Client.Request.deinit`
 //!   does two different things depending on the state the body was left in, and
 //!   both of them are wrong for a client that refuses bodies. From
@@ -121,9 +125,38 @@ pub const Client = struct {
         /// non-zero timeout (ADR 0230).
         timeout_ms: u32 = 30_000,
 
+        /// How long the far end may say **nothing** before the call is
+        /// `error.Stalled`: time since the last byte reached this side, not
+        /// time since the call began. Zero, the default, is no such bound.
+        ///
+        /// The other shape of bound, for the call whose whole point is the
+        /// transfer. A download may honestly take an hour, so `timeout_ms`
+        /// has to be zero there, and that leaves a peer that went quiet
+        /// with the socket open (a CDN edge that lost its origin, a NAT that
+        /// dropped the mapping) with nothing to end it. The two compose:
+        /// `timeout_ms` is the ceiling on the whole call, this is the
+        /// ceiling on silence inside it, and a caller sets either or both
+        /// ([ADR 0237](../docs/adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)).
+        ///
+        /// It is not a per-read timeout, which ADR 0230 rejected and still
+        /// does: a server sending one byte a second is *slow*, satisfies this
+        /// bound, and is the caller's to judge against its other connections.
+        /// What this catches is a server sending nothing.
+        stall_ms: u32 = 0,
+
         /// A response body larger than this is `error.BodyTooLarge` rather
         /// than an allocation. Nothing in std bounds it.
         max_body: usize = 8 << 20,
+
+        /// The read buffer every connection is given, and the number that
+        /// decides how much one socket read brings in. std's 8 KiB, passed
+        /// through; it is per connection and lives on the heap beside it,
+        /// which is the right place for sixteen sockets pulling one file
+        /// and the wrong place for a handler's one call, so the default is
+        /// std's. `Begin.transfer_buffer` is not this and does not change
+        /// the read size, which is the mistake this field is here to spare
+        /// the next reader (ADR 0238).
+        read_buffer_size: usize = 8 << 10,
 
         /// How much of an unread body is worth reading to keep a pooled
         /// connection. Past this the connection is dropped instead: losing it
@@ -152,6 +185,8 @@ pub const Client = struct {
         /// Overrides `Settings.timeout_ms` for this call — a health check that
         /// should give up in 500ms, an upload that may take a minute.
         timeout_ms: ?u32 = null,
+        /// Overrides `Settings.stall_ms` for this call.
+        stall_ms: ?u32 = null,
         max_body: ?usize = null,
     };
 
@@ -159,6 +194,16 @@ pub const Client = struct {
         /// The deadline for this call ran out. Distinct from `Canceled`,
         /// which is the server shutting down underneath it.
         TimedOut,
+        /// Nothing arrived for `stall_ms`. The peer is still holding the
+        /// socket, and this side stopped waiting for it. Told apart from
+        /// `TimedOut` because a caller does different things with them: a
+        /// stalled transfer is restarted on a fresh connection, a call that
+        /// blew its whole budget is given up on.
+        Stalled,
+        /// The answer was a 3xx with a `Location`, and `Begin.redirects` is
+        /// `.refuse`, which is the default. Say `.follow` with a buffer to
+        /// walk it, or `.expose` to be handed the 3xx as itself.
+        RedirectRefused,
         /// The body was longer than `max_body` and reading stopped there.
         BodyTooLarge,
         /// The body ended before the length its own head announced. A caller
@@ -181,7 +226,7 @@ pub const Client = struct {
 
     pub fn init(gpa: std.mem.Allocator, settings: Settings) Client {
         return .{
-            .inner = .{ .allocator = gpa, .io = undefined },
+            .inner = .{ .allocator = gpa, .io = undefined, .read_buffer_size = settings.read_buffer_size },
             .gate = .{ .permits = settings.max_in_flight },
             .settings = settings,
         };
@@ -248,16 +293,19 @@ pub const Client = struct {
     ) Error!Response {
         comptime core.checkScope(@TypeOf(c), "fetch.send");
 
-        // The two buffers this call needs, declared where a reader can see what
-        // they cost. They are stack, and by
+        // The one buffer this call needs, declared where a reader can see
+        // what it costs. It is stack, and by
         // [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md) a
         // handler's stack is held for the life of the *inbound* connection — so
-        // 6 KiB here is 6 KiB on every connection that ever dials out, which is
-        // a third of what ADR 0070 measured. An `Exchange` takes them as
-        // arguments rather than holding them as fields for exactly that reason:
-        // a caller that follows no redirects pays for no redirect buffer.
+        // 2 KiB here is 2 KiB on every connection that ever dials out. An
+        // `Exchange` takes it as an argument rather than holding it as a field
+        // for exactly that reason: a caller that follows no redirects pays for
+        // no redirect buffer.
+        //
+        // There used to be a 4 KiB transfer buffer beside it, and it bought
+        // nothing: the body goes from the connection's own read buffer to the
+        // arena without touching it, on every framing (ADR 0238).
         var redirect_buffer: [2 << 10]u8 = undefined;
-        var transfer_buffer: [4 << 10]u8 = undefined;
 
         var ex: Exchange = .idle;
         defer ex.end();
@@ -277,8 +325,8 @@ pub const Client = struct {
             .headers = headers,
             .body = if (body) |bytes| .{ .slice = bytes } else .none,
             .timeout_ms = call.timeout_ms,
-            .redirect_buffer = &redirect_buffer,
-            .transfer_buffer = &transfer_buffer,
+            .stall_ms = call.stall_ms,
+            .redirects = .{ .follow = &redirect_buffer },
         });
 
         return .{
@@ -326,10 +374,14 @@ pub const Client = struct {
     /// saying no, and is passed through as itself, which is the distinction
     /// that mattered in the first place.
     ///
-    /// `expired` is the same answer from the other deadline, the one an
-    /// Exchange keeps itself when there is no Engine (ADR 0230).
-    fn blame(_: *Client, bound: *core.Limits.Bound, expired: bool, err: anytype) Error {
-        if (expired or bound.fired()) return error.TimedOut;
+    /// `expired` and `stalled` are the same answers from the other clock,
+    /// the one an Exchange keeps itself when there is no Engine (ADR 0230);
+    /// `stall_armed` says which of the two bounds the Engine's one timer was
+    /// standing in for when it fired (ADR 0237).
+    fn blame(_: *Client, bound: *core.Limits.Bound, stall_armed: bool, expired: bool, stalled: bool, err: anytype) Error {
+        if (stalled) return error.Stalled;
+        if (expired) return error.TimedOut;
+        if (bound.fired()) return if (stall_armed) error.Stalled else error.TimedOut;
         return err;
     }
 
@@ -360,9 +412,9 @@ pub const Client = struct {
 /// var ex: fetch.Exchange = .idle;
 /// defer ex.end();
 ///
-/// const head = try ex.begin(client, .{ .method = .GET, .url = url, .transfer_buffer = &buf });
+/// const head = try ex.begin(client, .{ .method = .GET, .url = url });
 /// const etag = head.header("etag");     // valid until the body is touched
-/// _ = try ex.pipe(out);                 // and now it is not
+/// _ = try ex.pipe(out);                 // and now it is not; `head.keep(c)` if it must be
 /// ```
 ///
 /// **An Exchange must not be copied once it has begun**, for the reason a
@@ -389,9 +441,33 @@ pub const Exchange = struct {
     /// Whether `deadline` is what stopped the call. The engineless half of
     /// what `Bound.fired` answers, and read by `blame` the same way.
     expired: bool = false,
+    /// The ceiling on silence, in milliseconds, or zero for none. The
+    /// other clock (ADR 0237): where `deadline_us` counts from the start of
+    /// the call, this counts from `last_byte`, which every chunk moves.
+    stall_ms: u32 = 0,
+    /// When the last byte of body reached this side, on Core's monotonic
+    /// clock: the moment `begin` ran until the first chunk lands. Atomic
+    /// because with no Engine the reading task writes it and the waiting
+    /// caller reads it.
+    last_byte: std.atomic.Value(i64) = .init(0),
+    /// Whether silence is what stopped the call: the engineless half.
+    stalled: bool = false,
+    /// Under an Engine there is one timer, and this says which of the two
+    /// bounds it was armed for when it fired: the shorter of what is left
+    /// of the call and `stall_ms`, re-armed on every chunk.
+    stall_armed: bool = false,
     req: std.http.Client.Request = undefined,
     res: std.http.Client.Response = undefined,
+    /// The body, as the caller reads it. With a `stall_ms` this is `tap`,
+    /// which stamps `last_byte` on the way through; without one it is
+    /// std's own body reader, and the tap costs nothing.
     reader: ?*std.Io.Reader = null,
+    /// std's body reader, which `tap` reads through.
+    inner: *std.Io.Reader = undefined,
+    /// An unbuffered reader in front of `inner` that notices every chunk.
+    /// Address sensitive like the rest of the struct: its vtable finds the
+    /// Exchange by `@fieldParentPtr`.
+    tap: std.Io.Reader = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = &tap_vtable },
     /// What the response said its body was, kept so that `end` can decide
     /// whether reading the rest of it is cheaper than a new connection. Null
     /// is a body of unknown length, which counts as too much.
@@ -441,20 +517,51 @@ pub const Exchange = struct {
         user_agent: ?[]const u8 = null,
 
         timeout_ms: ?u32 = null,
+        /// Overrides `Settings.stall_ms` for this call (ADR 0237).
+        stall_ms: ?u32 = null,
 
-        /// Where a redirect's `Location` is kept while it is followed. **An
-        /// empty one means redirects are not followed at all** — the response
-        /// comes back as itself, 302 and all.
+        /// What a 3xx with a `Location` means to this call. **`.refuse`, the
+        /// default, is `error.RedirectRefused`**: a caller who has not
+        /// thought about redirects finds out from the error rather than
+        /// from a status 301 read as a broken server. `.follow` walks the
+        /// chain, and needs the buffer the `Location` is resolved in.
+        /// `.expose` is handed the 3xx as itself: for a signed request
+        /// checking where an object moved, or a client that reads the
+        /// body of the answer, which is what S3 puts its reason in
+        /// ([ADR 0239](../docs/adr/0239-a-redirect-is-a-decision-with-a-name.md)).
         ///
-        /// That is the right default for anything signed: a signature is
-        /// computed over one host and one path, so following a redirect sends
-        /// a request that cannot be valid at the other end — and sends the
-        /// `authorization` header there while it does it.
-        redirect_buffer: []u8 = &.{},
-        /// What the body is read through. Bigger is fewer trips into the
-        /// connection for a large object and more stack held per connection;
-        /// `Client.send` uses 4 KiB.
+        /// Not following is the right default for anything signed: a
+        /// signature is computed over one host and one path, so following a
+        /// redirect sends a request that cannot be valid at the other end —
+        /// and sends the `authorization` header there while it does it.
+        redirects: Redirects = .refuse,
+        /// A buffer for a caller who reads the body **buffered** off
+        /// `ex.reader` (`take`, `peek`, a delimiter) and for nothing else.
+        /// `take`, `readInto`, `pipe` and `stream` here go from the
+        /// connection's own read buffer straight to the destination on every
+        /// framing and never fill it, so the empty default is the ordinary
+        /// call and costs nothing. It does not change how much one socket
+        /// read brings in; `Settings.read_buffer_size` does (ADR 0238).
         transfer_buffer: []u8 = &.{},
+    };
+
+    /// What a 3xx with a `Location` means to a call. See `Begin.redirects`.
+    pub const Redirects = union(enum) {
+        /// The answer is `error.RedirectRefused`. The default.
+        refuse,
+        /// The answer comes back as itself, 302 and all.
+        expose,
+        /// Followed, at most three deep, with the `Location` resolved in
+        /// this buffer; `head.redirected` says where it ended, and its text
+        /// lives here (ADR 0232).
+        follow: []u8,
+
+        fn buffer(self: Redirects) []u8 {
+            return switch (self) {
+                .follow => |buf| buf,
+                else => &.{},
+            };
+        }
     };
 
     /// A body going out: nothing, bytes already in hand, or a reader of a
@@ -521,6 +628,39 @@ pub const Exchange = struct {
         pub fn ok(self: Head) bool {
             return @intFromEnum(self.status) >= 200 and @intFromEnum(self.status) < 300;
         }
+
+        /// The same head, copied into the Scope, so it reads the same after
+        /// the body has been through. For the caller who needs an `etag`
+        /// *after* `pipe`: the next run compares against it, and until this
+        /// every such caller wrote a `[512]u8` and a length of its own
+        /// ([ADR 0240](../docs/adr/0240-a-head-that-outlives-its-body.md)).
+        /// One arena allocation the size of the header block, on the calls
+        /// that ask and no other; the borrowed head stays the default.
+        pub fn keep(self: Head, c: anytype) error{OutOfMemory}!Head {
+            comptime core.checkScope(@TypeOf(c), "head.keep");
+            const arena = c.arena();
+            var kept = self;
+            kept.bytes = try arena.dupe(u8, self.bytes);
+            // std cut `content_type` out of the block, so it moves with it;
+            // a value that came from anywhere else is copied on its own.
+            if (self.content_type) |ct| {
+                const start = @intFromPtr(self.bytes.ptr);
+                const at = @intFromPtr(ct.ptr);
+                kept.content_type = if (at >= start and at + ct.len <= start + self.bytes.len)
+                    kept.bytes[at - start ..][0..ct.len]
+                else
+                    try arena.dupe(u8, ct);
+            }
+            // A `std.Uri` is eight slices into the redirect buffer. Written
+            // out as one string and read back, which is what `location`
+            // already does for the caller.
+            if (self.redirected) |uri| {
+                var w: std.Io.Writer.Allocating = .init(arena);
+                uri.format(&w.writer) catch return error.OutOfMemory;
+                kept.redirected = std.Uri.parse(w.written()) catch unreachable; // it was one before
+            }
+            return kept;
+        }
     };
 
     /// Take a permit, arm the deadline, send the head and the body, and read
@@ -542,9 +682,19 @@ pub const Exchange = struct {
         // Engine that is the Bound, which cancels the fiber; with none, it is
         // an absolute time every step below is run against as a task that
         // gets cancelled (ADR 0230). Zero is no limit either way.
+        // The other clock counts from the last byte, and until one arrives
+        // that is now: a head that never comes is silence too (ADR 0237).
         const ms = opts.timeout_ms orelse client.settings.timeout_ms;
+        self.stall_ms = opts.stall_ms orelse client.settings.stall_ms;
+        self.last_byte.store(core.monotonicMicros(), .release);
         if (client.limits.engineless()) {
             if (ms != 0) self.deadline_us = core.monotonicMicros() + @as(i64, ms) * std.time.us_per_ms;
+        } else if (self.stall_ms != 0) {
+            // One timer for two bounds: armed for whichever is nearer, and
+            // re-armed by every chunk. The call's end is kept so that the
+            // re-arm can tell which is nearer.
+            if (ms != 0) self.deadline_us = core.monotonicMicros() + @as(i64, ms) * std.time.us_per_ms;
+            self.armNearer();
         } else self.bound.arm(client.limits, ms);
 
         // **One retry, and only onto a connection the peer had already
@@ -628,11 +778,20 @@ pub const Exchange = struct {
             // with is a chain it walked, and `req.uri` is then the end of
             // it, resolved into the caller's `redirect_buffer` by std's own
             // `resolveInPlace`.
-            .redirected = if (opts.redirect_buffer.len != 0 and self.req.redirect_behavior.remaining() < max_redirects)
+            .redirected = if (opts.redirects == .follow and self.req.redirect_behavior.remaining() < max_redirects)
                 self.req.uri
             else
                 null,
         };
+
+        // A 3xx that says where to go, under the default that made no
+        // decision about it. A 304 has no `Location` and is an answer, so
+        // it is not this (ADR 0239). The Exchange stays open, and the
+        // caller's `end` drops the connection or drains the body the way it
+        // would for any answer it did not read.
+        if (opts.redirects == .refuse and head.status.class() == .redirect and self.res.head.location != null) {
+            return error.RedirectRefused;
+        }
 
         // **A HEAD's answer, a 1xx, a 204 and a 304 end at the header block,
         // whatever the headers say** (RFC 9112 §6.3). std's `receiveHead`
@@ -651,8 +810,58 @@ pub const Exchange = struct {
         }
 
         self.announced = head.content_length;
-        self.reader = self.res.reader(opts.transfer_buffer);
+        self.inner = self.res.reader(opts.transfer_buffer);
+        self.reader = if (self.stall_ms != 0) &self.tap else self.inner;
         return head;
+    }
+
+    /// Under an Engine: arm the one timer for whichever bound is nearer,
+    /// what is left of the call or `stall_ms`, and remember which. Called
+    /// at `begin` and again from `tap` on every chunk, so a moving transfer
+    /// never fires it and a silent one fires it `stall_ms` after the last
+    /// byte (ADR 0237).
+    fn armNearer(self: *Exchange) void {
+        self.bound.release();
+        var ms = self.stall_ms;
+        self.stall_armed = true;
+        if (self.deadline_us != 0) {
+            const left_us = self.deadline_us - core.monotonicMicros();
+            // Rounded up, and never zero: zero would be "no limit", and a
+            // call already past its end still has to be stopped.
+            const left_ms: u32 = @intCast(@max(1, @divTrunc(@max(left_us, 0) + std.time.us_per_ms - 1, std.time.us_per_ms)));
+            if (left_ms <= ms) {
+                ms = left_ms;
+                self.stall_armed = false;
+            }
+        }
+        self.bound.arm(self.client.limits, ms);
+    }
+
+    /// A chunk has landed: move the silence clock. Under an Engine that is
+    /// the timer re-armed; without one it is a word the waiter in `bounded`
+    /// reads.
+    fn mark(self: *Exchange) void {
+        self.last_byte.store(core.monotonicMicros(), .release);
+        if (!self.client.limits.engineless()) self.armNearer();
+    }
+
+    const tap_vtable: std.Io.Reader.VTable = .{
+        .stream = tapStream,
+        .discard = tapDiscard,
+    };
+
+    fn tapStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Exchange = @alignCast(@fieldParentPtr("tap", r));
+        const n = try self.inner.stream(w, limit);
+        self.mark();
+        return n;
+    }
+
+    fn tapDiscard(r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
+        const self: *Exchange = @alignCast(@fieldParentPtr("tap", r));
+        const n = try self.inner.discard(limit);
+        self.mark();
+        return n;
     }
 
     /// Whether the answer to this request has no body by rule, rather than
@@ -678,10 +887,10 @@ pub const Exchange = struct {
         const given = Given.of(opts.headers);
         self.req = try client.inner.request(opts.method, uri, .{
             .extra_headers = opts.headers,
-            .redirect_behavior = if (opts.redirect_buffer.len == 0)
-                .unhandled
+            .redirect_behavior = if (opts.redirects == .follow)
+                std.http.Client.Request.RedirectBehavior.init(max_redirects)
             else
-                std.http.Client.Request.RedirectBehavior.init(max_redirects),
+                .unhandled,
             .headers = .{
                 .host = slot(opts.host, given.host),
                 .authorization = slot(opts.authorization, given.authorization),
@@ -772,7 +981,7 @@ pub const Exchange = struct {
             },
         }
 
-        self.res = try self.req.receiveHead(opts.redirect_buffer);
+        self.res = try self.req.receiveHead(opts.redirects.buffer());
     }
 
     /// The head for a body on a method std frames no body for — a DELETE
@@ -924,9 +1133,37 @@ pub const Exchange = struct {
         return self.bounded(std.Io.Reader.streamRemaining, .{ reader, w }) catch |err| return self.blame(err);
     }
 
-    /// `Client.blame`, asked about both deadlines at once.
+    /// One chunk of the body into `w`, at most `limit` bytes, and how many
+    /// went: what one socket read handed over, which is the unit a caller
+    /// moving a body in pieces of its own choosing wants: a segment whose
+    /// far end another thread may move while it reads. **Zero is the end of
+    /// the body.**
+    ///
+    /// The same call on `ex.reader` directly is outside both clocks on a
+    /// client with no Engine, because there is nothing there to cancel the
+    /// read; this one is inside them (ADR 0237).
+    pub fn stream(self: *Exchange, w: *std.Io.Writer, limit: std.Io.Limit) Client.Error!usize {
+        const reader = self.reader orelse unreachable; // begin first, then stream
+        return self.bounded(std.Io.Reader.stream, .{ reader, w, limit }) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => |e| self.blame(e),
+        };
+    }
+
+    /// `Client.blame`, asked about every clock at once.
+    ///
+    /// The Engine's answer is consumed on asking, and `end` needs it as
+    /// well: a call its own clock stopped must not then drain the body it
+    /// stopped waiting for, which on a server that went quiet is the read
+    /// that never returns. So the answer is folded into the two flags the
+    /// engineless path already keeps, and `end` reads those. The first
+    /// draft asked the bound here and drained in `end`, and the stall test
+    /// under the Engine sat at zero CPU until it was noticed.
     fn blame(self: *Exchange, err: anytype) Client.Error {
-        return self.client.blame(&self.bound, self.expired, err);
+        if (self.bound.fired()) {
+            if (self.stall_armed) self.stalled = true else self.expired = true;
+        }
+        return self.client.blame(&self.bound, self.stall_armed, self.expired, self.stalled, err);
     }
 
     /// `f(args...)`, and bounded by `deadline` when there is one.
@@ -949,7 +1186,10 @@ pub const Exchange = struct {
     /// wait, is passed to the inner task, and is put back with `recancel`
     /// so the next `Io` call the caller makes still sees it.
     fn bounded(self: *Exchange, comptime f: anytype, args: anytype) Returns(f, @TypeOf(args)) {
-        if (self.deadline_us == 0) return @call(.auto, f, args);
+        // Under an Engine the fiber carries the bound; with none, and with
+        // neither clock set, there is nothing to wait for.
+        if (!self.client.limits.engineless()) return @call(.auto, f, args);
+        if (self.deadline_us == 0 and self.stall_ms == 0) return @call(.auto, f, args);
         const io = self.client.inner.io;
         const Task = struct {
             fn run(done: *std.atomic.Value(u32), on: std.Io, a: @TypeOf(args)) Returns(f, @TypeOf(args)) {
@@ -968,13 +1208,30 @@ pub const Exchange = struct {
             return @call(.auto, f, args);
         };
         while (done.load(.acquire) == 0) {
-            const left = self.deadline_us - core.monotonicMicros();
-            if (left <= 0) {
-                self.expired = true;
-                return future.cancel(io);
+            // Whichever clock is nearer is the wait. The silence clock is
+            // read fresh each time round, because the task moves it with
+            // every chunk: a transfer that keeps moving wakes this loop once
+            // per `stall_ms` and never fires it (ADR 0237).
+            const now = core.monotonicMicros();
+            var wait: i64 = std.math.maxInt(i64);
+            if (self.deadline_us != 0) {
+                const left = self.deadline_us - now;
+                if (left <= 0) {
+                    self.expired = true;
+                    return future.cancel(io);
+                }
+                wait = @min(wait, left);
+            }
+            if (self.stall_ms != 0) {
+                const left = self.last_byte.load(.acquire) + @as(i64, self.stall_ms) * std.time.us_per_ms - now;
+                if (left <= 0) {
+                    self.stalled = true;
+                    return future.cancel(io);
+                }
+                wait = @min(wait, left);
             }
             io.futexWaitTimeout(u32, &done.raw, 0, .{ .duration = .{
-                .raw = .fromMicroseconds(left),
+                .raw = .fromMicroseconds(wait),
                 .clock = .awake,
             } }) catch |err| switch (err) {
                 error.Canceled => {
@@ -1108,7 +1365,7 @@ pub const Exchange = struct {
             // leftover, and a leftover from a server that stalled is the
             // read that never returns — which is how the first draft of
             // this branch hung the stall test at zero CPU.
-            if (self.expired) {
+            if (self.expired or self.stalled) {
                 if (self.req.connection) |conn| conn.closing = true;
                 self.client.close(&self.req);
             } else {
@@ -1124,6 +1381,9 @@ pub const Exchange = struct {
         self.bound.release();
         self.deadline_us = 0;
         self.expired = false;
+        self.stall_ms = 0;
+        self.stalled = false;
+        self.stall_armed = false;
         if (self.permit) {
             self.client.gate.post(self.client.inner.io);
             self.permit = false;
@@ -1227,14 +1487,14 @@ test "a failure this call's own clock caused is a timeout, whatever it is called
     var mine: core.Limits.Bound = .idle;
     defer mine.release();
     mine.arm(always_fired, 1_000);
-    try testing.expectEqual(Client.Error.TimedOut, client.blame(&mine, false, error.Canceled));
+    try testing.expectEqual(Client.Error.TimedOut, client.blame(&mine, false, false, false, error.Canceled));
 
     // And the case a real timer actually produces. `std.Io.Reader`'s error set
     // is fixed, so a cancellation mid-body arrives as `error.ReadFailed` with
     // the cause kept in a field; `fetch/deadline.zig` is where that was seen.
     // A version of `blame` that matched on `error.Canceled` returned this
     // unchanged and every timeout looked like a broken upstream.
-    try testing.expectEqual(Client.Error.TimedOut, client.blame(&mine, false, error.ReadFailed));
+    try testing.expectEqual(Client.Error.TimedOut, client.blame(&mine, false, false, false, error.ReadFailed));
 
     // Armed against nothing, which is what a shutdown looks like: the
     // cancellation was somebody else's and must not be reported as a timeout,
@@ -1242,14 +1502,47 @@ test "a failure this call's own clock caused is a timeout, whatever it is called
     var theirs: core.Limits.Bound = .idle;
     defer theirs.release();
     theirs.arm(.off, 1_000);
-    try testing.expectEqual(Client.Error.Canceled, client.blame(&theirs, false, error.Canceled));
+    try testing.expectEqual(Client.Error.Canceled, client.blame(&theirs, false, false, false, error.Canceled));
 
     // A failure with no deadline behind it is passed through as itself, which
     // is the whole reason the bound is asked rather than assumed.
     try testing.expectEqual(
         Client.Error.ConnectionRefused,
-        client.blame(&theirs, false, error.ConnectionRefused),
+        client.blame(&theirs, false, false, false, error.ConnectionRefused),
     );
+}
+
+test "silence is blamed before the call's clock, and the Engine's one timer says which it stood for" {
+    var client: Client = .init(testing.allocator, .{});
+    defer client.deinit();
+
+    // With no Engine the Exchange keeps both clocks itself, and the one
+    // that fired is the one it says.
+    var theirs: core.Limits.Bound = .idle;
+    defer theirs.release();
+    try testing.expectEqual(Client.Error.Stalled, client.blame(&theirs, false, false, true, error.ReadFailed));
+    try testing.expectEqual(Client.Error.TimedOut, client.blame(&theirs, false, true, false, error.ReadFailed));
+
+    // Under an Engine there is one timer, armed for whichever bound was
+    // nearer, and `stall_armed` is what remembers which (ADR 0237).
+    var mine: core.Limits.Bound = .idle;
+    defer mine.release();
+    mine.arm(always_fired, 1_000);
+    try testing.expectEqual(Client.Error.Stalled, client.blame(&mine, true, false, false, error.ReadFailed));
+    var again: core.Limits.Bound = .idle;
+    defer again.release();
+    again.arm(always_fired, 1_000);
+    try testing.expectEqual(Client.Error.TimedOut, client.blame(&again, false, false, false, error.ReadFailed));
+}
+
+test "the read buffer size reaches std's client, and the default is std's own" {
+    var plain: Client = .init(testing.allocator, .{});
+    defer plain.deinit();
+    try testing.expectEqual(@as(usize, 8 << 10), plain.inner.read_buffer_size);
+
+    var wide: Client = .init(testing.allocator, .{ .read_buffer_size = 64 << 10 });
+    defer wide.deinit();
+    try testing.expectEqual(@as(usize, 64 << 10), wide.inner.read_buffer_size);
 }
 
 test "a streamed body is not replayed, because its reader is spent" {

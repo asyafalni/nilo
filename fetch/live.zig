@@ -473,6 +473,62 @@ const Canned = struct {
         _ = reader.interface.takeByte() catch {};
     }
 
+    /// A head that promises `body_len` bytes and sends them one at a time,
+    /// `trickle_ms` apart: the slow server ADR 0230 refused to call a
+    /// failure, and the control for the silence clock: a body that keeps
+    /// moving, however slowly, must never be called a stall (ADR 0237).
+    fn serveTrickle(self: *Canned, trickle_ms: u32) !void {
+        var stream = try self.server.accept(self.io);
+        defer stream.close(self.io);
+        self.accepted += 1;
+
+        var in_buf: [4 << 10]u8 = undefined;
+        var out_buf: [4 << 10]u8 = undefined;
+        var reader = stream.reader(self.io, &in_buf);
+        var writer = stream.writer(self.io, &out_buf);
+        while (true) {
+            const line = try reader.interface.takeDelimiterInclusive('\n');
+            if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
+        }
+        const w = &writer.interface;
+        try w.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{self.body_len});
+        try w.flush();
+        for (0..self.body_len) |_| {
+            try std.Io.sleep(self.io, .fromMilliseconds(trickle_ms), .awake);
+            try w.writeByte('x');
+            try w.flush();
+        }
+    }
+
+    /// `body_len` bytes of `x` as **chunked** transfer coding, in chunks of
+    /// at most 1,000: the framing that reads through a buffer if any does.
+    fn serveChunked(self: *Canned) !void {
+        var stream = try self.server.accept(self.io);
+        defer stream.close(self.io);
+        self.accepted += 1;
+
+        var in_buf: [4 << 10]u8 = undefined;
+        var out_buf: [8 << 10]u8 = undefined;
+        var reader = stream.reader(self.io, &in_buf);
+        var writer = stream.writer(self.io, &out_buf);
+        while (true) {
+            const line = try reader.interface.takeDelimiterInclusive('\n');
+            if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
+        }
+        const w = &writer.interface;
+        try w.writeAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+        var left = self.body_len;
+        while (left > 0) {
+            const n = @min(left, 1_000);
+            try w.print("{x}\r\n", .{n});
+            try w.splatByteAll('x', n);
+            try w.writeAll("\r\n");
+            left -= n;
+        }
+        try w.writeAll("0\r\n\r\n");
+        try w.flush();
+    }
+
     /// A `302` to `/moved` and then a `200`, on **one** connection: a chain
     /// of one, for the test about where it ended. One connection because
     /// std pools the first and comes back on it for the second — a server
@@ -846,7 +902,7 @@ test "a redirect that was followed says where it ended, and one that was not say
             const head = try ex.begin(&client, .{
                 .method = .GET,
                 .url = try canned.url(&buf),
-                .redirect_buffer = &redirect,
+                .redirects = .{ .follow = &redirect },
                 .transfer_buffer = &transfer,
             });
             try testing.expect(head.ok());
@@ -889,12 +945,313 @@ test "a redirect that was followed says where it ended, and one that was not say
             const head = try ex.begin(&client, .{
                 .method = .GET,
                 .url = try canned.url(&buf),
-                .redirect_buffer = &redirect,
+                .redirects = .{ .follow = &redirect },
                 .transfer_buffer = &transfer,
             });
             var where: [128]u8 = undefined;
             try testing.expect((try head.location(&where)) == null);
             try testing.expect(head.redirected == null);
+        }
+    }.run);
+}
+
+// ---- the other clock: silence, not the call (ADR 0237) ----
+
+test "silence after the head is a stall, told apart from the call's own clock" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 10;
+
+            var served = try io.concurrent(Canned.serveThenStall, .{&canned});
+            defer served.cancel(io) catch {};
+
+            // No ceiling on the call at all (a transfer may take an hour)
+            // and 200 ms on silence inside it.
+            var client = try started(io, .{ .timeout_ms = 0, .stall_ms = 200 });
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const started_at = core.monotonicMicros();
+            try testing.expectError(error.Stalled, client.get(&scope, try canned.url(&buf), .{}));
+            const took_ms = @divFloor(core.monotonicMicros() - started_at, std.time.us_per_ms);
+            try testing.expect(took_ms >= 150);
+            try testing.expect(took_ms < deadline_slack_ms);
+
+            // The permit came back, the same check the deadline makes.
+            try testing.expectEqual(@as(usize, client.settings.max_in_flight), client.gate.permits);
+        }
+    }.run);
+}
+
+test "a body that keeps moving never stalls, however slowly" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 8;
+
+            // Eight bytes, 60 ms apart: 480 ms of body under a 200 ms
+            // silence bound. A bound on the call would fire; a bound on
+            // silence must not, because every gap is under it.
+            var served = try io.concurrent(Canned.serveTrickle, .{ &canned, @as(u32, 60) });
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{ .timeout_ms = 0, .stall_ms = 200 });
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const res = try client.get(&scope, try canned.url(&buf), .{});
+            try testing.expectEqualStrings("xxxxxxxx", res.body.view());
+        }
+    }.run);
+}
+
+test "a chunk read through the Exchange is inside the silence clock" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 10;
+
+            var served = try io.concurrent(Canned.serveThenStall, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{ .timeout_ms = 0 });
+            defer client.deinit();
+
+            var buf: [64]u8 = undefined;
+            var out: [64]u8 = undefined;
+            var w = std.Io.Writer.fixed(&out);
+
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            _ = try ex.begin(&client, .{ .method = .GET, .url = try canned.url(&buf), .stall_ms = 200 });
+
+            // The loop a download manager writes: a chunk at a time, up to a
+            // boundary of its own. The three bytes land, then silence.
+            var got: usize = 0;
+            const failed = while (true) {
+                const n = ex.stream(&w, .limited(10 - got)) catch |err| break err;
+                if (n == 0) break error.EndedEarly;
+                got += n;
+            };
+            try testing.expectEqual(@as(usize, 3), got);
+            try testing.expectError(error.Stalled, @as(anyerror!void, failed));
+        }
+    }.run);
+}
+
+test "one socket read is one chunk, and zero is the end of the body" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 4096;
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var buf: [64]u8 = undefined;
+            var out: [8 << 10]u8 = undefined;
+            var w = std.Io.Writer.fixed(&out);
+
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            _ = try ex.begin(&client, .{ .method = .GET, .url = try canned.url(&buf) });
+
+            var total: usize = 0;
+            var reads: usize = 0;
+            while (true) {
+                const n = try ex.stream(&w, .limited(1000));
+                if (n == 0) break;
+                try testing.expect(n <= 1000);
+                total += n;
+                reads += 1;
+            }
+            try testing.expectEqual(@as(usize, 4096), total);
+            try testing.expect(reads >= 5);
+            // Asked again after the end, still the end.
+            try testing.expectEqual(@as(usize, 0), try ex.stream(&w, .limited(1000)));
+        }
+    }.run);
+}
+
+// ---- a redirect is a decision with a name (ADR 0239) ----
+
+test "an answer that says go elsewhere is refused unless the call decided otherwise" {
+    // The default: a 302 is an error that names what to decide.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.status = "302 Found";
+            canned.extra = "Location: http://127.0.0.1:1/moved\r\n";
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var buf: [64]u8 = undefined;
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            try testing.expectError(error.RedirectRefused, ex.begin(&client, .{ .method = .GET, .url = try canned.url(&buf) }));
+        }
+    }.run);
+
+    // Asked for: the same 302, handed over as itself.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.status = "302 Found";
+            canned.extra = "Location: http://127.0.0.1:1/moved\r\n";
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var buf: [64]u8 = undefined;
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            const head = try ex.begin(&client, .{ .method = .GET, .url = try canned.url(&buf), .redirects = .expose });
+            try testing.expectEqual(std.http.Status.found, head.status);
+            try testing.expectEqualStrings("http://127.0.0.1:1/moved", head.header("location").?);
+            try testing.expect(head.redirected == null);
+        }
+    }.run);
+
+    // A 304 is a 3xx and not a redirect: it says nothing about where to go,
+    // and a caller sending `if-none-match` is owed it as an answer.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.status = "304 Not Modified";
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var buf: [64]u8 = undefined;
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            const head = try ex.begin(&client, .{ .method = .GET, .url = try canned.url(&buf) });
+            try testing.expectEqual(std.http.Status.not_modified, head.status);
+        }
+    }.run);
+}
+
+// ---- a head that outlives its body (ADR 0240) ----
+
+test "a kept head reads the same after the body has been through" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 3000;
+            canned.extra = "ETag: \"d41d8cd9\"\r\nContent-Type: text/plain\r\n";
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            const head = try ex.begin(&client, .{ .method = .GET, .url = try canned.url(&buf) });
+            const kept = try head.keep(&scope);
+
+            // A body larger than the connection's buffer, so the bytes the
+            // borrowed head pointed at are read over for certain.
+            const body = try ex.take(&scope, 1 << 20);
+            try testing.expectEqual(@as(usize, 3000), body.len());
+
+            try testing.expectEqualStrings("\"d41d8cd9\"", kept.header("etag").?);
+            try testing.expectEqualStrings("text/plain", kept.content_type.?);
+            try testing.expectEqual(std.http.Status.ok, kept.status);
+            try testing.expectEqual(@as(u64, 3000), kept.content_length.?);
+            // Its `content_type` moved with the block rather than being a
+            // second copy: it points inside the kept bytes.
+            const start = @intFromPtr(kept.bytes.ptr);
+            const at = @intFromPtr(kept.content_type.?.ptr);
+            try testing.expect(at >= start and at < start + kept.bytes.len);
+        }
+    }.run);
+}
+
+// ---- the transfer buffer serves nothing here (ADR 0238) ----
+
+test "no transfer buffer is needed on any framing, and the read size is the client's" {
+    // Chunked, the framing that would read through one if any did, into
+    // the Scope with no buffer anywhere.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 2500;
+
+            var served = try io.concurrent(Canned.serveChunked, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            const head = try ex.begin(&client, .{ .method = .GET, .url = try canned.url(&buf) });
+            try testing.expect(head.content_length == null);
+            const body = try ex.take(&scope, 1 << 20);
+            try testing.expectEqual(@as(usize, 2500), body.len());
+            try testing.expectEqual(@as(u8, 'x'), body.view()[2499]);
+        }
+    }.run);
+
+    // And a wider read buffer, given to std at `init`, brings a body larger
+    // than the default one whole.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 100 << 10;
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{ .read_buffer_size = 64 << 10 });
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const res = try client.get(&scope, try canned.url(&buf), .{});
+            try testing.expectEqual(@as(usize, 100 << 10), res.body.len());
         }
     }.run);
 }

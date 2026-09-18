@@ -3519,3 +3519,40 @@ And one number: an `std.Io.Timeout` is 48 bytes, and the `Exchange` that
 would have held one sits on the stack of every handler that dials out. An
 `i64` of microseconds fits in padding the struct already had, so
 `@sizeOf(Exchange)` is 928 before and after.
+
+## The second round from the same CLI, and a buffer three documents described and no byte crossed
+
+Five more items, from what stayed behind once the first seven were gone
+([ADR 0237](./adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)
+to [0240](./adr/0240-a-head-that-outlives-its-body.md)). Two things from
+the round are worth more than the list.
+
+**A premise can be published in three places and disproved in a fourth
+under a different heading.** `Begin.transfer_buffer` was "what the body is
+read through; bigger is fewer trips", in the doc comment, the fetch guide
+and the S3 guide, and `Bucket.stream` took one as a parameter whose size
+the guide told the caller to weigh. The body goes from the connection's own
+read buffer to the writer and never crosses it, on every framing.
+`bench/result/s3.md` had measured 64 KB to 8 KB as worth one byte and filed
+it as "the lever is depth"; the download manager measured it as 2.5 KB a
+read either way and filed it as a bug. Taking the 4 KiB out of `send` moved
+`/call` by 14 bytes at 5,000 connections, interleaved twice, because **a
+stack buffer no byte touches is never a resident page**, which is also why
+lever 2 of `bench/result/fetch.md`, shrink the buffers, was always going to
+be worth nothing. A benchmark that says a lever did nothing is a claim about
+the lever, and the next reader should ask why before ranking it again.
+
+**The path a guard was never seen to take is the path with the hole.** `end`
+skipped the drain after a deadline on the engineless clock, with a comment
+saying a leftover from a stalled server is the read that never returns. The
+Engine path drained regardless, and nothing had ever reached it: the one
+Engine-side test stalled before the head, where there is nothing to drain.
+The first stall test with a body under the Engine sat at zero CPU, and
+`ps -o etime,cputime` said so in one command. The fix folds the Engine's
+consumed answer into the flags the other path already keeps
+([ADR 0237](./adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)),
+and it is the fourth time here that a test written for a new feature has
+found an old one's guard unexercised.
+
+One number: `@sizeOf(Exchange)` is 992, from 928, for the tap reader that
+notices a chunk, and `/call` did not move.

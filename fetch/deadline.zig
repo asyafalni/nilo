@@ -73,6 +73,11 @@ const Quiet = struct {
     /// shared with every other copy and with everything in TIME_WAIT.
     no_port: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
+    /// What to say before going quiet. `nothing` is the endpoint above;
+    /// the other two are for the silence clock (ADR 0237): a head and three
+    /// bytes of a ten-byte body and then nothing, or the whole body one
+    /// byte every 60 ms, which is slow and is not silence.
+    answer: enum { nothing, head_then_stall, trickle } = .nothing,
 
     /// Connect once, so `run`'s `accept` returns and the thread can be joined.
     ///
@@ -132,6 +137,26 @@ const Quiet = struct {
         var reader = stream.reader(io, &buf);
         _ = reader.interface.takeDelimiterInclusive('\n') catch {};
 
+        var out: [256]u8 = undefined;
+        var writer = stream.writer(io, &out);
+        const w = &writer.interface;
+        switch (self.answer) {
+            .nothing => {},
+            .head_then_stall => {
+                w.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nxxx") catch return;
+                w.flush() catch return;
+            },
+            .trickle => {
+                w.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n") catch return;
+                w.flush() catch return;
+                for (0..8) |_| {
+                    std.Io.sleep(io, .fromMilliseconds(60), .awake) catch return;
+                    w.writeByte('x') catch return;
+                    w.flush() catch return;
+                }
+            },
+        }
+
         while (!self.done.load(.acquire)) {
             std.Io.sleep(io, .fromMilliseconds(10), .awake) catch break;
         }
@@ -154,6 +179,16 @@ fn callQuiet(api: *fetch.Client, c: *nilo.Ctx) !nilo.Str {
     return c.str("answered");
 }
 
+/// The same call with no ceiling on the call at all and 200 ms on silence
+/// inside it, the download's shape (ADR 0237). Reports the body when it
+/// arrives, so the trickle test can see the whole of it came.
+fn callPatient(api: *fetch.Client, c: *nilo.Ctx) !nilo.Str {
+    const res = api.get(c, quiet_url, .{ .timeout_ms = 0, .stall_ms = 200 }) catch |err| {
+        return c.str(@errorName(err));
+    };
+    return res.body;
+}
+
 /// The nilo server under test, on a thread of its own, plus whether it ever
 /// got its port. `tryListen` blocks for the life of the server when it
 /// succeeds, so "did it bind?" cannot be read from the return value in time —
@@ -172,11 +207,14 @@ const Serving = struct {
     }
 };
 
-test "an endpoint that never answers is given up on, and says which clock did it" {
+/// The whole staging, once per test: a quiet endpoint of the given kind on
+/// its own thread, a nilo server on another with `handler` at `route`, one
+/// request through it, and what the handler reported as text.
+fn drive(comptime answer: @FieldType(Quiet, "answer"), comptime route: []const u8, comptime handler: anytype) ![]u8 {
     hushStartupWiring();
     const gpa = std.heap.smp_allocator;
 
-    var quiet: Quiet = .{};
+    var quiet: Quiet = .{ .answer = answer };
     const quiet_thread = try std.Thread.spawn(.{}, Quiet.run, .{&quiet});
     defer {
         // `done` first, so that once `knock` frees the `accept` the loop below
@@ -207,7 +245,7 @@ test "an endpoint that never answers is given up on, and says which clock did it
     var app = nilo.App.init(gpa);
     defer app.deinit();
     try app.provide(&api);
-    try app.get("/call", callQuiet);
+    try app.get(route, handler);
 
     // Derived from the port `Quiet` scanned its way to rather than fixed,
     // because `zig build test-fetch-engine` runs Debug and ReleaseSafe **at
@@ -221,13 +259,37 @@ test "an endpoint that never answers is given up on, and says which clock did it
         app_thread.join();
     }
 
-    const body = try askOnce(gpa, serving.port, "/call");
-    defer gpa.free(body);
+    return askOnce(gpa, serving.port, route);
+}
+
+test "an endpoint that never answers is given up on, and says which clock did it" {
+    const body = try drive(.nothing, "/call", callQuiet);
+    defer std.heap.smp_allocator.free(body);
 
     // The whole chain, in one string: the timer fired, the fiber was
     // cancelled, `bound.fired()` said the cancellation was this call's own,
     // and the handler was handed a timeout rather than a shutdown.
     try testing.expectEqualStrings("TimedOut", body);
+}
+
+test "silence inside a call with no ceiling is a stall, under the Engine's timer" {
+    const body = try drive(.head_then_stall, "/stall", callPatient);
+    defer std.heap.smp_allocator.free(body);
+
+    // The same timer as above, armed for the other bound: a head and three
+    // bytes came, then nothing for 200 ms, and the fiber was cancelled with
+    // `stall_armed` saying which clock it was (ADR 0237).
+    try testing.expectEqualStrings("Stalled", body);
+}
+
+test "a body that trickles under the Engine is re-armed on every byte and never stalls" {
+    const body = try drive(.trickle, "/trickle", callPatient);
+    defer std.heap.smp_allocator.free(body);
+
+    // 480 ms of body under a 200 ms silence bound: a timer armed once at
+    // `begin` would have fired at 200 ms, and one re-armed by each chunk
+    // never does. The whole body coming back is the proof of the re-arm.
+    try testing.expectEqualStrings("xxxxxxxx", body);
 }
 
 /// One request over a real socket, from a thread that is not the Engine's.

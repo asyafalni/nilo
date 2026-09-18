@@ -46,12 +46,14 @@ no request. Handing over something that is neither is a Refusal naming the call.
 |---|---|---|
 | `max_in_flight` | 32 | calls at once, across every host. Past it a caller waits for a permit rather than opening another connection — an HTTPS one holds 59,151 bytes |
 | `timeout_ms` | 30,000 | how long one whole call may take. `0` is no limit. It fires with or without an Engine: under `listen()` the Engine cancels the fiber; on a client started with `nilo_start(io, .none)` each step of the call runs as a task of that `Io` and the task is cancelled — one thread hop per step, paid only there ([ADR 0230](../adr/0230-a-deadline-with-no-engine-cancels-a-task.md)) |
+| `stall_ms` | 0 | how long the far end may say **nothing** before the call is `error.Stalled`: time since the last byte, not since the call began. `0` is no such bound. Composes with `timeout_ms`; the Engine's timer re-armed on every chunk, or the engineless wait re-read from the last byte ([ADR 0237](../adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)) |
 | `max_body` | 8 MiB | a longer body is `error.BodyTooLarge`, enforced while reading |
 | `max_drain` | 64 KiB | how much of an unread body is worth reading to keep a pooled connection. Past it the connection is dropped |
+| `read_buffer_size` | 8 KiB | each connection's socket read buffer, and so how much one read brings in. std's default, passed through ([ADR 0238](../adr/0238-the-transfer-buffer-serves-nothing-here.md)) |
 | `forward_request_id` | true | a call made under a `*Ctx` sends the request's id as `X-Request-Id`, so the other side's log lines up with this one. A `Run` has no id and sends none; a call naming its own `X-Request-Id` in `headers` keeps it ([ADR 0196](../adr/0196-a-request-id-goes-out-with-the-call.md)) |
 
-**`Client.Call`**, given per call: `headers`, and `timeout_ms` / `max_body` to
-override the settings above for one call. A header in `headers` that std has
+**`Client.Call`**, given per call: `headers`, and `timeout_ms` / `stall_ms` /
+`max_body` to override the settings above for one call. A header in `headers` that std has
 a slot for — `host`, `authorization`, `user-agent`, `content-type`,
 `connection`, `accept-encoding` — is sent **once**, the caller's copy, rather
 than beside std's ([ADR 0231](../adr/0231-a-header-std-owns-goes-out-once.md)).
@@ -62,9 +64,12 @@ a 204 and a 304 are complete at the blank line whatever `content-length` or
 connection is kept ([ADR 0215](../adr/0215-an-answer-with-no-body-ends-at-its-head.md)).
 
 **Errors worth naming.** `error.TimedOut` is this call's own deadline;
-`error.Canceled` is the server shutting down underneath it, and the two are
-told apart rather than guessed at. `error.NotStarted` is a call made before
-`listen()` — the client is finished at startup like any other service.
+`error.Stalled` is `stall_ms` of nothing arriving while the peer holds the
+socket; `error.Canceled` is the server shutting down underneath it, and the
+three are told apart rather than guessed at. `error.RedirectRefused` is a 3xx
+with a `Location` under an `Exchange` that made no decision about redirects
+(`Client.get` and its siblings follow). `error.NotStarted` is a call made
+before `listen()`; the client is finished at startup like any other service.
 
 **A 4xx or a 5xx is a `Response`, not an error.** The call worked and the
 service said no; only the caller knows which of those matters.
@@ -106,23 +111,28 @@ _ = try ex.pipe(&body.writer);   // straight out, allocating nothing
 
 | | |
 |---|---|
-| `ex.begin(client, .{…})` | `Head` — status, `content_length`, `content_type`, `header(name)` (case-insensitive), `ok()`, and `redirected` / `location(&buf)`: the `std.Uri` a followed redirect ended at, or null, and the same as one string. Its text lives in the `redirect_buffer` the call was given ([ADR 0232](../adr/0232-a-followed-redirect-says-where-it-ended.md)) |
+| `ex.begin(client, .{…})` | `Head`: status, `content_length`, `content_type`, `header(name)` (case-insensitive), `ok()`, and `redirected` / `location(&buf)`: the `std.Uri` a followed redirect ended at, or null, and the same as one string. Its text lives in the `.follow` buffer the call was given ([ADR 0232](../adr/0232-a-followed-redirect-says-where-it-ended.md)) |
+| `head.keep(c)` | the same `Head` copied into the Scope, good after the body: one arena allocation the size of the header block ([ADR 0240](../adr/0240-a-head-that-outlives-its-body.md)) |
 | `ex.take(c, max)` | the rest of the body as a `Str` in the Scope, refusing over `max` |
 | `ex.readInto(buf)` | exactly `buf.len` bytes, or `error.BodyTooShort` |
 | `ex.pipe(w)` | the rest into a `*std.Io.Writer`, and how many bytes |
+| `ex.stream(w, limit)` | one chunk into `w`, at most `limit`, and how many bytes; `0` is the end. What one socket read handed over; inside both clocks, where the same call on `ex.reader` is not |
 | `ex.discard()` | "I will not read this body; close the connection" — for the probe that got the whole file. `max_drain` stays a policy rather than a lever ([ADR 0235](../adr/0235-a-caller-that-knows-says-discard.md)) |
 | `ex.end()` | required, and safe twice |
 
-`Begin` takes `headers`, `host`, `authorization`, `content_type`, `user_agent`, `timeout_ms`,
-a `body` of `.none` / `.slice` / `.stream`, and the two buffers — an empty
-`redirect_buffer` means redirects are not followed, which is what a signed
-request wants. A name in `headers` that std has a slot for tells std to leave
+`Begin` takes `headers`, `host`, `authorization`, `content_type`, `user_agent`,
+`timeout_ms`, `stall_ms`, a `body` of `.none` / `.slice` / `.stream`, and
+`redirects`: `.refuse` (the default; a 3xx with a `Location` is
+`error.RedirectRefused`), `.follow = &buf` (walked, three deep, resolved in
+the buffer) or `.expose` (the 3xx as itself, which is what a signed request
+and an S3 client want) ([ADR 0239](../adr/0239-a-redirect-is-a-decision-with-a-name.md)).
+A name in `headers` that std has a slot for tells std to leave
 the slot out, so the line goes once; the explicit fields are the form for a
 caller who has the value and not a line, and a field *and* the line is two
-lines ([ADR 0231](../adr/0231-a-header-std-owns-goes-out-once.md)). **The buffers are the caller's because their cost is the
-caller's stack**, and by
-[ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md) that is per
-connection.
+lines ([ADR 0231](../adr/0231-a-header-std-owns-goes-out-once.md)).
+`transfer_buffer` is for a caller who reads buffered off `ex.reader` and for
+nothing else: `take`, `readInto`, `pipe` and `stream` never fill it, and the
+empty default is the ordinary call ([ADR 0238](../adr/0238-the-transfer-buffer-serves-nothing-here.md)).
 
 **It must not be copied once begun**: it holds a `std.http.Client.Request`.
 Declare it, fill it where it stands, leave it there.

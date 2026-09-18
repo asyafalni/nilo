@@ -224,11 +224,10 @@ fn presign(files: *Files, c: *nilo.Ctx) !nilo.Str {
 /// Chunked, because a stream has no length to announce, so its wire bytes
 /// differ from `/o/1m`'s and the driver leaves it out of the comparison.
 fn stream1m(files: *Files, c: *nilo.Ctx) !void {
-    var transfer: [64 << 10]u8 = undefined;
     var reading: Files.Reading = .idle;
     defer reading.close();
 
-    try files.stream(c, one_m, &reading, &transfer);
+    try files.stream(c, one_m, &reading);
 
     var body = try c.stream(200, octets);
     _ = try reading.pipe(&body.writer);
