@@ -2431,9 +2431,17 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 // The cost `types.zig` states: a Json column is parsed per
                 // row, into the arena, and freed by the reset that ends the
                 // request. This is `jsonPayload`'s one caller.
+                //
+                // `.alloc_always`, because the default hands a string with no
+                // escape in it back as a slice *into the input* — and the
+                // input is the driver's buffer the comment above says dies
+                // at the next row. The same trap `nilo_jwt` found in its own
+                // parse (ADR 0242); a payload's text is copied the way a
+                // text column's is.
                 return .{
-                    .value = std.json.parseFromSliceLeaky(Payload, c.arena(), value, .{}) catch
-                        return error.QueryFailed,
+                    .value = std.json.parseFromSliceLeaky(Payload, c.arena(), value, .{
+                        .allocate = .alloc_always,
+                    }) catch return error.QueryFailed,
                 };
             }
             // A tag rather than a view of the bytes it was named by, so

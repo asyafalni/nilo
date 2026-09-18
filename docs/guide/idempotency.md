@@ -9,6 +9,10 @@ handler once per key and answers the retries with what it already said.
 In nilo that is one argument, and the handler is otherwise the one you were
 going to write:
 
+(For a GET whose answer is the same for everybody for a minute, the sibling
+is [`Cached`](./cache.md#a-route-that-says-cache-this-answer-for-a-minute):
+the same record, keyed on the request line instead of a header.)
+
 <!-- compiles -->
 ```zig
 const cache = @import("nilo_cache");

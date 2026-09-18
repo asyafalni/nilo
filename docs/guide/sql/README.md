@@ -42,8 +42,8 @@ Read them in order the first time; each assumes the ones above it.
 1. [A table is a struct](./tables.md) — the Row, what a field may be, money,
    lists, and a column type of your own.
 2. [Reading](./reading.md) — the query is a constant, conditions, a filter
-   nobody set, one row or all of them, counting, paging, a query with no
-   server, and a result set too big to hold.
+   nobody set, one row or all of them, counting, paging, a deep page without
+   `OFFSET`, a query with no server, and a result set too big to hold.
 3. [Writing](./writing.md) — insert, update, delete, many rows at once, and
    a row that may already be there.
 4. [Transactions](./transactions.md) — deadlines, isolation, holding the rows

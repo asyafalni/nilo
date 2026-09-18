@@ -3568,3 +3568,54 @@ found an old one's guard unexercised.
 
 One number: `@sizeOf(Exchange)` is 992, from 928, for the tap reader that
 notices a chunk, and `/call` did not move.
+
+## A parse that promised to own its strings pointed back at the input
+
+Adding ES256 ([ADR 0242](./adr/0242-the-key-decides-the-algorithm.md)) meant
+reading `crv` out of a JWKS as text, and reading the std source for how
+`std.json` hands a `[]const u8` back said: for a slice input, the default
+is `.alloc_if_needed`, and a string with no escapes in it is a slice *into
+the input*. `parseKeys` had been reading `kid` that way, and `verify` had
+been reading the caller's `Claims` that way — into `payload_bytes`, in the
+scratch arena `verify` frees on the way out — under doc comments promising
+the opposite on both.
+
+Nothing found it because every caller handed `verify` an arena, and a
+scratch arena freed back into an arena gives nothing up; `c.arena()` in a
+handler works for the same reason, by accident. **A lifetime test that
+hands the code an arena tests nothing about lifetimes.** The check that does
+is to free the answer one string at a time on `std.testing.allocator`,
+which refuses a pointer it never handed out — and it is the same
+`.allocate = .alloc_always` that `http/testing.zig` had already written
+for the same reason, which is the other half of the lesson: the repo knew,
+in one file, and the next parse did not read that file.
+The third parse was `sql/db.zig`'s `Json(T)` column, sitting under a
+comment that said the buffer dies at the next row, and it was found by
+searching for the call once the lesson was written rather than by a test.
+
+## A loop the roadmap had diagnosed in the wrong place
+
+The queue's first two roadmap items and one gap closed together
+([ADR 0245](./adr/0245-a-job-can-push-the-next-one.md),
+[ADR 0246](./adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)).
+One thing from it is worth more than the list.
+
+**A `dependency loop` is wherever the type is named, not only where it
+was noticed.** The roadmap carried "a job cannot push the next one" for a
+cycle with the cause named — `.deps = struct { jobs: *Jobs }` loops
+because `Jobs(…)` reads the fields of `.deps` while `Jobs` is being
+computed — and the fix named beside it: make `.deps` a function of the
+finished type. Building that fix found the second loop under the first.
+`Download.run`'s own signature says `*Jobs`, and `checkRun` reads that
+signature in the body of `Jobs(…)` too, so moving the deps out of the
+argument list and leaving the `run` checks where they were still did not
+compile. Every read of a `run`'s type had to wait for the queue type, not
+only the read of `.deps`. A premise about *where* a loop is decays the
+way a number does: it was true, it was written down, and it described
+half the loop.
+
+The shape that worked is one private declaration the entry points name,
+rather than a container-level `comptime` block in the returned struct —
+whether such a block is analysed after the call or inline during it is a
+property of the compiler nobody here has measured, and a check whose
+timing is a guess may loop on the one case it exists for.

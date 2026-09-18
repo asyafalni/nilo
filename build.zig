@@ -1001,6 +1001,10 @@ const pw_refusals = [_]Refusal{
         .name = "pw_cost_more_lanes_than_memory",
         .says = "a password Cost of 2048 lanes needs at least 16384 KiB of memory, and it has 8192.",
     },
+    .{
+        .name = "pw_token_from_a_uuid",
+        .says = "a Token is made from 32 bytes of entropy and was given 16.",
+    },
 };
 
 /// The same, for `cache/refusals/`, hanging off `test-cache` for the reason
@@ -1091,6 +1095,43 @@ const job_refusals = [_]Refusal{
         .name = "job_final_with_no_retry",
         .says = "the job SendWelcome declares `final`, and its `retry` is `.none`.",
     },
+    // A job that pushes the next one: `.deps` as a function of the queue
+    // type (ADR 0245). The second fires at `open` rather than at
+    // `job.Jobs(…)`, because that is when the queue type exists to check
+    // a `run` against.
+    .{
+        .name = "job_deps_fn_of_the_wrong_shape",
+        .says = "`job.Jobs`'s `.deps` is a function, and it does not have the shape `fn (comptime Jobs: type) type`.",
+    },
+    .{
+        .name = "job_deps_fn_without_what_run_asks",
+        .says = "the job SendWelcome's `run` asks for a *job_deps_fn_without_what_run_asks.Mailer, and `job.Jobs`'s `.deps` has no such thing.",
+    },
+    // The tick a `run` may ask for is a value (ADR 0246).
+    .{
+        .name = "job_run_takes_the_tick_by_pointer",
+        .says = "the job SendWelcome's `run` takes a `*job.Tick` at position 2, and a tick is asked for by value.",
+    },
+};
+
+/// The same, for `fetch/refusals/`, hanging off `test-fetch` (ADR 0243). The
+/// eighth table, and the first this module has had: until the ordinary call
+/// took a struct of the caller's own, nothing here was checked while
+/// compiling. Each one is a mistake that would otherwise reach the wire —
+/// a body sent as one JSON string, a query with nothing to name its params.
+const fetch_refusals = [_]Refusal{
+    .{
+        .name = "fetch_query_not_a_struct",
+        .says = "fetch.withQuery was handed a comptime_int for its params, and a query is a struct with one field per param.",
+    },
+    .{
+        .name = "fetch_query_field_cannot_be_encoded",
+        .says = "the query field `when` is a fetch_query_field_cannot_be_encoded.When, and a query value is an int, a bool, text, or an optional of one.",
+    },
+    .{
+        .name = "fetch_json_body_is_text",
+        .says = "fetch.postJson was handed text, and would send it as one JSON string. A body already encoded goes through post, put, patch or send.",
+    },
 };
 
 /// One entry per file in `refusals/`: a program written wrong on purpose, and
@@ -1126,6 +1167,40 @@ const refusals = [_]Refusal{
     .{
         .name = "idempotent_handler_returns_a_file",
         .says = "the handler for route \"/receipts\" takes an `Idempotent(…)` and returns a nilo.FileBody, which is not an answer nilo can keep.",
+    },
+    // The eight ways to ask for an answer served again that nilo cannot
+    // serve (ADR 0247).
+    .{
+        .name = "cached_not_a_bytes_space",
+        .says = "the `Cached(u32, …)` on route \"/pages\" names u32 as where answers are kept, and it is not a Space.",
+    },
+    .{
+        .name = "cached_for_no_time",
+        .says = "the `Cached(cached_for_no_time.Pages, …)` on route \"/pages\" has a `ttl_s` of 0, and an answer kept for no time is a handler that runs every time.",
+    },
+    .{
+        .name = "cached_by_no_header",
+        .says = "the `Cached(cached_by_no_header.Pages, …)` on route \"/pages\" keys its answers on a header and names none.",
+    },
+    .{
+        .name = "cached_by_a_credential",
+        .says = "the `Cached(cached_by_a_credential.Pages, …)` on route \"/pages\" keys its answers on the `Cookie` header, and a credential is not a key.",
+    },
+    .{
+        .name = "cached_on_a_post",
+        .says = "the route \"POST /orders\" takes a `Cached(…)`, and a POST is not an answer to keep.",
+    },
+    .{
+        .name = "cached_handler_writes_its_own_response",
+        .says = "the handler for route \"/pages\" takes a `Cached(…)` and returns nothing, so there is no answer to keep.",
+    },
+    .{
+        .name = "cached_twice",
+        .says = "the handler for route \"/pages\" asks to be cached twice — argument 1 and argument 2.",
+    },
+    .{
+        .name = "cached_and_idempotent",
+        .says = "the handler for route \"/orders\" takes both an `Idempotent(…)` (argument 1) and a `Cached(…)` (argument 2), and an answer is kept under one key.",
     },
     // A readiness hook of the wrong shape (ADR 0192).
     .{
@@ -1671,6 +1746,13 @@ const refusals = [_]Refusal{
         .name = "wildcard_not_last",
         .says = "the route pattern \"/files/*/raw\" has a `*` that is not the last segment.",
     },
+    // The floor on a password Cost, reached through the door with no request
+    // behind it (ADR 0241). The message is `nilo_pw`'s; what this row holds
+    // is that `nilo.verifyPasswordWith` still gets there.
+    .{
+        .name = "password_checked_off_the_loop_below_the_floor",
+        .says = "a password Cost of 64 KiB of memory is below the floor of 7168 KiB.",
+    },
 };
 
 const Refusal = struct { name: []const u8, says: []const u8 };
@@ -1715,6 +1797,7 @@ const Snippets = struct {
         .{ .path = "docs/reference/pw.md" },
         .{ .path = "docs/reference/cache.md" },
         .{ .path = "docs/reference/jwt.md" },
+        .{ .path = "docs/reference/fetch.md" },
         .{ .path = "docs/guide/sessions.md" },
         .{ .path = "docs/guide/config.md" },
         .{ .path = "docs/guide/forms.md" },
@@ -3131,7 +3214,7 @@ pub fn build(b: *std.Build) void {
 
     const refusals_pw_step = b.step(
         "refusals-pw",
-        "Check that each password Cost mistake stops in nilo's own words",
+        "Check that each password Cost and Token mistake stops in nilo's own words",
     );
     for (pw_refusals) |refusal| {
         const module = b.createModule(.{
@@ -3207,6 +3290,29 @@ pub fn build(b: *std.Build) void {
         });
         test_fetch_step.dependOn(&b.addRunArtifact(tests).step);
     }
+
+    // The eighth Refusals table, held the way the other seven are, and the
+    // same warning as every one before it: a row added here while another
+    // step is running is a check that silently never ran.
+    const refusals_fetch_step = b.step(
+        "refusals-fetch",
+        "Check that each outbound-call mistake stops in nilo's own words",
+    );
+    for (fetch_refusals) |refusal| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("fetch/refusals/{s}.zig", .{refusal.name})),
+            .target = target,
+            .optimize = .Debug,
+            .imports = &.{
+                .{ .name = "nilo_fetch", .module = nilo_fetch },
+                .{ .name = "nilo_core", .module = nilo_core },
+            },
+        });
+        const refused = b.addObject(.{ .name = refusal.name, .root_module = module });
+        refused.expect_errors = .{ .contains = b.fmt("error: nilo: {s}", .{refusal.says}) };
+        refusals_fetch_step.dependOn(&refused.step);
+    }
+    test_fetch_step.dependOn(refusals_fetch_step);
     test_step.dependOn(test_fetch_step);
 
     // The deadline, watched firing. It needs the Engine, so it is a root of
@@ -3900,6 +4006,28 @@ pub fn build(b: *std.Build) void {
         });
         const deadline_tests = b.addTest(.{ .root_module = deadline_root, .use_llvm = testBackend(target, mode) });
         test_sql_step.dependOn(&b.addRunArtifact(deadline_tests).step);
+
+        // A transaction whose socket dies under it, through a proxy the test
+        // stands up between the pool and Postgres (ADR 0248). No Engine: it
+        // runs on `std.Io.Threaded` the way `live.zig` does. A root of its
+        // own so that a proxy that wedges is a binary that wedges, with a
+        // name of its own in `ps`, rather than one test among a hundred —
+        // and hung off `test-sql` for the reason `deadline.zig` is. Skips
+        // when `DATABASE_URL` reaches nothing.
+        const severed_root = b.createModule(.{
+            .root_source_file = b.path("sql/severed.zig"),
+            .target = target,
+            .optimize = mode,
+            .imports = &.{
+                .{ .name = "nilo_core", .module = core_mod },
+                .{ .name = "nilo_sql", .module = under_test },
+            },
+        });
+        // The same `live_config` the Db under test was given, for the reason
+        // `job/live.zig` shares it below: one options module, one URL.
+        severed_root.addImport("live_config", under_test.import_table.get("live_config").?);
+        const severed_tests = b.addTest(.{ .root_module = severed_root, .use_llvm = testBackend(target, mode) });
+        test_sql_step.dependOn(&b.addRunArtifact(severed_tests).step);
 
         // `job/live.zig`: the one root that names `nilo_sql` and `nilo_job`
         // together. The same Core as the Db under test, so a `Str` in a

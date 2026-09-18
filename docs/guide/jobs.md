@@ -101,12 +101,15 @@ carried.
 | `jobs.pushIn(&tx, c, value, .{})` | the same, inside a transaction you hold |
 | `jobs.stats(c)` | how many are `queued`, `running` and `dead` |
 | `jobs.status(id)` | `?job.Status` from the `.status` Space, when there is one |
+| `jobs.progress(id, n)` | how far a run has got, into the same Space |
 | `jobs.deadOnes(c)` | the rows that failed for the last time, newest first |
 | `jobs.retryDead(c, id)` | queue one of them again from its first attempt |
 | `Jobs.serve` | the worker loop, for `app.spawn` |
 | `jobs.serveOn(io)` | the same loop on an `Io` of yours, for a worker process |
 | `jobs.drain(&run)` | run everything due, here, now — for a test |
-| `jobs.runOne(&run)` | one row, or `false` |
+| `jobs.drainAt(&run, now)` | the same as if it were `now` — how a test moves the clock |
+| `jobs.runOne(&run)` / `runOneAt(&run, now)` | one row, or `false` |
+| `jobs.seed(&run)` / `seedAt(&run, now)` | queue every schedule's next tick, for a test that drains |
 
 ## A job is a struct
 
@@ -159,6 +162,26 @@ answered by the `db` field, and a pointer type nobody put in `deps` is a
 compile error naming the job and the field to add. A `run` that asks for a
 `*nilo.Ctx` is refused the same way, because a job runs outside any request
 and a fail function would have nobody to fail to.
+
+**And a `job.Tick`, by value, if it wants to know which tick it is.** The
+rule is the one a handler's argument list follows: a pointer is a service,
+a value is the tick. It carries the row's `id`, the attempt this is
+(`attempts`, `1` the first time), when the row was due (`run_at`), and
+whether this is the last attempt `retry` allows (`last`) — all of it in
+the worker's hand from the claim, so asking costs nothing
+([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)):
+
+```zig
+pub fn run(self: SendWelcome, scope: *nilo.Run, tick: job.Tick, mail: *Mailer) !void {
+    const via = if (tick.last) mail.fallback else mail.primary;
+    std.log.info("welcome row {d}, attempt {d}", .{ tick.id, tick.attempts });
+    try via.send(scope, self.email, "Welcome");
+}
+```
+
+`last` is about the count: a failure the kind lists in `final` is dead on
+whichever attempt it happens, and the tick cannot know which error is
+coming. A `*job.Tick` is refused naming the rule.
 
 **A payload holds no pointer.** A `*T` field is a compile error naming
 the field: the row is JSON read back on a worker, possibly in another
@@ -246,6 +269,58 @@ the commit, so a worker woken at the `pushIn` would claim nothing and go
 back to sleep. Call `jobs.wake()` after `tx.commit()` and the row starts at
 once; leave it and the next poll finds it, a second later at the default
 ([ADR 0229](../adr/0229-a-push-wakes-a-worker.md)).
+
+### From inside a job
+
+A pipeline — download, then process, then notify; a welcome now and a
+nudge three days later — is a `run` that pushes the next kind, and for
+that it asks for the queue itself: `jobs: *Jobs`. The queue is a dep like
+any other, with one wrinkle. `Jobs` does not exist while its own `.deps`
+is being read, so a struct naming `*Jobs` in a field is a `dependency
+loop` in the compiler's words. Write `.deps` as a function of the queue
+type instead, and nilo hands it the finished type
+([ADR 0245](../adr/0245-a-job-can-push-the-next-one.md)):
+
+```zig
+fn deps(comptime Queue: type) type {
+    return struct { db: *Db, jobs: *Queue };
+}
+
+const Jobs = job.Jobs(.{
+    .kinds = .{ Download, Process },
+    .store = job.Table(Db),
+    .deps = deps,
+});
+
+const Download = struct {
+    pub const nilo_job = "download";
+    pub const retry: job.Retry = .{ .times = 3, .backoff = .{ .fixed_ms = 30_000 } };
+
+    file: i64,
+
+    pub fn run(self: Download, scope: *nilo.Run, db: *Db, jobs: *Jobs) !void {
+        try fetchInto(scope, db, self.file);
+        _ = try jobs.push(scope, Process{ .file = self.file }, .{});
+    }
+};
+```
+
+The queue is a dep of its own kinds, so it is opened once it has an
+address to give:
+
+```zig
+var jobs: Jobs = undefined;
+jobs = .open(gpa, &table, .{ .db = &db, .jobs = &jobs }, .{ .workers = 4 });
+```
+
+Everything else is as before: `Jobs.Deps` is the struct the function
+answered, a pushed kind still has to be in `.kinds`, and a `run` asking
+for a service the struct has not got is the same compile error naming the
+job. What moves is *where* that error arrives for a queue whose `.deps`
+is a function — at the first `open` rather than at the `job.Jobs(…)`
+line, because that is when the queue type exists to check a `run`
+against; the compiler's trace points back. The nudge three days later is
+the same call with `.after_ms`.
 
 ## At least once
 
@@ -383,12 +458,34 @@ const Jobs = job.Jobs(.{
 jobs = .openWith(gpa, &table, .{ .db = &db }, .{}, Statuses.open(&store));
 ```
 
-`jobs.status(id)` then answers `.{ .state, .attempts }` for as long as the
-Space remembers the row — `queued`, `running`, `done` or `dead` — and null
-once it has forgotten, which for a route answering "is my export ready?"
-is the right shape. It is a cache and not the table on purpose: a status is
-the one thing here that may be forgotten, and a poll every second should
-not be a query every second.
+`jobs.status(id)` then answers `.{ .state, .attempts, .progress }` for as
+long as the Space remembers the row — `queued`, `running`, `done` or
+`dead` — and null once it has forgotten, which for a route answering "is
+my export ready?" is the right shape. It is a cache and not the table on
+purpose: a status is the one thing here that may be forgotten, and a poll
+every second should not be a query every second.
+
+**`progress` is the run's own figure in the same Space.** A `run` that
+asks for its `job.Tick` and for `*Jobs` writes `jobs.progress(tick.id, n)`
+as it goes — rows imported, a percentage, a step; the kind decides what
+the number means — and the route polling `status(id)` reads it beside the
+state ([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)):
+
+```zig
+pub fn run(self: Import, scope: *nilo.Run, tick: job.Tick, db: *Db, jobs: *Jobs) !void {
+    var done: u32 = 0;
+    while (try self.nextBatch(scope)) |batch| {
+        try db.insertMany(Row, scope, batch);
+        done += @intCast(batch.len);
+        jobs.progress(tick.id, done);
+    }
+}
+```
+
+The figure starts over with every attempt and is kept on `done`, so "done,
+4,000 rows" is what the last poll reads. It is a `get` and a `put` on the
+Space per call and touches the table not at all, which is why a run may
+report every batch rather than every thousand.
 
 **The dead ones** are listed newest first with the error's name, and
 `retryDead` puts one back at attempt one. An operator's route:
@@ -462,6 +559,44 @@ test "signing up queues a welcome, and the welcome finds the user" {
 compiling: a job that ran under a request would be a job that could call a
 fail function.
 
+**A test moves the clock with `drainAt`.** `drain` runs what is due now;
+`drainAt(&run, now)` runs what would be due if it were `now`, in
+microseconds since the epoch, and every read of the clock inside a tick —
+whether a row is due, when a failed run is tried again, when a schedule's
+next tick is — reads that number. So the reminder for tomorrow, the third
+attempt of a backoff, and the report at three in the morning are each a
+call rather than a sleep
+([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)):
+
+```zig
+test "the nudge goes out three days later and not before" {
+    const t = nilo.nowMicros();
+    _ = try jobs.push(&run, Nudge{ .user_id = 7 }, .{ .after_ms = 3 * 24 * 60 * 60 * 1_000 });
+    try testing.expectEqual(@as(usize, 0), try jobs.drainAt(&run, t + 2 * day));
+    try testing.expectEqual(@as(usize, 1), try jobs.drainAt(&run, t + 3 * day + std.time.us_per_s));
+}
+
+test "the report runs at three, and again the next day" {
+    try jobs.seedAt(&run, ten_in_the_morning);
+    const three = Nightly.schedule.next(ten_in_the_morning);
+    try testing.expectEqual(@as(usize, 0), try jobs.drainAt(&run, three - 1));
+    try testing.expectEqual(@as(usize, 1), try jobs.drainAt(&run, three));
+    try testing.expectEqual(@as(usize, 1), try jobs.drainAt(&run, three + day));
+}
+```
+
+`seedAt` is what `serve` does at start — queue every schedule's next tick
+— for a test that drains rather than serves. A retry's wait is walked the
+same way: a kind with `.exponential = .{ .from_ms = 100, … }` that fails
+at `t` runs again at `drainAt(&run, t + 100 * ms)`, not at `t + 99 * ms`,
+and the third attempt at `t + 300 * ms`. `push` takes `.at` for the row
+side of the same arithmetic.
+
+`drain` itself is `drainAt` at the moment it was called, and reads the
+clock once: what is due is due against that one reading, so a schedule of
+`every(1)` under a slow tick cannot keep a drain going for as long as the
+ticks take.
+
 ## What it costs
 
 Against [ADR 0018](../adr/0018-the-trade-budget-has-three-axes.md)'s axes,
@@ -481,6 +616,12 @@ the latency of a row this process pushed
 
 **Per connection, nothing.** A worker is a fiber per process, and its stack
 is paid once and held at the high-water mark of whatever `run` touches.
+
+**Per row, a `job.Tick` built whether or not the `run` asks for it** —
+three words and a bool on the worker's stack — and a tag test on the
+clock for each of the three or four times a tick reads it, which is what
+lets `drainAt` hand a test's number to every one of them
+([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)).
 
 ## What it will not do
 

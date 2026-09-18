@@ -707,6 +707,10 @@ pub const Ctx = struct {
     /// thirteen and turns the form into a list of which addresses are
     /// registered. Passing null does the work anyway and answers false. There
     /// is no signature here that lets the fast wrong version be written.
+    ///
+    /// **The request is not used**: the salt is in the stored string. With
+    /// no request in hand — a CLI, a job, a test — `nilo.verifyPassword` is
+    /// this call without the `Ctx`, through the same Gate (ADR 0241).
     pub fn verifyPassword(
         self: *const Ctx,
         gpa: std.mem.Allocator,

@@ -30,7 +30,7 @@ const sql = @import("nilo_sql");      // only if you talk to Postgres or SQLite
 const s3 = @import("nilo_s3");        // only if you store objects
 const id = @import("nilo_id");        // only if you make identifiers
 const config = @import("nilo_config");// only if you read settings
-const pw = @import("nilo_pw");        // only if you hash passwords
+const pw = @import("nilo_pw");        // only if you hash passwords or mint a token
 const cache = @import("nilo_cache");  // only if you cache something
 const jwt = @import("nilo_jwt");      // only if you verify somebody else's tokens
 const job = @import("nilo_job");      // only if some work runs later, or on a schedule
@@ -75,6 +75,7 @@ section on it. A name is found here first and read on its page.
   - [`FromHeader(name, T)`](./handlers.md#fromheadername-t)
   - [`Authorization(scheme)`](./handlers.md#authorizationscheme)
   - [`Idempotent(Replays, options)`](./handlers.md#idempotentreplays-options)
+  - [`Cached(Pages, options)`](./handlers.md#cachedpages-options)
   - [A query field that is a list](./handlers.md#a-query-field-that-is-a-list)
   - [`Bound(W)`](./handlers.md#boundw)
 - [Handler returns](./handlers.md#handler-returns)
@@ -167,6 +168,7 @@ section on it. A name is found here first and read on its page.
 
 - [`nilo_fetch`](./fetch.md#nilo_fetch)
   - [`fetch.Exchange`](./fetch.md#fetchexchange)
+  - [`fetch.testing`](./fetch.md#fetchtesting)
 
 **[nilo_job](./job.md)** — work that runs later, again, or on a schedule.
 
@@ -184,6 +186,7 @@ section on it. A name is found here first and read on its page.
 **[nilo_pw](./pw.md)** — password hashing.
 
 - [`nilo_pw`](./pw.md#nilo_pw)
+  - [A token that is not a password](./pw.md#a-token-that-is-not-a-password)
 
 **[nilo_cache](./cache.md)** — an expiring cache in this process.
 

@@ -18,7 +18,8 @@ var api: fetch.Client = .init(gpa, .{});
 try app.provide(&api);
 
 fn charge(api: *fetch.Client, c: *nilo.Ctx) !Receipt {
-    const res = try api.post(c, "https://api.example.com/v1/charges", "amount=500", .{});
+    const res = try api.postJson(c, "https://api.example.com/v1/charges", .{ .amount = 500 }, .{});
+    if (res.status == .too_many_requests) return nilo.fail.status(503, "retry after {s}", .{res.header("retry-after") orelse "a while"});
     if (!res.ok()) return nilo.fail.status(502, "the payment service said no", .{});
     return res.json(Receipt, c);
 }
@@ -32,9 +33,13 @@ fn charge(api: *fetch.Client, c: *nilo.Ctx) !Receipt {
 | `client.delete(c, url, .{})` | `Response` |
 | `client.patch(c, url, body_or_null, .{})` | `Response` — `null` for the verb endpoint whose whole request is its path |
 | `client.send(c, method, url, body_or_null, .{})` | for a method the five above do not name. **The body decides the framing, not the method** ([ADR 0213](../adr/0213-the-body-decides-not-the-method.md)): a DELETE with a body sends it under its `content-length`, a POST with `null` sends `content-length: 0`. `error.HeadTooLong` is a body on a method std frames none for whose head did not fit the connection's buffer |
+| `client.postJson(c, url, value, .{})` | `Response` — `value` written out with `std.json` into the Scope and sent under `content-type: application/json`, unless `headers` names one. `putJson`, `patchJson` and `sendJson(c, method, url, value, .{})` beside it. Text handed here is a Refusal: it would go out as one JSON string ([ADR 0243](../adr/0243-the-ordinary-call-sends-json-and-a-query.md)) |
+| `fetch.withQuery(c, base, .{ .page = 2, .q = "a b" })` | `[]const u8` — `base?page=2&q=a%20b`, in the Scope, one allocation sized exactly. A field is an int, a bool, text or an optional of one (null left out); anything else is a Refusal naming the field. `&` after a base that has a `?` already ([ADR 0243](../adr/0243-the-ordinary-call-sends-json-and-a-query.md)) |
 | `res.ok()` | `bool` — 2xx |
 | `res.status` | `std.http.Status` |
 | `res.body` | `Str`, in the Scope you passed. Goes when the request does |
+| `res.headers` | `[]const u8`, the header block the answer arrived with, kept into the Scope ([ADR 0244](../adr/0244-a-response-carries-its-headers.md)) |
+| `res.header(name)` | `?[]const u8` — case-insensitively; null when the answer did not carry it. `Retry-After` off a 429, `ETag` for the next conditional GET, `Location` on a 201 |
 | `res.json(T, c)` | `T`, parsed into the same Scope |
 
 `c` is a Scope — the `*Ctx` a handler was given, or a `nilo.Run` where there is
@@ -136,3 +141,46 @@ empty default is the ordinary call ([ADR 0238](../adr/0238-the-transfer-buffer-s
 
 **It must not be copied once begun**: it holds a `std.http.Client.Request`.
 Declare it, fill it where it stands, leave it there.
+
+### `fetch.testing`
+
+A canned server for a suite of your own: one real exchange over a loopback
+socket on `std.Io.Threaded`, with no Engine anywhere. What the module's own
+tests drive, exported ([ADR 0243](../adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+
+<!-- compiles -->
+```zig
+const fetch = @import("nilo_fetch");
+
+fn oneExchange(io: std.Io, gpa: std.mem.Allocator) !void {
+    var canned = try fetch.testing.Canned.open(io);
+    defer canned.close();
+    canned.reply("429 Too Many Requests", "Retry-After: 30\r\n", "slow down");
+    var served = try io.concurrent(fetch.testing.Canned.serveOne, .{&canned});
+    defer served.cancel(io) catch {};
+
+    var api: fetch.Client = .init(gpa, .{});
+    defer api.deinit();
+    try api.nilo_start(io, .none);
+
+    var run: nilo.Run = .init(gpa);
+    defer run.deinit();
+    var buf: [64]u8 = undefined;
+    const res = try api.get(&run, try canned.url(&buf), .{});
+    try std.testing.expectEqualStrings("30", res.header("retry-after").?);
+}
+```
+
+| | |
+|---|---|
+| `Canned.open(io)` | bound to port 0 on loopback, the kernel's answer read back; no port range to keep apart from anybody's |
+| `canned.reply(status, headers, body)` | what `serveOne` answers: the status line after `HTTP/1.1 `, headers each ending in `\r\n` (`Content-Length` is written for you), the body as it is |
+| `canned.url(&buf)` | `http://127.0.0.1:<port>/` |
+| `canned.serveOne()` | accept one connection, read the request whole, answer, close. **Start it with `io.concurrent`**, never `io.async`, which may run it on your own thread and wait there for the connection you were about to make |
+| `canned.request()` | the request head that arrived, one line per header, `\n` between |
+| `canned.requestBody()` | the request body that arrived, up to a kilobyte |
+| `canned.close()` | |
+
+The client is finished with `nilo_start(io, .none)`, as `listen()` would
+have done it; `.none` is "no Engine to arm a deadline on", and the client
+then bounds the call itself ([ADR 0230](../adr/0230-a-deadline-with-no-engine-cancels-a-task.md)).

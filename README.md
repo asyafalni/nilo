@@ -170,7 +170,7 @@ test "getUser" {
 | **`nilo_fetch`** | calling somebody else's HTTP API from inside a request: the policy in front of `std.http.Client` | retries, circuit breaker |
 | **`nilo_job`** | work that runs later, again, or on a schedule: a queue in the database you already have, a cron schedule parsed while compiling | priorities, exactly-once, time zones |
 | **`nilo_cache`** | an expiring cache in this process, on a fixed budget with nothing allocated per operation | pointers in a cached value, which is a compile error naming the field |
-| **`nilo_jwt`** | checking somebody else's signed token: RS256 and a JWKS | fetching the key set and refreshing it |
+| **`nilo_jwt`** | checking somebody else's signed token: RS256, ES256 and a JWKS | fetching the key set and refreshing it |
 | **`nilo_config`** | settings out of the environment, every bad one named at once | file parsing, and that's a decision |
 | **`nilo_pw`** | password hashing: argon2id, stored as PHC | rate limiting the endpoint |
 | **`nilo_id`** | UUIDs, v4 and v7 | where the randomness comes from |
@@ -418,7 +418,7 @@ and seven build steps checking the wording of every failure:
 |---|---|---|
 | `zig build refusals` | 140 | the framework |
 | `zig build refusals-sql` | 140 | queries, rows and schemas |
-| `zig build refusals-job` | 14 | jobs and schedules |
+| `zig build refusals-job` | 17 | jobs and schedules |
 | `zig build refusals-s3` | 10 | buckets and keys |
 | `zig build refusals-config` | 9 | settings |
 | `zig build refusals-cache` | 5 | cached values |

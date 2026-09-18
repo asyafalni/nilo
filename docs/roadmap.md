@@ -42,12 +42,12 @@ nilo is a toolkit whose largest module is a server, rather than a server with th
 | [`nilo_core`](#nilo_core-the-vocabulary) | needs no loop | an entropy pool nobody has needed, a layering step that trusts its test-import list, and where `convert` belongs |
 | [`nilo_id`](#nilo_id-identifiers) | needs no loop | quiet. Two questions about scope, one gap nobody has hit |
 | [`nilo_config`](#nilo_config-settings) | needs no loop | reading a name the field is not called |
-| [`nilo_pw`](#nilo_pw-hashing-a-password) | needs no loop | no home for a token that is not a password, a `verify` that wants a request it does not use, and a Cost floor that weighs the wrong half |
+| [`nilo_pw`](#nilo_pw-hashing-a-password) | needs no loop | a Cost floor that weighs the wrong half, and a password longer than a page |
 | [`nilo_cache`](#nilo_cache-an-expiring-cache-in-this-process) | needs no loop | 60% still between it and quick_cache on eight threads, unattributed, no counter, and no `getOrPut` |
-| [`nilo_jwt`](#nilo_jwt-checking-somebody-elses-token) | needs no loop | an issuer it cannot read now that Supabase signs ES256, a key set that cannot rotate safely, and no number against a verification |
-| [`nilo_fetch`](#nilo_fetch-calling-somebody-elses-api) | borrows the loop | no way to send JSON, a `Response` with no headers on it, no per-service base URL, and nothing measured through TLS |
-| [`nilo_job`](#nilo_job-work-that-runs-later-again-or-on-a-schedule) | borrows the loop | a job that cannot push the next one, a queue whose clock a test cannot move, a claim per row, and UTC only |
-| [`nilo_http`](#nilo_http-the-server) | owns the loop | a route that cannot cache its own answer, a response never compressed, a handler never told its client left, and fifteen answered questions kept to a row each |
+| [`nilo_jwt`](#nilo_jwt-checking-somebody-elses-token) | needs no loop | a key set that cannot rotate safely, and no number against a verification |
+| [`nilo_fetch`](#nilo_fetch-calling-somebody-elses-api) | borrows the loop | no per-service base URL, and nothing measured through TLS |
+| [`nilo_job`](#nilo_job-work-that-runs-later-again-or-on-a-schedule) | borrows the loop | a claim per row, a queued row that cannot be cancelled, and UTC only |
+| [`nilo_http`](#nilo_http-the-server) | owns the loop | a response never compressed, a handler never told its client left, and fifteen answered questions kept to a row each |
 | [`nilo_sql`](#nilo_sql-postgres-and-sqlite) | borrows the loop | `reset` and `squash` for the migrations, a plain query with no deadline, and a connection URL a managed Postgres hands out that stops the server |
 | [`nilo_s3`](#nilo_s3-object-storage) | borrows the loop | nothing measured through TLS, and no `LIST`, `COPY` or multipart |
 
@@ -135,20 +135,11 @@ Nothing open. A setting marked secret, so `report` could print `PGPASSWORD=***`,
 
 ## `nilo_pw`: hashing a password
 
-argon2id as a pure function of a password, a salt and a Cost, plus the two `Ctx` methods that take the salt from the loop and a permit from the Gate ([ADR 0048](./adr/0048-a-password-hash-is-gated-because-forgetting-is-silent.md)). It imports nothing at all, and a project that never signs anybody in links none of it, measured at 0 bytes.
+argon2id as a pure function of a password, a salt and a Cost, plus the two `Ctx` methods that take the salt from the loop and a permit from the Gate ([ADR 0048](./adr/0048-a-password-hash-is-gated-because-forgetting-is-silent.md)), and a `Token` for the secret that is not a password ([ADR 0241](./adr/0241-a-token-is-not-a-password-and-a-check-needs-no-request.md)). It imports nothing at all, and a project that never signs anybody in links none of it, measured at 0 bytes.
 
 ### Next
 
-**1. A token that is not a password has no home: a password reset, an email verification, an API key.** Every ordinary application has all three, and the recipe is the class of thing this repository builds modules for, the kind that runs perfectly and is open: 32 bytes of entropy, base64url to send, the **digest** stored rather than the token, a constant-time compare when it comes back, an expiry, and one use. What goes wrong in practice is the plaintext in the table, `std.mem.eql` on the compare, or `id.v4` used as the token and kept as it was sent. Nothing under `pw/`, `id/` or any guide page says any of this; a search of the guides for "api key" and "reset" finds nothing. The shape is small and allocates nothing: `pw.Token.new(entropy)` with `.text()` to send (43 bytes of base64url) and `.digest()` (`[32]u8`, SHA-256) to store, and `pw.Token.matches(digest, presented)` in constant time. The salt-and-argon2 machinery is wrong for it on purpose: a 256-bit random token needs no stretching, and a reset link verified in 13 ms is a reset endpoint that can be walked.
-
-**Waiting on: ready.** The one decision, whether it lives under `nilo_pw` as "secrets" or as a tool module of its own, is settled by the import rule: it needs `std.crypto` and nothing else, which is what `pw/` already is.
-
-**2. `verifyPassword` takes a `Ctx` it does not use, so a password cannot be checked outside a request.** The first line of `verifyWith` is `_ = c;`. Hashing needs a `Ctx` because the salt comes from `Ctx.entropy` ([ADR 0046](./adr/0046-entropy-belongs-to-the-loop.md)); verifying reads the salt out of the stored string and needs nothing. So the parameter is there for symmetry, and what it costs is that a password cannot be checked outside a request: a CLI that resets an account, a migration that re-hashes, a background job, and a test that wants neither an App nor a fake Ctx all have to go through `nilo_pw` directly and lose the Gate.
-
-Dropping the parameter is a breaking change to a signature that shipped, which is why it is here rather than done. The other shape is a free function beside it, which is a second name for one job.
-
-**Waiting on: ready.** Next 1 is the caller: the job that sends a reset link verifies nothing, but the CLI that resets an account and the job that re-hashes at a raised Cost are the same shape, and both are written today against `nilo_pw` with no Gate. A free function beside the method is the shape that breaks nothing.
-
+Nothing queued.
 
 ### Known gaps
 
@@ -170,7 +161,7 @@ Dropping the parameter is a breaking change to a signature that shipped, which i
 
 **What would settle it: somebody sending the patch.** It is upstream's to take.
 
-**Whether a second factor belongs here.** TOTP (RFC 6238) is HMAC-SHA1 over a counter derived from the clock, a base32 secret, and a window; forty lines, and the trap is quiet: a code accepted twice inside its own thirty-second window is a replay, and a verifier that forgets to record the last counter it accepted passes every test. The same argument that put Next 1 here applies. Against it is that the audience is narrower, and that the enrolment half (a QR code, a provisioning URI) is a page rather than a function.
+**Whether a second factor belongs here.** TOTP (RFC 6238) is HMAC-SHA1 over a counter derived from the clock, a base32 secret, and a window; forty lines, and the trap is quiet: a code accepted twice inside its own thirty-second window is a replay, and a verifier that forgets to record the last counter it accepted passes every test. The same argument that put `pw.Token` here applies ([ADR 0241](./adr/0241-a-token-is-not-a-password-and-a-check-needs-no-request.md)). Against it is that the audience is narrower, and that the enrolment half (a QR code, a provisioning URI) is a page rather than a function.
 
 **What would settle it: an application that is asked for a second factor**, since a sign-in form is what most of this repository's callers have and a second factor is what fewer of them are asked for.
 
@@ -200,10 +191,6 @@ A ring of bytes with a table over it, sized once and never grown ([ADR 0138](./a
 
 **Waiting on: a caller.**
 
-**The guide says "encode it" and shows nothing.** `cache.Space("user", User)` with a `name` field in it is the first thing anyone writes, and the Refusal sends them to [the guide](./guide/cache.md#the-value-type-decides-the-shape-of-get), which has one sentence and no code. A `<!-- compiles -->` snippet, JSON into a bytes Space at `put`, `getInto` the arena and `std.json` back at `get`, is the interim until the shape above is built, and it is what makes the gap above a nuisance rather than a wall.
-
-**Waiting on: ready.**
-
 **There is no `getOrPut`.** Every caller writes the miss, the compute and the put, which is three lines rather than one and, more to the point, lets two threads compute the same value at once. A cache stampede is a real thing and this module has no answer to it. The answer is not obvious either: holding the lock across the caller's computation is the one thing this module may never do (ADR 0138).
 
 The shape that fits the rule is a claim rather than a lock: `putIfAbsent` a marker, and whoever got it computes while everybody else either computes too or waits *outside this module*, where there is an `Io` to wait on. That is what `nilo.Idempotent`'s `in_flight` marker already does for a POST, and the route cache under [`nilo_http`](#nilo_http-the-server) is where a GET would get the same. What is not decided is whether a `getOrPut` with no `Io` should exist at all, or whether the answer is "the module hands out the claim and the layer with a loop does the waiting".
@@ -220,15 +207,11 @@ The shape that fits the rule is a claim rather than a lock: `putIfAbsent` a mark
 
 ## `nilo_jwt`: checking somebody else's token
 
-RS256 and a JWKS document, and nothing else ([ADR 0140](./adr/0140-nilo-verifies-a-token-and-does-not-fetch-one.md)). The arithmetic is `std.crypto.Certificate.rsa`'s; what this adds is the order the checks happen in and the switch over key sizes. It imports nothing, so `zig test jwt/jwt.zig` is the whole of its suite.
+RS256 and ES256 over a JWKS document, and nothing else ([ADR 0140](./adr/0140-nilo-verifies-a-token-and-does-not-fetch-one.md), [ADR 0242](./adr/0242-the-key-decides-the-algorithm.md)). The arithmetic is std's; what this adds is the order the checks happen in, the key deciding which one runs, and the switch over RSA key sizes. It imports nothing, so `zig test jwt/jwt.zig` is the whole of its suite.
 
 ### Next
 
-**1. An issuer this cannot read now exists, and it is the one most likely to be paired with a Zig API: Supabase signs ES256.** Supabase Auth's signing keys are P-256 ECDSA, and a token from it is `error.WrongAlgorithm` here, which is the right refusal and still a refusal. The arithmetic is `std.crypto.sign.ecdsa.EcdsaP256Sha256`, so the argument that admitted RS256 ([ADR 0140](./adr/0140-nilo-verifies-a-token-and-does-not-fetch-one.md)) admits this: what nilo adds is the order of the checks and the refusal of everything else. The design is already implied by the module's first rule: the algorithm is chosen from the **key's** `kty` and `crv` in the JWKS, never from the token's `alg`, and the header is compared only to refuse a mismatch, so a set holding both an RSA and an EC key still cannot be confused into verifying one with the other.
-
-**Waiting on: ready.** JWKS `EC` keys carry `x` and `y`; the signature is `r || s` raw rather than DER, which is the one place a first attempt goes wrong.
-
-**2. A key set cannot be rotated without a race, and the guide says it is three lines.** Today the caller fetches with `nilo_fetch`, parses with `parseKeys`, holds a `*const Keys`, and on `error.NoSuchKey` decides whether that means "refetch" or "refuse". Every issuer rotates, Google on the order of days, so the decision is not optional, and the three lines it takes are wrong in three ways that no test finds: a `NoSuchKey` with no refetch is every sign-in failing until a restart; a refetch with no rate limit is one HTTPS GET to the issuer per forged token; and replacing the `Keys` a handler on another fiber is reading, then `deinit`ing the old one, is a use-after-free. The last is not policy, it is concurrency, and it is the reason this belongs here rather than in a guide: `jwt.Keyring` holding the current `Keys` under a lock, `refresh(scope, client)` that swaps in a new set and keeps the old one until its readers are done, and a bound on how often an unknown `kid` may trigger a fetch. It borrows `nilo_fetch` only through a parameter, the way `job.Table` borrows a Db, so the module still imports nothing.
+**1. A key set cannot be rotated without a race, and the guide says it is three lines.** Today the caller fetches with `nilo_fetch`, parses with `parseKeys`, holds a `*const Keys`, and on `error.NoSuchKey` decides whether that means "refetch" or "refuse". Every issuer rotates, Google on the order of days, so the decision is not optional, and the three lines it takes are wrong in three ways that no test finds: a `NoSuchKey` with no refetch is every sign-in failing until a restart; a refetch with no rate limit is one HTTPS GET to the issuer per forged token; and replacing the `Keys` a handler on another fiber is reading, then `deinit`ing the old one, is a use-after-free. The last is not policy, it is concurrency, and it is the reason this belongs here rather than in a guide: `jwt.Keyring` holding the current `Keys` under a lock, `refresh(scope, client)` that swaps in a new set and keeps the old one until its readers are done, and a bound on how often an unknown `kid` may trigger a fetch. It borrows `nilo_fetch` only through a parameter, the way `job.Table` borrows a Db, so the module still imports nothing.
 
 **Waiting on: a design** for who owns the old `Keys` after a swap, which is the lifetime question `nilo_cache` answered with a generation and a read-after check ([ADR 0188](./adr/0188-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md)) and this module cannot answer with a copy, because a key set is not flat.
 
@@ -239,13 +222,13 @@ RS256 and a JWKS document, and nothing else ([ADR 0140](./adr/0140-nilo-verifies
 
 **Waiting on: a number**, and a row in [`bench/result/`](../bench/result/) to put it in.
 
-**Only 2048, 3072 and 4096 bits of RSA.** A key size with no branch is `error.KeySizeNotSupported` rather than a best effort, which is the right refusal and is still a refusal. The EC half of this entry is Next 1 now.
+**Only 2048, 3072 and 4096 bits of RSA, and only P-256 of EC.** A key size with no branch is `error.KeySizeNotSupported` and a curve with none is `error.CurveNotSupported`, rather than a best effort — the right refusal, and still a refusal. ES384 is the same twenty lines over `EcdsaP384Sha384`; ES512 wants P-521, which std does not carry; Ed25519 (`EdDSA`) is a different key type again, and is the one the mixed test set uses as the key nilo skips.
 
-**Waiting on: a caller** who has an RSA key of another size, which no issuer in the comparison publishes.
+**Waiting on: a caller** who has an RSA key of another size or an EC key on another curve, which no issuer in the comparison publishes.
 
 **Verified claims are not a handler argument.** A handler that wants the user behind a bearer token writes `nilo.Authorization(.bearer)`, then `jwt.verify` with the keys, the issuer, the audience and the clock, then a refusal with the challenge on it, in every handler or in a resolver of its own. `http/` may import `nilo_jwt`, which is downward, so the shape is one argument: `Google = jwt.Verifier(Claims, .{ .issuer = "…", .audience = "…" })`, opened with a keyring and `provide`d, and `fn me(user: nilo.Verified(Google), c: *nilo.Ctx)` is the claims or a 401 with `WWW-Authenticate: Bearer` before the handler runs. The `security` entry in the API description that [ADR 0191](./adr/0191-an-authorization-header-a-handler-can-ask-for.md) writes for a bearer argument would then be written for a verified one, which is what the document should have said all along. Costs what `Authorization(.bearer)` plus one `verify` cost today, on the route that asks.
 
-**Waiting on: a design**, and on Next 2, because a verifier that holds a `*const Keys` is a verifier that cannot survive a rotation.
+**Waiting on: a design**, and on Next 1, because a verifier that holds a `*const Keys` is a verifier that cannot survive a rotation.
 
 **HS256 is absent on purpose and that is not free.** A shared-secret token is what a service issues to itself, and the reason it is not here is that a module verifying both algorithms has to be careful about the confusion attack that a module verifying one cannot commit. A caller who needs it has to write four lines of `HmacSha256` beside this module and get the constant-time compare right on their own, which is the shape of mistake this module exists to prevent.
 
@@ -255,7 +238,7 @@ RS256 and a JWKS document, and nothing else ([ADR 0140](./adr/0140-nilo-verifies
 
 **Whether nilo should hold the key set as well as read it.** Today the caller fetches with `nilo_fetch`, holds with `nilo_cache`, and decides when a `kid` miss means "refetch" rather than "refuse". That is three lines and one real decision, and every one of them is visible. A `Jwks.fetch(url)` that did all three would be one line and would hide the decision.
 
-**What would settle it:** two callers writing the same refresh policy. One caller writing one is a caller, not a pattern. The concurrency half of this question, the swap, has moved to Next 2; what stays open here is only the policy: when a `kid` miss means fetch and when it means refuse.
+**What would settle it:** two callers writing the same refresh policy. One caller writing one is a caller, not a pattern. The concurrency half of this question, the swap, has moved to Next 1; what stays open here is only the policy: when a `kid` miss means fetch and when it means refuse.
 
 **Whether nilo signs a token for a client that cannot hold a cookie.** [ADR 0140](./adr/0140-nilo-verifies-a-token-and-does-not-fetch-one.md) refuses signing because a server issuing its own sessions has `Session(T)`, and that holds for a browser. The client it does not obviously hold for is a native mobile application talking to the same API, where a bearer token is the convention and a cookie jar is a thing the developer has to go and find. HS256 sign and verify is forty lines and the confusion attack is the reason this module verifies one algorithm; a signer here would have to be a type that cannot be handed an RSA public key as its secret, which is a Refusal rather than a runtime check. Against it is everything ADR 0140 already says, and the fact that the mobile client *can* hold a cookie.
 
@@ -269,24 +252,11 @@ Sixty-five lines of policy in front of `std.http.Client`: a gate on calls in fli
 
 ### Next
 
-The policy half of this module is the strong half, and two rounds of fdm made it so. The ordinary call is the thin half, and `examples/outbound/main.zig` is the evidence: five lines to assemble a URL with two path params, a `user-agent` repeated on every call, and a 429 branch that cannot read the `Retry-After` it needs. The four entries below are that, in the order every caller meets them.
+The policy half of this module is the strong half, and two rounds of fdm made it so. What the ordinary call still lacks is somewhere for a service's base URL and standing headers to live, and `examples/outbound/main.zig` is the evidence: five lines to assemble a URL with two path params, and a `user-agent` repeated on every call.
 
-**1. There is no way to send JSON.** `res.json(T, c)` exists for the way in and nothing exists for the way out: `post(c, url, body, .{})` takes bytes, so every caller writes `std.json.Stringify.valueAlloc(c.arena(), value, .{})` and a `content-type` line by hand. `.body = .{ .json = value }` on `Call`, or `api.postJson(c, url, value, .{})`, is the whole of it: stringify into the arena, one header. The arena allocation is the one the caller already pays today.
-
-**Waiting on: ready.**
-
-**2. A `Response` carries no headers.** It is `status` and `body`, and the ordinary handler needs one more thing off the answer at least once: `Retry-After` on a 429, `ETag` for a conditional GET, `Location` on a 201, `Link` for a page-by-header API, `X-RateLimit-Remaining` before deciding whether to make the next call. `Exchange.Head.header(name)` already reads one case-insensitively; a `Response` keeps the header block into the Scope the way `head.keep(c)` does ([ADR 0240](./adr/0240-a-head-that-outlives-its-body.md)) and answers `res.header(name)`. One arena allocation the size of the header block, on the four whole-body calls only, beside the one the body already takes.
-
-**Waiting on: ready.**
-
-**3. There is no target: a base URL and the headers a service always wants.** `Client` is one for the whole program on purpose, since the pool lives in it, so there is nowhere to write "Stripe is `https://api.stripe.com`, sends `authorization: Bearer …`, and gets five seconds". Every call repeats all three. The shape this repository already has for the same problem is `s3.Bucket`: a type, `fetch.Target("stripe", .{ .base = "…" })`, opened once on the client with what it holds at run time, `Stripe.open(&api, .{ .authorization = key })`, and asked for by type, `fn charge(stripe: *Stripe, c: *nilo.Ctx)`. Two services are two types. It is also the natural home for two things the `Client` cannot hold because it has no destination: `max_in_flight` per host, since today one slow third party eats the permits of every other, and a `nilo_ready` saying whether the upstream answers. Nothing per request: a comptime type and a pointer.
+**1. There is no target: a base URL and the headers a service always wants.** `Client` is one for the whole program on purpose, since the pool lives in it, so there is nowhere to write "Stripe is `https://api.stripe.com`, sends `authorization: Bearer …`, and gets five seconds". Every call repeats all three. The shape this repository already has for the same problem is `s3.Bucket`: a type, `fetch.Target("stripe", .{ .base = "…" })`, opened once on the client with what it holds at run time, `Stripe.open(&api, .{ .authorization = key })`, and asked for by type, `fn charge(stripe: *Stripe, c: *nilo.Ctx)`. Two services are two types. It is also the natural home for two things the `Client` cannot hold because it has no destination: `max_in_flight` per host, since today one slow third party eats the permits of every other, and a `nilo_ready` saying whether the upstream answers. Nothing per request: a comptime type and a pointer. The path half of the query entry rides on it: `stripe.get(c, "/v1/charges/{}", .{id})` with the segment encoded on the way in is the five lines out of the example, and it needs a base for the path to hang off, where `fetch.withQuery` needed none.
 
 **Waiting on: a design.** Whether a target is a type of its own or a struct of defaults handed to `Client`, which is the same argument `s3.Bucket` had and settled for the type ([ADR 0068](./adr/0068-a-bucket-is-a-type-and-a-key-is-not.md)); and what a target does that a `Client` does not, which decides whether it is a wrapper or a layer. That is the ADR.
-
-**4. A query string is percent-encoded by hand, and so is a path param.** `client.get(c, url)` takes the URL finished, so a search endpoint is `nilo.percent.encodeWrite` into an `Allocating` writer, which is what the example does for two path segments. `.query = .{ .page = 2, .q = "a b" }` on `Call` is `?page=2&q=a%20b` from `core.percent`, and with a target from Next 3 a path is `stripe.get(c, "/v1/charges/{}", .{id})` with the segment encoded on the way in, which is the five lines out of the example.
-
-**Waiting on: ready** for the query half; the path half rides on Next 3.
-
 
 ### Known gaps
 
@@ -298,6 +268,10 @@ One lever is left and it is depth. [`bench/result/fetch.md`](../bench/result/fet
 
 **Waiting on: a caller** who is holding enough connections for 4 KB to matter.
 
+**A whole-body call makes two arena allocations, and every caller pays the second whether or not it reads a header.** The header block is kept before the body reads over it ([ADR 0244](./adr/0244-a-response-carries-its-headers.md)), and it is kept for every call because a flag nobody sets correctly at every site is worse than a few hundred bytes of arena. The shape that gets back to one without a flag is head and body in one buffer: with a `content-length`, allocate `head.len + length` once, copy the block to the front and read the body into the rest, with `header(name)` walking the front. A chunked body has to grow that buffer, which is the part that touches [ADR 0238](./adr/0238-the-transfer-buffer-serves-nothing-here.md)'s path.
+
+**Waiting on: a number** — a caller for whom the second allocation shows up, since it is a bump of the arena and a `memcpy` inside the noise of a round trip.
+
 **Nothing is measured through TLS.** Every figure in `bench/result/fetch.md` is `http://`, and the 59,151 bytes per HTTPS connection is std's number read out of its buffer sizes rather than one this repository has put on a scale. That is 3.6× the plain-HTTP figure, if it holds.
 
 **Waiting on: ready.** `zig build smoke-tls -Dnetwork` already reaches a real endpoint; what is missing is the measurement beside it.
@@ -305,10 +279,6 @@ One lever is left and it is depth. [`bench/result/fetch.md`](../bench/result/fet
 **A certificate bundle is loaded per client, not per process.** `std.http.Client` rescans the system roots the first time it makes an HTTPS request. One client per program is the shape the docs push, so this has not bitten, but two would pay twice and nothing says so at the call site.
 
 **Waiting on: a caller** who genuinely wants two clients.
-
-**A suite of somebody's own has to rewrite the canned server.** The guide's testing section says, rightly, not to hand a handler a `Client` and to test the function that turns the far end's struct into yours; for the call itself it says to copy the shape of `fetch/live.zig`'s `Canned`, which is a loopback `std.Io.net.Server` walked from a port range, a `serveOne`, and the client started with `nilo_start(io, .none)`. `Canned` is private to that test file, so every suite that wants one real exchange writes it again, port range and all. Exporting it as `fetch.testing.Canned` with `reply(status, headers, body)` and one paragraph in the guide is the whole of it, and `s3/canned.zig` already carries the same shape a second time.
-
-**Waiting on: ready.**
 
 ### Not decided
 
@@ -324,15 +294,7 @@ A Fitting, and the second one: a queue over a table in the caller's database, wi
 
 ### Next
 
-**1. A job cannot push the next one.** A pipeline (download, then process, then notify; a welcome now and a nudge three days later) is the first thing a queue is for, and it does not compile: `.deps = struct { jobs: *Jobs }` is a `dependency loop with length 2`, because `Jobs` reads the fields of `deps` to build itself and one of them names `Jobs`. The message is Zig's rather than a Refusal, so nothing points anywhere. The shape that breaks the loop is `.deps` as a function of the type being built, `fn (comptime Jobs: type) type`, evaluated inside the struct once `Self` exists, so `run(self, scope, jobs: *Jobs)` is an ordinary dep. A type-erased `*job.Queue` would do it too, and would lose the `kinds` check at `push`. Nothing per request; one comptime branch.
-
-**Waiting on: ready.**
-
-**2. A test cannot move the clock.** `drain` runs what is due *now*, and `core.nowMicros()` is read straight in `push`, `claim` and `execute`. So a test can assert that a row pushed with `after_ms = 60_000` does **not** run, and nothing more: not that it runs after a minute, not that the third attempt of an exponential backoff waits the doubled time, not that `job.cron("0 3 * * *")` fires at three. The module's own tests get by on `.fixed_ms = 0`, and the cache's on `store.opened_s -= 60`, which is a field and not an API. `drainAt(&run, at_micros)` and `runOneAt` are the small shape; a `Settings` clock is the general one.
-
-**Waiting on: ready.**
-
-**3. A claim takes one row, and a busy queue pays a round trip per job.** On the two-core box a Postgres claim that takes a row is 1.2 ms across a Docker port ([`bench/result/job.md`](../bench/result/job.md)); a claim of ten rows would spread that over ten. The price is ten rows held by one worker that may die — every one of them waits out the lease — and the number that decides it is throughput under several workers, which one connection cannot measure.
+**1. A claim takes one row, and a busy queue pays a round trip per job.** On the two-core box a Postgres claim that takes a row is 1.2 ms across a Docker port ([`bench/result/job.md`](../bench/result/job.md)); a claim of ten rows would spread that over ten. The price is ten rows held by one worker that may die — every one of them waits out the lease — and the number that decides it is throughput under several workers, which one connection cannot measure.
 
 **Waiting on: a machine** with cores, and a run of `bench-job` extended to several workers on it.
 
@@ -341,10 +303,6 @@ A Fitting, and the second one: a queue over a table in the caller's database, wi
 **A queued row cannot be cancelled.** The user closed the export dialog, or unsubscribed before the nudge went out, and the row runs anyway. `cancel(id) !bool`, true when a `queued` row was deleted and false when it is `running`, finished or absent, is one more optional method on the store contract, the way `pushIn` is, and a `unique` key plus `cancel` is how "move it to tomorrow" gets written.
 
 **Waiting on: a caller.**
-
-**A `run` does not know which tick it is.** The store hands the worker a `Claimed` with the row's `id`, `attempts` and `run_at`, and `run` sees none of them. "On the last attempt, use the fallback provider", a log line that names the row, and a progress figure a route can poll all need one of those three. A `job.Tick` value `run` may ask for beside its deps costs nothing that is not already in hand; progress on top of it is a field on `job.Status` and a `jobs.progress(tick.id, n)` into the `status` Space.
-
-**Waiting on: ready.**
 
 **`stats` is three numbers for the whole queue.** What an operator wants on a dashboard is how old the oldest `queued` row is (the lag) and the counts by kind, so that a thousand queued thumbnails and one queued invoice do not read as the same number. One more query, run only when asked.
 
@@ -407,10 +365,6 @@ The three that left first were a `Transfer-Encoding` nilo could not decode being
 **3. `permessage-deflate`.** Negotiated in the handshake, and a compressor per connection is memory that has not been budgeted.
 
 **Waiting on: a number.** The per-connection cost has to be priced against the 4,669 bytes an idle connection holds today.
-
-**4. A route cannot say "cache this answer for a minute".** The most ordinary use of a cache in a web app has no shape here, and the parts are already built: `http/idempotent.zig` encodes whatever a handler returned into a bytes Space and replays it byte for byte, with an `in_flight` marker for the request still being answered. `nilo.Cached(Pages, .{ .ttl_s = 60, .by = … })` as a route parameter is that with the key made of the path and query instead of an `Idempotency-Key` header, and with the second request that finds the marker sleeping and reading again instead of being told 409, which is the stampede answer `nilo_cache` cannot give on its own, done in the one layer that has an `Io` to wait on. Costs what `Idempotent` costs, on the route that asks and nowhere else: two arena allocations of `max_bytes` on a fresh answer, one on a replay, nothing on the stack.
-
-**Waiting on: ready.**
 
 ### Known gaps
 
@@ -565,19 +519,9 @@ What is left here is only the forgetting. The *second* way to end up without a c
 
 **Waiting on: a design** that does not become a second metrics registry. `app.metrics` is the shape and a `Db` is a Service, which knows nothing about an App — so where the numbers meet is the question, not how to count them.
 
-**A deep page is still `OFFSET`, and nothing writes down the keyset form.** The database counts past every row it is not going to answer with, which is the one pagination shape that gets slower as the table grows. The sort can be made stable now that an order term says where NULLs go ([ADR 0173](./adr/0173-the-database-escapes-the-pattern-it-is-going-to-match.md) is a different entry; the order half is [ADR 0171](./adr/0171-a-row-over-there-is-a-condition.md)'s neighbour in the same cycle), so what is left is a condition the caller writes by hand — and a guide page saying which one.
-
-`DISTINCT` is not in this entry and is not coming: over one table with a key every row appears once, so asking for it is almost always a sign the query wanted something else. ADR 0058 makes the same argument for `UNION`.
-
-**Waiting on: ready.** It is a guide page rather than a feature.
-
 **The SQLite half has no live test against contention.** The Wire's own tests run one process, so the case the reader and writer split exists for has a design and no test: two writers meeting, `busy_timeout` expiring, `Locked` coming back.
 
 **Waiting on: a harness.** A build step that stands up a second writer, which here is a second process on the same file rather than a socket.
-
-**Nothing tests what a transaction does when the socket dies.** `Tx.fresh` clears the connection's server error before each statement, so a broken pipe after a unique violation is no longer reported as `AlreadyExists`. The fix has no test under it, because provoking a transport failure between two statements of one transaction needs a socket the suite never opens. `Tx.revive` rides along: it reads `conn.err` to tell an aborted transaction from a dead connection ([ADR 0047](./adr/0047-a-deadline-needs-a-connection-you-hold.md)), and only the first half of that has a test.
-
-**Waiting on: ready.** The harness this used to wait on exists twice over: `zig build test-fetch-engine` and `http/live.zig` both stand a server on a real port and drive a real socket at it. What is left is writing the case.
 
 **A query outside a transaction has no deadline, and `options=` and `client_encoding` in a connection URL are refused, for one upstream reason.** `tx.deadline(ms)` covers the operation that holds a connection ([ADR 0047](./adr/0047-a-deadline-needs-a-connection-you-hold.md)), and the wait *for* a connection is bounded by `core.Limits` since [ADR 0135](./adr/0135-a-wait-for-a-connection-has-a-bound.md). A plain `db.select` takes whichever connection is free and gives it straight back, so there is nowhere to put a deadline that is not a second round trip per query; what would close it is a pool-wide `statement_timeout` handed over in the startup packet, which costs nothing per statement. The two libpq parameters that ride on the same packet, `options=` and `client_encoding`, are refused by `dialOpts` today for the same reason rather than silently dropped. (`channel_binding=require`, `gssencmode=require` and a client certificate are refused for the plainer reason that the driver does none of those.)
 
@@ -700,12 +644,6 @@ The latest stable release only, on one branch. The people this is aimed at downl
 What could go wrong that is not a bug and not a feature, and is still waiting on something. The risks that *are* held, and what holds each, are a record rather than work, and they live in [`docs/risks.md`](./risks.md): eleven held by a mechanism with a test under it, and three that cannot be held and are said out loud instead. What stays here is what has no such mechanism yet.
 
 ### Open
-
-**A live `<!-- compiles -->` block that only declares types is checked for syntax and almost nothing else.** Zig analyses a container-level declaration lazily, and `zig build snippets` compiles each block as an object with nothing referencing it — so a block that declares a Row and stops has its `pub const nilo_table` read by no one. Every comptime check the marker is made of is skipped, and the block passes. Demonstrated rather than reasoned: a `.references` pointing at a table no Row in the block declares compiled clean, and only grew nilo's refusal once a `comptime { _ = … }` in the same block used the Rows.
-
-A mark can mean less than it looks like it means, and this is the way that survives the step going and finding its own pages: the page *is* read, the step *does* compile the block, and what it proves is that the text parses. The guide's Row examples are where it bites, because a Row example that declares and stops is the natural shape to write.
-
-**Waiting on: ready.** The fix is a convention rather than a mechanism — a block declaring Rows ends with a `comptime` block that names them — and the place to write it down is `docs/snippets/`'s own README beside the `<!-- compiles: body -->` note. A stricter version is possible and costs a design: have the extractor append a reference to every `pub` declaration it finds, which would check every block of this shape whether or not its author remembered.
 
 **A fail function in spawned work is safe only because of where a threadlocal gets written.** `bulkhead.slot()` falls back to a threadlocal when a fiber has no slot, which spawned fibers never do. It is null on executor threads only because the one thing that sets it does so from inside `zio.blockInPlace`, which runs on a thread-pool worker. Both ends carry a comment saying so. Nothing enforces it, and if it broke, spawned work would write its message into an unrelated request, which is [ADR 0007](./adr/0007-failure-box-bound-to-the-fiber.md)'s leak by another route.
 

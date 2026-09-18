@@ -46,9 +46,24 @@
 //! session — a hash is a value, and where it lives is the application's. The
 //! session that follows a successful check is `Session(T)` and already built
 //! (ADR 0035).
+//!
+//! **`Token` is the other secret an application has**, and it is not a
+//! password: a reset link, an email verification, an API key. Thirty-two
+//! bytes of entropy, 43 characters to send, a SHA-256 digest to store, a
+//! constant-time compare when it comes back — and no argon2 anywhere near it,
+//! because a 256-bit token needs no stretching and a reset endpoint that
+//! answers in 13 ms is one that can be walked (ADR 0241).
+//!
+//! ```zig
+//! const token = pw.Token.new(try c.entropy(pw.token_len));
+//! // mail `token.text()`; store `token.digest()`; keep nothing else
+//! …
+//! if (!pw.Token.matches(row.digest.bytes, presented)) return nilo.fail.unauthorized("…", .{});
+//! ```
 
 const argon2id = @import("argon2id.zig");
 const pages = @import("pages.zig");
+const token = @import("token.zig");
 
 /// A stored password hash, in the PHC form everybody else writes.
 pub const Hash = argon2id.Hash;
@@ -88,7 +103,16 @@ pub const needsRehash = argon2id.needsRehash;
 /// hash, and nothing held between them (ADR 0049).
 pub const huge_pages = pages.huge_pages;
 
+/// A token that is not a password — a reset link, an email verification, an
+/// API key. Sent as text, stored as a digest, compared in constant time, and
+/// never stretched (ADR 0241).
+pub const Token = token.Token;
+
+/// Bytes of entropy a Token is made from, and what to ask `Ctx.entropy` for.
+pub const token_len = token.Token.len;
+
 test {
     _ = argon2id;
     _ = pages;
+    _ = token;
 }

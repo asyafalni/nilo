@@ -16,6 +16,10 @@ const User = struct {
     orders: i32,
     created_at: sql.Timestamp,
 };
+
+comptime {
+    _ = User;
+}
 ```
 
 The table name is written out, never guessed. `User` → `users` looks clever
@@ -84,6 +88,10 @@ const Ticket = struct {
     scores: ?[]const i32,      // integer[], and the column may be null
     owners: []const sql.Uuid,  // uuid[]
 };
+
+comptime {
+    _ = Ticket;
+}
 ```
 
 Reading one is a Zig `for` and nothing else:

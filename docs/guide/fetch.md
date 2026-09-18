@@ -60,7 +60,62 @@ request does and nothing is freed by hand.
 | `api.post(c, url, body, .{})` | `Response` |
 | `api.put(c, url, body, .{})` | `Response` |
 | `api.delete(c, url, .{})` | `Response` |
-| `api.send(c, method, url, body_or_null, .{})` | for a method the four above do not name |
+| `api.patch(c, url, body_or_null, .{})` | `Response` |
+| `api.send(c, method, url, body_or_null, .{})` | for a method the five above do not name |
+| `api.postJson(c, url, value, .{})` | `Response` — `value` written out as JSON, `content-type` said for you. `putJson`, `patchJson`, `sendJson` beside it |
+
+**Most APIs take JSON, so the value goes as itself.** `postJson` writes it
+out with `std.json` into the Scope's arena — the one allocation every caller
+was already paying to `std.json.Stringify.valueAlloc` by hand — and says
+`content-type: application/json`, unless your `headers` name one, which then
+goes instead. What `res.json(T, c)` is for the way in, this is for the way
+out ([ADR 0243](../adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+
+<!-- compiles -->
+```zig
+const fetch = @import("nilo_fetch");
+
+fn chargeJson(api: *fetch.Client, c: *nilo.Ctx) !Receipt {
+    const res = try api.postJson(c, "https://api.example.com/v1/charges", .{
+        .amount = 500,
+        .currency = "idr",
+    }, .{});
+    if (!res.ok()) return nilo.fail.status(502, "the payment service said no", .{});
+    return res.json(Receipt, c);
+}
+```
+
+A body you already have as text is refused here while compiling — `std.json`
+would write it out as *one JSON string*, quotes and escapes and all, and the
+far end would answer 400 to a body that looked right in your editor. That one
+goes through `post`.
+
+**A query string is a struct, and the encoding is done for you.**
+`fetch.withQuery(c, base, params)` answers the URL with the params on the
+end of it, percent-encoded, in the Scope's memory — one allocation, sized
+exactly. A field is an int, a bool, text (a `[]const u8`, a string literal,
+a `Str`) or an optional of one, where null is the param left out; anything
+else is a Refusal naming the field. A base that already has a `?` gets `&`.
+
+<!-- compiles -->
+```zig
+const fetch = @import("nilo_fetch");
+
+fn search(api: *fetch.Client, c: *nilo.Ctx, q: nilo.Str, page: u32) !fetch.Response {
+    const url = try fetch.withQuery(c, "https://api.example.com/search", .{
+        .q = q, // "a b" goes as a%20b, "a/b" as a%2Fb
+        .page = page,
+        .cursor = @as(?[]const u8, null), // left out
+    });
+    return api.get(c, url, .{});
+}
+```
+
+The URL is what every call takes, `Exchange.begin` included, which is why
+this is a function and not a field on the call. A path segment —
+`/v1/charges/{id}` with the id encoded on the way in — is still
+`nilo.percent.encodeWrite` by hand, as the [example below](#reading-the-answer)
+does; that half waits on a per-service base URL to live under.
 
 The last argument is a `Call` — per-call overrides, every field null, so
 `.{}` is the ordinary case:
@@ -88,7 +143,19 @@ a `Str` full of gzip. Leave it out and the client asks for identity itself.
 | `res.status` | `std.http.Status` |
 | `res.ok()` | `bool` — 2xx |
 | `res.body` | `Str`, in the Scope's arena. Goes when the request does |
+| `res.header(name)` | `?[]const u8`, case-insensitively; null when the answer did not carry it |
+| `res.headers` | the whole header block, kept into the Scope beside the body |
 | `res.json(T, c)` | `T`, parsed into the same Scope. Unknown fields are ignored |
+
+**The answer's headers came back with it.** `Retry-After` on a 429, `ETag`
+for the next conditional GET, `Location` on a 201, `Link` on an API that
+pages by header, `X-RateLimit-Remaining` before deciding whether to make the
+next call: `res.header("retry-after")` reads any of them after the call,
+because the block was kept into the Scope before the body read over it. It
+is the same copy `head.keep(c)` makes on an `Exchange`, made for you here
+because a whole-body call has no other moment to make it — one arena
+allocation the size of the block, beside the body's own
+([ADR 0244](../adr/0244-a-response-carries-its-headers.md)).
 
 **A 4xx or a 5xx is a `Response`, not an error.** The call worked and the
 service said no; only the caller knows which of those matters and what to
@@ -121,7 +188,9 @@ fn stars(api: *fetch.Client, c: *nilo.Ctx, owner: nilo.Str, name: nilo.Str) !u64
 
     if (!res.ok()) return switch (@intFromEnum(res.status)) {
         404 => nilo.fail.notFound("no repository {s}/{s}", .{ owner.view(), name.view() }),
-        403, 429 => nilo.fail.status(502, "github is rate-limiting this address", .{}),
+        403, 429 => nilo.fail.status(502, "github is rate-limiting this address; retry after {s}", .{
+            res.header("retry-after") orelse res.header("x-ratelimit-reset") orelse "a while",
+        }),
         else => nilo.fail.status(502, "github answered {d}", .{@intFromEnum(res.status)}),
     };
 
@@ -131,16 +200,19 @@ fn stars(api: *fetch.Client, c: *nilo.Ctx, owner: nilo.Str, name: nilo.Str) !u64
 }
 ```
 
-Three things in there are the habits worth keeping. **Text from a request
+Four things in there are the habits worth keeping. **Text from a request
 going into a URL is percent-encoded**, never pasted — `%2e%2e%2f` in a path
 param is how a caller reaches an endpoint you never meant to offer, and
 `nilo.percent` is in Core so a handler and a Service can both reach it
-([ADR 0066](../adr/0066-percent-is-needed-by-two-layers.md)). **`error.TimedOut`
+([ADR 0066](../adr/0066-percent-is-needed-by-two-layers.md)); a query gets
+the same treatment for free through `fetch.withQuery`. **`error.TimedOut`
 gets its own arm**, because it is the one failure every caller of anything
 has to have an answer for, and 504 says *the thing I asked is slow* where 500
-would say *I am broken*. And **the struct you parse into is what your program
-depends on**, not a transcription of the far end's schema: `Repo` names two of
-GitHub's hundred fields, and the parse ignores the rest.
+would say *I am broken*. **A refusal says when to come back**, because the
+header that carries that is on the answer and one call away. And **the
+struct you parse into is what your program depends on**, not a
+transcription of the far end's schema: `Repo` names two of GitHub's hundred
+fields, and the parse ignores the rest.
 
 [`examples/outbound`](../../examples/outbound/main.zig) is that handler with
 a `main` around it, against GitHub's public API.
@@ -369,8 +441,10 @@ status code.
 ## What it costs
 
 On the request path, nothing that was not already there: one call is one
-permit, one arena allocation for the body, and the parse if you asked for
-one. **What it costs is per idle connection**, and it is stack: a handler
+permit, two arena allocations — the header block, then the body
+([ADR 0244](../adr/0244-a-response-carries-its-headers.md)) — the JSON
+written out or the URL assembled if you asked for either, and the parse if
+you asked for that. **What it costs is per idle connection**, and it is stack: a handler
 that has made one call holds 4,139 bytes more than one that has not, for the
 life of the connection, at the depth `std.http.Client` drives the fiber to
 ([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)). That is
@@ -401,19 +475,48 @@ usual answer is not to give it one: shape the far end's response into a
 struct, and test the function that turns that struct into yours, which is
 what `examples/outbound` does with its `card`. For the call itself, the
 module's own tests stand a real socket up on `std.Io.Threaded` with no
-Engine anywhere — which is the entry condition for its layer, and the shape
-to copy for a test that wants a real exchange.
+Engine anywhere — which is the entry condition for its layer — and the
+server they drive is yours to use.
 
-**The shape, for a suite of your own.** `fetch/live.zig`'s `Canned` is the
-whole of it: a `std.Io.net.Server` bound to a loopback port, walked from a
-range rather than fixed (a closed port sits in `TIME-WAIT` for a minute), a
-`serveOne` that reads one head and writes one canned answer, run with
-`io.async(Canned.serveOne, .{&canned})` beside the call and `await`ed after
-it; and the client finished with `client.nilo_start(io, .none)` as `listen()`
-would have done. `s3/canned.zig` is the same shape with more answers. Give
-your suite a port range of its own — those two have 39,200–40,199 and
-40,200–41,199, and `zig build test-all` runs two binaries at once — and put a
-comment on it saying so, because nothing else keeps the ranges apart.
+**`fetch.testing.Canned` is one real exchange, for a suite of your own.**
+Open it, say what it answers, start it with `io.concurrent` beside the
+call, and finish the client with `nilo_start(io, .none)` as `listen()` would
+have done. It binds port 0 and reads the kernel's answer back, so there is
+no port range to keep apart from anybody's; `serveOne` reads the request
+whole and `request()` and `requestBody()` show what reached it, which is
+what a test about a POST wants
+([ADR 0243](../adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+
+<!-- compiles -->
+```zig
+const fetch = @import("nilo_fetch");
+
+fn retryAfterIsRead(io: std.Io, gpa: std.mem.Allocator) !void {
+    var canned = try fetch.testing.Canned.open(io);
+    defer canned.close();
+    canned.reply("429 Too Many Requests", "Retry-After: 30\r\n", "slow down");
+    var served = try io.concurrent(fetch.testing.Canned.serveOne, .{&canned});
+    defer served.cancel(io) catch {};
+
+    var api: fetch.Client = .init(gpa, .{});
+    defer api.deinit();
+    try api.nilo_start(io, .none);
+
+    var run: nilo.Run = .init(gpa);
+    defer run.deinit();
+    var buf: [64]u8 = undefined;
+    const res = try api.get(&run, try canned.url(&buf), .{});
+    try std.testing.expectEqualStrings("30", res.header("retry-after").?);
+    try std.testing.expect(std.mem.startsWith(u8, canned.request(), "GET / "));
+}
+```
+
+`io` is a `std.Io.Threaded` the test owns — `var threaded: std.Io.Threaded =
+.init(std.testing.allocator, .{}); defer threaded.deinit();` and
+`threaded.io()`. `concurrent` rather than `async`, because `async` may run
+the server on your own thread and sit in `accept` waiting for the connection
+that thread was about to make; the module's tests found that at zero CPU
+([ADR 0230](../adr/0230-a-deadline-with-no-engine-cancels-a-task.md)).
 
 ## See also
 

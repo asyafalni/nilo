@@ -43,6 +43,10 @@ const Member = struct {
     created_at: sql.Timestamp,
     left_on: ?sql.Date,
 };
+
+comptime {
+    _ = sql.migrate.tablesOf(sql.Postgres, &.{ Org, Member });
+}
 ```
 
 `.default` is what the database writes when your insert leaves the column out.
@@ -378,6 +382,10 @@ const Renamed = struct {
     id: i64,
     email: nilo.Str,
 };
+
+comptime {
+    _ = sql.migrate.tablesOf(sql.Postgres, &.{Renamed});
+}
 ```
 
 Every other tool guesses that a dropped `handle` and a new `email` are the same

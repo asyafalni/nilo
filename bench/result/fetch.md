@@ -153,11 +153,19 @@ ADR 0018's running total gains 1,688 bytes, and only for programs that call out.
 
 ## Allocations per call
 
-**One, and it is the response body**, into the Scope's arena via
-`allocRemaining`. Held by a test rather than by this file —
-`test "a call on a warm connection allocates once, and it is the body"` in
-`fetch/live.zig`, which counts through a wrapping allocator the way
-`http/app.zig`'s budget test does.
+**Two, and they are the response's header block and its body**, into the
+Scope's arena: the block is `dupe`d before the body reads over it
+([ADR 0244](../../docs/adr/0244-a-response-carries-its-headers.md)), and the
+body is `allocRemaining`. Held by a test rather than by this file —
+`test "a call on a warm connection allocates twice: the header block, then the body"`
+in `fetch/live.zig`, which counts through a wrapping allocator the way
+`http/app.zig`'s budget test does. It was one — the body alone — until the
+`Response` started carrying its headers, and that is the whole of the
+change: a call that never reads a header pays one `memcpy` of a few hundred
+bytes it did not before. An `Exchange` still allocates nothing in `begin`.
+`postJson` and `withQuery` each add one more, for the JSON written out and
+the URL assembled, which is the allocation their callers were already making
+by hand ([ADR 0243](../../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
 
 The gate is a semaphore with nothing allocated behind it, the deadline arms into
 a slot inside the `Bound` on the stack, and the request head is written into the

@@ -69,7 +69,7 @@ Three files carry context this one deliberately does not repeat:
 - **`CONTEXT.md`** — the project's vocabulary, and the words it refuses to use
   (Ctx not "Context", Str not "string", keep not "dupe", Refusal not "negative
   test"). Match it in code, comments, docs and commit messages.
-- **`docs/adr/`** — 227 binding decisions, each naming the alternative it
+- **`docs/adr/`** — 241 binding decisions, each naming the alternative it
   rejected. Check here before proposing a design change; "why not X?" usually
   already has an answer on file. **ADR 0041 decides which module new work goes
   in and ADR 0042 decides what that module may import**, and they are the two
@@ -90,7 +90,7 @@ goes in an ADR, a number goes in `docs/history.md`, a rule goes in a build step.
 
 Two of those rules are build steps rather than paragraphs, and they are the ones
 to lean on: `zig build layering` refuses an import that goes upward or sideways,
-and the seven `refusals` steps check the wording of 321 error messages. Prefer making
+and the eight `refusals` steps check the wording of 330 error messages. Prefer making
 a new rule enforceable that way over writing it down here — a paragraph nobody
 runs is the thing that rots.
 
@@ -116,7 +116,7 @@ zig build test-config  # only nilo_config, the same way, plus its refusals
 zig build test-pw      # only nilo_pw, the same way, plus its refusals
 zig build test-cache   # only nilo_cache, the same way, plus its refusals
 zig build test-jwt     # only nilo_jwt, both modes — no Engine, no module graph
-zig build test-fetch   # only nilo_fetch, both modes — a real socket, no Engine
+zig build test-fetch   # only nilo_fetch, both modes, plus its refusals — a real socket, no Engine
 zig build test-fetch-engine  # an outbound deadline firing against a real port; on `test`
 zig build test-job     # only nilo_job, both modes, plus its refusals — std.Io.Threaded, job.Memory, no Engine
 zig build test-job-sql # nilo_job over a SQLite table, and Postgres if DATABASE_URL reaches one; on `test-sql`
@@ -124,10 +124,11 @@ zig build test-s3      # only nilo_s3, both modes, plus its refusals
 zig build layering     # check that no module imports upward or sideways
 zig build refusals     # the framework's 140 compile-error checks — NOT the others
 zig build refusals-sql # nilo_sql's 140; also run by test-sql
-zig build refusals-config  # nilo_config's 9, and refusals-pw for nilo_pw's 3
+zig build refusals-config  # nilo_config's 9, and refusals-pw for nilo_pw's 4
 zig build refusals-cache   # nilo_cache's 5; also run by test-cache
 zig build refusals-s3  # nilo_s3's 10; also run by test-s3
-zig build refusals-job # nilo_job's 14; also run by test-job
+zig build refusals-job # nilo_job's 17; also run by test-job
+zig build refusals-fetch # nilo_fetch's 3; also run by test-fetch
 zig build snippets     # the documentation's own marked snippets, which must compile
 zig build smoke-tls -Dnetwork   # a real HTTPS endpoint — NOT part of test
 zig build examples     # build all nine examples
@@ -458,10 +459,10 @@ everything else does. `bench/result/` is the raw record those two cite.
 **Error messages are a feature, and a build step holds them.** Each file in
 `refusals/` is a program written wrong on purpose; it must fail to compile with
 a message nilo wrote. Adding a comptime check means adding **both** a file in
-`refusals/` and a row in the matching table in `build.zig`. **There are seven
-tables and seven steps**, one per module — `refusals`, `sql_refusals`,
+`refusals/` and a row in the matching table in `build.zig`. **There are eight
+tables and eight steps**, one per module — `refusals`, `sql_refusals`,
 `s3_refusals`, `config_refusals`, `pw_refusals`, `cache_refusals`,
-`job_refusals` — and adding
+`job_refusals`, `fetch_refusals` — and adding
 a row to one while running another is a check that silently never ran. Leave the `nilo: `
 prefix off the `.says` text — the build step supplies it, which is what makes a
 failure inside the standard library impossible to record as passing. See

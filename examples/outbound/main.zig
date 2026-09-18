@@ -68,6 +68,10 @@ fn getCard(api: *fetch.Client, c: *nilo.Ctx, owner: nilo.Str, name: nilo.Str) !C
     // to offer, so they are encoded rather than pasted — `nilo_core`'s
     // `percent`, which is in Core precisely so both a Service and a handler
     // can reach it ([ADR 0066](../../docs/adr/0066-percent-is-needed-by-two-layers.md)).
+    // A *query* on the URL is one call, `fetch.withQuery(c, base, .{ .q = q })`,
+    // encoded the same way; a path segment is still written out by hand,
+    // until a target (the roadmap's `nilo_fetch` Next 1) gives it somewhere
+    // to go.
     var url: std.Io.Writer.Allocating = .init(c.arena());
     try url.writer.writeAll("https://api.github.com/repos/");
     try nilo.percent.encodeWrite(&url.writer, owner.view(), .unreserved);
@@ -91,10 +95,16 @@ fn getCard(api: *fetch.Client, c: *nilo.Ctx, owner: nilo.Str, name: nilo.Str) !C
 
     // `res.ok()` is 2xx. A 404 from the far end is a 404 from this one; a 403
     // is the rate limit, and saying which is the difference between an error
-    // somebody can act on and one they file a ticket about.
+    // somebody can act on and one they file a ticket about. The answer's
+    // headers came back with it, so the one that says *when* — `Retry-After`
+    // on a 429, or GitHub's own `X-RateLimit-Reset` on its 403 — goes into
+    // the message rather than being lost with the head
+    // ([ADR 0244](../../docs/adr/0244-a-response-carries-its-headers.md)).
     if (!res.ok()) return switch (@intFromEnum(res.status)) {
         404 => fail.notFound("no repository {s}/{s}", .{ owner.view(), name.view() }),
-        403, 429 => fail.status(502, "github is rate-limiting this address", .{}),
+        403, 429 => fail.status(502, "github is rate-limiting this address; retry after {s}", .{
+            res.header("retry-after") orelse res.header("x-ratelimit-reset") orelse "a while",
+        }),
         else => fail.status(502, "github answered {d}", .{@intFromEnum(res.status)}),
     };
 

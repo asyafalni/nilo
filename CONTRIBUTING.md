@@ -52,7 +52,7 @@ zig build test-config  # only nilo_config, the same way, plus its refusals
 zig build test-pw      # only nilo_pw, the same way, plus its refusals
 zig build test-cache   # only nilo_cache, the same way, plus its refusals
 zig build test-jwt     # only nilo_jwt, both modes — no Engine, no module graph
-zig build test-fetch   # only nilo_fetch, both modes — a real socket, no Engine
+zig build test-fetch   # only nilo_fetch, both modes, plus its refusals — a real socket, no Engine
 zig build test-job     # only nilo_job, both modes, plus its refusals — a worker loop on std.Io.Threaded, no Engine
 zig build test-job-sql # nilo_job over a SQLite table, and Postgres if DATABASE_URL reaches one; on test-sql
 zig build test-s3      # only nilo_s3, both modes, plus its refusals
@@ -143,16 +143,16 @@ the feature, and it needs a program that proves the message still says the right
 thing.
 
 That means a file in `refusals/` (or `sql/refusals/`, `config/refusals/`,
-`pw/refusals/`, `cache/refusals/`, `s3/refusals/`, `job/refusals/`) and a row in the matching table in `build.zig`.
+`pw/refusals/`, `cache/refusals/`, `s3/refusals/`, `job/refusals/`, `fetch/refusals/`) and a row in the matching table in `build.zig`.
 [`refusals/README.md`](./refusals/README.md) shows exactly how, including the
 trick for finding out what to put in `.says`: guess, run the **matching** step —
 `refusals`, `refusals-sql`, `refusals-config`, `refusals-pw`, `refusals-cache`,
-`refusals-s3` or `refusals-job`,
+`refusals-s3`, `refusals-job` or `refusals-fetch`,
 because each one runs only its own table and a row added to one while another is
 running is a check that silently never ran —
 and read what it prints.
 
-**There are seven tables now.** That warning gets sharper with each one, and the
+**There are eight tables now.** That warning gets sharper with each one, and the
 failure is silent by construction: the row is there, the file is there, and the
 step you ran never looked at either.
 

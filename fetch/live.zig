@@ -18,558 +18,12 @@ const fetch = @import("fetch.zig");
 
 const testing = std.testing;
 
-/// A server that answers exactly what a test asked it to, once per
-/// connection. Not an HTTP server — just enough of one to drive a client.
-///
-/// **Every test starts one with `io.concurrent`, and `io.async` is the
-/// deadlock this file held for a day.** `std.Io.async` is allowed to run the
-/// function on the calling thread — `Threaded` does exactly that whenever
-/// its pool counts as many busy tasks as it has spare cores, which on a
-/// two-core machine is one. Until ADR 0230 nothing here ever had a task in
-/// flight while a server was being started, so the inline path was never
-/// taken. Now every bounded call runs as a task of its own, and the worker
-/// that ran it wakes the awaiter *before* it takes the pool's lock to count
-/// itself free — so the very next `io.async(serveOne)` can see the pool
-/// full, run `accept` on the test's own thread, and wait there for a
-/// connection that thread was about to make. Found at test 19 of 34 with
-/// two of these binaries running at once, at zero CPU, the way `CLAUDE.md`
-/// says to look. `concurrent` is the call whose contract is the one the
-/// harness actually needs: the server has to be on another thread, or
-/// there is no test.
-const Canned = struct {
-    server: std.Io.net.Server,
-    io: std.Io,
-    port: u16,
-    /// How many bytes of body to send, and what to claim in the header. They
-    /// differ only when a test is about a server that lies.
-    body_len: usize = 0,
-    claim_len: ?usize = null,
-    status: []const u8 = "200 OK",
-    /// Response headers beyond the two above, each with its own `\r\n`.
-    extra: []const u8 = "",
-    /// Filled in by `serveOne` so a test can assert on what arrived.
-    seen: [1024]u8 = undefined,
-    seen_len: usize = 0,
-    /// The request body, for the tests about what a streamed send puts on the
-    /// wire.
-    body_seen: [1024]u8 = undefined,
-    body_seen_len: usize = 0,
-    /// How many connections have been accepted — see `serveEach`.
-    accepted: usize = 0,
-
-    /// Port 0, and the kernel's answer read back.
-    ///
-    /// **This used to walk a range of a thousand ports from a start derived
-    /// from the thread id**, on the belief that `std.Io.net.Server` could not
-    /// report the port it was given — and it could the whole time.
-    /// `Threaded.netListenIpPosix` calls `getsockname` after `listen` and
-    /// hands the result back as `Server.socket.address`, whose own doc says
-    /// "the resolved ephemeral port number". The belief was written down in
-    /// three files as re-checked rather than believed, and the walk it
-    /// justified needed `s3/canned.zig` and `http/live.zig` to keep their
-    /// ranges apart from this one by comment: ten consecutive `zig build
-    /// test-all` runs failed from the sixth on when two of them overlapped.
-    ///
-    /// An ephemeral port is one nothing else is walking, and a port the
-    /// kernel just handed out is not one in `TIME-WAIT`, so both halves of
-    /// what the walk was for are the kernel's job again. `reuse_address` is
-    /// still not set, for the reason it never was: std sets `SO_REUSEPORT`
-    /// with it, and two test binaries would share one port.
-    fn open(io: std.Io) !Canned {
-        const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-        const server = try address.listen(io, .{});
-        return .{ .server = server, .io = io, .port = server.socket.address.getPort() };
-    }
-
-    fn url(self: *Canned, buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}/", .{self.port});
-    }
-
-    fn serveOne(self: *Canned) !void {
-        var stream = try self.server.accept(self.io);
-        defer stream.close(self.io);
-
-        var in_buf: [4 << 10]u8 = undefined;
-        var reader = stream.reader(self.io, &in_buf);
-
-        // The whole head, line by line to the blank one. Reading only as far
-        // as the first `\r` would keep the request line and drop every header,
-        // which is exactly what the header test is about — so it is read the
-        // way a server reads it.
-        while (true) {
-            // Inclusive, because the exclusive form leaves the delimiter in
-            // the buffer and the next call comes straight back empty — which
-            // reads as "the head ended after one line".
-            const line = try reader.interface.takeDelimiterInclusive('\n');
-            const trimmed = std.mem.trimEnd(u8, line, "\r\n");
-            if (trimmed.len == 0) break;
-            const room = self.seen.len - self.seen_len;
-            if (room < trimmed.len + 1) continue;
-            @memcpy(self.seen[self.seen_len..][0..trimmed.len], trimmed);
-            self.seen[self.seen_len + trimmed.len] = '\n';
-            self.seen_len += trimmed.len + 1;
-        }
-
-        var out_buf: [64 << 10]u8 = undefined;
-        var writer = stream.writer(self.io, &out_buf);
-        const w = &writer.interface;
-        // `extra` goes here as well as in `serveEach`, and leaving it out of
-        // one of them is how the header test came to assert against headers
-        // that were never sent: it sets `extra`, it is served by *this*
-        // function, and `head.header("etag").?` panicked on a null.
-        try w.print("HTTP/1.1 {s}\r\nContent-Length: {d}\r\n{s}\r\n", .{
-            self.status,
-            self.claim_len orelse self.body_len,
-            self.extra,
-        });
-        try w.splatByteAll('x', self.body_len);
-        try w.flush();
-    }
-
-    /// `count` requests on **one** connection, which `serveOne` cannot do:
-    /// it closes after answering, so a client that comes back gets
-    /// `error.HttpConnectionClosing` from its own pool. Keep-alive is the
-    /// ordinary case for anything a service calls repeatedly, and it is the
-    /// only way to ask what a call costs once the connection already exists.
-    fn serveKeepAlive(self: *Canned, count: usize) !void {
-        var stream = try self.server.accept(self.io);
-        defer stream.close(self.io);
-
-        var in_buf: [4 << 10]u8 = undefined;
-        var out_buf: [64 << 10]u8 = undefined;
-        var reader = stream.reader(self.io, &in_buf);
-        var writer = stream.writer(self.io, &out_buf);
-
-        for (0..count) |_| {
-            while (true) {
-                const line = try reader.interface.takeDelimiterInclusive('\n');
-                if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
-            }
-            const w = &writer.interface;
-            try w.print("HTTP/1.1 {s}\r\nContent-Length: {d}\r\n\r\n", .{
-                self.status,
-                self.claim_len orelse self.body_len,
-            });
-            try w.splatByteAll('x', self.body_len);
-            try w.flush();
-        }
-    }
-
-    /// A connection answered once and then closed, twice over: exactly what a
-    /// peer reaping an idle keep-alive looks like from the client side.
-    ///
-    /// The client's first call pools a connection this server has already
-    /// hung up on. Its second call takes that dead socket out of the pool,
-    /// gets `HttpConnectionClosing` from `receiveHead` — no bytes, no answer
-    /// — and either retries once on a fresh connection, which is the second
-    /// `accept` here, or hands the caller a failure nobody caused.
-    ///
-    /// Measured against a real MinIO before it was written: 80 seconds idle
-    /// and a `wrk` run answered exactly `max_in_flight` requests non-2xx.
-    fn serveThenReap(self: *Canned) !void {
-        for (0..2) |_| {
-            var stream = try self.server.accept(self.io);
-            defer stream.close(self.io);
-            // Counted here rather than after the answer, so the tally cannot
-            // race the client: a caller holding a response is a caller whose
-            // connection was accepted, and both fibers share one thread.
-            self.accepted += 1;
-
-            var in_buf: [4 << 10]u8 = undefined;
-            var out_buf: [64 << 10]u8 = undefined;
-            var reader = stream.reader(self.io, &in_buf);
-            var writer = stream.writer(self.io, &out_buf);
-
-            while (true) {
-                const line = try reader.interface.takeDelimiterInclusive('\n');
-                if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
-            }
-            const w = &writer.interface;
-            try w.print("HTTP/1.1 {s}\r\nContent-Length: {d}\r\n\r\n", .{
-                self.status,
-                self.claim_len orelse self.body_len,
-            });
-            try w.splatByteAll('x', self.body_len);
-            try w.flush();
-        }
-    }
-
-    /// The same reaping as `serveThenReap`, arrived at the other way round:
-    /// the peer closes a connection that has an **unread** request sitting in
-    /// it, so the kernel sends an RST rather than a FIN and the client sees
-    /// `ReadFailed` where the other spelling gives `HttpConnectionClosing`.
-    ///
-    /// Which of the two a real client meets is a race it does not run, so both
-    /// belong in the suite. This one used to arrive by accident: `serveThenReap`
-    /// produced it whenever the machine was loaded enough for the client's
-    /// second request to beat the server's `close`, which under `zig build
-    /// test-all` was about one run in three, and it failed because
-    /// `Exchange.nothingCameBack` did not exist yet.
-    ///
-    /// **The one unread byte is what makes it deterministic, and a timer would
-    /// not have been.** Reading exactly one byte of the second request proves
-    /// the request arrived, and leaves the rest of it in the receive queue,
-    /// which is the condition the kernel turns into an RST. A `sleep` long
-    /// enough to lose the race on this machine is a `sleep` that silently
-    /// stops losing it on a slower one, and the test would go on passing
-    /// through the FIN branch while claiming to cover this one.
-    fn serveThenReset(self: *Canned) !void {
-        {
-            var stream = try self.server.accept(self.io);
-            defer stream.close(self.io);
-            self.accepted += 1;
-
-            var in_buf: [4 << 10]u8 = undefined;
-            var out_buf: [64 << 10]u8 = undefined;
-            var reader = stream.reader(self.io, &in_buf);
-            var writer = stream.writer(self.io, &out_buf);
-
-            while (true) {
-                const line = try reader.interface.takeDelimiterInclusive('\n');
-                if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
-            }
-            const w = &writer.interface;
-            try w.print("HTTP/1.1 {s}\r\nContent-Length: {d}\r\n\r\n", .{
-                self.status,
-                self.claim_len orelse self.body_len,
-            });
-            try w.splatByteAll('x', self.body_len);
-            try w.flush();
-
-            // Blocks until the client comes back on this connection, which is
-            // the point: everything after the byte stays unread, and `close`
-            // on a socket with unread data is an RST.
-            //
-            // **A reader of one byte, and the size is the whole mechanism.**
-            // Taking the byte through `in_buf` above reads as much as has
-            // arrived, which is the entire second request, and a receive queue
-            // that has been drained into user space closes with a FIN like any
-            // other. Written that way this test passed with the branch it
-            // exists for switched off. One byte of buffer is one byte off the
-            // socket.
-            var held_buf: [1]u8 = undefined;
-            var held = stream.reader(self.io, &held_buf);
-            _ = try held.interface.takeByte();
-        }
-
-        var stream = try self.server.accept(self.io);
-        defer stream.close(self.io);
-        self.accepted += 1;
-
-        var in_buf: [4 << 10]u8 = undefined;
-        var out_buf: [64 << 10]u8 = undefined;
-        var reader = stream.reader(self.io, &in_buf);
-        var writer = stream.writer(self.io, &out_buf);
-
-        while (true) {
-            const line = try reader.interface.takeDelimiterInclusive('\n');
-            if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
-        }
-        const w = &writer.interface;
-        try w.print("HTTP/1.1 {s}\r\nContent-Length: {d}\r\n\r\n", .{
-            self.status,
-            self.claim_len orelse self.body_len,
-        });
-        try w.splatByteAll('x', self.body_len);
-        try w.flush();
-    }
-
-    /// `count` **requests**, however many connections they arrive on, and a
-    /// tally of how many connections that took.
-    ///
-    /// The tally is the whole point: whether a client kept a pooled connection
-    /// or dropped it is not visible from the client side at all, and it is
-    /// exactly what the drain policy decides. A second `accept` means the
-    /// first connection was dropped.
-    ///
-    /// **Counting requests rather than connections is what keeps this from
-    /// hanging the suite**, and both of the other spellings did. A version that
-    /// closed after answering one produced a second `accept` in *both* cases —
-    /// a dropped connection because the client opened a new one, and a kept
-    /// connection because the client came back to a socket this server had
-    /// already closed — so the tally could not tell them apart and the control
-    /// test asserted a 1 that nothing could produce. Fixing that by looping
-    /// `for (0..count)` over *accepts* then parked the server on an `accept`
-    /// that never comes the moment the client did the right thing and kept its
-    /// connection: two requests on one socket leaves the second accept
-    /// outstanding, and whether the test finishes comes down to whether
-    /// `cancel` wins a race against it. Requests are what the client makes and
-    /// what the test counts, so they are what the loop should be bounded by.
-    fn serveEach(self: *Canned, count: usize) !void {
-        var served: usize = 0;
-        while (served < count) {
-            var stream = try self.server.accept(self.io);
-            defer stream.close(self.io);
-            self.accepted += 1;
-
-            var in_buf: [4 << 10]u8 = undefined;
-            var out_buf: [64 << 10]u8 = undefined;
-            var reader = stream.reader(self.io, &in_buf);
-            var writer = stream.writer(self.io, &out_buf);
-
-            while (served < count) {
-                // End of head, or end of connection. EOF here is the client
-                // saying it is finished with this socket, which is the signal
-                // to go back to `accept` — not an error.
-                var ended = false;
-                while (true) {
-                    const line = reader.interface.takeDelimiterInclusive('\n') catch {
-                        ended = true;
-                        break;
-                    };
-                    if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
-                }
-                if (ended) break;
-
-                // Counted on arrival rather than on a completed answer. A
-                // client that refuses this body may drop the connection before
-                // the write finishes, and a request that was made is one the
-                // loop has to account for — counting replies instead leaves it
-                // short and sends it back to `accept` for a connection nobody
-                // is going to open.
-                served += 1;
-
-                const w = &writer.interface;
-                w.print("HTTP/1.1 {s}\r\nContent-Length: {d}\r\n{s}\r\n", .{
-                    self.status,
-                    self.claim_len orelse self.body_len,
-                    self.extra,
-                }) catch break;
-                // A client under test is *allowed* to stop reading and drop the
-                // connection mid-body — that is the whole of what the drain
-                // policy decides, and the write then fails with a reset. Take
-                // the next connection rather than failing the server.
-                //
-                // This is also the guard on the one way these tests can hang
-                // the suite rather than fail it. The body has to fit in kernel
-                // socket buffers, because nothing is reading the far end; if a
-                // future `body_len` stops fitting, the write parks with nothing
-                // to wake it and `zig build test` sits at 0% CPU forever.
-                // Swallowing the error means the worst case is `accepted`
-                // coming out wrong, which is a failed expectation with a line
-                // number.
-                w.splatByteAll('x', self.body_len) catch break;
-                w.flush() catch break;
-            }
-        }
-    }
-
-    /// Read a request whole — head and `content-length` bytes of body — and
-    /// answer it. For the tests about what goes *out*.
-    fn serveWithBody(self: *Canned) !void {
-        var stream = try self.server.accept(self.io);
-        defer stream.close(self.io);
-
-        var in_buf: [64 << 10]u8 = undefined;
-        var reader = stream.reader(self.io, &in_buf);
-
-        var body_len: usize = 0;
-        while (true) {
-            const line = try reader.interface.takeDelimiterInclusive('\n');
-            const trimmed = std.mem.trimEnd(u8, line, "\r\n");
-            if (trimmed.len == 0) break;
-            if (std.ascii.startsWithIgnoreCase(trimmed, "content-length:")) {
-                const value = std.mem.trim(u8, trimmed["content-length:".len..], " \t");
-                body_len = try std.fmt.parseInt(usize, value, 10);
-            }
-            const room = self.seen.len - self.seen_len;
-            if (room < trimmed.len + 1) continue;
-            @memcpy(self.seen[self.seen_len..][0..trimmed.len], trimmed);
-            self.seen[self.seen_len + trimmed.len] = '\n';
-            self.seen_len += trimmed.len + 1;
-        }
-
-        self.body_seen_len = @min(body_len, self.body_seen.len);
-        try reader.interface.readSliceAll(self.body_seen[0..self.body_seen_len]);
-
-        var out_buf: [4 << 10]u8 = undefined;
-        var writer = stream.writer(self.io, &out_buf);
-        const w = &writer.interface;
-        try w.print("HTTP/1.1 {s}\r\nContent-Length: 0\r\n{s}\r\n", .{ self.status, self.extra });
-        try w.flush();
-    }
-
-    /// A `204 No Content` with no `content-length` — the way hyper answers a
-    /// presigned POST, and S3 answers a DELETE — on a connection kept open
-    /// for a second request, which is answered with a body. What a peer
-    /// reaping an idle keep-alive looks like is `serveThenReap`; this is the
-    /// peer *not* reaping it, which is what turned a complete answer into a
-    /// wait for EOF (ADR 0215).
-    fn serveNoContentThenOne(self: *Canned) !void {
-        var stream = try self.server.accept(self.io);
-        defer stream.close(self.io);
-        self.accepted += 1;
-
-        var in_buf: [64 << 10]u8 = undefined;
-        var out_buf: [4 << 10]u8 = undefined;
-        var reader = stream.reader(self.io, &in_buf);
-        var writer = stream.writer(self.io, &out_buf);
-        const w = &writer.interface;
-
-        for (0..2) |n| {
-            var body_len: usize = 0;
-            while (true) {
-                const line = try reader.interface.takeDelimiterInclusive('\n');
-                const trimmed = std.mem.trimEnd(u8, line, "\r\n");
-                if (trimmed.len == 0) break;
-                if (std.ascii.startsWithIgnoreCase(trimmed, "content-length:")) {
-                    const value = std.mem.trim(u8, trimmed["content-length:".len..], " \t");
-                    body_len = try std.fmt.parseInt(usize, value, 10);
-                }
-            }
-            if (body_len > 0) _ = try reader.interface.discard(.limited(body_len));
-
-            if (n == 0) {
-                try w.writeAll("HTTP/1.1 204 No Content\r\nlocation: /bucket/key\r\netag: \"1\"\r\n\r\n");
-            } else {
-                try w.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{self.body_len});
-                try w.splatByteAll('x', self.body_len);
-            }
-            try w.flush();
-        }
-    }
-
-    /// Accept, read the head, and never answer: the endpoint that takes the
-    /// connection and then says nothing, which is the whole reason a
-    /// deadline exists. Holds the socket until the client gives up on it,
-    /// which is what closes it from the far side.
-    fn serveSilence(self: *Canned) !void {
-        var stream = try self.server.accept(self.io);
-        defer stream.close(self.io);
-        self.accepted += 1;
-
-        var in_buf: [4 << 10]u8 = undefined;
-        var reader = stream.reader(self.io, &in_buf);
-        while (true) {
-            const line = try reader.interface.takeDelimiterInclusive('\n');
-            if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
-        }
-        // Nothing more is coming from the client, so this is EOF when the
-        // client closes and nothing before that.
-        _ = reader.interface.takeByte() catch {};
-    }
-
-    /// A head that promises `body_len` bytes and sends three of them, then
-    /// stalls the way `serveSilence` does. The deadline has to cover the
-    /// body as well as the head, or a server that answers at once and then
-    /// trickles is outside it.
-    fn serveThenStall(self: *Canned) !void {
-        var stream = try self.server.accept(self.io);
-        defer stream.close(self.io);
-        self.accepted += 1;
-
-        var in_buf: [4 << 10]u8 = undefined;
-        var out_buf: [4 << 10]u8 = undefined;
-        var reader = stream.reader(self.io, &in_buf);
-        var writer = stream.writer(self.io, &out_buf);
-        while (true) {
-            const line = try reader.interface.takeDelimiterInclusive('\n');
-            if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
-        }
-        const w = &writer.interface;
-        try w.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{self.body_len});
-        try w.writeAll("xxx");
-        try w.flush();
-        _ = reader.interface.takeByte() catch {};
-    }
-
-    /// A head that promises `body_len` bytes and sends them one at a time,
-    /// `trickle_ms` apart: the slow server ADR 0230 refused to call a
-    /// failure, and the control for the silence clock: a body that keeps
-    /// moving, however slowly, must never be called a stall (ADR 0237).
-    fn serveTrickle(self: *Canned, trickle_ms: u32) !void {
-        var stream = try self.server.accept(self.io);
-        defer stream.close(self.io);
-        self.accepted += 1;
-
-        var in_buf: [4 << 10]u8 = undefined;
-        var out_buf: [4 << 10]u8 = undefined;
-        var reader = stream.reader(self.io, &in_buf);
-        var writer = stream.writer(self.io, &out_buf);
-        while (true) {
-            const line = try reader.interface.takeDelimiterInclusive('\n');
-            if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
-        }
-        const w = &writer.interface;
-        try w.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{self.body_len});
-        try w.flush();
-        for (0..self.body_len) |_| {
-            try std.Io.sleep(self.io, .fromMilliseconds(trickle_ms), .awake);
-            try w.writeByte('x');
-            try w.flush();
-        }
-    }
-
-    /// `body_len` bytes of `x` as **chunked** transfer coding, in chunks of
-    /// at most 1,000: the framing that reads through a buffer if any does.
-    fn serveChunked(self: *Canned) !void {
-        var stream = try self.server.accept(self.io);
-        defer stream.close(self.io);
-        self.accepted += 1;
-
-        var in_buf: [4 << 10]u8 = undefined;
-        var out_buf: [8 << 10]u8 = undefined;
-        var reader = stream.reader(self.io, &in_buf);
-        var writer = stream.writer(self.io, &out_buf);
-        while (true) {
-            const line = try reader.interface.takeDelimiterInclusive('\n');
-            if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
-        }
-        const w = &writer.interface;
-        try w.writeAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
-        var left = self.body_len;
-        while (left > 0) {
-            const n = @min(left, 1_000);
-            try w.print("{x}\r\n", .{n});
-            try w.splatByteAll('x', n);
-            try w.writeAll("\r\n");
-            left -= n;
-        }
-        try w.writeAll("0\r\n\r\n");
-        try w.flush();
-    }
-
-    /// A `302` to `/moved` and then a `200`, on **one** connection: a chain
-    /// of one, for the test about where it ended. One connection because
-    /// std pools the first and comes back on it for the second — a server
-    /// that hung up after the 302 would hand the client a reaped socket,
-    /// and the stale-connection retry would then send the *original* URL
-    /// again on a fresh one, which is a different test.
-    fn serveRedirectThenOne(self: *Canned) !void {
-        var stream = try self.server.accept(self.io);
-        defer stream.close(self.io);
-        self.accepted += 1;
-
-        var in_buf: [4 << 10]u8 = undefined;
-        var out_buf: [4 << 10]u8 = undefined;
-        var reader = stream.reader(self.io, &in_buf);
-        var writer = stream.writer(self.io, &out_buf);
-        for (0..2) |n| {
-            while (true) {
-                const line = try reader.interface.takeDelimiterInclusive('\n');
-                const trimmed = std.mem.trimEnd(u8, line, "\r\n");
-                if (trimmed.len == 0) break;
-                const room = self.seen.len - self.seen_len;
-                if (room < trimmed.len + 1) continue;
-                @memcpy(self.seen[self.seen_len..][0..trimmed.len], trimmed);
-                self.seen[self.seen_len + trimmed.len] = '\n';
-                self.seen_len += trimmed.len + 1;
-            }
-            const w = &writer.interface;
-            if (n == 0) {
-                try w.print("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{d}/moved\r\nContent-Length: 0\r\n\r\n", .{self.port});
-            } else {
-                try w.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{self.body_len});
-                try w.splatByteAll('x', self.body_len);
-            }
-            try w.flush();
-        }
-    }
-
-    fn close(self: *Canned) void {
-        self.server.socket.close(self.io);
-    }
-};
+/// The canned server, exported so a suite of somebody's own can stand one
+/// real exchange without writing the far end again
+/// ([ADR 0243](../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+/// Everything about how it is started — `io.concurrent`, never `io.async` —
+/// is on the type.
+const Canned = fetch.testing.Canned;
 
 /// Everything here runs the loop the same way, and the way matters: this is
 /// `std.Io.Threaded`, not the Engine.
@@ -1096,7 +550,7 @@ test "an answer that says go elsewhere is refused unless the call decided otherw
             var canned = try Canned.open(io);
             defer canned.close();
             canned.status = "302 Found";
-            canned.extra = "Location: http://127.0.0.1:1/moved\r\n";
+            canned.headers = "Location: http://127.0.0.1:1/moved\r\n";
 
             var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
@@ -1117,7 +571,7 @@ test "an answer that says go elsewhere is refused unless the call decided otherw
             var canned = try Canned.open(io);
             defer canned.close();
             canned.status = "302 Found";
-            canned.extra = "Location: http://127.0.0.1:1/moved\r\n";
+            canned.headers = "Location: http://127.0.0.1:1/moved\r\n";
 
             var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
@@ -1166,7 +620,7 @@ test "a kept head reads the same after the body has been through" {
             var canned = try Canned.open(io);
             defer canned.close();
             canned.body_len = 3000;
-            canned.extra = "ETag: \"d41d8cd9\"\r\nContent-Type: text/plain\r\n";
+            canned.headers = "ETag: \"d41d8cd9\"\r\nContent-Type: text/plain\r\n";
 
             var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
@@ -1550,7 +1004,7 @@ test "a response header is readable before the body is touched" {
             var canned = try Canned.open(io);
             defer canned.close();
             canned.body_len = 5;
-            canned.extra = "ETag: \"d41d8cd9\"\r\nx-amz-request-id: 8F2C\r\n";
+            canned.headers = "ETag: \"d41d8cd9\"\r\nx-amz-request-id: 8F2C\r\n";
 
             var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
@@ -1861,7 +1315,145 @@ const Counting = struct {
     }
 };
 
-test "a call on a warm connection allocates once, and it is the body" {
+// ---- the ordinary call: JSON out, headers back (ADR 0243, ADR 0244) ----
+
+test "a JSON body arrives written out, under a content-type the caller did not have to say" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(std.testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const res = try client.postJson(&scope, try canned.url(&buf), .{ .amount = 500, .currency = "idr" }, .{});
+            try testing.expect(res.ok());
+
+            served.await(io) catch {};
+            const sent = canned.request();
+            try testing.expect(std.mem.startsWith(u8, sent, "POST /"));
+            try testing.expect(std.mem.indexOf(u8, sent, "content-type: application/json") != null);
+            try testing.expectEqual(@as(usize, 1), countLines(sent, "content-type:"));
+            try testing.expectEqualStrings("{\"amount\":500,\"currency\":\"idr\"}", canned.requestBody());
+        }
+    }.run);
+
+    // A `content-type` the caller wrote is the one that goes, once, and the
+    // body is still the value written out.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(std.testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            _ = try client.sendJson(&scope, .DELETE, try canned.url(&buf), .{ .ids = [_]u32{ 1, 2, 3 } }, .{
+                .headers = &.{.{ .name = "Content-Type", .value = "application/vnd.api+json" }},
+            });
+
+            served.await(io) catch {};
+            const sent = canned.request();
+            try testing.expect(std.mem.startsWith(u8, sent, "DELETE /"));
+            try testing.expectEqual(@as(usize, 1), countLines(sent, "content-type:"));
+            try testing.expect(std.mem.indexOf(u8, sent, "application/vnd.api+json") != null);
+            try testing.expect(std.mem.indexOf(u8, sent, "application/json\n") == null);
+            try testing.expectEqualStrings("{\"ids\":[1,2,3]}", canned.requestBody());
+        }
+    }.run);
+}
+
+test "a response carries its headers, so the Retry-After off a 429 is one call away" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.reply("429 Too Many Requests", "Retry-After: 30\r\nX-RateLimit-Remaining: 0\r\n", "slow down");
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(std.testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const res = try client.get(&scope, try canned.url(&buf), .{});
+            try testing.expectEqual(std.http.Status.too_many_requests, res.status);
+            try testing.expectEqualStrings("slow down", res.body.view());
+
+            // Read after the body has been through, which is the whole
+            // point: the block was kept before the body read over it.
+            try testing.expectEqualStrings("30", res.header("retry-after").?);
+            // Case-insensitively, because the server picks its spelling.
+            try testing.expectEqualStrings("30", res.header("RETRY-AFTER").?);
+            try testing.expectEqualStrings("0", res.header("x-ratelimit-remaining").?);
+            // A header the answer did not carry is null, which for `etag`
+            // is a fact about the server rather than an error.
+            try testing.expect(res.header("etag") == null);
+            // The block is the Scope's memory, like the body.
+            const start = @intFromPtr(res.headers.ptr);
+            const at = @intFromPtr(res.header("retry-after").?.ptr);
+            try testing.expect(at >= start and at < start + res.headers.len);
+        }
+    }.run);
+}
+
+// ---- the canned server, for a suite of somebody's own (ADR 0243) ----
+
+test "a canned server answers what reply said, and shows the request that reached it" {
+    // The shape a caller's own suite writes, end to end, on nothing but the
+    // exported type: open, reply, serve, call, assert. `serveOne` reads the
+    // body the head announced, so a test about a POST sees what went out.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try fetch.testing.Canned.open(io);
+            defer canned.close();
+            canned.reply("201 Created", "Location: /charges/ch_1\r\nContent-Type: application/json\r\n", "{\"id\":\"ch_1\"}");
+
+            var served = try io.concurrent(fetch.testing.Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(std.testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const res = try client.post(&scope, try canned.url(&buf), "amount=500", .{
+                .headers = &.{.{ .name = "Idempotency-Key", .value = "k1" }},
+            });
+            try testing.expectEqual(std.http.Status.created, res.status);
+            try testing.expectEqualStrings("/charges/ch_1", res.header("location").?);
+            try testing.expectEqualStrings("application/json", res.header("content-type").?);
+            try testing.expectEqualStrings("{\"id\":\"ch_1\"}", res.body.view());
+
+            served.await(io) catch {};
+            try testing.expect(std.mem.startsWith(u8, canned.request(), "POST / HTTP/1.1\n"));
+            try testing.expect(std.mem.indexOf(u8, canned.request(), "Idempotency-Key: k1\n") != null);
+            try testing.expectEqualStrings("amount=500", canned.requestBody());
+        }
+    }.run);
+}
+
+test "a call on a warm connection allocates twice: the header block, then the body" {
     try withIo(struct {
         fn run(io: std.Io) !void {
             var canned = try Canned.open(io);
@@ -1895,14 +1487,23 @@ test "a call on a warm connection allocates once, and it is the body" {
             const res = try client.get(&counted, url, .{});
             try testing.expectEqual(@as(usize, 64), res.body.view().len);
 
-            // One, and it is the body — `allocRemaining` into the Scope's
-            // arena. The gate is a semaphore with no allocation behind it, the
-            // deadline arms into a slot inside the `Bound` on the stack, and
-            // the head is written into the connection's own buffer.
+            // Two, and they are the header block and the body, in that
+            // order: the block is kept into the Scope's arena before the
+            // body reads over it (ADR 0244), and the body is `allocRemaining`
+            // into the same arena. The gate is a semaphore with no allocation
+            // behind it, the deadline arms into a slot inside the `Bound` on
+            // the stack, and the request head is written into the
+            // connection's own buffer.
             //
-            // Raising this needs a reason. It is the same rule ADR 0018's
-            // second row puts on the inbound path, applied to the way out.
-            try testing.expectEqual(@as(usize, 1), counting.allocs);
+            // What is counted is the arena's calls on its backing allocator,
+            // so this is chunks rather than bumps: the block is the first
+            // thing the arena is asked for and gets a chunk sized to itself,
+            // and the body's writer then asks for more than what is left of
+            // it. It was one for a year, when the body was the first and
+            // only thing. Raising this needs a reason. It is the same rule
+            // ADR 0018's second row puts on the inbound path, applied to the
+            // way out.
+            try testing.expectEqual(@as(usize, 2), counting.allocs);
         }
     }.run);
 }

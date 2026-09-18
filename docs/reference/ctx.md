@@ -33,6 +33,7 @@ One page of [the reference](./README.md): one request in flight: reading it, ans
 | `c.hashPasswordWith(cost, gpa, text)` | the same, at a `pw.Cost` of your own |
 | `c.verifyPassword(gpa, stored, text)` | `!bool` — `stored` is `?[]const u8`; null means no such account |
 | `c.verifyPasswordWith(cost, gpa, stored, text)` | the same, told what a hash of yours costs |
+| `nilo.verifyPassword(gpa, stored, text)` | the same check with no request in hand — a CLI, a job, a test. Same Gate; see [`nilo_pw`](./pw.md) |
 | `c.bodyStream()` | `!Body` — the body in pieces |
 | `c.bodyStreamWith(.{ .max_bytes = … })` | the same, with a ceiling. Default 64 MB |
 | `c.peer()` | the address the connection came from — the proxy's, if there is one |

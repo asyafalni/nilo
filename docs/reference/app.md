@@ -136,6 +136,7 @@ series at all. See [Metrics](../guide/metrics.md).
 | `nilo.spawn(f, args)` | run something that is not a request, now — `error.NoServer` if nothing is listening |
 | `app.spawn(f, args)` | the same fiber, registered before the server and started once it is up ([the guide](../guide/background.md)) |
 | `nilo.randomSecure(&buf)` | fill a buffer you already hold, off the event loop |
+| `nilo.verifyPassword(gpa, stored, text)` | `c.verifyPassword` with no request in hand — the same Gate and pool, inline with no loop ([`nilo_pw`](./pw.md)) |
 | `nilo.monotonicNanos()` | a clock reading, for durations |
 
 `lock()` and `sleep()` fail with `error.Canceled` if the request went away, which

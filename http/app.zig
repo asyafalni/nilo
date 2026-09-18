@@ -14,6 +14,7 @@ const ctx_mod = @import("ctx.zig");
 const str_mod = @import("nilo_core");
 const service_mod = @import("service.zig");
 const typed = @import("typed.zig");
+const cached_mod = @import("cached.zig");
 const fail = @import("fail.zig");
 const mw = @import("middleware.zig");
 const static_mod = @import("static.zig");
@@ -618,21 +619,25 @@ pub const App = struct {
 
     pub fn post(self: *App, comptime pattern: []const u8, comptime handler: anytype) !void {
         comptime typed.check(pattern, handler);
+        comptime typed.checkVerb(.POST, pattern, handler);
         try self.route(.POST, pattern, handler);
     }
 
     pub fn put(self: *App, comptime pattern: []const u8, comptime handler: anytype) !void {
         comptime typed.check(pattern, handler);
+        comptime typed.checkVerb(.PUT, pattern, handler);
         try self.route(.PUT, pattern, handler);
     }
 
     pub fn delete(self: *App, comptime pattern: []const u8, comptime handler: anytype) !void {
         comptime typed.check(pattern, handler);
+        comptime typed.checkVerb(.DELETE, pattern, handler);
         try self.route(.DELETE, pattern, handler);
     }
 
     pub fn patch(self: *App, comptime pattern: []const u8, comptime handler: anytype) !void {
         comptime typed.check(pattern, handler);
+        comptime typed.checkVerb(.PATCH, pattern, handler);
         try self.route(.PATCH, pattern, handler);
     }
 
@@ -643,6 +648,7 @@ pub const App = struct {
 
     pub fn options(self: *App, comptime pattern: []const u8, comptime handler: anytype) !void {
         comptime typed.check(pattern, handler);
+        comptime typed.checkVerb(.OPTIONS, pattern, handler);
         try self.route(.OPTIONS, pattern, handler);
     }
 
@@ -677,7 +683,7 @@ pub const App = struct {
     ) !void {
         comptime typed.check(pattern, handler);
         self.tryRouteNamed(name, method, pattern, handler) catch |err| {
-            if (err == error.DuplicateRoute or err == error.DuplicateName) std.process.exit(1);
+            if (err == error.DuplicateRoute or err == error.DuplicateName or err == error.CachedWrite) std.process.exit(1);
             return err;
         };
     }
@@ -718,6 +724,23 @@ pub const App = struct {
                 .{ @tagName(method), pattern, existing },
             );
             return error.DuplicateRoute;
+        }
+
+        // `app.post` refuses this while compiling; here the verb is a
+        // runtime value, so it is said at registration instead — and, like
+        // a duplicate, stops the process unless the caller asked for the
+        // error (ADR 0247).
+        if (comptime typed.isCached(pattern, handler)) {
+            if (!cached_mod.allows(method)) {
+                std.log.err(
+                    "the route \"{s} {s}\" takes a `Cached(…)`, and a {s} is not an answer to keep: " ++
+                        "a kept answer is served again to whoever asks next, and the request the second " ++
+                        "client sent was not the one the first client sent. A `Cached(…)` goes on a GET " ++
+                        "or a HEAD; for a write answered once per client, that is `Idempotent(…)`.",
+                    .{ @tagName(method), pattern, @tagName(method) },
+                );
+                return error.CachedWrite;
+            }
         }
 
         try self.requirements.appendSlice(self.gpa, comptime typed.requirements(pattern, handler));
@@ -1390,6 +1413,7 @@ pub fn GroupWith(
 
         pub fn post(self: Self, comptime pattern: []const u8, comptime handler: anytype) !void {
             comptime typed.check(joined(prefix, pattern), handler);
+            comptime typed.checkVerb(.POST, joined(prefix, pattern), handler);
             try self.excepting(pattern, .POST);
             try self.attaching(pattern, .POST);
             return self.app.routeNamed(route_name, .POST, comptime joined(prefix, pattern), handler);
@@ -1397,6 +1421,7 @@ pub fn GroupWith(
 
         pub fn put(self: Self, comptime pattern: []const u8, comptime handler: anytype) !void {
             comptime typed.check(joined(prefix, pattern), handler);
+            comptime typed.checkVerb(.PUT, joined(prefix, pattern), handler);
             try self.excepting(pattern, .PUT);
             try self.attaching(pattern, .PUT);
             return self.app.routeNamed(route_name, .PUT, comptime joined(prefix, pattern), handler);
@@ -1404,6 +1429,7 @@ pub fn GroupWith(
 
         pub fn delete(self: Self, comptime pattern: []const u8, comptime handler: anytype) !void {
             comptime typed.check(joined(prefix, pattern), handler);
+            comptime typed.checkVerb(.DELETE, joined(prefix, pattern), handler);
             try self.excepting(pattern, .DELETE);
             try self.attaching(pattern, .DELETE);
             return self.app.routeNamed(route_name, .DELETE, comptime joined(prefix, pattern), handler);
@@ -1411,6 +1437,7 @@ pub fn GroupWith(
 
         pub fn patch(self: Self, comptime pattern: []const u8, comptime handler: anytype) !void {
             comptime typed.check(joined(prefix, pattern), handler);
+            comptime typed.checkVerb(.PATCH, joined(prefix, pattern), handler);
             try self.excepting(pattern, .PATCH);
             try self.attaching(pattern, .PATCH);
             return self.app.routeNamed(route_name, .PATCH, comptime joined(prefix, pattern), handler);
@@ -1425,6 +1452,7 @@ pub fn GroupWith(
 
         pub fn options(self: Self, comptime pattern: []const u8, comptime handler: anytype) !void {
             comptime typed.check(joined(prefix, pattern), handler);
+            comptime typed.checkVerb(.OPTIONS, joined(prefix, pattern), handler);
             try self.excepting(pattern, .OPTIONS);
             try self.attaching(pattern, .OPTIONS);
             return self.app.routeNamed(route_name, .OPTIONS, comptime joined(prefix, pattern), handler);

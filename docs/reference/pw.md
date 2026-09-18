@@ -31,6 +31,8 @@ if (row) |r| if (try pw.needsRehash(r.password.view(), .default)) {
 | `c.hashPassword(gpa, text)` | `!pw.Hash` — the call a handler makes |
 | `c.verifyPassword(gpa, stored, text)` | `!bool` — `stored` is `?[]const u8` |
 | `c.verifyPasswordWith(cost, gpa, stored, text)` | the same, if you hash at anything but the default |
+| `nilo.verifyPassword(gpa, stored, text)` | `!bool` — the same check with no request in hand: a CLI, a job, a test. Same Gate, same pool |
+| `nilo.verifyPasswordWith(cost, gpa, stored, text)` | the same, told what a hash of yours costs |
 | `pw.needsRehash(stored, cost)` | `!bool` — was this row written weaker than you write now |
 | `pw.huge_pages` | the allocator to hand it: the 19 MiB in 2 MiB pages, 11.0 ms against 13.6 |
 | `stored.text()` | the PHC string, `$argon2id$v=19$m=19456,t=2,p=1$…` |
@@ -66,3 +68,68 @@ everywhere.
 **A hash made elsewhere verifies here**, at any parallelism, and a hash made
 here can be read by anything that reads PHC. That is the only reason to have a
 format.
+
+**Checking needs no request; making does.** The salt of a stored hash is in
+the string, so `nilo.verifyPassword` is the method without the `Ctx` — the same
+Gate and the same blocking pool, for a CLI resetting an account, a job
+re-hashing at a raised Cost, or a test with neither an App nor a Ctx. With no
+loop at all it runs inline. There is no `nilo.hashPassword` beside it, because
+a hash needs entropy and `c.entropy` is where the wait for it is paid
+([ADR 0241](../adr/0241-a-token-is-not-a-password-and-a-check-needs-no-request.md)).
+
+## A token that is not a password
+
+A password-reset link, an email verification, an API key
+([ADR 0241](../adr/0241-a-token-is-not-a-password-and-a-check-needs-no-request.md)).
+Thirty-two bytes of entropy, 43 characters to send, a SHA-256 digest to
+store, and a constant-time compare when it comes back.
+
+<!-- compiles: body -->
+```zig
+// making one: mail the text, store the digest, keep nothing else
+const user = try db.one(User, c, .{ .where = .{ .email = form.email } }) orelse return;
+const token = pw.Token.new(try c.entropy(pw.token_len));
+const digest = token.digest();
+_ = try db.insert(Reset, c, .{
+    .user_id = user.id,
+    .digest = sql.Bytes.of(&digest),
+    .expires_at = sql.Timestamp.fromSeconds(sql.Timestamp.now().seconds() + 3600),
+});
+const sent = token.text();
+const link = try std.fmt.allocPrint(c.arena(), "https://example.com/reset/{d}/{s}", .{ user.id, &sent });
+
+// checking one, on the route the link points at
+const presented = c.param("token") orelse return nilo.fail.unauthorized("that link is not one", .{});
+const row = try db.one(Reset, c, .{ .where = .{ .user_id = user.id } }) orelse
+    return nilo.fail.unauthorized("that link is not one", .{});
+if (row.expires_at.micros < nilo.nowMicros() or !pw.Token.matches(row.digest.bytes, presented.view()))
+    return nilo.fail.unauthorized("that link is not one", .{});
+```
+
+| | |
+|---|---|
+| `pw.Token.new(entropy)` | `Token` — from `try c.entropy(pw.token_len)`, or `std.Io.randomSecure` outside a request |
+| `pw.token_len` | 32 — bytes of entropy one is made from, and `Token.len` |
+| `token.text()` | `[43]u8` — base64url, no padding: the form to send. Safe in a URL, a header and a mail |
+| `token.digest()` | `[32]u8` — SHA-256 over the bytes: the form to store. `Token.Digest` is the type |
+| `pw.Token.matches(stored, presented)` | `bool` — decode, hash, compare in constant time. `stored` is the `[]const u8` a `bytea` hands back |
+| `pw.Token.parse(presented)` | `?Token` — the token read back, for a lookup where the digest is the key: `parse(header).?.digest()` |
+
+**Every wrong answer is `false`.** A presented value of the wrong length, a
+character outside base64url, a padded spelling: one answer, because which
+way it was wrong is not something to tell whoever presented it. And a stored
+value that is not 32 bytes is `false` too — which is what a table that stored
+the 43-character text instead of the digest answers on every row, so the
+mistake the digest exists to prevent fails closed.
+
+**No argon2, on purpose.** A password has perhaps forty bits of entropy and
+the stretching is what makes each guess cost 13 ms. A token has 256 and no
+number of guesses at 256 bits is a threat; the digest is stored so that a copy
+of the table is not a set of working links, and SHA-256 does that in a
+microsecond. A reset endpoint that answered in 13 ms would be one that can be
+walked.
+
+**Expiry and single use are columns**, `expires_at` and `used_at` on the
+caller's table, the way the password hash's row is the caller's. What this
+settles is the three things that are the same in every application and wrong
+in most: how wide, how sent, how compared.

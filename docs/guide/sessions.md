@@ -247,6 +247,110 @@ if (try pw.needsRehash(row.?.password.view(), .default)) {
 }
 ```
 
+### Checking one with no request in hand
+
+A CLI that resets an account, a job that re-hashes every row at a raised
+Cost, a test that wants neither an App nor a `Ctx`: none of them has a
+request, and none of them needs one, because the salt is in the stored
+string. `nilo.verifyPassword` is the method without the `Ctx` — the same
+Gate and the same blocking pool, run inline when there is no loop at all
+([ADR 0241](../adr/0241-a-token-is-not-a-password-and-a-check-needs-no-request.md)):
+
+<!-- compiles -->
+```zig
+fn checkFromTheCommandLine(gpa: std.mem.Allocator, stored: []const u8, typed: []const u8) !bool {
+    return nilo.verifyPassword(gpa, stored, typed);
+}
+```
+
+There is no `nilo.hashPassword` beside it. Making a hash needs entropy, and
+`c.entropy` is where the wait for it is paid; outside a request,
+`std.Io.randomSecure` into a `[pw.salt_len]u8` and `pw.hash` is the whole of
+it.
+
+## A token that is not a password
+
+A password-reset link, an email verification, an API key. Every application
+has all three, and the recipe is small enough that everybody writes it and
+wrong in enough places that most get one of them: the token stored as it was
+sent, so that a copy of the table is a set of working links; `std.mem.eql` on
+the compare; a UUID used as the token. `pw.Token` is the recipe written once
+([ADR 0241](../adr/0241-a-token-is-not-a-password-and-a-check-needs-no-request.md)).
+
+<!-- compiles -->
+```zig
+const pw = @import("nilo_pw");
+
+const Forgot = struct { email: Str };
+
+fn forgot(c: *nilo.Ctx, db: *sql.Db, form: nilo.Form(Forgot)) !nilo.Redirect(303) {
+    // The same answer whether or not the address is known, for the reason a
+    // sign-in's is.
+    const user = try db.one(Account, c, .{ .where = .{ .email = form.value.email } }) orelse
+        return .to("/check-your-mail");
+
+    const token = pw.Token.new(try c.entropy(pw.token_len));
+    const digest = token.digest();
+    _ = try db.insert(Reset, c, .{
+        .user_id = user.id,
+        .digest = sql.Bytes.of(&digest),
+        .expires_at = sql.Timestamp.fromSeconds(sql.Timestamp.now().seconds() + 3600),
+    });
+
+    // The text goes in the mail and nowhere else.
+    const sent = token.text();
+    try sendResetMail(c, user.email, &sent);
+    return .to("/check-your-mail");
+}
+
+const NewPassword = struct { password: Str };
+
+// `POST /reset/:user/:token`
+fn reset(
+    c: *nilo.Ctx,
+    db: *sql.Db,
+    user_id: i64,
+    token: Str,
+    form: nilo.Form(NewPassword),
+) !nilo.Redirect(303) {
+    const row = try db.one(Reset, c, .{ .where = .{ .user_id = user_id } }) orelse
+        return nilo.fail.unauthorized("that link is not one", .{});
+    if (row.expires_at.micros < nilo.nowMicros() or !pw.Token.matches(row.digest.bytes, token.view()))
+        return nilo.fail.unauthorized("that link is not one", .{});
+
+    const fresh = try c.hashPassword(pw.huge_pages, form.value.password.view());
+    _ = try db.update(Account, c, .{ .set = .{ .password = fresh.text() }, .where = .{ .id = user_id } });
+    _ = try db.delete(Reset, c, .{ .where = .{ .id = row.id } });
+    return .to("/sign-in");
+}
+
+fn sendResetMail(c: *nilo.Ctx, to: Str, text: []const u8) !void {
+    _ = c;
+    _ = to;
+    _ = text;
+}
+```
+
+Four things about it:
+
+- **Send the text, store the digest, keep nothing else.** `token.text()` is
+  43 characters of base64url — safe in a URL, a header and a mail — and
+  `token.digest()` is SHA-256 over the bytes. A row holding the digest is
+  useless to whoever reads the table, which is the point of it.
+- **`matches` is the whole check, and every wrong answer is `false`.** The
+  wrong length, a character outside base64url, a padded spelling: one
+  answer, because which way a token was wrong is not something to tell
+  whoever presented it. A stored value that is not 32 bytes is `false` too,
+  so a table that kept the text by mistake signs nobody in rather than
+  everybody.
+- **No argon2.** A token has 256 bits of entropy and needs no stretching;
+  a reset endpoint that took 13 ms to say no would be one that can be
+  walked. This is why it is `pw.Token` and not a Cost.
+- **Expiry and single use are yours.** `expires_at` and the `delete` above
+  are columns and a statement in your table, the way the password hash's row
+  is. An API key is the same three calls with no expiry and the digest as
+  the key: `pw.Token.parse(header).?.digest()` is what to look the row up by.
+
 ## Testing
 
 A handler taking a session is an ordinary function, and the session is an

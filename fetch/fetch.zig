@@ -5,7 +5,8 @@
 //! try app.provide(&api);
 //!
 //! fn charge(api: *fetch.Client, c: *nilo.Ctx) !Receipt {
-//!     const res = try api.post(c, "https://api.example.com/v1/charges", "amount=500", .{});
+//!     const res = try api.postJson(c, "https://api.example.com/v1/charges", .{ .amount = 500 }, .{});
+//!     if (res.status == .too_many_requests) return nilo.fail.status(503, "retry after {s}", .{res.header("retry-after") orelse "a while"});
 //!     if (!res.ok()) return nilo.fail.badGateway(c, "the payment service said no");
 //!     return res.json(Receipt, c);
 //! }
@@ -55,9 +56,14 @@
 //!
 //! Two shapes, and the second is the first with the middle left out. An
 //! `Exchange` is one call held open — the response head readable, the body
-//! taken into the Scope or piped straight out. `Client.get` and the three
+//! taken into the Scope or piped straight out. `Client.get` and the calls
 //! beside it are an Exchange begun and finished in one line, which is what a
-//! handler calling somebody's JSON API wants.
+//! handler calling somebody's JSON API wants: `postJson` writes the value
+//! out and says `content-type`, `withQuery` puts a struct on the URL
+//! percent-encoded, and the `Response` keeps its header block so the
+//! `Retry-After` off a 429 is one call away
+//! ([ADR 0243](../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md),
+//! [ADR 0244](../docs/adr/0244-a-response-carries-its-headers.md)).
 //!
 //! ## Where it sits
 //!
@@ -80,6 +86,12 @@ const std = @import("std");
 const core = @import("nilo_core");
 
 const Str = core.Str;
+
+/// A canned server for a suite of your own: `fetch.testing.Canned`, which
+/// answers what `reply` told it to over a real loopback socket on
+/// `std.Io.Threaded`. What the module's own tests drive, exported
+/// ([ADR 0243](../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+pub const testing = @import("testing.zig");
 
 /// The header a request's id travels under (ADR 0196). nilo's own spelling,
 /// the one `Ctx.requestId` reads on the way in and the logger writes on the
@@ -277,7 +289,53 @@ pub const Client = struct {
         return self.send(c, .PATCH, url, body, call);
     }
 
-    /// The whole of what the four above do, for a method they do not name.
+    /// `post` with `value` written out as JSON and `content-type:
+    /// application/json` said for you — unless `call.headers` names one,
+    /// which is then the one that goes. What `res.json(T, c)` is for the way
+    /// in, this is for the way out
+    /// ([ADR 0243](../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+    ///
+    /// One arena allocation for the text, which is the one every caller was
+    /// already paying to `std.json.Stringify.valueAlloc` by hand. Text is
+    /// refused while compiling: a `[]const u8` here would go out as one JSON
+    /// *string*, quotes and all, and a body already encoded goes through
+    /// `post`.
+    pub fn postJson(self: *Client, c: anytype, url: []const u8, value: anytype, call: Call) Error!Response {
+        comptime core.checkScope(@TypeOf(c), "fetch.postJson");
+        comptime refuseJsonText(@TypeOf(value), "fetch.postJson");
+        return self.sendJson(c, .POST, url, value, call);
+    }
+
+    pub fn putJson(self: *Client, c: anytype, url: []const u8, value: anytype, call: Call) Error!Response {
+        comptime core.checkScope(@TypeOf(c), "fetch.putJson");
+        comptime refuseJsonText(@TypeOf(value), "fetch.putJson");
+        return self.sendJson(c, .PUT, url, value, call);
+    }
+
+    pub fn patchJson(self: *Client, c: anytype, url: []const u8, value: anytype, call: Call) Error!Response {
+        comptime core.checkScope(@TypeOf(c), "fetch.patchJson");
+        comptime refuseJsonText(@TypeOf(value), "fetch.patchJson");
+        return self.sendJson(c, .PATCH, url, value, call);
+    }
+
+    /// The whole of what the three above do, for a method they do not name
+    /// — a DELETE with `{ids:[…]}` in it (ADR 0213).
+    pub fn sendJson(
+        self: *Client,
+        c: anytype,
+        method: std.http.Method,
+        url: []const u8,
+        value: anytype,
+        call: Call,
+    ) Error!Response {
+        comptime core.checkScope(@TypeOf(c), "fetch.sendJson");
+        comptime refuseJsonText(@TypeOf(value), "fetch.sendJson");
+        const bytes = try std.json.Stringify.valueAlloc(c.arena(), value, .{});
+        return self.sendAs(c, method, url, bytes, "application/json", call);
+    }
+
+    /// The whole of what `get`, `post`, `put`, `delete` and `patch` do, for
+    /// a method they do not name.
     ///
     /// The permit is held until the body is in hand rather than until the head
     /// arrives, because a connection is live for the whole of that — counting
@@ -292,7 +350,21 @@ pub const Client = struct {
         call: Call,
     ) Error!Response {
         comptime core.checkScope(@TypeOf(c), "fetch.send");
+        return self.sendAs(c, method, url, body, null, call);
+    }
 
+    /// `send`, with a `content-type` the call decided — what `sendJson`
+    /// says for its body. Null is std's slot left to std, which writes none
+    /// for a body it was not told the type of.
+    fn sendAs(
+        self: *Client,
+        c: anytype,
+        method: std.http.Method,
+        url: []const u8,
+        body: ?[]const u8,
+        content_type: ?[]const u8,
+        call: Call,
+    ) Error!Response {
         // The one buffer this call needs, declared where a reader can see
         // what it costs. It is stack, and by
         // [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md) a
@@ -324,13 +396,24 @@ pub const Client = struct {
             .url = url,
             .headers = headers,
             .body = if (body) |bytes| .{ .slice = bytes } else .none,
+            // The caller's own `content-type` line wins over the one the
+            // call decided, and std's slot is then left out so it goes once
+            // (ADR 0231).
+            .content_type = if (Exchange.Given.of(call.headers).content_type) null else content_type,
             .timeout_ms = call.timeout_ms,
             .stall_ms = call.stall_ms,
             .redirects = .{ .follow = &redirect_buffer },
         });
 
+        // The header block, kept before the body reads over it: the second
+        // arena allocation of a whole-body call, beside the body's own, so
+        // that `res.header("retry-after")` is there to read after the call
+        // ([ADR 0244](../docs/adr/0244-a-response-carries-its-headers.md)).
+        const kept = try c.arena().dupe(u8, head.bytes);
+
         return .{
             .status = head.status,
+            .headers = kept,
             .body = try ex.take(c, call.max_body orelse self.settings.max_body),
         };
     }
@@ -603,11 +686,7 @@ pub const Exchange = struct {
         /// A header by name, case-insensitively. Null when it is absent —
         /// which for `etag` is a fact about the server rather than an error.
         pub fn header(self: Head, name: []const u8) ?[]const u8 {
-            var it: std.http.HeaderIterator = .init(self.bytes);
-            while (it.next()) |h| {
-                if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
-            }
-            return null;
+            return headerIn(self.bytes, name);
         }
 
         /// The URL a followed redirect ended at, written into `buf`, or null
@@ -1404,8 +1483,29 @@ pub const Exchange = struct {
     }
 };
 
+/// A header by name out of a head block, case-insensitively: the walk
+/// `Exchange.Head.header` and `Response.header` share. Null for a block with
+/// no line in it, because `std.http.HeaderIterator.init` asserts the first
+/// `\r\n` is there and a `Response` built by hand in a test has none.
+fn headerIn(block: []const u8, name: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, block, "\r\n") == null) return null;
+    var it: std.http.HeaderIterator = .init(block);
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
+}
+
 pub const Response = struct {
     status: std.http.Status,
+    /// The header block the answer arrived with — status line, every header,
+    /// the blank line — kept into the Scope the way `head.keep(c)` keeps it,
+    /// so it reads the same after the body has been through. One arena
+    /// allocation its own size, on the whole-body calls only
+    /// ([ADR 0244](../docs/adr/0244-a-response-carries-its-headers.md)).
+    /// `header(name)` is the way to read it; a `Response` built by hand in
+    /// a test leaves it empty and every lookup then answers null.
+    headers: []const u8 = "",
     /// Request-lifetime text. It is in the Scope's arena, so it goes when the
     /// request does and nothing has to be freed — and it may not outlive the
     /// request without `.keep()`, like every other `Str`.
@@ -1415,6 +1515,14 @@ pub const Response = struct {
     /// and because everybody writes this line anyway.
     pub fn ok(self: Response) bool {
         return @intFromEnum(self.status) >= 200 and @intFromEnum(self.status) < 300;
+    }
+
+    /// A header by name, case-insensitively, or null when the answer did not
+    /// carry it: `Retry-After` on a 429, `ETag` for the next conditional GET,
+    /// `Location` on a 201, `Link` on a page-by-header API. The slice points
+    /// into `headers`, so it lives as long as the Scope does and no longer.
+    pub fn header(self: Response, name: []const u8) ?[]const u8 {
+        return headerIn(self.headers, name);
     }
 
     /// The body parsed into a type of your own, allocated from the same Scope
@@ -1430,44 +1538,211 @@ pub const Response = struct {
     }
 };
 
-const testing = std.testing;
+/// `base` with `params` on the end of it as a query string, percent-encoded,
+/// in the Scope's memory:
+///
+/// ```zig
+/// const url = try fetch.withQuery(c, "https://api.example.com/search", .{ .page = 2, .q = q });
+/// // https://api.example.com/search?page=2&q=a%20b
+/// const res = try api.get(c, url, .{});
+/// ```
+///
+/// `params` is a struct of your own, one field per param, and the field's
+/// type is the whole of what it may be: an int, a bool, text (`[]const u8`,
+/// a string literal, a `Str`), or an optional of one of those, where null is
+/// the param left out. Anything else is a Refusal naming the field. A `base`
+/// that already carries a `?` gets `&`; a `base` ending in `?` or `&` gets
+/// the first param straight after it.
+///
+/// A function that answers a URL rather than a `.query` field on `Call`,
+/// because `Call` is a plain struct and a struct of the caller's own cannot
+/// sit in a field of it — and the same reason it is not an arm of
+/// `Exchange.Body` ([ADR 0243](../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+/// The URL is what every call takes, `Exchange.begin` included, so one
+/// function serves all of them.
+///
+/// **One arena allocation, sized exactly**: the params are measured and then
+/// written, the way `core.percent`'s own callers do, so there is no growing
+/// writer and no second copy. The space is `%20` and never `+`, and the hex
+/// is upper-case, for the reasons `core/percent.zig` gives: both are the
+/// difference between a signed request that verifies and one that does not.
+pub fn withQuery(c: anytype, base: []const u8, params: anytype) error{OutOfMemory}![]const u8 {
+    comptime core.checkScope(@TypeOf(c), "fetch.withQuery");
+    const P = @TypeOf(params);
+    const info = @typeInfo(P);
+    // `.{}` is the empty tuple to Zig and "no params" to a caller, so it
+    // passes; a tuple with something in it has no names to be params.
+    const named = switch (info) {
+        .@"struct" => |st| !st.is_tuple or st.fields.len == 0,
+        else => false,
+    };
+    if (!named) @compileError("nilo: fetch.withQuery was handed a " ++ @typeName(P) ++
+        " for its params, and a query is a struct with one field per param.");
+    const fields = info.@"struct".fields;
+    inline for (fields) |f| comptime checkQueryField(f.name, f.type);
+
+    // What goes between the base and the first param: nothing when the base
+    // already ends on a separator, `&` when it already has a query, `?`
+    // otherwise. Every param after the first gets `&`.
+    const first: ?u8 = if (base.len == 0)
+        '?'
+    else if (base[base.len - 1] == '?' or base[base.len - 1] == '&')
+        null
+    else if (std.mem.indexOfScalar(u8, base, '?') != null)
+        '&'
+    else
+        '?';
+
+    // Measured, then written, into exactly that.
+    var len: usize = base.len;
+    var written: usize = 0;
+    inline for (fields) |f| {
+        if (queryValue(@field(params, f.name))) |v| {
+            if (written > 0 or first != null) len += 1;
+            len += core.percent.encodedLen(f.name, .unreserved) + 1 + v.encodedLen();
+            written += 1;
+        }
+    }
+
+    const out = try c.arena().alloc(u8, len);
+    var w: std.Io.Writer = .fixed(out);
+    w.writeAll(base) catch unreachable; // measured above
+    var sep = first;
+    inline for (fields) |f| {
+        if (queryValue(@field(params, f.name))) |v| {
+            if (sep) |ch| w.writeByte(ch) catch unreachable;
+            sep = '&';
+            core.percent.encodeWrite(&w, f.name, .unreserved) catch unreachable;
+            w.writeByte('=') catch unreachable;
+            v.write(&w) catch unreachable;
+        }
+    }
+    std.debug.assert(w.buffered().len == len);
+    return w.buffered();
+}
+
+/// One query param's value, on its way out: digits and the two words go as
+/// they are, text is percent-encoded.
+const QueryValue = union(enum) {
+    /// An int, formatted. Forty bytes holds a 128-bit one with its sign.
+    number: struct { buf: [40]u8, len: usize },
+    /// `true` or `false`.
+    word: []const u8,
+    /// Text, encoded on the way out with `/` as data.
+    text: []const u8,
+
+    fn encodedLen(self: QueryValue) usize {
+        return switch (self) {
+            .number => |n| n.len,
+            .word => |s| s.len,
+            .text => |s| core.percent.encodedLen(s, .unreserved),
+        };
+    }
+
+    fn write(self: QueryValue, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .number => |n| try w.writeAll(n.buf[0..n.len]),
+            .word => |s| try w.writeAll(s),
+            .text => |s| try core.percent.encodeWrite(w, s, .unreserved),
+        }
+    }
+};
+
+/// The value of one field of a query struct as a `QueryValue`, or null for
+/// an optional that is null, which is the param left out.
+fn queryValue(v: anytype) ?QueryValue {
+    const T = @TypeOf(v);
+    switch (@typeInfo(T)) {
+        .null => return null,
+        .optional => return if (v) |inner| queryValue(inner) else null,
+        .int, .comptime_int => {
+            var out: QueryValue = .{ .number = .{ .buf = undefined, .len = 0 } };
+            const digits = std.fmt.bufPrint(&out.number.buf, "{d}", .{v}) catch unreachable; // 40 bytes holds any int here
+            out.number.len = digits.len;
+            return out;
+        },
+        .bool => return .{ .word = if (v) "true" else "false" },
+        else => return .{ .text = if (T == Str) v.view() else v },
+    }
+}
+
+/// Whether `T` is text this module reads as such: a `Str`, a slice of
+/// bytes, or a pointer to an array of them, which is what a string literal
+/// is.
+fn isText(comptime T: type) bool {
+    if (T == Str) return true;
+    return switch (@typeInfo(T)) {
+        .pointer => |p| switch (p.size) {
+            .slice => p.child == u8,
+            .one => switch (@typeInfo(p.child)) {
+                .array => |a| a.child == u8,
+                else => false,
+            },
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// The Refusal for a query field of a type no query string can carry: a
+/// struct, a float, an enum, a pointer to something that is not text. Named
+/// by the field, because the struct is anonymous and the field is what the
+/// caller wrote.
+fn checkQueryField(comptime field: []const u8, comptime T: type) void {
+    const ok = switch (@typeInfo(T)) {
+        .int, .comptime_int, .bool, .null => true,
+        .optional => |o| return checkQueryField(field, o.child),
+        else => isText(T),
+    };
+    if (!ok) @compileError("nilo: the query field `" ++ field ++ "` is a " ++ @typeName(T) ++
+        ", and a query value is an int, a bool, text, or an optional of one.");
+}
+
+/// The Refusal for text handed to a JSON call. `std.json` would write it
+/// out as one JSON string — `"{\"amount\":500}"`, quotes and escapes and all
+/// — and the far end would answer 400 to a body that looked right in the
+/// editor. A body already encoded goes through `post`.
+fn refuseJsonText(comptime T: type, comptime called: []const u8) void {
+    if (isText(T)) @compileError("nilo: " ++ called ++ " was handed text, and would send it as one JSON string. " ++
+        "A body already encoded goes through post, put, patch or send.");
+}
 
 test "a client that was never started refuses rather than dialling undefined" {
-    var client: Client = .init(testing.allocator, .{});
+    var client: Client = .init(std.testing.allocator, .{});
     defer client.deinit();
 
-    var run: core.Run = .init(testing.allocator);
+    var run: core.Run = .init(std.testing.allocator);
     defer run.deinit();
 
-    try testing.expectError(error.NotStarted, client.get(&run, "http://example.invalid/", .{}));
+    try std.testing.expectError(error.NotStarted, client.get(&run, "http://example.invalid/", .{}));
 }
 
 test "an answer with no body by rule is bodiless whatever its headers say" {
     // The four the RFC lists, and a 200 beside them as the control.
-    try testing.expect(Exchange.bodiless(.HEAD, .ok));
-    try testing.expect(Exchange.bodiless(.GET, .@"continue"));
-    try testing.expect(Exchange.bodiless(.POST, .no_content));
-    try testing.expect(Exchange.bodiless(.GET, .not_modified));
-    try testing.expect(!Exchange.bodiless(.GET, .ok));
-    try testing.expect(!Exchange.bodiless(.DELETE, .ok));
+    try std.testing.expect(Exchange.bodiless(.HEAD, .ok));
+    try std.testing.expect(Exchange.bodiless(.GET, .@"continue"));
+    try std.testing.expect(Exchange.bodiless(.POST, .no_content));
+    try std.testing.expect(Exchange.bodiless(.GET, .not_modified));
+    try std.testing.expect(!Exchange.bodiless(.GET, .ok));
+    try std.testing.expect(!Exchange.bodiless(.DELETE, .ok));
 }
 
 test "the gate hands out no more permits than it was given" {
-    var client: Client = .init(testing.allocator, .{ .max_in_flight = 2 });
+    var client: Client = .init(std.testing.allocator, .{ .max_in_flight = 2 });
     defer client.deinit();
-    try testing.expectEqual(@as(usize, 2), client.gate.permits);
+    try std.testing.expectEqual(@as(usize, 2), client.gate.permits);
 }
 
 test "a response says whether it is one to read" {
     const body: Str = .static("");
-    try testing.expect((Response{ .status = .ok, .body = body }).ok());
-    try testing.expect((Response{ .status = .created, .body = body }).ok());
-    try testing.expect(!(Response{ .status = .not_found, .body = body }).ok());
-    try testing.expect(!(Response{ .status = .internal_server_error, .body = body }).ok());
+    try std.testing.expect((Response{ .status = .ok, .body = body }).ok());
+    try std.testing.expect((Response{ .status = .created, .body = body }).ok());
+    try std.testing.expect(!(Response{ .status = .not_found, .body = body }).ok());
+    try std.testing.expect(!(Response{ .status = .internal_server_error, .body = body }).ok());
     // The edges of the class, because 299 and 300 are one apart and one of
     // them is a redirect.
-    try testing.expect((Response{ .status = @enumFromInt(299), .body = body }).ok());
-    try testing.expect(!(Response{ .status = @enumFromInt(300), .body = body }).ok());
+    try std.testing.expect((Response{ .status = @enumFromInt(299), .body = body }).ok());
+    try std.testing.expect(!(Response{ .status = @enumFromInt(300), .body = body }).ok());
 }
 
 /// A `Limits` that always says its deadline is what fired, so the decision
@@ -1487,7 +1762,7 @@ const always_fired: core.Limits = .{ .vtable = &.{
 } };
 
 test "a failure this call's own clock caused is a timeout, whatever it is called" {
-    var client: Client = .init(testing.allocator, .{});
+    var client: Client = .init(std.testing.allocator, .{});
     defer client.deinit();
 
     // Armed against a Limits that claims every cancellation as its own: this
@@ -1495,14 +1770,14 @@ test "a failure this call's own clock caused is a timeout, whatever it is called
     var mine: core.Limits.Bound = .idle;
     defer mine.release();
     mine.arm(always_fired, 1_000);
-    try testing.expectEqual(Client.Error.TimedOut, client.blame(&mine, false, false, false, error.Canceled));
+    try std.testing.expectEqual(Client.Error.TimedOut, client.blame(&mine, false, false, false, error.Canceled));
 
     // And the case a real timer actually produces. `std.Io.Reader`'s error set
     // is fixed, so a cancellation mid-body arrives as `error.ReadFailed` with
     // the cause kept in a field; `fetch/deadline.zig` is where that was seen.
     // A version of `blame` that matched on `error.Canceled` returned this
     // unchanged and every timeout looked like a broken upstream.
-    try testing.expectEqual(Client.Error.TimedOut, client.blame(&mine, false, false, false, error.ReadFailed));
+    try std.testing.expectEqual(Client.Error.TimedOut, client.blame(&mine, false, false, false, error.ReadFailed));
 
     // Armed against nothing, which is what a shutdown looks like: the
     // cancellation was somebody else's and must not be reported as a timeout,
@@ -1510,47 +1785,47 @@ test "a failure this call's own clock caused is a timeout, whatever it is called
     var theirs: core.Limits.Bound = .idle;
     defer theirs.release();
     theirs.arm(.off, 1_000);
-    try testing.expectEqual(Client.Error.Canceled, client.blame(&theirs, false, false, false, error.Canceled));
+    try std.testing.expectEqual(Client.Error.Canceled, client.blame(&theirs, false, false, false, error.Canceled));
 
     // A failure with no deadline behind it is passed through as itself, which
     // is the whole reason the bound is asked rather than assumed.
-    try testing.expectEqual(
+    try std.testing.expectEqual(
         Client.Error.ConnectionRefused,
         client.blame(&theirs, false, false, false, error.ConnectionRefused),
     );
 }
 
 test "silence is blamed before the call's clock, and the Engine's one timer says which it stood for" {
-    var client: Client = .init(testing.allocator, .{});
+    var client: Client = .init(std.testing.allocator, .{});
     defer client.deinit();
 
     // With no Engine the Exchange keeps both clocks itself, and the one
     // that fired is the one it says.
     var theirs: core.Limits.Bound = .idle;
     defer theirs.release();
-    try testing.expectEqual(Client.Error.Stalled, client.blame(&theirs, false, false, true, error.ReadFailed));
-    try testing.expectEqual(Client.Error.TimedOut, client.blame(&theirs, false, true, false, error.ReadFailed));
+    try std.testing.expectEqual(Client.Error.Stalled, client.blame(&theirs, false, false, true, error.ReadFailed));
+    try std.testing.expectEqual(Client.Error.TimedOut, client.blame(&theirs, false, true, false, error.ReadFailed));
 
     // Under an Engine there is one timer, armed for whichever bound was
     // nearer, and `stall_armed` is what remembers which (ADR 0237).
     var mine: core.Limits.Bound = .idle;
     defer mine.release();
     mine.arm(always_fired, 1_000);
-    try testing.expectEqual(Client.Error.Stalled, client.blame(&mine, true, false, false, error.ReadFailed));
+    try std.testing.expectEqual(Client.Error.Stalled, client.blame(&mine, true, false, false, error.ReadFailed));
     var again: core.Limits.Bound = .idle;
     defer again.release();
     again.arm(always_fired, 1_000);
-    try testing.expectEqual(Client.Error.TimedOut, client.blame(&again, false, false, false, error.ReadFailed));
+    try std.testing.expectEqual(Client.Error.TimedOut, client.blame(&again, false, false, false, error.ReadFailed));
 }
 
 test "the read buffer size reaches std's client, and the default is std's own" {
-    var plain: Client = .init(testing.allocator, .{});
+    var plain: Client = .init(std.testing.allocator, .{});
     defer plain.deinit();
-    try testing.expectEqual(@as(usize, 8 << 10), plain.inner.read_buffer_size);
+    try std.testing.expectEqual(@as(usize, 8 << 10), plain.inner.read_buffer_size);
 
-    var wide: Client = .init(testing.allocator, .{ .read_buffer_size = 64 << 10 });
+    var wide: Client = .init(std.testing.allocator, .{ .read_buffer_size = 64 << 10 });
     defer wide.deinit();
-    try testing.expectEqual(@as(usize, 64 << 10), wide.inner.read_buffer_size);
+    try std.testing.expectEqual(@as(usize, 64 << 10), wide.inner.read_buffer_size);
 }
 
 test "a streamed body is not replayed, because its reader is spent" {
@@ -1560,11 +1835,93 @@ test "a streamed body is not replayed, because its reader is spent" {
     // on the wire than the `content-length` announced, which is a corrupted
     // request rather than a recovered one
     // ([ADR 0067](../docs/adr/0067-most-of-an-s3-client-is-not-s3.md)).
-    try testing.expect(Exchange.replayable(.none));
-    try testing.expect(Exchange.replayable(.{ .slice = "x" }));
+    try std.testing.expect(Exchange.replayable(.none));
+    try std.testing.expect(Exchange.replayable(.{ .slice = "x" }));
 
     var empty: std.Io.Reader = .fixed("");
-    try testing.expect(!Exchange.replayable(.{ .stream = .{ .reader = &empty, .len = 0 } }));
+    try std.testing.expect(!Exchange.replayable(.{ .stream = .{ .reader = &empty, .len = 0 } }));
+}
+
+// ---- the ordinary call: a query on the URL (ADR 0243) ----
+
+test "a query struct becomes a percent-encoded query string, in one allocation" {
+    var run: core.Run = .init(std.testing.allocator);
+    defer run.deinit();
+
+    const url = try withQuery(&run, "https://api.example.com/search", .{ .page = 2, .q = "a b" });
+    try std.testing.expectEqualStrings("https://api.example.com/search?page=2&q=a%20b", url);
+
+    // Every type a value may be, and the encoding each gets: digits and the
+    // two words go bare, text is escaped with `/` as data and the hex in
+    // upper case, the way a signature wants it.
+    const mixed = try withQuery(&run, "http://h/", .{
+        .n = @as(i64, -7),
+        .big = @as(u64, std.math.maxInt(u64)),
+        .yes = true,
+        .no = false,
+        .path = "a/b?c=d&e",
+        .word = run.str("café"),
+    });
+    try std.testing.expectEqualStrings(
+        "http://h/?n=-7&big=18446744073709551615&yes=true&no=false&path=a%2Fb%3Fc%3Dd%26e&word=caf%C3%A9",
+        mixed,
+    );
+}
+
+test "a null param is left out, and a base that already has a query gets an ampersand" {
+    var run: core.Run = .init(std.testing.allocator);
+    defer run.deinit();
+
+    const cursor: ?[]const u8 = null;
+    const limit: ?u32 = 50;
+    const url = try withQuery(&run, "http://h/items?sort=asc", .{ .cursor = cursor, .limit = limit });
+    try std.testing.expectEqualStrings("http://h/items?sort=asc&limit=50", url);
+
+    // Nothing to add is the base handed back byte for byte, and a base
+    // that ends on its separator takes the first param straight after it.
+    try std.testing.expectEqualStrings("http://h/items", try withQuery(&run, "http://h/items", .{ .cursor = cursor }));
+    try std.testing.expectEqualStrings("http://h/items", try withQuery(&run, "http://h/items", .{}));
+    try std.testing.expectEqualStrings("http://h/?a=1", try withQuery(&run, "http://h/?", .{ .a = 1 }));
+    try std.testing.expectEqualStrings("http://h/?x=1&a=1", try withQuery(&run, "http://h/?x=1&", .{ .a = 1 }));
+}
+
+test "a query is written into exactly the bytes it was measured at" {
+    // The measuring pass and the writing pass are two walks over the same
+    // fields, and the assert in `withQuery` is what holds them together;
+    // this is the same claim from the outside, on a value of every kind.
+    var run: core.Run = .init(std.testing.allocator);
+    defer run.deinit();
+    const url = try withQuery(&run, "http://h/x", .{ .a = 0, .b = "", .c = true, .d = "%" });
+    try std.testing.expectEqualStrings("http://h/x?a=0&b=&c=true&d=%25", url);
+}
+
+// ---- a response carries its headers (ADR 0244) ----
+
+test "a response answers a header case-insensitively, and null for one it did not carry" {
+    const res: Response = .{
+        .status = .too_many_requests,
+        .headers = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\n\r\n",
+        .body = .static(""),
+    };
+    try std.testing.expectEqualStrings("30", res.header("retry-after").?);
+    try std.testing.expectEqualStrings("30", res.header("RETRY-AFTER").?);
+    try std.testing.expectEqualStrings("0", res.header("content-length").?);
+    try std.testing.expect(res.header("etag") == null);
+
+    // A `Response` built by hand carries no block, and a lookup is then a
+    // null rather than a walk off the end of nothing.
+    const bare: Response = .{ .status = .ok, .body = .static("") };
+    try std.testing.expect(bare.header("retry-after") == null);
+}
+
+test "text is read as text and a struct is not, which is what the two Refusals rest on" {
+    try std.testing.expect(isText([]const u8));
+    try std.testing.expect(isText([]u8));
+    try std.testing.expect(isText(*const [3:0]u8));
+    try std.testing.expect(isText(Str));
+    try std.testing.expect(!isText(u32));
+    try std.testing.expect(!isText(struct { a: u8 }));
+    try std.testing.expect(!isText([]const u32));
 }
 
 test {

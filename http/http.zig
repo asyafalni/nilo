@@ -236,6 +236,27 @@ pub const sleep = @import("bulkhead.zig").sleep;
 /// fits in the expression that wants it.
 pub const randomSecure = @import("bulkhead.zig").randomSecure;
 
+/// Whether a password matches a stored hash, with no request in hand — what
+/// `c.verifyPassword` is underneath, for a CLI resetting an account, a job
+/// re-hashing at a raised Cost, or a test with neither an App nor a Ctx
+/// (ADR 0241).
+///
+/// ```zig
+/// if (!try nilo.verifyPassword(pw.huge_pages, row.password, typed)) return error.WrongPassword;
+/// ```
+///
+/// The same Gate and the same blocking pool as the method: on the server's
+/// loop it holds one of `password_hashes_at_once` permits, and with no loop
+/// at all it runs inline. Checking needs no request because the salt is in
+/// the stored string; making a hash does, because the salt comes from
+/// `c.entropy`, which is why there is no `nilo.hashPassword` beside this.
+/// `stored` is `?[]const u8` and null costs what an account costs, here as
+/// everywhere.
+pub const verifyPassword = @import("password.zig").verifyAnywhere;
+
+/// The same, told what a hash of yours costs (ADR 0049).
+pub const verifyPasswordWith = @import("password.zig").verifyAnywhereWith;
+
 /// What time it is: microseconds and milliseconds since the epoch, from
 /// `nilo_core` (ADR 0045). Reading the wall clock needs no event loop, so
 /// this is a plain function rather than a call on the `Ctx` — nobody owns
@@ -388,6 +409,28 @@ pub const Authorization = @import("authorization.zig").Authorization;
 /// `nilo_cache` one — provided as a service; `.by` is whose key it is.
 pub const Idempotent = @import("typed.zig").Idempotent;
 pub const IdempotentOptions = @import("typed.zig").IdempotentOptions;
+
+/// A kept answer served again for a time, as a typed argument that makes
+/// a GET say "cache this for a minute" in its signature
+/// ([ADR 0247](../docs/adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)).
+///
+/// ```zig
+/// const Pages = cache.Space("pages", []const u8, .{ .max_bytes = 64 << 10 });
+///
+/// fn frontPage(page: nilo.Cached(Pages, .{ .ttl_s = 60 }), db: *sql.Db, c: *nilo.Ctx) !Front
+/// ```
+///
+/// The first request runs the handler and keeps what it returned under the
+/// path and query; every request for the same inside `ttl_s` gets that
+/// back, with `Cache-Status: nilo; hit`, and the handler does not run. A
+/// request that finds the answer still being made waits for it — bounded,
+/// and by the route's deadline first — rather than being told 409. A
+/// failure is not kept. GET and HEAD only: a write is a Refusal. `Pages`
+/// is any bytes Space with `putIfAbsent` and `putFor` — a `nilo_cache` one
+/// — provided as a service; `.by` is what the key is made of.
+pub const Cached = @import("cached.zig").Cached;
+pub const CachedOptions = @import("cached.zig").Options;
+pub const CachedBy = @import("cached.zig").By;
 
 /// An HTML form body, read into a struct of yours — the same idea as
 /// `Query(T)`, on the body instead of the query string (ADR 0031).
@@ -856,6 +899,7 @@ test {
     _ = @import("within.zig");
     _ = @import("authorization.zig");
     _ = @import("idempotent.zig");
+    _ = @import("cached.zig");
     _ = @import("health.zig");
     _ = @import("ctx.zig");
     _ = @import("logger.zig");

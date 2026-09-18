@@ -52,6 +52,10 @@ const Busiest = struct {
     email: Str,
     documents: i64,
 };
+
+comptime {
+    _ = Busiest;
+}
 ```
 
 It has every column type, every reader and every conversion an ordinary Row has,
@@ -80,6 +84,10 @@ const CommentLine = struct {
     body: Str,
     attachments: []const Attachment = &.{},
 };
+
+comptime {
+    _ = CommentLine;
+}
 ```
 
 The field is an ordinary typed field to the JSON writer and the document, and
@@ -464,6 +472,11 @@ the `LIMIT` nothing, so two requests for the same page can hold one row twice an
 miss another; and `FOR UPDATE` beside a window function is a run-time error from
 Postgres. `tx.page` is the same call inside a transaction. `sql.Page(Row)` is the
 answer's type, for a handler returning one.
+
+A page too deep for `OFFSET` to stay fast wants
+[the keyset form](../guide/sql/reading.md#the-keyset-form-of-a-deep-page)
+instead — a condition the caller writes by hand rather than a call here, and
+without `db.page`'s running total.
 
 ### A batch
 
@@ -1098,6 +1111,10 @@ const Staff = struct {
     id: i64,
     email: Str,
 };
+
+comptime {
+    _ = Staff;
+}
 ```
 
 Everything else about the Row is unchanged — `.references` may point at it,

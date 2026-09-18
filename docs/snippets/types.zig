@@ -52,6 +52,18 @@ pub const Account = User;
 /// What that guide's session actually holds — a user's id, not the row.
 pub const Signed = struct { user: u32, admin: bool = false };
 
+/// The row a password-reset link points at, for the `pw.Token` section of
+/// the sessions guide: whose it is, the digest and never the text, and when
+/// it stops working (ADR 0241).
+pub const Reset = struct {
+    pub const nilo_table = .{ .name = "password_resets", .key = .id };
+
+    id: i64,
+    user_id: i64,
+    digest: sql.Bytes,
+    expires_at: sql.Timestamp,
+};
+
 /// What the cache page keeps: a flat value, because a cache entry outlives the
 /// request that wrote it and so may hold no pointer (ADR 0138).
 pub const Cart = struct {

@@ -23,6 +23,18 @@
 //! there is one blocking pool and one memory controller per process, and two
 //! Apps in one process hashing 8 each would be 16 — which is the number the
 //! measurement says not to run. `limit` is set from `Options` by `listen`.
+//!
+//! **Checking needs no request, and `verifyAnywhere` is that half said out
+//! loud** (ADR 0241). Hashing takes a `Ctx` because the salt comes from
+//! `Ctx.entropy`; verifying reads the salt out of the stored string and
+//! needs nothing from the request at all — `verifyWith` began with `_ = c;`
+//! for a year. What the parameter cost was every caller that has no request:
+//! a CLI resetting an account, a job re-hashing at a raised Cost, a test
+//! that wants neither an App nor a Ctx — all of them written against
+//! `nilo_pw` directly and so outside the Gate. `verifyAnywhere` is the same
+//! Gate and the same pool with no `Ctx` in the signature, exported as
+//! `nilo.verifyPassword`; the method stays and calls it, because dropping a
+//! parameter from a signature that shipped is a break for nothing.
 
 const std = @import("std");
 const pw = @import("nilo_pw");
@@ -131,7 +143,37 @@ pub fn verifyWith(
     stored: ?[]const u8,
     password: []const u8,
 ) !bool {
+    // The request is not used, and never was: the salt is in `stored`. The
+    // parameter stays because the method shipped with it (ADR 0241).
     _ = c;
+    return verifyAnywhereWith(cost, gpa, stored, password);
+}
+
+/// Whether a password matches a stored hash, with no request in hand — a
+/// CLI resetting an account, a job re-hashing at a raised Cost, a test that
+/// wants neither an App nor a Ctx (ADR 0241). `nilo.verifyPassword` is this.
+///
+/// The same Gate and the same blocking pool as `verify`, so a job checking
+/// passwords on the server's loop holds one of the eight permits like a
+/// sign-in does, and a CLI with no loop at all runs the call inline — which
+/// is what `nilo.blocking` does outside a fiber (ADR 0003). `stored` is
+/// optional for the reason it is everywhere else: null costs what an
+/// account costs.
+pub fn verifyAnywhere(
+    gpa: std.mem.Allocator,
+    stored: ?[]const u8,
+    password: []const u8,
+) !bool {
+    return verifyAnywhereWith(.default, gpa, stored, password);
+}
+
+/// The same, told what a hash of yours costs (ADR 0049).
+pub fn verifyAnywhereWith(
+    comptime cost: pw.Cost,
+    gpa: std.mem.Allocator,
+    stored: ?[]const u8,
+    password: []const u8,
+) !bool {
     try gate.enter();
     defer gate.leave();
 
@@ -218,6 +260,25 @@ test "a handler can hash a password and check it again" {
     const answer = try client.post(&app, "/sign-in", "");
     try testing.expectEqual(@as(u16, 200), answer.status);
     try testing.expect(std.mem.startsWith(u8, answer.body, "$argon2id$v=19$"));
+}
+
+test "a stored hash is checked with no request in hand, through the same Gate" {
+    // No App, no Client, no Ctx: the shape a CLI resetting an account has,
+    // and the one a job re-hashing at a raised Cost has. The hash is made
+    // through `nilo_pw` directly because making one needs entropy and this
+    // test has no request to draw it from; checking it needs nothing, which
+    // is the whole of what ADR 0241 says.
+    const gpa = testing.allocator;
+    const salt: [pw.salt_len]u8 = @splat(9);
+    const stored = try pw.hashWith(test_cost, gpa, "hunter2", salt);
+
+    try testing.expect(try verifyAnywhereWith(test_cost, gpa, stored.text(), "hunter2"));
+    try testing.expect(!try verifyAnywhereWith(test_cost, gpa, stored.text(), "hunter3"));
+    // The no-account path does the work and answers false here too.
+    try testing.expect(!try verifyAnywhereWith(test_cost, gpa, null, "hunter2"));
+    // And a string that is not a hash is the database's problem, not a
+    // wrong password.
+    try testing.expectError(error.NotAHash, verifyAnywhereWith(test_cost, gpa, "hunter2", "hunter2"));
 }
 
 test "the Gate lets its number through and puts the rest back in order" {

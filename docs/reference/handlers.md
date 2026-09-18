@@ -15,6 +15,7 @@ One page of [the reference](./README.md): what a handler's arguments mean, what 
 | `FromHeader("X-Staff-Id", T)` | one request header, converted like a path param |
 | `Authorization(.bearer)`, `Authorization(.{ .basic = "realm" })` | the `Authorization` header as one scheme — absent or another scheme is a 401 with the challenge on it |
 | `Idempotent(Replays, .{ .by = fn })` | the `Idempotency-Key` header, and with it the route answering once per key: a retry gets the kept answer back and the handler does not run |
+| `Cached(Pages, .{ .ttl_s = 60 })` | the answer kept for a minute under the path and query: the next request gets it back and the handler does not run. GET and HEAD only |
 | `Form(T)` | the body as an HTML form — urlencoded or multipart |
 | `Bound(W)` | any of the three above, with its failures instead of a 400 |
 | `Session(T)` | the session, out of its cookie |
@@ -203,6 +204,50 @@ file or a redirect has no answer nilo can keep, and is a Refusal.
 On the route that asks, and nowhere else: one arena allocation of the
 Space's `max_bytes` to read a kept answer into, one to encode the answer being
 kept, and the JSON buffer the answer was taking anyway. Nothing on the stack.
+
+### `Cached(Pages, options)`
+
+A kept answer served again for a time, as the argument that makes a GET say
+so in its signature
+([ADR 0247](../adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)):
+
+<!-- compiles -->
+```zig
+const Pages = cache.Space("pages", []const u8, .{ .max_bytes = 32 << 10 });
+
+const Front = struct { headline: Str, stories: u32 };
+
+fn frontPage(page: nilo.Cached(Pages, .{ .ttl_s = 60 })) !Front {
+    _ = page;                                // `.key` is what the answer is kept under
+    return .{ .headline = .static("Selamat pagi"), .stories = 12 };
+}
+```
+
+The first request runs the handler and **keeps what it returned** — status,
+the `Response(T)` headers of its own, the body — under the path and the
+query. Every request for the same inside `ttl_s` gets the kept answer back,
+byte for byte, with `Cache-Status: nilo; hit` on it, and the handler does not
+run; a fresh answer carries `Cache-Status: nilo; fwd=miss`. What the handler
+*failed* with is not kept, so the next request runs it again.
+
+| | |
+|---|---|
+| `Pages` | where answers are kept: a `cache.Space` holding `[]const u8`, `app.provide`d. Any type with `getInto`, `putIfAbsent`, `putFor`, `del`, `max_bytes` and `Held` will do. A service the route needs, so `listen()` names it when it is missing |
+| `.ttl_s` | how long a kept answer is served, in seconds. No default, and 0 is a Refusal |
+| `.by` | what the key is made of: `.path_and_query` (the default), `.path`, or `.{ .header = "Accept-Language" }` for the path, the query and one header's value. The query is taken as it arrived — `?a=1&b=2` and `?b=2&a=1` are two entries. `Cookie` and `Authorization` are refused as keys |
+| `.key` | what the answer was kept under, as `Str` |
+
+**A request that finds the answer still being made waits for it** rather than
+being told 409: it reads again every 10 ms, for at most 2 s or half of what
+`nilo.deadline(ms)` left the route, and past that runs the handler itself.
+**GET and HEAD only** — `app.post(…)` and the rest refuse it while compiling,
+and `app.route(.POST, …)` refuses it at registration with `error.CachedWrite`.
+A handler that returns nothing, a file or a redirect has no answer nilo can
+keep, and is a Refusal; so is one that takes an `Idempotent(…)` too.
+
+Costs what `Idempotent` costs, on the route that asks and nowhere else — one
+more arena allocation to join the path and the query when there is one.
+Nothing on the stack.
 
 ### A query field that is a list
 

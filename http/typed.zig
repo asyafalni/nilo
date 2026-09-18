@@ -45,9 +45,11 @@ const form_mod = @import("form.zig");
 const http1 = @import("http1.zig");
 const router = @import("router.zig");
 const service_mod = @import("service.zig");
+const bulkhead = @import("bulkhead.zig");
 const fail = @import("fail.zig");
 const authorization_mod = @import("authorization.zig");
 const idempotent_mod = @import("idempotent.zig");
+const cached_mod = @import("cached.zig");
 const str_mod = @import("nilo_core");
 const resolve = @import("resolve.zig");
 const openapi = @import("openapi.zig");
@@ -290,6 +292,11 @@ const Role = union(enum) {
     /// one argument that can end the request before the handler runs with
     /// a *success*, and the one that has to see the handler's answer after.
     idempotent,
+    /// A kept answer served again for a time, keyed on the request line
+    /// rather than on a header (ADR 0247). Its own role for the reason
+    /// `.idempotent` is: it can end the request before the handler runs,
+    /// and it sees the answer after. The two are refused together.
+    cached,
     /// The body again, but as an HTML form rather than as JSON (ADR 0031).
     /// A separate role and not a flavour of `.body`, because the two are
     /// the same slot and asking for both has to be refused.
@@ -319,7 +326,8 @@ pub fn wrap(comptime pattern: []const u8, comptime f: anytype) router.CtxHandler
     const params = @typeInfo(Fn).@"fn".params;
     const roles = comptime rolesOf(pattern, params);
     const param_names = comptime patternParamNames(pattern);
-    comptime if (idempotentAt(roles) != null) checkKeepable(pattern, Fn);
+    comptime if (idempotentAt(roles) != null) checkKeepable(pattern, Fn, "an `Idempotent(…)`");
+    comptime if (cachedAt(roles) != null) checkKeepable(pattern, Fn, "a `Cached(…)`");
 
     const Wrapper = struct {
         fn run(c: *Ctx) anyerror!void {
@@ -334,68 +342,92 @@ pub fn wrap(comptime pattern: []const u8, comptime f: anytype) router.CtxHandler
                 }
             else
                 null;
+            // The same, keyed on the request line (ADR 0247). Never both:
+            // `rolesOf` refuses a handler that asks for the two.
+            const caching: ?cached_mod.Begun = if (comptime cachedAt(roles)) |at|
+                switch (try cachedBegin(params[at].type.?, c)) {
+                    .replayed => return,
+                    .fresh => |begun| begun,
+                }
+            else
+                null;
 
-            inline for (params, 0..) |p, i| {
-                const P = p.type.?;
-                switch (comptime roles[i]) {
-                    .ctx => args[i] = c,
-                    // **Logged as well as answered** (ADR 0079). `listen()`
-                    // refuses to open the socket over this and names the type
-                    // and the routes, so a server never reaches here — but
-                    // `testing.Client` does not call `listen()`, and a test
-                    // used to get a bare 500 on every route that wanted the
-                    // service with nothing anywhere naming it. That is the
-                    // worst shape a clue can have, because the same routes
-                    // work over a real socket, so the evidence points at the
-                    // test.
-                    .service => args[i] = c._services.get(P) orelse {
-                        // A warning and not an error, for the reason the
-                        // unopened pool logs one: `std.log.err` fails the
-                        // test runner, and this fires in a test by design.
-                        std.log.warn(
-                            "service {s} was never registered, and route \"{s}\" needs it. " ++
-                                "`app.listen()` refuses to start over this and says which routes; " ++
-                                "a test driving the App itself does not, so here it is. " ++
-                                "Call app.provide() before serving.",
-                            .{ @typeName(P), pattern },
-                        );
-                        return fail.internal(
-                            "service {s} was never registered; call app.provide() before app.listen()",
-                            .{@typeName(P)},
-                        );
-                    },
-                    .param => |nth| args[i] = try paramValue(P, c, param_names[nth]),
-                    .body => args[i] = try c.json(P),
-                    .query => args[i] = .{ .value = try queryValue(P.nilo_query, c) },
-                    .header => args[i] = .{ .value = try headerValue(P, c) },
-                    .authorization => args[i] = try c.authorization(P.nilo_authorization),
-                    .idempotent => args[i] = .{ .key = replaying.?.key },
-                    .form => args[i] = .{ .value = try c.form(P.nilo_form) },
-                    .arena => args[i] = c._arena,
-                    .resolved => args[i] = try resolve.value(P, c),
-                    // The outcomes live here, on the stack of the fiber that
-                    // is already serving this request, and are copied into
-                    // the binding. Sized while compiling, so a field that did
-                    // not bind costs no allocation (ADR 0018).
-                    .bound_body => {
-                        var outcomes: P.Outcomes = undefined;
-                        const filled = try c.jsonCollecting(P.Value, &outcomes);
-                        args[i] = .from(filled, outcomes);
-                    },
-                    .bound_form => {
-                        var outcomes: P.Outcomes = undefined;
-                        const filled = try c.formCollecting(P.Value, &outcomes);
-                        args[i] = .from(filled, outcomes);
-                    },
-                    .bound_query => {
-                        var outcomes: P.Outcomes = undefined;
-                        const filled = queryValueCollecting(P.Value, c, &outcomes);
-                        args[i] = .from(filled, outcomes);
-                    },
+            // A claim taken and then not honoured — a path param that would
+            // not convert, a service missing under a test — is released on
+            // the way out, or the next request would wait on an answer
+            // nobody is making. The block is the scope of the `errdefer`:
+            // the reads, and not the handler's own failure, which is
+            // `cached_mod.finish`'s to release.
+            {
+                errdefer {
+                    if (comptime cachedAt(roles)) |at| cachedRelease(params[at].type.?, c, caching.?);
+                }
+                inline for (params, 0..) |p, i| {
+                    const P = p.type.?;
+                    switch (comptime roles[i]) {
+                        .ctx => args[i] = c,
+                        // **Logged as well as answered** (ADR 0079). `listen()`
+                        // refuses to open the socket over this and names the type
+                        // and the routes, so a server never reaches here — but
+                        // `testing.Client` does not call `listen()`, and a test
+                        // used to get a bare 500 on every route that wanted the
+                        // service with nothing anywhere naming it. That is the
+                        // worst shape a clue can have, because the same routes
+                        // work over a real socket, so the evidence points at the
+                        // test.
+                        .service => args[i] = c._services.get(P) orelse {
+                            // A warning and not an error, for the reason the
+                            // unopened pool logs one: `std.log.err` fails the
+                            // test runner, and this fires in a test by design.
+                            std.log.warn(
+                                "service {s} was never registered, and route \"{s}\" needs it. " ++
+                                    "`app.listen()` refuses to start over this and says which routes; " ++
+                                    "a test driving the App itself does not, so here it is. " ++
+                                    "Call app.provide() before serving.",
+                                .{ @typeName(P), pattern },
+                            );
+                            return fail.internal(
+                                "service {s} was never registered; call app.provide() before app.listen()",
+                                .{@typeName(P)},
+                            );
+                        },
+                        .param => |nth| args[i] = try paramValue(P, c, param_names[nth]),
+                        .body => args[i] = try c.json(P),
+                        .query => args[i] = .{ .value = try queryValue(P.nilo_query, c) },
+                        .header => args[i] = .{ .value = try headerValue(P, c) },
+                        .authorization => args[i] = try c.authorization(P.nilo_authorization),
+                        .idempotent => args[i] = .{ .key = replaying.?.key },
+                        .cached => args[i] = .{ .key = caching.?.key },
+                        .form => args[i] = .{ .value = try c.form(P.nilo_form) },
+                        .arena => args[i] = c._arena,
+                        .resolved => args[i] = try resolve.value(P, c),
+                        // The outcomes live here, on the stack of the fiber that
+                        // is already serving this request, and are copied into
+                        // the binding. Sized while compiling, so a field that did
+                        // not bind costs no allocation (ADR 0018).
+                        .bound_body => {
+                            var outcomes: P.Outcomes = undefined;
+                            const filled = try c.jsonCollecting(P.Value, &outcomes);
+                            args[i] = .from(filled, outcomes);
+                        },
+                        .bound_form => {
+                            var outcomes: P.Outcomes = undefined;
+                            const filled = try c.formCollecting(P.Value, &outcomes);
+                            args[i] = .from(filled, outcomes);
+                        },
+                        .bound_query => {
+                            var outcomes: P.Outcomes = undefined;
+                            const filled = queryValueCollecting(P.Value, c, &outcomes);
+                            args[i] = .from(filled, outcomes);
+                        },
+                    }
                 }
             }
             if (comptime idempotentAt(roles)) |at| {
                 return idempotentFinish(params[at].type.?, c, replaying.?, @call(.auto, f, args));
+            }
+            if (comptime cachedAt(roles)) |at| {
+                return cachedFinish(params[at].type.?, c, caching.?, @call(.auto, f, args));
             }
             return sendResult(c, @call(.auto, f, args));
         }
@@ -404,12 +436,14 @@ pub fn wrap(comptime pattern: []const u8, comptime f: anytype) router.CtxHandler
 }
 
 /// A kept answer is one the handler returned, so a handler that writes its
-/// own, or answers with a file or a redirect, cannot be idempotent this way
-/// (ADR 0193). Said at the route rather than on the first replay.
-fn checkKeepable(comptime pattern: []const u8, comptime Fn: type) void {
+/// own, or answers with a file or a redirect, cannot be kept this way — for
+/// `Idempotent` (ADR 0193) and for `Cached` (ADR 0247) alike. Said at the
+/// route rather than on the first replay. `what` is the argument, with its
+/// article: "an `Idempotent(…)`".
+fn checkKeepable(comptime pattern: []const u8, comptime Fn: type, comptime what: []const u8) void {
     comptime {
         if (returnsNothing(Fn)) @compileError(
-            "nilo: the handler for route \"" ++ pattern ++ "\" takes an `Idempotent(…)` and " ++
+            "nilo: the handler for route \"" ++ pattern ++ "\" takes " ++ what ++ " and " ++
                 "returns nothing, so there is no answer to keep.\n" ++
                 "  A kept answer is one the handler returned: a struct, a `Status(code, T)`, a " ++
                 "`Response(T)`. A handler that writes its own response through the Ctx has " ++
@@ -422,7 +456,7 @@ fn checkKeepable(comptime pattern: []const u8, comptime Fn: type) void {
         };
         if (@typeInfo(V) == .optional) V = @typeInfo(V).optional.child;
         if (hasNamedDecl(V, "nilo_redirect") or filebody.isFileBody(V)) @compileError(
-            "nilo: the handler for route \"" ++ pattern ++ "\" takes an `Idempotent(…)` and " ++
+            "nilo: the handler for route \"" ++ pattern ++ "\" takes " ++ what ++ " and " ++
                 "returns a " ++ naming.of(V) ++ ", which is not an answer nilo can keep.\n" ++
                 "  A file is sent from disk and a redirect is a status and a Location; what " ++
                 "is kept and sent again is a body the handler returned. Answer with the " ++
@@ -436,6 +470,39 @@ fn checkKeepable(comptime pattern: []const u8, comptime Fn: type) void {
 fn idempotentAt(comptime roles: []const Role) ?usize {
     for (roles, 0..) |r, i| if (r == .idempotent) return i;
     return null;
+}
+
+/// Which argument is the `Cached(…)`, if any. At most one, and never
+/// beside an `Idempotent(…)`, which `rolesOf` holds.
+fn cachedAt(comptime roles: []const Role) ?usize {
+    for (roles, 0..) |r, i| if (r == .cached) return i;
+    return null;
+}
+
+/// Whether this handler takes a `Cached(…)`. For `App.route`, whose verb
+/// is a runtime value and so cannot be refused while compiling the way
+/// `App.post` refuses it (ADR 0247).
+pub fn isCached(comptime pattern: []const u8, comptime handler: anytype) bool {
+    const Fn = comptime fnTypeOf(pattern, @TypeOf(handler));
+    return comptime cachedAt(rolesOf(pattern, @typeInfo(Fn).@"fn".params)) != null;
+}
+
+/// A `Cached(…)` on a verb that writes, refused at the call that named the
+/// verb (ADR 0247). `App.post`, `put`, `patch`, `delete` and `options` call
+/// this beside `check`; a GET or a HEAD passes through.
+pub fn checkVerb(comptime method: http1.Method, comptime pattern: []const u8, comptime handler: anytype) void {
+    comptime {
+        if (cached_mod.allows(method)) return;
+        if (!isCached(pattern, handler)) return;
+        @compileError(
+            "nilo: the route \"" ++ @tagName(method) ++ " " ++ pattern ++ "\" takes a `Cached(…)`, and a " ++
+                @tagName(method) ++ " is not an answer to keep.\n" ++
+                "  A kept answer is served again to whoever asks next, and the request the second " ++
+                "client sent was not the one the first client sent — the body, the account, the order " ++
+                "placed. A `Cached(…)` goes on a GET or a HEAD; for a write answered once per client, " ++
+                "that is `Idempotent(…)`.",
+        );
+    }
 }
 
 /// What `idempotentBegin` hands the rest of the request.
@@ -527,29 +594,228 @@ fn idempotentFinish(comptime P: type, c: *Ctx, begun: Begun, result: anytype) !v
     const Replays = P.nilo_idempotent.replays;
     const replays = c._services.get(*Replays).?; // `idempotentBegin` found it
 
-    const R = @TypeOf(result);
-    const value = if (@typeInfo(R) == .error_union) result catch |err| {
+    const answer = renderAnswer(c, result) catch |err| {
         _ = replays.del(begun.under);
         return err;
-    } else result;
+    };
+
+    const record = idempotent_mod.encode(c._arena, answer.kind, answer.status, begun.fingerprint, answer.headers, answer.content_type, answer.body) catch |err| switch (err) {
+        error.TooLarge => {
+            _ = replays.del(begun.under);
+            std.log.warn("route \"{s}\" answered with more headers than an idempotency record holds; the answer was sent and not kept", .{c._path});
+            return sendRendered(c, answer);
+        },
+        else => |e| return e,
+    };
+    replays.put(begun.under, record) catch |err| switch (err) {
+        error.TooLarge => {
+            // The answer goes out either way; what is lost is the replay,
+            // and a retry runs the handler again. Said once per occurrence
+            // because the fix is a number in the Space.
+            _ = replays.del(begun.under);
+            std.log.warn(
+                "route \"{s}\" answered {d} bytes, more than the {d} its Space keeps; the answer was sent and not kept",
+                .{ c._path, record.len, Replays.max_bytes },
+            );
+        },
+    };
+    return sendRendered(c, answer);
+}
+
+/// The `Cached(…)` half of what `idempotentBegin` is: claim the key or find
+/// what was kept under it; send the kept answer, wait for one being made, or
+/// say the handler may run (ADR 0247). Here rather than in `cached.zig` so
+/// that file names nothing in the App's core.
+fn cachedBegin(comptime P: type, c: *Ctx) !cached_mod.Outcome {
+    const spec = P.nilo_cached;
+    const Pages = spec.pages;
+    const pages = c._services.get(*Pages) orelse {
+        // A warning and not an error, for the reason `wrap` gives:
+        // `listen()` refuses to start over this, and a test does not call
+        // it (ADR 0079).
+        std.log.warn(
+            "the Space {s} was never registered, and route \"{s}\" keeps its answers in it. " ++
+                "Call app.provide() on it before serving.",
+            .{ @typeName(Pages), c._path },
+        );
+        return fail.internal("the Space {s} was never registered; call app.provide() before app.listen()", .{@typeName(Pages)});
+    };
+
+    const under = try cachedKeyOf(spec.by, c);
+    const fingerprint = cached_mod.fingerprintOf(under);
+    const begun: cached_mod.Begun = .{
+        .key = Str.fromRequest(under, c._lifetime),
+        .under = under,
+        .fingerprint = fingerprint,
+    };
+    const fresh: cached_mod.Outcome = .{ .fresh = begun };
+
+    // Half of what the route has left, so that a request which waited and
+    // then had to make the answer itself is not late for having waited.
+    const cap: u32 = if (c.timeLeftMs()) |left| @min(cached_mod.max_wait_ms, left / 2) else cached_mod.max_wait_ms;
+    var waited: u32 = 0;
+    // Into the arena rather than a `Held` on the stack, which would be
+    // `max_bytes` per idle connection (ADR 0063) — and only once somebody
+    // else was first, so a fresh answer does not pay for it.
+    var room: ?[]u8 = null;
+
+    while (true) {
+        // The claim is what makes twenty requests racing for one page get
+        // one handler run between them: the cache takes the marker under
+        // its lock.
+        const claimed = pages.putIfAbsent(under, &idempotent_mod.marker(fingerprint)) catch |err| switch (err) {
+            // A key the Space cannot hold — a query string the size of a
+            // page. Nothing can be kept under it, so the handler runs and
+            // the answer goes out unkept, the way an answer too large does.
+            error.TooLarge => return .{ .fresh = .{
+                .key = begun.key,
+                .under = under,
+                .fingerprint = fingerprint,
+                .keep = false,
+            } },
+        };
+        if (claimed) return fresh;
+
+        if (room == null) room = try c._arena.alloc(u8, Pages.max_bytes);
+        if (pages.getInto(under, room.?)) |kept| {
+            // Bytes that are not a record of this key are a miss: the
+            // handler runs and its answer is put over them.
+            const record = idempotent_mod.decode(kept) orelse return fresh;
+            if (record.fingerprint != fingerprint) return fresh;
+            if (record.kind != .in_flight) {
+                var it = record.eachHeader();
+                while (it.next()) |h| try c.setHeader(h.name, h.value);
+                try c.setStaticHeader(cached_mod.status_name, cached_mod.hit_value);
+                try c.send(record.status, record.contentType(), record.body);
+                return .replayed;
+            }
+        }
+        // Somebody is making it — or it went between the claim and the
+        // read, and the next claim is ours. Either way: a bounded wait,
+        // and past the bound the handler runs here.
+        if (waited >= cap) return fresh;
+        try bulkhead.sleep(cached_mod.poll_ms);
+        waited += cached_mod.poll_ms;
+    }
+}
+
+/// What the handler answered, kept for `ttl_s` and then sent — or not kept,
+/// when it failed, so the next request runs it again (ADR 0247).
+fn cachedFinish(comptime P: type, c: *Ctx, begun: cached_mod.Begun, result: anytype) !void {
+    const spec = P.nilo_cached;
+    const Pages = spec.pages;
+    const pages = c._services.get(*Pages).?; // `begin` found it
+
+    const answer = renderAnswer(c, result) catch |err| {
+        if (begun.keep) _ = pages.del(begun.under);
+        return err;
+    };
+    try c.setStaticHeader(cached_mod.status_name, cached_mod.miss_value);
+    if (!begun.keep) return sendRendered(c, answer);
+
+    const record = idempotent_mod.encode(
+        c._arena,
+        answer.kind,
+        answer.status,
+        begun.fingerprint,
+        answer.headers,
+        answer.content_type,
+        answer.body,
+    ) catch |err| switch (err) {
+        error.TooLarge => {
+            _ = pages.del(begun.under);
+            std.log.warn("route \"{s}\" answered with more headers than a kept answer holds; the answer was sent and not kept", .{c._path});
+            return sendRendered(c, answer);
+        },
+        else => |e| return e,
+    };
+    pages.putFor(begun.under, record, spec.ttl_s) catch |err| switch (err) {
+        error.TooLarge => {
+            // The answer goes out either way; what is lost is the next
+            // request's hit. Said once per occurrence because the fix is a
+            // number in the Space.
+            _ = pages.del(begun.under);
+            std.log.warn(
+                "route \"{s}\" answered {d} bytes, more than the {d} its Space keeps; the answer was sent and not kept",
+                .{ c._path, record.len, Pages.max_bytes },
+            );
+        },
+    };
+    return sendRendered(c, answer);
+}
+
+/// Release the claim a request took and then could not honour — an
+/// argument after the `Cached` that failed to read, say — so the next
+/// request is first rather than a waiter.
+fn cachedRelease(comptime P: type, c: *Ctx, begun: cached_mod.Begun) void {
+    if (!begun.keep) return;
+    const pages = c._services.get(*P.nilo_cached.pages) orelse return;
+    _ = pages.del(begun.under);
+}
+
+/// The Space's key, from what `By` said. The path alone costs nothing; a
+/// query or a header is joined into the arena.
+fn cachedKeyOf(comptime by: cached_mod.By, c: *Ctx) ![]const u8 {
+    return switch (by) {
+        .path => c._path,
+        .path_and_query => cachedJoined(c, null),
+        .header => |name| cachedJoined(c, if (c.header(name)) |value| value.view() else ""),
+    };
+}
+
+fn cachedJoined(c: *Ctx, vary: ?[]const u8) ![]const u8 {
+    if (c._query.len == 0 and vary == null) return c._path;
+    const extra: usize = if (vary) |v| 1 + v.len else 0;
+    const out = try c._arena.alloc(u8, c._path.len + 1 + c._query.len + extra);
+    @memcpy(out[0..c._path.len], c._path);
+    out[c._path.len] = '?';
+    @memcpy(out[c._path.len + 1 ..][0..c._query.len], c._query);
+    if (vary) |v| {
+        const at = c._path.len + 1 + c._query.len;
+        out[at] = 0;
+        @memcpy(out[at + 1 ..][0..v.len], v);
+    }
+    return out;
+}
+
+/// A handler's answer, rendered rather than sent, so it can be kept first.
+/// What `Idempotent` (ADR 0193) and `Cached` (ADR 0247) both put in a
+/// record.
+pub const Rendered = struct {
+    kind: idempotent_mod.Kind,
+    status: u16,
+    /// The handler's own — a `Response(T)`'s, a `Bytes`' — and not the
+    /// ones middleware set, which set themselves again on a replay.
+    headers: []const http1.Header,
+    /// What an `.own` answer goes out as; empty for every other kind.
+    content_type: []const u8,
+    body: []const u8,
+};
+
+/// The same reading `sendResult` does, with the answer rendered into the
+/// arena rather than sent. An error the handler returned, and the 404 an
+/// empty `?T` means, come back as errors — for the caller to release its
+/// claim on and pass up, since neither is an answer to keep.
+fn renderAnswer(c: *Ctx, result: anytype) !Rendered {
+    const R = @TypeOf(result);
+    const value = if (@typeInfo(R) == .error_union) try result else result;
     const T = @TypeOf(value);
 
-    // The same reading `sendResult` does, with the answer rendered rather
-    // than sent so it can be kept first.
     var own_headers: []const http1.Header = &.{};
     var status: u16 = 200;
     const inner = if (comptime hasNamedDecl(T, "nilo_response")) blk: {
-        own_headers = value.headers.view();
+        // Into the arena, not a view: `value` is this frame's copy of the
+        // answer and its `Headers` live inline in it, so a view would be
+        // dangling the moment this returns. `sendResult` sends before it
+        // returns and can view; a rendered answer outlives the frame.
+        own_headers = try keptHeaders(c._arena, value.headers.view());
         status = if (comptime hasNamedDecl(T, "nilo_status")) T.nilo_status else value.status;
         break :blk value.value;
     } else value;
     const V = @TypeOf(inner);
 
     const present = if (comptime @typeInfo(V) == .optional)
-        inner orelse {
-            _ = replays.del(begun.under);
-            return fail.notFound("there is no {s}", .{c._path});
-        }
+        inner orelse return fail.notFound("there is no {s}", .{c._path})
     else
         inner;
     const B = @TypeOf(present);
@@ -586,33 +852,26 @@ fn idempotentFinish(comptime P: type, c: *Ctx, begun: Begun, result: anytype) !v
         body = out.written();
     }
 
-    const record = idempotent_mod.encode(c._arena, kind, status, begun.fingerprint, own_headers, content_type, body) catch |err| switch (err) {
-        error.TooLarge => {
-            _ = replays.del(begun.under);
-            std.log.warn("route \"{s}\" answered with more headers than an idempotency record holds; the answer was sent and not kept", .{c._path});
-            return sendKept(c, own_headers, status, kind, content_type, body);
-        },
-        else => |e| return e,
+    return .{
+        .kind = kind,
+        .status = status,
+        .headers = own_headers,
+        .content_type = content_type,
+        .body = body,
     };
-    replays.put(begun.under, record) catch |err| switch (err) {
-        error.TooLarge => {
-            // The answer goes out either way; what is lost is the replay,
-            // and a retry runs the handler again. Said once per occurrence
-            // because the fix is a number in the Space.
-            _ = replays.del(begun.under);
-            std.log.warn(
-                "route \"{s}\" answered {d} bytes, more than the {d} its Space keeps; the answer was sent and not kept",
-                .{ c._path, record.len, Replays.max_bytes },
-            );
-        },
-    };
-    return sendKept(c, own_headers, status, kind, content_type, body);
 }
 
-/// Two header lists as one, allocating only when both have something in
-/// them — the ordinary `Bytes` answer has no wrapper and costs nothing here.
+/// A header list copied into the arena, or nothing when it is empty — the
+/// ordinary answer sets no header of its own and costs nothing here.
+fn keptHeaders(arena: std.mem.Allocator, view: []const http1.Header) ![]const http1.Header {
+    if (view.len == 0) return &.{};
+    return arena.dupe(http1.Header, view);
+}
+
+/// Two header lists as one. `a` is already the arena's (or empty) and `b`
+/// is a view into a value about to go out of scope, so `b` is always
+/// copied and `a` is handed back as it is when there is nothing to add.
 fn joinedHeaders(arena: std.mem.Allocator, a: []const http1.Header, b: []const http1.Header) ![]const http1.Header {
-    if (a.len == 0) return b;
     if (b.len == 0) return a;
     const both = try arena.alloc(http1.Header, a.len + b.len);
     @memcpy(both[0..a.len], a);
@@ -620,9 +879,11 @@ fn joinedHeaders(arena: std.mem.Allocator, a: []const http1.Header, b: []const h
     return both;
 }
 
-fn sendKept(c: *Ctx, own_headers: []const http1.Header, status: u16, kind: idempotent_mod.Kind, content_type: []const u8, body: []const u8) !void {
-    for (own_headers) |h| try c.setHeader(h.name, h.value);
-    return c.send(status, if (kind == .own) content_type else kind.contentType(), body);
+/// Send a rendered answer: its own headers, then the body under the label
+/// its kind implies or the one the type chose.
+fn sendRendered(c: *Ctx, answer: Rendered) !void {
+    for (answer.headers) |h| try c.setHeader(h.name, h.value);
+    return c.send(answer.status, if (answer.kind == .own) answer.content_type else answer.kind.contentType(), answer.body);
 }
 
 /// Which services this handler needs. Computed at compile time and used by
@@ -642,6 +903,11 @@ pub fn requirements(comptime pattern: []const u8, comptime f: anytype) []const s
                 // caught by `listen()`, or the first request to an
                 // authenticated route finds it instead (ADR 0016).
                 .resolved => list = list ++ resolve.requirements(p.type.?, pattern),
+                // The Space a cached route keeps its answers in is a service
+                // the route needs, so `listen()` names it when it is missing
+                // rather than the first request finding out (ADR 0247).
+                .cached => list = list ++
+                    [_]service_mod.Requirement{service_mod.requirementFor(*p.type.?.nilo_cached.pages, pattern)},
                 else => {},
             }
         }
@@ -994,6 +1260,7 @@ fn rolesOf(
         var form_at: ?usize = null;
         var query_at: ?usize = null;
         var idempotent_at: ?usize = null;
+        var cached_at: ?usize = null;
         var wants_ctx = false;
 
         for (params, 0..) |p, i| {
@@ -1077,9 +1344,30 @@ fn rolesOf(
                     );
                     idempotent_at = i;
                 },
+                .cached => {
+                    if (cached_at) |first| @compileError(
+                        "nilo: the handler for route \"" ++ pattern ++ "\" asks to be " ++
+                            "cached twice — argument " ++ num(first + 1) ++ " and argument " ++
+                            num(i + 1) ++ ".\n" ++
+                            "  A request has one key and one kept answer. Ask for it once.",
+                    );
+                    cached_at = i;
+                },
                 else => {},
             }
         }
+
+        // Both keep the answer and both claim a key, and the two keys are
+        // not the same key: one is the client's and one is the request
+        // line's. A route that wants to answer a write once per client is
+        // `Idempotent`; one that wants to serve a read again is `Cached`.
+        if (idempotent_at != null and cached_at != null) @compileError(
+            "nilo: the handler for route \"" ++ pattern ++ "\" takes both an `Idempotent(…)` " ++
+                "(argument " ++ num(idempotent_at.? + 1) ++ ") and a `Cached(…)` (argument " ++
+                num(cached_at.? + 1) ++ "), and an answer is kept under one key.\n" ++
+                "  `Idempotent` keeps a write under the client's Idempotency-Key; `Cached` keeps a " ++
+                "read under its path and query. A route is one of the two.",
+        );
 
         if (body_at != null and form_at != null) @compileError(
             "nilo: the handler for route \"" ++ pattern ++ "\" asks for both a request body " ++
@@ -1192,6 +1480,10 @@ fn roleOf(comptime pattern: []const u8, comptime P: type, comptime i: usize) Rol
     if (comptime hasNamedDecl(P, "nilo_idempotent")) {
         idempotent_mod.checkSpace(P.nilo_idempotent.replays, pattern);
         return .idempotent;
+    }
+    if (comptime hasNamedDecl(P, "nilo_cached")) {
+        cached_mod.check(P, pattern);
+        return .cached;
     }
     if (comptime hasNamedDecl(P, form_mod.marker)) return .form;
     // Before `.@"struct" => .body`, and with a message of its own: an

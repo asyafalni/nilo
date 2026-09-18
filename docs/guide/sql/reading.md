@@ -348,6 +348,61 @@ A key that is a string — `.value = "value_currency, value_minor"` — is SQL o
 your own, and only `db.rawOrdered` takes it, with `{order}` in your statement
 where the whole clause goes ([Raw SQL](./raw.md)).
 
+## The keyset form of a deep page
+
+`db.page` above is `OFFSET`, and `OFFSET` costs the database every row it is
+not going to answer with: page 4,000 of `/orders` scans and discards 12,000
+rows to reach the twenty this call wants, and it gets slower the deeper a
+caller goes. No index fixes that — an index tells the database *where* a row
+is, not how many came before it.
+
+**Keyset pagination** asks a different question: not *the twenty after the
+twelve-thousandth*, but *the twenty after this one*. The caller carries the
+last row it saw instead of a page number, and the condition is the tuple
+comparison a book uses to find its place — `(created_at, id) < (…)` —
+written the way this module writes every OR, as `.any`:
+
+<!-- compiles -->
+```zig
+fn olderThan(db: *sql.Db, c: *nilo.Ctx, after: sql.Timestamp, after_id: i64) ![]User {
+    return db.select(User, c, .{
+        .where = .{ .any = .{
+            .{ .created_at = .{ .lt = after } },
+            .{ .created_at = after, .id = .{ .lt = after_id } },
+        } },
+        .order = .{ .created_at = .desc_nulls_last, .id = .desc },
+        .limit = 20,
+    });
+}
+```
+
+`after` and `after_id` are the `created_at` and `id` off the last row the
+previous call answered with — a cursor the caller carries rather than a page
+number the database counts up to. The first call has none to carry: read the
+first page with `.order` and `.limit` alone, and start carrying a cursor once
+there is a last row to take it from.
+
+`.order` is doing two jobs. `.desc_nulls_last` is one of the four directions
+beside plain `.asc` and `.desc` that also say where a NULL goes, so a row
+with no `created_at` sorts to the same place on every call rather than
+wherever the database happens to put one; `id` beside it breaks a tie
+between two rows sharing one `created_at`, which is why the condition needs
+two terms and not one — drop either and two calls can disagree about where
+the boundary was, the same failure `.limit` with no `.order` already has
+against `OFFSET`.
+
+**The trade is the running total.** `db.page`'s `count(*) OVER ()` rides on
+the page it counts; a keyset condition has nothing to ride it on, because
+there is no "page 4,000" for a count to be relative to. Ask for one row more
+than the page needs and drop it to know whether there is a next page, or keep
+`db.count` beside the call for a total that does not have to be exact this
+second.
+
+`DISTINCT` is not part of this and is not coming: over one table with a key
+every row appears once anyway, which is the same argument
+[ADR 0058](../../adr/0058-a-set-operation-over-one-table-is-a-condition.md)
+makes for `UNION`.
+
 ## Why writing the limit out is worth it
 
 A `.limit` written as a literal is baked into the SQL, and that buys two

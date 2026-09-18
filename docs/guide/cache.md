@@ -140,6 +140,36 @@ cache stores `interface{}` and gets away with it because a collector holds
 the other end; there is none here. Encode it and use a Space of
 `[]const u8`, or keep an id in the cache and look the rest up.
 
+JSON is the ordinary encoding once the value has more than one field. `put`
+takes the bytes `std.json.Stringify` wrote into a buffer of your own;
+`getInto` reads them back into a buffer of your own too — here the request
+arena, since the value is going out in a response — and
+`std.json.parseFromSliceLeaky` turns them back into the struct:
+
+<!-- compiles -->
+```zig
+const Note = struct { owner: u64, text: []const u8 };
+
+const Notes = cache.Space("note", []const u8, .{ .max_bytes = 256 });
+
+fn saveNote(notes: *Notes, key: []const u8, note: Note) !void {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try std.json.Stringify.value(note, .{}, &w);
+    try notes.put(key, w.buffered());
+}
+
+fn loadNote(notes: *Notes, key: []const u8, c: *nilo.Ctx) !?Note {
+    const buf = try c.arena().alloc(u8, 256);
+    const bytes = notes.getInto(key, buf) orelse return null;
+    return try std.json.parseFromSliceLeaky(Note, c.arena(), bytes, .{});
+}
+```
+
+`parseFromSliceLeaky` rather than `parseFromSlice`, because there is nothing
+here to call `.deinit()` on — the arena is what frees it, the same rule
+every row this module hands back already follows.
+
 There is no allocator to pass anywhere in this module, and the signatures
 are what say so: nothing allocates per operation.
 
@@ -232,6 +262,76 @@ The TTL clock is the coarse monotonic one — a page the kernel updates on its
 own tick rather than a vDSO call — because an operation costing a hundred
 nanoseconds should not spend a fifth of it on accuracy a TTL measured in
 seconds has no use for.
+
+## A route that says "cache this answer for a minute"
+
+The most ordinary use of a cache in a web app is a page that costs four
+queries and changes once a minute. That is one argument on the handler, and
+the handler is otherwise the one you were going to write:
+
+<!-- compiles -->
+```zig
+const FrontPages = cache.Space("front", []const u8, .{ .max_bytes = 32 << 10 });
+
+const Front = struct { headline: Str, stories: u32 };
+
+fn frontPage(kept: nilo.Cached(FrontPages, .{ .ttl_s = 60 })) !Front {
+    _ = kept;
+    // …the four queries…
+    return .{ .headline = .static("Selamat pagi"), .stories = 12 };
+}
+```
+
+```
+GET /                       → 200 {"headline":"Selamat pagi","stories":12}   Cache-Status: nilo; fwd=miss
+GET /  (within a minute)    → 200 {"headline":"Selamat pagi","stories":12}   Cache-Status: nilo; hit
+GET /?lang=en               → the handler runs: another query is another entry
+GET /  (a minute later)     → the handler runs, and its new answer is the one kept
+```
+
+The first request runs the handler and **keeps what it returned** — the
+status, the body, and a `Response(T)`'s own headers — under the path and the
+query. Every request for the same inside `ttl_s` gets that back, byte for
+byte, and the handler does not run. What the handler *failed* with is not
+kept; the next request runs it again.
+
+`FrontPages` is a bytes Space, opened on the Store and handed to the App as a
+service, the way [`Replays`](./idempotency.md#wiring-it-up) is — the record
+in it is the same record, and `Cached` is `Idempotent` with the key made of
+the request line instead of a header
+([ADR 0247](../adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)).
+The TTL is the route's rather than the Space's, so one Space may hold a
+page kept a minute beside one kept an hour.
+
+**When the entry expires, everybody does not run the handler.** Twenty
+browsers asking for the front page in the same hundred milliseconds are
+what a cache is for, and a `get` followed by a `put` would run the four
+queries twenty times. The first request claims the key; the other nineteen
+find the claim and **wait for its answer** — reading again every 10 ms, for
+at most two seconds or half of what [`nilo.deadline`](./middleware.md) left
+the route — and get it when it lands. One that waits the bound out runs the
+handler itself. This is the one thing `nilo_cache` cannot do on its own,
+because its lock spins and nothing that waits may go inside it; the server
+is the layer with an `Io` to wait on.
+
+**What the key is made of** is `.by`: `.path_and_query` unless said, `.path`
+for a handler that ignores the query, or `.{ .header = "Accept-Language" }`
+for a page that answers differently per language — the same thing `Vary`
+says. The query is taken as it arrived, so `?a=1&b=2` and `?b=2&a=1` are two
+entries; nothing is normalised. `Cookie` and `Authorization` are refused as
+keys: a cache keyed on a credential is a session store with a stranger's
+answers in it. Answer per user without the cache.
+
+**GET and HEAD only.** A kept answer is served to whoever asks next, and a
+POST's second client did not send the first client's body. `app.post(…)`
+refuses it while compiling; `app.route(.POST, …)` refuses it when the route
+is registered. For a write answered once per client, that is
+[`Idempotent`](./idempotency.md).
+
+It costs what `Idempotent` costs, on the route that asks and nowhere else:
+one arena allocation of `max_bytes` on a hit, one to encode the answer on a
+miss, and one to join the path and the query when there is a query. Nothing
+on the stack.
 
 ## Testing
 

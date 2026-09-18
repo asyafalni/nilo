@@ -37,21 +37,29 @@
 //!
 //! So the three that are easiest to get wrong are not options:
 //!
-//! - **The algorithm is a constant in this file, never the token's `alg`.**
-//!   `{"alg":"none"}` and an HMAC signed with the published RSA modulus are
-//!   both refused before a key is looked up.
+//! - **The algorithm is the key's, never the token's `alg`.** Two are read:
+//!   RS256 for a JWKS key that says `RSA`, ES256 for one that says `EC` on
+//!   `P-256`. Which one runs is decided by the key the `kid` found, and the
+//!   header's `alg` is only compared — against the two names before a key is
+//!   looked up, so `{"alg":"none"}` and an HMAC signed with the published
+//!   RSA modulus are refused before anything else, and against the key's
+//!   own name after, so `ES256` over an RSA key is a mismatch and not a
+//!   request (ADR 0242).
 //! - **Nothing in the payload is read until the signature has passed.** An
 //!   `exp` off an unverified token is a number somebody chose.
 //!   `exp` is required, because a credential with no end is not one.
 //! - **`iss` and `aud` are checked whenever you name them**, and the claims
 //!   struct does not have to mention either.
 //!
-//! **The arithmetic is `std.crypto.Certificate.rsa`'s**, which is public in
-//! Zig 0.16 and is the code that verifies a TLS certificate chain. This
-//! module writes no RSA. What it adds is the switch over key sizes, because
-//! `modulus_len` is a comptime parameter there and a run-time length here.
+//! **The arithmetic is std's.** RS256 is `std.crypto.Certificate.rsa`, which
+//! is public in Zig 0.16 and is the code that verifies a TLS certificate
+//! chain; ES256 is `std.crypto.sign.ecdsa.EcdsaP256Sha256`. This module
+//! writes no RSA and no ECDSA. What it adds is the switch over RSA key
+//! sizes, because `modulus_len` is a comptime parameter there and a run-time
+//! length here, and the one fact about a JWS signature std cannot know: it
+//! is raw `r || s`, not DER.
 //!
-//! **What it does not do**: HS256 and the EC families, encrypted tokens
+//! **What it does not do**: HS256, any curve but P-256, encrypted tokens
 //! (JWE), signing, discovery, PKCE, and the nonce. Signing is not here
 //! because a server that issues its own sessions has `Session(T)` sealed into
 //! a cookie (ADR 0035) and does not need a token; the rest is the sign-in
@@ -65,13 +73,16 @@ const std = @import("std");
 
 const jwks = @import("jwks.zig");
 const rs256 = @import("rs256.zig");
+const es256 = @import("es256.zig");
 const token_mod = @import("token.zig");
 
 /// A JWKS document read into the keys that can be verified with. `parse`
 /// takes the bytes of the document; fetching them is the caller's.
 pub const Keys = jwks.Keys;
 
-/// One RSA public key out of a key set.
+/// One public key out of a key set: its `kid`, and its `material` — `.rsa`
+/// with `e` and `n`, or `.ec` with `crv`, `x` and `y`. Which of the two it
+/// is decides how a token under it is checked.
 pub const Key = jwks.Key;
 
 /// What `verify` is told: the keys, the issuer and audience to insist on,
@@ -93,10 +104,15 @@ pub const verify = token_mod.verify;
 /// a best effort.
 pub const key_sizes = rs256.sizes;
 
+/// The curves that have a branch: `P-256`, and only that. An EC key on
+/// another curve is `error.CurveNotSupported` rather than a best effort.
+pub const curves = es256.curves;
+
 test {
     _ = @import("b64.zig");
     _ = jwks;
     _ = rs256;
+    _ = es256;
     _ = token_mod;
 }
 
@@ -117,4 +133,22 @@ test "the module's own example compiles and reads a token end to end" {
         .now_s = 1_500_000_000,
     });
     try std.testing.expectEqualStrings("u-7", claims.sub);
+}
+
+test "an ES256 token reads end to end the same way, off the key's type alone" {
+    const vector = @import("vector.zig");
+    const Claims = struct { iss: []const u8 };
+
+    var keys = try parseKeys(std.testing.allocator, vector.es256_jwks);
+    defer keys.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const claims = try verify(Claims, arena.allocator(), vector.es256_token, .{
+        .keys = &keys,
+        .issuer = "joe",
+        .now_s = 1_300_000_000,
+    });
+    try std.testing.expectEqualStrings("joe", claims.iss);
 }

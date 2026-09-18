@@ -1,10 +1,11 @@
 # Checking somebody else's token
 
 `nilo_jwt` verifies a JWT that an identity provider signed — a Google ID
-token, an Auth0 or Clerk access token, a Keycloak or Cognito bearer — and
-reads the claims into a struct of your own. It is a tool module: no event
-loop, no allocator of its own, and it imports nothing, so `zig test
-jwt/jwt.zig` runs the whole of it
+token, an Auth0 or Clerk access token, a Keycloak or Cognito bearer, a
+Supabase session — and reads the claims into a struct of your own. RS256
+and ES256, which between them are what those issuers sign with. It is a
+tool module: no event loop, no allocator of its own, and it imports
+nothing, so `zig test jwt/jwt.zig` runs the whole of it
 ([ADR 0140](../adr/0140-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 
 **It is for a token somebody else issued.** A sign-in your own server keeps
@@ -82,9 +83,16 @@ Each of these is a way to write a verifier that passes every test and leaves
 the endpoint open, which is the whole reason the module exists rather than a
 paragraph pointing at `std.crypto`:
 
-- **The algorithm is nilo's constant, never the token's `alg`.** A header
-  saying `none`, or `HS256` with the RSA modulus you published used as the
-  HMAC secret, is refused before a key is looked up.
+- **The algorithm is the key's, never the token's `alg`.** A JWKS key that
+  says `RSA` is checked as RS256 and one that says `EC` on `P-256` as ES256,
+  and nothing in the header can change which. The header's `alg` is only
+  compared: a header saying `none`, or `HS256` with the RSA modulus you
+  published used as the HMAC secret, is refused before a key is looked up,
+  and a header saying `ES256` over a key that is RSA — or `RS256` over one
+  that is EC — is `error.WrongAlgorithm` before any arithmetic runs. A key
+  set holding both kinds, which is what an issuer mid-migration publishes,
+  cannot be talked into checking one with the other
+  ([ADR 0242](../adr/0242-the-key-decides-the-algorithm.md)).
 - **Nothing in the payload is read until the signature has passed.** An `exp`
   off an unverified token is a number somebody chose.
 - **`exp` is required.** A credential with no end is not one, so a token
@@ -95,13 +103,16 @@ paragraph pointing at `std.crypto`:
 | Error | When | What to answer |
 |---|---|---|
 | `error.NotAToken` | not three base64url segments, or the header is not JSON | 401 |
-| `error.WrongAlgorithm` | the header says anything but `RS256`, `none` included | 401 |
+| `error.WrongAlgorithm` | the header says anything but `RS256` or `ES256`, `none` included — or says one over a key of the other kind | 401 |
 | `error.NoSuchKey` | the `kid` is not in the set, or none was named and the set has more than one key | the issuer may have rotated — [refresh](#when-the-issuer-rotates), then 401 |
 | `error.BadSignature` | the key is right and the signature is not | 401 |
 | `error.NoExpiry`, `error.Expired`, `error.NotYetValid` | `exp` missing, `exp` passed, `nbf` not arrived | 401 |
 | `error.WrongIssuer`, `error.WrongAudience` | `iss` or `aud` is not what you named | 401 |
 | `error.ClaimsNotReadable` | the signature passed and the payload does not fit your struct | 401 — or a 500 if the struct is the thing that is wrong |
 | `error.KeySizeNotSupported` | a modulus that is not 2048, 3072 or 4096 bits | 500, and a caller on the [roadmap](../roadmap.md#nilo_jwt-checking-somebody-elses-token) |
+| `error.CurveNotSupported` | an EC key whose `crv` is not `P-256` | the same 500, and the same roadmap entry |
+| `error.SignatureWrongLength` | a signature that is not the size of its key — for ES256, sixty-four bytes of `r \|\| s` | 401. If it is *your* test token, the signer wrote DER — [below](#es256-and-the-shape-of-the-signature) |
+| `error.KeyNotUsable` | the set carried a key the arithmetic cannot use: an even exponent, a coordinate that is not on the curve | 500 — the document is wrong, and no token will pass |
 
 Every one of them is a 401 to the client, and the *reason* belongs in your
 log rather than in the response: telling a caller which check failed is
@@ -118,14 +129,19 @@ module does is read the document:
 
 | | |
 |---|---|
-| `jwt.parseKeys(gpa, bytes)` | `!Keys` — a JWKS document read into the RSA keys it can verify with. Keys of another type are skipped, not refused |
+| `jwt.parseKeys(gpa, bytes)` | `!Keys` — a JWKS document read into the keys it can verify with: `RSA` as `n` and `e`, `EC` as `crv`, `x` and `y`. Keys of another type — an Ed25519, a key marked `"use":"enc"` — are skipped, not refused |
 | `keys.find(kid)` | `?Key`. A set with exactly one key answers for a token that named no `kid` |
+| `key.material` | `.rsa` or `.ec`, and the key's own `algorithm()` is `RS256` or `ES256` accordingly |
 | `keys.deinit()` | frees the lot |
 | `jwt.key_sizes` | the modulus lengths with a branch: 256, 384 and 512 bytes |
+| `jwt.curves` | the curves with a branch: `P-256` |
 
 `parseKeys` answers `error.NotAKeySet` for bytes that are not a JSON object
 with a `keys` array, and `error.KeyNotUsable` for a key that said RSA and then
-carried no `n` and `e`.
+carried no `n` and `e`, or said EC and carried no `crv`, `x` or `y`. An EC
+key on a curve other than `P-256` is *kept*, so that a token naming it is
+`error.CurveNotSupported` rather than a `NoSuchKey` that sends you looking
+for a rotation.
 
 The document's address is published by the issuer — Google's is
 `https://www.googleapis.com/oauth2/v3/certs`, and for anything OIDC it is the
@@ -149,6 +165,22 @@ server](./sql/reading.md#a-query-with-no-server),
 [ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)):
 `fn fetchKeys(run: *nilo.Run, client: *fetch.Client, keys: *Keys) !void`,
 registered with `app.before(fetchKeys, .{ &client, &keys })`.
+
+## ES256 and the shape of the signature
+
+Supabase, Apple and a growing number of issuers sign with ES256 — ECDSA over
+P-256 with SHA-256 — and their JWKS carries `{"kty":"EC","crv":"P-256","x":…,"y":…}`
+rather than `n` and `e`. Nothing in the call above changes: the key's type is
+what picks the arithmetic, and the same `verify` reads both.
+
+One thing is worth knowing if you ever *make* an ES256 token for a test. A
+JWS signature is the two integers `r` and `s` back to back, thirty-two bytes
+each, sixty-four in all (RFC 7518 §3.4). Every tool outside JOSE — `openssl
+dgst`, a certificate, a `.sig` file — writes the DER `SEQUENCE { INTEGER r,
+INTEGER s }` instead, seventy bytes or so with a variable length. A token
+whose last segment is DER arrives here as `error.SignatureWrongLength`, by
+name, rather than as a `BadSignature` you spend an afternoon on. The
+module's own vector is RFC 7515's, which sidesteps the question.
 
 ## The signed-in user
 
@@ -237,13 +269,15 @@ for that one.
 ## Testing
 
 `now_s` is an argument, so an expiry is tested by choosing the time rather
-than by waiting. A token signed with a key you hold — `openssl genrsa`,
-the public half as a JWKS document, a token signed by any library — and a
-`verify` at the second before its `exp`, the second of it, and the second
-after is the whole of a test, and it runs under `zig test` with no server.
+than by waiting. A token signed with a key you hold — `openssl genrsa` or
+`openssl ecparam -name prime256v1 -genkey`, the public half as a JWKS
+document, a token signed by any JOSE library — and a `verify` at the second
+before its `exp`, the second of it, and the second after is the whole of a
+test, and it runs under `zig test` with no server.
 
-The module's own suite does exactly that against a fixed vector
-(`jwt/vector.zig`), which is the file to copy the shape from.
+The module's own suite does exactly that against two fixed vectors
+(`jwt/vector.zig`) — an RSA one signed elsewhere, and RFC 7515's own ES256
+example — which is the file to copy the shape from.
 
 ## What it costs
 
@@ -252,16 +286,18 @@ the claims need, from the allocator you passed, and holds nothing between
 calls.
 
 **And the number for one verification is not on file.** An RSA verify at
-2048 bits is a modular exponentiation and it is not small; whether a hot
-endpoint should cache the answer or just do it is a question the roadmap is
-waiting on a measurement for. Until then, the safe reading is that a resolved
+2048 bits is a modular exponentiation and it is not small; an ES256 verify
+is two scalar multiplications on P-256 and is usually the cheaper of the two,
+but neither has been measured here. Whether a hot endpoint should cache the
+answer or just do it is a question the roadmap is waiting on a measurement
+for. Until then, the safe reading is that a resolved
 value is already the cheapest shape — once per request, not once per
 handler — and a session cookie set after the first verified request is the
 usual way to stop paying it at all.
 
 ## What it will not do
 
-HS256 and the EC families, encrypted tokens (JWE), signing, discovery, PKCE
+HS256, any curve but P-256, encrypted tokens (JWE), signing, discovery, PKCE
 and the nonce. Signing is absent because a server issuing its own sessions has
 [`Session(T)`](./sessions.md) and needs no token; HS256 is absent because a
 module verifying both a shared secret and a public key has to defend against
@@ -278,3 +314,5 @@ yours.
 - [Calling somebody else's API](./fetch.md) — the fetch that gets the key set.
 - [ADR 0140](../adr/0140-nilo-verifies-a-token-and-does-not-fetch-one.md) —
   why verifying is here and fetching is not.
+- [ADR 0242](../adr/0242-the-key-decides-the-algorithm.md) — why the key
+  picks the algorithm, and what ES256 costs.

@@ -83,6 +83,14 @@ where it was made.
   says `.redirects = .expose`; one that left the field out and never met a
   3xx changes nothing.
 
+- **`jwt.Key` is a `kid` and a `material` union**, `.rsa = .{ .e, .n }` or
+  `.ec = .{ .crv, .x, .y }`, now that a key set can hold two kinds of key
+  ([ADR 0242](./docs/adr/0242-the-key-decides-the-algorithm.md)).
+
+  What to change: `key.n` becomes `key.material.rsa.n`, and a `switch` on
+  `key.material` is how to tell the two apart. Code that only ever handed
+  `&keys` to `verify` changes nothing.
+
 - **`Bucket.stream(c, key, &reading)` takes no buffer.** The one it took was
   documented as what the body moved through, and no byte ever crossed it:
   the body goes from the connection's own read buffer to the writer `pipe`
@@ -92,6 +100,80 @@ where it was made.
 
 ### Added
 
+- **`nilo.Cached(Pages, .{ .ttl_s = 60 })`** as a route argument: the
+  answer a GET or HEAD returned is kept under the path and query in a bytes
+  Space and served again, byte for byte, for `ttl_s` — the handler does not
+  run. A request that finds the answer still being made waits for it rather
+  than running the handler again, which is the stampede answer `nilo_cache`
+  cannot give on its own. `.by` picks the key (`.path_and_query`, `.path`,
+  or one header); a credential as the key is a Refusal, and so is a POST.
+  Costs what `Idempotent` costs, on the route that asks and nowhere else
+  ([ADR 0247](./docs/adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)).
+- **`pw.Token`** — the secret that is not a password: a reset link, an email
+  verification, an API key. `pw.Token.new(try c.entropy(pw.token_len))`,
+  then `token.text()` to send (43 characters of base64url) and
+  `token.digest()` to store (SHA-256); `pw.Token.matches(stored, presented)`
+  decodes, hashes and compares in constant time, and answers `false` for
+  every wrong shape rather than an error that says which. No argon2: a
+  256-bit token needs no stretching, and a reset endpoint that took 13 ms to
+  say no would be one that can be walked. `pw.Token.parse` is the token read
+  back, for the lookup where the digest is the key. A `[16]u8` — a UUID's
+  bytes — is refused in nilo's words
+  ([ADR 0241](./docs/adr/0241-a-token-is-not-a-password-and-a-check-needs-no-request.md)).
+- **`nilo.verifyPassword(gpa, stored, text)`** and `nilo.verifyPasswordWith`:
+  `c.verifyPassword` with no request in hand, through the same Gate and the
+  same blocking pool, for a CLI resetting an account, a job re-hashing at a
+  raised Cost, or a test with neither an App nor a `Ctx`. Checking reads the
+  salt out of the stored string and never needed the request; the method
+  keeps its signature and calls this
+  ([ADR 0241](./docs/adr/0241-a-token-is-not-a-password-and-a-check-needs-no-request.md)).
+- **`nilo_jwt` reads ES256.** A JWKS key that says `"kty":"EC"` on `P-256`
+  is checked as ECDSA over P-256 with SHA-256 — what Supabase and Apple sign
+  with — through the same `verify`, and the token's header still picks
+  nothing: the key's type decides the algorithm, the header's `alg` is
+  compared against the two names before a key is looked up and against the
+  key's own name after, so `ES256` over an RSA key and `RS256` over an EC
+  key are both `error.WrongAlgorithm` before any arithmetic. A curve with
+  no branch is `error.CurveNotSupported` by name; a DER-shaped signature,
+  which is the mistake every signer outside JOSE makes, is
+  `error.SignatureWrongLength` rather than a `BadSignature`. `jwt.curves`
+  lists the one curve, beside `jwt.key_sizes`. The vector is RFC 7515
+  Appendix A.3, verbatim
+  ([ADR 0242](./docs/adr/0242-the-key-decides-the-algorithm.md)).
+- **`client.postJson(c, url, value, .{})`**, with `putJson`, `patchJson` and
+  `sendJson(c, method, url, value, .{})`: the value written out with
+  `std.json` into the Scope and sent under `content-type: application/json`,
+  unless `headers` names one. What `res.json(T, c)` is for the way in.
+  Text handed to any of them is a Refusal — it would go out as one JSON
+  string — and a body already encoded goes through `post`
+  ([ADR 0243](./docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+
+- **`fetch.withQuery(c, base, .{ .page = 2, .q = "a b" })`** is
+  `base?page=2&q=a%20b` in the Scope, one allocation sized exactly. A field
+  is an int, a bool, text or an optional of one, where null is the param
+  left out; any other type is a Refusal naming the field. A base that
+  already has a `?` gets `&`. The path half — a segment encoded on the way
+  in — waits on a target to hang it off
+  ([ADR 0243](./docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+
+- **`res.header(name)` and `res.headers`** on `fetch.Response`: the header
+  block the answer arrived with, kept into the Scope before the body read
+  over it, so `Retry-After` off a 429 or `ETag` for the next conditional
+  GET is one call away after `get` returns. **A whole-body call now makes
+  two arena allocations rather than one** — the block, then the body — and
+  the test that held the one now holds the two
+  ([ADR 0244](./docs/adr/0244-a-response-carries-its-headers.md)).
+
+- **`fetch.testing.Canned`** — the loopback server the module's own tests
+  drive, exported for a suite of your own: `open(io)`, `reply(status,
+  headers, body)`, `serveOne`, `url(&buf)`, `request()`, `requestBody()`.
+  Port 0 and the kernel's answer read back, so it needs no port range. The
+  guide's testing section used to say "copy the shape of `fetch/live.zig`'s
+  `Canned`"; it now shows the call
+  ([ADR 0243](./docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+
+- **`zig build refusals-fetch`**, `nilo_fetch`'s first Refusals table:
+  three rows, run by `test-fetch` and so by `test` and `test-all`.
 - **`stall_ms`**, on `fetch.Client.Settings`, `Call` and `Exchange.Begin`:
   the call is `error.Stalled` when nothing has arrived for that long,
   counted from the last byte rather than from the start. The other shape
@@ -351,6 +433,37 @@ where it was made.
   transaction that has since committed
   ([ADR 0229](./docs/adr/0229-a-push-wakes-a-worker.md)).
 
+- **A job can push the next one.** `.deps` on a `job.Jobs` may be a
+  function of the queue type, `fn (comptime Jobs: type) type`, answering
+  the struct of pointers a plain `.deps` is; a `run` then asks for
+  `jobs: *Jobs` and pushes the next kind. `.deps = struct { jobs: *Jobs }`
+  was a `dependency loop` in the compiler's words, and so was a `run`
+  naming `*Jobs` — every check that reads a `run`'s signature now waits
+  for the queue type when `.deps` is a function, so for such a queue a
+  `run` with the wrong shape is reported at the first `open` rather than
+  at the `job.Jobs(…)` line. `Jobs.Deps` names the struct either way; a
+  plain-struct `.deps` is unchanged. Two Refusals: a `.deps` function of
+  another shape, and one whose struct lacks what a `run` asks for
+  ([ADR 0245](./docs/adr/0245-a-job-can-push-the-next-one.md)).
+
+- **A `run` may ask for `tick: job.Tick`** beside its deps — the row's
+  `id`, `attempts`, `run_at`, and `last` for whether this is the attempt
+  `retry` stops at — by value, since after the job and the Run a pointer
+  is a service. `*job.Tick` is a Refusal naming the rule. On top of it,
+  `jobs.progress(tick.id, n)` writes a figure into the `status` Space and
+  `job.Status` carries it as `progress`, reset by every change of state
+  except `done` ([ADR 0246](./docs/adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)).
+
+- **`jobs.drainAt(&run, now)` and `jobs.runOneAt(&run, now)`** run what
+  would be due if it were `now`, and every read of the clock inside the
+  tick — the retry's wait, the schedule's next tick, a missed tick — reads
+  that number, so a test walks a backoff or a cron to three in the morning
+  without sleeping. `jobs.seed(&run)` / `seedAt(&run, now)` queue every
+  schedule's first tick, which is what `serve` does at start. `drain` and
+  `runOne` are the same calls at `nilo.nowMicros()`, and `drain` now reads
+  the clock once for the whole run rather than once per row
+  ([ADR 0246](./docs/adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)).
+
 - **`fetch.Settings.timeout_ms` fires without an Engine.** On a client
   started with `nilo_start(io, .none)` — a CLI, a worker, a test — a non-zero
   timeout used to arm nothing and say nothing, and a server that stopped
@@ -400,6 +513,23 @@ where it was made.
   ([ADR 0234](./docs/adr/0234-a-scalar-out-of-raw.md)).
 
 ### Fixed
+
+- A `Json(T)` column whose `T` holds text pointed that text at the driver's
+  read buffer rather than the arena when the string had no escape in it, so
+  the second row read made the first row's text garbage. `std.json`'s
+  default is a view into the input where it can be; the read now asks it to
+  copy, the way a text column is copied. Found by the same reading that
+  found it in `nilo_jwt`, one module over.
+- **`jwt.verify`'s claims and `jwt.parseKeys`'s `kid` no longer point at
+  memory that is gone.** `std.json`'s default for a slice input hands back
+  a slice *into the input* for any string with no escapes, so `claims.sub`
+  pointed into the scratch arena `verify` frees on the way out, and a key's
+  `kid` pointed into the response body it was parsed from — while both doc
+  comments promised the opposite. Unnoticed because every caller so far
+  handed `verify` an arena, and a scratch arena freed into an arena gives
+  nothing up. Both parses copy now, and a test frees the claims one string
+  at a time on the debug allocator
+  ([ADR 0242](./docs/adr/0242-the-key-decides-the-algorithm.md)).
 
 - **A call the Engine's own deadline stopped no longer drains the body it
   stopped waiting for.** `end` skipped the drain when the engineless clock
@@ -451,6 +581,22 @@ where it was made.
   could not report the port it was given. It could all along:
   `Server.socket.address` carries it after `listen`. `http/live.zig` binds
   port 0 too, through `app.boundPort()` above.
+
+### Docs
+
+- **The keyset form of a deep page.** `db.page`'s `OFFSET` gets slower as a
+  list goes deeper; [Reading](./docs/guide/sql/reading.md#the-keyset-form-of-a-deep-page)
+  now shows the `(created_at, id) < (…)` condition written as `.any`, with the
+  order term that keeps NULLs in a stable place beside it.
+- **`cache.Space` of bytes, with a struct behind it.** The guide's own
+  Refusal for a value that holds a pointer pointed at
+  [a sentence and no code](./docs/guide/cache.md#the-value-type-decides-the-shape-of-get);
+  it now shows `std.json.Stringify` into a bytes Space at `put` and
+  `std.json.parseFromSliceLeaky` off the request arena at `get`.
+- **A `<!-- compiles -->` block that only declares a type is now a documented
+  convention rather than a silent gap.** `docs/snippets/README.md` says why a
+  block declaring a Row and nothing else needs a `comptime { _ = … }` naming
+  it, and the guide's own Row examples that were missing one now carry it.
 
 ## Released
 

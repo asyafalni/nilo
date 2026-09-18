@@ -1,10 +1,13 @@
 //! Reading a signed JWT, in the order that makes the checks mean something.
 //!
-//! **The algorithm comes from this file, never from the token.** A verifier
+//! **The algorithm comes from the key, never from the token.** A verifier
 //! that reads `alg` out of the header and does what it says will accept
 //! `{"alg":"none"}`, and will accept an HMAC signed with the RSA public key
 //! it published. So `alg` is not an instruction here, it is one more thing
-//! compared against a constant.
+//! compared — first against the two names this file knows, before any key
+//! is looked up, and then against the one the key that was found answers to
+//! (ADR 0242). A token saying `ES256` over an RSA key is not "try ECDSA"; it
+//! is a mismatch, and it is refused the way `none` is.
 //!
 //! **Nothing in the payload is looked at until the signature has passed.**
 //! `exp` off an unverified token is a number somebody chose.
@@ -18,11 +21,18 @@ const std = @import("std");
 const b64 = @import("b64.zig");
 const jwks = @import("jwks.zig");
 const rs256 = @import("rs256.zig");
+const es256 = @import("es256.zig");
+
+/// The two names a header's `alg` may carry, and the whole of what is
+/// accepted before a key is looked up. Which of the two a token actually
+/// gets is the key's decision.
+const known_algorithms = [_][]const u8{ "RS256", "ES256" };
 
 pub const Error = error{
     /// Not three base64url segments separated by two dots.
     NotAToken,
-    /// The header says something other than `RS256` — including `none`.
+    /// The header says something other than `RS256` or `ES256` — including
+    /// `none` — or says one of them over a key of the other kind.
     WrongAlgorithm,
     /// The header's `kid` is not in the key set, or it named none and the
     /// set has more than one key to choose from.
@@ -41,7 +51,7 @@ pub const Error = error{
     /// caller asked for.
     ClaimsNotReadable,
     OutOfMemory,
-} || rs256.Error;
+} || rs256.Error || es256.Error;
 
 pub const Options = struct {
     /// The issuer's keys. Fetching and refreshing them is the caller's —
@@ -118,17 +128,26 @@ pub fn verify(
         else => return error.NotAToken,
     };
 
-    // Against a constant, not against whatever the token would like.
+    // Against the names known here, not against whatever the token would
+    // like — and before a key is looked up, so `none` and `HS256` never get
+    // as far as a `kid` match.
     const alg = header.alg orelse return error.WrongAlgorithm;
-    if (!std.mem.eql(u8, alg, "RS256")) return error.WrongAlgorithm;
+    if (!isKnown(alg)) return error.WrongAlgorithm;
 
     const key = opts.keys.find(header.kid) orelse return error.NoSuchKey;
+
+    // The key decides which arithmetic runs, and the header has to agree
+    // with it. `ES256` over an RSA key is a mismatch, not a request.
+    if (!std.mem.eql(u8, alg, key.algorithm())) return error.WrongAlgorithm;
 
     const sig = b64.keep(tmp, sig_text) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.NotBase64Url => return error.NotAToken,
     };
-    try rs256.verify(signed, sig, key.e, key.n);
+    switch (key.material) {
+        .rsa => |rsa| try rs256.verify(signed, sig, rsa.e, rsa.n),
+        .ec => |ec| try es256.verify(signed, sig, ec.crv, ec.x, ec.y),
+    }
 
     // Past here the bytes are the issuer's.
     const payload_bytes = b64.keep(tmp, payload_text) catch |err| switch (err) {
@@ -156,12 +175,22 @@ pub fn verify(
         if (!audienceCarries(reg.aud, want)) return error.WrongAudience;
     }
 
+    // `.alloc_always`: the default for a slice input points a string with no
+    // escapes in it back into `payload_bytes`, which is scratch and is freed
+    // on the way out. The promise on this function is that the strings live
+    // in `gpa`, and this is what keeps it.
     return std.json.parseFromSliceLeaky(Claims, gpa, payload_bytes, .{
         .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.ClaimsNotReadable,
     };
+}
+
+fn isKnown(alg: []const u8) bool {
+    for (known_algorithms) |name| if (std.mem.eql(u8, alg, name)) return true;
+    return false;
 }
 
 /// `aud` is one string in most tokens and a list in some. Both are the same
@@ -183,9 +212,10 @@ fn audienceCarries(aud: ?std.json.Value, want: []const u8) bool {
 const testing = std.testing;
 
 /// A 2048-bit key and a token signed with it, generated once with openssl and
-/// pinned here. The payload is
+/// pinned here, beside RFC 7515's own ES256 example. The RS256 payload is
 /// `{"iss":"https://accounts.example","aud":"client-1","sub":"u-7",
-///   "email":"a@example.com","exp":2000000000,"nbf":1000000000}`.
+///   "email":"a@example.com","exp":2000000000,"nbf":1000000000}`;
+/// the RFC's is `{"iss":"joe","exp":1300819380,"http://example.com/is_root":true}`.
 const vector = @import("vector.zig");
 
 fn keySet() !jwks.Keys {
@@ -207,6 +237,27 @@ test "a token signed by the key in the set verifies, and the claims come back" {
         .audience = "client-1",
         .now_s = 1_500_000_000,
     });
+    try testing.expectEqualStrings("u-7", claims.sub);
+    try testing.expectEqualStrings("a@example.com", claims.email);
+}
+
+test "the claims live in the allocator handed in, not in verify's scratch" {
+    const Claims = struct { sub: []const u8, email: []const u8 };
+
+    var keys = try keySet();
+    defer keys.deinit();
+
+    // A real allocator rather than an arena, so that each string is its own
+    // allocation and can be handed back to it. A string pointing into the
+    // scratch arena — freed before this line runs — could not be freed here,
+    // and the debug allocator says so.
+    const claims = try verify(Claims, testing.allocator, vector.token, .{
+        .keys = &keys,
+        .now_s = 1_500_000_000,
+    });
+    defer testing.allocator.free(claims.sub);
+    defer testing.allocator.free(claims.email);
+
     try testing.expectEqualStrings("u-7", claims.sub);
     try testing.expectEqualStrings("a@example.com", claims.email);
 }
@@ -389,4 +440,141 @@ test "things that are not tokens" {
     }) |bad| {
         try testing.expectError(error.NotAToken, verify(Claims, a, bad, opts));
     }
+}
+
+// ES256, against RFC 7515 Appendix A.3.
+
+const RfcClaims = struct { iss: []const u8, @"http://example.com/is_root": bool };
+
+test "an ES256 token signed by the RFC's own key verifies, and the claims come back" {
+    var keys = try jwks.parse(testing.allocator, vector.es256_jwks);
+    defer keys.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const claims = try verify(RfcClaims, arena.allocator(), vector.es256_token, .{
+        .keys = &keys,
+        .issuer = "joe",
+        .now_s = 1_300_000_000,
+    });
+    try testing.expectEqualStrings("joe", claims.iss);
+    try testing.expect(claims.@"http://example.com/is_root");
+
+    // The registered claims are the module's business here as well.
+    try testing.expectError(error.Expired, verify(RfcClaims, arena.allocator(), vector.es256_token, .{
+        .keys = &keys,
+        .now_s = 1_300_819_381,
+    }));
+    try testing.expectError(error.WrongIssuer, verify(RfcClaims, arena.allocator(), vector.es256_token, .{
+        .keys = &keys,
+        .issuer = "jane",
+        .now_s = 1_300_000_000,
+    }));
+}
+
+test "one flipped byte in an ES256 payload is a bad signature, not a claim" {
+    var keys = try jwks.parse(testing.allocator, vector.es256_jwks);
+    defer keys.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const bad = try arena.allocator().dupe(u8, vector.es256_token);
+    const at = std.mem.indexOfScalar(u8, bad, '.').? + 1;
+    bad[at] = if (bad[at] == 'A') 'B' else 'A';
+    try testing.expectError(error.BadSignature, verify(RfcClaims, arena.allocator(), bad, .{
+        .keys = &keys,
+        .now_s = 1_300_000_000,
+    }));
+}
+
+test "an ES256 signature sent as DER is refused by its length, not as a bad signature" {
+    var keys = try jwks.parse(testing.allocator, vector.es256_jwks);
+    defer keys.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // The same r and s, wrapped the way every tool outside JOSE wraps them.
+    const der = vector.es256_header ++ "." ++ vector.es256_payload ++ "." ++ vector.es256_signature_der;
+    try testing.expectError(error.SignatureWrongLength, verify(RfcClaims, arena.allocator(), der, .{
+        .keys = &keys,
+        .now_s = 1_300_000_000,
+    }));
+}
+
+test "a header saying ES256 over an RSA key is a mismatch, and so is the other way round" {
+    const Claims = struct { iss: []const u8 };
+
+    // The mixed set: an RSA key under `test-key`, the RFC's EC key under
+    // `es256-key`, and the RS256 token still reads against it.
+    var keys = try keySet();
+    defer keys.deinit();
+    try testing.expectEqual(@as(usize, 2), keys.all.len);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    _ = try verify(Claims, a, vector.token, .{ .keys = &keys, .now_s = 1_500_000_000 });
+
+    // {"alg":"ES256","kid":"test-key"} — the RFC's real ES256 payload and
+    // signature, pointed at the RSA key. Refused before any arithmetic.
+    const es_over_rsa = "eyJhbGciOiJFUzI1NiIsImtpZCI6InRlc3Qta2V5In0." ++ vector.es256_payload ++ "." ++ vector.es256_signature;
+    try testing.expectError(error.WrongAlgorithm, verify(Claims, a, es_over_rsa, .{
+        .keys = &keys,
+        .now_s = 1_300_000_000,
+    }));
+
+    // {"alg":"RS256","kid":"es256-key"} — the real RS256 payload and
+    // signature, pointed at the EC key.
+    const rsa_over_ec = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImVzMjU2LWtleSJ9." ++ vector.payload ++ "." ++ vector.signature;
+    try testing.expectError(error.WrongAlgorithm, verify(Claims, a, rsa_over_ec, .{
+        .keys = &keys,
+        .now_s = 1_500_000_000,
+    }));
+
+    // And the honest header over the EC key gets as far as the signature,
+    // which was taken over a different header: a bad signature, not a
+    // mismatch. That is the check after the one above, doing its job.
+    const es_over_ec = "eyJhbGciOiJFUzI1NiIsImtpZCI6ImVzMjU2LWtleSJ9." ++ vector.es256_payload ++ "." ++ vector.es256_signature;
+    try testing.expectError(error.BadSignature, verify(Claims, a, es_over_ec, .{
+        .keys = &keys,
+        .now_s = 1_300_000_000,
+    }));
+}
+
+test "ES384 and every other name are refused before a key is looked up" {
+    const Claims = struct { iss: []const u8 };
+
+    var keys = try jwks.parse(testing.allocator, vector.es256_jwks);
+    defer keys.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // {"alg":"ES384"} over the one-key set, which would otherwise answer.
+    const forged = "eyJhbGciOiJFUzM4NCJ9." ++ vector.es256_payload ++ "." ++ vector.es256_signature;
+    try testing.expectError(error.WrongAlgorithm, verify(Claims, arena.allocator(), forged, .{
+        .keys = &keys,
+        .now_s = 1_300_000_000,
+    }));
+}
+
+test "a key on a curve with no branch is refused by name rather than as missing" {
+    const Claims = struct { iss: []const u8 };
+
+    var keys = try jwks.parse(testing.allocator,
+        \\{"keys":[{"kty":"EC","crv":"P-384","x":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4v","y":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4v"}]}
+    );
+    defer keys.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    try testing.expectError(error.CurveNotSupported, verify(Claims, arena.allocator(), vector.es256_token, .{
+        .keys = &keys,
+        .now_s = 1_300_000_000,
+    }));
 }

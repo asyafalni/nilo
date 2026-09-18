@@ -342,7 +342,7 @@ A JWT somebody else signed and this program has to believe or refuse. The word i
 _Avoid_: JWT as a verb, bearer, credential, ticket, id token
 
 **Key set**:
-An issuer's public keys, as they come back from its JWKS endpoint, read into the ones RS256 can be checked against. Keys of another type in the same document are skipped rather than refused, because an issuer adding a key type is not a reason to stop signing people in. Fetching it and deciding when it is stale are the caller's.
+An issuer's public keys, as they come back from its JWKS endpoint, read into the ones a token can be checked against — RSA for RS256, EC on P-256 for ES256 — and each one's type is what decides which check a token under it gets. Keys of another type in the same document are skipped rather than refused, because an issuer adding a key type is not a reason to stop signing people in. Fetching it and deciding when it is stale are the caller's.
 _Avoid_: JWKS as a noun on its own, keyring, key store, certificate
 
 **Claims**:
@@ -374,3 +374,7 @@ _Avoid_: dead letter queue, DLQ, failed, poison, discarded
 **Schedule**:
 When a job that nobody pushes runs: a cron expression or an interval, in UTC, parsed while compiling. The next tick is a row with a unique key, so a schedule on ten instances is one row. A schedule declares what an overlap and a missed tick mean, or it does not compile.
 _Avoid_: cron job, timer, ticker, interval (for the whole — an interval is one kind of schedule), recurring task
+
+**Tick**:
+One run of one row: the row's id, which attempt this is, when it was due, and whether `retry` allows another. What a `run` is handed when it asks for `job.Tick` beside its deps — by value, because after the job and the Run a pointer is a service and this is not one. Everything in it was in the worker's hand at the claim, so asking costs nothing. Under `drainAt` a test says what time the tick is.
+_Avoid_: job context, execution, invocation, attempt (for the whole — an attempt is one field of it), metadata

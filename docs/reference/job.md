@@ -44,13 +44,23 @@ is copied rather than carried. Three declarations are read while compiling:
 |---|---|
 | `pub const nilo_job = "…"` | the name the row carries. Required; at most 64 bytes; unique across the `kinds` |
 | `pub const retry: job.Retry` | required, no default: `.none`, or `.{ .times, .backoff }` with `.{ .fixed_ms }` or `.{ .exponential = .{ .from_ms, .to_ms } }` |
-| `pub fn run(self, scope: *nilo.Run, …) !void` | the work: the job by value, the Run, then any service by pointer, found in `.deps` by type |
+| `pub fn run(self, scope: *nilo.Run, …) !void` | the work: the job by value, the Run, then any service by pointer, found in `.deps` by type — and `tick: job.Tick` by value, if it wants to know which tick it is ([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)) |
 | `pub const final = error{ … }` | optional: the failures that are **final**. A `run` failing with one is dead on that attempt whatever `retry` says, and the row keeps the error's name; a timeout never is. Refused on a kind whose `retry` is `.none` ([ADR 0218](../adr/0218-a-run-can-say-its-failure-is-final.md)) |
 | `pub const timeout_ms` | optional, over the queue's. Also the lease |
 | `pub const schedule`, `overlap`, `missed` | for a job that runs on the clock — below |
 
 A field that is a `*T` is a Refusal naming the field; a `run` that asks for a
-`*Ctx`, or for a pointer type nobody put in `.deps`, is one naming the job.
+`*Ctx`, for a `*job.Tick`, or for a pointer type nobody put in `.deps`, is
+one naming the job.
+
+**`job.Tick`** — what a `run` that asks for one is handed:
+
+| Field | |
+|---|---|
+| `id` | the row's, for `jobs.progress` and `jobs.status` |
+| `attempts` | counting this one: `1` the first time |
+| `run_at` | when the row was due, microseconds since the epoch |
+| `last` | whether this is the last attempt `retry` allows. About the count: a failure in `final` is dead on any attempt |
 
 **`job.Jobs(.{ … })`:**
 
@@ -58,23 +68,27 @@ A field that is a `*T` is a Refusal naming the field; a `run` that asks for a
 |---|---|
 | `.kinds` | a tuple of job types. A job pushed but not listed is a Refusal |
 | `.store` | `job.Table(Db)`, `job.Memory`, or anything carrying the contract in `job/contract.zig` |
-| `.deps` | optional: a struct of pointers a `run` may ask for by type |
+| `.deps` | optional: a struct of pointers a `run` may ask for by type — or `fn (comptime Jobs: type) type` answering one, for a `run` that asks for `*Jobs` to push the next job ([ADR 0245](../adr/0245-a-job-can-push-the-next-one.md)). A function of another shape is a Refusal |
 | `.status` | optional: a `cache.Space` of `job.Status` kept per row, for a route to poll |
 
 | | |
 |---|---|
-| `Jobs.open(gpa, &store, deps, settings)` | the queue. `openWith(…, space)` when `.status` names a Space |
+| `Jobs.open(gpa, &store, deps, settings)` | the queue. `openWith(…, space)` when `.status` names a Space. When `.deps` names `*Jobs`, open it once it has an address: `var jobs: Jobs = undefined; jobs = .open(…, .{ .jobs = &jobs, … }, .{})` |
+| `Jobs.Deps` | the struct of pointers `open` takes: `.deps` as written, or what `.deps(Jobs)` answered |
 | `Jobs.Row` | the store's table, for `createMissing` and `db.checking`; `void` for `job.Memory` |
 | `jobs.push(c, value, opts)` | `!Id`; `!?Id` when `opts` has `.unique`, null when a row already carries the key |
 | `jobs.pushIn(&tx, c, value, opts)` | the same inside a transaction you hold. A Refusal on `job.Memory`, and with `.within`. Wakes nobody — the row is not there until the commit — so call `wake` after it |
 | `jobs.wake()` | wake every idle worker, for a row nilo did not see arrive: another process's, or one `pushIn` put under a transaction that has since committed. A `push` wakes one worker itself ([ADR 0229](../adr/0229-a-push-wakes-a-worker.md)) |
 | `jobs.stats(c)` | `Stats` — `queued`, `running`, `dead` |
-| `jobs.status(id)` | `?job.Status` — `state` and `attempts`, from the Space, while it remembers |
+| `jobs.status(id)` | `?job.Status` — `state`, `attempts` and `progress`, from the Space, while it remembers |
+| `jobs.progress(id, n)` | `n` into the Space's `progress` for the row, from inside a `run` with a `job.Tick` and a `*Jobs`. Reset by every change of state except `done`, which keeps it. Nothing without a Space ([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)) |
 | `jobs.deadOnes(c)` | `[]Dead` — `id`, `kind`, `attempts`, `err`, newest first |
 | `jobs.retryDead(c, id)` | `bool` — queued again from attempt one |
 | `Jobs.serve(&jobs)` | the worker loop, for `app.spawn`. Stops with the server |
 | `jobs.serveOn(io)` | the same on an `Io` of yours, for a worker process. Returns when cancelled |
-| `jobs.drain(&run)` / `jobs.runOne(&run)` | run what is due on this thread, for a test. A `*Ctx` is refused |
+| `jobs.drain(&run)` / `jobs.runOne(&run)` | run what is due on this thread, for a test, against one reading of the clock. A `*Ctx` is refused |
+| `jobs.drainAt(&run, now)` / `jobs.runOneAt(&run, now)` | the same as if it were `now`, microseconds since the epoch: what is due, when a retry is, when the next tick is, all read that number. How a test moves the clock ([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)) |
+| `jobs.seed(&run)` / `jobs.seedAt(&run, now)` | queue every schedule's next tick, the way `serve` does at start — for a test that drains rather than serves |
 | `jobs.nilo_ready(scope)` | what `app.health` asks: the store, and whether a worker is alive |
 
 **Push options** — `.{}` is the ordinary call:
