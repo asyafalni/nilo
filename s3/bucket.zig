@@ -40,6 +40,7 @@ const core = @import("nilo_core");
 const fetch = @import("nilo_fetch");
 
 const code = @import("code.zig");
+const listing_mod = @import("listing.zig");
 const sign = @import("sign.zig");
 const store_mod = @import("store.zig");
 
@@ -159,6 +160,10 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         const url_max = "https://".len + host_max + prefix_max + 1 + settings.key_max * 3;
         const host_max = 63 + 1 + 255;
         const prefix_max = 1 + 63;
+        /// The same for a `list`, whose URL is the bucket's root and a query
+        /// rather than a key: sized by the query, which is sized by
+        /// `key_max` too, since a prefix is the start of a key.
+        const list_url_max = "https://".len + host_max + prefix_max + "/?".len + listing_mod.queryMax(settings.key_max);
 
         pub fn open(s: *Store) !Self {
             const host_len = hostLen(s.authority);
@@ -539,6 +544,122 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             };
         }
 
+        /// One page of the bucket's keys under a prefix, and where the next
+        /// page starts
+        /// ([ADR 0250](../docs/adr/0250-a-list-is-a-page-with-a-cursor-and-nothing-that-follows-it.md)).
+        ///
+        /// ```zig
+        /// var cursor: ?[]const u8 = null;
+        /// while (true) {
+        ///     const page = try files.list(c, .{ .prefix = "exports/2026/", .max_keys = 200, .cursor = cursor });
+        ///     for (page.objects) |o| { … }
+        ///     cursor = (page.next orelse break).view();
+        /// }
+        /// ```
+        ///
+        /// Bounded three ways, on purpose. The page is at most `max_keys`
+        /// objects and at most `keys_max` (1,000, S3's own ceiling — a number
+        /// over it is refused rather than clamped, so a loop sized by what it
+        /// asked for is never quietly given less). The body is read into the
+        /// Scope up to a ceiling derived from `max_keys` and `key_max`, so a
+        /// server answering more than it was asked for is `TooLarge` rather
+        /// than an arena it fills. And **nothing here follows the cursor for
+        /// the caller**: a helper that walked every page would be the call
+        /// with unbounded output the module does not have, and would invite
+        /// reading a bucket as a database. The cursor is handed back and the
+        /// loop is the caller's.
+        ///
+        /// What it costs: two allocations in the Scope for the body and the
+        /// page, plus one per key for the decoded key and one per ETag —
+        /// a key arrives percent-encoded and an ETag with its quotes as
+        /// entities, and each is decoded once into memory of its own size.
+        pub fn list(self: *Self, c: anytype, listing: Listing) Error!Page {
+            comptime core.checkScope(@TypeOf(c), "bucket.list");
+
+            if (listing.max_keys == 0 or listing.max_keys > listing_mod.keys_max) {
+                std.log.warn(
+                    "nilo_s3: `{s}`.list asked for {d} keys a page; S3 answers 1 to {d}",
+                    .{ name, listing.max_keys, listing_mod.keys_max },
+                );
+                return error.Rejected;
+            }
+            if (listing.prefix.len > settings.key_max) {
+                std.log.warn(
+                    "nilo_s3: a prefix of {d} bytes is longer than `{s}`'s `key_max` of {d}",
+                    .{ listing.prefix.len, name, settings.key_max },
+                );
+                return error.Rejected;
+            }
+            if (listing.cursor) |cursor| if (cursor.len > listing_mod.cursor_max) {
+                std.log.warn(
+                    "nilo_s3: `{s}`.list was handed a cursor of {d} bytes, over the {d} a server hands out",
+                    .{ name, cursor.len, listing_mod.cursor_max },
+                );
+                return error.Rejected;
+            };
+
+            var url_buf: [list_url_max]u8 = undefined;
+            var token_buf: [settings.session_token_max]u8 = undefined;
+            var sig: sign.Signature = .none;
+            var headers: Headers = .{};
+
+            // One buffer: the query is written in place, after the `?`, and
+            // signed from there — so the bytes signed are the bytes sent
+            // by construction rather than by a copy.
+            const target = self.urlForList(&url_buf, listing);
+            const query = target[std.mem.indexOfScalar(u8, target, '?').? + 1 ..];
+            try self.prepare(&sig, &headers, .{
+                .method = "GET",
+                .key = "",
+                .query = query,
+                .payload = self.store.payloadNoBody(),
+                .token_buf = &token_buf,
+            });
+
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+
+            const got = ex.begin(&self.store.client, .{
+                .method = .GET,
+                .url = target,
+                .host = self.host,
+                .authorization = sig.value(),
+                .headers = headers.slice(),
+                .redirects = .expose,
+            }) catch |err| return blame(err);
+
+            if (!got.ok()) return self.failure(c, &ex, got);
+
+            // What a page of this many keys can weigh: a fixed frame, and per
+            // object the tags, a date, an ETag, a size, and a key encoded at
+            // three bytes a character. A server sending more than that is
+            // not answering the question that was asked.
+            const bound = 2048 + @as(usize, listing.max_keys) * (320 + settings.key_max * 3);
+            const body = ex.take(c, bound) catch |err| return blame(err);
+            const xml = body.view();
+
+            const objects = try c.arena().alloc(Listed, listing_mod.Objects.count(xml));
+            var walk: listing_mod.Objects = .init(xml);
+            for (objects) |*object| {
+                const raw = walk.next() orelse unreachable; // counted a moment ago
+                const key = core.percent.decode(c.arena(), raw.key, false) catch return error.OutOfMemory;
+                const etag = try c.arena().alloc(u8, listing_mod.unescapedLen(raw.etag));
+                object.* = .{
+                    .key = c.str(key),
+                    .size = std.fmt.parseInt(u64, raw.size, 10) catch return error.Failed,
+                    .etag = c.str(listing_mod.unescapeInto(etag, raw.etag)),
+                    .last_modified = c.str(raw.last_modified),
+                };
+            }
+
+            const next: ?Str = if (listing_mod.nextCursor(xml)) |raw| next: {
+                const room = try c.arena().alloc(u8, listing_mod.unescapedLen(raw));
+                break :next c.str(listing_mod.unescapeInto(room, raw));
+            } else null;
+
+            return .{ .objects = objects, .next = next };
+        }
+
         // ---- presigning ----
 
         /// A URL somebody else can use, and the moment it stops working.
@@ -794,6 +915,10 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             content_disposition: ?[]const u8 = null,
             range: ?[]const u8 = null,
             if_none_match: ?[]const u8 = null,
+            /// Canonical already — `listing.query` writes it so. Empty for
+            /// every call but `list`, which is the one call here whose
+            /// request is a question rather than a key.
+            query: []const u8 = "",
             token_buf: []u8,
         };
 
@@ -830,6 +955,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .method = req.method,
                 .prefix = self.prefix,
                 .key = req.key,
+                .query = req.query,
                 .headers = signed,
                 .payload = req.payload,
             });
@@ -957,6 +1083,21 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             return w.buffered();
         }
 
+        /// `https://s3.amazonaws.com/files/?encoding-type=url&list-type=2…`:
+        /// the bucket's root and a query, for the one call that asks about
+        /// the bucket rather than about a key. Cannot fail: `list_url_max`
+        /// is a ceiling on every part, and `list` has already refused a
+        /// prefix or a cursor longer than the ceiling was sized for.
+        fn urlForList(self: *Self, buf: *[list_url_max]u8, listing: Listing) []const u8 {
+            var w = std.Io.Writer.fixed(buf);
+            w.writeAll(self.base) catch unreachable;
+            w.writeAll(self.prefix) catch unreachable;
+            w.writeAll("/?") catch unreachable;
+            const written = w.buffered().len;
+            const query = listing_mod.query(buf[written..], listing);
+            return buf[0 .. written + query.len];
+        }
+
         /// One place where everything `nilo_fetch` and the Store can fail with
         /// becomes one of the seven.
         fn blame(err: anyerror) Error {
@@ -996,6 +1137,33 @@ pub const Meta = struct {
     len: u64,
     content_type: Str,
     etag: Str,
+};
+
+/// What `list` asks: a prefix, a page size and where to start
+/// (`listing.Listing`, named here so a caller writes `s3.Listing`).
+pub const Listing = listing_mod.Listing;
+
+/// One object as a list names it: the four things S3 says about a key
+/// without being asked for the key. Every text is a `Str` in the Scope.
+pub const Listed = struct {
+    key: Str,
+    size: u64,
+    /// Quotes included, the way `head` and `get` hand it back — so a value
+    /// from here can be given to `getIf` as it is.
+    etag: Str,
+    /// As the server wrote it: `2026-09-18T10:11:12.000Z`. Text rather
+    /// than a number, because the one thing every caller does with it is
+    /// compare or print, and `sql.Timestamp` reads it if a caller wants
+    /// arithmetic.
+    last_modified: Str,
+};
+
+/// One page of a listing. `next` is the cursor to hand back as
+/// `Listing.cursor` for the page after this one, and null when this was
+/// the last — the loop that follows it is the caller's (ADR 0250).
+pub const Page = struct {
+    objects: []const Listed,
+    next: ?Str,
 };
 
 /// A URL somebody else can use, and the truth about when it stops working.

@@ -522,6 +522,15 @@ pub const Postgres = struct {
     /// at all.
     pub const trigger_repeatable_head = "CREATE OR REPLACE TRIGGER ";
 
+    /// The three lists a `sql.Schema` carries beside its tables (ADR 0253).
+    /// Postgres has all three; the head is what `createMissing` sends for a
+    /// view, and `CREATE OR REPLACE VIEW` is the one form Postgres has —
+    /// there is no `IF NOT EXISTS` on a view — so a view whose columns went
+    /// away is refused there and is the diff's to drop and remake.
+    pub const has_extensions = true;
+    pub const has_functions = true;
+    pub const view_repeatable_head = "CREATE OR REPLACE VIEW ";
+
     /// The whole column clause for the key, which is where the two databases
     /// disagree most and disagree structurally rather than in spelling.
     ///
@@ -982,6 +991,15 @@ pub const SQLite = struct {
     /// And it has had `IF NOT EXISTS` on `CREATE TRIGGER` since 3.3, so the
     /// repeatable form costs nothing here.
     pub const trigger_repeatable_head = "CREATE TRIGGER IF NOT EXISTS ";
+
+    /// No extensions and no `CREATE FUNCTION`: a SQLite function is a C
+    /// callback registered on the connection, and an extension is a shared
+    /// library loaded into it. Neither is a statement, so `sql.Schema`
+    /// refuses both lists here rather than sending text the database
+    /// cannot read (ADR 0253). Views it has, with `IF NOT EXISTS`.
+    pub const has_extensions = false;
+    pub const has_functions = false;
+    pub const view_repeatable_head = "CREATE VIEW IF NOT EXISTS ";
 
     /// **No either**, and for the same reason: a table constraint here is
     /// written at creation and is part of the table from then on. A changed

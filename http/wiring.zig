@@ -190,12 +190,33 @@ pub fn chainsFor(self: *App, set: *const static_mod.Set) ![]const []const mw.Mid
 /// the same call on the same operations — which is what stops a checked-in
 /// file and a running server describing two different APIs.
 pub fn writeOpenApi(self: *const App, w: *std.Io.Writer) !void {
-    const info: openapi.Info = if (self.docs_options) |opts| .{
+    var info: openapi.Info = if (self.docs_options) |opts| .{
         .title = opts.title,
         .version = opts.version,
         .description = opts.description,
     } else .{};
-    try openapi.write(self.gpa, w, self.operations.items, info);
+    const guard = self.declared_guard orelse
+        return openapi.write(self.gpa, w, self.operations.items, info);
+
+    // Which routes the guard is in front of is settled here, from the
+    // same wiring `resolveChains` reads, rather than when the route was
+    // registered — a `without` or a `with` written after the route would
+    // otherwise be missed (ADR 0252). On a copy, because the operations
+    // are the App's and this is a `*const` view of it.
+    info.cookie = guard.cookie;
+    const ops = try self.gpa.dupe(openapi.Operation, self.operations.items);
+    defer self.gpa.free(ops);
+    for (ops) |*op| {
+        op.guarded = mw.wraps(
+            self.scoped.items,
+            self.exemptions.items,
+            self.attached.items,
+            op.method,
+            op.pattern,
+            guard.middleware,
+        );
+    }
+    try openapi.write(self.gpa, w, ops, info);
 }
 
 /// Turn the collected operations into the document and its reader page.

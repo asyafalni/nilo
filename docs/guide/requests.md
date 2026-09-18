@@ -193,6 +193,24 @@ rather than a megabyte
 normally pays for that in nothing: under a page it is the one allocation it
 always was, over a page it is two.
 
+**A body sent as `Content-Encoding: gzip` is inflated before anything reads
+it** — `c.body()`, `c.json`, a struct argument, a `Form(T)` all see the JSON
+and not the stream, the way they see neither framing. The stock OpenTelemetry
+Collector and most agents that push to a server gzip by default, and until
+[ADR 0251](../adr/0251-a-gzipped-body-is-inflated-into-the-buffer-that-holds-it.md)
+that default met a 415. The compressed bytes are bounded by `max_body`; what
+they inflate to is bounded by the same number, checked against the length the
+stream announces before a byte is inflated, so a small body that would inflate
+to a large one is a 413 and not a megabyte. A stream that does not decode is a
+400 naming the coding. Every other coding — `br`, `deflate`, `zstd`, two
+stacked — is still a 415 naming the header. What it costs a gzipped request is
+one more arena allocation, of the inflated size exactly; a request that is not
+gzipped pays nothing.
+
+`c.bodyStream()` is the exception: a stream hands bytes out as they arrive and
+holds nothing, so there is nowhere to inflate into, and a gzipped body on a
+streaming route is a 415 that says so.
+
 ## Bodies too big to hold
 
 ```zig

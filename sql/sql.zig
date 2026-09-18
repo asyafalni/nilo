@@ -140,7 +140,7 @@ pub const cli = @import("cli.zig");
 /// program that never names it links none of it, the same way `sqlite.zig` is
 /// dropped by a program holding only `sql.Db`.
 ///
-/// Two calls cover the two ends. `migrate.createMissing(&db, &run, &.{ … })` is
+/// Two calls cover the two ends. `migrate.createMissing(&db, &run, .{ .tables = &.{ … } })` is
 /// a small application's whole startup, and every statement it sends is a
 /// constant in the binary. `migrate.plan(…)` is the diff a tool generates from,
 /// and it touches no database at all.
@@ -150,6 +150,7 @@ pub const migrate = @import("migrate.zig");
 /// other, so `listen()` checks it is registered before the first request
 /// rather than after (ADR 0006).
 pub const Db = db.Db;
+pub const Schema = migrate.Schema;
 
 /// One statement that has run, as `db.watching`'s function is told about it
 /// ([ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)). The text,

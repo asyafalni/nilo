@@ -186,7 +186,7 @@ test "a date is TEXT on SQLite, and the day that went in is the day that comes o
     var fx = try Fixture.init(gpa, "dates");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{Holiday});
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Holiday} });
 
     // Before the epoch, which the ISO text spells the same way as any other
     // day and the `days` field holds as a negative.
@@ -212,7 +212,7 @@ test "the ten characters sort as days, which is why the text is ISO and not loca
     var fx = try Fixture.init(gpa, "datesort");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{Holiday});
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Holiday} });
 
     // `17/08/1945` would compare as text in whatever order the day of the
     // month happened to fall in. This is the whole reason the stored spelling
@@ -239,7 +239,7 @@ test "bytes go into a BLOB and come back the same bytes" {
     var fx = try Fixture.init(gpa, "bytes");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{Doc});
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Doc} });
 
     // A NUL in the middle, a byte no UTF-8 decoder accepts, and a `%`. The
     // first is what a text read would truncate at, the second is what a text
@@ -267,7 +267,7 @@ test "the column a bytes Row creates is the column the check accepts" {
     var fx = try Fixture.init(gpa, "bytescheck");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{Doc});
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Doc} });
     try testing.expectEqual(@as(usize, 0), try fx.db.checkSchema(&.{Doc}));
 }
 
@@ -276,7 +276,7 @@ test "a row keyed by two columns is found by both of them" {
     var fx = try Fixture.init(gpa, "composite");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{Seat});
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Seat} });
 
     _ = try fx.db.insert(Seat, &fx.run, .{
         .tenant_id = 1,
@@ -308,7 +308,7 @@ test "the composite PRIMARY KEY is a real constraint, not a clause nobody enforc
     var fx = try Fixture.init(gpa, "compositepk");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{Seat});
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Seat} });
     _ = try fx.db.insert(Seat, &fx.run, .{
         .tenant_id = 1,
         .id = 7,
@@ -328,7 +328,7 @@ test "a counter adds to its own value, so two updates in a row make two" {
     var fx = try Fixture.init(gpa, "counter");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{Seat});
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Seat} });
     _ = try fx.db.insert(Seat, &fx.run, .{
         .tenant_id = 1,
         .id = 7,
@@ -361,7 +361,7 @@ test "a search term holding a wildcard matches the wildcard and nothing else" {
     var fx = try Fixture.init(gpa, "search");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{Slot});
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Slot} });
     for ([_][]const u8{ "100% cotton", "1000 threads", "a_b", "axb" }) |label| {
         _ = try fx.db.insert(Slot, &fx.run, .{ .label = label, .rank = null });
     }
@@ -386,7 +386,7 @@ test "starts_with anchors, and a backslash in the term is still just a backslash
     var fx = try Fixture.init(gpa, "anchored");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{Slot});
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Slot} });
     for ([_][]const u8{ "alpha", "beta alpha", "a\\b", "a%b" }) |label| {
         _ = try fx.db.insert(Slot, &fx.run, .{ .label = label, .rank = null });
     }
@@ -410,7 +410,7 @@ test "an exists narrows to the rows with a match over there, and counts the same
     var fx = try Fixture.init(gpa, "exists");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{ Partner, Capability });
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{ Partner, Capability } });
 
     const one = try fx.db.insert(Partner, &fx.run, .{ .name = "acme" });
     const two = try fx.db.insert(Partner, &fx.run, .{ .name = "globex" });
@@ -458,7 +458,7 @@ test "an order term decides where NULLs go, rather than the database deciding" {
     var fx = try Fixture.init(gpa, "nulls");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{Slot});
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Slot} });
     _ = try fx.db.insert(Slot, &fx.run, .{ .label = "has", .rank = 1 });
     _ = try fx.db.insert(Slot, &fx.run, .{ .label = "none", .rank = null });
 
@@ -478,7 +478,7 @@ test "createMissing creates every table the types describe, in reference order" 
 
     // `User` first in the list and `orgs` created first anyway, because the
     // order is worked out from the references while compiling.
-    try migrate.createMissing(&fx.db, &fx.run, &.{ User, Org });
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{ User, Org } });
 
     const org = try fx.db.insert(Org, &fx.run, .{ .name = "nodeflux" });
     const user = try fx.db.insert(User, &fx.run, .{
@@ -533,7 +533,7 @@ test "a foreign key of two columns is a constraint the database enforces, not a 
     // Cards before boards in the list, and boards created first anyway: the
     // order comes from the reference, and a reference written as text orders
     // exactly as one written as a type.
-    try migrate.createMissing(&fx.db, &fx.run, &.{ Card, Board });
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{ Card, Board } });
     // SQLite checks foreign keys only when it is told to, per connection.
     _ = try fx.db.exec(&fx.run, "PRAGMA foreign_keys = ON", .{});
 
@@ -567,7 +567,7 @@ test "a table nilo created is a table nilo's own check accepts" {
     var fx = try Fixture.init(gpa, "checked");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{ User, Org });
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{ User, Org } });
 
     try migrate.ensureLedger(&fx.db, &fx.run);
 
@@ -586,14 +586,33 @@ test "createMissing run twice changes nothing, which is what a boot needs" {
     var fx = try Fixture.init(gpa, "twice");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{ Org, User });
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{ Org, User } });
     const org = try fx.db.insert(Org, &fx.run, .{ .name = "kept" });
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{ Org, User });
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{ Org, User } });
 
     // The row is still there, so nothing was recreated.
     const found = try fx.db.find(Org, &fx.run, org.id);
     try testing.expectEqualStrings("kept", found.?.name);
+}
+
+test "createMissing makes a schema's views after its tables, and a second run leaves them" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "views");
+    defer fx.deinit(gpa);
+
+    const schema: sql.Schema = .{
+        .tables = &.{ Org, User },
+        .views = &.{.{ .name = "org_names", .body = "SELECT name FROM orgs ORDER BY name" }},
+    };
+    try migrate.createMissing(&fx.db, &fx.run, schema);
+    _ = try fx.db.insert(Org, &fx.run, .{ .name = "beta" });
+    _ = try fx.db.insert(Org, &fx.run, .{ .name = "alpha" });
+    try migrate.createMissing(&fx.db, &fx.run, schema);
+
+    const names = try fx.db.raw([]const u8, &fx.run, "SELECT name FROM org_names", .{});
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqualStrings("alpha", names[0]);
 }
 
 test "the case-folding unique is the one that stops two addresses differing only in case" {
@@ -601,7 +620,7 @@ test "the case-folding unique is the one that stops two addresses differing only
     var fx = try Fixture.init(gpa, "folding");
     defer fx.deinit(gpa);
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{ Org, User });
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{ Org, User } });
     const org = try fx.db.insert(Org, &fx.run, .{ .name = "one" });
 
     _ = try fx.db.insert(User, &fx.run, .{
@@ -795,7 +814,7 @@ test "the plan a diff produces is the plan that runs, end to end" {
 
     try migrate.ensureLedger(&fx.db, &fx.run);
 
-    const tables = comptime migrate.tablesOf(Db.Dialect, &.{ Org, User });
+    const tables = comptime migrate.desiredOf(Db.Dialect, .{ .tables = &.{ Org, User } });
     const first = try migrate.plan(fx.run.arena(), Db.Dialect, tables, migrate.snapshot.empty(Db.Dialect));
     try testing.expectEqual(@as(usize, 0), first.problems.len);
     var d1: [64]u8 = undefined;
@@ -831,12 +850,12 @@ test "an added column is one ALTER, planned with no database and applied to one"
     };
 
     try migrate.ensureLedger(&fx.db, &fx.run);
-    try migrate.createMissing(&fx.db, &fx.run, &.{Before});
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Before} });
     _ = try fx.db.insert(Before, &fx.run, .{ .name = "kept across the alter" });
 
     const a = fx.run.arena();
-    const before = try migrate.snapshotOf(a, Db.Dialect, 1, comptime migrate.tablesOf(Db.Dialect, &.{Before}));
-    const change = try migrate.plan(a, Db.Dialect, comptime migrate.tablesOf(Db.Dialect, &.{After}), before);
+    const before = try migrate.snapshotOf(a, Db.Dialect, 1, comptime migrate.desiredOf(Db.Dialect, .{ .tables = &.{Before} }));
+    const change = try migrate.plan(a, Db.Dialect, comptime migrate.desiredOf(Db.Dialect, .{ .tables = &.{After} }), before);
 
     try testing.expectEqual(@as(usize, 1), change.steps.len);
     var d2: [64]u8 = undefined;
@@ -875,12 +894,12 @@ test "addMissingColumns adds what the Row has and the table has not, typed as cr
         tries: i64,
     };
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{Before});
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Before} });
     _ = try fx.db.insert(Before, &fx.run, .{ .url = "http://a/1" });
 
     // Three columns, once; then nothing, which is what a boot needs.
-    try testing.expectEqual(@as(usize, 3), try migrate.addMissingColumns(&fx.db, &fx.run, &.{After}));
-    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, &.{After}));
+    try testing.expectEqual(@as(usize, 3), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
 
     // The row survived, the defaults filled it, and the shape the check
     // accepts is the shape it would have accepted from `createMissing`.
@@ -897,7 +916,7 @@ test "addMissingColumns adds what the Row has and the table has not, typed as cr
         id: i64,
         note: ?[]const u8,
     };
-    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, &.{Elsewhere}));
+    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{Elsewhere} }));
 }
 
 test "addMissingColumns refuses a required column with no default, and sends nothing" {
@@ -920,10 +939,10 @@ test "addMissingColumns refuses a required column with no default, and sends not
         owner: []const u8,
     };
 
-    try migrate.createMissing(&fx.db, &fx.run, &.{Before});
-    try testing.expectError(error.NeedsBackfill, migrate.addMissingColumns(&fx.db, &fx.run, &.{After}));
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Before} });
+    try testing.expectError(error.NeedsBackfill, migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
     // One transaction: the column that was fine did not land either.
-    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, &.{Before}));
+    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{Before} }));
     const live = try fx.db.liveColumns(&fx.run, null, "downloads");
     try testing.expectEqual(@as(usize, 2), live.len);
 }
@@ -1008,7 +1027,7 @@ test "`status` says `edited` for a version whose file no longer matches what ran
     var fx = try Fixture.init(gpa, "status");
     defer fx.deinit(gpa);
 
-    const Tool = sql.cli.Tool(Db, &.{ User, Org });
+    const Tool = sql.cli.Tool(Db, .{ .tables = &.{ User, Org } });
     const two: []const migrate.Version = &.{
         .{ .number = 1, .name = "make_a", .steps = &.{
             .{ .kind = .create_table, .sql = "CREATE TABLE \"a\" (\"id\" INTEGER)", .why = "" },
@@ -1066,7 +1085,7 @@ test "a twin brings a database to head on its own, ledger row and all" {
     const migrations = @import("migrations.zig");
     const D = Db.Dialect;
 
-    const tables = comptime migrate.tablesOf(D, &.{ User, Org });
+    const tables = comptime migrate.desiredOf(D, .{ .tables = &.{ User, Org } });
     const change = try migrate.plan(fx.run.arena(), D, tables, migrate.snapshot.empty(D));
 
     var hash: [64]u8 = undefined;

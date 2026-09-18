@@ -13,6 +13,7 @@ const body_mod = @import("body.zig");
 const bulkhead = @import("bulkhead.zig");
 const convert = @import("convert.zig");
 const cookie_mod = @import("cookie.zig");
+const encoded = @import("encoded.zig");
 const http1 = @import("http1.zig");
 const json_mod = @import("json.zig");
 const password_mod = @import("password.zig");
@@ -1012,6 +1013,24 @@ pub const Ctx = struct {
                     self._deadlines,
                 ) catch |err| return self.slowBody(err);
             }
+
+            // A gzipped body is the bytes above, inflated once into the arena
+            // and held in their place — so `json`, `form` and every reader
+            // past this line see the body and not the way it was sent, the
+            // same way they see neither framing (ADR 0251). What was read
+            // above was bounded by `max_body` as compressed bytes; what it
+            // inflates to is bounded by the same number, checked against the
+            // length the stream announces before a byte is inflated.
+            if (self._request.content_encoding == .gzip) {
+                self._body = encoded.inflate(self._arena, self._body.?, self._limits.max_body) catch |err| switch (err) {
+                    error.BodyTooLarge, error.OutOfMemory => |e| return e,
+                    error.BadEncodedBody => return fail.badRequest(
+                        "the request body is not a gzip stream this server could decode — " ++
+                            "it arrived under Content-Encoding: gzip",
+                        .{},
+                    ),
+                };
+            }
         }
         return Str.fromRequest(self._body.?, self._lifetime);
     }
@@ -1053,6 +1072,18 @@ pub const Ctx = struct {
         // Asking twice would hand out two readers into one stream, and the
         // second would get whatever the first left.
         std.debug.assert(self._body == null and self._incoming == null);
+
+        // A stream hands the bytes out as they arrive and holds nothing, so
+        // there is nowhere to inflate a gzipped body into: the destination
+        // that `body()` uses as the inflater's window is the caller's buffer
+        // here, and it is handed back a piece at a time (ADR 0251). Refused
+        // with the status the parser gives every other coding, and the
+        // sentence says which side to change.
+        if (self._request.content_encoding != .identity) return fail.status(
+            415,
+            "this route reads its body as a stream, which is not decoded — send it as identity",
+            .{},
+        );
 
         // A Content-Length says up front how big it is, so a body over the
         // limit is refused before a byte of it is read. A chunked one has to

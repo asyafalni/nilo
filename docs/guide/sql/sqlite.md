@@ -12,7 +12,7 @@ const Db = sql.Sqlite(.{ .threading = .{ .hop = nilo } });
 
 var db = Db.init(gpa, "/var/lib/app/shop.db", .{ .size = 5 });
 defer db.deinit();
-db.checking(&.{ User, Order });
+db.checking(.{ .tables = &.{ User, Order } });
 try app.provide(&db);
 ```
 

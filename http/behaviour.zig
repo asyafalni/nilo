@@ -650,6 +650,77 @@ test "an Authorization a handler asks for is a security scheme the document prom
     try testing.expectEqualStrings("basic", schemes.get("basicAuth").?.object.get("scheme").?.string);
 }
 
+fn requireCookie(c: *Ctx, next: mw.Next) anyerror!void {
+    if (c.cookie("session") == null) return fail.unauthorized("sign in first", .{});
+    try next.run(c);
+}
+
+test "a guard declared on a cookie is a security scheme on every route it is in front of, and none it is not" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.docs(.{});
+    // The shape ADR 0252 exists for: a prefix behind a session, two routes
+    // inside it that cannot be, one outside that wants it anyway — and one
+    // that asks for a header on top of the cookie.
+    const api = app.group("/api");
+    try api.use(requireCookie);
+    try api.get("/me", whoIsAsking);
+    try api.get("/whose", whoseToken);
+    const open = api.without(requireCookie);
+    try open.post("/sign-in", testQuiet);
+    try app.get("/asking", whoIsAsking);
+    try app.with(requireCookie).get("/mine", whoIsAsking);
+    try app.guard(requireCookie, "session");
+    // Declared once: the program has one cookie.
+    try testing.expectError(error.GuardAlreadyDeclared, app.guard(requireCookie, "other"));
+
+    const json = try docsFor(&app);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const paths = parsed.value.object.get("paths").?.object;
+
+    // Under the prefix: the cookie, and the 401 the guard sends.
+    const me = paths.get("/api/me").?.object.get("get").?.object;
+    try testing.expect(me.get("security").?.array.items[0].object.get("cookieAuth") != null);
+    try testing.expect(me.get("responses").?.object.get("401") != null);
+
+    // The cookie and the header, in one requirement: both, not either.
+    const whose = paths.get("/api/whose").?.object.get("get").?.object;
+    const both = whose.get("security").?.array.items[0].object;
+    try testing.expect(both.get("cookieAuth") != null);
+    try testing.expect(both.get("bearerAuth") != null);
+    try testing.expectEqual(@as(usize, 2), both.count());
+
+    // The exception `without` wrote, and the route outside the prefix.
+    const sign_in = paths.get("/api/sign-in").?.object.get("post").?.object;
+    try testing.expect(sign_in.get("security") == null);
+    try testing.expect(sign_in.get("responses").?.object.get("401") == null);
+    const asking = paths.get("/asking").?.object.get("get").?.object;
+    try testing.expect(asking.get("security") == null);
+
+    // A `with` on one route counts the same as a `use` on a group.
+    const mine = paths.get("/mine").?.object.get("get").?.object;
+    try testing.expect(mine.get("security").?.array.items[0].object.get("cookieAuth") != null);
+
+    const scheme = parsed.value.object.get("components").?.object
+        .get("securitySchemes").?.object.get("cookieAuth").?.object;
+    try testing.expectEqualStrings("apiKey", scheme.get("type").?.string);
+    try testing.expectEqualStrings("cookie", scheme.get("in").?.string);
+    try testing.expectEqualStrings("session", scheme.get("name").?.string);
+}
+
+test "a guard declared on a middleware in front of nothing writes no cookie scheme" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.docs(.{});
+    try app.get("/asking", whoIsAsking);
+    try app.guard(requireCookie, "session");
+
+    const json = try docsFor(&app);
+    try testing.expect(std.mem.indexOf(u8, json, "cookieAuth") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "securitySchemes") == null);
+}
+
 test "a document with no Authorization anywhere lists no security scheme" {
     var app = App.init(testing.allocator);
     defer app.deinit();
@@ -6033,7 +6104,7 @@ test "with a proxy trusted, the scheme and host are the ones it forwarded" {
 
 // ---- a body under an encoding nilo cannot read ----
 
-test "a compressed request body is refused with a 415 naming the header" {
+test "a body under a Content-Encoding nilo cannot decode is refused with a 415 naming the header" {
     var app = App.init(testing.allocator);
     defer app.deinit();
     try app.post("/things", plainOk);
@@ -6042,16 +6113,25 @@ test "a compressed request body is refused with a 415 naming the header" {
     var h = Harness.init();
     defer h.deinit();
 
-    // What used to happen: the gzip stream reached the JSON parser and came
-    // back as "malformed body", which is true of the bytes and useless to
-    // whoever sent them (ADR 0111).
-    const gzipped = h.send(
+    // What used to happen: the stream reached the JSON parser and came back
+    // as "malformed body", which is true of the bytes and useless to whoever
+    // sent them (ADR 0111). gzip is decoded now (ADR 0251); brotli is not.
+    const brotli = h.send(
         &app,
-        "POST /things HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\n" ++
-            "Content-Type: application/json\r\nContent-Length: 3\r\n\r\n\x1f\x8b\x08",
+        "POST /things HTTP/1.1\r\nHost: t\r\nContent-Encoding: br\r\n" ++
+            "Content-Type: application/json\r\nContent-Length: 3\r\n\r\nabc",
     );
-    try testing.expect(std.mem.startsWith(u8, gzipped.response, "HTTP/1.1 415"));
-    try testing.expect(std.mem.indexOf(u8, gzipped.response, "Content-Encoding") != null);
+    try testing.expect(std.mem.startsWith(u8, brotli.response, "HTTP/1.1 415"));
+    try testing.expect(std.mem.indexOf(u8, brotli.response, "Content-Encoding") != null);
+    try testing.expect(std.mem.indexOf(u8, brotli.response, "gzip") != null);
+
+    // Two codings stacked is a coding nilo cannot read, whichever they are.
+    const stacked = h.send(
+        &app,
+        "POST /things HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip, br\r\n" ++
+            "Content-Length: 3\r\n\r\nabc",
+    );
+    try testing.expect(std.mem.startsWith(u8, stacked.response, "HTTP/1.1 415"));
 
     // `identity` is the one coding that means "these are the bytes".
     const plain = h.send(
@@ -6065,9 +6145,108 @@ test "a compressed request body is refused with a 415 naming the header" {
     // left alone rather than turned into a refusal nobody expected.
     const bodyless = h.send(
         &app,
-        "GET /nothing HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\n\r\n",
+        "GET /nothing HTTP/1.1\r\nHost: t\r\nContent-Encoding: br\r\n\r\n",
     );
     try testing.expect(std.mem.startsWith(u8, bodyless.response, "HTTP/1.1 404"));
+}
+
+/// `text`, gzipped by std, framed as a request body of that length.
+fn gzippedRequest(gpa: std.mem.Allocator, head: []const u8, text: []const u8) ![]u8 {
+    // `Compress.init` asserts its output has somewhere to write, and an
+    // `Allocating` starts with a buffer of nothing at all (see `static.zig`).
+    var out: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
+    defer out.deinit();
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var compress: std.compress.flate.Compress = try .init(&out.writer, &window, .gzip, .default);
+    try compress.writer.writeAll(text);
+    try compress.finish();
+    const packed_bytes = out.written();
+    return std.fmt.allocPrint(gpa, "{s}Content-Length: {d}\r\n\r\n{s}", .{ head, packed_bytes.len, packed_bytes });
+}
+
+const Greeting = struct { name: []const u8, times: u32 };
+
+fn greetGzipped(g: Greeting) ![]const u8 {
+    _ = g.times;
+    return g.name;
+}
+
+test "a gzipped body is inflated before anything reads it, so a typed handler sees the JSON" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/greet", greetGzipped);
+    try app.post("/echo", echoBody);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    // A typed body: what the stock OpenTelemetry Collector and most agents
+    // send by default reaches `c.json` as JSON (ADR 0251).
+    const greeting = try gzippedRequest(
+        testing.allocator,
+        "POST /greet HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\nContent-Type: application/json\r\n",
+        "{\"name\":\"wati\",\"times\":3}",
+    );
+    defer testing.allocator.free(greeting);
+    const greeted = h.send(&app, greeting);
+    try testing.expect(std.mem.startsWith(u8, greeted.response, "HTTP/1.1 200"));
+    try testing.expect(std.mem.endsWith(u8, greeted.response, "\r\n\r\nwati"));
+
+    // `c.body()` too, and the old spelling of the coding.
+    const text = "the same line, sent again and again and again and again, " ** 20;
+    const raw = try gzippedRequest(testing.allocator, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: x-gzip\r\n", text);
+    defer testing.allocator.free(raw);
+    const echoed = h.send(&app, raw);
+    try testing.expect(std.mem.startsWith(u8, echoed.response, "HTTP/1.1 200"));
+    try testing.expect(std.mem.endsWith(u8, echoed.response, text));
+    try testing.expect(echoed.keep_alive);
+}
+
+test "a gzipped body that does not decode is a 400 that names the coding, and one over the ceiling is a 413" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/echo", echoBody);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    // The JSON somebody forgot to compress, under a header that says they did.
+    const not_gzip = h.send(
+        &app,
+        "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\n" ++
+            "Content-Length: 27\r\n\r\n{\"name\":\"wati\",\"a\":1,\"b\":2}",
+    );
+    try testing.expect(std.mem.startsWith(u8, not_gzip.response, "HTTP/1.1 400"));
+    try testing.expect(std.mem.indexOf(u8, not_gzip.response, "Content-Encoding: gzip") != null);
+    // Answered, and the connection is still good for the next request: the
+    // body was read whole before it was found wanting.
+    try testing.expect(not_gzip.keep_alive);
+
+    // Over `max_body` once inflated, by the stream's own account — refused
+    // by the number, before a byte is inflated.
+    const big = "0123456789abcdef" ** (64 * 1024 / 16 + 1);
+    const over = try gzippedRequest(testing.allocator, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\n", big);
+    defer testing.allocator.free(over);
+    app.limits.max_body = 64 * 1024;
+    const refused = h.send(&app, over);
+    try testing.expect(std.mem.startsWith(u8, refused.response, "HTTP/1.1 413"));
+}
+
+test "a body read as a stream is not decoded, and says so with a 415" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/weigh", weighBody);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+    const raw = try gzippedRequest(testing.allocator, "POST /weigh HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\n", "twenty bytes of body");
+    defer testing.allocator.free(raw);
+    const result = h.send(&app, raw);
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 415"));
+    try testing.expect(std.mem.indexOf(u8, result.response, "stream") != null);
 }
 
 // ---- who the client is (X-Forwarded-For) ----

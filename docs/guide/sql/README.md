@@ -93,7 +93,7 @@ pub fn main() !void {
 
     var db = sql.Db.init(gpa, "postgres://app:secret@localhost/shop", .{});
     defer db.deinit();
-    db.checking(&.{ User, Order });     // optional — see Running it
+    db.checking(.{ .tables = &.{ User, Order } });     // optional — see Running it
 
     var app = nilo.App.init(gpa);
     defer app.deinit();

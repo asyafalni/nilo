@@ -132,7 +132,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Compared against the table it names, once, during `listen()` rather than
     // at the first request that reached it.
-    db.checking(&.{accounts_mod.Account});
+    db.checking(.{ .tables = &.{accounts_mod.Account} });
 
     var accounts: Accounts = .{ .db = &db };
     try app.provide(&accounts);

@@ -99,10 +99,13 @@ ignored ([ADR 0120](../adr/0120-a-target-is-read-in-the-form-it-arrived-in.md)).
 The router still matches on the path, so nothing about writing routes changes.
 A trusted `X-Forwarded-Host` outranks both.
 
-**A body arriving under a `Content-Encoding` other than `identity` is a 415**
-naming the header, before any handler runs — nilo decodes none of them, and
-handing a gzip stream to `c.json` produced a 400 about malformed JSON that was
-true of the bytes and useless to whoever sent them
+**A body arriving under `Content-Encoding: gzip` is inflated into the arena
+before anything reads it** — `body`, `json`, a struct argument, a form — bounded
+by `max_body` on both sides of the inflating, and a 400 naming the coding when
+it does not decode
+([ADR 0251](../adr/0251-a-gzipped-body-is-inflated-into-the-buffer-that-holds-it.md)).
+`bodyStream` does not decode and answers a gzipped body with a 415. **Any other
+coding is a 415** naming the header, before any handler runs
 ([ADR 0111](../adr/0111-a-body-under-an-encoding-nilo-cannot-read-is-refused.md)).
 The header on a request with no body is ignored.
 

@@ -2,19 +2,19 @@
 //! ([ADR 0153](../docs/adr/0153-a-migration-is-a-diff-against-a-snapshot.md)).
 //!
 //! ```zig
-//! const tables = comptime sql.migrate.tablesOf(Db.Dialect, &.{ Org, User, Post });
+//! const desired = comptime sql.migrate.desiredOf(Db.Dialect, .{ .tables = &.{ Org, User, Post } });
 //!
 //! // No database anywhere in these two lines.
 //! const before = try sql.migrate.snapshot.parse(run.arena(), text, null);
-//! const change = try sql.migrate.plan(run.arena(), Db.Dialect, tables, before);
+//! const change = try sql.migrate.plan(run.arena(), Db.Dialect, desired, before);
 //! ```
 //!
 //! ## What is settled while compiling, and what is not
 //!
-//! `tablesOf` is the desired schema, and every byte of SQL in it is a constant
-//! in the binary: the `CREATE TABLE`, every index, and the order they have to
-//! run in. Only the diff against a snapshot is runtime work, because the
-//! snapshot is a file.
+//! `desiredOf` is the desired schema, and every byte of SQL in it is a constant
+//! in the binary: the `CREATE TABLE`, every index, every function and view,
+//! and the order they have to run in. Only the diff against a snapshot is
+//! runtime work, because the snapshot is a file.
 //!
 //! That split is what the two cheapest paths are built on.
 //!
@@ -71,6 +71,166 @@ pub const Table = struct {
     created: ddl.Created,
 };
 
+/// What a program's database is: every table, and the three kinds of object
+/// that hang off the schema rather than off a table
+/// ([ADR 0253](../docs/adr/0253-a-schema-is-one-value-and-the-tool-owns-the-order.md)).
+///
+/// ```zig
+/// pub const schema = sql.Schema{
+///     .extensions = &.{"pgcrypto"},
+///     .functions = &.{
+///         .{ .name = "set_updated_at", .body = @embedFile("sql/set_updated_at.sql") },
+///     },
+///     .tables = &.{ Org, User, Post },
+///     .views = &.{
+///         .{ .name = "sku_catalogue", .body = @embedFile("sql/sku_catalogue.sql") },
+///     },
+/// };
+/// ```
+///
+/// **The one value `cli.Tool`, `db.checking`, `createMissing` and the diff are
+/// all given**, which is what keeps the four from drifting apart. Order inside
+/// a list does not matter; the tool owns the order — extensions, functions,
+/// tables by reference, each table's indexes and triggers, then views — and a
+/// version file's `before` and `after` slots are for what is none of these.
+///
+/// `@embedFile` is the point of the two named lists: a sixty-line view belongs
+/// in a `.sql` file with highlighting rather than in sixty `\\` lines, and the
+/// snapshot records its name and a hash rather than the text (ADR 0226).
+pub const Schema = struct {
+    /// Every Row whose table this program reads or builds, in any order.
+    tables: []const type,
+    /// Postgres extensions, by name: `CREATE EXTENSION IF NOT EXISTS "x"`,
+    /// and `DROP EXTENSION` when the name leaves the list. Refused on
+    /// SQLite, which has none to create.
+    extensions: []const []const u8 = &.{},
+    /// Each the **whole** `CREATE OR REPLACE FUNCTION <name> …` statement,
+    /// and it has to begin with those words and that name — that is what
+    /// makes applying it twice applying it once, and what lets a changed
+    /// body be one step rather than a drop and a create. Refused on SQLite.
+    functions: []const Text = &.{},
+    /// Each the `SELECT`; nilo writes `CREATE VIEW "name" AS` in front of
+    /// it, and drops and remakes the view when the text moves.
+    views: []const Text = &.{},
+
+    /// A name and its text — the same struct a table's `.check` and
+    /// `.trigger` compile to, so the snapshot hashes all four the same way.
+    pub const Text = table_mod.NamedText;
+};
+
+/// The desired half of every diff: the tables in create order with the SQL
+/// that makes them, and the schema-level objects beside them. What `plan`,
+/// `snapshotOf` and `migrations.generate` take.
+pub const Desired = struct {
+    tables: []const Table,
+    extensions: []const []const u8 = &.{},
+    functions: []const table_mod.NamedText = &.{},
+    views: []const table_mod.NamedText = &.{},
+};
+
+/// The schema as the types describe it, settled while compiling.
+pub fn desiredOf(comptime D: type, comptime schema: Schema) Desired {
+    comptime {
+        return .{
+            .tables = tablesOf(D, schema),
+            .extensions = schema.extensions,
+            .functions = schema.functions,
+            .views = schema.views,
+        };
+    }
+}
+
+/// The three lists a Dialect can refuse, and the two shapes an entry can be
+/// written wrong in. Run from `orderOf`, the one place every schema reaches,
+/// for the reason the foreign-key check runs there (ADR 0222).
+fn assertSchema(comptime D: type, comptime schema: Schema) void {
+    comptime {
+        if (schema.extensions.len > 0 and !D.has_extensions) @compileError(
+            "nilo: `.extensions` names \"" ++ schema.extensions[0] ++ "\", and " ++ D.name ++
+                " has no extensions to create. Leave the list out of this schema.",
+        );
+        if (schema.functions.len > 0 and !D.has_functions) @compileError(
+            "nilo: `.functions` names \"" ++ schema.functions[0].name ++ "\", and " ++ D.name ++
+                " has no `CREATE FUNCTION`. Leave the list out of this schema.",
+        );
+        for (schema.extensions) |name| {
+            if (name.len == 0) @compileError("nilo: `.extensions` has an empty name in it.");
+        }
+        for (schema.functions) |f| {
+            if (f.name.len == 0) @compileError("nilo: `.functions` has an entry with no name.");
+            if (!beginsWithFunctionHead(f)) @compileError(
+                "nilo: `.functions` entry \"" ++ f.name ++ "\" has to begin `CREATE OR REPLACE FUNCTION " ++
+                    f.name ++ "`, so that applying it twice is applying it once. It begins `" ++
+                    headOf(f.body) ++ "`.",
+            );
+        }
+        for (schema.views) |v| {
+            if (v.name.len == 0) @compileError("nilo: `.views` has an entry with no name.");
+            const trimmed = std.mem.trim(u8, v.body, &std.ascii.whitespace);
+            if (trimmed.len == 0) @compileError(
+                "nilo: `.views` entry \"" ++ v.name ++ "\" is empty.",
+            );
+            if (trimmed.len >= 6 and std.ascii.eqlIgnoreCase(trimmed[0..6], "CREATE")) @compileError(
+                "nilo: `.views` entry \"" ++ v.name ++ "\" begins `CREATE`, and nilo writes the " ++
+                    "`CREATE VIEW \"" ++ v.name ++ "\" AS` itself — the entry is the SELECT.",
+            );
+        }
+    }
+}
+
+/// Whether the text opens `CREATE OR REPLACE FUNCTION <name>`, with any
+/// whitespace between the words and the name quoted or bare.
+fn beginsWithFunctionHead(comptime f: table_mod.NamedText) bool {
+    comptime {
+        var rest = std.mem.trimStart(u8, f.body, &std.ascii.whitespace);
+        for ([_][]const u8{ "CREATE", "OR", "REPLACE", "FUNCTION" }) |word| {
+            if (rest.len < word.len or !std.ascii.eqlIgnoreCase(rest[0..word.len], word)) return false;
+            rest = std.mem.trimStart(u8, rest[word.len..], &std.ascii.whitespace);
+        }
+        if (std.mem.startsWith(u8, rest, f.name)) return true;
+        return std.mem.startsWith(u8, rest, "\"" ++ f.name ++ "\"");
+    }
+}
+
+/// The first forty characters of a text, for a refusal to quote.
+fn headOf(comptime text: []const u8) []const u8 {
+    comptime {
+        const trimmed = std.mem.trimStart(u8, text, &std.ascii.whitespace);
+        return if (trimmed.len <= 40) trimmed else trimmed[0..40] ++ "…";
+    }
+}
+
+/// What `createMissing` sends before any table: the extensions, then the
+/// functions, each in a form that may already have run.
+pub fn leadingOf(comptime D: type, comptime schema: Schema) []const []const u8 {
+    comptime {
+        assertSchema(D, schema);
+        var out: [schema.extensions.len + schema.functions.len][]const u8 = undefined;
+        var n: usize = 0;
+        for (schema.extensions) |name| {
+            out[n] = ddl.createExtensionIfMissing(D, name);
+            n += 1;
+        }
+        for (schema.functions) |f| {
+            out[n] = f.body;
+            n += 1;
+        }
+        const frozen = out;
+        return &frozen;
+    }
+}
+
+/// What `createMissing` sends after every table: the views, each under the
+/// Dialect's repeatable head.
+pub fn trailingOf(comptime D: type, comptime schema: Schema) []const []const u8 {
+    comptime {
+        var out: [schema.views.len][]const u8 = undefined;
+        for (schema.views, 0..) |v, i| out[i] = ddl.viewStatement(D, D.view_repeatable_head, v);
+        const frozen = out;
+        return &frozen;
+    }
+}
+
 pub fn tableOf(comptime D: type, comptime Row: type) Table {
     comptime {
         return .{ .desc = table_mod.descOf(D, Row), .created = ddl.createdFor(D, Row) };
@@ -88,9 +248,11 @@ pub fn tableOf(comptime D: type, comptime Row: type) Table {
 /// tables, this runs while compiling, and the version somebody can read is
 /// worth more than the version that is asymptotically better. A table pointing
 /// at itself is not a ring and is left alone.
-pub fn orderOf(comptime D: type, comptime Rows: []const type) []const type {
+pub fn orderOf(comptime D: type, comptime schema: Schema) []const type {
     comptime {
+        const Rows = schema.tables;
         @setEvalBranchQuota(50_000 + 20_000 * Rows.len);
+        assertSchema(D, schema);
 
         var descs: [Rows.len]Desc = undefined;
         for (Rows, 0..) |R, i| descs[i] = table_mod.descOf(D, R);
@@ -134,9 +296,9 @@ pub fn orderOf(comptime D: type, comptime Rows: []const type) []const type {
 
 /// Every table as the types describe it, in create order, with the SQL that
 /// makes it. This is the desired half of every diff.
-pub fn tablesOf(comptime D: type, comptime Rows: []const type) []const Table {
+pub fn tablesOf(comptime D: type, comptime schema: Schema) []const Table {
     comptime {
-        const ordered = orderOf(D, Rows);
+        const ordered = orderOf(D, schema);
         var out: [ordered.len]Table = undefined;
         for (ordered, 0..) |R, i| out[i] = tableOf(D, R);
         const frozen = out;
@@ -146,9 +308,9 @@ pub fn tablesOf(comptime D: type, comptime Rows: []const type) []const Table {
 
 /// The same tables, in the same order, as statements that do nothing when the
 /// table is already there. What `createMissing` sends.
-pub fn missingOf(comptime D: type, comptime Rows: []const type) []const ddl.Created {
+pub fn missingOf(comptime D: type, comptime schema: Schema) []const ddl.Created {
     comptime {
-        const ordered = orderOf(D, Rows);
+        const ordered = orderOf(D, schema);
         var out: [ordered.len]ddl.Created = undefined;
         var n: usize = 0;
         for (ordered) |R| {
@@ -207,17 +369,24 @@ pub fn snapshotOf(
     gpa: std.mem.Allocator,
     comptime D: type,
     version: u32,
-    tables: []const Table,
+    desired: Desired,
 ) !snapshot.Doc {
-    const out = try gpa.alloc(Desc, tables.len);
-    for (tables, 0..) |t, i| {
+    const out = try gpa.alloc(Desc, desired.tables.len);
+    for (desired.tables, 0..) |t, i| {
         out[i] = t.desc;
         out[i].row = "";
         out[i].renames = &.{};
         out[i].checks = try hashedOnly(gpa, t.desc.checks);
         out[i].triggers = try hashedOnly(gpa, t.desc.triggers);
     }
-    return .{ .version = version, .dialect = D.name, .tables = out };
+    return .{
+        .version = version,
+        .dialect = D.name,
+        .tables = out,
+        .extensions = desired.extensions,
+        .functions = try hashedOnly(gpa, desired.functions),
+        .views = try hashedOnly(gpa, desired.views),
+    };
 }
 
 /// The named objects as a snapshot records them: the name, and sixteen hex
@@ -269,6 +438,18 @@ pub const Kind = enum {
     /// which kind of object moved.
     create_trigger,
     drop_trigger,
+    /// The three kinds that hang off the schema rather than off a table
+    /// (ADR 0253). An extension is made if missing and dropped when it
+    /// leaves the list; a function is one `CREATE OR REPLACE` whether it is
+    /// new or moved, and dropped by name; a view is dropped and remade when
+    /// its text moves, because `CREATE OR REPLACE VIEW` refuses a column
+    /// that went away.
+    create_extension,
+    drop_extension,
+    create_function,
+    drop_function,
+    create_view,
+    drop_view,
 
     /// A statement somebody wrote, which the diff never produces.
     ///
@@ -337,7 +518,7 @@ pub const Plan = struct {
 pub fn plan(
     gpa: std.mem.Allocator,
     comptime D: type,
-    desired: []const Table,
+    desired: Desired,
     before: snapshot.Doc,
 ) !Plan {
     var steps: std.ArrayList(Step) = .empty;
@@ -357,7 +538,45 @@ pub fn plan(
         return .{ .steps = &.{}, .problems = try problems.toOwnedSlice(gpa) };
     }
 
-    for (desired) |t| {
+    // A view that is gone or moved goes first, before any table does: it may
+    // name a column about to be dropped, and the database refuses to drop a
+    // column a view still reads.
+    for (before.views) |old| {
+        const now = findNamed(desired.views, old.name);
+        if (now != null and now.?.sameAs(old)) continue;
+        try steps.append(gpa, .{
+            .kind = .drop_view,
+            .sql = try ddl.dropView(gpa, old.name),
+            .why = if (now == null)
+                try std.fmt.allocPrint(gpa, "drop view {s}, which the schema no longer names", .{old.name})
+            else
+                try std.fmt.allocPrint(gpa, "drop view {s}, whose text moved", .{old.name}),
+        });
+    }
+    // Extensions and functions before the tables, because a column type or
+    // a trigger may name either.
+    for (desired.extensions) |name| {
+        if (hasName(before.extensions, name)) continue;
+        try steps.append(gpa, .{
+            .kind = .create_extension,
+            .sql = try ddl.createExtension(gpa, name),
+            .why = try std.fmt.allocPrint(gpa, "extension {s}", .{name}),
+        });
+    }
+    for (desired.functions) |f| {
+        const old = findNamed(before.functions, f.name);
+        if (old != null and old.?.sameAs(f)) continue;
+        try steps.append(gpa, .{
+            .kind = .create_function,
+            .sql = f.body,
+            .why = if (old == null)
+                try std.fmt.allocPrint(gpa, "function {s}", .{f.name})
+            else
+                try std.fmt.allocPrint(gpa, "function {s}, whose text moved", .{f.name}),
+        });
+    }
+
+    for (desired.tables) |t| {
         // A table this program reads and does not build
         // ([ADR 0162](../docs/adr/0162-a-table-this-program-reads-and-does-not-build.md)).
         // It stays in `desired` rather than being filtered out before the
@@ -392,10 +611,11 @@ pub fn plan(
         try diffTable(gpa, D, t, old, &steps, &problems);
     }
 
-    // A table the snapshot has and the types do not. Dropped last, so that
-    // anything still pointing at it has been dropped first.
+    // A table the snapshot has and the types do not. Dropped after every
+    // table that is kept, so that anything still pointing at it has been
+    // dropped first.
     for (before.tables) |old| {
-        if (has(desired, old)) continue;
+        if (has(desired.tables, old)) continue;
         try steps.append(gpa, .{
             .kind = .drop_table,
             .sql = try dropTableSql(gpa, old),
@@ -404,10 +624,48 @@ pub fn plan(
         });
     }
 
+    // Views after the tables they read are in their final shape.
+    for (desired.views) |v| {
+        const old = findNamed(before.views, v.name);
+        if (old != null and old.?.sameAs(v)) continue;
+        try steps.append(gpa, .{
+            .kind = .create_view,
+            .sql = try ddl.createView(gpa, v),
+            .why = try std.fmt.allocPrint(gpa, "view {s}", .{v.name}),
+        });
+    }
+    // A function nothing names any more, after the triggers that named it
+    // have gone with their tables; an extension last of all, and destructive,
+    // because dropping one drops every object it made.
+    for (before.functions) |old| {
+        if (findNamed(desired.functions, old.name) != null) continue;
+        try steps.append(gpa, .{
+            .kind = .drop_function,
+            .sql = try ddl.dropFunction(gpa, old.name),
+            .why = try std.fmt.allocPrint(gpa, "drop function {s}, which the schema no longer names", .{old.name}),
+        });
+    }
+    for (before.extensions) |name| {
+        if (hasName(desired.extensions, name)) continue;
+        try steps.append(gpa, .{
+            .kind = .drop_extension,
+            .sql = try ddl.dropExtension(gpa, name),
+            .why = try std.fmt.allocPrint(gpa, "drop extension {s}, which the schema no longer names, and everything it made", .{name}),
+            .destructive = true,
+        });
+    }
+
     return .{
         .steps = try steps.toOwnedSlice(gpa),
         .problems = try problems.toOwnedSlice(gpa),
     };
+}
+
+fn hasName(list: []const []const u8, name: []const u8) bool {
+    for (list) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
 }
 
 fn has(desired: []const Table, old: Desc) bool {
@@ -1161,7 +1419,7 @@ fn DialectOf(comptime Db: type) type {
 ///
 /// ```zig
 /// fn makeTables(run: *nilo.Run, db: *sql.Db) !void {
-///     try sql.migrate.createMissing(db, run, &.{ Account, Document });
+///     try sql.migrate.createMissing(db, run, .{ .tables = &.{ Account, Document } });
 /// }
 ///
 /// try app.before(makeTables, .{&db});
@@ -1176,18 +1434,21 @@ fn DialectOf(comptime Db: type) type {
 /// moved is left exactly as it was and `db.checking` is what says so. A program
 /// that has to change a table it already shipped wants `apply` and the files
 /// behind it.
-pub fn createMissing(db: anytype, scope: anytype, comptime Rows: []const type) !void {
+pub fn createMissing(db: anytype, scope: anytype, comptime schema: Schema) !void {
     const D = comptime DialectOf(@TypeOf(db));
     comptime core.checkScope(@TypeOf(scope), "migrate.createMissing");
 
     var tx = try db.begin(scope, .{});
     errdefer tx.rollback();
 
-    for (comptime missingOf(D, Rows)) |made| {
+    // The order the tool owns: extensions, functions, tables, views (ADR 0253).
+    for (comptime leadingOf(D, schema)) |sql| _ = try tx.exec(scope, sql, .{});
+    for (comptime missingOf(D, schema)) |made| {
         _ = try tx.exec(scope, made.table, .{});
         for (made.indexes) |ix| _ = try tx.exec(scope, ix.sql, .{});
         for (made.triggers) |tr| _ = try tx.exec(scope, tr.sql, .{});
     }
+    for (comptime trailingOf(D, schema)) |sql| _ = try tx.exec(scope, sql, .{});
     try tx.commit();
 }
 
@@ -1197,8 +1458,8 @@ pub fn createMissing(db: anytype, scope: anytype, comptime Rows: []const type) !
 /// ([ADR 0233](../docs/adr/0233-a-column-a-shipped-table-has-not-got.md)).
 ///
 /// ```zig
-/// try sql.migrate.createMissing(&db, &run, &.{ Download, Segment });
-/// _ = try sql.migrate.addMissingColumns(&db, &run, &.{ Download, Segment });
+/// try sql.migrate.createMissing(&db, &run, schema);
+/// _ = try sql.migrate.addMissingColumns(&db, &run, schema);
 /// ```
 ///
 /// **For the program that keeps its own SQLite file and added a field.** A
@@ -1223,7 +1484,7 @@ pub fn createMissing(db: anytype, scope: anytype, comptime Rows: []const type) !
 /// else is touched: a column the table has that the Row does not is left,
 /// a type that moved is left, and `db.checking` is what says so — this adds
 /// and does not alter, the same line `createMissing` draws.
-pub fn addMissingColumns(db: anytype, scope: anytype, comptime Rows: []const type) !usize {
+pub fn addMissingColumns(db: anytype, scope: anytype, comptime schema: Schema) !usize {
     const D = comptime DialectOf(@TypeOf(db));
     comptime core.checkScope(@TypeOf(scope), "migrate.addMissingColumns");
     const arena = scope.arena();
@@ -1232,7 +1493,7 @@ pub fn addMissingColumns(db: anytype, scope: anytype, comptime Rows: []const typ
     errdefer tx.rollback();
 
     var added: usize = 0;
-    inline for (Rows) |R| {
+    inline for (schema.tables) |R| {
         if (comptime row_mod.managedOf(R)) {
             const t = comptime tableOf(D, R);
             const q = comptime row_mod.qualifiedOf(R);
@@ -1490,8 +1751,7 @@ const User = struct {
 /// A snapshot built from a list of Rows, which is how every test below states
 /// "the schema before" without writing a `.zon` file out by hand.
 fn snapshotFrom(gpa: std.mem.Allocator, comptime D: type, comptime Rows: []const type) !snapshot.Doc {
-    const tables = comptime tablesOf(D, Rows);
-    return snapshotOf(gpa, D, 1, tables);
+    return snapshotOf(gpa, D, 1, comptime desiredOf(D, .{ .tables = Rows }));
 }
 
 test "a schema that has never been generated is one CREATE TABLE per Row" {
@@ -1499,7 +1759,7 @@ test "a schema that has never been generated is one CREATE TABLE per Row" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const tables = comptime tablesOf(Pg, &.{ User, Org });
+    const tables = comptime desiredOf(Pg, .{ .tables = &.{ User, Org } });
     const change = try plan(a, Pg, tables, snapshot.empty(Pg));
 
     try testing.expectEqual(@as(usize, 0), change.problems.len);
@@ -1537,7 +1797,7 @@ test "a table this program only reads is never created, and the one pointing at 
     defer arena.deinit();
     const a = arena.allocator();
 
-    const tables = comptime tablesOf(Pg, &.{ Comment, Staff });
+    const tables = comptime desiredOf(Pg, .{ .tables = &.{ Comment, Staff } });
     const change = try plan(a, Pg, tables, snapshot.empty(Pg));
 
     try testing.expectEqual(@as(usize, 0), change.problems.len);
@@ -1553,9 +1813,121 @@ test "a table this program only reads is never created, and the one pointing at 
     try testing.expect(std.mem.indexOf(u8, change.steps[0].sql, "staff") != null);
 }
 
+// ---- the schema-level objects (ADR 0253) ----
+
+const touch_v1 = "CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$ BEGIN NEW.updated_at = now(); RETURN NEW; END $$ LANGUAGE plpgsql";
+const touch_v2 = "CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$ BEGIN NEW.updated_at = clock_timestamp(); RETURN NEW; END $$ LANGUAGE plpgsql";
+
+const full_v1: Schema = .{
+    .extensions = &.{"pgcrypto"},
+    .functions = &.{.{ .name = "set_updated_at", .body = touch_v1 }},
+    .tables = &.{ User, Org },
+    .views = &.{
+        .{ .name = "org_names", .body = "SELECT id, name FROM orgs" },
+        .{ .name = "user_emails", .body = "SELECT id, email FROM users" },
+    },
+};
+
+test "a schema's extensions, functions and views are planned around the tables in the order the tool owns" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const change = try plan(a, Pg, comptime desiredOf(Pg, full_v1), snapshot.empty(Pg));
+    try testing.expectEqual(@as(usize, 0), change.problems.len);
+
+    // Extension, function, the two tables in reference order with the
+    // unique and the index, then the views — nothing the caller wrote
+    // decided that.
+    const kinds = [_]Kind{ .create_extension, .create_function, .create_table, .create_table, .create_index, .create_index, .create_view, .create_view };
+    try testing.expectEqual(kinds.len, change.steps.len);
+    for (kinds, change.steps) |want, step| try testing.expectEqual(want, step.kind);
+    try testing.expectEqualStrings("CREATE EXTENSION IF NOT EXISTS \"pgcrypto\"", change.steps[0].sql);
+    try testing.expectEqualStrings(touch_v1, change.steps[1].sql);
+    try testing.expectEqualStrings("CREATE VIEW \"org_names\" AS SELECT id, name FROM orgs", change.steps[6].sql);
+    try testing.expect(!change.destructive());
+}
+
+test "a view whose text moved is dropped before any table moves and remade after, and a function's is one replace" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const before = try snapshotOf(a, Pg, 1, comptime desiredOf(Pg, full_v1));
+    const moved: Schema = .{
+        .extensions = full_v1.extensions,
+        .functions = &.{.{ .name = "set_updated_at", .body = touch_v2 }},
+        .tables = &.{ User, Org },
+        .views = &.{
+            .{ .name = "org_names", .body = "SELECT id, name FROM orgs" },
+            .{ .name = "user_emails", .body = "SELECT id, email, nickname FROM users" },
+        },
+    };
+    const change = try plan(a, Pg, comptime desiredOf(Pg, moved), before);
+    try testing.expectEqual(@as(usize, 0), change.problems.len);
+
+    // The unchanged extension and view plan nothing; the moved view is a
+    // drop first and a create last, and the moved function is one step.
+    try testing.expectEqual(@as(usize, 3), change.steps.len);
+    try testing.expectEqual(Kind.drop_view, change.steps[0].kind);
+    try testing.expectEqualStrings("DROP VIEW IF EXISTS \"user_emails\"", change.steps[0].sql);
+    try testing.expectEqual(Kind.create_function, change.steps[1].kind);
+    try testing.expectEqualStrings(touch_v2, change.steps[1].sql);
+    try testing.expectEqual(Kind.create_view, change.steps[2].kind);
+    try testing.expect(std.mem.indexOf(u8, change.steps[2].sql, "nickname") != null);
+    try testing.expect(!change.destructive());
+}
+
+test "a function or an extension that left the schema is dropped after everything else, and only the extension is destructive" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const before = try snapshotOf(a, Pg, 1, comptime desiredOf(Pg, full_v1));
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{ User, Org } }), before);
+
+    try testing.expectEqual(@as(usize, 4), change.steps.len);
+    try testing.expectEqual(Kind.drop_view, change.steps[0].kind);
+    try testing.expectEqual(Kind.drop_view, change.steps[1].kind);
+    try testing.expectEqual(Kind.drop_function, change.steps[2].kind);
+    try testing.expectEqualStrings("DROP FUNCTION IF EXISTS \"set_updated_at\"", change.steps[2].sql);
+    try testing.expect(!change.steps[2].destructive);
+    try testing.expectEqual(Kind.drop_extension, change.steps[3].kind);
+    try testing.expectEqualStrings("DROP EXTENSION IF EXISTS \"pgcrypto\"", change.steps[3].sql);
+    try testing.expect(change.steps[3].destructive);
+    try testing.expect(change.destructive());
+}
+
+test "a schema that has not moved plans nothing, functions and views included" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const before = try snapshotOf(a, Pg, 1, comptime desiredOf(Pg, full_v1));
+    const change = try plan(a, Pg, comptime desiredOf(Pg, full_v1), before);
+    try testing.expect(change.isEmpty());
+}
+
+test "createMissing's statements go extensions, functions, tables, views, and a view on SQLite is IF NOT EXISTS" {
+    const leading = comptime leadingOf(Pg, full_v1);
+    try testing.expectEqual(@as(usize, 2), leading.len);
+    try testing.expectEqualStrings("CREATE EXTENSION IF NOT EXISTS \"pgcrypto\"", leading[0]);
+    try testing.expectEqualStrings(touch_v1, leading[1]);
+
+    const trailing = comptime trailingOf(Pg, full_v1);
+    try testing.expectEqual(@as(usize, 2), trailing.len);
+    try testing.expectEqualStrings("CREATE OR REPLACE VIEW \"org_names\" AS SELECT id, name FROM orgs", trailing[0]);
+
+    const lite = comptime trailingOf(Lite, .{
+        .tables = &.{Org},
+        .views = &.{.{ .name = "org_names", .body = "  SELECT id, name FROM orgs\n" }},
+    });
+    try testing.expectEqualStrings("CREATE VIEW IF NOT EXISTS \"org_names\" AS SELECT id, name FROM orgs", lite[0]);
+}
+
 test "a table this program only reads is not created by createMissing either" {
     // The other call that would have made it, `IF NOT EXISTS` and all.
-    const missing = comptime missingOf(Pg, &.{ Comment, Staff });
+    const missing = comptime missingOf(Pg, .{ .tables = &.{ Comment, Staff } });
     try testing.expectEqual(@as(usize, 1), missing.len);
     try testing.expect(std.mem.indexOf(u8, missing[0].table, "comments") != null);
 }
@@ -1597,7 +1969,7 @@ test "a changed default and a changed set of words are three statements, not a r
     const a = arena.allocator();
 
     const before = try snapshotFrom(a, Pg, &.{Ticket});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{WiderTicket}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{WiderTicket} }), before);
 
     try testing.expectEqual(@as(usize, 0), change.problems.len);
     // level's default, level's words dropped and made again, note's default,
@@ -1622,7 +1994,7 @@ test "an index whose predicate turned over is dropped and made again" {
     const a = arena.allocator();
 
     const before = try snapshotFrom(a, Pg, &.{Ticket});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{WiderTicket}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{WiderTicket} }), before);
 
     // The name is the same, so the pair is a drop and a create rather than
     // two indexes: neither database alters one in place.
@@ -1643,7 +2015,7 @@ test "a word taken off an enum is a backfill, because the rows holding it are th
     // them, so the statement fails rather than removing anything — which is a
     // backfill to write beside it, not data loss.
     const before = try snapshotFrom(a, Pg, &.{WiderTicket});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{Ticket}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{Ticket} }), before);
 
     try testing.expectEqual(@as(usize, 0), change.problems.len);
     try testing.expect(change.needsBackfill());
@@ -1656,7 +2028,7 @@ test "SQLite names everything that moved on one column, in one Problem" {
     const a = arena.allocator();
 
     const before = try snapshotFrom(a, Lite, &.{Ticket});
-    const change = try plan(a, Lite, comptime tablesOf(Lite, &.{WiderTicket}), before);
+    const change = try plan(a, Lite, comptime desiredOf(Lite, .{ .tables = &.{WiderTicket} }), before);
 
     // One Problem for `level` and one for `note`, and none of the column's
     // three changes becomes a Problem of its own: the answer to all of them
@@ -1692,7 +2064,7 @@ test "a required column added with a default fills the rows that are there, so i
     const a = arena.allocator();
 
     const before = try snapshotFrom(a, Pg, &.{Plain});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{PlainWithCount}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{PlainWithCount} }), before);
 
     try testing.expectEqual(@as(usize, 1), change.steps.len);
     try testing.expectEqual(Kind.add_column, change.steps[0].kind);
@@ -1714,7 +2086,7 @@ test "the same column with no default is still the loud one" {
         views: i64,
     };
     const before = try snapshotFrom(a, Pg, &.{Plain});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{Bare}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{Bare} }), before);
 
     try testing.expectEqual(@as(usize, 1), change.steps.len);
     try testing.expect(change.needsBackfill());
@@ -1738,7 +2110,7 @@ test "a table this program only reads is not dropped for not being described" {
     // Nothing to do, and in particular no `DROP TABLE staff` — the drop loop
     // reads the same desired list, so a table that is merely unmanaged still
     // counts as described.
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{ Comment, Staff }), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{ Comment, Staff } }), before);
     try testing.expectEqual(@as(usize, 0), change.steps.len);
     try testing.expectEqual(@as(usize, 0), change.problems.len);
 }
@@ -1746,7 +2118,7 @@ test "a table this program only reads is not dropped for not being described" {
 test "a table is created after the tables it points at, and the order is a constant" {
     // `User` is written first and `Org` second, and the plan reverses them,
     // because Postgres checks that `orgs` is there when `users` names it.
-    const tables = comptime tablesOf(Pg, &.{ User, Org });
+    const tables = comptime tablesOf(Pg, .{ .tables = &.{ User, Org } });
     try testing.expectEqualStrings("orgs", tables[0].desc.table);
     try testing.expectEqualStrings("users", tables[1].desc.table);
 }
@@ -1761,7 +2133,7 @@ test "a table pointing at itself is not a ring" {
         id: i64,
         parent_id: ?i64,
     };
-    const tables = comptime tablesOf(Pg, &.{Node});
+    const tables = comptime tablesOf(Pg, .{ .tables = &.{Node} });
     try testing.expectEqualStrings("nodes", tables[0].desc.table);
 }
 
@@ -1771,7 +2143,7 @@ test "a schema that has not moved plans nothing at all" {
     const a = arena.allocator();
 
     const before = try snapshotFrom(a, Pg, &.{ Org, User });
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{ Org, User }), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{ Org, User } }), before);
 
     try testing.expect(change.isEmpty());
     try testing.expectEqual(@as(usize, 0), change.problems.len);
@@ -1796,7 +2168,7 @@ test "a column added to a Row is one ALTER, and a required one says it needs a b
     };
 
     const before = try snapshotFrom(a, Pg, &.{Before});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{After}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{After} }), before);
 
     try testing.expectEqual(@as(usize, 2), change.steps.len);
     try testing.expectEqualStrings(
@@ -1830,7 +2202,7 @@ test "a column that left the Row is a drop, and the plan says it loses data" {
     };
 
     const before = try snapshotFrom(a, Pg, &.{Before});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{After}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{After} }), before);
 
     try testing.expectEqual(@as(usize, 1), change.steps.len);
     try testing.expectEqual(Kind.drop_column, change.steps[0].kind);
@@ -1855,7 +2227,7 @@ test "`.was` turns the same change into one rename, and the data comes with it" 
     };
 
     const before = try snapshotFrom(a, Pg, &.{Before});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{After}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{After} }), before);
 
     // One statement, not two. Without `.was` this is a drop and an add.
     try testing.expectEqual(@as(usize, 1), change.steps.len);
@@ -1880,7 +2252,7 @@ test "a `.was` that has already run plans nothing, which is how the entry become
 
     // The snapshot already calls it `email`, so the rename happened last time.
     const before = try snapshotFrom(a, Pg, &.{After});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{After}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{After} }), before);
     try testing.expect(change.isEmpty());
 }
 
@@ -1901,7 +2273,7 @@ test "a type change is one statement on Postgres and a named Refusal on SQLite" 
     };
 
     const pg_before = try snapshotFrom(a, Pg, &.{Before});
-    const pg = try plan(a, Pg, comptime tablesOf(Pg, &.{After}), pg_before);
+    const pg = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{After} }), pg_before);
     try testing.expectEqual(@as(usize, 1), pg.steps.len);
     try testing.expectEqualStrings(
         "ALTER TABLE \"orgs\" ALTER COLUMN \"seats\" TYPE int8",
@@ -1916,7 +2288,7 @@ test "a type change is one statement on Postgres and a named Refusal on SQLite" 
         seats: []const u8,
     };
     const lite_before = try snapshotFrom(a, Lite, &.{Before});
-    const lite = try plan(a, Lite, comptime tablesOf(Lite, &.{Wide}), lite_before);
+    const lite = try plan(a, Lite, comptime desiredOf(Lite, .{ .tables = &.{Wide} }), lite_before);
     try testing.expectEqual(@as(usize, 0), lite.steps.len);
     try testing.expectEqual(@as(usize, 1), lite.problems.len);
     try testing.expectEqualStrings("seats", lite.problems[0].column);
@@ -1942,14 +2314,14 @@ test "a nullability change is a statement in each direction, and tightening need
     };
 
     const before = try snapshotFrom(a, Pg, &.{Loose});
-    const tightened = try plan(a, Pg, comptime tablesOf(Pg, &.{Tight}), before);
+    const tightened = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{Tight} }), before);
     try testing.expectEqual(@as(usize, 1), tightened.steps.len);
     try testing.expectEqual(Kind.change_null, tightened.steps[0].kind);
     try testing.expect(tightened.steps[0].needs_backfill);
     try testing.expect(tightened.needsBackfill());
 
     const after = try snapshotFrom(a, Pg, &.{Tight});
-    const loosened = try plan(a, Pg, comptime tablesOf(Pg, &.{Loose}), after);
+    const loosened = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{Loose} }), after);
     try testing.expectEqualStrings(
         "ALTER TABLE \"orgs\" ALTER COLUMN \"note\" DROP NOT NULL",
         loosened.steps[0].sql,
@@ -1976,7 +2348,7 @@ test "an index whose columns changed is a new name, so it is one drop and one cr
     };
 
     const before = try snapshotFrom(a, Pg, &.{Before});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{After}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{After} }), before);
 
     try testing.expectEqual(@as(usize, 2), change.steps.len);
     try testing.expectEqual(Kind.create_index, change.steps[0].kind);
@@ -2006,7 +2378,7 @@ test "a unique that starts ignoring case keeps its name and is rebuilt" {
     };
 
     const before = try snapshotFrom(a, Pg, &.{Before});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{After}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{After} }), before);
 
     try testing.expectEqual(@as(usize, 2), change.steps.len);
     try testing.expectEqual(Kind.drop_index, change.steps[0].kind);
@@ -2035,7 +2407,7 @@ test "a foreign key on a table that exists is refused, with the two safe stateme
     };
 
     const before = try snapshotFrom(a, Pg, &.{ Org, Before });
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{ Org, After }), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{ Org, After } }), before);
 
     try testing.expectEqual(@as(usize, 0), change.steps.len);
     try testing.expectEqual(@as(usize, 1), change.problems.len);
@@ -2049,7 +2421,7 @@ test "a table no Row describes is dropped, and it is the last thing to happen" {
     const a = arena.allocator();
 
     const before = try snapshotFrom(a, Pg, &.{ Org, User });
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{Org}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{Org} }), before);
 
     try testing.expectEqual(@as(usize, 1), change.steps.len);
     try testing.expectEqual(Kind.drop_table, change.steps[0].kind);
@@ -2063,7 +2435,7 @@ test "a snapshot from the other dialect is one sentence, not a schema rewritten"
     const a = arena.allocator();
 
     const before = try snapshotFrom(a, Lite, &.{Org});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{Org}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{Org} }), before);
 
     try testing.expect(change.isEmpty());
     try testing.expectEqual(@as(usize, 1), change.problems.len);
@@ -2181,7 +2553,7 @@ test "a table with a check and a trigger is created with one inside it and one a
     defer arena.deinit();
     const a = arena.allocator();
 
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{Ledger}), snapshot.empty(Pg));
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{Ledger} }), snapshot.empty(Pg));
 
     try testing.expectEqual(@as(usize, 2), change.steps.len);
     try testing.expectEqual(Kind.create_table, change.steps[0].kind);
@@ -2213,7 +2585,7 @@ test "a check and a trigger that have not moved plan nothing, because the hash i
     try testing.expectEqual(@as(usize, 16), recorded.checks[0].hash.len);
     try testing.expectEqualStrings("", recorded.triggers[0].tail);
 
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{Ledger}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{Ledger} }), before);
     try testing.expect(change.isEmpty());
     try testing.expectEqual(@as(usize, 0), change.problems.len);
 }
@@ -2224,7 +2596,7 @@ test "a changed body under the same name is one drop and one create, for both ki
     const a = arena.allocator();
 
     const before = try snapshotFrom(a, Pg, &.{Ledger});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{LedgerMoved}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{LedgerMoved} }), before);
 
     try testing.expectEqual(@as(usize, 0), change.problems.len);
     try testing.expectEqual(@as(usize, 4), change.steps.len);
@@ -2259,7 +2631,7 @@ test "a check the types no longer name is dropped, and so is a trigger" {
     const a = arena.allocator();
 
     const before = try snapshotFrom(a, Pg, &.{Ledger});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{LedgerBare}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{LedgerBare} }), before);
 
     try testing.expectEqual(@as(usize, 2), change.steps.len);
     try testing.expectEqual(Kind.drop_check, change.steps[0].kind);
@@ -2274,7 +2646,7 @@ test "a check added to a table that has rows says so, because the database tests
     const a = arena.allocator();
 
     const before = try snapshotFrom(a, Pg, &.{LedgerBare});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{Ledger}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{Ledger} }), before);
 
     try testing.expectEqual(Kind.create_check, change.steps[0].kind);
     try testing.expect(change.steps[0].needs_backfill);
@@ -2287,7 +2659,7 @@ test "SQLite says the four statements for a check, because a table constraint th
     const a = arena.allocator();
 
     const before = try snapshotFrom(a, Lite, &.{Ledger});
-    const change = try plan(a, Lite, comptime tablesOf(Lite, &.{LedgerMoved}), before);
+    const change = try plan(a, Lite, comptime desiredOf(Lite, .{ .tables = &.{LedgerMoved} }), before);
 
     try testing.expectEqual(@as(usize, 1), change.problems.len);
     try testing.expect(std.mem.indexOf(
@@ -2324,7 +2696,7 @@ test "naming an enum column's check is one drop by the old name and one add by t
     const a = arena.allocator();
 
     const before = try snapshotFrom(a, Pg, &.{Sku});
-    const change = try plan(a, Pg, comptime tablesOf(Pg, &.{SkuNamed}), before);
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{SkuNamed} }), before);
 
     try testing.expectEqual(@as(usize, 0), change.problems.len);
     try testing.expectEqual(@as(usize, 2), change.steps.len);

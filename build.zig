@@ -715,6 +715,27 @@ const sql_refusals = [_]Refusal{
         .says = "table_trigger_half_is_empty.Ledger's `.trigger.ledgers_touch.run` is empty.",
     },
     .{
+        .name = "schema_extensions_on_sqlite",
+        .says = "`.extensions` names \"pgcrypto\", and sqlite has no extensions to create." ++
+            " Leave the list out of this schema.",
+    },
+    .{
+        .name = "schema_functions_on_sqlite",
+        .says = "`.functions` names \"touch\", and sqlite has no `CREATE FUNCTION`." ++
+            " Leave the list out of this schema.",
+    },
+    .{
+        .name = "schema_function_is_not_or_replace",
+        .says = "`.functions` entry \"set_updated_at\" has to begin `CREATE OR REPLACE FUNCTION" ++
+            " set_updated_at`, so that applying it twice is applying it once. It begins" ++
+            " `CREATE FUNCTION set_updated_at() RETURNS…`.",
+    },
+    .{
+        .name = "schema_view_begins_with_create",
+        .says = "`.views` entry \"names\" begins `CREATE`, and nilo writes the `CREATE VIEW" ++
+            " \"names\" AS` itself — the entry is the SELECT.",
+    },
+    .{
         .name = "table_two_constraints_one_name",
         .says = "table_two_constraints_one_name.Outbox names two constraints" ++
             " `outbox_sent_at_idx`.",

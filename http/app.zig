@@ -87,6 +87,9 @@ pub const App = struct {
     /// too: the shape it exists for is the one endpoint inside a group that
     /// needs a guard its neighbours do not.
     attached: std.ArrayList(mw.Attached) = .empty,
+    /// The middleware `guard` said reads the session cookie, if one did
+    /// (ADR 0252). Read by `writeOpenApi` and by nothing on the request path.
+    declared_guard: ?mw.Guard = null,
     /// Directories loaded into memory by `static`, searched only when no
     /// route matched (ADR 0010).
     static_sets: std.ArrayList(static_mod.Set) = .empty,
@@ -335,6 +338,33 @@ pub const App = struct {
         return .{ .app = self };
     }
 
+    /// Say that `middleware` refuses a request without the session cookie
+    /// named `cookie`, so the API description can say so too
+    /// ([ADR 0252](../docs/adr/0252-the-document-takes-a-guards-word-for-the-cookie.md)).
+    ///
+    /// ```zig
+    /// const api = app.group("/api");
+    /// try api.use(requireSession);
+    /// try app.guard(requireSession, nilo.session.cookie_name);
+    /// ```
+    ///
+    /// Every route the middleware is in front of — through `use`, `useOn`
+    /// or `with`, less what `without` took out — is written with a
+    /// `cookieAuth` requirement and a 401; the rest are written as they
+    /// were. Which routes those are is read from the middleware wiring when
+    /// the document is written, so an exception moves in the document the
+    /// moment it moves in the program. The cookie's name is the one thing
+    /// the document takes on your word.
+    ///
+    /// Declaring it does not install it: `use` the middleware as before.
+    /// One guard per App, because a program has one session cookie
+    /// (ADR 0035); a second call is `error.GuardAlreadyDeclared`.
+    pub fn guard(self: *App, middleware: mw.Middleware, cookie: []const u8) error{GuardAlreadyDeclared}!void {
+        std.debug.assert(cookie.len > 0);
+        if (self.declared_guard != null) return error.GuardAlreadyDeclared;
+        self.declared_guard = .{ .middleware = middleware, .cookie = cookie };
+    }
+
     /// The App, with the next route registered through what this hands back
     /// carrying `name` as its `operationId`
     /// ([ADR 0149](../docs/adr/0149-a-route-can-say-its-own-name.md)).
@@ -440,6 +470,49 @@ pub const App = struct {
         opts: static_mod.Options,
     ) !void {
         const set = try static_mod.load(self.gpa, url_prefix, dir_path, opts);
+        errdefer {
+            var mutable = set;
+            mutable.deinit();
+        }
+        try self.static_sets.append(self.gpa, set);
+    }
+
+    /// Serve files the binary carries, the way `static` serves a directory
+    /// (ADR 0249).
+    ///
+    /// ```zig
+    /// try app.embedded("/", &.{
+    ///     .{ .path = "index.html", .bytes = @embedFile("dist/index.html") },
+    ///     .{ .path = "assets/app.js", .bytes = @embedFile("dist/assets/app.js") },
+    /// });
+    /// ```
+    ///
+    /// Everything `static` does past the read — an ETag per file, a gzipped
+    /// copy made once, the SPA fallback, nothing per request — happens here
+    /// too, on the same code. What is different is that there is no
+    /// directory to get wrong at deploy time: the files are in the
+    /// executable, and the list is the whole of what the caller writes.
+    ///
+    /// The failures are the caller's, not the environment's — a URL listed
+    /// twice, a fallback that names no entry — so they say why in one line
+    /// and stop the process, and there is no `try` variant to catch them
+    /// with: the list that failed was fixed when the program was compiled.
+    pub fn embedded(self: *App, url_prefix: []const u8, files: []const static_mod.Embedded) !void {
+        try self.embeddedWith(url_prefix, files, .{});
+    }
+
+    /// `embedded`, with the caching, index and single-page-app options
+    /// spelled out. See `static.EmbedOptions`.
+    pub fn embeddedWith(
+        self: *App,
+        url_prefix: []const u8,
+        files: []const static_mod.Embedded,
+        opts: static_mod.EmbedOptions,
+    ) !void {
+        const set = static_mod.embed(self.gpa, url_prefix, files, opts) catch |err| {
+            if (static_mod.explained(err)) std.process.exit(1);
+            return err;
+        };
         errdefer {
             var mutable = set;
             mutable.deinit();
@@ -1506,6 +1579,19 @@ pub fn GroupWith(
             opts: static_mod.Options,
         ) !void {
             return self.app.tryStaticWith(comptime joined(prefix, url_prefix), dir_path, opts);
+        }
+
+        pub fn embedded(self: Self, comptime url_prefix: []const u8, files: []const static_mod.Embedded) !void {
+            return self.app.embedded(comptime joined(prefix, url_prefix), files);
+        }
+
+        pub fn embeddedWith(
+            self: Self,
+            comptime url_prefix: []const u8,
+            files: []const static_mod.Embedded,
+            opts: static_mod.EmbedOptions,
+        ) !void {
+            return self.app.embeddedWith(comptime joined(prefix, url_prefix), files, opts);
         }
     };
 }

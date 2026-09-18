@@ -231,6 +231,13 @@ pub const Operation = struct {
     /// scheme a generated client signs in with
     /// ([ADR 0191](../docs/adr/0191-an-authorization-header-a-handler-can-ask-for.md)).
     security: Security = .none,
+    /// Whether a middleware `app.guard` declared stands in front of this
+    /// route — the cookie scheme, which no signature can say because the
+    /// cookie is read by a guard on the group rather than by the handler
+    /// ([ADR 0252](../docs/adr/0252-the-document-takes-a-guards-word-for-the-cookie.md)).
+    /// Settled by `writeOpenApi` from the App's middleware, not at
+    /// registration, because `without` and `with` can still move it.
+    guarded: bool = false,
     /// Whether the route answers once per `Idempotency-Key`, and so can
     /// answer 409 and 422 on the key alone (ADR 0193).
     idempotent: bool = false,
@@ -266,10 +273,19 @@ pub const Security = enum {
     }
 };
 
+/// The name the cookie scheme is written under. One per document, because
+/// a program has one session cookie (ADR 0035), and the guard that reads
+/// it is declared once (ADR 0252).
+pub const cookie_scheme = "cookieAuth";
+
 pub const Info = struct {
     title: []const u8 = "API",
     version: []const u8 = "1.0.0",
     description: []const u8 = "",
+    /// The cookie a guarded route is behind, from `app.guard`, or null when
+    /// no guard was declared. What `components.securitySchemes.cookieAuth`
+    /// names as `name` (ADR 0252).
+    cookie: ?[]const u8 = null,
 };
 
 /// What `app.docs(…)` takes. Every field has a default, so `app.docs(.{})`
@@ -900,6 +916,13 @@ const Components = struct {
 
     /// Whether any route signs in with `which`, and so whether that scheme
     /// has to be described.
+    fn anyGuarded(ops: []const Operation) bool {
+        for (ops) |op| {
+            if (op.guarded) return true;
+        }
+        return false;
+    }
+
     fn anySecurity(ops: []const Operation, which: Security) bool {
         for (ops) |op| {
             if (op.security == which) return true;
@@ -992,6 +1015,15 @@ pub fn write(gpa: std.mem.Allocator, w: *std.Io.Writer, ops: []const Operation, 
             },
         });
     }
+    // The cookie: `apiKey` in a cookie is the one spelling OpenAPI has for
+    // a session, and every generator reads it as "send the cookie" (ADR 0252).
+    if (info.cookie) |cookie| if (Components.anyGuarded(ops)) {
+        try w.writeAll(if (wrote_scheme) "," else ",\"securitySchemes\":{");
+        wrote_scheme = true;
+        try w.print("\"{s}\":{{\"type\":\"apiKey\",\"in\":\"cookie\",\"name\":", .{cookie_scheme});
+        try writeString(w, cookie);
+        try w.writeByte('}');
+    };
     if (wrote_scheme) try w.writeByte('}');
 
     try w.writeAll("}}");
@@ -1071,9 +1103,15 @@ fn writeOperation(w: *std.Io.Writer, components: *const Components, op: Operatio
 
     // Before the responses, and written whether or not the route can be
     // refused for anything else: the 401 is nilo's, sent before the handler
-    // runs, so the document can promise it (ADR 0191).
-    if (op.security != .none) {
-        try w.print(",\"security\":[{{\"{s}\":[]}}]", .{op.security.name()});
+    // runs, so the document can promise it (ADR 0191). A guard's cookie and
+    // a signature's header in one requirement object, which OpenAPI reads
+    // as *both*: the guard ran first and the handler still asked (ADR 0252).
+    if (op.security != .none or op.guarded) {
+        try w.writeAll(",\"security\":[{");
+        if (op.guarded) try w.print("\"{s}\":[]", .{cookie_scheme});
+        if (op.guarded and op.security != .none) try w.writeByte(',');
+        if (op.security != .none) try w.print("\"{s}\":[]", .{op.security.name()});
+        try w.writeAll("}]");
     }
 
     try w.writeAll(",\"responses\":{");
@@ -1081,6 +1119,9 @@ fn writeOperation(w: *std.Io.Writer, components: *const Components, op: Operatio
     if (op.security != .none) {
         try writeFailure(w, "401", "no Authorization header, or not the scheme this endpoint " ++
             "takes; WWW-Authenticate says which");
+    } else if (op.guarded) {
+        try writeFailure(w, "401", "refused by the guard in front of this endpoint: no session " ++
+            "cookie, or not one it accepts");
     }
     if (op.idempotent) {
         try writeFailure(w, "409", "a request with this Idempotency-Key is still being answered");

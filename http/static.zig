@@ -3,6 +3,7 @@
 //! ```zig
 //! try app.static("/", "public");
 //! try app.staticWith("/assets", "dist", .{ .cache_control = "public, max-age=31536000, immutable" });
+//! try app.embedded("/", &.{ .{ .path = "index.html", .bytes = @embedFile("dist/index.html") } });
 //! ```
 //!
 //! A directory is read once, at startup, into memory owned by the App.
@@ -10,6 +11,14 @@
 //! whole reason it is done this way: a blocking read inside a fiber stalls
 //! every other connection sharing that OS thread, and the p99 the project
 //! measures itself on would go with it.
+//!
+//! A tree the binary carries takes the same path from one step further in
+//! (ADR 0249): `embed` is `load` with the read taken out. The bytes are
+//! borrowed from the binary rather than read from a disk, and everything
+//! after that — the sorted list, the ETag, the gzipped copy, the fallback —
+//! is the same code, which is why a product that compiles its UI in serves
+//! it exactly as one that ships a directory does, and nothing per request
+//! knows the difference.
 //!
 //! Two things fall out of that for free. Path traversal is not possible —
 //! the set of files is fixed before the socket opens, so `../../etc/passwd`
@@ -296,12 +305,17 @@ pub const File = struct {
 /// Everything one file allocated, in one place. `load` frees a half-built
 /// list with this and `Set.deinit` frees a finished one, so a file that
 /// grows an allocation cannot be freed on one path and leaked on the other.
-fn freeFile(gpa: std.mem.Allocator, f: File) void {
+///
+/// `owns_bytes` is the Set's: a held file's bytes were read by `load` and
+/// are the Set's to free, or were handed to `embed` out of the binary and
+/// are nobody's to free. The gzipped copy and both ETags are always the
+/// Set's own, whichever way the bytes arrived.
+fn freeFile(gpa: std.mem.Allocator, f: File, owns_bytes: bool) void {
     gpa.free(f.url);
     gpa.free(f.etag);
     switch (f.contents) {
         .held => |held| {
-            gpa.free(held.bytes);
+            if (owns_bytes) gpa.free(held.bytes);
             if (held.gzip) |p| gpa.free(p);
             if (held.gzip_etag.len > 0) gpa.free(held.gzip_etag);
         },
@@ -328,11 +342,17 @@ pub const Set = struct {
     /// name a request never chose the only name that ever reaches `openat`.
     ///
     /// Null for a Set that has no directory — `fromMemory`, which is bytes
-    /// that were already here (ADR 0017) and can spill nothing.
+    /// that were already here (ADR 0017), and `embed`, which is bytes the
+    /// binary carries (ADR 0249). Neither can spill anything.
     dir: ?bulkhead.Dir = null,
+    /// Whether a held file's bytes are this Set's to free. `load` and
+    /// `fromMemory` read or copy them and own them; `embed` borrows them
+    /// from the binary, where they cost nothing to keep and cannot be
+    /// given back.
+    owns_bytes: bool = true,
 
     pub fn deinit(self: *Set) void {
-        for (self.files) |f| freeFile(self.gpa, f);
+        for (self.files) |f| freeFile(self.gpa, f, self.owns_bytes);
         self.gpa.free(self.files);
         self.gpa.free(self.prefix);
         if (self.dir) |d| d.close();
@@ -419,6 +439,9 @@ pub const LoadError = error{
     StaticUrlTooLong,
     OutOfMemory,
     StaticReadFailed,
+    /// Two entries handed to `embed` under one URL. A directory cannot
+    /// hold two files by one name, so `load` never sees this; a list can.
+    StaticDuplicateUrl,
 };
 
 /// Which of these failures `load` has already put into words, so `App` can
@@ -434,6 +457,7 @@ pub fn explained(err: anyerror) bool {
         error.StaticSetTooLarge,
         error.StaticUrlTooLong,
         error.StaticReadFailed,
+        error.StaticDuplicateUrl,
         => true,
         else => false,
     };
@@ -574,7 +598,7 @@ pub fn load(
 
     var files: std.ArrayList(File) = .empty;
     errdefer {
-        for (files.items) |f| freeFile(gpa, f);
+        for (files.items) |f| freeFile(gpa, f, true);
         files.deinit(gpa);
     }
 
@@ -758,6 +782,187 @@ pub fn load(
     );
     return set;
 }
+
+/// One file the binary carries, for `embed`.
+///
+/// ```zig
+/// try app.embedded("/", &.{
+///     .{ .path = "index.html", .bytes = @embedFile("dist/index.html") },
+///     .{ .path = "assets/app.js", .bytes = @embedFile("dist/assets/app.js") },
+/// });
+/// ```
+///
+/// `@embedFile` has to be written by the caller: its path is relative to
+/// the file it is written in and the file has to be inside that module, so
+/// nothing in nilo can name a caller's `dist/`. The list is the whole of
+/// what the caller writes, and a build step that walks a directory into one
+/// is theirs until two of them have written the same one (ADR 0249).
+pub const Embedded = struct {
+    /// Where the file sits in the tree, relative and with forward slashes:
+    /// `"index.html"`, `"assets/app.js"`. Joined onto the URL prefix the
+    /// way a directory walk's path is.
+    path: []const u8,
+    /// The file. Borrowed for as long as the App lives and never freed,
+    /// which is what bytes in the binary are.
+    bytes: []const u8,
+};
+
+/// What `embed` takes: `Options`, less every field that is about a disk.
+///
+/// A file in the binary cannot spill, so there is no threshold to set and
+/// no total to stay under — the bytes are mapped whether or not a Set names
+/// them, and `max_total_bytes` would be counting memory that is not spent
+/// twice. `dotfiles` is the walk's rule about names it found; here every
+/// name was written by the caller. `reload` is the disk. What is left is
+/// what the request sees, with the same defaults, taken from `Options` so
+/// there is one place they are written.
+pub const EmbedOptions = struct {
+    index: []const u8 = (Options{}).index,
+    cache_control: []const u8 = (Options{}).cache_control,
+    spa_fallback: []const u8 = (Options{}).spa_fallback,
+    spa_fallback_for: Options.Fallback = (Options{}).spa_fallback_for,
+    compress: bool = (Options{}).compress,
+    compress_min_bytes: usize = (Options{}).compress_min_bytes,
+};
+
+/// A Set over bytes the binary carries, mapped to URLs under `url_prefix`
+/// (ADR 0249).
+///
+/// Everything past this call is the path `load` built: the same sorted list,
+/// the same lookup, an ETag per file, a gzipped copy made once for the files
+/// worth it, the SPA fallback, and nothing per request. What differs is where
+/// the bytes come from — they are borrowed rather than read, so the Set owns
+/// the ETags and the gzipped copies and not the files — and what cannot
+/// happen: nothing spills, and nothing is over any limit, because the binary
+/// already holds it.
+///
+/// Two things a directory walk could not produce are refused here. Two
+/// entries under one URL is `error.StaticDuplicateUrl` naming the URL, and a
+/// fallback that names no entry is `error.StaticDirNotFound`, both said in
+/// one line the way `load`'s failures are.
+pub fn embed(
+    gpa: std.mem.Allocator,
+    url_prefix: []const u8,
+    files: []const Embedded,
+    options: EmbedOptions,
+) LoadError!Set {
+    std.debug.assert(url_prefix.len > 0 and url_prefix[0] == '/');
+
+    var set = Set{
+        .gpa = gpa,
+        .prefix = &.{},
+        .files = &.{},
+        .fallback = null,
+        .index = options.index,
+        .owns_bytes = false,
+    };
+    errdefer set.deinit();
+    set.prefix = try gpa.dupe(u8, url_prefix);
+
+    set.files = try gpa.alloc(File, files.len);
+    // Emptied before anything can fail, for the reason `fromMemory` does it:
+    // `deinit` on the way out of a half-built Set frees what exists and steps
+    // over what does not.
+    for (set.files) |*file| file.* = .{
+        .url = &.{},
+        .etag = &.{},
+        .content_type = "",
+        .cache_control = "",
+        .contents = .{ .held = .{ .bytes = &.{} } },
+    };
+
+    var carried_total: usize = 0;
+    var packed_total: usize = 0;
+
+    for (files, set.files) |entry, *file| {
+        var url_buf: [max_url]u8 = undefined;
+        const url = join(&url_buf, url_prefix, entry.path) orelse {
+            std.log.err("nilo: embedded file \"{s}\" has a path longer than {d} bytes", .{ entry.path, max_url });
+            return error.StaticUrlTooLong;
+        };
+        toForwardSlashes(url);
+
+        file.url = try gpa.dupe(u8, url);
+        file.content_type = contentTypeFor(url);
+        file.cache_control = options.cache_control;
+        file.etag = try etagFor(gpa, entry.bytes);
+
+        const held = &file.contents.held;
+        held.bytes = entry.bytes;
+        carried_total += entry.bytes.len;
+        if (options.compress and
+            entry.bytes.len >= options.compress_min_bytes and
+            compressible(file.content_type))
+        {
+            held.gzip = try gzipped(gpa, entry.bytes);
+            if (held.gzip) |p| {
+                held.gzip_etag = try etagFor(gpa, p);
+                packed_total += p.len;
+            }
+        }
+    }
+
+    sortByUrl(set.files);
+
+    if (listedTwice(set.files)) |url| {
+        std.log.err("nilo: embedded file \"{s}\" is listed twice", .{url});
+        return error.StaticDuplicateUrl;
+    }
+
+    if (options.spa_fallback.len > 0) {
+        var buf: [max_url]u8 = undefined;
+        const url = join(&buf, url_prefix, options.spa_fallback) orelse {
+            std.log.err(
+                "nilo: the SPA fallback URL \"{s}\" + \"{s}\" is longer than {d} bytes",
+                .{ url_prefix, options.spa_fallback, max_url },
+            );
+            return error.StaticUrlTooLong;
+        };
+        set.fallback = set.lookup(url) orelse {
+            std.log.err(
+                "nilo: the SPA fallback \"{s}\" is not among the embedded files — " ++
+                    "the name is relative to the tree, e.g. \"index.html\"",
+                .{options.spa_fallback},
+            );
+            return error.StaticDirNotFound;
+        };
+        set.fallback_for = options.spa_fallback_for;
+    }
+
+    // Two numbers again, and different ones from `load`'s: the first is what
+    // the binary carries and costs nothing more to serve, the second is what
+    // this call allocated and is the only memory the Set adds.
+    std.log.info(
+        "nilo: embedded {d} static file(s) ({d} bytes in the binary{f}) onto \"{s}\"",
+        .{ set.files.len, carried_total, EmbedGzipNote{ .bytes = packed_total }, url_prefix },
+    );
+    return set;
+}
+
+/// The URL that appears twice in a list sorted by URL, or null when every
+/// one is its own. A directory cannot hold two files by one name and a
+/// list can, and the second entry would then be unreachable forever,
+/// quietly — the binary search stops at whichever of the two it finds.
+/// Sorted, so a repeat is beside itself and this is one pass.
+fn listedTwice(sorted: []const File) ?[]const u8 {
+    var i: usize = 1;
+    while (i < sorted.len) : (i += 1) {
+        if (std.mem.eql(u8, sorted[i - 1].url, sorted[i].url)) return sorted[i].url;
+    }
+    return null;
+}
+
+/// The gzip half of `embed`'s line, on `GzipNote`'s terms — and worded so
+/// the number is read as memory allocated beside the binary rather than as
+/// part of what the binary carries.
+const EmbedGzipNote = struct {
+    bytes: usize,
+
+    pub fn format(self: EmbedGzipNote, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.bytes == 0) return;
+        try w.print(", plus {d} bytes of gzipped copies allocated", .{self.bytes});
+    }
+};
 
 /// The gzip half of the load line, and nothing at all when no file was
 /// worth compressing — a directory of images should not have to read a
@@ -1843,4 +2048,127 @@ test "a set with no directory closes cleanly, and one with a directory gives it 
     try testing.expect(loaded.dir != null);
     loaded.deinit();
     try testing.expect(loaded.dir == null);
+}
+
+// ---- embedded trees (ADR 0249) ----
+
+/// A tree the way a caller writes one: `@embedFile` on each entry. These
+/// are the repository's own files, because a test cannot embed what the
+/// build did not put beside it — and `bytes` is a `[]const u8` pointing
+/// into the binary either way, which is what `embed` is being handed.
+const embedded_tree = [_]Embedded{
+    .{ .path = "index.html", .bytes = @embedFile("testdata/embedded/index.html") },
+    .{ .path = "assets/app.js", .bytes = @embedFile("testdata/embedded/assets/app.js") },
+    .{ .path = "assets/logo.svg", .bytes = @embedFile("testdata/embedded/assets/logo.svg") },
+};
+
+test "an embedded tree answers the way a directory does: the file, the index, the fallback, a 304" {
+    const gpa = testing.allocator;
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.embeddedWith("/", &embedded_tree, .{
+        .spa_fallback = "index.html",
+        .cache_control = "public, max-age=60",
+        // Below every file here, so the one that is text and worth it gets
+        // a copy and the test can see it.
+        .compress_min_bytes = 16,
+    });
+
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+
+    // A file, with everything a held file's answer carries.
+    const js = try client.get(&app, "/assets/app.js");
+    try testing.expectEqual(@as(u16, 200), js.status);
+    try testing.expectEqualStrings(embedded_tree[1].bytes, js.body);
+    try testing.expectEqualStrings("text/javascript; charset=utf-8", js.header("Content-Type").?);
+    try testing.expectEqualStrings("public, max-age=60", js.header("Cache-Control").?);
+    try testing.expect(js.header("ETag") != null);
+    var etag_buf: [64]u8 = undefined;
+    const etag = etag_buf[0..js.header("ETag").?.len];
+    @memcpy(etag, js.header("ETag").?);
+
+    // The index, for a path ending in a slash.
+    const index = try client.get(&app, "/");
+    try testing.expectEqual(@as(u16, 200), index.status);
+    try testing.expectEqualStrings(embedded_tree[0].bytes, index.body);
+
+    // The fallback, for a page a browser asked for, and a 404 for an asset
+    // that is not there (ADR 0109) — the same two answers a directory gives.
+    const deep = try client.send(&app, "GET /users/42 HTTP/1.1\r\nHost: t\r\nAccept: text/html\r\n\r\n");
+    try testing.expectEqual(@as(u16, 200), deep.status);
+    try testing.expectEqualStrings(embedded_tree[0].bytes, deep.body);
+    const missing = try client.get(&app, "/assets/gone.js");
+    try testing.expectEqual(@as(u16, 404), missing.status);
+
+    // Gzipped once at build, and served from that copy under its own tag.
+    const packed_answer = try client.send(
+        &app,
+        "GET /assets/app.js HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n",
+    );
+    try testing.expectEqual(@as(u16, 200), packed_answer.status);
+    try testing.expectEqualStrings("gzip", packed_answer.header("Content-Encoding").?);
+    try testing.expect(!std.mem.eql(u8, etag, packed_answer.header("ETag").?));
+
+    // A repeat visitor: a comparison and a head, no body.
+    var request_buf: [256]u8 = undefined;
+    const conditional = try client.send(&app, try std.fmt.bufPrint(
+        &request_buf,
+        "GET /assets/app.js HTTP/1.1\r\nHost: t\r\nIf-None-Match: {s}\r\n\r\n",
+        .{etag},
+    ));
+    try testing.expectEqual(@as(u16, 304), conditional.status);
+    try testing.expectEqualStrings("", conditional.body);
+}
+
+test "an embedded file is borrowed, and the Set frees the tags and the copies and not the bytes" {
+    // `testing.allocator` is the check: bytes from `@embedFile` are in the
+    // binary, and a `free` on them would be reported as an invalid free.
+    // What the Set does own — the URL, the ETags, the gzipped copy — is what
+    // a leak would show.
+    const gpa = testing.allocator;
+    var set = try embed(gpa, "/app", &embedded_tree, .{ .compress_min_bytes = 16 });
+    defer set.deinit();
+
+    try testing.expect(!set.owns_bytes);
+    try testing.expect(set.dir == null);
+    try testing.expectEqual(@as(usize, 3), set.files.len);
+
+    const js = set.find("/app/assets/app.js").?;
+    try testing.expectEqual(embedded_tree[1].bytes.ptr, js.contents.held.bytes.ptr);
+    try testing.expect(js.contents.held.gzip != null);
+    // An SVG is `+xml`, which is text however it starts, so it gets a copy.
+    try testing.expect(set.find("/app/assets/logo.svg").?.contents.held.gzip != null);
+    // Under its prefix only, on a segment boundary, as a directory is.
+    try testing.expect(set.find("/assets/app.js") == null);
+    try testing.expect(set.find("/apple/assets/app.js") == null);
+}
+
+test "a URL listed twice is found by name, whichever way the two were spelled" {
+    // The refusal itself logs at `err`, which the test runner counts as a
+    // failure, so what is tested is the check `embed` makes and not the
+    // line it prints — the same split `docs/history.md` records for the
+    // schema check. A directory cannot hold two files by one name; a list
+    // can, and whichever the binary search stopped at would answer forever.
+    const gpa = testing.allocator;
+    var twice = try fakeSet(gpa, "/", &.{ "/a.txt", "/b.txt", "/a.txt" });
+    defer twice.deinit();
+    sortByUrl(twice.files);
+    try testing.expectEqualStrings("/a.txt", listedTwice(twice.files).?);
+
+    var once = try fakeSet(gpa, "/", &.{ "/a.txt", "/b.txt", "/c.txt" });
+    defer once.deinit();
+    sortByUrl(once.files);
+    try testing.expect(listedTwice(once.files) == null);
+    try testing.expect(listedTwice(&.{}) == null);
+
+    // `join` is what makes "/a.txt" and "a.txt" one URL before the check
+    // runs, so the two spellings meet here rather than at a request.
+    var buf: [max_url]u8 = undefined;
+    try testing.expectEqualStrings("/a.txt", join(&buf, "/", "/a.txt").?);
+    try testing.expectEqualStrings("/a.txt", join(&buf, "/", "a.txt").?);
+
+    // An empty list is a Set that answers nothing, and closes.
+    var empty = try embed(gpa, "/", &.{}, .{});
+    empty.deinit();
 }

@@ -15,12 +15,15 @@ One page of [the reference](./README.md): the App and its groups, what `listen()
 | `app.useOn(prefix, mw)` | middleware, under a path prefix |
 | `app.without(mw)` | the same App with `mw` off for the routes registered through what comes back — how a sign-up route sits inside a guarded prefix ([ADR 0080](../adr/0080-a-route-can-say-it-is-not-covered.md)) |
 | `app.with(mw)` | the other direction: the same App with `mw` **on** for the routes registered through what comes back, so one endpoint can be guarded where its neighbours are not ([ADR 0126](../adr/0126-a-route-can-say-what-covers-it.md)) |
+| `app.guard(mw, cookie)` | say that `mw` refuses a request without the session cookie named `cookie`, so every route it is in front of is written in the API description with a `cookieAuth` requirement and a 401 — which routes is read from `use`/`useOn`/`with`/`without` when the document is written; only the cookie's name is taken on your word. One per App; a second is `error.GuardAlreadyDeclared`. Declaring it does not install it ([ADR 0252](../adr/0252-the-document-takes-a-guards-word-for-the-cookie.md)) |
 | `app.named("listPartners")` | the same App with the next route registered through what comes back carrying that as its `operationId`, instead of the one derived from the method and the path ([ADR 0149](../adr/0149-a-route-can-say-its-own-name.md)). Letters, digits, `_` and `-`, starting with a letter or `_` — `auth-login` is a name a generator can carry ([ADR 0200](../adr/0200-a-hyphen-is-a-spelling-a-generator-can-carry.md)) |
 | `app.group(prefix)` | a group — see below |
 | `app.get / post / put / delete / patch / head / options (pattern, handler)` | a route |
 | `app.route(method, pattern, handler)` | any other method |
 | `app.static(url_prefix, dir_path)` | a directory, read into memory at startup |
 | `app.staticWith(url_prefix, dir_path, options)` | the same, with [options](#static-options) |
+| `app.embedded(url_prefix, files)` | files the binary carries — a list of `.{ .path, .bytes }` with `@embedFile` on each — served as a directory is ([Static files](../guide/static-files.md#files-the-binary-carries), [ADR 0249](../adr/0249-a-tree-the-binary-carries-is-served-as-a-directory-is.md)) |
+| `app.embeddedWith(url_prefix, files, options)` | the same, with the [options that are not about a disk](#static-options) |
 | `app.docs(options)` | serve an [OpenAPI document](../guide/openapi.md) |
 | `app.health(path)` | a page that says whether this process can do its job — `200 {"status":"ok"}`, or `503` naming the services that are not ready and why, or `503 {"status":"stopping"}` once the server was told to stop. Asks every service that declared `pub fn nilo_ready(self: *T, scope: *nilo_core.AnyScope) ?[]const u8` — null is ready, a sentence is why not ([Deploying](../guide/deploying.md#knowing-whether-it-is-ready), [ADR 0192](../adr/0192-a-health-route-asks-the-services.md)) |
 | `app.metrics(options)` | count every request and serve the numbers at `/metrics`, Prometheus format ([Metrics](../guide/metrics.md), [ADR 0100](../adr/0100-the-route-table-is-the-registry.md)) |
@@ -177,6 +180,14 @@ Both the length and the ETag of a spilled file come from one look at the
 descriptor whose bytes are about to go out, so editing a file under a running
 server cannot serve a stale length under a stale tag
 ([ADR 0125](../adr/0125-a-file-is-described-by-the-descriptor-being-sent.md)).
+
+`app.embeddedWith(prefix, files, …)` takes `index`, `cache_control`,
+`spa_fallback`, `spa_fallback_for`, `compress` and `compress_min_bytes`, with the
+defaults above, and none of the rest: nothing in the binary can spill, nothing is
+over a total, every name was written by the caller, and there is no disk to
+reload from. A path listed twice and a fallback that names no entry are refused
+at startup
+([ADR 0249](../adr/0249-a-tree-the-binary-carries-is-served-as-a-directory-is.md)).
 
 **`reload = true` is `max_file_bytes = 0` with a name**: nothing is held, every
 file is opened per request, and editing one works without a restart. For

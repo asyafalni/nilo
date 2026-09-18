@@ -45,7 +45,7 @@ const Member = struct {
 };
 
 comptime {
-    _ = sql.migrate.tablesOf(sql.Postgres, &.{ Org, Member });
+    _ = sql.migrate.desiredOf(sql.Postgres, .{ .tables = &.{ Org, Member } });
 }
 ```
 
@@ -115,12 +115,12 @@ const Staff = struct {
     email: Str,
 };
 
-// The list `sql.cli.Tool` and `db.checking` are given, and the one place every
+// The schema `sql.cli.Tool` and `db.checking` are given, and the one place every
 // Row is together — so it is where `"staff"` is resolved and where the two
 // columns' types are compared. Written `comptime` here because that is what
-// makes this page's own check run; in a program it is `Tool(Db, &.{ … })`.
+// makes this page's own check run; in a program it is `Tool(Db, schema)`.
 comptime {
-    _ = sql.migrate.tablesOf(sql.Postgres, &.{ Comment, Staff });
+    _ = sql.migrate.desiredOf(sql.Postgres, .{ .tables = &.{ Comment, Staff } });
 }
 ```
 
@@ -163,7 +163,7 @@ const Task = struct {
 };
 
 comptime {
-    _ = sql.migrate.tablesOf(sql.Postgres, &.{ Task, Epic });
+    _ = sql.migrate.desiredOf(sql.Postgres, .{ .tables = &.{ Task, Epic } });
 }
 ```
 
@@ -196,7 +196,7 @@ const Agent = struct {
 };
 
 comptime {
-    _ = sql.migrate.tablesOf(sql.Postgres, &.{Agent});
+    _ = sql.migrate.desiredOf(sql.Postgres, .{ .tables = &.{Agent} });
 }
 ```
 
@@ -241,7 +241,7 @@ const Invoice = struct {
 };
 
 comptime {
-    _ = sql.migrate.tablesOf(sql.Postgres, &.{Invoice});
+    _ = sql.migrate.desiredOf(sql.Postgres, .{ .tables = &.{Invoice} });
 }
 ```
 
@@ -274,11 +274,71 @@ four-statement rebuild every other table constraint needs, and the diff spells
 it out. A trigger is a statement of its own and both databases do all three
 cases.
 
+## The schema is one value
+
+Every call on this page is given the same thing: a `sql.Schema`, which is
+every Row and the three kinds of object that hang off the schema rather than
+off a table
+([ADR 0253](../../adr/0253-a-schema-is-one-value-and-the-tool-owns-the-order.md)).
+
+<!-- compiles -->
+```zig
+pub const schema = sql.Schema{
+    .extensions = &.{"pgcrypto"},
+    .functions = &.{
+        .{ .name = "set_updated_at", .body = 
+            \\CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
+            \\BEGIN NEW.updated_at = now(); RETURN NEW; END
+            \\$$ LANGUAGE plpgsql
+        },
+    },
+    .tables = &.{ User, Order },
+    .views = &.{
+        .{ .name = "open_orders", .body = "SELECT id, user_id, total FROM orders WHERE status = 'open'" },
+    },
+};
+```
+
+Write it once and hand it to `db.checking(schema)`, `sql.cli.Tool(Db, schema)`
+and `createMissing(&db, &run, schema)`. That is the whole reason it is a value
+rather than three lists: the tool, the startup check and the boot cannot
+disagree about what the database is. A program with tables and nothing else
+writes `.{ .tables = &.{ User, Order } }` and is done.
+
+`@embedFile` is the point of the two named lists. A sixty-line view belongs in
+`sql/open_orders.sql` with highlighting, not in sixty `\\` lines, and
+`.body = @embedFile("sql/open_orders.sql")` puts it there. The snapshot
+records a function or a view as its name and a hash, the way it records a
+check, so the file stays readable however long the SQL is.
+
+Two of the three have a shape nilo holds you to, and both are compile errors
+rather than a failed apply:
+
+- A **function** is the whole `CREATE OR REPLACE FUNCTION <name> …`
+  statement, and it has to open with those words and that name. That is what
+  makes applying it twice applying it once, and what lets a changed body be
+  one step in the diff rather than a drop and a create.
+- A **view** is the `SELECT`. nilo writes `CREATE VIEW "name" AS` in front of
+  it, for the reason a trigger is two words: the name is the thing the schema
+  already knows, and a second copy of it stops matching the day it is renamed.
+  A view whose text moved is dropped before any table moves and remade after
+  every table has, so a view reading a column about to go is never in the way.
+
+An extension is a name. `CREATE EXTENSION IF NOT EXISTS` when it arrives, and
+`DROP EXTENSION` when it leaves the list — marked destructive, because dropping
+one drops every object it made. SQLite has neither extensions nor
+`CREATE FUNCTION` as statements, so both lists are refused there; views it has.
+
+**The tool owns the order**: extensions, functions, tables by reference, each
+table's indexes and triggers, then views. What is none of these — a backfill,
+a seed row, a `create_hypertable` — is what a version file's `before` and
+`after` slots are for.
+
 ## Creating them
 
 <!-- compiles: body -->
 ```zig
-try sql.migrate.createMissing(&db, &run, &.{User});
+try sql.migrate.createMissing(&db, &run, .{ .tables = &.{User} });
 ```
 
 One `CREATE TABLE IF NOT EXISTS` per Row plus its indexes, all in one
@@ -299,7 +359,7 @@ on the server's own loop, before the first request
 <!-- compiles -->
 ```zig
 fn makeTables(run: *nilo.Run, db: *sql.Db) !void {
-    try sql.migrate.createMissing(db, run, &.{User});
+    try sql.migrate.createMissing(db, run, .{ .tables = &.{User} });
 }
 ```
 
@@ -321,8 +381,8 @@ the next time nilo's moves. `addMissingColumns` is the step after
 
 <!-- compiles: body -->
 ```zig
-try sql.migrate.createMissing(&db, &run, &.{User});
-_ = try sql.migrate.addMissingColumns(&db, &run, &.{User});
+try sql.migrate.createMissing(&db, &run, .{ .tables = &.{User} });
+_ = try sql.migrate.addMissingColumns(&db, &run, .{ .tables = &.{User} });
 ```
 
 One `ALTER TABLE … ADD COLUMN` per field the table lacks, typed from the same
@@ -347,7 +407,7 @@ The other half is a diff, and **it needs no database on either side**:
 <!-- compiles: body -->
 ```zig
 const before = sql.snapshot.empty(sql.Db.Dialect);   // or snapshot.zon, read back
-const desired = comptime sql.migrate.tablesOf(sql.Db.Dialect, &.{User});
+const desired = comptime sql.migrate.desiredOf(sql.Db.Dialect, .{ .tables = &.{User} });
 
 const change = try sql.migrate.plan(gpa, sql.Db.Dialect, desired, before);
 ```
@@ -384,7 +444,7 @@ const Renamed = struct {
 };
 
 comptime {
-    _ = sql.migrate.tablesOf(sql.Postgres, &.{Renamed});
+    _ = sql.migrate.desiredOf(sql.Postgres, .{ .tables = &.{Renamed} });
 }
 ```
 
@@ -467,7 +527,7 @@ const sql = @import("nilo_sql");
 const manifest = @import("migrations/manifest.zig");
 
 const Db = sql.Sqlite(.{ .threading = .in_fiber });
-const Tool = sql.cli.Tool(Db, &.{ User, Org });
+const Tool = sql.cli.Tool(Db, .{ .tables = &.{ User, Org } });
 
 pub fn main(init: std.process.Init) !u8 {
     var buf: [8192]u8 = undefined;
@@ -532,8 +592,9 @@ Only one declaration in it is generated. The other three are yours:
 ```zig
 const migrate = @import("nilo_sql").migrate;
 
-/// Steps of your own that have to run *before* the generated ones: the
-/// extension a generated column's type comes from, a function a default calls.
+/// Steps of your own that have to run *before* the generated ones — what is
+/// not an extension, a function, a table or a view, since those four the
+/// schema already orders.
 pub const before: []const migrate.Step = &.{};
 
 /// And the ones that run after: a backfill, a seed row, a `create_hypertable`.

@@ -299,7 +299,7 @@ pub fn Jobs(comptime options: anytype) type {
             break :blk true;
         };
 
-        /// The store's table Row, for `db.checking(&.{ Jobs.Row })` and a
+        /// The store's table Row, for `db.checking(.{ .tables = &.{ Jobs.Row } })` and a
         /// migration. `void` for a store that has no table.
         pub const Row = if (@hasDecl(Store, "Row")) Store.Row else void;
 

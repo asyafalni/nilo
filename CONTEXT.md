@@ -191,7 +191,7 @@ A function callable from anywhere to stop a request with a given status and mess
 _Avoid_: abort, throw, bail
 
 **Static set**:
-One directory read when the App is built, and answered from a list fixed before the socket opens. Files small enough are held in memory and never touch the disk again; the rest are Spilled. Not a middleware: it holds state, so it is a terminal handler the middleware chain wraps like any other.
+One directory read when the App is built — or one list of files the binary carries — and answered from a list fixed before the socket opens. Files small enough are held in memory and never touch the disk again; the rest are Spilled. An embedded tree is the same Set with the read taken out: nothing in it can spill. Not a middleware: it holds state, so it is a terminal handler the middleware chain wraps like any other.
 _Avoid_: file server, asset middleware, public dir
 
 **Spilled file**:

@@ -17,6 +17,27 @@ where it was made.
 
 ### Breaking
 
+- **`sql.Schema` is the one spelling of what a program's database is**, and
+  every call that took `&.{ Row, Row }` takes it instead: `db.checking`,
+  `sql.cli.Tool`, `migrate.createMissing`, `migrate.addMissingColumns`,
+  `migrate.tablesOf`, `migrate.missingOf` and `migrate.orderOf`. `plan`,
+  `snapshotOf` and `migrations.generate`/`check` take `migrate.Desired`,
+  from `migrate.desiredOf(D, schema)` where `tablesOf` used to go. Beside
+  `.tables` the value carries `.extensions`, `.functions` and `.views`, and
+  the tool owns their order — extensions, functions, tables by reference,
+  each table's indexes and triggers, then views — in `createMissing` and in
+  the diff, where a moved view is dropped before any table moves and remade
+  after. A function is the whole `CREATE OR REPLACE FUNCTION <name> …`
+  statement and a view is the `SELECT`; `@embedFile` is how either gets in.
+  The snapshot records them as a name and a hash, defaulted, so an old file
+  reads as one with none and plans nothing
+  ([ADR 0253](./docs/adr/0253-a-schema-is-one-value-and-the-tool-owns-the-order.md)).
+
+  What to change: `&.{ User, Org }` becomes `.{ .tables = &.{ User, Org } }`
+  at each of those calls — or, better, one `pub const schema = sql.Schema{ … }`
+  handed to all three. `comptime sql.migrate.tablesOf(D, &.{ … })` handed to
+  `plan` becomes `comptime sql.migrate.desiredOf(D, .{ .tables = &.{ … } })`.
+
 - **`app.start(io)` followed by `listen()` is refused** when any provided
   service declares `nilo_start`. The shape ADR 0079 recommended handed the
   pool one loop and the requests another: a job worker started that way
@@ -100,6 +121,47 @@ where it was made.
 
 ### Added
 
+- **`app.embedded(prefix, files)`** and `embeddedWith`: a tree the binary
+  carries, served the way a directory is. A list of `.{ .path, .bytes }`
+  with `@embedFile` on each goes through the same Set `app.static` builds —
+  an ETag per file, a gzipped copy made once, the SPA fallback, nothing per
+  request — with the bytes borrowed from the binary rather than read or
+  copied. The options are `static`'s less every one that is about a disk.
+  A path listed twice and a fallback that names no entry are refused at
+  startup, in one line each
+  ([ADR 0249](./docs/adr/0249-a-tree-the-binary-carries-is-served-as-a-directory-is.md)).
+- **`bucket.list(c, .{ .prefix, .max_keys, .cursor })`** in `nilo_s3`: one
+  page of a bucket's keys under a prefix, as `Page` — `objects`, each a
+  `Listed` with `key`, `size`, `etag` and `last_modified`, and `next`, the
+  cursor for the page after or null. At most 1,000 a page, which is S3's own
+  ceiling and is refused rather than clamped; the body is bounded by what
+  that many keys can weigh; and nothing follows the cursor for the caller.
+  The XML is five element names scanned for, the way `code.zig` reads an
+  error body, and the request asks for `encoding-type=url` so a key with an
+  `&` in it is a percent problem rather than an XML one
+  ([ADR 0250](./docs/adr/0250-a-list-is-a-page-with-a-cursor-and-nothing-that-follows-it.md)).
+- **A request body under `Content-Encoding: gzip` is inflated** before
+  anything reads it — `c.body()`, `c.json`, a struct argument, a `Form(T)` —
+  where 0.4.0 answered every coding but `identity` with a 415. The stock
+  OpenTelemetry Collector and most agents gzip by default. No window and no
+  pool: `std.compress.flate.Decompress` uses the destination as its history,
+  so the arena buffer that holds the body is the window, and the gzip
+  trailer's length makes that one allocation exact and the `max_body` check a
+  comparison before a byte is inflated. A stream that does not decode is a
+  400 naming the coding; `br`, `deflate`, `zstd` and stacked codings are
+  still a 415, and its message now says which one is decoded. `c.bodyStream()`
+  does not decode and answers a gzipped body with a 415 that says so
+  ([ADR 0251](./docs/adr/0251-a-gzipped-body-is-inflated-into-the-buffer-that-holds-it.md)).
+- **`app.guard(middleware, cookie)`**: the API description says which
+  routes are behind a session cookie. Every route the middleware is in
+  front of — through `use`, `useOn` or `with`, less what `without` took
+  out — is written with a `cookieAuth` requirement and a 401, and
+  `securitySchemes` gains `{"type":"apiKey","in":"cookie","name":…}`.
+  Which routes is read from the middleware wiring when the document is
+  written, so an exception moves in the document the moment it moves in
+  the program; the cookie's name is the one thing taken on your word. One
+  per App, and declaring it installs nothing
+  ([ADR 0252](./docs/adr/0252-the-document-takes-a-guards-word-for-the-cookie.md)).
 - **`nilo.Cached(Pages, .{ .ttl_s = 60 })`** as a route argument: the
   answer a GET or HEAD returned is kept under the path and query in a bytes
   Space and served again, byte for byte, for `ttl_s` — the handler does not

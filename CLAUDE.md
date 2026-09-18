@@ -123,7 +123,7 @@ zig build test-job-sql # nilo_job over a SQLite table, and Postgres if DATABASE_
 zig build test-s3      # only nilo_s3, both modes, plus its refusals
 zig build layering     # check that no module imports upward or sideways
 zig build refusals     # the framework's 140 compile-error checks — NOT the others
-zig build refusals-sql # nilo_sql's 140; also run by test-sql
+zig build refusals-sql # nilo_sql's 144; also run by test-sql
 zig build refusals-config  # nilo_config's 9, and refusals-pw for nilo_pw's 4
 zig build refusals-cache   # nilo_cache's 5; also run by test-cache
 zig build refusals-s3  # nilo_s3's 10; also run by test-s3

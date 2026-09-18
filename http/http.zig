@@ -879,6 +879,7 @@ test {
     _ = @import("scan.zig");
     _ = @import("accept.zig");
     _ = @import("static.zig");
+    _ = @import("encoded.zig");
     _ = @import("router.zig");
     _ = @import("url.zig");
     _ = @import("proxies.zig");

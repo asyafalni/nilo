@@ -17,5 +17,5 @@ const Card = struct {
 };
 
 export fn refusal() void {
-    _ = comptime sql.migrate.missingOf(sql.Postgres, &.{Card});
+    _ = comptime sql.migrate.missingOf(sql.Postgres, .{ .tables = &.{Card} });
 }

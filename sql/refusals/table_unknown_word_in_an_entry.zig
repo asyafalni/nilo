@@ -16,5 +16,5 @@ const User = struct {
 };
 
 export fn refusal() void {
-    _ = comptime sql.migrate.missingOf(sql.Postgres, &.{User});
+    _ = comptime sql.migrate.missingOf(sql.Postgres, .{ .tables = &.{User} });
 }

@@ -60,7 +60,7 @@ pub fn main() !void {
         try db.nilo_start(threaded.io(), .off);
         var run: core.Run = .init(gpa);
         defer run.deinit();
-        try sql.migrate.createMissing(&db, &run, &.{job.Table(Db).Row});
+        try sql.migrate.createMissing(&db, &run, .{ .tables = &.{job.Table(Db).Row} });
         var store = job.Table(Db).open(&db);
         try measure(w, gpa, "sqlite", &store);
     }
@@ -73,7 +73,7 @@ pub fn main() !void {
         var run: core.Run = .init(gpa);
         defer run.deinit();
         _ = try db.exec(&run, "DROP TABLE IF EXISTS \"nilo_jobs\"", .{});
-        try sql.migrate.createMissing(&db, &run, &.{job.Table(sql.Db).Row});
+        try sql.migrate.createMissing(&db, &run, .{ .tables = &.{job.Table(sql.Db).Row} });
         var store = job.Table(sql.Db).open(&db);
         try measure(w, gpa, "postgres", &store);
         _ = try db.exec(&run, "DROP TABLE IF EXISTS \"nilo_jobs\"", .{});

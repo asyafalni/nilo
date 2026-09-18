@@ -72,7 +72,7 @@ const Fixture = struct {
         f.db = .init(testing.allocator, url, .{ .size = 2 });
         f.run = .init(testing.allocator);
         try f.db.nilo_start(f.threaded.io(), .off);
-        try sql.migrate.createMissing(&f.db, &f.run, &.{ SqliteTable.Row, Note });
+        try sql.migrate.createMissing(&f.db, &f.run, .{ .tables = &.{ SqliteTable.Row, Note } });
         return f;
     }
 
@@ -226,7 +226,7 @@ const Pg = struct {
         p.run = .init(testing.allocator);
         try p.db.nilo_start(p.threaded.io(), .off);
         _ = try p.db.exec(&p.run, "DROP TABLE IF EXISTS \"nilo_jobs\"", .{});
-        try sql.migrate.createMissing(&p.db, &p.run, &.{PgTable.Row});
+        try sql.migrate.createMissing(&p.db, &p.run, .{ .tables = &.{PgTable.Row} });
         return p;
     }
 

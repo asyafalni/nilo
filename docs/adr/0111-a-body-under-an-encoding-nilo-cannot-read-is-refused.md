@@ -1,5 +1,9 @@
 # A body under an encoding nilo cannot read is refused
 
+**Amended by:** [ADR 0251](./0251-a-gzipped-body-is-inflated-into-the-buffer-that-holds-it.md)
+— `gzip` is decoded now, and the pool this ADR expected turned out not to be
+needed for that direction. The refusal below stands for every other coding.
+
 Nothing read a request's `Content-Encoding`. A client sending
 
 ```

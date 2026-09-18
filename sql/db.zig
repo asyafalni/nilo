@@ -531,22 +531,25 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             _ = @atomicRmw(usize, field, delta, 1, .monotonic);
         }
 
-        /// Check these Rows against the tables they name, once, while the
-        /// server is starting.
+        /// Check the schema's Rows against the tables they name, once, while
+        /// the server is starting.
         ///
-        /// The list cannot be an option on `Opts`, because a `[]const type`
+        /// The schema cannot be an option on `Opts`, because a `[]const type`
         /// would make the whole struct comptime-only and a `Db` is a
         /// runtime value a handler holds. So it is a call, and what it
-        /// stores is a function with the list already inside it.
+        /// stores is a function with the list already inside it. The same
+        /// `sql.Schema` the `db` tool and `createMissing` are given, so the
+        /// three cannot drift (ADR 0253); the functions and views in it are
+        /// not checked here, only the tables.
         ///
         /// ```zig
         /// var db = sql.Db.init(gpa, url, .{});
-        /// db.checking(&.{ User, Order });
+        /// db.checking(schema);
         /// ```
-        pub fn checking(self: *Self, comptime Rows: []const type) void {
+        pub fn checking(self: *Self, comptime schema_decl: migrate.Schema) void {
             self.check = &struct {
                 fn run(me: *Self) anyerror!usize {
-                    return me.checkSchema(Rows);
+                    return me.checkSchema(schema_decl.tables);
                 }
             }.run;
         }

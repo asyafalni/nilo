@@ -152,6 +152,7 @@ section on it. A name is found here first and read on its page.
 - [A column type of your own](./sql.md#a-column-type-of-your-own)
   - [Errors](./sql.md#errors)
   - [Migrations](./sql.md#migrations)
+- [The schema](./sql.md#the-schema)
 - [Creating tables](./sql.md#creating-tables)
 - [The diff](./sql.md#the-diff)
 - [The ledger, and applying](./sql.md#the-ledger-and-applying)

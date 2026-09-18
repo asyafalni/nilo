@@ -49,6 +49,13 @@ pub const Doc = struct {
     /// their whole schema.
     dialect: []const u8,
     tables: []const Desc = &.{},
+    /// The three lists a `sql.Schema` carries beside its tables (ADR 0253),
+    /// each with a default so a file written before they existed reads as
+    /// one with none. A function and a view go in as a name and a hash, the
+    /// way a check does.
+    extensions: []const []const u8 = &.{},
+    functions: []const table_mod.NamedText = &.{},
+    views: []const table_mod.NamedText = &.{},
 
     pub fn table(self: Doc, schema: ?[]const u8, name: []const u8) ?Desc {
         for (self.tables) |t| {
@@ -639,9 +646,9 @@ test "a check and a trigger go into the file as a name and a hash, and no SQL at
     const migrate = @import("migrate.zig");
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    const doc = try migrate.snapshotOf(arena.allocator(), Pg, 1, comptime migrate.tablesOf(
+    const doc = try migrate.snapshotOf(arena.allocator(), Pg, 1, comptime migrate.desiredOf(
         Pg,
-        &.{Ledger},
+        .{ .tables = &.{Ledger} },
     ));
 
     const text = try render(gpa, doc);
@@ -665,6 +672,38 @@ test "a check and a trigger go into the file as a name and a hash, and no SQL at
     try testing.expectEqualStrings("", t.checks[0].body);
     try testing.expectEqual(@as(usize, 1), t.triggers.len);
     try testing.expectEqualStrings("ledgers_touch", t.triggers[0].name);
+}
+
+test "a schema's extensions go into the file by name, and its functions and views as a name and a hash" {
+    const gpa = testing.allocator;
+    const migrate = @import("migrate.zig");
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const doc = try migrate.snapshotOf(arena.allocator(), Pg, 3, comptime migrate.desiredOf(Pg, .{
+        .extensions = &.{"pgcrypto"},
+        .functions = &.{.{ .name = "touch", .body = "CREATE OR REPLACE FUNCTION touch() RETURNS trigger AS $$ BEGIN RETURN NEW; END $$ LANGUAGE plpgsql" }},
+        .tables = &.{Org},
+        .views = &.{.{ .name = "org_names", .body = "SELECT id, name FROM orgs" }},
+    }));
+
+    const text = try render(gpa, doc);
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "pgcrypto") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "LANGUAGE plpgsql") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "FROM orgs") == null);
+
+    const zeroed = try gpa.dupeZ(u8, text);
+    defer gpa.free(zeroed);
+    const back = try parse(gpa, zeroed, null);
+    defer free(gpa, back);
+    try testing.expectEqual(@as(usize, 1), back.extensions.len);
+    try testing.expectEqualStrings("pgcrypto", back.extensions[0]);
+    try testing.expectEqualStrings("touch", back.functions[0].name);
+    try testing.expectEqual(@as(usize, 16), back.functions[0].hash.len);
+    try testing.expectEqualStrings("org_names", back.views[0].name);
+    try testing.expectEqual(@as(usize, 16), back.views[0].hash.len);
+    // And the hash is the one the types compute, so a diff sees no move.
+    try testing.expect(back.views[0].sameAs(.{ .name = "org_names", .body = "SELECT id, name FROM orgs" }));
 }
 
 test "a snapshot written before a table could carry a check reads back as one with none" {

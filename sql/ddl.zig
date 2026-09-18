@@ -642,6 +642,59 @@ pub fn createTrigger(
     return aw.toOwnedSlice();
 }
 
+/// `CREATE EXTENSION IF NOT EXISTS "n"`, as a constant — what `createMissing`
+/// sends (ADR 0253).
+pub fn createExtensionIfMissing(comptime D: type, comptime name: []const u8) []const u8 {
+    comptime {
+        return "CREATE EXTENSION IF NOT EXISTS " ++ D.quote(name);
+    }
+}
+
+/// `CREATE VIEW "n" AS <select>` under whichever head the caller wants, as a
+/// constant. The entry is the SELECT and nilo writes the head, for the reason
+/// a trigger is two words: the name is the thing the schema already knows.
+pub fn viewStatement(comptime D: type, comptime head: []const u8, comptime v: NamedText) []const u8 {
+    comptime {
+        return head ++ D.quote(v.name) ++ " AS " ++ std.mem.trim(u8, v.body, &std.ascii.whitespace);
+    }
+}
+
+/// The same four, built where the name is runtime text — the diff's side.
+pub fn createExtension(gpa: std.mem.Allocator, name: []const u8) Error![]const u8 {
+    return oneIdent(gpa, "CREATE EXTENSION IF NOT EXISTS ", name);
+}
+
+pub fn dropExtension(gpa: std.mem.Allocator, name: []const u8) Error![]const u8 {
+    return oneIdent(gpa, "DROP EXTENSION IF EXISTS ", name);
+}
+
+pub fn dropFunction(gpa: std.mem.Allocator, name: []const u8) Error![]const u8 {
+    return oneIdent(gpa, "DROP FUNCTION IF EXISTS ", name);
+}
+
+pub fn dropView(gpa: std.mem.Allocator, name: []const u8) Error![]const u8 {
+    return oneIdent(gpa, "DROP VIEW IF EXISTS ", name);
+}
+
+pub fn createView(gpa: std.mem.Allocator, v: NamedText) Error![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll("CREATE VIEW ");
+    try writeIdent(w, v.name);
+    try w.writeAll(" AS ");
+    try w.writeAll(std.mem.trim(u8, v.body, &std.ascii.whitespace));
+    return aw.toOwnedSlice();
+}
+
+fn oneIdent(gpa: std.mem.Allocator, head: []const u8, name: []const u8) Error![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    try aw.writer.writeAll(head);
+    try writeIdent(&aw.writer, name);
+    return aw.toOwnedSlice();
+}
+
 /// `DROP TRIGGER "n" ON "t"` on Postgres, `DROP TRIGGER "n"` on SQLite.
 ///
 /// The two databases scope a trigger name differently — per table on one, per

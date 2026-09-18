@@ -105,7 +105,7 @@ one round trip, and the document says `T`.
 ```zig
 var db = sql.Db.init(gpa, "postgres://…", .{});
 defer db.deinit();
-db.checking(&.{ User, Order });   // optional
+db.checking(.{ .tables = &.{ User, Order } });   // optional
 db.expecting(manifest.head);      // optional
 db.watching(sql.logging);         // optional
 try app.provide(&db);
@@ -1145,17 +1145,53 @@ is a rule rather than a word in the marker: `id: i64` becomes
 `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite, and `id: sql.Uuid` becomes a
 `NOT NULL PRIMARY KEY` the insert has to fill.
 
+#### The schema
+
+```zig
+pub const schema = sql.Schema{
+    .extensions = &.{"pgcrypto"},
+    .functions = &.{
+        .{ .name = "set_updated_at", .body = @embedFile("sql/set_updated_at.sql") },
+    },
+    .tables = &.{ Org, User, Post },
+    .views = &.{
+        .{ .name = "sku_catalogue", .body = @embedFile("sql/sku_catalogue.sql") },
+    },
+};
+```
+
+One value, and the one value `db.checking`, `cli.Tool`, `createMissing`,
+`addMissingColumns` and the diff are all given — so the three cannot drift
+([ADR 0253](../adr/0253-a-schema-is-one-value-and-the-tool-owns-the-order.md)).
+`.tables` is every Row, in any order. The other three lists hang off the
+schema rather than off a table, and each has a default of none:
+
+| | |
+|---|---|
+| `.extensions` | names. `CREATE EXTENSION IF NOT EXISTS "x"`; `DROP EXTENSION` when the name leaves, marked destructive. A Refusal on SQLite |
+| `.functions` | `.{ .name, .body }`, the body the **whole** `CREATE OR REPLACE FUNCTION <name> …` statement — a Refusal if it opens with anything else. New or moved is that one statement; gone is `DROP FUNCTION IF EXISTS`. A Refusal on SQLite |
+| `.views` | `.{ .name, .body }`, the body the `SELECT` — nilo writes `CREATE VIEW "name" AS` in front, and a body that opens `CREATE` is a Refusal. Moved is a drop and a create, gone is a drop |
+
+**The tool owns the order**: extensions, functions, tables by reference, each
+table's indexes and triggers, then views. A stale view is dropped before any
+table moves and a new one made after every table has, so a view that reads a
+column about to go is never in the way. In the snapshot an extension is its
+name and a function or a view is a name and a hash, the way a check is.
+
 #### Creating tables
 
 ```zig
-try sql.migrate.createMissing(&db, &run, &.{ User, Org });
+try sql.migrate.createMissing(&db, &run, schema);
 ```
 
-One `CREATE TABLE IF NOT EXISTS` per Row plus its indexes, in one transaction.
-**The order is worked out while compiling**, not from the list: foreign keys are
-written inline, which is the only shape SQLite has, so `orgs` is created before
-`users` whichever way round they are written. Two tables pointing at each other
-is a compile error naming both.
+One `CREATE TABLE IF NOT EXISTS` per Row plus its indexes, in one transaction —
+and before them the schema's extensions and functions, after them its views,
+each in the form that may already have run (`CREATE OR REPLACE VIEW` on
+Postgres, which has no `IF NOT EXISTS` for a view, and `IF NOT EXISTS` on
+SQLite). **The order is worked out while compiling**, not from the list:
+foreign keys are written inline, which is the only shape SQLite has, so `orgs`
+is created before `users` whichever way round they are written. Two tables
+pointing at each other is a compile error naming both.
 
 This is for a test, a fixture or a single-file SQLite application. It is not a
 migration: it creates what is missing and never alters what is there.
@@ -1168,16 +1204,17 @@ the statement in the log and nothing sent; a table that is not there is
 skipped ([ADR 0233](../adr/0233-a-column-a-shipped-table-has-not-got.md)).
 
 ```zig
-try sql.migrate.createMissing(&db, &run, &.{ Download, Segment });
-_ = try sql.migrate.addMissingColumns(&db, &run, &.{ Download, Segment });
+try sql.migrate.createMissing(&db, &run, .{ .tables = &.{ Download, Segment } });
+_ = try sql.migrate.addMissingColumns(&db, &run, .{ .tables = &.{ Download, Segment } });
 ```
 
 | | |
 |---|---|
-| `migrate.createMissing(db, scope, Rows)` | the above |
-| `migrate.addMissingColumns(db, scope, Rows)` | `!usize` — the columns added |
-| `migrate.tablesOf(D, Rows)` | comptime: every table as the types describe it, in create order |
-| `migrate.missingOf(D, Rows)` | comptime: just the statements |
+| `migrate.createMissing(db, scope, schema)` | the above |
+| `migrate.addMissingColumns(db, scope, schema)` | `!usize` — the columns added |
+| `migrate.desiredOf(D, schema)` | comptime: the `Desired` half of a diff — every table as the types describe it, in create order, and the schema's other three lists |
+| `migrate.tablesOf(D, schema)` | comptime: just the tables, as `[]const Table` |
+| `migrate.missingOf(D, schema)` | comptime: just the table statements |
 | `ddl.createTable(D, Row)` | comptime: one `CREATE TABLE`, as text |
 
 #### The diff
@@ -1186,7 +1223,7 @@ _ = try sql.migrate.addMissingColumns(&db, &run, &.{ Download, Segment });
 const change = try sql.migrate.plan(arena, Db.Dialect, desired, before);
 ```
 
-`desired` is `migrate.tablesOf(D, Rows)` — the types. `before` is a
+`desired` is `migrate.desiredOf(D, schema)` — the types. `before` is a
 `snapshot.Doc`, which is `migrations/snapshot.zon` read back. **Both halves are
 files, so a diff needs no database**, and two branches that both generate
 conflict in git rather than at deploy.
@@ -1387,7 +1424,7 @@ the two marker lines, matched whole; a file that has lost one is refused with
 #### The commands
 
 ```zig
-const Tool = sql.cli.Tool(Db, &.{ User, Org });
+const Tool = sql.cli.Tool(Db, .{ .tables = &.{ User, Org } });
 return Tool.run(gpa, io, out, try sql.cli.parse(argv[1..]), &db, manifest.versions);
 ```
 

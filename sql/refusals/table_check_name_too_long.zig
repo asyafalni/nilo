@@ -18,5 +18,5 @@ const Ledger = struct {
 };
 
 export fn refusal() void {
-    _ = comptime sql.migrate.missingOf(sql.Postgres, &.{Ledger});
+    _ = comptime sql.migrate.missingOf(sql.Postgres, .{ .tables = &.{Ledger} });
 }

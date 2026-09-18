@@ -25,7 +25,7 @@ const SendWelcome = struct {
 
 const Jobs = job.Jobs(.{ .kinds = .{SendWelcome}, .store = job.Table(Db), .deps = struct { db: *Db } });
 
-try sql.migrate.createMissing(&db, &run, &.{ User, Jobs.Row });
+try sql.migrate.createMissing(&db, &run, .{ .tables = &.{ User, Jobs.Row } });
 var table = job.Table(Db).open(&db);
 var jobs: Jobs = .open(gpa, &table, .{ .db = &db }, .{});
 try app.provide(&jobs);

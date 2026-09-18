@@ -9,7 +9,7 @@ log line that shows them, and the nine errors.
 
 <!-- compiles: body -->
 ```zig
-db.checking(&.{ User, Order });
+db.checking(.{ .tables = &.{ User, Order } });
 ```
 
 Each Row is compared against the table it names, once, while the server

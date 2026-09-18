@@ -66,7 +66,7 @@ service and a fiber:
 
 <!-- compiles: body -->
 ```zig
-try sql.migrate.createMissing(db, &run, &.{ User, Jobs.Row });
+try sql.migrate.createMissing(db, &run, .{ .tables = &.{ User, Jobs.Row } });
 
 table = job.Table(Db).open(db);
 jobs = .open(gpa, &table, .{ .db = db }, .{ .workers = 4 });
@@ -405,7 +405,7 @@ like any other row.
 **`job.Table(Db)`** is the queue in your database. `Db` is your `sql.Db`
 or `sql.Sqlite(…)` type; the Row it carries is a `nilo_table` like yours,
 named `nilo_jobs`, migrated beside your own with `createMissing` or the
-`db` command, and checked by `db.checking(&.{ …, Jobs.Row })` at startup.
+`db` command, and checked by `db.checking(.{ .tables = &.{ …, Jobs.Row } })` at startup.
 Both databases are production stores here. What differs on SQLite is that
 every claim is a write, so `workers` is the number of claims in flight as
 well as the number of jobs — four is right, forty is a queue for the

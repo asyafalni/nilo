@@ -166,7 +166,7 @@ test "getUser" {
 |---|---|---|
 | **`nilo_http`** | routing, typed handlers, middleware, cookies and sessions, static files, streaming, WebSocket, OpenAPI, metrics, rate limiting | templates and TLS, both on the record below |
 | **`nilo_sql`** | Postgres and SQLite. Your struct is the table, and it makes the table: reads, writes, transactions, streaming, the schema, the diff and the ledger | joins, aggregates and `GROUP BY`, which go through `db.raw`. A migration `down` |
-| **`nilo_s3`** | object storage: S3, MinIO, R2. Your bucket is a type. Get, put, range, stream, presigned GET and POST | `LIST`, `COPY`, multipart |
+| **`nilo_s3`** | object storage: S3, MinIO, R2. Your bucket is a type. Get, put, range, stream, list a page, presigned GET and POST | `COPY`, multipart |
 | **`nilo_fetch`** | calling somebody else's HTTP API from inside a request: the policy in front of `std.http.Client` | retries, circuit breaker |
 | **`nilo_job`** | work that runs later, again, or on a schedule: a queue in the database you already have, a cron schedule parsed while compiling | priorities, exactly-once, time zones |
 | **`nilo_cache`** | an expiring cache in this process, on a fixed budget with nothing allocated per operation | pointers in a cached value, which is a compile error naming the field |
@@ -262,10 +262,10 @@ error: nilo: User has no column `agee`, asked for in a condition.
        Did you mean `age`?
 ```
 
-**The same struct also makes the table, and diffs it.** `createMissing` creates every table a list of Rows describes:
+**The same struct also makes the table, and diffs it.** `createMissing` creates every table a schema describes:
 
 ```zig
-try sql.migrate.createMissing(&db, &run, &.{ Org, User });
+try sql.migrate.createMissing(&db, &run, .{ .tables = &.{ Org, User } });
 ```
 
 For a schema that changes, your project gets a `db` command out of a `main` of

@@ -53,7 +53,7 @@ pub fn Table(comptime Db: type) type {
 
         db: *Db,
 
-        /// The table. Add it to `db.checking(&.{ … })` and to the migration
+        /// The table. Add it to `db.checking(.{ .tables = &.{ … } })` and to the migration
         /// beside the program's own rows; nothing here creates it.
         pub const Row = struct {
             pub const nilo_table = .{

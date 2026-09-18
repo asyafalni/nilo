@@ -323,7 +323,7 @@ pub fn check(
     io: Io,
     dir: Dir,
     comptime D: type,
-    desired: []const Table,
+    desired: migrate.Desired,
 ) !Plan {
     const state = try read(gpa, io, dir, D);
     return migrate.plan(gpa, D, desired, state.before);
@@ -342,7 +342,7 @@ pub fn generate(
     io: Io,
     dir: Dir,
     comptime D: type,
-    desired: []const Table,
+    desired: migrate.Desired,
     opts: Options,
 ) !Outcome {
     try checkName(opts.name);
@@ -437,7 +437,7 @@ fn baseline(
     io: Io,
     dir: Dir,
     comptime D: type,
-    desired: []const Table,
+    desired: migrate.Desired,
     opts: Options,
     state: State,
 ) !Outcome {
@@ -501,7 +501,7 @@ fn writeManifestAndSnapshot(
     io: Io,
     dir: Dir,
     comptime D: type,
-    desired: []const Table,
+    desired: migrate.Desired,
     opts: Options,
     entries: []const Entry,
     version: u32,
@@ -939,7 +939,7 @@ test "an empty directory generates every table, and says which file it wrote" {
     var box = try Sandbox.init(gpa);
     defer box.deinit(gpa);
 
-    const desired = comptime migrate.tablesOf(Pg, &.{ User, Org });
+    const desired = comptime migrate.desiredOf(Pg, .{ .tables = &.{ User, Org } });
     const out = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "initial" });
 
     try testing.expectEqualStrings("0001_initial.zig", out.file.?);
@@ -961,7 +961,7 @@ test "the three files land together, and the snapshot moves with them" {
     var box = try Sandbox.init(gpa);
     defer box.deinit(gpa);
 
-    const desired = comptime migrate.tablesOf(Pg, &.{ User, Org });
+    const desired = comptime migrate.desiredOf(Pg, .{ .tables = &.{ User, Org } });
     _ = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "initial" });
 
     const manifest = try box.slurp(manifest_file);
@@ -986,7 +986,7 @@ test "generating twice against the same types writes nothing the second time" {
     var box = try Sandbox.init(gpa);
     defer box.deinit(gpa);
 
-    const desired = comptime migrate.tablesOf(Pg, &.{ User, Org });
+    const desired = comptime migrate.desiredOf(Pg, .{ .tables = &.{ User, Org } });
     _ = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "initial" });
 
     const again = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "nothing" });
@@ -1009,7 +1009,7 @@ test "a second version follows the first, and the manifest names both" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Org}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} }),
         .{ .name = "orgs" },
     );
 
@@ -1024,7 +1024,7 @@ test "a second version follows the first, and the manifest names both" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Grown}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Grown} }),
         .{ .name = "add_note" },
     );
 
@@ -1065,7 +1065,7 @@ test "a destructive step is not written until somebody asks for it by name" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Wide}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Wide} }),
         .{ .name = "wide" },
     );
 
@@ -1074,7 +1074,7 @@ test "a destructive step is not written until somebody asks for it by name" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Narrow}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Narrow} }),
         .{ .name = "drop_note" },
     );
 
@@ -1090,7 +1090,7 @@ test "a destructive step is not written until somebody asks for it by name" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Narrow}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Narrow} }),
         .{ .name = "drop_note", .allow_destructive = true },
     );
     try testing.expectEqualStrings("0002_drop_note.zig", asked.file.?);
@@ -1105,7 +1105,7 @@ test "a version name that is not safe as a path and an identifier is refused" {
     var box = try Sandbox.init(gpa);
     defer box.deinit(gpa);
 
-    const desired = comptime migrate.tablesOf(Pg, &.{Org});
+    const desired = comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} });
     for ([_][]const u8{ "", "../escape", "Add Note", "add-note", "add.note" }) |bad| {
         try testing.expectError(
             Error.BadName,
@@ -1275,7 +1275,7 @@ test "a baseline derives version 1 again and keeps the half somebody wrote" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Org}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} }),
         .{ .name = "schema", .baseline = true },
     );
     // An empty directory is the case where a baseline is just the first
@@ -1305,7 +1305,7 @@ test "a baseline derives version 1 again and keeps the half somebody wrote" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Noted}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Noted} }),
         .{ .name = "schema", .baseline = true },
     );
 
@@ -1332,7 +1332,7 @@ test "a baseline derives version 1 again and keeps the half somebody wrote" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Noted}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Noted} }),
     )).isEmpty());
 }
 
@@ -1420,7 +1420,7 @@ test "a baseline does not read the snapshot it is there to replace" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Org}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} }),
         .{ .name = "schema", .baseline = true },
     );
     try testing.expectEqualStrings("0001_schema.zig", out.file.?);
@@ -1455,7 +1455,7 @@ test "an older snapshot is understood, so a generate against it is a diff and no
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{ Member, Org }),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{ Member, Org } }),
     )).isEmpty());
 
     // So one new column is one step, rather than a `CREATE TABLE` for a table
@@ -1465,7 +1465,7 @@ test "an older snapshot is understood, so a generate against it is a diff and no
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{ MemberNoted, Org }),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{ MemberNoted, Org } }),
         .{ .name = "add_note" },
     );
     try testing.expectEqualStrings("0002_add_note.zig", out.file.?);
@@ -1488,7 +1488,7 @@ test "a baseline in a directory that has moved past version 1 is refused" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Org}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} }),
         .{ .name = "orgs" },
     );
     _ = try generate(
@@ -1496,7 +1496,7 @@ test "a baseline in a directory that has moved past version 1 is refused" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Noted}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Noted} }),
         .{ .name = "add_note" },
     );
 
@@ -1507,7 +1507,7 @@ test "a baseline in a directory that has moved past version 1 is refused" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Noted}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Noted} }),
         .{ .name = "orgs", .baseline = true },
     ));
 
@@ -1520,7 +1520,7 @@ test "a baseline under another name is refused rather than leaving two version 1
     var box = try Sandbox.init(gpa);
     defer box.deinit(gpa);
 
-    const desired = comptime migrate.tablesOf(Pg, &.{Org});
+    const desired = comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} });
     _ = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "schema", .baseline = true });
 
     try testing.expectError(Error.BaselineRenames, generate(
@@ -1542,7 +1542,7 @@ test "a version file that lost its markers is refused, not overwritten" {
     var box = try Sandbox.init(gpa);
     defer box.deinit(gpa);
 
-    const desired = comptime migrate.tablesOf(Pg, &.{Org});
+    const desired = comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} });
     _ = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "schema", .baseline = true });
 
     const hand_written = "// all of this is mine now\npub const version = 1;\n";
@@ -1553,7 +1553,7 @@ test "a version file that lost its markers is refused, not overwritten" {
         box.io(),
         box.dir(),
         Pg,
-        comptime migrate.tablesOf(Pg, &.{Noted}),
+        comptime migrate.desiredOf(Pg, .{ .tables = &.{Noted} }),
         .{ .name = "schema", .baseline = true },
     ));
 
@@ -1600,7 +1600,7 @@ test "a version written with no manifest to hand gets no twin, and says nothing 
     var box = try Sandbox.init(gpa);
     defer box.deinit(gpa);
 
-    const desired = comptime migrate.tablesOf(Pg, &.{ User, Org });
+    const desired = comptime migrate.desiredOf(Pg, .{ .tables = &.{ User, Org } });
     const out = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "initial" });
 
     // `versions` is empty, which is what a library caller with no generated
@@ -1616,7 +1616,7 @@ test "the twin is the version's statements, the ledger table and the ledger row"
     var box = try Sandbox.init(gpa);
     defer box.deinit(gpa);
 
-    const desired = comptime migrate.tablesOf(Pg, &.{Org});
+    const desired = comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} });
     _ = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "initial" });
 
     const text = try box.slurp("0001_initial.sql");
@@ -1659,7 +1659,7 @@ test "a twin somebody edited is written again by the next generate, and named by
     var box = try Sandbox.init(gpa);
     defer box.deinit(gpa);
 
-    const desired = comptime migrate.tablesOf(Pg, &.{Org});
+    const desired = comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} });
     _ = try generate(box.a(), box.io(), box.dir(), Pg, desired, .{ .name = "initial" });
 
     const version: Version = .{
@@ -1707,7 +1707,7 @@ test "a second version's twin is chained onto the first, so the hash is the one 
     var box = try Sandbox.init(gpa);
     defer box.deinit(gpa);
 
-    const first = comptime migrate.tablesOf(Pg, &.{Org});
+    const first = comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} });
     _ = try generate(box.a(), box.io(), box.dir(), Pg, first, .{ .name = "initial" });
 
     const one: Version = .{
@@ -1716,7 +1716,7 @@ test "a second version's twin is chained onto the first, so the hash is the one 
         .steps = (try migrate.plan(box.a(), Pg, first, snapshot.empty(Pg))).steps,
     };
 
-    const second = comptime migrate.tablesOf(Pg, &.{Noted});
+    const second = comptime migrate.desiredOf(Pg, .{ .tables = &.{Noted} });
     const out = try generate(box.a(), box.io(), box.dir(), Pg, second, .{
         .name = "orgs_get_a_note",
         .versions = &.{one},
@@ -1747,13 +1747,13 @@ test "a binary behind the directory writes no twin rather than one with a wrong 
     var box = try Sandbox.init(gpa);
     defer box.deinit(gpa);
 
-    const first = comptime migrate.tablesOf(Pg, &.{Org});
+    const first = comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} });
     const one = try generate(box.a(), box.io(), box.dir(), Pg, first, .{ .name = "initial" });
     try testing.expectEqual(@as(u32, 1), one.number);
 
     // Version 2 generated by a binary that still holds no manifest at all: its
     // parent hash is unknown, so chaining would invent one.
-    const second = comptime migrate.tablesOf(Pg, &.{Noted});
+    const second = comptime migrate.desiredOf(Pg, .{ .tables = &.{Noted} });
     const two = try generate(box.a(), box.io(), box.dir(), Pg, second, .{
         .name = "orgs_get_a_note",
         .versions = &.{},

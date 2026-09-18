@@ -109,6 +109,39 @@ there was one, at sixty-four, and a product of six contexts reached it
 `Failure` is the shape every error body takes
 ([ADR 0025](../adr/0025-every-failure-answers-with-the-same-json-body.md)).
 
+## What a guard promises
+
+A handler that takes `nilo.Authorization(.bearer)` gets a `security` entry,
+because the header is in the type. A session cookie is not in any type — it
+is read by the middleware in front of the group — so until you say so, the
+document describes every route behind it as open. Saying so is one line:
+
+```zig
+const api = app.group("/api");
+try api.use(requireSession);
+try app.guard(requireSession, nilo.session.cookie_name);
+
+try api.get("/me", me);                            // cookieAuth, and a 401
+try api.without(requireSession).post("/sign-in", signIn);   // open, as it is
+```
+
+Every route `requireSession` is in front of — through `use`, `useOn` or
+`with`, less what `without` took out — is written with a `cookieAuth`
+requirement and a 401, and `components.securitySchemes` gains
+`{"type":"apiKey","in":"cookie","name":"session"}`, which a generated client
+reads as "send the cookie". Which routes those are is read from the
+middleware wiring when the document is written, not from the declaration,
+so moving a `without` moves the document in the same line. The one thing
+taken on your word is the cookie's name and that the middleware refuses
+without it ([ADR 0252](../adr/0252-the-document-takes-a-guards-word-for-the-cookie.md)).
+
+A route behind the guard whose handler *also* asks for `Authorization` is
+written with both schemes in one requirement, which means both: the guard
+ran first, and the handler still asked.
+
+One guard per App, because a program has one session cookie; declaring it
+installs nothing, so `use` the middleware as before.
+
 ## What it won't claim
 
 It won't say what your signature doesn't.

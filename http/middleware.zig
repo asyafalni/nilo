@@ -189,6 +189,38 @@ pub fn chainFor(
     return chain;
 }
 
+/// A middleware the program said reads the session cookie, from `app.guard`
+/// (ADR 0252). The document cannot check that it does; what it can check is
+/// which routes the middleware is in front of, and that half is `wraps`.
+pub const Guard = struct {
+    middleware: Middleware,
+    /// The cookie's name, for `securitySchemes`. The document's only
+    /// unverifiable claim.
+    cookie: []const u8,
+};
+
+/// Whether `middleware` would be in `chainFor`'s answer for this route —
+/// the same two questions, asked without building the chain. What the
+/// document asks at `writeOpenApi`, which runs before `listen()` has
+/// resolved anything and must not allocate a chain per route to find out
+/// ([ADR 0252](../docs/adr/0252-the-document-takes-a-guards-word-for-the-cookie.md)).
+pub fn wraps(
+    scoped: []const Scoped,
+    exemptions: []const Exemption,
+    attached: []const Attached,
+    method: ?http1.Method,
+    path: []const u8,
+    middleware: Middleware,
+) bool {
+    for (scoped) |s| {
+        if (s.middleware == middleware and covered(s, exemptions, method, path)) return true;
+    }
+    for (attached) |a| {
+        if (a.middleware == middleware and a.covers(path, method)) return true;
+    }
+    return false;
+}
+
 fn covered(s: Scoped, exemptions: []const Exemption, method: ?http1.Method, path: []const u8) bool {
     if (!s.covers(path)) return false;
     for (exemptions) |e| if (e.frees(path, method, s.middleware)) return false;

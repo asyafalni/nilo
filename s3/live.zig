@@ -396,6 +396,46 @@ test "a presigned POST is a form a real server accepts" {
     }.run);
 }
 
+test "a list from a real server pages under a prefix, and the cursor reaches the rest" {
+    try withStore(struct {
+        fn run(store: *Store) !void {
+            var live = try Live.open(store);
+            defer live.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            // Three under one prefix and one beside it, so the prefix and
+            // the page size are both seen to do something.
+            const keys = [_][]const u8{ "live/list/a.txt", "live/list/b c.txt", "live/list/d.txt", "live/other.txt" };
+            for (keys) |key| try live.put(&scope, key, .{ .bytes = "x", .content_type = "text/plain" });
+            defer for (keys) |key| live.delete(&scope, key) catch {};
+
+            const first = try live.list(&scope, .{ .prefix = "live/list/", .max_keys = 2 });
+            try testing.expectEqual(@as(usize, 2), first.objects.len);
+            try testing.expectEqualStrings("live/list/a.txt", first.objects[0].key.view());
+            try testing.expectEqualStrings("live/list/b c.txt", first.objects[1].key.view());
+            try testing.expectEqual(@as(u64, 1), first.objects[0].size);
+            // A real server quotes its ETag, and a value from here is one
+            // `getIf` understands as it is.
+            try testing.expect(first.objects[0].etag.len() > 2);
+            try testing.expect(first.next != null);
+
+            const second = try live.list(&scope, .{
+                .prefix = "live/list/",
+                .max_keys = 2,
+                .cursor = first.next.?.view(),
+            });
+            try testing.expectEqual(@as(usize, 1), second.objects.len);
+            try testing.expectEqualStrings("live/list/d.txt", second.objects[0].key.view());
+            try testing.expect(second.next == null);
+
+            const conditional = try live.getIf(&scope, "live/list/a.txt", first.objects[0].etag.view());
+            try testing.expect(conditional == .unmodified);
+        }
+    }.run);
+}
+
 test "a bucket that is not there is a NotFound rather than a crash" {
     try withStore(struct {
         fn run(store: *Store) !void {

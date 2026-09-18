@@ -220,6 +220,47 @@ nilo: loaded 12 static file(s) (48211 bytes held, 9022 of them gzipped copies)
 A handler can answer with a file the same way — see
 [Responses](./responses.md#files).
 
+## Files the binary carries
+
+```zig
+try app.embeddedWith("/", &.{
+    .{ .path = "index.html", .bytes = @embedFile("dist/index.html") },
+    .{ .path = "assets/app.js", .bytes = @embedFile("dist/assets/app.js") },
+    .{ .path = "assets/app.css", .bytes = @embedFile("dist/assets/app.css") },
+}, .{ .spa_fallback = "index.html" });
+```
+
+A product that is one binary has no `dist/` on the machine it runs on. `embedded`
+is `static` with the read taken out
+([ADR 0249](../adr/0249-a-tree-the-binary-carries-is-served-as-a-directory-is.md)):
+the bytes come from `@embedFile` rather than from a disk, and everything after
+that is the same code — the sorted list, an ETag per file, a gzipped copy made
+once for the files worth it, the fallback, and nothing per request. What a
+request sees is indistinguishable from a directory that was read at startup.
+
+`@embedFile` is yours to write, because its path is relative to the file it is
+written in and nilo cannot name your `dist/`. The list is the whole of it; a
+build step that walks a directory into one is an ordinary `build.zig` step, and
+is yours until two projects have written the same one.
+
+The options are `static`'s less every one that is about a disk: `index`,
+`cache_control`, `spa_fallback`, `spa_fallback_for`, `compress` and
+`compress_min_bytes`, with the same defaults. There is no `max_file_bytes`,
+because nothing here can spill; no `max_total_bytes`, because the bytes are
+mapped whether or not a Set names them and counting them would be counting
+memory that is not spent twice; no `dotfiles`, because every name was written
+by you; and no `reload`, because there is no disk.
+
+Two mistakes a directory cannot make are refused at startup, in one line: a path
+listed twice — a list can do what a directory cannot, and the second entry would
+be unreachable forever — and a `spa_fallback` that names no entry. There is no
+`tryEmbedded`: the list that failed was fixed when the program was compiled, so
+there is nothing for a program to do about it at run time but stop.
+
+What it costs is what a held file costs, less the bytes: the URL, two ETags and
+the gzipped copy are allocated once at startup, and the file itself is the
+binary's. The log line says both numbers.
+
 ## While you are working on it
 
 `staticWith(.{ .reload = true })` holds nothing: every file is left on disk and
@@ -239,7 +280,8 @@ into a filename is the traversal the design refuses.
 
 The set of *names* is fixed at startup. Without `.reload`, so are the bytes:
 changing a file means restarting the process, which is what a deploy does
-anyway.
+anyway. An embedded tree is the same, one step further: changing a file means
+rebuilding the binary.
 
 Static files are not middleware: the set holds state, so it is a terminal handler
 that the middleware chain wraps like any other. Your logger sees them, and CORS

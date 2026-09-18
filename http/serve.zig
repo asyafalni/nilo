@@ -230,7 +230,8 @@ pub noinline fn serveRequest(
     http1.parseHead(raw_head, &r) catch |err| {
         // One of these is not a malformed request: a body under a
         // `Content-Encoding` nilo cannot decode is a request everybody
-        // understands and this server cannot read (ADR 0111).
+        // understands and this server cannot read (ADR 0111). gzip is not
+        // one of them any more (ADR 0251).
         const answer, const status: u16 = switch (err) {
             error.UnsupportedContentEncoding => .{ RESPONSE_415, 415 },
             else => .{ RESPONSE_400, 400 },
@@ -518,10 +519,11 @@ pub fn hit(
 const RESPONSE_400 = http1.staticResponse(400, "Bad Request", failure_content_type, staticFailure(400, "malformed request"), false);
 const RESPONSE_431 = http1.staticResponse(431, "Request Header Fields Too Large", failure_content_type, staticFailure(431, "head too long"), false);
 /// Sent when a body arrives under a `Content-Encoding` nilo cannot decode,
-/// which is all of them but `identity` (ADR 0111). The message names the
-/// header, because the mistake is one line of client configuration and the
-/// alternative — a 400 about malformed JSON — sends the reader to the body.
-const RESPONSE_415 = http1.staticResponse(415, "Unsupported Media Type", failure_content_type, staticFailure(415, "this server does not decode a Content-Encoding: send the body as identity"), false);
+/// which is all of them but `identity` and `gzip` (ADR 0111, ADR 0251). The
+/// message names the header, because the mistake is one line of client
+/// configuration and the alternative — a 400 about malformed JSON — sends
+/// the reader to the body.
+const RESPONSE_415 = http1.staticResponse(415, "Unsupported Media Type", failure_content_type, staticFailure(415, "this server decodes Content-Encoding: gzip and nothing else — send the body as identity or gzip"), false);
 /// Sent when a request head started arriving and then stopped (ADR 0023).
 /// Not when a keep-alive connection simply sat idle: that client has not
 /// asked for anything, and a status answering nothing is noise a proxy has

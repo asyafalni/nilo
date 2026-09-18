@@ -19,5 +19,5 @@ const Outbox = struct {
 };
 
 export fn refusal() void {
-    _ = comptime sql.migrate.missingOf(sql.Postgres, &.{Outbox});
+    _ = comptime sql.migrate.missingOf(sql.Postgres, .{ .tables = &.{Outbox} });
 }

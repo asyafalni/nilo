@@ -3619,3 +3619,34 @@ rather than a container-level `comptime` block in the returned struct —
 whether such a block is analysed after the call or inline during it is a
 property of the compiler nobody here has measured, and a check whose
 timing is a guess may loop on the one case it exists for.
+
+## Five roadmap entries closed by one reading of a product that ships as a binary
+
+An embedded static tree, a bounded `bucket.list`, gzipped request bodies, a
+cookie scheme in the API description and `sql.Schema` landed together
+([ADR 0249](./adr/0249-a-tree-the-binary-carries-is-served-as-a-directory-is.md)
+to [ADR 0253](./adr/0253-a-schema-is-one-value-and-the-tool-owns-the-order.md)).
+Two things from the five are worth more than the list.
+
+**A blocker written as one mechanism was blocking the wrong direction.**
+The roadmap held gzipped *request* bodies inside the response-compression
+entry, waiting on a pool of 64 KB deflate windows and a policy for when the
+pool was empty. The window is the compressor's; a decompressor needs only
+the last 32 KiB of what it has written, and `std.compress.flate.Decompress`
+handed no window at all uses the destination buffer as its history. The
+arena was going to hold the decoded body anyway, so the buffer that holds
+the body *is* the window, and the inbound half cost one exact allocation
+and no pool. The premise had been true of the other half and was copied
+across without being re-read — the ADR 0063 lesson again, one module over.
+
+**"Waiting on a design" for one sentence was two questions wearing one
+coat.** The cookie entry asked how a middleware says which scheme it
+enforces *without the document taking a middleware's word for something it
+cannot check*. Split, the sentence is a fact the document can verify —
+which routes the middleware is in front of, read from the same `use`,
+`useOn`, `with` and `without` the chains are built from — and a fact it
+cannot, the cookie's name, which is one line the program states about
+itself the way a `nilo_json` type does. The `sql.Schema` entry was the same
+shape: the design question was only whether a break was acceptable, and
+once it was, the seam was seven characters at each call.
+

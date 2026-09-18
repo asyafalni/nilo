@@ -4,7 +4,7 @@
 //! ```zig
 //! pub fn main() !u8 {
 //!     // … gpa, io, and a started Db …
-//!     const Tool = sql.cli.Tool(Db, &.{ User, Org });
+//!     const Tool = sql.cli.Tool(Db, .{ .tables = &.{ User, Org } });
 //!     return Tool.run(gpa, io, out, try sql.cli.parse(args), &db, manifest.versions);
 //! }
 //! ```
@@ -175,12 +175,14 @@ pub fn usage(w: *std.Io.Writer) !void {
     );
 }
 
-/// The commands, bound to one project's database and Rows.
+/// The commands, bound to one project's database and schema.
 ///
-/// `Db` is `sql.Db`, `sql.Sqlite(…)` or a named one, already started. `Rows` is
-/// every Row whose table this tool owns — the same list `db.checking` is given,
-/// which is what keeps the two from drifting apart.
-pub fn Tool(comptime Db: type, comptime Rows: []const type) type {
+/// `Db` is `sql.Db`, `sql.Sqlite(…)` or a named one, already started. `schema`
+/// is the `sql.Schema` — every Row whose table this tool owns, and the
+/// extensions, functions and views beside them — the same value `db.checking`
+/// and `createMissing` are given, which is what keeps the three from drifting
+/// apart (ADR 0253).
+pub fn Tool(comptime Db: type, comptime schema: migrate.Schema) type {
     return struct {
         const D = Db.Dialect;
 
@@ -227,7 +229,7 @@ pub fn Tool(comptime Db: type, comptime Rows: []const type) type {
             };
         }
 
-        const desired = migrate.tablesOf(D, Rows);
+        const desired = migrate.desiredOf(D, schema);
 
         /// `createDirPath` rather than one `createDir`, so that `--dir
         /// db/versions` works on a repository that has neither.

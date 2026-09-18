@@ -686,6 +686,107 @@ test "a head asks what an object is without asking for it" {
     }.run);
 }
 
+test "a list is a signed question about the bucket, and the answer is a page with a cursor" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.answer = .{
+                .content_type = "application/xml",
+                .body =
+                \\<?xml version="1.0" encoding="UTF-8"?>
+                \\<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                \\<Name>files</Name><Prefix>photos%2F</Prefix><KeyCount>2</KeyCount><MaxKeys>2</MaxKeys>
+                \\<EncodingType>url</EncodingType><IsTruncated>true</IsTruncated>
+                \\<NextContinuationToken>1dEs3p+aG/e=</NextContinuationToken>
+                \\<Contents><Key>photos%2Fwati%20sari.png</Key><LastModified>2026-09-18T10:11:12.000Z</LastModified>
+                \\<ETag>&quot;9a0364b9e99bb480dd25e1f0284c8555&quot;</ETag><Size>1024</Size><StorageClass>STANDARD</StorageClass></Contents>
+                \\<Contents><Key>photos%2Ftwo.png</Key><LastModified>2026-09-18T10:11:13.000Z</LastModified>
+                \\<ETag>&quot;abc&quot;</ETag><Size>0</Size></Contents>
+                \\</ListBucketResult>
+                ,
+            };
+
+            // Two pages on one connection, the way a loop over a cursor
+            // reaches a real server.
+            var served = try io.concurrent(Canned.serveMany, .{ &canned, @as(usize, 2) });
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+
+            var files = try Files.open(&store);
+            defer files.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            // A page at all is the first request verified: the server
+            // answers a signature it did not compute with a 403, which
+            // `list` would have handed back as `Rejected`. What it was
+            // asked is read off the second request, because `serveMany`
+            // clears `seen` the moment it starts reading the next one.
+            const first = try files.list(&scope, .{ .prefix = "photos/", .max_keys = 2 });
+
+            try testing.expectEqual(@as(usize, 2), first.objects.len);
+            // Decoded: the key out of its percent coding, the ETag out of
+            // its entities and quoted the way `head` hands it back.
+            try testing.expectEqualStrings("photos/wati sari.png", first.objects[0].key.view());
+            try testing.expectEqual(@as(u64, 1024), first.objects[0].size);
+            try testing.expectEqualStrings("\"9a0364b9e99bb480dd25e1f0284c8555\"", first.objects[0].etag.view());
+            try testing.expectEqualStrings("2026-09-18T10:11:12.000Z", first.objects[0].last_modified.view());
+            try testing.expectEqualStrings("photos/two.png", first.objects[1].key.view());
+            try testing.expectEqual(@as(u64, 0), first.objects[1].size);
+            try testing.expectEqualStrings("1dEs3p+aG/e=", first.next.?.view());
+
+            // The cursor goes back as it was, encoded for the query and
+            // signed as that — nothing follows it for the caller.
+            const second = try files.list(&scope, .{
+                .prefix = "photos/",
+                .max_keys = 2,
+                .cursor = first.next.?.view(),
+            });
+            served.await(io) catch {};
+            try expectVerified(&canned);
+            try testing.expectEqualStrings("GET", canned.seen.methodText());
+            try testing.expectEqualStrings("/files/", canned.seen.path());
+            try testing.expectEqualStrings(
+                "continuation-token=1dEs3p%2BaG%2Fe%3D&encoding-type=url&list-type=2&max-keys=2&prefix=photos%2F",
+                canned.seen.query(),
+            );
+            try testing.expectEqualStrings(sign.empty_payload, canned.seen.header("x-amz-content-sha256").?);
+            try testing.expectEqual(@as(usize, 2), second.objects.len);
+        }
+    }.run);
+}
+
+test "a list asking for more than a page, or a prefix longer than a key, is refused before a socket" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            // Nothing is served: a refusal here never reaches the wire.
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+
+            var files = try Files.open(&store);
+            defer files.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            try testing.expectError(error.Rejected, files.list(&scope, .{ .max_keys = 1001 }));
+            try testing.expectError(error.Rejected, files.list(&scope, .{ .max_keys = 0 }));
+            const long = "k" ** 513;
+            try testing.expectError(error.Rejected, files.list(&scope, .{ .prefix = long }));
+            const cursor = "c" ** 1025;
+            try testing.expectError(error.Rejected, files.list(&scope, .{ .cursor = cursor }));
+        }
+    }.run);
+}
+
 test "a streamed get pipes the object out without holding it" {
     try withIo(struct {
         fn run(io: std.Io) !void {

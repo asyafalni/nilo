@@ -45,14 +45,19 @@
 //! | `canned.zig` | a fake S3 that checks signatures, on a loopback socket |
 //! | `live.zig` | the half that needs a real one |
 //!
+//! | `listing.zig` | the query a `list` sends and the five names it reads back |
+//!
 //! ## What it will not do
 //!
-//! `LIST`, `COPY` and multipart upload, and for one reason rather than three:
-//! **they are where S3 stops being bytes at a key and starts being a document
-//! format.** A list result is a type AWS wrote rather than one the caller did,
-//! and it is the only operation whose *success* path is XML — which is what
-//! keeps the whole of `code.zig` at twenty lines of scanning. They are on the
-//! roadmap with that reason attached.
+//! `COPY` and multipart upload, for one reason rather than two: **they are
+//! where S3 stops being bytes at a key and starts being a document format.**
+//! `LIST` was the third of these for a cycle, and what let it in is the
+//! observation `code.zig` had already made about error bodies: a fixed, flat
+//! document with five interesting names in it is a scan rather than a parser
+//! (ADR 0250). It is bounded — one page, a cursor handed back, and no helper
+//! that follows it — because the call with unbounded output is the one that
+//! invites reading a bucket as a database. The other two are on the roadmap
+//! with the reason attached.
 //!
 //! Arbitrary `x-amz-meta-*` is refused too, on a performance argument that can
 //! therefore be revisited with a measurement: the header set being fixed is
@@ -94,6 +99,9 @@ pub fn open(gpa: std.mem.Allocator, options: Options) store.OpenError!Store {
 
 pub const Object = bucket.Object;
 pub const Meta = bucket.Meta;
+pub const Listing = bucket.Listing;
+pub const Listed = bucket.Listed;
+pub const Page = bucket.Page;
 pub const Presigned = bucket.Presigned;
 /// A browser's own upload: what to ask for, and the form that comes back
 /// (ADR 0141).
@@ -116,6 +124,7 @@ test {
     _ = code;
     _ = store;
     _ = bucket;
+    _ = @import("listing.zig");
     // A fake S3 on a loopback socket, which needs no container and runs in
     // `zig build test-s3` every time.
     _ = @import("canned.zig");

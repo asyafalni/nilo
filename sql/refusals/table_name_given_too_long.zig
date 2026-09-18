@@ -19,5 +19,5 @@ const Sku = struct {
 };
 
 export fn refusal() void {
-    _ = comptime sql.migrate.missingOf(sql.Postgres, &.{Sku});
+    _ = comptime sql.migrate.missingOf(sql.Postgres, .{ .tables = &.{Sku} });
 }

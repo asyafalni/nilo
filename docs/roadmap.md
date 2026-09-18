@@ -386,13 +386,13 @@ It is per tagged value, not per body, so a small object is nothing and an array 
 
 The reason is the one that shaped the static half. A deflate compressor needs a 64 KB window, so one per connection would multiply the 4,669 bytes an idle connection holds, and one per request would break the allocation budget ([ADR 0018](./adr/0018-the-trade-budget-has-three-axes.md)). **The shape that fits is a pool of compressors sized to the thread count rather than the connection count.** Four cores, 256 KB, and a request borrows one for as long as it is writing.
 
-The inbound direction is the same entry: a request body under a `Content-Encoding` other than `identity` is a 415 naming the header ([ADR 0111](./adr/0111-a-body-under-an-encoding-nilo-cannot-read-is-refused.md)), and decoding one wants the same 64 KB window from the same pool.
+The inbound direction closed without the pool ([ADR 0251](./adr/0251-a-gzipped-body-is-inflated-into-the-buffer-that-holds-it.md)): a decompressor needs only the history of what it has written, and `std.compress.flate.Decompress` will use the destination as that history, so a gzipped body is inflated straight into the arena buffer that was going to hold it. What is left inbound is `c.bodyStream()`, which hands bytes out as they arrive and has no buffer to be the window, and every coding but gzip.
 
 **Waiting on: a design.** What happens when the pool is empty, what it does to a stream, and what it does to SSE, which is the one thing that must never be buffered. A proxy in front does this today and does it well, in both directions.
 
-**The API description is silent about a session cookie.** A handler taking a `CurrentUser` that a resolver reads out of a cookie is documented as open, because the cookie is a line of Zig inside the resolver rather than something in a type. The `Authorization` half of this closed with [ADR 0191](./adr/0191-an-authorization-header-a-handler-can-ask-for.md): a handler that asks for `nilo.Authorization(.bearer)` gets a `security` entry and a `securitySchemes` block, and the resolver's own read of the header appears nowhere — which is the line, and the cookie is on the other side of it.
+**A handler that reads a body nilo does not know takes a `*Ctx`, and the document says nothing about it.** [ADR 0195](./adr/0195-a-type-can-write-its-own-answer.md) closed this on the way out: a type carrying `nilo_content_type` and `nilo_write` goes out as whatever it writes, under its own label, and the description names it. On the way in there is no third answer yet — a body is JSON, a form, or `c.body()` — so a route receiving protobuf, MsgPack or a vendor's binary takes a `*Ctx`, decodes by hand, and the API description cannot say what the route reads. The mirror is one declaration on the type: the same `nilo_content_type`, and a reader from the body's bytes into `Self`, checked and refused where the type is named the way `nilo_parse` is ([ADR 0142](./adr/0142-a-path-param-can-parse-itself.md)). nilo supplies the door and the caller brings the codec, which is the line ADR 0195 drew, and it is what "no protobuf" ([not coming](#not-coming)) should cost: a decoder in the caller's program, rather than a `*Ctx` and a blank in the document.
 
-**Waiting on: a design** that does not become a second thing to keep in step with the resolver. The consumer who generates a frontend client from the document has now hit it for real: every route under `/api` is behind a session cookie and four are not, and the document says nothing about either. Their proposal is a cookie scheme under `securitySchemes` and `without()` unsetting it per route, which is the group-and-exception vocabulary the guard already uses — and with `c.routeName()` ([ADR 0201](./adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)) that guard is one middleware on the group rather than a thing per handler, so the fact to document has moved from the signature to the group. What has not been settled is how a middleware says which scheme it enforces without the document taking a middleware's word for something it cannot check.
+**Waiting on: a design** for two things. The name — `nilo_read(text, arena) !Self` is already the column protocol ([ADR 0055](./adr/0055-a-column-type-can-come-from-outside-this-module.md)) with the same shape, and a type can legitimately be both a column and a body. And what the document says for a body with no JSON schema: the content type and a bare description, the way [ADR 0076](./adr/0076-a-type-that-writes-its-own-json-says-so.md) words a type that writes its own body, or a `nilo_openapi` the type declares.
 
 **The API description names one failure, and endpoints have several.** `!?T` puts a 404 in the document because the signature settles it ([ADR 0024](./adr/0024-a-failure-mode-belongs-in-the-return-type.md)). A `fail.conflict` on a duplicate email is a line in a function body and stays invisible. That is the rule rather than a gap, since the document promises what the signature settles, but it is the rule that costs the most.
 
@@ -470,28 +470,13 @@ The shape that would fit is not an annotation, and that is what makes the questi
 
 ### Next
 
-**1. Three of the five named texts have nowhere to be written, because there is no `sql.Schema`.** `.check` and `.trigger` hang off a table and ship ([ADR 0226](./adr/0226-the-marker-has-a-word-the-database-checks.md)). A function, a view and an extension hang off a schema, and the only place to put them today is a version file's `before` slot — which works, and which means a `CREATE OR REPLACE FUNCTION` is a hand-written step that no diff owns. The shape a 59-table port wanted:
-
-```zig
-pub const schema = sql.Schema{
-    .extensions = &.{"timescaledb"},
-    .functions = .{ .set_updated_at = @embedFile("sql/set_updated_at.sql") },
-    .tables = &.{ org.Department, org.Staff, work.WorkItem },
-    .views = .{ .sku_catalogue = @embedFile("sql/sku_catalogue.sql") },
-};
-```
-
-`@embedFile` is the point of it: a sixty-line view belongs in a `.sql` file with highlighting rather than in sixty `\\` lines. Order is fixed by kind and the tool owns it — extensions, functions, tables in reference order, each table's checks and triggers, views, then the version file's `after`.
-
-**Waiting on: a design.** The vocabulary is settled; what is not is the seam. `sql.Schema` replaces the `&.{ Row, Row }` list that `cli.Tool`, `db.checking` and `migrate.tablesOf` all take, so it changes the signature every program in the guide writes. Either it is a second spelling beside the list, which is two ways to say one thing, or it is the only spelling, which is a break. That choice is the ADR.
-
-**2. Four migration commands are missing, and two of them are the debt that forward-only creates.** `generate`, `check`, `status`, `migrate` and `verify` ship ([ADR 0153](./adr/0153-a-migration-is-a-diff-against-a-snapshot.md)). The four that do not are `push` and `pull`, which are the SQLite and the rescue cases, and `reset` and `squash`.
+**1. Four migration commands are missing, and two of them are the debt that forward-only creates.** `generate`, `check`, `status`, `migrate` and `verify` ship ([ADR 0153](./adr/0153-a-migration-is-a-diff-against-a-snapshot.md)). The four that do not are `push` and `pull`, which are the SQLite and the rescue cases, and `reset` and `squash`.
 
 `reset` and `squash` are the ones that matter. There is no `down`, so a developer whose laptop database is in a state no version describes has nothing to type, and a project three years in has four hundred version files every CI run reads. Skipping them does not remove that pain, it moves it onto somebody's laptop and into somebody's build. `squash` is the harder half: it has to leave the ledger of every database that already ran the old versions alone, which means writing a new first version that is only ever applied to a database that has applied nothing.
 
 **Waiting on: a design** for what `squash` writes into the ledger of a database that is already past it. Rewriting rows is out — that is the thing `verify` exists to catch.
 
-**3. Decide whether a SQLite statement hops or runs in the fiber.** The Wire ships with the choice as a field that has no default, so every program says which it wants and neither is a guess ([ADR 0073](./adr/0073-a-file-has-no-socket-to-wait-on.md)). What nobody has is the number that should make one of them the advised setting. A hop costs a few microseconds and so does a cached read, so `.in_fiber` is plausibly faster for a lookup service and plausibly fatal for one that scans.
+**2. Decide whether a SQLite statement hops or runs in the fiber.** The Wire ships with the choice as a field that has no default, so every program says which it wants and neither is a guess ([ADR 0073](./adr/0073-a-file-has-no-socket-to-wait-on.md)). What nobody has is the number that should make one of them the advised setting. A hop costs a few microseconds and so does a cached read, so `.in_fiber` is plausibly faster for a lookup service and plausibly fatal for one that scans.
 
 Both settings have to be measured unloaded and behind the pool, because [`bench/result/sql.md` §2](../bench/result/sql.md) is the standing warning that a per-operation saving measured only unloaded understated its worth at a pool by two to three times.
 
@@ -499,15 +484,15 @@ Half the harness is built. `zig build bench-sql` has a SQLite arm that needs no 
 
 **Waiting on: a machine.** The counters that could be taken on a shared vCPU have been ([§9](../bench/result/sql.md), [`spike/sqlite_facts`](../spike/sqlite_facts/)). This is the one that cannot.
 
-**4. A watched statement cannot say which request it came from.** `db.watching` shows the text, the plan, the duration and the rows ([ADR 0137](./adr/0137-a-statement-can-be-watched.md)), so *which statement is slow* is answerable. *Slow on which page* is not: a `Sent` carries no request id and no route, and the one thing that knows both is the fiber the statement is running on.
+**3. A watched statement cannot say which request it came from.** `db.watching` shows the text, the plan, the duration and the rows ([ADR 0137](./adr/0137-a-statement-can-be-watched.md)), so *which statement is slow* is answerable. *Slow on which page* is not: a `Sent` carries no request id and no route, and the one thing that knows both is the fiber the statement is running on.
 
 **Waiting on: a design.** `fail`'s message box is bound to the fiber ([ADR 0007](./adr/0007-failure-box-bound-to-the-fiber.md)) and reaching the same threadlocal from a Service is the arrangement the standing risk about `bulkhead.slot()` is already about. Handing the watcher the Scope is the other answer and costs the plain function pointer.
 
 ### Known gaps
 
-**The schema check is opt-in, and forgetting it is silent.** `db.checking(&.{ … })` takes the Row list by hand and nothing warns when it is never called or when a Row is left out of it — the check simply does not run for that Row, and the disagreement it would have caught arrives as a 500 on the first request that reads the column. Zig cannot enumerate the Rows a program declares, so there is nothing to derive the list from; what there *is* is the fact that a `Db` with `check == null` is a decision nobody wrote down.
+**The schema check is opt-in, and forgetting it is silent.** `db.checking(.{ .tables = &.{ … } })` takes the Row list by hand and nothing warns when it is never called or when a Row is left out of it — the check simply does not run for that Row, and the disagreement it would have caught arrives as a 500 on the first request that reads the column. Zig cannot enumerate the Rows a program declares, so there is nothing to derive the list from; what there *is* is the fact that a `Db` with `check == null` is a decision nobody wrote down.
 
-**Waiting on: a design.** A warning at `nilo_start` for a `Db` nobody called `checking` on is one line and is also noise for a program that meant it; an explicit `db.checking(&.{})` to say so is a second way to spell nothing.
+**Waiting on: a design.** A warning at `nilo_start` for a `Db` nobody called `checking` on is one line and is also noise for a program that meant it; an explicit `db.checking(.{ .tables = &.{} })` to say so is a second way to spell nothing.
 
 What is left here is only the forgetting. The *second* way to end up without a check — calling `checking` and getting a warning because the default pool had dialled nothing — is closed ([ADR 0144](./adr/0144-a-check-dials-the-connection-it-needs.md)).
 
@@ -569,9 +554,9 @@ Nothing queued.
 
 ### Known gaps
 
-**`LIST` and `COPY`.** One sentence covers both: they are where S3 stops being bytes at a key and starts being a document format. A list result is XML and a type AWS wrote rather than one the caller did, which is the opposite of what every other call here does. `COPY` carries its own trap for whoever adds it, because S3 can answer a copy with **200 and an error in the body**, so a client that checks the status is wrong.
+**`COPY`.** Where S3 stops being bytes at a key and starts being a document format, and it carries its own trap for whoever adds it: S3 can answer a copy with **200 and an error in the body**, so a client that checks the status is wrong.
 
-**Waiting on: a caller** who wants them enough to hold the XML.
+**Waiting on: a caller** who wants it enough to hold the XML.
 
 **Multipart upload, and therefore upload of unknown size.** `putStream` frames by length because S3 does not accept chunked, so a body whose length is not known before it starts has no way in. Multipart is the only way S3 offers, and it is a protocol rather than a call: initiate, N parts each with its own ETag, then a completion document listing them. XML again.
 

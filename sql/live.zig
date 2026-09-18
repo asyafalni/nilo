@@ -1029,7 +1029,7 @@ test "the schema check runs from nilo_start and passes on a table that agrees" {
 
     var db = db_mod.Db.init(gpa, "already open", .{});
     db.wire = live.wire;
-    db.checking(&.{Person});
+    db.checking(.{ .tables = &.{Person} });
 
     try testing.expectEqual(@as(usize, 0), try db.checkSchema(&.{Person}));
 }
@@ -2854,6 +2854,85 @@ const Widened = struct {
 
 const shipped_table = "nilo_live_shipped_" ++ mode_suffix;
 
+/// The three schema-level objects on a real Postgres (ADR 0253): a function
+/// a trigger calls, a table carrying that trigger, and a view over the
+/// table — made by `createMissing` in the order the tool owns.
+const touched_table = "nilo_live_touched_" ++ mode_suffix;
+const touched_fn = "nilo_live_touch_" ++ mode_suffix;
+const touched_view = "nilo_live_touched_names_" ++ mode_suffix;
+
+const Touched = struct {
+    pub const nilo_table = .{
+        .name = touched_table,
+        .key = .id,
+        .default = .{ .updated_at = .now },
+        .trigger = .{
+            .touch = .{ .when = "BEFORE UPDATE", .run = "FOR EACH ROW EXECUTE FUNCTION " ++ touched_fn ++ "()" },
+        },
+    };
+    id: i64,
+    name: []const u8,
+    updated_at: types.Timestamp,
+};
+
+const touched_schema: migrate.Schema = .{
+    .extensions = &.{"plpgsql"},
+    .functions = &.{.{
+        .name = touched_fn,
+        .body = "CREATE OR REPLACE FUNCTION " ++ touched_fn ++ "() RETURNS trigger AS $$ " ++
+            "BEGIN NEW.updated_at = NEW.updated_at + interval '1 hour'; RETURN NEW; END $$ LANGUAGE plpgsql",
+    }},
+    .tables = &.{Touched},
+    .views = &.{.{ .name = touched_view, .body = "SELECT id, name FROM " ++ touched_table ++ " ORDER BY name" }},
+};
+
+test "createMissing on Postgres makes the function before the trigger that calls it, and the view after the table" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    const arena = live.arena.allocator();
+    var db = db_mod.Db.init(gpa, "already open", .{});
+    db.wire = live.wire;
+    var run: nilo.Run = .init(gpa);
+    defer run.deinit();
+
+    // Three statements, because a prepared statement holds one; in the
+    // order the dependencies allow.
+    const clean = [_][]const u8{
+        "DROP VIEW IF EXISTS " ++ touched_view,
+        "DROP TABLE IF EXISTS " ++ touched_table,
+        "DROP FUNCTION IF EXISTS " ++ touched_fn,
+    };
+    for (clean) |stmt| {
+        var rows = try live.wire.run(arena, stmt, .{}, null, null);
+        live.wire.drain(&rows);
+    }
+    defer for (clean) |stmt| {
+        if (live.wire.run(arena, stmt, .{}, null, null)) |dropped| {
+            var rows = dropped;
+            live.wire.drain(&rows);
+        } else |_| {}
+    };
+
+    try migrate.createMissing(&db, &run, touched_schema);
+    // Twice, which is what a boot does: `CREATE OR REPLACE` on the function
+    // and the view, `IF NOT EXISTS` on the extension and the table.
+    try migrate.createMissing(&db, &run, touched_schema);
+
+    const b = try db.insert(Touched, &run, .{ .name = "beta" });
+    _ = try db.insert(Touched, &run, .{ .name = "alpha" });
+    // The trigger ran the function: an update moves `updated_at` an hour on.
+    const before = (try db.find(Touched, &run, b.id)).?.updated_at;
+    _ = try db.update(Touched, &run, .{ .set = .{ .name = "beta" }, .where = .{ .id = b.id } });
+    const after = (try db.find(Touched, &run, b.id)).?.updated_at;
+    try testing.expectEqual(before.micros + 3_600_000_000, after.micros);
+
+    const names = try db.raw([]const u8, &run, "SELECT name FROM " ++ touched_view, .{});
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqualStrings("alpha", names[0]);
+}
+
 test "addMissingColumns widens a Postgres table the way createMissing would have made it" {
     const gpa = testing.allocator;
     var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
@@ -2874,13 +2953,13 @@ test "addMissingColumns widens a Postgres table the way createMissing would have
         live.wire.drain(&rows);
     } else |_| {};
 
-    try migrate.createMissing(&db, &run, &.{Shipped});
+    try migrate.createMissing(&db, &run, .{ .tables = &.{Shipped} });
     _ = try db.insert(Shipped, &run, .{ .url = "http://a/1" });
 
     // Through `pg_catalog` rather than `pragma_table_info`, which is the
     // half of ADR 0233 the SQLite file cannot reach.
-    try testing.expectEqual(@as(usize, 3), try migrate.addMissingColumns(&db, &run, &.{Widened}));
-    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&db, &run, &.{Widened}));
+    try testing.expectEqual(@as(usize, 3), try migrate.addMissingColumns(&db, &run, .{ .tables = &.{Widened} }));
+    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&db, &run, .{ .tables = &.{Widened} }));
 
     const rows = try db.select(Widened, &run, .{});
     try testing.expectEqual(@as(usize, 1), rows.len);
