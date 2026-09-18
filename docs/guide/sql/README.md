@@ -160,6 +160,45 @@ Migrations *are* here, and they are the one thing in this guide that is not a
 query: [Making the tables](./migrations.md). They are not an ORM feature either —
 nothing tracks a change or writes a statement you did not ask for.
 
+## Measured against Drizzle
+
+[Drizzle](https://orm.drizzle.team/) is the fair yardstick, and not because it
+is popular. It refuses the same three things this module refuses, so what it
+*does* carry is a worked list of what a library can owe a service without
+becoming an ORM. On speed the two are already side by side, with eight other
+libraries, in [`bench/result/sql.md` §8](../../../bench/result/sql.md).
+
+Two whole areas come off before the list starts.
+
+- **Runtime query composition**, Drizzle's `$dynamic`: a builder held in a
+  variable and added to before it runs. This is the one thing this module
+  cannot have rather than has not got, because the statement is a comptime
+  constant. The answer past it is `db.raw`, and it always will be.
+- **The validation packages**, `drizzle-zod` and its five siblings: they exist
+  because a TypeScript type is gone by run time. A Zig struct is not, which is
+  why one Row already feeds the query, the JSON body and the API description
+  with nothing generated in between. Same for the ESLint plugin that catches an
+  `update` with no `where`. That is a Refusal here, and the compiler holds it.
+
+What is left splits three ways.
+
+- **Refused on the record**, each with its ADR: set operations and CTEs
+  ([0058](../../adr/0058-a-set-operation-over-one-table-is-a-condition.md));
+  several statements in one round trip
+  ([0059](../../adr/0059-a-round-trip-is-not-the-cost-worth-chasing.md)); automatic
+  read-replica routing and a query cache
+  ([0060](../../adr/0060-a-second-database-is-a-second-type.md)).
+- **Waiting on the one-table line**: joins, nested rows and aggregates.
+  Subqueries came off this list — `.exists` is a condition and ships
+  ([ADR 0171](../../adr/0171-a-row-over-there-is-a-condition.md)). The tooling
+  commands wait on [the roadmap](../../roadmap.md#nilo_sql-postgres-and-sqlite)'s
+  second entry rather than on a decision:
+  [ADR 0153](../../adr/0153-a-migration-is-a-diff-against-a-snapshot.md) made it and
+  the library under them is built.
+- **Nobody has looked**: row-level security, and Postgres extensions.
+
+A GUI over the database is not coming from here.
+
 ---
 
 The reasoning behind all of it is in

@@ -347,6 +347,15 @@ pub const Wire = struct {
         out.size = opts.size;
         out.timeout = opts.timeout_ms;
         out.connect_on_init_count = opts.connect_on_init;
+        // `result_state_size` is left at pg.zig's 32, on purpose. It looked
+        // free to size from the widest Row a `Db` reads, since every
+        // statement is a comptime constant, and it is not: the same number
+        // sizes the parameter-OID array a prepared statement is described
+        // with, and a statement wider than it allocates per call rather
+        // than failing, so a value chosen from the Rows would be paid for
+        // again by the first `insertMany` whose tuple is wider than any Row.
+        // A few hundred bytes a connection, held for the life of the pool,
+        // against a stack that costs kilobytes (ADR 0063).
         return out;
     }
 

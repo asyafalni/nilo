@@ -771,6 +771,14 @@ fn serveSpilledFile(
 /// cannot be compressed once), so `sendfile.send` has nothing to choose
 /// between and answers from the file's own tag and size. Sharing these lines
 /// would mean handing it a choice it can never have.
+///
+/// **The seam is here rather than beside `sendfile.zig`, and that is worth
+/// knowing before the next change to either arm.** This is the one part of
+/// the request path that is about static files rather than about serving
+/// requests, `headerValue` below is copied into `sendfile.zig` four lines
+/// each, and both `If-Range` gaps diverged exactly here. Nothing is wrong
+/// today; moving code that works has to be worth the diff, and the next
+/// change to either arm is when it is.
 fn serveHeldFile(c: *Ctx, file: *const static_mod.File) anyerror!void {
     // A `Range` is an offset into a representation, and the gzipped copy is
     // a different representation with different offsets. Rather than work

@@ -284,9 +284,9 @@ and watches an outbound deadline actually fire against a real server. Putting
 those tests in `fetch/fetch.zig`'s test block would make `zig test
 fetch/fetch.zig` need a server and cost the Fitting layer its entry condition.
 It hangs off `zig build test`, and **it is the first test here that opens a
-real port**, the harness `docs/roadmap.md`'s standing risks have wanted for
-`sendfile` and the WebSocket, which is why two entries there now read
-`Waiting on: ready`.
+real port**, the harness the standing risks wanted for `sendfile` and the
+WebSocket; both are held now, and sit in `docs/risks.md` rather than on the
+roadmap.
 
 `nilo_s3` runs on `std.Io.Threaded` too — its canned server and its live tests
 both open real sockets with no Engine anywhere — but it needs the module graph

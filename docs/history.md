@@ -1334,6 +1334,18 @@ is "the same work minus X" has to be checked for a plus as well as a minus** —
 addition was the larger of the two. A negative result is the check working; the
 cause was one layer below where the check could see.
 
+**And the fix the roadmap then carried cannot be built as it was written.** The
+entry said a per-thread block cache, sized to threads rather than connections,
+was worth 10,229 req/s to 14,365 where sixty-four connections each hold a
+megabyte. A block recycled into another connection's arena while an `io_uring`
+send still references it corrupts that response: the completion holds the
+pointer, not a copy, and the arena has no idea a write is outstanding. So the
+cache needs a block to be unreachable until every operation naming it has
+completed, which is a lifetime rule the arena does not have and `defer` cannot
+express; and the motivating number was taken on a 32 MB L3 this box does not
+have. Anybody picking it up starts by rebuilding the before on a machine where
+the L3 argument is real.
+
 ## The suite passed, and somebody else's suite found the thing it could not
 
 The WebSocket had never been run against
