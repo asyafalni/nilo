@@ -519,7 +519,8 @@ compressed — see [Static files](./static-files.md#compression)).
 
 Templates are a refusal rather than a backlog item: nilo is for building APIs
 and services, and rendering pages is not what it is for. The reasoning is in
-[the roadmap](../roadmap.md#not-coming).
+[`decided.md`](../decided.md#not-coming).
 
-Each item is listed with its reason in [`../roadmap.md`](../roadmap.md); the ones
-that are refusals rather than backlog are in [`../adr/`](../adr/).
+What is outstanding is listed with what it is waiting for in
+[`../roadmap.md`](../roadmap.md); what has been refused, with the reason, is in
+[`../decided.md`](../decided.md) and the ADR each entry names.

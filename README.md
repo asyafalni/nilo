@@ -8,8 +8,8 @@
   <a href="https://ziglang.org/"><img alt="Zig 0.16" src="https://img.shields.io/badge/zig-0.16-f7a41d?style=flat-square&logo=zig&logoColor=white"></a>
   <a href="./CHANGELOG.md"><img alt="version 0.4.0" src="https://img.shields.io/badge/version-0.4.0-3b82f6?style=flat-square"></a>
   <a href="./docs/reference/"><img alt="11 modules" src="https://img.shields.io/badge/modules-11-8957e5?style=flat-square"></a>
-  <a href="./refusals/README.md"><img alt="321 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-321-e05d44?style=flat-square"></a>
-  <a href="./docs/adr/"><img alt="227 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-227-6b7280?style=flat-square"></a>
+  <a href="./refusals/README.md"><img alt="364 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-364-e05d44?style=flat-square"></a>
+  <a href="./docs/adr/"><img alt="263 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-263-6b7280?style=flat-square"></a>
   <a href="./LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-16a34a?style=flat-square"></a>
 </p>
 
@@ -35,12 +35,10 @@ the signature and the field list already say everything nilo needs. The biggest
 module is an HTTP server, but you import what you use and Zig never compiles the
 rest.
 
-| | |
-|---|---|
-| **One rule** | a pointer is a service, a value is request data. There is no second rule. |
-| **One allocation** | per request. A test fails if it ever becomes two. |
-| **321 refusals** | mistakes that stop the build with a sentence nilo wrote, held by seven build steps. |
-| **Zero glue** | routing, the 400, the 404, the OpenAPI document and the SQL all read the same struct. |
+- **One rule.** A pointer is a service, a value is request data. There is no second rule.
+- **One allocation** per request. A test fails if it ever becomes two.
+- **364 refusals.** Mistakes that stop the build with a sentence nilo wrote, held by eight build steps.
+- **Zero glue.** Routing, the 400, the 404, the OpenAPI document and the SQL all read the same struct.
 
 ## ⚡ Quickstart
 
@@ -140,12 +138,10 @@ and an OpenAPI document that mentions all of the above. Delete the `?` and the
 >
 > That's it. That's the API.
 
-| You wrote | It means |
-|---|---|
-| `db: *Db` | a pointer, so it's a service: the one you handed to `provide` |
-| `id: u32` | a value, so it's request data: here `:id`, converted, or a 400 if it won't convert |
-| `!?User` | it might not be there, so `null` goes out as a 404, and the API document says so |
-| `!Status(201, User)` | the status is part of the type, so the API document names it |
+- `db: *Db` — a pointer, so it's a service: the one you handed to `provide`.
+- `id: u32` — a value, so it's request data: here `:id`, converted, or a 400 if it won't convert.
+- `!?User` — it might not be there, so `null` goes out as a 404, and the API document says so.
+- `!Status(201, User)` — the status is part of the type, so the API document names it.
 
 **Registration order doesn't matter.** `/users/new` and `/users/:id` both work
 whichever you write first; `use` after `get` still applies; `docs()` can go
@@ -162,19 +158,19 @@ test "getUser" {
 
 ## 🧰 What's in the box
 
-| Module | What it does | What isn't in it |
-|---|---|---|
-| **`nilo_http`** | routing, typed handlers, middleware, cookies and sessions, static files, streaming, WebSocket, OpenAPI, metrics, rate limiting | templates and TLS, both on the record below |
-| **`nilo_sql`** | Postgres and SQLite. Your struct is the table, and it makes the table: reads, writes, transactions, streaming, the schema, the diff and the ledger | joins, aggregates and `GROUP BY`, which go through `db.raw`. A migration `down` |
-| **`nilo_s3`** | object storage: S3, MinIO, R2. Your bucket is a type. Get, put, range, stream, list a page, presigned GET and POST | `COPY`, multipart |
-| **`nilo_fetch`** | calling somebody else's HTTP API from inside a request: the policy in front of `std.http.Client` | retries, circuit breaker |
-| **`nilo_job`** | work that runs later, again, or on a schedule: a queue in the database you already have, a cron schedule parsed while compiling | priorities, exactly-once, time zones |
-| **`nilo_cache`** | an expiring cache in this process, on a fixed budget with nothing allocated per operation | pointers in a cached value, which is a compile error naming the field |
-| **`nilo_jwt`** | checking somebody else's signed token: RS256, ES256 and a JWKS | fetching the key set and refreshing it |
-| **`nilo_config`** | settings out of the environment, every bad one named at once | file parsing, and that's a decision |
-| **`nilo_pw`** | password hashing: argon2id, stored as PHC | rate limiting the endpoint |
-| **`nilo_id`** | UUIDs, v4 and v7 | where the randomness comes from |
-| **`nilo_core`** | `Str`, the Scope, the clock and percent coding, shared by the rest | any IO at all, on purpose |
+Each module, and what is deliberately not in it:
+
+- **`nilo_http`** — routing, typed handlers, middleware, cookies and sessions, static files, streaming, WebSocket, OpenAPI, metrics, rate limiting. *Not:* templates and TLS, both on the record below.
+- **`nilo_sql`** — Postgres and SQLite. Your struct is the table, and it makes the table: reads, writes, transactions, streaming, the schema, the diff and the ledger. *Not:* joins, aggregates and `GROUP BY`, which go through `db.raw`; a migration `down`.
+- **`nilo_s3`** — object storage: S3, MinIO, R2. Your bucket is a type. Get, put, range, stream, list a page, presigned GET and POST. *Not:* `COPY`, multipart.
+- **`nilo_fetch`** — calling somebody else's HTTP API from inside a request: the policy in front of `std.http.Client`. *Not:* retries, circuit breaker.
+- **`nilo_job`** — work that runs later, again, or on a schedule: a queue in the database you already have, a cron schedule parsed while compiling. *Not:* priorities, exactly-once, time zones.
+- **`nilo_cache`** — an expiring cache in this process, on a fixed budget with nothing allocated per operation. *Not:* pointers in a cached value, which is a compile error naming the field.
+- **`nilo_jwt`** — checking somebody else's signed token: RS256, ES256, a JWKS, and a key set that rotates under its readers. *Not:* signing one, and HS256.
+- **`nilo_config`** — settings out of the environment, every bad one named at once. *Not:* file parsing, and that's a decision.
+- **`nilo_pw`** — password hashing: argon2id, stored as PHC. *Not:* rate limiting the endpoint.
+- **`nilo_id`** — UUIDs, v4 and v7. *Not:* where the randomness comes from.
+- **`nilo_core`** — `Str`, the Scope, the clock and percent coding, shared by the rest. *Not:* any IO at all, on purpose.
 
 A module imports downward only and never sideways, and `zig build layering`
 holds that as a build step rather than a paragraph
@@ -185,7 +181,7 @@ inside a handler, a CLI, or a test with no server in the process.
 
 Mail is unwritten but no longer blocked, and is the most useful thing an outside
 contributor could pick up; [`docs/roadmap.md`](./docs/roadmap.md) has the queue,
-one list per module.
+grouped by module and by what each entry is waiting for.
 
 ## 🐈 Philosophy
 
@@ -247,14 +243,7 @@ const adults = try db.select(User, c, .{
 
 No tags on the fields, no schema file, no generated client. That query is a
 constant in your binary before the program starts — only the `18` reaches
-runtime:
-
-```sql
-SELECT "id", "org_id", "email", "age", "created_at" FROM "users"
-WHERE "age" > $1 ORDER BY "created_at" DESC LIMIT 10
-```
-
-So a typo is a build error instead of a 500 at 3am:
+runtime — so a typo is a build error instead of a 500 at 3am:
 
 ```
 $ zig build
@@ -262,36 +251,15 @@ error: nilo: User has no column `agee`, asked for in a condition.
        Did you mean `age`?
 ```
 
-**The same struct also makes the table, and diffs it.** `createMissing` creates every table a schema describes:
-
-```zig
-try sql.migrate.createMissing(&db, &run, .{ .tables = &.{ Org, User } });
-```
-
-For a schema that changes, your project gets a `db` command out of a `main` of
-ten lines:
-
-```console
-$ db check                       # do the Rows and the migrations agree?
-$ db generate --name add_nickname
-$ db migrate
-```
-
-`generate` and `check` **open no database**: your types on one side, a
-snapshot kept in git on the other, so CI needs no service container. A rename
-is written in the type (`.was = .{ .email = "e_mail" }`) rather than guessed
-from the diff. There is no `down`, and
+**The same struct also makes the table, and diffs it.** `createMissing` creates
+every table a schema describes, and a `main` of ten lines gives your project a
+`db` command — `check`, `generate --name add_nickname`, `migrate` — whose
+`generate` and `check` open no database: your types on one side, a snapshot
+kept in git on the other, so CI needs no service container. A rename is written
+in the type (`.was = .{ .email = "e_mail" }`) rather than guessed from the
+diff. There is no `down`, and
 [ADR 0153](./docs/adr/0153-a-migration-is-a-diff-against-a-snapshot.md) is the
 reasoning.
-
-Every word in the marker is checked while compiling, `.references` hardest:
-
-```
-$ zig build
-error: nilo: User.org_id is []const u8 and points at Org.id, which is i64.
-         Two sides of a foreign key hold the same value, so they are the same
-         type. One of the two is wrong about its column.
-```
 
 Postgres and SQLite, written the same way. It is not an ORM and won't turn into
 one: no change tracking, no lazy relations, no identity map. Joins and
@@ -358,28 +326,21 @@ read the same struct you wrote. Nothing here is glued together at runtime.
 
 Most frameworks say "fast" and "lightweight". Here are numbers instead.
 
-| | |
-|---|---|
-| **1 allocation** | per request. A test fails if it ever becomes 2 |
-| **4,669 bytes** | per idle connection, for the framework. Flat from 1,000 to 10,000. An idle WebSocket is 5,183. A handler adds the stack it touches ([ADR 0063](./docs/adr/0063-a-handlers-stack-is-per-connection.md), [ADR 0071](./docs/adr/0071-where-a-connection-waits-is-what-it-costs.md)) |
-| **69µs** | p99 under load: 9.4× below Go's `net/http`, 11× below Fiber |
-| **5.4 MB** | idle server |
-| **1,401,412 req/s** | on four physical cores, and the least interesting number on this page |
+- **1 allocation** per request. A test fails if it ever becomes 2.
+- **4,669 bytes** per idle connection, for the framework, flat from 1,000 to 10,000. An idle WebSocket is 5,183. A handler adds the stack it touches ([ADR 0063](./docs/adr/0063-a-handlers-stack-is-per-connection.md), [ADR 0071](./docs/adr/0071-where-a-connection-waits-is-what-it-costs.md)).
+- **69µs** p99 under load: 9.4× below Go's `net/http`, 11× below Fiber.
+- **5.4 MB** idle server.
+- **1,401,412 req/s** on four physical cores, and the least interesting number on this page.
 
 Against eight other servers on the same machine, every candidate returning the
 **same 982 bytes** of JSON, verified byte for byte
-([`docs/comparison.md`](./docs/comparison.md)):
+([`docs/comparison.md`](./docs/comparison.md)): 1st of 9 on throughput and
+inside the noise of http.zig; 2nd on p99, 3–45× ahead of everything outside
+the top two; 2nd on CPU per request and on idle memory; 3rd on memory per
+connection, and it was 7th before this measurement got the code changed; and
+**last of the five compiled languages on warm release rebuild**, at 7.4s.
 
-| | Where nilo lands |
-|---|---|
-| Throughput | 1st of 9, and inside the noise of http.zig |
-| p99 under equal load | 2nd of 9, and 3–45× ahead of everything outside the top two |
-| CPU per request | 2nd of 9 |
-| Memory, idle server | 2nd of 9, at 5.4 MB |
-| Memory per connection | 3rd of 9, and it was 7th before this measurement got the code changed |
-| Warm rebuild, release | **last of the five compiled languages**, at 7.4s |
-
-The last row is the honest one. Throughput is the least interesting because
+The last one is the honest one. Throughput is the least interesting because
 [the benchmarks page says so itself](./bench/result/http.md): at this payload
 nilo's own code is about 4% of a request's CPU. The tail latency is a result,
 and so is the build time, against us.
@@ -397,12 +358,10 @@ is the amalgamation ([`bench/result/sql.md`](./bench/result/sql.md)).
 That trade runs on four axes, not one
 ([ADR 0018](./docs/adr/0018-the-trade-budget-has-three-axes.md)):
 
-| Axis | The rule |
-|---|---|
-| Throughput and p99 | a nicer API wins if it costs under 10% |
-| Allocations per request | fixed. Currently 1, held by a test |
-| Memory per idle connection | fixed. Every feature states its own cost |
-| Binary size | anything the linker can't drop states its measured cost |
+- **Throughput and p99** — a nicer API wins if it costs under 10%.
+- **Allocations per request** — fixed. Currently 1, held by a test.
+- **Memory per idle connection** — fixed. Every feature states its own cost.
+- **Binary size** — anything the linker can't drop states its measured cost.
 
 Response compression is what "doesn't ship in a worse shape" looks like in
 practice: the shape that would fit is known, it hasn't been built, and no
@@ -411,20 +370,11 @@ allocate-per-request version shipped in the meantime.
 ## 🙂 What happens when you get it wrong
 
 An error message is a feature right up until somebody refactors it into mush.
-So this repository has **321 programs that are supposed to fail to compile**,
-and seven build steps checking the wording of every failure:
-
-| Step | Programs | Over |
-|---|---|---|
-| `zig build refusals` | 140 | the framework |
-| `zig build refusals-sql` | 140 | queries, rows and schemas |
-| `zig build refusals-job` | 17 | jobs and schedules |
-| `zig build refusals-s3` | 10 | buckets and keys |
-| `zig build refusals-config` | 9 | settings |
-| `zig build refusals-cache` | 5 | cached values |
-| `zig build refusals-pw` | 3 | passwords |
-
-Every one says what you did *and* what to do about it:
+So this repository has **364 programs that are supposed to fail to compile**,
+and eight build steps checking the wording of every failure: `refusals` (158,
+the framework), `refusals-sql` (145), `refusals-job` (17), `refusals-fetch`
+(15), `refusals-s3` (10), `refusals-config` (9), `refusals-cache` (6) and
+`refusals-pw` (4). Every one says what you did *and* what to do about it:
 
 ```
 $ zig build
@@ -434,10 +384,8 @@ error: nilo: route "/users/:user/pets/:pet" has 2 path params (:user, :pet), but
        pattern, or ask for a `*Ctx` if you would rather fetch them yourself with `c.param("…")`.
 ```
 
-### And the two places a compiler can't reach
-
-**At startup, before a single request is served** — a route registered twice,
-a service nobody provided:
+**At startup, before a single request is served**, the two things a compiler
+can't see — a route registered twice, a service nobody provided:
 
 ```
 error: the route "GET /users/:name" answers the same requests as "/users/:id", which is
@@ -448,7 +396,7 @@ error: service *Db was never registered, but 3 routes need it ("/users/:id", "/u
        "/users/:id/orders") — call app.provide() before app.listen()
 ```
 
-**While running.** Holding request data past its request is trapped in a Debug
+**While running**, holding request data past its request is trapped in a Debug
 build, and a handler that blocks the thread its neighbours share is timed and
 named in the log, in any build:
 
@@ -470,15 +418,14 @@ whole, and the running server serves its own contract at `/openapi.json`.
 
 ## 🚫 What it won't do
 
-| | Why, and where to go instead |
-|---|---|
-| **Templates** | rendering means a string per request, which is an allocation per request, and that number is fixed. If your app's job is HTML, [jetzig](https://www.jetzig.dev/) is built for it |
-| **TLS**, and so HTTP/2 and gRPC | terminate it in front. The [deploying guide](./docs/guide/deploying.md#tls-and-the-proxy-in-front) has the five lines ([ADR 0028](./docs/adr/0028-tls-is-terminated-in-front.md)) |
-| **Revoking a session** | `Session(T)` is sealed into the cookie, so there is no table, no sweep, and no way to revoke one ([ADR 0035](./docs/adr/0035-a-session-is-sealed-into-the-cookie.md)) |
-| **Parsing config files** | `nilo_config` reads the environment; a TOML parser taxes every project that imports the module ([ADR 0043](./docs/adr/0043-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)) |
+- **Templates.** Rendering means a string per request, which is an allocation per request, and that number is fixed. If your app's job is HTML, [jetzig](https://www.jetzig.dev/) is built for it.
+- **TLS**, and so HTTP/2 and gRPC. Terminate it in front; the [deploying guide](./docs/guide/deploying.md#tls-and-the-proxy-in-front) has the five lines ([ADR 0028](./docs/adr/0028-tls-is-terminated-in-front.md)).
+- **Revoking a session.** `Session(T)` is sealed into the cookie, so there is no table, no sweep, and no way to revoke one ([ADR 0035](./docs/adr/0035-a-session-is-sealed-into-the-cookie.md)).
+- **Parsing config files.** `nilo_config` reads the environment; a TOML parser taxes every project that imports the module ([ADR 0043](./docs/adr/0043-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)).
 
 None of these are gaps. Each has an ADR naming the alternative it lost to, so if
-you think a decision is wrong there's something specific to argue with.
+you think a decision is wrong there's something specific to argue with;
+[`docs/decided.md`](./docs/decided.md) has the rest of the list.
 
 ## 🧪 Examples
 
@@ -499,7 +446,6 @@ $ zig build run-outbound   # calling somebody else's API from inside a handler
 
 `zig build dev-hello` is the same server restarted on every save
 ([getting started](./docs/guide/getting-started.md#restarting-on-every-save)).
-
 Read **`rest`** first, **`orders`** when you hit "yes, but what about…", and
 **`forms`** if you're building a web page rather than an API.
 
@@ -512,15 +458,14 @@ background work, then one page per module
 ([nine](./docs/guide/sql/README.md) for the database), then testing, OpenAPI,
 metrics, deploying.
 
-| | |
-|---|---|
-| [`docs/reference/`](./docs/reference/) | the entire API surface, one page a module |
-| [`docs/adr/`](./docs/adr/) | 207 decisions, each naming the alternative it rejected |
-| [`CONTEXT.md`](./CONTEXT.md) | the vocabulary, and the words this project refuses to use |
-| [`docs/roadmap.md`](./docs/roadmap.md) | what's next, what's refused, what's undecided |
-| [`docs/history.md`](./docs/history.md) | what got measured, and what turned out to be wrong |
-| [`docs/comparison.md`](./docs/comparison.md) | how this sits next to the other Zig options |
-| [`bench/result/`](./bench/result/) | every benchmark run, and what each one changed |
+- [`docs/reference/`](./docs/reference/) — the entire API surface, one page a module.
+- [`docs/adr/`](./docs/adr/) — 263 decisions, each naming the alternative it rejected.
+- [`CONTEXT.md`](./CONTEXT.md) — the vocabulary, and the words this project refuses to use.
+- [`docs/roadmap.md`](./docs/roadmap.md) — what's next, what's waiting for a caller, and what's undecided.
+- [`docs/decided.md`](./docs/decided.md) — what's refused, and what was answered so it isn't asked twice.
+- [`docs/history.md`](./docs/history.md) — what got measured, and what turned out to be wrong.
+- [`docs/comparison.md`](./docs/comparison.md) — how this sits next to the other Zig options.
+- [`bench/result/`](./bench/result/) — every benchmark run, and what each one changed.
 
 ## 🤝 Contributing
 
@@ -530,8 +475,8 @@ answer isn't already written down somewhere, that's the bug.
 
 Nothing load-bearing lives only in my head: every decision has a file in
 [`docs/adr/`](./docs/adr/), the rules are build steps (`zig build layering`,
-`zig build refusals`) rather than review comments, and the roadmap is one list
-per module so two people can work at once without a merge to negotiate.
+`zig build refusals`) rather than review comments, and the roadmap is grouped
+by module so two people can work at once without a merge to negotiate.
 **[CONTRIBUTING.md](./CONTRIBUTING.md)** has what a change has to carry, where
 to start, and how to point an agent at this.
 

@@ -5,15 +5,42 @@ This file holds the release that has not been tagged yet;
 [the releases page](https://github.com/nevindra/nilo/releases) holds the ones
 that have, one page each. What was measured and what was got wrong on the way is
 in [`docs/history.md`](./docs/history.md); what is coming is in
-[`docs/roadmap.md`](./docs/roadmap.md).
+[`docs/roadmap.md`](./docs/roadmap.md), and what was refused or answered is in
+[`docs/decided.md`](./docs/decided.md).
 
 ## Unreleased
 
-Needs Zig 0.16, as 0.4.0 does. Two halves. The schema half is what a Row can
-say about its own table — its defaults, a `CHECK`, a trigger, a foreign key
-over more than one column — and beside it the ten things the roadmap had
-marked ready, most of them a failure that used to arrive somewhere other than
-where it was made.
+Needs Zig 0.16, as 0.4.0 does. Seventy-eight entries, in four groups.
+
+**A Row says more about its own table.** Defaults, an enum's `CHECK`, a
+named constraint, a trigger, a foreign key over several columns or to a table
+named as text, `sql.Date`, an index with a direction and a `WHERE` — and
+`sql.Schema` as the one value that `checking`, the migrations tool and
+`createMissing` all read, which is the break most programs will meet first.
+The tool gains `--baseline`, a `.sql` twin per version, `db.expecting`, and a
+`Db` that was never told to check now says so once at startup.
+
+**Somebody else's token, and somebody else's API.** `nilo.Verified(V)` puts
+the claims behind a bearer token in a handler's argument list; `jwt.Keyring`
+holds the key set and rotates it under its readers; ES256 joins RS256.
+`fetch.Target` names a service once — base URL, standing headers, its own
+gate — and `postJson`, `withQuery`, `res.header`, `stall_ms` and a Refusals
+table of its own fill in what the first release of `nilo_fetch` left out.
+
+**A route can say more about its answer.** `nilo.Versioned(T)` for a 304,
+`nilo.Cached` for an answer kept a minute, `app.guard` so the document names
+the cookie, `app.embedded` for a tree the binary carries, a gzipped request
+body inflated in place, a `Form(T)` field that is a list, and
+`space.incr` on a cache of integers.
+
+**And the loop around the loop.** `nilo-dev` restarts the server on every
+save and prunes the builds it leaves; `app.before` runs work that needs the
+services before the first request; a `push` wakes a worker, a job can push
+the next one, and `jobs.cancel` takes a queued row back; `pw.Token` is the
+secret that is not a password.
+
+Eight of the entries change what a running program does, and they are under
+**Breaking** with what to change next to each.
 
 ### Breaking
 
@@ -762,6 +789,17 @@ where it was made.
 
 ### Docs
 
+- **The roadmap is what is still open, and nothing else.** It is now five
+  sections by what an entry is waiting for — `Next`, `Known, waiting for a
+  caller`, `Open questions`, `Measurements outstanding` (one table) and
+  `Waiting on upstream` (one table, with the pin each row was last checked
+  at) — grouped by module inside the first three, in place of a section per
+  module with `Next`, `Known gaps` and `Not decided` under each. What was
+  accepted as the rule, what was answered in a line and what is not coming
+  moved to [`docs/decided.md`](./docs/decided.md), and the three standing
+  risks with no mechanism under them yet moved to
+  [`docs/risks.md`](./docs/risks.md#open) beside the ones that are held.
+  Links into the old per-module anchors now point at the section instead.
 - **The keyset form of a deep page.** `db.page`'s `OFFSET` gets slower as a
   list goes deeper; [Reading](./docs/guide/sql/reading.md#the-keyset-form-of-a-deep-page)
   now shows the `(created_at, id) < (…)` condition written as `.any`, with the

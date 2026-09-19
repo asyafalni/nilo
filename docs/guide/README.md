@@ -129,5 +129,6 @@ will not do.
 
 - [The reference](../reference/README.md) — the whole surface as a list.
 - [`../adr/`](../adr/) — why each decision went the way it did.
-- [`../roadmap.md`](../roadmap.md) — what's next, and what's refused.
+- [`../roadmap.md`](../roadmap.md) — what's next.
+- [`../decided.md`](../decided.md) — what's refused, and why.
 - [`../../CONTEXT.md`](../../CONTEXT.md) — the project's vocabulary.

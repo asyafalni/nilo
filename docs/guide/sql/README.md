@@ -191,10 +191,10 @@ What is left splits three ways.
 - **Waiting on the one-table line**: joins, nested rows and aggregates.
   Subqueries came off this list — `.exists` is a condition and ships
   ([ADR 0171](../../adr/0171-a-row-over-there-is-a-condition.md)). The tooling
-  commands wait on [the roadmap](../../roadmap.md#nilo_sql-postgres-and-sqlite)'s
-  second entry rather than on a decision:
-  [ADR 0153](../../adr/0153-a-migration-is-a-diff-against-a-snapshot.md) made it and
-  the library under them is built.
+  commands still missing are on [the roadmap](../../roadmap.md#next) under
+  `nilo_sql`, and they wait on one question rather than on a decision:
+  [ADR 0153](../../adr/0153-a-migration-is-a-diff-against-a-snapshot.md) made that,
+  and the library under them is built.
 - **Nobody has looked**: row-level security, and Postgres extensions.
 
 A GUI over the database is not coming from here.

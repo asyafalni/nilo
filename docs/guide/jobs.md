@@ -649,8 +649,8 @@ lets `drainAt` hand a test's number to every one of them
 Not a priority queue: rows come out in `run_at` order and nothing else. Not
 a workflow engine, not a rate limiter for a kind — `nilo.Gate` inside `run`
 is that — and not exactly once. Not a time zone. Each of those is in
-[`docs/roadmap.md`](../roadmap.md#nilo_job-work-that-runs-later-again-or-on-a-schedule)
-with what it is waiting for.
+[`docs/roadmap.md`](../roadmap.md) under `nilo_job`, with what it is waiting
+for.
 
 ## See also
 

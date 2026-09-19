@@ -189,6 +189,7 @@ Documentation is part of the change, not a follow-up:
 | something you measured, or a guess that turned out wrong | [`docs/history.md`](./docs/history.md) |
 | a benchmark you ran | [`bench/result/`](./bench/result/) — one file an area |
 | something now built | delete its entry from [`docs/roadmap.md`](./docs/roadmap.md) |
+| a question answered, or a feature refused with its reason | [`docs/decided.md`](./docs/decided.md) — and out of the roadmap |
 | something a user has to change | [`CHANGELOG.md`](./CHANGELOG.md) |
 
 **A snippet you publish is a program, so let the build compile it.** Put
@@ -236,9 +237,11 @@ second on the machine in `bench/result/http.md`; pinned to the cores nilo gets,
 8.2, 7.1 and 4.7, and a margin narrower than its own spread is quoted as a
 range or it is quoted wrong.
 
-The roadmap holds nothing that's finished. When something ships, its entry
-leaves entirely. No strikethrough, no "done", no summary of how it went. The
-test is that you can read the roadmap top to bottom as work outstanding.
+The roadmap holds nothing that's finished and nothing that's decided. When
+something ships, its entry leaves entirely. No strikethrough, no "done", no
+summary of how it went. When a question gets an answer, the answer goes to
+[`docs/decided.md`](./docs/decided.md) and the question leaves the same way.
+The test is that you can read the roadmap top to bottom as work outstanding.
 
 `docs/history.md` earns its length the hard way. An entry gets in only if it
 would change what somebody does next time: a number that got measured, an
@@ -323,9 +326,10 @@ at the parser.
 
 ## Where to start
 
-**Something in the roadmap marked "Not decided".** Those want an argument more
-than they want a patch, and an argument is a cheap thing to contribute. You can
-write one in an issue in ten minutes.
+**Something under [Open questions](./docs/roadmap.md#open-questions) in the
+roadmap.** Those want an argument more than they want a patch, and an argument
+is a cheap thing to contribute. You can write one in an issue in ten minutes —
+each entry ends with what would settle it.
 
 **A module that dials out.** This used to be the biggest thing on the list, and
 for the opposite reason: object storage, mail, a Redis client and an HTTP client

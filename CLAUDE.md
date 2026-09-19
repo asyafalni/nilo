@@ -514,8 +514,9 @@ sentences with long bodies, which is the older convention rather than a mistake.
 
 **Documentation is part of the change**, not a follow-up: a design decision goes
 in a new `docs/adr/` file, what got built and what was measured goes in
-`docs/history.md`, what is next or refused goes in `docs/roadmap.md`, and what a
-user has to change goes in `CHANGELOG.md`.
+`docs/history.md`, what is next goes in `docs/roadmap.md`, what is refused or
+answered goes in `docs/decided.md`, and what a user has to change goes in
+`CHANGELOG.md`.
 
 **`CHANGELOG.md` holds one release, the untagged one.** Work lands under
 `## Unreleased`; cutting a release renames that heading to the version and bumps
@@ -530,22 +531,31 @@ resolve on a release page. What stays in the file is one line under
 becomes a link to that page. The file is then the next release again, and it
 never grows past one.
 
-**The roadmap holds nothing that is built.** It is what is coming, what is
-refused and what nobody has decided: a plan, not a record. The moment something
-ships, its entry leaves `docs/roadmap.md` entirely: no strikethrough, no
-"**Built**", no account of how it went. What was measured and what was learned
-moves to `docs/history.md`, which is the record; the item is then cut, not
-annotated. A gap only *partly* closed keeps one sentence scoping what is left,
-never a paragraph about the half that landed. The test is that the roadmap can
-be read top to bottom as work outstanding.
+**The roadmap holds nothing that is built, and nothing that is decided.** It
+is what is still open: a plan, not a record. The moment something ships, its
+entry leaves `docs/roadmap.md` entirely: no strikethrough, no "**Built**", no
+account of how it went. What was measured and what was learned moves to
+`docs/history.md`, which is the record; the item is then cut, not annotated. A
+gap only *partly* closed keeps one sentence scoping what is left, never a
+paragraph about the half that landed. And a gap that was looked at and kept as
+the rule, a question answered in a line, or a feature refused with its reason
+goes to `docs/decided.md`, not the roadmap — that file exists so an answer is
+not re-derived, and the roadmap exists to be read top to bottom as work
+outstanding. A risk with no mechanism under it yet is in `docs/risks.md`
+under `## Open`, beside the ones that are held.
 
-**The other six rules live in the roadmap itself**, under
+**The roadmap is five sections, and an entry is in exactly one by what it is
+waiting for**: `Next` (a decision), `Known, waiting for a caller` (a use case),
+`Open questions` (an argument), `Measurements outstanding` (a number, as a
+table row naming the run), `Waiting on upstream` (somebody else's commit, as a
+table row naming the pin it was last checked at). The first three group by
+module. The other rules live in the roadmap itself, under
 [How this file is written](docs/roadmap.md#how-this-file-is-written), which is
 the canonical copy rather than a summary of this paragraph. The two that get
 forgotten: every entry opens with its whole claim in bold, and every entry
-closes with a `Waiting on:` line from a fixed list. That closing line is what
-makes a blocker that has quietly stopped being one findable, which this
-repository has needed four times.
+closes with one line — `Needs:` or `What would settle it:` — saying what to
+bring. That closing line is what makes a blocker that has quietly stopped being
+one findable, which this repository has needed four times.
 
 **`docs/history.md` stays short, and that is a constraint rather than a wish** —
 it gains an entry every stage forever, so left alone it becomes the longest file

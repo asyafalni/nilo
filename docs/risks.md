@@ -1,15 +1,13 @@
 # The standing risks, and what holds them
 
 What could go wrong that is not a bug and not a feature, and what stands in the
-way of each. A record rather than a plan: nothing here is waiting on anything,
-which is why it is not in [the roadmap](./roadmap.md). The risks that *are*
-still open, with no mechanism under them yet, stay there under
-[Open](./roadmap.md#open), and an entry moves from that list to this file when
-something is built that holds it.
-
-Two groups. The first is held by a mechanism with a test under it; the second
-cannot be held in this language and is said out loud instead, which is the
-whole of what can be done about it.
+way of each. Three groups. The first is held by a mechanism with a test under
+it; the second cannot be held in this language and is said out loud instead,
+which is the whole of what can be done about it; the third is
+[still open](#open), with no mechanism under it yet, and an entry moves from
+that list to the first when something is built that holds it. The open ones
+are the only part of this file that is work, and [the roadmap](./roadmap.md)
+points here rather than repeating them.
 
 ## Held by something
 
@@ -38,9 +36,9 @@ byte values under an `application/json` label, while the generated document
 described it as a string
 ([ADR 0103](./adr/0103-one-file-decides-what-counts-as-text.md)). The tests did
 not catch it because every value in them was a type somebody sat down and
-wrote. One case is still open — a byte slice that is not valid UTF-8 — and it is
-a gap on [the roadmap](./roadmap.md#nilo_http-the-server) rather than a
-risk here.
+wrote. The one case that was still open after it — a byte slice that is not valid
+UTF-8 — went the same way, as the array of byte values `std.json` writes
+([ADR 0121](./adr/0121-a-byte-that-is-not-text-is-not-a-string.md)).
 
 **Deadlines are on by default, so a client on a genuinely bad link could be cut
 off where it used to be served.** The numbers are generous and each bounds one
@@ -128,3 +126,21 @@ function, in the reference and in
 takes its arguments by value so the copy is at least the obvious thing to
 write. A `Str` that escapes this way is the staleness trap's problem, and it is
 the case that trap cannot watch.
+
+## Open
+
+No mechanism holds these yet. Each says what it needs; until that arrives the comment at the site is what there is.
+
+**A fail function in spawned work is safe only because of where a threadlocal gets written.** `bulkhead.slot()` falls back to a threadlocal when a fiber has no slot, which spawned fibers never do. It is null on executor threads only because the one thing that sets it does so from inside `zio.blockInPlace`, which runs on a thread-pool worker. Both ends carry a comment saying so. Nothing enforces it, and if it broke, spawned work would write its message into an unrelated request, which is [ADR 0007](./adr/0007-failure-box-bound-to-the-fiber.md)'s leak by another route.
+
+**Needs:** a design that makes it a rule rather than a comment.
+
+**Nothing checks that a completion handed to the loop is given back before its frame goes.** `Wake` submitted two and never did, and the cost was a server that would not come back from a SIGTERM three runs in four ([ADR 0098](./adr/0098-a-completion-the-loop-holds-outlives-the-frame-that-submitted-it.md)). What makes it a standing risk rather than a closed bug is that the fix is one `defer` and the next `submit` anybody writes is under no obligation to match it.
+
+The failure gives nothing away at the place it happens: the loop writes into memory that has been handed on, and what arrives is a spinning thread somewhere else entirely, after a shutdown that has already logged success. Only the Engine may name zio, so the whole surface is one file — but one file is what the threadlocal entry above says too.
+
+**Needs:** a design that makes it a rule rather than a `defer` somebody has to remember. This particular one is guarded — a test in the Engine parks a `Wake` and checks the queue is empty after `deinit` — but the guard names `Wake`, and the next `submit` will not be in `Wake`.
+
+**`zio.BroadcastChannel` aborts, or in `ReleaseFast` deadlocks, when a fiber parked in `receive` is cancelled.** Not used here, reported upstream with a standalone reproduction, and **fixed upstream** in zio `ab6873eb` with a fresh `Waiter` per receive attempt. A waiter node was pushed onto a queue it was already linked into (`simple_queue.zig:43`, from `broadcast_channel.zig:72`). Debug aborted 10 runs in 10, ReleaseSafe 3 in 3, and `ReleaseFast`, which has no such assertion, **hung 17 runs in 20** where a clean run takes 200ms. Cancellation was what reached it: the same program closing the channel and waiting was clean 5 in 5 ([zio#667](https://github.com/lalinsky/zio/issues/667)).
+
+**Needs:** the pin to move: v0.17.0 predates the fix and is what `build.zig.zon` holds, so it arrives whenever nilo next moves it. Nothing here depends on it.

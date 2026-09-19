@@ -1,0 +1,131 @@
+# Decided
+
+What nilo has decided, so it is not decided twice. Three kinds of thing are in here, and none of them is work: a gap that was looked at and **accepted** as the rule rather than as debt, a question that was **answered** in a line and kept so nobody re-derives it, and a feature that is **not coming**, with the reason. What is still open is in [`roadmap.md`](./roadmap.md); the decisions that are binding on the code are in [`adr/`](./adr/), and an entry here that grows past a screen is one of those.
+
+An entry leaves this file only by being reopened, and every entry says what would do that. Bring that, not the patch.
+
+## Accepted
+
+A gap that is the rule. Each was looked at, priced, and kept as it is, and the entry says what it would take to look again.
+
+### `nilo_core`
+
+**The layering step cannot tell a test import from a real one.** `zig build layering` refuses an import that is not in that module's row of the `layers` table, and `sql/db.zig` legitimately names `nilo_http` from a `test` block. Telling the two apart needs a parser rather than a scan, so the table has an `in_tests` list the step allows and does not verify. A rule with a listed exception still beats a rule in a document. This is the part of it that is weaker than the rest.
+
+**Reopened by:** the exception list getting long enough to hide something.
+
+### `nilo_config`
+
+**`config.Env` is POSIX only.** It reads the environment block where it lies, which is what makes the whole module allocate nothing, and Windows moves that block. `config.Map` is the portable half and takes the `environ_map` that `std.process.Init` already hands to `main`, so nothing is unreachable. It just costs the map, and the `@compileError` on `Env.get` says which to use rather than letting the failure come out of the standard library.
+
+**Reopened by:** nothing on its own. The allocation-free property is worth more than one uniform call.
+
+### `nilo_job`
+
+**Nothing sweeps finished rows.** `Table.sweep(scope, before)` deletes `done` rows older than a moment, and nothing calls it: a program that wants the table small runs it from a scheduled job of its own. Written down so nobody is surprised by a table that only grows.
+
+**Reopened by:** somebody who would rather have a `keep_done_s` setting than a three-line job.
+
+### `nilo_http`
+
+**A `print` or `json` message bigger than the write buffer is still unchecked.** [ADR 0097](./adr/0097-a-frame-that-lies-about-its-length-is-not-sent.md) holds the two passes to each other by reading `Writer.end`, which is exact only while nothing drains. Past the write buffer a drain moves it and there is nothing left to compare against, so a large formatted message can still put a length on the wire that its bytes do not match.
+
+**Reopened by:** nothing on its own. The two calls are for the small structured messages a WebSocket carries, and the alternatives — a wrapper writer on every byte, or a third pass over the arguments — both cost more than the shape they would guard.
+
+**The API description names one failure, and endpoints have several.** `!?T` puts a 404 in the document because the signature settles it ([ADR 0024](./adr/0024-a-failure-mode-belongs-in-the-return-type.md)). A `fail.conflict` on a duplicate email is a line in a function body and stays invisible. That is the rule rather than a gap, since the document promises what the signature settles, but it is the rule that costs the most. Widening it means a second place to write a failure down, which is an annotation wearing another name and is the one thing this framework does not ask for.
+
+**Reopened by:** a shape that states a failure *in the type*. Wanting one does not.
+
+### `nilo_sql`
+
+**A Row left out of the `checking` list is not checked, and nothing says so.** A `Db` with no list at all warns now ([ADR 0262](./adr/0262-a-db-with-no-schema-check-says-so-or-is-told.md)); a list with one Row missing from it is still silent for that Row, because Zig cannot enumerate the Rows a program declares and there is nothing to compare the list against. One `sql.Schema` handed to `checking`, the migrations tool and `createMissing` is the answer ([ADR 0253](./adr/0253-a-schema-is-one-value-and-the-tool-owns-the-order.md)): a Row the tool does not know about has no table either, which is found the first time a migration is generated.
+
+**Reopened by:** nothing on its own.
+
+---
+
+## Answered, and kept to one line each
+
+Every row has a design that is known and nobody who needs it, or a decision that has been made. They are rows rather than paragraphs because none of them is work until the last column happens.
+
+### `nilo_id`
+
+| Claim | The answer today | What reopens it |
+|---|---|---|
+| Only UUID v4 and v7 are here; ULID, nanoid, Snowflake, and the v3/v5 name hashes are not | UUID is here because a database column has that type, and a module holding every identifier is a catalogue rather than a decision; v3 and v5 would also make it carry MD5 and SHA-1 | the argument UUID had: a column, a wire format, or a system that requires the shape |
+
+### `nilo_config`
+
+| Claim | The answer today | What reopens it |
+|---|---|---|
+| A setting cannot be marked secret, so a `report` could print `PGPASSWORD=…` | nothing in the module logs a Config, so there is nothing to redact | the first thing that logs one |
+
+### `nilo_pw`
+
+| Claim | The answer today | What reopens it |
+|---|---|---|
+| `std.crypto.pwhash.argon2` does its 16-word permutation one word at a time; as four `@Vector(4, u64)` lanes the same hash is **11.19 ms instead of 13.78**, and 8.98 out of `pw.huge_pages`, byte-identical | upstream's to take; nilo will not carry a copy of somebody else's crypto to get it ([ADR 0049](./adr/0049-a-hash-asks-for-the-pages-it-walks.md)) | somebody sending `std` the patch |
+
+### `nilo_jwt`
+
+| Claim | The answer today | What reopens it |
+|---|---|---|
+| A `kid` miss fetches the key set rather than refusing | `jwt.Keyring` bounds that fetch to one an interval ([ADR 0255](./adr/0255-a-key-set-is-swapped-whole-and-freed-after-its-readers.md)), and a caller who wants a miss refused calls `verify` rather than `verifyOrRefresh` and decides | two callers writing the same refusal policy; one is a caller, not a pattern |
+
+### `nilo_http`
+
+| Claim | The answer today | What reopens it |
+|---|---|---|
+| A response whose text is not ASCII pays a byte-at-a-time UTF-8 walk: 10ns for the 365-byte payload `bench/` measures, 2,404ns for a kilobyte of `é` ([ADR 0121](./adr/0121-a-byte-that-is-not-text-is-not-a-string.md), [`http.md`](../bench/result/http.md)) | `std.json` pays the same; a Keiser–Lemire validator is the fix | a caller whose payloads are mostly not ASCII |
+| `Room.handOut` holds the roster lock for a whole broadcast, so `join` and `leave` queue behind it | shortening the hold means draining in `takeSeat` as well, and nothing measures a Room under load: `bench/ws_server.zig` runs the chat loop with the room taken out | a harness that contends for the lock |
+| A service argument is found by scanning the registry per request: 1.2ns an entry, 1.6% of a request at four services, 13.4% at thirty-two ([`http.md`](../bench/result/http.md)) | under [ADR 0001](./adr/0001-dx-wins-below-the-10-percent-threshold.md)'s bar for every app in `examples/`; resolving it into the route at `listen()` is the fix | a caller with more than about sixteen services |
+| A megabyte assembled in the arena is retained per connection, and a per-thread block cache read as worth 10,229 → 14,365 req/s | it cannot be built as described: a block recycled while an `io_uring` send still names it corrupts that response, and the number was taken on an L3 this box does not have ([history](./history.md#the-control-was-doing-work-the-route-it-was-subtracted-from-never-did)) | a rule for when a block is safe to recycle, which is [ADR 0004](./adr/0004-request-arena-and-the-str-type.md)'s territory |
+| The API description costs +14 KB on hello and +34 KB on rest whether or not `docs()` is called ([ADR 0017](./adr/0017-the-api-description-comes-from-the-signatures.md)) | accepted: 14 KB does not buy a line in every dependent's `build.zig`; it rides along if a third build option ever lands | nothing on its own |
+| The logged duration of a streamed response is its lifetime, not its latency | one line per request is the contract; time to first byte is a different number | a caller who needs time to first byte |
+| A listener somebody else opened cannot be taken over, so a deploy with nothing in front drops connections in flight | `unix:` addresses ship ([ADR 0130](./adr/0130-a-path-is-an-address-to-listen-on.md)); an inherited descriptor is one more `address` variant in the Engine, plus a naming protocol (`LISTEN_FDS` or a bare number) | a caller with no proxy in front, saying which spelling their supervisor uses |
+| `Forwarded` (RFC 7239) is not read, only the `X-` headers are ([ADR 0112](./adr/0112-a-request-can-be-read-past-the-parts-a-handler-names.md)) | nginx, HAProxy, Envoy, the cloud balancers and Cloudflare all send the `X-` headers | a proxy that writes `Forwarded` and nothing else |
+| A cookie cannot be bound to a handler argument the way a header can ([ADR 0163](./adr/0163-a-header-a-handler-can-be-given.md)) | `Session(T)` owns the one cookie most programs read; a bare cookie is `c.cookie` and a convert | the cookie half at the scale the header half was built for |
+| Every method nilo does not name is `.other`: `PROPFIND`, `PURGE`, `LINK`, `CONNECT` and `TRACE` are one tag | a method carrying its own text costs a string compare on the request path that an enum tag does not | WebDAV, a cache purge, or an internal API that needs two of them apart |
+| Rotating the session secret signs everybody out at once | correct and blunt; better means a second key and a policy for how long to keep it | somebody who actually rotates |
+| A sealed cookie cannot be revoked, so "sign out everywhere" is not in the mechanism | a version number in the session checked against the row the handler fetches anyway ([guide](./guide/sessions.md#what-it-cannot-do)); anything further is the store [ADR 0035](./adr/0035-a-session-is-sealed-into-the-cookie.md) declined | an argument that nilo should have more of an opinion than that |
+| `If-Modified-Since` is never answered, only `If-None-Match` and `If-Range` | every browser and CDN made this century sends an ETag, and two validators are two answers that have to agree | a client that sends only the date |
+| A route cannot be scoped by host; `useOn` and `group` scope by path | two processes behind the proxy, which is a good answer | a deployment that cannot put two processes behind the proxy |
+| Of Fiber's thirty-two middleware, eight are neither queued here nor a typed argument: `favicon`, `etag`, `cache`, `responsetime`, `redirect`, `rewrite`, `proxy`, `skip` | each is three to ten lines against nilo's own middleware shape, which is the argument on both sides | an application that wrote one of the eight wrong |
+
+
+### `nilo_sql`
+
+| Claim | The answer today | What reopens it |
+|---|---|---|
+| `db.watching` shows the statement, the plan, the duration and the rows, and not the values it bound ([ADR 0137](./adr/0137-a-statement-can-be-watched.md)) | the decision rather than the gap: bound values are personal data in a log | a second flag whose name says it puts personal data in a log, designed rather than defaulted |
+| SQLite stores a `Timestamp` as an integer and there is no way to ask for text ([ADR 0136](./adr/0136-a-timestamp-is-checked-against-the-column-it-is-bound-into.md)) | a `time_form` beside `uuid_form` is the shape, and [ADR 0159](./adr/0159-what-a-server-prints-it-can-read.md) already gave `Timestamp` the RFC 3339 parser it needs | a caller with a SQLite file whose times are RFC 3339 text |
+| An upsert cannot name a constraint (`ON CONFLICT ON CONSTRAINT …`), a partial index (`… WHERE deleted_at IS NULL`) or a `DO UPDATE … WHERE` | `db.raw`, which cannot express `RETURNING` into a Row plus a conflict target without giving up the column check; a constraint name is a string this module would have to take on trust, which is the one place it takes nothing on trust | a caller, and the soft-delete uniqueness case is the one most likely to be it |
+| `db.raw` is routed to the reader or the writer by its first keyword ([ADR 0074](./adr/0074-one-writer-is-not-a-setting-it-is-the-database.md)), and a wrong guess fails loudly on a file and silently on `:memory:`, where SQLite's URI `mode=` outranks the open flags | refusing a bare `:memory:` at `open` stands in for the missing backstop | a design for the in-memory case, which is exactly the one a test suite reaches for first |
+
+---
+
+## Not coming
+
+Not "later". Decided against, with the reasoning written down. This list is about the repository, so it is what to check before proposing a change, whichever module the change is in.
+
+**Templates.** nilo is for building APIs and services, and rendering a page is the thing it is not for. Two arguments point the same way. Rendering means producing a string per request, which is an allocation per request, which is the one axis [ADR 0018](./adr/0018-the-trade-budget-has-three-axes.md) treats as a hard invariant rather than a budget: the 4,669 bytes and the single allocation are what nilo has to sell, and a template layer spends both. And the two shapes Zig actually offers are far apart with nothing argued for in between, comptime-checked templates being a compiler of their own and runtime string interpolation being a worse `std.fmt`. [jetzig](https://www.jetzig.dev/) is built for that job and does it with zmpl, which is a better outcome for everybody than a second half-answer here.
+
+A `<form>` posted to a handler still works. [`examples/forms`](../examples/forms/) is that, and `Bound(Form(T))` is what makes its failures legible ([ADR 0036](./adr/0036-a-binding-hands-its-failures-to-the-handler.md)). **This is a refusal of templates, not of everything on that side of the line.** Whether some other convenience from the batteries-included world earns its place gets decided one feature at a time, against the two numbers above.
+
+**A serialiser for anything but JSON: XML, CSV, MsgPack, ProtoBuf.** Gin ships four and Fiber three, and nilo ships a declaration instead: a type carrying `nilo_content_type` and `nilo_write` goes out as whatever it writes, under its own label, and the document names it ([ADR 0195](./adr/0195-a-type-can-write-its-own-answer.md)). What is refused is the reflection — a struct turned into XML elements by a rule nilo picked — because XML has namespaces, attributes and a dozen date encodings, and the consumer who needs XML is by definition the one who will not change to suit nilo's pick. The same goes for CSV's quoting and MsgPack's schema. The bytes are the caller's; the label and the description are what nilo adds.
+
+**A config file parser: TOML, YAML, or any other.** `nilo_config` reads the environment and hands `Fixed` to a program that has parsed something itself ([ADR 0043](./adr/0043-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)). Writing one means weeks to reach where somebody else already is, and depending on one means every project importing the module fetches it. For TOML that somebody is [sam701/zig-toml](https://github.com/sam701/zig-toml): about 2,000 lines, arena-backed, already on 0.16's `std.Io`. For YAML there is no finished answer to depend on, and that is the argument rather than a gap. [kubkon/zig-yaml](https://github.com/kubkon/zig-yaml) skips 322 of the roughly 400 cases in the official suite, written by a Zig core contributor, and a partial YAML parser misreads real files quietly instead of refusing them.
+
+`config.Dotenv` is not the exception it looks like. It takes *text*, opens no file, and needs no dependency at all ([ADR 0064](./adr/0064-a-dotenv-is-text-somebody-else-read.md)). What the module refuses is the filesystem, and a format whose parser somebody else has to maintain.
+
+**A `recover` middleware.** Zig cannot recover from a panic at all, so there is nothing to build ([ADR 0008](./adr/0008-no-recover-middleware.md)).
+
+**TLS, and with it HTTP/2 and a gRPC server.** Terminated in front, and that is the answer rather than the plan ([ADR 0028](./adr/0028-tls-is-terminated-in-front.md)). Zig's standard library can be a TLS client and not a TLS server, nobody in the comparison wrote their own, and the two alternatives are a one-person crypto dependency or a C toolchain in the install story. HTTP/2 and gRPC are said out loud because nobody derives them from "no TLS". `Ctx.clientIp()` and `.trusted_hops` are this decision's other half.
+
+**An ORM.** `nilo_sql` is not one and the name is the promise. No change tracking, which costs a copy of every row. No lazy relations, which are queries nobody wrote. No identity map, which is a lifetime problem in a language with no garbage collector ([ADR 0039](./adr/0039-the-shape-of-a-query-is-settled-while-compiling.md)).
+
+**Auth contents.** The mechanism is provided, in middleware and resolved values. The policy is yours.
+
+**Benchmark claims without a benchmark machine.** A figure gets published only alongside what it does *not* mean, and alongside the fact that a handler touching a database flattens the whole comparison ([ADR 0001](./adr/0001-dx-wins-below-the-10-percent-threshold.md)).
+
+---

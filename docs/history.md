@@ -3420,7 +3420,7 @@ declaration lazily, and the step compiles each block as an object with nothing
 referencing it, so `pub const nilo_table` is read by nobody and every comptime
 check the marker is made of is skipped. Adding `comptime { _ = tablesOf(…) }` to
 the block turned the same text into nilo's refusal. The guide is full of blocks
-of exactly that shape; the standing risk in `roadmap.md` is the general form.
+of exactly that shape; the standing risk in `risks.md` is the general form.
 
 **A generated file nothing compiles is a file whose shape is unchecked.** The
 migrations tests write version files into a temporary directory and read them

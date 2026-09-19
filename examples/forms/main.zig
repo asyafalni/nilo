@@ -304,7 +304,7 @@ fn writeField(w: *std.Io.Writer, comptime name: []const u8, value: []const u8) !
 /// Twelve lines rather than a dependency, and **not optional**: `age` goes
 /// back to the page as whatever was typed, and what was typed may be
 /// `<script>`. nilo has no template layer to do this for you and is not
-/// getting one ([the roadmap](../../docs/roadmap.md#not-coming) says why), so
+/// getting one ([`decided.md`](../../docs/decided.md#not-coming) says why), so
 /// it is yours to remember — and this is what remembering it looks like.
 fn writeEscaped(w: *std.Io.Writer, text: []const u8) !void {
     for (text) |ch| switch (ch) {

@@ -109,7 +109,7 @@ paragraph pointing at `std.crypto`:
 | `error.NoExpiry`, `error.Expired`, `error.NotYetValid` | `exp` missing, `exp` passed, `nbf` not arrived | 401 |
 | `error.WrongIssuer`, `error.WrongAudience` | `iss` or `aud` is not what you named | 401 |
 | `error.ClaimsNotReadable` | the signature passed and the payload does not fit your struct | 401 — or a 500 if the struct is the thing that is wrong |
-| `error.KeySizeNotSupported` | a modulus that is not 2048, 3072 or 4096 bits | 500, and a caller on the [roadmap](../roadmap.md#nilo_jwt-checking-somebody-elses-token) |
+| `error.KeySizeNotSupported` | a modulus that is not 2048, 3072 or 4096 bits | 500, and a caller on the [roadmap](../roadmap.md#known-waiting-for-a-caller) |
 | `error.CurveNotSupported` | an EC key whose `crv` is not `P-256` | the same 500, and the same roadmap entry |
 | `error.SignatureWrongLength` | a signature that is not the size of its key — for ES256, sixty-four bytes of `r \|\| s` | 401. If it is *your* test token, the signer wrote DER — [below](#es256-and-the-shape-of-the-signature) |
 | `error.KeyNotUsable` | the set carried a key the arithmetic cannot use: an even exponent, a coordinate that is not on the curve | 500 — the document is wrong, and no token will pass |
@@ -121,11 +121,13 @@ answer is `NoSuchKey`, because it is what a key rotation looks like from here.
 
 ## Where the keys come from
 
-**Fetching the key set is yours** — deliberately, because it is an HTTPS GET
-that [`nilo_fetch`](./fetch.md) already sends, and *when* to fetch it again is
-a policy with more than one right answer
-([roadmap](../roadmap.md#nilo_jwt-checking-somebody-elses-token)). What the
-module does is read the document:
+**The client that fetches the key set is yours** — deliberately, because it
+is an HTTPS GET that [`nilo_fetch`](./fetch.md) already sends, and this module
+imports nothing. A `Keyring` takes that client, fetches at startup, and fetches
+again on an unknown `kid` at most once an interval; whether a miss should
+refuse instead is `verify` rather than `verifyOrRefresh`, and yours to pick
+([decided](../decided.md#answered-and-kept-to-one-line-each)). What the module
+does with the document is read it:
 
 | | |
 |---|---|
@@ -385,7 +387,7 @@ and the nonce. Signing is absent because a server issuing its own sessions has
 [`Session(T)`](./sessions.md) and needs no token; HS256 is absent because a
 module verifying both a shared secret and a public key has to defend against
 the confusion attack that a module verifying one cannot commit
-([roadmap](../roadmap.md#nilo_jwt-checking-somebody-elses-token)). The rest is
+([roadmap](../roadmap.md#known-waiting-for-a-caller)). The rest is
 the sign-in flow — redirecting to the provider, exchanging a code — which is
 yours.
 
