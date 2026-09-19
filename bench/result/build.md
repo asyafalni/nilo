@@ -299,14 +299,24 @@ reproduction is `zig build-exe main.zig -lc -fincremental` on 0.16.0, and
 the same file without `-lc`, or with `-fllvm`, runs. Every nilo server
 links libc through zio.
 
+One save, listed file by file: exactly one new file in the cache,
+`.zig-cache/o/<hash>/example-hello` at 27.2 MB (the 23 MB above is `du`'s
+block count), and nothing else grows — the manifest under `h/` is rewritten
+in place. Deleting a previous build's directory and reverting the source to
+it rebuilt into the same directory, so the runner deletes them after each
+restart: an edit, its undo, the edit and the undo again left the cache
+0.0 MB larger, with one such directory at every step.
+
 **What it changed:** the runner watches the build's output rather than the
-sources and runs one `zig build --watch` rather than one per change;
-`--incremental` is a flag rather than the default, and asks for LLVM; the
-roadmap carries the third row as an upstream gap.
+sources and runs one `zig build --watch` rather than one per change, and
+deletes the previous build's directory after each restart; `--incremental`
+is a flag rather than the default, and asks for LLVM; the roadmap carries
+the third row as an upstream gap.
 
 **Can it go further:** the 0.12 s row is the number, and it is Zig's to
 reach — the new ELF linker learning libc, or incremental state surviving
-under the old one. The 23 MB per save on the default path is Zig's cache
-policy and not nilo's to move. On this machine the LLVM row is bounded by
+under the old one. The 27 MB written per save on the default path is the
+Debug binary and is Zig's to shrink; what nilo could do about it, delete
+it afterwards, it does. On this machine the LLVM row is bounded by
 LLVM emit on two cores and should divide by the core count elsewhere; that
 is a guess until somebody runs it on the sixteen-core box in the header.

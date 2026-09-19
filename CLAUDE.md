@@ -156,7 +156,7 @@ bash bench/compare-cache/run.sh          # nilo_cache against go-cache — needs
 zig build run          # the benchmark server (bench/main.zig): GET /users/:id, ~1 KB JSON
 zig build profile      # where the time inside one request goes
 zig build run-{hello,rest,orders,forms,spa,stream,chat,scheduled,outbound}  # run one example
-zig build dev-{hello,…}  # the same, restarted on every save; `-- --incremental -Dllvm` keeps .zig-cache flat (ADR 0259)
+zig build dev-{hello,…}  # the same, restarted on every save, stale builds pruned from .zig-cache (ADR 0259)
 ./bench/bench.sh       # wrk/oha against an already-running ReleaseFast server
 ```
 

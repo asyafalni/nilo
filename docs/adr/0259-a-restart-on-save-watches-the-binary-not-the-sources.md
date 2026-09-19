@@ -65,6 +65,25 @@ found the first time it was tried.
 same stamp, 250 ms apart, before a restart, so a binary still being copied
 is not started half way through.
 
+**After every restart the stale builds are deleted.** One save leaves
+exactly one new file in the cache — `.zig-cache/o/<hash>/<exe>`, the whole
+Debug binary, 27 MB for `examples/hello` and the size of the program for
+anything else — and Zig never removes it. So once the new server is up
+the runner walks `o/`, keeps the one directory whose copy of the binary is
+byte for byte the one it just started, and deletes every other directory
+holding a file of that name. Four saves that alternated an edit and its
+undo left the cache 0.0 MB larger, with one directory in it at every step.
+
+Deleting is safe because the directory's name is a hash of the build's
+content: an undo back to the previous version does not hit a manifest
+whose output is gone, it rebuilds into the same directory — which was
+tried before it was relied on, by deleting a build's directory, reverting
+the source to it, and building. It runs after a restart and not at the
+first start, because at a restart the build has just finished writing and
+is idle, and at the first start it is running. It does not run under
+`--incremental`, where the one directory is patched in place and nothing
+is stale. `--keep-cache` turns it off.
+
 **`--incremental` is opt-in, and on Zig 0.16.0 it wants LLVM.** This is the
 row of the table that was most surprising, and the reason the flag is not
 the default:
@@ -89,10 +108,11 @@ the cache at zero growth, and asks for `exe.use_llvm = true` beside it —
 `-Dllvm` for nilo's own examples. A server that dies within a second of
 starting under `--incremental` gets a message naming that fix.
 
-**The default is the 23 MB row**, because it is the one that works with
-nothing else set, on the backend the loop already runs on (ADR 0170). The
-person who cares about the disk more than the four seconds turns the flag
-on; the person who never reads the flag gets a server that restarts.
+**The default is the 23 MB row with the 23 MB deleted afterwards**,
+because it is the one that works with nothing else set, on the backend the
+loop already runs on (ADR 0170), and pruning brings its cache cost to what
+the incremental row's is. What the flag still buys is the compile time on
+a machine with the cores for LLVM; on this one it does not.
 
 ## What it costs
 
@@ -100,8 +120,8 @@ Against ADR 0018's axes: nothing. Not one byte of `nilo_http` changes;
 `nilo-dev` is an executable nobody imports. What it costs the machine:
 
 - **Per save, default:** one compile of the changed module, 2.8–3.6 s here,
-  and 23 MB of `.zig-cache` that stays until somebody deletes the
-  directory.
+  27 MB written to `.zig-cache` and the previous 27 MB deleted after the
+  restart — a read of the new binary to compare it, and one `rm -rf`.
 - **Per save, `--incremental`:** an LLVM emit, 4.8 s to a served response
   here, and 0 MB.
 - **Resident:** the build runner and, under `--incremental`, one compiler
@@ -130,11 +150,19 @@ upstream, because it is the number this loop wants to be.
 announced before the build finished. Nothing to announce: the server keeps
 serving until there is a new one.
 
+**A cache directory of the loop's own**, `--cache-dir .zig-cache/dev`,
+pruned whole on exit. Race-free by construction, and a second copy of
+everything the shared cache already holds — a cold build per machine, and
+hundreds of megabytes standing where the per-save leak was 27. Pruning by
+name in the shared cache touches only directories holding a copy of the
+one binary this loop serves, and a concurrent build of that same binary is
+the one thing nobody runs beside its dev loop.
+
 ## Consequences
 
 - `dev/main.zig`: `nilo-dev`, with `--zig`, `--build`, `--incremental`,
-  `--trace`, `-D…` pass-through, and `-- <server args>`; `dev` in
-  `build.zig.zon`'s `.paths` and in `shipped_roots`.
+  `--keep-cache`, `--trace`, `-D…` pass-through, and `-- <server args>`;
+  `dev` in `build.zig.zon`'s `.paths` and in `shipped_roots`.
 - `zig build dev-<example>` for each example, `zig build example-<name>` to
   build one, `-Dllvm` for the examples, `zig build test-dev` on `test`.
 - The guide's getting-started page gains the three lines; the roadmap loses

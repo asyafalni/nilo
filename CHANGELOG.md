@@ -167,11 +167,14 @@ where it was made.
   again whenever the binary it writes changes — a build that fails prints
   its errors and leaves the old server serving. Ships as
   `nilo.artifact("nilo-dev")`, three lines in a dependent's `build.zig`;
-  imports `std` and nothing of nilo's, so no server links it. The default
-  rebuild is 2.8 s and 23 MB of `.zig-cache` per save on the machine it was
-  measured on; `--incremental` keeps the cache flat and, on Zig 0.16.0,
-  needs `exe.use_llvm = true` beside it — the self-hosted backend's
-  incremental binary does not run when libc is linked
+  imports `std` and nothing of nilo's, so no server links it. A save
+  writes the whole binary into `.zig-cache` and Zig keeps every one, so
+  after each restart the runner deletes the directories holding earlier
+  builds of the binary it serves — four saves left the cache 0.0 MB larger
+  — and `--keep-cache` leaves them. `--incremental` keeps the compiler
+  resident instead and, on Zig 0.16.0, needs `exe.use_llvm = true` beside
+  it — the self-hosted backend's incremental binary does not run when
+  libc is linked
   ([ADR 0259](./docs/adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
 - **`nilo.Versioned(T)`**: `T` with a `u64` version the handler names,
   sent under a weak `ETag` — `W/"1a"` — and answered **304** with no body

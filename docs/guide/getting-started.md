@@ -162,12 +162,18 @@ server is asked with SIGTERM and gets five seconds to finish what it was
 answering before it is killed. Ctrl-C stops all of it. Arguments after `--`
 go to your server; `--build <step>` names a build step other than `install`.
 
-**What a save costs is Zig's to decide, and on 0.16.0 it is 23 MB of
-`.zig-cache` every time**, because the cache evicts nothing. `--incremental`
-keeps the compiler resident and the cache flat instead — and on 0.16.0 its
-output only runs under the LLVM backend when libc is linked, which every nilo
-server does through zio. So the flag goes with one more line in `build.zig`,
-and costs an LLVM emit per save rather than a self-hosted compile:
+**Every save writes a whole new binary into `.zig-cache`, and Zig never
+deletes the old one** — 27 MB a save for the smallest example, the size of
+your program for yours. So after each restart `nilo-dev` deletes the cache
+directories holding earlier builds of the binary it serves, and nothing else:
+four saves in a row left the cache 0.0 MB larger. Undo is safe — a build back
+to a version it deleted is rebuilt, not looked up. `--keep-cache` leaves them.
+
+`--incremental` is the other route to a flat cache: the compiler stays
+resident and patches what it already made, so a rebuild is milliseconds where
+the cores allow. On 0.16.0 its output only runs under the LLVM backend when
+libc is linked, which every nilo server does through zio, so the flag goes
+with one more line in `build.zig` and costs an LLVM emit per save:
 
 ```zig
 exe.use_llvm = true; // or behind a -D option, for the dev loop only
@@ -178,7 +184,7 @@ $ zig build dev -- --incremental
 ```
 
 The numbers behind both paragraphs — 0.12 s for an incremental binary that
-did not run, 23 MB a save for one that did — are in
+did not run, 27 MB a save for one that did — are in
 [`bench/result/build.md`](../../bench/result/build.md#what-a-restart-on-save-costs-per-save).
 Files served by `staticWith(.{ .reload = true })` need none of this: they are
 read from disk per request already
