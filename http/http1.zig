@@ -146,11 +146,16 @@ pub fn readRequest(in: *std.Io.Reader) !Request {
 /// Discard a request body nobody read, so the keep-alive connection is
 /// clean for the next request.
 ///
-/// `limit` bounds a chunked body only: a Content-Length body announces its
-/// own size up front, while a chunked one could otherwise be streamed at us
-/// forever by a client that has worked out we will sit here reading it.
+/// `limit` bounds both framings. A chunked body could be streamed forever by
+/// a client that has worked out we will sit here reading it; a Content-Length
+/// body over the limit would be read in full only to be thrown away, as many
+/// bytes as a stranger cared to announce — where `max_body` caps every other
+/// way a body arrives (ADR 0020). Both are `error.BodyTooLarge`, and the
+/// caller closes the connection rather than serving the next request behind a
+/// body nobody asked for.
 pub fn discardBody(in: *std.Io.Reader, r: *const Request, limit: u64) !void {
     if (r.chunked) return discardChunkedBody(in, limit);
+    if (r.content_length > limit) return error.BodyTooLarge;
     if (r.content_length > 0) try in.discardAll64(r.content_length);
 }
 
@@ -252,8 +257,11 @@ pub fn discardChunkedBody(in: *std.Io.Reader, limit: u64) !void {
     while (true) {
         const size = try readChunkSize(in);
         if (size == 0) break;
+        // Checked before it is added, not after: `seen + size` on a size the
+        // client chose overflows u64, which panics in a safe build and wraps
+        // past the limit in a fast one. `readChunkedBody` guards the same way.
+        if (size > limit - seen) return error.BodyTooLarge;
         seen += size;
-        if (seen > limit) return error.BodyTooLarge;
         try in.discardAll64(size);
         try endOfChunk(in);
     }
@@ -265,9 +273,27 @@ pub fn discardChunkedBody(in: *std.Io.Reader, limit: u64) !void {
 pub fn readChunkSize(in: *std.Io.Reader) !u64 {
     const line = takeLine(in) catch return error.BadChunk;
     const end = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
-    const digits = std.mem.trim(u8, line[0..end], " \t");
-    if (digits.len == 0) return error.BadChunk;
-    return std.fmt.parseInt(u64, digits, 16) catch error.BadChunk;
+    return hexOnly(line[0..end]) orelse error.BadChunk;
+}
+
+/// A chunk size, strictly `1*HEXDIG` as RFC 9112 §7.1 writes it.
+///
+/// `std.fmt.parseInt(…, 16)` is too generous for a stranger's framing: it
+/// takes a leading `+`, and it ignores `_`, so `1_0` reads as 16. Trimming
+/// spaces first — which this used to do — takes ` 5` and `5\t` as well. A
+/// front end that reads any of those differently frames the body at another
+/// length, which is where a smuggled request travels — the same disagreement
+/// `digitsOnly` keeps a `Content-Length` from, one framing over. The checked
+/// arithmetic refuses a size too long for u64 rather than wrapping it.
+fn hexOnly(text: []const u8) ?u64 {
+    if (text.len == 0) return null;
+    var n: u64 = 0;
+    for (text) |c| {
+        const d = std.fmt.charToDigit(c, 16) catch return null;
+        n = std.math.mul(u64, n, 16) catch return null;
+        n = std.math.add(u64, n, d) catch return null;
+    }
+    return n;
 }
 
 /// A chunk's data is followed by its own CRLF. Anything else means the
@@ -530,6 +556,11 @@ pub fn parseHead(head: []const u8, r: *Request) ParseError!void {
                 // colon at all — found by `fuzz.zig`, which had nilo
                 // ignoring it and every reference parser refusing it.
                 if (colon <= line_start or colon >= end) return error.BadHeader;
+                // No whitespace between the field name and the colon (RFC 9112
+                // §5.1). `Name : value` a front end reads leniently as
+                // `Name: value` while nilo drops it is a framing disagreement,
+                // so it is a 400 rather than a line that is quietly ignored.
+                if (head[colon - 1] == ' ' or head[colon - 1] == '\t') return error.BadHeader;
                 // Five headers matter and between them they start with four
                 // letters, so one compare throws out Accept, User-Agent and the
                 // rest before their name is even measured. `e` is here for
@@ -686,6 +717,9 @@ pub fn applyHeader(line: []const u8, r: *Request) ParseError!void {
     // A line that begins with its colon has no name — malformed, same as
     // one with no colon.
     if (colon == 0) return error.BadHeader;
+    // No whitespace between the field name and the colon, the same refusal
+    // `parseHead` makes on the fast path (RFC 9112 §5.1).
+    if (line[colon - 1] == ' ' or line[colon - 1] == '\t') return error.BadHeader;
     return applyHeaderAt(line, 0, colon, line.len, r);
 }
 
@@ -1217,6 +1251,88 @@ test "a size that is not hex, or data that does not end where it said" {
     // bytes — the shape of a smuggled request.
     var drifted = std.Io.Reader.fixed("5\r\nhelloXX\r\n0\r\n\r\n");
     try testing.expectError(error.BadChunk, readChunkedBody(&drifted, arena.allocator(), 1024));
+}
+
+test "a chunk size that overflows u64 is refused, not a panic" {
+    // `seen + size` used to add before it checked, so a size of all-ones after
+    // any earlier chunk overflowed — a panic in a safe build, a wrap past the
+    // limit in a fast one. Refused on the announced size now, before a read.
+    var in = std.Io.Reader.fixed("1\r\na\r\nffffffffffffffff\r\n");
+    try testing.expectError(error.BodyTooLarge, discardChunkedBody(&in, 1024));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var reading = std.Io.Reader.fixed("ffffffffffffffff\r\n");
+    try testing.expectError(error.BodyTooLarge, readChunkedBody(&reading, arena.allocator(), 1024));
+}
+
+test "a chunk size is strict hex, so a lenient one cannot smuggle a length" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Each of these is a size a front end may read differently: `+5` and `1_0`
+    // (which std would read as 16) and leading or trailing whitespace. Every
+    // one is `BadChunk` here rather than a body framed at a length nilo and the
+    // proxy disagree about.
+    inline for ([_][]const u8{
+        "+5\r\nhello\r\n0\r\n\r\n",
+        "1_0\r\n0123456789abcdef\r\n0\r\n\r\n",
+        " 5\r\nhello\r\n0\r\n\r\n",
+        "5\t\r\nhello\r\n0\r\n\r\n",
+        "0x5\r\nhello\r\n0\r\n\r\n",
+    }) |body| {
+        var in = std.Io.Reader.fixed(body);
+        try testing.expectError(error.BadChunk, readChunkedBody(&in, arena.allocator(), 1024));
+    }
+
+    // Real hex still reads, upper and lower case, so this refuses the lenient
+    // spellings without refusing a legitimate size.
+    var lower = std.Io.Reader.fixed("a\r\n0123456789\r\n0\r\n\r\n");
+    try testing.expectEqualStrings("0123456789", try readChunkedBody(&lower, arena.allocator(), 1024));
+    var upper = std.Io.Reader.fixed("A\r\n0123456789\r\n0\r\n\r\n");
+    try testing.expectEqualStrings("0123456789", try readChunkedBody(&upper, arena.allocator(), 1024));
+}
+
+test "a Content-Length body over the limit is refused rather than drained" {
+    // The drain path used to read a Content-Length body in full whatever it
+    // announced, so a body over `max_body` was read only to be thrown away.
+    // Refused now, and the caller closes the connection.
+    var empty = std.Io.Reader.fixed("");
+    const big = Request{ .content_length = 2000, .has_content_length = true };
+    try testing.expectError(error.BodyTooLarge, discardBody(&empty, &big, 1024));
+
+    // Under the limit still drains, and leaves the next request where it is.
+    var in = std.Io.Reader.fixed("helloGET /next HTTP/1.1\r\nHost: t\r\n\r\n");
+    const small = Request{ .content_length = 5, .has_content_length = true };
+    try discardBody(&in, &small, 1024);
+    const next = try readRequest(&in);
+    try testing.expectEqualStrings("/next", next.target);
+}
+
+test "whitespace between a field name and its colon is a 400, not an ignored line" {
+    // RFC 9112 §5.1: a server must reject a field with whitespace before the
+    // colon. Both parse paths refuse it — the fast one over a whole head, and
+    // the fragment one a caller reaches directly.
+    var r = Request{};
+    try testing.expectError(error.BadHeader, parseHead(
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding : chunked\r\n\r\n",
+        &r,
+    ));
+    var r2 = Request{};
+    try testing.expectError(error.BadHeader, parseHead(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length : 5\r\n\r\n",
+        &r2,
+    ));
+    var r3 = Request{};
+    try testing.expectError(error.BadHeader, applyHeader("Content-Length : 5", &r3));
+    var r4 = Request{};
+    try testing.expectError(error.BadHeader, applyHeader("X-Any\t: 1", &r4));
+
+    // A tidy header beside it still parses, so the check is the whitespace and
+    // not the name.
+    var ok = Request{};
+    try parseHead("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n", &ok);
+    try testing.expectEqual(@as(u64, 5), ok.content_length);
 }
 
 test "a broken request line" {

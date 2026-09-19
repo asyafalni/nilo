@@ -10,8 +10,36 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ## Unreleased
 
-Nothing yet. Work lands here under `### Breaking`, `### Added`, `### Fixed`
-and `### Docs`, newest first.
+**0.6.0 adds nothing.** It is the release that reads what is already here:
+`http/` scanned line by line for what a stranger on the socket can make it do,
+the public surface read back against the reference before 1.0 freezes it, and
+the ADRs that only correct an older one folded into the one they correct. What
+the scan found lands under `### Fixed` below as it is fixed; what it found and
+cannot hold goes to [`docs/risks.md`](./docs/risks.md).
+
+Work lands here under `### Breaking`, `### Added`, `### Fixed` and `### Docs`,
+newest first.
+
+### Fixed
+
+- A chunked request body nobody read no longer panics on a chunk size that
+  overflows a `u64`. It was added to the running total before the total was
+  checked, so `ffffffffffffffff` after any earlier chunk overflowed — a crash
+  in a safe build, a wrapped limit in a fast one. It is refused on the
+  announced size now, before a read, the way a buffered chunked body already
+  was.
+- A chunk size is read as strict `1*HEXDIG` rather than through a lenient
+  integer parse. `+5`, `1_0` (which read as 16), and a size with leading or
+  trailing whitespace were accepted, each a length a front end could frame
+  differently — the request-smuggling shape a duplicated `Content-Length` is.
+- Whitespace between a header field name and its colon — `Content-Length :` —
+  is a 400 rather than a line that is silently dropped, which RFC 9112 §5.1
+  requires and which closes the same framing disagreement.
+- A `Content-Length` body being discarded to reuse a keep-alive connection is
+  bounded by `max_body`, and a body over it closes the connection instead of
+  being read in full. The drain path ignored the limit the handler path
+  enforces, so a body larger than the server would ever accept was read only
+  to be thrown away.
 
 ## Released
 
