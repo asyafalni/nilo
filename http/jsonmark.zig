@@ -707,10 +707,10 @@ fn Parsed(comptime T: type) type {
                 inline .string, .allocated_string, .number, .allocated_number => |slice| slice,
                 else => return error.UnexpectedToken,
             };
-            defer switch (token) {
-                .allocated_string, .allocated_number => gpa.free(text),
-                else => {},
-            };
+            // An allocated token — a string with an escape in it — is not
+            // freed: `gpa` is the request arena here, and a type that keeps
+            // the text it was parsed from (a `nilo.Text`, ADR 0264) points
+            // at it for the rest of the request.
             return T.nilo_parse(text) orelse error.InvalidCharacter;
         }
     };

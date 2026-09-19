@@ -32,6 +32,7 @@ pub const Str = str_mod.Str;
 pub const Lifetime = str_mod.Lifetime;
 pub const stamp = str_mod.stamp;
 pub const stampWith = str_mod.stampWith;
+pub const stampLike = str_mod.stampLike;
 pub const trap_enabled = str_mod.trap_enabled;
 
 pub const Run = scope_mod.Run;

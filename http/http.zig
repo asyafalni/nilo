@@ -405,6 +405,14 @@ pub const Authorization = @import("authorization.zig").Authorization;
 /// `nilo.Verified(Google).refuse("…", .{})`. A middleware reads the same
 /// thing with `c.verified(Google)`.
 pub const Verified = @import("verified.zig").Verified;
+/// Text with a shape (ADR 0264): a `Str` with a length, a check of your own,
+/// or both, refused with one sentence in every slot and described in the
+/// document. `Email` and `Url` are presets.
+pub const Text = @import("text.zig").Text;
+pub const Email = @import("text.zig").Email;
+pub const Url = @import("text.zig").Url;
+/// What a struct's `nilo_check` writes into (ADR 0264).
+pub const Rules = @import("bound.zig").Rules;
 
 /// The `Idempotency-Key` header, as a typed argument that makes the route
 /// answer once per key
@@ -888,6 +896,7 @@ test {
     _ = @import("bytebody.zig");
     _ = @import("versioned.zig");
     _ = @import("verified.zig");
+    _ = @import("text.zig");
     _ = @import("http1.zig");
     _ = @import("bulkhead.zig");
     _ = @import("watchdog.zig");

@@ -10,7 +10,7 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ## Unreleased
 
-Needs Zig 0.16, as 0.4.0 does. Seventy-eight entries, in four groups.
+Needs Zig 0.16, as 0.4.0 does. Seventy-nine entries, in four groups.
 
 **A Row says more about its own table.** Defaults, an enum's `CHECK`, a
 named constraint, a trigger, a foreign key over several columns or to a table
@@ -27,11 +27,13 @@ holds the key set and rotates it under its readers; ES256 joins RS256.
 gate — and `postJson`, `withQuery`, `res.header`, `stall_ms` and a Refusals
 table of its own fill in what the first release of `nilo_fetch` left out.
 
-**A route can say more about its answer.** `nilo.Versioned(T)` for a 304,
-`nilo.Cached` for an answer kept a minute, `app.guard` so the document names
-the cookie, `app.embedded` for a tree the binary carries, a gzipped request
-body inflated in place, a `Form(T)` field that is a list, and
-`space.incr` on a cache of integers.
+**A route can say more about what it takes and what it answers.**
+`nilo.Text`, `nilo.Email` and a `nilo_check` on the struct, so a password's
+length and "confirm matches" are the type's and the document's rather than
+one handler's; `nilo.Versioned(T)` for a 304, `nilo.Cached` for an answer
+kept a minute, `app.guard` so the document names the cookie, `app.embedded`
+for a tree the binary carries, a gzipped request body inflated in place, a
+`Form(T)` field that is a list, and `space.incr` on a cache of integers.
 
 **And the loop around the loop.** `nilo-dev` restarts the server on every
 save and prunes the builds it leaves; `app.before` runs work that needs the
@@ -160,6 +162,25 @@ Eight of the entries change what a running program does, and they are under
 
 ### Added
 
+- **`nilo.Text(.{ .min, .max, .check, .said })`, `nilo.Email`, `nilo.Url`,
+  and `nilo_check` on a struct** — text with a shape, as a type, and a rule
+  about the struct, on the struct. A `Text` is a `Str` that parses itself,
+  so `password: nilo.Text(.{ .min = 10, .max = 72 })` is read wherever a
+  `Str` is — a form, a query string, a JSON body, a path param — refused
+  with one sentence in all four, collected by `Bound` beside every other
+  field, and described in the document with `minLength`, `maxLength` and
+  `format`. `min` and `max` count code points; `check` is any
+  `fn ([]const u8) bool` with `said` as its sentence; a `Text` never quotes
+  the text back (`"password" has to be text of 10 to 72 characters, not
+  7`), and the presets do. `pub fn nilo_check(self: T, r: *nilo.Rules(T))
+  void` is `must` written once on the struct — `r.must("confirm",
+  self.password.eql(self.confirm.view()), "has to match the password")` —
+  run after every field has bound in every slot, a 422 on a plain one and
+  one more line of the collected answer under `Bound`. The handler's own
+  `must` is unchanged, for the rule that needs the request. Five Refusals:
+  bounds reversed, a `Text` with no shape, a check with no sentence, a
+  default outside its shape, a `nilo_check` of the wrong shape
+  ([ADR 0264](./docs/adr/0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)).
 - **`nilo.Verified(V)`**: the claims behind a bearer token as a handler
   argument, or a 401 with `WWW-Authenticate: Bearer` and the reason before
   the handler runs. `V` is a `jwt.Verifier(Claims, Client)` — new, the ring,

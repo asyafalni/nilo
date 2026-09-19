@@ -229,7 +229,20 @@ pub fn stampWith(value: anytype, scope: anytype) void {
     stampInner(value, scope, 8);
 }
 
-/// `by` is a `*const Lifetime` or a Scope; only the leaf tells them apart.
+/// The same walk, copying the marker off a `Str` that already has one.
+///
+/// For a type that parses itself out of request text (ADR 0142): its
+/// `nilo_parse` takes bytes and can only build a `Str` with no marker, and
+/// the engine, which holds the `Str` those bytes came from, puts that one's
+/// marker on every `Str` the parse built — so a `nilo.Text` out of a form
+/// goes stale with the form (ADR 0264).
+pub fn stampLike(value: anytype, like: Str) void {
+    if (!trap_enabled) return;
+    stampInner(value, like, 8);
+}
+
+/// `by` is a `*const Lifetime`, a `Str` to copy the marker from, or a Scope;
+/// only the leaf tells them apart.
 fn stampInner(value: anytype, by: anytype, comptime depth: u8) void {
     if (depth == 0) return;
     const T = @typeInfo(@TypeOf(value)).pointer.child;
@@ -238,6 +251,8 @@ fn stampInner(value: anytype, by: anytype, comptime depth: u8) void {
     if (T == Str) {
         if (comptime @TypeOf(by) == *const Lifetime) {
             value._marker = .{ .gen_ptr = &by.gen, .gen = by.gen };
+        } else if (comptime @TypeOf(by) == Str) {
+            value._marker = by._marker;
         } else {
             value.* = by.str(value._bytes);
         }
@@ -459,6 +474,19 @@ test "stampWith reaches the same Strs through a Scope's own str()" {
     lifetime.end();
     try testing.expect(!value.name.alive());
     try testing.expect(!value.tags[1].alive());
+}
+
+test "stampLike copies the marker off the Str the bytes came from" {
+    if (!trap_enabled) return;
+    var lifetime = Lifetime{};
+    const from = Str.fromRequest("wati@example.com", &lifetime);
+    const Parsed = struct { value: Str };
+    var parsed: Parsed = .{ .value = .static(from._bytes) };
+    stampLike(&parsed, from);
+
+    try testing.expect(parsed.value.alive());
+    lifetime.end();
+    try testing.expect(!parsed.value.alive());
 }
 
 test "stamp leaves types without a Str alone" {

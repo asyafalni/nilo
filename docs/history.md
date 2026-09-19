@@ -3692,3 +3692,23 @@ about a blocker that names a mechanism rather than what it has to catch
 ([ADR 0063](./adr/0063-a-handlers-stack-is-per-connection.md), last section)
 applies to a rule as much as to a blocker.
 
+
+## The first design was the half-measure, and what showed it was the competitor's spelling
+
+The question "does a rule like *this is an email address* belong here" got
+its first answer as a bag of predicates for `must`, and its second as
+`nilo.Text` and `nilo.Email` — types, the way ADR 0206 had already answered
+it for a number. Both were consistent with every ADR on file, and the second
+was still wrong in two places that only turned up when the sign-up struct
+was written out beside what a zod user writes for it: a rule used once
+meant eight lines of type for one predicate, and a rule across two fields
+stayed in the handler — the exact place the three applications that
+motivated the feature had lost it. `Text(.{ .check })` and `nilo_check`
+are what closed those, and closing them meant amending ADR 0082 rather than
+merely extending ADR 0206
+([ADR 0264](./adr/0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)).
+
+**A design checked only against the repository's own rules is checked for
+consistency and not for use.** Writing the worked example in the other
+framework's syntax, side by side, took ten minutes and found both gaps;
+reading three ADRs had found neither. Do that before proposing, not after.

@@ -85,6 +85,42 @@ const ListQuery = struct {
 };
 ```
 
+**`Text(.{ .min, .max, .check, .said })` is text with a shape**, and
+**`Email`** and **`Url`** are presets of it
+([ADR 0264](../adr/0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)):
+a `Str` that parses itself, read wherever a `Str` is, refused with one
+sentence in every slot, and described with `minLength`, `maxLength` and
+`format`. `min` and `max` count code points; `check` is a
+`fn ([]const u8) bool` of your own and wants `said`, its sentence in `must`'s
+shape, beside it. A `Text` never quotes the text back — `"password" has to be
+text of 10 to 72 characters, not 7` — and the presets do. The `Str` is
+`.value`, with `view`, `len`, `eql` and `blank` forwarded; `.of("…")` is the
+default, checked against the shape while compiling. Bounds the wrong way
+round, a `Text` with no bound and no check, a check with no `said`, and a
+default outside the shape are each a compile error.
+
+**`nilo_check` is a rule about the struct, on the struct** (the same ADR):
+`pub fn nilo_check(self: T, r: *nilo.Rules(T)) void`, run once every field has
+bound — in a form, a query string, a JSON body, and under `Bound` — with
+`r.must(field, holds, sentence)` in the shape `Bound.must` has. On a plain
+slot a rule that did not hold is a 422 naming every one that did not; under
+`Bound` the sentences join the other failures. It is not run over a value
+with a field that did not bind, takes nothing but the value, and is a compile
+error if its shape is not that one.
+
+<!-- compiles -->
+```zig
+const SignUp = struct {
+    email: nilo.Email,
+    password: nilo.Text(.{ .min = 10, .max = 72 }),
+    confirm: Str,
+
+    pub fn nilo_check(self: SignUp, r: *nilo.Rules(SignUp)) void {
+        r.must("confirm", self.password.eql(self.confirm.view()), "has to match the password");
+    }
+};
+```
+
 `Form(T)` and a plain struct are the same slot — a form *is* the body — so
 asking for both is a compile error. A `Form(T)` field is a `Str`, a number, a
 `bool`, an enum or an `Upload`, optionally in a `?`; a default is what "not

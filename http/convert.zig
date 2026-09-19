@@ -122,6 +122,15 @@ pub const parse_marker = @import("jsonmark.zig").parse_marker;
 /// "500"`.
 pub const expects_marker = "nilo_expects";
 
+/// The declaration a type that parses itself may carry to word the tail of
+/// its own refusal — `has to be text of 10 to 72 characters, not 6` — in
+/// place of the sentence `sayWhy` writes for one that does not (ADR 0264).
+///
+/// ```zig
+/// pub fn nilo_explain(text: []const u8, w: *std.Io.Writer) !void { … }
+/// ```
+pub const explain_marker = "nilo_explain";
+
 /// What a message says a `P` has to be: what the type said with
 /// `nilo_expects`, or `a` and its name.
 pub fn expects(comptime P: type) []const u8 {
@@ -277,6 +286,10 @@ pub fn tryConvert(comptime P: type, comptime slot: Slot, s: Str, out: *P) ?Reaso
     // its kind would otherwise have meant (ADR 0142).
     if (comptime parsesItself(P)) {
         out.* = P.nilo_parse(text) orelse return .not_that_type;
+        // A parse takes bytes, so a `Str` it built has no lifetime marker;
+        // the one on the text it was built from goes on it here, and a
+        // `nilo.Text` out of a form goes stale with the form (ADR 0264).
+        str_mod.stampLike(out, s);
         return null;
     }
     switch (@typeInfo(P)) {
@@ -331,6 +344,12 @@ pub fn sayWhy(
     // import line in front of the name rather than a file of nilo's
     // (ADR 0122).
     if (comptime parsesItself(P)) {
+        // A type that words its own refusal — a `nilo.Text`, which says the
+        // count and never the text (ADR 0264) — writes the tail itself.
+        if (comptime @hasDecl(P, explain_marker)) {
+            try w.writeAll(label ++ " ");
+            return @field(P, explain_marker)(text, w);
+        }
         return w.print(label ++ " has to be " ++ expects(P) ++ ", not \"{s}\"", .{text});
     }
     switch (@typeInfo(P)) {

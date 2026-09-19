@@ -1954,6 +1954,8 @@ fn queryValue(comptime T: type, c: *const Ctx) !T {
             return fail.badRequest("{s} is required", .{label});
         }
     }
+    // A struct that checks itself is checked once it is whole (ADR 0264).
+    try bound_mod.enforce(.query, T, out);
     return out;
 }
 

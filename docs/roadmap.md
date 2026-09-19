@@ -244,10 +244,6 @@ A question nobody has answered. Not a backlog item, and not blocked: what a read
 
 **What would settle it:** somebody designing it. Until then the answer is `c.bodyStream()`, which holds nothing and makes the framing the handler's problem.
 
-**Whether a rule like "this is an email address" belongs in this repository.** `Bound` reports five reasons a field did not bind, and `must` lets a handler add a rule of its own to the same 422 ([ADR 0082](./adr/0082-a-rule-of-your-own-joins-the-answer.md)). What is not here is the vocabulary everybody else ships: `email`, `min`, `max`, `len`, `oneof`, `url`. The shape that would fit is not an annotation — a rule is already an ordinary function handed to `must`, so `nilo.rules.email` would be a constant that costs nothing to a handler that does not name it. Against it is that a validator's vocabulary never stops growing.
-
-**What would settle it:** three applications having written the same predicate, which is the evidence that it is vocabulary rather than policy.
-
 ### `nilo_sql`
 
 **Whether the line past one table moves further.** It moved once: `.exists` is a condition and ships ([ADR 0171](./adr/0171-a-row-over-there-is-a-condition.md)). What is still refused is joins, nested rows fetched with their parent, aggregates and `GROUP BY`, with `db.raw` as the way out. ADR 0171 names the two properties that let `EXISTS` across — it does not change the column list, so the Row still describes the answer, and it does not change the row count, so `.limit` still means what the caller thinks — and every one of the four breaks at least one. A join to a one-to-many breaks both, and the second is the expensive one: the query runs, the page renders, and some rows never appear.

@@ -237,6 +237,17 @@ const ListQuery = struct {
 `minimum` and `maximum` are not keys of `nilo_openapi`, on purpose: a marker is
 a claim, and a range the document promises is one the type enforces.
 
+## What text promises
+
+The same for text ([ADR 0264](../adr/0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)).
+`nilo.Text(.{ .min = 10, .max = 72 })` says
+`{"type":"string","minLength":10,"maxLength":72}`, `nilo.Email` says
+`{"type":"string","maxLength":254,"format":"email"}`, and `nilo.Url` says
+`format: uri` — each read off a type that refuses what it does not fit. A
+`check` of your own, and a `nilo_check` on the struct, have no JSON Schema
+and are not claimed: the field is a `string`, and the 422 is where those are
+told.
+
 ## A type that writes its own answer
 
 The same rule, one step further out. A type carrying `nilo_content_type` and

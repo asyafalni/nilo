@@ -1437,6 +1437,26 @@ const refusals = [_]Refusal{
         .says = "the handler for route \"/me\" returns nilo.Verified(verified_as_an_answer.Google), which is what a handler is *given* rather than what it answers with.",
     },
     .{
+        .name = "text_bounds_reversed",
+        .says = "`Text(.{ .min = 72, .max = 10 })` has its bounds the wrong way round: nothing is at least 72 and at most 10 characters.",
+    },
+    .{
+        .name = "text_with_no_shape",
+        .says = "`Text(.{})` asks nothing of the text, so it is a `Str` with a longer name.",
+    },
+    .{
+        .name = "text_check_with_no_sentence",
+        .says = "`Text(.{ .check = … })` has a check and no sentence, so text it refuses would get a 400 that cannot say why.",
+    },
+    .{
+        .name = "text_default_outside_its_shape",
+        .says = "`nilo.Text(.{ .max = 3 }).of(\"wati\")` does not fit its own shape.",
+    },
+    .{
+        .name = "check_of_the_wrong_shape",
+        .says = "`check_of_the_wrong_shape.SignUp`'s `nilo_check` takes 1 arguments rather than the value and its rules.",
+    },
+    .{
         .name = "versioned_as_an_argument",
         .says = "argument 1 of the handler for route \"/orders\" is a `nilo.Versioned(u32)`, which is what a handler answers *with* rather than something it is given.",
     },

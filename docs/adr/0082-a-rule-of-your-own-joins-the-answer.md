@@ -2,6 +2,10 @@
 
 **Status:** accepted
 **Amends:** [ADR 0036](./0036-a-binding-hands-its-failures-to-the-handler.md)
+**Amended by:** [ADR 0264](./0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md),
+which puts a rule about the struct on the struct as a function — `nilo_check`
+— and reads the `nilo_rules` declaration rejected below as the data marker
+it was, not as that.
 
 ## Context
 

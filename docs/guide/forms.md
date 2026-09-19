@@ -261,24 +261,80 @@ fn signUp(arena: std.mem.Allocator, b: nilo.Bound(nilo.Form(SignUp))) !Page {
 The field name in `given("…")` is checked while compiling — a typo there would
 otherwise be an empty box nobody notices.
 
-### Your own rules, in the same answer
+### Text with a shape
 
 The reasons above are exactly the conversions nilo performs: `.missing`,
 `.not_a_number`, `.not_true_or_false`, `.not_a_choice`, `.wrong_kind`. **This
-is not a validator.** Whether the age is plausible, whether the email has an
-`@`, whether the two passwords match — all yours.
+is not a validator.** But a `u8` refuses 300 and nobody calls that one, and
+text can have a shape the same way a number has a range
+([ADR 0264](../adr/0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)):
 
-What nilo does carry is the *answer*. Write the rule, hand over the sentence,
-and it comes out beside nilo's own in one 422 rather than as a second shape a
-client has to handle:
+<!-- compiles -->
+```zig
+fn startsWithSku(text: []const u8) bool {
+    return std.mem.startsWith(u8, text, "SKU-");
+}
+
+const SignUp = struct {
+    email: nilo.Email,
+    password: nilo.Text(.{ .min = 10, .max = 72 }),
+    nickname: nilo.Text(.{ .max = 30 }) = .of(""),
+    sku: nilo.Text(.{ .check = startsWithSku, .said = "has to be a SKU code" }),
+    confirm: Str,
+
+    pub fn nilo_check(self: SignUp, r: *nilo.Rules(SignUp)) void {
+        r.must("confirm", self.password.eql(self.confirm.view()), "has to match the password");
+    }
+};
+```
+
+A `nilo.Text` is a `Str` that parses itself, so it is read wherever a `Str` is
+— a form field, a query value, a JSON body, a path param — and refused with
+one sentence in all four. `min` and `max` count characters (code points, the
+same thing JSON Schema's `minLength` counts). `check` is any `fn ([]const u8)
+bool` of your own, with `said` as its sentence in `must`'s shape. `Email` and
+`Url` are presets. The `Str` is `.value`, and `view`, `len`, `eql` and `blank`
+are on the `Text` itself; `.of("…")` is the default, checked against the shape
+while compiling.
+
+**A `Text` never quotes the text back.** A password in a 422 body is a leak,
+so the sentence says the count: `"password" has to be text of 10 to 72
+characters, not 7`. `Email` does quote, because seeing the address is how the
+typo is found: `"email" has to look like an address, not "wati"`.
+
+**A rule about the struct goes on the struct.** `nilo_check` runs once every
+field has bound, in whichever slot the struct arrived through, and what it
+says with `must` comes out in the same 422 as everything else — so the second
+handler binding `SignUp` cannot forget the rule. It takes the value and
+nothing else: a rule that needs the request stays below.
+
+On a plain `Form(SignUp)` a field outside its shape is the 400 a bad number
+gets, and a `nilo_check` that does not hold is a 422 naming every rule that
+did not. Under `Bound` all of it is collected:
+
+```
+3 fields did not fit: "email" has to look like an address, not "wati";
+"password" has to be text of 10 to 72 characters, not 7;
+"confirm" has to match the password
+```
+
+The document says the shape — `minLength`, `maxLength`, `format: email` —
+read off the type, so a generated client refuses the same text before
+sending it. A `check` and a `nilo_check` have no JSON Schema and are not
+claimed.
+
+### Your own rules, in the same answer
+
+What is left for the handler is the rule that needs the request — "that
+address is already registered" wants a database. Write it, hand over the
+sentence, and it comes out beside nilo's own in one 422 rather than as a
+second shape a client has to handle:
 
 ```zig
-fn signUp(b: nilo.Bound(NewUser)) !nilo.Status(201, User) {
+fn signUp(db: *Db, b: nilo.Bound(nilo.Form(SignUp))) !nilo.Status(201, User) {
     const in = b.value() orelse return b.fail();
 
-    const checked = b
-        .must("password", in.password.view().len >= 10, "wants at least 10 characters")
-        .must("email", hasAt(in.email.view()), "has to look like an address");
+    const checked = b.must("email", !try db.exists(in.email.view()), "is already registered");
     if (checked.failed()) return checked.fail();
 
     return db.create(in);
@@ -286,8 +342,7 @@ fn signUp(b: nilo.Bound(NewUser)) !nilo.Status(201, User) {
 ```
 
 ```
-2 fields did not fit: "email" has to look like an address;
-"password" wants at least 10 characters
+"email" is already registered
 ```
 
 The bool is the rule **holding**, not failing — read the call as the sentence it
@@ -309,7 +364,8 @@ hand back: a body that is not a form at all, text that is not JSON, and a field
 the endpoint has never heard of.
 
 The same wrapper works on the other two slots: `Bound(T)` for a JSON body and
-`Bound(Query(T))` for the query string.
+`Bound(Query(T))` for the query string — and a `nilo.Text` or a `nilo_check`
+on the struct works in all three the same way, with or without the wrapper.
 
 ## A form is the body
 

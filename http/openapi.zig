@@ -47,6 +47,10 @@ pub const Schema = union(enum) {
     /// Zig integer, both for a `nilo.Within(min, max)`
     /// ([ADR 0206](../docs/adr/0206-a-whole-number-inside-a-range-is-a-type.md)).
     bounded: Bounds,
+    /// Text with a shape the server holds — `minLength`, `maxLength`, a
+    /// `format` — read off a `nilo.Text`
+    /// ([ADR 0264](../docs/adr/0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)).
+    sized: TextShape,
     number,
     boolean,
     /// A string from a fixed set — what an enum becomes.
@@ -84,6 +88,17 @@ pub const Bounds = struct {
 
 /// The declaration a bounded integer carries (`nilo.Within`), read by name.
 const within_marker = "nilo_within";
+
+/// The shape of a `nilo.Text`, as the document says it. A check of the
+/// caller's own has no JSON Schema and is not claimed.
+pub const TextShape = struct {
+    min: ?usize = null,
+    max: ?usize = null,
+    format: ?[]const u8 = null,
+};
+
+/// The declaration shaped text carries (`nilo.Text`), read by name.
+const text_marker = "nilo_text";
 
 /// What a `pub const nilo_openapi` says, and the whole of what it may say.
 ///
@@ -341,6 +356,8 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
         // the writer check below, because it writes itself as the number and
         // the number's bounds are the thing worth telling a client.
         if (withinOf(T)) |bounds| return held(.{ .bounded = bounds });
+        // Text with a shape says its shape, for the same reason (ADR 0264).
+        if (textOf(T)) |shape| return held(.{ .sized = shape });
 
         // **A type that writes its own JSON is not described by its fields**
         // (ADR 0076). `std.json` calls `jsonStringify` and never looks at the
@@ -464,6 +481,26 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
 
             else => held(.unknown),
         };
+    }
+}
+
+/// `T.nilo_text`, or null for a type that carries none. Read by name the
+/// way `nilo_within` is, and checked the same way.
+fn textOf(comptime T: type) ?TextShape {
+    comptime {
+        const holds = switch (@typeInfo(T)) {
+            .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(T, text_marker),
+            else => false,
+        };
+        if (!holds) return null;
+        const said = @field(T, text_marker);
+        const Said = @TypeOf(said);
+        if (@typeInfo(Said) != .@"struct" or !@hasField(Said, "min") or !@hasField(Said, "max") or !@hasField(Said, "format")) @compileError(
+            "nilo: " ++ @typeName(T) ++ "'s `" ++ text_marker ++ "` does not say `min`, `max` and `format`, " ++
+                "which is what shaped text's document carries.\n" ++
+                "  Write `pub const " ++ text_marker ++ " = .{ .min = 10, .max = 72, .format = null };`, or use `nilo.Text(.{ .min = 10, .max = 72 })`.",
+        );
+        return .{ .min = said.min, .max = said.max, .format = said.format };
     }
 }
 
@@ -872,6 +909,10 @@ const Components = struct {
         return switch (a.*) {
             .string, .integer, .number, .boolean, .binary, .untold, .unknown => true,
             .bounded => |x| x.min == b.bounded.min and x.max == b.bounded.max,
+            .sized => |x| x.min == b.sized.min and x.max == b.sized.max and
+                ((x.format == null and b.sized.format == null) or
+                    (x.format != null and b.sized.format != null and
+                        std.mem.eql(u8, x.format.?, b.sized.format.?))),
             .told => |t| std.mem.eql(u8, t.type, b.told.type) and
                 ((t.format == null and b.told.format == null) or
                     (t.format != null and b.told.format != null and
@@ -1314,6 +1355,16 @@ fn writeSchema(
             if (b.max) |max| try w.print(",\"maximum\":{d}", .{max});
             try w.writeByte('}');
         },
+        .sized => |s| {
+            try w.writeAll("{\"type\":\"string\"");
+            if (s.min) |min| try w.print(",\"minLength\":{d}", .{min});
+            if (s.max) |max| try w.print(",\"maxLength\":{d}", .{max});
+            if (s.format) |f| {
+                try w.writeAll(",\"format\":");
+                try writeString(w, f);
+            }
+            try w.writeByte('}');
+        },
         .number => try w.writeAll("{\"type\":\"number\"}"),
         .boolean => try w.writeAll("{\"type\":\"boolean\"}"),
         .binary => try w.writeAll("{\"type\":\"string\",\"format\":\"binary\"}"),
@@ -1538,6 +1589,23 @@ fn expectSchema(comptime T: type, expected: []const u8) !void {
     const json = try schemaJson(T);
     defer testing.allocator.free(json);
     try testing.expectEqualStrings(expected, json);
+}
+
+test "text with a shape says its shape, and a check of the caller's own is not claimed" {
+    const text_mod = @import("text.zig");
+    try expectSchema(text_mod.Text(.{ .min = 10, .max = 72 }), "{\"type\":\"string\",\"minLength\":10,\"maxLength\":72}");
+    try expectSchema(text_mod.Text(.{ .max = 30 }), "{\"type\":\"string\",\"maxLength\":30}");
+    try expectSchema(text_mod.Email, "{\"type\":\"string\",\"maxLength\":254,\"format\":\"email\"}");
+    try expectSchema(text_mod.Url, "{\"type\":\"string\",\"maxLength\":2048,\"format\":\"uri\"}");
+    try expectSchema(
+        text_mod.Text(.{ .check = struct {
+            fn f(_: []const u8) bool {
+                return true;
+            }
+        }.f, .said = "has to be a SKU code" }),
+        "{\"type\":\"string\"}",
+    );
+    try expectSchema(?text_mod.Email, "{\"anyOf\":[{\"type\":\"string\",\"maxLength\":254,\"format\":\"email\"},{\"type\":\"null\"}]}");
 }
 
 test "the plain types map to what JSON Schema calls them" {

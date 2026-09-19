@@ -8092,6 +8092,173 @@ fn listLines(q: typed.Query(ListQuery)) !struct { limit: u8, offset: u32 } {
     return .{ .limit = q.value.limit.value, .offset = q.value.offset };
 }
 
+// ---- text with a shape, and a struct that checks itself (ADR 0264) ----
+
+const text_mod = @import("text.zig");
+
+fn startsWithSku(text: []const u8) bool {
+    return std.mem.startsWith(u8, text, "SKU-");
+}
+
+const SignUp = struct {
+    email: text_mod.Email,
+    password: text_mod.Text(.{ .min = 10, .max = 72 }),
+    confirm: Str,
+    sku: text_mod.Text(.{ .check = startsWithSku, .said = "has to be a SKU code" }) = .of("SKU-0"),
+
+    pub fn nilo_check(self: SignUp, r: *bound_mod.Rules(SignUp)) void {
+        r.must("confirm", self.password.eql(self.confirm.view()), "has to match the password");
+    }
+};
+
+fn signUpPlain(in: form_mod.Form(SignUp)) ![]const u8 {
+    return in.value.email.view();
+}
+
+fn signUpBound(b: bound_mod.Bound(form_mod.Form(SignUp))) ![]const u8 {
+    const form = b.value() orelse return b.fail();
+    return form.email.view();
+}
+
+fn signUpJson(in: SignUp) ![]const u8 {
+    return in.email.view();
+}
+
+const Lookup = struct {
+    email: text_mod.Email,
+    nick: text_mod.Text(.{ .max = 8 }) = .of(""),
+
+    pub fn nilo_check(self: Lookup, r: *bound_mod.Rules(Lookup)) void {
+        r.must("nick", !self.nick.eql("root"), "is taken");
+    }
+};
+
+fn lookup(q: typed.Query(Lookup)) ![]const u8 {
+    return q.value.email.view();
+}
+
+fn postSignUp(h: *Harness, app: *App, path: []const u8, content_type: []const u8, body: []const u8) []const u8 {
+    var head_buf: [256]u8 = undefined;
+    const head = std.fmt.bufPrint(&head_buf, "POST {s} HTTP/1.1\r\nHost: t\r\n" ++
+        "Content-Type: {s}\r\nContent-Length: {d}\r\n\r\n", .{ path, content_type, body.len }) catch unreachable;
+    var request_buf: [512]u8 = undefined;
+    const request = std.fmt.bufPrint(&request_buf, "{s}{s}", .{ head, body }) catch unreachable;
+    return h.send(app, request).response;
+}
+
+test "a form field with a shape is refused in the form's own words, and the text is never quoted" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/plain", signUpPlain);
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const form = "application/x-www-form-urlencoded";
+    const ok = postSignUp(&h, &app, "/plain", form, "email=wati%40example.com&password=correct+horse&confirm=correct+horse");
+    try testing.expect(std.mem.endsWith(u8, ok, "wati@example.com"));
+
+    const short = postSignUp(&h, &app, "/plain", form, "email=wati%40example.com&password=hunter2&confirm=hunter2");
+    try testing.expect(std.mem.startsWith(u8, short, "HTTP/1.1 400"));
+    try testing.expect(try Harness.saysFailure(short, "\"password\" has to be text of 10 to 72 characters, not 7"));
+    try testing.expect(std.mem.indexOf(u8, short, "hunter2") == null);
+
+    const not_an_address = postSignUp(&h, &app, "/plain", form, "email=wati&password=correct+horse&confirm=correct+horse");
+    try testing.expect(std.mem.startsWith(u8, not_an_address, "HTTP/1.1 400"));
+    try testing.expect(try Harness.saysFailure(not_an_address, "\"email\" has to look like an address, not \"wati\""));
+
+    const missing = postSignUp(&h, &app, "/plain", form, "password=correct+horse&confirm=correct+horse");
+    try testing.expect(try Harness.saysFailure(missing, "the form is missing \"email\" (an email address)"));
+}
+
+test "a struct's own check refuses a plain form with a 422, after the fields have bound" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/plain", signUpPlain);
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const form = "application/x-www-form-urlencoded";
+    const mismatch = postSignUp(&h, &app, "/plain", form, "email=wati%40example.com&password=correct+horse&confirm=correct+hoarse");
+    try testing.expect(std.mem.startsWith(u8, mismatch, "HTTP/1.1 422"));
+    try testing.expect(try Harness.saysFailure(mismatch, "\"confirm\" has to match the password"));
+
+    // A shape failure is answered first, as a 400, and the check waits.
+    const both = postSignUp(&h, &app, "/plain", form, "email=wati&password=correct+horse&confirm=correct+hoarse");
+    try testing.expect(std.mem.startsWith(u8, both, "HTTP/1.1 400"));
+    try testing.expect(try Harness.saysFailure(both, "\"email\" has to look like an address"));
+}
+
+test "under Bound the shape, the check and the handler's own rule are one 422" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/bound", signUpBound);
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const form = "application/x-www-form-urlencoded";
+    const shapes = postSignUp(&h, &app, "/bound", form, "email=wati&password=hunter2&confirm=hunter2&sku=abc");
+    try testing.expect(std.mem.startsWith(u8, shapes, "HTTP/1.1 422"));
+    try testing.expect(try Harness.saysFailure(shapes, "3 fields did not fit"));
+    try testing.expect(try Harness.saysFailure(shapes, "\"email\" has to look like an address, not \"wati\""));
+    try testing.expect(try Harness.saysFailure(shapes, "\"password\" has to be text of 10 to 72 characters, not 7"));
+    try testing.expect(try Harness.saysFailure(shapes, "\"sku\" has to be a SKU code"));
+
+    const rule = postSignUp(&h, &app, "/bound", form, "email=wati%40example.com&password=correct+horse&confirm=correct+hoarse");
+    try testing.expect(std.mem.startsWith(u8, rule, "HTTP/1.1 422"));
+    try testing.expect(try Harness.saysFailure(rule, "\"confirm\" has to match the password"));
+
+    const ok = postSignUp(&h, &app, "/bound", form, "email=wati%40example.com&password=correct+horse&confirm=correct+horse");
+    try testing.expect(std.mem.endsWith(u8, ok, "wati@example.com"));
+}
+
+test "a JSON body holds a shaped field the same way, escapes and all" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/json", signUpJson);
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const ok = postSignUp(&h, &app, "/json", "application/json", "{\"email\":\"wati\\u0040example.com\",\"password\":\"correct horse\",\"confirm\":\"correct horse\"}");
+    try testing.expect(std.mem.endsWith(u8, ok, "wati@example.com"));
+
+    const short = postSignUp(&h, &app, "/json", "application/json", "{\"email\":\"wati@example.com\",\"password\":\"hunter2\",\"confirm\":\"hunter2\"}");
+    try testing.expect(std.mem.startsWith(u8, short, "HTTP/1.1 400"));
+    try testing.expect(try Harness.saysFailure(short, "\"password\" has to be text of 10 to 72 characters, not 7"));
+
+    const mismatch = postSignUp(&h, &app, "/json", "application/json", "{\"email\":\"wati@example.com\",\"password\":\"correct horse\",\"confirm\":\"correct hoarse\"}");
+    try testing.expect(std.mem.startsWith(u8, mismatch, "HTTP/1.1 422"));
+    try testing.expect(try Harness.saysFailure(mismatch, "\"confirm\" has to match the password"));
+}
+
+test "a query string reads a shaped field and runs the struct's check, and the document says the shape" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.docs(.{});
+    try app.get("/lookup", lookup);
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const ok = h.send(&app, "GET /lookup?email=wati%40example.com&nick=wati HTTP/1.1\r\nHost: t\r\n\r\n").response;
+    try testing.expect(std.mem.endsWith(u8, ok, "wati@example.com"));
+
+    const long = h.send(&app, "GET /lookup?email=wati%40example.com&nick=watiwatiwati HTTP/1.1\r\nHost: t\r\n\r\n").response;
+    try testing.expect(std.mem.startsWith(u8, long, "HTTP/1.1 400"));
+    try testing.expect(try Harness.saysFailure(long, "?nick has to be text of at most 8 characters, not 12"));
+
+    const taken = h.send(&app, "GET /lookup?email=wati%40example.com&nick=root HTTP/1.1\r\nHost: t\r\n\r\n").response;
+    try testing.expect(std.mem.startsWith(u8, taken, "HTTP/1.1 422"));
+    try testing.expect(try Harness.saysFailure(taken, "?nick is taken"));
+
+    const json = try docsFor(&app);
+    try testing.expect(std.mem.indexOf(u8, json, "{\"name\":\"email\",\"in\":\"query\",\"required\":true,\"schema\":{\"type\":\"string\",\"maxLength\":254,\"format\":\"email\"}}") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "{\"name\":\"nick\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"string\",\"maxLength\":8}}") != null);
+}
+
 test "a query field carries its bounds, and the document says them" {
     // Item 68: `limit` between 1 and 200 was two lines at the top of every
     // list handler, and the document said nothing about either (ADR 0206).

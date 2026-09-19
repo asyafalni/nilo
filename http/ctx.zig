@@ -1147,6 +1147,9 @@ pub const Ctx = struct {
         var value = std.json.parseFromSliceLeaky(T, self._arena, b, .{}) catch |err|
             return describeBadBody(T, self._arena, b, err);
         str_mod.stamp(&value, self._lifetime);
+        // A struct that checks itself is checked once it is whole, and a
+        // rule that did not hold is a 422 naming it (ADR 0264).
+        try @import("bound.zig").enforce(.body, T, value);
         return value;
     }
 
@@ -1167,7 +1170,10 @@ pub const Ctx = struct {
         // a body the head has been copied for exactly that reason.
         const content_type = if (self.header("Content-Type")) |h| h.view() else null;
         const b = (try self.body()).view();
-        return @import("form.zig").readInto(T, self._arena, self._lifetime, content_type, b);
+        const value = try @import("form.zig").readInto(T, self._arena, self._lifetime, content_type, b);
+        // The same check a JSON body gets, in the form's own words (ADR 0264).
+        try @import("bound.zig").enforce(.form, T, value);
+        return value;
     }
 
     /// The same as `form`, but recording why each field that would not bind
@@ -2110,12 +2116,24 @@ fn describeField(
         // The same for a type that parses itself and said no: what arrived
         // was the right kind and the wrong text, and the sentence is the one
         // a query value of that type gets, quoting it (ADR 0205).
-        if (comptime parsedOf(T) != null) {
+        if (comptime parsedOf(T)) |P| {
             var buf: [64]u8 = undefined;
-            if (textOf(given, &buf)) |text| return fail.badRequest(
-                "\"{s}\" has to be {s}, not \"{s}\"",
-                .{ name, comptime expectedOf(T), text },
-            );
+            if (textOf(given, &buf)) |text| {
+                // A type that words its own refusal — a `nilo.Text`, which
+                // says the count and never the text — writes the tail
+                // (ADR 0264). Small on purpose: this frame is reached eight
+                // deep, and only on the way to a 400.
+                if (comptime @hasDecl(P, convert.explain_marker)) {
+                    var tail: [128]u8 = undefined;
+                    var w = std.Io.Writer.fixed(&tail);
+                    @field(P, convert.explain_marker)(text, &w) catch {};
+                    return fail.badRequest("\"{s}\" {s}", .{ name, w.buffered() });
+                }
+                return fail.badRequest(
+                    "\"{s}\" has to be {s}, not \"{s}\"",
+                    .{ name, comptime expectedOf(T), text },
+                );
+            }
         }
         return fail.badRequest(
             "\"{s}\" has to be {s}, not {s}",
