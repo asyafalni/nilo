@@ -162,6 +162,17 @@ where it was made.
   read. One arena allocation on a form that asked for a list and no other;
   a list of `Upload` is a Refusal
   ([ADR 0256](./docs/adr/0256-a-form-list-is-a-repeated-name-and-nothing-else.md)).
+- **`nilo-dev`, and `zig build dev-<example>`**: the server restarted on
+  every save. One `zig build --watch` kept running, and the server started
+  again whenever the binary it writes changes — a build that fails prints
+  its errors and leaves the old server serving. Ships as
+  `nilo.artifact("nilo-dev")`, three lines in a dependent's `build.zig`;
+  imports `std` and nothing of nilo's, so no server links it. The default
+  rebuild is 2.8 s and 23 MB of `.zig-cache` per save on the machine it was
+  measured on; `--incremental` keeps the cache flat and, on Zig 0.16.0,
+  needs `exe.use_llvm = true` beside it — the self-hosted backend's
+  incremental binary does not run when libc is linked
+  ([ADR 0259](./docs/adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
 - **`nilo.Versioned(T)`**: `T` with a `u64` version the handler names,
   sent under a weak `ETag` — `W/"1a"` — and answered **304** with no body
   when `If-None-Match` carries it. `c.clientHas(version)` asks first, so a

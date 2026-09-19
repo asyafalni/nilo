@@ -56,10 +56,12 @@ zig build test-fetch   # only nilo_fetch, both modes, plus its refusals — a re
 zig build test-job     # only nilo_job, both modes, plus its refusals — a worker loop on std.Io.Threaded, no Engine
 zig build test-job-sql # nilo_job over a SQLite table, and Postgres if DATABASE_URL reaches one; on test-sql
 zig build test-s3      # only nilo_s3, both modes, plus its refusals
+zig build test-dev     # only nilo-dev's argument parser, both modes — no module graph
 
 zig build run          # the benchmark server
 zig build profile      # where the time inside one request goes
 zig build run-hello    # or rest, orders, forms, spa, stream, chat, outbound
+zig build dev-hello    # the same, restarted on every save (ADR 0259)
 zig build fuzz -- --iterations 1000000 --seed 0x…
 zig build bench-ws-server && python3 bench/ws_idle.py both   # what a socket costs idle
 ```

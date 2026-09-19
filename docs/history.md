@@ -3650,3 +3650,23 @@ itself the way a `nilo_json` type does. The `sql.Schema` entry was the same
 shape: the design question was only whether a break was acceptable, and
 once it was, the seam was seven characters at each call.
 
+
+## A build time quoted before the binary was run
+
+The restart-on-save loop
+([ADR 0259](./adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md))
+was measured before it was designed, and the first measurement said what
+everybody wanted: `--watch -fincremental` rebuilt an example in 0.12 s and
+left `.zig-cache` flat, against 2.8 s and 23 MB for a plain build. It was
+quoted in a session as the answer. The binary it produced had never been
+executed, and when it was, it died at exec with `undefined symbol: main` —
+the new ELF linker's incremental output does not run with libc linked,
+which every nilo server is.
+
+**A build figure is a figure about an artifact, and the artifact has to run
+before the figure is a number.** The same rule the repository already has
+for a benchmark — build the before, run both — read one step earlier: a
+compile that finishes is not evidence that it produced anything. The table
+in [`bench/result/build.md`](../bench/result/build.md#what-a-restart-on-save-costs-per-save)
+carries a "binary" column for that reason, and the row that looked best is
+the one that failed it.

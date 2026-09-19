@@ -1,0 +1,397 @@
+//! `zig build dev` — the server restarted on every save
+//! ([ADR 0259](../docs/adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
+//!
+//! ```
+//! nilo-dev [--zig <path>] [--build <step>] [--incremental] [-D<option>…] <exe> [-- <server args>]
+//! ```
+//!
+//! This is not hot reloading and cannot be: a Zig binary does not swap its
+//! own code. What it is: one `zig build <step> --watch`, run once and left
+//! running, and the server it produces started again every time the binary
+//! it writes changes. The watching, the rebuilding and the deciding what to
+//! rebuild are all the build system's — this file spawns two processes and
+//! reads the size and mtime of one file every quarter second.
+//!
+//! **A build that fails changes nothing, so nothing restarts.** The watch
+//! prints the errors, the binary on disk is the last one that compiled, and
+//! the server running is the one serving it. There is no code here for
+//! that case, and that is the point of watching the output rather than the
+//! sources.
+//!
+//! **`--incremental` is what keeps `.zig-cache` flat, and it is opt-in.**
+//! A rebuild that is not incremental leaves 23 MB in the cache every save,
+//! forever, because Zig evicts nothing; one that is leaves nothing, because
+//! the compiler stays resident and patches what it already made. On Zig
+//! 0.16.0 the resident compiler's output only *runs* under the LLVM
+//! backend when libc is linked — and every nilo server links libc through
+//! zio — so the flag wants `exe.use_llvm = true` beside it, and costs an
+//! LLVM emit per save. The numbers, all five rows of them, are in the ADR.
+//!
+//! **The old server is asked, not killed.** SIGTERM, which nilo answers by
+//! draining what is in flight (ADR 0098); SIGKILL only after `drain_ms`.
+//! Each child is in a process group of its own, so Ctrl-C reaches this
+//! process alone and the two signals a server gets are this file's — a
+//! second one would be read by nilo as "stop waiting" and skip the drain.
+//!
+//! Nothing in this file is linked into a server. It imports `std` and
+//! nothing of nilo's, and a release build never names it.
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+/// How often the binary is looked at.
+const poll_ms = 250;
+/// How long a server gets to drain after SIGTERM before SIGKILL.
+const drain_ms = 5_000;
+/// How long the build is given to stop on the way out.
+const build_stop_ms = 3_000;
+
+const Options = struct {
+    exe: []const u8,
+    zig: []const u8 = "zig",
+    step: []const u8 = "install",
+    incremental: bool = false,
+    /// `--trace`: print the binary's stamp on every poll it changes.
+    trace: bool = false,
+    /// `-D…` options handed on to `zig build`, so a project can flip the
+    /// backend for the dev loop alone: `-Dllvm`, say.
+    build_options: []const []const u8 = &.{},
+    server_args: []const []const u8 = &.{},
+};
+
+/// The size and mtime of the binary as it was last started. Both, because
+/// a patched binary can keep its size and a copied one its mtime.
+const Stamp = struct {
+    size: u64,
+    mtime_ns: i96,
+
+    fn eql(a: Stamp, b: Stamp) bool {
+        return a.size == b.size and a.mtime_ns == b.mtime_ns;
+    }
+};
+
+/// A child and the thread waiting on it. `Child.wait` blocks, and the loop
+/// below must not, so the wait runs on a thread of its own and reports
+/// through `term`.
+const Running = struct {
+    child: std.process.Child,
+    pid: std.posix.pid_t,
+    waiter: std.Thread,
+    started_ns: u64,
+    term: std.atomic.Value(u32) = .init(still_running),
+    exit: std.process.Child.Term = .{ .unknown = 0 },
+
+    const still_running: u32 = 0;
+    const done: u32 = 1;
+
+    fn start(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !*Running {
+        const r = try gpa.create(Running);
+        errdefer gpa.destroy(r);
+        r.* = .{
+            // A group of its own (see the header), which for the build
+            // also means the compilers it keeps under it are one `kill`.
+            .child = try std.process.spawn(io, .{ .argv = argv, .pgid = 0 }),
+            .pid = undefined,
+            .waiter = undefined,
+            .started_ns = now(io),
+        };
+        r.pid = r.child.id.?;
+        r.waiter = try std.Thread.spawn(.{}, waitOn, .{ r, io });
+        return r;
+    }
+
+    fn waitOn(r: *Running, io: std.Io) void {
+        r.exit = r.child.wait(io) catch .{ .unknown = 0 };
+        r.term.store(done, .release);
+    }
+
+    fn exited(r: *const Running) bool {
+        return r.term.load(.acquire) == done;
+    }
+
+    /// SIGTERM to the group, a bounded wait, SIGKILL if it is still there,
+    /// then reap. Answers how long the drain took.
+    fn stop(r: *Running, io: std.Io, grace_ms: u64) u64 {
+        const t0 = now(io);
+        if (!r.exited()) std.posix.kill(-r.pid, .TERM) catch {};
+        var waited: u64 = 0;
+        while (!r.exited() and waited < grace_ms) : (waited += 50) sleep(io, 50);
+        if (!r.exited()) {
+            std.posix.kill(-r.pid, .KILL) catch {};
+            while (!r.exited()) sleep(io, 20);
+        }
+        r.waiter.join();
+        return (now(io) - t0) / std.time.ns_per_ms;
+    }
+
+    /// Whether the process died within a second of starting — a binary
+    /// that could not be run at all rather than a server that fell over.
+    fn diedAtOnce(r: *const Running, io: std.Io) bool {
+        return r.exited() and now(io) - r.started_ns < std.time.ns_per_s;
+    }
+
+    fn free(r: *Running, gpa: std.mem.Allocator) void {
+        gpa.destroy(r);
+    }
+};
+
+/// Set by SIGINT or SIGTERM; read by the loop.
+var stopping: std.atomic.Value(bool) = .init(false);
+
+/// The signal number's type, read off `Sigaction` the way the Engine does.
+const SigNum = @typeInfo(@typeInfo(@typeInfo(
+    @FieldType(@FieldType(std.posix.Sigaction, "handler"), "handler"),
+).optional.child).pointer.child).@"fn".params[0].type.?;
+
+fn onSignal(_: SigNum) callconv(.c) void {
+    stopping.store(true, .release);
+}
+
+fn installSignals() void {
+    if (builtin.os.tag == .windows) return;
+    const action = std.posix.Sigaction{
+        .handler = .{ .handler = onSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &action, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+}
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    // What lives as long as the process — the parsed options, the argv
+    // lines — comes out of the arena `Init` frees on exit, so the leak
+    // check under Debug has nothing to say about it.
+    const arena = init.arena.allocator();
+    const opts = parse(arena, init.minimal.args) orelse usage();
+    installSignals();
+
+    // The build, once. `--watch` is the whole of the file watching, and
+    // `-fincremental` is the whole of the difference between 0.12s and
+    // 2.8s (see the header). Its output is the terminal's, so a compile
+    // error lands where the person is looking.
+    var build_argv: std.ArrayList([]const u8) = .empty;
+    defer build_argv.deinit(gpa);
+    try build_argv.appendSlice(gpa, &.{ opts.zig, "build", opts.step, "--watch" });
+    if (opts.incremental) try build_argv.append(gpa, "-fincremental");
+    try build_argv.appendSlice(gpa, opts.build_options);
+    say("building with `{s}`; serving {s} when it is written", .{ joined(arena, build_argv.items), opts.exe });
+    const build = try Running.start(gpa, io, build_argv.items);
+    defer build.free(gpa);
+
+    var server_argv: std.ArrayList([]const u8) = .empty;
+    defer server_argv.deinit(gpa);
+    try server_argv.append(gpa, opts.exe);
+    try server_argv.appendSlice(gpa, opts.server_args);
+
+    const t_start = now(io);
+    var server: ?*Running = null;
+    var serving: ?Stamp = null;
+    // A change is acted on once it has been seen twice, so a binary still
+    // being written is not started half way through.
+    var pending: ?Stamp = null;
+
+    while (!stopping.load(.acquire)) {
+        if (build.exited()) {
+            say("`zig build` stopped ({s}); nothing will be rebuilt", .{termText(build.exit)});
+            break;
+        }
+
+        if (server) |r| if (r.exited()) {
+            say("the server exited ({s}); waiting for the next build", .{termText(r.exit)});
+            if (opts.incremental and r.diedAtOnce(io) and r.exit != .signal) say(
+                "  if it said `undefined symbol: main`: on Zig 0.16.0 an incremental binary that " ++
+                    "links libc only runs under LLVM. Set `exe.use_llvm = true` for the dev loop, " ++
+                    "or drop --incremental",
+                .{},
+            );
+            r.waiter.join();
+            r.free(gpa);
+            server = null;
+        };
+
+        if (stamp(io, opts.exe)) |seen| {
+            if (opts.trace) say("TRACE t={d}ms size={d} mtime={d}", .{ (now(io) - t_start) / std.time.ns_per_ms, seen.size, @as(i64, @intCast(@divTrunc(seen.mtime_ns, 1000))) });
+            const fresh = if (serving) |s| !s.eql(seen) else true;
+            if (fresh) {
+                if (pending != null and pending.?.eql(seen)) {
+                    var drained: u64 = 0;
+                    if (server) |r| {
+                        drained = r.stop(io, drain_ms);
+                        r.free(gpa);
+                        server = null;
+                    }
+                    server = Running.start(gpa, io, server_argv.items) catch |err| {
+                        say("could not start {s}: {s}", .{ opts.exe, @errorName(err) });
+                        serving = seen;
+                        pending = null;
+                        sleep(io, poll_ms);
+                        continue;
+                    };
+                    if (serving == null)
+                        say("started {s} (pid {d})", .{ opts.exe, server.?.pid })
+                    else
+                        say("{s} changed; restarted (pid {d}, the old one drained in {d} ms)", .{ opts.exe, server.?.pid, drained });
+                    serving = seen;
+                    pending = null;
+                } else {
+                    pending = seen;
+                }
+            }
+        }
+
+        sleep(io, poll_ms);
+    }
+
+    // The way out. Ctrl-C has usually reached both children already; this
+    // is what makes sure of it and waits.
+    if (server) |r| {
+        const drained = r.stop(io, drain_ms);
+        say("stopped the server (drained in {d} ms)", .{drained});
+        r.free(gpa);
+    }
+    if (!build.exited()) _ = build.stop(io, build_stop_ms) else build.waiter.join();
+    say("done", .{});
+}
+
+// ---- the small parts ----
+
+fn parse(arena: std.mem.Allocator, args: std.process.Args) ?Options {
+    var it: std.process.Args.Iterator = .init(args);
+    _ = it.skip(); // the program's own name
+    var opts: Options = .{ .exe = "" };
+    var rest: std.ArrayList([]const u8) = .empty;
+    var build_options: std.ArrayList([]const u8) = .empty;
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--")) {
+            while (it.next()) |a| rest.append(arena, a) catch return null;
+            break;
+        } else if (std.mem.eql(u8, arg, "--zig")) {
+            opts.zig = it.next() orelse return null;
+        } else if (std.mem.eql(u8, arg, "--build")) {
+            opts.step = it.next() orelse return null;
+        } else if (std.mem.eql(u8, arg, "--incremental")) {
+            opts.incremental = true;
+        } else if (std.mem.eql(u8, arg, "--trace")) {
+            opts.trace = true;
+        } else if (std.mem.startsWith(u8, arg, "-D")) {
+            build_options.append(arena, arg) catch return null;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return null;
+        } else if (opts.exe.len == 0) {
+            opts.exe = arg;
+        } else {
+            return null;
+        }
+    }
+    if (opts.exe.len == 0) return null;
+    opts.server_args = rest.items;
+    opts.build_options = build_options.items;
+    return opts;
+}
+
+fn usage() noreturn {
+    std.debug.print(
+        \\usage: nilo-dev [--zig <path>] [--build <step>] [--incremental] [--trace] [-D<option>…] <exe> [-- <server args>]
+        \\
+        \\  runs `zig build <step> --watch` once, and starts <exe> again every time that
+        \\  build writes it. --build defaults to `install`. -D options go to `zig build`.
+        \\  --incremental keeps the compiler resident and .zig-cache flat, at an LLVM
+        \\  emit a save on Zig 0.16.0 (`exe.use_llvm = true`); without it a save is 23 MB.
+        \\  --trace prints the binary's size and mtime whenever they move.
+        \\
+    , .{});
+    std.process.exit(2);
+}
+
+fn stamp(io: std.Io, path: []const u8) ?Stamp {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    return .{ .size = st.size, .mtime_ns = st.mtime.nanoseconds };
+}
+
+fn now(io: std.Io) u64 {
+    const t = std.Io.Timestamp.now(io, .awake);
+    return @intCast(@max(t.nanoseconds, 0));
+}
+
+fn sleep(io: std.Io, ms: u64) void {
+    io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
+}
+
+fn say(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print("nilo-dev: " ++ fmt ++ "\n", args);
+}
+
+fn termText(term: std.process.Child.Term) []const u8 {
+    return switch (term) {
+        .exited => |code| if (code == 0) "exit 0" else "a non-zero exit",
+        .signal => "a signal",
+        .stopped => "stopped",
+        .unknown => "unknown",
+    };
+}
+
+/// The argv as one line, for the first message.
+fn joined(arena: std.mem.Allocator, argv: []const []const u8) []const u8 {
+    return std.mem.join(arena, " ", argv) catch "zig build";
+}
+
+// ---- tests ----
+
+const testing = std.testing;
+
+/// The argument list as `main` receives it, for the parser alone.
+fn argsOf(comptime list: []const [:0]const u8) std.process.Args {
+    comptime var vector: [list.len][*:0]const u8 = undefined;
+    inline for (list, 0..) |arg, i| vector[i] = arg.ptr;
+    const held = vector;
+    return .{ .vector = &held };
+}
+
+test "the exe is the one bare argument, and everything after -- is the server's" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const opts = parse(arena.allocator(), argsOf(&.{ "nilo-dev", "zig-out/bin/app", "--", "--port", "9000" })).?;
+    try testing.expectEqualStrings("zig-out/bin/app", opts.exe);
+    try testing.expectEqualStrings("zig", opts.zig);
+    try testing.expectEqualStrings("install", opts.step);
+    try testing.expect(!opts.incremental);
+    try testing.expectEqual(@as(usize, 2), opts.server_args.len);
+    try testing.expectEqualStrings("--port", opts.server_args[0]);
+    try testing.expectEqualStrings("9000", opts.server_args[1]);
+}
+
+test "the flags name the zig, the step, the incremental mode, and -D options go to the build" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const opts = parse(arena.allocator(), argsOf(&.{
+        "nilo-dev",      "--zig",  "/opt/zig/zig",  "--build",                   "example-hello",
+        "--incremental", "-Dllvm", "-Dstrip=false", "zig-out/bin/example-hello",
+    })).?;
+    try testing.expectEqualStrings("/opt/zig/zig", opts.zig);
+    try testing.expectEqualStrings("example-hello", opts.step);
+    try testing.expect(opts.incremental);
+    try testing.expectEqual(@as(usize, 2), opts.build_options.len);
+    try testing.expectEqualStrings("-Dllvm", opts.build_options[0]);
+    try testing.expectEqualStrings("-Dstrip=false", opts.build_options[1]);
+    try testing.expectEqualStrings("zig-out/bin/example-hello", opts.exe);
+}
+
+test "no exe, two exes, a flag with no value, or a flag nobody knows is usage" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(parse(a, argsOf(&.{"nilo-dev"})) == null);
+    try testing.expect(parse(a, argsOf(&.{ "nilo-dev", "a", "b" })) == null);
+    try testing.expect(parse(a, argsOf(&.{ "nilo-dev", "--zig" })) == null);
+    try testing.expect(parse(a, argsOf(&.{ "nilo-dev", "--watch", "src", "a" })) == null);
+}
+
+test "a stamp moves when either the size or the mtime does" {
+    const a: Stamp = .{ .size = 10, .mtime_ns = 100 };
+    try testing.expect(a.eql(.{ .size = 10, .mtime_ns = 100 }));
+    try testing.expect(!a.eql(.{ .size = 11, .mtime_ns = 100 }));
+    try testing.expect(!a.eql(.{ .size = 10, .mtime_ns = 101 }));
+}

@@ -55,6 +55,8 @@ pub fn build(b: *std.Build) void {
 ```
 
 That is the whole file — `zig build run` after it, and `src/main.zig` next.
+[Restarting on every save](#restarting-on-every-save), below, is three more
+lines once the server exists.
 
 The package is `nilo`; the module is `nilo_http`. **The bare name is the
 project's, not any one module's** — `nilo_sql`, `nilo_id` and `nilo_core` sit
@@ -128,6 +130,59 @@ wati
 the first `:param` in the pattern — text that belongs to the request and is only
 valid while it runs. Neither function knows what HTTP is, which is the point:
 both are callable from a test.
+
+## Restarting on every save
+
+A Zig binary cannot swap its own code, so there is no hot reload; what there
+is instead is a server started again every time the build writes a new one.
+`nilo-dev` ships with the package and does that — it runs one
+`zig build --watch`, and restarts your server whenever the binary it
+produces changes
+([ADR 0259](../adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
+Three lines under the `run` step:
+
+```zig
+const dev = b.addRunArtifact(nilo.artifact("nilo-dev"));
+dev.addArgs(&.{ "--zig", b.graph.zig_exe, b.getInstallPath(.bin, exe.out_filename) });
+b.step("dev", "Rebuild and restart on every save").dependOn(&dev.step);
+```
+
+```
+$ zig build dev
+nilo-dev: building with `zig build install --watch`; serving zig-out/bin/my-app when it is written
+nilo-dev: started zig-out/bin/my-app (pid 41022)
+info: nilo listening on 127.0.0.1:8787 across 8 thread(s)
+   ← save a file
+nilo-dev: zig-out/bin/my-app changed; restarted (pid 41107, the old one drained in 100 ms)
+```
+
+**A build that fails changes nothing.** The errors print, the old server keeps
+serving, and the next save that compiles is the one that restarts it. The old
+server is asked with SIGTERM and gets five seconds to finish what it was
+answering before it is killed. Ctrl-C stops all of it. Arguments after `--`
+go to your server; `--build <step>` names a build step other than `install`.
+
+**What a save costs is Zig's to decide, and on 0.16.0 it is 23 MB of
+`.zig-cache` every time**, because the cache evicts nothing. `--incremental`
+keeps the compiler resident and the cache flat instead — and on 0.16.0 its
+output only runs under the LLVM backend when libc is linked, which every nilo
+server does through zio. So the flag goes with one more line in `build.zig`,
+and costs an LLVM emit per save rather than a self-hosted compile:
+
+```zig
+exe.use_llvm = true; // or behind a -D option, for the dev loop only
+```
+
+```
+$ zig build dev -- --incremental
+```
+
+The numbers behind both paragraphs — 0.12 s for an incremental binary that
+did not run, 23 MB a save for one that did — are in
+[`bench/result/build.md`](../../bench/result/build.md#what-a-restart-on-save-costs-per-save).
+Files served by `staticWith(.{ .reload = true })` need none of this: they are
+read from disk per request already
+([static files](./static-files.md)).
 
 ## The two lines at the top
 

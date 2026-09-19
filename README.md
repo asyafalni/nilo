@@ -497,6 +497,9 @@ $ zig build run-scheduled  # work that is not a request, owned by the server
 $ zig build run-outbound   # calling somebody else's API from inside a handler
 ```
 
+`zig build dev-hello` is the same server restarted on every save
+([getting started](./docs/guide/getting-started.md#restarting-on-every-save)).
+
 Read **`rest`** first, **`orders`** when you hit "yes, but what about…", and
 **`forms`** if you're building a web page rather than an API.
 

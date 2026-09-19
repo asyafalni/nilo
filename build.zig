@@ -11,7 +11,10 @@ const std = @import("std");
 /// **Adding a module means adding a row here as well as to `.paths`.** Core
 /// shipped for a whole session with neither, and nothing noticed, because a
 /// list that does not name a directory cannot check it.
-const shipped_roots = [_][]const u8{ "core", "id", "config", "pw", "cache", "jwt", "fetch", "job", "http", "sql", "s3" };
+///
+/// `dev` is not a module — nothing imports it — but a dependent builds
+/// `nilo.artifact("nilo-dev")` from it, so it ships the same way (ADR 0259).
+const shipped_roots = [_][]const u8{ "core", "id", "config", "pw", "cache", "jwt", "fetch", "job", "http", "sql", "s3", "dev" };
 
 comptime {
     const manifest = @embedFile("build.zig.zon");
@@ -4325,10 +4328,39 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(snippets_step);
 
+    // The server restarted on every save (ADR 0259). Installed so a
+    // dependent can `nilo.artifact("nilo-dev")`; it imports `std` and
+    // nothing of nilo's, and no server links it. Its tests are the argument
+    // parser's and run standalone — `zig test dev/main.zig` — for the reason
+    // a tool module's do: there is no module graph to need.
+    const dev_module = b.createModule(.{
+        .root_source_file = b.path("dev/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dev_tool = b.addExecutable(.{ .name = "nilo-dev", .root_module = dev_module });
+    b.installArtifact(dev_tool);
+    const test_dev_step = b.step("test-dev", "Run nilo-dev's tests — the restart-on-save runner, no module graph");
+    for (test_modes) |mode| {
+        const dev_under_test = b.createModule(.{
+            .root_source_file = b.path("dev/main.zig"),
+            .target = target,
+            .optimize = mode,
+        });
+        const dev_tests = b.addTest(.{ .root_module = dev_under_test, .use_llvm = testBackend(target, mode) });
+        test_dev_step.dependOn(&b.addRunArtifact(dev_tests).step);
+    }
+    test_step.dependOn(test_dev_step);
+
     // Every example is built by `zig build examples`, so one that stops
     // compiling is a failed build rather than a surprise for the first
     // person who copies it.
     const examples_step = b.step("examples", "Build every example");
+    // LLVM for the examples, which on Zig 0.16.0 is what `-fincremental`
+    // needs to produce a binary that runs when libc is linked (ADR 0259).
+    // Off by default: the self-hosted backend is the faster build, and the
+    // only reason to pay for LLVM here is the flat-cache dev loop.
+    const examples_llvm = b.option(bool, "llvm", "Build the examples with LLVM — what `dev-* -- --incremental` needs on 0.16.0") orelse false;
     for (examples) |example| {
         const module = b.createModule(.{
             .root_source_file = b.path(b.fmt("examples/{s}/main.zig", .{example.name})),
@@ -4345,13 +4377,31 @@ pub fn build(b: *std.Build) void {
         const built = b.addExecutable(.{
             .name = b.fmt("example-{s}", .{example.name}),
             .root_module = module,
+            .use_llvm = if (examples_llvm) true else null,
         });
-        examples_step.dependOn(&b.addInstallArtifact(built, .{}).step);
+        const installed = b.addInstallArtifact(built, .{});
+        examples_step.dependOn(&installed.step);
+        // One example on its own, which is what the dev loop below rebuilds:
+        // nine resident compilers at 180 MB each is not a loop anybody sits in.
+        b.step(b.fmt("example-{s}", .{example.name}), b.fmt("Build the {s} example", .{example.name})).dependOn(&installed.step);
 
         const run = b.addRunArtifact(built);
         // Run from the example's own directory: the static one reads its
         // files from a path relative to the working directory.
         run.setCwd(b.path(b.fmt("examples/{s}", .{example.name})));
         b.step(b.fmt("run-{s}", .{example.name}), example.about).dependOn(&run.step);
+
+        // The same, restarted on every save: `nilo-dev` keeps one
+        // `zig build example-<name> --watch` running and starts the example
+        // again whenever that build writes it (ADR 0259). The path is
+        // absolute because the runner's working directory is the example's.
+        // `zig build dev-hello -- --incremental -Dllvm` is the flat-cache
+        // loop; see `dev/main.zig` for why the two go together on 0.16.0.
+        const dev = b.addRunArtifact(dev_tool);
+        dev.setCwd(b.path(b.fmt("examples/{s}", .{example.name})));
+        dev.addArgs(&.{ "--zig", b.graph.zig_exe, "--build", b.fmt("example-{s}", .{example.name}) });
+        if (b.args) |args| dev.addArgs(args);
+        dev.addArg(b.getInstallPath(.bin, built.out_filename));
+        b.step(b.fmt("dev-{s}", .{example.name}), b.fmt("{s} — restarted on every save", .{example.about})).dependOn(&dev.step);
     }
 }

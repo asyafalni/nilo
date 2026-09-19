@@ -121,6 +121,7 @@ zig build test-fetch-engine  # an outbound deadline firing against a real port; 
 zig build test-job     # only nilo_job, both modes, plus its refusals — std.Io.Threaded, job.Memory, no Engine
 zig build test-job-sql # nilo_job over a SQLite table, and Postgres if DATABASE_URL reaches one; on `test-sql`
 zig build test-s3      # only nilo_s3, both modes, plus its refusals
+zig build test-dev     # only nilo-dev's argument parser, both modes — no module graph
 zig build layering     # check that no module imports upward or sideways
 zig build refusals     # the framework's 146 compile-error checks — NOT the others
 zig build refusals-sql # nilo_sql's 144; also run by test-sql
@@ -155,6 +156,7 @@ bash bench/compare-cache/run.sh          # nilo_cache against go-cache — needs
 zig build run          # the benchmark server (bench/main.zig): GET /users/:id, ~1 KB JSON
 zig build profile      # where the time inside one request goes
 zig build run-{hello,rest,orders,forms,spa,stream,chat,scheduled,outbound}  # run one example
+zig build dev-{hello,…}  # the same, restarted on every save; `-- --incremental -Dllvm` keeps .zig-cache flat (ADR 0259)
 ./bench/bench.sh       # wrk/oha against an already-running ReleaseFast server
 ```
 
@@ -174,8 +176,8 @@ and the ranked levers are in [`bench/result/build.md`](bench/result/build.md).
 **`test-all` is the whole gate, and the list below is a list of *narrower* runs
 rather than of things it misses.** It carries every module's own step —
 `test-core`, `test-id`, `test-config`, `test-pw`, `test-cache`, `test-jwt`,
-`test-fetch`, `test-fetch-engine`, `test-job`, `test-s3`, `test-sql`,
-`test-job-sql` and the refusal tables under those —
+`test-fetch`, `test-fetch-engine`, `test-job`, `test-s3`, `test-dev`,
+`test-sql`, `test-job-sql` and the refusal tables under those —
 plus `layering` and `snippets`. This is worth stating because two readers of
 this file concluded the opposite in one evening and gated a merge by running
 seven steps by hand: a change under `core/` moves every module above it while

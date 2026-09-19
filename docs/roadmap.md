@@ -347,15 +347,15 @@ The three that left first were a `Transfer-Encoding` nilo could not decode being
 
 ### Next
 
-**1. Reloading the server without a restart.** A development annoyance rather than a design hole, because a deploy restarts anyway. The static half is built: `staticWith(.{ .reload = true })` leaves every file on disk and opens it per request ([ADR 0125](./adr/0125-a-file-is-described-by-the-descriptor-being-sent.md)), and a file that changes under a running server is described by the descriptor its bytes come out of. A file that did not exist at startup still needs a restart. What is left is the whole process, which cannot live inside `App` — a running binary cannot rebuild itself — so it belongs in the build alongside `zig build run`. jetzig's dev server sums the modification times of its source tree and rebuilds when the sum moves, which is about as much machinery as this deserves. The part to be careful about is that it cannot end up in a release binary.
-
-**Waiting on: ready.**
-
-**2. `permessage-deflate`.** Negotiated in the handshake, and a compressor per connection is memory that has not been budgeted.
+**1. `permessage-deflate`.** Negotiated in the handshake, and a compressor per connection is memory that has not been budgeted.
 
 **Waiting on: a number.** The per-connection cost has to be priced against the 4,669 bytes an idle connection holds today.
 
 ### Known gaps
+
+**`zig build dev -- --incremental` costs an LLVM emit per save on Zig 0.16.0, and the 0.12 s self-hosted loop produces a binary that does not run.** `-fincremental` with the self-hosted x86_64 backend and the new ELF linker rebuilds `examples/hello` in 0.12 s and leaves `.zig-cache` flat, and its output dies at exec with `undefined symbol: main` whenever libc is linked — which every nilo server is, through zio. The old ELF linker spins on the first update instead. The LLVM backend's incremental mode works and is what the flag asks for ([ADR 0259](./adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md), [`bench/result/build.md`](../bench/result/build.md#what-a-restart-on-save-costs-per-save)). `zig build-exe main.zig -lc -fincremental` on a five-line program is the reproduction.
+
+**Waiting on: upstream (zig).** The new ELF linker learning libc, or incremental state surviving under the old one; re-test with `zig build dev-hello -- --incremental` and no `-Dllvm` on each Zig release.
 
 **An internally tagged union is read four times, and the module says the marker costs nothing per request.** `jsonmark.zig`'s header says "Nothing per request and nothing per connection: the marker is read while compiling", and on the write side that is true and measured. On the read side `Reader.parse` calls `skipValue` to find the span, `fromSpan` scans it for the discriminator, `parseFromSliceLeaky` parses it for the variant's fields, and `refuseUnknown` scans it a fourth time because `ignore_unknown_fields` had to be turned on to get past the tag. `ctx.json` parses with default options, so the fourth pass is not optional. Two of the four build a `std.json.Scanner` with an allocator.
 

@@ -1,0 +1,143 @@
+# 0259 — a restart on save watches the binary, not the sources
+
+**Status:** accepted
+**Extends:** [ADR 0125](./0125-a-file-is-described-by-the-descriptor-being-sent.md),
+whose `staticWith(.{ .reload = true })` was the half of "reload without a
+restart" that could live inside `App`; this is the other half, and it
+lives in the build.
+**Applies:** [ADR 0098](./0098-a-completion-the-loop-holds-outlives-the-frame-that-submitted-it.md),
+[ADR 0018](./0018-the-trade-budget-has-three-axes.md),
+[ADR 0170](./0170-a-test-does-not-need-the-optimiser.md).
+
+## Context
+
+A file that changes under a running server is served fresh since ADR 0125,
+and a `.zig` file that changes still needs the person to stop the server,
+rebuild and start it again. The roadmap held the entry at *ready* with one
+sentence of design — jetzig sums the mtimes of its source tree and rebuilds
+when the sum moves, "about as much machinery as this deserves" — and one
+constraint: none of it may end up in a release binary.
+
+The question that reshaped it was asked before a line was written: **does
+this eat the disk?** Zig's cache evicts nothing
+([ziglang/zig#15358](https://github.com/ziglang/zig/issues/15358), closed to
+[Codeberg #30193](https://codeberg.org/ziglang/zig/issues/30193) with no
+eviction in 0.16.0's release notes), and a watcher that ran `zig build` on
+every save would be a leak with a good excuse. So the loop was measured
+before it was designed, five ways, on this machine — the table is in
+[`bench/result/build.md`](../../bench/result/build.md#what-a-restart-on-save-costs-per-save)
+— and two of the five rows moved the decision.
+
+## Decision
+
+**`nilo-dev` runs one `zig build <step> --watch` and leaves it running,
+starts the server whenever the binary that build writes changes, and
+watches nothing else.** It spawns two processes and reads the size and
+mtime of one file every 250 ms. It imports `std` and nothing of nilo's,
+ships as `nilo.artifact("nilo-dev")`, and no server links it — which is
+the release-binary constraint met by construction rather than by a flag.
+
+```zig
+const dev = b.addRunArtifact(nilo.artifact("nilo-dev"));
+dev.addArgs(&.{ "--zig", b.graph.zig_exe, b.getInstallPath(.bin, exe.out_filename) });
+b.step("dev", "Rebuild and restart on every save").dependOn(&dev.step);
+```
+
+**The build system watches the sources, because it already does.** A
+watcher of nilo's own would be a second reading of which files matter, kept
+in step with `build.zig` by hand; `zig build --watch` reads the same graph
+the build does. Watching the *output* instead of the inputs is also what
+makes a failed build free: the watch prints the errors, the binary on disk
+is the last one that compiled, and the server running is the one serving
+it. There is no code for that case.
+
+**The old server is asked to stop, in a process group of its own.** SIGTERM
+is what nilo drains on (ADR 0098), and SIGKILL comes only after five
+seconds. Each child gets a process group of its own so a Ctrl-C at the
+terminal reaches `nilo-dev` alone: nilo reads a *second* signal as "stop
+waiting" and exits without the drain, and the terminal's group would have
+delivered one before the runner's TERM arrived. The build's group is also
+what makes the compilers it keeps under it one `kill` on the way out — a
+`zig build --watch` sent SIGTERM on its own leaves them running, which was
+found the first time it was tried.
+
+**A change is acted on once it has been seen twice.** Two polls with the
+same stamp, 250 ms apart, before a restart, so a binary still being copied
+is not started half way through.
+
+**`--incremental` is opt-in, and on Zig 0.16.0 it wants LLVM.** This is the
+row of the table that was most surprising, and the reason the flag is not
+the default:
+
+| the same edit to `examples/hello`, 2 cores | rebuild | `.zig-cache` per save | binary |
+|---|---|---|---|
+| `zig build` per save, self-hosted | 2.8 s | +23 MB | runs |
+| `--watch`, self-hosted | 3.6 s | +23 MB | runs |
+| `--watch -fincremental`, self-hosted, new ELF linker | 0.12 s | 0 | **does not run** |
+| `--watch -fincremental`, self-hosted, old ELF linker | never finishes | 0 | not written |
+| `--watch -fincremental`, LLVM + LLD | 7.4–9.4 s | 0 | runs |
+
+The 0.12 s row is the one everybody wants, and its binary dies at exec with
+`undefined symbol: main`: the new ELF linker's incremental output does not
+run when libc is linked, and every nilo server links libc through zio. A
+five-line program reproduces it — `zig build-exe main.zig -lc -fincremental`
+— and the old linker, tried next, spins at 100% CPU for minutes on the first
+update. The LLVM backend's incremental mode works, keeps the cache flat, and
+costs an LLVM emit per save; the release notes say as much about what
+incremental does and does not skip under LLVM. So the flag exists, keeps
+the cache at zero growth, and asks for `exe.use_llvm = true` beside it —
+`-Dllvm` for nilo's own examples. A server that dies within a second of
+starting under `--incremental` gets a message naming that fix.
+
+**The default is the 23 MB row**, because it is the one that works with
+nothing else set, on the backend the loop already runs on (ADR 0170). The
+person who cares about the disk more than the four seconds turns the flag
+on; the person who never reads the flag gets a server that restarts.
+
+## What it costs
+
+Against ADR 0018's axes: nothing. Not one byte of `nilo_http` changes;
+`nilo-dev` is an executable nobody imports. What it costs the machine:
+
+- **Per save, default:** one compile of the changed module, 2.8–3.6 s here,
+  and 23 MB of `.zig-cache` that stays until somebody deletes the
+  directory.
+- **Per save, `--incremental`:** an LLVM emit, 4.8 s to a served response
+  here, and 0 MB.
+- **Resident:** the build runner and, under `--incremental`, one compiler
+  kept alive per artifact the step builds — 180 MB for the self-hosted
+  backend, 406 MB for LLVM, measured as RSS. `zig build examples` under
+  the flag would keep nine, which is why the dev steps build one example
+  each.
+- **The runner itself:** one `stat` every 250 ms.
+
+## Alternatives
+
+**A watcher of nilo's own, summing mtimes, running `zig build` per change.**
+The roadmap's sketch, and the first design. Rejected on the first row of
+the table: it is the 23 MB row with a second copy of the file list.
+
+**`zig build run --watch`, with the server as the Run step.** The watch
+waits for every step to finish before it listens again, and a server never
+finishes.
+
+**`-fincremental` as the default.** Rejected by the third row: a default
+that produces a binary that does not run is worse than one that is slow.
+The roadmap keeps the row under `nilo_http`'s known gaps, waiting on
+upstream, because it is the number this loop wants to be.
+
+**Watching the sources as well as the binary**, so the restart could be
+announced before the build finished. Nothing to announce: the server keeps
+serving until there is a new one.
+
+## Consequences
+
+- `dev/main.zig`: `nilo-dev`, with `--zig`, `--build`, `--incremental`,
+  `--trace`, `-D…` pass-through, and `-- <server args>`; `dev` in
+  `build.zig.zon`'s `.paths` and in `shipped_roots`.
+- `zig build dev-<example>` for each example, `zig build example-<name>` to
+  build one, `-Dllvm` for the examples, `zig build test-dev` on `test`.
+- The guide's getting-started page gains the three lines; the roadmap loses
+  "Reloading the server without a restart" and gains the upstream gap.
+- [`bench/result/build.md`](../../bench/result/build.md) carries the table
+  and the machine.

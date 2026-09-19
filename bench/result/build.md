@@ -261,3 +261,52 @@ itself, and is not nilo's to move. The 0.9 s above it is; the lever is a
 `build/` directory of `@import`ed helpers so the runner sees less of what
 `bench/` and `stress/` need. Not worth pulling until something else wants the
 file split.
+
+## What a restart-on-save costs per save
+
+**Not the machine in the header.** 2 cores, 7.9 GB, x86_64 Linux, Zig
+0.16.0, commit `b99a5b4`. Taken before `nilo-dev` was designed rather than
+after, because the question that decided its shape was "does this eat the
+disk?" ([ADR 0259](../../docs/adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
+
+The edit is one string literal in `examples/hello/main.zig`, changed three
+to five times in a row; the build is `zig build examples` (all nine, of which
+one changed) or `example-hello`; cache is `du` of `.zig-cache` after each
+save, and "binary" is whether `zig-out/bin/example-hello` then runs and
+serves the new string.
+
+| | rebuild | `.zig-cache` per save | binary |
+|---|---|---|---|
+| `zig build` per save, self-hosted | 2.7–2.9 s | +23 MB | runs |
+| `--watch`, self-hosted | 3.6–3.7 s | +23 MB | runs |
+| `--watch -fincremental`, self-hosted, new ELF linker | 0.11–0.12 s | 0 | `undefined symbol: main` at exec |
+| `--watch -fincremental`, self-hosted, `use_new_linker = false` | none in 60 s; 3m52s CPU and counting | 0 | not rewritten |
+| `--watch -fincremental`, `use_llvm = true` | 7.4–9.4 s | 0 | runs |
+
+Through `nilo-dev` the LLVM row is 4.8 s from the save to the new string
+being served, because the restart happens on the first of two writes Zig
+makes to the installed binary per change — a 27 MB one and, five seconds
+later, an 8 MB one — and both carry the change.
+
+Resident memory, RSS: the build runner and a compiler per artifact under
+`-fincremental` — 180 MB each for the self-hosted backend (1.78 GB for the
+nine examples), 406 MB for LLVM. Plain `--watch` keeps 275 MB over two
+processes.
+
+The third row was first read as the answer and quoted in a session as
+"0.12 s and zero bytes" before anybody ran the binary. The five-line
+reproduction is `zig build-exe main.zig -lc -fincremental` on 0.16.0, and
+the same file without `-lc`, or with `-fllvm`, runs. Every nilo server
+links libc through zio.
+
+**What it changed:** the runner watches the build's output rather than the
+sources and runs one `zig build --watch` rather than one per change;
+`--incremental` is a flag rather than the default, and asks for LLVM; the
+roadmap carries the third row as an upstream gap.
+
+**Can it go further:** the 0.12 s row is the number, and it is Zig's to
+reach — the new ELF linker learning libc, or incremental state surviving
+under the old one. The 23 MB per save on the default path is Zig's cache
+policy and not nilo's to move. On this machine the LLVM row is bounded by
+LLVM emit on two cores and should divide by the core count elsewhere; that
+is a guess until somebody runs it on the sixteen-core box in the header.
