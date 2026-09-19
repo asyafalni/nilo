@@ -8,7 +8,7 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 [`docs/roadmap.md`](./docs/roadmap.md), and what was refused or answered is in
 [`docs/decided.md`](./docs/decided.md).
 
-## Unreleased
+## 0.5.0
 
 Needs Zig 0.16, as 0.4.0 does. Seventy-nine entries, in four groups.
 

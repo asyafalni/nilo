@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://ziglang.org/"><img alt="Zig 0.16" src="https://img.shields.io/badge/zig-0.16-f7a41d?style=flat-square&logo=zig&logoColor=white"></a>
-  <a href="./CHANGELOG.md"><img alt="version 0.4.0" src="https://img.shields.io/badge/version-0.4.0-3b82f6?style=flat-square"></a>
+  <a href="./CHANGELOG.md"><img alt="version 0.5.0" src="https://img.shields.io/badge/version-0.5.0-3b82f6?style=flat-square"></a>
   <a href="./docs/reference/"><img alt="11 modules" src="https://img.shields.io/badge/modules-11-8957e5?style=flat-square"></a>
   <a href="./refusals/README.md"><img alt="369 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-369-e05d44?style=flat-square"></a>
   <a href="./docs/adr/"><img alt="264 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-264-6b7280?style=flat-square"></a>
@@ -46,7 +46,7 @@ Zig 0.16 and nothing else — no C library, no system package.
 
 ```console
 $ zig init                                                          # only if you have no build.zig.zon yet
-$ zig fetch --save git+https://github.com/nevindra/nilo?ref=v0.4.0
+$ zig fetch --save git+https://github.com/nevindra/nilo?ref=v0.5.0
 ```
 
 **Keep the `?ref=`.** Without it `zig fetch` takes whatever `main` is that day.
@@ -114,10 +114,12 @@ module called `nilo`.** Alias it back in your own code:
 `zig build run` and it's serving. [Getting started](./docs/guide/getting-started.md)
 walks the same ground line by line.
 
-> **Coming from 0.3.0?** Five things the compiler finds and seven it cannot,
-> each with its fix:
-> [Read this before you deploy](https://github.com/nevindra/nilo/releases/tag/v0.4.0#read-this-before-you-deploy).
-> From 0.2.0, start at [v0.3.0's](https://github.com/nevindra/nilo/releases/tag/v0.3.0#read-this-before-deploying);
+> **Coming from 0.4.0?** Five things the compiler finds and three it cannot —
+> `sql.Schema` is the one every program with a database meets — each with
+> its fix:
+> [Read this before you deploy](https://github.com/nevindra/nilo/releases/tag/v0.5.0#read-this-before-you-deploy).
+> From 0.3.0, start at [v0.4.0's](https://github.com/nevindra/nilo/releases/tag/v0.4.0#read-this-before-you-deploy);
+> from 0.2.0, at [v0.3.0's](https://github.com/nevindra/nilo/releases/tag/v0.3.0#read-this-before-deploying);
 > from 0.1.0, at [Upgrading](https://github.com/nevindra/nilo/releases/tag/v0.2.0#upgrading-from-010).
 
 ## A route is just a function

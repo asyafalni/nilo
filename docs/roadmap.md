@@ -22,7 +22,7 @@ Inside the first three, entries are grouped by module, because **two modules tou
 
 **A `Waiting on upstream` row is the line to distrust.** This repository has been wrong about a blocker five times, and four of those were somebody else's code that turned out to already do the thing ([history](./history.md)) — the latest being the standard library it pins, which had been reading a bound port back the whole time. Nothing downstream ever re-tests a blocker, so re-test it before repeating it.
 
-**0.4.0 needs Zig 0.16.** The latest stable release only, on one branch: the people this is aimed at download Zig, run `zig build`, and give up if it fails, and they are not going to go hunting for the right branch. Every new Zig release brings a few awkward weeks, made worse by zio following a branch-per-version pattern too.
+**0.5.0 needs Zig 0.16.** The latest stable release only, on one branch: the people this is aimed at download Zig, run `zig build`, and give up if it fails, and they are not going to go hunting for the right branch. Every new Zig release brings a few awkward weeks, made worse by zio following a branch-per-version pattern too.
 
 ---
 
