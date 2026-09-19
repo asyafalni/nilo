@@ -538,7 +538,7 @@ test "a Db told what to expect boots against a real Postgres and asks its ledger
     // dialled up front for the reason `Live.open` gives. `expecting(0)` is
     // level or ahead on any database, so the guard goes through; behind is
     // pinned on SQLite in `migrate_live.zig`, where the file is fresh.
-    var db = db_mod.Db.init(gpa, url, .{ .size = 2, .connect_on_init = 2 });
+    var db = db_mod.Db.init(gpa, url, .{ .size = 2, .connect_on_init = 2, .unchecked = true });
     defer db.deinit();
     db.expecting(0);
     try db.nilo_start(threaded.io(), .off);
@@ -2970,7 +2970,9 @@ test "addMissingColumns widens a Postgres table the way createMissing would have
 
     // And a scalar read off the catalogue, the way the SQLite test reads
     // `pragma_table_info` (ADR 0234).
-    const names = try db.raw([]const u8, &run,
+    const names = try db.raw(
+        []const u8,
+        &run,
         "SELECT column_name::text FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position",
         .{@as([]const u8, shipped_table)},
     );

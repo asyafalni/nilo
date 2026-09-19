@@ -390,6 +390,22 @@ pub const FromHeader = @import("typed.zig").FromHeader;
 /// the same thing with `c.authorization(.bearer)`.
 pub const Authorization = @import("authorization.zig").Authorization;
 
+/// The same header verified: the claims behind a bearer token, read through
+/// the `jwt.Verifier` the argument names, or a 401 with the challenge before
+/// the handler runs
+/// ([ADR 0260](../docs/adr/0260-verified-claims-are-a-handler-argument.md)).
+///
+/// ```zig
+/// const Google = jwt.Verifier(Claims, fetch.Client);
+/// fn me(user: nilo.Verified(Google)) !Profile { … user.claims.sub … }
+/// ```
+///
+/// The Verifier is a service the route requires, so `listen()` refuses to
+/// start without it. A refusal after reading is
+/// `nilo.Verified(Google).refuse("…", .{})`. A middleware reads the same
+/// thing with `c.verified(Google)`.
+pub const Verified = @import("verified.zig").Verified;
+
 /// The `Idempotency-Key` header, as a typed argument that makes the route
 /// answer once per key
 /// ([ADR 0193](../docs/adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)).
@@ -871,6 +887,7 @@ test {
     _ = @import("filebody.zig");
     _ = @import("bytebody.zig");
     _ = @import("versioned.zig");
+    _ = @import("verified.zig");
     _ = @import("http1.zig");
     _ = @import("bulkhead.zig");
     _ = @import("watchdog.zig");

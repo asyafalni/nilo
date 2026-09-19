@@ -44,6 +44,23 @@
 //! There is no third shape and no `BufferTooSmall`: `max_bytes` bounds both
 //! ends, so a `put` that would not fit is `error.TooLarge` at the moment it
 //! happens, and a `get` can never be handed too little.
+//!
+//! ## A Space of integers counts
+//!
+//! ```zig
+//! const Attempts = cache.Space("signin", u32, .{ .ttl_s = 3600 });
+//! if (attempts.incr(email, 1) > 5) return fail.tooMany("try again in an hour", .{});
+//! ```
+//!
+//! `incr` is one add under the shard's lock, so two requests arriving at
+//! once count two — the `get` then `put` it replaces lost one of them
+//! ([ADR 0261](../docs/adr/0261-a-count-is-added-to-under-the-lock-the-copy-is-under.md)).
+//! A key nobody wrote counts from zero and lives `ttl_s`; one already there
+//! keeps the expiry it had, so the hour above is the hour of the first
+//! attempt rather than a window that slides with every one. Saturating: a
+//! counter at its type's ceiling stays there rather than opening the quota
+//! again. Only on a Space whose value is an integer — anything else is a
+//! Refusal naming the type.
 
 const std = @import("std");
 const flat = @import("flat.zig");
@@ -130,6 +147,20 @@ pub fn Space(comptime name: []const u8, comptime V: type, comptime opts: Options
         /// Forget a key. True when there was something to forget.
         pub fn del(self: Self, key: []const u8) bool {
             return self.store.del(id, key);
+        }
+
+        /// Add `delta` to the count under `key` and answer the new count
+        /// — see the file header. A Space whose value is not an integer has
+        /// nothing to add to, and says so while compiling.
+        pub fn incr(self: Self, key: []const u8, delta: V) V {
+            comptime if (@typeInfo(V) != .int) @compileError(
+                "nilo: the cache Space \"" ++ name ++ "\" holds " ++ shortName(V) ++
+                    ", and `incr` adds to an integer.\n" ++
+                    "  A count is a Space of its own: `cache.Space(\"" ++ name ++
+                    "\", u64, .{ .ttl_s = … })`, and `incr(key, 1)` on that is the " ++
+                    "new count under the lock a `put` already takes (ADR 0261).",
+            );
+            return self.store.add(V, id, key, delta, opts.ttl_s);
         }
 
         /// Store a value **only if the key is free**, and say whether it was:
@@ -249,6 +280,24 @@ test "a key nobody wrote is null rather than a zero value" {
     try testing.expectEqual(@as(?u64, null), hits.get("/pricing"));
     hits.put("/pricing", 0);
     try testing.expectEqual(@as(?u64, 0), hits.get("/pricing"));
+}
+
+test "a Space of integers counts, and a key nobody wrote counts from zero" {
+    var store = try openStore();
+    defer store.deinit();
+
+    const Attempts = Space("signin", u32, .{ .ttl_s = 3600 });
+    var attempts = Attempts.open(&store);
+
+    try testing.expectEqual(@as(?u32, null), attempts.get("ada@example"));
+    try testing.expectEqual(@as(u32, 1), attempts.incr("ada@example", 1));
+    try testing.expectEqual(@as(u32, 4), attempts.incr("ada@example", 3));
+    try testing.expectEqual(@as(?u32, 4), attempts.get("ada@example"));
+    // Adding nothing reads the count under the same lock, and a delete
+    // starts it over.
+    try testing.expectEqual(@as(u32, 4), attempts.incr("ada@example", 0));
+    try testing.expect(attempts.del("ada@example"));
+    try testing.expectEqual(@as(u32, 1), attempts.incr("ada@example", 1));
 }
 
 test "a bytes Space reads into the array it hands out" {

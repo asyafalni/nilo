@@ -29,6 +29,22 @@ which is usually a migration that has not run.
 
 Set `.schema_mismatch_is_fatal = false` to log and carry on.
 
+**A `Db` that never had `checking` called on it says so at startup**, at
+`warn`, once: the Rows will be checked by the first request that reads
+them, which is later than anybody wanted. It is one line and it is not a
+failure — a program with a `Db` and no Rows is a perfectly good program.
+Say `.unchecked = true` in the options when that is what was meant, and
+the line goes away
+([ADR 0262](../../adr/0262-a-db-with-no-schema-check-says-so-or-is-told.md)):
+
+```zig
+var scratch = sql.Db.init(gpa, url, .{ .unchecked = true });
+```
+
+The two used to look the same, and the second was the one that reached
+production: a Row disagreeing with its table on a `Db` nobody had thought
+about checking.
+
 ## The arena is cheaper than the stack
 
 Worth knowing before you write a handler that needs a scratch buffer, because

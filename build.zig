@@ -858,6 +858,10 @@ const sql_refusals = [_]Refusal{
         .name = "sqlite_case_sensitive_pattern",
         .says = "the sqlite dialect has no `contains`, asked for on column `email`.",
     },
+    .{
+        .name = "sqlite_like",
+        .says = "the sqlite dialect has no `like`, asked for on column `email`.",
+    },
     // `.exists`. The first two are the two ways a schema can fail to say how
     // two tables are joined, and they are different mistakes: nothing said, and
     // said twice (ADR 0171).
@@ -1054,6 +1058,10 @@ const cache_refusals = [_]Refusal{
     .{
         .name = "cache_bytes_space_with_no_room",
         .says = "the cache Space \"page\" holds bytes and its `max_bytes` is 0.",
+    },
+    .{
+        .name = "cache_incr_on_a_struct",
+        .says = "the cache Space \"cart\" holds Cart, and `incr` adds to an integer.",
     },
 };
 
@@ -1415,6 +1423,18 @@ const refusals = [_]Refusal{
     .{
         .name = "form_list_element_cannot_convert",
         .says = "the field `photos: []const nilo.Upload` of the `Form(form_list_element_cannot_convert.Gallery)` on route \"/gallery\" is a list of something a form value cannot become.",
+    },
+    .{
+        .name = "verified_of_the_claims",
+        .says = "`nilo.Verified(verified_of_the_claims.Claims)` names verified_of_the_claims.Claims, which is not a `jwt.Verifier`.",
+    },
+    .{
+        .name = "verified_of_a_pointer",
+        .says = "`nilo.Verified(*verified_of_a_pointer.Google)` names a pointer, and the argument names the Verifier's type.",
+    },
+    .{
+        .name = "verified_as_an_answer",
+        .says = "the handler for route \"/me\" returns nilo.Verified(verified_as_an_answer.Google), which is what a handler is *given* rather than what it answers with.",
     },
     .{
         .name = "versioned_as_an_argument",

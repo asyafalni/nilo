@@ -32,6 +32,7 @@ const percent = @import("nilo_core").percent;
 const fail = @import("fail.zig");
 const watchdog = @import("watchdog.zig");
 const authorization_mod = @import("authorization.zig");
+const verified_mod = @import("verified.zig");
 const versioned_mod = @import("versioned.zig");
 const Str = str_mod.Str;
 
@@ -791,6 +792,24 @@ pub const Ctx = struct {
     pub fn authorization(self: *Ctx, comptime which: authorization_mod.Scheme) !authorization_mod.Authorization(which) {
         const raw: ?[]const u8 = if (self.header("Authorization")) |h| h.view() else null;
         return authorization_mod.read(which, raw, self.arena(), self._lifetime);
+    }
+
+    /// The `Authorization` header verified through the `jwt.Verifier` `V`,
+    /// or the 401 — with the challenge — that says why not
+    /// ([ADR 0260](../docs/adr/0260-verified-claims-are-a-handler-argument.md)).
+    /// For a middleware guarding a prefix; a handler writes
+    /// `nilo.Verified(V)` in its argument list and gets the document entry
+    /// as well. A handler under the guard that asks again verifies again.
+    pub fn verified(self: *Ctx, comptime V: type) !verified_mod.Verified(V) {
+        const T = verified_mod.Verified(V);
+        const verifier = self._services.get(*V) orelse return fail.internal(
+            "service {s} was never registered; call app.provide() before app.listen()",
+            .{@typeName(V)},
+        );
+        const raw: ?[]const u8 = if (self.header("Authorization")) |h| h.view() else null;
+        // Seconds since the epoch, which is what a token's `exp` is in.
+        const now_s = @divFloor(str_mod.nowMillis(), std.time.ms_per_s);
+        return verified_mod.read(T, raw, self.arena(), self._lifetime, now_s, self, verifier);
     }
 
     /// The address the connection itself came from — the proxy's, when

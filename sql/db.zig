@@ -417,6 +417,17 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             /// starting, or only says so in the log. A disagreement is a
             /// 500 waiting to happen, so stopping is the default.
             schema_mismatch_is_fatal: bool = true,
+            /// Say so when this `Db` has no `checking` list **on purpose** —
+            /// a scratch database, a fixture, a program whose every query is
+            /// `db.raw`. Without it, a `Db` that reaches `nilo_start` with
+            /// `checking` never called warns once that the Rows will be
+            /// checked by the first request that reads them, which is later
+            /// than anybody wanted
+            /// ([ADR 0262](../docs/adr/0262-a-db-with-no-schema-check-says-so-or-is-told.md)).
+            /// The two are a decision written down and a decision nobody
+            /// made, and until this field existed they looked the same.
+            /// A `checking` list that was given still runs whatever this says.
+            unchecked: bool = false,
             /// Whether a statement is kept prepared on the connection it went
             /// down, so the next one that sends it skips Parse and Describe.
             ///
@@ -719,6 +730,21 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             const dialing_for_check = has_check and self.opts.connect_on_init == 0;
             var check_dial_failed = false;
 
+            // **The one way to have no schema check is to say so** (ADR
+            // 0262). A `Db` with `check == null` used to be a decision
+            // nobody had written down, and the disagreement the check would
+            // have caught arrived as a 500 on the first request that read the
+            // column. Said before the dial, because it is true whether or not
+            // the database is up, and at `warn` for the reason the lines
+            // below are: `err` fails the test runner (ADR 0178).
+            if (self.forgotTheCheck()) std.log.warn(
+                "{s} is starting with no schema check: `db.checking(schema)` was never " ++
+                    "called, so a Row that disagrees with its table is found by the first " ++
+                    "request that reads it. If that is meant, say `.unchecked = true` in " ++
+                    "the options.",
+                .{nilo_type_name},
+            );
+
             var opened = W.open(io, self.gpa, self.url, .{
                 .size = self.opts.size,
                 .connect_on_init = if (dialing_for_check) 1 else self.opts.connect_on_init,
@@ -791,6 +817,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
             try self.checkAtBoot();
             try self.expectAtBoot(io);
+        }
+
+        /// Whether this `Db` has neither a `checking` list nor the word
+        /// that says none was wanted — the state `nilo_start` warns about.
+        fn forgotTheCheck(self: *const Self) bool {
+            return self.check == null and !self.opts.unchecked;
         }
 
         /// The `checking` list against the database, once, at boot.
@@ -3670,6 +3702,23 @@ fn listPeople(db: *FakeDb, c: *nilo.Ctx) ![]Person {
     return db.select(Person, c, .{ .where = .{ .age = .{ .gt = 18 } } });
 }
 
+test "a Db with no checking list has forgotten the check unless it said so" {
+    var forgot = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer forgot.deinit();
+    try testing.expect(forgot.forgotTheCheck());
+
+    // The word is the decision written down (ADR 0262).
+    var meant = FakeDb.init(testing.allocator, "postgres://test/test", .{ .unchecked = true });
+    defer meant.deinit();
+    try testing.expect(!meant.forgotTheCheck());
+
+    // And a list given is a check, whatever the word says.
+    var listed = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer listed.deinit();
+    listed.checking(.{ .tables = &.{Person} });
+    try testing.expect(!listed.forgotTheCheck());
+}
+
 test "a handler's select runs the whole path, with no database anywhere" {
     var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
     defer db.deinit();
@@ -5329,7 +5378,7 @@ test "a Db answers the health page with SELECT 1, and says so before it has star
     var db: SqliteDb = .init(
         testing.allocator,
         "file:ready-probe?mode=memory&cache=shared",
-        .{ .size = 1 },
+        .{ .size = 1, .unchecked = true },
     );
     defer db.deinit();
 
@@ -5356,7 +5405,7 @@ test "a uuid column is written and read back on the SQLite Wire" {
     var db: SqliteDb = .init(
         testing.allocator,
         "file:uuid-round-trip?mode=memory&cache=shared",
-        .{ .size = 2 },
+        .{ .size = 2, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -5407,7 +5456,7 @@ test "a uuid bound bare to db.exec and db.raw reaches the database" {
     var db: SqliteDb = .init(
         testing.allocator,
         "file:raw-uuid?mode=memory&cache=shared",
-        .{ .size = 2 },
+        .{ .size = 2, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -5463,7 +5512,7 @@ test "the schema check agrees with the wire about a uuid column" {
     var db: SqliteDb = .init(
         testing.allocator,
         "file:uuid-schema-check?mode=memory&cache=shared",
-        .{ .size = 1 },
+        .{ .size = 1, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -5497,7 +5546,7 @@ test "the introspection asks the attached database whether the name is a view" {
     var db: SqliteDb = .init(
         testing.allocator,
         "file:attached-view-check?mode=memory&cache=shared",
-        .{ .size = 1 },
+        .{ .size = 1, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -5615,7 +5664,7 @@ test "every call this module offers is compiled against the SQLite wire too" {
     var db: SqliteDb = .init(
         testing.allocator,
         "file:everything?mode=memory&cache=shared",
-        .{ .size = 2 },
+        .{ .size = 2, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -5727,7 +5776,7 @@ test "an `in` on SQLite is the JSON array json_each reads, and it matches" {
     var db: SqliteDb = .init(
         testing.allocator,
         "file:in-list?mode=memory&cache=shared",
-        .{ .size = 2 },
+        .{ .size = 2, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -5803,7 +5852,7 @@ test "an INTEGER PRIMARY KEY is the rowid, so a correct table no longer stops th
     var db: SqliteDb = .init(
         testing.allocator,
         "file:rowid-alias?mode=memory&cache=shared",
-        .{ .size = 1 },
+        .{ .size = 1, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -5853,7 +5902,7 @@ test "db.exec answers with the rows it changed and needs no Row to do it" {
     var db: SqliteDb = .init(
         testing.allocator,
         "file:exec-counts?mode=memory&cache=shared",
-        .{ .size = 1 },
+        .{ .size = 1, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -5913,7 +5962,7 @@ test "rawOne answers with the row or with null, so a key lookup is not an unwrap
     var db: SqliteDb = .init(
         testing.allocator,
         "file:raw-one?mode=memory&cache=shared",
-        .{ .size = 2 },
+        .{ .size = 2, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -5964,7 +6013,7 @@ test "raw reads one column into a slice, an integer or a Str, with no Row and no
     var db: SqliteDb = .init(
         testing.allocator,
         "file:raw-scalar?mode=memory&cache=shared",
-        .{ .size = 2 },
+        .{ .size = 2, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -6019,7 +6068,7 @@ test "rawOne hands back the first row when a statement matches several" {
     var db: SqliteDb = .init(
         testing.allocator,
         "file:raw-one-many?mode=memory&cache=shared",
-        .{ .size = 2 },
+        .{ .size = 2, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -6048,7 +6097,7 @@ test "updateReturningOne is the PATCH shape: the row as it now is, or null" {
     var db: SqliteDb = .init(
         testing.allocator,
         "file:update-returning-one?mode=memory&cache=shared",
-        .{ .size = 2 },
+        .{ .size = 2, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -6165,7 +6214,7 @@ test "a page carries the total the condition matched, in one statement" {
     var db: SqliteDb = .init(
         testing.allocator,
         "file:paged-list?mode=memory&cache=shared",
-        .{ .size = 2 },
+        .{ .size = 2, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -6255,7 +6304,7 @@ test "the order a request chose is the order the rows come back in, on a page an
     var db: SqliteDb = .init(
         testing.allocator,
         "file:ordered-list?mode=memory&cache=shared",
-        .{ .size = 2 },
+        .{ .size = 2, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);
@@ -6354,7 +6403,7 @@ test "an optional filter narrows when it is set and drops when it is not" {
     var db: SqliteDb = .init(
         testing.allocator,
         "file:optional-filter?mode=memory&cache=shared",
-        .{ .size = 2 },
+        .{ .size = 2, .unchecked = true },
     );
     defer db.deinit();
     try db.nilo_start(threaded.io(), .none);

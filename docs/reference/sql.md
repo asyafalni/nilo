@@ -191,6 +191,7 @@ A query string is split before it is percent-decoded, so `password=p%26w` is
 | `connect_on_init` | how many to dial during `listen()`. Default 0 — set it to `size` when driving a `Db` from a `std.Io.Threaded` ([ADR 0062](../adr/0062-a-pool-that-dialled-itself-whatever-it-was-told.md)) |
 | `timeout_ms` | how long a caller waits for a free connection. Default 10,000. Bounded on SQLite too since [ADR 0135](../adr/0135-a-wait-for-a-connection-has-a-bound.md), where it needs the Engine to enforce it |
 | `schema_mismatch_is_fatal` | whether a Row that disagrees with its table stops startup. Default true |
+| `unchecked` | say so when this `Db` has no `checking` list on purpose. Default false, and then a `Db` that starts with `checking` never called warns once that the Rows will be checked by the first request that reads them ([ADR 0262](../adr/0262-a-db-with-no-schema-check-says-so-or-is-told.md)) |
 | `prepared` | whether a statement is kept prepared on the connection it went down. Default true |
 
 **A suite whose database is not running: turn the log level down, and do it with
@@ -548,7 +549,7 @@ Different fields are ANDed. Several operators on one field are ANDed too.
 | `.id = 7` | `"id" = $1` |
 | `.age = .{ .gt = 18, .lt = 65 }` | `"age" > $1 AND "age" < $2` |
 | `.eq` `.ne` `.gt` `.gte` `.lt` `.lte` | |
-| `.like` / `.ilike` | and `.not_like` / `.not_ilike`. **These do not escape the text you give them**; the row below is the one to reach for. On SQLite `.ilike` is spelled `LIKE`, because that database's `LIKE` already folds ASCII case |
+| `.like` / `.ilike` | and `.not_like` / `.not_ilike`. **These do not escape the text you give them**; the row below is the one to reach for. On SQLite `.ilike` is spelled `LIKE`, because that database's `LIKE` already folds ASCII case — and `.like` is a Refusal there naming `.ilike`, for the reason `.contains` is ([ADR 0263](../adr/0263-like-on-sqlite-is-refused-the-way-contains-is.md)) |
 | `.contains` `.starts_with` `.ends_with` | the pattern is built *and* escaped by the statement, so `%` and `_` in a search term match themselves. `i` in front folds case (`.icontains`), `not_` in front negates — twelve in all. On SQLite the case-sensitive half is a Refusal: its `LIKE` folds ASCII case and cannot be told not to |
 | `.in = &.{ 1, 2, 3 }` | `= ANY($1)` — one parameter, so the statement stays a constant |
 | `.not_in = &.{ 1, 2, 3 }` | `<> ALL($1)` — one parameter likewise |

@@ -60,7 +60,7 @@ const Fixture = struct {
     run: core.Run,
 
     fn init(gpa: std.mem.Allocator, name: []const u8) !*Fixture {
-        return initWith(gpa, name, .{ .size = 2 }, null);
+        return initWith(gpa, name, .{ .size = 2, .unchecked = true }, null);
     }
 
     /// `expect` is what `expecting` would be told before the boot, or null
@@ -778,7 +778,7 @@ test "a Db told what to expect asks the ledger at boot, on the pool it just open
     // level and ahead go through. Behind is `migrate.expect`'s own refusal,
     // pinned above through `standing` for the reason given there.
     const gpa = testing.allocator;
-    var fx = try Fixture.initWith(gpa, "expect_at_boot", .{ .size = 2 }, 0);
+    var fx = try Fixture.initWith(gpa, "expect_at_boot", .{ .size = 2, .unchecked = true }, 0);
     defer fx.deinit(gpa);
 
     // No `ensureLedger` here: boot made it, or this query has no table.
@@ -791,14 +791,14 @@ test "a Db told what to expect asks the ledger at boot, on the pool it just open
     _ = try migrate.apply(&fx.db, &fx.run, three, three_hash);
 
     // A second `Db` on the same file, booted the way a deploy would be.
-    var level = Db.init(gpa, fx.path, .{ .size = 1 });
+    var level = Db.init(gpa, fx.path, .{ .size = 1, .unchecked = true });
     defer level.deinit();
     level.expecting(3);
     try level.nilo_start(fx.threaded.io(), .off);
 
     // And one built before the migration that is already in: the middle of
     // a two-stage deploy, allowed.
-    var ahead = Db.init(gpa, fx.path, .{ .size = 1 });
+    var ahead = Db.init(gpa, fx.path, .{ .size = 1, .unchecked = true });
     defer ahead.deinit();
     ahead.expecting(2);
     try ahead.nilo_start(fx.threaded.io(), .off);
@@ -1079,7 +1079,7 @@ test "a twin brings a database to head on its own, ledger row and all" {
     const gpa = testing.allocator;
     // One connection, so `BEGIN` and `COMMIT` in the file are the same
     // transaction rather than two connections out of a pool.
-    var fx = try Fixture.initWith(gpa, "twin", .{ .size = 1 }, null);
+    var fx = try Fixture.initWith(gpa, "twin", .{ .size = 1, .unchecked = true }, null);
     defer fx.deinit(gpa);
 
     const migrations = @import("migrations.zig");

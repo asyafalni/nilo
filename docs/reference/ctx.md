@@ -20,6 +20,7 @@ One page of [the reference](./README.md): one request in flight: reading it, ans
 | `c.header(name)` | `?Str`, name matched case-insensitively. The **first** of that name |
 | `c.clientHas(version)` | `bool` — whether `If-None-Match` names the tag a `nilo.Versioned(T)` with that `u64` goes out under. Asked before building the body, so `.unchanged(version)` skips the query as well as the bytes ([ADR 0258](../adr/0258-a-version-a-handler-names-is-an-etag.md)) |
 | `c.authorization(.bearer)` | `!Authorization(.bearer)` — the header as one scheme, or the 401 with the challenge on it. For a resolver; a handler asks in its argument list |
+| `c.verified(V)` | `!Verified(V)` — the bearer token verified through the `jwt.Verifier` `V`, or the 401. For a middleware guarding a prefix; a handler asks in its argument list |
 | `c.headers()` | an iterator over every header, in arrival order — `while (it.next()) \|h\|`, `h.name` and `h.value` are `Str` |
 | `c.cookie(name)` | `?Str` — as the client sent it, nothing decoded. Allocates nothing |
 | `c.body()` | `!Str` — the whole body, up to `max_body` (1 MB) |

@@ -74,6 +74,7 @@ section on it. A name is found here first and read on its page.
 - [Handler arguments](./handlers.md#handler-arguments)
   - [`FromHeader(name, T)`](./handlers.md#fromheadername-t)
   - [`Authorization(scheme)`](./handlers.md#authorizationscheme)
+  - [`Verified(V)`](./handlers.md#verifiedv)
   - [`Idempotent(Replays, options)`](./handlers.md#idempotentreplays-options)
   - [`Cached(Pages, options)`](./handlers.md#cachedpages-options)
   - [A query field that is a list](./handlers.md#a-query-field-that-is-a-list)
@@ -198,3 +199,4 @@ section on it. A name is found here first and read on its page.
 
 - [`nilo_jwt`](./jwt.md#nilo_jwt)
   - [`jwt.Keyring`](./jwt.md#jwtkeyring)
+  - [`jwt.Verifier(Claims, Client)`](./jwt.md#jwtverifierclaims-client)

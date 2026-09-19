@@ -1525,10 +1525,20 @@ fn operator(
         // the same swap `dialect.SQLite.pattern` makes for `icontains`
         // (ADR 0061). The table below predates the second Dialect and wrote
         // `ILIKE` on both, which compiled and came back a syntax error.
+        //
+        // And the case-sensitive pair is the Refusal `contains` already is
+        // there: `.like` on SQLite compiled and folded, matching more than
+        // it was asked to on one database only, which is the lie the seam
+        // exists not to tell (ADR 0263). The message names `ilike`, which
+        // is what that database was doing all along.
         const spelled = if (D.like_folds and std.mem.eql(u8, op.name, "ilike"))
             "LIKE"
         else if (D.like_folds and std.mem.eql(u8, op.name, "not_ilike"))
             "NOT LIKE"
+        else if (D.like_folds and std.mem.eql(u8, op.name, "like"))
+            dialect_mod.noPatternForm(D, column, "like", "ilike")
+        else if (D.like_folds and std.mem.eql(u8, op.name, "not_like"))
+            dialect_mod.noPatternForm(D, column, "not_like", "not_ilike")
         else
             spelling(op.name).?;
 

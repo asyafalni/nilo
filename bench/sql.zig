@@ -326,7 +326,7 @@ fn throughTheModule(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !void {
 }
 
 fn findRounds(gpa: std.mem.Allocator, io: std.Io, url: []const u8, prepared: bool) !u64 {
-    var db = sql.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .prepared = prepared });
+    var db = sql.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .prepared = prepared, .unchecked = true });
     defer db.deinit();
     try db.nilo_start(io, .off);
 
@@ -560,7 +560,7 @@ fn sqliteThroughTheModule(gpa: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn sqliteFindRounds(gpa: std.mem.Allocator, io: std.Io, prepared: bool) !u64 {
-    var db = SqliteDb.init(gpa, sqlite_db, .{ .size = 2, .prepared = prepared });
+    var db = SqliteDb.init(gpa, sqlite_db, .{ .size = 2, .prepared = prepared, .unchecked = true });
     defer db.deinit();
     try db.nilo_start(io, .off);
 

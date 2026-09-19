@@ -205,7 +205,49 @@ module's own vector is RFC 7515's, which sidesteps the question.
 
 ## The signed-in user
 
-With the keys held, the token check is a
+With the keys held, the claims behind a bearer token are one argument
+([ADR 0260](../adr/0260-verified-claims-are-a-handler-argument.md)):
+
+<!-- compiles -->
+```zig
+const Google = jwt.Verifier(Claims, fetch.Client);
+
+fn me(user: nilo.Verified(Google)) Claims {
+    return user.claims;
+}
+```
+
+and beside the ring in `main`:
+
+```zig
+var verifier = Google.init(&google, &api);
+try app.provide(&verifier);
+```
+
+`jwt.Verifier(Claims, Client)` is the ring, the client its refresh needs
+and the claims type, held as one service — which is what lets an argument
+name one type and reach all three. Before `me` runs, nilo reads the
+`Authorization` header, insists on `Bearer`, verifies the token through
+the ring with the issuer, the audience and the clock, fetches the keys
+once if a `kid` went missing, and hands over the claims parsed into the
+request arena. Anything short of that is a 401 with `WWW-Authenticate:
+Bearer` on it and the reason in the body — `Expired`, `WrongAudience` —
+and the one thing that is not a 401 is the issuer being unreachable when
+a refresh was needed, which is a 503 because the token was never judged.
+`listen()` refuses to start if the verifier was not provided, the way it
+does for a `*Db`; the OpenAPI document carries the bearer scheme and the
+401.
+
+The refusal after reading — the account is closed, the role is wrong —
+is `nilo.Verified(Google).refuse("that account is closed", .{})`, the
+same 401 with the same header. `user.token` is the token as the client
+sent it, for a handler that passes it on to another service. A middleware
+guarding a prefix reads the same thing with `c.verified(Google)`, and a
+handler under it that asks again verifies again — the signature check
+twice, which the next section is the way round.
+
+**When the handler wants more than the claims** — the database row behind
+`sub`, a struct of your own — the token check is a
 [resolved value](./middleware.md#resolved-values): the type says how it is
 worked out, a handler asks for it by writing it in its argument list, and it
 is worked out once per request however many things ask.
@@ -237,7 +279,7 @@ fn authenticate(c: *nilo.Ctx, google: *jwt.Keyring, api: *fetch.Client) !Current
     return .{ .id = claims.sub, .email = claims.email };
 }
 
-fn me(user: CurrentUser) !CurrentUser {
+fn profile(user: CurrentUser) !CurrentUser {
     return user;
 }
 ```
@@ -252,14 +294,16 @@ on it, for the refusal that comes after reading. A handler that wants the
 token itself rather than the user asks for `nilo.Authorization(.bearer)` in
 its argument list and gets a security scheme in the OpenAPI document as well.
 
-`me` is still an ordinary function — `me(.{ .id = "7", .email = "…" })` in a
-test, with no token anywhere. Guarding a whole prefix is the same `c.resolve`
+`profile` is still an ordinary function — `profile(.{ .id = "7", .email = "…" })`
+in a test, with no token anywhere. Guarding a whole prefix is the same `c.resolve`
 the middleware page shows: `try app.useOn("/api", requireUser)` with
 `_ = try c.resolve(CurrentUser)` inside it, and the handler behind it gets the
 same lookup rather than a second one.
 
 `c.arena()` is the right allocator there. The claims live exactly as long as
-the request, and nothing is freed.
+the request, and nothing is freed. A resolver that takes a `*Google` and
+calls `google.verify(c.arena(), auth.value.view(), now_s, c)` is the same
+five lines with the client already inside.
 
 ## When the issuer rotates
 

@@ -356,7 +356,7 @@ const Harness = struct {
         // connection the transaction holds" a thing the proxy can point at,
         // and `connect_on_init = size` is the constraint every test on
         // `std.Io.Threaded` is under — the reconnector cannot park here.
-        h.db = .init(gpa, h.url, .{ .size = 1, .connect_on_init = 1 });
+        h.db = .init(gpa, h.url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
         try h.db.nilo_start(io, .off);
         errdefer {
             h.db.nilo_stop();

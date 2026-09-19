@@ -40,6 +40,7 @@ const Carts = cache.Space("cart", Cart, .{ .ttl_s = 300 });
 | `space.putFor(key, value, ttl_s)` | for a life of its own. `0` is "until the ring writes over it" |
 | `space.get(key)` | `?V` for a flat value; `?[]const u8` and a `*Held` for bytes |
 | `space.del(key)` | `bool` — was there anything to forget |
+| `space.incr(key, delta)` | `V` — the new count, for a Space whose `V` is an integer; anything else is a Refusal. The read, the add and the write are under the shard's lock, so two callers count two. A key nobody wrote counts from zero and lives `ttl_s`; one there keeps the expiry it had. Saturating ([ADR 0261](../adr/0261-a-count-is-added-to-under-the-lock-the-copy-is-under.md)) |
 | `space.putIfAbsent(key, value)` | store only if the key is free, and say whether it was — `bool` for a flat value, `!bool` for bytes. One shard lock around the scan and the write, so two callers racing get one `true` between them. What `nilo.Idempotent` claims a key with ([ADR 0193](../adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)) |
 | `space.getInto(key, buf)` | the bytes read as `get` reads them, into a buffer of your choosing rather than a `Held` — for a caller whose buffer is an arena |
 | `store.stats()` | hits, and the three different ways of missing |

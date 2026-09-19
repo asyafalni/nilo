@@ -55,7 +55,7 @@ pub fn main() !void {
 
     {
         const Db = sql.Sqlite(.{ .threading = .in_fiber });
-        var db: Db = .init(gpa, "file:nilo-bench-job?mode=memory&cache=shared", .{ .size = 1 });
+        var db: Db = .init(gpa, "file:nilo-bench-job?mode=memory&cache=shared", .{ .size = 1, .unchecked = true });
         defer db.deinit();
         try db.nilo_start(threaded.io(), .off);
         var run: core.Run = .init(gpa);
@@ -66,7 +66,7 @@ pub fn main() !void {
     }
 
     if (live_config.database_url) |url| {
-        var db: sql.Db = .init(gpa, url, .{ .size = 1, .connect_on_init = 1 });
+        var db: sql.Db = .init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
         defer db.deinit();
         try db.nilo_start(threaded.io(), .off);
         defer db.nilo_stop();

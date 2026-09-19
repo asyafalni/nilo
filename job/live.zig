@@ -69,7 +69,7 @@ const Fixture = struct {
         f.threaded = .init(testing.allocator, .{});
         const url = try std.fmt.allocPrint(testing.allocator, "file:{s}?mode=memory&cache=shared", .{name});
         defer testing.allocator.free(url);
-        f.db = .init(testing.allocator, url, .{ .size = 2 });
+        f.db = .init(testing.allocator, url, .{ .size = 2, .unchecked = true });
         f.run = .init(testing.allocator);
         try f.db.nilo_start(f.threaded.io(), .off);
         try sql.migrate.createMissing(&f.db, &f.run, .{ .tables = &.{ SqliteTable.Row, Note } });
@@ -238,7 +238,7 @@ const Pg = struct {
         // Every connection dialled here: under `std.Io.Threaded` the pool's
         // own reconnector cannot park, so the harness dials in full — the
         // constraint `sql/db.zig`'s `connect_on_init` documents.
-        p.db = .init(testing.allocator, url, .{ .size = 3, .connect_on_init = 3 });
+        p.db = .init(testing.allocator, url, .{ .size = 3, .connect_on_init = 3, .unchecked = true });
         p.run = .init(testing.allocator);
         try p.db.nilo_start(p.threaded.io(), .off);
         _ = try p.db.exec(&p.run, "DROP TABLE IF EXISTS \"nilo_jobs\"", .{});

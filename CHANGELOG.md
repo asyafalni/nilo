@@ -17,6 +17,18 @@ where it was made.
 
 ### Breaking
 
+- **`.like` and `.not_like` are Refusals on SQLite**, naming `.ilike` and
+  `.not_ilike` — the rule ADR 0061 already applied to `.contains`,
+  `.starts_with` and `.ends_with`, caught up with. SQLite's `LIKE` folds
+  ASCII case and cannot be told not to by a statement, so `.like` there
+  compiled and folded, on that database only
+  ([ADR 0263](./docs/adr/0263-like-on-sqlite-is-refused-the-way-contains-is.md)).
+
+  What to change: on SQLite, `.like` becomes `.ilike` and `.not_like`
+  becomes `.not_ilike`, which is the statement that was being sent. A
+  program that wanted case sensitivity was not getting it, and now knows.
+  Postgres changes nothing.
+
 - **`sql.Schema` is the one spelling of what a program's database is**, and
   every call that took `&.{ Row, Row }` takes it instead: `db.checking`,
   `sql.cli.Tool`, `migrate.createMissing`, `migrate.addMissingColumns`,
@@ -120,6 +132,37 @@ where it was made.
   What to change: drop the fourth argument and the `var transfer` above it.
 
 ### Added
+
+- **`nilo.Verified(V)`**: the claims behind a bearer token as a handler
+  argument, or a 401 with `WWW-Authenticate: Bearer` and the reason before
+  the handler runs. `V` is a `jwt.Verifier(Claims, Client)` — new, the ring,
+  the client its refresh needs and the claims type held as one service,
+  `provide`d once and looked up by the argument. `.claims` is parsed into
+  the request arena; `.token` is the token as sent; `T.refuse` is the 401
+  after reading; `c.verified(V)` is the same read for a middleware. The
+  issuer's keys unreachable when a refresh was needed is a 503 rather than
+  a 401, since the token was never judged. The document carries the bearer
+  scheme. `nilo_http` reads a marker and imports no `nilo_jwt`; `nilo_jwt`
+  takes the client as a type and imports nothing. Three refusals;
+  `refusals` is 158
+  ([ADR 0260](./docs/adr/0260-verified-claims-are-a-handler-argument.md)).
+
+- **`space.incr(key, delta)`** on a `cache.Space` whose value is an integer:
+  the read, the add and the write under the shard's lock, answering the new
+  count, so two requests arriving at once count two where a `get` and a
+  `put` counted one. A key nobody wrote counts from zero and lives `ttl_s`;
+  one there keeps the expiry it had, so a window does not slide with the
+  attempts inside it. Saturating. `incr` on a Space of anything else is a
+  Refusal naming the type; `refusals-cache` is six. ADR 0138's rule reads
+  "nothing that waits", and an add is not a wait
+  ([ADR 0261](./docs/adr/0261-a-count-is-added-to-under-the-lock-the-copy-is-under.md)).
+
+- **A `Db` that starts with `checking` never called says so**, once, at
+  `warn`: the Rows will be checked by the first request that reads them.
+  `.unchecked = true` in `Opts` is how a program says it meant it — a word
+  rather than an empty list, because an empty list is a claim to have
+  checked. A `checking` list given still runs whatever the option says
+  ([ADR 0262](./docs/adr/0262-a-db-with-no-schema-check-says-so-or-is-told.md)).
 
 - **`fetch.Target(name, .{…})`**: a service's base URL, standing headers
   and ceilings as a type of its own, opened once on the client and asked for

@@ -348,7 +348,7 @@ pub fn main(init: std.process.Init) !void {
     var conn = try pool.acquire();
     defer conn.release();
 
-    var db = sql.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .prepared = true });
+    var db = sql.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .prepared = true, .unchecked = true });
     defer db.deinit();
     try db.nilo_start(io, .off);
 

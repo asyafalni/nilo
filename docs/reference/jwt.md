@@ -124,7 +124,34 @@ fn whoIsThis(c: *nilo.Ctx, google: *jwt.Keyring, api: *fetch.Client, token: []co
 
 A verify pins the set for its own length and never waits; a swap spins on
 the old set's count, bounded by one verify, once per rotation. Provide the
-ring as a service and ask for `*jwt.Keyring` where the token is checked.
+ring as a service and ask for `*jwt.Keyring` where the token is checked —
+or hold it in a `Verifier` and ask for the claims.
+
+### `jwt.Verifier(Claims, Client)`
+
+The ring, the client its refresh needs and the claims type, as one service
+— what [`nilo.Verified(V)`](./handlers.md#verifiedv) names to hand a handler
+the claims behind a bearer token
+([ADR 0260](../adr/0260-verified-claims-are-a-handler-argument.md)). The
+client is a type parameter, so the module still imports nothing.
+
+<!-- compiles -->
+```zig
+const Google = jwt.Verifier(Claims, fetch.Client);
+
+fn wire(app: *nilo.App, google: *jwt.Keyring, api: *fetch.Client) !void {
+    const verifier = try app.gpa.create(Google);
+    verifier.* = Google.init(google, api);
+    try app.provide(verifier);
+}
+```
+
+| | |
+|---|---|
+| `Verifier(Claims, Client)` | a type; `Client` is anything with `get(scope, url, .{})` answering `ok()` and `body.view()`, which `fetch.Client` is |
+| `Google.init(&ring, &client)` | the value to `provide` — two pointers, nothing started |
+| `verifier.verify(gpa, token, now_s, scope)` | `ring.verifyOrRefresh(Claims, …)` with the claims type, the ring and the client filled in |
+| `Google.nilo_verifier` | `Claims` — what `nilo.Verified` reads |
 
 **What it will not do**: HS256, any curve but P-256, encrypted tokens, signing,
 discovery, PKCE and the nonce. Signing is absent because a server issuing its

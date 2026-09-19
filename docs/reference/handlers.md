@@ -167,6 +167,41 @@ Bearer allocates nothing; Basic decodes into the request arena, once. There is
 no chain that also looks in the query string or a cookie, on purpose: a token
 in a query string is a token in every access log on the way here.
 
+### `Verified(V)`
+
+The same header, verified: the claims behind a bearer token, read through
+the `jwt.Verifier` the argument names, or a 401 with the challenge before
+the handler runs
+([ADR 0260](../adr/0260-verified-claims-are-a-handler-argument.md)):
+
+<!-- compiles -->
+```zig
+const Claims = struct { sub: []const u8, email: []const u8 };
+const Google = jwt.Verifier(Claims, fetch.Client);
+
+fn me(user: nilo.Verified(Google), db: *sql.Db, c: *nilo.Ctx) !User {
+    return try db.one(User, c, .{ .where = .{ .email = user.claims.email } }) orelse
+        return nilo.Verified(Google).refuse("that account is closed", .{});
+}
+```
+
+| | |
+|---|---|
+| `V` | a `jwt.Verifier(Claims, Client)` — the ring, the client its refresh needs and the claims type, held as one service ([`jwt.Verifier`](./jwt.md#jwtverifierclaims-client)). Provided like any other; `listen()` refuses to start without it |
+| `.claims` | the payload as `Claims`, strings in the request arena |
+| `.token` | the token as sent, for a handler that passes it on |
+| `T.challenge` | `Bearer` |
+| `T.refuse(fmt, args)` | `fail.unauthorized` with the challenge on it — for the refusal *after* verifying |
+| `c.verified(V)` | the same read from a middleware guarding a prefix; a handler under it that asks again verifies again |
+
+Absent, another scheme, or a token the ring refuses — expired, wrong
+audience, unknown `kid` after one bounded fetch, bad signature — is a 401
+with `WWW-Authenticate: Bearer` and the reason in the body. The issuer's
+keys unreachable when a refresh was needed is a 503, since the token was
+never judged. In the document, the bearer scheme and a 401. Costs what
+`Authorization(.bearer)` plus one `verify` cost: the claims are the one
+allocation, into the arena, and the signature check is the work.
+
 ### `Idempotent(Replays, options)`
 
 The `Idempotency-Key` header, as the argument that makes a route answer once

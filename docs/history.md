@@ -3266,9 +3266,10 @@ comparison table beside it did not, and wrote `ILIKE` for SQLite, which has
 no such word. Nothing could depend on a spelling that was a syntax error, so
 the fix went the way `icontains` already had — `LIKE`, since that database's
 `LIKE` folds — rather than to the Refusal the roadmap had proposed. What that
-leaves is `.like` on SQLite folding case silently, which is the same lie
-`contains` is refused there for; refusing it breaks working code, so it is a
-decision rather than a fix.
+left was `.like` on SQLite folding case silently, which is the same lie
+`contains` is refused there for; it is a Refusal now
+([ADR 0263](./adr/0263-like-on-sqlite-is-refused-the-way-contains-is.md)),
+and the break is one letter.
 
 ## The second five, and the one that was not free
 
@@ -3670,3 +3671,24 @@ compile that finishes is not evidence that it produced anything. The table
 in [`bench/result/build.md`](../bench/result/build.md#what-a-restart-on-save-costs-per-save)
 carries a "binary" column for that reason, and the row that looked best is
 the one that failed it.
+
+## Two entries waited a cycle on a sentence, and the sentence was an example
+
+`incr` on a cache Space was held at *waiting on a design* because ADR 0138
+says the lock is held across "a `memcpy` and nothing else, forever", and an
+add is not a `memcpy`. `nilo.Verified` was held because the argument names
+one type and a refresh needs two services. Neither needed a measurement or
+a mechanism: the first needed the rule read as what it was written to catch
+— a wait inside a lock that cannot park — and the second needed the two
+services held as one value, which `job.Table(Db)` had already shown the
+shape of ([ADR 0260](./adr/0260-verified-claims-are-a-handler-argument.md),
+[ADR 0261](./adr/0261-a-count-is-added-to-under-the-lock-the-copy-is-under.md)).
+
+**A rule written as its example gets read as its example.** "A `memcpy` and
+nothing else" was the sentence that kept a callback out of the critical
+section, and it kept an integer add out for the same cycle. The header of
+`store.zig` now says what the rule is about, and the roadmap's own note
+about a blocker that names a mechanism rather than what it has to catch
+([ADR 0063](./adr/0063-a-handlers-stack-is-per-connection.md), last section)
+applies to a rule as much as to a blocker.
+

@@ -61,6 +61,7 @@ const json_mod = @import("json.zig");
 const mark = @import("jsonmark.zig");
 const ownbody = @import("ownbody.zig");
 const versioned_mod = @import("versioned.zig");
+const verified_mod = @import("verified.zig");
 
 const Ctx = ctx_mod.Ctx;
 const Str = str_mod.Str;
@@ -288,6 +289,12 @@ const Role = union(enum) {
     /// 400 and the document carries it as a security scheme, not a
     /// parameter.
     authorization,
+    /// The same header, verified: the claims behind a bearer token, read
+    /// through the `jwt.Verifier` the argument names (ADR 0260). Its own
+    /// role rather than a flavour of `.authorization`, because it needs a
+    /// service the route then requires, and a flavour of `.resolved` would
+    /// need a `*Ctx` a file outside the core cannot name.
+    verified,
     /// The `Idempotency-Key` header, and with it the whole of the route
     /// answering once per key (ADR 0193). Its own role because it is the
     /// one argument that can end the request before the handler runs with
@@ -397,6 +404,7 @@ pub fn wrap(comptime pattern: []const u8, comptime f: anytype) router.CtxHandler
                         .query => args[i] = .{ .value = try queryValue(P.nilo_query, c) },
                         .header => args[i] = .{ .value = try headerValue(P, c) },
                         .authorization => args[i] = try c.authorization(P.nilo_authorization),
+                        .verified => args[i] = try c.verified(P.nilo_verified),
                         .idempotent => args[i] = .{ .key = replaying.?.key },
                         .cached => args[i] = .{ .key = caching.?.key },
                         .form => args[i] = .{ .value = try c.form(P.nilo_form) },
@@ -909,6 +917,10 @@ pub fn requirements(comptime pattern: []const u8, comptime f: anytype) []const s
                 // rather than the first request finding out (ADR 0247).
                 .cached => list = list ++
                     [_]service_mod.Requirement{service_mod.requirementFor(*p.type.?.nilo_cached.pages, pattern)},
+                // The Verifier a verified argument reads through, for the
+                // same reason (ADR 0260).
+                .verified => list = list ++
+                    [_]service_mod.Requirement{service_mod.requirementFor(*p.type.?.nilo_verified, pattern)},
                 else => {},
             }
         }
@@ -1014,6 +1026,9 @@ pub fn operation(comptime pattern: []const u8, comptime f: anytype) openapi.Oper
                 .bearer => .bearer,
                 .basic => .basic,
             },
+            // The same scheme, which is what the document should have said
+            // for a verified token all along (ADR 0260).
+            .verified => security = .bearer,
             // A required header parameter, the way a `FromHeader` is, plus
             // the two answers only this route can give (ADR 0193).
             .idempotent => {
@@ -1224,6 +1239,7 @@ fn checkAnswer(comptime pattern: []const u8, comptime Fn: type) void {
             else => Returned,
         };
         if (V == void) return;
+        verified_mod.checkNotAnswered(pattern, V);
         // Before the `Response` unwrap, because one of the things it
         // refuses is a versioned answer inside a `Response` (ADR 0258).
         versioned_mod.check(pattern, V);
@@ -1497,6 +1513,7 @@ fn roleOf(comptime pattern: []const u8, comptime P: type, comptime i: usize) Rol
         return .header;
     }
     if (comptime authorization_mod.is(P)) return .authorization;
+    if (comptime verified_mod.is(P)) return .verified;
     if (comptime hasNamedDecl(P, "nilo_idempotent")) {
         idempotent_mod.checkSpace(P.nilo_idempotent.replays, pattern);
         return .idempotent;

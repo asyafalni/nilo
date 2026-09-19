@@ -78,6 +78,7 @@ const rs256 = @import("rs256.zig");
 const es256 = @import("es256.zig");
 const token_mod = @import("token.zig");
 const keyring_mod = @import("keyring.zig");
+const verifier_mod = @import("verifier.zig");
 
 /// A JWKS document read into the keys that can be verified with. `parse`
 /// takes the bytes of the document; fetching them is the caller's.
@@ -105,6 +106,13 @@ pub const parseKeys = jwks.parse;
 /// The client is a parameter, so the module still imports nothing.
 pub const Keyring = keyring_mod.Keyring;
 
+/// A ring, the client its refresh needs and a claims type, as one Service —
+/// what `nilo.Verified(T)` names to hand a handler the claims behind a
+/// bearer token, or a 401 before it runs
+/// ([ADR 0260](../docs/adr/0260-verified-claims-are-a-handler-argument.md)).
+/// The client is a type parameter, so the module still imports nothing.
+pub const Verifier = verifier_mod.Verifier;
+
 /// Verify a token and read its payload into a struct of your own. Strings in
 /// the result point into `gpa`, so a request arena leaves nothing to free.
 pub const verify = token_mod.verify;
@@ -125,6 +133,7 @@ test {
     _ = es256;
     _ = token_mod;
     _ = keyring_mod;
+    _ = verifier_mod;
 }
 
 test "the module's own example compiles and reads a token end to end" {

@@ -173,6 +173,44 @@ every row this module hands back already follows.
 There is no allocator to pass anywhere in this module, and the signatures
 are what say so: nothing allocates per operation.
 
+## A Space of integers counts
+
+Five OTPs per phone number an hour, failed sign-ins per email, a quota per
+API key: a count under a key, and `get` then `put` loses one whenever two
+requests land between them. A Space whose value is an integer has `incr`
+([ADR 0261](../adr/0261-a-count-is-added-to-under-the-lock-the-copy-is-under.md)):
+
+<!-- compiles -->
+```zig
+const Attempts = cache.Space("signin", u32, .{ .ttl_s = 3600 });
+
+fn signIn(attempts: *Attempts, email: []const u8) !void {
+    if (attempts.incr(email, 1) > 5) {
+        return nilo.fail.tooManyRequests("too many attempts; try again in an hour", .{});
+    }
+    // … check the password, and `attempts.del(email)` when it matches …
+}
+```
+
+`incr(key, delta)` answers the new count, and the read, the add and the
+write happen under the shard's lock — the same lock a `put`'s copy is
+under, and one add is not a wait, which is the sentence the rule in
+[ADR 0138](../adr/0138-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)
+turned out to be about. Two requests arriving at once count two. A key
+nobody wrote counts from zero and lives `ttl_s`; one already there **keeps
+the expiry it had**, so the hour above is the hour of the first attempt
+rather than a window that slides with every one, and `del` is what opens
+it early. The arithmetic saturates: a counter at its type's ceiling stays
+there rather than wrapping to zero and opening the quota again, and
+`incr(key, 0)` reads the count under the lock. `delta` is the Space's own
+type, so an unsigned Space counts up only; one that has to count down is a
+Space of `i64`.
+
+`nilo.Allowance` is the same thing keyed by address and nothing else; this
+is the one to reach for when the key is a user, a phone number or an API
+key. A Space of anything but an integer has no `incr`, and says so while
+compiling.
+
 ## Store options
 
 Given to `cache.open`:

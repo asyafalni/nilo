@@ -100,6 +100,7 @@ surprise:
 | `tx.deadline(ms)` | a deadline has to be enforced by the database, and there is no server. `busy_timeout_ms` covers the case that actually happens |
 | a `[]const T` column | no array type. A list belongs in its own table, or in a TEXT column your own code encodes |
 | `.isolation` below `.serializable` | SQLite gives every transaction a snapshot and serialises the writers. There is nothing weaker to ask for |
+| `.like`, `.not_like`, `.contains`, `.starts_with`, `.ends_with` | its `LIKE` folds ASCII case and cannot be told not to by a statement, so a case-sensitive match would depend on how the file was opened. Each Refusal names the folding spelling — `.ilike`, `.icontains` — which is what this database does ([ADR 0263](../../adr/0263-like-on-sqlite-is-refused-the-way-contains-is.md)) |
 
 **So a program that batches does not compile against both.** That is the seam
 refusing rather than quietly doing something else, and it is worth knowing
@@ -109,7 +110,10 @@ is free.
 One operator moves the other way. `.ilike` is Postgres's word for what SQLite's
 `LIKE` already does — fold ASCII case — so on SQLite it is spelled `LIKE`, the
 same one-word swap `icontains` makes. It used to be written `ILIKE` on both and
-came back a syntax error here; nothing could have depended on that.
+came back a syntax error here; nothing could have depended on that. `.like`
+went the other way for a while — it compiled here and folded, on this
+database only — and a program that wrote it and wanted the folding writes
+`.ilike` now, which is the one letter the Refusal names.
 
 A `sql.Uuid` is **not** on that list. SQLite has no uuid type, so one travels as
 the thirty-six hyphenated characters into a TEXT column — which is what

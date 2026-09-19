@@ -57,7 +57,10 @@
 //! **That turns a preference into a rule this file has to keep forever:
 //! nothing that waits, ever, inside a critical section.** It is also what makes
 //! the lock safe to hold inside a fiber — a fiber only moves at a point that
-//! waits, so a holder always finishes and releases.
+//! waits, so a holder always finishes and releases. The rule is about waiting
+//! and not about copying: `add` does one integer add under the same lock the
+//! `memcpy` is under, which is how a count survives two writers
+//! ([ADR 0261](../docs/adr/0261-a-count-is-added-to-under-the-lock-the-copy-is-under.md)).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -843,7 +846,7 @@ pub const Store = struct {
     /// value cannot fit an entry — the caller's `Space` turns that into a
     /// named error rather than letting it pass quietly.
     pub fn put(self: *Store, space: u32, key: []const u8, value: []const u8, ttl_s: u32) bool {
-        return self.write(false, space, key, value, ttl_s) == .stored;
+        return self.write(.put, space, key, value, ttl_s, {}) == .stored;
     }
 
     /// What `putIfAbsent` answers.
@@ -861,13 +864,60 @@ pub const Store = struct {
     /// thing that decides who was first
     /// ([ADR 0193](../docs/adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)).
     pub fn putIfAbsent(self: *Store, space: u32, key: []const u8, value: []const u8, ttl_s: u32) Claim {
-        return self.write(true, space, key, value, ttl_s);
+        return self.write(.claim, space, key, value, ttl_s, {});
     }
 
-    /// `put` and `putIfAbsent` are one function with a comptime flag, so
-    /// the ordinary write compiles to exactly what it was before the flag
-    /// existed — the branch it adds is on a constant.
-    fn write(self: *Store, comptime only_if_absent: bool, space: u32, key: []const u8, value: []const u8, ttl_s: u32) Claim {
+    /// Add `delta` to the integer under `key` and answer the sum, which is
+    /// the new value stored. A key nobody wrote, or whose entry expired, is
+    /// counted from zero; one that is there keeps the expiry it had, so a
+    /// counter that started a window stays in that window. Saturating,
+    /// because a count that wraps to negative is a quota that just opened.
+    ///
+    /// The read, the add and the write happen under the shard's lock, the
+    /// same lock `put`'s `memcpy` is under, so two callers adding one each
+    /// answer two rather than one. That is what makes this a count and not a
+    /// `get` followed by a `put` (ADR 0261). The value already there has to
+    /// be exactly `@sizeOf(Int)` long, or it is treated as absent — which
+    /// cannot happen inside one Space.
+    pub fn add(self: *Store, comptime Int: type, space: u32, key: []const u8, delta: Int, ttl_s: u32) Int {
+        var sum: Int = undefined;
+        _ = self.write(.{ .add = Int }, space, key, std.mem.asBytes(&delta), ttl_s, &sum);
+        return sum;
+    }
+
+    /// What `write` is asked to do. A comptime union rather than three
+    /// functions, so the key scan and the eviction ranking are written once
+    /// and the ordinary `put` compiles to exactly what it was before the
+    /// other two existed — every branch on `mode` is on a constant.
+    const Mode = union(enum) {
+        put,
+        claim,
+        /// The integer type an `add` reads and writes.
+        add: type,
+    };
+
+    fn SumOf(comptime mode: Mode) type {
+        return switch (mode) {
+            .add => |Int| *Int,
+            else => void,
+        };
+    }
+
+    fn write(
+        self: *Store,
+        comptime mode: Mode,
+        space: u32,
+        key: []const u8,
+        value: []const u8,
+        ttl_s: u32,
+        sum: SumOf(mode),
+    ) Claim {
+        const only_if_absent = mode == .claim;
+        const adding = mode == .add;
+        const Int = switch (mode) {
+            .add => |I| I,
+            else => void,
+        };
         const total = header + key.len + value.len;
         const hash = std.hash.Wyhash.hash(space, key);
         const shard = self.shardFor(hash);
@@ -893,7 +943,7 @@ pub const Store = struct {
         // (ADR 0138). A claim reads it once more for the same reason: the
         // expiry test it makes inside the lock has to use a clock read
         // outside it.
-        const now: u32 = if (ttl_s == 0 and !only_if_absent) 0 else self.elapsed();
+        const now: u32 = if (ttl_s == 0 and mode == .put) 0 else self.elapsed();
         var head_bytes: [header]u8 = undefined;
         std.mem.writeInt(u32, head_bytes[0..4], if (ttl_s == 0) 0 else now + ttl_s, .little);
         std.mem.writeInt(u32, head_bytes[4..8], space, .little);
@@ -912,6 +962,9 @@ pub const Store = struct {
         var keep_freq: u2 = 0;
         var displaced = true;
         var returning = false;
+        // An add counts from zero unless the scan below finds the key live,
+        // and what is copied into the ring is the sum rather than `value`.
+        if (adding) sum.* = std.mem.bytesToValue(Int, value[0..@sizeOf(Int)]);
         const small_to = shard.small.to;
         const small_mark = shard.small.mark();
         const main_mark = shard.main.mark();
@@ -946,6 +999,13 @@ pub const Store = struct {
                 // they wrote has not expired. The lock is what makes this
                 // true at the moment it is said.
                 if (only_if_absent and (e.expires == 0 or now < e.expires)) return .taken;
+                // The one thing an add does that a put does not: read what
+                // is there, and keep the expiry it had. An entry that has
+                // expired is counted from zero and given a fresh one.
+                if (adding and (e.expires == 0 or now < e.expires) and e.value.len == @sizeOf(Int)) {
+                    sum.* = std.mem.bytesToValue(Int, e.value[0..@sizeOf(Int)]) +| sum.*;
+                    std.mem.writeInt(u32, head_bytes[0..4], e.expires, .little);
+                }
                 chosen = i;
                 keep_freq = seen.freq;
                 displaced = false;
@@ -984,7 +1044,7 @@ pub const Store = struct {
         const off = into.reserve(total);
         @memcpy(shard.ring[off..][0..header], &head_bytes);
         @memcpy(shard.ring[off + header ..][0..key.len], key);
-        @memcpy(shard.ring[off + header + key.len ..][0..value.len], value);
+        @memcpy(shard.ring[off + header + key.len ..][0..value.len], if (adding) std.mem.asBytes(sum) else value);
 
         // Only a genuinely new key pays for the ranking, and only then does
         // the bucket have to give something up. **After the reserve, not
@@ -1345,6 +1405,54 @@ test "a claim is taken by whoever was first, and an expired one is free again" {
     try testing.expectEqual(Store.Claim.stored, store.putIfAbsent(1, "brief", "a", 1));
     store.opened_s -= 2;
     try testing.expectEqual(Store.Claim.stored, store.putIfAbsent(1, "brief", "b", 1));
+}
+
+test "an add counts from zero, keeps the expiry it found, and saturates" {
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    defer store.deinit();
+
+    // Nobody wrote the key: the delta is the count, and it lives ttl_s.
+    try testing.expectEqual(@as(u32, 1), store.add(u32, 1, "otp:+62", 1, 10));
+    try testing.expectEqual(@as(u32, 3), store.add(u32, 1, "otp:+62", 2, 10));
+    var out: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 4), store.get(1, "otp:+62", &out).?);
+    try testing.expectEqual(@as(u32, 3), std.mem.bytesToValue(u32, out[0..4]));
+
+    // The expiry the first add set is the one the entry keeps: two seconds
+    // later a ten-second window is still open, and after it the count
+    // starts again rather than carrying on — a window that is not slid by
+    // the attempts inside it.
+    store.opened_s -= 2;
+    try testing.expectEqual(@as(u32, 4), store.add(u32, 1, "otp:+62", 1, 10));
+    store.opened_s -= 9;
+    try testing.expectEqual(@as(u32, 1), store.add(u32, 1, "otp:+62", 1, 10));
+
+    // A delta the type cannot hold stops at the ceiling rather than wrapping
+    // to a small number, which would be the quota opening again.
+    try testing.expectEqual(@as(u8, 250), store.add(u8, 1, "cap", 250, 0));
+    try testing.expectEqual(std.math.maxInt(u8), store.add(u8, 1, "cap", 250, 0));
+    try testing.expectEqual(std.math.maxInt(u8), store.add(u8, 1, "cap", 1, 0));
+    // A signed count goes down as well as up.
+    try testing.expectEqual(@as(i64, -3), store.add(i64, 1, "signed", -3, 0));
+    try testing.expectEqual(@as(i64, 2), store.add(i64, 1, "signed", 5, 0));
+}
+
+test "two threads adding one each count two — the reason this is not a get and a put" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 2 });
+    defer store.deinit();
+
+    const Adder = struct {
+        fn run(s: *Store) void {
+            for (0..20_000) |_| _ = s.add(u64, 1, "hits", 1, 0);
+        }
+    };
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Adder.run, .{&store});
+    for (threads) |t| t.join();
+
+    try testing.expectEqual(@as(u64, 80_000), store.add(u64, 1, "hits", 0, 0));
 }
 
 test "a deleted key is gone and says so" {

@@ -72,7 +72,12 @@ misread.
 statement stays a constant no matter how long the list is. Its negation is
 `.not_in`, which is `<> ALL($1)` and costs the same one parameter;
 `.not_like` and `.not_ilike` are the other two. `.distinct_from` and
-`.not_distinct_from` are the null-safe pair — see below.
+`.not_distinct_from` are the null-safe pair — see below. On SQLite, `.like`
+and `.not_like` are Refusals naming `.ilike` and `.not_ilike`: that
+database's `LIKE` folds ASCII case and cannot be told not to by a
+statement, so the case-sensitive spelling would have matched more than it
+said, on one database only — the same reason `.contains` is refused there
+([ADR 0263](../../adr/0263-like-on-sqlite-is-refused-the-way-contains-is.md)).
 
 ### A null is written, never held
 

@@ -143,6 +143,7 @@ test "a fiber queueing for the writer it already holds gives up, rather than wai
 
     var db: Db = .init(gpa, "file:deadline-test?mode=memory&cache=shared", .{
         .size = 2,
+        .unchecked = true,
         // Short enough that a failing run is a failing run rather than a
         // build that looks stuck, and long enough that a loaded machine does
         // not report a timeout the code did not cause.

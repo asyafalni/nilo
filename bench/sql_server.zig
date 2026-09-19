@@ -139,6 +139,8 @@ pub fn main(init: std.process.Init) !void {
         .size = size,
         .connect_on_init = size,
         .prepared = prepared,
+        // The Rows here are the controls' own; nothing checks them on purpose.
+        .unchecked = true,
     });
     defer db.deinit();
 
