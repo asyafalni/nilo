@@ -88,7 +88,15 @@ const ListQuery = struct {
 `Form(T)` and a plain struct are the same slot — a form *is* the body — so
 asking for both is a compile error. A `Form(T)` field is a `Str`, a number, a
 `bool`, an enum or an `Upload`, optionally in a `?`; a default is what "not
-sent" means. See [Forms](../guide/forms.md).
+sent" means. **A field that is a slice of one of those is a list**, one
+element per arrival of the name — a checkbox group, a `<select multiple>` —
+in the order sent; nothing sent is the empty list and never a 400, an empty
+value contributes nothing, and a comma is data because a browser never
+joins a group with one, so there is no second spelling as there is for a
+query. A list of `Upload` is a Refusal. Under `Bound(Form(T))` the first
+value that will not convert is the one reported and the rest are still read
+([ADR 0256](../adr/0256-a-form-list-is-a-repeated-name-and-nothing-else.md)).
+See [Forms](../guide/forms.md#a-checkbox-group-is-a-list).
 
 ### `FromHeader(name, T)`
 
@@ -331,6 +339,7 @@ builds one and pays nothing
 | `Redirect(code)` | that status and a `Location`, no body |
 | `FileBody` | a file on disk, opened and sent without being held in memory |
 | `Bytes` | bytes already in hand, under a content type chosen per request — somebody else's download passed on ([ADR 0212](../adr/0212-bytes-handed-on-are-an-answer.md)) |
+| `Versioned(T)` | `T` under a weak `ETag` made from a `u64` the handler names; **304** with no body when `If-None-Match` carries it ([ADR 0258](../adr/0258-a-version-a-handler-names-is-an-etag.md)) |
 | a type with `nilo_content_type` and `nilo_write` | 200, the bytes `nilo_write` wrote, under that content type — [below](#a-type-that-writes-its-own-answer) |
 
 ```zig
@@ -341,6 +350,7 @@ Redirect(303).to("/welcome")                               // written `return .t
 Redirect(303).with("/welcome", .of(&.{…}))                 // …with headers of its own
 FileBody{ .dir = files.dir, .name = name }                 // `?FileBody` — null is a 404
 Bytes{ .body = got.body, .content_type = got.content_type } // `?Bytes` likewise; takes a wrapper's status
+Versioned([]Order){ .version = revision, .value = orders }  // `W/"…"`; `.unchanged(revision)` when `c.clientHas(revision)`
 ```
 
 **A handler that also takes a `*Ctx` and returns `void` is the one case the
@@ -373,6 +383,19 @@ label is decided while the request runs, and a document that guessed
 It is the answer for a proxy that downloads from one service and hands the
 bytes to the browser with *their* `Content-Type` and a `Content-Disposition`,
 where a `*Ctx` handler calling `c.send` was undescribed.
+
+`Versioned(T)` fields: `version` (a `u64`), `headers` and `value` (`?T` —
+null is `.unchanged(version)`, the answer for a client `c.clientHas(version)`
+said already holds it; `.unchangedWith(version, headers)` when the 304 should
+carry the `Cache-Control` the 200 does). The tag is `W/"<hex>"`, weak because a version says
+the representation is the same and nothing about the bytes; `headers` go out
+on the 200 and the 304 both. `.unchanged` to a client that did not send the
+version is a 500 naming the route. `Versioned(?T)`, `Versioned(void)`, a
+`Versioned` inside a `Status` or a `Response`, and one under a `Cached` or an
+`Idempotent` are each a compile error saying what to write instead; a thing
+that is not there is `fail.notFound`. The document puts the `ETag` on the 200
+and a `304` beside it. See
+[Responses](../guide/responses.md#a-body-the-client-already-holds).
 
 `Headers` holds up to 8 by value; a ninth is a compile error.
 

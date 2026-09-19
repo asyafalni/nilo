@@ -8,9 +8,12 @@
 //!
 //! The whole of what `nilo_fetch` is for is in `getCard` below: one call, a
 //! deadline on it, a check that the far end agreed, and the answer parsed into
-//! a struct this program declared. The client is registered once in `main` and
-//! asked for by type, the way every service is
-//! ([ADR 0070](../../docs/adr/0070-a-fitting-borrows-the-loop.md)).
+//! a struct this program declared. GitHub is a *target* — its base URL, the
+//! `user-agent` it insists on and the two seconds it gets are written once,
+//! on a type, and the handler asks for that type the way it would ask for a
+//! database ([ADR 0254](../../docs/adr/0254-a-target-is-a-type-and-a-path-is-a-template.md));
+//! the client under it is registered once in `main`, the way every service
+//! is ([ADR 0070](../../docs/adr/0070-a-fitting-borrows-the-loop.md)).
 //!
 //! It calls GitHub's public API, which needs no key and allows 60 requests an
 //! hour from one address. Past that it answers 403, and this program says so
@@ -26,6 +29,13 @@ const fail = nilo.fail;
 pub const std_options = nilo.std_options;
 pub const std_options_debug_io = nilo.debug_io;
 pub const panic = nilo.panic;
+
+/// GitHub as a type. What is on the type is what is true of GitHub wherever
+/// this program runs: two seconds rather than the client's thirty, because
+/// this call is inside a request somebody's browser is holding open. The
+/// base URL and the `user-agent` are given at `open`, where a `Config`
+/// could reach them.
+const GitHub = fetch.Target("github", .{ .timeout_ms = 2_000 });
 
 /// What the upstream sends, trimmed to the fields this program reads.
 ///
@@ -62,31 +72,16 @@ fn card(repo: Repo) Card {
 /// A pointer is a service; a value is request data. `owner` and `name` come
 /// from `:owner` and `:name` **by position**, because Zig does not keep
 /// argument names (ADR 0003).
-fn getCard(api: *fetch.Client, c: *nilo.Ctx, owner: nilo.Str, name: nilo.Str) !Card {
+fn getCard(github: *GitHub, c: *nilo.Ctx, owner: nilo.Str, name: nilo.Str) !Card {
     // Two segments of somebody else's text going into a URL. `%2e%2e%2f` in a
     // path param is how a caller reaches an endpoint this program never meant
-    // to offer, so they are encoded rather than pasted — `nilo_core`'s
-    // `percent`, which is in Core precisely so both a Service and a handler
-    // can reach it ([ADR 0066](../../docs/adr/0066-percent-is-needed-by-two-layers.md)).
-    // A *query* on the URL is one call, `fetch.withQuery(c, base, .{ .q = q })`,
-    // encoded the same way; a path segment is still written out by hand,
-    // until a target (the roadmap's `nilo_fetch` Next 1) gives it somewhere
-    // to go.
-    var url: std.Io.Writer.Allocating = .init(c.arena());
-    try url.writer.writeAll("https://api.github.com/repos/");
-    try nilo.percent.encodeWrite(&url.writer, owner.view(), .unreserved);
-    try url.writer.writeByte('/');
-    try nilo.percent.encodeWrite(&url.writer, name.view(), .unreserved);
-
-    const res = api.get(c, url.written(), .{
-        // Two seconds rather than the client's thirty. A page nobody is
-        // waiting behind can afford thirty; this one is inside a request
-        // somebody's browser is holding open.
-        .timeout_ms = 2_000,
-        // GitHub refuses a request with no user agent. Most APIs want a header
-        // of some kind, and this is where it goes.
-        .headers = &.{.{ .name = "user-agent", .value = "nilo-example" }},
-    }) catch |err| switch (err) {
+    // to offer, so each `{}` is percent-encoded on the way in, with `/` as
+    // data — `nilo_core`'s `percent`, which is in Core precisely so both a
+    // Service and a handler can reach it
+    // ([ADR 0066](../../docs/adr/0066-percent-is-needed-by-two-layers.md)).
+    // The count of segments against the count of arguments is checked while
+    // compiling; a query would be a struct in their place, `.{ .page = 2 }`.
+    const res = github.get(c, "/repos/{}/{}", .{ owner, name }, .{}) catch |err| switch (err) {
         // The one failure mode a caller of anything has to have an answer for.
         // 504 rather than 500: this program is fine, the thing it asked is not.
         error.TimedOut => return fail.status(504, "github took longer than 2s", .{}),
@@ -129,15 +124,25 @@ pub fn main() !void {
     });
     defer api.deinit();
 
+    // GitHub, opened once on that client. GitHub refuses a request with no
+    // user agent; most APIs want a header of some kind, and this is where
+    // it goes — once, rather than at every call.
+    var github = try GitHub.open(&api, .{
+        .base = "https://api.github.com",
+        .user_agent = "nilo-example",
+    });
+
     var app = nilo.App.init(gpa);
     defer app.deinit();
 
     try app.use(nilo.logger.standard);
 
     // `provide` before `listen`, like any service. `nilo_start` runs inside
-    // `listen()`, which is where the event loop first exists — a client that
-    // is called before that gets `error.NotStarted` rather than a crash.
-    try app.provide(&api);
+    // `listen()`, which is where the event loop first exists — a target
+    // called before that gets `error.NotStarted` rather than a crash. The
+    // target starts the client under it, so the client itself is provided
+    // only if a handler asks for it by that type too.
+    try app.provide(&github);
 
     try app.get("/repos/:owner/:name", getCard);
 

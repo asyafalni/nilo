@@ -168,6 +168,7 @@ section on it. A name is found here first and read on its page.
 **[nilo_fetch](./fetch.md)** — calling somebody else's HTTP API.
 
 - [`nilo_fetch`](./fetch.md#nilo_fetch)
+  - [`fetch.Target`](./fetch.md#fetchtarget)
   - [`fetch.Exchange`](./fetch.md#fetchexchange)
   - [`fetch.testing`](./fetch.md#fetchtesting)
 
@@ -196,3 +197,4 @@ section on it. A name is found here first and read on its page.
 **[nilo_jwt](./jwt.md)** — checking somebody else's signed token.
 
 - [`nilo_jwt`](./jwt.md#nilo_jwt)
+  - [`jwt.Keyring`](./jwt.md#jwtkeyring)

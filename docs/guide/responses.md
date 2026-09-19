@@ -198,6 +198,61 @@ says. The document describes it as `format: binary`, for `FileBody`'s reason.
 Before this the choices were `c.send` from a `*Ctx` handler, which the document
 could not see, or a `nilo_write` type naming a content type it did not know.
 
+## A body the client already holds
+
+A list a dashboard polls every five seconds is the same list nearly every
+time, and a handler can say so: `nilo.Versioned(T)` is `T` with a version on
+it, which goes out as a weak `ETag`. A client that sends the tag back as
+`If-None-Match` gets a 304 and no body — and, if the handler asks first, no
+query either
+([ADR 0258](../adr/0258-a-version-a-handler-names-is-an-etag.md)):
+
+<!-- compiles -->
+```zig
+const Order = struct {
+    pub const nilo_table = .{ .name = "orders", .key = .id };
+
+    id: i64,
+    total: i64,
+    revision: i64,
+};
+
+fn listOrders(c: *nilo.Ctx, db: *Db) !nilo.Versioned([]Order) {
+    const revision = try db.rawOne(i64, c, "select coalesce(max(revision), 0) from orders", .{}) orelse 0;
+    const version: u64 = @intCast(revision);
+    if (c.clientHas(version)) return .unchanged(version);
+    return .{ .version = version, .value = try db.select(Order, c, .{ .order = .{ .id = .asc } }) };
+}
+```
+
+The version is yours to name, because you are the only one who knows what it
+is: a revision column, a `max(updated_at)`, a counter the writer bumps. What
+matters is that it is known *before* the body is built, which is what lets
+`c.clientHas` save the query and not just the bytes. A handler that never asks
+still answers 304 — nilo compares on the way out — but has done the work.
+
+It is a `u64`. A timestamp in milliseconds fits; text — an `updated_at` kept
+as a string, say — is one hash away:
+
+```zig
+const version = std.hash.Wyhash.hash(0, row.updated_at.view());
+```
+
+The tag is weak, `W/"1a"`, because a version says the representation is the
+same and promises nothing about the bytes — the same value goes out gzipped
+to one client and plain to another. Weak is all `If-None-Match` ever compares
+by. `headers` on the value go out on the 200 and the 304 both, which is where
+a `Cache-Control` belongs — `.unchangedWith(version, headers)` is the 304 with
+them on. `.unchanged(version)` to a client that did *not*
+send the version is a 500 naming the route: the handler skipped the work
+without asking.
+
+`Versioned(?T)` is a compile error — `null` would mean a 404 and "you have it"
+both — so a thing that is not there is `nilo.fail.notFound`. So is a
+`Versioned` inside a `Status` or a `Response`, and one under a `Cached` or an
+`Idempotent`, where a 304 decided for the first client would be replayed to
+the rest. The API description puts the `ETag` on the 200 and a 304 beside it.
+
 ## JSON shapes of your own
 
 A struct is its JSON and an enum is its tag name, and that covers nearly

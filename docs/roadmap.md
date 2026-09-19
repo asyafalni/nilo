@@ -44,9 +44,9 @@ nilo is a toolkit whose largest module is a server, rather than a server with th
 | [`nilo_config`](#nilo_config-settings) | needs no loop | reading a name the field is not called |
 | [`nilo_pw`](#nilo_pw-hashing-a-password) | needs no loop | a Cost floor that weighs the wrong half, and a password longer than a page |
 | [`nilo_cache`](#nilo_cache-an-expiring-cache-in-this-process) | needs no loop | 60% still between it and quick_cache on eight threads, unattributed, no counter, and no `getOrPut` |
-| [`nilo_jwt`](#nilo_jwt-checking-somebody-elses-token) | needs no loop | a key set that cannot rotate safely, and no number against a verification |
-| [`nilo_fetch`](#nilo_fetch-calling-somebody-elses-api) | borrows the loop | no per-service base URL, and nothing measured through TLS |
-| [`nilo_job`](#nilo_job-work-that-runs-later-again-or-on-a-schedule) | borrows the loop | a claim per row, a queued row that cannot be cancelled, and UTC only |
+| [`nilo_jwt`](#nilo_jwt-checking-somebody-elses-token) | needs no loop | verified claims as a handler argument, and no number against a verification |
+| [`nilo_fetch`](#nilo_fetch-calling-somebody-elses-api) | borrows the loop | a streamed call outside a target's headers, and nothing measured through TLS |
+| [`nilo_job`](#nilo_job-work-that-runs-later-again-or-on-a-schedule) | borrows the loop | a claim per row, three numbers for the whole queue, and UTC only |
 | [`nilo_http`](#nilo_http-the-server) | owns the loop | a response never compressed, a handler never told its client left, and fifteen answered questions kept to a row each |
 | [`nilo_sql`](#nilo_sql-postgres-and-sqlite) | borrows the loop | `reset` and `squash` for the migrations, a plain query with no deadline, and a connection URL a managed Postgres hands out that stops the server |
 | [`nilo_s3`](#nilo_s3-object-storage) | borrows the loop | nothing measured through TLS, and no `LIST`, `COPY` or multipart |
@@ -211,10 +211,7 @@ RS256 and ES256 over a JWKS document, and nothing else ([ADR 0140](./adr/0140-ni
 
 ### Next
 
-**1. A key set cannot be rotated without a race, and the guide says it is three lines.** Today the caller fetches with `nilo_fetch`, parses with `parseKeys`, holds a `*const Keys`, and on `error.NoSuchKey` decides whether that means "refetch" or "refuse". Every issuer rotates, Google on the order of days, so the decision is not optional, and the three lines it takes are wrong in three ways that no test finds: a `NoSuchKey` with no refetch is every sign-in failing until a restart; a refetch with no rate limit is one HTTPS GET to the issuer per forged token; and replacing the `Keys` a handler on another fiber is reading, then `deinit`ing the old one, is a use-after-free. The last is not policy, it is concurrency, and it is the reason this belongs here rather than in a guide: `jwt.Keyring` holding the current `Keys` under a lock, `refresh(scope, client)` that swaps in a new set and keeps the old one until its readers are done, and a bound on how often an unknown `kid` may trigger a fetch. It borrows `nilo_fetch` only through a parameter, the way `job.Table` borrows a Db, so the module still imports nothing.
-
-**Waiting on: a design** for who owns the old `Keys` after a swap, which is the lifetime question `nilo_cache` answered with a generation and a read-after check ([ADR 0188](./adr/0188-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md)) and this module cannot answer with a copy, because a key set is not flat.
-
+Nothing queued.
 
 ### Known gaps
 
@@ -226,9 +223,9 @@ RS256 and ES256 over a JWKS document, and nothing else ([ADR 0140](./adr/0140-ni
 
 **Waiting on: a caller** who has an RSA key of another size or an EC key on another curve, which no issuer in the comparison publishes.
 
-**Verified claims are not a handler argument.** A handler that wants the user behind a bearer token writes `nilo.Authorization(.bearer)`, then `jwt.verify` with the keys, the issuer, the audience and the clock, then a refusal with the challenge on it, in every handler or in a resolver of its own. `http/` may import `nilo_jwt`, which is downward, so the shape is one argument: `Google = jwt.Verifier(Claims, .{ .issuer = "…", .audience = "…" })`, opened with a keyring and `provide`d, and `fn me(user: nilo.Verified(Google), c: *nilo.Ctx)` is the claims or a 401 with `WWW-Authenticate: Bearer` before the handler runs. The `security` entry in the API description that [ADR 0191](./adr/0191-an-authorization-header-a-handler-can-ask-for.md) writes for a bearer argument would then be written for a verified one, which is what the document should have said all along. Costs what `Authorization(.bearer)` plus one `verify` cost today, on the route that asks.
+**Verified claims are not a handler argument.** A handler that wants the user behind a bearer token writes `nilo.Authorization(.bearer)`, then `keyring.verifyOrRefresh` with the claims type and the clock, then a refusal with the challenge on it, in every handler or in a resolver of its own. `http/` may import `nilo_jwt`, which is downward, so the shape is one argument: `Google = jwt.Verifier(Claims)`, opened over a `jwt.Keyring` and `provide`d, and `fn me(user: nilo.Verified(Google), c: *nilo.Ctx)` is the claims or a 401 with `WWW-Authenticate: Bearer` before the handler runs. The `security` entry in the API description that [ADR 0191](./adr/0191-an-authorization-header-a-handler-can-ask-for.md) writes for a bearer argument would then be written for a verified one, which is what the document should have said all along. Costs what `Authorization(.bearer)` plus one `verify` cost today, on the route that asks. The ring already survives a rotation ([ADR 0255](./adr/0255-a-key-set-is-swapped-whole-and-freed-after-its-readers.md)), so what is left is the argument and the document.
 
-**Waiting on: a design**, and on Next 1, because a verifier that holds a `*const Keys` is a verifier that cannot survive a rotation.
+**Waiting on: a design** for how the resolver reaches the client the refresh needs, since a `nilo.Verified(T)` argument names the ring and not the `fetch.Client` beside it.
 
 **HS256 is absent on purpose and that is not free.** A shared-secret token is what a service issues to itself, and the reason it is not here is that a module verifying both algorithms has to be careful about the confusion attack that a module verifying one cannot commit. A caller who needs it has to write four lines of `HmacSha256` beside this module and get the constant-time compare right on their own, which is the shape of mistake this module exists to prevent.
 
@@ -236,9 +233,9 @@ RS256 and ES256 over a JWKS document, and nothing else ([ADR 0140](./adr/0140-ni
 
 ### Not decided
 
-**Whether nilo should hold the key set as well as read it.** Today the caller fetches with `nilo_fetch`, holds with `nilo_cache`, and decides when a `kid` miss means "refetch" rather than "refuse". That is three lines and one real decision, and every one of them is visible. A `Jwks.fetch(url)` that did all three would be one line and would hide the decision.
+**Whether a `kid` miss should ever mean refuse rather than fetch.** `jwt.Keyring` holds the set, swaps it safely and bounds the fetch an unknown `kid` triggers to one an interval ([ADR 0255](./adr/0255-a-key-set-is-swapped-whole-and-freed-after-its-readers.md)); a caller who wants a miss refused calls `verify` rather than `verifyOrRefresh` and decides. What is still open is whether anybody does: an issuer whose document must not be fetched on a request's schedule, or a `kid` that should be a 401 with no fetch behind it.
 
-**What would settle it:** two callers writing the same refresh policy. One caller writing one is a caller, not a pattern. The concurrency half of this question, the swap, has moved to Next 1; what stays open here is only the policy: when a `kid` miss means fetch and when it means refuse.
+**What would settle it:** two callers writing the same refusal policy. One caller writing one is a caller, not a pattern.
 
 **Whether nilo signs a token for a client that cannot hold a cookie.** [ADR 0140](./adr/0140-nilo-verifies-a-token-and-does-not-fetch-one.md) refuses signing because a server issuing its own sessions has `Session(T)`, and that holds for a browser. The client it does not obviously hold for is a native mobile application talking to the same API, where a bearer token is the convention and a cookie jar is a thing the developer has to go and find. HS256 sign and verify is forty lines and the confusion attack is the reason this module verifies one algorithm; a signer here would have to be a type that cannot be handed an RSA public key as its secret, which is a Refusal rather than a runtime check. Against it is everything ADR 0140 already says, and the fact that the mobile client *can* hold a cookie.
 
@@ -248,17 +245,17 @@ RS256 and ES256 over a JWKS document, and nothing else ([ADR 0140](./adr/0140-ni
 
 ## `nilo_fetch`: calling somebody else's API
 
-Sixty-five lines of policy in front of `std.http.Client`: a gate on calls in flight, a deadline per call, a bounded drain, a body ceiling, and a body that comes back as a `Str` in the caller's Scope. The first **Fitting**, which borrows the loop and owns no destination ([ADR 0070](./adr/0070-a-fitting-borrows-the-loop.md)).
+Sixty-five lines of policy in front of `std.http.Client`: a gate on calls in flight, a deadline per call, a bounded drain, a body ceiling, a body that comes back as a `Str` in the caller's Scope, and a target per service the program calls. The first **Fitting**, which borrows the loop and owns no destination ([ADR 0070](./adr/0070-a-fitting-borrows-the-loop.md)).
 
 ### Next
 
-The policy half of this module is the strong half, and two rounds of fdm made it so. What the ordinary call still lacks is somewhere for a service's base URL and standing headers to live, and `examples/outbound/main.zig` is the evidence: five lines to assemble a URL with two path params, and a `user-agent` repeated on every call.
-
-**1. There is no target: a base URL and the headers a service always wants.** `Client` is one for the whole program on purpose, since the pool lives in it, so there is nowhere to write "Stripe is `https://api.stripe.com`, sends `authorization: Bearer …`, and gets five seconds". Every call repeats all three. The shape this repository already has for the same problem is `s3.Bucket`: a type, `fetch.Target("stripe", .{ .base = "…" })`, opened once on the client with what it holds at run time, `Stripe.open(&api, .{ .authorization = key })`, and asked for by type, `fn charge(stripe: *Stripe, c: *nilo.Ctx)`. Two services are two types. It is also the natural home for two things the `Client` cannot hold because it has no destination: `max_in_flight` per host, since today one slow third party eats the permits of every other, and a `nilo_ready` saying whether the upstream answers. Nothing per request: a comptime type and a pointer. The path half of the query entry rides on it: `stripe.get(c, "/v1/charges/{}", .{id})` with the segment encoded on the way in is the five lines out of the example, and it needs a base for the path to hang off, where `fetch.withQuery` needed none.
-
-**Waiting on: a design.** Whether a target is a type of its own or a struct of defaults handed to `Client`, which is the same argument `s3.Bucket` had and settled for the type ([ADR 0068](./adr/0068-a-bucket-is-a-type-and-a-key-is-not.md)); and what a target does that a `Client` does not, which decides whether it is a wrapper or a layer. That is the ADR.
+Nothing queued.
 
 ### Known gaps
+
+**An `Exchange` cannot be begun on a target.** `Exchange.begin` takes the client and a URL, and a target's `url(c, path, args)` is the URL — so the streamed call reaches the base and the template, and not the standing headers or the target's own gate. The shape is a `begin` on the target that takes a path and hands the Exchange the `Standing` the whole-body calls already pass ([ADR 0254](./adr/0254-a-target-is-a-type-and-a-path-is-a-template.md)).
+
+**Waiting on: a caller** who streams from a service that has standing headers, since a signed request sets its own and an unsigned download has none.
 
 **A plain call costs 4,139 bytes on every idle connection**, still the largest per-connection figure in the framework and no longer by three orders of magnitude. It is fiber stack rather than buffers, at the depth `std.http.Client` drives it to.
 
@@ -299,10 +296,6 @@ A Fitting, and the second one: a queue over a table in the caller's database, wi
 **Waiting on: a machine** with cores, and a run of `bench-job` extended to several workers on it.
 
 ### Known gaps
-
-**A queued row cannot be cancelled.** The user closed the export dialog, or unsubscribed before the nudge went out, and the row runs anyway. `cancel(id) !bool`, true when a `queued` row was deleted and false when it is `running`, finished or absent, is one more optional method on the store contract, the way `pushIn` is, and a `unique` key plus `cancel` is how "move it to tomorrow" gets written.
-
-**Waiting on: a caller.**
 
 **`stats` is three numbers for the whole queue.** What an operator wants on a dashboard is how old the oldest `queued` row is (the lag) and the counts by kind, so that a thousand queued thumbnails and one queued invoice do not read as the same number. One more query, run only when asked.
 
@@ -358,11 +351,7 @@ The three that left first were a `Transfer-Encoding` nilo could not decode being
 
 **Waiting on: ready.**
 
-**2. A form field cannot bind to a list.** A query parameter can, since [ADR 0164](./adr/0164-a-query-parameter-that-is-a-list.md); a `<select multiple>` or a checkbox group into a `Form(T)` is still a compile error naming the field. `parseMultipart` already keeps every occurrence in order and `Fields.find` deliberately returns the first, so the data is there and only the binding is missing.
-
-**Waiting on: a design** for the separator, which is where this stops being the query case one slot over. A browser sends a repeated name and never a comma-joined one, so the reading that made sense for a query string — take both spellings, write the comma into the document — is half wrong here: there is no document to write, and a comma in a form value is a value with a comma in it.
-
-**3. `permessage-deflate`.** Negotiated in the handshake, and a compressor per connection is memory that has not been budgeted.
+**2. `permessage-deflate`.** Negotiated in the handshake, and a compressor per connection is memory that has not been budgeted.
 
 **Waiting on: a number.** The per-connection cost has to be priced against the 4,669 bytes an idle connection holds today.
 
@@ -411,12 +400,6 @@ This entry used to end "there is simply no second architecture in `bench/result/
 **The router is still a linear scan.** Indexing the first segment took 44% off a hundred-route app and moved [ADR 0001](./adr/0001-dx-wins-below-the-10-percent-threshold.md)'s 10% bar out to around 40 routes, so what is left is the actual tree, for the app with hundreds of them.
 
 **Waiting on: a number.** The numbers no longer point at it urgently. `zig build profile` is the harness for the day they do, and two attempts that lost are written up in [`history.md`](./history.md) so they are not repeated. An application with 203 routes now exists, against a threshold measured at about 40, and has said it will report a number rather than ask for the work.
-
-**A response a handler wrote can never answer 304.** An ETag is made in `static.zig` — `etagFor` over a held file's bytes, `etagForSpilled` over a mtime and a size — and matched by `static.etagMatches` against an `If-None-Match` or the `If-Range` that `range.parse` reads. Those are the file paths, and they are the only paths there are. A JSON endpoint polled every five seconds sends the whole body every time, and a handler that wants to do it by hand gets no help either: it reads `c.header("If-None-Match")`, works something out, and calls `c.sendEmpty(304)`.
-
-The reason this is not simply a middleware is [ADR 0018](./adr/0018-the-trade-budget-has-three-axes.md). Hashing a response means the body exists before the head is written, which the streaming paths do not do, and it means a buffer to hash over. A weak validator the handler hands in — a row's `updated_at`, a version column — costs nothing and is the shape worth designing.
-
-**Waiting on: a design** for what the handler hands over, given that nothing in this framework should be hashing a body per request.
 
 **Nothing tells a handler its client has gone.** `error.Canceled` comes from a shutdown or from one of the deadlines the Engine sets; a client closing its connection in the middle of a handler produces neither, so the work runs to the end and the response is written into a socket nobody is reading. The other half of this — cutting a slow handler off — is `nilo.deadline(ms)` now ([ADR 0133](./adr/0133-a-route-can-say-how-long-it-has.md)). This half is not, and it is not simply unbuilt: **the obvious implementation is wrong.** A read-side EOF is not "the client left". A client that sent `Connection: close` and then `shutdown(SHUT_WR)` produces exactly that and is still waiting for its response, so answering "peer gone" from it would abandon correct requests. Gin gets the disconnect from `net/http` for nothing; Fiber does not have it either.
 

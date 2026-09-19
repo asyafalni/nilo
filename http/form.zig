@@ -155,12 +155,26 @@ pub const Fields = struct {
 
     /// The first field of this name, or null. First rather than last
     /// because a repeated name is a checkbox group, and taking the last
-    /// would quietly answer with whichever the browser put at the end.
+    /// would quietly answer with whichever the browser put at the end. A
+    /// field declared as a list reads every occurrence instead
+    /// ([ADR 0256](../docs/adr/0256-a-form-list-is-a-repeated-name-and-nothing-else.md)).
     pub fn find(self: Fields, name: []const u8) ?[]const u8 {
         for (self.text) |p| {
             if (std.mem.eql(u8, p.name, name)) return p.value;
         }
         return null;
+    }
+
+    /// How many non-empty values arrived under `name`: the size of the
+    /// list a field of that name becomes. An empty value is what an
+    /// unticked box never sends and an empty text box does, and it
+    /// contributes nothing, the rule ADR 0164 set for a query.
+    pub fn count(self: Fields, name: []const u8) usize {
+        var n: usize = 0;
+        for (self.text) |p| {
+            if (std.mem.eql(u8, p.name, name) and p.value.len > 0) n += 1;
+        }
+        return n;
     }
 
     pub fn file(self: Fields, name: []const u8) ?Part {
@@ -202,7 +216,7 @@ pub fn readInto(
     body: []const u8,
 ) !T {
     const fields = try parsedFor(T, arena, content_type, body);
-    return fill(T, fields, lifetime);
+    return fill(T, arena, fields, lifetime);
 }
 
 /// Read a form body into `T`, recording why each field that would not bind
@@ -222,7 +236,7 @@ pub fn readIntoCollecting(
     outcomes: *[@typeInfo(T).@"struct".fields.len]convert.Outcome,
 ) !T {
     const fields = try parsedFor(T, arena, content_type, body);
-    return fillCollecting(T, fields, lifetime, outcomes);
+    return fillCollecting(T, arena, fields, lifetime, outcomes);
 }
 
 /// Everything that has to be true before a form body is worth taking apart,
@@ -281,7 +295,7 @@ pub fn parse(arena: std.mem.Allocator, kind: Kind, body: []const u8) !Fields {
 }
 
 /// Fill `T` from an already-parsed form.
-fn fill(comptime T: type, fields: Fields, lifetime: *const str_mod.Lifetime) !T {
+fn fill(comptime T: type, arena: std.mem.Allocator, fields: Fields, lifetime: *const str_mod.Lifetime) !T {
     var out: T = undefined;
     inline for (@typeInfo(T).@"struct".fields) |f| {
         const label = "\"" ++ f.name ++ "\"";
@@ -290,7 +304,11 @@ fn fill(comptime T: type, fields: Fields, lifetime: *const str_mod.Lifetime) !T 
             else => f.type,
         };
 
-        if (Inner == Upload) {
+        if (comptime convert.listElement(f.type)) |Item| {
+            // A list is never missing: a checkbox group with nothing ticked
+            // sends nothing, and that is the empty list (ADR 0256).
+            @field(out, f.name) = try collectList(Item, arena, fields, f.name, lifetime, label);
+        } else if (Inner == Upload) {
             if (fields.file(f.name)) |part| {
                 @field(out, f.name) = Upload{
                     .filename = Str.fromRequest(part.filename, lifetime),
@@ -330,6 +348,7 @@ fn fill(comptime T: type, fields: Fields, lifetime: *const str_mod.Lifetime) !T 
 /// way, which is what a form showing itself again needs.
 fn fillCollecting(
     comptime T: type,
+    arena: std.mem.Allocator,
     fields: Fields,
     lifetime: *const str_mod.Lifetime,
     outcomes: *[@typeInfo(T).@"struct".fields.len]convert.Outcome,
@@ -342,7 +361,9 @@ fn fillCollecting(
         };
         outcomes[i] = .{};
 
-        if (Inner == Upload) {
+        if (comptime convert.listElement(f.type)) |Item| {
+            @field(out, f.name) = collectListCollecting(Item, arena, fields, f.name, lifetime, &outcomes[i]) catch &.{};
+        } else if (Inner == Upload) {
             if (fields.file(f.name)) |part| {
                 @field(out, f.name) = Upload{
                     .filename = Str.fromRequest(part.filename, lifetime),
@@ -381,6 +402,78 @@ fn fillCollecting(
     return out;
 }
 
+/// Every value that arrived under a repeated name, converted
+/// ([ADR 0256](../docs/adr/0256-a-form-list-is-a-repeated-name-and-nothing-else.md)).
+///
+/// **A repeated name and nothing else.** A browser sends a `<select
+/// multiple>` and a checkbox group as the same name once per value and
+/// never comma-joined, so there is no second spelling to read: a comma in
+/// a form value is a value with a comma in it. That is where this stops
+/// being the query case one slot over (ADR 0164), whose comma is a
+/// contract written into the document for a client to send back.
+///
+/// **One allocation, for a form that asked for a list and no other.** The
+/// elements point into the parsed body, which lives as long as the request;
+/// what is allocated is the slice of them, sized by `count`, out of the
+/// request arena (ADR 0018). An empty value contributes nothing, so a row of
+/// empty text boxes is an empty list rather than a list of empty strings.
+fn collectList(
+    comptime Item: type,
+    arena: std.mem.Allocator,
+    fields: Fields,
+    comptime name: []const u8,
+    lifetime: *const str_mod.Lifetime,
+    comptime label: []const u8,
+) ![]const Item {
+    const n = fields.count(name);
+    if (n == 0) return &.{};
+
+    const out = arena.alloc(Item, n) catch
+        return fail.internal("no room for the values of {s}", .{label});
+
+    var at: usize = 0;
+    for (fields.text) |p| {
+        if (!std.mem.eql(u8, p.name, name) or p.value.len == 0) continue;
+        out[at] = try convert.convert(Item, .form, Str.fromRequest(p.value, lifetime), label);
+        at += 1;
+    }
+    return out[0..at];
+}
+
+/// `collectList`, recording what would not convert instead of answering
+/// with it. The **first** bad value is the one the handler is told about,
+/// and the rest of the list is still read, the rule ADR 0164 set: a group
+/// with one bad box in it is a group, not a form with nothing in it.
+fn collectListCollecting(
+    comptime Item: type,
+    arena: std.mem.Allocator,
+    fields: Fields,
+    comptime name: []const u8,
+    lifetime: *const str_mod.Lifetime,
+    outcome: *convert.Outcome,
+) ![]const Item {
+    const n = fields.count(name);
+    if (n == 0) return &.{};
+
+    const out = try arena.alloc(Item, n);
+    var at: usize = 0;
+    for (fields.text) |p| {
+        if (!std.mem.eql(u8, p.name, name) or p.value.len == 0) continue;
+        const text = Str.fromRequest(p.value, lifetime);
+        var converted: Item = undefined;
+        if (convert.tryConvert(Item, .form, text, &converted)) |reason| {
+            if (outcome.reason == null) {
+                outcome.given = text;
+                outcome.reason = reason;
+            }
+        } else {
+            out[at] = converted;
+            at += 1;
+        }
+    }
+    return out[0..at];
+}
+
 /// Everything that can be wrong with the struct a form is read into.
 ///
 /// `what` names the thing being complained about — the typed engine passes
@@ -409,6 +502,20 @@ pub fn checkFields(comptime T: type, comptime what: []const u8) void {
             };
             if (Inner == Upload) continue;
             if (convert.convertible(f.type)) continue;
+            // A list of anything a form value can become, filled from the
+            // repeated name a checkbox group or a `<select multiple>` sends
+            // (ADR 0256). A list of files is not one: `Upload` is a part
+            // rather than a value, and a field takes one.
+            if (convert.listElement(f.type)) |Item| {
+                if (Item != Upload and convert.convertible(Item) and @typeInfo(Item) != .optional) continue;
+                @compileError(
+                    "nilo: the field `" ++ f.name ++ ": " ++ naming.of(f.type) ++ "` of " ++ what ++
+                        " is a list of something a form value cannot become.\n" ++
+                        "  A list field takes every value sent under its name, and each is a " ++
+                        "`nilo.Str`, a number, a `bool`, an enum, or a type that parses itself " ++
+                        "with `nilo_parse` — not a file, and not an optional.",
+                );
+            }
             @compileError(
                 "nilo: the field `" ++ f.name ++ ": " ++ naming.of(f.type) ++ "` of " ++ what ++
                     " is not something a form value can become.\n" ++
@@ -829,6 +936,97 @@ test "a body that is not a form at all says what it was" {
         "this endpoint takes a form, so the body has to be sent as " ++
             "application/x-www-form-urlencoded or multipart/form-data — this one arrived as \"application/json\"",
     );
+}
+
+// ---- a form list is a repeated name and nothing else (ADR 0256) ----
+
+const Kind2 = enum { comment, mention };
+
+const Post = struct {
+    title: Str,
+    tags: []const Str = &.{},
+    notify: []const Kind2 = &.{},
+    scores: []const u32 = &.{},
+};
+
+test "a checkbox group binds to a list, one value per repeated name, in the order sent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const filled = try read(
+        Post,
+        arena.allocator(),
+        "application/x-www-form-urlencoded",
+        "title=hi&tags=zig&notify=comment&tags=http&notify=mention&scores=3&scores=1",
+    );
+    try testing.expectEqual(@as(usize, 2), filled.tags.len);
+    try testing.expectEqualStrings("zig", filled.tags[0].view());
+    try testing.expectEqualStrings("http", filled.tags[1].view());
+    try testing.expectEqualSlices(Kind2, &.{ .comment, .mention }, filled.notify);
+    try testing.expectEqualSlices(u32, &.{ 3, 1 }, filled.scores);
+}
+
+test "a list nobody sent is the empty list, and an empty value contributes nothing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Nothing ticked: no name arrives at all, and that is not "missing".
+    const none = try read(Post, arena.allocator(), "application/x-www-form-urlencoded", "title=hi");
+    try testing.expectEqual(@as(usize, 0), none.tags.len);
+    try testing.expectEqual(@as(usize, 0), none.notify.len);
+
+    // A row of text boxes with two left blank is a list of one, and a
+    // value with a comma in it is one value with a comma in it: there is
+    // no second spelling to split on.
+    const some = try read(
+        Post,
+        arena.allocator(),
+        "application/x-www-form-urlencoded",
+        "title=hi&tags=&tags=a%2Cb&tags=",
+    );
+    try testing.expectEqual(@as(usize, 1), some.tags.len);
+    try testing.expectEqualStrings("a,b", some.tags[0].view());
+}
+
+test "a select multiple in a multipart form binds the same way" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const filled = try read(Post, arena.allocator(), multipart_type, comptime multipart(&.{
+        "Content-Disposition: form-data; name=\"title\"\r\n\r\nhi",
+        "Content-Disposition: form-data; name=\"notify\"\r\n\r\nmention",
+        "Content-Disposition: form-data; name=\"notify\"\r\n\r\ncomment",
+    }));
+    try testing.expectEqualSlices(Kind2, &.{ .mention, .comment }, filled.notify);
+}
+
+test "one value that will not convert names the field, and the binding still reads the rest" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    try expectFails(
+        Post,
+        arena.allocator(),
+        "application/x-www-form-urlencoded",
+        "title=hi&notify=comment&notify=nonsense",
+        "\"notify\" is not one of the known choices (comment, mention): \"nonsense\"",
+    );
+
+    // Collecting: the first bad value is the one recorded, and the good
+    // ones around it are still in the list, the way a query list reads.
+    var outcomes: [@typeInfo(Post).@"struct".fields.len]convert.Outcome = undefined;
+    const filled = try readIntoCollecting(
+        Post,
+        arena.allocator(),
+        &test_lifetime,
+        "application/x-www-form-urlencoded",
+        "title=hi&scores=1&scores=x&scores=y&scores=4",
+        &outcomes,
+    );
+    try testing.expectEqualSlices(u32, &.{ 1, 4 }, filled.scores);
+    try testing.expect(outcomes[3].reason != null);
+    try testing.expectEqualStrings("x", outcomes[3].given.view());
+    try testing.expect(outcomes[0].reason == null);
 }
 
 /// A multipart body written the way a browser writes one, so the tests are

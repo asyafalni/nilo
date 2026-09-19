@@ -82,6 +82,7 @@ one naming the job.
 | `jobs.stats(c)` | `Stats` — `queued`, `running`, `dead` |
 | `jobs.status(id)` | `?job.Status` — `state`, `attempts` and `progress`, from the Space, while it remembers |
 | `jobs.progress(id, n)` | `n` into the Space's `progress` for the row, from inside a `run` with a `job.Tick` and a `*Jobs`. Reset by every change of state except `done`, which keeps it. Nothing without a Space ([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)) |
+| `jobs.cancel(c, id)` | `bool` — a `queued` row deleted before it runs, its `unique` key with it; `false` when the row is running, finished or absent. One statement, so a claim in the same instant wins or loses whole. A Refusal on a store with no `cancel` ([ADR 0257](../adr/0257-a-queued-row-can-be-taken-back.md)) |
 | `jobs.deadOnes(c)` | `[]Dead` — `id`, `kind`, `attempts`, `err`, newest first |
 | `jobs.retryDead(c, id)` | `bool` — queued again from attempt one |
 | `Jobs.serve(&jobs)` | the worker loop, for `app.spawn`. Stops with the server |

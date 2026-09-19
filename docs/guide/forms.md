@@ -29,6 +29,7 @@ type says what its text has to become, and a default is what "not sent" means.
 | `nickname: ?Str = null` | optional: absent is null |
 | `limit: u32 = 20` | absent means the default |
 | `remember: bool = false` | a checkbox — see below |
+| `tags: []const Str = &.{}` | a checkbox group or a `<select multiple>` — see below |
 | `avatar: Upload` | a file — see below |
 
 The messages are the ones a query param gets, because it is the same code:
@@ -52,6 +53,45 @@ rather than about booleans — a JSON client sending `"on"` has a bug, and heari
 about it is more use than having it guessed at. `off` is not accepted anywhere:
 no browser sends it, and an unticked box is an absent field rather than a
 present false one.
+
+## A checkbox group is a list
+
+Three boxes named `tags` post `tags=zig&tags=http` when two are ticked, and a
+`<select multiple>` posts the same shape. A field that is a slice takes
+every value sent under its name, in the order the browser put them, and
+each one is converted the way a single field would be
+([ADR 0256](../adr/0256-a-form-list-is-a-repeated-name-and-nothing-else.md)):
+
+<!-- compiles -->
+```zig
+const NewPost = struct {
+    title: nilo.Str,
+    tags: []const nilo.Str = &.{},
+    notify: []const enum { comment, mention } = &.{},
+};
+
+fn create(incoming: nilo.Form(NewPost)) !nilo.Redirect(303) {
+    for (incoming.value.tags) |tag| _ = tag;
+    return .to("/posts");
+}
+```
+
+**Nothing ticked is the empty list**, never a 400: a group with no box
+ticked sends no name at all, and that is what every filter and every
+opt-in already means by not being sent. Give the field `= &.{}` and the
+document says it is optional. **An empty value contributes nothing**, so a
+row of text boxes named `alias` with two left blank is a list of the ones
+filled in. **A value with a comma in it is a value with a comma in it**: a
+browser never joins a group with commas, so unlike a
+[query list](./requests.md#query-params) there is no second spelling to
+read, and `tags=a%2Cb` is one tag. A list of `Upload` is refused while
+compiling — a file is a part, not a value, and a field takes one.
+
+A value that will not convert — `notify=nonsense` — is the 400 the single
+field would have got, naming the field. Behind a
+[`Bound(Form(T))`](#when-one-field-is-wrong-and-the-rest-are-fine) the first
+bad value is the one recorded and the rest of the list is still read, so a
+group with one bad box is a group rather than a form with nothing in it.
 
 ## Which encoding arrived is not your problem
 

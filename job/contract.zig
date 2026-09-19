@@ -22,9 +22,11 @@
 //! | `release(scope, id) !void` | put it back untouched — the server is going |
 //! | `stats(scope) !Stats` | how many are waiting, running and dead |
 //!
-//! Two more are optional, and a `Jobs` refuses a call that its store does
+//! Three more are optional, and a `Jobs` refuses a call that its store does
 //! not carry rather than faking it: `pushIn(tx, scope, …)` for a store that
-//! can join a transaction, and `ready()` for one that can be down.
+//! can join a transaction, `ready()` for one that can be down, and
+//! `cancel(scope, id) !bool` for one that can take a queued row back
+//! ([ADR 0257](../docs/adr/0257-a-queued-row-can-be-taken-back.md)).
 
 /// The number a store gives a row. Whatever the store's own key is, it fits
 /// in here — a `bigint` does, and so does a counter.

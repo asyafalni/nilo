@@ -60,6 +60,7 @@ const bytebody = @import("bytebody.zig");
 const json_mod = @import("json.zig");
 const mark = @import("jsonmark.zig");
 const ownbody = @import("ownbody.zig");
+const versioned_mod = @import("versioned.zig");
 
 const Ctx = ctx_mod.Ctx;
 const Str = str_mod.Str;
@@ -1141,6 +1142,14 @@ fn answerOf(comptime Fn: type) openapi.Answer {
             return answerWith(status, Inner);
         }
 
+        // A versioned answer is the body's answer with an `ETag` on it and
+        // a 304 beside it (ADR 0258).
+        if (versioned_mod.isVersioned(V)) {
+            var answer = answerWith(200, V.nilo_versioned);
+            answer.versioned = true;
+            return answer;
+        }
+
         return answerWith(200, V);
     }
 }
@@ -1215,7 +1224,18 @@ fn checkAnswer(comptime pattern: []const u8, comptime Fn: type) void {
             else => Returned,
         };
         if (V == void) return;
+        // Before the `Response` unwrap, because one of the things it
+        // refuses is a versioned answer inside a `Response` (ADR 0258).
+        versioned_mod.check(pattern, V);
         if (hasNamedDecl(V, "nilo_response")) V = V.nilo_response;
+        if (versioned_mod.isVersioned(V)) {
+            for (@typeInfo(Fn).@"fn".params) |p| {
+                const P = p.type orelse continue;
+                if (hasNamedDecl(P, "nilo_cached")) versioned_mod.checkNotKept(pattern, V, "nilo.Cached");
+                if (hasNamedDecl(P, "nilo_idempotent")) versioned_mod.checkNotKept(pattern, V, "nilo.Idempotent");
+            }
+            V = V.nilo_versioned;
+        }
         if (V == void) return;
         if (@typeInfo(V) == .optional) V = @typeInfo(V).optional.child;
         ownbody.check(pattern, V);
@@ -1504,6 +1524,14 @@ fn roleOf(comptime pattern: []const u8, comptime P: type, comptime i: usize) Rol
     // directions. Read as the request body — which is what a struct by value
     // is — this would land somewhere inside `std.json` being asked to parse a
     // directory descriptor, which is a message nilo did not write (ADR 0015).
+    if (comptime versioned_mod.isVersioned(P)) @compileError(
+        "nilo: argument " ++ num(i + 1) ++ " of the handler for route \"" ++ pattern ++
+            "\" is a `" ++ naming.of(P) ++ "`, which is what a handler answers *with* rather " ++
+            "than something it is given.\n" ++
+            "  The version a client holds is read with `c.clientHas(version)`; the body and " ++
+            "its version going to the client are the return type:\n" ++
+            "    fn listOrders(c: *nilo.Ctx, db: *Db) !nilo.Versioned([]const Order) { … }",
+    );
     if (comptime bytebody.isBytes(P)) @compileError(
         "nilo: argument " ++ num(i + 1) ++ " of the handler for route \"" ++ pattern ++
             "\" is a `nilo.Bytes`, which is what a handler answers *with* rather than " ++
@@ -1983,6 +2011,22 @@ fn sendResult(c: *Ctx, result: anytype) !void {
     if (comptime hasNamedDecl(T, "nilo_redirect")) {
         for (value.headers.view()) |h| try c.setHeader(h.name, h.value);
         return c.redirect(T.nilo_redirect, value.location);
+    }
+    // A version the handler named is an `ETag`, and a client that sent it
+    // back gets a 304 with no body (ADR 0258). The tag and the handler's
+    // headers go on both answers, because a 304 describes the
+    // representation the client is holding. The tag lives in this frame,
+    // so it is `setHeader` — copied — and not `setStaticHeader`.
+    if (comptime versioned_mod.isVersioned(T)) {
+        var buf: [versioned_mod.max_tag]u8 = undefined;
+        try c.setHeader("ETag", versioned_mod.tagOf(&buf, value.version));
+        for (value.headers.view()) |h| try c.setHeader(h.name, h.value);
+        if (c.clientHas(value.version)) return c.sendEmpty(304);
+        const body = value.value orelse return fail.internal(
+            "route \"{s}\" answered `unchanged`, and the client did not send that version",
+            .{c._path},
+        );
+        return sendValue(c, 200, body);
     }
     if (comptime hasNamedDecl(T, "nilo_response")) {
         // Copied rather than borrowed, the same as `Ctx.setHeader`: a

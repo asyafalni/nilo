@@ -113,9 +113,9 @@ fn search(api: *fetch.Client, c: *nilo.Ctx, q: nilo.Str, page: u32) !fetch.Respo
 
 The URL is what every call takes, `Exchange.begin` included, which is why
 this is a function and not a field on the call. A path segment —
-`/v1/charges/{id}` with the id encoded on the way in — is still
-`nilo.percent.encodeWrite` by hand, as the [example below](#reading-the-answer)
-does; that half waits on a per-service base URL to live under.
+`/v1/charges/{id}` with the id encoded on the way in — needs a base for the
+path to hang off, and that is a [target](#a-service-as-a-type): the same
+struct is then the query, and the segments come out of it by name.
 
 The last argument is a `Call` — per-call overrides, every field null, so
 `.{}` is the ordinary case:
@@ -171,17 +171,10 @@ const Repo = struct {
     stargazers_count: u64,
 };
 
-fn stars(api: *fetch.Client, c: *nilo.Ctx, owner: nilo.Str, name: nilo.Str) !u64 {
-    var url: std.Io.Writer.Allocating = .init(c.arena());
-    try url.writer.writeAll("https://api.github.com/repos/");
-    try nilo.percent.encodeWrite(&url.writer, owner.view(), .unreserved);
-    try url.writer.writeByte('/');
-    try nilo.percent.encodeWrite(&url.writer, name.view(), .unreserved);
+const GitHub = fetch.Target("github", .{ .timeout_ms = 2_000 });
 
-    const res = api.get(c, url.written(), .{
-        .timeout_ms = 2_000,
-        .headers = &.{.{ .name = "user-agent", .value = "my-app" }},
-    }) catch |err| switch (err) {
+fn stars(github: *GitHub, c: *nilo.Ctx, owner: nilo.Str, name: nilo.Str) !u64 {
+    const res = github.get(c, "/repos/{}/{}", .{ owner, name }, .{}) catch |err| switch (err) {
         error.TimedOut => return nilo.fail.status(504, "github took longer than 2s", .{}),
         else => return err,
     };
@@ -202,10 +195,10 @@ fn stars(api: *fetch.Client, c: *nilo.Ctx, owner: nilo.Str, name: nilo.Str) !u64
 
 Four things in there are the habits worth keeping. **Text from a request
 going into a URL is percent-encoded**, never pasted — `%2e%2e%2f` in a path
-param is how a caller reaches an endpoint you never meant to offer, and
-`nilo.percent` is in Core so a handler and a Service can both reach it
-([ADR 0066](../adr/0066-percent-is-needed-by-two-layers.md)); a query gets
-the same treatment for free through `fetch.withQuery`. **`error.TimedOut`
+param is how a caller reaches an endpoint you never meant to offer, and each
+`{}` in a target's path is encoded on the way in with `/` as data, by the
+same `nilo.percent` a query goes through
+([ADR 0066](../adr/0066-percent-is-needed-by-two-layers.md)). **`error.TimedOut`
 gets its own arm**, because it is the one failure every caller of anything
 has to have an answer for, and 504 says *the thing I asked is slow* where 500
 would say *I am broken*. **A refusal says when to come back**, because the
@@ -216,6 +209,113 @@ fields, and the parse ignores the rest.
 
 [`examples/outbound`](../../examples/outbound/main.zig) is that handler with
 a `main` around it, against GitHub's public API.
+
+## A service as a type
+
+A program that calls Stripe from six handlers writes Stripe's host, its
+`authorization` and the seconds it gets six times, and there is nowhere on
+the client to write them once — the client is one for the whole program,
+because the pool is in it. **A target is that sentence as a type**: two
+services are two types, opened once on the client, and a handler asks for
+the one it wants the way it asks for a database
+([ADR 0254](../adr/0254-a-target-is-a-type-and-a-path-is-a-template.md)).
+
+<!-- compiles -->
+```zig
+const fetch = @import("nilo_fetch");
+
+const Stripe = fetch.Target("stripe", .{ .timeout_ms = 5_000, .max_in_flight = 8 });
+
+const Refund = struct { id: []const u8, amount: u64 };
+
+fn refund(stripe: *Stripe, c: *nilo.Ctx, charge_id: nilo.Str) !Refund {
+    const res = try stripe.postJson(c, "/v1/charges/{}/refunds", .{charge_id}, .{ .amount = 500 }, .{});
+    if (!res.ok()) return nilo.fail.status(502, "stripe said no", .{});
+    return res.json(Refund, c);
+}
+```
+
+and in `main`, once, beside the client:
+
+```zig
+var stripe = try Stripe.open(&api, .{
+    .base = cfg.stripe_base, // https://api.stripe.com
+    .authorization = cfg.stripe_key,
+});
+try app.provide(&stripe);
+```
+
+**What is on the type is what is true of the service wherever the program
+runs**; what is given to `open` is the deployment's. The split is
+[the one a bucket makes](./s3.md): the name, the clocks and the ceilings are
+Stripe's, and the base URL and the key come from a `Config`, because a
+sandbox host with a test key in development and the real pair in production
+is one binary rather than two.
+
+| On the type | Default | |
+|---|---|---|
+| `max_in_flight` | 0 | calls to this service at once, under the client's own ceiling. `0` is no gate of its own. Set it for the slow third party, so its calls queue at its own gate rather than holding the permits every other service shares |
+| `timeout_ms` | the client's | this service's own deadline; a `Call` still overrides it for one call |
+| `stall_ms` | the client's | likewise, for silence |
+| `max_body` | the client's | likewise, for the body |
+| `ready` | null | a path the [health route](./deploying.md#health) GETs on every probe, with a 2xx as ready. Null is started-is-ready, because a balancer asks every second and a call to somebody else's API at that rate is a bill and a rate limit rather than a check |
+
+| Given to `open` | |
+|---|---|
+| `base` | `https://api.stripe.com`, or `https://api.sandbox.example.com/v2` — scheme, host, and a path prefix if there is one. No query, no fragment; a trailing `/` is dropped. `error.BaseNotAbsolute` and `error.BaseHasQuery` otherwise |
+| `authorization` | sent on every call, unless the call's own `headers` name one |
+| `user_agent` | likewise |
+| `headers` | anything else the service always wants — `accept`, an API version, a tenant. A call's own line of the same name goes instead of it |
+
+Every call the client has, the target has with a **path** in place of the
+URL: `get`, `post`, `put`, `delete`, `patch`, `send`, `postJson`,
+`putJson`, `patchJson`, `sendJson`, and `url(c, path, args)` for the URL
+alone — an `Exchange` begun on the client, a link written into a response.
+
+**The path is a template, read while compiling.** `{}` is a segment filled
+by position from a tuple, and the count is checked: two `{}` and one
+argument is a compile error rather than a 404 from the far end. A segment is
+an int, a bool or text, and text is percent-encoded with `/` as data, so an
+id off a request that says `../admin` is one segment rather than a walk.
+
+**Name the segments and the same struct is the query.** `{id}` is filled
+from the field `id`, and every field the template does not name goes on the
+end as a query param under `withQuery`'s rules — an optional that is null is
+left out:
+
+<!-- compiles -->
+```zig
+fn refunds(stripe: *Stripe, c: *nilo.Ctx, charge_id: nilo.Str, cursor: ?nilo.Str) !fetch.Response {
+    // GET /v1/charges/<charge_id>/refunds?limit=20, and &starting_after=… when there is one
+    return stripe.get(c, "/v1/charges/{id}/refunds", .{
+        .id = charge_id,
+        .limit = 20,
+        .starting_after = cursor,
+    }, .{});
+}
+```
+
+A name with no field, a tuple for a named segment, a struct for a
+positional one, and a template that mixes the two are each refused while
+compiling, in a sentence that says what to write instead.
+
+**The call's own headers win.** A `Call` on a target is the same `Call`,
+and a line in its `headers` naming `authorization` or `user-agent` goes
+instead of the standing value — one line on the wire, yours, the rule
+[ADR 0231](../adr/0231-a-header-std-owns-goes-out-once.md) already sets for
+std's own slot. A line naming any other standing header shadows it, so a
+target that says `accept: application/json` can be asked for `text/csv` on
+one call. The ordinary call has no standing headers and costs nothing here;
+a call that passes headers of its own under a target that has some spends
+one arena allocation on the merge.
+
+**One target's gate is taken before the client's.** With `max_in_flight` on
+the type, a call to a slow service waits at that service's own gate holding
+no permit the others share; the client's ceiling on live connections still
+holds over all of them. The target starts the client under it, so a program
+that provides three targets and never the client is fine, and one that
+provides all four starts the client four times, which sets the same `Io`
+four times.
 
 ## The client's settings
 

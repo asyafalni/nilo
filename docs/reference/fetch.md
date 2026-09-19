@@ -98,6 +98,54 @@ ADR 0018's four axes.
 are decisions about somebody else's service and belong to whoever knows what
 that service promises.
 
+### `fetch.Target`
+
+A service's base URL, standing headers and ceilings as a type of its own,
+opened once on the client and asked for by type. Two services are two types
+([ADR 0254](../adr/0254-a-target-is-a-type-and-a-path-is-a-template.md)).
+
+<!-- compiles -->
+```zig
+const fetch = @import("nilo_fetch");
+
+const Stripe = fetch.Target("stripe", .{ .timeout_ms = 5_000, .max_in_flight = 8 });
+
+fn charge(stripe: *Stripe, c: *nilo.Ctx, charge_id: nilo.Str) !fetch.Response {
+    return stripe.get(c, "/v1/charges/{}", .{charge_id}, .{});
+}
+```
+
+| | |
+|---|---|
+| `fetch.Target(name, .{…})` | a type. `name` tells two targets with the same options apart and is what the health route calls it; empty is a Refusal |
+| `Stripe.open(&client, .{ .base, .authorization, .user_agent, .headers })` | `error.BaseNotAbsolute` for a base with no scheme or host, `error.BaseHasQuery` for one with a `?` or `#`; a trailing `/` is dropped. Every value is held, not copied |
+| `app.provide(&stripe)` | starts the client under it at `listen()`; the client itself is provided only if a handler asks for it by that type |
+| `stripe.get(c, path, args, .{})` | `Response` — and `post(c, path, args, body, .{})`, `put`, `delete`, `patch(c, path, args, body_or_null, .{})`, `send(c, method, path, args, body_or_null, .{})`, `postJson(c, path, args, value, .{})`, `putJson`, `patchJson`, `sendJson`: every call the client has, with a path in place of the URL and the same `Call` last |
+| `stripe.url(c, path, args)` | `[]const u8`, the URL alone, in the Scope, one allocation sized exactly — for an `Exchange` begun on the client |
+| `stripe.nilo_ready(scope)` | started is ready, unless the type names a `ready` path, which is then GET on every probe with anything but a 2xx reported |
+
+**`fetch.target.Options`**, on the type: `max_in_flight` (0, no gate of its
+own; otherwise this service's own semaphore, taken before the client's and
+given back after), `timeout_ms`, `stall_ms`, `max_body` (each null for the
+client's, and a `Call` still overrides for one call), `ready` (null, or a
+path beginning with `/`).
+
+**`path` is a comptime template.** `{}` is filled by position from a tuple
+— `"/repos/{}/{}", .{ owner, name }` — with the count checked. `{name}` is
+filled from a struct's field of that name, and **every field the template
+does not name is a query param** under `withQuery`'s rules — `"/v1/charges/{id}/refunds",
+.{ .id = id, .limit = 10, .cursor = cursor }` with a null cursor left out.
+A segment is an int, a bool or text, encoded with `/` as data. A count that
+disagrees, a name with no field, a tuple for a named segment, a struct for a
+positional one, a template mixing the two, a segment of another type, and a
+path not beginning with `/` are each a Refusal.
+
+**Standing headers, and the call's over them.** `authorization` and
+`user_agent` go through std's slot; a line in `Call.headers` naming either
+goes instead ([ADR 0231](../adr/0231-a-header-std-owns-goes-out-once.md)).
+A line naming any other standing header shadows it. No allocation unless a
+call with headers of its own meets a target with some, and then one.
+
 ### `fetch.Exchange`
 
 The four calls above hold the whole body in the Scope, which is right for an

@@ -32,6 +32,7 @@ const percent = @import("nilo_core").percent;
 const fail = @import("fail.zig");
 const watchdog = @import("watchdog.zig");
 const authorization_mod = @import("authorization.zig");
+const versioned_mod = @import("versioned.zig");
 const Str = str_mod.Str;
 
 /// What one request is allowed to do. Filled from `listen()`'s options and
@@ -333,6 +334,22 @@ pub const Ctx = struct {
 
     pub fn path(self: *const Ctx) Str {
         return Str.fromRequest(self._path, self._lifetime);
+    }
+
+    /// Whether the client already holds `version` — its `If-None-Match`
+    /// names the tag a `nilo.Versioned(T)` with that version goes out under
+    /// (ADR 0258). Asked before building the body, so a handler returning
+    /// `.unchanged(version)` skips the work as well as the bytes:
+    ///
+    /// ```zig
+    /// if (c.clientHas(version)) return .unchanged(version);
+    /// ```
+    ///
+    /// A handler that never asks still answers 304 to such a client; what
+    /// asking buys is the query it did not run.
+    pub fn clientHas(self: *const Ctx, version: u64) bool {
+        const sent = self.header("If-None-Match") orelse return false;
+        return versioned_mod.matches(sent.view(), version);
     }
 
     /// A path param from the route pattern: `/users/:id` → `param("id")`.

@@ -121,6 +121,65 @@ where it was made.
 
 ### Added
 
+- **`fetch.Target(name, .{…})`**: a service's base URL, standing headers
+  and ceilings as a type of its own, opened once on the client and asked for
+  by type — `fn charge(stripe: *Stripe, c: *nilo.Ctx)`. Every call the
+  client has, with a path in place of the URL: `stripe.get(c,
+  "/v1/charges/{}", .{id}, .{})`, the segments counted while compiling and
+  percent-encoded with `/` as data; name them, `{id}`, and the same struct
+  is the query, every field the template does not name going on the end
+  under `withQuery`'s rules. `authorization` and `user_agent` go through
+  std's slot and a call's own line goes instead of either; `max_in_flight`
+  on the type is this service's own gate, taken before the client's, so a
+  slow third party stops eating the permits every other one shares;
+  `ready` is a path the health route GETs. The base and the credential are
+  given to `open`, where a `Config` can reach them, because a sandbox host
+  in development is the same binary. Twelve refusals; `refusals-fetch` is
+  fifteen. `examples/outbound` is a `GitHub` target now, and the five lines
+  it wrote to encode two path segments are gone
+  ([ADR 0254](./docs/adr/0254-a-target-is-a-type-and-a-path-is-a-template.md)).
+- **`jwt.Keyring`**: a key set that rotates under its readers. `init(gpa,
+  .{ .url, .issuer, .audience })` holds the issuer's URL and what every
+  verify insists on; `refresh(scope, client, now_s)` fetches the document
+  through the `fetch.Client` you pass — the module still imports nothing —
+  and `load(bytes)` swaps it in, freeing the old set only after the
+  verifies already reading it are done, with no wait on the reading side.
+  `verifyOrRefresh(Claims, gpa, token, now_s, scope, client)` is `verify`,
+  and on `NoSuchKey` one fetch at most per `refresh_interval_s` (60), then
+  `verify` again. The guide's three-line rotation — refetch, hold a
+  `*const Keys`, swap under a mutex — is gone, because each line was wrong
+  in a way no test finds
+  ([ADR 0255](./docs/adr/0255-a-key-set-is-swapped-whole-and-freed-after-its-readers.md)).
+- **A `Form(T)` field can be a list.** `tags: []const Str = &.{}` takes
+  every value sent under `tags` — a checkbox group, a `<select multiple>`,
+  a row of inputs sharing a name — in the order the browser sent them, each
+  converted the way a single field is, so `[]const Kind` for an enum refuses
+  a bad value with the sentence a single `kind` gets. Nothing sent is the
+  empty list, never a 400; an empty value contributes nothing; and a comma
+  is data, because a browser never joins a group with one, so there is no
+  second spelling to read as there is for a query list. Under
+  `Bound(Form(T))` the first bad value is reported and the rest are still
+  read. One arena allocation on a form that asked for a list and no other;
+  a list of `Upload` is a Refusal
+  ([ADR 0256](./docs/adr/0256-a-form-list-is-a-repeated-name-and-nothing-else.md)).
+- **`nilo.Versioned(T)`**: `T` with a `u64` version the handler names,
+  sent under a weak `ETag` — `W/"1a"` — and answered **304** with no body
+  when `If-None-Match` carries it. `c.clientHas(version)` asks first, so a
+  handler returning `.unchanged(version)` skips the query as well as the
+  bytes; one that never asks still answers 304. `headers` go out on both
+  answers. `Versioned(?T)`, `Versioned(void)`, one inside a `Status` or a
+  `Response`, and one under a `Cached` or an `Idempotent` are Refusals, and
+  `refusals` is 146; the document puts the `ETag` on the 200 and a `304`
+  beside it
+  ([ADR 0258](./docs/adr/0258-a-version-a-handler-names-is-an-etag.md)).
+- **`jobs.cancel(c, id)`**: a `queued` row taken back before it runs —
+  `true` when it went, `false` when a worker already holds it, it finished,
+  or there is no such row. One `DELETE … WHERE state = 'queued'`, so a claim
+  in the same instant wins or loses whole; the `unique` key goes with the
+  row, so a cancel and a push is "move it to tomorrow". On `job.Memory` and
+  `job.Table` both; a store of your own that cannot take a row back is a
+  Refusal at the call
+  ([ADR 0257](./docs/adr/0257-a-queued-row-can-be-taken-back.md)).
 - **`app.embedded(prefix, files)`** and `embeddedWith`: a tree the binary
   carries, served the way a directory is. A list of `.{ .path, .bytes }`
   with `@embedFile` on each goes through the same Set `app.static` builds —

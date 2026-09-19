@@ -207,6 +207,18 @@ pub fn Table(comptime Db: type) type {
             return n == 1;
         }
 
+        /// Delete a `queued` row before it runs: `true` when one went, and
+        /// `false` when the row is running, finished or absent — one
+        /// statement, so a worker that claims it in the same instant is
+        /// the one that wins, and the row is then its to finish
+        /// ([ADR 0257](../docs/adr/0257-a-queued-row-can-be-taken-back.md)).
+        pub fn cancel(self: *Self, scope: anytype, id: contract.Id) !bool {
+            const n = try self.db.delete(Row, scope, .{
+                .where = .{ .id = @as(i64, @intCast(id)), .state = contract.State.queued },
+            });
+            return n == 1;
+        }
+
         /// Delete rows that finished before `before`. Not called by a `Jobs`;
         /// a program that wants the table to stay small runs this from a
         /// scheduled job of its own, which is the same loop everything else

@@ -53,6 +53,11 @@
 //!   a sender lying about `content-length` cannot get past it.
 //! - **A Scope**, so the body comes back as a `Str` that lives exactly as long
 //!   as the request does and nobody frees anything.
+//! - **A target**, for the service a program calls more than once: its base
+//!   URL and the headers it always wants, as a type opened once on the client
+//!   and asked for by type in a handler, with a path template whose segments
+//!   are encoded on the way in — `stripe.get(c, "/v1/charges/{}", .{id}, .{})`
+//!   ([ADR 0254](../docs/adr/0254-a-target-is-a-type-and-a-path-is-a-template.md)).
 //!
 //! Two shapes, and the second is the first with the middle left out. An
 //! `Exchange` is one call held open — the response head readable, the body
@@ -92,6 +97,14 @@ const Str = core.Str;
 /// `std.Io.Threaded`. What the module's own tests drive, exported
 /// ([ADR 0243](../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
 pub const testing = @import("testing.zig");
+
+/// A service's base URL and standing headers as a type of its own, opened
+/// once on the client: `const Stripe = fetch.Target("stripe", .{});`
+/// ([ADR 0254](../docs/adr/0254-a-target-is-a-type-and-a-path-is-a-template.md)).
+/// `fetch.target.Options` is what the type carries and `fetch.target.Open`
+/// what `open` takes.
+pub const target = @import("target.zig");
+pub const Target = target.Target;
 
 /// The header a request's id travels under (ADR 0196). nilo's own spelling,
 /// the one `Ctx.requestId` reads on the way in and the logger writes on the
@@ -331,7 +344,7 @@ pub const Client = struct {
         comptime core.checkScope(@TypeOf(c), "fetch.sendJson");
         comptime refuseJsonText(@TypeOf(value), "fetch.sendJson");
         const bytes = try std.json.Stringify.valueAlloc(c.arena(), value, .{});
-        return self.sendAs(c, method, url, bytes, "application/json", call);
+        return self.sendAs(c, method, url, bytes, "application/json", call, .{});
     }
 
     /// The whole of what `get`, `post`, `put`, `delete` and `patch` do, for
@@ -350,13 +363,29 @@ pub const Client = struct {
         call: Call,
     ) Error!Response {
         comptime core.checkScope(@TypeOf(c), "fetch.send");
-        return self.sendAs(c, method, url, body, null, call);
+        return self.sendAs(c, method, url, body, null, call, .{});
     }
 
+    /// What a `Target` sends on every call it makes: the headers a service
+    /// always wants, held once at `open` rather than repeated at every
+    /// call site (ADR 0254). `send` and its siblings pass `.{}`, which is
+    /// nothing. A line in `Call.headers` naming `authorization` or
+    /// `user-agent` goes instead of the standing value, the rule ADR 0231
+    /// already sets for std's own slot; a line naming any other standing
+    /// header shadows it, so a call can say `accept: text/csv` under a
+    /// target that says `accept: application/json`.
+    pub const Standing = struct {
+        authorization: ?[]const u8 = null,
+        user_agent: ?[]const u8 = null,
+        headers: []const std.http.Header = &.{},
+    };
+
     /// `send`, with a `content-type` the call decided — what `sendJson`
-    /// says for its body. Null is std's slot left to std, which writes none
-    /// for a body it was not told the type of.
-    fn sendAs(
+    /// says for its body — and the headers a `Target` stands behind every
+    /// call. Null for the type is std's slot left to std, which writes none
+    /// for a body it was not told the type of. Public for `target.zig`;
+    /// the calls above are the way to write it.
+    pub fn sendAs(
         self: *Client,
         c: anytype,
         method: std.http.Method,
@@ -364,6 +393,7 @@ pub const Client = struct {
         body: ?[]const u8,
         content_type: ?[]const u8,
         call: Call,
+        standing: Standing,
     ) Error!Response {
         // The one buffer this call needs, declared where a reader can see
         // what it costs. It is stack, and by
@@ -382,24 +412,32 @@ pub const Client = struct {
         var ex: Exchange = .idle;
         defer ex.end();
 
+        // A target's standing headers under the call's own, which shadow
+        // them by name: nothing to do for the ordinary call, one arena
+        // allocation when both lists have something in them (ADR 0254).
+        const lines = try withStanding(c, standing.headers, call.headers);
+
         // The request's id, when there is a request. One header, and for the
         // ordinary call — no headers of its own — it lives in this array
         // rather than in the arena (ADR 0196).
         var one: [1]std.http.Header = undefined;
         const headers = if (self.settings.forward_request_id)
-            try withRequestId(c, call.headers, &one)
+            try withRequestId(c, lines, &one)
         else
-            call.headers;
+            lines;
 
+        // The caller's own line wins over the value the call or the target
+        // decided, and std's slot is then left out so it goes once
+        // (ADR 0231).
+        const given = Exchange.Given.of(lines);
         const head = try ex.begin(self, .{
             .method = method,
             .url = url,
             .headers = headers,
             .body = if (body) |bytes| .{ .slice = bytes } else .none,
-            // The caller's own `content-type` line wins over the one the
-            // call decided, and std's slot is then left out so it goes once
-            // (ADR 0231).
-            .content_type = if (Exchange.Given.of(call.headers).content_type) null else content_type,
+            .content_type = if (given.content_type) null else content_type,
+            .authorization = if (given.authorization) null else standing.authorization,
+            .user_agent = if (given.user_agent) null else standing.user_agent,
             .timeout_ms = call.timeout_ms,
             .stall_ms = call.stall_ms,
             .redirects = .{ .follow = &redirect_buffer },
@@ -437,6 +475,36 @@ pub const Client = struct {
         @memcpy(merged[0..given.len], given);
         merged[given.len] = .{ .name = request_id_header, .value = id.view() };
         return merged;
+    }
+
+    /// `standing` under `given`, with a standing line the call names again
+    /// left out, or one of the two lists as it was when the other is empty.
+    ///
+    /// The ordinary call has no standing headers and costs nothing here; a
+    /// call on a target that passes headers of its own spends one bump of
+    /// the Scope's arena on the merge, the way `withRequestId` does for the
+    /// id (ADR 0254).
+    fn withStanding(c: anytype, standing: []const std.http.Header, given: []const std.http.Header) Error![]const std.http.Header {
+        if (standing.len == 0) return given;
+        if (given.len == 0) return standing;
+        var kept: usize = 0;
+        for (standing) |s| {
+            if (!namesHeader(given, s.name)) kept += 1;
+        }
+        const merged = try c.arena().alloc(std.http.Header, kept + given.len);
+        var i: usize = 0;
+        for (standing) |s| {
+            if (namesHeader(given, s.name)) continue;
+            merged[i] = s;
+            i += 1;
+        }
+        @memcpy(merged[i..], given);
+        return merged;
+    }
+
+    fn namesHeader(headers: []const std.http.Header, name: []const u8) bool {
+        for (headers) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return true;
+        return false;
     }
 
     /// Ask the deadline whether this failure is its doing.
@@ -1568,7 +1636,23 @@ pub const Response = struct {
 /// difference between a signed request that verifies and one that does not.
 pub fn withQuery(c: anytype, base: []const u8, params: anytype) error{OutOfMemory}![]const u8 {
     comptime core.checkScope(@TypeOf(c), "fetch.withQuery");
-    const P = @TypeOf(params);
+    comptime checkQuery(@TypeOf(params), "fetch.withQuery", &.{});
+
+    // Measured, then written, into exactly that.
+    const first = querySeparator(base);
+    const out = try c.arena().alloc(u8, base.len + queryLen(params, first, &.{}));
+    var w: std.Io.Writer = .fixed(out);
+    w.writeAll(base) catch unreachable; // measured above
+    queryWrite(&w, params, first, &.{});
+    std.debug.assert(w.buffered().len == out.len);
+    return w.buffered();
+}
+
+/// The Refusal for params that are not a struct with one field per param,
+/// and for any field no query string can carry. `skip` names the fields
+/// that are not the query's — a target's path segments — so they are held
+/// to a segment's rules instead (ADR 0254).
+pub fn checkQuery(comptime P: type, comptime called: []const u8, comptime skip: []const []const u8) void {
     const info = @typeInfo(P);
     // `.{}` is the empty tuple to Zig and "no params" to a caller, so it
     // passes; a tuple with something in it has no names to be params.
@@ -1576,54 +1660,64 @@ pub fn withQuery(c: anytype, base: []const u8, params: anytype) error{OutOfMemor
         .@"struct" => |st| !st.is_tuple or st.fields.len == 0,
         else => false,
     };
-    if (!named) @compileError("nilo: fetch.withQuery was handed a " ++ @typeName(P) ++
+    if (!named) @compileError("nilo: " ++ called ++ " was handed a " ++ @typeName(P) ++
         " for its params, and a query is a struct with one field per param.");
-    const fields = info.@"struct".fields;
-    inline for (fields) |f| comptime checkQueryField(f.name, f.type);
+    inline for (info.@"struct".fields) |f| {
+        if (comptime !among(skip, f.name)) comptime checkQueryField(f.name, f.type);
+    }
+}
 
-    // What goes between the base and the first param: nothing when the base
-    // already ends on a separator, `&` when it already has a query, `?`
-    // otherwise. Every param after the first gets `&`.
-    const first: ?u8 = if (base.len == 0)
-        '?'
-    else if (base[base.len - 1] == '?' or base[base.len - 1] == '&')
-        null
-    else if (std.mem.indexOfScalar(u8, base, '?') != null)
-        '&'
-    else
-        '?';
+/// What goes between a base and the first param: nothing when the base
+/// already ends on a separator, `&` when it already has a query, `?`
+/// otherwise. Every param after the first gets `&`.
+pub fn querySeparator(base: []const u8) ?u8 {
+    if (base.len == 0) return '?';
+    if (base[base.len - 1] == '?' or base[base.len - 1] == '&') return null;
+    if (std.mem.indexOfScalar(u8, base, '?') != null) return '&';
+    return '?';
+}
 
-    // Measured, then written, into exactly that.
-    var len: usize = base.len;
+/// How many bytes `params` add after a base, with `first` the separator
+/// before the first of them. The measuring half of `withQuery`, shared with
+/// a target's URL so that one is also one allocation sized exactly.
+pub fn queryLen(params: anytype, first: ?u8, comptime skip: []const []const u8) usize {
+    var len: usize = 0;
     var written: usize = 0;
-    inline for (fields) |f| {
+    inline for (@typeInfo(@TypeOf(params)).@"struct".fields) |f| {
+        if (comptime among(skip, f.name)) continue;
         if (queryValue(@field(params, f.name))) |v| {
             if (written > 0 or first != null) len += 1;
             len += core.percent.encodedLen(f.name, .unreserved) + 1 + v.encodedLen();
             written += 1;
         }
     }
+    return len;
+}
 
-    const out = try c.arena().alloc(u8, len);
-    var w: std.Io.Writer = .fixed(out);
-    w.writeAll(base) catch unreachable; // measured above
+/// The writing half of `queryLen`, into a writer already sized by it.
+pub fn queryWrite(w: *std.Io.Writer, params: anytype, first: ?u8, comptime skip: []const []const u8) void {
     var sep = first;
-    inline for (fields) |f| {
+    inline for (@typeInfo(@TypeOf(params)).@"struct".fields) |f| {
+        if (comptime among(skip, f.name)) continue;
         if (queryValue(@field(params, f.name))) |v| {
             if (sep) |ch| w.writeByte(ch) catch unreachable;
             sep = '&';
-            core.percent.encodeWrite(&w, f.name, .unreserved) catch unreachable;
+            core.percent.encodeWrite(w, f.name, .unreserved) catch unreachable;
             w.writeByte('=') catch unreachable;
-            v.write(&w) catch unreachable;
+            v.write(w) catch unreachable;
         }
     }
-    std.debug.assert(w.buffered().len == len);
-    return w.buffered();
+}
+
+fn among(comptime names: []const []const u8, comptime name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
 }
 
 /// One query param's value, on its way out: digits and the two words go as
-/// they are, text is percent-encoded.
-const QueryValue = union(enum) {
+/// they are, text is percent-encoded. A path segment of a target is written
+/// the same way, which is why the type is shared (ADR 0254).
+pub const QueryValue = union(enum) {
     /// An int, formatted. Forty bytes holds a 128-bit one with its sign.
     number: struct { buf: [40]u8, len: usize },
     /// `true` or `false`.
@@ -1631,7 +1725,7 @@ const QueryValue = union(enum) {
     /// Text, encoded on the way out with `/` as data.
     text: []const u8,
 
-    fn encodedLen(self: QueryValue) usize {
+    pub fn encodedLen(self: QueryValue) usize {
         return switch (self) {
             .number => |n| n.len,
             .word => |s| s.len,
@@ -1639,7 +1733,7 @@ const QueryValue = union(enum) {
         };
     }
 
-    fn write(self: QueryValue, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn write(self: QueryValue, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .number => |n| try w.writeAll(n.buf[0..n.len]),
             .word => |s| try w.writeAll(s),
@@ -1650,7 +1744,7 @@ const QueryValue = union(enum) {
 
 /// The value of one field of a query struct as a `QueryValue`, or null for
 /// an optional that is null, which is the param left out.
-fn queryValue(v: anytype) ?QueryValue {
+pub fn queryValue(v: anytype) ?QueryValue {
     const T = @TypeOf(v);
     switch (@typeInfo(T)) {
         .null => return null,
@@ -1669,7 +1763,7 @@ fn queryValue(v: anytype) ?QueryValue {
 /// Whether `T` is text this module reads as such: a `Str`, a slice of
 /// bytes, or a pointer to an array of them, which is what a string literal
 /// is.
-fn isText(comptime T: type) bool {
+pub fn isText(comptime T: type) bool {
     if (T == Str) return true;
     return switch (@typeInfo(T)) {
         .pointer => |p| switch (p.size) {
@@ -1688,7 +1782,7 @@ fn isText(comptime T: type) bool {
 /// struct, a float, an enum, a pointer to something that is not text. Named
 /// by the field, because the struct is anonymous and the field is what the
 /// caller wrote.
-fn checkQueryField(comptime field: []const u8, comptime T: type) void {
+pub fn checkQueryField(comptime field: []const u8, comptime T: type) void {
     const ok = switch (@typeInfo(T)) {
         .int, .comptime_int, .bool, .null => true,
         .optional => |o| return checkQueryField(field, o.child),
@@ -1702,7 +1796,7 @@ fn checkQueryField(comptime field: []const u8, comptime T: type) void {
 /// out as one JSON string — `"{\"amount\":500}"`, quotes and escapes and all
 /// — and the far end would answer 400 to a body that looked right in the
 /// editor. A body already encoded goes through `post`.
-fn refuseJsonText(comptime T: type, comptime called: []const u8) void {
+pub fn refuseJsonText(comptime T: type, comptime called: []const u8) void {
     if (isText(T)) @compileError("nilo: " ++ called ++ " was handed text, and would send it as one JSON string. " ++
         "A body already encoded goes through post, put, patch or send.");
 }
@@ -1926,4 +2020,5 @@ test "text is read as text and a struct is not, which is what the two Refusals r
 
 test {
     _ = @import("live.zig");
+    _ = @import("target.zig");
 }

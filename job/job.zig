@@ -578,6 +578,30 @@ pub fn Jobs(comptime options: anytype) type {
             return did;
         }
 
+        /// Take a queued row back before it runs: the export whose dialog
+        /// was closed, the nudge for somebody who has since unsubscribed.
+        /// `true` when a `queued` row went; `false` when it is running,
+        /// finished or absent, because a row a worker holds is that
+        /// worker's to finish and nothing here interrupts a `run`. With a
+        /// `unique` key, a cancel and a push is how "move it to tomorrow"
+        /// is written ([ADR 0257](../docs/adr/0257-a-queued-row-can-be-taken-back.md)).
+        pub fn cancel(self: *Self, scope: anytype, id: Id) !bool {
+            comptime core.checkScope(@TypeOf(scope), "jobs.cancel");
+            comptime if (!@hasDecl(Store, "cancel")) @compileError(
+                "nilo: `jobs.cancel` was called on a queue over " ++ shortName(Store) ++ ", which has no `cancel`.\n" ++
+                    "  A store that can take a queued row back declares `cancel(scope, id) !bool`; `job.Memory` and `job.Table` both do.",
+            );
+            const did = try self.store.cancel(scope, id);
+            // The row is gone, so what the Space said about it is stale:
+            // a route polling `status(id)` should hear nothing rather than
+            // `queued` until the entry expires.
+            if (did and StatusSpace != void and comptime @hasDecl(StatusSpace, "del")) {
+                var buf: [20]u8 = undefined;
+                _ = self.statuses.del(idKey(&buf, id));
+            }
+            return did;
+        }
+
         // -- serving --------------------------------------------------------
 
         /// The worker loop, for `app.spawn(Jobs.serve, .{&jobs})`. It may not
@@ -1514,6 +1538,26 @@ test "a unique key queues one and answers null for the second" {
     const second = try jobs.push(&run, Greet{ .who = .static("a") }, .{ .unique = "greet:a" });
     try testing.expect(second == null);
     try testing.expectEqual(@as(usize, 1), try jobs.drain(&run));
+}
+
+test "a queued job can be cancelled, and one that ran cannot" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var ledger: Ledger = .{ .gpa = testing.allocator };
+    defer ledger.deinit();
+    var jobs: TestJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{});
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    const id = try jobs.push(&run, Greet{ .who = .static("a") }, .{});
+    try testing.expect(try jobs.cancel(&run, id));
+    try testing.expectEqual(@as(usize, 0), try jobs.drain(&run));
+    try testing.expectEqual(@as(usize, 0), ledger.lines.items.len);
+
+    const ran = try jobs.push(&run, Greet{ .who = .static("b") }, .{});
+    try testing.expectEqual(@as(usize, 1), try jobs.drain(&run));
+    try testing.expect(!(try jobs.cancel(&run, ran)));
+    try testing.expect(!(try jobs.cancel(&run, 4_000)));
 }
 
 test "a payload the program cannot read is dead at once rather than retried" {

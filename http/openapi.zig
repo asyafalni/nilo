@@ -195,6 +195,11 @@ pub const Answer = struct {
     /// rather than claiming 200 — a document that guesses is worse than one
     /// that only promises what the signature settles.
     binary: bool = false,
+    /// Whether this endpoint answers with an `ETag` and a 304 to a client
+    /// that sends it back — a `Versioned(T)` (ADR 0258). The body described
+    /// is `T`'s; what this adds is the header on the 200 and the 304 beside
+    /// it, which is the half a client that caches has to see.
+    versioned: bool = false,
 };
 
 /// How a request body is expected to arrive on the wire. The shape is
@@ -1126,6 +1131,12 @@ fn writeOperation(w: *std.Io.Writer, components: *const Components, op: Operatio
     if (op.idempotent) {
         try writeFailure(w, "409", "a request with this Idempotency-Key is still being answered");
     }
+    // Not a failure: no body, and the `ETag` the 200 carries.
+    if (op.answer.versioned) {
+        try w.writeAll(",\"304\":{\"description\":\"the client already holds this version\"," ++
+            "\"headers\":{\"ETag\":{\"description\":\"the version the client holds\"," ++
+            "\"schema\":{\"type\":\"string\"}}}}");
+    }
     if (op.can_reject) {
         try writeFailure(w, "400", "the request did not fit what this endpoint takes; " ++
             "the body says which part");
@@ -1195,7 +1206,13 @@ fn writeAnswer(w: *std.Io.Writer, components: *const Components, answer: Answer)
     try writeString(w, answer.content_type);
     try w.writeAll(":{\"schema\":");
     try writeSchema(w, components, answer.schema.?);
-    try w.writeAll("}}}");
+    try w.writeAll("}}");
+    if (answer.versioned) {
+        try w.writeAll(",\"headers\":{\"ETag\":{\"description\":\"the version of the body; " ++
+            "send it back as If-None-Match to be told when it has not changed\"," ++
+            "\"schema\":{\"type\":\"string\"}}}");
+    }
+    try w.writeByte('}');
 }
 
 /// `getUsersId` — a name for the endpoint that a client generator can turn

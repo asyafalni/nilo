@@ -90,7 +90,7 @@ goes in an ADR, a number goes in `docs/history.md`, a rule goes in a build step.
 
 Two of those rules are build steps rather than paragraphs, and they are the ones
 to lean on: `zig build layering` refuses an import that goes upward or sideways,
-and the eight `refusals` steps check the wording of 330 error messages. Prefer making
+and the eight `refusals` steps check the wording of 348 error messages. Prefer making
 a new rule enforceable that way over writing it down here — a paragraph nobody
 runs is the thing that rots.
 
@@ -122,13 +122,13 @@ zig build test-job     # only nilo_job, both modes, plus its refusals — std.Io
 zig build test-job-sql # nilo_job over a SQLite table, and Postgres if DATABASE_URL reaches one; on `test-sql`
 zig build test-s3      # only nilo_s3, both modes, plus its refusals
 zig build layering     # check that no module imports upward or sideways
-zig build refusals     # the framework's 140 compile-error checks — NOT the others
+zig build refusals     # the framework's 146 compile-error checks — NOT the others
 zig build refusals-sql # nilo_sql's 144; also run by test-sql
 zig build refusals-config  # nilo_config's 9, and refusals-pw for nilo_pw's 4
 zig build refusals-cache   # nilo_cache's 5; also run by test-cache
 zig build refusals-s3  # nilo_s3's 10; also run by test-s3
 zig build refusals-job # nilo_job's 17; also run by test-job
-zig build refusals-fetch # nilo_fetch's 3; also run by test-fetch
+zig build refusals-fetch # nilo_fetch's 15; also run by test-fetch
 zig build snippets     # the documentation's own marked snippets, which must compile
 zig build smoke-tls -Dnetwork   # a real HTTPS endpoint — NOT part of test
 zig build examples     # build all nine examples
@@ -162,7 +162,7 @@ zig build run-{hello,rest,orders,forms,spa,stream,chat,scheduled,outbound}  # ru
 builds of the two measured binaries strip; examples and tests keep theirs).
 
 **The refusals never cache** — the compiler keeps nothing from a compilation
-that failed, so all 140 are re-analysed every run. They stay on `test` on
+that failed, so all 146 are re-analysed every run. They stay on `test` on
 purpose (ADR 0027). They are the *floor*: 2.6s of a 2.9s run that changed
 nothing, and 15.9s of CPU spread over sixteen cores.
 

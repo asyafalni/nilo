@@ -1580,3 +1580,175 @@ test "a pooled connection the peer reset costs one retry too" {
         }
     }.run);
 }
+
+// ---- a target is a type, and a path is a template (ADR 0254) ----
+
+test "a target's standing headers go out on every call, and the call's own line goes instead of one" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+            var buf: [64]u8 = undefined;
+            const base = try canned.url(&buf);
+
+            const Api = fetch.Target("api", .{});
+            var api = try Api.open(&client, .{
+                .base = base,
+                .authorization = "Bearer standing",
+                .user_agent = "nilo-test",
+                .headers = &.{ .{ .name = "accept", .value = "application/json" }, .{ .name = "x-tenant", .value = "acme" } },
+            });
+
+            // Nothing on the call: every standing line arrives, once, and
+            // the path's segment is encoded with the slash as data.
+            {
+                canned.seen_len = 0;
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
+                defer served.cancel(io) catch {};
+                _ = try api.get(&scope, "/v1/charges/{}", .{scope.str("ch/1")}, .{});
+                served.await(io) catch {};
+                const seen = canned.request();
+                try testing.expect(std.mem.startsWith(u8, seen, "GET /v1/charges/ch%2F1 "));
+                try testing.expect(std.mem.indexOf(u8, seen, "authorization: Bearer standing") != null);
+                try testing.expect(std.mem.indexOf(u8, seen, "user-agent: nilo-test") != null);
+                try testing.expect(std.mem.indexOf(u8, seen, "accept: application/json") != null);
+                try testing.expect(std.mem.indexOf(u8, seen, "x-tenant: acme") != null);
+                try testing.expectEqual(@as(usize, 1), std.mem.count(u8, seen, "authorization:"));
+                try testing.expectEqual(@as(usize, 1), std.mem.count(u8, seen, "user-agent:"));
+            }
+
+            // The call's own `authorization` and `accept` go instead of the
+            // standing ones — one line each, the caller's — and the standing
+            // header the call did not name still arrives.
+            {
+                canned.seen_len = 0;
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
+                defer served.cancel(io) catch {};
+                _ = try api.get(&scope, "/v1/me", .{}, .{ .headers = &.{
+                    .{ .name = "Authorization", .value = "Bearer mine" },
+                    .{ .name = "Accept", .value = "text/csv" },
+                } });
+                served.await(io) catch {};
+                const seen = canned.request();
+                try testing.expect(std.mem.indexOf(u8, seen, "Authorization: Bearer mine") != null);
+                try testing.expect(std.mem.indexOf(u8, seen, "standing") == null);
+                try testing.expect(std.mem.indexOf(u8, seen, "Accept: text/csv") != null);
+                try testing.expect(std.mem.indexOf(u8, seen, "application/json") == null);
+                try testing.expect(std.mem.indexOf(u8, seen, "x-tenant: acme") != null);
+                try testing.expect(std.mem.indexOf(u8, seen, "user-agent: nilo-test") != null);
+            }
+        }
+    }.run);
+}
+
+test "a target's JSON call and its query arrive, and the target's own clock bounds the call" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+            var buf: [64]u8 = undefined;
+            const base = try canned.url(&buf);
+
+            const Api = fetch.Target("api", .{ .timeout_ms = 200 });
+            var api = try Api.open(&client, .{ .base = base });
+
+            {
+                canned.seen_len = 0;
+                canned.body_seen_len = 0;
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
+                defer served.cancel(io) catch {};
+                const cursor: ?[]const u8 = null;
+                _ = try api.postJson(&scope, "/v1/charges/{id}/refunds", .{ .id = "ch_1", .limit = 10, .cursor = cursor }, .{ .amount = 500 }, .{});
+                served.await(io) catch {};
+                try testing.expect(std.mem.startsWith(u8, canned.request(), "POST /v1/charges/ch_1/refunds?limit=10 "));
+                try testing.expect(std.mem.indexOf(u8, canned.request(), "content-type: application/json") != null);
+                try testing.expectEqualStrings("{\"amount\":500}", canned.requestBody());
+            }
+
+            // The target says 200 ms where the client says thirty seconds,
+            // and a server that answers nothing is `TimedOut` by the
+            // target's number.
+            {
+                var served = try io.concurrent(Canned.serveSilence, .{&canned});
+                defer served.cancel(io) catch {};
+                const began = core.monotonicMicros();
+                try testing.expectError(error.TimedOut, api.get(&scope, "/slow", .{}, .{}));
+                const took_ms = @divTrunc(core.monotonicMicros() - began, std.time.us_per_ms);
+                try testing.expect(took_ms < 5_000);
+            }
+        }
+    }.run);
+}
+
+test "a target's own permit is given back after every call, and its ready path is what the health route asks" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var client = try started(io, .{ .max_body = 1024 });
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+            var buf: [64]u8 = undefined;
+            const base = try canned.url(&buf);
+
+            const Api = fetch.Target("api", .{ .max_in_flight = 1, .ready = "/status" });
+            var api = try Api.open(&client, .{ .base = base });
+            try testing.expectEqual(@as(usize, 1), api.gate.permits);
+
+            // A call that succeeds and one that is refused mid-body both
+            // give the permit back; the gate is what bounds this service and
+            // a permit lost to an error would close it one call at a time.
+            {
+                canned.body_len = 8;
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
+                defer served.cancel(io) catch {};
+                _ = try api.get(&scope, "/ok", .{}, .{});
+                served.await(io) catch {};
+                try testing.expectEqual(@as(usize, 1), api.gate.permits);
+            }
+            {
+                canned.body_len = 4096;
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
+                defer served.cancel(io) catch {};
+                try testing.expectError(error.BodyTooLarge, api.get(&scope, "/big", .{}, .{}));
+                served.await(io) catch {};
+                try testing.expectEqual(@as(usize, 1), api.gate.permits);
+            }
+
+            // The health route: a 2xx from the ready path is ready, and
+            // anything else names the target.
+            var any: core.AnyScope = .of(&scope);
+            {
+                canned.reply("200 OK", "", "up");
+                canned.seen_len = 0;
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
+                defer served.cancel(io) catch {};
+                try testing.expect(api.nilo_ready(&any) == null);
+                served.await(io) catch {};
+                try testing.expect(std.mem.startsWith(u8, canned.request(), "GET /status "));
+            }
+            {
+                canned.reply("503 Service Unavailable", "", "down");
+                var served = try io.concurrent(Canned.serveOne, .{&canned});
+                defer served.cancel(io) catch {};
+                try testing.expectEqualStrings("api answered outside 2xx", api.nilo_ready(&any).?);
+                served.await(io) catch {};
+            }
+        }
+    }.run);
+}

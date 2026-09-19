@@ -130,6 +130,22 @@ test "on SQLite a unique key is the index, and is free again once the row is fin
     try testing.expect(!(try table.retryDead(&f.run, claimed.id, 5)));
 }
 
+test "on SQLite cancel deletes a queued row and leaves one a worker holds" {
+    const f = try Fixture.open("job-cancel");
+    defer f.close();
+    var table = SqliteTable.open(&f.db);
+
+    const id = (try table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "u1" })).?;
+    try testing.expect(try table.cancel(&f.run, id));
+    try testing.expect(!(try table.cancel(&f.run, id)));
+    try testing.expectEqual(@as(u64, 0), (try table.stats(&f.run)).queued);
+    // The unique key went with the row, so the same key queues again.
+    const again = (try table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "u1" })).?;
+    _ = (try table.claim(&f.run, 1, 100)).?;
+    try testing.expect(!(try table.cancel(&f.run, again)));
+    try testing.expectEqual(@as(u64, 1), (try table.stats(&f.run)).running);
+}
+
 test "on SQLite pushIn commits with the transaction and rolls back with it" {
     const f = try Fixture.open("job-tx");
     defer f.close();

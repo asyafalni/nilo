@@ -1153,6 +1153,56 @@ const fetch_refusals = [_]Refusal{
         .name = "fetch_json_body_is_text",
         .says = "fetch.postJson was handed text, and would send it as one JSON string. A body already encoded goes through post, put, patch or send.",
     },
+    // A target is a type, and a path is a template (ADR 0254): what the
+    // template and its arguments can be got wrong about while compiling.
+    .{
+        .name = "fetch_target_path_not_absolute",
+        .says = "the path `v1/charges` does not begin with `/`, and a target's path hangs off its base.",
+    },
+    .{
+        .name = "fetch_target_path_brace_unclosed",
+        .says = "the path `/v1/charges/{id` opens a `{` it never closes.",
+    },
+    .{
+        .name = "fetch_target_path_brace_unopened",
+        .says = "the path `/v1/charges/id}` closes a `}` it never opened.",
+    },
+    .{
+        .name = "fetch_target_args_not_a_struct",
+        .says = "the path `/v1/charges/{}` was given a comptime_int for its arguments, and they are a tuple for `{}` or a struct for `{name}`.",
+    },
+    .{
+        .name = "fetch_target_path_mixes_shapes",
+        .says = "the path `/v1/{}/refunds/{id}` mixes `{}` and `{name}`, and a template fills its segments one way.",
+    },
+    .{
+        .name = "fetch_target_tuple_for_named_segment",
+        .says = "the path `/v1/charges/{id}` names its segments and was given a tuple. Name the fields, `.{ .id = … }`.",
+    },
+    .{
+        .name = "fetch_target_segments_mismatch",
+        .says = "the path `/v1/charges/{}/refunds/{}` has 2 segments to fill and was given 1 argument.",
+    },
+    .{
+        .name = "fetch_target_struct_for_positional_segment",
+        .says = "the path `/v1/charges/{}` fills its segments by position and was given a struct. Pass a tuple, `.{ … }`, or name the segment `{field}`.",
+    },
+    .{
+        .name = "fetch_target_names_missing_field",
+        .says = "the path `/v1/charges/{id}` names a segment `id`, and the struct it was given has no field `id`.",
+    },
+    .{
+        .name = "fetch_target_segment_cannot_be_encoded",
+        .says = "segment 1 of the path `/v1/reports/{}` is a fetch_target_segment_cannot_be_encoded.When, and a segment is an int, a bool or text.",
+    },
+    .{
+        .name = "fetch_target_name_empty",
+        .says = "fetch.Target was given an empty name, and the name is what the health route and a log line call it.",
+    },
+    .{
+        .name = "fetch_target_ready_not_absolute",
+        .says = "fetch.Target(\"api\") has a ready path `status` that does not begin with `/`, and it hangs off the base like any other.",
+    },
 };
 
 /// One entry per file in `refusals/`: a program written wrong on purpose, and
@@ -1358,6 +1408,30 @@ const refusals = [_]Refusal{
     .{
         .name = "form_field_cannot_convert",
         .says = "the field `tags: []const u8` of the `Form(form_field_cannot_convert.SignUp)` on route \"/sign-up\" is not something a form value can become.",
+    },
+    .{
+        .name = "form_list_element_cannot_convert",
+        .says = "the field `photos: []const nilo.Upload` of the `Form(form_list_element_cannot_convert.Gallery)` on route \"/gallery\" is a list of something a form value cannot become.",
+    },
+    .{
+        .name = "versioned_as_an_argument",
+        .says = "argument 1 of the handler for route \"/orders\" is a `nilo.Versioned(u32)`, which is what a handler answers *with* rather than something it is given.",
+    },
+    .{
+        .name = "versioned_of_void",
+        .says = "the handler for route \"/orders\" returns nilo.Versioned(void), and there is no body for a client to hold a version of.",
+    },
+    .{
+        .name = "versioned_of_an_optional",
+        .says = "the handler for route \"/orders/:id\" returns nilo.Versioned(?versioned_of_an_optional.Order), and the `?` would have to mean two things: a 404, and a body the client already holds.",
+    },
+    .{
+        .name = "versioned_inside_a_status",
+        .says = "the handler for route \"/orders\" returns nilo.Status(201,nilo.Versioned(versioned_inside_a_status.Order)), and a versioned answer is a 200 or a 304 by itself.",
+    },
+    .{
+        .name = "versioned_under_a_cached",
+        .says = "the handler for route \"/orders\" returns nilo.Versioned([]const versioned_under_a_cached.Order) under a `nilo.Cached`, and a kept answer is sent again as it was kept.",
     },
     .{
         .name = "form_not_a_struct",

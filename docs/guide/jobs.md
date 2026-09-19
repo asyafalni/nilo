@@ -99,6 +99,7 @@ carried.
 | `Jobs.Row` | the store's table, for `createMissing` and `db.checking` |
 | `jobs.push(c, value, .{})` | `Id`, or `?Id` when `.unique` is given |
 | `jobs.pushIn(&tx, c, value, .{})` | the same, inside a transaction you hold |
+| `jobs.cancel(c, id)` | `bool` — a `queued` row taken out before it runs; false once a worker holds it |
 | `jobs.stats(c)` | how many are `queued`, `running` and `dead` |
 | `jobs.status(id)` | `?job.Status` from the `.status` Space, when there is one |
 | `jobs.progress(id, n)` | how far a run has got, into the same Space |
@@ -234,6 +235,26 @@ over `(kind, unique_key)`, and a row that finishes has its key set to NULL,
 so "at most one queued or running" is the database's promise rather than a
 read followed by a write. Ten servers pushing the same key at once get one
 row between them.
+
+**A queued row can be taken back.** The user closed the export dialog, or
+unsubscribed before the nudge went out: `jobs.cancel(c, id)` deletes the
+row while it is still `queued` and answers `true`; once a worker has
+claimed it the answer is `false` and the run finishes, because nothing
+interrupts a `run` and a half-cancelled row would be the worse outcome. One
+statement, so a worker claiming in the same instant either got it or did
+not. The `unique` key goes with the row, which is how "move it to tomorrow"
+is written — a cancel and a push
+([ADR 0257](../adr/0257-a-queued-row-can-be-taken-back.md)):
+
+<!-- compiles -->
+```zig
+fn postpone(jobs: *Jobs, c: *nilo.Ctx, row: job.Id, user_id: i64, email: nilo.Str) !void {
+    if (!try jobs.cancel(c, row)) return nilo.fail.conflict("that reminder is already going out", .{});
+    _ = try jobs.push(c, SendWelcome{ .user_id = user_id, .email = email }, .{
+        .after_ms = 24 * 60 * 60 * 1_000,
+    });
+}
+```
 
 **`.within` is the cheaper version of the same promise**, for when a miss
 costs a second run and not a wrong one: the Space remembers the key for its

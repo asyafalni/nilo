@@ -50,9 +50,10 @@ fn signIn(gpa: std.mem.Allocator, keys: *const jwt.Keys, id_token: []const u8) !
 | `.now_s` | seconds since the epoch. An argument, not a clock |
 | `.leeway_s` | how far the two clocks may disagree, both ways. `0` |
 
-**Fetching the key set is yours.** It is an HTTPS GET, which `nilo_fetch`
-already sends, and holding the answer is `nilo_cache`. What this module does
-is the half where being wrong is silent.
+**Fetching the key set is yours, and holding it across a rotation is a
+`Keyring`.** The fetch is an HTTPS GET, which `nilo_fetch` already sends;
+what this module does is the half where being wrong is silent, and the swap
+under readers is that half too ([below](#jwtkeyring)).
 
 <!-- compiles: body -->
 ```zig
@@ -90,6 +91,40 @@ Strings in the returned claims point into the allocator you passed. Hand it
 | `error.CurveNotSupported` | an EC key whose `crv` is not `P-256` |
 | `error.SignatureWrongLength` | a signature that is not the size of its key — for ES256, sixty-four bytes of `r \|\| s`, which is where a DER signature lands |
 | `error.KeyNotUsable` | a key the set carried that the arithmetic cannot use: an even RSA exponent, an EC coordinate that is not thirty-two bytes or not on the curve |
+
+### `jwt.Keyring`
+
+A key set that rotates under its readers: the set is swapped whole, the old
+one freed after the verifies reading it are done, and an unknown `kid` is a
+fetch at most once an interval
+([ADR 0255](../adr/0255-a-key-set-is-swapped-whole-and-freed-after-its-readers.md)).
+The client is a parameter, so the module still imports nothing.
+
+<!-- compiles -->
+```zig
+const fetch = @import("nilo_fetch");
+
+fn fetchKeys(run: *nilo.Run, google: *jwt.Keyring, api: *fetch.Client) !void {
+    try google.refresh(run, api, @divFloor(nilo.nowMillis(), 1000));
+}
+
+fn whoIsThis(c: *nilo.Ctx, google: *jwt.Keyring, api: *fetch.Client, token: []const u8) !Claims {
+    return google.verifyOrRefresh(Claims, c.arena(), token, @divFloor(nilo.nowMillis(), 1000), c, api);
+}
+```
+
+| | |
+|---|---|
+| `jwt.Keyring.init(gpa, .{ .url, .issuer, .audience, .leeway_s, .refresh_interval_s })` | `!Keyring`, holding no keys: every verify is `NoSuchKey` until `load` or `refresh`. `refresh_interval_s` is 60 |
+| `ring.deinit()` | frees the set it holds |
+| `ring.load(bytes)` | parse a JWKS document and make it the set every verify from now on reads; the old set is freed once its readers are done. A document that does not parse leaves the old set in place |
+| `ring.refresh(scope, client, now_s)` | `client.get(scope, url, .{})` and `load` the body; `error.KeysNotAvailable` for anything but a 2xx, with the old set still held. `client` is anything answering `ok()` and `body.view()`, which `fetch.Client` is. Records `now_s` as the last refresh |
+| `ring.verify(Claims, gpa, token, now_s)` | `jwt.verify` against the set held now, with the ring's issuer, audience and leeway |
+| `ring.verifyOrRefresh(Claims, gpa, token, now_s, scope, client)` | `verify`, and on `NoSuchKey` a `refresh` at most once per `refresh_interval_s`, then `verify` again. A miss inside the interval is `NoSuchKey` as it was |
+
+A verify pins the set for its own length and never waits; a swap spins on
+the old set's count, bounded by one verify, once per rotation. Provide the
+ring as a service and ask for `*jwt.Keyring` where the token is checked.
 
 **What it will not do**: HS256, any curve but P-256, encrypted tokens, signing,
 discovery, PKCE and the nonce. Signing is absent because a server issuing its

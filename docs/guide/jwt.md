@@ -145,15 +145,31 @@ for a rotation.
 
 The document's address is published by the issuer — Google's is
 `https://www.googleapis.com/oauth2/v3/certs`, and for anything OIDC it is the
-`jwks_uri` in `/.well-known/openid-configuration`. The ordinary shape is a
-fetch at startup, before `listen()`, held as a service:
+`jwks_uri` in `/.well-known/openid-configuration`. **The ordinary shape is a
+`Keyring`**: the issuer's URL, issuer and audience written once, the
+document fetched at startup, and the set swapped safely when the issuer
+rotates ([below](#when-the-issuer-rotates)).
 
-<!-- compiles: body -->
+<!-- compiles -->
 ```zig
-const res = try client.get(&run, "https://www.googleapis.com/oauth2/v3/certs", .{});
-if (!res.ok()) return error.NoKeys;
-var keys = try jwt.parseKeys(gpa, res.body.view());
-defer keys.deinit();
+const fetch = @import("nilo_fetch");
+
+fn fetchKeys(run: *nilo.Run, google: *jwt.Keyring, api: *fetch.Client) !void {
+    try google.refresh(run, api, @divFloor(nilo.nowMillis(), 1000));
+}
+```
+
+and in `main`:
+
+```zig
+var google: jwt.Keyring = try .init(gpa, .{
+    .url = "https://www.googleapis.com/oauth2/v3/certs",
+    .issuer = "https://accounts.google.com",
+    .audience = cfg.google_client_id,
+});
+defer google.deinit();
+try app.provide(&google);
+try app.before(fetchKeys, .{ &google, &api });
 ```
 
 `run` there is a [`nilo.Run`](../reference/core.md#run) — the Scope for work that
@@ -162,9 +178,14 @@ is not a request, which a startup path is. Since `nilo_fetch` is finished by
 inside `listen()` once the client is up and before the first request, exactly
 as a database migration does ([A query with no
 server](./sql/reading.md#a-query-with-no-server),
-[ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)):
-`fn fetchKeys(run: *nilo.Run, client: *fetch.Client, keys: *Keys) !void`,
-registered with `app.before(fetchKeys, .{ &client, &keys })`.
+[ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+The ring asks the client for one call — `get(scope, url, .{})` — and holds
+the module to importing nothing: the client is an argument, the way a
+[`job.Table`](./jobs.md) takes your Db.
+
+A program that wants the bytes and nothing else still has `parseKeys`:
+`jwt.parseKeys(gpa, res.body.view())` off a `client.get`, held as a
+`*const Keys` for a set that never rotates.
 
 ## ES256 and the shape of the signature
 
@@ -191,13 +212,6 @@ is worked out once per request however many things ask.
 
 <!-- compiles -->
 ```zig
-const jwt = @import("nilo_jwt");
-
-const Issuer = struct {
-    keys: jwt.Keys,
-    audience: []const u8,
-};
-
 const CurrentUser = struct {
     pub const nilo_resolve = authenticate;
 
@@ -205,16 +219,17 @@ const CurrentUser = struct {
     email: []const u8,
 };
 
-fn authenticate(c: *nilo.Ctx, issuer: *const Issuer) !CurrentUser {
+fn authenticate(c: *nilo.Ctx, google: *jwt.Keyring, api: *fetch.Client) !CurrentUser {
     const auth = try c.authorization(.bearer);
 
-    const claims = jwt.verify(struct { sub: []const u8, email: []const u8 }, c.arena(), auth.value.view(), .{
-        .keys = &issuer.keys,
-        .issuer = "https://accounts.google.com",
-        .audience = issuer.audience,
-        .now_s = @divFloor(nilo.nowMillis(), 1000),
-        .leeway_s = 60,
-    }) catch |err| {
+    const claims = google.verifyOrRefresh(
+        struct { sub: []const u8, email: []const u8 },
+        c.arena(),
+        auth.value.view(),
+        @divFloor(nilo.nowMillis(), 1000),
+        c,
+        api,
+    ) catch |err| {
         std.log.info("token refused: {t}", .{err});
         return nilo.Authorization(.bearer).refuse("that token is not valid here", .{});
     };
@@ -250,21 +265,45 @@ the request, and nothing is freed.
 
 An issuer publishes a new key, signs with it, and keeps the old one in the
 document for a while. From here that arrives as `error.NoSuchKey` on a token
-that is otherwise fine, and the answer is to fetch the document again — once,
-not on every refused request, because a flood of tokens with a made-up `kid`
-is otherwise a flood of requests to the issuer.
+that is otherwise fine. This guide used to say the answer was three lines —
+fetch again, hold a `*const Keys`, swap under a mutex — and each of the
+three was wrong in a way no test finds: no refetch is every sign-in failing
+until a restart, an unbounded refetch is one GET to the issuer per forged
+`kid`, and swapping a set another thread is reading is a use-after-free the
+Debug build has no trap for. The last one is concurrency rather than policy,
+and it is why the ring is in the module
+([ADR 0255](../adr/0255-a-key-set-is-swapped-whole-and-freed-after-its-readers.md)).
 
-The pieces are all things this guide already has: the fetch above, a
-[`nilo.Mutex`](./services.md#they-are-shared-across-threads) around the swap,
-and either a [ticker](./background.md) that refreshes on a schedule or a
-timestamp beside the keys so a `NoSuchKey` triggers at most one refresh a
-minute. Which policy is right depends on the issuer, which is why none is
-built in; the roadmap says what would change that.
+**`verifyOrRefresh` is `verify`, and on `NoSuchKey` one fetch at most per
+`refresh_interval_s`**, then `verify` again. Whichever request sees the miss
+first takes the slot; the others inside that minute are `NoSuchKey` as they
+were, which under a real rotation is a handful of 401s in the second the
+first new-key token arrives, and under a flood of forged tokens is the bound
+doing its job. A [ticker](./background.md) calling `refresh` on a schedule
+sits beside it, and a refresh that ran — scheduled or not — is the last
+one, so a miss straight after it does not fetch again.
 
-One rule holds whatever the policy: **swap the `Keys` under the same lock a
-`verify` reads them under.** A verify in flight on another thread is reading
-`keys.all` while `deinit` frees it otherwise, and the Debug build has no trap
-for that one.
+| | |
+|---|---|
+| `ring.load(bytes)` | a document read and made current; the old set is freed once the verifies reading it are done, and a document that does not parse leaves it in place |
+| `ring.refresh(scope, client, now_s)` | `client.get(scope, url, .{})` and `load`; `error.KeysNotAvailable` for anything but a 2xx, with the old set still held |
+| `ring.verify(Claims, gpa, token, now_s)` | `jwt.verify` against the set held now, with the ring's issuer, audience and leeway; never fetches |
+| `ring.verifyOrRefresh(Claims, gpa, token, now_s, scope, client)` | the above, and one bounded refresh on a missing `kid` |
+
+**The swap is safe because a verify pins the set it reads.** A verify
+counts itself on the set, reads, and counts itself off; a swap publishes
+the new set and then waits for the old set's count to reach zero before
+freeing it. Readers never wait. The one wait is the writer's, and it is a
+spin bounded by the length of one verify, once per rotation — a
+`std.Io.Mutex` needs an `Io` a tool module does not have, which is the
+same reason the [cache](./cache.md) spins. `nilo_cache` answers the same
+lifetime question with a copy and a generation
+([ADR 0188](../adr/0188-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md));
+a key set is not flat, so here it is a pin.
+
+When a `kid` miss should mean *refuse* rather than *fetch* is still yours:
+call `verify` and decide. The interval is a bound on the fetch, not a
+policy about it.
 
 ## Testing
 

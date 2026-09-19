@@ -25,9 +25,11 @@
 //! ```
 //!
 //! **nilo verifies a token and does not fetch one.** The JWKS fetch is an
-//! HTTPS GET, which `nilo_fetch` already sends; holding the answer is
-//! `nilo_cache`; when to refresh it is a policy, and policy is the caller's
-//! the way it is everywhere else here. What a caller cannot already write
+//! HTTPS GET, which `nilo_fetch` already sends, and a `Keyring` borrows that
+//! client through a parameter to hold the answer and swap it under readers
+//! without a race — the one part of a rotation that is concurrency rather
+//! than policy (ADR 0255). When to refresh is still the caller's, the way
+//! policy is everywhere else here. What a caller cannot already write
 //! safely is this module — and the reason is the same one that justifies
 //! `nilo_pw` when `std.crypto.argon2` is right there. A password hash written
 //! subtly wrong runs perfectly and leaks; a token check written subtly wrong
@@ -75,6 +77,7 @@ const jwks = @import("jwks.zig");
 const rs256 = @import("rs256.zig");
 const es256 = @import("es256.zig");
 const token_mod = @import("token.zig");
+const keyring_mod = @import("keyring.zig");
 
 /// A JWKS document read into the keys that can be verified with. `parse`
 /// takes the bytes of the document; fetching them is the caller's.
@@ -95,6 +98,13 @@ pub const Error = token_mod.Error;
 /// Read a JWKS document. The result owns its memory; `deinit` frees it.
 pub const parseKeys = jwks.parse;
 
+/// A key set that rotates under its readers: `load` swaps a new document
+/// in and frees the old one after the verifies reading it are done, and
+/// `verifyOrRefresh` fetches on an unknown `kid` at most once an interval
+/// ([ADR 0255](../docs/adr/0255-a-key-set-is-swapped-whole-and-freed-after-its-readers.md)).
+/// The client is a parameter, so the module still imports nothing.
+pub const Keyring = keyring_mod.Keyring;
+
 /// Verify a token and read its payload into a struct of your own. Strings in
 /// the result point into `gpa`, so a request arena leaves nothing to free.
 pub const verify = token_mod.verify;
@@ -114,6 +124,7 @@ test {
     _ = rs256;
     _ = es256;
     _ = token_mod;
+    _ = keyring_mod;
 }
 
 test "the module's own example compiles and reads a token end to end" {

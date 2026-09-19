@@ -246,6 +246,20 @@ pub const Memory = struct {
         return true;
     }
 
+    /// Take a queued row out before it runs. `true` when a `queued` row was
+    /// removed; `false` when it is running, finished or absent, since a
+    /// row a worker holds is that worker's to finish
+    /// ([ADR 0257](../docs/adr/0257-a-queued-row-can-be-taken-back.md)).
+    pub fn cancel(self: *Memory, scope: anytype, id: contract.Id) !bool {
+        _ = scope;
+        self.lock.take();
+        defer self.lock.release();
+        const s = self.find(id) orelse return false;
+        if (s.state != .queued) return false;
+        s.state = .free;
+        return true;
+    }
+
     // -- inside -----------------------------------------------------------
 
     fn find(self: *Memory, id: contract.Id) ?*Slot {
@@ -424,6 +438,27 @@ test "retry, dead and retryDead move a row through its states" {
     try testing.expect(!(try store.retryDead(&run, id, 700)));
     const third = (try store.claim(&run, 700, 800)).?;
     try testing.expectEqual(@as(u32, 1), third.attempts);
+}
+
+test "cancel takes a queued row out, and leaves one that is running or finished" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    const id = (try store.push(&run, "a", "{}", .{ .run_at = 0, .unique = "k" })).?;
+    try testing.expect(try store.cancel(&run, id));
+    try testing.expect(!(try store.cancel(&run, id)));
+    try testing.expect((try store.claim(&run, 1, 100)) == null);
+    // The unique key is free again: "move it to tomorrow" is a cancel and
+    // a push.
+    const later = (try store.push(&run, "a", "{}", .{ .run_at = 0, .unique = "k" })).?;
+
+    _ = (try store.claim(&run, 1, 100)).?;
+    try testing.expect(!(try store.cancel(&run, later)));
+    try store.done(&run, later);
+    try testing.expect(!(try store.cancel(&run, later)));
+    try testing.expect(!(try store.cancel(&run, 999)));
 }
 
 test "release puts a claimed row back without spending the attempt" {
