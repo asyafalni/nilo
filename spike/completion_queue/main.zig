@@ -137,26 +137,23 @@ fn owner(shared: *Shared, handle: zio.ev.Backend.NetHandle, rearm: Rearm, pace: 
     // every time would just add `window_ms` to every pass.
     var window_left: usize = if (pace == .window) 1 else 0;
 
-    cq.submit(&poll.c);
-    cq.submit(&wake.c);
+    cq.submit(&poll.c) catch unreachable;
+    cq.submit(&wake.c) catch unreachable;
     shared.wake.store(&wake, .release);
 
     while (true) {
         shared.parked.store(true, .release);
-        const maybe = cq.wait() catch |err| {
+        // zio 0.18: `wait` reports an emptied queue as `error.Closed` rather
+        // than `null`, and `submit` can refuse.
+        const done = cq.wait() catch |err| {
             shared.parked.store(false, .release);
-            shared.outcome.store(
-                @intFromEnum(if (err == error.Canceled) Outcome.canceled else Outcome.failed),
-                .release,
-            );
+            shared.outcome.store(@intFromEnum(switch (err) {
+                error.Canceled => Outcome.canceled,
+                error.Closed => Outcome.emptied,
+            }), .release);
             return;
         };
         shared.parked.store(false, .release);
-
-        const done = maybe orelse {
-            shared.outcome.store(@intFromEnum(Outcome.emptied), .release);
-            return;
-        };
 
         if (done == &wake.c) {
             // Drain first, then re-arm — the order a real mailbox has to use,
@@ -185,7 +182,7 @@ fn owner(shared: *Shared, handle: zio.ev.Backend.NetHandle, rearm: Rearm, pace: 
                 .reinit => wake = zio.ev.Async.init(),
                 .recomplete => wake.c = .init(.async),
             }
-            cq.submit(&wake.c);
+            cq.submit(&wake.c) catch unreachable;
             _ = shared.async_wakes.fetchAdd(1, .release);
         } else if (done == &poll.c) {
             // Drain the byte before re-arming. `NetPoll` is level-triggered,
@@ -203,7 +200,7 @@ fn owner(shared: *Shared, handle: zio.ev.Backend.NetHandle, rearm: Rearm, pace: 
                 // rebuilding modes differ only for the `Async`.
                 .recomplete => poll.c = .init(.net_poll),
             }
-            cq.submit(&poll.c);
+            cq.submit(&poll.c) catch unreachable;
             _ = shared.poll_wakes.fetchAdd(1, .release);
         } else {
             shared.stranger.store(true, .release);

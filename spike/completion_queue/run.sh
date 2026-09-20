@@ -8,8 +8,9 @@
 # would have called that bug fixed.
 #
 # `plain` is the zio#673 repro: handing an already-completed completion
-# straight back to `submit`, which is the obvious thing to write. It crashes
-# everywhere and does so under both paces, so it is only run once.
+# straight back to `submit`, which is the obvious thing to write. Under
+# v0.17.0 it crashed everywhere; under v0.18.0 (zio#674) it holds, and it is
+# run under every pace so the `--window` column says so in a number.
 #
 # `reinit` and `recomplete` both dodge that crash, and neither `--paced` nor
 # `--blind` can tell them apart — the re-arm window is nanoseconds wide and
@@ -49,8 +50,7 @@ for mode in Debug ReleaseSafe ReleaseFast; do
     continue
   fi
 
-  cell "$mode" plain paced
-  for rearm in reinit recomplete; do
+  for rearm in plain reinit recomplete; do
     for pace in paced blind window; do
       cell "$mode" "$rearm" "$pace"
     done

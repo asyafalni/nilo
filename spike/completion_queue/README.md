@@ -109,7 +109,28 @@ every test uses a fresh timer, and "dynamic submit during iteration" submits a
 
 Filed upstream as [zio#673](https://github.com/lalinsky/zio/issues/673) — by
 lalinsky's own automation, found independently while documenting
-`CompletionQueue`. Still open, no comments, no fix.
+`CompletionQueue`. Fixed the same day as zio#674 (`Loop.add` no longer clears
+group membership), released in v0.18.0.
+
+### Under v0.18.0, `plain` holds
+
+The pin moved on 2026-09-21 and the question was whether the Engine could
+drop the rebuild. Same spike, pin at v0.18.0, three small API changes
+(`submit` is fallible, `wait` reports an emptied queue as `error.Closed`
+rather than `null`), 20 runs a cell:
+
+| mode | rearm | pace | result |
+|---|---|---|---|
+| Debug | plain | paced / blind / window | 20 / 20 / 20 ok |
+| ReleaseSafe | plain | paced / blind / window | 20 / 20 / 20 ok |
+| ReleaseFast | plain | paced / blind / window | 20 / 20 / 20 ok |
+| all three | recomplete | window | 20 ok each |
+
+`plain --window` is the cell that matters: the same object handed straight
+back to `submit`, with a post placed inside the re-arm window on purpose, and
+`drained=5/5` every time. So the loop re-arms a completed completion *and*
+`Async.pending` survives it, which is what `recomplete` was preserving by hand.
+`Wake.wait` in the Engine now does what a connection would obviously write.
 
 ### The workaround is free after all, and the first pass said otherwise
 

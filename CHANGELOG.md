@@ -39,6 +39,16 @@ newest first.
 
 ### Fixed
 
+- A client that connects and gives up before the server reaches it in the
+  backlog no longer stops the server. zio v0.17.0 surfaced that as
+  `error.ConnectionAborted` from `accept`, and the accept loop returned on
+  anything but a timeout — so one aborted connection ended `listen()` with
+  a clean "nilo stopping" in the log. The pin is v0.18.0, whose `accept`
+  retries it on the same deadline. Rare on Linux, which usually hands the
+  socket over and fails the read instead; the ordinary path on the BSDs.
+  The same bump takes the `BroadcastChannel` fix the roadmap was waiting on,
+  and lets the Engine hand a fired completion straight back to `submit`
+  instead of rebuilding it first (zio#673, fixed by zio#674).
 - A chunked request body nobody read no longer panics on a chunk size that
   overflows a `u64`. It was added to the running total before the total was
   checked, so `ffffffffffffffff` after any earlier chunk overflowed — a crash

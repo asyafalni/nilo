@@ -140,7 +140,3 @@ No mechanism holds these yet. Each says what it needs; until that arrives the co
 The failure gives nothing away at the place it happens: the loop writes into memory that has been handed on, and what arrives is a spinning thread somewhere else entirely, after a shutdown that has already logged success. Only the Engine may name zio, so the whole surface is one file — but one file is what the threadlocal entry above says too.
 
 **Needs:** a design that makes it a rule rather than a `defer` somebody has to remember. This particular one is guarded — a test in the Engine parks a `Wake` and checks the queue is empty after `deinit` — but the guard names `Wake`, and the next `submit` will not be in `Wake`.
-
-**`zio.BroadcastChannel` aborts, or in `ReleaseFast` deadlocks, when a fiber parked in `receive` is cancelled.** Not used here, reported upstream with a standalone reproduction, and **fixed upstream** in zio `ab6873eb` with a fresh `Waiter` per receive attempt. A waiter node was pushed onto a queue it was already linked into (`simple_queue.zig:43`, from `broadcast_channel.zig:72`). Debug aborted 10 runs in 10, ReleaseSafe 3 in 3, and `ReleaseFast`, which has no such assertion, **hung 17 runs in 20** where a clean run takes 200ms. Cancellation was what reached it: the same program closing the channel and waiting was clean 5 in 5 ([zio#667](https://github.com/lalinsky/zio/issues/667)).
-
-**Needs:** the pin to move: v0.17.0 predates the fix and is what `build.zig.zon` holds, so it arrives whenever nilo next moves it. Nothing here depends on it.

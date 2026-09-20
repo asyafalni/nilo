@@ -474,9 +474,10 @@ pub const Woken = enum {
 /// alternative reads worse now than it did then, not better. It named this
 /// shape as the right one and recorded it as
 /// unreachable, because zio exported no way to park on a completion. It does
-/// — `zio.CompletionQueue` is public in the pinned v0.17.0 — and
+/// — `zio.CompletionQueue` has been public since v0.17.0 — and
 /// `spike/completion_queue/` holds the cancel path and the re-arm to 630 runs
-/// across three optimize modes.
+/// across three optimize modes, and the plain re-arm to 180 more under
+/// v0.18.0.
 ///
 /// **The struct lives in the connection's own fiber frame**, not in an
 /// allocation of its own. `spike/mailbox/` measured why: given its own
@@ -494,9 +495,9 @@ pub const Wake = struct {
     /// because a notify carries no data that anybody has to read first.
     armed: bool = false,
     /// The readable half, which is **not** re-submitted on the way out — see
-    /// `wait`. Separate from `armed` because handing a completion that is
-    /// already submitted back to `submit` crashes zio (zio#673), so the two
-    /// halves cannot share one flag once they stop being re-armed together.
+    /// `wait`. Separate from `armed` because the two halves are re-armed at
+    /// different moments, and a completion that is still pending must not be
+    /// handed to `submit` a second time: the queue would link it twice.
     poll_armed: bool = false,
 
     pub fn init(handle: zio.ev.Backend.NetHandle) Wake {
@@ -523,7 +524,7 @@ pub const Wake = struct {
     /// `limit_ms` of 0 waits with no limit at all.
     pub fn wait(self: *Wake, limit_ms: u32) Woken {
         if (!self.armed) {
-            self.cq.submit(&self.wake.c);
+            self.cq.submit(&self.wake.c) catch unreachable;
             self.armed = true;
         }
         // Armed on the way *in*, after the caller has read whatever the last
@@ -540,8 +541,13 @@ pub const Wake = struct {
         // `Waker` in `bulkhead.zig` states it as the contract it is: one
         // `.readable` per arrival of bytes, not one per call. Measured in
         // `bench/result/http.md`.
+        //
+        // `submit` can refuse (zio 0.18): a closed queue, or a completion that
+        // belongs to a group or another queue. Nothing closes this queue and
+        // both completions are this queue's own, so neither can happen here
+        // — which is what `unreachable` states, at every `submit` in this file.
         if (!self.poll_armed) {
-            self.cq.submit(&self.poll.c);
+            self.cq.submit(&self.poll.c) catch unreachable;
             self.poll_armed = true;
         }
 
@@ -550,29 +556,30 @@ pub const Wake = struct {
             // measured from *this* call, so a client that spoke a moment ago
             // gets a full stretch of silence before anybody asks after it.
             // `CompletionQueue` carries this already, which is why there is no
-            // timer completion here to arm, cancel and re-arm.
-            const done = (self.cq.timedWait(if (limit_ms == 0)
+            // timer completion here to arm, cancel and re-arm. A queue that is
+            // closed and drained answers `error.Closed`; nothing closes this
+            // one, so that arm is the same "stop" as a cancel.
+            const done = self.cq.waitTimeout(if (limit_ms == 0)
                 .none
             else
                 .{ .duration = .fromMilliseconds(limit_ms) }) catch |err| {
                 return if (err == error.Timeout) .timed_out else .closed;
-            }) orelse return .closed;
+            };
 
-            // Rebuilding only the completion, never the handle around it.
-            // Handing a fired completion straight back to `submit` crashes
-            // zio 90 runs in 90 (zio#673, fix in flight as zio#674), and
-            // rebuilding the *whole* `Async` clears the `pending` flag that
-            // holds a notify landing in this window — 30 runs in 30 in the
-            // spike's `--window` mode. `pending` belongs to `Async`, the
-            // phase belongs to `Completion`, and only one of them needs
-            // resetting.
+            // The fired completion goes straight back to `submit`, and the
+            // loop re-arms it. Under v0.17.0 that crashed 90 runs in 90
+            // (zio#673): `Loop.add` reset the completion and wiped the
+            // queue's claim on it, and the workaround was to rebuild `wake.c`
+            // first — the completion only, because rebuilding the whole
+            // `Async` drops the `pending` flag that holds a notify landing in
+            // this window. zio#674 fixed it and v0.18.0 carries the fix, so
+            // the rebuild is gone; `spike/completion_queue/` holds the plain
+            // re-arm to 180 runs in 180, `--window` included.
             if (done == &self.wake.c) {
-                self.wake.c = .init(.async);
-                self.cq.submit(&self.wake.c);
+                self.cq.submit(&self.wake.c) catch unreachable;
                 return .posted;
             }
             if (done == &self.poll.c) {
-                self.poll.c = .init(.net_poll);
                 self.poll_armed = false;
                 return .readable;
             }
@@ -603,10 +610,12 @@ pub const Wake = struct {
     /// ordinary request: a branch, no lock and no syscall.
     pub fn deinit(self: *Wake) void {
         if (!self.armed and !self.poll_armed) return;
-        // `cancel` drains with cancellation disabled, so this finishes even
-        // when the fiber is being cancelled — which is the case that matters,
-        // since that is what shutdown does to a WebSocket that is still up.
-        self.cq.cancel();
+        // `cancelAll` drains with cancellation disabled, so this finishes
+        // even when the fiber is being cancelled — which is the case that
+        // matters, since that is what shutdown does to a WebSocket that is
+        // still up. `.discard` because both completions live in this frame:
+        // nothing needs their results, and nothing else holds them.
+        self.cq.cancelAll(.discard);
         self.armed = false;
         self.poll_armed = false;
     }
@@ -647,7 +656,7 @@ const stack_margin = 512;
 /// ([ADR 0063](../../docs/adr/0063-a-handlers-stack-is-per-connection.md)).
 /// The frames that took it there have long since returned; the pages have not.
 ///
-/// `zio.coro.Coroutine.getCurrent()` is public in the pinned v0.17.0 and
+/// `zio.coro.Coroutine.getCurrent()` has been public since v0.17.0 and
 /// carries `context.stack_info` — `base` and `limit`.
 ///
 /// Three things make the arithmetic safe, and they are the whole reason this is
@@ -1076,7 +1085,7 @@ pub fn serve(
     var warned_at_ns: u64 = 0;
 
     while (!stop.isRequested()) {
-        const stream = server.accept(.{ .timeout = .fromMilliseconds(accept_poll_ms) }) catch |err| {
+        const stream = server.accept(.{ .timeout = .fromMilliseconds(accept_poll_ms) }) catch |err| switch (err) {
             // The wait ran out, which is the loop's chance to look at the
             // stop flag rather than anything having gone wrong.
             if (err == error.Timeout) continue;
@@ -1257,7 +1266,7 @@ pub const Dir = struct {
     /// issuing the call on the loop thread, so the fiber parks and the
     /// executor goes on serving the other connections it holds.
     pub fn writeFileAtomic(self: Dir, name: []const u8, bytes: []const u8) !void {
-        var atomic = try self._dir.createFileAtomic(name, .{});
+        var atomic = try self._dir.createAtomicFile(name, .{});
         // Removes the temporary file, including on the path where the fiber
         // is cancelled — after `replace` there is nothing left to remove.
         defer atomic.deinit();

@@ -190,12 +190,17 @@ this.
 - **`zio.BroadcastChannel`.** Better delivery and a much smaller send path, and
   it aborts (or in `ReleaseFast` deadlocks) when a fiber parked in `receive` is
   cancelled, which every nilo connection is at shutdown. Reported as zio#667
-  and fixed upstream in `ab6873eb`; still not in a release, and a shared ring
-  has no per-consumer close, which is what forces the cancel in the first place.
-- **Waiting for zio#673 to land.** The fix belongs upstream and is in flight.
-  Nothing here needs it: rebuilding only the completion is correct on the pinned
-  v0.17.0 and stays correct after, because it leaves `owner` null and satisfies
-  the assert zio#674 adds.
+  and fixed upstream in `ab6873eb`, which v0.18.0 carries; the fix does not
+  change the answer, because a shared ring has no per-consumer close, which
+  is what forces the cancel in the first place.
+- **Waiting for zio#673 to land.** The fix belonged upstream and was in
+  flight. Nothing here needed it: rebuilding only the completion was correct
+  on v0.17.0 and stayed correct after, because it left `owner` null and
+  satisfied the assert zio#674 adds. *Amended when the pin moved to v0.18.0:*
+  zio#674 is in that release, the rebuild is gone from `Wake.wait`, and the
+  spike's `plain` mode — the same object handed straight back to `submit`,
+  which crashed 90 in 90 before — holds 180 runs in 180 across three optimize
+  modes, `--window` included.
 
 ## Consequences
 

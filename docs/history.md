@@ -3712,3 +3712,31 @@ merely extending ADR 0206
 consistency and not for use.** Writing the worked example in the other
 framework's syntax, side by side, took ten minutes and found both gaps;
 reading three ADRs had found neither. Do that before proposing, not after.
+
+## The dependency's changelog found a server-killer no test had reached
+
+The move from zio v0.17.0 to v0.18.0 cost seven lines in the Engine, and the
+line that mattered was not one of them. `Server.accept` under v0.17.0 surfaced
+`error.ConnectionAborted` — a client that connected and gave up while still in
+the kernel's backlog — and the accept loop in `serve` returned on anything but
+a timeout. One such client ended `listen()`, and the log said "nilo stopping"
+as if asked. Rare on Linux, which hands the socket over and fails the read;
+the ordinary path on the BSDs. v0.18.0 retries it inside `accept`, on the same
+deadline, and it is gone.
+
+**The error set a loop returns on was never read against what the callee
+could actually produce.** `catch |err| { if (err == error.Timeout) continue;
+return err; }` reads as "anything else is fatal", and nobody had listed what
+"anything else" was. Ninety upstream commits were read for API breaks; the
+robustness fix was one line in the middle and it was the whole reason to take
+the release. When a dependency moves, read its fixes as a list of failures the
+old pin had, and ask which of them a `return err` here turned into a shutdown.
+
+**A workaround that kept its instrument was removed in an afternoon.** The
+rebuild in `Wake.wait` existed for zio#673, and `spike/completion_queue/` kept
+the `plain` mode that crashed 90 in 90 as the thing it was there to reproduce.
+Pointing the spike at v0.18.0 was three API changes and twelve cells; 180 in
+180 and the rebuild left with its comment. The alternative — reading the zio
+diff and trusting the sentence "the loop re-arms it" — would have shipped a
+belief about a race ([ADR 0038](./adr/0038-a-broadcast-rings-a-bell-it-does-not-write.md)).
+
