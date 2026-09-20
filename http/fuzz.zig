@@ -13,6 +13,12 @@
 //! smuggling; and `Content-Length` and `Transfer-Encoding` are the two
 //! fields a smuggled request is built out of.
 //!
+//! **A refusal added to `http1` is added to the reference here in the same
+//! commit**, or the two disagree on purpose and the fuzzer reports it as a
+//! bug — on whichever later commit's seed happens to reach that shape. That
+//! is how `Name : value` went from a 400 in `http1` to a CI failure two
+//! commits on, with the parser untouched in between.
+//!
 //! ## How to run it
 //!
 //! `zig build test` runs the corpus below — every input this has ever
@@ -198,6 +204,12 @@ fn refSplitTarget(r: *http1.Request) http1.ParseError!void {
 fn refApplyHeader(line: []const u8, r: *http1.Request) http1.ParseError!void {
     const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadHeader;
     if (colon == 0) return error.BadHeader;
+    // No whitespace between the field name and the colon (RFC 9112 §5.1),
+    // which `http1` refuses since it was made a 400 there — a `Name : value`
+    // one side reads and the other drops is a framing disagreement. The
+    // fuzzer found the reference still lenient two commits later, on a seed
+    // CI derived from a commit that never touched the parser.
+    if (line[colon - 1] == ' ' or line[colon - 1] == '\t') return error.BadHeader;
     const name = line[0..colon];
     const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
 
@@ -484,6 +496,11 @@ const corpus = [_][]const u8{
     seed("GET / HTTP/1.1\r\nHost: h\r\nConnection: Upgrade, keep-alive\r\n\r\n"),
     seed("GET / HTTP/1.1\r\nHost: h\r\nConnection: close, keep-alive\r\n\r\n"),
     seed("GET / HTTP/1.1\r\nHost: h\r\n Connection: close\r\n\r\n"),
+    seed("GET / HTTP/1.1\r\nHost: h\r\nContent-Length : 5\r\n\r\n"),
+    seed("GET / HTTP/1.1\r\nHost: h\r\nHost\t: h\r\n\r\n"),
+    // What CI's seed found at input 300 of a million: the reference parser
+    // taking `Content-Length : …` after `http1` had been made to refuse it.
+    seed("PATCH http://x/y HTTP/1.0\nHost: 18446744073709551615\nCookie: close\nContent-Length : identity, chunked\nContent-Length : 5\nTransfer-Enco\rding: localhost:8787\nCookie: 007\nUpgrade:  \n\nffffffffffffffff\nhello\n0\n\n"),
 
     // Bytes a text protocol is not supposed to contain.
     seed("GET / HTTP/1.1\r\nHost: h\r\nX\x00: y\r\n\r\n"),
