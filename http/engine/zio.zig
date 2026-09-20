@@ -243,6 +243,13 @@ const capacity_warn_gap_ns: u64 = 60 * std.time.ns_per_s;
 /// of a second is below what anybody notices after pressing Ctrl-C.
 const accept_poll_ms = 200;
 
+/// How long the accept loop waits after failing for want of a file
+/// descriptor or memory, doubling up to the cap. Short enough that a brief
+/// shortage costs a little latency, capped so a sustained one settles into
+/// one attempt a second rather than a spin (ADR 0265).
+const accept_backoff_min_ms: u32 = 5;
+const accept_backoff_max_ms: u32 = 1000;
+
 /// How often a stop looks to see whether the last request has finished.
 /// Shorter than the accept poll: by the time this runs somebody is waiting
 /// for the process to go, and an ordinary request finishes in less time
@@ -491,6 +498,8 @@ pub const Wake = struct {
     cq: zio.CompletionQueue,
     wake: zio.ev.Async,
     poll: zio.ev.NetPoll,
+    /// The socket, for `halfClose`. The same handle `poll` was built on.
+    handle: zio.ev.Backend.NetHandle,
     /// The post half. Submitted once and re-submitted the moment it fires,
     /// because a notify carries no data that anybody has to read first.
     armed: bool = false,
@@ -504,6 +513,7 @@ pub const Wake = struct {
         return .{
             .cq = zio.CompletionQueue.init(),
             .wake = zio.ev.Async.init(),
+            .handle = handle,
             // `NetPoll` rather than `NetRecv`, which is the exception zio's
             // author named when he said to prefer the latter: the connection's
             // buffered `std.Io.Reader` does its own reading, so what is wanted
@@ -512,6 +522,21 @@ pub const Wake = struct {
             // reads on every `.readable`.
             .poll = zio.ev.NetPoll.init(handle, .recv),
         };
+    }
+
+    /// Tell the peer there is nothing more coming, without closing: a FIN on
+    /// the send side. What it is for is a refused request whose bytes are
+    /// still queued unread on this socket — closing with those unread makes
+    /// the kernel send a reset instead, and a peer that gets a reset throws
+    /// away the answer it had buffered and reports "connection reset" where
+    /// the 431 should have been (ADR 0266). The socket is still closed by
+    /// `Conn.run` afterwards; this only orders the FIN before it.
+    ///
+    /// Every failure is swallowed: a peer that is already gone has nothing
+    /// left to be told, and the close that follows is the same either way.
+    pub fn halfClose(self: *Wake) void {
+        const socket: zio.net.Socket = .{ .handle = self.handle, .address = undefined };
+        socket.shutdown(.send) catch {};
     }
 
     /// Park until the socket has something to read or somebody posts.
@@ -1084,13 +1109,53 @@ pub fn serve(
     var capacity: Capacity = .{ .max = options.max_connections };
     var warned_at_ns: u64 = 0;
 
+    warnIfDescriptorsShort(options.max_connections);
+
+    // Grows while accepting keeps failing for want of a descriptor, and is
+    // reset by the first connection that gets through.
+    var backoff_ms: u32 = 0;
+
     while (!stop.isRequested()) {
         const stream = server.accept(.{ .timeout = .fromMilliseconds(accept_poll_ms) }) catch |err| switch (err) {
             // The wait ran out, which is the loop's chance to look at the
             // stop flag rather than anything having gone wrong.
-            if (err == error.Timeout) continue;
-            return err;
+            error.Timeout => continue,
+            // The machine is out of something, for now: this process's
+            // descriptor table is full, the system's is, or the kernel had
+            // no memory for a socket. None of that is the listener's fault
+            // and all of it clears on its own — the moment a connection
+            // closes, the next accept works. Returning would turn a
+            // condition that clears into an outage that needs a restart,
+            // and until ADR 0265 that is what happened: a server holding
+            // ~1,000 connections on a default `ulimit -n` ended `listen()`
+            // with a clean "nilo stopping" in the log, well short of its
+            // own `max_connections`. So the loop sleeps and tries again,
+            // for longer each time, and says so once per shortage.
+            error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => {
+                const first = backoff_ms == 0;
+                backoff_ms = if (first) accept_backoff_min_ms else @min(backoff_ms * 2, accept_backoff_max_ms);
+                if (first) std.log.warn(
+                    "accept failed with {s}: the process or the machine is out of file " ++
+                        "descriptors or memory, so nilo is pausing before it tries again. Held " ++
+                        "connections: {d} of {d}. Raise `ulimit -n` (or `LimitNOFILE=` under " ++
+                        "systemd) past `.max_connections`, or lower `.max_connections`.",
+                    .{ @errorName(err), capacity.held(), capacity.max },
+                );
+                zio.sleep(.fromMilliseconds(backoff_ms)) catch {};
+                continue;
+            },
+            // Anything else is the listener's own failure, and returning
+            // stops the server. A client that gave up while still in the
+            // backlog is not that: under zio v0.17.0 it surfaced here as
+            // `error.ConnectionAborted` and took the whole server down with
+            // it; since v0.18.0 `accept` retries it inside, on the same
+            // deadline, and it never reaches this line.
+            else => return err,
         };
+        if (backoff_ms != 0) {
+            std.log.info("accept works again after the descriptor shortage", .{});
+            backoff_ms = 0;
+        }
 
         // Full: closed at once, without being read from and without being
         // answered. Closing rather than not accepting, so that the client
@@ -1126,6 +1191,42 @@ pub fn serve(
     }
 
     drain(stop, options.shutdown_grace_ms);
+}
+
+/// Descriptors a process holds that are not connections: the listener, the
+/// log, stdin/out/err, the Runtime's own eventfds and timer fds, a database
+/// pool. Two dozen is more than any of that comes to, and being generous
+/// here only ever makes the warning fire a little early.
+const descriptor_headroom: u64 = 32;
+
+/// Say so at startup if `max_connections` is a number this process could
+/// never reach, because the operating system would refuse the descriptor
+/// first (ADR 0265).
+///
+/// A warning rather than a refusal, and rather than raising the limit
+/// ourselves. The default of 10,000 is above the 1,024 most shells hand out,
+/// so refusing would stop every server that never changed either number —
+/// and `setrlimit` past the soft limit is a policy call the person running
+/// the process made when they left it there. What they need is the two
+/// numbers next to each other, once, before the traffic arrives; the accept
+/// loop's backoff is what holds the server up if they turn out to be wrong.
+///
+/// A soft limit is the one that applies; the hard limit is how far
+/// `ulimit -n` may be raised without root, which is why it is in the message.
+fn warnIfDescriptorsShort(max_connections: u32) void {
+    if (max_connections == 0) return;
+    if (comptime std.posix.rlimit == void) return;
+    const limit = std.posix.getrlimit(.NOFILE) catch return;
+    const wanted: u64 = @as(u64, max_connections) + descriptor_headroom;
+    if (limit.cur >= wanted) return;
+    std.log.warn(
+        "`.max_connections` is {d} but this process may hold {d} file descriptors, so the " ++
+            "operating system would refuse a connection long before nilo does — at about " ++
+            "{d} of them. Raise it with `ulimit -n {d}` (the hard limit here is {d}) or " ++
+            "`LimitNOFILE={d}` under systemd, or lower `.max_connections` to what the " ++
+            "machine allows.",
+        .{ max_connections, limit.cur, limit.cur -| descriptor_headroom, wanted, limit.max, wanted },
+    );
 }
 
 /// Having stopped accepting, let the requests still being answered finish.

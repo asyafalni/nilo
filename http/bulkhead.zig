@@ -54,6 +54,10 @@
 //!   Engine that waits on sockets can already wait on two things — it has to,
 //!   to wait with a deadline at all — so this asks for nothing new of it
 //!   beyond a handle to say so with.
+//! - `Waker.halfClose` — send the peer a FIN without closing the socket, so
+//!   a refused request's answer reaches it before the reset that closing on
+//!   unread input would send (ADR 0266). One `shutdown(2)`; an Engine that
+//!   owns a socket has it.
 //! - `Stop`/`explained` — the flag that ends `serve`, and which startup
 //!   failures it has already explained in words.
 //! - `debug_io` — wired into `std_options_debug_io` so that `std.log`
@@ -209,7 +213,18 @@ pub const Options = struct {
     /// Bytes of the connection's read buffer. It doubles as the ceiling on
     /// the size of a request head: a head that does not fit is answered
     /// with 431.
-    read_buffer: usize = 8 * 1024,
+    ///
+    /// Sixteen kilobytes, up from eight, because a head is mostly cookies
+    /// and a browser behind a single sign-on carries several kilobytes of
+    /// them — an identity token in a cookie is 4–8 KB on its own, and the
+    /// 431 it earned under the old default was answered to the one client
+    /// least able to do anything about it (ADR 0268). It is what Go's
+    /// `net/http` and nginx's `large_client_header_buffers` allow too.
+    /// What it costs is paid only while a connection is busy: an idle one
+    /// gives the pages back (ADR 0071), so the 4,669 bytes per idle
+    /// connection do not move, and an active one holds two more pages than
+    /// it did.
+    read_buffer: usize = 16 * 1024,
 
     /// Bytes of the connection's write buffer. A response that fits in it
     /// leaves as one write; a bigger one is split across several.
@@ -304,6 +319,32 @@ pub const Options = struct {
     /// away — the write fails, the handler gets an error, the fiber
     /// unwinds.
     write_timeout_ms: u32 = 30_000,
+
+    /// How long any request has, in total, from its head arriving to its
+    /// answer leaving — counted the way `nilo.deadline(ms)` counts for one
+    /// route, given here to every route at once. 0, the default, means no
+    /// such limit ([ADR 0267](../docs/adr/0267-a-deadline-every-request-starts-with.md)).
+    ///
+    /// **What it bounds is every wait nilo owns** — reading the body, writing
+    /// the response — each cut down to whichever of this and its own limit
+    /// comes first, and `c.overdue()` answers a handler doing its own work.
+    /// What it does not do is interrupt a handler that is running rather
+    /// than waiting; there is no cancellation here, and deliberately none
+    /// ([ADR 0104](../docs/adr/0104-a-cleanup-path-is-not-cancellable.md)).
+    ///
+    /// **A request that takes the connection over lets go of it** — a
+    /// stream, a WebSocket, a body read in pieces — because those are meant
+    /// to outlive an ordinary request, and a number chosen for the ordinary
+    /// ones would cut every event stream off at the same second. A route
+    /// that wants a deadline through a takeover says so with
+    /// `nilo.deadline(ms)`, which is kept.
+    ///
+    /// Off by default rather than thirty seconds, which is what every other
+    /// server ships: the four deadlines above already answer a client that
+    /// stalls, and a total is a policy about the handlers behind it that
+    /// only their author can set. Thirty seconds is a reasonable one for an
+    /// API; an hour is for a report.
+    request_deadline_ms: u32 = 0,
 
     /// The most connections this process holds at once. 0 means no limit.
     ///
@@ -594,6 +635,12 @@ const engine_waker: Waker.VTable = .{
             // Engine asks the coroutine it is running on rather than being
             // told which connection is asking.
             engine.releaseIdleStack();
+        }
+    }.f,
+    .half_close = struct {
+        fn f(target: ?*anyopaque) void {
+            const wake: *engine.Wake = @ptrCast(@alignCast(target.?));
+            wake.halfClose();
         }
     }.f,
 };
@@ -1028,6 +1075,9 @@ pub const Waker = struct {
         /// fiber and is not getting one — naming the Engine anywhere but the
         /// Engine is what ADR 0002 refuses.
         release_stack: *const fn (target: ?*anyopaque) void,
+        /// Shut the send side of this connection's socket, and nothing else.
+        /// See `halfClose`.
+        half_close: *const fn (target: ?*anyopaque) void,
     };
 
     /// No Engine underneath: every wait says "go and read", every post is
@@ -1044,6 +1094,9 @@ pub const Waker = struct {
             fn f(_: ?*anyopaque) void {}
         }.f,
         .release_stack = struct {
+            fn f(_: ?*anyopaque) void {}
+        }.f,
+        .half_close = struct {
             fn f(_: ?*anyopaque) void {}
         }.f,
     };
@@ -1082,6 +1135,14 @@ pub const Waker = struct {
     /// behind the same 200ms peek that gates the buffers.
     pub fn releaseStack(self: Waker) void {
         self.vtable.release_stack(self.target);
+    }
+
+    /// Send the peer a FIN and keep the socket open to read from. For a
+    /// connection about to be closed with input still unread — a refused head,
+    /// a body nobody took — so the answer already written reaches the peer
+    /// before the close (ADR 0266). Nothing happens with no Engine underneath.
+    pub fn halfClose(self: Waker) void {
+        self.vtable.half_close(self.target);
     }
 };
 

@@ -3740,3 +3740,43 @@ Pointing the spike at v0.18.0 was three API changes and twelve cells; 180 in
 diff and trusting the sentence "the loop re-arms it" — would have shipped a
 belief about a race ([ADR 0038](./adr/0038-a-broadcast-rings-a-bell-it-does-not-write.md)).
 
+## Reading a peer's server found two bugs the suite could not
+
+[dusty](https://github.com/lalinsky/dusty) is an HTTP server by zio's author,
+on the same loop, and an afternoon of reading its `server.zig` against nilo's
+found two things that were wrong here and four worth taking.
+
+**The accept loop returned on a descriptor shortage.** `ProcessFdQuotaExceeded`
+from `accept` ended `listen()` with a clean "nilo stopping", at about a
+thousand connections on a default `ulimit -n` — well short of the 10,000
+`max_connections` promises. The zio bump the day before had fixed the
+sibling, `ConnectionAborted`, and the history entry above it says the lesson:
+*read the callee's error set against what the loop returns on*. This was
+the second error in the same set, found by reading somebody else's `switch`
+over it ([ADR 0265](./adr/0265-an-accept-loop-that-is-out-of-descriptors-waits.md)).
+
+**`clientIp()` read the first `X-Forwarded-For` field, and HAProxy adds a
+second.** With the rules set, a client's forgery in the first field was the
+answer, because the proxy's honest field sat behind it unread. nginx appends
+to the existing field, so every test and every deployment on nginx was fine;
+dusty's `ForwardedForIterator` walks every field, and the comment on it was
+the whole finding ([ADR 0129](./adr/0129-a-proxy-is-trusted-by-which-one-it-is.md)).
+**A bug the suite cannot reach is one somebody else's code can**: neither of
+these was findable from a test somebody here would have thought to write,
+because both are about what a peer does, and the peer in the tests was
+always the same one.
+
+**And one rejection re-read.** ADR 0133 had refused a request deadline in
+`listen()` because one number is the wrong budget for every route. True, and
+it answered the wrong question: the routes with no deadline are not the ones
+that chose "unbounded", they are the ones nobody looked at. dusty ships one
+number on by default; nilo now takes one, off by default, dropped at a
+takeover, replaced by a route's own ([ADR 0267](./adr/0267-a-deadline-every-request-starts-with.md)).
+**A rejection in an ADR is a claim like any other, and decays the same way**
+— it holds for the question it answered and not for the one beside it.
+
+What was not taken, and why, is in the same four ADRs: llhttp, a headers
+table, a radix router, TLS, cancellation. Each is the right answer for
+dusty's shape and the wrong trade for nilo's, and the reading was worth
+doing because it said which was which.
+

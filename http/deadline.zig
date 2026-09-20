@@ -224,3 +224,66 @@ test "every limit nilo arms is cut down to the deadline, and none is lengthened"
     none.armBody();
     try testing.expectEqual(@as(u32, 30_000), caught.within_ms);
 }
+
+// ---- listen()'s default deadline (ADR 0267) ----
+
+fn hasTheDefault(c: *Ctx) anyerror!void {
+    // What `listen()` gave every request, seen from a route that set none.
+    try testing.expect(c.timeLeftMs() != null);
+    try testing.expect(c.timeLeftMs().? <= 60_000);
+    try c.sendEmpty(200);
+}
+
+fn streamsAndLetsGo(c: *Ctx) anyerror!void {
+    try testing.expect(c.timeLeftMs() != null);
+    var s = try c.stream(200, "text/plain");
+    // Taking the connection over drops the default: a stream is meant to
+    // outlive a number chosen for the requests that answer and go.
+    try testing.expect(c.timeLeftMs() == null);
+    try s.writeAll("hello");
+    try s.finish();
+}
+
+fn streamsAndKeepsItsOwn(c: *Ctx) anyerror!void {
+    const before = c.timeLeftMs().?;
+    var s = try c.stream(200, "text/plain");
+    // A deadline the route asked for by name is kept through the takeover.
+    try testing.expect(c.timeLeftMs() != null);
+    try testing.expect(c.timeLeftMs().? <= before);
+    try s.writeAll("hello");
+    try s.finish();
+}
+
+test "listen()'s deadline reaches every route, and a route's own replaces it" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/plain", hasTheDefault);
+    try app.with(with(20)).get("/own", insideItsBudget);
+    app.limits.request_deadline_ms = 60_000;
+
+    var client = try nilo_testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 200), (try client.get(&app, "/plain")).status);
+    try testing.expectEqual(@as(u16, 200), (try client.get(&app, "/own")).status);
+
+    // Off, which is the default, is exactly what it was before: null.
+    app.limits.request_deadline_ms = 0;
+    var none = App.init(testing.allocator);
+    defer none.deinit();
+    try none.get("/quick", hasNoDeadlineAtAll);
+    try testing.expectEqual(@as(u16, 200), (try client.get(&none, "/quick")).status);
+}
+
+test "a request that takes the connection over lets go of the default and keeps its own" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/default", streamsAndLetsGo);
+    try app.with(with(60_000)).get("/own", streamsAndKeepsItsOwn);
+    app.limits.request_deadline_ms = 60_000;
+
+    var client = try nilo_testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 200), (try client.get(&app, "/default")).status);
+    try testing.expectEqual(@as(u16, 200), (try client.get(&app, "/own")).status);
+}
+

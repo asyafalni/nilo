@@ -6413,6 +6413,49 @@ test "a trusted proxy that is not an address stops the server rather than being 
     );
 }
 
+test "a proxy that adds a field of its own is read the same as one that appends" {
+    // HAProxy's `option forwardfor` adds an `X-Forwarded-For` field rather
+    // than appending to the one the client sent, so a forged header arrives
+    // as two fields: the forgery first, the proxy's own after it. RFC 9110
+    // §5.3 reads them as one list in wire order, and so does nilo — reading
+    // the first field alone answered "1.2.3.4" here with the rules set, which
+    // is the address the client typed.
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/who", echoClientIp);
+    try app.resolveChains();
+    try wiring.parseTrustedProxies(&app, &.{"10.0.0.0/8"});
+    app.limits.trusted_proxies = app.trusted_proxies;
+
+    var h = Harness.init();
+    defer h.deinit();
+    h.peer = try bulkhead.Peer.from("10.0.0.7");
+
+    const named = h.send(
+        &app,
+        "GET /who HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 1.2.3.4\r\nX-Forwarded-For: 203.0.113.9, 10.0.0.7\r\n\r\n",
+    );
+    try testing.expect(std.mem.endsWith(u8, named.response, "203.0.113.9"));
+
+    // The count reads the same list: one hop back from the right is the
+    // proxy's entry, in the second field.
+    app.limits.trusted_proxies = &.{};
+    app.limits.trusted_hops = 1;
+    const counted = h.send(
+        &app,
+        "GET /who HTTP/1.1\r\nHost: t\r\nX-Forwarded-For: 1.2.3.4\r\nX-Forwarded-For: 203.0.113.9\r\n\r\n",
+    );
+    try testing.expect(std.mem.endsWith(u8, counted.response, "203.0.113.9"));
+
+    // More fields than any chain of proxies writes is a head stuffed by the
+    // client, and none of it is read.
+    const stuffed = h.send(
+        &app,
+        "GET /who HTTP/1.1\r\nHost: t\r\n" ++ ("X-Forwarded-For: 1.2.3.4\r\n" ** 9) ++ "\r\n",
+    );
+    try testing.expect(std.mem.endsWith(u8, stuffed.response, "10.0.0.7"));
+}
+
 test "a header with fewer entries than there are hops falls back to the socket" {
     var app = App.init(testing.allocator);
     defer app.deinit();

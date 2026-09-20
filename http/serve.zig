@@ -89,8 +89,36 @@ pub fn handleConnection(
         // pages are handed back and faulted in again next time (ADR 0096).
         lifetime.end();
         _ = arena.reset(.{ .retain_with_limit = self.arena_keep });
-        if (!served.keep_alive) return;
+        if (!served.keep_alive) {
+            if (served.linger) hangUp(in, deadlines, waker);
+            return;
+        }
     }
+}
+
+/// How much of a refused request is thrown away before hanging up on it,
+/// and how long that is given. A peer that has read the answer hangs up
+/// within a round trip; one that keeps sending, or never reads, gets the
+/// reset it was always going to get once either bound is reached.
+const linger_limit: usize = 64 * 1024;
+const linger_ms: u32 = 1000;
+
+/// Close so the peer gets the answer: a refused request has bytes still
+/// queued on the socket, and closing with input unread makes the kernel
+/// send a reset instead of a FIN — and a peer that receives a reset throws
+/// the buffered answer away. Windows does; so does anything that reads the
+/// error before the data. So the send side is shut first, which tells the
+/// peer there is nothing more to wait for, and what it sent is thrown away
+/// until it hangs up, or `linger_ms` passes, or `linger_limit` bytes of a
+/// peer that keeps sending ([ADR 0266](../docs/adr/0266-a-refused-request-is-hung-up-on-with-a-fin.md)).
+///
+/// Only on the paths that set `Served.linger`, which is where unread input
+/// is possible; an ordinary `Connection: close` has nothing queued and closes
+/// as it always did, with no syscall and no wait.
+fn hangUp(in: *std.Io.Reader, deadlines: bulkhead.Deadlines, waker: bulkhead.Waker) void {
+    waker.halfClose();
+    deadlines.armPeek(linger_ms);
+    _ = in.discardShort(linger_limit) catch {};
 }
 
 /// How long a connection has to produce its next request before its
@@ -165,6 +193,12 @@ pub fn waitForRequest(
 pub const Served = struct {
     keep_alive: bool,
     handover: ?websocket.Handover = null,
+    /// Set with `keep_alive` false when the client's bytes may still be on
+    /// the socket unread — a head that was refused, a body nobody took. The
+    /// connection loop then hangs up with a FIN first rather than a reset,
+    /// so the answer reaches the peer (ADR 0266). Never set for a peer that
+    /// is already gone, or one that stalled: there is nothing to wait for.
+    linger: bool = false,
 };
 
 /// Answer one request, and hand back a socket if the handler opened one.
@@ -215,6 +249,9 @@ pub noinline fn serveRequest(
             error.HeadTooLong => {
                 sendFinal(out, RESPONSE_431);
                 record.finish(431);
+                // The rest of the head is still queued: the reason it was
+                // refused is that it did not fit in the buffer.
+                return .{ .keep_alive = false, .linger = true };
             },
         }
         return .{ .keep_alive = false };
@@ -238,7 +275,9 @@ pub noinline fn serveRequest(
         };
         sendFinal(out, answer);
         record.finish(status);
-        return .{ .keep_alive = false };
+        // A head that did not parse may have a body behind it, and a body
+        // under a coding nilo cannot read certainly does.
+        return .{ .keep_alive = false, .linger = true };
     };
 
     // Past the limit on requests in flight, and said so now rather than
@@ -250,7 +289,7 @@ pub noinline fn serveRequest(
         sendFinal(out, RESPONSE_503_SHED);
         record.at(metrics_mod.shed);
         record.finish(503);
-        return .{ .keep_alive = false };
+        return .{ .keep_alive = false, .linger = http1.readsMore(&r) };
     }
 
     // Every `Str` from this request points into the head, and the head is
@@ -324,6 +363,11 @@ pub noinline fn serveRequest(
         // the caller runs the loop from *its* frame (ADR 0071).
         ._handover = &handover,
     };
+
+    // `listen()`'s deadline for every request, before the chain runs so a
+    // route's own `nilo.deadline` replaces it rather than the other way
+    // round. One clock read when set, none when it is not (ADR 0267).
+    c.giveDefaultDeadline(self.limits.request_deadline_ms);
 
     // Every way out of here from this point on — a clean answer, a
     // failure, a stream abandoned, a socket handed over — goes past this,
@@ -407,7 +451,7 @@ pub noinline fn serveRequest(
         // of unclear provenance.
         if (c.answered() != null) {
             warnFailedAfterAnswering(&c, path, deadlines, err);
-            return .{ .keep_alive = false, .handover = handover };
+            return .{ .keep_alive = false, .handover = handover, .linger = http1.readsMore(&r) };
         }
         // Nothing sent yet: this is a clean failure. A body nobody read
         // still has to be discarded so the connection can be reused —
@@ -415,22 +459,27 @@ pub noinline fn serveRequest(
         // reason to drop keep-alive. If it cannot be discarded the
         // answer still goes out; only the connection is given up.
         const reusable = drain(&c, in, &r);
-        sendFailure(&c, failure, err) catch return .{ .keep_alive = false, .handover = handover };
-        return .{ .keep_alive = reusable, .handover = handover };
+        // Not reusable and a body was announced: some of it may be unread —
+        // too big to discard, or behind an `Expect` nobody answered. That is
+        // the 413 naming `bodyStream()` that a reset would take back.
+        const linger = !reusable and http1.readsMore(&r);
+        sendFailure(&c, failure, err) catch return .{ .keep_alive = false, .handover = handover, .linger = linger };
+        return .{ .keep_alive = reusable, .handover = handover, .linger = linger };
     };
     watchdog.finish(&in_flight.watch);
 
     // A body the handler did not read is discarded so the next request
     // on this connection starts at the right byte.
     const reusable = drain(&c, in, &r);
+    const linger = !reusable and http1.readsMore(&r);
 
     if (c.answered() == null) {
         // A handler that returned without answering meant an empty 200.
         // No content type, because there is no content to give one to.
-        sendDirect(&c, 200, "", "") catch return .{ .keep_alive = false, .handover = handover };
+        sendDirect(&c, 200, "", "") catch return .{ .keep_alive = false, .handover = handover, .linger = linger };
     }
-    if (c._stream != null) return .{ .keep_alive = endAbandonedStream(&c), .handover = handover };
-    return .{ .keep_alive = reusable, .handover = handover };
+    if (c._stream != null) return .{ .keep_alive = endAbandonedStream(&c), .handover = handover, .linger = linger };
+    return .{ .keep_alive = reusable, .handover = handover, .linger = linger };
 }
 
 /// Run the socket a handler handed back, from the caller's frame.
@@ -994,3 +1043,115 @@ noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror) !v
     };
     try sendDirect(c, status, failure_content_type, buf[0..body.end]);
 }
+
+// ---- tests ----
+
+const testing = std.testing;
+
+/// One request through `serveRequest` with no Engine, for what it leaves
+/// behind rather than for what it writes: the behaviour tests read the
+/// response, and this reads `Served`.
+fn serveOnce(app: *App, request: []const u8) Served {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var lifetime = str_mod.Lifetime.init();
+    defer lifetime.deinit();
+    var in_flight = fail.InFlight{};
+    // A buffer of the connection's own over the bytes, the way a socket is
+    // read: `Reader.fixed` alone has no buffer, so an empty request reads as
+    // a head too long for it rather than as a peer that hung up.
+    var underlying = std.Io.Reader.fixed(request);
+    var read_buf: [4096]u8 = undefined;
+    var limited = std.Io.Reader.Limited.init(&underlying, .unlimited, &read_buf);
+    var buf: [4096]u8 = undefined;
+    var out = std.Io.Writer.fixed(&buf);
+    var served = serveRequest(app, arena.allocator(), &lifetime, &in_flight, &limited.interface, &out, .off, .off, .{});
+    runHandover(&served);
+    lifetime.end();
+    return served;
+}
+
+fn echoBody(c: *Ctx) anyerror!void {
+    try c.sendText(200, (try c.body()).view());
+}
+
+test "a connection is lingered on only where the client's bytes may still be unread" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/echo", echoBody);
+    try app.get("/ping", struct {
+        fn run(c: *Ctx) anyerror!void {
+            try c.sendText(200, "pong");
+        }
+    }.run);
+    try app.resolveChains();
+    // The 413 below is logged as a failed handler, which is the behaviour
+    // under test rather than news.
+    const previous = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = previous;
+
+    // A body the handler read whole: nothing left on the socket, the
+    // connection is reused, and there is nothing to linger for.
+    const read = serveOnce(&app, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello");
+    try testing.expect(read.keep_alive);
+    try testing.expect(!read.linger);
+
+    // `Connection: close` with no body: closes as it always did, without the
+    // shutdown and the wait, because there is nothing queued to reset over.
+    const closing = serveOnce(&app, "GET /ping HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    try testing.expect(!closing.keep_alive);
+    try testing.expect(!closing.linger);
+
+    // A body past the ceiling: the 413 goes out and the body is still on
+    // the wire, which is exactly the answer a reset would take back.
+    app.limits.max_body = 4;
+    const too_big = serveOnce(&app, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\n0123456789");
+    try testing.expect(!too_big.keep_alive);
+    try testing.expect(too_big.linger);
+    app.limits.max_body = 1024 * 1024;
+
+    // A head that did not parse may have a body behind it.
+    const malformed = serveOnce(&app, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\nContent-Length: 11\r\n\r\n0123456789");
+    try testing.expect(!malformed.keep_alive);
+    try testing.expect(malformed.linger);
+
+    // A body under a coding nilo cannot read certainly has one.
+    const coded = serveOnce(&app, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: br\r\nContent-Length: 2\r\n\r\nhi");
+    try testing.expect(!coded.keep_alive);
+    try testing.expect(coded.linger);
+
+    // A peer that hung up before saying anything: nothing to wait for.
+    const gone = serveOnce(&app, "");
+    try testing.expect(!gone.keep_alive);
+    try testing.expect(!gone.linger);
+}
+
+test "a head that does not fit is answered 431 and lingered on" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.resolveChains();
+
+    // A reader whose buffer is smaller than the head, the way a connection's
+    // read buffer is: the head cannot be completed, so it is refused, and the
+    // rest of it is still on the peer's side of the socket.
+    const head = "GET /ping HTTP/1.1\r\nHost: t\r\nCookie: " ++ ("x" ** 200) ++ "\r\n\r\n";
+    var underlying = std.Io.Reader.fixed(head);
+    var small: [64]u8 = undefined;
+    var limited = std.Io.Reader.Limited.init(&underlying, .unlimited, &small);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var lifetime = str_mod.Lifetime.init();
+    defer lifetime.deinit();
+    var in_flight = fail.InFlight{};
+    var buf: [4096]u8 = undefined;
+    var out = std.Io.Writer.fixed(&buf);
+    const served = serveRequest(&app, arena.allocator(), &lifetime, &in_flight, &limited.interface, &out, .off, .off, .{});
+    lifetime.end();
+
+    try testing.expect(std.mem.startsWith(u8, out.buffered(), "HTTP/1.1 431"));
+    try testing.expect(!served.keep_alive);
+    try testing.expect(served.linger);
+}
+

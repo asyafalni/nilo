@@ -286,6 +286,7 @@ while (it.next()) |h| {
 
 Nothing is allocated either way: both read the head where it lies.
 
-The whole request head has to fit in the connection's `read_buffer` (8 KB by
-default); one that doesn't is answered with a 431. Turn it up in `listen()` if
-you serve clients with enormous cookies.
+The whole request head has to fit in the connection's `read_buffer` (16 KB by
+default, which covers a browser behind a single sign-on); one that doesn't is
+answered with a 431. Turn it up in `listen()` if you serve clients with cookies
+bigger than that.

@@ -20,8 +20,42 @@ cannot hold goes to [`docs/risks.md`](./docs/risks.md).
 Work lands here under `### Breaking`, `### Added`, `### Fixed` and `### Docs`,
 newest first.
 
+### Breaking
+
+- `read_buffer` defaults to 16 KiB, up from 8. It is also the ceiling on a
+  request head, and 8 KiB was inside what a browser behind a single sign-on
+  sends in cookies on every request. An idle connection holds the same 4,669
+  bytes — the pages go back while it waits (ADR 0071) — and a connection
+  inside a request holds two pages more. A server that wants the old number
+  passes `.read_buffer = 8 * 1024`
+  ([ADR 0268](./docs/adr/0268-a-head-is-mostly-cookies-and-sixteen-kilobytes-of-them.md)).
+
 ### Added
 
+- `listen()` takes `request_deadline_ms`: a deadline every request starts
+  with, what `nilo.deadline(ms)` gives one route given to all of them. Every
+  wait nilo owns is cut to it and `c.overdue()` reads it; a route's own
+  `nilo.deadline` replaces it, and a request that takes the connection over —
+  a stream, a WebSocket, `bodyStream()` — lets a default go and keeps a
+  route's own. Off by default. ADR 0133 had rejected the option; ADR 0267
+  is why it is back ([ADR 0267](./docs/adr/0267-a-deadline-every-request-starts-with.md)).
+- The accept loop waits out a descriptor shortage instead of returning.
+  `ProcessFdQuotaExceeded`, `SystemFdQuotaExceeded` and `SystemResources`
+  from `accept` now sleep 5 ms, doubling to a second, and try again, with one
+  warning per shortage; before, any of them ended `listen()` with a clean
+  "nilo stopping" — at about a thousand connections on a default `ulimit -n`,
+  well short of `max_connections`. `listen()` also warns at startup when the
+  process's descriptor limit is below `max_connections`, with both numbers and
+  the `ulimit -n` / `LimitNOFILE=` to change. `bench/fdlimit.py` is the
+  regression check ([ADR 0265](./docs/adr/0265-an-accept-loop-that-is-out-of-descriptors-waits.md)).
+- A refused request is hung up on with a FIN before the close, so its answer
+  reaches the client. A 431, a 400 or 415 with a body behind it, a 413 for a
+  body past `max_body`, a shed 503 — each left the client's bytes unread on
+  the socket, and closing over unread input sends a reset, which a Windows
+  client answers by throwing the buffered 431 away. The send side is shut
+  first and what arrives is discarded, bounded at 64 KiB and one second. An
+  ordinary `Connection: close` is untouched. The Engine contract gains
+  `Waker.halfClose` ([ADR 0266](./docs/adr/0266-a-refused-request-is-hung-up-on-with-a-fin.md)).
 - Every crafted request in the parser's tests — the framing conflicts, the
   strict chunk sizes, the absolute-form target, the head that never ends — is
   now also run split at every byte and trickled a few bytes a read, and has to
@@ -32,6 +66,11 @@ newest first.
 
 ### Docs
 
+- `Ctx.body()` says that a gzipped body comes back inflated while
+  `header("Content-Encoding")` and `header("Content-Length")` still describe
+  the wire, because the head is read in place and nothing rewrites it — and
+  what a handler forwarding the body should send instead. ADR 0251 carries
+  the same note.
 - [Deploying](./docs/guide/deploying.md#when-a-bound-is-hit) has one table
   for every bound `listen()` takes: what a client sees past it, what the log
   says, and what has to happen before the server takes that work again. The
@@ -39,6 +78,16 @@ newest first.
 
 ### Fixed
 
+- `c.clientIp()` reads every `X-Forwarded-For` field, as one list in wire
+  order, rather than the first. HAProxy's `option forwardfor` adds a field of
+  its own instead of appending to the client's, so a forged header arrived as
+  two fields with the forgery first — and with `.trusted_proxies` set, the
+  walk started from the forgery and returned it. nginx appends, which is why
+  the tests passed. Both the rules and `.trusted_hops` now walk
+  `proxies.Forwarded`, from the last field's right end; more than eight
+  fields is answered with the socket's address. No allocation
+  ([ADR 0129](./docs/adr/0129-a-proxy-is-trusted-by-which-one-it-is.md), the
+  closing section).
 - A client that connects and gives up before the server reaches it in the
   backlog no longer stops the server. zio v0.17.0 surfaced that as
   `error.ConnectionAborted` from `accept`, and the accept loop returned on

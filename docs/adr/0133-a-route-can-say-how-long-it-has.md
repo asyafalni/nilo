@@ -102,6 +102,14 @@ number loose enough for the slowest route bounds none of the others. A route
 that wants the deadline says so, which is what `with` is for
 ([ADR 0126](0126-a-route-can-say-what-covers-it.md)).
 
+> **Superseded on this point by
+> [ADR 0267](0267-a-deadline-every-request-starts-with.md).** The argument
+> stands — it is why the option defaults to off — but it answered "what is
+> the right budget for this route" when the gap was "which routes have none
+> at all". `listen()` now takes `request_deadline_ms` as the floor every
+> request starts with; a route's own `with(nilo.deadline(ms))` replaces it,
+> and a request that takes the connection over lets the floor go.
+
 **Refusing the request at the start of every framework call once overdue** —
 `c.send` returning an error because the clock ran out. It turns a correct
 response that was late into no response at all, and it puts a branch on the

@@ -111,3 +111,28 @@ health check reaching the pod directly while public traffic comes through a
 load balancer. Naming the networks answers it without a per-path anything —
 the health check's connection comes from an address that is or is not in the
 list, and the walk works either way.
+
+## What was wrong, and is not any more
+
+**The walk read the first `X-Forwarded-For` field, and a proxy may add a
+second.** RFC 9110 §5.3 lets a list header arrive split across fields, read
+as one list in wire order — and HAProxy's `option forwardfor` does exactly
+that, adding a field of its own rather than appending to the one the client
+sent. A client behind it that sent `X-Forwarded-For: 1.2.3.4` reached nilo as
+two fields, the forgery first and the proxy's honest one second; `Ctx.header`
+returns the first match, so the walk started from the forgery, found it was
+not one of ours, and returned it. The rules were set and the answer was the
+one they exist to refuse. nginx appends to the existing field, which is why
+the tests passed and why this was found by reading
+[dusty](https://github.com/lalinsky/dusty)'s `ForwardedForIterator` rather
+than by a deployment.
+
+Every field of that name is read now, as one list, and both walks — the
+rules and the count — go through `proxies.Forwarded`, which hands out entries
+from the last field's right end to the first field's left. Up to eight
+fields; more is a head nobody honest sends, and is answered with the socket's
+address. Still no allocation: eight slices on the stack, on the path only a
+`clientIp()` call walks. `test "a proxy that adds a field of its own is read
+the same as one that appends"` in `behaviour.zig` holds it, with HAProxy's
+order.
+

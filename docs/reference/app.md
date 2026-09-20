@@ -71,7 +71,7 @@ try v1.without(requireOperator).with(rateLimitSignups).post("/sign-up", signUp);
 | `address` | `"127.0.0.1"` — an address, not a host name. `"unix:/run/nilo.sock"` listens on a path ([ADR 0130](../adr/0130-a-path-is-an-address-to-listen-on.md)) |
 | `port` | `8787` — not read when `address` names a unix socket |
 | `threads` | `0` (one per core) |
-| `read_buffer` | `8 * 1024` — also the ceiling on a request head |
+| `read_buffer` | `16 * 1024` — also the ceiling on a request head. Paid only while a connection is busy; an idle one gives the pages back ([ADR 0268](../adr/0268-a-head-is-mostly-cookies-and-sixteen-kilobytes-of-them.md)) |
 | `write_buffer` | `4 * 1024` |
 | `arena_keep` | `16 * 1024` — of a connection's request arena, kept between requests |
 | `reuse_address` | `true` — on a unix socket, removes a socket file left behind by a process that is gone |
@@ -83,7 +83,8 @@ try v1.without(requireOperator).with(rateLimitSignups).post("/sign-up", signUp);
 | `body_min_rate` | `8 * 1024` — bytes a second a buffered body has to keep up. `0` = off |
 | `body_grace_ms` | `10_000` — before the rate is asked for |
 | `write_timeout_ms` | `30_000` — any one write to the client |
-| `max_connections` | `10_000` — held at once, 4,669 bytes each when idle. `0` = no limit |
+| `request_deadline_ms` | `0` — a deadline every request starts with, what [`nilo.deadline(ms)`](./middleware.md#nilodeadline) gives one route. A route that takes the connection over lets go of it; a route's own is kept. `0` = none ([ADR 0267](../adr/0267-a-deadline-every-request-starts-with.md)) |
+| `max_connections` | `10_000` — held at once, 4,669 bytes each when idle. `0` = no limit. `listen()` warns when the process's descriptor limit (`ulimit -n`) is below it, and the accept loop waits out a shortage rather than stopping ([ADR 0265](../adr/0265-an-accept-loop-that-is-out-of-descriptors-waits.md)) |
 | `max_in_flight` | `0` — the most requests answered at once; past it a request is a `503` with `Retry-After: 1` at once rather than a place in a queue. `0` = no limit ([ADR 0197](../adr/0197-a-server-past-its-limit-says-so-at-once.md)) |
 | `max_body` | `1024 * 1024` — the most `c.body()` reads into the arena. One route can say its own with [`nilo.maxBody(bytes)`](./middleware.md#nilomaxbody) |
 | `trusted_hops` | `0` — how many proxies stand in front, for `c.clientIp()` |

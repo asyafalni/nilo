@@ -42,7 +42,7 @@ try app.listen(.{
     .address = "0.0.0.0",     // IPv4 or IPv6 — "::" for every interface
     .port = 8080,
     .threads = 0,             // 0 = one per core
-    .read_buffer = 8 * 1024,  // also the ceiling on a request head (431 past it)
+    .read_buffer = 16 * 1024, // also the ceiling on a request head (431 past it)
     .write_buffer = 4 * 1024,
     .reuse_address = true,
     .shutdown_grace_ms = 10_000,
@@ -54,6 +54,7 @@ try app.listen(.{
     .body_min_rate = 8 * 1024,    // bytes a second a body has to keep up
     .body_grace_ms = 10_000,      // before that rate is asked for
     .write_timeout_ms = 30_000,   // any one write to the client
+    .request_deadline_ms = 0,     // a deadline every request starts with; 0 = none
 
     .max_connections = 10_000,    // held at once; 0 = no limit
 
@@ -91,13 +92,15 @@ follow say why each one is shaped the way it is.
 | Bound | Default | Past it | What lets it go again |
 |---|---|---|---|
 | `max_connections` | 10,000 | The connection is accepted and closed at once — nothing read, no status written, so the client usually sees a reset. The log says so once a minute with a running count | A held connection ends: a keep-alive one idles out, a WebSocket tab closes, a stream finishes |
+| the process's descriptor limit (`ulimit -n`) | usually 1,024 | `accept` fails with `ProcessFdQuotaExceeded`; the loop waits — 5 ms, doubling to a second — and tries again, and the log says so once per shortage. Connections meanwhile wait in the kernel's backlog. `listen()` warned at startup if this was below `max_connections` ([ADR 0265](../adr/0265-an-accept-loop-that-is-out-of-descriptors-waits.md)) | A held connection ends |
 | `max_in_flight` | off | The head is read, then `503` with `Retry-After: 1` and `Connection: close` — one write of a constant, no queue. Counted under `<shed>` on the metrics page | A request inside its handler finishes |
 | `header_timeout_ms` | 10,000 | A client partway through a head gets a `408` and the connection is closed. One that sent nothing is closed without a status — there is nothing to answer | Nothing to release: the connection is gone |
-| `read_buffer` | 8 KiB | A head that does not fit is a `431`, and the connection is closed | Nothing to release |
+| `read_buffer` | 16 KiB | A head that does not fit is a `431`, and the connection is closed — send side first, so the `431` reaches a client that would otherwise see a reset ([ADR 0266](../adr/0266-a-refused-request-is-hung-up-on-with-a-fin.md)) | Nothing to release |
 | `idle_timeout_ms` | 75,000 | A keep-alive connection that has asked for nothing is closed, no status | Nothing to release |
 | `body_timeout_ms` | 30,000 | A read of the body that outlasts it fails the handler's `c.body()` with a `408`, and the connection is closed. `c.bodyStream()` sees the same read fail | Nothing to release |
 | `body_min_rate` after `body_grace_ms` | 8 KiB/s after 10,000 | A body `c.body()` is assembling gets a deadline worked out from its announced length; too slow is a `408` however steady the bytes were. `c.bodyStream()` is not under it | Nothing to release |
-| `max_body`, or `nilo.maxBody` on the route | 1 MiB | `c.body()` refuses with a `413` before reading past it. A body nobody read that is over it is not drained after the answer: the response goes out and the connection is closed rather than read to the end | Nothing to release — the next request needs a new connection |
+| `max_body`, or `nilo.maxBody` on the route | 1 MiB | `c.body()` refuses with a `413` before reading past it. A body nobody read that is over it is not drained after the answer: the response goes out and the connection is closed rather than read to the end — send side first, so the `413` arrives ([ADR 0266](../adr/0266-a-refused-request-is-hung-up-on-with-a-fin.md)) | Nothing to release — the next request needs a new connection |
+| `request_deadline_ms` | off | Every wait of the request — body reads, the write — is cut to it, and `c.overdue()` says so to a handler doing its own work; the failure is the wait's own (`408`, or the write given up), the same as `nilo.deadline(ms)` on one route. A stream, a WebSocket or a `bodyStream()` lets go of it ([ADR 0267](../adr/0267-a-deadline-every-request-starts-with.md)) | — |
 | `write_timeout_ms` | 30,000 | One write to the client that outlasts it gives the response up: no status can be sent by then, the connection is closed, and the log says `gave up writing after 30000ms — the client stopped reading` rather than blaming the handler | Nothing to release |
 | `shutdown_grace_ms` | 10,000 | A stop waits this long for requests inside their handlers. Idle connections are closed at once, not waited for. Past it the rest are cut off and the log says how many | — |
 | `arena_keep` | 16 KiB | Not a refusal: a response assembled in `c.arena()` that is larger than this is built in memory the arena gives back after the request, so the next one faults it in a page at a time ([ADR 0096](../adr/0096-a-response-larger-than-the-arena-keep-is-a-page-fault-per-page.md)) | Raise it just past the largest response, and no further — it is held per connection |

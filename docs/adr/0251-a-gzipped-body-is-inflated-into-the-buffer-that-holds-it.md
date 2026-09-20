@@ -132,5 +132,14 @@ pushes telemetry sends it, and the 415 says gzip in the sentence.
 - `Ctx.body` inflates `.gzip`; `Ctx.bodyStreamWith` refuses any coding
   with a 415 of its own.
 - `RESPONSE_415`'s sentence names gzip.
+- **The head is not rewritten.** `header("Content-Encoding")` still says
+  `gzip` and `header("Content-Length")` still gives the wire length after
+  `body()` has inflated it, because the head is read where it lies
+  (ADR 0107) and there is nothing to remove a line from. A proxy handler
+  that forwards `body()` with the request's own headers sends plain bytes
+  labelled `gzip`; `Ctx.body`'s doc comment says so and says what to send
+  instead. dusty removes both headers after decoding and keeps the wire
+  values on the request, which is the right answer for a parser that copies
+  headers into a table and the wrong trade for one that does not.
 - The roadmap's compression entry loses its inbound paragraph and keeps
   one sentence for the stream and the other codings.

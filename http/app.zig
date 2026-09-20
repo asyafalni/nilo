@@ -1049,6 +1049,7 @@ pub const App = struct {
             .trusted_hops = options_.trusted_hops,
             .trusted_proxies = self.trusted_proxies,
             .block_warning_ms = options_.block_warning_ms,
+            .request_deadline_ms = options_.request_deadline_ms,
         };
         // Read once per request by the connection loop rather than by a
         // request, which is why it is a field of its own (ADR 0096).

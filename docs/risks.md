@@ -45,6 +45,9 @@ off where it used to be served.** The numbers are generous and each bounds one
 wait rather than a whole request, so nothing legitimate and slow is hurried by
 any of them: not a big upload, not an hour-long stream
 ([ADR 0023](./adr/0023-a-deadline-belongs-to-an-operation-not-to-a-request.md)).
+The one that does bound a whole request, `request_deadline_ms`, is off unless
+set, and a stream or a WebSocket lets it go
+([ADR 0267](./adr/0267-a-deadline-every-request-starts-with.md)).
 
 **A WebSocket has no read limit, so a client that vanishes without a FIN holds
 a fiber.** Caught by the write limit as soon as the server sends anything, and

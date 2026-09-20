@@ -50,6 +50,10 @@ pub const Limits = struct {
     /// is what every App that never set it gets.
     trusted_proxies: []const proxies_mod.Cidr = &.{},
     block_warning_ms: u32 = 250,
+    /// The deadline every request starts with, in milliseconds; 0 is none.
+    /// What `nilo.deadline` gives one route, given to all of them at
+    /// `listen()` (ADR 0267).
+    request_deadline_ms: u32 = 0,
 };
 
 /// The size `sendJson` reserves before serialising. Not a limit — a
@@ -208,6 +212,11 @@ pub const Ctx = struct {
     /// still a request that spent its time on the socket, and the blocking
     /// detector has to leave it alone either way (ADR 0034).
     _took_over: bool = false,
+    /// Set while the deadline on `_deadlines` is `listen()`'s default rather
+    /// than a route's own. A request that takes the connection over drops a
+    /// default deadline — a stream or a WebSocket is meant to outlive it —
+    /// and keeps one a route asked for by name (ADR 0267).
+    _deadline_default: bool = false,
     /// Set when the response cannot share its connection with another
     /// request whatever the client asked for — an unframed HTTP/1.0 stream,
     /// where the end of the body *is* the end of the connection.
@@ -839,6 +848,36 @@ pub const Ctx = struct {
     /// Zero takes the deadline off.
     pub fn giveDeadline(self: *Ctx, ms: u32) void {
         self._deadlines.until_ns = if (ms == 0) 0 else bulkhead.monotonicNanos() + @as(u64, ms) * std.time.ns_per_ms;
+        // Asked for by name, so it stays through a takeover; `listen()`'s
+        // default is the one a stream lets go of (ADR 0267).
+        self._deadline_default = false;
+    }
+
+    /// The deadline `listen()` gives every request, applied before the route
+    /// runs. Separate from `giveDeadline` because it has to be marked as the
+    /// default: a route's own deadline outlives a takeover, this one does not.
+    pub fn giveDefaultDeadline(self: *Ctx, ms: u32) void {
+        if (ms == 0) return;
+        self._deadlines.until_ns = bulkhead.monotonicNanos() + @as(u64, ms) * std.time.ns_per_ms;
+        self._deadline_default = true;
+    }
+
+    /// This request has taken the connection over — a body read in pieces, a
+    /// stream, a WebSocket. The three callers used to set `_took_over` by
+    /// hand; one place, so the deadline rule below cannot be forgotten at a
+    /// fourth.
+    ///
+    /// A default deadline is dropped here: `listen()`'s number is for the
+    /// requests that answer and go, and a stream cut off at thirty seconds
+    /// because every other route wanted thirty is the shape ADR 0267 refused.
+    /// A deadline the route asked for by name is kept, since that route knew
+    /// what it was.
+    fn tookOver(self: *Ctx) void {
+        self._took_over = true;
+        if (self._deadline_default) {
+            self._deadlines.until_ns = 0;
+            self._deadline_default = false;
+        }
     }
 
     /// How much body this request may read into the arena, in place of
@@ -915,6 +954,13 @@ pub const Ctx = struct {
     /// unread. A header with fewer entries than there are hops means the chain
     /// is not the one configured, so the socket's address is used rather than
     /// the closest guess.
+    ///
+    /// **Every `X-Forwarded-For` field is read, as one list in wire order.** A
+    /// proxy may add a field of its own rather than append to the one the
+    /// client sent — HAProxy does — and reading only the first field handed
+    /// that client its own forgery back. More than
+    /// `proxies.max_forwarded_fields` of them is a head nobody honest sends,
+    /// and is answered with the socket's address.
     pub fn clientIp(self: *const Ctx) Str {
         const hops = self._limits.trusted_hops;
         const named_proxies = self._limits.trusted_proxies;
@@ -922,37 +968,29 @@ pub const Ctx = struct {
             return Str.fromRequest(self._peer.address(), self._lifetime);
         }
 
-        const forwarded = self.header("X-Forwarded-For") orelse
-            return Str.fromRequest(self._peer.address(), self._lifetime);
+        // Every field of that name, in wire order, as slices into the head.
+        // Collected here rather than walked in place because the walk goes
+        // right to left and a header iterator only goes forward; eight
+        // slices on the stack is cheaper than a second pass per entry.
+        var fields: [proxies_mod.max_forwarded_fields][]const u8 = undefined;
+        var n: usize = 0;
+        var it = http1.HeaderIterator.from(self._head);
+        while (it.next()) |h| {
+            if (!std.ascii.eqlIgnoreCase(h.name, "X-Forwarded-For")) continue;
+            if (n == fields.len) return Str.fromRequest(self._peer.address(), self._lifetime);
+            fields[n] = h.value;
+            n += 1;
+        }
+        if (n == 0) return Str.fromRequest(self._peer.address(), self._lifetime);
 
         // Naming the network wins over counting it: an operator who described
         // their proxies meant that, and a hop count left over from before is
         // the thing the description exists to stop mattering.
-        if (named_proxies.len > 0) {
-            const found = proxies_mod.clientFrom(
-                named_proxies,
-                self._peer.address(),
-                self._peer.local,
-                forwarded.view(),
-            ) orelse return Str.fromRequest(self._peer.address(), self._lifetime);
-            return Str.fromRequest(found, self._lifetime);
-        }
-
-        // Walk right to left, counting entries. `hops` of them belong to
-        // proxies; the one before those is the client.
-        var rest = forwarded.view();
-        var seen: u8 = 0;
-        while (rest.len > 0) {
-            const at = std.mem.lastIndexOfScalar(u8, rest, ',');
-            const entry = std.mem.trim(u8, if (at) |i| rest[i + 1 ..] else rest, " \t");
-            seen += 1;
-            if (seen == hops) {
-                if (entry.len == 0) break;
-                return Str.fromRequest(entry, self._lifetime);
-            }
-            rest = if (at) |i| rest[0..i] else "";
-        }
-        return Str.fromRequest(self._peer.address(), self._lifetime);
+        const found = if (named_proxies.len > 0)
+            proxies_mod.clientFrom(named_proxies, self._peer.address(), self._peer.local, fields[0..n])
+        else
+            proxies_mod.clientByHops(hops, fields[0..n]);
+        return Str.fromRequest(found orelse self._peer.address(), self._lifetime);
     }
 
     /// Called by everything that is about to read from the connection.
@@ -1007,6 +1045,15 @@ pub const Ctx = struct {
     /// The whole request body, read once into the request arena. Chunked
     /// and Content-Length look the same from here — the handler asks for
     /// the body, not for the way it arrived.
+    ///
+    /// **A gzipped body comes back inflated, and the head still says gzip.**
+    /// `header("Content-Encoding")` and `header("Content-Length")` describe
+    /// what arrived on the wire, because the head is read in place and
+    /// nothing rewrites it (ADR 0107, ADR 0251). A handler that forwards
+    /// this body to another service along with the request's headers would
+    /// be sending plain bytes labelled `gzip`, at the wrong length: send
+    /// `body().len` as the length and no `Content-Encoding`, or forward the
+    /// wire bytes through `bodyStream()`, which hands them over as they came.
     pub fn body(self: *Ctx) !Str {
         if (self._body == null) {
             // Waiting for a client to finish sending is not the handler
@@ -1129,7 +1176,7 @@ pub const Ctx = struct {
         }
         if (self._request.chunked or self._request.content_length > 0) try self.aboutToReadBody();
 
-        self._took_over = true;
+        self.tookOver();
         self._incoming = .start(self._request, options.max_bytes);
         var incoming: body_mod.Body = .init(self._in, &self._incoming.?);
         incoming._watch = self._watch;
@@ -1626,7 +1673,7 @@ pub const Ctx = struct {
         if (!chunked and options.length == null) self._force_close = true;
 
         self.markAnswered(status);
-        self._took_over = true;
+        self.tookOver();
         self._stream = .{
             .chunked = chunked,
             .drop = self.method == .HEAD,
@@ -1777,7 +1824,7 @@ pub const Ctx = struct {
 
         // From here the answer is written, so nothing above may fail.
         self.markAnswered(101);
-        self._took_over = true;
+        self.tookOver();
         // The connection stops being HTTP at the blank line below, so it can
         // never carry another request.
         self._force_close = true;

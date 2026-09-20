@@ -18,6 +18,15 @@
 //! header from the right, drop entries that came from an address you named,
 //! and the first one that did not is the client.
 //!
+//! **The header is every field of that name, not the first.** A list header
+//! may arrive split across fields (RFC 9110 §5.3), and the fields read as one
+//! list in wire order — which is exactly what HAProxy's `option forwardfor`
+//! produces, since it adds a field of its own rather than appending to one the
+//! client sent. Reading the first field alone handed a client its own forgery
+//! back with the rules set: the proxy's honest field sat second and was never
+//! looked at. `Forwarded` below walks every field from the last entry of the
+//! last one, so where a proxy put its address makes no difference.
+//!
 //! **What it costs.** Parsing happens once, at `listen()`. Per request it is a
 //! prefix compare per entry per rule, on requests that call `clientIp()` and
 //! carry the header — nothing at all for everybody else, because `Ctx` reads
@@ -173,13 +182,60 @@ pub fn holds(rules: []const Cidr, address: []const u8) bool {
     return false;
 }
 
+/// The most `X-Forwarded-For` fields one head may carry before nilo stops
+/// reading any of them. Each proxy adds at most one, so eight is more chain
+/// than any deployment has; more than that is a client stuffing the head,
+/// and a header nilo cannot hold whole is answered with the socket's address
+/// rather than with whichever part of it fitted.
+pub const max_forwarded_fields = 8;
+
+/// The entries of every `X-Forwarded-For` field in a head, handed out from
+/// the rightmost — the one the proxy nearest this server wrote last — to the
+/// leftmost, which is whatever the client claimed.
+///
+/// Holds slices into the head and nothing else: no allocation, on a path
+/// that only a request asking `clientIp()` ever walks.
+pub const Forwarded = struct {
+    fields: []const []const u8,
+    /// What is left of the field being walked, right to left.
+    rest: []const u8,
+    /// Fields already walked to their leftmost entry.
+    done: usize,
+
+    pub fn init(fields: []const []const u8) Forwarded {
+        return .{
+            .fields = fields,
+            .rest = if (fields.len == 0) "" else fields[fields.len - 1],
+            .done = 0,
+        };
+    }
+
+    /// The next entry from the right, trimmed of the blanks around a comma.
+    /// Empty entries are handed out too — `a,,b` has three — so a caller that
+    /// counts sees the same list a caller that reads does.
+    pub fn next(self: *Forwarded) ?[]const u8 {
+        while (true) {
+            if (self.rest.len > 0) {
+                const at = std.mem.lastIndexOfScalar(u8, self.rest, ',');
+                const entry = std.mem.trim(u8, if (at) |i| self.rest[i + 1 ..] else self.rest, " \t");
+                self.rest = if (at) |i| self.rest[0..i] else "";
+                return entry;
+            }
+            if (self.done + 1 >= self.fields.len) return null;
+            self.done += 1;
+            self.rest = self.fields[self.fields.len - 1 - self.done];
+        }
+    }
+};
+
 /// The client's address, out of an `X-Forwarded-For` written by proxies whose
 /// own addresses are in `rules`.
 ///
-/// Walk right to left. The rightmost entry was written by the proxy nearest
-/// this server, so an entry that names a trusted address is a proxy of ours
-/// and is skipped; the first that does not is the client, and everything to
-/// the left of it is whatever the client claimed and is never looked at.
+/// Walk right to left, across every field. The rightmost entry was written by
+/// the proxy nearest this server, so an entry that names a trusted address is
+/// a proxy of ours and is skipped; the first that does not is the client, and
+/// everything to the left of it is whatever the client claimed and is never
+/// looked at.
 ///
 /// `peer` is the address the connection itself came from, and it is checked
 /// first: a header from a machine that is not one of ours is not read at all.
@@ -196,20 +252,36 @@ pub fn clientFrom(
     rules: []const Cidr,
     peer: []const u8,
     local: bool,
-    forwarded: []const u8,
+    fields: []const []const u8,
 ) ?[]const u8 {
     if (!local and !holds(rules, peer)) return null;
 
-    var rest = forwarded;
-    while (rest.len > 0) {
-        const at = std.mem.lastIndexOfScalar(u8, rest, ',');
-        const entry = std.mem.trim(u8, if (at) |i| rest[i + 1 ..] else rest, " \t");
+    var entries = Forwarded.init(fields);
+    while (entries.next()) |entry| {
         if (entry.len > 0 and !holds(rules, entry)) return entry;
-        rest = if (at) |i| rest[0..i] else "";
     }
     // Every entry was one of ours, which happens when a proxy of ours is
     // itself the client — a health check from the load balancer. The socket's
     // address is the honest answer.
+    return null;
+}
+
+/// The client's address by count: `hops` entries from the right belong to
+/// proxies, and the one before those is the client. Null when the list is
+/// shorter than that, or the entry there is empty — the chain is not what the
+/// count says it is, and the socket's address is used rather than a guess.
+///
+/// The older, arithmetic answer; `clientFrom` is the one that survives a
+/// deployment growing a hop. Both walk the same `Forwarded`, so both read every
+/// field.
+pub fn clientByHops(hops: u8, fields: []const []const u8) ?[]const u8 {
+    if (hops == 0) return null;
+    var entries = Forwarded.init(fields);
+    var seen: u8 = 0;
+    while (entries.next()) |entry| {
+        seen += 1;
+        if (seen == hops) return if (entry.len == 0) null else entry;
+    }
     return null;
 }
 
@@ -285,21 +357,21 @@ test "the client is the first entry the trusted set does not hold" {
     // One proxy of ours, and the client to the left of it.
     try testing.expectEqualStrings(
         "203.0.113.9",
-        clientFrom(&rules, "10.0.0.7", false, "203.0.113.9, 10.0.0.7").?,
+        clientFrom(&rules, "10.0.0.7", false, &.{"203.0.113.9, 10.0.0.7"}).?,
     );
 
     // Two of ours, however many the operator thought there were — which is
     // the number a hop count would have had to get right.
     try testing.expectEqualStrings(
         "203.0.113.9",
-        clientFrom(&rules, "10.0.0.7", false, "203.0.113.9, 10.0.0.4, 10.0.0.7").?,
+        clientFrom(&rules, "10.0.0.7", false, &.{"203.0.113.9, 10.0.0.4, 10.0.0.7"}).?,
     );
 
     // A client that forged entries of its own: they sit to the left of the
     // first untrusted entry and are never reached.
     try testing.expectEqualStrings(
         "203.0.113.9",
-        clientFrom(&rules, "10.0.0.7", false, "10.9.9.9, 1.1.1.1, 203.0.113.9, 10.0.0.7").?,
+        clientFrom(&rules, "10.0.0.7", false, &.{"10.9.9.9, 1.1.1.1, 203.0.113.9, 10.0.0.7"}).?,
     );
 }
 
@@ -307,15 +379,15 @@ test "a header from a machine that is not ours is not read at all" {
     const rules = cidrs(&.{"10.0.0.0/8"});
     // The connection came straight off the internet. Whatever it says about
     // who it is forwarding for is its own invention.
-    try testing.expect(clientFrom(&rules, "203.0.113.9", false, "1.2.3.4") == null);
+    try testing.expect(clientFrom(&rules, "203.0.113.9", false, &.{"1.2.3.4"}) == null);
 }
 
 test "a request from the proxy itself falls back to the socket" {
     const rules = cidrs(&.{"10.0.0.0/8"});
     // A health check from the load balancer: every entry is one of ours, so
     // there is no client behind them to name.
-    try testing.expect(clientFrom(&rules, "10.0.0.7", false, "10.0.0.4") == null);
-    try testing.expect(clientFrom(&rules, "10.0.0.7", false, "") == null);
+    try testing.expect(clientFrom(&rules, "10.0.0.7", false, &.{"10.0.0.4"}) == null);
+    try testing.expect(clientFrom(&rules, "10.0.0.7", false, &.{""}) == null);
 }
 
 test "a connection over a unix socket may carry a forwarded header" {
@@ -327,7 +399,7 @@ test "a connection over a unix socket may carry a forwarded header" {
     const rules = cidrs(&.{"10.0.0.0/8"});
     try testing.expectEqualStrings(
         "203.0.113.9",
-        clientFrom(&rules, "", true, "203.0.113.9").?,
+        clientFrom(&rules, "", true, &.{"203.0.113.9"}).?,
     );
 
     // Reading the header is still something the operator turns on: with no
@@ -337,7 +409,7 @@ test "a connection over a unix socket may carry a forwarded header" {
     // skipped, exactly as over TCP.
     try testing.expectEqualStrings(
         "203.0.113.9",
-        clientFrom(&rules, "", true, "203.0.113.9, 10.0.0.7").?,
+        clientFrom(&rules, "", true, &.{"203.0.113.9, 10.0.0.7"}).?,
     );
 }
 
@@ -348,6 +420,49 @@ test "an entry that is not an address is not trusted" {
     // it into whatever the client claimed.
     try testing.expectEqualStrings(
         "unknown",
-        clientFrom(&rules, "10.0.0.7", false, "1.1.1.1, unknown, 10.0.0.7").?,
+        clientFrom(&rules, "10.0.0.7", false, &.{"1.1.1.1, unknown, 10.0.0.7"}).?,
     );
+}
+
+test "the fields of a split header read as one list, in wire order" {
+    const rules = cidrs(&.{"10.0.0.0/8"});
+
+    // What HAProxy's `option forwardfor` sends when the client already sent
+    // a field: the forgery first, the proxy's own field after it. Read as
+    // one list the rightmost entry is the proxy's and the client is the
+    // entry before it — not the forgery, which is what reading the first
+    // field alone returned.
+    try testing.expectEqualStrings(
+        "203.0.113.9",
+        clientFrom(&rules, "10.0.0.7", false, &.{ "1.2.3.4", "203.0.113.9, 10.0.0.7" }).?,
+    );
+    // A chain of two proxies each adding a field of its own.
+    try testing.expectEqualStrings(
+        "203.0.113.9",
+        clientFrom(&rules, "10.0.0.7", false, &.{ "203.0.113.9", "10.0.0.4", "10.0.0.7" }).?,
+    );
+    // The count walks the same list: three fields, one entry each.
+    try testing.expectEqualStrings("203.0.113.9", clientByHops(3, &.{ "203.0.113.9", "10.0.0.4", "10.0.0.7" }).?);
+    try testing.expectEqualStrings("10.0.0.4", clientByHops(2, &.{ "203.0.113.9", "10.0.0.4", "10.0.0.7" }).?);
+}
+
+test "a count past the end of the list, or landing on a blank, is no answer" {
+    try testing.expect(clientByHops(2, &.{"203.0.113.9"}) == null);
+    try testing.expect(clientByHops(1, &.{"203.0.113.9, "}) == null);
+    try testing.expect(clientByHops(0, &.{"203.0.113.9"}) == null);
+    try testing.expect(clientByHops(1, &.{}) == null);
+    // Blank entries are counted, as they were: `a,,b` is three entries.
+    try testing.expectEqualStrings("a", clientByHops(3, &.{"a,,b"}).?);
+}
+
+test "the walk hands out entries from the last field's right end to the first field's left" {
+    var it = Forwarded.init(&.{ "a, b", "", "c" });
+    try testing.expectEqualStrings("c", it.next().?);
+    try testing.expectEqualStrings("b", it.next().?);
+    try testing.expectEqualStrings("a", it.next().?);
+    try testing.expect(it.next() == null);
+    try testing.expect(it.next() == null);
+
+    var none = Forwarded.init(&.{});
+    try testing.expect(none.next() == null);
 }

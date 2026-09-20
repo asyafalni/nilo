@@ -1332,6 +1332,9 @@ const Quiet = struct {
         .release_stack = struct {
             fn f(_: ?*anyopaque) void {}
         }.f,
+        .half_close = struct {
+            fn f(_: ?*anyopaque) void {}
+        }.f,
     };
 };
 
