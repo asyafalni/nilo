@@ -80,6 +80,35 @@ more than one core. See [Services](./services.md).
 On the request path, a routed GET returning JSON with CORS installed makes
 **one allocation** — the JSON body, and nothing else. A test holds it there.
 
+## When a bound is hit
+
+Every limit above is a number with a behaviour behind it, and during an
+incident the behaviour is the half that matters: what the client saw, what the
+log said, and what has to happen before the server takes that work again. One
+row per bound, so the answer is a lookup rather than a read. The sections that
+follow say why each one is shaped the way it is.
+
+| Bound | Default | Past it | What lets it go again |
+|---|---|---|---|
+| `max_connections` | 10,000 | The connection is accepted and closed at once — nothing read, no status written, so the client usually sees a reset. The log says so once a minute with a running count | A held connection ends: a keep-alive one idles out, a WebSocket tab closes, a stream finishes |
+| `max_in_flight` | off | The head is read, then `503` with `Retry-After: 1` and `Connection: close` — one write of a constant, no queue. Counted under `<shed>` on the metrics page | A request inside its handler finishes |
+| `header_timeout_ms` | 10,000 | A client partway through a head gets a `408` and the connection is closed. One that sent nothing is closed without a status — there is nothing to answer | Nothing to release: the connection is gone |
+| `read_buffer` | 8 KiB | A head that does not fit is a `431`, and the connection is closed | Nothing to release |
+| `idle_timeout_ms` | 75,000 | A keep-alive connection that has asked for nothing is closed, no status | Nothing to release |
+| `body_timeout_ms` | 30,000 | A read of the body that outlasts it fails the handler's `c.body()` with a `408`, and the connection is closed. `c.bodyStream()` sees the same read fail | Nothing to release |
+| `body_min_rate` after `body_grace_ms` | 8 KiB/s after 10,000 | A body `c.body()` is assembling gets a deadline worked out from its announced length; too slow is a `408` however steady the bytes were. `c.bodyStream()` is not under it | Nothing to release |
+| `max_body`, or `nilo.maxBody` on the route | 1 MiB | `c.body()` refuses with a `413` before reading past it. A body nobody read that is over it is not drained after the answer: the response goes out and the connection is closed rather than read to the end | Nothing to release — the next request needs a new connection |
+| `write_timeout_ms` | 30,000 | One write to the client that outlasts it gives the response up: no status can be sent by then, the connection is closed, and the log says `gave up writing after 30000ms — the client stopped reading` rather than blaming the handler | Nothing to release |
+| `shutdown_grace_ms` | 10,000 | A stop waits this long for requests inside their handlers. Idle connections are closed at once, not waited for. Past it the rest are cut off and the log says how many | — |
+| `arena_keep` | 16 KiB | Not a refusal: a response assembled in `c.arena()` that is larger than this is built in memory the arena gives back after the request, so the next one faults it in a page at a time ([ADR 0096](../adr/0096-a-response-larger-than-the-arena-keep-is-a-page-fault-per-page.md)) | Raise it just past the largest response, and no further — it is held per connection |
+
+Two things are true of every row. **A status goes out only when nothing has
+been written yet**: a `408` or `413` reached mid-response cannot take back the
+half that is already on the wire, so the connection is closed instead. And
+**none of the deadlines bounds a request** — an hour-long stream, a WebSocket, a 4 GB upload through
+`c.bodyStream()` are all fine — because each bounds one wait for the network
+and nothing else, which is the next section.
+
 ## Deadlines
 
 The four `_timeout_ms` knobs above bound how long the server waits on a client,

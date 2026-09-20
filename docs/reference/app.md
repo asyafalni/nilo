@@ -103,7 +103,9 @@ Leaving it alone is right for a server whose responses fit in 16 KiB.
 
 Each of the four deadlines bounds one wait for the network, not a request, so a
 long upload or an hour-long stream is not hurried by any of them. `0` turns one
-off. See [Deploying](../guide/deploying.md#deadlines).
+off. See [Deploying](../guide/deploying.md#deadlines) — and what each bound in
+this table does once it is reached, the status and the log line, is one table
+under [When a bound is hit](../guide/deploying.md#when-a-bound-is-hit).
 
 Past `max_connections` a connection is accepted and closed at once — no request
 read, no status sent

@@ -20,6 +20,13 @@ cannot hold goes to [`docs/risks.md`](./docs/risks.md).
 Work lands here under `### Breaking`, `### Added`, `### Fixed` and `### Docs`,
 newest first.
 
+### Docs
+
+- [Deploying](./docs/guide/deploying.md#when-a-bound-is-hit) has one table
+  for every bound `listen()` takes: what a client sees past it, what the log
+  says, and what has to happen before the server takes that work again. The
+  prose under it was already there; the lookup was not.
+
 ### Fixed
 
 - A chunked request body nobody read no longer panics on a chunk size that
