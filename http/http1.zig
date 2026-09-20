@@ -1796,6 +1796,291 @@ test "the fused parser agrees with a plain line-by-line one" {
     }
 }
 
+// ---- the same bytes, arriving in pieces ----
+//
+// Every test above hands the parser a `Reader.fixed`, where the input *is*
+// the buffer and no read ever refills it. A socket is not like that: the
+// head arrives across as many reads as the network cares to make, and the
+// place a read ends is chosen by the sender. Everything that resumes across
+// a read boundary — `readHead`'s scan, a chunk size line, a chunk's own
+// CRLF, the two runs of a sized body — has a seam there, and a seam that
+// reads one way whole and another way split is where a smuggled request
+// travels. So the crafted heads and bodies are run again, at every split
+// and at several steady trickles, against the same bytes arriving at once.
+
+/// A connection that hands its bytes over in pieces, into a buffer of its
+/// own. `first` is how much the opening read delivers and `per_read` how
+/// much each one after it does — so `first = k` with an unbounded `per_read`
+/// is one split at *k*, and `first = 0` with `per_read = 1` is a byte at a
+/// time. Neither exceeds what the buffer has room for, which is what a
+/// socket read does too.
+const Pieces = struct {
+    rest: []const u8,
+    first: usize,
+    per_read: usize,
+    reader: std.Io.Reader,
+
+    fn init(source: []const u8, first: usize, per_read: usize, buffer: []u8) Pieces {
+        return .{
+            .rest = source,
+            .first = first,
+            .per_read = per_read,
+            .reader = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = buffer,
+                .end = 0,
+                .seek = 0,
+            },
+        };
+    }
+
+    fn stream(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const self: *Pieces = @alignCast(@fieldParentPtr("reader", r));
+        if (self.rest.len == 0) return error.EndOfStream;
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        const want = if (self.first > 0) self.first else self.per_read;
+        const n = @min(dest.len, want, self.rest.len);
+        @memcpy(dest[0..n], self.rest[0..n]);
+        self.rest = self.rest[n..];
+        self.first = 0;
+        w.advance(n);
+        return n;
+    }
+};
+
+/// What one request on a connection came to, with every slice copied out
+/// of the reader's buffer so two of them can be held side by side after
+/// the buffer has been reused. `left` is whatever followed the request —
+/// where the next one would start, which is the byte that has to agree.
+const Seen = struct {
+    err: ?anyerror = null,
+    head: []const u8 = "",
+    method: []const u8 = "",
+    target: []const u8 = "",
+    authority: []const u8 = "",
+    minor_version: u1 = 1,
+    keep_alive: bool = true,
+    content_length: u64 = 0,
+    has_content_length: bool = false,
+    chunked: bool = false,
+    content_encoding: Encoding = .identity,
+    has_host: bool = false,
+    upgrade: bool = false,
+    expect_continue: bool = false,
+    body: []const u8 = "",
+    left: []const u8 = "",
+};
+
+/// The two things `App` does with a body once the head is parsed: read it
+/// into the arena, or step over it because nobody asked.
+const Consume = enum { read, discard };
+
+/// The limit both body paths run under here. Small, so a body over it is
+/// one of the cases rather than something the wires cannot reach.
+const pieces_body_limit = 64;
+
+fn observe(in: *std.Io.Reader, arena: std.mem.Allocator, how: Consume) !Seen {
+    var seen = Seen{};
+    const head = readHead(in, .off) catch |err| {
+        seen.err = err;
+        return seen;
+    };
+    seen.head = try arena.dupe(u8, head);
+    var r = Request{};
+    parseHead(head, &r) catch |err| {
+        seen.err = err;
+        return seen;
+    };
+    in.toss(head.len);
+    seen.method = try arena.dupe(u8, r.method);
+    seen.target = try arena.dupe(u8, r.target);
+    seen.authority = try arena.dupe(u8, r.authority);
+    seen.minor_version = r.minor_version;
+    seen.keep_alive = r.keep_alive;
+    seen.content_length = r.content_length;
+    seen.has_content_length = r.has_content_length;
+    seen.chunked = r.chunked;
+    seen.content_encoding = r.content_encoding;
+    seen.has_host = r.has_host;
+    seen.upgrade = r.upgrade;
+    seen.expect_continue = r.expect_continue;
+
+    switch (how) {
+        .read => if (r.chunked) {
+            seen.body = readChunkedBody(in, arena, pieces_body_limit) catch |err| {
+                seen.err = err;
+                return seen;
+            };
+        } else if (r.content_length > 0) {
+            seen.body = readSizedBody(in, arena, @intCast(r.content_length), .off) catch |err| {
+                seen.err = err;
+                return seen;
+            };
+        },
+        .discard => discardBody(in, &r, pieces_body_limit) catch |err| {
+            seen.err = err;
+            return seen;
+        },
+    }
+    seen.left = in.allocRemaining(arena, .unlimited) catch |err| {
+        seen.err = err;
+        return seen;
+    };
+    return seen;
+}
+
+fn expectSame(want: Seen, got: Seen) !void {
+    try testing.expectEqual(want.err, got.err);
+    try testing.expectEqualStrings(want.head, got.head);
+    try testing.expectEqualStrings(want.method, got.method);
+    try testing.expectEqualStrings(want.target, got.target);
+    try testing.expectEqualStrings(want.authority, got.authority);
+    try testing.expectEqual(want.minor_version, got.minor_version);
+    try testing.expectEqual(want.keep_alive, got.keep_alive);
+    try testing.expectEqual(want.content_length, got.content_length);
+    try testing.expectEqual(want.has_content_length, got.has_content_length);
+    try testing.expectEqual(want.chunked, got.chunked);
+    try testing.expectEqual(want.content_encoding, got.content_encoding);
+    try testing.expectEqual(want.has_host, got.has_host);
+    try testing.expectEqual(want.upgrade, got.upgrade);
+    try testing.expectEqual(want.expect_continue, got.expect_continue);
+    try testing.expectEqualStrings(want.body, got.body);
+    try testing.expectEqualStrings(want.left, got.left);
+}
+
+test "a request arriving in pieces agrees with the same bytes arriving at once" {
+    const gpa = testing.allocator;
+    // The wires that have to be built live for the whole test; what each
+    // observation copies out lives until the next wire.
+    var wire_arena = std.heap.ArenaAllocator.init(gpa);
+    defer wire_arena.deinit();
+    const a = wire_arena.allocator();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    // A header name long enough that its colon crosses a scan block, and a
+    // sized body long enough to take both of `readSizedBody`'s runs.
+    const long_name = try a.alloc(u8, 70);
+    @memset(long_name, 'x');
+    long_name[0] = 'C';
+    const long_head = try std.mem.concat(a, u8, &.{
+        "GET / HTTP/1.1\r\nHost: t\r\n", long_name, ": v\r\nConnection: close\r\n\r\nNEXT",
+    });
+    const big_len = sized_body_step * 2 + 7;
+    const big_body = try a.alloc(u8, big_len);
+    for (big_body, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 26));
+    const big = try std.fmt.allocPrint(
+        a,
+        "POST /up HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n{s}NEXT",
+        .{ big_len, big_body },
+    );
+    const over = try a.alloc(u8, pieces_body_limit + 1);
+    @memset(over, 'z');
+    const chunk_over = try std.fmt.allocPrint(
+        a,
+        "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n{x}\r\n{s}\r\n0\r\n\r\nNEXT",
+        .{ over.len, over },
+    );
+
+    // `NEXT` after a complete request stands for the one behind it: both
+    // sides have to leave the connection exactly there.
+    const wires = [_][]const u8{
+        "GET / HTTP/1.1\r\nHost: t\r\n\r\nNEXT",
+        "GET /users/7?x=1 HTTP/1.1\r\nHost: example.dev\r\nUser-Agent: wrk\r\n" ++
+            "Accept: */*\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\nNEXT",
+        "GET / HTTP/1.1\nHost: x\n\nNEXT",
+        "GET / HTTP/1.0\r\n\r\nNEXT",
+        "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\nNEXT",
+        "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\nNEXT",
+        "GET / HTTP/1.1\r\nHost: example.dev:8080\r\n" ++
+            "If-Modified-Since: Mon, 01 Jan 2024 00:00:00 GMT\r\nContent-Length: 3\r\n\r\nabcNEXT",
+        long_head,
+        // Bodies of an announced length: short, across the step, and one
+        // the client never finishes.
+        "POST /send HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhelloNEXT",
+        "POST / HTTP/1.1\r\nHost: t\r\nContent-Length:  42  \r\n\r\n" ++ ("0123456789" ** 4) ++ "01NEXT",
+        big,
+        "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\nabc",
+        "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 6\r\nContent-Length: 6\r\n\r\nabcdefNEXT",
+        // Chunked: extensions, trailers, bare LF, and the seams a chunk has.
+        "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "5\r\nhello\r\n1;ext=1\r\n \r\n5\r\nworld\r\n0\r\nX-Trailer: a\r\n\r\nNEXT",
+        "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\nabc\n0\n\nNEXT",
+        "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\nNEXT",
+        "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloX\r\n0\r\n\r\nNEXT",
+        "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffffff\r\n",
+        "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n1_0\r\n",
+        "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n 5\r\nhello\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n",
+        chunk_over,
+        // Framed twice, or not at all.
+        "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\nabcdef",
+        "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 6\r\nContent-Length: 7\r\n\r\nabcdef",
+        "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: xchunked\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: +5\r\n\r\n",
+        // The target, the host, and the headers the rest of nilo reads.
+        "GET http://example.com:8080/users/7?x=1 HTTP/1.1\r\nHost: ignored\r\n\r\nNEXT",
+        "GET / HTTP/1.1\r\n\r\nNEXT",
+        "GET / HTTP/1.1\r\nHost: t\r\nHost: t\r\n\r\nNEXT",
+        "POST / HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabcNEXT",
+        "GET /chat HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nNEXT",
+        "POST / HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\nContent-Length: 2\r\n\r\nhiNEXT",
+        "POST / HTTP/1.1\r\nHost: t\r\nContent-Encoding: br\r\nContent-Length: 2\r\n\r\nhiNEXT",
+        // Malformed lines, and a head that never ends.
+        "GET / HTTP/1.1\r\nHost: t\r\nX: a:b:c:d:e\r\nNope\r\n\r\nNEXT",
+        "GET / HTTP/1.1\r\nHost : t\r\n\r\nNEXT",
+        "GET /\r\nHost: t\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: x\r\n",
+        "GET / HTTP/1.1",
+        // Two whole requests, the second with a body of its own: only the
+        // first is consumed, and the second is what is left.
+        "POST /a HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc" ++
+            "POST /b HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\nxy",
+    };
+
+    // The buffer a server reads into by default. Roomy against every wire
+    // here, so a head that never ends is the client going away on both
+    // sides rather than a full buffer on one.
+    var buffer: [8 * 1024]u8 = undefined;
+    const whole = std.math.maxInt(usize);
+
+    for (wires) |wire| {
+        for ([_]Consume{ .read, .discard }) |how| {
+            var at_once = Pieces.init(wire, 0, whole, &buffer);
+            const want = try observe(&at_once.reader, scratch, how);
+
+            // Every two-way split, or every few bytes of one when the
+            // wire is long enough that every byte would be a while.
+            const stride = @max(1, wire.len / 256);
+            var k: usize = 1;
+            while (k < wire.len) : (k += stride) {
+                var split = Pieces.init(wire, k, whole, &buffer);
+                const got = try observe(&split.reader, scratch, how);
+                expectSame(want, got) catch |err| {
+                    std.debug.print("split at {d} of {d} bytes, {s}:\n{s}\n", .{ k, wire.len, @tagName(how), wire });
+                    return err;
+                };
+            }
+
+            // Steady trickles, including the three around a scan block.
+            for ([_]usize{ 1, 2, 3, 7, 16, lanes - 1, lanes, lanes + 1 }) |per_read| {
+                var trickle = Pieces.init(wire, 0, per_read, &buffer);
+                const got = try observe(&trickle.reader, scratch, how);
+                expectSame(want, got) catch |err| {
+                    std.debug.print("{d} bytes a read, {s}:\n{s}\n", .{ per_read, @tagName(how), wire });
+                    return err;
+                };
+            }
+        }
+        _ = arena.reset(.retain_capacity);
+    }
+}
+
 test "staticResponse and writeResponse produce the same bytes" {
     const fixed = comptime staticResponse(200, "OK", "text/plain", "hello\n", true);
     var buf: [256]u8 = undefined;

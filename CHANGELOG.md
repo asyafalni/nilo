@@ -20,6 +20,16 @@ cannot hold goes to [`docs/risks.md`](./docs/risks.md).
 Work lands here under `### Breaking`, `### Added`, `### Fixed` and `### Docs`,
 newest first.
 
+### Added
+
+- Every crafted request in the parser's tests — the framing conflicts, the
+  strict chunk sizes, the absolute-form target, the head that never ends — is
+  now also run split at every byte and trickled a few bytes a read, and has to
+  come out identical to the same bytes arriving at once, down to where the
+  next request starts. The parser's own tests only ever read from a buffer
+  holding the whole input, so every seam that resumes across a read boundary
+  was untested at exactly the boundary. `http/http1.zig`, one test.
+
 ### Docs
 
 - [Deploying](./docs/guide/deploying.md#when-a-bound-is-hit) has one table
