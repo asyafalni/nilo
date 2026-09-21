@@ -77,7 +77,12 @@ them for the responses you send rather than for the connections you hold —
 
 `threads = 1` makes handlers stop running at the same time, which removes the
 reason for `nilo.Mutex` — and also removes the reason to have a machine with
-more than one core. See [Services](./services.md).
+more than one core. See [Services](./services.md). Whatever the count, a
+connection is served by the thread it was dealt to, and a handler runs on
+that one OS thread from its first line to its last, across every wait in
+it — no work stealing between threads, because what stealing cost was a
+second wakeup on every request of a server that is not busy
+([ADR 0272](../adr/0272-a-connection-is-served-by-the-thread-it-was-dealt-to.md)).
 
 On the request path, a routed GET returning JSON with CORS installed makes
 **one allocation** — the JSON body, and nothing else. A test holds it there.

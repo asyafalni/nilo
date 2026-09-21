@@ -111,6 +111,14 @@ newest first.
 
 ### Fixed
 
+- A server that is not busy spends a third less CPU per request. zio's
+  scheduler dozes for 100 µs before each park so that work stealing does not
+  churn, and on a thread with nothing coming that is a second context switch
+  per request: 100 µs of CPU a request at 500 req/s on two threads, 70 with
+  stealing off, and +3% at saturation. Stealing is now off, and a handler
+  runs on one OS thread from its first line to its last, across every wait
+  in it. `bench/paced.py` is the instrument
+  ([ADR 0272](./docs/adr/0272-a-connection-is-served-by-the-thread-it-was-dealt-to.md)).
 - `c.clientIp()` reads every `X-Forwarded-For` field, as one list in wire
   order, rather than the first. HAProxy's `option forwardfor` adds a field of
   its own instead of appending to the client's, so a forged header arrived as

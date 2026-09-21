@@ -944,7 +944,21 @@ pub fn serve(
     else
         @intCast(@min(std.Thread.getCpuCount() catch 1, 255));
 
-    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(threads) });
+    // No work stealing between executors. A connection is served by the
+    // thread that was dealt it, start to finish — its socket's completions
+    // land on that thread's ring whatever the scheduler does, so a stolen
+    // fiber only moves the *running* of a request away from where its I/O
+    // is. What stealing costs is paid on every wake: an executor that has
+    // just run a task dozes for 100 µs before it parks, so that its own
+    // loop can hand work back before a thief takes it, and on a server
+    // that is not busy that doze is a second context switch per request —
+    // 100 µs of CPU a request at 500 req/s against 70 without it, 44
+    // against 34 at 8,000, and +3% at saturation, four pairs of four
+    // ([ADR 0272](../../docs/adr/0272-a-connection-is-served-by-the-thread-it-was-dealt-to.md)).
+    const rt = try zio.Runtime.init(gpa, .{
+        .executors = .exact(threads),
+        .enable_task_migration = false,
+    });
     defer rt.deinit();
 
     // **Registered second, so it runs second to last** — after the group

@@ -1810,6 +1810,114 @@ measured is where that would show, and an accept per executor
 (`SO_REUSEPORT`, or handing accepted sockets round-robin the way actix
 does) is the shape if it does.
 
+## What a request costs when the server is not busy
+
+Every figure above is taken at saturation, and a server at saturation is
+the one place a wakeup is free: the thread was awake anyway. HttpArena's
+`latency-10k` profile asks the other question — 1,024 connections at
+10,000 req/s over sixty-four threads — and reported nilo at 40 µs of CPU
+a request against 18 µs for the same server near saturation on eight CPUs,
+where tokio reads 21 in both. [ADR 0272](../../docs/adr/0272-a-connection-is-served-by-the-thread-it-was-dealt-to.md)
+is the decision; this is the run.
+
+**The instrument is `bench/paced.py`**: a fixed offered rate, round-robin
+over keep-alive connections with one request in flight per connection,
+and the server's `utime + stime` from `/proc/<pid>/stat` — plus its
+voluntary context switches from `/proc/<pid>/task/*/status` and its minor
+faults — read before and after the window. Python paces it, so the client's
+own cost shows in the latency columns and nowhere else. **The box is the
+two-vCPU one the `Date` section names**, `nilo-hello` from `91f7c0d` with
+two env knobs patched into a scratch copy of the tree (`NILO_THREADS`,
+`NILO_MIGRATION`) so that four variants came out of one build.
+
+`/health`, 64 connections, 6 s windows after 2 s warm-up:
+
+| threads | migration | rate | CPU/req | switches/req | p50 | p99 |
+|---:|---|---:|---:|---:|---:|---:|
+| 2 | on | 500 | **100.0 µs** | 2.02 | 140 µs | 768 µs |
+| 2 | on | 2,000 | 64.2 µs | 1.23 | 133 µs | 751 µs |
+| 2 | on | 8,000 | 43.8 µs | 0.62 | 212 µs | 1,420 µs |
+| 2 | off | 500 | **70.0 µs** | 1.02 | 124 µs | 876 µs |
+| 2 | off | 2,000 | 55.0 µs | 0.87 | 142 µs | 795 µs |
+| 2 | off | 8,000 | 34.0 µs | 0.39 | 200 µs | 1,352 µs |
+| 1 | on | 500 | 70.0 µs | 1.02 | 126 µs | 875 µs |
+| 1 | on | 2,000 | 41.7 µs | 0.51 | 111 µs | 606 µs |
+| 1 | on | 8,000 | 24.6 µs | 0.13 | 181 µs | 1,007 µs |
+| 1 | off | 500 | 66.7 µs | 1.02 | 125 µs | 592 µs |
+| 1 | off | 2,000 | 41.7 µs | 0.51 | 113 µs | 662 µs |
+| 1 | off | 8,000 | 25.0 µs | 0.15 | 187 µs | 1,114 µs |
+
+The first block against the second is the finding: **two voluntary
+context switches a request against one, and 30% more CPU for it.** The
+second switch is zio's doze — a 100 µs timed park an executor takes after
+running work, so its own loop can hand tasks back before a thief takes
+them — and on a thread with nothing coming it is a sleep, a timer, a wake
+to nothing and a second sleep. The one-thread rows are the control: with
+nobody to steal from zio skips the doze, and migration on and off read
+the same to the microsecond. The remaining gap between one thread and
+two with migration off (25 vs 34 µs at 8,000) is batching: one executor
+at 8,000 req/s stays awake for several requests (0.13 switches a request),
+two executors at 4,000 each do not (0.39).
+
+The same at 1,024 connections on `/users/1`, which is the arena's
+connection count and a JSON body, twice each:
+
+| migration | rate | CPU/req | switches/req | faults/req |
+|---|---:|---:|---:|---:|
+| on | 2,000 | 146.7 / 150.0 µs | 2.59 / 2.64 | — |
+| off | 2,000 | 116.7 / 117.5 µs | 1.61 / 1.59 | 3.00 |
+| on | 8,000 | 53.8 / 54.8 µs | 0.98 / 1.02 | — |
+| off | 8,000 | 49.4 / 50.2 µs | 0.76 / 0.78 | — |
+
+Same direction, −20% at 2,000 and −8% at 8,000. **And a second finding
+the row was not looking for**: at 2,000 req/s over 1,024 connections a
+request costs 117 µs against 59 at 64 or 256 connections, on the same
+route at the same rate. The difference is that a connection sees a
+request every 512 ms at 1,024 and every 32 ms at 64, and `idle_peek_ms`
+is 200: past it the connection hands its pages back (ADR 0071) — a timer
+wake, three `madvise` calls, and three minor faults on the next request,
+which on this VM is ~57 µs. That is the trade ADR 0071 made, memory for
+CPU on a connection that has gone quiet, and it is the right trade for a
+person behind a browser; it is now a number rather than a sentence. Not
+acted on. The arena's `latency-10k` sits at ~100 ms between requests on a
+connection, inside the window, so it does not pay this.
+
+Saturation, so the other side of the trade is on the record: `wrk -t1
+-c64 -d8s` after a 3 s warm-up, two threads, four interleaved pairs.
+
+| pair | migration on | migration off | off vs on |
+|---:|---:|---:|---:|
+| 1 | 46,132 req/s, p99 4.22 ms | 47,267, p99 3.59 ms | +2.5% |
+| 2 | 46,465, p99 3.97 ms | 48,322, p99 3.91 ms | +4.0% |
+| 3 | 47,072, p99 3.73 ms | 47,457, p99 3.80 ms | +0.8% |
+| 4 | 45,757, p99 4.08 ms | 47,653, p99 3.63 ms | +4.1% |
+
+Four of four the same sign, mean +2.9%. Not the spread-changing-sign
+result the `Date` and atomics sections got on this box: turning stealing
+off takes the `seq_cst` traffic on `idle_mask` and the searcher election
+out of every park, and a busy executor parks often.
+
+### Can it be pushed further
+
+Yes, and the levers are ranked by the table. The single-executor row at
+8,000 req/s is 25 µs a request and the two-executor row is 34, so **9 µs
+a request is the price of the second thread's wakeups** — an executor
+that could be told "stay awake a little" would batch the way one thread
+does. That is Go's spinning-M and it burns CPU to save CPU; the honest
+version is a `poll` with a short timeout only when the *previous* poll
+returned work, which is zio's doze with the condition inverted, and is
+the upstream issue ADR 0272 describes. Below that, the 25 µs floor is
+one `io_uring_enter` to wake and one to submit, and one context switch;
+what is left is the request itself.
+
+The `idle_peek_ms` finding has a lever too: `MADV_FREE` instead of
+`DONTNEED` for the two buffers would make the give-back lazy — no fault
+on the next request unless the kernel actually took the page — at the
+cost of `VmRSS` no longer showing the saving, which is the number ADR
+0071 was measured by. A run with `--conns 1024 --rate 2000` before and
+after, plus `bench/mem.py` to see what RSS does under pressure, would
+settle whether the 57 µs is worth the honesty of the RSS figure.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

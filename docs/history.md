@@ -3830,6 +3830,23 @@ server. 1,024 was the first answer and a burst of four thousand refused it;
 ([ADR 0271](./adr/0271-a-backlog-is-sized-for-the-burst-not-the-load.md),
 [`http.md`](../bench/result/http.md#what-a-listen-backlog-of-128-drops)).
 
+**Every number in the file was taken at saturation, and a server at
+saturation is the one place a wakeup is free.** HttpArena's `latency-10k`
+profile — a server that is nearly idle — read nilo at 40 µs of CPU a request
+against 18 for the same code near saturation, and the engine measurement of
+the day before, which had put zio at ~10% of CPU and closed the question of
+writing one, had been taken under `wrk -c64` on two cores: busy. The idle
+number was a second context switch per request — zio's 100 µs doze before
+a park, there to protect work stealing from churn — and turning stealing
+off took it from 100 µs a request to 70 at 500 req/s, and read +3% at
+saturation four pairs of four. **A premise measured under one load does not
+hold under another, and "zio is 10% of CPU" was a saturation figure quoted
+as a property of zio** ([ADR 0272](./adr/0272-a-connection-is-served-by-the-thread-it-was-dealt-to.md),
+[`http.md`](../bench/result/http.md#what-a-request-costs-when-the-server-is-not-busy)).
+The same instrument put a number on a trade ADR 0071 made in words: a
+connection quiet past `idle_peek_ms` pays ~57 µs on its next request for
+the pages it gave back.
+
 **A `std.log.warn` call site is two kilobytes of binary, fired or not.** A
 warning for a failure shape that outgrew its buffer measured 2,121 bytes
 with two `{d}`s, 1,446 with none, and the same again inlined when it shared
