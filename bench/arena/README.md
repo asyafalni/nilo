@@ -16,8 +16,24 @@ directory as it is — the same five files, nothing generated.
 ## Which profiles, and why not the others
 
 Subscribed: `baseline`, `limited-conn`, `latency-1m`, `latency-10k`,
-`latency-500k-8cpu`, `pipelined`, `async`, `async-db`, `echo-ws`. Each is a
-route in `src/main.zig` with the board's contract quoted above it.
+`latency-500k-8cpu`, `pipelined`, `async`, `async-db`, `echo-ws`,
+`echo-ws-pipeline`, `echo-ws-limited`. Each is a route in `src/main.zig`
+with the board's contract quoted above it; the three WebSocket profiles are
+the one `/ws` route driven three ways.
+
+The two WebSocket profiles at the end were held back until the server was
+right for them, and each waited on one change. `echo-ws-pipeline` sends
+sixteen frames a write and was worth entering once a response stopped
+costing a `send(2)` of its own
+([ADR 0274](../../docs/adr/0274-a-response-is-flushed-before-the-connection-waits.md)).
+`echo-ws-limited` opens 4,096 connections, closes each after ten frames with
+a reset, and opens the next: it needed every executor accepting
+([ADR 0273](../../docs/adr/0273-every-executor-accepts.md)) and then a
+reset between frames not being a warning per connection
+([ADR 0275](../../docs/adr/0275-a-reset-between-frames-is-a-client-that-has-gone.md)),
+which the first change alone had made three times worse, not better. Run the
+shape locally before subscribing to a profile; `bench/result/http.md` has the
+gcannon lines.
 
 Not subscribed, because the entry is *standard* mode and nilo refuses the
 thing the profile needs ([ADR 0028](../../docs/adr/0028-what-nilo-will-not-do.md)):

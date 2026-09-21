@@ -91,6 +91,11 @@ pub fn handleConnection(
         lifetime.end();
         _ = arena.reset(.{ .retain_with_limit = self.arena_keep });
         if (!served.keep_alive) {
+            // The last answer on this connection may still be buffered: a
+            // response is flushed when the connection next reads, and this
+            // connection never reads again (ADR 0274). Before the FIN below,
+            // for the same reason the FIN comes before the close.
+            out.flush() catch {};
             if (served.linger) hangUp(in, deadlines, waker);
             return;
         }
@@ -992,24 +997,28 @@ fn sendDirect(c: *Ctx, status: u16, content_type: []const u8, body: []const u8) 
     const w = watchdog.waiting(c._watch);
     defer watchdog.waited(c._watch, w);
     const connection = c.connection();
-    if (c.method == .HEAD) return http1.writeResponseHeadOnly(
-        c._out,
-        status,
-        http1.statusPhrase(status),
-        content_type,
-        body.len,
-        connection,
-        c.extraHeaders(),
-    );
-    try http1.writeResponse(
-        c._out,
-        status,
-        http1.statusPhrase(status),
-        content_type,
-        body,
-        connection,
-        c.extraHeaders(),
-    );
+    if (c.method == .HEAD) {
+        try http1.writeResponseHeadOnly(
+            c._out,
+            status,
+            http1.statusPhrase(status),
+            content_type,
+            body.len,
+            connection,
+            c.extraHeaders(),
+        );
+    } else {
+        try http1.writeResponse(
+            c._out,
+            status,
+            http1.statusPhrase(status),
+            content_type,
+            body,
+            connection,
+            c.extraHeaders(),
+        );
+    }
+    try http1.settle(c._out, c._in);
 }
 
 /// Turn a handler failure into a response. A fail function's message is

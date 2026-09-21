@@ -163,15 +163,18 @@ fn writeBody(c: *Ctx, contents: Contents, status: u16, from: u64, len: u64) !voi
     // A HEAD gets the head a GET would have got, `Content-Length` and all,
     // and none of the body. Nothing is read from the file, so a HEAD of a
     // four-gigabyte file costs an open, a stat and a close.
-    if (c.method == .HEAD) return http1.writeResponseHeadOnly(
-        c._out,
-        status,
-        http1.statusPhrase(status),
-        contents.content_type,
-        len,
-        connection,
-        c.extraHeaders(),
-    );
+    if (c.method == .HEAD) {
+        try http1.writeResponseHeadOnly(
+            c._out,
+            status,
+            http1.statusPhrase(status),
+            contents.content_type,
+            len,
+            connection,
+            c.extraHeaders(),
+        );
+        return http1.settle(c._out, c._in);
+    }
 
     // Left in the write buffer on purpose: `sendFileAll` sends what is
     // already buffered ahead of the file's first bytes, so the head and the

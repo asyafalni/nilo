@@ -476,6 +476,85 @@ test "a spilled file's bytes reach a real socket, by the route only a real socke
     try testing.expectEqualStrings(Spilled.contents[10..20], part.body);
 }
 
+fn pong(c: *nilo.Ctx) anyerror!void {
+    try c.sendText(200, "pong");
+}
+
+/// Read from `stream` until `text` has turned up `times` times, or the read
+/// fails. Bounded by a receive timeout on the socket, set with std's own
+/// `setsockopt`, so a server that never sends the second answer fails the
+/// test instead of holding the suite (`CLAUDE.md`).
+fn readUntilSeen(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    whole: *std.Io.Writer.Allocating,
+    text: []const u8,
+    times: usize,
+) !void {
+    const limit: std.posix.timeval = .{ .sec = 5, .usec = 0 };
+    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit));
+
+    var in_buf: [4096]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+    while (std.mem.count(u8, whole.written(), text) < times) {
+        _ = reader.interface.stream(&whole.writer, .limited(in_buf.len)) catch return error.AnswerNeverCame;
+    }
+}
+
+test "two requests sent together are answered together, and the second is not held for a third" {
+    // ADR 0274: a response whose successor is already in the read buffer is
+    // held, and put on the wire before the connection next waits. Only a
+    // real socket reaches the second half, which is the Engine's: a fixed
+    // reader never parks. If the hold were not made good, the client here
+    // would get one answer and then silence.
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/ping", pong);
+
+    var serving: ServingAt = .{ .app = &app };
+    const thread = try std.Thread.spawn(.{}, ServingAt.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    const port = try waitForPort(gpa, &serving);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var stream: std.Io.net.Stream = for (0..300) |_| {
+        break address.connect(io, .{ .mode = .stream }) catch {
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+            continue;
+        };
+    } else return error.ServerNeverCameUp;
+    defer stream.close(io);
+
+    var out_buf: [512]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    const one = "GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    // Both in one write, so the server reads them in one go and the second
+    // is in its buffer when it answers the first.
+    try writer.interface.writeAll(one ++ one);
+    try writer.interface.flush();
+
+    var whole: std.Io.Writer.Allocating = .init(gpa);
+    defer whole.deinit();
+    try readUntilSeen(io, stream, &whole, "\r\n\r\npong", 2);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, whole.written(), "HTTP/1.1 200 "));
+    // Nothing said the connection was closing, and it was not: a third
+    // request, sent alone, is answered alone.
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, whole.written(), "Connection: close"));
+    try writer.interface.writeAll(one);
+    try writer.interface.flush();
+    try readUntilSeen(io, stream, &whole, "\r\n\r\npong", 3);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, whole.written(), "HTTP/1.1 200 "));
+}
+
 /// The server under test on a path rather than a port.
 const ServingOnPath = struct {
     app: *nilo.App,

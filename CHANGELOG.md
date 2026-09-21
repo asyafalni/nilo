@@ -32,6 +32,38 @@ newest first.
 
 ### Added
 
+- nilo's HttpArena entry (`bench/arena/`) subscribes to `echo-ws-pipeline`
+  and `echo-ws-limited`, each held back until the server was right for it:
+  the first waited on ADR 0274, the second on ADR 0273 and then ADR 0275,
+  because the first of those alone had made the shape three times worse
+  ([`bench/arena/README.md`](./bench/arena/README.md)).
+- A response is flushed before the connection waits, not before `send`
+  returns. When the client's next request is already in the read buffer,
+  `c.send` leaves the response in the write buffer and it goes out with
+  the next one, so sixteen pipelined requests are answered in one write
+  rather than sixteen; a client that sends one request and waits, which
+  is every browser and every client by default, is answered on `send`
+  exactly as before. The same for a WebSocket's `send`, `print` and
+  `json`, and a room's posts. The Engine guarantees the hold is never for
+  good: every socket read flushes what is pending first, the WebSocket's
+  wait does too, and a closing connection flushes before its FIN. Sixteen
+  pipelined `/health` on eight cores: 3.05M → 12.3–13.6M req/s, p99
+  1.8 ms → 370 µs; sixteen pipelined echoes: 3.6M → 37M messages a second.
+  Keep-alive and one-frame-at-a-time shapes are unchanged. What a
+  pipelining client gives up is that a fast answer queued behind a slow
+  handler now arrives with the slow one, bounded by `write_buffer`
+  ([ADR 0274](./docs/adr/0274-a-response-is-flushed-before-the-connection-waits.md)).
+- Every executor accepts. `listen()` used to take connections on one fiber,
+  which capped a server at ~43,000 connections a second whatever its thread
+  count — the arena's short-lived profile read 426K req/s on 18 of 64 cores,
+  with a p99 that was the backlog divided by that rate. Now one acceptor sits
+  in `accept` on each executor and the connection is dealt round-robin as
+  before. Connections closed after ten requests: 660K → 1.97M req/s on eight
+  cores, p99 8.2 ms → 1.5 ms; keep-alive throughput unchanged. One parked
+  fiber per thread for the life of the server, nothing per connection, and
+  one timer per server fewer per connection accepted. Nothing changes in
+  what `listen()` takes
+  ([ADR 0273](./docs/adr/0273-every-executor-accepts.md)).
 - `listen()` takes `backlog`: how many completed handshakes the kernel holds
   for `accept`. 4,096 — `net.core.somaxconn`'s default, what Go listens with —
   up from zio's 128, which nilo had been passing without saying so. Past the
@@ -111,6 +143,16 @@ newest first.
 
 ### Fixed
 
+- A WebSocket client that leaves with a reset rather than a FIN, which is
+  every load generator that keeps its ports out of `TIME_WAIT` and every
+  tab that was killed rather than closed, ends `receive` with `null` the
+  way a FIN does, instead of `error.ReadFailed` and a warning per
+  connection. The warning was one lock every connection queued on to
+  leave; at 70,000 connections a second it held reset sockets open to
+  `max_connections`, and the server began refusing at accept. 512
+  WebSocket connections closed after ten frames each: 461K → 1.68M
+  frames a second, descriptors mid-run 10,024 → 560
+  ([ADR 0275](./docs/adr/0275-a-reset-between-frames-is-a-client-that-has-gone.md)).
 - A server that is not busy spends a third less CPU per request. zio's
   scheduler dozes for 100 µs before each park so that work stealing does not
   churn, and on a thread with nothing coming that is a second context switch

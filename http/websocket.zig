@@ -600,7 +600,7 @@ pub const Socket = struct {
         }.run, args));
         self._out.print(fmt, args) catch return error.WriteFailed;
         try self.keptTo(promise);
-        self._out.flush() catch return error.WriteFailed;
+        try self.settle();
     }
 
     /// Serialise `value` as JSON into one text message — which is what a
@@ -613,7 +613,7 @@ pub const Socket = struct {
         const promise = try self.beginCounted(counted(json_mod.write, value));
         json_mod.write(self._out, value) catch return error.WriteFailed;
         try self.keptTo(promise);
-        self._out.flush() catch return error.WriteFailed;
+        try self.settle();
     }
 
     /// Ask the other end to answer, which is how a connection through a
@@ -634,7 +634,10 @@ pub const Socket = struct {
         std.mem.writeInt(u16, payload[0..2], @intFromEnum(code), .big);
         const room = fits(reason);
         @memcpy(payload[2..][0..room], reason[0..room]);
-        return self.sendFrame(.close, payload[0 .. 2 + room]);
+        try self.writeFrame(.close, payload[0 .. 2 + room]);
+        // Flushed whatever the read buffer holds: this connection is not
+        // going to read again, so there is no later moment (ADR 0274).
+        self._out.flush() catch return error.WriteFailed;
     }
 
     /// Whether the connection ended with a close frame rather than by simply
@@ -692,7 +695,7 @@ pub const Socket = struct {
             self._out.writeAll(in_room.framedBytes(post)) catch return error.WriteFailed;
             any = true;
         }
-        if (any) self._out.flush() catch return error.WriteFailed;
+        if (any) try self.settle();
     }
 
     fn stopping(self: *const Socket) bool {
@@ -788,12 +791,23 @@ pub const Socket = struct {
     /// Wait for the rest of a header. Only reached when a frame arrived split
     /// across reads, which a real network does and a fixed buffer never will.
     fn fillHeader(self: *Socket) Error!Frame {
-        // The only place `EndOfStream` means the connection simply ended:
-        // between frames, with nothing half-read. Everywhere below here a
-        // stream that stops is a truncated frame, which is a broken one.
+        // The only place a stream that stops means the connection simply
+        // ended: between frames, with nothing half-read. A FIN and a reset
+        // are the same event here, a client that has gone, and a client
+        // that closes with `SO_LINGER` at zero, which is how a load
+        // generator avoids `TIME_WAIT`, ends every connection with the
+        // reset. So a read that fails on an empty buffer is the end of the
+        // conversation, not an error for the handler's loop or a line in
+        // the log; measured, the line was one per connection at 70,000
+        // connections a second, and the one lock under it was what every
+        // connection queued on to leave (ADR 0275,
+        // [`http.md`](../bench/result/http.md#a-reset-between-frames-is-a-client-that-has-gone)).
+        // Everywhere below here a stream that stops is a truncated frame,
+        // which is a broken one.
+        const between = self._in.bufferedLen() == 0;
         const lead = (self._in.peekArray(2) catch |err| return switch (err) {
             error.EndOfStream => error.EndOfStream,
-            else => error.ReadFailed,
+            else => if (between) error.EndOfStream else error.ReadFailed,
         }).*;
 
         // 14 bytes is the longest header there is, and the smallest read
@@ -922,6 +936,14 @@ pub const Socket = struct {
     /// process with eight threads shoots TLB entries down on all of them. A
     /// socket with a conversation on it answers inside 200ms and never pays.
     fn park(self: *Socket, may_give_buffer: bool) bulkhead.Woken {
+        // Nothing waits with a message still in memory. A send skips its
+        // flush when the next frame is already buffered (`settle`), and this
+        // is where the skipped flushes are made good: the wait below is on
+        // the socket's readiness rather than on a read, so the Engine's own
+        // guarantee, which sits on reads, does not reach it (ADR 0274). A
+        // peer that cannot be written to is a peer that is gone.
+        if (self._out.end != 0) self._out.flush() catch return .closed;
+
         // Silence on a socket is not the handler holding its thread. This is
         // the wait that used to excuse a WebSocket from the detector
         // entirely; bracketed, what is left between two of them is exactly
@@ -971,10 +993,34 @@ pub const Socket = struct {
         self._out.writeVecAll(&parts) catch return error.WriteFailed;
     }
 
-    /// One frame, gone. Flushed every time: a message nobody sent yet is a
-    /// message that has not arrived, and there is no later moment to flush at.
+    /// One frame, gone, or as good as: on the wire unless the peer's next
+    /// frame is already here, in which case it leaves with that one's
+    /// answer (`settle`).
     fn sendFrame(self: *Socket, opcode: Opcode, data: []const u8) Error!void {
         try self.writeFrame(opcode, data);
+        try self.settle();
+    }
+
+    /// Put what is written on the wire, unless the next frame is already
+    /// waiting in the read buffer.
+    ///
+    /// A peer that sent its next message before reading this answer is not
+    /// waiting on this flush, so the answer goes out with the next one, or
+    /// with the last of the batch: a burst of sixteen echoes is one write
+    /// rather than sixteen. A peer that sends one message and waits, which
+    /// is a browser on a click, leaves the buffer empty and is answered here
+    /// as it always was.
+    ///
+    /// What makes skipping safe is that nothing on this connection can wait
+    /// for the peer with a message still in memory: `park` flushes before
+    /// it waits, and the Engine flushes before any read of the socket
+    /// ([ADR 0274](../docs/adr/0274-a-response-is-flushed-before-the-connection-waits.md)).
+    /// What that leaves is a handler that stops calling `receive` while the
+    /// peer has sent something it has not read, whose sends then leave when
+    /// the write buffer fills; a handler that does not read what it is sent
+    /// has a message queued for it either way.
+    fn settle(self: *Socket) Error!void {
+        if (self._in.bufferedLen() != 0) return;
         self._out.flush() catch return error.WriteFailed;
     }
 
@@ -1506,6 +1552,75 @@ const Trickle = struct {
         return wrote;
     }
 };
+
+/// A reader whose connection breaks: it hands over `bytes`, and then every
+/// read fails the way a socket that was reset fails, with `ReadFailed`
+/// rather than `EndOfStream`.
+///
+/// A load generator that closes with `SO_LINGER` at zero ends every
+/// connection this way, and so does a client whose network went. `Trickle`
+/// ends with a FIN and cannot stand in for it.
+const Reset = struct {
+    rest: []const u8,
+    buf: [16]u8 = undefined,
+    reader: std.Io.Reader = undefined,
+
+    fn init(self: *Reset, bytes: []const u8) void {
+        self.rest = bytes;
+        self.reader = .{ .vtable = &vtable, .buffer = &self.buf, .seek = 0, .end = 0 };
+    }
+
+    const vtable: std.Io.Reader.VTable = .{ .stream = stream };
+
+    fn stream(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const self: *Reset = @alignCast(@fieldParentPtr("reader", r));
+        if (self.rest.len == 0) return error.ReadFailed;
+        const n = @min(self.rest.len, @intFromEnum(limit));
+        const wrote = try w.write(self.rest[0..n]);
+        self.rest = self.rest[wrote..];
+        return wrote;
+    }
+};
+
+test "a reset between frames ends the conversation the way a close does, quietly" {
+    var peer: Peer = .{};
+    defer peer.deinit();
+    try peer.frame(true, 1, "last words");
+
+    var reset: Reset = undefined;
+    reset.init(peer.to_server.items);
+    var bytes: [64]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var socket: Socket = .{ ._in = &reset.reader, ._out = &out, ._stopping = null };
+
+    const message = (try socket.receive()).?;
+    try testing.expectEqualStrings("last words", message.data);
+    // The client is gone. Not an error: the handler's loop ends the way it
+    // ends for a FIN, and nothing is logged for a client that hung up.
+    try testing.expect(try socket.receive() == null);
+    try testing.expect(!socket.closedCleanly());
+    // Nothing was sent to a peer that cannot hear it.
+    try testing.expectEqualStrings("", out.buffered());
+}
+
+test "a reset in the middle of a frame is still a broken frame" {
+    var peer: Peer = .{};
+    defer peer.deinit();
+    try peer.frame(true, 1, "a message that never finishes arriving");
+
+    var reset: Reset = undefined;
+    // The header and the first few bytes of the payload, then the reset.
+    reset.init(peer.to_server.items[0..12]);
+    var bytes: [64]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var socket: Socket = .{ ._in = &reset.reader, ._out = &out, ._stopping = null };
+
+    try testing.expectError(error.ReadFailed, socket.receive());
+}
 
 /// RFC 6455 §5.3 transformed-octet-i, written the way the RFC writes it:
 /// one byte at a time, no cleverness. Every test masks with this and lets
@@ -2139,4 +2254,109 @@ test "the header a room builds once is the one a socket would have written" {
     try testing.expectEqual(@as(usize, 4), headerFor(&mine, .text, 126).len);
     try testing.expectEqual(@as(usize, 4), headerFor(&mine, .text, 65_535).len);
     try testing.expectEqual(@as(usize, 10), headerFor(&mine, .text, 65_536).len);
+}
+
+/// A writer that counts how many times it put bytes on the wire, and keeps
+/// them. What ADR 0274 changes is how many writes a burst of echoes costs,
+/// which `Peer`'s fixed writer cannot say: its flush is a no-op.
+const Wire = struct {
+    buffer: [1024]u8 = undefined,
+    kept: std.ArrayList(u8) = .empty,
+    writes: usize = 0,
+    writer: std.Io.Writer = undefined,
+
+    fn init(self: *Wire) void {
+        self.writer = .{ .vtable = &vtable, .buffer = &self.buffer };
+    }
+
+    fn deinit(self: *Wire) void {
+        self.kept.deinit(testing.allocator);
+    }
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain };
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Wire = @fieldParentPtr("writer", w);
+        self.writes += 1;
+        self.kept.appendSlice(testing.allocator, w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.kept.appendSlice(testing.allocator, bytes) catch return error.WriteFailed;
+            n += bytes.len;
+        }
+        for (0..splat) |_| {
+            self.kept.appendSlice(testing.allocator, data[data.len - 1]) catch return error.WriteFailed;
+            n += data[data.len - 1].len;
+        }
+        return n;
+    }
+};
+
+test "echoes of frames that arrived together leave in one write" {
+    var peer: Peer = .{};
+    defer peer.deinit();
+    for (0..16) |_| try peer.frame(true, 1, "hello");
+    var wire: Wire = .{};
+    wire.init();
+    defer wire.deinit();
+    var socket = peer.socket();
+    socket._out = &wire.writer;
+
+    // The echo loop, as `bench/arena/src/main.zig` writes it. Each send finds
+    // the next frame already in the read buffer and holds its echo; the
+    // sixteenth finds nothing behind it and lets them all go.
+    var echoed: usize = 0;
+    while (try socket.receive()) |message| {
+        try socket.send(message.kind, message.data);
+        echoed += 1;
+        if (echoed < 16) try testing.expectEqual(@as(usize, 0), wire.writes);
+    }
+    try testing.expectEqual(@as(usize, 16), echoed);
+    try testing.expectEqual(@as(usize, 1), wire.writes);
+    try testing.expectEqual(@as(usize, 16 * "\x81\x05hello".len), wire.kept.items.len);
+    try testing.expectEqual(@as(usize, 16), std.mem.count(u8, wire.kept.items, "\x81\x05hello"));
+}
+
+test "an echo to a frame that arrived alone leaves at once" {
+    var peer: Peer = .{};
+    defer peer.deinit();
+    try peer.frame(true, 1, "hello");
+    var wire: Wire = .{};
+    wire.init();
+    defer wire.deinit();
+    var socket = peer.socket();
+    socket._out = &wire.writer;
+
+    const message = (try socket.receive()).?;
+    try socket.send(message.kind, message.data);
+    // Nothing is buffered behind it, so nothing holds the answer: on the
+    // wire before the handler has done anything else, the same as before.
+    try testing.expectEqual(@as(usize, 1), wire.writes);
+    try testing.expectEqualStrings("\x81\x05hello", wire.kept.items);
+
+    // `print` and `json` settle the same way.
+    try socket.print("{d} more", .{2});
+    try testing.expectEqual(@as(usize, 2), wire.writes);
+    try socket.json(.{ .n = 3 });
+    try testing.expectEqual(@as(usize, 3), wire.writes);
+}
+
+test "a close frame leaves whatever the read buffer holds" {
+    var peer: Peer = .{};
+    defer peer.deinit();
+    try peer.frame(true, 1, "hello");
+    try peer.frame(true, 1, "unread");
+    var wire: Wire = .{};
+    wire.init();
+    defer wire.deinit();
+    var socket = peer.socket();
+    socket._out = &wire.writer;
+
+    _ = (try socket.receive()).?;
+    // A handler that answers the first message by closing, with the second
+    // still unread: the goodbye cannot wait for a read that is never coming.
+    try socket.close(.normal, "bye");
+    try testing.expectEqual(@as(usize, 1), wire.writes);
+    try testing.expectEqualStrings("\x88\x05\x03\xe8bye", wire.kept.items);
 }

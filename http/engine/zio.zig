@@ -192,12 +192,13 @@ pub const Stop = struct {
 /// anything, so a cap is the one option that turns that figure into a
 /// number an operator can multiply.
 ///
-/// `take` is only ever called from the accept loop, and there is one of
-/// those, so the load and the increment cannot race each other and a
-/// compare-and-swap would be a lock nobody contends. `give` is called from
-/// every connection fiber, which is why the counter is atomic at all.
-/// Nothing is published through it — it is a count, not a handoff — so
-/// `.monotonic` is the whole ordering requirement.
+/// `take` is called from every acceptor at once — there is one per
+/// executor ([ADR 0273](../../docs/adr/0273-every-executor-accepts.md)) —
+/// so the load and the increment are one compare-and-swap rather than two
+/// operations that could interleave and let two acceptors past the cap on
+/// the same free slot. `give` is called from every connection fiber.
+/// Nothing is published through either — it is a count, not a handoff —
+/// so `.monotonic` is the whole ordering requirement.
 pub const Capacity = struct {
     live: std.atomic.Value(u32) = .init(0),
     /// 0 means no limit, which is what nilo did before this existed.
@@ -205,15 +206,20 @@ pub const Capacity = struct {
     /// Connections closed because the server was full, since it started.
     /// Read only for the log line.
     refused: std.atomic.Value(u64) = .init(0),
+    /// When the "server is full" warning last went out, so that N acceptors
+    /// refusing at once write it once between them. 0 is never.
+    warned_at_ns: std.atomic.Value(u64) = .init(0),
 
     /// Count one more connection, or say there is no room for it.
     pub fn take(self: *Capacity) bool {
-        if (self.max != 0 and self.live.load(.monotonic) >= self.max) {
-            _ = self.refused.fetchAdd(1, .monotonic);
-            return false;
+        var live = self.live.load(.monotonic);
+        while (true) {
+            if (self.max != 0 and live >= self.max) {
+                _ = self.refused.fetchAdd(1, .monotonic);
+                return false;
+            }
+            live = self.live.cmpxchgWeak(live, live + 1, .monotonic, .monotonic) orelse return true;
         }
-        _ = self.live.fetchAdd(1, .monotonic);
-        return true;
     }
 
     /// A connection has closed. Called from the fiber that held it.
@@ -223,6 +229,16 @@ pub const Capacity = struct {
 
     pub fn held(self: *const Capacity) u32 {
         return self.live.load(.monotonic);
+    }
+
+    /// Whether the acceptor that asks is the one to write the "full" warning:
+    /// true once per `capacity_warn_gap_ns`, whoever asks. The claim is a
+    /// compare-and-swap on the timestamp, so two acceptors refusing in the
+    /// same microsecond cannot both win it.
+    pub fn claimWarning(self: *Capacity, now_ns: u64) bool {
+        const last = self.warned_at_ns.load(.monotonic);
+        if (last != 0 and now_ns - last < capacity_warn_gap_ns) return false;
+        return self.warned_at_ns.cmpxchgStrong(last, now_ns, .monotonic, .monotonic) == null;
     }
 };
 
@@ -234,19 +250,55 @@ pub const Capacity = struct {
 /// the same thing.
 const capacity_warn_gap_ns: u64 = 60 * std.time.ns_per_s;
 
-/// How often the accept loop looks up to see whether a stop was asked for.
+/// What the acceptors share, on `serve`'s frame: the count of connections
+/// held, whether the descriptor shortage has been said, and the first
+/// listener failure, kept for `serve` to return once the others are
+/// cancelled (ADR 0273).
+const Accepting = struct {
+    capacity: Capacity,
+    /// Whether "out of descriptors" has been said and not yet taken back, so
+    /// that N acceptors hitting the same shortage write one line and one
+    /// "works again" between them.
+    short: std.atomic.Value(bool) = .init(false),
+    /// The first listener failure as `@intFromError`, or 0 for none.
+    failure: std.atomic.Value(ErrorInt) = .init(0),
+
+    const ErrorInt = std.meta.Int(.unsigned, @bitSizeOf(anyerror));
+
+    /// Keep the first failure; a second acceptor failing after it changes
+    /// nothing about what `serve` should say.
+    fn fail(self: *Accepting, err: anyerror) void {
+        _ = self.failure.cmpxchgStrong(0, @intFromError(err), .acq_rel, .monotonic);
+    }
+
+    fn failed(self: *const Accepting) bool {
+        return self.failure.load(.acquire) != 0;
+    }
+
+    fn takeFailure(self: *const Accepting) ?anyerror {
+        const code = self.failure.load(.acquire);
+        return if (code == 0) null else @errorFromInt(code);
+    }
+};
+
+/// How often `serve` looks up to see whether a stop was asked for.
 ///
 /// Polling rather than waking the loop directly: a signal handler may not
-/// touch a wait queue, and closing the listening socket out from under a
-/// pending `accept` is a use-after-free waiting to happen. One timer per
-/// server, five times a second, is not a cost worth avoiding — and a fifth
-/// of a second is below what anybody notices after pressing Ctrl-C.
+/// touch a wait queue. One timer per server, five times a second, is not a
+/// cost worth avoiding — and a fifth of a second is below what anybody
+/// notices after pressing Ctrl-C.
+///
+/// Until ADR 0273 this was the timeout on every `accept`, so that the one
+/// accept loop could look at the flag between connections. Now that there
+/// is an acceptor per executor they wait with no timeout and are cancelled
+/// when the flag is seen, and the poll is the main fiber's alone: it costs
+/// one timer per server rather than a timer per connection accepted.
 const accept_poll_ms = 200;
 
-/// How long the accept loop waits after failing for want of a file
-/// descriptor or memory, doubling up to the cap. Short enough that a brief
-/// shortage costs a little latency, capped so a sustained one settles into
-/// one attempt a second rather than a spin (ADR 0265).
+/// How long an acceptor waits after failing for want of a file descriptor
+/// or memory, doubling up to the cap. Short enough that a brief shortage
+/// costs a little latency, capped so a sustained one settles into one
+/// attempt a second rather than a spin (ADR 0265).
 const accept_backoff_min_ms: u32 = 5;
 const accept_backoff_max_ms: u32 = 1000;
 
@@ -1046,6 +1098,65 @@ pub fn serve(
         }
     }.f;
 
+    // A connection's two halves, joined so that a read on one flushes the
+    // other first ([ADR 0274](../../docs/adr/0274-a-response-is-flushed-before-the-connection-waits.md)).
+    //
+    // The HTTP and WebSocket layers skip the flush on a response whose
+    // successor is already sitting in the read buffer, so a pipelined batch
+    // goes out as one write instead of one a response. What makes that
+    // safe to do without thinking is here: the reader's vtable is swapped
+    // for one that flushes the writer before every socket read, so no read
+    // can park this fiber with a response still in memory. The layers decide
+    // when a flush is worth skipping; the Engine guarantees it is never
+    // skipped for good. A read that finds nothing to flush pays one load.
+    //
+    // A flush that fails here is left alone: the bytes stay buffered with
+    // the writer's error beside them, and the next write to the connection
+    // fails where the HTTP layer already knows how to say why. The read
+    // goes ahead, which is the read that finds the peer gone.
+    const Link = struct {
+        reader: zio.net.Stream.Reader,
+        writer: zio.net.Stream.Writer,
+        // zio's own vtable, which does the reading once the writer is empty.
+        inner: *const std.Io.Reader.VTable,
+
+        const Self = @This();
+
+        const vtable: std.Io.Reader.VTable = .{
+            .stream = stream,
+            .readVec = readVec,
+        };
+
+        fn init(link: *Self, s: zio.net.Stream, read_buf: []u8, write_buf: []u8) void {
+            link.reader = s.reader(read_buf);
+            link.writer = s.writer(write_buf);
+            link.inner = link.reader.interface.vtable;
+            link.reader.interface.vtable = &vtable;
+        }
+
+        fn of(io_r: *std.Io.Reader) *Self {
+            const r: *zio.net.Stream.Reader = @alignCast(@fieldParentPtr("interface", io_r));
+            return @alignCast(@fieldParentPtr("reader", r));
+        }
+
+        fn settle(link: *Self) void {
+            const w = &link.writer.interface;
+            if (w.end != 0) w.flush() catch {};
+        }
+
+        fn stream(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const link = of(io_r);
+            link.settle();
+            return link.inner.stream(io_r, io_w, limit);
+        }
+
+        fn readVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+            const link = of(io_r);
+            link.settle();
+            return link.inner.readVec(io_r, data);
+        }
+    };
+
     const Conn = struct {
         fn run(
             st: State,
@@ -1064,8 +1175,10 @@ pub fn serve(
             // opened it. Both of those matter below.
             const over_ip = stream.socket.address.getType() == .ip;
 
-            // One response = one flush = one segment; Nagle would only add
-            // latency without saving anything, so it is turned off.
+            // A response goes out the moment nothing is queued behind it, and
+            // the next one may be microseconds later; Nagle would hold the
+            // second for the first's ack and save nothing, so it is turned
+            // off.
             //
             // TCP only. On a unix socket the option is `EOPNOTSUPP`, and zio
             // answers an errno it does not recognise with a stack trace and an
@@ -1090,9 +1203,9 @@ pub fn serve(
             const write_buf = alignedPages(conn_gpa, sizes.write_buffer) catch return;
             defer conn_gpa.free(write_buf);
 
-            var reader = stream.reader(read_buf);
-            var writer = stream.writer(write_buf);
-            var clocks = Clocks{ .reader = &reader, .writer = &writer };
+            var link: Link = undefined;
+            link.init(stream, read_buf, write_buf);
+            var clocks = Clocks{ .reader = &link.reader, .writer = &link.writer };
 
             // In the fiber's own frame, so it costs pages that are already
             // mapped rather than an allocation of its own — see `Wake`. An
@@ -1114,96 +1227,142 @@ pub fn serve(
             };
             peer._len = writePeer(&peer._text, stream.socket.address);
 
-            handler(st, &reader.interface, &writer.interface, &clocks, &wake, peer);
+            handler(st, &link.reader.interface, &link.writer.interface, &clocks, &wake, peer);
         }
     };
 
     if (options.stop_on_signal) installStopSignals(stop);
     defer if (options.stop_on_signal) restoreStopSignals();
 
-    var capacity: Capacity = .{ .max = options.max_connections };
-    var warned_at_ns: u64 = 0;
-
     warnIfDescriptorsShort(options.max_connections);
 
-    // Grows while accepting keeps failing for want of a descriptor, and is
-    // reset by the first connection that gets through.
-    var backoff_ms: u32 = 0;
+    // What every acceptor shares. On the main fiber's frame, which outlives
+    // them: they are cancelled below before this function returns.
+    var shared: Accepting = .{
+        .capacity = .{ .max = options.max_connections },
+    };
 
-    while (!stop.isRequested()) {
-        const stream = server.accept(.{ .timeout = .fromMilliseconds(accept_poll_ms) }) catch |err| switch (err) {
-            // The wait ran out, which is the loop's chance to look at the
-            // stop flag rather than anything having gone wrong.
-            error.Timeout => continue,
-            // The machine is out of something, for now: this process's
-            // descriptor table is full, the system's is, or the kernel had
-            // no memory for a socket. None of that is the listener's fault
-            // and all of it clears on its own — the moment a connection
-            // closes, the next accept works. Returning would turn a
-            // condition that clears into an outage that needs a restart,
-            // and until ADR 0265 that is what happened: a server holding
-            // ~1,000 connections on a default `ulimit -n` ended `listen()`
-            // with a clean "nilo stopping" in the log, well short of its
-            // own `max_connections`. So the loop sleeps and tries again,
-            // for longer each time, and says so once per shortage.
-            error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => {
-                const first = backoff_ms == 0;
-                backoff_ms = if (first) accept_backoff_min_ms else @min(backoff_ms * 2, accept_backoff_max_ms);
-                if (first) std.log.warn(
-                    "accept failed with {s}: the process or the machine is out of file " ++
-                        "descriptors or memory, so nilo is pausing before it tries again. Held " ++
-                        "connections: {d} of {d}. Raise `ulimit -n` (or `LimitNOFILE=` under " ++
-                        "systemd) past `.max_connections`, or lower `.max_connections`.",
-                    .{ @errorName(err), capacity.held(), capacity.max },
-                );
-                zio.sleep(.fromMilliseconds(backoff_ms)) catch {};
-                continue;
-            },
-            // Anything else is the listener's own failure, and returning
-            // stops the server. A client that gave up while still in the
-            // backlog is not that: under zio v0.17.0 it surfaced here as
-            // `error.ConnectionAborted` and took the whole server down with
-            // it; since v0.18.0 `accept` retries it inside, on the same
-            // deadline, and it never reaches this line.
-            else => return err,
-        };
-        if (backoff_ms != 0) {
-            std.log.info("accept works again after the descriptor shortage", .{});
-            backoff_ms = 0;
-        }
+    // One acceptor. There is one per executor ([ADR 0273](../../docs/adr/0273-every-executor-accepts.md)),
+    // each parked in its own `accept` on the one listening socket, so a
+    // burst of connections is taken by as many threads as there are rather
+    // than queued behind one fiber's round trips through the loop. The
+    // kernel hands each completed handshake to one waiting acceptor; which
+    // one does not matter, because the connection is then dealt to an
+    // executor round-robin by `spawn`, the same as before.
+    const Acceptor = struct {
+        fn run(sh: *Accepting, server_: zio.net.Server, st: State, conn_gpa: std.mem.Allocator, sizes: Options, connections: *zio.Group) void {
+            // Grows while accepting keeps failing for want of a descriptor,
+            // and is reset by the first connection that gets through. Per
+            // acceptor, because each one waits on its own; the log line is
+            // shared, so a shortage is said once and not once a thread.
+            var backoff_ms: u32 = 0;
 
-        // Full: closed at once, without being read from and without being
-        // answered. Closing rather than not accepting, so that the client
-        // finds out now — a connection left in the kernel's backlog hangs
-        // until something times out, and the load balancer that ADR 0028
-        // says is in front cannot fail over to another instance until it
-        // does. Closing rather than answering 503, because writing to a
-        // client the server has just decided it cannot afford to serve is
-        // work an attacker gets to choose, and it would put a write with a
-        // deadline on it inside the one loop that must not stall.
-        if (!capacity.take()) {
-            stream.close();
-            const now = monotonicNanos();
-            if (warned_at_ns == 0 or now - warned_at_ns >= capacity_warn_gap_ns) {
-                warned_at_ns = now;
-                std.log.warn(
-                    "nilo is holding its limit of {d} connections, so new ones are being closed " ++
-                        "unanswered ({d} so far). Raise `.max_connections` in listen() if the " ++
-                        "machine has the memory — an idle connection costs 4,669 bytes, plus " ++
-                        "whatever stack the handler touches — or put fewer of them on this " ++
-                        "process.",
-                    .{ capacity.max, capacity.refused.load(.monotonic) },
-                );
+            while (true) {
+                const stream = server_.accept(.{}) catch |err| switch (err) {
+                    // `serve` saw the stop flag and cancelled every acceptor.
+                    // Not an error, and the one way this loop ends.
+                    error.Canceled => return,
+                    // The machine is out of something, for now: this process's
+                    // descriptor table is full, the system's is, or the kernel had
+                    // no memory for a socket. None of that is the listener's fault
+                    // and all of it clears on its own — the moment a connection
+                    // closes, the next accept works. Returning would turn a
+                    // condition that clears into an outage that needs a restart,
+                    // and until ADR 0265 that is what happened: a server holding
+                    // ~1,000 connections on a default `ulimit -n` ended `listen()`
+                    // with a clean "nilo stopping" in the log, well short of its
+                    // own `max_connections`. So the loop sleeps and tries again,
+                    // for longer each time, and says so once per shortage.
+                    error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => {
+                        const first = backoff_ms == 0;
+                        backoff_ms = if (first) accept_backoff_min_ms else @min(backoff_ms * 2, accept_backoff_max_ms);
+                        if (first and sh.short.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null) std.log.warn(
+                            "accept failed with {s}: the process or the machine is out of file " ++
+                                "descriptors or memory, so nilo is pausing before it tries again. Held " ++
+                                "connections: {d} of {d}. Raise `ulimit -n` (or `LimitNOFILE=` under " ++
+                                "systemd) past `.max_connections`, or lower `.max_connections`.",
+                            .{ @errorName(err), sh.capacity.held(), sh.capacity.max },
+                        );
+                        zio.sleep(.fromMilliseconds(backoff_ms)) catch return;
+                        continue;
+                    },
+                    // Anything else is the listener's own failure, and it stops
+                    // the server: the first acceptor to see one keeps it for
+                    // `serve` to return, and raises the stop flag so that the
+                    // others are cancelled and the drain begins. A client that
+                    // gave up while still in the backlog is not that: under zio
+                    // v0.17.0 it surfaced here as `error.ConnectionAborted` and
+                    // took the whole server down with it; since v0.18.0 `accept`
+                    // retries it inside, and it never reaches this line.
+                    else => {
+                        sh.fail(err);
+                        return;
+                    },
+                };
+                if (backoff_ms != 0) {
+                    backoff_ms = 0;
+                    if (sh.short.cmpxchgStrong(true, false, .acq_rel, .monotonic) == null) {
+                        std.log.info("accept works again after the descriptor shortage", .{});
+                    }
+                }
+
+                // Full: closed at once, without being read from and without being
+                // answered. Closing rather than not accepting, so that the client
+                // finds out now — a connection left in the kernel's backlog hangs
+                // until something times out, and the load balancer that ADR 0028
+                // says is in front cannot fail over to another instance until it
+                // does. Closing rather than answering 503, because writing to a
+                // client the server has just decided it cannot afford to serve is
+                // work an attacker gets to choose, and it would put a write with a
+                // deadline on it inside the one loop that must not stall.
+                if (!sh.capacity.take()) {
+                    stream.close();
+                    if (sh.capacity.claimWarning(monotonicNanos())) {
+                        std.log.warn(
+                            "nilo is holding its limit of {d} connections, so new ones are being closed " ++
+                                "unanswered ({d} so far). Raise `.max_connections` in listen() if the " ++
+                                "machine has the memory — an idle connection costs 4,669 bytes, plus " ++
+                                "whatever stack the handler touches — or put fewer of them on this " ++
+                                "process.",
+                            .{ sh.capacity.max, sh.capacity.refused.load(.monotonic) },
+                        );
+                    }
+                    continue;
+                }
+
+                connections.spawn(Conn.run, .{ st, stream, conn_gpa, sizes, &sh.capacity }) catch |err| {
+                    sh.capacity.give();
+                    stream.close();
+                    // `error.Closed` is the connections group winding up,
+                    // which means `serve` is already on its way out.
+                    if (err != error.Closed) sh.fail(err);
+                    return;
+                };
             }
-            continue;
         }
+    };
 
-        group.spawn(Conn.run, .{ state, stream, gpa, options, &capacity }) catch |err| {
-            capacity.give();
-            stream.close();
-            return err;
-        };
+    // One acceptor per executor. Spawned back to back, so that `spawn`'s
+    // round-robin puts each on a different thread; what a thread gets is
+    // one fiber parked in `accept`, four kilobytes of stack, for the life of
+    // the server. Cancelled before anything else on the way out — before
+    // the connections, before the listener is closed — so no `accept` is
+    // ever pending on a socket that is being taken away.
+    var acceptors: zio.Group = .init;
+    defer acceptors.cancel();
+    for (0..threads) |_| {
+        try acceptors.spawn(Acceptor.run, .{ &shared, server, state, gpa, options, &group });
     }
+
+    // The main fiber's only job from here is to notice a stop. It cannot be
+    // woken for one — a signal handler may not touch a wait queue — so it
+    // looks five times a second, and then cancels the acceptors, which is
+    // the one thing that ends their `accept`.
+    while (!stop.isRequested() and !shared.failed()) {
+        zio.sleep(.fromMilliseconds(accept_poll_ms)) catch break;
+    }
+    acceptors.cancel();
+    if (shared.takeFailure()) |err| return err;
 
     drain(stop, options.shutdown_grace_ms);
 }

@@ -54,6 +54,13 @@
 //!   Engine that waits on sockets can already wait on two things — it has to,
 //!   to wait with a deadline at all — so this asks for nothing new of it
 //!   beyond a handle to say so with.
+//! - a read that flushes first — the `in` handed to `handler` puts whatever
+//!   `out` still holds on the wire before it reads the socket. nilo skips
+//!   the flush on a response whose successor is already in the read buffer,
+//!   so a pipelined batch leaves as one write, and this is what makes the
+//!   skip safe rather than a bet: no read can park a connection with a
+//!   response still in memory (ADR 0274). One load of the writer's fill on
+//!   each read that reaches the socket, and nothing on a read that does not.
 //! - `Waker.halfClose` — send the peer a FIN without closing the socket, so
 //!   a refused request's answer reaches it before the reset that closing on
 //!   unread input would send (ADR 0266). One `shutdown(2)`; an Engine that

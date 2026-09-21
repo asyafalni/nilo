@@ -3872,3 +3872,69 @@ never reach. ADR 0071 found the same machinery on the connection loop's
 stack; this is the binary-size reading of it, and the warning was replaced
 by a fallback the first failure in development shows
 ([ADR 0270](./adr/0270-a-failure-body-is-a-struct-the-application-names.md)).
+
+**A server at 18 of 64 cores with a 48 µs p50 was at its ceiling, and the
+p99 said where.** HttpArena's short-lived profile read nilo at 426K req/s
+against 2–2.7M for the rows above it, on a server that looked idle and
+answered fast. Two runs at two backlogs gave it away: a p99 of 3 ms at 128
+and 100 ms at 4,096, each the backlog divided by ~43K connections a second,
+which is what one accept fiber at ~23 µs a connection comes to. ADR 0271's
+backlog had turned a dropped SYN into a tenth of a second in the queue and
+left the ceiling where it was. **A bottleneck on one fiber shows as idle
+CPU and a tail on the first request only**, and the arithmetic
+`queue depth ÷ rate = tail` is the test for it. One acceptor per executor
+took the same shape from 660K to 1.97M on eight cores here
+([ADR 0273](./adr/0273-every-executor-accepts.md),
+[`http.md`](../bench/result/http.md#what-one-accept-fiber-caps-a-server-at)).
+
+**ADR 0272 was measured on the side it helped, and the arena measured the
+other.** Its prediction — 25–30 µs a request on `latency-10k`, from 40 —
+came in at 34.5, with 30.6 on `latency-1m` and the rate held for the first
+time. At the same throughput the saturated profiles paid: the baseline's
+p50 doubled, the pipelined tail went from a quarter second to over one, the
+async profile's timers fire 6 ms late instead of 3. `bench/paced.py`
+measures a server that is not busy; a burst of completions on one executor
+now drains alone while its neighbours sleep, and 64 connections on two
+threads never produced one. The trade stands, and it is written down as a
+trade rather than a win
+([`http.md`](../bench/result/http.md#the-arenas-two-readings-and-what-changed-between-them)).
+The same readings put a connection that is *inside* a request or a `sleep`
+at ~29.5 KiB — 483 MiB over 16,384 echoing WebSockets, 924 MiB over 32,000
+sleeping fibers — beside the 4,669 bytes an idle one holds, which no number
+here had done.
+
+**On a pipelined request the syscall was the request.** Every response
+ended in a `flush()` since ADR 0009, for honesty's sake, and a client
+sending sixteen requests a write got sixteen `send(2)`s back: 1.78 µs of
+server CPU a `/health` against 0.57 once the sixteen left as one write,
+and 1.38 µs a WebSocket echo against 0.16. Four times the throughput on
+the first shape and ten on the second, with the tails down by the same
+factor, and the shapes that do not pipeline unchanged to within 0.4%. The
+lesson is about what the rule was standing in for: "flush on `send`" was
+one way to guarantee **a response is on the wire before the connection
+next waits for its client**, and the guarantee is what was wanted. It now
+sits in the Engine, where every socket read passes, rather than in every
+`send`; the layers skip the flush when the next request is already
+buffered, and cannot skip it for good
+([ADR 0274](./adr/0274-a-response-is-flushed-before-the-connection-waits.md),
+[`http.md`](../bench/result/http.md#what-a-flush-per-response-costs-a-client-that-pipelines)).
+
+**A profile was run locally before subscribing to it, and the run said the
+last change had made it worse.** `echo-ws-limited` is a WebSocket
+connection closed after ten frames and reopened, and gcannon closes every
+one of them with a reset, because `SO_LINGER {1, 0}` is how a load
+generator keeps its ports out of `TIME_WAIT`. A reset between frames was
+`error.ReadFailed` and a warning per connection, and the warning took the
+one stderr lock for its format and write. One acceptor had throttled the
+intake to roughly what the lock could pass; eight acceptors (ADR 0273)
+filled the queue behind it, each waiting fiber holding a reset socket,
+until the descriptors reached `max_connections` and the server refused at
+accept: 874K → 461K frames a second, from the change that took HTTP's
+same shape 3×. `/dev/null` for stderr moved the number and not the shape,
+which is what said the lock rather than the disk. **A `std.log` call on a
+per-connection path is one lock every connection queues on**, and a
+client-caused event there is never a line; treating the reset as the FIN
+it is took the shape to 1.68M
+([ADR 0275](./adr/0275-a-reset-between-frames-is-a-client-that-has-gone.md),
+[`http.md`](../bench/result/http.md#a-reset-between-frames-is-a-client-that-has-gone)).
+The half-hour it cost is the cheapest measurement in this file.

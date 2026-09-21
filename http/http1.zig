@@ -988,6 +988,10 @@ pub fn bodyless(status: u16) bool {
 /// `extra` are headers a handler or middleware added; the framework's own
 /// go out first and `extra` may not repeat them — except `Date`, which a
 /// handler that sets one is trusted about, and the framework's is left off.
+///
+/// Written, not flushed: `settle` is the flush, and the caller makes it
+/// once the response is whole. The tests here write into a fixed buffer
+/// and read it back, which is why nothing in this file needs a socket.
 pub fn writeResponse(
     out: *std.Io.Writer,
     status: u16,
@@ -1002,6 +1006,26 @@ pub fn writeResponse(
     // request on this connection, which is how a response-splitting bug
     // begins. The head already said there is none.
     if (!bodyless(status)) try out.writeAll(body);
+}
+
+/// Put a finished response on the wire, unless the request after it is
+/// already here.
+///
+/// A client that pipelines sent its next request before reading this
+/// answer, so nothing is waiting on this flush: the answer goes out with
+/// the next one, or with the last of the batch, in one write instead of
+/// one a response. A client that does not pipeline, which is every browser
+/// and every client by default, leaves the read buffer empty once its
+/// request is parsed, and its answer is flushed here as it always was.
+///
+/// Skipping is safe because of the Engine, not because of anything the
+/// caller promises: a socket read flushes what is pending before it can
+/// park, so a response is never left in memory while the connection waits
+/// for its client ([ADR 0274](../docs/adr/0274-a-response-is-flushed-before-the-connection-waits.md)).
+/// The write buffer bounds the batch; a run of responses longer than it
+/// drains as it fills, the way any write does.
+pub fn settle(out: *std.Io.Writer, in: *const std.Io.Reader) !void {
+    if (in.seek != in.end) return;
     try out.flush();
 }
 
@@ -1080,17 +1104,15 @@ pub fn writeResponseHeadOnly(
     extra: []const Header,
 ) !void {
     try writeHead(out, status, phrase, content_type, body_len, connection, extra);
-    try out.flush();
 }
 
 /// The head of a response whose body is about to be sent straight from a
-/// file — and, unlike every other head here, **not flushed** (ADR 0037).
+/// file (ADR 0037).
 ///
-/// That is the whole reason it exists. `sendFile` takes whatever the writer
-/// already has buffered as the first thing to put on the wire, so leaving
-/// the head there is what makes the head and the first bytes of the file
-/// leave in one operation instead of two. Flushing first would cost a
-/// syscall and, on a small file, a packet.
+/// `sendFile` takes whatever the writer already has buffered as the first
+/// thing to put on the wire, so leaving the head there is what makes the
+/// head and the first bytes of the file leave in one operation instead of
+/// two. Flushing first would cost a syscall and, on a small file, a packet.
 ///
 /// The caller flushes, once the body is done.
 pub fn writeFileHead(
@@ -2424,4 +2446,88 @@ test "the redirect statuses all have a phrase, and it is written from the consta
             out.buffered(),
         );
     }
+}
+
+/// A writer that counts how many times it put bytes on the wire, and keeps
+/// them. What ADR 0274 changes is how many writes a batch of responses costs,
+/// which a fixed writer cannot say: its flush is a no-op.
+const Wire = struct {
+    buffer: [1024]u8 = undefined,
+    kept: std.ArrayList(u8) = .empty,
+    writes: usize = 0,
+    writer: std.Io.Writer = undefined,
+
+    fn init(self: *Wire) void {
+        self.writer = .{ .vtable = &vtable, .buffer = &self.buffer };
+    }
+
+    fn deinit(self: *Wire) void {
+        self.kept.deinit(testing.allocator);
+    }
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain };
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Wire = @fieldParentPtr("writer", w);
+        self.writes += 1;
+        self.kept.appendSlice(testing.allocator, w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.kept.appendSlice(testing.allocator, bytes) catch return error.WriteFailed;
+            n += bytes.len;
+        }
+        for (0..splat) |_| {
+            self.kept.appendSlice(testing.allocator, data[data.len - 1]) catch return error.WriteFailed;
+            n += data[data.len - 1].len;
+        }
+        return n;
+    }
+};
+
+test "a response is held while the next request is already here, and both leave in one write" {
+    var wire: Wire = .{};
+    wire.init();
+    defer wire.deinit();
+
+    // Two requests arrived together, the way a pipelining client sends them.
+    var in = std.Io.Reader.fixed("GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+    const first = try readRequest(&in);
+    try testing.expectEqualStrings("/a", first.target);
+
+    try writeResponse(&wire.writer, 200, "OK", "text/plain", "one", .implied, &.{});
+    try settle(&wire.writer, &in);
+    // The second request is sitting in the buffer, so nothing is waiting on
+    // this answer: it stays.
+    try testing.expectEqual(@as(usize, 0), wire.writes);
+
+    const second = try readRequest(&in);
+    try testing.expectEqualStrings("/b", second.target);
+    try writeResponse(&wire.writer, 200, "OK", "text/plain", "two", .implied, &.{});
+    try settle(&wire.writer, &in);
+    // Nothing left to read: both answers go, together.
+    try testing.expectEqual(@as(usize, 1), wire.writes);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, wire.kept.items, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.endsWith(u8, wire.kept.items, "\r\n\r\ntwo"));
+}
+
+test "a response to a client that sent one request and waits leaves at once" {
+    var wire: Wire = .{};
+    wire.init();
+    defer wire.deinit();
+
+    var in = std.Io.Reader.fixed("GET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = try readRequest(&in);
+    try writeResponse(&wire.writer, 200, "OK", "text/plain", "one", .implied, &.{});
+    try settle(&wire.writer, &in);
+    try testing.expectEqual(@as(usize, 1), wire.writes);
+    try testing.expect(std.mem.endsWith(u8, wire.kept.items, "\r\n\r\none"));
+
+    // The same for a HEAD, whose answer is a head with nothing after it.
+    var again = std.Io.Reader.fixed("HEAD /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    _ = try readRequest(&again);
+    try writeResponseHeadOnly(&wire.writer, 200, "OK", "text/plain", 3, .implied, &.{});
+    try settle(&wire.writer, &again);
+    try testing.expectEqual(@as(usize, 2), wire.writes);
+    try testing.expect(std.mem.endsWith(u8, wire.kept.items, "Content-Length: 3\r\n\r\n"));
 }

@@ -1918,6 +1918,249 @@ cost of `VmRSS` no longer showing the saving, which is the number ADR
 after, plus `bench/mem.py` to see what RSS does under pressure, would
 settle whether the 57 µs is worth the honesty of the RSS figure.
 
+## What one accept fiber caps a server at
+
+[ADR 0273](../../docs/adr/0273-every-executor-accepts.md) is the decision;
+this is the run, and the arena reading that led to it.
+
+**The instrument on this box is [gcannon](https://github.com/MDA2AV/gcannon)**
+(`11c802b`, built native against liburing 2.15), which is what HttpArena
+drives every H/1.1 profile with, so the shape is the arena's: `-t 8`, five
+seconds, `-r 10` for a connection closed after ten requests. The server is
+`nilo-hello` (`bench/main.zig`, `/health`) in `ReleaseFast`, pinned to CPUs
+0–7 with gcannon on 8–15, on an AMD Ryzen 7 9700X (8 cores, 16 threads,
+SMT on) under Linux 7.2.5 (Omarchy). CPU is `utime + stime` from
+`/proc/<pid>/stat` across the run. Before is `7e084ce`, one acceptor;
+after is the working tree with one acceptor per executor. The pairs are
+interleaved.
+
+| shape | before | after |
+|---|---|---|
+| short-lived, 512 conns × 10 req | 664K / 668K / 660K req/s, p50 17 µs, p99 8.2 ms, **12.6 core-s** | **1.97M / 1.97M / 1.97M**, p50 121–127 µs, p99 1.5–1.8 ms, 30.0 core-s |
+| short-lived, 4,096 conns × 10 req | 708K, p50 18 µs, p99 61 ms | 1.75M, p50 257 µs, p99 41 ms |
+| keep-alive, 512 conns | 2.65M / 2.64M / 2.62M, 29.5 core-s | 2.64M / 2.64M / 2.64M, 29.3 core-s |
+
+**2.95× on the shape that churns connections, unchanged on the one that
+does not**, which is the whole of what the change was meant to do. The
+before row's CPU is the finding in one number: 12.6 core-seconds over five
+seconds is 2.5 cores of the 8 the server had, and its p99 is
+512 / 66K connections a second = 7.8 ms — the time a handshake waited in
+the backlog for the one fiber to get round to it. After, the server is at
+6 of 8 cores and the p50 has moved from 17 µs to 121, because the first
+request of every connection is now served rather than queued, and it costs
+what a connection costs.
+
+### The arena's two readings, and what changed between them
+
+HttpArena ran nilo twice on 2026-09-21, first at `da101ff` and then at
+`f1152a7`, which is the same tree plus the `Date` header (ADR 0269), the
+4,096 backlog (ADR 0271) and stealing off (ADR 0272). Sixty-four logical
+CPUs for the server (`0-31,64-95` on a Threadripper PRO 3995WX), 5 s runs,
+best of three on throughput.
+
+| profile | `da101ff` | `f1152a7` | |
+|---|---|---|---|
+| baseline, 4,096 | 3.06M, p50 0.53–0.61 ms, 126 MiB | 3.17M, **p50 1.27 ms**, 186 MiB | +3.7%, latency 2× |
+| pipelined, 4,096 (ref.) | 3.99M, p50 5.5 ms, p99.9 225 ms | 3.90M, p50 16.6 ms, **p99.9 1.13 s** | |
+| limited-conn, 4,096 | 451K, p50 45 µs, **p99 3 ms**, 1832% | 426K, p50 48 µs, **p99 100 ms**, 1805% | |
+| async-db, 1,024 (ref.) | 66.2K, p99 50 ms | 59.7K, p99 245–362 ms | −10% |
+| echo-ws, 512 / 4,096 / 16,384 | 3.54M / 3.60M / 3.52M, 188 MiB at 16K | 3.57M / 3.73M / 3.44M, **483 MiB** at 16K | |
+| latency-1m | 39.8 µs/req, rate 0.979, p99.9 2,035 µs | **30.6 µs/req**, rate 0.998, p99.9 320 µs | −23% CPU |
+| latency-10k | 40.4 µs/req, rate 0.976 | **34.5 µs/req**, rate 0.998 | −15% CPU |
+| latency-500k-8cpu (ref.) | rate 0.884, p99 6.6 s | rate 0.899, p99 2.0 s | still short |
+| async, 32,000 | 1.88M, mean 13.4 ms, p99.9 23 ms | 1.83M, mean 16.0 ms, p99.9 277–534 ms | −3% |
+
+Three things to read off it, one of which was predicted.
+
+**ADR 0272 landed where it said it would, and its other side is now
+measured.** The prediction was 25–30 µs on `latency-10k` from 40; the
+reading is 34.5, and 30.6 on `latency-1m`, with the rate held at 0.998 on
+both for the first time (ADR 0271's backlog). Everything saturated paid
+for it: at the same throughput the baseline's p50 doubled, pipelined's
+tail went from a quarter of a second to over one, and the async profile's
+timers fire 6 ms late instead of 3. `bench/paced.py` measured a server
+that is not busy; this is the busy one, and the account is that an
+executor with a burst on its ring drains it alone while its neighbours
+sleep. The trade stands — the fixed-rate profiles are the ones the arena
+weights, and the tails are reference columns — but it is a trade, and the
+saturation pairs in the section above did not show it because 64
+connections on two threads is not a burst.
+
+**`limited-conn` is not about the change at all, and its p99 says what it
+is about.** 451K and 426K are the same number; the p99 moved from 3 ms to
+100 ms because the backlog moved from 128 to 4,096, and each p99 is that
+backlog divided by ~43K connections a second. One accept fiber at ~23 µs a
+connection is the ceiling, on 18 of 64 cores, and ADR 0273 is the answer.
+The next arena run is the reading this box cannot take.
+
+**Memory per active connection is ~29.5 KiB, not 4,669 bytes.** 483 MiB
+over 16,384 echoing WebSockets and 924 MiB over 32,000 sleeping fibers
+both divide to it. The 4,669 figure is an idle connection whose pages went
+back (ADR 0071); a connection inside a request or a `sleep` holds its
+fiber's stack to its high-water mark plus both buffers, and that is what
+the arena's memory column reads. It feeds only the board's optional memory
+bonus, and it is ADR 0018's third axis for a connection that is *not* idle,
+which no number here had put beside the idle one.
+
+### Can it be pushed further
+
+On this box the after row is 6 of 8 cores at 1.97M with gcannon on the
+other eight, so the next factor is not in the server. On the arena's
+sixty-four the remaining per-connection cost is the handoff — a task
+pushed onto another executor's queue and an eventfd write to wake it —
+which a spawn homed on the accepting executor would remove; that is the
+upstream row in the roadmap. Below that is the kernel's accept queue lock
+on one listener, and `SO_REUSEPORT` is the lever if a profile ever puts it
+there.
+
+## What a flush per response costs a client that pipelines
+
+[ADR 0274](../../docs/adr/0274-a-response-is-flushed-before-the-connection-waits.md)
+is the decision; this is the run.
+
+Same instrument and same split as the section above: gcannon (`11c802b`,
+native, liburing 2.15) on CPUs 8–15, the server on 0–7, `ReleaseFast`,
+eight-second runs, CPU as `utime + stime` from `/proc/<pid>/stat` across
+the run. Before is `0efa4c0` (every executor accepts, every response
+flushed), after is the working tree; each row is three interleaved pairs
+unless it says two. `-p 16` is the arena's `pipelined` and
+`echo-ws-pipeline` shape: sixteen requests or frames in one write, refilled
+as answers come back. The HTTP server is `nilo-hello` on `/health`; the
+WebSocket server is `bench/ws_server.zig` on `/ws/small`, echoing.
+
+| shape | before | after |
+|---|---|---|
+| HTTP, 256 conns, `-p 16` | 3.06 / 3.04 / 3.05M req/s, p50 1.34 ms, p99 1.76–1.85 ms, p99.9 3.0–3.2 ms, 43.3–43.7 core-s | **13.58 / 12.75 / 12.31M**, p50 299–331 µs, p99 365–384 µs, p99.9 498–533 µs, 58.7–59.4 core-s |
+| HTTP, 4,096 conns, `-p 16` (two pairs) | 2.06 / 2.05M, p50 14.8 ms, p99 107 ms, p99.9 338 ms | **10.99 / 10.37M**, p50 2.5–2.6 ms, p99 39 ms, p99.9 81–83 ms |
+| WS echo, 256 conns, `-p 16` | 3.61 / 3.59 / 3.59M msg/s, p50 1.13 ms, p99 1.32–1.54 ms, 39.7 core-s | **37.27 / 37.12 / 37.36M**, p50 108 µs, p99 200–223 µs, 48.6 core-s |
+| WS echo, 4,096 conns, `-p 16` (two pairs) | 2.93 / 2.91M, p50 11.0 ms, p99 81.5 ms | **31.14 / 30.77M**, p50 0.86 ms, p99 33 ms |
+| HTTP, 256 conns, keep-alive | 2.61 / 2.61 / 2.61M, p99 161–193 µs, 46.3 core-s | 2.59 / 2.60 / 2.60M, p99 157–212 µs, 46.3 core-s |
+| WS echo, 256 conns, one frame at a time | 2.75 / 2.75 / 2.74M, p99 183–204 µs, 45.6 core-s | 2.75 / 2.75 / 2.75M, p99 194–205 µs, 45.6 core-s |
+
+**The syscall was the request.** Divide CPU by responses: a pipelined
+`/health` cost 1.78 µs of server CPU before and 0.57 after; a pipelined
+echo 1.38 µs before and 0.16 after. The echo is a memcpy of five bytes and
+a frame header, so the syscall was nearly all of it, which is why the
+WebSocket factor is ten and the HTTP one four. The tails move by the same
+factors, because a response that used to wait behind fifteen `send(2)`s
+now waits behind fifteen memcpys.
+
+**The other two rows are the check that nothing else moved.** Neither
+shape ever has a second request buffered when it answers, so both flush on
+`send` exactly as before, and the change they see is the compare of
+`in.seek` against `in.end` on every response and the load of the writer's
+fill on every read that reaches the socket. WebSocket: identical to the
+third digit and to the CPU tick. HTTP: 0.4% down with the sign the same in
+all three pairs, at the same CPU. That is within the spread the section
+above quotes for the same shape (2.62–2.65M) and inside ADR 0018's 10% by
+a factor of twenty, but it is not nothing, and it is written down as the
+price rather than rounded away.
+
+**Memory per idle connection does not move.** `bench/mem.py` against both
+binaries at 2,000, 5,000 and 10,000 keep-alive connections: 5,218 / 5,198 /
+5,191 bytes on before and the same three numbers on after. (5,191 on this
+box against the 4,674 the section on idle connections quotes for the same
+binary is the box, Linux 7.2.5 against 7.0.0, and not this change, since
+both sides read it; it has not been taken apart.)
+
+**`bench/shutdown.py`** comes back 6 of 6 on the WebSocket server and 6 of
+6 on HTTP, so a connection with a held response is still one the shutdown
+reaches.
+
+### Can it be pushed further
+
+On the pipelined HTTP row the server is now at 7.4 of its 8 cores, so the
+next factor on this box is inside the request rather than around it, and
+[the per-request accounting above](#what-a-request-costs-in-process) is
+where to look. On the WebSocket row it is at 6.1 of 8 and gcannon at
+37M frames a second is the more likely limit; a second box would say.
+Sixteen is the arena's depth; a client that pipelines deeper than the
+4 KiB write buffer holds gets a drain per 4 KiB, which is the right bound
+and could be raised per server with `write_buffer` if a profile ever
+wanted it.
+
+## A reset between frames is a client that has gone
+
+[ADR 0275](../../docs/adr/0275-a-reset-between-frames-is-a-client-that-has-gone.md)
+is the decision; this is the run that found it, made before subscribing
+nilo's arena entry to `echo-ws-limited`.
+
+The shape is the arena's: `--ws -r 10`, a WebSocket connection closed
+after ten echoed frames and reopened, at 512 and 4,096 connections. Same
+instrument and split as the two sections above (gcannon on CPUs 8–15, the
+server `bench/ws_server.zig` on 0–7, `/ws/small`, `ReleaseFast`, CPU from
+`/proc/<pid>/stat`). One thing about the instrument matters here and was
+read out of its source: **under `-r`, gcannon sets `SO_LINGER {1, 0}` on
+every socket**, so each connection ends with a reset rather than a FIN.
+That is what a load generator does to keep its ports out of `TIME_WAIT`,
+and it is what every connection on the arena's two `limited` columns does.
+
+Three builds, five-second runs, stderr to a file or to `/dev/null`,
+descriptors sampled at 2.5 s with `ls /proc/<pid>/fd`, connection counts
+from gcannon's `Reconnects` and `WS upgrades`:
+
+| server | stderr | frames/s | descriptors mid-run | connections made | upgraded |
+|---|---|---|---|---|---|
+| `7e084ce`, one acceptor | a file | 878K | 10,014 | 542K | 445K |
+| | `/dev/null` | 1.18M | 323 | 590K | 600K |
+| `0efa4c0`, every executor accepts (ADR 0273) | a file | 454K | 10,025 | 2.6M | 233K |
+| | `/dev/null` | 708K | 10,021 | 2.4M | 360K |
+| the tree with ADR 0275 | a file | 1.70M | 560 | 851K | 863K |
+
+**The warning per connection was the ceiling, and ADR 0273 lowered it.**
+A reset between frames came up through `receive` as `ReadFailed` and was
+logged as "the WebSocket loop failed", once per connection; the log takes
+one lock for the whole process and holds it across the format and the
+write. With one acceptor the intake was throttled to roughly what that
+lock could pass. With eight, connections arrived faster than the ones
+before them could get through it; each fiber waiting for the lock held
+the reset socket it was about to close, the descriptors climbed to
+`max_connections` (10,000 on this server), the acceptors began refusing,
+and gcannon retries a refused connection at once, so 2.4M connections
+were made for 233K that reached a handshake. `/dev/null` moves the number
+and not the shape, which is what says the lock and not the disk.
+Treating the reset the way a FIN is already treated, `null` from
+`receive` and no line, is the whole fix.
+
+Interleaved pairs, eight seconds, `0efa4c0` → the tree with ADR 0274 and
+0275, stderr to a file:
+
+| shape | before | after |
+|---|---|---|
+| 512 conns × 10 frames | 461K / 469K frames/s, p50 340 µs, p99 640–670 µs, 39.6 core-s | **1.67M / 1.69M**, p50 69–86 µs, p99 380 µs, 48.6 core-s |
+| 4,096 conns × 10 frames | 286K / 283K, p50 5.4 ms, p99 6.8 ms, 34.2 core-s | **1.58M / 1.58M**, p50 270 µs, p99 1.1–1.2 ms, 48.6 core-s |
+| `7e084ce` for context, one run each | 874K, p50 12 µs, p99 46 µs (512) / 845K, p50 13 µs, p99 74 µs (4,096) | |
+
+The one-acceptor row's latency is low because its intake was throttled:
+gcannon times a frame from send to echo, and a connection waiting in the
+backlog to be accepted is not yet sending frames. The after rows are at
+6.1 of 8 cores, with descriptors and established sockets tracking the
+client's connection count.
+
+**The HTTP short-lived shape does not have this** and never did:
+`-r 10` on `/health` at 512 and 4,096 connections holds 565 and ~2,500
+descriptors mid-run at 1.96M and 1.76M req/s, with no line per connection,
+because a reset between two requests is `waitForRequest`'s to swallow and
+always was.
+
+**What is not explained.** Both servers log "handler … failed after
+answering: WriteFailed" for 0.05–0.1% of short-lived connections: 403 in
+879K on HTTP at 4,096 connections, 934 in 794K on WebSocket, 163 in 435K
+on the one-acceptor build, so it is older than any change here. The
+response, or the 101, was written to a socket the client had already
+reset, which under `-r 10` and `-p 1` should not happen before the tenth
+answer has been read. gcannon reports ~100–200 `read` errors per run,
+which is the same order but not the same number. The roadmap carries it.
+
+### Can it be pushed further
+
+The after rows are the same server that echoes 2.75M frames a second on
+persistent connections, so the remaining 1M a second is the connection:
+accept, the upgrade's SHA-1 and base64, a fiber and its two buffers, and
+the teardown. ADR 0273's upstream row, a spawn homed on the accepting
+executor, is the next lever on it, and the same for HTTP's short-lived
+shape.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

@@ -27,7 +27,7 @@ fn handler(c: *nilo.Ctx) !void { … }
 | `c.setHeader(name, value)` | copied into the request arena |
 | `c.setStaticHeader(name, value)` | for text that already outlives the request (a literal), so nothing is copied |
 
-**Set them before sending.** A response is flushed the moment it is sent, so
+**Set them before sending.** A response is finished the moment it is sent, so
 there is nothing left to change afterwards.
 
 `Content-Type`, `Content-Length`, `Transfer-Encoding` and `Connection` are the
@@ -407,11 +407,18 @@ from it reads what the server actually sends
 
 ## One request, one response
 
-A response is written and flushed in one go. There is no "start the response,
-change your mind" — that state doesn't exist, so neither do the bugs where a
-header set too late silently vanishes. If you need to decide as you go, that's
-what [a stream](./streaming.md) is for, and even there the head goes out first
-and is fixed once written.
+A response is written in one go. There is no "start the response, change your
+mind" — that state doesn't exist, so neither do the bugs where a header set too
+late silently vanishes. If you need to decide as you go, that's what
+[a stream](./streaming.md) is for, and even there the head goes out first and
+is fixed once written.
+
+It is on the wire before the connection next waits for the client. For a
+client that sends a request and waits for the answer, which is every browser,
+that is the moment `send` returns. A client that pipelines, sending its next
+request before reading this answer, gets the answers in one write rather than
+one each; it was not waiting, and the batch is bounded by `write_buffer`
+([ADR 0274](../adr/0274-a-response-is-flushed-before-the-connection-waits.md)).
 
 Sending twice is an assertion failure rather than two responses on the wire. A
 handler that fails *after* sending gets its connection closed, because a

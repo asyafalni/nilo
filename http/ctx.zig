@@ -1557,24 +1557,31 @@ pub const Ctx = struct {
 
         // A handler need not know this is a HEAD: it assembles a response
         // as usual, and what must not go out is filtered here.
-        if (self.method == .HEAD) return http1.writeResponseHeadOnly(
-            self._out,
-            status,
-            http1.statusPhrase(status),
-            content_type,
-            response_body.len,
-            self.connection(),
-            self.extraHeaders(),
-        );
-        try http1.writeResponse(
-            self._out,
-            status,
-            http1.statusPhrase(status),
-            content_type,
-            response_body,
-            self.connection(),
-            self.extraHeaders(),
-        );
+        if (self.method == .HEAD) {
+            try http1.writeResponseHeadOnly(
+                self._out,
+                status,
+                http1.statusPhrase(status),
+                content_type,
+                response_body.len,
+                self.connection(),
+                self.extraHeaders(),
+            );
+        } else {
+            try http1.writeResponse(
+                self._out,
+                status,
+                http1.statusPhrase(status),
+                content_type,
+                response_body,
+                self.connection(),
+                self.extraHeaders(),
+            );
+        }
+        // On the wire now, unless the client has pipelined the next request
+        // behind this one, in which case it goes out with that one's answer
+        // (ADR 0274).
+        try http1.settle(self._out, self._in);
     }
 
     pub fn sendText(self: *Ctx, status: u16, text: []const u8) !void {
