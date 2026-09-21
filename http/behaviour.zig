@@ -1621,6 +1621,98 @@ test "a path nothing is registered under is still a 404" {
     try testing.expect(std.mem.indexOf(u8, result.response, "Allow:") == null);
 }
 
+// ---- the failure body an application names (ADR 0270) ----
+
+const ApiError = struct {
+    code: u16,
+    detail: []const u8,
+
+    pub fn nilo_failure(status: u16, message: []const u8) ApiError {
+        return .{ .code = status, .detail = message };
+    }
+};
+
+fn failsWithASentence(c: *Ctx) anyerror!void {
+    _ = c;
+    return fail.notFound("no order \"{d}\"", .{7});
+}
+
+test "app.failures gives every failure the application's shape, message and headers intact" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.failures(ApiError);
+    try app.get("/orders", failsWithASentence);
+    try app.post("/orders", testQuiet);
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    // A fail function's sentence, JSON-escaped by the same writer a handler's
+    // answer goes through — nothing here escapes by hand.
+    const failed = h.send(&app, "GET /orders HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, failed.response, "HTTP/1.1 404 Not Found\r\n"));
+    try testing.expect(std.mem.indexOf(u8, failed.response, "Content-Type: application/json\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, failed.response, "\r\n\r\n{\"code\":404,\"detail\":\"no order \\\"7\\\"\"}"));
+    try testing.expect(std.mem.indexOf(u8, failed.response, "\"error\":") == null);
+    try testing.expect(failed.keep_alive);
+
+    // The built-in 405 goes through the same place, so it takes the shape
+    // too — and still carries the `Allow` it has to (ADR 0025).
+    const wrong_verb = h.send(&app, "DELETE /orders HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, wrong_verb.response, "HTTP/1.1 405 Method Not Allowed\r\n"));
+    try testing.expect(std.mem.indexOf(u8, wrong_verb.response, "Allow: GET, HEAD, POST\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wrong_verb.response, "{\"code\":405,\"detail\":\"DELETE is not allowed here") != null);
+
+    // And a route nobody registered.
+    const nowhere = h.send(&app, "GET /nowhere HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, nowhere.response, "{\"code\":404,\"detail\":\"there is no /nowhere\"}") != null);
+}
+
+test "app.failures is said once" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.failures(ApiError);
+    try testing.expectError(error.FailureShapeAlreadySet, app.failures(ApiError));
+}
+
+const Oversized = struct {
+    padding: []const u8,
+    detail: []const u8,
+
+    pub fn nilo_failure(_: u16, message: []const u8) Oversized {
+        return .{ .padding = "x" ** 2048, .detail = message };
+    }
+};
+
+test "a shape that outgrows the failure buffer falls back to nilo's own, sentence intact" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.failures(Oversized);
+    try app.get("/orders", failsWithASentence);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(&app, "GET /orders HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 404 Not Found\r\n"));
+    try testing.expect(std.mem.indexOf(u8, result.response, "\"padding\"") == null);
+    try testing.expect(std.mem.endsWith(u8, result.response, "{\"error\":\"no order \\\"7\\\"\",\"status\":404}"));
+}
+
+test "a malformed head keeps nilo's own shape whatever app.failures said" {
+    // Answered before there is a request to route, as a constant (ADR 0197),
+    // and `failurebody.zig` says why that is kept.
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.failures(ApiError);
+    try app.get("/orders", testQuiet);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(&app, "GET /orders HTTP/1.1\r\nHost: x\r\nBad Header\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expect(std.mem.indexOf(u8, result.response, "{\"error\":\"malformed request\",\"status\":400}") != null);
+}
+
 test "a 405 knows about params and catch-alls, not just literal paths" {
     var app = App.init(testing.allocator);
     defer app.deinit();
@@ -4413,6 +4505,26 @@ test "the document names the statuses and failures the signatures settle" {
         json,
         "\"$ref\":\"#/components/schemas/Failure\"",
     ) != null);
+}
+
+test "the document's Failure schema is the shape app.failures named" {
+    var db = Db{ .rows = &.{} };
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&db);
+    app.docs(.{});
+    try app.failures(ApiError);
+    try app.get("/users/:id", docFindUser);
+
+    const json = try docsFor(&app);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        json,
+        "\"Failure\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"integer\",\"minimum\":0},\"detail\":{\"type\":\"string\"}}",
+    ) != null);
+    // Under `Failure` and not under its own name as well: one shape, one entry.
+    try testing.expect(std.mem.indexOf(u8, json, "\"ApiError\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"$ref\":\"#/components/schemas/Failure\"") != null);
 }
 
 test "a shape used by more than one route is written once and referred to" {

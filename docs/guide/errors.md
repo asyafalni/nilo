@@ -85,6 +85,50 @@ nilo's internals goes out — no stack trace, no file name, no Zig error name
 unless a `fail` function put it in the message on purpose. A 500 logs the error
 name and sends `internal server error`.
 
+### When your clients already read another shape
+
+The one shape is right until the frontend in front of you already reads
+`{"code":…,"detail":…}` from three other services. Then name a struct and let
+nilo fill it:
+
+<!-- compiles -->
+```zig
+const ApiError = struct {
+    code: u16,
+    detail: []const u8,
+
+    pub fn nilo_failure(status: u16, message: []const u8) ApiError {
+        return .{ .code = status, .detail = message };
+    }
+};
+```
+
+<!-- compiles: body -->
+```zig
+try app.failures(ApiError);
+```
+
+```
+$ curl -i localhost:8787/users/99
+HTTP/1.1 404 Not Found
+Content-Type: application/json
+
+{"code":404,"detail":"no user 99"}
+```
+
+The fields are the JSON and `nilo_failure` fills them from the status and the
+sentence — a nested struct for `{"error":{"code":…}}` works the same way. Every
+failure nilo assembles takes the shape, headers intact: a 405 still carries
+its `Allow`, a 401 its `WWW-Authenticate`, and the CORS headers still go out.
+The OpenAPI document's `Failure` schema is read from the same fields, so it
+describes what the wire carries. What keeps nilo's own shape is the handful of
+answers written before there is a request to route — a malformed head, a head
+too long, a shed 503 — because those are constants written in one call. The
+body is written into a fixed buffer with 256 bytes of room for the envelope
+around the sentence; a shape that needs more gets nilo's own shape instead,
+sentence intact, which the first failure in development shows
+([ADR 0270](../adr/0270-a-failure-body-is-a-struct-the-application-names.md)).
+
 In tests, read the field rather than matching the wire:
 
 ```zig

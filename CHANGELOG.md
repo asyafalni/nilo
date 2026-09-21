@@ -32,6 +32,18 @@ newest first.
 
 ### Added
 
+- `app.failures(T)`: the body every failure goes out with, when nilo's
+  `{"error":…,"status":…}` is not the one your clients already read. `T` is a
+  struct whose fields are the JSON, with a `pub fn nilo_failure(status: u16,
+  message: []const u8) T` that fills it; nilo writes it with the JSON writer a
+  handler's answer goes through, and the API description's `Failure` schema
+  comes from the same fields. A fail function's sentence, the 404 and 405
+  nilo answers itself, a 401's challenge, a 405's `Allow` and the CORS
+  headers all survive it. The five answers written before there is a
+  request to route — a malformed head, a head too long or too slow, an
+  unreadable coding, a shed 503 — keep nilo's own. Nothing changes for an
+  App that does not call it. Three refusals
+  ([ADR 0270](./docs/adr/0270-a-failure-body-is-a-struct-the-application-names.md)).
 - Every response carries a `Date`, second after the status line — RFC 9110
   §6.6.1's MUST, which nilo had never met, and what a cache in front does its
   freshness arithmetic from. Formatted once a second per thread, lazily, from

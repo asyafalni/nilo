@@ -195,6 +195,7 @@ pub fn writeOpenApi(self: *const App, w: *std.Io.Writer) !void {
         .version = opts.version,
         .description = opts.description,
     } else .{};
+    info.failure = self.failure_schema;
     const guard = self.declared_guard orelse
         return openapi.write(self.gpa, w, self.operations.items, info);
 

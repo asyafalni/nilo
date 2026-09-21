@@ -27,6 +27,7 @@ const metrics_mod = @import("metrics.zig");
 const serve = @import("serve.zig");
 const wiring = @import("wiring.zig");
 const health = @import("health.zig");
+const failurebody = @import("failurebody.zig");
 
 /// Say so if the program was built in a mode its log level does not match.
 /// Lives in `wiring.zig`; re-exported because `nilo.warn…` is public API.
@@ -105,6 +106,12 @@ pub const App = struct {
     /// takes no slot here.
     derived_names: std.ArrayList([]const u8) = .empty,
     docs_options: ?openapi.Options = null,
+    /// The body a failure goes out with, from `failures()`, or null for
+    /// nilo's own `{"error":…,"status":…}` (ADR 0270). Read on the failure
+    /// path only, so a request that succeeds never touches it. The schema
+    /// beside it is what the document says under `Failure`; set together.
+    failure_write: ?failurebody.Write = null,
+    failure_schema: ?*const openapi.Schema = null,
     /// Every counter in the process, or null on a server that never called
     /// `metrics()` — which is what makes the whole feature one branch on the
     /// request path (ADR 0100). Sized when the chains are resolved, because
@@ -874,6 +881,38 @@ pub const App = struct {
     /// still gets its way.
     pub fn docs(self: *App, opts: openapi.Options) void {
         self.docs_options = opts;
+    }
+
+    /// The body every failure goes out with, when nilo's
+    /// `{"error":"…","status":404}` is not the one your clients already read
+    /// ([ADR 0270](../docs/adr/0270-a-failure-body-is-a-struct-the-application-names.md)).
+    ///
+    /// ```zig
+    /// const ApiError = struct {
+    ///     code: u16,
+    ///     detail: []const u8,
+    ///     pub fn nilo_failure(status: u16, message: []const u8) ApiError {
+    ///         return .{ .code = status, .detail = message };
+    ///     }
+    /// };
+    /// try app.failures(ApiError);
+    /// ```
+    ///
+    /// The struct's fields are the JSON; `nilo_failure` fills it from the
+    /// status and the fail function's sentence; the API description's
+    /// `Failure` schema is derived from the same fields. Every failure nilo
+    /// assembles takes the shape — a fail function, a 404, a 405 with its
+    /// `Allow`, a 401 with its challenge, a 500 — and the headers the request
+    /// collected still go out with it. The five answers written before there
+    /// is a request to route (a malformed head, a head too long or too slow,
+    /// an unreadable coding, a shed 503) keep nilo's own; `failurebody.zig`
+    /// says why. Called once; a second call is `error.FailureShapeAlreadySet`.
+    pub fn failures(self: *App, comptime T: type) error{FailureShapeAlreadySet}!void {
+        const write = comptime failurebody.writerOf(T);
+        const schema = comptime openapi.schemaOf(T);
+        if (self.failure_write != null) return error.FailureShapeAlreadySet;
+        self.failure_write = write;
+        self.failure_schema = schema;
     }
 
     /// Serve a page that says whether this process can do its job, by asking

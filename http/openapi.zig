@@ -306,6 +306,10 @@ pub const Info = struct {
     /// no guard was declared. What `components.securitySchemes.cookieAuth`
     /// names as `name` (ADR 0252).
     cookie: ?[]const u8 = null,
+    /// The shape of a failure body, from `app.failures`, or null for nilo's
+    /// own (ADR 0270). Written under `components.schemas.Failure` in place
+    /// of `error_schema`, so the document describes what the wire carries.
+    failure: ?*const Schema = null,
 };
 
 /// What `app.docs(…)` takes. Every field has a default, so `app.docs(.{})`
@@ -989,6 +993,15 @@ pub fn write(gpa: std.mem.Allocator, w: *std.Io.Writer, ops: []const Operation, 
     var components = Components.init(gpa);
     defer components.deinit();
     try components.gather(ops);
+    // A failure shape of the application's is written inline under
+    // `Failure` rather than under its own name, so only what it holds is
+    // gathered — a nested struct it carries gets a slot like any other.
+    if (info.failure) |shape| {
+        switch (shape.*) {
+            .object => |o| for (o.fields) |f| try components.add(f.schema),
+            else => try components.add(shape),
+        }
+    }
 
     try w.writeAll("{\"openapi\":\"3.1.0\",\"info\":{\"title\":");
     try writeString(w, info.title);
@@ -1028,7 +1041,15 @@ pub fn write(gpa: std.mem.Allocator, w: *std.Io.Writer, ops: []const Operation, 
     try w.writeAll("},\"components\":{\"schemas\":{");
     var wrote_schema = false;
     if (Components.anyFailure(ops)) {
-        try w.writeAll("\"" ++ error_schema_name ++ "\":" ++ error_schema);
+        try w.writeAll("\"" ++ error_schema_name ++ "\":");
+        if (info.failure) |shape| {
+            switch (shape.*) {
+                .object => |o| try writeObject(w, &components, o),
+                else => try writeSchema(w, &components, shape),
+            }
+        } else {
+            try w.writeAll(error_schema);
+        }
         wrote_schema = true;
     }
     for (components.slots.items, 0..) |slot, i| {

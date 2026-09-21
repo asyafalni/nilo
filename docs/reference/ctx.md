@@ -218,4 +218,6 @@ directory.
 
 All return `error.Failed`. The message goes into a 240-byte slot, no allocation,
 and goes out as `{"error": "…", "status": 404}` — the same shape for every
-failure, whatever the endpoint returns when it works.
+failure, whatever the endpoint returns when it works — or as the struct
+`app.failures(T)` named, filled from the same status and message
+([ADR 0270](../adr/0270-a-failure-body-is-a-struct-the-application-names.md)).

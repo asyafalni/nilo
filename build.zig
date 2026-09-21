@@ -1405,6 +1405,18 @@ const refusals = [_]Refusal{
         .says = "ownbody_write_wrong_signature.Invoice's `nilo_write` is not `fn (self: ownbody_write_wrong_signature.Invoice, w: *std.Io.Writer) !void`.",
     },
     .{
+        .name = "failures_not_a_struct",
+        .says = "`app.failures` was given failures_not_a_struct.Kind, and the shape of a failure body is a struct.",
+    },
+    .{
+        .name = "failures_without_from",
+        .says = "failures_without_from.ApiError has no `nilo_failure`, so nilo cannot fill it from a status and a message.",
+    },
+    .{
+        .name = "failures_from_wrong_signature",
+        .says = "failures_from_wrong_signature.ApiError's `nilo_failure` is not `fn (status: u16, message: []const u8) failures_from_wrong_signature.ApiError`.",
+    },
+    .{
         .name = "bytes_as_an_argument",
         .says = "argument 1 of the handler for route \"/bundles\" is a `nilo.Bytes`, which is what a handler answers *with* rather than something it is given.",
     },
@@ -1937,6 +1949,7 @@ const Snippets = struct {
         .{ .path = "docs/reference/jwt.md" },
         .{ .path = "docs/reference/fetch.md" },
         .{ .path = "docs/guide/sessions.md" },
+        .{ .path = "docs/guide/errors.md" },
         .{ .path = "docs/guide/config.md" },
         .{ .path = "docs/guide/forms.md" },
         // These three were carrying `<!-- compiles -->` marks that nothing

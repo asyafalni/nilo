@@ -899,6 +899,7 @@ test {
     _ = @import("text.zig");
     _ = @import("http1.zig");
     _ = @import("date.zig");
+    _ = @import("failurebody.zig");
     _ = @import("bulkhead.zig");
     _ = @import("watchdog.zig");
     _ = @import("engine/zio.zig");

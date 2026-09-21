@@ -23,6 +23,7 @@ const watchdog = @import("watchdog.zig");
 const scratch = @import("scratch.zig");
 const websocket = @import("websocket.zig");
 const metrics_mod = @import("metrics.zig");
+const failurebody = @import("failurebody.zig");
 
 const App = app_mod.App;
 const Ctx = ctx_mod.Ctx;
@@ -463,7 +464,7 @@ pub noinline fn serveRequest(
         // too big to discard, or behind an `Expect` nobody answered. That is
         // the 413 naming `bodyStream()` that a reset would take back.
         const linger = !reusable and http1.readsMore(&r);
-        sendFailure(&c, failure, err) catch return .{ .keep_alive = false, .handover = handover, .linger = linger };
+        sendFailure(&c, failure, err, self.failure_write) catch return .{ .keep_alive = false, .handover = handover, .linger = linger };
         return .{ .keep_alive = reusable, .handover = handover, .linger = linger };
     };
     watchdog.finish(&in_flight.watch);
@@ -598,8 +599,9 @@ const RESPONSE_503_SHED: http1.Static = blk: {
 
 /// Room for the longest failure body there can be: a message at the Failure's
 /// ceiling where every byte needs the six-character `\u00xx` escape, plus the
-/// wrapper around it.
-const failure_body_max = fail.max_message * 6 + 32;
+/// wrapper around it — nilo's own is 32 bytes, and a shape the application
+/// named (ADR 0270) gets 256 for its envelope.
+const failure_body_max = fail.max_message * 6 + 256;
 
 /// A failure body for a message known while compiling — no escaping, because
 /// these three are written here and have nothing in them to escape.
@@ -1013,8 +1015,9 @@ fn sendDirect(c: *Ctx, status: u16, content_type: []const u8, body: []const u8) 
 /// Turn a handler failure into a response. A fail function's message is
 /// used if there is one; otherwise the error goes through the mapping
 /// table, and anything unrecognised becomes a 500 logged with its error
-/// name (ADR 0005).
-noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror) !void {
+/// name (ADR 0005). The body is nilo's own shape, or the one the
+/// application named with `app.failures` (ADR 0270).
+noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror, shape: ?failurebody.Write) !void {
     const status = fail.resolveStatus(failure, err);
     const message: []const u8 = if (failure.isSet()) failure.message() else blk: {
         if (status == 500) {
@@ -1038,10 +1041,21 @@ noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror) !v
 
     var buf: [failure_body_max]u8 = undefined;
     var body: std.Io.Writer = .fixed(&buf);
+    // A shape of the application's can outgrow the buffer — an envelope past
+    // its 256 bytes — and then nilo's own shape goes out instead, with the
+    // sentence intact: the first failure in development shows the wrong
+    // shape, which is the whole of what a warning would have said. Not a
+    // `std.log.warn` here on purpose — one measured 1,446 bytes of binary
+    // (2,121 with two `{d}`s) for a line an App with no shape can never
+    // reach, on every App.
+    if (shape) |write| write(status, message, &body) catch {
+        body = .fixed(&buf);
+        writeFailureBody(&body, status, message) catch unreachable; // sized for it, below
+    };
     // The buffer is sized for the longest message a Failure can hold, so
     // this cannot run out of room; if it somehow did, what was written so
     // far would not be JSON, and the status alone is better than that.
-    writeFailureBody(&body, status, message) catch {
+    if (shape == null) writeFailureBody(&body, status, message) catch {
         return sendDirect(c, status, "", "");
     };
     try sendDirect(c, status, failure_content_type, buf[0..body.end]);

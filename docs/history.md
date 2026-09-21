@@ -3803,3 +3803,12 @@ function links. The number is in ADR 0018's running total with the split
 beside it, and the throughput pairs in
 [`bench/result/http.md`](../bench/result/http.md#what-a-date-costs-and-what-leaving-connection-off-gives-back)
 say the clock read is invisible, which was the axis worth worrying about.
+
+**A `std.log.warn` call site is two kilobytes of binary, fired or not.** A
+warning for a failure shape that outgrew its buffer measured 2,121 bytes
+with two `{d}`s, 1,446 with none, and the same again inlined when it shared
+the 500's format string — on every App, for a line an App with no shape can
+never reach. ADR 0071 found the same machinery on the connection loop's
+stack; this is the binary-size reading of it, and the warning was replaced
+by a fallback the first failure in development shows
+([ADR 0270](./adr/0270-a-failure-body-is-a-struct-the-application-names.md)).

@@ -81,6 +81,10 @@ A struct that came from a type with a name is written once under
 so a route says `{"$ref":"#/components/schemas/Todo"}` rather than carrying a
 copy. Generated clients get one `Todo` type instead of five identical ones.
 
+`Failure` is nilo's own shape, or the struct `app.failures(T)` named — read
+from its fields, under that name and not again under the type's own
+([ADR 0270](../adr/0270-a-failure-body-is-a-struct-the-application-names.md)).
+
 An instantiated generic gets a name too, read back out of the one the compiler
 gives it:
 
