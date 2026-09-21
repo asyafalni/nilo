@@ -3804,6 +3804,17 @@ beside it, and the throughput pairs in
 [`bench/result/http.md`](../bench/result/http.md#what-a-date-costs-and-what-leaving-connection-off-gives-back)
 say the clock read is invisible, which was the axis worth worrying about.
 
+**The two atomics every request makes were measured where they cannot be
+seen, and the arithmetic was worth more than the run.** actix has no atomic
+on its request path; nilo has two `fetchAdd`s on one line for the count a
+stop waits for. Per-thread lanes on the two-core box: −1.1%, sign changing,
+unchanged — which two threads on one cache line were always going to say.
+What settled it was the sum: 2.8M contended RMWs a second across sixteen
+cores is 1–2% of the machine, the same 1.5% `cache.md` had measured for the
+same shape, and inside ADR 0001's bar either way. The lanes stayed out and
+the roadmap row names the box
+([`http.md`](../bench/result/http.md#what-the-two-atomics-a-request-always-makes-cost-on-two-cores)).
+
 **A `std.log.warn` call site is two kilobytes of binary, fired or not.** A
 warning for a failure shape that outgrew its buffer measured 2,121 bytes
 with two `{d}`s, 1,446 with none, and the same again inlined when it shared

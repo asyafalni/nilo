@@ -1673,6 +1673,67 @@ for a panic that cannot fire. Neither is done, because 6 KB on a megabyte is
 0.6% and the wire and throughput axes are where a response header would
 have hurt, and did not.
 
+## What the two atomics a request always makes cost, on two cores
+
+Every request does `stop.in_flight.fetchAdd(1, .acq_rel)` when its head has
+arrived and `fetchSub` when it is answered (`http/serve.zig`), on one `u32`
+every thread writes — the count a graceful stop waits for, and the number
+`max_in_flight` sheds against. actix-web has no atomic on its request path
+at all: a connection never leaves the thread that accepted it, so its
+counters are `Rc`s. The question was whether nilo's two read-modify-writes
+on a shared cache line show up.
+
+**The experiment.** `Stop` grew sixty-four lanes of `i32`, each padded to a
+cache line, and a `threadlocal` index handed out on a thread's first
+request; with `max_in_flight` off — the default, and the benchmark's — the
+request added to and subtracted from its own thread's lane, and `drain()`
+summed the lanes. Signed, because a fiber that starts on one thread and
+finishes on another leaves +1 and −1 in two lanes. With `max_in_flight`
+set the shared counter stayed, since the shed check needs the old value in
+one operation. Forty lines, on the tree at `79c663e`.
+
+**The box is the one the `Date` section above names** — two vCPUs, wrk on
+the same two — and that is the weakest place to look for cache-line
+contention, which the roadmap row for `app.metrics`' atomics already says.
+Same protocol as above: eight interleaved pairs, 3 s warm-up, `wrk -t1
+-c64 -d10s`.
+
+| pair | before req/s | before p99 | after req/s | after p99 | after vs before |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 46,100 | 3.80ms | 46,458 | 3.84ms | +0.8% |
+| 2 | 48,438 | 3.68ms | 46,494 | 3.79ms | -4.0% |
+| 3 | 46,710 | 3.77ms | 46,270 | 3.75ms | -0.9% |
+| 4 | 44,886 | 3.78ms | 46,707 | 3.78ms | +4.1% |
+| 5 | 45,935 | 3.79ms | 44,189 | 4.12ms | -3.8% |
+| 6 | 46,915 | 3.69ms | 45,727 | 3.90ms | -2.5% |
+| 7 | 46,591 | 3.82ms | 45,484 | 3.71ms | -2.4% |
+| 8 | 45,842 | 4.02ms | 46,016 | 3.68ms | +0.4% |
+
+Means: 46,427 before, 45,918 after, **-1.1%**, three pairs up and
+five down. Inside the spread: **unchanged**, and the lanes were not landed.
+
+**What the run does say.** Two threads on one line is not contention, so
+the run cannot see the gain; what it can see is the lanes' own cost — a
+`threadlocal` read, a null check, and an uncontended RMW in place of a
+contended one — and that is also inside the noise. Arithmetic for the box
+that matters: at 1.4M requests a second on sixteen threads that is 2.8M
+RMWs a second on one line, and at 50–100 ns each under contention it is
+0.14–0.28 s of CPU a second across sixteen cores, **1–2% of the machine**.
+That is the ceiling on what the lanes can give back, and it is the same
+1.5% [`cache.md`](./cache.md) measured for per-thread lanes on eight
+threads. Inside ADR 0001's 10% either way; a number worth having, not a
+number worth a second design.
+
+### Can it be pushed further
+
+The run that decides is the roadmap's: the same pair on the eight-core
+box, together with `app.metrics`' four atomics, which share the diagnosis
+and the fix. If that run reads under 2%, the lanes stay out and the row
+closes; over it, the forty lines above are the shape, with one addition —
+the `threadlocal` index should come from the Engine's executor number
+rather than a global counter, so a test thread and a worker thread cannot
+share a lane.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings
