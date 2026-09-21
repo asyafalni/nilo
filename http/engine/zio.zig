@@ -143,7 +143,7 @@ fn writeIp6(w: *std.Io.Writer, bytes: [16]u8) void {
 // business. They arrive here as `anytype` so that this file names only the
 // fields it actually reads:
 //
-//   address  port  reuse_address  threads  read_buffer  write_buffer
+//   address  port  reuse_address  backlog  threads  read_buffer  write_buffer
 //   header_timeout_ms  idle_timeout_ms  body_timeout_ms  write_timeout_ms
 //   stop_on_signal  shutdown_grace_ms  max_connections
 //
@@ -751,7 +751,7 @@ fn listenOnIp(options: anytype, why: *StartupFailure) ?zio.net.Server {
         return null;
     };
 
-    return addr.listen(.{ .reuse_address = options.reuse_address }) catch |err| {
+    return addr.listen(.{ .reuse_address = options.reuse_address, .kernel_backlog = options.backlog }) catch |err| {
         why.* = classifyListenFailure(@errorName(err));
         switch (why.*) {
             .in_use => std.log.err(
@@ -786,6 +786,7 @@ fn listenOnUnix(
     gpa: std.mem.Allocator,
     path: []const u8,
     reuse_address: bool,
+    backlog: u31,
     why: *StartupFailure,
 ) ?zio.net.Server {
     if (!zio.net.has_unix_sockets) {
@@ -828,7 +829,7 @@ fn listenOnUnix(
     // sentence about it.
     if (reuse_address) clearStaleSocket(gpa, path);
 
-    return addr.listen(.{}) catch |err| {
+    return addr.listen(.{ .kernel_backlog = backlog }) catch |err| {
         why.* = classifyListenFailure(@errorName(err));
         switch (why.*) {
             .in_use => std.log.err(
@@ -976,7 +977,7 @@ pub fn serve(
     const unix_path = unixPathIn(options.address);
 
     const maybe_server: ?zio.net.Server = if (unix_path) |path|
-        listenOnUnix(gpa, path, options.reuse_address, &why)
+        listenOnUnix(gpa, path, options.reuse_address, options.backlog, &why)
     else
         listenOnIp(options, &why);
     const server = maybe_server orelse return why.toError();

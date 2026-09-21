@@ -197,6 +197,30 @@ pub const Options = struct {
     /// left alone.
     reuse_address: bool = true,
 
+    /// How many completed handshakes the kernel holds for `accept` before it
+    /// starts dropping them. 4,096, up from zio's 128.
+    ///
+    /// This is a queue *capacity*, not a count of anything held: the kernel
+    /// allocates only for connections actually waiting in it, so raising it
+    /// costs nothing on a quiet server. What it buys is a burst — every
+    /// client reconnecting at once after a deploy, a load balancer's health
+    /// checks landing together, a benchmark opening a thousand sockets in
+    /// one go. Past the backlog a SYN is dropped rather than refused, the
+    /// client's TCP retries it a second later, and nothing in this
+    /// process's log says so: what a person sees is a p99 on connection
+    /// setup of one second, against an accept loop that was never busy.
+    /// At 128, 623 of a thousand connections opened at once took that
+    /// second; at 1,024 none did, and a burst of four thousand still lost
+    /// some; at 4,096 none did either
+    /// ([ADR 0271](../docs/adr/0271-a-backlog-is-sized-for-the-burst-not-the-load.md)).
+    ///
+    /// 4,096 is `net.core.somaxconn` on a current Linux, which is also
+    /// what Go listens with; the kernel caps this at that sysctl silently,
+    /// so on an old kernel whose ceiling is 128 the number here is 128.
+    /// `max_connections` is the other half of the arithmetic: this bounds
+    /// what waits to be accepted, that bounds what is held once it has been.
+    backlog: u31 = 4096,
+
     /// How many OS threads run fibers. 0 means one per core.
     ///
     /// zio's own default is a single executor. That is the right default

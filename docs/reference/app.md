@@ -76,6 +76,7 @@ try v1.without(requireOperator).with(rateLimitSignups).post("/sign-up", signUp);
 | `write_buffer` | `4 * 1024` |
 | `arena_keep` | `16 * 1024` — of a connection's request arena, kept between requests |
 | `reuse_address` | `true` — on a unix socket, removes a socket file left behind by a process that is gone |
+| `backlog` | `4096` — completed handshakes the kernel holds for `accept`; past it a SYN is dropped and the client retries a second later. `somaxconn`'s default, and the kernel caps it there ([ADR 0271](../adr/0271-a-backlog-is-sized-for-the-burst-not-the-load.md)) |
 | `stop_on_signal` | `true` — Ctrl-C and SIGTERM |
 | `shutdown_grace_ms` | `10_000` |
 | `header_timeout_ms` | `10_000` — the whole head, from its first byte |

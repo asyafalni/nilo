@@ -149,6 +149,7 @@ python3 bench/mem.py --port … --path …   # memory per idle connection, any s
 python3 bench/mem.py --port … --path … --hold   # the same for a stream nobody closes
 python3 bench/shutdown.py --cmd … --port …  # does SIGTERM come back? The regression check for ADR 0098
 python3 bench/fdlimit.py --cmd … --port …   # does a descriptor shortage take the server down? The check for ADR 0265
+python3 bench/burst.py --cmd … --port …     # does a burst of connections get through, or does the kernel drop some? The check for ADR 0271
 python3 bench/slowloris.py --port … --path …  # what a body that never finishes holds. Reports VmData, not just VmRSS
 python3 bench/ws_idle.py both            # the same axis for WebSockets, nilo and gws
 python3 bench/s3_setup.py                # the bucket and objects both of the above want

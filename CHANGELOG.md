@@ -32,6 +32,15 @@ newest first.
 
 ### Added
 
+- `listen()` takes `backlog`: how many completed handshakes the kernel holds
+  for `accept`. 4,096 — `net.core.somaxconn`'s default, what Go listens with —
+  up from zio's 128, which nilo had been passing without saying so. Past the
+  backlog a SYN is dropped, not refused, and the client retries a second
+  later with nothing in the server's log: a burst of a thousand connections
+  against 128 put 623 of them on that one-second retry, against 4,096 none.
+  A queue capacity, so it costs nothing on a quiet server. `bench/burst.py`
+  is the regression check
+  ([ADR 0271](./docs/adr/0271-a-backlog-is-sized-for-the-burst-not-the-load.md)).
 - `app.failures(T)`: the body every failure goes out with, when nilo's
   `{"error":…,"status":…}` is not the one your clients already read. `T` is a
   struct whose fields are the JSON, with a `pub fn nilo_failure(status: u16,

@@ -45,6 +45,7 @@ try app.listen(.{
     .read_buffer = 16 * 1024, // also the ceiling on a request head (431 past it)
     .write_buffer = 4 * 1024,
     .reuse_address = true,
+    .backlog = 4096,          // handshakes the kernel queues for accept; past it a SYN waits a second
     .shutdown_grace_ms = 10_000,
     .stop_on_signal = true,   // off if your program handles signals itself
 
@@ -93,6 +94,7 @@ follow say why each one is shaped the way it is.
 |---|---|---|---|
 | `max_connections` | 10,000 | The connection is accepted and closed at once — nothing read, no status written, so the client usually sees a reset. The log says so once a minute with a running count | A held connection ends: a keep-alive one idles out, a WebSocket tab closes, a stream finishes |
 | the process's descriptor limit (`ulimit -n`) | usually 1,024 | `accept` fails with `ProcessFdQuotaExceeded`; the loop waits — 5 ms, doubling to a second — and tries again, and the log says so once per shortage. Connections meanwhile wait in the kernel's backlog. `listen()` warned at startup if this was below `max_connections` ([ADR 0265](../adr/0265-an-accept-loop-that-is-out-of-descriptors-waits.md)) | A held connection ends |
+| `backlog` | 4,096 | The kernel drops the SYN — no reset, no log line here — and the client's TCP retries it one second later, so the connection succeeds late. `ListenOverflows` in `/proc/net/netstat` is the only trace; `bench/burst.py` reads it ([ADR 0271](../adr/0271-a-backlog-is-sized-for-the-burst-not-the-load.md)) | The accept loop drains the queue, which it does as fast as it can accept |
 | `max_in_flight` | off | The head is read, then `503` with `Retry-After: 1` and `Connection: close` — one write of a constant, no queue. Counted under `<shed>` on the metrics page | A request inside its handler finishes |
 | `header_timeout_ms` | 10,000 | A client partway through a head gets a `408` and the connection is closed. One that sent nothing is closed without a status — there is nothing to answer | Nothing to release: the connection is gone |
 | `read_buffer` | 16 KiB | A head that does not fit is a `431`, and the connection is closed — send side first, so the `431` reaches a client that would otherwise see a reset ([ADR 0266](../adr/0266-a-refused-request-is-hung-up-on-with-a-fin.md)) | Nothing to release |

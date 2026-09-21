@@ -1734,6 +1734,82 @@ the `threadlocal` index should come from the Engine's executor number
 rather than a global counter, so a test thread and a worker thread cannot
 share a lane.
 
+## What a listen backlog of 128 drops
+
+[ADR 0271](../../docs/adr/0271-a-backlog-is-sized-for-the-burst-not-the-load.md)
+raised the listen backlog from zio's default of 128 to 4,096. The question
+was not throughput — a backlog is a queue capacity and costs nothing per
+request — but what a burst of connections does against each number, which
+is the shape HttpArena's paced profiles have (1,024 sockets opened in one
+go) and the shape a deploy has (every client reconnecting at once).
+
+**The box is the two-vCPU one the `Date` section names**, kernel 6.8.0-110,
+`net.core.somaxconn` 4096, `tcp_syncookies` 1, with the client on the same
+two cores as the server. Before is `d4700a2` from `git archive`, the two
+afters are the same tree with `backlog` at 1,024 and at 4,096, all
+`nilo-hello`, `ReleaseFast`. The instrument is `bench/burst.py`: `--conns`
+non-blocking `connect()`s back to back, polled to completion, with
+`ListenOverflows` and `ListenDrops` from `/proc/net/netstat` read before
+and after. A connect over half a second is one the kernel dropped and the
+client's TCP retried, since the SYN retransmit timer is one second and
+nothing else on loopback takes that long.
+
+Bursts of 1,000, one burst per server start:
+
+| backlog | run | connected | p50 | p99 | retried (>0.5 s) | `ListenDrops` |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 1 | 1000/1000 | 1,075.7 ms | 1,080.2 ms | **623** | +1,719 |
+| 128 | 2 | 1000/1000 | 1,039.6 ms | 1,044.6 ms | **631** | +1,279 |
+| 128 | 3 | 1000/1000 | 1,056.5 ms | 1,058.1 ms | **623** | +1,287 |
+| 1,024 | 1 | 1000/1000 | 56.3 ms | 57.4 ms | 0 | 0 |
+| 1,024 | 2 | 1000/1000 | 44.7 ms | 45.8 ms | 0 | 0 |
+| 1,024 | 3 | 1000/1000 | 66.4 ms | 67.6 ms | 0 | 0 |
+| 4,096 | 1 | 1000/1000 | 51.6 ms | 52.4 ms | 0 | 0 |
+
+The 128 rows are the finding: **a median connect of one second**, from a
+server whose accept loop was idle, with nothing in its log. The client
+count (623) and the kernel count (1,279–1,719) disagree because a retried
+SYN can be dropped again, and because a burst of 1,000 against a queue
+of 128 that is being drained overflows more than once per connection. The
+p50s under the other two rows are the Python client's own pace — a
+thousand `connect()` calls on a shared two-core box — and say nothing
+about the server.
+
+Then 4,000 in one go, which is `limited-conn`'s connection count,
+interleaved:
+
+| backlog | run | connected | p50 | p99 | retried (>0.5 s) | `ListenDrops` |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1,024 | 1 | 4000/4000 | 336.7 ms | 1,269.1 ms | **187** | +187 |
+| 1,024 | 2 | 4000/4000 | 301.5 ms | 307.7 ms | 0 | 0 |
+| 1,024 | 3 | 4000/4000 | 307.0 ms | 316.8 ms | 0 | 0 |
+| 1,024 | 4 | 4000/4000 | 245.9 ms | 1,238.6 ms | **420** | +420 |
+| 4,096 | 1–6 | 4000/4000 | 206–352 ms | 212–364 ms | 0 | 0 |
+
+At 1,024 two runs of four dropped; at 4,096 none of six did. Whether the
+1,024 row drops depends on how far the accept loop gets before the client
+finishes issuing connects, which on a shared box is the scheduler's call —
+on a box where the client is faster than this one, it would drop more.
+That is what moved the default from actix's 1,024 to the kernel's own
+4,096.
+
+**What the run does not say.** Nothing about the arena's `limited-conn`
+figure, which reconnects 4,096 connections continuously rather than once;
+the accept loop's own throughput is the other half of that profile and it
+is untested here. It is the next section to write, and the arena's next
+run of nilo is the reading that decides both.
+
+### Can it be pushed further
+
+Not the number — 4,096 is `somaxconn`'s default and the kernel clamps
+above it. What can move is the accept loop behind the queue: one fiber,
+one `accept` with a 200 ms timeout armed on every call for the stop flag's
+sake. A burst that drains slowly is a burst that overflows a bigger queue;
+`bench/burst.py --conns 8000` against a server with the loop's drain rate
+measured is where that would show, and an accept per executor
+(`SO_REUSEPORT`, or handing accepted sockets round-robin the way actix
+does) is the shape if it does.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

@@ -3815,6 +3815,21 @@ same shape, and inside ADR 0001's bar either way. The lanes stayed out and
 the roadmap row names the box
 ([`http.md`](../bench/result/http.md#what-the-two-atomics-a-request-always-makes-cost-on-two-cores)).
 
+**The listen backlog was zio's 128, and a burst of a thousand connections
+put 623 of them on a one-second SYN retry.** Found by reading actix's
+`backlog(1024)` against a `listen` call that passed nothing, and confirmed
+by HttpArena before it was measured here: its paced profiles open 1,024
+sockets in one go and reported nilo 2–2.5% short of the offered rate, with
+`connect` errors, on a server at 37% of one core. The failure has no trace
+in the process — no error, no log line, an idle accept loop — only
+`ListenOverflows` in `/proc/net/netstat` and a p99 on connect that reads a
+second. **A drop the kernel makes on the server's behalf is invisible from
+the server**, which is why it survived every measurement that watched the
+server. 1,024 was the first answer and a burst of four thousand refused it;
+4,096 is the kernel's own ceiling and costs the same nothing
+([ADR 0271](./adr/0271-a-backlog-is-sized-for-the-burst-not-the-load.md),
+[`http.md`](../bench/result/http.md#what-a-listen-backlog-of-128-drops)).
+
 **A `std.log.warn` call site is two kilobytes of binary, fired or not.** A
 warning for a failure shape that outgrew its buffer measured 2,121 bytes
 with two `{d}`s, 1,446 with none, and the same again inlined when it shared
