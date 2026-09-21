@@ -48,6 +48,7 @@ One page of [the reference](./README.md): one request in flight: reading it, ans
 | `c.service(*Db)` | `?*Db` |
 | `c.resolve(V)` | `!V` — a resolved value, worked out once per request |
 | `c.keepAlive()` | whether the connection will carry another request |
+| `c.connection()` | the same as the `Connection` line the response will carry: `.implied` (HTTP/1.1, staying open, no line), `.keep_alive` (HTTP/1.0, kept), `.close` |
 | `c.arena()` | `std.mem.Allocator` — memory that lasts exactly this request. Never freed by hand |
 | `c.str(bytes)` | `Str` — text you allocated from `c.arena()`, stamped with this request's lifetime |
 
@@ -73,6 +74,8 @@ One page of [the reference](./README.md): one request in flight: reading it, ans
 | `c.upgrade(loop, state)` | `!void` — the connection becomes a WebSocket and `loop` reads it. `{}` when there is no state |
 | `c.upgradeWith(loop, state, .{ .protocol = "chat.v1" })` | the same, naming a subprotocol |
 
+Every response goes out with a `Date`, written by nilo; set one yourself and
+yours is sent instead ([ADR 0269](../adr/0269-a-response-says-when-it-was-sent.md)).
 `Content-Type`, `Content-Length`, `Transfer-Encoding` and `Connection` are
 refused by `setHeader`. So is a name that is not a token, and a value holding a
 control byte — a newline in one would start a second header, and two would start

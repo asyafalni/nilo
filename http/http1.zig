@@ -13,6 +13,7 @@
 const std = @import("std");
 const scan = @import("scan.zig");
 const bulkhead = @import("bulkhead.zig");
+const date = @import("date.zig");
 
 pub const Method = enum {
     /// What a nilo compile error calls this type, which is the name the
@@ -886,20 +887,90 @@ pub fn statusPhrase(status: u16) []const u8 {
     };
 }
 
-/// Assemble a whole response as a compile-time constant — for responses
-/// with fixed contents, this turns writing one into a single `writeAll`
-/// with no formatting.
+/// What a response's `Connection` line says — or that there is none
+/// ([ADR 0269](../docs/adr/0269-a-response-says-when-it-was-sent.md)).
+///
+/// The line carries information in two cases and none in the third. An
+/// HTTP/1.1 connection is persistent unless somebody says otherwise (RFC
+/// 9112 §9.3), so `keep-alive` on an HTTP/1.1 response tells the client
+/// what it already assumed, and the twenty-four bytes are left off. An
+/// HTTP/1.0 client assumes the opposite and has to be told it may stay; a
+/// closing connection has to be announced whichever version asked.
+pub const Connection = enum {
+    /// HTTP/1.1, staying open: no line at all.
+    implied,
+    /// HTTP/1.0 asked to stay open and is being kept: `keep-alive`.
+    keep_alive,
+    /// Closing after this response.
+    close,
+
+    /// The line for a connection that is (or is not) being kept, given
+    /// which version the request came in under.
+    pub fn of(keep_alive: bool, minor_version: u1) Connection {
+        if (!keep_alive) return .close;
+        return if (minor_version == 0) .keep_alive else .implied;
+    }
+
+    fn write(self: Connection, out: *std.Io.Writer) !void {
+        switch (self) {
+            .implied => {},
+            .keep_alive => try out.writeAll("Connection: keep-alive\r\n"),
+            .close => try out.writeAll("Connection: close\r\n"),
+        }
+    }
+};
+
+/// A response assembled at compile time, in the two pieces the `Date`
+/// line goes between: for responses with fixed contents, this turns
+/// writing one into three `writeAll`s and no formatting.
+pub const Static = struct {
+    /// The status line, CRLF included.
+    line: []const u8,
+    /// Everything after the `Date` line: the rest of the head, and the body.
+    rest: []const u8,
+};
+
 pub fn staticResponse(
     comptime status: u16,
     comptime phrase: []const u8,
     comptime content_type: []const u8,
     comptime body: []const u8,
-    comptime keep_alive: bool,
-) []const u8 {
-    return std.fmt.comptimePrint(
-        "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n{s}",
-        .{ status, phrase, content_type, body.len, if (keep_alive) "keep-alive" else "close", body },
-    );
+    comptime connection: Connection,
+) Static {
+    return .{
+        .line = std.fmt.comptimePrint("HTTP/1.1 {d} {s}\r\n", .{ status, phrase }),
+        .rest = std.fmt.comptimePrint(
+            "Content-Type: {s}\r\nContent-Length: {d}\r\n{s}\r\n{s}",
+            .{ content_type, body.len, comptime connectionLine(connection), body },
+        ),
+    };
+}
+
+fn connectionLine(comptime connection: Connection) []const u8 {
+    return switch (connection) {
+        .implied => "",
+        .keep_alive => "Connection: keep-alive\r\n",
+        .close => "Connection: close\r\n",
+    };
+}
+
+/// Put a `Static` on the wire with the `Date` it is being sent at.
+pub fn writeStatic(out: *std.Io.Writer, response: Static) !void {
+    try out.writeAll(response.line);
+    try date.writeLine(out);
+    try out.writeAll(response.rest);
+}
+
+/// Whether a handler or middleware already set a `Date`, in which case the
+/// framework's is not written over it. A loop over `extra`, which is
+/// empty or a few entries long on every response there is.
+fn hasDate(extra: []const Header) bool {
+    for (extra) |h| if (h.name.len == 4 and std.ascii.eqlIgnoreCase(h.name, "Date")) return true;
+    return false;
+}
+
+fn writeDate(out: *std.Io.Writer, extra: []const Header) !void {
+    if (!hasDate(extra)) try date.writeLine(out);
 }
 
 /// A status defined to carry no body at all, whatever the handler passed.
@@ -915,17 +986,18 @@ pub fn bodyless(status: u16) bool {
 
 /// The cold path, for responses whose contents are only known at runtime.
 /// `extra` are headers a handler or middleware added; the framework's own
-/// three go out first and `extra` may not repeat them.
+/// go out first and `extra` may not repeat them — except `Date`, which a
+/// handler that sets one is trusted about, and the framework's is left off.
 pub fn writeResponse(
     out: *std.Io.Writer,
     status: u16,
     phrase: []const u8,
     content_type: []const u8,
     body: []const u8,
-    keep_alive: bool,
+    connection: Connection,
     extra: []const Header,
 ) !void {
-    try writeHead(out, status, phrase, content_type, body.len, keep_alive, extra);
+    try writeHead(out, status, phrase, content_type, body.len, connection, extra);
     // A body under a bodyless status would be read as the start of the next
     // request on this connection, which is how a response-splitting bug
     // begins. The head already said there is none.
@@ -949,8 +1021,8 @@ pub fn writeResponse(
 /// ends the body, so the connection survives to carry another request.
 ///
 /// HTTP/1.0 has neither, and the only thing left to mark the end of the body
-/// with is the end of the connection — so there both are off, `keep_alive`
-/// must be false with them, and the pieces go out unframed (ADR 0020).
+/// with is the end of the connection — so there both are off, `connection`
+/// must be `.close` with them, and the pieces go out unframed (ADR 0020).
 pub fn writeStreamHead(
     out: *std.Io.Writer,
     status: u16,
@@ -958,7 +1030,7 @@ pub fn writeStreamHead(
     content_type: []const u8,
     chunked: bool,
     length: ?u64,
-    keep_alive: bool,
+    connection: Connection,
     extra: []const Header,
 ) !void {
     // Never both: a head carrying a length and a chunked encoding is one a
@@ -966,10 +1038,11 @@ pub fn writeStreamHead(
     std.debug.assert(!(chunked and length != null));
 
     try writeStatusLine(out, status, phrase);
+    try writeDate(out, extra);
     try out.print("Content-Type: {s}\r\n", .{content_type});
     if (length) |n| try out.print("Content-Length: {d}\r\n", .{n});
     if (chunked) try out.writeAll("Transfer-Encoding: chunked\r\n");
-    try out.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
+    try connection.write(out);
     for (extra) |h| try out.print("{s}: {s}\r\n", .{ h.name, h.value });
     try out.writeAll("\r\n");
 }
@@ -1003,10 +1076,10 @@ pub fn writeResponseHeadOnly(
     phrase: []const u8,
     content_type: []const u8,
     body_len: u64,
-    keep_alive: bool,
+    connection: Connection,
     extra: []const Header,
 ) !void {
-    try writeHead(out, status, phrase, content_type, body_len, keep_alive, extra);
+    try writeHead(out, status, phrase, content_type, body_len, connection, extra);
     try out.flush();
 }
 
@@ -1026,10 +1099,10 @@ pub fn writeFileHead(
     phrase: []const u8,
     content_type: []const u8,
     body_len: u64,
-    keep_alive: bool,
+    connection: Connection,
     extra: []const Header,
 ) !void {
-    return writeHead(out, status, phrase, content_type, body_len, keep_alive, extra);
+    return writeHead(out, status, phrase, content_type, body_len, connection, extra);
 }
 
 /// The whole first line, assembled at compile time for every status the
@@ -1060,10 +1133,14 @@ fn writeHead(
     phrase: []const u8,
     content_type: []const u8,
     body_len: u64,
-    keep_alive: bool,
+    connection: Connection,
     extra: []const Header,
 ) !void {
     try writeStatusLine(out, status, phrase);
+    // `Date` is second, straight after the status line, on every response
+    // that reaches here (ADR 0269). The interim ones — a 100, a 101 — are
+    // written elsewhere and carry none, which RFC 9110 §6.6.1 allows.
+    try writeDate(out, extra);
     if (bodyless(status)) {
         // No Content-Length: see `bodyless`. Content-Type still goes out on
         // a 304, which is describing a representation the client already
@@ -1071,7 +1148,6 @@ fn writeHead(
         if (status == 304 and content_type.len > 0) {
             try out.print("Content-Type: {s}\r\n", .{content_type});
         }
-        try out.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
     } else {
         // An empty content type is how a caller says there is no body to
         // describe — a handler returning `void` under a status that is not
@@ -1079,11 +1155,9 @@ fn writeHead(
         // because that status *does* have a body and its length is nothing;
         // `Content-Type:` with nothing after it would be a malformed header.
         if (content_type.len > 0) try out.print("Content-Type: {s}\r\n", .{content_type});
-        try out.print(
-            "Content-Length: {d}\r\nConnection: {s}\r\n",
-            .{ body_len, if (keep_alive) "keep-alive" else "close" },
-        );
+        try out.print("Content-Length: {d}\r\n", .{body_len});
     }
+    try connection.write(out);
     for (extra) |h| try out.print("{s}: {s}\r\n", .{ h.name, h.value });
     try out.writeAll("\r\n");
 }
@@ -1425,7 +1499,7 @@ test "the headers that matter are read at any position in a long head" {
         // The two framings take a turn each at the same offsets rather than
         // sharing one head, because a head carrying both is now refused.
         const sized = try std.mem.concat(gpa, u8, &.{
-            "POST / HTTP/1.1\r\nHost: t\r\nX-Pad: ", filler,
+            "POST / HTTP/1.1\r\nHost: t\r\nX-Pad: ",                 filler,
             "\r\nContent-Length: 1234\r\nConnection: close\r\n\r\n",
         });
         defer gpa.free(sized);
@@ -1438,7 +1512,7 @@ test "the headers that matter are read at any position in a long head" {
         try testing.expect(!r.chunked);
 
         const streamed = try std.mem.concat(gpa, u8, &.{
-            "POST / HTTP/1.1\r\nHost: t\r\nX-Pad: ", filler,
+            "POST / HTTP/1.1\r\nHost: t\r\nX-Pad: ",                       filler,
             "\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
         });
         defer gpa.free(streamed);
@@ -1709,7 +1783,7 @@ test "Expect is found wherever it falls, and Cookie is not mistaken for it" {
         @memset(filler, 'y');
 
         const head = try std.mem.concat(gpa, u8, &.{
-            "POST / HTTP/1.1\r\nHost: t\r\nX-Pad: ",         filler,
+            "POST / HTTP/1.1\r\nHost: t\r\nX-Pad: ",                                        filler,
             "\r\nExpect: 100-continue\r\nCookie: session=abc\r\nContent-Length: 9\r\n\r\n",
         });
         defer gpa.free(head);
@@ -2081,47 +2155,66 @@ test "a request arriving in pieces agrees with the same bytes arriving at once" 
     }
 }
 
+/// The `Date` line every head in these tests carries, with the clock pinned
+/// at the epoch so the bytes can be written down.
+const epoch_date = "Date: Thu, 01 Jan 1970 00:00:00 GMT\r\n";
+
 test "staticResponse and writeResponse produce the same bytes" {
-    const fixed = comptime staticResponse(200, "OK", "text/plain", "hello\n", true);
+    defer date.pinned = null;
+    date.pinned = 0;
+    const fixed = comptime staticResponse(200, "OK", "text/plain", "hello\n", .implied);
+    var fixed_buf: [256]u8 = undefined;
+    var fixed_out = std.Io.Writer.fixed(&fixed_buf);
+    try writeStatic(&fixed_out, fixed);
     var buf: [256]u8 = undefined;
     var out = std.Io.Writer.fixed(&buf);
-    try writeResponse(&out, 200, "OK", "text/plain", "hello\n", true, &.{});
-    try testing.expectEqualStrings(fixed, out.buffered());
+    try writeResponse(&out, 200, "OK", "text/plain", "hello\n", .implied, &.{});
+    try testing.expectEqualStrings(fixed_out.buffered(), out.buffered());
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++ epoch_date ++ "Content-Type: text/plain\r\nContent-Length: 6\r\n\r\nhello\n",
+        out.buffered(),
+    );
 }
 
 test "writeResponseHeadOnly matches writeResponse's head but sends no body" {
+    defer date.pinned = null;
+    date.pinned = 0;
     var full_buf: [256]u8 = undefined;
     var full = std.Io.Writer.fixed(&full_buf);
-    try writeResponse(&full, 200, "OK", "text/plain", "hello\n", true, &.{});
+    try writeResponse(&full, 200, "OK", "text/plain", "hello\n", .implied, &.{});
 
     var head_buf: [256]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
-    try writeResponseHeadOnly(&head, 200, "OK", "text/plain", "hello\n".len, true, &.{});
+    try writeResponseHeadOnly(&head, 200, "OK", "text/plain", "hello\n".len, .implied, &.{});
 
     try testing.expectEqualStrings(full.buffered()[0 .. full.buffered().len - "hello\n".len], head.buffered());
 }
 
 test "a 204 carries neither Content-Length nor Content-Type" {
+    defer date.pinned = null;
+    date.pinned = 0;
     var buf: [256]u8 = undefined;
     var out = std.Io.Writer.fixed(&buf);
-    try writeResponse(&out, 204, "No Content", "text/plain", "", true, &.{
+    try writeResponse(&out, 204, "No Content", "text/plain", "", .implied, &.{
         .{ .name = "Allow", .value = "GET, HEAD" },
     });
     try testing.expectEqualStrings(
-        "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\nAllow: GET, HEAD\r\n\r\n",
+        "HTTP/1.1 204 No Content\r\n" ++ epoch_date ++ "Allow: GET, HEAD\r\n\r\n",
         out.buffered(),
     );
 }
 
 test "a 304 keeps its Content-Type but drops the Content-Length" {
+    defer date.pinned = null;
+    date.pinned = 0;
     var buf: [256]u8 = undefined;
     var out = std.Io.Writer.fixed(&buf);
-    try writeResponse(&out, 304, "Not Modified", "text/css; charset=utf-8", "", true, &.{
+    try writeResponse(&out, 304, "Not Modified", "text/css; charset=utf-8", "", .implied, &.{
         .{ .name = "ETag", .value = "\"abc\"" },
     });
     try testing.expectEqualStrings(
-        "HTTP/1.1 304 Not Modified\r\nContent-Type: text/css; charset=utf-8\r\n" ++
-            "Connection: keep-alive\r\nETag: \"abc\"\r\n\r\n",
+        "HTTP/1.1 304 Not Modified\r\n" ++ epoch_date ++ "Content-Type: text/css; charset=utf-8\r\n" ++
+            "ETag: \"abc\"\r\n\r\n",
         out.buffered(),
     );
 }
@@ -2132,21 +2225,71 @@ test "a body handed to a bodyless status is dropped rather than framed wrong" {
     // next request would be read out of.
     var buf: [256]u8 = undefined;
     var out = std.Io.Writer.fixed(&buf);
-    try writeResponse(&out, 204, "No Content", "text/plain", "leftovers", true, &.{});
+    try writeResponse(&out, 204, "No Content", "text/plain", "leftovers", .implied, &.{});
     try testing.expect(std.mem.endsWith(u8, out.buffered(), "\r\n\r\n"));
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "leftovers") == null);
 }
 
 test "extra headers go out after the framework's own" {
+    defer date.pinned = null;
+    date.pinned = 0;
     var buf: [256]u8 = undefined;
     var out = std.Io.Writer.fixed(&buf);
-    try writeResponse(&out, 200, "OK", "text/plain", "hi", true, &.{
+    try writeResponse(&out, 200, "OK", "text/plain", "hi", .implied, &.{
         .{ .name = "Access-Control-Allow-Origin", .value = "*" },
         .{ .name = "Vary", .value = "Origin" },
     });
     try testing.expectEqualStrings(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n" ++
-            "Connection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\nVary: Origin\r\n\r\nhi",
+        "HTTP/1.1 200 OK\r\n" ++ epoch_date ++ "Content-Type: text/plain\r\nContent-Length: 2\r\n" ++
+            "Access-Control-Allow-Origin: *\r\nVary: Origin\r\n\r\nhi",
+        out.buffered(),
+    );
+}
+
+test "the Connection line is written only when it carries information" {
+    // HTTP/1.1 staying open is the default and says nothing; an HTTP/1.0
+    // client has to be told it may stay; a close is announced to both.
+    try testing.expectEqual(Connection.implied, Connection.of(true, 1));
+    try testing.expectEqual(Connection.keep_alive, Connection.of(true, 0));
+    try testing.expectEqual(Connection.close, Connection.of(false, 1));
+    try testing.expectEqual(Connection.close, Connection.of(false, 0));
+
+    var buf: [256]u8 = undefined;
+    const Case = struct { connection: Connection, line: ?[]const u8 };
+    for ([_]Case{
+        .{ .connection = .implied, .line = null },
+        .{ .connection = .keep_alive, .line = "Connection: keep-alive\r\n" },
+        .{ .connection = .close, .line = "Connection: close\r\n" },
+    }) |case| {
+        var out = std.Io.Writer.fixed(&buf);
+        try writeResponse(&out, 200, "OK", "text/plain", "hi", case.connection, &.{});
+        if (case.line) |line| {
+            try testing.expect(std.mem.indexOf(u8, out.buffered(), line) != null);
+        } else {
+            try testing.expect(std.mem.indexOf(u8, out.buffered(), "Connection:") == null);
+        }
+    }
+}
+
+test "a Date set by the handler wins over the framework's" {
+    var buf: [256]u8 = undefined;
+    var out = std.Io.Writer.fixed(&buf);
+    try writeResponse(&out, 200, "OK", "text/plain", "hi", .implied, &.{
+        .{ .name = "date", .value = "Sun, 06 Nov 1994 08:49:37 GMT" },
+    });
+    const head = out.buffered();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, head, "ate:"));
+    try testing.expect(std.mem.indexOf(u8, head, "date: Sun, 06 Nov 1994 08:49:37 GMT\r\n") != null);
+}
+
+test "a stream head carries the Date and the same Connection rule" {
+    defer date.pinned = null;
+    date.pinned = 0;
+    var buf: [256]u8 = undefined;
+    var out = std.Io.Writer.fixed(&buf);
+    try writeStreamHead(&out, 200, "OK", "text/plain", true, null, .implied, &.{});
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++ epoch_date ++ "Content-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n",
         out.buffered(),
     );
 }

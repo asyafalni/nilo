@@ -45,7 +45,11 @@ encoding and puts 12 bytes of framing on the wire nobody else was sending.
 What is **not** equal, and cannot be: response header sets differ, so bytes on
 the wire run from 1,099 (http.zig) to 1,171 (Node) against nilo's 1,110. That
 is a 6% spread on a ~1.1 KB response and it is part of what is being measured,
-not an error in it.
+not an error in it. nilo's 1,110 was 13 bytes light: it sent no `Date` and a
+`Connection: keep-alive` HTTP/1.1 does not need. Since
+[ADR 0269](./adr/0269-a-response-says-when-it-was-sent.md) it sends 1,123,
+the same as Go, axum, Fiber and Bun; the table below predates that and has
+not been re-run.
 
 Versions: Go 1.26.3, Fiber v2.52.14 (fasthttp 1.51), Node 24.16, Bun 1.3.13,
 axum 0.8 with hyper 1.11 and tokio 1.53, http.zig at `c22672f`, Zig 0.16.0.

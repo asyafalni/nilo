@@ -32,6 +32,18 @@ newest first.
 
 ### Added
 
+- Every response carries a `Date`, second after the status line — RFC 9110
+  §6.6.1's MUST, which nilo had never met, and what a cache in front does its
+  freshness arithmetic from. Formatted once a second per thread, lazily, from
+  `nilo_core`'s clock; no task, no atomic, no allocation. A `Date` a handler
+  sets wins. In the same head, `Connection: keep-alive` is no longer written
+  on an HTTP/1.1 response — persistence is what HTTP/1.1 means, and the line
+  is now written only when it says something: `keep-alive` to an HTTP/1.0
+  client being kept, `close` to anybody being closed. The benchmark
+  response goes from 1,110 bytes on the wire to 1,123, which is what every
+  other server in `bench/compare/` sends for the same body. `Ctx.connection()`
+  is the new way to ask; `Ctx.keepAlive()` still answers the bool
+  ([ADR 0269](./docs/adr/0269-a-response-says-when-it-was-sent.md)).
 - `listen()` takes `request_deadline_ms`: a deadline every request starts
   with, what `nilo.deadline(ms)` gives one route given to all of them. Every
   wait nilo owns is cut to it and `c.overdue()` reads it; a route's own

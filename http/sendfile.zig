@@ -158,7 +158,7 @@ fn writeBody(c: *Ctx, contents: Contents, status: u16, from: u64, len: u64) !voi
     const w = watchdog.waiting(c._watch);
     defer watchdog.waited(c._watch, w);
 
-    const keep_alive = c.keepAlive();
+    const connection = c.connection();
 
     // A HEAD gets the head a GET would have got, `Content-Length` and all,
     // and none of the body. Nothing is read from the file, so a HEAD of a
@@ -169,7 +169,7 @@ fn writeBody(c: *Ctx, contents: Contents, status: u16, from: u64, len: u64) !voi
         http1.statusPhrase(status),
         contents.content_type,
         len,
-        keep_alive,
+        connection,
         c.extraHeaders(),
     );
 
@@ -182,7 +182,7 @@ fn writeBody(c: *Ctx, contents: Contents, status: u16, from: u64, len: u64) !voi
         http1.statusPhrase(status),
         contents.content_type,
         len,
-        keep_alive,
+        connection,
         c.extraHeaders(),
     );
 

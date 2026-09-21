@@ -72,6 +72,7 @@ Measured stripped, `ReleaseFast`, on the examples in this repository.
 | Counters ([ADR 0100](./0100-the-route-table-is-the-registry.md)) | +1,984 B | +1,984 B |
 | An allowance ([ADR 0114](./0114-an-allowance-is-a-table-sized-while-compiling.md)) | +0 | +0 |
 | A body limit per route, a type that writes its own answer, a request id on the way out, and a server that sheds past its limit ([ADRs 0194](./0194-a-route-can-say-how-much-body-it-takes.md)–[0197](./0197-a-server-past-its-limit-says-so-at-once.md)) | +896 B | +944 B |
+| A `Date` on every response, and no `Connection: keep-alive` on HTTP/1.1 ([ADR 0269](./0269-a-response-says-when-it-was-sent.md)) | +6,064 B | +6,072 B |
 
 `nilo_fetch` is +0 on both examples because neither imports it, and that is the
 whole of the row rather than an accident: a module nothing names is never

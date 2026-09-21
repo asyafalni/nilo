@@ -1320,6 +1320,12 @@ pub const Ctx = struct {
         return !self.stopping();
     }
 
+    /// `keepAlive` as the `Connection` line the response will carry — which
+    /// for an HTTP/1.1 connection staying open is no line at all (ADR 0269).
+    pub fn connection(self: *const Ctx) http1.Connection {
+        return .of(self.keepAlive(), self._request.minor_version);
+    }
+
     /// Whether the server has been told to stop and is draining. What the
     /// health route answers `stopping` on (ADR 0192).
     pub fn stopping(self: *const Ctx) bool {
@@ -1557,7 +1563,7 @@ pub const Ctx = struct {
             http1.statusPhrase(status),
             content_type,
             response_body.len,
-            self.keepAlive(),
+            self.connection(),
             self.extraHeaders(),
         );
         try http1.writeResponse(
@@ -1566,7 +1572,7 @@ pub const Ctx = struct {
             http1.statusPhrase(status),
             content_type,
             response_body,
-            self.keepAlive(),
+            self.connection(),
             self.extraHeaders(),
         );
     }
@@ -1687,7 +1693,7 @@ pub const Ctx = struct {
             content_type,
             chunked,
             options.length,
-            self.keepAlive(),
+            self.connection(),
             self.extraHeaders(),
         );
 

@@ -565,19 +565,19 @@ pub fn hit(
 /// The three answers that go out before there is a Ctx to assemble one with.
 /// They carry the same JSON shape every other failure does (ADR 0025), so a
 /// client has one thing to parse and not two.
-const RESPONSE_400 = http1.staticResponse(400, "Bad Request", failure_content_type, staticFailure(400, "malformed request"), false);
-const RESPONSE_431 = http1.staticResponse(431, "Request Header Fields Too Large", failure_content_type, staticFailure(431, "head too long"), false);
+const RESPONSE_400 = http1.staticResponse(400, "Bad Request", failure_content_type, staticFailure(400, "malformed request"), .close);
+const RESPONSE_431 = http1.staticResponse(431, "Request Header Fields Too Large", failure_content_type, staticFailure(431, "head too long"), .close);
 /// Sent when a body arrives under a `Content-Encoding` nilo cannot decode,
 /// which is all of them but `identity` and `gzip` (ADR 0111, ADR 0251). The
 /// message names the header, because the mistake is one line of client
 /// configuration and the alternative — a 400 about malformed JSON — sends
 /// the reader to the body.
-const RESPONSE_415 = http1.staticResponse(415, "Unsupported Media Type", failure_content_type, staticFailure(415, "this server decodes Content-Encoding: gzip and nothing else — send the body as identity or gzip"), false);
+const RESPONSE_415 = http1.staticResponse(415, "Unsupported Media Type", failure_content_type, staticFailure(415, "this server decodes Content-Encoding: gzip and nothing else — send the body as identity or gzip"), .close);
 /// Sent when a request head started arriving and then stopped (ADR 0023).
 /// Not when a keep-alive connection simply sat idle: that client has not
 /// asked for anything, and a status answering nothing is noise a proxy has
 /// to decide what to do with.
-const RESPONSE_408 = http1.staticResponse(408, "Request Timeout", failure_content_type, staticFailure(408, "request head timed out"), false);
+const RESPONSE_408 = http1.staticResponse(408, "Request Timeout", failure_content_type, staticFailure(408, "request head timed out"), .close);
 
 const failure_content_type = "application/json";
 
@@ -585,12 +585,15 @@ const failure_content_type = "application/json";
 /// (ADR 0197). Assembled here rather than through `staticResponse` for the
 /// one header that function does not write: `Retry-After`, which is what
 /// tells a client and a balancer this is load rather than a fault.
-const RESPONSE_503_SHED = blk: {
+const RESPONSE_503_SHED: http1.Static = blk: {
     const body = staticFailure(503, "this server is answering as many requests as it was told to; try again in a moment");
-    break :blk std.fmt.comptimePrint(
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nRetry-After: 1\r\n\r\n{s}",
-        .{ failure_content_type, body.len, body },
-    );
+    break :blk .{
+        .line = "HTTP/1.1 503 Service Unavailable\r\n",
+        .rest = std.fmt.comptimePrint(
+            "Content-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nRetry-After: 1\r\n\r\n{s}",
+            .{ failure_content_type, body.len, body },
+        ),
+    };
 };
 
 /// Room for the longest failure body there can be: a message at the Failure's
@@ -970,8 +973,8 @@ noinline fn warnSocketFailed(path: []const u8, err: anyerror) void {
     std.log.warn("the WebSocket loop on {s} failed: {s}", .{ path, @errorName(err) });
 }
 
-fn sendFinal(out: *std.Io.Writer, response: []const u8) void {
-    out.writeAll(response) catch return;
+fn sendFinal(out: *std.Io.Writer, response: http1.Static) void {
+    http1.writeStatic(out, response) catch return;
     out.flush() catch return;
 }
 
@@ -986,14 +989,14 @@ fn sendDirect(c: *Ctx, status: u16, content_type: []const u8, body: []const u8) 
     // is nilo waiting on the client, not a handler running (ADR 0034).
     const w = watchdog.waiting(c._watch);
     defer watchdog.waited(c._watch, w);
-    const keep_alive = c.keepAlive();
+    const connection = c.connection();
     if (c.method == .HEAD) return http1.writeResponseHeadOnly(
         c._out,
         status,
         http1.statusPhrase(status),
         content_type,
         body.len,
-        keep_alive,
+        connection,
         c.extraHeaders(),
     );
     try http1.writeResponse(
@@ -1002,7 +1005,7 @@ fn sendDirect(c: *Ctx, status: u16, content_type: []const u8, body: []const u8) 
         http1.statusPhrase(status),
         content_type,
         body,
-        keep_alive,
+        connection,
         c.extraHeaders(),
     );
 }
@@ -1154,4 +1157,3 @@ test "a head that does not fit is answered 431 and lingered on" {
     try testing.expect(!served.keep_alive);
     try testing.expect(served.linger);
 }
-

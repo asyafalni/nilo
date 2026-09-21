@@ -44,10 +44,11 @@ const builtin = @import("builtin");
 /// **`CLOCK_REALTIME_COARSE` was measured and not taken.** It is 2ns instead
 /// of 15, and it moves once a millisecond — so it would make this function's
 /// name a lie while `nowMillis` below would be entirely happy with it. The
-/// 13ns buys a branch, a Linux-only path and two clocks to explain, for a
-/// call nothing in the framework makes per request; it is the caller's own,
-/// made once or twice. If one ever turns up who reads the clock in a loop,
-/// this is the note that says where the 13ns went.
+/// 13ns buys a branch, a Linux-only path and two clocks to explain. The
+/// framework does now make this call once per response — `http/date.zig`
+/// reads it for the `Date` header (ADR 0269) — and 15ns on a request that
+/// takes microseconds is where the 13ns went; the note stays so nobody
+/// re-derives the trade.
 pub fn nowMicros() i64 {
     // The same page-read argument holds on Windows: `RtlGetSystemTimePrecise`
     // reads KUSER_SHARED_DATA, in 100 ns units from 1601 (ADR 0228).

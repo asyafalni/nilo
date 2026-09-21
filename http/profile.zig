@@ -131,7 +131,7 @@ fn serialiseBody() void {
 
 fn writeTheResponse() void {
     var out = std.Io.Writer.fixed(&out_buf);
-    http1.writeResponse(&out, 200, "OK", "application/json", body_json, true, &.{
+    http1.writeResponse(&out, 200, "OK", "application/json", body_json, .implied, &.{
         .{ .name = "Access-Control-Allow-Origin", .value = "*" },
     }) catch unreachable;
     sink += out.buffered().len;

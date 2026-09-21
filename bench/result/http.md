@@ -1615,6 +1615,64 @@ What the run is good for is that the next person arrives at a threshold instead
 of at "it may well be nothing", which is a sentence that cannot be acted on in
 either direction.
 
+## What a `Date` costs, and what leaving `Connection` off gives back
+
+[ADR 0269](../../docs/adr/0269-a-response-says-when-it-was-sent.md) put a
+`Date` on every response and took `Connection: keep-alive` off HTTP/1.1
+ones. The wire goes from 1,110 bytes to 1,123 on the benchmark response —
+checked with `nc | wc -c`, not arithmetic — which is what Go, axum, Fiber
+and Bun send for the same body. The question was whether the clock read,
+the compare and the extra `writeAll`s per response show up.
+
+**Not the machine above.** A 2-vCPU cloud VM — Intel Xeon Platinum 8255C,
+`kvm-clock` (so `clock_gettime` is a vDSO read, checked with `strace -c`:
+no syscalls), 8 GB, kernel 6.8.0-110, Zig 0.16.0, wrk 4.1.0 — with wrk on
+the same two cores as the server. The absolute figures are a fortieth of
+the table at the top and mean nothing outside this section; the *pairs*
+are what the run is for. Before is `ab3c893` from `git archive`, after is
+the same tree with ADR 0269 on it, both `ReleaseFast`, stripped. Each run:
+3 s warm-up discarded, then `wrk -t1 -c64 -d10s --latency`, server and
+client restarted between every run, before and after alternating.
+
+| pair | before req/s | before p99 | after req/s | after p99 | after vs before |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 47,455 | 3.76ms | 45,403 | 3.94ms | -4.3% |
+| 2 | 47,058 | 3.75ms | 46,246 | 4.04ms | -1.7% |
+| 3 | 47,287 | 3.71ms | 46,834 | 3.78ms | -1.0% |
+| 4 | 47,209 | 3.83ms | 45,417 | 3.77ms | -3.8% |
+| 5 | 46,370 | 3.71ms | 46,127 | 3.79ms | -0.5% |
+| 6 | 44,324 | 3.94ms | 47,956 | 3.74ms | +8.2% |
+| 7 | 46,450 | 3.88ms | 46,181 | 3.96ms | -0.6% |
+| 8 | 46,392 | 3.92ms | 47,899 | 3.84ms | +3.3% |
+
+Means: 46,568 before, 46,508 after, **-0.1%**. The first four
+pairs all read the after side low, by 1–4%, and the second four read it
+high twice by more than that; the sign changes and the margin is inside the
+spread, so by this file's own rule the answer is **unchanged**. p99 sits in
+the same 3.7–4.0 ms band on both sides. That is the expected answer — 15 ns
+of clock and one compare on a request this box serves in ~21 µs of CPU — and
+the run exists so the next person does not have to guess it.
+
+**Binary size is the axis that moved: +6,064 bytes on `example-hello`,
++6,072 on `example-rest`**, stripped `ReleaseFast`, against a guess of 400.
+`nm --size-sort` on unstripped builds splits it: `date.writeLine` is 1,842
+bytes, because `std.time.epoch`'s `calculateYearDay` and `calculateMonthDay`
+loop over years and months and both inline; the errno name table
+`__zig_tag_name_os.linux.E` is about 2,000, pulled in by `core.nowMicros`'s
+panic message and paid for the first time here because nothing on the
+request path had read the wall clock before; `sendFinal` grows 342 and the
+head writers by a call each. The row is in ADR 0018's running total.
+
+### Can it be pushed further
+
+The two levers are the two big symbols. Howard Hinnant's `civil_from_days`,
+which `sql/types.zig` already carries, is a few divisions with no loop and
+would take `writeLine` well under 500 bytes; and `core/clock.zig` printing
+the errno as a number rather than `@tagName` would drop the 2 KB table —
+for a panic that cannot fire. Neither is done, because 6 KB on a megabyte is
+0.6% and the wire and throughput axes are where a response header would
+have hurt, and did not.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

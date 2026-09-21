@@ -3780,3 +3780,26 @@ table, a radix router, TLS, cancellation. Each is the right answer for
 dusty's shape and the wrong trade for nilo's, and the reading was worth
 doing because it said which was which.
 
+## Reading actix-web found the one header nilo never sent
+
+An afternoon over [actix-web](https://github.com/actix/actix-web)'s
+`actix-http` — the dispatcher, the encoder, `date.rs` — against `http/`.
+Most of what actix does differently solves a problem nilo's shape does not
+have: pools of 128 heads and requests per thread because `httparse` fills a
+`HeaderMap` per request, a `LocalBoxFuture` at every layer, a timer task per
+worker. The one thing it had that nilo lacked was a `Date` header, and the
+one thing nilo sent that actix does not was `Connection: keep-alive` on
+HTTP/1.1. **Both had been in the comparison table for a cycle**: the wire
+figure credited nilo 13 bytes it should have been spending, and nobody read
+the header sets against the RFC because the numbers were the interesting part
+([ADR 0269](./adr/0269-a-response-says-when-it-was-sent.md)).
+
+**The formatter was guessed at 400 bytes and measured at 6 KB.** 1.8 KB is
+`std.time.epoch`'s loops inlined, and 2 KB is an errno name table the
+`nowMicros` panic message drags in — a cost the whole HTTP binary had never
+paid because nothing on the request path had read the wall clock. The guess
+was the formatter alone; the bill was for everything the first call to a
+function links. The number is in ADR 0018's running total with the split
+beside it, and the throughput pairs in
+[`bench/result/http.md`](../bench/result/http.md#what-a-date-costs-and-what-leaving-connection-off-gives-back)
+say the clock read is invisible, which was the axis worth worrying about.

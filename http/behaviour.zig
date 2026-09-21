@@ -17,6 +17,7 @@ const serve = @import("serve.zig");
 const wiring = @import("wiring.zig");
 const bulkhead = @import("bulkhead.zig");
 const http1 = @import("http1.zig");
+const date_mod = @import("date.zig");
 const router = @import("router.zig");
 const ctx_mod = @import("ctx.zig");
 const str_mod = @import("nilo_core");
@@ -295,10 +296,16 @@ test "a quiet handler answers an empty 200" {
 
     var h = Harness.init();
     defer h.deinit();
+    defer date_mod.pinned = null;
+    date_mod.pinned = 0;
     const result = h.send(&app, "GET /quiet HTTP/1.1\r\nHost: t\r\n\r\n");
     try testing.expect(result.keep_alive);
     // No Content-Type: there is no content to give one to.
-    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"));
+    try testing.expect(std.mem.startsWith(
+        u8,
+        result.response,
+        "HTTP/1.1 200 OK\r\nDate: Thu, 01 Jan 1970 00:00:00 GMT\r\nContent-Length: 0\r\n",
+    ));
 }
 
 fn testHeaderAndQuery(c: *Ctx) anyerror!void {
@@ -1690,7 +1697,8 @@ test "once a stop is asked for, a connection answers what it has and closes" {
 
     const before = h.send(&app, "GET /users HTTP/1.1\r\nHost: x\r\n\r\n");
     try testing.expect(before.keep_alive);
-    try testing.expect(std.mem.indexOf(u8, before.response, "Connection: keep-alive\r\n") != null);
+    // HTTP/1.1 staying open says nothing about it (ADR 0269).
+    try testing.expect(std.mem.indexOf(u8, before.response, "Connection:") == null);
 
     app.shutdown();
 
@@ -1860,12 +1868,14 @@ test "an empty response is a 204 with nothing after the head" {
     // Both spellings answer the same thing. A 204 carries neither
     // Content-Type nor Content-Length — see `http1.bodyless` — and the
     // connection is fine to carry another request.
+    defer date_mod.pinned = null;
+    date_mod.pinned = 0;
     for ([_][]const u8{ "/one", "/two" }) |path| {
         var buf: [64]u8 = undefined;
         const request = std.fmt.bufPrint(&buf, "DELETE {s} HTTP/1.1\r\nHost: t\r\n\r\n", .{path}) catch unreachable;
         const result = h.send(&app, request);
         try testing.expectEqualStrings(
-            "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n",
+            "HTTP/1.1 204 No Content\r\nDate: Thu, 01 Jan 1970 00:00:00 GMT\r\n\r\n",
             result.response,
         );
         try testing.expect(result.keep_alive);
@@ -2257,10 +2267,12 @@ test "extra response headers are written after the framework's own" {
 
     var h = Harness.init();
     defer h.deinit();
+    defer date_mod.pinned = null;
+    date_mod.pinned = 0;
     const result = h.send(&app, "GET /h HTTP/1.1\r\nHost: t\r\n\r\n");
     try testing.expectEqualStrings(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n" ++
-            "Connection: keep-alive\r\nX-One: 1\r\nX-Two: 2\r\n\r\nok",
+        "HTTP/1.1 200 OK\r\nDate: Thu, 01 Jan 1970 00:00:00 GMT\r\nContent-Type: text/plain\r\n" ++
+            "Content-Length: 2\r\nX-One: 1\r\nX-Two: 2\r\n\r\nok",
         result.response,
     );
 }

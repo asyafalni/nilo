@@ -430,6 +430,13 @@ an unreadable body closes. `c.keepAlive()` reports what will happen. Nothing a
 handler does has to think about it — a 404 is a normal thing to answer, not a
 reason to hang up.
 
+The response says so only when there is something to say: `Connection: close`
+when it is closing, `Connection: keep-alive` to an HTTP/1.0 client being kept,
+and nothing at all on an HTTP/1.1 connection staying open, because that is
+what HTTP/1.1 means ([ADR 0269](../adr/0269-a-response-says-when-it-was-sent.md)).
+Every response also carries a `Date`, which is what a cache in front reads to
+decide how old the answer is.
+
 ## Content types
 
 | Returned | Sent as |
