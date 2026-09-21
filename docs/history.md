@@ -3847,6 +3847,23 @@ The same instrument put a number on a trade ADR 0071 made in words: a
 connection quiet past `idle_peek_ms` pays ~57 µs on its next request for
 the pages it gave back.
 
+**The arena's database rank was taken apart as far as two cores allow, and
+the part that could be measured was not the part that was slow.** 66k
+req/s over a pool of 256 is 3.9 ms a query for a scan Postgres finishes in
+0.1 ms, on a server using nine cores of sixty-four; the arena's handler
+beside two controls put nilo's own cost at 284 µs of CPU a request, 116 of
+it decoding fifty rows and half of that the `jsonb` column — real, and not
+the wait. Postgres's log put a third of *its* time in `bind`, because a
+`LIMIT $3` bound as a parameter is a plan it cannot make generic and so
+plans every call. The wait itself is a 64-thread question the box cannot
+ask; what it could ask was whether pg.zig's pool lock is slow, and the
+answer was 1.5M handoffs a second with stealing on and four times that
+with it off — the same doze ADR 0272 removed, seen from a second
+instrument. **A rank on somebody else's box gets decomposed on this one
+until the remainder is a single named question**, and that question is a
+roadmap row rather than a guess
+([`sql.md` §12](../bench/result/sql.md#12-the-arenas-query-at-one-connection)).
+
 **A `std.log.warn` call site is two kilobytes of binary, fired or not.** A
 warning for a failure shape that outgrew its buffer measured 2,121 bytes
 with two `{d}`s, 1,446 with none, and the same again inlined when it shared

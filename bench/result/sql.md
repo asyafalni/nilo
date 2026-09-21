@@ -982,6 +982,103 @@ that stops changing is what maturity means. On the port's side, not nilo's:
 Rows leave out `created_at` and `updated_at`, and folding the two is what
 ADR 0222's by-name `.references` was for.
 
+## 12. The arena's query at one connection
+
+[HttpArena](https://github.com/MDA2AV/HttpArena)'s `async-db` profile —
+1,024 connections at `GET /async-db?min=10&max=50&limit=N` over a
+100,000-row table with no index on `price`, a pool of 256 — read nilo at
+66,189 req/s on 874% of sixty-four CPUs, rank 53 of 79, where zix answers
+400k, actix 149k and go-stdlib 86k. Neither the server nor Postgres was
+busy: 66k a second over 256 connections is 3.9 ms a query, for a scan the
+planner finishes in 0.1 ms. This section is what could be taken apart on
+the two-core box, which is the per-query cost with one request in flight,
+and what could not, which is the 64-thread question that decides the rank.
+
+**The box is the two-vCPU one `http.md` names**, Postgres 18 in a container
+on a Docker *published* port (`127.0.0.1:5440`, so `docker-proxy` is in the
+path — the absolutes are inflated by it and only the differences between
+rows are meant), the arena's own `pgdb-seed.sql`, the routes in
+`bench/sql_server.zig` at `3ca49e4` plus this commit, pool 64. `wrk -t1
+-c1 -d4s`, two rounds each; the first block is the committed tree.
+
+| route | what it leaves out | c=1 avg | against `/health` |
+|---|---|---:|---:|
+| `/health` | everything | 92 µs | — |
+| `/async-db-ids?…&limit=50` | eight columns a row; one `i32` decoded, nothing written | 692 / 730 µs | +620 µs |
+| `/async-db-notags?…&limit=50` | the `jsonb` column | 792 / 789 µs | +700 µs |
+| `/async-db?…&limit=50` | nothing: the arena's handler | 880 / 880 µs | +788 µs |
+| `/async-db?…&limit=5` | forty-five rows | 676 / 663 µs | +580 µs |
+
+Postgres's own log (`log_min_duration_statement = 0`) puts its side of a
+`limit=50` query at **bind 0.11 ms + execute 0.15–0.28 ms**, after the one
+`parse` that ADR 0057's statement cache makes. The bind is the part worth a
+sentence: it is 0.11 ms on the thirty-sixth execution as on the sixth,
+because `LIMIT $3` as a parameter is a plan Postgres cannot make generic —
+the generic plan's cost assumes ten per cent of the rows, the custom plan
+knows it is fifty — so it plans every call, and a third of the database's
+time on this query is planning. The arena's five request files use five
+limits; a handler that switched on them and passed each as a comptime
+`.limit` would prepare five statements with the limit inlined and drop the
+bind to a few microseconds. That is the entry's business rather than the
+module's, and it is the same for every framework that binds the limit.
+
+**What the rows cost nilo itself**, from `bench/paced.py` at 500 req/s over
+16 connections — CPU per request, with the context switches beside it:
+
+| route | CPU/req | switches/req | faults/req |
+|---|---:|---:|---:|
+| `/health` | 68 µs | 1.02 | 0 |
+| `/async-db-ids` | 168 µs | 3.01 | 0 |
+| `/async-db-notags` | 228 µs | 3.00 | 2 |
+| `/async-db` | 284 µs | 3.01 | 5 |
+
+So the round trip is +100 µs of CPU and two more context switches a
+request; fifty rows of eight columns are +60 µs; fifty `jsonb` parses are
++56 µs — `std.json` into the arena at about a microsecond a row, plus the
+arena's pages for it. **Decoding is 116 µs of the 284, and none of it is
+the 3.9 ms.** At the arena's 66k req/s the whole 284 µs is 19 cores of 64;
+the run reported 8.7. The server was waiting.
+
+### What the two-core box cannot settle, and what it could
+
+The wait is either Postgres or the pool, and the pool is one `xsync.Mutex`
+and one `Condition` in pg.zig's `Pool.acquire`/`release` that every one of
+1,024 fibers on 64 threads takes twice a request — a three-state futex
+mutex whose every contended unlock is a cross-thread wake. Whether that
+convoys at 64 threads is the question, and two threads cannot ask it. What
+two threads could ask was whether the lock is slow *at all*, with a scratch
+program — 1,024 fibers over a pool of 256 tokens on zio, `acquire`, one
+`yield` for the round trip, `release`, the same `xsync` types pg.zig uses,
+500 rounds each:
+
+| threads | fibers / pool | stealing | acquire+release a second |
+|---:|---|---|---:|
+| 1 | 256 / 64 | on | 2,607,718 |
+| 2 | 256 / 64 | on | 1,549,453 / 1,622,219 |
+| 2 | 256 / 64 | **off** | 5,998,587 / 4,706,664 |
+| 2 | 1,024 / 256 | on | 1,518,590 / 1,577,411 / 1,569,130 |
+| 2 | 1,024 / 256 | **off** | 6,262,277 / 6,446,833 / 5,314,706 |
+| 2 | 64 / 64, no wait ever | on | 9,157,313 |
+
+Not slow: 1.5M handoffs a second with stealing on, and the arena needs 66k.
+**But four times faster with stealing off**, three of three, which is the
+scheduler churning the very wakes the pool makes — a `yield` or a
+`Condition.signal` puts a task on a ring, a searcher steals it, its next
+wait hands it back. ADR 0272 turned stealing off for the reason `http.md`
+gives, and this is a second reason from a second instrument. The arena run
+that produced the 66k had it on.
+
+**What would settle it:** the same three routes on a box with eight cores
+or more, `wrk -c1024` against pool 256, Postgres on `--network host`; then
+the same with `POOL_SIZE=32`, because `§6` says past the database's core
+count a bigger pool buys queueing rather than concurrency, and the arena's
+256 is eight times what this table found best. If the per-query latency
+under load is Postgres's, the rank is the database's; if it is nilo's, the
+pool is the next thing to read, and the shape is one lane of connections
+per executor with a local wait queue — a connection that never crosses a
+thread, which is what ADR 0272 already made of a request.
+
+
 ## Reproducing this
 
 ```bash
