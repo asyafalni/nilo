@@ -4111,3 +4111,54 @@ test "a batch seventeen columns wide goes into a twenty-column table in one stat
     const total = try stack.db.count(Line, &run, .{ .where = .{ .rab_id = @as(i64, 1) } });
     try testing.expectEqual(@as(usize, 40), total);
 }
+
+test "a statement composed at run time fills a Row by position and runs unnamed" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // The pieces a query engine has: names out of a model, values out of a
+    // request. Nothing here is a comptime statement.
+    const measure: []const u8 = "age";
+    const by: []const u8 = "handle";
+    var s = stack.db.compose(&run);
+    try s.text("SELECT ");
+    try s.ident(by);
+    try s.text(", sum(");
+    try s.ident(measure);
+    try s.text(")::bigint FROM ");
+    try s.ident(table);
+    try s.text(" WHERE ");
+    try s.ident(measure);
+    try s.text(" > ");
+    try s.param(1);
+    try s.text(" GROUP BY 1 ORDER BY 1 NULLS LAST LIMIT ");
+    try s.number(10);
+
+    const Tallied = struct {
+        pub const nilo_table = .projection;
+        handle: ?[]const u8,
+        total: i64,
+    };
+    const rows = try stack.db.composed(Tallied, &run, s, .{@as(i32, 0)});
+    try testing.expect(rows.len >= 1);
+    var sum: i64 = 0;
+    for (rows) |r| sum += r.total;
+    const exact = try stack.db.rawOne(i64, &run, "SELECT sum(age)::bigint FROM " ++ table ++ " WHERE age > 0", .{});
+    try testing.expectEqual(exact.?, sum);
+
+    // One column into a scalar, the way `raw` allows (ADR 0234).
+    var one = stack.db.compose(&run);
+    try one.text("SELECT count(*)::bigint FROM ");
+    try one.ident(table);
+    const n = try stack.db.composedOne(i64, &run, one, .{});
+    try testing.expectEqual(@as(i64, 3), n.?);
+
+    // A name that is not one never reaches the database, and neither does a
+    // statement with more placeholders than values.
+    var bad = stack.db.compose(&run);
+    try testing.expectError(error.NotAnIdentifier, bad.ident("people; DROP TABLE people"));
+    try testing.expectError(error.ParamCountMismatch, stack.db.composed(i64, &run, s, .{}));
+}

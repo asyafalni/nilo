@@ -27,6 +27,16 @@ the ADRs that only correct an older one folded into the one they correct.
 Work lands here under `### Breaking`, `### Added`, `### Fixed` and `### Docs`,
 newest first.
 
+### Added
+
+- `sql.Composed`, `db.compose` and `db.composed` / `db.composedOne` /
+  `tx.composed`: a statement composed at run time from literals, checked
+  identifiers and parameters — the pieces a query engine has — and from
+  nothing that can carry a run-time string. Placeholders are spelled for the
+  Db's dialect; the values are counted against them at run time. `raw` is
+  unchanged
+  ([ADR 0283](./docs/adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
+
 ### Breaking
 
 - A `Db`'s schema check and version guard run from a new service hook,
