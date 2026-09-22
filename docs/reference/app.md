@@ -105,6 +105,7 @@ try v1.without(requireOperator).with(rateLimitSignups).post("/sign-up", signUp);
 | `trusted_proxies` | `&.{}` — **which** ones: CIDRs, bare addresses, `"private"`, `"loopback"`. Wins over `trusted_hops` ([ADR 0129](../adr/0129-a-proxy-is-trusted-by-which-one-it-is.md)) |
 | `session_secret` | `null` — 32 bytes, for `Session(T)`. The same on every instance |
 | `tls` | `null` — `.{ .cert = "…pem", .key = "…pem" }` serves HTTPS, TLS 1.3, on a build that passed `.tls = true` to the dependency (`-Dtls` here); any other build refuses it at `listen()`. 560 KB of binary and a page per idle connection in that build, about 300 µs of CPU per handshake, and no audit behind it; a proxy in front stays the recommendation ([ADR 0288](../adr/0288-tls-is-an-option-a-build-asks-for.md), [deploying](../guide/deploying.md#tls-without-a-proxy)) |
+| `also` | `&.{}` — more addresses to answer on, each `.{ .address, .port, .tls }` and nothing else. One server, one route table, one thread pool; the handler is not told which listener a request arrived on, and `max_connections` counts sockets across all of them. A cleartext port beside a TLS one is what it is for. 82 KB of resident memory per extra listener on sixteen threads, and nothing per connection or per request ([ADR 0289](../adr/0289-a-server-answers-on-more-than-one-address.md)) |
 | `block_warning_ms` | `250` — say so when a handler holds its thread. `0` = off |
 
 **`arena_keep` is the one in that table with a cliff under it.** A response

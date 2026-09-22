@@ -76,6 +76,7 @@ Measured stripped, `ReleaseFast`, on the examples in this repository.
 | A failure body the application names ([ADR 0270](./0270-a-failure-body-is-a-struct-the-application-names.md)) | +400 B | +448 B |
 | Response compression on a pooled compressor ([ADR 0287](./0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)), and the `Accept-Encoding` reader no longer waking `parseFloat` | +4,896 B, then −24,608 B net | +4,064 B, then −3,648 B net |
 | A TLS listener the build has to ask for ([ADR 0288](./0288-tls-is-an-option-a-build-asks-for.md)); the build that asks pays +573,152 B and +574,320 B on top | +2,872 B | +2,720 B |
+| A server answering on more than one address ([ADR 0289](./0289-a-server-answers-on-more-than-one-address.md)); the `-Dtls` build pays +1,872 B, where a listener's certificate is real | +256 B | +256 B |
 
 `nilo_fetch` is +0 on both examples because neither imports it, and that is the
 whole of the row rather than an accident: a module nothing names is never

@@ -194,6 +194,25 @@ pub const Options = struct {
         key: []const u8,
     };
 
+    /// One more address to answer on, named by `also`. The three fields a
+    /// second listener can differ in and no others: everything else about
+    /// a connection — its buffers, its deadlines, how many the process
+    /// holds — is the server's rather than the port's
+    /// ([ADR 0289](../docs/adr/0289-a-server-answers-on-more-than-one-address.md)).
+    pub const Listener = struct {
+        /// What a nilo compile error calls this type (ADR 0122).
+        pub const nilo_type_name = "nilo.Listener";
+
+        /// Read exactly as `Options.address` is, `unix:` spelling included.
+        address: []const u8 = "127.0.0.1",
+        /// Ignored when `address` names a unix socket.
+        port: u16 = 8787,
+        /// Serve HTTPS on this one. Independent of every other listener's:
+        /// a plain port and a TLS port in one process is what the field
+        /// exists for, and each certificate is that listener's alone.
+        tls: ?Tls = null,
+    };
+
     /// An IPv4 or IPv6 address in the usual notation: `"127.0.0.1"` and
     /// `"::1"` for this machine only, `"0.0.0.0"` and `"::"` for every
     /// interface. A host name is not resolved — this is the address to bind
@@ -325,6 +344,41 @@ pub const Options = struct {
     /// client that connects and goes quiet, or speaks plain HTTP to this
     /// port, is dropped when the first of those runs out.
     tls: ?Tls = null,
+
+    /// More addresses to answer on, beside the one `address` and `port`
+    /// name ([ADR 0289](../docs/adr/0289-a-server-answers-on-more-than-one-address.md)).
+    ///
+    /// ```zig
+    /// try app.listen(.{
+    ///     .port = 8080,
+    ///     .also = &.{
+    ///         .{ .port = 8081, .tls = .{ .cert = "cert.pem", .key = "key.pem" } },
+    ///     },
+    /// });
+    /// ```
+    ///
+    /// **One server, one set of routes, one pool of threads.** A request is
+    /// answered the same way whichever port it arrived on, and the handler
+    /// is not told which: the listener decides how the bytes are carried
+    /// and nothing above it. `max_connections` counts sockets across all of
+    /// them rather than per port, because what it protects is this
+    /// process's descriptor table.
+    ///
+    /// **What it costs, which is why it is a list rather than the default.**
+    /// Each extra listener is one more socket and one more acceptor fiber
+    /// per thread, parked in `accept` for the life of the server:
+    /// **82 KB on a sixteen-thread server** (330 KB for four extra ones,
+    /// measured), which is about 5.3 KB a thread rather than the 4 KB the
+    /// stack alone would suggest. Nothing per connection and nothing per request: an idle
+    /// connection measured 9,300 bytes with one listener and 9,300 with
+    /// two, at ten thousand of them. Both numbers are in ADR 0289.
+    ///
+    /// A TLS listener here still needs the build to have asked for TLS
+    /// (`.tls = true` on the dependency), and is refused at `listen()` the
+    /// same way `tls` above is. `boundPort()` answers for `port`, the
+    /// first listener, because a test that asked the kernel to choose asked
+    /// about that one.
+    also: []const Listener = &.{},
 
     /// Bytes of the connection's write buffer. A response that fits in it
     /// leaves as one write; a bigger one is split across several.

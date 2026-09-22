@@ -564,6 +564,48 @@ connects and goes quiet, or speaks plain HTTP to the port, is dropped when
 that runs out. `clientIp()` on this listener is the real address, since no
 proxy is in the way.
 
+### More than one address
+
+A server answers on one address by default and on as many as you list
+([ADR 0289](../adr/0289-a-server-answers-on-more-than-one-address.md)). The
+case this exists for is the other half of the section above: HTTPS for the
+people outside and cleartext for whatever is already inside.
+
+<!-- compiles: body -->
+```zig
+try app.listen(.{
+    .port = 8080,
+    .also = &.{
+        .{ .port = 8081, .tls = .{ .cert = "cert.pem", .key = "key.pem" } },
+    },
+});
+```
+
+An entry carries an address, a port and a certificate, and nothing else.
+Everything else on `listen()` belongs to the server rather than to one of
+its addresses: the buffers, the deadlines, the thread count, and
+`max_connections`, which counts the sockets this process holds rather than
+the sockets a port holds.
+
+**A handler is not told which listener a request came in on**, and there is
+no way to ask. A listener decides how the bytes are carried and nothing
+above it does, so a route is a route on every address. A program that wants
+two different surfaces gives them two route prefixes, which it could always
+do.
+
+Three things worth knowing before you reach for it:
+
+- `boundPort()` answers for `port`, the first listener. An extra listener
+  may ask for port 0 and the kernel will give it one, but nothing reports
+  which.
+- Two entries naming the same address are refused at `listen()`, naming
+  both, rather than arriving as the kernel's `AddressInUse` — which reads
+  as another process holding the port and sends you hunting for one.
+- Each extra listener costs about **82 KB** of resident memory on a
+  sixteen-thread server: one socket, and one acceptor fiber per thread
+  parked in `accept` for the life of the server. Nothing per connection and
+  nothing per request; an idle connection is exactly what it was.
+
 ## Knowing whether it is ready
 
 A load balancer, Kubernetes, or the script that restarts the process all ask

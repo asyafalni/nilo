@@ -190,6 +190,14 @@ The design is known and priced; what is missing is somebody who needs it. Bring 
 
 **Needs:** that deployment.
 
+**A handler cannot tell which listener a request arrived on.** `listen(.{ .also = … })` answers on as many addresses as it is given, and deliberately tells nothing above the listener which one carried the bytes ([ADR 0289](./adr/0289-a-server-answers-on-more-than-one-address.md)): a listener decides how bytes move and a route is a route on every address. The case that would change that is an admin surface on a port of its own, where the point is precisely that the public listener must not reach it, and route prefixes do not express "only from this socket". The shape is a field on `Ctx` or a route scoped to a listener, and both cost something on the hot type for a use case nobody has brought yet.
+
+**Needs:** a caller with an admin or metrics port that must not be reachable from the public one, and a reading of what it costs the park frame, which ADR 0288 showed is one page away from noticing anything.
+
+**An extra listener that asked the kernel for a port cannot say which one it got.** `boundPort()` answers for `port`, the first listener, and an entry in `also` with `.port = 0` binds fine and reports nothing ([ADR 0289](./adr/0289-a-server-answers-on-more-than-one-address.md)). It costs the tests something already: they give a second listener a unix path rather than a port, because a path is knowable and a kernel-chosen port is not. The shape is `boundPorts()` returning the lot, or `boundPort(n)`.
+
+**Needs:** somebody who binds more than one listener to port 0 outside a test, or a test here that cannot be written with a path.
+
 **A stream is never compressed, and neither is an event stream; and gzip is the only coding.** `app.compress` gzips a whole body on a compressor borrowed for the CPU it takes and handed back before the socket is written, which is what keeps one compressor per thread enough ([ADR 0287](./adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)). A stream has no whole body and would hold its compressor across every write, so its shape is a second pool larger than the thread count and chunked framing; an event stream must never be buffered and stays out on principle. Brotli is a C dependency, and a decision of its own.
 
 **Needs:** a caller streaming something text and large enough that the bandwidth matters, or a scoreboard reason for brotli that survives the dependency it brings.

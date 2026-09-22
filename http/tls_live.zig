@@ -357,3 +357,110 @@ test "a stop comes back with an idle TLS connection still open, within the idle 
     // grace, which an idle connection is not charged against.
     if (took_ms >= 3000) return error.StopHeldPastTheIdleLimit;
 }
+
+/// The shape a server behind no proxy actually wants, and the one the
+/// benchmark arena's profiles ask for: **HTTPS and cleartext at the same
+/// time, from one process, over one set of routes**
+/// ([ADR 0289](../docs/adr/0289-a-server-answers-on-more-than-one-address.md)).
+///
+/// TLS on the listener `Options` itself names, because that is the one
+/// `boundPort()` answers for and the client below needs a number. The
+/// cleartext half goes on a unix socket rather than a second port, for the
+/// reason `live.zig` gives: a path cannot collide with the other optimize
+/// mode running this same suite beside us, and what is being tested is that
+/// each listener keeps its own way of carrying bytes rather than that the
+/// loop ran twice.
+const ServingTlsAndPlain = struct {
+    app: *nilo.App,
+    path: []const u8,
+    bound: std.atomic.Value(bool) = .init(true),
+
+    fn run(self: *ServingTlsAndPlain) void {
+        var buf: [std.Io.net.UnixAddress.max_len + 8]u8 = undefined;
+        const beside = std.fmt.bufPrint(&buf, "unix:{s}", .{self.path}) catch {
+            self.bound.store(false, .release);
+            return;
+        };
+        self.app.tryListen(.{
+            .port = 0,
+            .threads = 1,
+            .stop_on_signal = false,
+            .tls = .{ .cert = cert_path, .key = key_path },
+            .also = &.{.{ .address = beside }},
+        }) catch {
+            self.bound.store(false, .release);
+        };
+    }
+};
+
+test "a TLS listener and a cleartext one answer in one process, over the same routes" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/plain.sock", .{tmp.sub_path});
+    defer gpa.free(path);
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/", hello);
+
+    var serving: ServingTlsAndPlain = .{ .app = &app, .path = path };
+    const thread = try std.Thread.spawn(.{}, ServingTlsAndPlain.run, .{&serving});
+    var stopped = false;
+    defer if (!stopped) {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    };
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Waited for against this harness's own flag rather than `waitForPort`,
+    // which takes the other one.
+    const port = for (0..300) |_| {
+        if (app.boundPort()) |p| break p;
+        if (!serving.bound.load(.acquire)) return error.ServerNeverCameUp;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    } else return error.ServerNeverCameUp;
+
+    // The encrypted half, handshaken by a client that shares no code with
+    // the server and checks the certificate the way a browser would.
+    const stream = try connect(io, port);
+    var client: Client = undefined;
+    try client.handshake(io, stream);
+    const secure = try client.ask(gpa, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    defer gpa.free(secure);
+    stream.close(io);
+    try testing.expect(std.mem.startsWith(u8, secure, "HTTP/1.1 200 "));
+    try testing.expect(std.mem.endsWith(u8, secure, "hello over tls\n"));
+
+    // The cleartext half, at the same moment, from the same App. No
+    // handshake, no records, and the same handler at the end of it: what
+    // the listener decides is how the bytes are carried, and nothing above
+    // it is told which one they came in on.
+    const address = try std.Io.net.UnixAddress.init(path);
+    var plain: std.Io.net.Stream = for (0..300) |_| {
+        break address.connect(io) catch {
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+            continue;
+        };
+    } else return error.ServerNeverCameUp;
+    defer plain.close(io);
+
+    var out: [256]u8 = undefined;
+    var writer = plain.writer(io, &out);
+    try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
+
+    var seen: [1024]u8 = undefined;
+    const n = try readSome(plain, &seen);
+    try testing.expect(std.mem.startsWith(u8, seen[0..n], "HTTP/1.1 200 "));
+    try testing.expect(std.mem.indexOf(u8, seen[0..n], "hello over tls\n") != null);
+
+    app.shutdown();
+    thread.join();
+    stopped = true;
+}

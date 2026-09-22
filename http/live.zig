@@ -750,3 +750,96 @@ test "spawning with no server says so, and the App is what remembers instead" {
     try app.spawn(Ticker.run, .{&ticker});
     try testing.expectEqual(@as(u32, 0), ticker.ticks.load(.monotonic));
 }
+
+/// The server under test answering on two addresses at once: the one
+/// `Options` names, on a port the kernel chose, and a unix socket beside it
+/// ([ADR 0289](../docs/adr/0289-a-server-answers-on-more-than-one-address.md)).
+///
+/// Two *transports* rather than two ports, and that is what makes it a test
+/// rather than a repetition: a second entry that differed only in its number
+/// would prove the loop runs twice, while this one proves each listener
+/// keeps its own way of carrying bytes and that the routes underneath are
+/// the server's rather than the address's. The TLS pairing is the same fact
+/// with encryption in place of the socket file, and lives in `tls_live.zig`
+/// because only a build with TLS in it can run it.
+const ServingOnBoth = struct {
+    app: *nilo.App,
+    path: []const u8,
+    bound: std.atomic.Value(bool) = .init(true),
+
+    fn run(self: *ServingOnBoth) void {
+        var buf: [std.Io.net.UnixAddress.max_len + 8]u8 = undefined;
+        const beside = std.fmt.bufPrint(&buf, "unix:{s}", .{self.path}) catch {
+            self.bound.store(false, .release);
+            return;
+        };
+        self.app.tryListen(.{
+            .port = 0,
+            .threads = 1,
+            .stop_on_signal = false,
+            .also = &.{.{ .address = beside }},
+        }) catch {
+            self.bound.store(false, .release);
+        };
+    }
+};
+
+/// The port the first listener took. The same bounded wait `waitForPort`
+/// does, against this harness's own flag.
+fn waitForFirstPort(gpa: std.mem.Allocator, serving: *const ServingOnBoth) !u16 {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    for (0..300) |_| {
+        if (serving.app.boundPort()) |port| return port;
+        if (!serving.bound.load(.acquire)) return error.ServerNeverCameUp;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    return error.ServerNeverCameUp;
+}
+
+test "a server answers on a second address, and both addresses reach the same routes" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var where = try SocketDir.init(gpa, "beside.sock");
+    defer where.deinit(gpa);
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/who", whoIsAsking);
+
+    var serving: ServingOnBoth = .{ .app = &app, .path = where.path };
+    const thread = try std.Thread.spawn(.{}, ServingOnBoth.run, .{&serving});
+    var stopped = false;
+    defer if (!stopped) {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    };
+    const port = try waitForFirstPort(gpa, &serving);
+
+    // The address `Options` itself named. `boundPort()` answers for this one
+    // and only this one, which is what the option's doc says.
+    const over_port = try ask(gpa, port, "GET /who HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n");
+    defer over_port.deinit(gpa);
+    try testing.expect(std.mem.startsWith(u8, over_port.head, "HTTP/1.1 200 "));
+
+    // The one `also` added. Same App, same route table, same handler — the
+    // listener decides how the bytes are carried and nothing above it does.
+    const over_path = try askOverPath(gpa, where.path, "GET /who HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n");
+    defer over_path.deinit(gpa);
+    try testing.expect(std.mem.startsWith(u8, over_path.head, "HTTP/1.1 200 "));
+
+    // A route that is not there is not there on either, which is the same
+    // table answering twice rather than two tables that happen to agree.
+    const missing = try askOverPath(gpa, where.path, "GET /nowhere HTTP/1.1\r\nHost: nilo\r\nConnection: close\r\n\r\n");
+    defer missing.deinit(gpa);
+    try testing.expect(std.mem.startsWith(u8, missing.head, "HTTP/1.1 404 "));
+
+    // Both sockets are this process's to take away, not just the first.
+    app.shutdown();
+    thread.join();
+    stopped = true;
+    try testing.expect(!stillThere(gpa, where.path));
+}

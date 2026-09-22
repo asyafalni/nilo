@@ -63,6 +63,20 @@ newest first.
 
 ### Added
 
+- `listen(.{ .also = &.{ .{ .port = 8081, .tls = … } } })`: more addresses
+  to answer on, from one process. An entry is an address, a port and a
+  certificate and nothing else; everything else on `listen()` belongs to
+  the server rather than to one of its addresses, and `max_connections`
+  counts the sockets this process holds rather than the sockets a port
+  holds. One route table, one thread pool, and a handler is not told which
+  listener a request arrived on. A cleartext port beside a TLS one is what
+  it is for. Two entries naming one address are refused at `listen()`
+  naming both, rather than arriving as the kernel's `AddressInUse`.
+  `boundPort()` still answers for `port`, the first listener. Costs 82 KB
+  of resident memory per extra listener on sixteen threads and nothing per
+  connection: an idle connection measured 9,300 bytes before and after
+  ([ADR 0289](./docs/adr/0289-a-server-answers-on-more-than-one-address.md),
+  [deploying](./docs/guide/deploying.md#more-than-one-address)).
 - `listen(.{ .tls = .{ .cert = "…pem", .key = "…pem" } })`: HTTPS, TLS 1.3,
   on a build that asked for it with `.tls = true` on the dependency
   (`-Dtls` in this repository). The library behind it, ianic/tls.zig, is

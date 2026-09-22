@@ -272,15 +272,19 @@ const Secured = struct {
     io: std.Io,
 };
 
-/// What the acceptors share, on `serve`'s frame: the count of connections
-/// held, whether the descriptor shortage has been said, the first
-/// listener failure, kept for `serve` to return once the others are
-/// cancelled (ADR 0273), and the TLS material if this is a TLS listener.
-const Accepting = struct {
+/// What every acceptor of every listener shares, on `serve`'s frame: the
+/// count of connections held, whether the descriptor shortage has been
+/// said, and the first listener failure, kept for `serve` to return once
+/// the others are cancelled (ADR 0273).
+///
+/// Separate from `Accepting` below because these three are the *server's*
+/// and the TLS material beside them is one *listener's* (ADR 0289).
+/// `max_connections` counts the sockets this process holds rather than the
+/// sockets a port holds, because what it protects is one descriptor table;
+/// a shortage is one machine's and is said once, not once a port; and a
+/// listener that fails takes the server down whichever one it was.
+const Serving = struct {
     capacity: Capacity,
-    /// Set on a TLS listener and null on a plain one, which is the whole
-    /// of how the acceptor tells them apart.
-    secured: ?*Secured = null,
     /// Whether "out of descriptors" has been said and not yet taken back, so
     /// that N acceptors hitting the same shortage write one line and one
     /// "works again" between them.
@@ -292,17 +296,38 @@ const Accepting = struct {
 
     /// Keep the first failure; a second acceptor failing after it changes
     /// nothing about what `serve` should say.
-    fn fail(self: *Accepting, err: anyerror) void {
+    fn fail(self: *Serving, err: anyerror) void {
         _ = self.failure.cmpxchgStrong(0, @intFromError(err), .acq_rel, .monotonic);
     }
 
-    fn failed(self: *const Accepting) bool {
+    fn failed(self: *const Serving) bool {
         return self.failure.load(.acquire) != 0;
     }
 
-    fn takeFailure(self: *const Accepting) ?anyerror {
+    fn takeFailure(self: *const Serving) ?anyerror {
         const code = self.failure.load(.acquire);
         return if (code == 0) null else @errorFromInt(code);
+    }
+};
+
+/// What one listener's acceptors share: the server they all belong to, and
+/// the TLS material if this listener is a TLS one.
+///
+/// **Two fields and not four, which is the frame again.** A connection
+/// fiber is handed one of these and keeps it live across the handler
+/// (`Conn.run`), so what it costs is measured rather than assumed: the
+/// server's three parts are reached through one pointer instead of being
+/// copied in beside the certificate. An idle connection is what it was
+/// before this type existed, to the byte (ADR 0289, ADR 0288).
+const Accepting = struct {
+    /// The server every listener of this process belongs to.
+    all: *Serving,
+    /// Set on a TLS listener and null on a plain one, which is the whole
+    /// of how the acceptor tells them apart.
+    secured: ?*Secured = null,
+
+    fn fail(self: *Accepting, err: anyerror) void {
+        self.all.fail(err);
     }
 };
 
@@ -845,6 +870,24 @@ fn unixPathIn(address: []const u8) ?[]const u8 {
     return address[unix_prefix.len..];
 }
 
+/// Whether a listener asking for `address`:`port` wants one a listener
+/// already bound at `bound_address`:`bound_port` has taken (ADR 0289).
+///
+/// **The other side's *bound* port rather than the one it asked for**,
+/// because 0 means "whichever is free" and two of those are two different
+/// ports rather than a collision. A unix path has no port at all, so there
+/// the path alone decides — and it is the *asking* listener's transport
+/// that says so, because two listeners whose address strings are equal are
+/// both unix or neither is.
+///
+/// A pure function and not the log line beside it, for the reason
+/// `tlsRefusal` is one: an error log inside a test is a failed test
+/// whatever it says, so the decision is what gets tested.
+fn sameListener(address: []const u8, port: u16, over_unix: bool, bound_address: []const u8, bound_port: u16) bool {
+    if (!std.mem.eql(u8, address, bound_address)) return false;
+    return over_unix or port == bound_port;
+}
+
 /// The listener for an `address`/`port` pair, or null with `why` set and the
 /// reason already said out loud.
 fn listenOnIp(options: anytype, why: *StartupFailure) ?zio.net.Server {
@@ -1154,55 +1197,142 @@ pub fn serve(
     // business, in a crash log least of all).
     var why: StartupFailure = .other;
 
-    // A path rather than a port: `.address = "unix:/run/nilo.sock"`. One
-    // more spelling of the field that already says what to listen on, rather
-    // than a field beside it — two fields would leave a third state, both
-    // set, that means nothing (ADR 0130).
-    const unix_path = unixPathIn(options.address);
-
-    // The certificate and key, read before the port is taken (ADR 0288). A
-    // file that is not there is a deployment mistake of the same kind as a
-    // port that is not free, and it is said the same way: one line, what to
-    // change, and no port held meanwhile. Only a build with `-Dtls` can
-    // read one; every other build refuses the option in words rather than
-    // serving plain HTTP on a port the caller believed was encrypted.
-    var secured_storage: ?Secured = null;
-    defer if (nilo_build.tls) {
-        if (secured_storage) |*sec| sec.auth.deinit(gpa);
+    // One address, or several: what `Options` names is the first, and
+    // `also` is the rest ([ADR 0289](../../docs/adr/0289-a-server-answers-on-more-than-one-address.md)).
+    // A plain port beside a TLS one in a single process is what the list
+    // exists for, and almost every server has exactly one entry here.
+    const Want = struct {
+        address: []const u8,
+        port: u16,
+        tls: @TypeOf(options.tls),
     };
-    if (tlsRefusal(nilo_build.tls, options.tls != null, unix_path != null)) |refusal| {
-        refusal.say(options.address);
-        return refusal.toError();
-    }
-    if (nilo_build.tls) if (options.tls) |t| {
-        // Into a local first: assigned straight into the optional, the
-        // `orelse return` would leave it non-null with nothing in it (the
-        // result location sets the tag before the fields), and the defer
-        // above would free a key pair that was never loaded.
-        const auth = readCertKeyPair(gpa, rt.io(), t.cert, t.key) catch |err| {
+
+    // One address this server answers on, and everything that belongs to
+    // that address alone.
+    const Bound = struct {
+        server: zio.net.Server,
+        /// The path, when this listener is a unix socket, so the file is
+        /// taken away on the way out (ADR 0130).
+        unix_path: ?[]const u8,
+        /// This listener's certificate, owned here. `accepting.secured`
+        /// points into this field, so nothing may move after the pointers
+        /// below are taken.
+        secured: ?Secured,
+        /// Filled once `Serving` exists, which is after every socket is
+        /// open. Nothing reads it before the acceptors are spawned.
+        accepting: Accepting,
+        /// What `listen()` was told, for the log line.
+        address: []const u8,
+    };
+
+    const listeners = try gpa.alloc(Bound, 1 + options.also.len);
+    defer gpa.free(listeners);
+
+    // How many are open. The one `defer` below reads it at its final value,
+    // so a failure part way along the list closes exactly what was taken
+    // and a clean run closes all of it, without two paths to keep in step.
+    var opened: usize = 0;
+    defer for (listeners[0..opened]) |*b| {
+        // The socket first and the file second, which is the order the
+        // two separate `defer`s had before there was a list of them: a
+        // socket file left behind is what makes the next start fail.
+        b.server.close();
+        if (b.unix_path) |path| removeSocket(gpa, path);
+        if (nilo_build.tls) if (b.secured) |*sec| sec.auth.deinit(gpa);
+    };
+
+    for (listeners, 0..) |*b, i| {
+        const want: Want = if (i == 0)
+            .{ .address = options.address, .port = options.port, .tls = options.tls }
+        else
+            .{
+                .address = options.also[i - 1].address,
+                .port = options.also[i - 1].port,
+                .tls = options.also[i - 1].tls,
+            };
+
+        // A path rather than a port: `.address = "unix:/run/nilo.sock"`. One
+        // more spelling of the field that already says what to listen on, rather
+        // than a field beside it — two fields would leave a third state, both
+        // set, that means nothing (ADR 0130).
+        const unix_path = unixPathIn(want.address);
+
+        if (tlsRefusal(nilo_build.tls, want.tls != null, unix_path != null)) |refusal| {
+            refusal.say(want.address);
+            return refusal.toError();
+        }
+
+        // Two listeners on one address is a configuration mistake the
+        // kernel would report as "already in use", which reads as another
+        // process holding the port and sends the reader hunting for one
+        // (ADR 0289). Said here instead, naming both.
+        for (listeners[0..i], 0..) |*earlier, j| {
+            const taken = if (unix_path != null) 0 else earlier.server.socket.address.ip.getPort();
+            if (!sameListener(want.address, want.port, unix_path != null, earlier.address, taken)) continue;
             std.log.err(
-                "could not load the TLS certificate \"{s}\" and key \"{s}\" ({s}). Both are PEM " ++
-                    "files, the key unencrypted, and the paths are relative to the directory " ++
-                    "the server is started in. `openssl x509 -in {s} -noout -text` says " ++
-                    "whether the first is a certificate at all.",
-                .{ t.cert, t.key, @errorName(err), t.cert },
+                "listener {d} and listener {d} are both {s}:{d}. A server answers on each " ++
+                    "address once; give one of them a different port, or drop it from `also`.",
+                .{ j, i, want.address, want.port },
             );
-            return error.TlsCertificate;
+            return error.AddressInUse;
+        }
+
+        // The certificate and key, read before the port is taken (ADR 0288). A
+        // file that is not there is a deployment mistake of the same kind as a
+        // port that is not free, and it is said the same way: one line, what to
+        // change, and no port held meanwhile. Only a build with `-Dtls` can
+        // read one; every other build refuses the option in words rather than
+        // serving plain HTTP on a port the caller believed was encrypted.
+        //
+        // Into a local first: assigned straight into `b.secured`, a failure
+        // below would leave the array holding a key pair the `defer` above
+        // does not yet count as open, and the `errdefer` is what frees it
+        // while it is still this iteration's.
+        var secured: ?Secured = null;
+        errdefer if (nilo_build.tls) {
+            if (secured) |*sec| sec.auth.deinit(gpa);
         };
-        secured_storage = .{ .auth = auth, .io = rt.io() };
-    };
+        if (nilo_build.tls) if (want.tls) |t| {
+            const auth = readCertKeyPair(gpa, rt.io(), t.cert, t.key) catch |err| {
+                std.log.err(
+                    "could not load the TLS certificate \"{s}\" and key \"{s}\" ({s}). Both are PEM " ++
+                        "files, the key unencrypted, and the paths are relative to the directory " ++
+                        "the server is started in. `openssl x509 -in {s} -noout -text` says " ++
+                        "whether the first is a certificate at all.",
+                    .{ t.cert, t.key, @errorName(err), t.cert },
+                );
+                return error.TlsCertificate;
+            };
+            secured = .{ .auth = auth, .io = rt.io() };
+        };
 
-    const maybe_server: ?zio.net.Server = if (unix_path) |path|
-        listenOnUnix(gpa, path, options.reuse_address, options.backlog, &why)
-    else
-        listenOnIp(options, &why);
-    const server = maybe_server orelse return why.toError();
+        const maybe_server: ?zio.net.Server = if (unix_path) |path|
+            listenOnUnix(gpa, path, options.reuse_address, options.backlog, &why)
+        else
+            listenOnIp(.{
+                .address = want.address,
+                .port = want.port,
+                .reuse_address = options.reuse_address,
+                .backlog = options.backlog,
+            }, &why);
+        const sock = maybe_server orelse return why.toError();
 
-    // Registered before the close, so it runs after it: the socket file is
-    // this process's to take away, and one left behind is what makes the
-    // next start fail.
-    defer if (unix_path) |path| removeSocket(gpa, path);
-    defer server.close();
+        b.* = .{
+            .server = sock,
+            .unix_path = unix_path,
+            .secured = secured,
+            .accepting = undefined,
+            .address = want.address,
+        };
+        opened = i + 1;
+    }
+
+    // The one every other line below still means when it says "the server":
+    // the address `Options` itself named, which is the port `boundPort()`
+    // answers with and the one a test that asked the kernel to choose asked
+    // about.
+    const server = listeners[0].server;
+    const unix_path = listeners[0].unix_path;
 
     var group: zio.Group = .init;
     // Whatever is still running when the grace period is over is cut off
@@ -1236,10 +1366,20 @@ pub fn serve(
     // because 0 asks the kernel to choose and a test is the caller that does.
     try ready(state, rt.io(), if (unix_path != null) null else server.socket.address.ip.getPort());
 
-    if (secured_storage != null)
+    // The first listener keeps the line it always had, word for word: it is
+    // what the guides quote and what a reader looks for. The rest say the
+    // same thing one line each, without repeating the thread count, which
+    // is the server's and not any one address's (ADR 0289).
+    if (listeners[0].secured != null)
         std.log.info("nilo listening on https://{f} across {d} thread(s)", .{ server.socket.address, threads })
     else
         std.log.info("nilo listening on {f} across {d} thread(s)", .{ server.socket.address, threads });
+    for (listeners[1..]) |*b| {
+        if (b.secured != null)
+            std.log.info("nilo also listening on https://{f}", .{b.server.socket.address})
+        else
+            std.log.info("nilo also listening on {f}", .{b.server.socket.address});
+    }
 
     // A buffer that starts on a page boundary and ends on one, so every page
     // of it belongs to this connection alone and can be given back.
@@ -1316,7 +1456,7 @@ pub fn serve(
             stream: zio.net.Stream,
             conn_gpa: std.mem.Allocator,
             sizes: Options,
-            // The shared state rather than `&sh.capacity`, which is all this
+            // The listener's own state rather than `&sh.all.capacity`, which is all this
             // entry reads of it: `runTls` below wants the rest, and the two
             // entries keep one argument list so the plain one's frame is
             // what it was. Two more arguments kept live across the handler
@@ -1325,7 +1465,7 @@ pub fn serve(
             // anything added above it is a whole page (ADR 0288).
             sh: *Accepting,
         ) void {
-            const capacity = &sh.capacity;
+            const capacity = &sh.all.capacity;
             // After the close, not before: the count is meant to answer
             // "how many sockets does this process hold", and the socket is
             // held until it is shut. Deferred first so it runs last.
@@ -1419,7 +1559,7 @@ pub fn serve(
             sh: *Accepting,
         ) void {
             if (!nilo_build.tls) unreachable;
-            const capacity = &sh.capacity;
+            const capacity = &sh.all.capacity;
             defer capacity.give();
             defer stream.close();
             // Always IP: a TLS listener on a unix socket is refused in
@@ -1508,11 +1648,17 @@ pub fn serve(
 
     warnIfDescriptorsShort(options.max_connections);
 
-    // What every acceptor shares. On the main fiber's frame, which outlives
-    // them: they are cancelled below before this function returns.
-    var shared: Accepting = .{
-        .capacity = .{ .max = options.max_connections },
-        .secured = if (secured_storage) |*sec| sec else null,
+    // What every acceptor of every listener shares. On the main fiber's
+    // frame, which outlives them: they are cancelled below before this
+    // function returns.
+    var shared: Serving = .{ .capacity = .{ .max = options.max_connections } };
+
+    // The per-listener half, filled now that the array is final and the
+    // server it belongs to exists. `secured` points into `Bound`, so this
+    // is the line that fixes the array in place (ADR 0289).
+    for (listeners) |*b| b.accepting = .{
+        .all = &shared,
+        .secured = if (b.secured) |*sec| sec else null,
     };
 
     // One acceptor. There is one per executor ([ADR 0273](../../docs/adr/0273-every-executor-accepts.md)),
@@ -1549,12 +1695,12 @@ pub fn serve(
                     error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => {
                         const first = backoff_ms == 0;
                         backoff_ms = if (first) accept_backoff_min_ms else @min(backoff_ms * 2, accept_backoff_max_ms);
-                        if (first and sh.short.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null) std.log.warn(
+                        if (first and sh.all.short.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null) std.log.warn(
                             "accept failed with {s}: the process or the machine is out of file " ++
                                 "descriptors or memory, so nilo is pausing before it tries again. Held " ++
                                 "connections: {d} of {d}. Raise `ulimit -n` (or `LimitNOFILE=` under " ++
                                 "systemd) past `.max_connections`, or lower `.max_connections`.",
-                            .{ @errorName(err), sh.capacity.held(), sh.capacity.max },
+                            .{ @errorName(err), sh.all.capacity.held(), sh.all.capacity.max },
                         );
                         zio.sleep(.fromMilliseconds(backoff_ms)) catch return;
                         continue;
@@ -1574,7 +1720,7 @@ pub fn serve(
                 };
                 if (backoff_ms != 0) {
                     backoff_ms = 0;
-                    if (sh.short.cmpxchgStrong(true, false, .acq_rel, .monotonic) == null) {
+                    if (sh.all.short.cmpxchgStrong(true, false, .acq_rel, .monotonic) == null) {
                         std.log.info("accept works again after the descriptor shortage", .{});
                     }
                 }
@@ -1588,16 +1734,16 @@ pub fn serve(
                 // client the server has just decided it cannot afford to serve is
                 // work an attacker gets to choose, and it would put a write with a
                 // deadline on it inside the one loop that must not stall.
-                if (!sh.capacity.take()) {
+                if (!sh.all.capacity.take()) {
                     stream.close();
-                    if (sh.capacity.claimWarning(monotonicNanos())) {
+                    if (sh.all.capacity.claimWarning(monotonicNanos())) {
                         std.log.warn(
                             "nilo is holding its limit of {d} connections, so new ones are being closed " ++
                                 "unanswered ({d} so far). Raise `.max_connections` in listen() if the " ++
                                 "machine has the memory — an idle connection costs 4,669 bytes, plus " ++
                                 "whatever stack the handler touches — or put fewer of them on this " ++
                                 "process.",
-                            .{ sh.capacity.max, sh.capacity.refused.load(.monotonic) },
+                            .{ sh.all.capacity.max, sh.all.capacity.refused.load(.monotonic) },
                         );
                     }
                     continue;
@@ -1611,7 +1757,7 @@ pub fn serve(
                 else
                     connections.spawn(Conn.run, .{ st, stream, conn_gpa, sizes, sh });
                 spawned catch |err| {
-                    sh.capacity.give();
+                    sh.all.capacity.give();
                     stream.close();
                     // `error.Closed` is the connections group winding up,
                     // which means `serve` is already on its way out.
@@ -1628,10 +1774,17 @@ pub fn serve(
     // the server. Cancelled before anything else on the way out — before
     // the connections, before the listener is closed — so no `accept` is
     // ever pending on a socket that is being taken away.
+    //
+    // One set per listener (ADR 0289), and the listener is the outer loop
+    // so that each one's acceptors still land on consecutive executors: the
+    // round-robin wraps, so a second listener gets the same spread of
+    // threads the first did rather than the leftovers.
     var acceptors: zio.Group = .init;
     defer acceptors.cancel();
-    for (0..threads) |_| {
-        try acceptors.spawn(Acceptor.run, .{ &shared, server, state, gpa, options, &group });
+    for (listeners) |*b| {
+        for (0..threads) |_| {
+            try acceptors.spawn(Acceptor.run, .{ &b.accepting, b.server, state, gpa, options, &group });
+        }
     }
 
     // The main fiber's only job from here is to notice a stop. It cannot be
@@ -2216,4 +2369,32 @@ test "a Wake that parked hands its completions back before its frame goes" {
     // cancel and drain the queue underneath it.
     wake.deinit();
     try testing.expect(wake.cq.isEmpty());
+}
+
+test "two listeners asking for one address is a refusal, and two asking for port 0 is not" {
+    // The decision, apart from the line it prints: the line is an error log,
+    // and an error log inside a test is a failed test whatever it says.
+
+    // The same address and the same port, which is the mistake `also` makes
+    // possible and the kernel would blame on another process.
+    try testing.expect(sameListener("127.0.0.1", 8080, false, "127.0.0.1", 8080));
+
+    // Different ports on one interface is the whole point of the option.
+    try testing.expect(!sameListener("127.0.0.1", 8081, false, "127.0.0.1", 8080));
+
+    // Different interfaces on one port is a server with two homes, which is
+    // legitimate and is not this function's business to refuse: the kernel
+    // takes both.
+    try testing.expect(!sameListener("127.0.0.1", 8080, false, "0.0.0.0", 8080));
+
+    // **Two listeners that both asked the kernel to choose are two ports.**
+    // The one already bound reports the number it was given, and the one
+    // asking still says 0, so they differ and neither is refused. A test is
+    // the caller that does this.
+    try testing.expect(!sameListener("127.0.0.1", 0, false, "127.0.0.1", 54321));
+
+    // A path has no port, so the path alone decides. The same one twice is
+    // a refusal whatever number rides along.
+    try testing.expect(sameListener("unix:/run/nilo.sock", 0, true, "unix:/run/nilo.sock", 0));
+    try testing.expect(!sameListener("unix:/run/one.sock", 0, true, "unix:/run/two.sock", 0));
 }
