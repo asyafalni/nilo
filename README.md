@@ -162,7 +162,7 @@ test "getUser" {
 
 Each module, and what is deliberately not in it:
 
-- **`nilo_http`** — routing, typed handlers, middleware, cookies and sessions, static files, streaming, WebSocket, OpenAPI, metrics, rate limiting. *Not:* templates and TLS, both on the record below.
+- **`nilo_http`** — routing, typed handlers, middleware, cookies and sessions, static files, streaming, WebSocket, OpenAPI, metrics, rate limiting, and TLS 1.3 in a build that asks for it. *Not:* templates, on the record below.
 - **`nilo_sql`** — Postgres and SQLite. Your struct is the table, and it makes the table: reads, writes, transactions, streaming, the schema, the diff and the ledger. *Not:* joins, aggregates and `GROUP BY`, which go through `db.raw`; a migration `down`.
 - **`nilo_s3`** — object storage: S3, MinIO, R2. Your bucket is a type. Get, put, range, stream, list a page, presigned GET and POST. *Not:* `COPY`, multipart.
 - **`nilo_fetch`** — calling somebody else's HTTP API from inside a request: the policy in front of `std.http.Client`. *Not:* retries, circuit breaker.
@@ -421,7 +421,7 @@ whole, and the running server serves its own contract at `/openapi.json`.
 ## 🚫 What it won't do
 
 - **Templates.** Rendering means a string per request, which is an allocation per request, and that number is fixed. If your app's job is HTML, [jetzig](https://www.jetzig.dev/) is built for it.
-- **TLS**, and so HTTP/2 and gRPC. Terminate it in front; the [deploying guide](./docs/guide/deploying.md#tls-and-the-proxy-in-front) has the five lines ([ADR 0028](./docs/adr/0028-tls-is-terminated-in-front.md)).
+- **TLS by default**, and HTTP/2 and gRPC at all. Terminate it in front; the [deploying guide](./docs/guide/deploying.md#tls-and-the-proxy-in-front) has the five lines ([ADR 0028](./docs/adr/0028-tls-is-terminated-in-front.md)). A build that passes `.tls = true` gets a TLS 1.3 listener for the server with nothing in front of it, and pays 560 KB of binary and a page per idle connection for it, stated where the option is ([ADR 0288](./docs/adr/0288-tls-is-an-option-a-build-asks-for.md)).
 - **Revoking a session.** `Session(T)` is sealed into the cookie, so there is no table, no sweep, and no way to revoke one ([ADR 0035](./docs/adr/0035-a-session-is-sealed-into-the-cookie.md)).
 - **Parsing config files.** `nilo_config` reads the environment; a TOML parser taxes every project that imports the module ([ADR 0043](./docs/adr/0043-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)).
 

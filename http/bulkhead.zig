@@ -183,6 +183,17 @@ pub const Options = struct {
     /// reader's own import line gives it (ADR 0122).
     pub const nilo_type_name = "nilo.Options";
 
+    /// What `tls` names: the two PEM files a TLS listener presents. Paths,
+    /// read once at `listen()`, relative to the working directory unless
+    /// absolute. Change the files and restart; nothing here watches them.
+    pub const Tls = struct {
+        /// The certificate chain, leaf first, as every issuer hands it out.
+        cert: []const u8,
+        /// The leaf's private key, unencrypted. ECDSA P-256 is what was
+        /// measured; RSA is accepted by the library.
+        key: []const u8,
+    };
+
     /// An IPv4 or IPv6 address in the usual notation: `"127.0.0.1"` and
     /// `"::1"` for this machine only, `"0.0.0.0"` and `"::"` for every
     /// interface. A host name is not resolved — this is the address to bind
@@ -269,6 +280,51 @@ pub const Options = struct {
     /// connection do not move, and an active one holds two more pages than
     /// it did.
     read_buffer: usize = 16 * 1024,
+
+    /// Serve HTTPS on this listener: TLS 1.3, with the certificate chain
+    /// and private key read from these two PEM files when `listen()` is
+    /// called ([ADR 0288](../docs/adr/0288-tls-is-an-option-a-build-asks-for.md)).
+    /// Set it and every connection is handshaken before its first request;
+    /// the routes, the handlers and the `Ctx` see nothing different.
+    ///
+    /// **Off is still the recommendation** for a server that has a proxy in
+    /// front of it, and ADR 0028 says why. This is for the server that has
+    /// nothing in front of it: an internal tool on a VM, a service on a
+    /// private network that its policy says must be encrypted, a machine
+    /// with one port and a certificate and nobody who wants to run a
+    /// second process.
+    ///
+    /// It has to be built in. The library behind it is fetched and linked
+    /// only when the dependency is asked for it, `.tls = true` in
+    /// `b.dependency("nilo", …)` (`-Dtls` in this repository), and a
+    /// build without that refuses this option at `listen()` in one line
+    /// rather than serving plain HTTP on a port the caller believed was
+    /// encrypted. What that build costs, measured (ADR 0288): **560 KB** of
+    /// binary, before a single certificate is loaded, and **one page per
+    /// idle connection** on every listener of that build, TLS or not,
+    /// 9,293 bytes against 5,191. A TLS connection then costs what a plain
+    /// one in that build costs plus fourteen bytes at idle (9,307), because
+    /// its 33 KB of record buffers are handed back with the rest at every
+    /// idle transition. Where it is paid is the handshake: about **300 µs
+    /// of CPU for every new connection** on a Ryzen 9700X, twenty times a
+    /// plain accept, and half a microsecond a request on a connection kept
+    /// alive (3.5–4.0 µs against 3.0–3.5). A server whose clients connect once and
+    /// stay does not notice; one whose clients connect per request pays
+    /// the handshake per request, and that is the deployment a proxy with
+    /// session resumption is for.
+    ///
+    /// TLS 1.3 only, which every browser and client library of the last
+    /// six years speaks and nothing older does. One certificate per
+    /// listener: no selection by name, no client certificates, no session
+    /// tickets, and no reload without a restart, each of which is a
+    /// use case waiting for a caller (`docs/roadmap.md`).
+    ///
+    /// The handshake is bounded by `header_timeout_ms` and
+    /// `write_timeout_ms`, because until it is done that is what a
+    /// connection is: a client that has not yet sent a request head. A
+    /// client that connects and goes quiet, or speaks plain HTTP to this
+    /// port, is dropped when the first of those runs out.
+    tls: ?Tls = null,
 
     /// Bytes of the connection's write buffer. A response that fits in it
     /// leaves as one write; a bigger one is split across several.
@@ -674,10 +730,20 @@ const engine_waker: Waker.VTable = .{
         }
     }.f,
     .release_stack = struct {
-        fn f(_: ?*anyopaque) void {
-            // The target is not needed: it is *this* fiber's stack, and the
-            // Engine asks the coroutine it is running on rather than being
-            // told which connection is asking.
+        fn f(target: ?*anyopaque) void {
+            // A TLS connection has a record layer under the buffers the
+            // caller just released, 33 KB of it, and it goes back too, on
+            // the same two checks: nothing buffered in either direction.
+            // The third check, cleartext decrypted and not yet read, is the
+            // Engine's, because only it knows where that lives (ADR 0288).
+            // A plain connection has no such layer and this is one branch.
+            if (target) |t| {
+                const wake: *engine.Wake = @ptrCast(@alignCast(t));
+                if (wake.rawIdle()) |raw| releaseIdlePages(raw.in, raw.out);
+            }
+            // The stack is *this* fiber's, and the Engine asks the coroutine
+            // it is running on rather than being told which connection is
+            // asking.
             engine.releaseIdleStack();
         }
     }.f,
@@ -1111,7 +1177,9 @@ pub const Waker = struct {
         wait: *const fn (target: ?*anyopaque, limit_ms: u32) Woken,
         post: *const fn (target: ?*anyopaque) void,
         /// Hand back the pages of this connection's fiber stack that are below
-        /// its current frame, for a connection that has gone quiet.
+        /// its current frame, for a connection that has gone quiet, and, on a
+        /// TLS connection, the record layer's buffers under the pair the
+        /// caller has already given back.
         ///
         /// It sits on `Waker` because `Waker` is what a connection's fiber
         /// looks like from up here: the thing that parks it, wakes it, and now

@@ -5,6 +5,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
+// The TLS 1.3 server behind `-Dtls` (ADR 0288), and the second library
+// this file is allowed to name. `nilo_build.tls` is the flag as `build.zig`
+// saw it; the import is taken only when it is on, so a build without the
+// flag has no module named `tls` to resolve and links none of the library.
+// Every use below sits under the same comptime `if`.
+const nilo_build = @import("nilo_build");
+const tls = if (nilo_build.tls) @import("tls") else struct {};
 
 pub const debug_io = zio.debug_io;
 
@@ -250,12 +257,30 @@ pub const Capacity = struct {
 /// the same thing.
 const capacity_warn_gap_ns: u64 = 60 * std.time.ns_per_s;
 
+/// What every connection of a TLS listener shares (ADR 0288): the
+/// certificate chain and key each handshake presents, read from disk once
+/// at startup, and the loop's clock for the handshake's `now`.
+///
+/// Reached through `Accepting` rather than passed to the connection fiber
+/// as arguments of its own, and that is a measured choice rather than
+/// tidiness: two more arguments kept live across the handler grew a
+/// *plain* connection's park frame past a page boundary, and that was a
+/// whole page on every idle connection of a listener with no TLS on it
+/// (see `Conn.runTls`). `void` without `-Dtls`, when nothing can build one.
+const Secured = struct {
+    auth: if (nilo_build.tls) tls.config.CertKeyPair else void,
+    io: std.Io,
+};
+
 /// What the acceptors share, on `serve`'s frame: the count of connections
-/// held, whether the descriptor shortage has been said, and the first
+/// held, whether the descriptor shortage has been said, the first
 /// listener failure, kept for `serve` to return once the others are
-/// cancelled (ADR 0273).
+/// cancelled (ADR 0273), and the TLS material if this is a TLS listener.
 const Accepting = struct {
     capacity: Capacity,
+    /// Set on a TLS listener and null on a plain one, which is the whole
+    /// of how the acceptor tells them apart.
+    secured: ?*Secured = null,
     /// Whether "out of descriptors" has been said and not yet taken back, so
     /// that N acceptors hitting the same shortage write one line and one
     /// "works again" between them.
@@ -321,6 +346,9 @@ pub fn explained(err: anyerror) bool {
         error.PermissionDenied,
         error.AddressNotAvailable,
         error.CannotListen,
+        error.TlsNotBuilt,
+        error.TlsOnUnixSocket,
+        error.TlsCertificate,
         => true,
         else => false,
     };
@@ -547,6 +575,12 @@ pub const Woken = enum {
 /// `post` is the only call another fiber makes, and `zio.ev.Async.notify` is
 /// documented thread-safe. Everything else is the owning fiber's.
 pub const Wake = struct {
+    /// The ciphertext layer under a TLS connection, and null on a plain one.
+    /// Here because `Wake` is the one thing of a connection's the Bulkhead
+    /// holds a pointer to while the connection idles, and idling is when
+    /// these pages are given back (ADR 0288).
+    raw: ?*const RawLayer = null,
+
     cq: zio.CompletionQueue,
     wake: zio.ev.Async,
     poll: zio.ev.NetPoll,
@@ -560,6 +594,29 @@ pub const Wake = struct {
     /// different moments, and a completion that is still pending must not be
     /// handed to `submit` a second time: the queue would link it twice.
     poll_armed: bool = false,
+
+    /// What sits between a TLS connection's socket and the buffers the
+    /// handler reads: the records arrive in `in` and leave from `out`, and
+    /// `leftover` is cleartext the last record decrypted that nobody has
+    /// asked for yet. That last one can point *into* `in` (the library
+    /// decrypts in place when the caller's buffer is smaller than the
+    /// record), which is why it is carried here: while it is non-empty the
+    /// input pages are live data, whatever the reader's own cursor says.
+    pub const RawLayer = struct {
+        in: *std.Io.Reader,
+        out: *std.Io.Writer,
+        leftover: *const []const u8,
+    };
+
+    /// The raw layer, if there is one and it is safe to hand its pages back:
+    /// null on a plain connection, and null while decrypted bytes are still
+    /// waiting in it. Whether the reader and writer themselves are empty is
+    /// the Bulkhead's check, the same one it makes on the cleartext pair.
+    pub fn rawIdle(self: *const Wake) ?*const RawLayer {
+        const raw = self.raw orelse return null;
+        if (raw.leftover.len != 0) return null;
+        return raw;
+    }
 
     pub fn init(handle: zio.ev.Backend.NetHandle) Wake {
         return .{
@@ -831,6 +888,60 @@ fn listenOnIp(options: anytype, why: *StartupFailure) ?zio.net.Server {
     };
 }
 
+/// Why `.tls` cannot be honoured, decided before anything is opened, with
+/// the saying of it kept apart so the deciding can be tested (ADR 0288).
+/// Not built comes second: a caller who set both a socket path and `.tls`
+/// has a mistake to fix whichever build they have, and is told that one.
+const TlsRefusal = enum {
+    on_unix_socket,
+    not_built,
+
+    fn toError(self: TlsRefusal) anyerror {
+        return switch (self) {
+            .on_unix_socket => error.TlsOnUnixSocket,
+            .not_built => error.TlsNotBuilt,
+        };
+    }
+
+    fn say(self: TlsRefusal, address: []const u8) void {
+        switch (self) {
+            .on_unix_socket => std.log.err(
+                "`.tls` is set and the address is a unix socket, \"{s}\". TLS is for a " ++
+                    "port somebody else can reach; a socket file is reached by processes on " ++
+                    "this machine, which the file's permissions already decide. Drop one of " ++
+                    "the two.",
+                .{address},
+            ),
+            .not_built => std.log.err(
+                "`.tls` is set, and this build has no TLS in it. The library behind it is " ++
+                    "fetched and linked only when asked for: pass `.tls = true` to " ++
+                    "`b.dependency(\"nilo\", …)` in build.zig (`-Dtls` in this repository), " ++
+                    "or drop `.tls` and terminate TLS in front (ADR 0028).",
+                .{},
+            ),
+        }
+    }
+};
+
+fn tlsRefusal(built: bool, wanted: bool, over_unix_socket: bool) ?TlsRefusal {
+    if (!wanted) return null;
+    if (over_unix_socket) return .on_unix_socket;
+    if (!built) return .not_built;
+    return null;
+}
+
+/// The certificate chain and private key a TLS listener presents, read
+/// once (ADR 0288). Two files, PEM, relative to the working directory
+/// unless absolute: the shape every certificate tool writes and every
+/// other server reads, so there is nothing to convert. What is checked
+/// here is that both parse; a key that is not the leaf's is found by the
+/// first client rather than by this call, which is a roadmap entry. Said
+/// out loud by the caller, not here, so this can be tested against a file
+/// that is not there.
+fn readCertKeyPair(gpa: std.mem.Allocator, io: std.Io, cert_path: []const u8, key_path: []const u8) !@FieldType(Secured, "auth") {
+    return tls.config.CertKeyPair.fromFilePath(gpa, io, std.Io.Dir.cwd(), cert_path, key_path);
+}
+
 /// The same for a path. `port` is not read at all — there is nowhere for a
 /// port to go on a unix socket, and pretending otherwise would put a number
 /// in the log line that means nothing.
@@ -1042,6 +1153,38 @@ pub fn serve(
     // set, that means nothing (ADR 0130).
     const unix_path = unixPathIn(options.address);
 
+    // The certificate and key, read before the port is taken (ADR 0288). A
+    // file that is not there is a deployment mistake of the same kind as a
+    // port that is not free, and it is said the same way: one line, what to
+    // change, and no port held meanwhile. Only a build with `-Dtls` can
+    // read one; every other build refuses the option in words rather than
+    // serving plain HTTP on a port the caller believed was encrypted.
+    var secured_storage: ?Secured = null;
+    defer if (nilo_build.tls) {
+        if (secured_storage) |*sec| sec.auth.deinit(gpa);
+    };
+    if (tlsRefusal(nilo_build.tls, options.tls != null, unix_path != null)) |refusal| {
+        refusal.say(options.address);
+        return refusal.toError();
+    }
+    if (nilo_build.tls) if (options.tls) |t| {
+        // Into a local first: assigned straight into the optional, the
+        // `orelse return` would leave it non-null with nothing in it (the
+        // result location sets the tag before the fields), and the defer
+        // above would free a key pair that was never loaded.
+        const auth = readCertKeyPair(gpa, rt.io(), t.cert, t.key) catch |err| {
+            std.log.err(
+                "could not load the TLS certificate \"{s}\" and key \"{s}\" ({s}). Both are PEM " ++
+                    "files, the key unencrypted, and the paths are relative to the directory " ++
+                    "the server is started in. `openssl x509 -in {s} -noout -text` says " ++
+                    "whether the first is a certificate at all.",
+                .{ t.cert, t.key, @errorName(err), t.cert },
+            );
+            return error.TlsCertificate;
+        };
+        secured_storage = .{ .auth = auth, .io = rt.io() };
+    };
+
     const maybe_server: ?zio.net.Server = if (unix_path) |path|
         listenOnUnix(gpa, path, options.reuse_address, options.backlog, &why)
     else
@@ -1086,7 +1229,10 @@ pub fn serve(
     // because 0 asks the kernel to choose and a test is the caller that does.
     try ready(state, rt.io(), if (unix_path != null) null else server.socket.address.ip.getPort());
 
-    std.log.info("nilo listening on {f} across {d} thread(s)", .{ server.socket.address, threads });
+    if (secured_storage != null)
+        std.log.info("nilo listening on https://{f} across {d} thread(s)", .{ server.socket.address, threads })
+    else
+        std.log.info("nilo listening on {f} across {d} thread(s)", .{ server.socket.address, threads });
 
     // A buffer that starts on a page boundary and ends on one, so every page
     // of it belongs to this connection alone and can be given back.
@@ -1163,8 +1309,16 @@ pub fn serve(
             stream: zio.net.Stream,
             conn_gpa: std.mem.Allocator,
             sizes: Options,
-            capacity: *Capacity,
+            // The shared state rather than `&sh.capacity`, which is all this
+            // entry reads of it: `runTls` below wants the rest, and the two
+            // entries keep one argument list so the plain one's frame is
+            // what it was. Two more arguments kept live across the handler
+            // measured one page more per *plain* idle connection: the plain
+            // park sits under 300 bytes short of a page boundary, and
+            // anything added above it is a whole page (ADR 0288).
+            sh: *Accepting,
         ) void {
+            const capacity = &sh.capacity;
             // After the close, not before: the count is meant to answer
             // "how many sockets does this process hold", and the socket is
             // held until it is shut. Deferred first so it runs last.
@@ -1229,6 +1383,117 @@ pub fn serve(
 
             handler(st, &link.reader.interface, &link.writer.interface, &clocks, &wake, peer);
         }
+
+        /// The TLS connection's entry (ADR 0288): the same as `run` with a
+        /// handshake in front of the first request and a record layer under
+        /// every read and write, and a fiber function of its own rather than
+        /// a branch in `run`.
+        ///
+        /// A branch was measured. The call it adds (a `Peer` copied for the
+        /// argument, the unwrap, the spills) grew the frame above a *plain*
+        /// connection's park by 272 bytes, 2,618 to 2,890, and that crossed
+        /// a page of the fiber's stack on a listener with no TLS on it. Two
+        /// entries keep the plain path in a build without `-Dtls` byte for
+        /// byte what it was, 5,191 idle; a build with the flag still pays
+        /// the page on a plain listener, 9,293, and that one is the
+        /// inliner's rather than this frame's (ADR 0288). A listener that
+        /// is not TLS never spawns this.
+        ///
+        /// What one of these holds while idle, measured at 10,000
+        /// connections: 9,307 bytes, fourteen more than a plain connection
+        /// on the same build. The 33 KB of record buffers are page-aligned
+        /// and handed back with the cleartext pair at every idle transition,
+        /// so they are not in that figure.
+        fn runTls(
+            st: State,
+            stream: zio.net.Stream,
+            conn_gpa: std.mem.Allocator,
+            sizes: Options,
+            sh: *Accepting,
+        ) void {
+            if (!nilo_build.tls) unreachable;
+            const capacity = &sh.capacity;
+            defer capacity.give();
+            defer stream.close();
+            // Always IP: a TLS listener on a unix socket is refused in
+            // `serve` before the port is taken.
+            stream.socket.setNoDelay(true) catch {};
+
+            // The record layer. A TLS record is at most 16,645 bytes on the
+            // wire and has to be whole before it can be decrypted, so the
+            // input side cannot be smaller than one; the output side is the
+            // largest record this library writes. Page-aligned for the same
+            // reason the cleartext pair is: so every page of them belongs
+            // to this connection alone and can be given back.
+            const raw_in = alignedPages(conn_gpa, tls.input_buffer_len) catch return;
+            defer conn_gpa.free(raw_in);
+            const raw_out = alignedPages(conn_gpa, tls.output_buffer_len) catch return;
+            defer conn_gpa.free(raw_out);
+            var link: Link = undefined;
+            link.init(stream, raw_in, raw_out);
+            var clocks = Clocks{ .reader = &link.reader, .writer = &link.writer };
+            var wake = Wake.init(stream.socket.handle);
+            defer wake.deinit();
+            var peer: Peer = .{
+                .port = portOf(stream.socket.address),
+                .local = false,
+            };
+            peer._len = writePeer(&peer._text, stream.socket.address);
+
+            // The handshake is bounded by the same limits the first request
+            // head would be, because until it is done that is what this is:
+            // a client that has connected and not yet said anything nilo
+            // can act on. Without this a client that connects and goes quiet,
+            // or speaks plain HTTP to a TLS port, holds the fiber and its
+            // 33 KB for ever. The Bulkhead arms its own limits once the
+            // handler starts, the way it does on a plain connection.
+            if (sizes.header_timeout_ms != 0)
+                clocks.readByNanos(monotonicNanos() + @as(u64, sizes.header_timeout_ms) * std.time.ns_per_ms);
+            if (sizes.write_timeout_ms != 0) clocks.writeWithinMs(sizes.write_timeout_ms);
+
+            // Never inlined: the handshake's frames, a 16 KB cleartext
+            // buffer among them, must be *below* this frame, in the region
+            // the idle release hands back, and not folded into the frame
+            // that lives as long as the connection (ADR 0071). Measured as
+            // one page per idle connection: 13,360 bytes inlined against
+            // 9,302 not.
+            const sec = sh.secured.?;
+            var rng_source: std.Random.IoSource = .{ .io = sec.io };
+            var conn = @call(.never_inline, tls.server, .{ &link.reader.interface, &link.writer.interface, tls.config.Server{
+                .auth = &sec.auth,
+                .now = std.Io.Clock.real.now(sec.io),
+                .rng = rng_source.interface(),
+                .alpn_protocols = &.{"http/1.1"},
+            } }) catch |err| {
+                // Debug rather than warn: a port on the internet is
+                // handshaken at by scanners all day, and every one of those
+                // is this line.
+                std.log.debug("tls handshake with {s} failed: {s}", .{ peer.address(), @errorName(err) });
+                return;
+            };
+
+            // Cleartext: the buffers the handler sees, the size a plain
+            // connection's are, and released the same way. The record layer
+            // goes back with them through `wake.raw`.
+            const clear_in = alignedPages(conn_gpa, sizes.read_buffer) catch return;
+            defer conn_gpa.free(clear_in);
+            const clear_out = alignedPages(conn_gpa, sizes.write_buffer) catch return;
+            defer conn_gpa.free(clear_out);
+            var tr = conn.reader(clear_in);
+            var tw = conn.writer(clear_out);
+            const raw: Wake.RawLayer = .{
+                .in = &link.reader.interface,
+                .out = &link.writer.interface,
+                .leftover = &conn.cleartext_buf,
+            };
+            wake.raw = &raw;
+            handler(st, &tr.interface, &tw.interface, &clocks, &wake, peer);
+            // The handler is done with the connection: what it wrote goes
+            // out as records, then close_notify, so the peer sees an end
+            // rather than a reset. A failure here is a peer already gone.
+            tw.interface.flush() catch {};
+            conn.close() catch {};
+        }
     };
 
     if (options.stop_on_signal) installStopSignals(stop);
@@ -1240,6 +1505,7 @@ pub fn serve(
     // them: they are cancelled below before this function returns.
     var shared: Accepting = .{
         .capacity = .{ .max = options.max_connections },
+        .secured = if (secured_storage) |*sec| sec else null,
     };
 
     // One acceptor. There is one per executor ([ADR 0273](../../docs/adr/0273-every-executor-accepts.md)),
@@ -1330,7 +1596,14 @@ pub fn serve(
                     continue;
                 }
 
-                connections.spawn(Conn.run, .{ st, stream, conn_gpa, sizes, &sh.capacity }) catch |err| {
+                // Two entries and one argument list, for the reason on
+                // `Conn.runTls`. `nilo_build.tls` first so that a build
+                // without TLS has no reference to `runTls` to analyse.
+                const spawned = if (nilo_build.tls and sh.secured != null)
+                    connections.spawn(Conn.runTls, .{ st, stream, conn_gpa, sizes, sh })
+                else
+                    connections.spawn(Conn.run, .{ st, stream, conn_gpa, sizes, sh });
+                spawned catch |err| {
                     sh.capacity.give();
                     stream.close();
                     // `error.Closed` is the connections group winding up,
@@ -1727,6 +2000,37 @@ test "a path is read as a path only when it says unix:" {
     // Said, rather than guessed at: an empty path is refused by `listenOnUnix`
     // with a sentence, not treated as an address.
     try testing.expectEqualStrings("", unixPathIn("unix:").?);
+}
+
+test "`.tls` is refused, in words, by a build without it and by a listener on a socket file" {
+    // The decision, apart from the line it prints: the line is an error log,
+    // and an error log inside a test is a failed test whatever it says.
+    try testing.expectEqual(@as(?TlsRefusal, null), tlsRefusal(false, false, false));
+    try testing.expectEqual(@as(?TlsRefusal, null), tlsRefusal(true, true, false));
+    try testing.expectEqual(@as(?TlsRefusal, .not_built), tlsRefusal(false, true, false));
+    try testing.expectEqual(@as(?TlsRefusal, .on_unix_socket), tlsRefusal(true, true, true));
+    // Both wrong: the one that is wrong on every build is the one said.
+    try testing.expectEqual(@as(?TlsRefusal, .on_unix_socket), tlsRefusal(false, true, true));
+    // And both are errors `listen()` stops the process on, having explained.
+    try testing.expect(explained(TlsRefusal.not_built.toError()));
+    try testing.expect(explained(TlsRefusal.on_unix_socket.toError()));
+    try testing.expect(explained(error.TlsCertificate));
+}
+
+test "a certificate that is not there is an error, and the suite's own loads with its key" {
+    if (!nilo_build.tls) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try testing.expectError(error.FileNotFound, readCertKeyPair(gpa, io, "http/testdata/tls/no-such.pem", "http/testdata/tls/localhost-key.pem"));
+    // The suite's own pair parses, and the key is the ECDSA one the fixture
+    // was made with, so the signing key pair is derived once here rather
+    // than on every handshake.
+    var pair = try readCertKeyPair(gpa, io, "http/testdata/tls/localhost.pem", "http/testdata/tls/localhost-key.pem");
+    defer pair.deinit(gpa);
+    try testing.expect(pair.ecdsa_key_pair != null);
 }
 
 test "only a socket is ever taken away" {

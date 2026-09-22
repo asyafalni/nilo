@@ -143,7 +143,7 @@ One ask: read the diff before you send it. An agent will happily write a paragra
 
 ## What gets turned down
 
-Templates, TLS, HTTP/2 and gRPC. These aren't gaps waiting for a volunteer, they are decisions with reasoning on file; the move is to argue against the ADR, not to open a pull request adding one. Also anything that needs an annotation to work, anything that can't say what it costs, and anything that adds an allocation to a request path that didn't ask for one. None of that is meant to sound closed; it's meant to save you from writing a thousand lines that were never going to land.
+Templates, TLS in the default build, HTTP/2 and gRPC. These aren't gaps waiting for a volunteer, they are decisions with reasoning on file; the move is to argue against the ADR, not to open a pull request adding one. (TLS behind `-Dtls` is the one that was argued and moved, and [ADR 0288](./docs/adr/0288-tls-is-an-option-a-build-asks-for.md) is what that took: the numbers on all four axes, and a default build that pays 2,760 bytes.) Also anything that needs an annotation to work, anything that can't say what it costs, and anything that adds an allocation to a request path that didn't ask for one. None of that is meant to sound closed; it's meant to save you from writing a thousand lines that were never going to land.
 
 ## License
 

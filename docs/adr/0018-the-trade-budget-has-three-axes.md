@@ -74,6 +74,7 @@ Measured stripped, `ReleaseFast`, on the examples in this repository.
 | A body limit per route, a type that writes its own answer, a request id on the way out, and a server that sheds past its limit ([ADRs 0194](./0194-a-route-can-say-how-much-body-it-takes.md)–[0197](./0197-a-server-past-its-limit-says-so-at-once.md)) | +896 B | +944 B |
 | A `Date` on every response, and no `Connection: keep-alive` on HTTP/1.1 ([ADR 0269](./0269-a-response-says-when-it-was-sent.md)) | +6,064 B | +6,072 B |
 | A failure body the application names ([ADR 0270](./0270-a-failure-body-is-a-struct-the-application-names.md)) | +400 B | +448 B |
+| A TLS listener the build has to ask for ([ADR 0288](./0288-tls-is-an-option-a-build-asks-for.md)); the build that asks pays +573,152 B and +574,320 B on top | +2,872 B | +2,720 B |
 
 `nilo_fetch` is +0 on both examples because neither imports it, and that is the
 whole of the row rather than an accident: a module nothing names is never

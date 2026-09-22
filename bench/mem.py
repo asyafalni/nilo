@@ -16,6 +16,7 @@ compounds does not, and no total will say which you have.
     python3 bench/mem.py --port 8787 --path /health
     python3 bench/mem.py --port 8789 --path /call --steps 200,500,1000
     python3 bench/mem.py --port 8790 --path /stream --hold
+    python3 bench/mem.py --port 8787 --path /health --tls
 
 The server is found by port rather than named, so this works against any of
 them — `nilo-hello`, `nilo-bench-sql-server`, `nilo-bench-fetch-server`, or
@@ -24,6 +25,7 @@ something that is not nilo at all.
 
 import argparse
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -49,7 +51,7 @@ def rss_kb(pid):
     raise SystemExit(f"process {pid} went away")
 
 
-def open_one(host, port, path, timeout, hold=False):
+def open_one(host, port, path, timeout, hold=False, tls=None):
     """One keep-alive connection with one request already served on it.
 
     `hold` is for a response that has no end to drain to: an event stream the
@@ -62,6 +64,12 @@ def open_one(host, port, path, timeout, hold=False):
     """
     s = socket.create_connection((host, port), timeout=timeout)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    if tls:
+        # The same connection through TLS 1.3, for a server built with
+        # -Dtls (ADR 0288). The certificate is not checked because the one
+        # the benchmark server presents is the suite's self-signed fixture;
+        # one context serves every connection.
+        s = tls.wrap_socket(s, server_hostname=host)
     s.sendall(
         f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n".encode()
     )
@@ -130,9 +138,20 @@ def main():
         help="read the head and stop, for a response the server is holding open",
     )
     p.add_argument("--timeout", type=float, default=10.0)
+    p.add_argument(
+        "--tls",
+        action="store_true",
+        help="connect through TLS 1.3, against `zig build bench-tls-server -Dtls`",
+    )
     args = p.parse_args()
 
     steps = [int(x) for x in args.steps.split(",")]
+    tls_ctx = None
+    if args.tls:
+        tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        tls_ctx.check_hostname = False
+        tls_ctx.verify_mode = ssl.CERT_NONE
+        tls_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     pid = find_pid(args.port)
 
     time.sleep(args.settle)
@@ -146,7 +165,7 @@ def main():
         for want in steps:
             while len(held) < want:
                 held.append(
-                    open_one(args.host, args.port, args.path, args.timeout, args.hold)
+                    open_one(args.host, args.port, args.path, args.timeout, args.hold, tls_ctx)
                 )
             time.sleep(args.settle)
             now = rss_kb(pid)

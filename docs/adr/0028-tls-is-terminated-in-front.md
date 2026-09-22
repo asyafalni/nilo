@@ -1,5 +1,10 @@
 # TLS is terminated in front, and that is the answer rather than the plan
 
+**Status:** accepted, amended by [ADR 0288](./0288-tls-is-an-option-a-build-asks-for.md)
+(TLS 1.3 is a listener option in a build that asked for it with `-Dtls`; the
+default build contains none of it, and the recommendation below stands for a
+server with a proxy in front)
+
 `docs/roadmap.md` carried TLS under "Not decided" with the note that it *may stay out on purpose*. This decides it. **nilo does not speak TLS, and is not going to.** It listens on plaintext HTTP and expects a proxy in front of it wherever the internet is involved.
 
 The question that settled it was not "how hard is TLS" but "what does every other server in the comparison actually do".

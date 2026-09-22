@@ -1,0 +1,359 @@
+//! The tests of a TLS listener, which need a server that is actually running
+//! and a client that is not nilo's.
+//!
+//! The client is `std.crypto.tls.Client`, the standard library's own, driven
+//! on `std.Io.Threaded` with no zio anywhere on this side. That is what makes
+//! an answer evidence: the handshake is between two implementations that
+//! share no code, the certificate is checked by the client the way a browser
+//! would check it (self-signed, and issued for the name asked for), and a
+//! record that nilo's side wrote wrong would be refused by somebody who did
+//! not write it. A test of the library talking to itself would show that its
+//! two halves agree, which is not the question.
+//!
+//! Compiled only into a build that has TLS in it: `http.zig` imports this
+//! file under `@import("nilo_build").tls`, and `build.zig` sets that for the
+//! repository's own http test root whether or not `-Dtls` was passed, so the
+//! feature is held by `zig build test` and not by whoever remembers a flag
+//! ([ADR 0288](../docs/adr/0288-tls-is-an-option-a-build-asks-for.md)).
+//!
+//! Every port is 0 and read back, the way `live.zig` does it. The
+//! certificate is `testdata/tls/localhost.pem`, a self-signed ECDSA P-256
+//! certificate for `localhost` and `127.0.0.1` with a century on it, and
+//! its key beside it. The key is not a secret: it signs nothing but this
+//! suite's handshakes, on loopback, for a process that is gone a second
+//! later.
+
+const std = @import("std");
+const nilo = @import("http.zig");
+
+const testing = std.testing;
+
+const cert_path = "http/testdata/tls/localhost.pem";
+const key_path = "http/testdata/tls/localhost-key.pem";
+
+/// Quieten the log for one test; see `live.zig` for why every test here
+/// starts with it.
+fn hush() void {
+    std.testing.log_level = .err;
+}
+
+fn hello() []const u8 {
+    return "hello over tls\n";
+}
+
+/// The server under test on a thread of its own, the way `live.zig`'s
+/// `ServingAt` does it, with a certificate and whatever header limit the
+/// test wants.
+const ServingTls = struct {
+    app: *nilo.App,
+    header_timeout_ms: u32 = 10_000,
+    idle_timeout_ms: u32 = 75_000,
+    bound: std.atomic.Value(bool) = .init(true),
+    /// Set once `tryListen` has returned, so a test can bound how long a
+    /// stop takes rather than join a thread that may never come back.
+    stopped: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *ServingTls) void {
+        self.app.tryListen(.{
+            .port = 0,
+            .threads = 1,
+            .stop_on_signal = false,
+            .header_timeout_ms = self.header_timeout_ms,
+            .idle_timeout_ms = self.idle_timeout_ms,
+            .tls = .{ .cert = cert_path, .key = key_path },
+        }) catch {
+            self.bound.store(false, .release);
+        };
+        self.stopped.store(true, .release);
+    }
+};
+
+/// The port the server took, once it has. Bounded, because a server that
+/// never binds has to fail here rather than leave the suite waiting.
+fn waitForPort(gpa: std.mem.Allocator, serving: *const ServingTls) !u16 {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    for (0..300) |_| {
+        if (serving.app.boundPort()) |port| return port;
+        if (!serving.bound.load(.acquire)) return error.ServerNeverCameUp;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    return error.ServerNeverCameUp;
+}
+
+/// A TCP connection to the port, with the first attempts forgiven while the
+/// server is still coming up.
+fn connect(io: std.Io, port: u16) !std.Io.net.Stream {
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    return for (0..300) |_| {
+        break address.connect(io, .{ .mode = .stream }) catch {
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+            continue;
+        };
+    } else error.ServerNeverCameUp;
+}
+
+/// Whatever the server sends next, or nothing, with a ceiling on the wait:
+/// a server that never answers and never hangs up has to be a failed test
+/// rather than a suite that does not finish (`CLAUDE.md`). `poll` and a raw
+/// `read` rather than the stream's reader, because `std.Io.Threaded` treats
+/// a receive timeout on a socket as a programmer error and panics on it.
+fn readSome(stream: std.Io.net.Stream, buf: []u8) !usize {
+    var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    if (try std.posix.poll(&fds, 5_000) == 0) return error.ServerNeverHungUp;
+    return std.posix.read(stream.socket.handle, buf);
+}
+
+/// A client on top of a stream, handshaken and checking the certificate.
+///
+/// `.self_signed` and `.explicit = "localhost"` are the two checks a browser
+/// makes against a certificate it has been told to trust: that it is signed
+/// by the key it carries, and that it was issued for the name asked for.
+/// `no_verification` on either would pass whatever the server sent.
+const Client = struct {
+    reader: std.Io.net.Stream.Reader,
+    writer: std.Io.net.Stream.Writer,
+    in_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
+    out_buf: [std.crypto.tls.max_ciphertext_record_len]u8 = undefined,
+    tls_in: [8192]u8 = undefined,
+    tls_out: [1024]u8 = undefined,
+    client: std.crypto.tls.Client = undefined,
+
+    fn handshake(self: *Client, io: std.Io, stream: std.Io.net.Stream) !void {
+        self.reader = stream.reader(io, &self.in_buf);
+        self.writer = stream.writer(io, &self.out_buf);
+        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+        try std.Io.randomSecure(io, &entropy);
+        self.client = try std.crypto.tls.Client.init(&self.reader.interface, &self.writer.interface, .{
+            .host = .{ .explicit = "localhost" },
+            .ca = .self_signed,
+            .write_buffer = &self.tls_out,
+            .read_buffer = &self.tls_in,
+            .entropy = &entropy,
+            .realtime_now = std.Io.Clock.real.now(io),
+        });
+    }
+
+    /// One request, and the head of its answer plus exactly the body the
+    /// head announced, without waiting for the server to hang up: the
+    /// connection is meant to stay open. A server that hangs up early is
+    /// `error.EndOfStream` from the reader, which is the failure.
+    fn ask(self: *Client, gpa: std.mem.Allocator, request: []const u8) ![]u8 {
+        try self.client.writer.writeAll(request);
+        try self.client.writer.flush();
+        try self.writer.interface.flush();
+
+        var whole: std.ArrayList(u8) = .empty;
+        defer whole.deinit(gpa);
+        const r = &self.client.reader;
+        var length: ?usize = null;
+        while (true) {
+            const line = try r.takeDelimiterInclusive('\n');
+            try whole.appendSlice(gpa, line);
+            if (std.mem.eql(u8, line, "\r\n")) break;
+            if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+                const digits = std.mem.trim(u8, line["content-length:".len..], " \r\n");
+                length = try std.fmt.parseInt(usize, digits, 10);
+            }
+        }
+        const body = try r.readAlloc(gpa, length orelse return error.NoContentLength);
+        defer gpa.free(body);
+        try whole.appendSlice(gpa, body);
+        return whole.toOwnedSlice(gpa);
+    }
+};
+
+test "a request over TLS is answered, and the certificate is the one the listener was given" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/", hello);
+
+    var serving: ServingTls = .{ .app = &app };
+    const thread = try std.Thread.spawn(.{}, ServingTls.run, .{&serving});
+    const port = try waitForPort(gpa, &serving);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const stream = try connect(io, port);
+    var client: Client = undefined;
+    try client.handshake(io, stream);
+    const answer = try client.ask(gpa, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    defer gpa.free(answer);
+    // Closed before the stop, the way `live.zig`'s `ask` does: the server
+    // is not being asked to take a connection away from a client here.
+    stream.close(io);
+
+    app.shutdown();
+    thread.join();
+
+    try testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 200 "));
+    try testing.expect(std.mem.endsWith(u8, answer, "hello over tls\n"));
+}
+
+test "a TLS connection kept alive answers again after idling past the peek, on the same handshake" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/", hello);
+
+    var serving: ServingTls = .{ .app = &app };
+    const thread = try std.Thread.spawn(.{}, ServingTls.run, .{&serving});
+    const port = try waitForPort(gpa, &serving);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const stream = try connect(io, port);
+    var client: Client = undefined;
+    try client.handshake(io, stream);
+
+    const first = try client.ask(gpa, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    defer gpa.free(first);
+    // Longer than the 200ms peek a connection between requests waits before
+    // it gives its pages back (ADR 0071). What is being checked is that the
+    // record layer under those pages is still a record layer afterwards:
+    // the release must not have discarded a byte the next record needs.
+    try std.Io.sleep(io, .fromMilliseconds(450), .awake);
+    const second = try client.ask(gpa, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    defer gpa.free(second);
+    stream.close(io);
+
+    app.shutdown();
+    thread.join();
+
+    try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 200 "));
+    try testing.expect(std.mem.startsWith(u8, second, "HTTP/1.1 200 "));
+    try testing.expect(std.mem.endsWith(u8, second, "hello over tls\n"));
+}
+
+test "a client that connects to a TLS port and says nothing is dropped when the header limit runs out" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/", hello);
+
+    var serving: ServingTls = .{ .app = &app, .header_timeout_ms = 200 };
+    const thread = try std.Thread.spawn(.{}, ServingTls.run, .{&serving});
+    const port = try waitForPort(gpa, &serving);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const stream = try connect(io, port);
+    // Not a byte sent. Before the handshake had a deadline this held the
+    // fiber and its 33 KB for ever; now the server hangs up at 200ms, which
+    // the read below sees as end of stream.
+    var buf: [64]u8 = undefined;
+    const got = try readSome(stream, &buf);
+    stream.close(io);
+
+    app.shutdown();
+    thread.join();
+
+    try testing.expectEqual(@as(usize, 0), got);
+}
+
+test "plain HTTP sent to a TLS port is refused rather than answered" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/", hello);
+
+    // The header limit is what ends this one too. The library reads a
+    // record's length from the first bytes before it looks at what they
+    // are, so "GET /" is taken as a 12 KB record that never finishes rather
+    // than refused on sight; the deadline is what turns that into a hang-up
+    // rather than a fiber held for ever (ADR 0288, the section on what the
+    // library does not do yet).
+    var serving: ServingTls = .{ .app = &app, .header_timeout_ms = 200 };
+    const thread = try std.Thread.spawn(.{}, ServingTls.run, .{&serving});
+    const port = try waitForPort(gpa, &serving);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const stream = try connect(io, port);
+    var out_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try writer.interface.flush();
+    // What comes back is a TLS alert or nothing, and then the end of the
+    // stream. What must not come back is an HTTP response: a listener told
+    // to encrypt that answered a plain request would be the failure a
+    // deployment could not see.
+    var buf: [256]u8 = undefined;
+    const got = try readSome(stream, &buf);
+    stream.close(io);
+
+    app.shutdown();
+    thread.join();
+
+    try testing.expect(!std.mem.startsWith(u8, buf[0..got], "HTTP/"));
+}
+
+test "a stop comes back with an idle TLS connection still open, within the idle limit" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/", hello);
+
+    // The idle limit is what bounds this today, on a TLS connection and on
+    // a plain one alike: a stop cancels the read the connection is parked
+    // in, and the loop's next read parks again until the client speaks,
+    // hangs up, or the idle limit runs out. What this test holds is that
+    // the record layer adds nothing to that: no wait in `close_notify`, no
+    // wait in the release of its buffers, nothing a plain connection would
+    // not also do. Short, so the suite is not held for the default 75s.
+    var serving: ServingTls = .{ .app = &app, .idle_timeout_ms = 1_000 };
+    const thread = try std.Thread.spawn(.{}, ServingTls.run, .{&serving});
+    const port = try waitForPort(gpa, &serving);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const stream = try connect(io, port);
+    var client: Client = undefined;
+    try client.handshake(io, stream);
+    const first = try client.ask(gpa, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    defer gpa.free(first);
+    // Idle past the peek, so the connection is parked where an idle one
+    // parks, with its pages given back, when the stop arrives.
+    try std.Io.sleep(io, .fromMilliseconds(450), .awake);
+
+    // The connection stays open across the stop. It has to come back on
+    // its own; the client closing its end would be the test doing the
+    // server's job for it, so that happens only after the verdict is in.
+    const started = std.Io.Clock.awake.now(io);
+    app.shutdown();
+    const came_back = for (0..500) |_| {
+        if (serving.stopped.load(.acquire)) break true;
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    } else false;
+    const took_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    stream.close(io);
+    thread.join();
+
+    if (!came_back) return error.StopNeverCameBack;
+    // The idle limit plus the stop's own polling, and well under the 10s
+    // grace, which an idle connection is not charged against.
+    if (took_ms >= 3000) return error.StopHeldPastTheIdleLimit;
+}

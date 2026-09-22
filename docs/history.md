@@ -4038,3 +4038,40 @@ from.
 ## The dev loop was offered as a watcher of a directory it never reads
 
 Two files said `zig build dev` watching a bundler's output directory would restart the server when the bundle changed, and neither had been run. It cannot: the loop restarts on the binary and on nothing else (ADR 0259), and a save under a front end kept beside the server moves nothing, which is what a project with both wants, and nothing said it had. **A sentence about what a tool watches is a claim until a save is made under it.** The saves are in [`build.md`](../bench/result/build.md#what-a-save-has-to-touch), the line a reader needs is [What a save has to touch](./guide/getting-started.md#what-a-save-has-to-touch), and `bench/devloop.py` is what keeps it from being prose again.
+
+## A guess about TLS's memory was a guess about a design
+
+ADR 0028 said record buffers would take an idle connection from 8,767
+bytes "to something like five times that", and that sentence was the whole
+of the memory argument against TLS. Built and measured, an idle TLS
+connection is 9,307 bytes against a plain one's 5,191, and the 33 KB of
+record buffers are not in it: page-aligned and handed back at idle like the
+cleartext pair, they cost what the cleartext pair costs, which is nothing
+while the connection waits ([ADR 0288](./adr/0288-tls-is-an-option-a-build-asks-for.md)).
+**A cost that is a property of a design should not be written down as a
+property of a feature**, and the tell was that the sentence had no run
+under it.
+
+What the same run found instead was a page that nobody had guessed at.
+The first shape, a branch in the plain connection's entry, cost a plain
+listener 4,102 bytes per idle connection with no certificate anywhere in
+the process, because the plain park sits under 300 bytes short of a page
+boundary and a second caller of the handler moved the inliner enough to
+cross it. Two fiber entries with one argument list took it back for the
+build without the flag; the build with it still pays the page on every
+listener, and the headroom under the plain park is now a measurement the
+roadmap names. **Where a fiber is suspended is what it costs, and a change
+that adds no frame of its own can still move where that is.**
+
+Two things the spike had wrong and the tests found. The handshake had no
+deadline, so a client that connected and said nothing held its fiber and
+33 KB for ever; `header_timeout_ms` bounds it now, and the test that holds
+that is the one that found it. And a stop with an idle keep-alive
+connection open comes back only when `idle_timeout_ms` runs out, on a TLS
+listener and on a plain one alike: 75.003 seconds measured on `main`'s
+plain server with one idle connection open, where the `shutdown_grace_ms`
+doc leads a reader to expect a stop that does not wait on it at all. The
+cancel ends the read the connection is parked in, and the loop's next read
+parks again until the client speaks, hangs up, or the idle limit runs out.
+Found by the TLS stop test, which now holds the idle limit rather than the
+claim; the fix is the plain path's and is not in this change.

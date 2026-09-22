@@ -435,11 +435,13 @@ try app.post("/admin/quit", quit);
 
 ## TLS, and the proxy in front
 
-**nilo does not speak TLS, and is not going to**
-([ADR 0028](../adr/0028-tls-is-terminated-in-front.md)). Zig's standard library
-can be a TLS client and not a TLS server; the alternatives were a one-person
-crypto dependency or a C toolchain in the install story, and both cost the
-per-connection memory figure this project publishes.
+**nilo does not speak TLS unless the build asks for it, and a proxy in front
+is still the recommendation** ([ADR 0028](../adr/0028-tls-is-terminated-in-front.md)).
+Zig's standard library can be a TLS client and not a TLS server; the
+alternatives were a one-person crypto dependency or a C toolchain in the
+install story. The first of those is now an option, below, for the server
+that has nothing in front of it. Everything else on this page is about the
+server that does, which is most of them.
 
 On Fly.io, Railway, Render, Cloud Run, a Kubernetes ingress, an ALB or
 Cloudflare this changes nothing — every one of them terminates TLS before the
@@ -490,8 +492,77 @@ nothing remote can open a unix socket
 
 Two things go with this decision and are worth knowing before you need them:
 **HTTP/2 is not available** — browsers only speak it over TLS, negotiated during
-the handshake — and therefore **nilo cannot be a gRPC server**, since gRPC is
-HTTP/2. Neither follows from "no TLS" on its own, which is why both are here.
+the handshake, and the listener below offers only `http/1.1` — and therefore
+**nilo cannot be a gRPC server**, since gRPC is HTTP/2. Neither follows from
+"no TLS" on its own, which is why both are here.
+
+### TLS without a proxy
+
+For the server with nothing in front of it: an internal tool on a VM, a
+service on a private network whose policy says encrypted, a machine with one
+port and a certificate and nobody who wants to run a second process. It is
+TLS 1.3, on [ianic/tls.zig](https://github.com/ianic/tls.zig), and it has to
+be built in ([ADR 0288](../adr/0288-tls-is-an-option-a-build-asks-for.md)):
+
+```zig
+// build.zig
+const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize, .tls = true });
+```
+
+The library is fetched and linked only behind that flag, so a build without it
+is the build this page has described all along. With it, the listener takes
+two PEM files:
+
+<!-- compiles: body -->
+```zig
+try app.listen(.{ .tls = .{
+    .cert = "/etc/nilo/fullchain.pem",
+    .key = "/etc/nilo/privkey.pem",
+} });
+```
+
+The certificate chain leaf first, the way every issuer hands it out, and the
+key unencrypted; `certbot` and `step` both write exactly that. Paths are
+relative to the directory the server is started in unless absolute. A
+certificate that cannot be read stops the server before it takes the port,
+in one line saying which file; a `.tls` on a build without the flag is
+refused the same way rather than served as plain HTTP. A key that is not
+the certificate's is not caught there yet: the server comes up and every
+handshake fails, so `curl -k https://…` once after a deploy is the check
+until it is. Rotation is a restart, which is the deployment this server
+already has.
+
+What it costs, so that the choice is a choice ([ADR 0288](../adr/0288-tls-is-an-option-a-build-asks-for.md)
+has the tables):
+
+- **560 KB of binary**, before a certificate is loaded, in every build that
+  passes the flag. The build that does not pays 2,760 bytes.
+- **One page per idle connection**, on every listener of that build, TLS or
+  not: 9,293 bytes against 5,191. A TLS connection's 33 KB of record buffers
+  are not in that figure, because they go back to the kernel at idle the way
+  the rest do.
+- **About 300 µs of CPU per new connection** for the handshake, twenty times
+  a plain accept, and half a microsecond per request on a connection kept
+  alive. A service whose clients hold a connection does not notice; one whose
+  clients connect per request pays the handshake per request, and that is the
+  deployment a proxy with session resumption is for, because this listener
+  has none. Build for the CPU you run on: without AES instructions in the
+  target (`-Dcpu`), a request costs six times as much.
+- **One certificate per listener**, no client certificates, and no reload
+  without a restart. TLS 1.3 only, which every browser and client library of
+  the last six years speaks.
+- **The library has no audit.** ADR 0028's trust argument is unchanged, and a
+  deployment choosing this is choosing an unaudited TLS stack over an audited
+  one, on purpose, for a server that would otherwise have none. On the
+  internet, put Caddy in front and leave this off.
+
+`.tls` and a unix socket together are refused: the socket file's permissions
+are already the access control, and there is nobody on the path to encrypt
+against. The handshake is bounded by `header_timeout_ms`, because until it is
+done a connection is a client that has not yet sent a request; a scanner that
+connects and goes quiet, or speaks plain HTTP to the port, is dropped when
+that runs out. `clientIp()` on this listener is the real address, since no
+proxy is in the way.
 
 ## Knowing whether it is ready
 

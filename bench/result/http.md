@@ -2161,6 +2161,89 @@ the teardown. ADR 0273's upstream row, a spawn homed on the accepting
 executor, is the next lever on it, and the same for HTTP's short-lived
 shape.
 
+## What TLS costs a listener, and what it costs one that never asked
+
+[ADR 0288](../../docs/adr/0288-tls-is-an-option-a-build-asks-for.md) is the
+decision; these are the runs it quotes, taken on the code as shipped rather
+than on the spike that preceded it (the spike's figures were within 2% on
+memory and read 455 µs per handshake where the shipped code reads 280–295,
+the difference being that the spike's client shared the server's cores).
+
+The machine is the one at the top of this file, on Linux 7.2.5 rather than
+the kernel listed there; commit `1264cac` plus the change. Server on CPUs
+0–7, client on 8–15, loopback. Four binaries, all `ReleaseFast`, stripped,
+`-Dtarget=x86_64-linux-gnu`: `nilo-hello` from `main` (the control),
+`nilo-hello` from this change without `-Dtls`, `nilo-hello` from this change
+with `-Dtls` and `.tls` never set, and `nilo-bench-tls-server` (the same
+routes and middleware as `nilo-hello`, `bench/tls_server.zig`, with the
+suite's certificate). The CPU rows add `-Dcpu=native` variants of the last
+two.
+
+**Size**, `stat -c %s`:
+
+| binary | bytes | against `main` |
+|---|---|---|
+| `main` | 990,696 | |
+| this change, no `-Dtls` | 993,456 | +2,760 |
+| this change, `-Dtls`, `.tls` never set | 1,568,208 | +577,512 |
+| `nilo-bench-tls-server`, `-Dtls` | 1,593,424 | +602,728 |
+
+The 2,760 bytes the default build pays are the two refusal messages (`.tls`
+on a build without it, `.tls` on a unix socket) and the branch that chooses
+them; the spike, which had neither message, paid 488. The 560 KB the
+`-Dtls` build pays before a certificate is loaded is `std.crypto`'s X.509,
+the AEADs and the key exchange, reached by reference from `Conn.runTls`
+whether or not the acceptor ever spawns it.
+
+**Memory per idle connection**, `bench/mem.py --steps 2000,5000,10000
+--settle 3`, `/health`, `--tls` for the last row. The marginal column is
+(RSS at 10,000 − RSS at 5,000) / 5,000, and it agrees with the average, so
+the figure is a property of the connection rather than a transient:
+
+| listener | build | at 10,000 | marginal 5k→10k | against plain |
+|---|---|---|---|---|
+| plain | `main` | 5,191 | 5,184 | |
+| plain | this change, no `-Dtls` | 5,191 | 5,184 | 0 |
+| plain | this change, `-Dtls` | 9,293 | 9,280 | +4,102 |
+| TLS | this change, `-Dtls` | 9,307 | 9,279 | +4,116 |
+
+The default build is unchanged to the byte. The `-Dtls` build costs one
+page per idle connection on a plain listener, and a TLS connection then
+costs 14 bytes more than that: its 33,114 bytes of record buffers are
+page-aligned and handed back at idle with the cleartext pair, and `smaps`
+on the spike showed the slab mappings unchanged between the two rows. The
+page is the plain path's park frame crossing a page boundary once the
+handler has a second caller; ADR 0288 has the account and the roadmap has
+the measurement that would buy it back.
+
+**CPU per operation**, server `utime + stime` from `/proc/<pid>/stat`
+around 20,000 keep-alive requests on one connection (after 500 to warm it)
+and around 2,000 connect-request-close cycles, from one Python client
+(`ssl` for the TLS rows, certificate unchecked). Three runs each, quoted as
+the band; the resolution is a 10 ms tick, so 0.5 µs on the request rows and
+5 µs on the connection rows:
+
+| | plain | TLS | ratio |
+|---|---|---|---|
+| per request, kept alive, baseline `x86_64` | 3.0–3.5 µs | 22–23 µs | ~6.5 |
+| per new connection, baseline `x86_64` | 15 µs | 325 µs | ~22 |
+| per request, kept alive, `-Dcpu=native` | 3.0–3.5 µs | 3.5–4.0 µs | ~1.15 |
+| per new connection, `-Dcpu=native` | 10–15 µs | 280–295 µs | ~20–29 |
+
+Two things to read out of that. **The request is cheap and the handshake is
+not**, which is the shape TLS has everywhere: what a deployment pays is
+decided by how often its clients connect, and a client that connects per
+request pays twenty times an accept every time, with no session resumption
+in the library to make the second cheaper. And **the baseline ISA has no AES
+instructions**, so a `-Dtarget=x86_64-linux-gnu` binary with no `-Dcpu`
+encrypts in software and a request costs six times what it costs with them:
+a TLS listener is the one place in this repository where `-Dcpu` decides
+the number, and ADR 0288's guide page says so.
+
+**Not measured, and the roadmap carries each:** throughput and p99 at
+saturation over `https://` (no load generator with TLS on this box), the
+plain park's headroom under the page boundary, and kernel TLS.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

@@ -2621,6 +2621,33 @@ fn s3For(
     return module;
 }
 
+/// `-Dtls`, and whether this is the repository building itself. Read by
+/// `wireTls` below, which every instance of the http module goes through.
+var want_tls: bool = false;
+var in_repo: bool = false;
+
+/// What every instance of the http module is given so that
+/// `http/engine/zio.zig` can ask `@import("nilo_build").tls` and, when the
+/// answer is yes, `@import("tls")` (ADR 0288).
+///
+/// `on` decides both. The library is reached through `lazyDependency`
+/// **inside** the `if`, which is what makes the manifest's `.lazy = true`
+/// mean anything: called unconditionally it would fetch for every dependent
+/// whatever they asked for (ADR 0075). An instance built with `on = false`
+/// carries no import named `tls`, so a `@import("tls")` reached from it is a
+/// compile error rather than a link, and the comptime `if` in the Engine is
+/// what keeps it from being reached.
+fn wireTls(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, mode: std.builtin.OptimizeMode, on: bool) void {
+    const opts = b.addOptions();
+    opts.addOption(bool, "tls", on);
+    module.addImport("nilo_build", opts.createModule());
+    if (on) {
+        if (b.lazyDependency("tls", .{ .target = target, .optimize = mode })) |dep| {
+            module.addImport("tls", dep.module("tls"));
+        }
+    }
+}
+
 /// A copy of the server for one optimize mode, for a test root that needs a
 /// running one.
 ///
@@ -2635,7 +2662,7 @@ fn httpFor(
     core_mod: *std.Build.Module,
 ) *std.Build.Module {
     const engine = b.dependency("zio", .{ .target = target, .optimize = mode });
-    return b.createModule(.{
+    const module = b.createModule(.{
         .root_source_file = b.path("http/http.zig"),
         .target = target,
         .optimize = mode,
@@ -2645,6 +2672,8 @@ fn httpFor(
             .{ .name = "nilo_pw", .module = pwFor(b, target, mode) },
         },
     });
+    wireTls(b, module, target, mode, want_tls);
+    return module;
 }
 
 /// The step that reads `layers` and refuses an import that is not in it.
@@ -3061,6 +3090,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Whether the published module speaks TLS (ADR 0288). Off until asked,
+    // for everybody: the library it needs is fetched and linked only behind
+    // this flag, the same way the drivers sit behind `-Dsql`, and the two
+    // measured binaries stay what ADR 0018 publishes. What is always on is
+    // the *test* of it: this repository's own suite builds its `http` test
+    // root with TLS in it whatever the flag says, so the feature is held by
+    // `zig build test` rather than by whoever remembers to pass `-Dtls`.
+    want_tls = b.option(
+        bool,
+        "tls",
+        "Build the TLS listener into nilo_http and fetch the library it needs (ADR 0288). Off until a dependent passes `.tls = true`",
+    ) orelse false;
+    in_repo = b.pkg_hash.len == 0;
+
     // The bottom layer: what every other one agrees about, and nothing else
     // (ADR 0041). It names no Engine and does no IO, which is why it is the
     // one module here that needs no import of its own — and why
@@ -3202,6 +3245,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "nilo_pw", .module = nilo_pw },
         },
     });
+    wireTls(b, nilo_http, target, optimize, want_tls);
 
     // The SQL module: a second module beside the library rather than inside
     // it (ADR 0039). It lives in `sql/` rather than under `src/` so that the
@@ -3797,6 +3841,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "nilo_core", .module = bench_core },
         },
     });
+    wireTls(b, bench_http, target, .ReleaseFast, want_tls);
     const bench_nilo_sql = b.createModule(.{
         .root_source_file = b.path("sql/sql.zig"),
         .target = target,
@@ -4105,6 +4150,27 @@ pub fn build(b: *std.Build) void {
     b.step("bench-body-server", "A server reading request bodies, for what one holds while it arrives")
         .dependOn(&b.addInstallArtifact(bench_body_server, .{}).step);
 
+    // The benchmark target over TLS, so the plain one has a control on the
+    // axes ADR 0288 spends: `bench/mem.py --tls` for the idle connection, and
+    // `wrk` over `https://` for the request. Only under `-Dtls`, because a
+    // step that fetches a lazy dependency is a step that has to be asked for
+    // (ADR 0075); without the flag the step is absent rather than failing.
+    if (want_tls) {
+        const bench_tls_server_module = b.createModule(.{
+            .root_source_file = b.path("bench/tls_server.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .strip = stripMeasured(strip, .ReleaseFast),
+            .imports = &.{.{ .name = "nilo_http", .module = bench_http }},
+        });
+        const bench_tls_server = b.addExecutable(.{
+            .name = "nilo-bench-tls-server",
+            .root_module = bench_tls_server_module,
+        });
+        b.step("bench-tls-server", "The benchmark server over TLS, for what the encryption costs a request and an idle connection")
+            .dependOn(&b.addInstallArtifact(bench_tls_server, .{}).step);
+    }
+
     // The server `wstest` is driven at, which is a conformance run rather than
     // a measurement and is here because `bench/` is where a harness needing
     // something external already lives. Installed rather than run, because the
@@ -4149,6 +4215,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "nilo_core", .module = core_mod },
             },
         });
+        wireTls(b, framework, target, mode, want_tls);
 
         // The test build is the one place this module names an App, and it
         // gets both: `nilo_core` for the module itself, `nilo` for the tests
@@ -4294,6 +4361,12 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "nilo_pw", .module = pw_mod },
             },
         });
+        // TLS is in the http test root whether or not `-Dtls` was passed,
+        // because a feature only tested when somebody remembers a flag is a
+        // feature that is not tested (ADR 0033). In-repo only: a dependent
+        // running its own tests against nilo is not made to fetch the
+        // library for a listener it never asked for.
+        wireTls(b, lib_tests, target, mode, want_tls or in_repo);
 
         const library = b.createModule(.{
             .root_source_file = b.path("http/http.zig"),
@@ -4305,6 +4378,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "nilo_pw", .module = pw_mod },
             },
         });
+        wireTls(b, library, target, mode, want_tls);
 
         const bench_tests = b.createModule(.{
             .root_source_file = b.path("bench/main.zig"),

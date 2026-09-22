@@ -948,4 +948,10 @@ test {
     // Last, and the only one here that stands a real server up. Nothing else
     // in this suite opens a socket at all (ADR 0086).
     _ = @import("live.zig");
+    // Except this, in a build that has TLS in it: the same server with a
+    // certificate, talked to by std's own TLS client (ADR 0288). Under a
+    // comptime `if` because the file names the option's machinery, which a
+    // build without `-Dtls` does not have; the repository's own test root
+    // always does (see `wireTls` in build.zig).
+    if (@import("nilo_build").tls) _ = @import("tls_live.zig");
 }

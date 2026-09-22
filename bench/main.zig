@@ -24,7 +24,7 @@ const User = struct {
 
 /// A service: registered once in `main`, asked for by handlers via its
 /// type.
-const Db = struct {
+pub const Db = struct {
     // The payload is made ~1KB so the benchmark numbers match the metric.
     const bio = "A systems nerd who writes Zig before breakfast. " ** 19;
 
@@ -41,11 +41,11 @@ const Db = struct {
     }
 };
 
-fn getUser(db: *Db, id: u32) !User {
+pub fn getUser(db: *Db, id: u32) !User {
     return db.find(id) orelse fail.notFound("no user {d}", .{id});
 }
 
-fn health() []const u8 {
+pub fn health() []const u8 {
     return "alive\n";
 }
 

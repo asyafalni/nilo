@@ -58,7 +58,13 @@ imports `nilo_sql` does not fetch, build or link any of them** — and it is
 `b.lazyDependency` is a *request*: called unconditionally it runs for every
 dependent whatever they import, which is how an app with no database in it
 downloaded 11.1 MB of driver for a year (ADR 0075). A dependent that wants the
-module passes `.sql = true` to `b.dependency("nilo", …)`.
+module passes `.sql = true` to `b.dependency("nilo", …)`. **The TLS listener
+sits behind the same kind of flag**, `.tls = true` (`-Dtls` here), and pulls
+[tls.zig](https://github.com/ianic/tls.zig) the same way (ADR 0288): a build
+without it has no module named `tls`, and the Engine's every use of one is
+under a comptime `if` on `@import("nilo_build").tls`. The repository's own
+http test root is built with it whatever the flag says, so `zig build test`
+holds the feature; a dependent's tests are not made to fetch it.
 **`zig build fetch-check -Dnetwork` is what holds that** — it builds
 `bench/dependent/`, which imports `nilo_http` and nothing else, against two cold
 caches and fails on anything but zio landing. Not on `test`, for the reason
@@ -69,7 +75,7 @@ Three files carry context this one deliberately does not repeat:
 - **`CONTEXT.md`** — the project's vocabulary, and the words it refuses to use
   (Ctx not "Context", Str not "string", keep not "dupe", Refusal not "negative
   test"). Match it in code, comments, docs and commit messages.
-- **`docs/adr/`** — 286 binding decisions, each naming the alternative it
+- **`docs/adr/`** — 287 binding decisions, each naming the alternative it
   rejected. Check here before proposing a design change; "why not X?" usually
   already has an answer on file. **ADR 0041 decides which module new work goes
   in and ADR 0042 decides what that module may import**, and they are the two
@@ -142,11 +148,13 @@ zig build bench-job    # what a claim and a push cost on job.Memory, SQLite, and
 zig build bench-fetch-server # what an outbound call costs, with its controls
 zig build bench-s3-server  # a server reading an object store per request, with its controls
 zig build bench-body-server  # a server reading request bodies, with its controls
+zig build bench-tls-server -Dtls  # the benchmark server over TLS, for what the encryption costs; absent without the flag
 zig build bench-ws-server  # a server of idle WebSockets, for what one costs
 zig build bench-stream-server  # a server of held-open streams, for what one costs
 zig build autobahn-server  # the echo server `bash bench/autobahn/run.sh` drives wstest at
 python3 bench/mem.py --port … --path …   # memory per idle connection, any server
 python3 bench/mem.py --port … --path … --hold   # the same for a stream nobody closes
+python3 bench/mem.py --port … --path … --tls    # the same through TLS 1.3, against bench-tls-server
 python3 bench/shutdown.py --cmd … --port …  # does SIGTERM come back? The regression check for ADR 0098
 python3 bench/fdlimit.py --cmd … --port …   # does a descriptor shortage take the server down? The check for ADR 0265
 python3 bench/burst.py --cmd … --port …     # does a burst of connections get through, or does the kernel drop some? The check for ADR 0271
@@ -588,8 +596,16 @@ while writing, not later.
 
 ## Refused on the record
 
-Templates, TLS, HTTP/2 and gRPC are not gaps — they are decisions (README "What
-it won't do", ADR 0028). Do not add them; propose a change to the ADR instead.
+Templates, HTTP/2 and gRPC are not gaps — they are decisions (README "What it
+won't do", ADR 0028). Do not add them; propose a change to the ADR instead.
+TLS is the one that was argued and moved, and the shape it moved into is the
+precedent: an option behind a build flag, the default build unchanged to the
+byte on the memory axis and 2.8 KB on the size one, and every number on the
+record before the option shipped (ADR 0288). **A `-Dtls` build pays a page per
+idle connection on every listener, TLS or not**, and the reason is the plain
+park sitting under 300 bytes short of a page boundary; any change to the
+connection loop is one page away from being noticed, and `bench/mem.py` is
+what notices.
 
 <!-- devrun:begin -->
 ## Running this project's services

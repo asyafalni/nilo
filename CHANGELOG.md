@@ -29,6 +29,21 @@ newest first.
 
 ### Added
 
+- `listen(.{ .tls = .{ .cert = "…pem", .key = "…pem" } })`: HTTPS, TLS 1.3,
+  on a build that asked for it with `.tls = true` on the dependency
+  (`-Dtls` in this repository). The library behind it, ianic/tls.zig, is
+  fetched and linked only behind that flag, so every other build is what it
+  was, and refuses the option at `listen()` in one line rather than serving
+  plain HTTP on the port. What it costs is stated where the option is: 560 KB
+  of binary and a page per idle connection in the build that asked, about
+  300 µs of CPU per handshake, no session resumption, one certificate per
+  listener, a restart to reload it, and no audit behind the library, which
+  is why a proxy in front stays the recommendation for anything on the
+  internet ([ADR 0288](./docs/adr/0288-tls-is-an-option-a-build-asks-for.md),
+  amending ADR 0028; [deploying](./docs/guide/deploying.md#tls-without-a-proxy)).
+  The handshake is bounded by `header_timeout_ms`. `zig build bench-tls-server
+  -Dtls` and `bench/mem.py --tls` are the benchmark server and the idle
+  reading for it.
 - `sql.Composed`, `db.compose` and `db.composed` / `db.composedOne` /
   `tx.composed`: a statement composed at run time from literals, checked
   identifiers and parameters — the pieces a query engine has — and from
