@@ -46,10 +46,10 @@ Zig 0.16 and nothing else — no C library, no system package.
 
 ```console
 $ zig init                                                          # only if you have no build.zig.zon yet
-$ zig fetch --save git+https://github.com/nevindra/nilo?ref=v0.5.0
+$ zig fetch --save 'git+https://github.com/nevindra/nilo?ref=v0.5.0#c7147f9b4af692c67701b3189afe39757a744cf0'
 ```
 
-**Keep the `?ref=`.** Without it `zig fetch` takes whatever `main` is that day.
+**Keep the `#commit`.** The tag is annotated and Zig 0.16's `zig fetch` does not peel one: `?ref=v0.5.0` on its own hands you whatever `main` is that day.
 
 ```zig
 const std = @import("std");

@@ -3986,3 +3986,51 @@ linker error that is not nilo's and stops every quickstart on a new Arch.
 **The first stranger's application is the review the reference cannot give
 itself**, and the shape of every item was the same: the guide said how,
 and not what happens when the other choice is made.
+
+## A fix scoped to the caller that found it
+
+**ADR 0144's fix was scoped to the check, and the next boot-time reader
+found the same hole.** A query engine built on 0.5.0 — an `unchecked` `Db`,
+its tables its own DDL, a migration in `app.before` — got `Disconnected`
+every cold boot, Postgres up, on the documented path. The check had been
+given its connection; the hook had not, because the dial was gated on
+`self.check != null`. Now the boot dials the one for whatever runs next
+([ADR 0284](./adr/0284-a-boot-dials-the-connection-its-work-needs.md)).
+The live test that holds it goes red on the old rule — checked by putting
+the old rule back. **A fix scoped to the caller that found it is the bug
+with one caller subtracted.**
+## The select-list counter read `WITHIN GROUP` as `GROUP BY`
+
+`GROUP` at depth 0 ended the list, so a percentile beside a count —
+`percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS median, count(*) AS n` —
+was one column, and the two-field Row was refused with a message about
+reordering the SELECT. The query engine that hit it worked round it with a
+CTE for a week before the cause was read. The counter now wants the `BY`.
+Same lesson as ADR 0154's `*`: **a keyword is a keyword in a position, and
+the scanner knows positions by depth alone** — a word that means two things
+at one depth needs the next word.
+## A pin that was not one
+
+**The install line did not pin.** `zig fetch --save
+git+…/nilo?ref=v0.5.0` — the README's own line — put the tree of `main` in
+the lockfile. Reproduced on Zig 0.16.0 with an empty `build.zig` beside it:
+
+```
+$ zig fetch 'git+https://github.com/nevindra/nilo?ref=v0.5.0'
+nilo-0.5.0-5HEqwqxzVgDscgcwD-1SsQRQTROVDT5VOI-6rBEHkU89
+$ zig fetch 'git+https://github.com/nevindra/nilo?ref=v0.5.0#c7147f9b4af692c67701b3189afe39757a744cf0'
+nilo-0.5.0-5HEqwoL3UwDixFNKEudr5MENGRgBK7TpXWSh3RjKMNdc
+```
+
+Two different packages for one tag. `http/app.zig` out of the first
+checksums `25d835e6433d0337…`, which is `main` at `b012502`; out of the
+second, `d3baac6ae27bc68d…`, which is the tag's commit `c7147f9`. The tag
+is annotated (`git cat-file -t v0.5.0` says `tag`), and Zig 0.16's fetcher
+does not peel it to the commit; with `#commit` appended the tree is the
+tag's. Two files said "pinned to the tag you asked for", and the claim had
+the same shape as `connect_on_init`
+([ADR 0062](./adr/0062-a-pool-that-dialled-itself-whatever-it-was-told.md)):
+its only expression is a difference nobody diffed. **A pin is a checksum
+against the thing it names, or it is a sentence.** The install line now
+carries the commit, and the release checklist says where the commit comes
+from.

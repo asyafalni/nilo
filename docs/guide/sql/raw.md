@@ -230,32 +230,53 @@ builder, and joins and aggregates are where databases disagree most. A
 boundary you can state in a sentence is worth more than one further out,
 because you can predict what it does without opening this guide.
 
-## What SQLite does differently
+## A statement the program cannot write while compiling
 
-The text of a raw statement is yours, so the dialect is yours to write in.
-Four things to know when the file is SQLite:
+`db.raw`'s text is comptime, and the case it refuses is a program assembling
+SQL out of run-time strings. One kind of program has no finite set of
+statements to write: a query engine, where the tables, the columns and the
+aggregates come out of a model that is data. What it never needs is a
+run-time *string* in a statement — only names and values — so that is what
+`sql.Composed` lets it write, and nothing else
+([ADR 0283](../../adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)):
 
-- **`$1`, `$2`, … are the same text on both.** SQLite's own numbered
-  placeholder is `?1`, and a `$name` there is a *named* parameter indexed by
-  first appearance, so `$2` written before `$1` used to bind the first value.
-  nilo respells `$n` as `?n` while compiling for every call that takes
-  comptime text, which is `raw`, `rawOne`, `rawExactlyOne`, `rawPage`,
-  `rawOrdered` and the `Tx` versions
-  ([ADR 0278](../../adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
-  `exec` takes its text at run time and sends it as written: write `?1`
-  there, or a bare `?`, or a statement with no parameters, which is what
-  DDL is.
-- **A `Timestamp` is an INTEGER of microseconds**, not a datetime SQLite's
-  date functions read directly. Divide by a million and say `'unixepoch'`:
-  `strftime('%Y-%m', issued_at / 1000000, 'unixepoch')`. A `Date` is its
-  ten characters of text, which `date()` and `strftime` read as they are.
-- **Casts are spelled `CAST(x AS INTEGER)`**, and `::bigint` is Postgres.
-  A `count(*)` is already an integer on both; a `sum` over an INTEGER
-  column is too, and `coalesce(sum(total), 0)` needs no cast.
-- **`ILIKE` is Postgres.** SQLite's `LIKE` ignores case for ASCII already,
-  and `COLLATE NOCASE` on the column is the durable spelling. `FILTER
-  (WHERE …)` on an aggregate and `count(*) OVER ()` both work on the SQLite
-  nilo links.
+<!-- compiles: body -->
+```zig
+const Line = struct {
+    pub const nilo_table = .projection;
+    key: ?[]const u8,
+    total: i64,
+};
+
+var s = db.compose(c);           // spelled for this Db's dialect
+try s.text("SELECT ");
+try s.ident(dimension);          // a name out of the model; not a name → error.NotAnIdentifier
+try s.text(", sum(");
+try s.ident(measure);
+try s.text(") FROM ");
+try s.ident(rollup);
+try s.text(" WHERE bucket >= ");
+try s.param(1);
+try s.text(" AND bucket < ");
+try s.param(2);
+try s.text(" GROUP BY 1 LIMIT ");
+try s.number(limit);
+
+const rows = try db.composed(Line, c, s, .{ from, to });
+```
+
+`text` is `comptime`, so a slice that arrived at run time does not compile,
+and a `$1` inside it is a Refusal — a placeholder is `param(1)`;
+`ident` checks that a name is letters, digits and `_` and writes it quoted;
+`param` writes the `n`th placeholder the way the dialect spells it — `$n` on
+Postgres, `?n` on SQLite. A statement built where no `Db` is in scope is
+`sql.Composed.init(arena, sql.Spelling.of(Dialect))`, and `db.composed`
+refuses one spelled for the other dialect. A `Composed` is filled by position
+like a `raw` statement, with the run-time width check and the same value
+conversion, and its values are counted against its placeholders at run time
+(`error.ParamCountMismatch`) the way `raw`'s are while compiling. It runs
+unnamed — its text is the model's, not the program's. Reach for `raw`
+whenever the statement can be written down.
 
 ## Set operations are conditions, not a second idea
 

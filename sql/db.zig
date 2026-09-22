@@ -86,6 +86,7 @@ const migrate = @import("migrate.zig");
 const ordering = @import("ordering.zig");
 const postgres = @import("postgres.zig");
 const rawcheck = @import("rawcheck.zig");
+const composed_mod = @import("composed.zig");
 const row_mod = @import("row.zig");
 const schema = @import("schema.zig");
 const statement = @import("statement.zig");
@@ -410,11 +411,14 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             /// across threads; this is a constraint on a test harness rather
             /// than on a server.
             ///
-            /// **Zero and a `checking` list means one, not zero** (ADR
-            /// 0144). The check has to borrow a connection, and a pool that
-            /// dialled none had nothing to lend it, so the check that was
-            /// meant to stop a bad deploy became a warning. The dial is
-            /// still allowed to fail — the server starts either way.
+            /// **Zero means one dialled now and the rest lazily** (ADR
+            /// 0144, ADR 0284). The schema check, the version guard and
+            /// `app.before` all borrow a connection before the first
+            /// request, and a pool that dialled none had nothing to lend
+            /// them: the check that was meant to stop a bad deploy became a
+            /// warning, and a migration in `app.before` failed on every
+            /// cold boot. The dial is still allowed to fail — the server
+            /// starts either way, and says so.
             connect_on_init: u16 = 0,
             /// How long a caller waits for a free connection.
             timeout_ms: u32 = 10 * std.time.ms_per_s,
@@ -745,8 +749,18 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // down does not stop the server: a dial that fails here falls
             // back to the pool the caller asked for and says in one line
             // that the check is not happening.
-            const has_check = self.check != null or self.expect != null;
-            const dialing_for_check = has_check and self.opts.connect_on_init == 0;
+            //
+            // **Every `Db` dials the one, not only a checked one**
+            // ([ADR 0284](../docs/adr/0284-a-boot-dials-the-connection-its-work-needs.md)).
+            // The check is not the only work that runs before the first
+            // request: `app.before` is the documented place for a migration
+            // or a key set, and it runs a moment after this returns. A pool
+            // that is still being filled by the reconnector answers
+            // `Disconnected` to it on every cold boot — an `unchecked` `Db`
+            // with `app.before` was that, deterministically. `nilo_start`
+            // cannot see what the App will run next, so it dials one for
+            // whatever that is.
+            const dialing_for_check = self.opts.connect_on_init == 0;
             var check_dial_failed = false;
 
             // **The one way to have no schema check is to say so** (ADR
@@ -776,10 +790,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 // written for it.
                 if (!isUrlProblem(err)) {
                     std.log.warn(
-                        "nilo could not dial the database to check the schema against it " ++
-                            "({s}), so it is starting without the check. `connect_on_init` " ++
-                            "is 0, which is what asks for a server that starts while its " ++
-                            "database is down.",
+                        "nilo could not dial the database for the work that runs at boot " ++
+                            "({s}), so it is starting without the schema check, and anything " ++
+                            "`app.before` asks of this database will find it down. " ++
+                            "`connect_on_init` is 0, which is what asks for a server that " ++
+                            "starts while its database is down.",
                         .{@errorName(err)},
                     );
                     check_dial_failed = true;
@@ -1377,6 +1392,84 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             var total: i64 = 0;
             const rows = try filling(Row, null, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c), &total);
             return .{ .rows = rows, .total = total };
+        }
+
+        /// An empty `Composed` that spells its placeholders the way this Db's
+        /// dialect does, writing into the Scope's arena
+        /// ([ADR 0283](../docs/adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
+        /// A statement built elsewhere — a generator with no Db in scope —
+        /// is `sql.Composed.init(arena, sql.Spelling.of(Dialect))`, and
+        /// `db.composed` checks the two agree.
+        pub fn compose(self: *Self, c: anytype) composed_mod.Composed {
+            _ = self;
+            comptime core.checkScope(@TypeOf(c), "db.compose");
+            return composed_mod.Composed.init(c.arena(), comptime composed_mod.Spelling.of(D));
+        }
+
+        /// `db.raw` for a statement composed at run time from pieces that
+        /// cannot carry a string — literals, checked identifiers and
+        /// parameters
+        /// ([ADR 0283](../docs/adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
+        ///
+        /// ```zig
+        /// var s = db.compose(c);
+        /// try s.text("SELECT sum(");
+        /// try s.ident(measure);            // a name the model declared
+        /// try s.text(") FROM ");
+        /// try s.ident(rollup);
+        /// try s.text(" WHERE bucket >= ");
+        /// try s.param(1);
+        /// try s.text(" AND bucket < ");
+        /// try s.param(2);
+        /// const rows = try db.composed(Total, c, s, .{ from, to });
+        /// ```
+        ///
+        /// What it keeps of `raw`: the Row filled by position, the run-time
+        /// width check (ADR 0134), the values converted the way a Row's are
+        /// (ADR 0145), one column into a scalar (ADR 0234), and the values
+        /// counted against the placeholders — `rawcheck.assertParams` while
+        /// compiling for `raw`, `error.ParamCountMismatch` here, since the
+        /// text is not there to read until the request is. A statement
+        /// spelled for the other dialect is `error.WrongDialect` before it
+        /// is sent. What it gives up: the comptime column count, and the
+        /// plan name — the text is the model's rather than the program's,
+        /// so it runs unnamed.
+        pub fn composed(
+            self: *Self,
+            comptime Row: type,
+            c: anytype,
+            stmt: composed_mod.Composed,
+            values: anytype,
+        ) ![]Row {
+            comptime core.checkScope(@TypeOf(c), "db.composed");
+            try checkComposed(stmt, @TypeOf(values));
+            if (comptime scalarColumn(Row)) {
+                return fillScalar(Row, self, null, c, stmt.view(), null, try rawValuesOf(values, c));
+            }
+            return fill(Row, null, self, null, c, stmt.view(), null, try rawValuesOf(values, c));
+        }
+
+        /// `db.composed` with the unwrap done, as `rawOne` is to `raw`.
+        pub fn composedOne(
+            self: *Self,
+            comptime Row: type,
+            c: anytype,
+            stmt: composed_mod.Composed,
+            values: anytype,
+        ) !?Row {
+            const found = try self.composed(Row, c, stmt, values);
+            return if (found.len == 0) null else found[0];
+        }
+
+        /// What `rawText` does for comptime text, done at run time for a
+        /// `Composed`: the placeholders are this dialect's, and there is one
+        /// value for each. A tuple is one value per placeholder; a named
+        /// struct is the driver's to read, as in `rawcheck.assertParams`.
+        fn checkComposed(stmt: composed_mod.Composed, comptime V: type) error{ WrongDialect, ParamCountMismatch }!void {
+            if (stmt.spelling != comptime composed_mod.Spelling.of(D)) return error.WrongDialect;
+            const info = @typeInfo(V);
+            if (comptime info != .@"struct" or !info.@"struct".is_tuple) return;
+            if (stmt.params != info.@"struct".fields.len) return error.ParamCountMismatch;
         }
 
         /// A statement that answers with **nothing**, and the number of rows
@@ -2069,6 +2162,27 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 }
                 comptime rawcheck.assertList(D, Row, sql, "tx.raw");
                 return fill(Row, null, self.db, &self.inner, c, text, self.db.rawPlanOf(text), try rawValuesOf(values, c));
+            }
+
+            /// `db.compose` inside the transaction (ADR 0283).
+            pub fn compose(self: *Tx, c: anytype) composed_mod.Composed {
+                return self.db.compose(c);
+            }
+
+            /// `db.composed` inside the transaction (ADR 0283).
+            pub fn composed(
+                self: *Tx,
+                comptime Row: type,
+                c: anytype,
+                stmt: composed_mod.Composed,
+                values: anytype,
+            ) ![]Row {
+                comptime core.checkScope(@TypeOf(c), "tx.composed");
+                try checkComposed(stmt, @TypeOf(values));
+                if (comptime scalarColumn(Row)) {
+                    return fillScalar(Row, self.db, &self.inner, c, stmt.view(), null, try rawValuesOf(values, c));
+                }
+                return fill(Row, null, self.db, &self.inner, c, stmt.view(), null, try rawValuesOf(values, c));
             }
 
             /// `db.rawOrdered` inside the transaction: the caller's statement
@@ -6299,6 +6413,62 @@ test "a $n in a raw statement is the nth value on SQLite too, whatever order it 
         "SELECT email FROM accounts WHERE (?2 IS NULL OR email = ?2) AND id >= ?1 ORDER BY id",
         comptime rawcheck.spelled(dialect.SQLite, "SELECT email FROM accounts WHERE ($2 IS NULL OR email = $2) AND id >= $1 ORDER BY id"),
     );
+}
+
+test "a composed statement is spelled for SQLite, and held against its values before it is sent" {
+    // `db.compose` hands out a Composed that writes `?n`, the way `rawText`
+    // respells a raw `$n` for this dialect (ADR 0278); and what `rawcheck`
+    // counts while compiling for `raw` is counted here at run time, because
+    // the text is not there to read until the request is (ADR 0283).
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:composed?mode=memory&cache=shared",
+        .{ .size = 2, .unchecked = true },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, accounts_ddl, .{});
+    _ = try db.insert(SqliteAccount, &run, .{ .public = types.Uuid.nil, .email = "wati@example.dev" });
+    _ = try db.insert(SqliteAccount, &run, .{ .public = types.Uuid.nil, .email = "kid@example.dev" });
+
+    const column: []const u8 = "email";
+    var s = db.compose(&run);
+    try s.text("SELECT ");
+    try s.ident(column);
+    try s.text(" FROM accounts WHERE (");
+    try s.param(2);
+    try s.text(" IS NULL OR ");
+    try s.ident(column);
+    try s.text(" = ");
+    try s.param(2);
+    try s.text(") AND id >= ");
+    try s.param(1);
+    try s.text(" ORDER BY id");
+    try testing.expectEqualStrings(
+        "SELECT \"email\" FROM accounts WHERE (?2 IS NULL OR \"email\" = ?2) AND id >= ?1 ORDER BY id",
+        s.view(),
+    );
+
+    const filter: ?[]const u8 = "kid@example.dev";
+    const found = try db.composed(nilo.Str, &run, s, .{ @as(i64, 1), filter });
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqualStrings("kid@example.dev", found[0].view());
+
+    // Two placeholders and one value: on SQLite the missing one would bind
+    // NULL and nothing would say so, which is the answer this refuses.
+    try testing.expectError(error.ParamCountMismatch, db.composed(nilo.Str, &run, s, .{@as(i64, 1)}));
+
+    // A statement spelled for Postgres never reaches SQLite.
+    var dollar = composed_mod.Composed.init(run.arena(), .dollar);
+    try dollar.text("SELECT email FROM accounts WHERE id >= ");
+    try dollar.param(1);
+    try testing.expectError(error.WrongDialect, db.composed(nilo.Str, &run, dollar, .{@as(i64, 1)}));
 }
 
 test "rawPage reads the total off the window the caller put on the end" {

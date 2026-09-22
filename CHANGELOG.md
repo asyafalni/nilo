@@ -27,6 +27,16 @@ the ADRs that only correct an older one folded into the one they correct.
 Work lands here under `### Breaking`, `### Added`, `### Fixed` and `### Docs`,
 newest first.
 
+### Added
+
+- `sql.Composed`, `db.compose` and `db.composed` / `db.composedOne` /
+  `tx.composed`: a statement composed at run time from literals, checked
+  identifiers and parameters — the pieces a query engine has — and from
+  nothing that can carry a run-time string. Placeholders are spelled for the
+  Db's dialect; the values are counted against them at run time. `raw` is
+  unchanged
+  ([ADR 0283](./docs/adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
+
 ### Breaking
 
 - A `Db`'s schema check and version guard run from a new service hook,
@@ -62,6 +72,14 @@ newest first.
   ([ADR 0268](./docs/adr/0268-a-head-is-mostly-cookies-and-sixteen-kilobytes-of-them.md)).
 
 ### Added
+
+- `run.loop()`: the `Io` a `Run` was made on, or null for a `Run.init(gpa)`,
+  for a job that writes a file or sleeps between attempts and has only the
+  Run the worker handed it.
+- `jwt.Keyring` takes `remember_tokens`: how many verified tokens to
+  remember by digest, so a bearer token seen again skips the signature
+  arithmetic and keeps every claims check. A new key set forgets them
+  ([ADR 0285](./docs/adr/0285-a-verified-signature-is-remembered-by-the-tokens-digest.md)).
 
 - `examples/sqlite/`: two Rows on one SQLite file, the tables made at boot
   with `createMissing` in `before` and checked after, a list with a
@@ -221,6 +239,23 @@ newest first.
   prose under it was already there; the lookup was not.
 
 ### Fixed
+
+- A `Db` on the default `connect_on_init = 0` dials one connection at boot
+  whether or not it has a schema check, so `app.before` — a migration, a
+  key set — finds a pool with something to lend. An `unchecked` `Db` with
+  a `before` hook got `Disconnected` on every cold boot with the database
+  up ([ADR 0284](./docs/adr/0284-a-boot-dials-the-connection-its-work-needs.md)).
+- The comptime count of a `raw` select list stopped at `WITHIN GROUP`,
+  reading its `GROUP` as `GROUP BY`, so `percentile_cont(0.5) WITHIN GROUP
+  (ORDER BY v) AS median, count(*) AS n` counted as one column and the Row
+  with two fields was refused. `GROUP` and `ORDER` end the list only with
+  their `BY`.
+- A database round trip over `block_warning_ms` no longer draws "handler
+  held its thread": `core.Limits` gained `waiting`/`waited`, the Engine
+  routes them to the watchdog, and the Postgres wire reports every
+  statement through them, once from the exchange to the result's close. A
+  handler that computes without parking is still reported
+  ([ADR 0286](./docs/adr/0286-a-services-wait-on-its-own-socket-is-a-park.md)).
 
 - `app.tryStatic` and `app.tryStaticWith` on a directory that is not there
   hand back `error.StaticDirNotFound` and log nothing; the `error:` line

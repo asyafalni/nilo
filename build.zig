@@ -392,6 +392,10 @@ const sql_refusals = [_]Refusal{
         .says = "`db.raw` was given `uuid.Uuid` in a struct with named fields, and nilo converts a parameter by position.",
     },
     .{
+        .name = "composed_text_naming_a_placeholder",
+        .says = "`Composed.text` was handed \"SELECT 1 WHERE id = $1\", which names a placeholder as text.",
+    },
+    .{
         .name = "raw_select_list_short",
         .says = "the statement handed to `db.raw` selects 2 columns, and raw_select_list_short.Person has 3 fields.",
     },

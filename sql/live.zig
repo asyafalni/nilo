@@ -552,6 +552,81 @@ test "a Db told what to expect boots against a real Postgres and asks its ledger
     try testing.expect((try migrate.headVersion(&db, &run)) >= 0);
 }
 
+test "an unchecked Db on the defaults has a connection to lend the moment it starts" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    // `connect_on_init` left at 0 and nothing to check: the shape a program
+    // whose tables are its own DDL writes, and then hands `app.before` a
+    // migration. Before ADR 0284 the pool reached that hook with nothing
+    // dialled and the hook got `Disconnected`, every cold boot. `size = 1`
+    // so that the one connection the boot dials is the whole pool, and the
+    // reconnector has nothing to fill from an OS thread `std.Io.Threaded`
+    // cannot park (the constraint `Live.open` states).
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    // What `app.before` does a moment after `nilo_start` returns.
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+    try testing.expectEqual(@as(?i64, 1), try db.rawOne(i64, &run, "SELECT 1::bigint", .{}));
+}
+
+/// A `Limits` that counts what the wire reports through it, for the test below.
+var waits_reported: usize = 0;
+var waits_closed: usize = 0;
+const counting_limits: core.Limits = .{ .vtable = &.{
+    .arm = core.Limits.noop.arm,
+    .release = core.Limits.noop.release,
+    .fired = core.Limits.noop.fired,
+    .waiting = struct {
+        fn f(_: ?*anyopaque) u64 {
+            waits_reported += 1;
+            return 1;
+        }
+    }.f,
+    .waited = struct {
+        fn f(_: ?*anyopaque, token: u64) void {
+            std.debug.assert(token == 1);
+            waits_closed += 1;
+        }
+    }.f,
+} };
+
+test "every wait on the database is reported through the Limits the wire was started with" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var wire = try postgres.Wire.open(threaded.io(), gpa, url, .{ .size = 1, .connect_on_init = 1, .limits = counting_limits });
+    defer wire.close();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    waits_reported = 0;
+    waits_closed = 0;
+    // One statement is one wait, from the exchange to the close, however
+    // many rows come off the socket in between (ADR 0286).
+    var rows = try wire.run(arena.allocator(), "SELECT generate_series(1, 1000)", .{}, null, null);
+    var n: usize = 0;
+    while (try wire.next(&rows)) n += 1;
+    try testing.expectEqual(@as(usize, 1000), n);
+    try testing.expectEqual(@as(usize, 1), waits_reported);
+    try testing.expectEqual(@as(usize, 0), waits_closed);
+    rows.close();
+    try testing.expectEqual(@as(usize, 1), waits_closed);
+    // A transaction reports its BEGIN, its statement and its COMMIT.
+    const before = waits_reported;
+    var tx = try wire.begin(arena.allocator(), .{});
+    _ = try tx.exec(arena.allocator(), "SELECT 1", .{}, null, null);
+    try tx.commit();
+    try testing.expect(waits_reported - before >= 3);
+}
+
 // -- the write half, and the things built on it ---------------------------
 
 /// A `Db` wired to an already-open pool, plus an App and a Client to drive
@@ -4085,4 +4160,55 @@ test "a batch seventeen columns wide goes into a twenty-column table in one stat
 
     const total = try stack.db.count(Line, &run, .{ .where = .{ .rab_id = @as(i64, 1) } });
     try testing.expectEqual(@as(usize, 40), total);
+}
+
+test "a statement composed at run time fills a Row by position and runs unnamed" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // The pieces a query engine has: names out of a model, values out of a
+    // request. Nothing here is a comptime statement.
+    const measure: []const u8 = "age";
+    const by: []const u8 = "handle";
+    var s = stack.db.compose(&run);
+    try s.text("SELECT ");
+    try s.ident(by);
+    try s.text(", sum(");
+    try s.ident(measure);
+    try s.text(")::bigint FROM ");
+    try s.ident(table);
+    try s.text(" WHERE ");
+    try s.ident(measure);
+    try s.text(" > ");
+    try s.param(1);
+    try s.text(" GROUP BY 1 ORDER BY 1 NULLS LAST LIMIT ");
+    try s.number(10);
+
+    const Tallied = struct {
+        pub const nilo_table = .projection;
+        handle: ?[]const u8,
+        total: i64,
+    };
+    const rows = try stack.db.composed(Tallied, &run, s, .{@as(i32, 0)});
+    try testing.expect(rows.len >= 1);
+    var sum: i64 = 0;
+    for (rows) |r| sum += r.total;
+    const exact = try stack.db.rawOne(i64, &run, "SELECT sum(age)::bigint FROM " ++ table ++ " WHERE age > 0", .{});
+    try testing.expectEqual(exact.?, sum);
+
+    // One column into a scalar, the way `raw` allows (ADR 0234).
+    var one = stack.db.compose(&run);
+    try one.text("SELECT count(*)::bigint FROM ");
+    try one.ident(table);
+    const n = try stack.db.composedOne(i64, &run, one, .{});
+    try testing.expectEqual(@as(i64, 3), n.?);
+
+    // A name that is not one never reaches the database, and neither does a
+    // statement with more placeholders than values.
+    var bad = stack.db.compose(&run);
+    try testing.expectError(error.NotAnIdentifier, bad.ident("people; DROP TABLE people"));
+    try testing.expectError(error.ParamCountMismatch, stack.db.composed(i64, &run, s, .{}));
 }

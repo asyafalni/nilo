@@ -190,6 +190,15 @@ pub const Run = struct {
         try std.Io.randomSecure(io, buf);
     }
 
+    /// The `Io` this Run was made on, for work that has to go through the
+    /// loop and is not a request — a job writing a file, a job sleeping
+    /// between attempts. Null on a `Run.init(gpa)`, which has none, and
+    /// the caller decides what that means (a job made by the worker always
+    /// has one).
+    pub fn loop(self: *Run) ?std.Io {
+        return self._io;
+    }
+
     /// Hand this tick a value, for something further down to ask for
     /// ([ADR 0165](../docs/adr/0165-a-value-that-reaches-the-bottom.md)).
     ///
@@ -821,4 +830,16 @@ test "entropyInto is the same bytes as entropy, at a width nobody said while com
         if (b != 0) all_zero = false;
     }
     try testing.expect(!all_zero);
+}
+
+test "a Run hands back the loop it was made on, and none when it was made without" {
+    var plain: Run = .init(testing.allocator);
+    defer plain.deinit();
+    try testing.expectEqual(@as(?std.Io, null), plain.loop());
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var with: Run = .initIo(testing.allocator, threaded.io());
+    defer with.deinit();
+    try testing.expect(with.loop() != null);
 }

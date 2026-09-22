@@ -22,6 +22,7 @@ const b64 = @import("b64.zig");
 const jwks = @import("jwks.zig");
 const rs256 = @import("rs256.zig");
 const es256 = @import("es256.zig");
+const memo_mod = @import("memo.zig");
 
 /// The two names a header's `alg` may carry, and the whole of what is
 /// accepted before a key is looked up. Which of the two a token actually
@@ -70,6 +71,10 @@ pub const Options = struct {
     now_s: i64,
     /// How far the two clocks are allowed to disagree, both ways.
     leeway_s: u32 = 0,
+    /// Signatures already checked under these keys, so a token seen again
+    /// skips the arithmetic and not the claims (`memo.zig`). Null checks
+    /// every signature.
+    memo: ?*memo_mod.Memo = null,
 };
 
 /// What the header is read into. Everything optional: it is somebody else's
@@ -144,9 +149,16 @@ pub fn verify(
         error.OutOfMemory => return error.OutOfMemory,
         error.NotBase64Url => return error.NotAToken,
     };
-    switch (key.material) {
-        .rsa => |rsa| try rs256.verify(signed, sig, rsa.e, rsa.n),
-        .ec => |ec| try es256.verify(signed, sig, ec.crv, ec.x, ec.y),
+    // The memo answers for the whole token's bytes, so a different
+    // signature, header or payload is a different digest and is checked.
+    const digest: ?memo_mod.Digest = if (opts.memo != null) memo_mod.Memo.digestOf(token) else null;
+    const remembered = if (opts.memo) |m| m.has(digest.?) else false;
+    if (!remembered) {
+        switch (key.material) {
+            .rsa => |rsa| try rs256.verify(signed, sig, rsa.e, rsa.n),
+            .ec => |ec| try es256.verify(signed, sig, ec.crv, ec.x, ec.y),
+        }
+        if (opts.memo) |m| m.remember(digest.?);
     }
 
     // Past here the bytes are the issuer's.

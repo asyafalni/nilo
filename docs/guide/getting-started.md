@@ -10,14 +10,16 @@ yet:
 
 ```
 zig init
-zig fetch --save git+https://github.com/nevindra/nilo?ref=v0.5.0
+zig fetch --save 'git+https://github.com/nevindra/nilo?ref=v0.5.0#c7147f9b4af692c67701b3189afe39757a744cf0'
 ```
 
-That writes nilo into your `build.zig.zon`, pinned to the tag you asked for.
-**Keep the `?ref=`.** Without it `zig fetch` resolves whatever `main` is at that
-moment and writes *that* commit's hash into your lockfile — so two people
-installing a week apart get two different libraries, and neither of them asked
-for a version.
+That writes nilo into your `build.zig.zon`, pinned to the commit the tag
+names. **Keep the `#commit`.** The `?ref=` on its own is not a pin: nilo's
+tags are annotated, Zig 0.16's `zig fetch` does not peel one, and what it
+hands you for `?ref=v0.5.0` alone is the tree of `main` that day — so two
+people installing a week apart get two different libraries, and neither of
+them asked for a version. The commit for each tag is on
+[its release page](https://github.com/nevindra/nilo/releases).
 
 What `zig init` leaves behind is a library-and-executable scaffold built around
 `src/root.zig`, and it is not what you want. **Replace the generated

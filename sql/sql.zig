@@ -122,6 +122,7 @@ pub const wire = @import("wire.zig");
 pub const where = @import("where.zig");
 pub const statement = @import("statement.zig");
 pub const ordering = @import("ordering.zig");
+pub const composed = @import("composed.zig");
 pub const schema = @import("schema.zig");
 pub const types = @import("types.zig");
 pub const postgres = @import("postgres.zig");
@@ -352,6 +353,13 @@ pub const Given = where.Given;
 /// compiling. What an ordered statement gives up is its plan name.
 pub const Ordering = ordering.Ordering;
 
+/// A statement composed at run time from literals, checked identifiers and
+/// parameters — what a query engine hands `db.composed` (ADR 0283).
+/// `db.compose(c)` makes one spelled for the Db; `Composed.init(arena,
+/// Spelling.of(Dialect))` where no Db is in scope.
+pub const Composed = composed.Composed;
+pub const Spelling = composed.Spelling;
+
 pub const Begin = wire.Begin;
 pub const Isolation = wire.Isolation;
 pub const Lock = dialect.Lock;
@@ -535,6 +543,7 @@ test {
     _ = where;
     _ = statement;
     _ = ordering;
+    _ = composed;
     _ = schema;
     _ = types;
     _ = postgres;

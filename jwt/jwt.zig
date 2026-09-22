@@ -113,6 +113,10 @@ pub const Keyring = keyring_mod.Keyring;
 /// The client is a type parameter, so the module still imports nothing.
 pub const Verifier = verifier_mod.Verifier;
 
+/// The signature memo a ring keeps when asked to (`remember_tokens`);
+/// exported for a program that verifies with `jwt.verify` and its own keys.
+pub const Memo = @import("memo.zig").Memo;
+
 /// Verify a token and read its payload into a struct of your own. Strings in
 /// the result point into `gpa`, so a request arena leaves nothing to free.
 pub const verify = token_mod.verify;
@@ -134,6 +138,7 @@ test {
     _ = token_mod;
     _ = keyring_mod;
     _ = verifier_mod;
+    _ = @import("memo.zig");
 }
 
 test "the module's own example compiles and reads a token end to end" {

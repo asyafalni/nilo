@@ -51,6 +51,7 @@
 const std = @import("std");
 const jwks = @import("jwks.zig");
 const token_mod = @import("token.zig");
+const memo_mod = @import("memo.zig");
 
 pub const Keyring = struct {
     gpa: std.mem.Allocator,
@@ -64,6 +65,8 @@ pub const Keyring = struct {
     /// When the last fetch ran, in seconds, or the minimum for never. What
     /// bounds a refresh an unknown `kid` asks for.
     last_refresh_s: std.atomic.Value(i64) = .init(std.math.minInt(i64)),
+    /// The signatures checked under the current set (`remember_tokens`).
+    memo: ?memo_mod.Memo = null,
 
     pub const Options = struct {
         /// Where the issuer publishes its keys: Google's is
@@ -80,6 +83,14 @@ pub const Keyring = struct {
         /// and one rotation noticed within a minute of the first token
         /// signed under the new key.
         refresh_interval_s: u32 = 60,
+        /// How many verified tokens to remember by digest, so a bearer
+        /// token that comes back skips the signature arithmetic — ES256 is
+        /// 400 µs a verify — and not the claims checks. Zero remembers
+        /// none. A service whose callers hold a handful of long-lived
+        /// tokens wants a few hundred; a site with a token per user wants
+        /// enough for the users on at once. A lookup costs the same at any
+        /// size; the memory is 66 bytes a token (ADR 0285).
+        remember_tokens: u16 = 0,
     };
 
     pub const Error = jwks.Error || error{
@@ -98,11 +109,14 @@ pub const Keyring = struct {
     /// `refresh` has run. `deinit` frees whatever it holds then.
     pub fn init(gpa: std.mem.Allocator, opts: Options) error{OutOfMemory}!Keyring {
         const set = try gpa.create(Set);
+        errdefer gpa.destroy(set);
         set.* = .{ .keys = .{ .all = &.{}, .arena = .init(gpa) } };
-        return .{ .gpa = gpa, .opts = opts, .current = .init(set) };
+        const memo: ?memo_mod.Memo = if (opts.remember_tokens > 0) try memo_mod.Memo.init(gpa, opts.remember_tokens) else null;
+        return .{ .gpa = gpa, .opts = opts, .current = .init(set), .memo = memo };
     }
 
     pub fn deinit(self: *Keyring) void {
+        if (self.memo) |*m| m.deinit(self.gpa);
         const set = self.current.load(.acquire);
         std.debug.assert(set.readers.load(.acquire) == 0); // a verify still in flight
         set.keys.deinit();
@@ -134,6 +148,13 @@ pub const Keyring = struct {
         // once per rotation, so the spin is the right wait here (ADR 0138).
         while (self.crossing.load(.seq_cst) != 0) std.atomic.spinLoopHint();
         while (old.readers.load(.acquire) != 0) std.atomic.spinLoopHint();
+
+        // Nothing remembered under the old set counts: a key that is gone
+        // verified nothing. Cleared *after* the drain, not at the swap — a
+        // reader still pinned on `old` was verifying under its keys, and
+        // would have remembered that digest a moment after a clear at the
+        // swap, leaving a token the new set never saw in the memo.
+        if (self.memo) |*m| m.clear();
         old.keys.deinit();
         self.gpa.destroy(old);
     }
@@ -164,6 +185,7 @@ pub const Keyring = struct {
             .audience = self.opts.audience,
             .now_s = now_s,
             .leeway_s = self.opts.leeway_s,
+            .memo = if (self.memo) |*m| m else null,
         });
     }
 
@@ -376,4 +398,36 @@ test "the ring's issuer and audience are what verify insists on" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(error.WrongIssuer, ring.verify(Sub, arena.allocator(), vector.token, 1_500_000_000));
+}
+
+test "a ring that remembers tokens skips the signature the second time, checks the claims every time, and forgets on a new set" {
+    var opts = google;
+    opts.remember_tokens = 8;
+    var ring: Keyring = try .init(testing.allocator, opts);
+    defer ring.deinit();
+    try ring.load(vector.jwks);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    _ = try ring.verify(Sub, arena.allocator(), vector.token, 1_500_000_000);
+    _ = try ring.verify(Sub, arena.allocator(), vector.token, 1_500_000_000);
+    try testing.expectEqual(@as(u64, 1), ring.memo.?.hits.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), ring.memo.?.misses.load(.monotonic));
+
+    // Remembered or not, an expired token is expired.
+    try testing.expectError(error.Expired, ring.verify(Sub, arena.allocator(), vector.token, 2_000_000_001));
+
+    // One byte of the signature changed is a different token, and it fails
+    // the arithmetic rather than riding the memo.
+    var forged = try testing.allocator.dupe(u8, vector.token);
+    defer testing.allocator.free(forged);
+    forged[forged.len - 1] = if (forged[forged.len - 1] == 'A') 'B' else 'A';
+    try testing.expectError(error.BadSignature, ring.verify(Sub, arena.allocator(), forged, 1_500_000_000));
+
+    // A new set forgets: the token has to prove itself under it again
+    // (the forged one was a miss too, and was not remembered).
+    try ring.load(vector.jwks);
+    _ = try ring.verify(Sub, arena.allocator(), vector.token, 1_500_000_000);
+    try testing.expectEqual(@as(u64, 3), ring.memo.?.misses.load(.monotonic));
 }

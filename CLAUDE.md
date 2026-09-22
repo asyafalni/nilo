@@ -69,7 +69,7 @@ Three files carry context this one deliberately does not repeat:
 - **`CONTEXT.md`** — the project's vocabulary, and the words it refuses to use
   (Ctx not "Context", Str not "string", keep not "dupe", Refusal not "negative
   test"). Match it in code, comments, docs and commit messages.
-- **`docs/adr/`** — 282 binding decisions, each naming the alternative it
+- **`docs/adr/`** — 286 binding decisions, each naming the alternative it
   rejected. Check here before proposing a design change; "why not X?" usually
   already has an answer on file. **ADR 0041 decides which module new work goes
   in and ADR 0042 decides what that module may import**, and they are the two
@@ -534,8 +534,13 @@ answered goes in `docs/decided.md`, and what a user has to change goes in
 it in five other places — `.version` in `build.zig.zon`, the badge and the
 `?ref=` in `README.md`, the `?ref=` in `docs/guide/getting-started.md`, the
 "needs Zig" line in `docs/roadmap.md`, and the comment in
-`stress/arsip/build.zig.zon`. Tagging then moves the section onto that tag's
-page — `gh release create vX.Y.Z --verify-tag --notes-file …`, with every `](./`
+`stress/arsip/build.zig.zon`. **The two `?ref=` lines carry the tag's commit
+after a `#`**, and the commit exists only once the tag does: write the lines
+with the new tag and the commit `git rev-parse vX.Y.Z^{commit}` will answer
+*after* tagging, or tag first and amend — a `?ref=` alone is not a pin,
+because the tags are annotated and Zig 0.16's fetcher hands `main` for one
+(`docs/history.md`, "A pin that was not one"). Tagging then moves the section
+onto that tag's page — `gh release create vX.Y.Z --verify-tag --notes-file …`, with every `](./`
 link rewritten to a blob URL pinned to the tag, because a relative link does not
 resolve on a release page. What stays in the file is one line under
 `## Released` pointing at the page, and any README link into the section it took

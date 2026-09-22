@@ -49,6 +49,15 @@ pub var capability: ?Str = undefined;
 // Not `tag`, which two snippets further down already use as a loop capture.
 pub var tag_name: []const u8 = undefined;
 
+// What a query engine holds when it composes a statement (ADR 0283): names
+// out of a model, a range and a ceiling out of a request.
+pub var dimension: []const u8 = undefined;
+pub var measure: []const u8 = undefined;
+pub var rollup: []const u8 = undefined;
+pub var from: i64 = undefined;
+pub var to: i64 = undefined;
+pub var limit: u64 = undefined;
+
 // The function the `app.before` blocks register. A declaration block that
 // introduces a function is kept out of the statements below it (its
 // parameters and the file-scope names here cannot both exist), so the

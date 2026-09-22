@@ -1853,6 +1853,14 @@ const always_fired: core.Limits = .{ .vtable = &.{
             return true;
         }
     }.f,
+    .waiting = struct {
+        fn f(_: ?*anyopaque) u64 {
+            return 0;
+        }
+    }.f,
+    .waited = struct {
+        fn f(_: ?*anyopaque, _: u64) void {}
+    }.f,
 } };
 
 test "a failure this call's own clock caused is a timeout, whatever it is called" {

@@ -50,6 +50,7 @@ const rows = try db.select(User, &run, .{ .where = .{ .age = .{ .gt = 18 } } });
 | `run.str(bytes)` | `Str` — text you allocated from `run.arena()`, stamped with this tick |
 | `run.entropy(n)` | `![n]u8` from the operating system. `error.NoIo` on a Run built by `init` |
 | `run.entropyInto(buf)` | `!void` — the same, at a width nobody said while compiling |
+| `run.loop()` | `?std.Io` — the loop this Run was made on, for a job that writes a file or sleeps between attempts; null for a `Run.init(gpa)` |
 | `run.give(V, value)` | hand this tick a value for something below to ask for |
 | `run.resolve(V)` | `!V` — what `give` put there. `error.NotGiven` if nothing did |
 | `run.reset()` | end the tick: the memory goes back, what was given goes with it, and every `Str` from it goes stale |
@@ -265,6 +266,11 @@ handler GET /users/7 held its thread for 2003ms. Every other request being
 served on that thread waited the whole time. Hand the call that waits to
 nilo.blocking (ADR 0014).
 ```
+
+A wait inside a service — `db.raw` on its socket, a pool a caller queues on —
+is a park too, and the service says so through `Limits.waiting`/`waited`
+([ADR 0286](../adr/0286-a-services-wait-on-its-own-socket-is-a-park.md)); a
+slow query is not a report, a slow loop is.
 
 It fires on the first request, with nobody else waiting, which is the point —
 under `curl` the mistake is otherwise invisible. `block_warning_ms` is the
