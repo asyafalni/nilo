@@ -4184,6 +4184,24 @@ pub fn build(b: *std.Build) void {
         });
         b.step("bench-tls-server", "The benchmark server over TLS, for what the encryption costs a request and an idle connection")
             .dependOn(&b.addInstallArtifact(bench_tls_server, .{}).step);
+
+        // Both directions loaded at once, which is the one thing the server
+        // above does not do: a 10 KB body in and the same 10 KB out, with
+        // TLS a switch rather than a second binary so the plain run is the
+        // same machine code. The row ADR 0288 left open.
+        const bench_echo_server_module = b.createModule(.{
+            .root_source_file = b.path("bench/echo_server.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .strip = stripMeasured(strip, .ReleaseFast),
+            .imports = &.{.{ .name = "nilo_http", .module = bench_http }},
+        });
+        const bench_echo_server = b.addExecutable(.{
+            .name = "nilo-bench-echo-server",
+            .root_module = bench_echo_server_module,
+        });
+        b.step("bench-echo-server", "A 10 KB body echoed over TLS and in plain, for what the record layer costs both directions at once")
+            .dependOn(&b.addInstallArtifact(bench_echo_server, .{}).step);
     }
 
     // The server `wstest` is driven at, which is a conformance run rather than

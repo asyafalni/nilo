@@ -2240,6 +2240,98 @@ field, and a brotli entry's is smaller than any gzip's. How much smaller
 on these bodies has not been measured here, and the ADR says why it is a
 decision of its own.
 
+## What TLS carries at saturation, and the build flag that decides it
+
+[ADR 0288](../../docs/adr/0288-tls-is-an-option-a-build-asks-for.md) closed
+saying "throughput at saturation over `https://` was not measured, for want
+of a load generator with TLS on the box, and is a roadmap row". This is that
+row. Ryzen 7 9700X (8 cores, 16 threads), Linux 7.2.5, Zig 0.16.0, over
+loopback and not a published port, against `219d51b`.
+
+The shape is the benchmark arena's `8gbit` profile, which is the only one
+anywhere here that loads ingest and egress at once: `POST /echo`, a
+10,240-byte body up and the same bytes back, 512 connections, the rate held
+at 50,000 req/s. That is 512 MB/s through the decrypt path and 512 MB/s
+through the encrypt path. The server is `bench/echo_server.zig`, where TLS
+is an env switch rather than a second binary, pinned to four physical cores
+(CPUs 0-3,8-11) with eight executors; the generator is **zrk 2.3.0, the
+board's own**, built from HttpArena's `docker/zrk.Dockerfile` and pinned to
+the other four. Three rounds, interleaved, spread under 2%.
+
+| build | rate_ratio | MB/s | p50 | p99 | server CPU/req |
+|---|---|---|---|---|---|
+| plain, the control | 0.995 | 491 | 0.05 ms | 0.08 ms | 6.8 µs |
+| TLS, `-Dcpu=x86_64_v3+aes+pclmul` | 0.993 | 491 | 0.07 ms | 0.11 ms | 14.6 µs |
+| TLS, `-Dcpu=x86_64_v3` | **0.389** | 192 | 3,040 ms | 5,990 ms | 407 µs |
+
+Closed-loop, the same pinning, two rounds: plain 923,000 req/s and 9.1 GB/s;
+TLS 303,700 req/s and 3.0 GB/s. Halving the server's cores took the TLS
+ceiling to 206,000 rather than to 152,000 and the server sat at ~87% CPU
+both times, so 300,000 is a floor on the server rather than its ceiling —
+the generator is near its own limit there too. It is six times the profile's
+requirement either way, and at the profile's rate the server spends 7.3 of
+the 80 CPU-seconds available in a ten-second window, about 9% of four cores.
+
+### The build flag is the whole story, and `x86_64_v3` is the wrong one
+
+**Zig's `x86_64_v3` carries no `aes` and no `pclmul`.** AES-NI is not part of
+the x86-64-v3 psABI level; it is a separate feature flag. Read off the
+compiler:
+
+```
+x86_64_v3    aes=false vaes=false pclmul=false avx2=true
+znver5       aes=true  vaes=true  pclmul=true  avx2=true
+```
+
+What that does to `std.crypto`, one core, 512 MB per measurement,
+`taskset`-pinned, encrypt and decrypt timed apart:
+
+| aead | record | `x86_64_v3` enc/dec | `+aes+pclmul` enc/dec |
+|---|---|---|---|
+| AES-256-GCM | 16 KB | **71 / 71 MB/s** | **5,133 / 5,102 MB/s** |
+| AES-128-GCM | 16 KB | 74 / 74 | 5,850 / 5,857 |
+| ChaCha20-Poly1305 | 16 KB | 734 / 735 | 734 / 735 |
+
+**AES-256-GCM is the row that matters, and tls.zig's own fallback cannot
+save it.** The library orders its TLS 1.3 suites on
+`crypto.core.aes.has_hardware_support` and puts ChaCha20 first when it finds
+none, which would be ten times quicker for that build. It never runs:
+`handshake_server.zig` takes the first suite in the *client's* list it
+supports, and an OpenSSL client offers AES-256-GCM first. Both builds were
+asked, and both answered the same:
+
+```
+echo-aesni   New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+echo-v3      New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+```
+
+So `bench/arena/Dockerfile`, which builds amd64 with `-Dcpu=x86_64_v3`, puts
+software AES on the hot path of every TLS profile. At 50,000 req/s it needs
+about seven cores to decrypt and seven to encrypt on an eight-core box; what
+it does instead is saturate, deliver 39% of the offered rate and answer at a
+six-second p99.
+
+### What did not move, against expectation
+
+**`write_buffer` at 16 KB is not worth anything, and at saturation it
+costs.** A 10 KB answer leaves as three records at the 4 KB default and one
+at 16 KB, and the AEAD table above makes a 16 KB record 8% cheaper than a
+4 KB one, so the change looked free. At the profile's rate it is inside the
+spread (14.70 µs against 14.74). Closed-loop it is **16% slower**, 255,500
+req/s against 303,700, consistent across both rounds. The arithmetic says
+why: 20 KB of AEAD is 4 µs of a 14.6 µs request, so 8% of it is 0.3 µs, and
+against that the larger buffers cost 512 connections × 12 KB more of
+working set. The published default stands.
+
+### Can it be pushed further
+
+The TLS request costs 14.6 µs against the plain 6.8, and about 4 µs of the
+difference is the AEAD itself at 20 KB a request. The rest is record
+framing and the copies through the cleartext buffers, which is where
+`Ktls` would go — the roadmap row for it is unchanged and this run does not
+settle it. Nothing here is worth doing for `8gbit`, which the server holds
+at 9% of four cores.
+
 ## What TLS costs a listener, and what it costs one that never asked
 
 [ADR 0288](../../docs/adr/0288-tls-is-an-option-a-build-asks-for.md) is the

@@ -163,9 +163,14 @@ deployment wants session resumption, which the library does not have and a
 proxy does. **Build for the ISA you run on**: the baseline row is what a
 `-Dtarget=x86_64-linux-gnu` binary with no `-Dcpu` does on a machine that
 has AES-NI, and it is six times slower per request than the same machine
-with the instructions used. Throughput at saturation over `https://` was
-not measured, for want of a load generator with TLS on the box, and is a
-roadmap row.
+with the instructions used. **How much that flag is worth was measured
+later and is larger than this table suggests**: `std.crypto`'s AES-256-GCM,
+which is what an OpenSSL client negotiates, is 71 MB/s a core without the
+instructions and 5,133 with, and a server built `-Dcpu=x86_64_v3` (which
+carries no `aes` and no `pclmul`) cannot hold 50,000 req/s of a 10 KB echo
+on eight cores while one built `+aes+pclmul` does it at 9% of four. The run
+is in [`bench/result/http.md`](../../bench/result/http.md), and it closes
+the roadmap row this paragraph used to name.
 
 ## What was rejected
 
