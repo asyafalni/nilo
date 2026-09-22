@@ -144,6 +144,19 @@ const engine_limits: Limits.VTable = .{
             return engine.firedOperation(state);
         }
     }.f,
+    // A service's wait on its own socket parks the fiber like any other
+    // wait; the watchdog learns of it here, or charges it to the handler
+    // (ADR 0286).
+    .waiting = struct {
+        fn f(_: ?*anyopaque) u64 {
+            return watchdog.waitingAnywhere();
+        }
+    }.f,
+    .waited = struct {
+        fn f(_: ?*anyopaque, token: u64) void {
+            watchdog.waitedAnywhere(token);
+        }
+    }.f,
 };
 
 /// What a Service is handed at startup. There is no `target`: the Engine arms

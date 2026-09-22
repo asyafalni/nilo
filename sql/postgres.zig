@@ -38,10 +38,15 @@ const pg = @import("pg");
 
 const types = @import("types.zig");
 const wire = @import("wire.zig");
+const core = @import("nilo_core");
 
 /// A pool of connections, behind the contract in `wire.zig`.
 pub const Wire = struct {
     pool: *pg.Pool,
+    /// What the Engine handed `nilo_start`: every wait on a connection or
+    /// its socket is reported through it, so the watchdog counts the fiber
+    /// as parked rather than as a handler holding its thread (ADR 0286).
+    limits: core.Limits = .off,
 
     /// One result set, and the connection it is being read from. Both go
     /// back in `close`.
@@ -60,6 +65,12 @@ pub const Wire = struct {
         /// with an open transaction on it — the exact failure the header of
         /// `wire.zig` is about.
         owns_conn: bool = true,
+        /// The wait `run` opened and this result is still inside: the
+        /// exchange and every row read after it reach the socket, and are
+        /// one park to the watchdog rather than one per row (ADR 0286).
+        /// Closed by `close`, where the handler has the whole result.
+        limits: core.Limits = .off,
+        wait: u64 = 0,
 
         /// Give the connection back, whatever happened. Named rather than
         /// deferred inside `run` because the caller's loop outlives that
@@ -67,6 +78,7 @@ pub const Wire = struct {
         pub fn close(self: *Rows) void {
             self.result.deinit();
             if (self.owns_conn) self.conn.release();
+            self.limits.waited(self.wait);
         }
     };
 
@@ -143,13 +155,15 @@ pub const Wire = struct {
         ) wire.Error!Rows {
             if (self.done) return error.QueryFailed;
             self.fresh();
+            const w = self.wire.limits.waiting();
+            errdefer self.wire.limits.waited(w);
             const result = self.conn.queryOpts(sql, opened(values), .{
                 .allocator = arena,
                 .cache_name = plan,
             }) catch |err| {
                 return reported(self.conn, err, arena, problem);
             };
-            return .{ .conn = self.conn, .result = result, .owns_conn = false };
+            return .{ .conn = self.conn, .result = result, .owns_conn = false, .limits = self.wire.limits, .wait = w };
         }
 
         pub fn exec(
@@ -162,6 +176,8 @@ pub const Wire = struct {
         ) wire.Error!usize {
             if (self.done) return error.QueryFailed;
             self.fresh();
+            const w = self.wire.limits.waiting();
+            defer self.wire.limits.waited(w);
             const count = self.conn.execOpts(sql, opened(values), .{
                 .allocator = arena,
                 .cache_name = plan,
@@ -190,6 +206,8 @@ pub const Wire = struct {
             // the unit the argument is named for.
             const sql = std.fmt.bufPrint(&buf, "SET LOCAL statement_timeout = {d}", .{ms}) catch
                 unreachable;
+            const w = self.wire.limits.waiting();
+            defer self.wire.limits.waited(w);
             _ = self.conn.exec(sql, .{}) catch |err| return translate(self.conn, err);
         }
 
@@ -227,6 +245,8 @@ pub const Wire = struct {
             var buf: [verb.len + name_prefix.len + 10]u8 = undefined;
             const sql = std.fmt.bufPrint(&buf, verb ++ name_prefix ++ "{d}", .{id}) catch
                 unreachable;
+            const w = self.wire.limits.waiting();
+            defer self.wire.limits.waited(w);
             _ = self.conn.exec(sql, .{}) catch |err| return translate(self.conn, err);
         }
 
@@ -244,6 +264,8 @@ pub const Wire = struct {
             self.revive();
             self.fresh();
             defer self.conn.release();
+            const w = self.wire.limits.waiting();
+            defer self.wire.limits.waited(w);
             _ = self.conn.exec("COMMIT", .{}) catch |err| return translate(self.conn, err);
         }
 
@@ -259,6 +281,8 @@ pub const Wire = struct {
             // usual reason anybody rolls back at all.
             self.revive();
             defer self.conn.release();
+            const w = self.wire.limits.waiting();
+            defer self.wire.limits.waited(w);
             _ = self.conn.exec("ROLLBACK", .{}) catch |err| {
                 std.log.err(
                     "nilo_sql: a transaction could not be rolled back ({s}). The connection " ++
@@ -277,6 +301,8 @@ pub const Wire = struct {
     /// socket is a constant this file assembled while compiling.
     pub fn begin(self: *Wire, arena: std.mem.Allocator, comptime opts: wire.Begin) wire.Error!Tx {
         _ = arena;
+        const w = self.limits.waiting();
+        defer self.limits.waited(w);
         var conn = self.pool.acquire() catch return error.Disconnected;
         errdefer conn.release();
         _ = conn.exec(comptime beginText(opts), .{}) catch |err| return translate(conn, err);
@@ -331,7 +357,7 @@ pub const Wire = struct {
         defer scratch.deinit();
 
         const pool = try pg.Pool.init(io, gpa, try poolOpts(uri, scratch.allocator(), opts));
-        return .{ .pool = pool };
+        return .{ .pool = pool, .limits = opts.limits };
     }
 
     /// Everything `pg.Pool.init` needs, in one value — which is the point:
@@ -617,6 +643,11 @@ pub const Wire = struct {
         plan: ?[]const u8,
         problem: ?*?wire.Problem,
     ) wire.Error!Rows {
+        // The wait stays open until `Rows.close`: the rows are read off the
+        // socket one `next` at a time, and a pair around each read would be
+        // two calls and a clock per row (ADR 0286).
+        const w = self.limits.waiting();
+        errdefer self.limits.waited(w);
         var conn = self.pool.acquire() catch return error.Disconnected;
         errdefer conn.release();
 
@@ -626,7 +657,7 @@ pub const Wire = struct {
         }) catch |err| {
             return reported(conn, err, arena, problem);
         };
-        return .{ .conn = conn, .result = result };
+        return .{ .conn = conn, .result = result, .limits = self.limits, .wait = w };
     }
 
     /// The next row, or false when the set is finished. The row itself is
@@ -802,6 +833,8 @@ pub const Wire = struct {
         plan: ?[]const u8,
         problem: ?*?wire.Problem,
     ) wire.Error!usize {
+        const w = self.limits.waiting();
+        defer self.limits.waited(w);
         var conn = self.pool.acquire() catch return error.Disconnected;
         defer conn.release();
         const count = conn.execOpts(sql, opened(values), .{

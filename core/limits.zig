@@ -93,6 +93,14 @@ pub const Limits = struct {
         arm: *const fn (target: ?*anyopaque, slot: *anyopaque, ms: u32) void,
         release: *const fn (target: ?*anyopaque, slot: *anyopaque) void,
         fired: *const fn (target: ?*anyopaque, slot: *anyopaque) bool,
+        /// A service is about to wait on the operating system through its
+        /// own `Io` — a socket the driver reads, a pool a caller queues on.
+        /// The fiber parks there like anywhere else, and the Engine's
+        /// watchdog has to be told, or the wait is charged to the handler
+        /// as time it held its thread (ADR 0286). `waiting` returns a token
+        /// `waited` takes back.
+        waiting: *const fn (target: ?*anyopaque) u64,
+        waited: *const fn (target: ?*anyopaque, token: u64) void,
     };
 
     /// No Engine underneath: arming does nothing and nothing ever fires. What
@@ -121,12 +129,31 @@ pub const Limits = struct {
         return self.vtable == &noop;
     }
 
-    const noop: VTable = .{
+    /// Mark the start of a wait on the operating system; see `VTable.waiting`.
+    pub fn waiting(self: Limits) u64 {
+        return self.vtable.waiting(self.target);
+    }
+
+    pub fn waited(self: Limits, token: u64) void {
+        self.vtable.waited(self.target, token);
+    }
+
+    /// The vtable of `none`, for a test that builds a vtable of its own and
+    /// wants the two wait hooks to do nothing.
+    pub const noop: VTable = .{
         .arm = struct {
             fn f(_: ?*anyopaque, _: *anyopaque, _: u32) void {}
         }.f,
         .release = struct {
             fn f(_: ?*anyopaque, _: *anyopaque) void {}
+        }.f,
+        .waiting = struct {
+            fn f(_: ?*anyopaque) u64 {
+                return 0;
+            }
+        }.f,
+        .waited = struct {
+            fn f(_: ?*anyopaque, _: u64) void {}
         }.f,
         .fired = struct {
             fn f(_: ?*anyopaque, _: *anyopaque) bool {
@@ -229,6 +256,8 @@ test "a Limits with no Engine says so, and one with a vtable of its own does not
                 return true;
             }
         }.f,
+        .waiting = Limits.noop.waiting,
+        .waited = Limits.noop.waited,
     };
     const with_engine: Limits = .{ .vtable = &armed };
     try testing.expect(!with_engine.engineless());

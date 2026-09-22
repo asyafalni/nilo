@@ -266,6 +266,11 @@ served on that thread waited the whole time. Hand the call that waits to
 nilo.blocking (ADR 0014).
 ```
 
+A wait inside a service — `db.raw` on its socket, a pool a caller queues on —
+is a park too, and the service says so through `Limits.waiting`/`waited`
+([ADR 0286](../adr/0286-a-services-wait-on-its-own-socket-is-a-park.md)); a
+slow query is not a report, a slow loop is.
+
 It fires on the first request, with nobody else waiting, which is the point —
 under `curl` the mistake is otherwise invisible. `block_warning_ms` is the
 threshold and `0` turns it off. What is measured is the longest stretch the

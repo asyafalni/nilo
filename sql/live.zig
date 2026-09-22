@@ -577,6 +577,56 @@ test "an unchecked Db on the defaults has a connection to lend the moment it sta
     try testing.expectEqual(@as(?i64, 1), try db.rawOne(i64, &run, "SELECT 1::bigint", .{}));
 }
 
+/// A `Limits` that counts what the wire reports through it, for the test below.
+var waits_reported: usize = 0;
+var waits_closed: usize = 0;
+const counting_limits: core.Limits = .{ .vtable = &.{
+    .arm = core.Limits.noop.arm,
+    .release = core.Limits.noop.release,
+    .fired = core.Limits.noop.fired,
+    .waiting = struct {
+        fn f(_: ?*anyopaque) u64 {
+            waits_reported += 1;
+            return 1;
+        }
+    }.f,
+    .waited = struct {
+        fn f(_: ?*anyopaque, token: u64) void {
+            std.debug.assert(token == 1);
+            waits_closed += 1;
+        }
+    }.f,
+} };
+
+test "every wait on the database is reported through the Limits the wire was started with" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var wire = try postgres.Wire.open(threaded.io(), gpa, url, .{ .size = 1, .connect_on_init = 1, .limits = counting_limits });
+    defer wire.close();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    waits_reported = 0;
+    waits_closed = 0;
+    // One statement is one wait, from the exchange to the close, however
+    // many rows come off the socket in between (ADR 0286).
+    var rows = try wire.run(arena.allocator(), "SELECT generate_series(1, 1000)", .{}, null, null);
+    var n: usize = 0;
+    while (try wire.next(&rows)) n += 1;
+    try testing.expectEqual(@as(usize, 1000), n);
+    try testing.expectEqual(@as(usize, 1), waits_reported);
+    try testing.expectEqual(@as(usize, 0), waits_closed);
+    rows.close();
+    try testing.expectEqual(@as(usize, 1), waits_closed);
+    // A transaction reports its BEGIN, its statement and its COMMIT.
+    const before = waits_reported;
+    var tx = try wire.begin(arena.allocator(), .{});
+    _ = try tx.exec(arena.allocator(), "SELECT 1", .{}, null, null);
+    try tx.commit();
+    try testing.expect(waits_reported - before >= 3);
+}
+
 // -- the write half, and the things built on it ---------------------------
 
 /// A `Db` wired to an already-open pool, plus an App and a Client to drive
