@@ -2161,6 +2161,85 @@ the teardown. ADR 0273's upstream row, a spawn homed on the accepting
 executor, is the next lever on it, and the same for HTTP's short-lived
 shape.
 
+## What gzipping an answer costs, and what putting the compressor on the stack would have
+
+[ADR 0287](../../docs/adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)
+is the decision; these are the three runs under it, all on the Ryzen 7
+9700X (8 cores, 16 threads) under Linux 7.2.5, Zig 0.16.0, against
+`dc19600` where a before is named.
+
+**The stack a `Compress.init` takes, read off the assembly.** A scratch
+program with two `noinline` wrappers, one assigning `try
+Compress.init(...)` into a heap slot and one `catch`-ing it, built
+`-OReleaseFast -femit-asm`: both prologues reserve **99,048 and 99,032
+bytes** (`sub rsp, 99048`), which is the 96 KB `buffered_tokens` built as a
+temporary from its `.empty` constant and copied in; the 128 KB hash table
+is splatted in place. The same wrapper doing the assignment field by field
+(`compress.reset`) reserves **40 bytes**, and the deepest frames under a
+`writeAll` + `finish` are `Compress.huffman.build` at 4,936 bytes and the
+`sort.block` instantiation under it at 4,888. This is the number that
+moved the compressor off the fiber and into a pool: on a fiber a frame is
+held at its high-water mark for the connection's life (ADR 0063), and
+99 KB × 4,096 keep-alive connections is 400 MB.
+
+**What the compressor costs per body: `zig build bench-compress`.** One
+thread, one pool slot, the request arena reset after each body, 2,000
+timed bodies after 100 warm ones, `std.json` bodies of the arena's three
+`json-comp` shapes:
+
+| items | bytes in | `.fastest` | `.default` | `.best` |
+|---|---|---|---|---|
+| 25 | 4,091 | 873 B, 35.0 µs | 748 B, 37.5 µs | 744 B, 38.1 µs |
+| 40 | 6,553 | 1,252 B, 44.5 µs | 1,041 B, 49.7 µs | 1,036 B, 51.3 µs |
+| 50 | 8,178 | 1,483 B, 50.6 µs | 1,225 B, 58.4 µs | 1,218 B, 63.7 µs |
+
+`reset` alone, timed the same way in the scratch program, is **6.0–6.4 µs**,
+nearly all of it the 128 KB `lookup.head` clear, so the three levels differ
+by less than that table's reader expects: the fixed cost is a sixth of a
+4 KB body. The clear is not optional. `matchAndAddHash` subtracts a head
+entry's distance from the current index with no bounds check, so a stale
+entry from the previous body reads before the buffer. What the table
+decided: `.default` as the default (`.best` is under 1% smaller for 5–9%
+more time), and the roadmap's stream question left open rather than
+answered with a compressor held across writes.
+
+**Binary size, both trees stripped `ReleaseFast`, `-Dtarget=x86_64-linux-gnu`.**
+Two measurements, because the change carried two things:
+
+| binary | before | feature alone | after | net | of which the qvalue scan |
+|---|---|---|---|---|---|
+| `example-hello` | 981,248 | +4,896 | 956,640 | **−24,608** | −29,504 |
+| `example-rest` | 1,150,872 | +4,064 | 1,147,224 | **−3,648** | −7,712 |
+| `nilo-hello` (bench) | 990,120 | +3,920 | 964,568 | −25,552 | −29,472 |
+| `example-orders` | 1,272,456 | +3,888 | 1,268,648 | −3,808 | −7,696 |
+| `example-spa` | 1,149,824 | +5,600 | 1,125,936 | −23,888 | −29,488 |
+
+The last column was measured on an intermediate tree, the feature with
+`parseFloat` still in against the same tree with the scan, and the feature
+column is the net with that saving added back; the first, third and fourth
+columns are direct. The feature is `Ctx.squeezed`, `Pool.eligible`,
+`compressible` and `Pool.gzip`: 3.9–5.6 KB the linker keeps because the
+switch is a runtime null on the Ctx. Deflate itself was already in every binary (`compress.flate.
+Compress.drain` is in the before `nm` of `hello`), because the API reader
+page is a static set and static sets gzip at load. The second column is
+the `Accept-Encoding` reader's `std.fmt.parseFloat(f32, q)` replaced by a
+digit scan: **25 KB** on a binary that parses no other float, 3.7 KB on
+the three that already do (`orders`, `rest`, `sqlite`). It had been there
+since static gzip landed. ADR 0018's table carries the row.
+
+### Can it be pushed further
+
+The 6 µs reset is the lever, and it is the standard library's: a `head`
+table that recorded which entries are live (a generation counter beside
+each, or a clear bounded by what the last body touched) would make a
+second body cost only its own matching. Not this repository's to change
+without a fork of `Compress.zig`, and not worth one for a sixth of a small
+body. Brotli is the other lever on the *score*, not the cost: the arena
+weights bytes per response quadratically against the smallest body in the
+field, and a brotli entry's is smaller than any gzip's. How much smaller
+on these bodies has not been measured here, and the ADR says why it is a
+decision of its own.
+
 ## What TLS costs a listener, and what it costs one that never asked
 
 [ADR 0288](../../docs/adr/0288-tls-is-an-option-a-build-asks-for.md) is the

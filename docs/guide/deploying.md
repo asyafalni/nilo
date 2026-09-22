@@ -629,8 +629,9 @@ metrics tell you something is wrong, a request id tells you which request.
 
 ## What isn't here yet
 
-`permessage-deflate`, and compression of a handler's response (files are
-compressed — see [Static files](./static-files.md#compression)).
+`permessage-deflate`, and compression of a stream or an event stream. A
+whole answer is compressed, per request ([Responses](./responses.md#compression)),
+and a file is, once, at load ([Static files](./static-files.md#compression)).
 
 Templates are a refusal rather than a backlog item: nilo is for building APIs
 and services, and rendering pages is not what it is for. The reasoning is in

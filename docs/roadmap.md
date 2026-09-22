@@ -60,10 +60,6 @@ Inside the first three, entries are grouped by module, because **two modules tou
 
 **Needs:** the dozen lines, and a Refusal beside the missing-file one, with a fixture key that is not the fixture certificate's.
 
-**A response body is never compressed, and only a held file is.** Static files under the spill threshold are gzipped once while the App is built, which is the shape that costs nothing per request ([static files](./guide/static-files.md#compression)). A file over it is opened per request and so has no "once" to be compressed in ([ADR 0037](./adr/0037-a-file-too-big-to-hold-is-opened-not-read.md)), and a handler returning JSON gets no such thing either. A deflate compressor needs a 64 KB window, so one per connection would multiply the 4,669 bytes an idle connection holds, and one per request would break the allocation budget ([ADR 0018](./adr/0018-the-trade-budget-has-three-axes.md)). **The shape that fits is a pool of compressors sized to the thread count rather than the connection count**: four cores, 256 KB, and a request borrows one for as long as it is writing. The inbound direction closed without the pool ([ADR 0251](./adr/0251-a-gzipped-body-is-inflated-into-the-buffer-that-holds-it.md)); what is left inbound is `c.bodyStream()`, which has no buffer to be the window, and every coding but gzip.
-
-**Needs:** what happens when the pool is empty, what it does to a stream, and what it does to SSE, which is the one thing that must never be buffered. A proxy in front does this today and does it well, in both directions.
-
 **A handler that reads a body nilo does not know takes a `*Ctx`, and the document says nothing about it.** [ADR 0195](./adr/0195-a-type-can-write-its-own-answer.md) closed this on the way out: a type carrying `nilo_content_type` and `nilo_write` goes out as whatever it writes, under its own label, and the description names it. On the way in there is no third answer yet — a body is JSON, a form, or `c.body()` — so a route receiving protobuf, MsgPack or a vendor's binary takes a `*Ctx`, decodes by hand, and the API description cannot say what the route reads. The mirror is one declaration on the type: the same `nilo_content_type`, and a reader from the body's bytes into `Self`, checked and refused where the type is named the way `nilo_parse` is ([ADR 0142](./adr/0142-a-path-param-can-parse-itself.md)). nilo supplies the door and the caller brings the codec, which is what "no protobuf" ([decided](./decided.md#not-coming)) should cost.
 
 **Needs:** two things. The name — `nilo_read(text, arena) !Self` is already the column protocol ([ADR 0055](./adr/0055-a-column-type-can-come-from-outside-this-module.md)) with the same shape, and a type can legitimately be both a column and a body. And what the document says for a body with no JSON schema: the content type and a bare description, the way [ADR 0076](./adr/0076-a-type-that-writes-its-own-json-says-so.md) words a type that writes its own body, or a `nilo_openapi` the type declares.
@@ -193,6 +189,10 @@ The design is known and priced; what is missing is somebody who needs it. Bring 
 **More than one certificate on a listener, chosen by SNI.** One `CertKeyPair` per listener today. Two names on one certificate is the answer for most of the cases; the one it does not cover is two tenants whose certificates cannot share a file.
 
 **Needs:** that deployment.
+
+**A stream is never compressed, and neither is an event stream; and gzip is the only coding.** `app.compress` gzips a whole body on a compressor borrowed for the CPU it takes and handed back before the socket is written, which is what keeps one compressor per thread enough ([ADR 0287](./adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)). A stream has no whole body and would hold its compressor across every write, so its shape is a second pool larger than the thread count and chunked framing; an event stream must never be buffered and stays out on principle. Brotli is a C dependency, and a decision of its own.
+
+**Needs:** a caller streaming something text and large enough that the bandwidth matters, or a scoreboard reason for brotli that survives the dependency it brings.
 
 ### Modules that do not exist yet
 

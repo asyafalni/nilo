@@ -3999,6 +3999,7 @@ given its connection; the hook had not, because the dial was gated on
 The live test that holds it goes red on the old rule — checked by putting
 the old rule back. **A fix scoped to the caller that found it is the bug
 with one caller subtracted.**
+
 ## The select-list counter read `WITHIN GROUP` as `GROUP BY`
 
 `GROUP` at depth 0 ended the list, so a percentile beside a count —
@@ -4009,6 +4010,7 @@ CTE for a week before the cause was read. The counter now wants the `BY`.
 Same lesson as ADR 0154's `*`: **a keyword is a keyword in a position, and
 the scanner knows positions by depth alone** — a word that means two things
 at one depth needs the next word.
+
 ## A pin that was not one
 
 **The install line did not pin.** `zig fetch --save
@@ -4038,6 +4040,14 @@ from.
 ## The dev loop was offered as a watcher of a directory it never reads
 
 Two files said `zig build dev` watching a bundler's output directory would restart the server when the bundle changed, and neither had been run. It cannot: the loop restarts on the binary and on nothing else (ADR 0259), and a save under a front end kept beside the server moves nothing, which is what a project with both wants, and nothing said it had. **A sentence about what a tool watches is a claim until a save is made under it.** The saves are in [`build.md`](../bench/result/build.md#what-a-save-has-to-touch), the line a reader needs is [What a save has to touch](./guide/getting-started.md#what-a-save-has-to-touch), and `bench/devloop.py` is what keeps it from being prose again.
+
+## The compressor's cost was not its window, and the number was in the assembly
+
+The roadmap had carried response compression for a year with the design settled: a pool of compressors sized to the thread count, because a deflate window is 64 KB and one per connection multiplies 4,669 bytes by fifteen. Building it found the premise was a fraction of the figure. `std.compress.flate.Compress` in Zig 0.16 is `~224 KB` of struct beside the window, and its `init` builds the 96 KB token buffer as a temporary before copying it into place: **99,048 bytes of stack for one call**, read off `-femit-asm` of a `ReleaseFast` build. On a fiber that is held at the high-water mark for the connection's life, so the obvious shape, `init` on the handler's stack, would have passed every test and shown up only in `bench/mem.py` on a busy server as 400 MB across 4,096 keep-alive connections. Resetting the compressor in place, field by field, is 40 bytes on the same measurement, and a byte-for-byte test against `init`'s own output is what holds the standard library's fields where the reset expects them ([ADR 0287](./adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
+
+**A stack frame is measured, not reasoned about.** Result-location semantics were expected to write `init`'s struct straight into the heap slot, through `try` or `catch` alike, and the reasoning was sound about the 128 KB hash table and wrong about the 96 KB beside it. Ten lines of scratch program and one `grep 'sub.*rsp'` settled it in under a minute, which is less time than the argument took.
+
+**The `Accept-Encoding` reader had cost every binary 25 KB since static gzip landed.** It answered "is this `q=0`" with `std.fmt.parseFloat(f32, …)`, and the size table in ADR 0018 had said from its first row that the cost of a feature in Zig is whichever generic it wakes. Nobody measured the reader because it was six lines; a digit scan took `hello` from 981,248 to 956,640 bytes stripped, more than the feature it landed with added. A six-line function is measured like a feature when it names a generic ([`bench/result/http.md`](../bench/result/http.md)).
 
 ## A guess about TLS's memory was a guess about a design
 

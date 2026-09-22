@@ -16,6 +16,8 @@ const mw = @import("middleware.zig");
 const static_mod = @import("static.zig");
 const proxies_mod = @import("proxies.zig");
 const openapi = @import("openapi.zig");
+const compress_mod = @import("compress.zig");
+const bulkhead = @import("bulkhead.zig");
 
 const App = app_mod.App;
 
@@ -134,6 +136,28 @@ pub fn resolveChains(self: *App) !void {
         self.static_chains.appendAssumeCapacity(try chainsFor(self, set));
     }
     try sizeMetrics(self);
+    try sizeCompressors(self);
+}
+
+/// Give `compress()` its pool, here rather than at `compress()`, because
+/// the thread count is not known until `listen()` says it, and one per
+/// thread is the whole design (ADR 0287).
+///
+/// Once. The test client resolves the chains before every request, and
+/// `~288 KB` a slot is not something to take again each time; a pool
+/// already the right size is kept.
+pub fn sizeCompressors(self: *App) !void {
+    const options = self.compress_options orelse return;
+    const count: usize = if (self.compress_slots > 0)
+        self.compress_slots
+    else
+        bulkhead.threadCount(bulkhead.Options{});
+    if (self.compressors) |*pool| {
+        if (pool.len() == count) return;
+        pool.deinit(self.gpa);
+        self.compressors = null;
+    }
+    self.compressors = try compress_mod.Pool.init(self.gpa, count, options);
 }
 
 /// Give the counters their memory and their labels, here rather than at

@@ -27,31 +27,6 @@ the ADRs that only correct an older one folded into the one they correct.
 Work lands here under `### Breaking`, `### Added`, `### Fixed` and `### Docs`,
 newest first.
 
-### Added
-
-- `listen(.{ .tls = .{ .cert = "…pem", .key = "…pem" } })`: HTTPS, TLS 1.3,
-  on a build that asked for it with `.tls = true` on the dependency
-  (`-Dtls` in this repository). The library behind it, ianic/tls.zig, is
-  fetched and linked only behind that flag, so every other build is what it
-  was, and refuses the option at `listen()` in one line rather than serving
-  plain HTTP on the port. What it costs is stated where the option is: 560 KB
-  of binary and a page per idle connection in the build that asked, about
-  300 µs of CPU per handshake, no session resumption, one certificate per
-  listener, a restart to reload it, and no audit behind the library, which
-  is why a proxy in front stays the recommendation for anything on the
-  internet ([ADR 0288](./docs/adr/0288-tls-is-an-option-a-build-asks-for.md),
-  amending ADR 0028; [deploying](./docs/guide/deploying.md#tls-without-a-proxy)).
-  The handshake is bounded by `header_timeout_ms`. `zig build bench-tls-server
-  -Dtls` and `bench/mem.py --tls` are the benchmark server and the idle
-  reading for it.
-- `sql.Composed`, `db.compose` and `db.composed` / `db.composedOne` /
-  `tx.composed`: a statement composed at run time from literals, checked
-  identifiers and parameters — the pieces a query engine has — and from
-  nothing that can carry a run-time string. Placeholders are spelled for the
-  Db's dialect; the values are counted against them at run time. `raw` is
-  unchanged
-  ([ADR 0283](./docs/adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
-
 ### Breaking
 
 - A `Db`'s schema check and version guard run from a new service hook,
@@ -88,6 +63,39 @@ newest first.
 
 ### Added
 
+- `listen(.{ .tls = .{ .cert = "…pem", .key = "…pem" } })`: HTTPS, TLS 1.3,
+  on a build that asked for it with `.tls = true` on the dependency
+  (`-Dtls` in this repository). The library behind it, ianic/tls.zig, is
+  fetched and linked only behind that flag, so every other build is what it
+  was, and refuses the option at `listen()` in one line rather than serving
+  plain HTTP on the port. What it costs is stated where the option is: 560 KB
+  of binary and a page per idle connection in the build that asked, about
+  300 µs of CPU per handshake, no session resumption, one certificate per
+  listener, a restart to reload it, and no audit behind the library, which
+  is why a proxy in front stays the recommendation for anything on the
+  internet ([ADR 0288](./docs/adr/0288-tls-is-an-option-a-build-asks-for.md),
+  amending ADR 0028; [deploying](./docs/guide/deploying.md#tls-without-a-proxy)).
+  The handshake is bounded by `header_timeout_ms`. `zig build bench-tls-server
+  -Dtls` and `bench/mem.py --tls` are the benchmark server and the idle
+  reading for it.
+- `app.compress(.{})`: every answer that is text, at least `min_bytes`
+  (1 KB) long and going to a client whose `Accept-Encoding` takes gzip goes
+  out gzipped, per request, with `Content-Encoding: gzip`, `Vary:
+  Accept-Encoding` and the compressed length; a client that did not ask
+  gets the body as it is. `level` is `.fastest`, `.default` or `.best`. The
+  compressor is borrowed from a pool of one per thread, `~288 KB` each,
+  built when the chains are resolved; a compressed request pays one arena
+  allocation for the compressed body and nothing per connection. Streams,
+  event streams and static files are not touched: files were gzipped once
+  at load. `nilo.compress.Options`, `zig build bench-compress`
+  ([ADR 0287](./docs/adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
+- `sql.Composed`, `db.compose` and `db.composed` / `db.composedOne` /
+  `tx.composed`: a statement composed at run time from literals, checked
+  identifiers and parameters — the pieces a query engine has — and from
+  nothing that can carry a run-time string. Placeholders are spelled for the
+  Db's dialect; the values are counted against them at run time. `raw` is
+  unchanged
+  ([ADR 0283](./docs/adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
 - `run.loop()`: the `Io` a `Run` was made on, or null for a `Run.init(gpa)`,
   for a job that writes a file or sleeps between attempts and has only the
   Run the worker handed it.
@@ -95,7 +103,6 @@ newest first.
   remember by digest, so a bearer token seen again skips the signature
   arithmetic and keeps every claims check. A new key set forgets them
   ([ADR 0285](./docs/adr/0285-a-verified-signature-is-remembered-by-the-tokens-digest.md)).
-
 - `examples/sqlite/`: two Rows on one SQLite file, the tables made at boot
   with `createMissing` in `before` and checked after, a list with a
   `Query`, a paged join through `rawPage`, a report through
@@ -256,6 +263,11 @@ newest first.
 
 ### Fixed
 
+- Every binary with a static set in it, which is every binary with the
+  API reader page, was 25 KB larger than it needed to be: the
+  `Accept-Encoding` reader answered "is this `q=0`" with
+  `std.fmt.parseFloat(f32, …)`. A digit scan now; `hello` is −24,608 bytes
+  stripped, `rest` −3,648 ([ADR 0287](./docs/adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 - A `Db` on the default `connect_on_init = 0` dials one connection at boot
   whether or not it has a schema check, so `app.before` — a migration, a
   key set — finds a pool with something to lend. An `unchecked` `Db` with

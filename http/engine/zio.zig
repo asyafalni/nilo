@@ -1073,6 +1073,16 @@ fn removeSocket(gpa: std.mem.Allocator, path: []const u8) void {
     std.Io.Dir.cwd().deleteFile(threaded.io(), path) catch {};
 }
 
+/// How many OS threads `options` means: `threads` when it was set, one per
+/// core when it was left at 0. Public, and re-exported by the Bulkhead, so
+/// that anything the App sizes to the thread count is sized to the number
+/// this Engine actually starts rather than to a second reading of the same
+/// field (ADR 0287).
+pub fn threadCount(options: anytype) u8 {
+    if (options.threads > 0) return options.threads;
+    return @intCast(@min(std.Thread.getCpuCount() catch 1, 255));
+}
+
 /// Run `handler(state, in, out, clocks, wake, peer)` for every accepted
 /// connection, each in its own fiber, until that connection is done. The
 /// Reader/Writer are already buffered; the handler does not need to know
@@ -1102,10 +1112,7 @@ pub fn serve(
 ) !void {
     const State = @TypeOf(state);
     const Options = @TypeOf(options);
-    const threads: u8 = if (options.threads > 0)
-        options.threads
-    else
-        @intCast(@min(std.Thread.getCpuCount() catch 1, 255));
+    const threads: u8 = threadCount(options);
 
     // No work stealing between executors. A connection is served by the
     // thread that was dealt it, start to finish — its socket's completions

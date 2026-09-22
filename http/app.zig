@@ -28,6 +28,7 @@ const serve = @import("serve.zig");
 const wiring = @import("wiring.zig");
 const health_mod = @import("health.zig");
 const failurebody = @import("failurebody.zig");
+const compress_mod = @import("compress.zig");
 
 /// Say so if the program was built in a mode its log level does not match.
 /// Lives in `wiring.zig`; re-exported because `nilo.warn…` is public API.
@@ -124,6 +125,18 @@ pub const App = struct {
     /// Numbers the application owns and asked nilo to publish, from
     /// `expose()`. Empty for almost every App, and read only by a scrape.
     exposed: std.ArrayList(metrics_mod.Exposed) = .empty,
+    /// What `compress()` asked for, kept until the chains are resolved and
+    /// the thread count is known, which is when the pool is sized. Null on
+    /// every App that never asked.
+    compress_options: ?compress_mod.Options = null,
+    /// The compressors, one per thread, built at `resolveChains` and never
+    /// touched by a request's stack (ADR 0287). Held by value so that a
+    /// request can point at it, the way `_session_key` points at the key.
+    compressors: ?compress_mod.Pool = null,
+    /// How many compressors to build: the thread count `listen()` was given,
+    /// set just before the chains are resolved. 0 means one per core, which
+    /// is what `start(io)` and a test that resolves the chains by hand get.
+    compress_slots: u8 = 0,
     /// The generated document and its reader page, held the way a loaded
     /// directory is so that ETags and 304s arrive without a second code
     /// path. Null until `listen()` builds it.
@@ -245,6 +258,7 @@ pub const App = struct {
         self.derived_names.deinit(self.gpa);
         if (self.metrics_table) |*t| t.free(self.gpa);
         self.exposed.deinit(self.gpa);
+        if (self.compressors) |*p| p.deinit(self.gpa);
         for (self.static_sets.items) |*s| s.deinit();
         self.static_sets.deinit(self.gpa);
         self.static_chains.deinit(self.gpa);
@@ -1013,6 +1027,36 @@ pub const App = struct {
         });
     }
 
+    /// Gzip every answer worth gzipping, per request, for a client that
+    /// asked for it (ADR 0287).
+    ///
+    /// ```zig
+    /// try app.compress(.{});
+    /// try app.compress(.{ .level = .best, .min_bytes = 512 });
+    /// ```
+    ///
+    /// From then on a body that is text (JSON, HTML, anything under
+    /// `text/`) and at least `min_bytes` long goes out gzipped to a client
+    /// whose `Accept-Encoding` says gzip is welcome, with `Content-Encoding:
+    /// gzip`, `Vary: Accept-Encoding` and the compressed length. A client
+    /// that did not ask gets the body as it is. Static files are not
+    /// touched: they were gzipped once when the App was built. Streams and
+    /// event streams are never compressed.
+    ///
+    /// **What it costs is stated rather than hidden.** One compressor per
+    /// thread, `~288 KB` each, allocated when the chains are resolved and
+    /// held for the life of the App; one more arena allocation on every
+    /// request that is compressed, for the compressed body; and the CPU of
+    /// gzip itself, which for a five-kilobyte JSON answer at `.default` is
+    /// in the tens of microseconds. Nothing on a request that is not
+    /// compressed, and nothing per connection.
+    ///
+    /// Once per App; a second call is `error.CompressionAlreadyEnabled`.
+    pub fn compress(self: *App, opts: compress_mod.Options) error{CompressionAlreadyEnabled}!void {
+        if (self.compress_options != null) return error.CompressionAlreadyEnabled;
+        self.compress_options = opts;
+    }
+
     /// Publish a number of the application's own on the metrics page.
     ///
     /// ```zig
@@ -1108,6 +1152,10 @@ pub const App = struct {
     pub fn tryListen(self: *App, options_: bulkhead.Options) !void {
         wiring.checkRootWiring();
         try self.checkServices();
+        // Before the chains are resolved, because that is when the
+        // compressors are sized, and they are sized to the threads the
+        // Engine is about to start (ADR 0287).
+        self.compress_slots = bulkhead.threadCount(options_);
         try self.resolveChains();
         wiring.countUndescribed(self);
         // Parsed here rather than per request, and before the port is taken:

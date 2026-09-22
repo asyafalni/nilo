@@ -644,6 +644,13 @@ pub const Options = struct {
     session_secret: ?[]const u8 = null,
 };
 
+/// How many OS threads `options` means: `threads` when it was set, one per
+/// core when it was left at 0. The Engine's own reading of its own field,
+/// so that anything the App sizes to the thread count (the compressors
+/// `app.compress` keeps, one per thread, ADR 0287) is sized to the number
+/// the Engine starts.
+pub const threadCount = engine.threadCount;
+
 /// Listen, and run `handler(state, in, out, deadlines)` for every
 /// connection. The one call here that is a wrapper rather than a re-export,
 /// and only for this: the Engine hands over something it can put a time

@@ -644,6 +644,11 @@ pub const logger = @import("logger.zig");
 pub const cors = @import("cors.zig");
 pub const metrics = @import("metrics.zig");
 
+/// Gzip every answer worth gzipping, per request, for a client that asked:
+/// `try app.compress(.{})`. `nilo.compress.Options` is what it takes
+/// ([ADR 0287](../docs/adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
+pub const compress = @import("compress.zig");
+
 /// How many requests one address may make inside a window, and a 429 when it
 /// asks for more: `app.useOn("/api", nilo.allowance.with(.{ .per_window = 100,
 /// .window_s = 60 }))`. The table is sized while compiling and lives in
@@ -936,6 +941,7 @@ test {
     _ = @import("logger.zig");
     _ = @import("cors.zig");
     _ = @import("metrics.zig");
+    _ = @import("compress.zig");
     _ = @import("allowance.zig");
     _ = @import("deadline.zig");
     _ = @import("maxbody.zig");

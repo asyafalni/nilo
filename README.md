@@ -162,7 +162,7 @@ test "getUser" {
 
 Each module, and what is deliberately not in it:
 
-- **`nilo_http`** — routing, typed handlers, middleware, cookies and sessions, static files, streaming, WebSocket, OpenAPI, metrics, rate limiting, and TLS 1.3 in a build that asks for it. *Not:* templates, on the record below.
+- **`nilo_http`** — routing, typed handlers, middleware, cookies and sessions, static files, streaming, WebSocket, OpenAPI, metrics, rate limiting, gzip, and TLS 1.3 in a build that asks for it. *Not:* templates, on the record below.
 - **`nilo_sql`** — Postgres and SQLite. Your struct is the table, and it makes the table: reads, writes, transactions, streaming, the schema, the diff and the ledger. *Not:* joins, aggregates and `GROUP BY`, which go through `db.raw`; a migration `down`.
 - **`nilo_s3`** — object storage: S3, MinIO, R2. Your bucket is a type. Get, put, range, stream, list a page, presigned GET and POST. *Not:* `COPY`, multipart.
 - **`nilo_fetch`** — calling somebody else's HTTP API from inside a request: the policy in front of `std.http.Client`. *Not:* retries, circuit breaker.
@@ -365,9 +365,13 @@ That trade runs on four axes, not one
 - **Memory per idle connection** — fixed. Every feature states its own cost.
 - **Binary size** — anything the linker can't drop states its measured cost.
 
-Response compression is what "doesn't ship in a worse shape" looks like in
-practice: the shape that would fit is known, it hasn't been built, and no
-allocate-per-request version shipped in the meantime.
+Response compression is what "doesn't ship in a worse shape" looked like in
+practice: for a year the shape that would fit was known, it hadn't been built,
+and no allocate-per-request version shipped in the meantime. It shipped when it
+fit ([ADR 0287](./docs/adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)):
+one compressor per thread, borrowed for the microseconds a body takes and
+never on a connection's stack, where the standard library's own `init` would
+have put 99 KB of it.
 
 ## 🙂 What happens when you get it wrong
 

@@ -444,6 +444,49 @@ what HTTP/1.1 means ([ADR 0269](../adr/0269-a-response-says-when-it-was-sent.md)
 Every response also carries a `Date`, which is what a cache in front reads to
 decide how old the answer is.
 
+## Compression
+
+Off unless asked for. One line asks:
+
+<!-- compiles: body -->
+```zig
+try app.compress(.{});
+```
+
+From then on every answer that is text, at least a kilobyte long and going to a
+client whose `Accept-Encoding` takes gzip goes out gzipped, whether it came from
+`sendJson`, `sendText`, `send` or a typed handler returning a value. The response
+carries `Content-Encoding: gzip`, `Vary: Accept-Encoding` and the compressed
+length. A client that sent no `Accept-Encoding`, or `gzip;q=0`, gets the body as
+it is and no `Content-Encoding` at all.
+
+| | Default |
+|---|---|
+| `min_bytes` | `1024`: bodies shorter than this go out as they are; compressing a hundred bytes makes them longer |
+| `level` | `.default`, zlib's level 6. `.fastest` is level 1, roughly a fifth larger and a little quicker; `.best` is level 9, under one percent smaller and five to nine percent slower |
+
+What counts as text is the list static files use: `text/*`, JSON, JavaScript,
+XML, WASM, the `+json` and `+xml` structured types. A PNG, a woff2 or an
+`application/octet-stream` is left alone, as is a body under `min_bytes`, a
+204, and an answer whose handler set `Content-Encoding` itself: a body you
+gzipped is not gzipped twice. A HEAD carries the length its GET would have.
+
+**Three things are never compressed here.** A static file, because it was
+gzipped once when the App was built and that copy costs nothing per request
+([Static files](./static-files.md#compression)). A stream, because it has no
+whole body to compress and would hold a compressor across every write. An event
+stream, because it must never be buffered at all
+([ADR 0287](../adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
+
+**What it costs**, stated because every feature here states it. One compressor
+per thread, about 288 KB each, allocated once when the chains are resolved and
+never on a connection's stack: 4.6 MB on sixteen threads. One arena allocation
+on a request that is compressed, for the compressed body, and none on a request
+that is not. And the gzip itself, which for a 4 KB JSON answer at `.default` is
+about 37 µs on one core, of which 6 µs is the compressor being reset; `zig build
+bench-compress` prints the table for the machine you are on. Nothing per
+connection, and nothing on a request under the threshold, which a test holds.
+
 ## Content types
 
 | Returned | Sent as |

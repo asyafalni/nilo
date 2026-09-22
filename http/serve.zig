@@ -19,6 +19,7 @@ const str_mod = @import("nilo_core");
 const fail = @import("fail.zig");
 const mw = @import("middleware.zig");
 const static_mod = @import("static.zig");
+const compress_mod = @import("compress.zig");
 const watchdog = @import("watchdog.zig");
 const scratch = @import("scratch.zig");
 const websocket = @import("websocket.zig");
@@ -355,6 +356,7 @@ pub noinline fn serveRequest(
         // A pointer to the App's copy, not the copy: the key is 32 bytes
         // on every Ctx otherwise, for something almost no request reads.
         ._session_key = if (self.session_key) |*k| k else null,
+        ._compressors = if (self.compressors) |*p| p else null,
         ._params = &.{},
         ._services = &self.services,
         // Stopping: this one still gets answered — a request already on
@@ -848,7 +850,7 @@ fn serveHeldFile(c: *Ctx, file: *const static_mod.File) anyerror!void {
     // bytes` has been promising all along.
     const wants_part = c.header("Range") != null;
     const wants_gzip = !wants_part and
-        static_mod.acceptsGzip(headerValue(c, "Accept-Encoding"));
+        compress_mod.acceptsGzip(headerValue(c, "Accept-Encoding"));
     const sending = file.representation(wants_gzip);
 
     // Everything here belongs to the loaded file, which outlives every

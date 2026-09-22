@@ -3898,6 +3898,21 @@ pub fn build(b: *std.Build) void {
             .dependOn(&run.step);
     }
 
+    // What gzipping an answer costs, per level, on the bodies the benchmark
+    // arena asks for (ADR 0287). `ReleaseFast` whatever was asked, because
+    // a Debug deflate is a different program.
+    const bench_compress = b.addExecutable(.{
+        .name = "nilo-bench-compress",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/compress_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "nilo_http", .module = bench_http }},
+        }),
+    });
+    b.step("bench-compress", "Time gzipping a JSON answer at each level, and weigh the result")
+        .dependOn(&b.addRunArtifact(bench_compress).step);
+
     const bench_sql_module = b.createModule(.{
         .root_source_file = b.path("bench/sql.zig"),
         .target = target,

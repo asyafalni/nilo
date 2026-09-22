@@ -74,6 +74,7 @@ Measured stripped, `ReleaseFast`, on the examples in this repository.
 | A body limit per route, a type that writes its own answer, a request id on the way out, and a server that sheds past its limit ([ADRs 0194](./0194-a-route-can-say-how-much-body-it-takes.md)–[0197](./0197-a-server-past-its-limit-says-so-at-once.md)) | +896 B | +944 B |
 | A `Date` on every response, and no `Connection: keep-alive` on HTTP/1.1 ([ADR 0269](./0269-a-response-says-when-it-was-sent.md)) | +6,064 B | +6,072 B |
 | A failure body the application names ([ADR 0270](./0270-a-failure-body-is-a-struct-the-application-names.md)) | +400 B | +448 B |
+| Response compression on a pooled compressor ([ADR 0287](./0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)), and the `Accept-Encoding` reader no longer waking `parseFloat` | +4,896 B, then −24,608 B net | +4,064 B, then −3,648 B net |
 | A TLS listener the build has to ask for ([ADR 0288](./0288-tls-is-an-option-a-build-asks-for.md)); the build that asks pays +573,152 B and +574,320 B on top | +2,872 B | +2,720 B |
 
 `nilo_fetch` is +0 on both examples because neither imports it, and that is the
@@ -137,6 +138,17 @@ The `nilo_sql` row is +0 for a reason worth stating rather than glossing: **no e
 **The last row is the worst-recorded one here and is written down as such**: ten ADRs in one figure, because they landed as one pass over a list somebody else wrote. It is measured rather than estimated — `git archive HEAD | tar -x` into a scratch directory, both trees built with `-Doptimize=ReleaseFast -Dstrip=true`, `hello` 881,296 → 892,696 and `rest` 1,014,736 → 1,032,008. The useful split is by section rather than by feature: on `hello` it is `.text` +8,128, `.data.rel.ro` +2,632 and `.rodata` +567, so it is **code rather than message strings**, which is what an unconditional cost looks like. `hello` has no body type, no binding, no service and no document, so what it pays for is the App itself — a start phase before the server, an exemption list on the chain resolver, and a third startup warning. Nothing here was attributed further, and a later change to any of the three should re-measure rather than subtract from this.
 
 The same pass costs +16,880 bytes on `bench/size/pg_only.zig` and +15,392 on `sqlite_only.zig`, which moves the published *difference* between them — what SQLite costs a program that uses it — from 524,840 to **523,352**. That number was quoted in four places and reproduced exactly twice; it is a different number now, and [`bench/result/sql.md`](../../bench/result/sql.md) carries the run.
+
+The compression row is two numbers on purpose. The first is the feature:
+`Ctx.squeezed`, the eligibility check, the type allowlist and the pool's
+`gzip`, kept by the linker because the switch is a runtime null on the Ctx;
+deflate itself was already in every binary through the API reader page's
+static set. The second is what the same change took out: the `Accept-Encoding`
+reader static files have used since ADR 0010 answered "is this `q=0`" with
+`std.fmt.parseFloat(f32, …)`, which is **25 KB of machine code** in a binary
+that parses no other float and 3.7 KB in one that does. That is this table's
+own first-row lesson (the generic you woke up) met in the other direction;
+the run is in [`bench/result/http.md`](../../bench/result/http.md).
 
 `orders`, the largest example, is 1,327,992 bytes stripped. It is not a row here because it has no before.
 

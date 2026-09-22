@@ -61,7 +61,7 @@ One page of [the reference](./README.md): one request in flight: reading it, ans
 | `c.setCookie(cookie)` | a `Set-Cookie`. Calling it twice sets two, not one |
 | `c.clearCookie(.{ .name = …, .path = …, .domain = … })` | delete one. Path and domain have to match |
 | `c.redirect(status, location)` | a `Location` and no body |
-| `c.send(status, content_type, bytes)` | |
+| `c.send(status, content_type, bytes)` | gzipped on the way out when `app.compress` is on and the body, the type and the client all qualify ([ADR 0287](../adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)); so are the two below |
 | `c.sendText(status, text)` | `text/plain` |
 | `c.sendJson(status, value)` | `application/json` |
 | `c.sendEmpty(status)` | no body and no `Content-Type` — a 204, usually |

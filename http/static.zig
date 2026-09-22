@@ -42,6 +42,7 @@
 const std = @import("std");
 
 const accept_mod = @import("accept.zig");
+const compress_mod = @import("compress.zig");
 const bulkhead = @import("bulkhead.zig");
 
 pub const Options = struct {
@@ -1061,85 +1062,11 @@ fn hasDotSegment(rel_path: []const u8) bool {
     return rel_path.len > start and rel_path[start] == '.';
 }
 
-/// Whether an `Accept-Encoding` header says gzip is welcome.
-///
-/// Not `indexOf("gzip")`, because `gzip;q=0` contains the word and means the
-/// exact opposite — it is how a client that cannot decompress says so, and
-/// answering it with a gzipped body is a broken page rather than a slow one.
-/// `*` is honoured too, with an explicit `gzip` entry outranking it either
-/// way, which is what RFC 9110 §12.5.3 says to do.
-pub fn acceptsGzip(header: ?[]const u8) bool {
-    const value = header orelse return false;
-
-    var star: ?bool = null;
-    var it = std.mem.splitScalar(u8, value, ',');
-    while (it.next()) |raw| {
-        const entry = std.mem.trim(u8, raw, " \t");
-        if (entry.len == 0) continue;
-
-        const semi = std.mem.indexOfScalar(u8, entry, ';');
-        const name = std.mem.trimEnd(u8, entry[0 .. semi orelse entry.len], " \t");
-        const wanted = if (semi) |i| !isQualityZero(entry[i + 1 ..]) else true;
-
-        if (std.ascii.eqlIgnoreCase(name, "gzip")) return wanted;
-        if (std.mem.eql(u8, name, "*")) star = wanted;
-    }
-    return star orelse false;
-}
-
-/// Whether the parameters after a `;` say `q=0` — `q=0`, `q=0.0`, `q=0.000`.
-/// Anything else, including a malformed one, is read as "wanted": the cost
-/// of being wrong that way is a header the client asked for by listing the
-/// encoding at all.
-fn isQualityZero(params: []const u8) bool {
-    var it = std.mem.splitScalar(u8, params, ';');
-    while (it.next()) |raw| {
-        const param = std.mem.trim(u8, raw, " \t");
-        if (param.len < 2) continue;
-        if (param[0] != 'q' and param[0] != 'Q') continue;
-        const eq = std.mem.indexOfScalar(u8, param, '=') orelse continue;
-        if (std.mem.trim(u8, param[1..eq], " \t").len != 0) continue;
-
-        const q = std.mem.trim(u8, param[eq + 1 ..], " \t");
-        const value = std.fmt.parseFloat(f32, q) catch continue;
-        return value == 0;
-    }
-    return false;
-}
-
-/// Whether gzipping a file of this type is worth the memory it will sit in
-/// for the life of the process.
-///
-/// An allowlist rather than a blocklist. Getting it wrong in the permissive
-/// direction means spending a second copy of a JPEG to save nothing; in the
-/// strict direction it means a CSS file goes out uncompressed, which is
-/// merely the behaviour of every previous version. So the list names what is
-/// known to be text.
-fn compressible(content_type: []const u8) bool {
-    // `text/anything` is text, including the ones nobody has thought of.
-    if (std.mem.startsWith(u8, content_type, "text/")) return true;
-
-    // A structured type ending in `+json` or `+xml` — `image/svg+xml`,
-    // `application/manifest+json` — is text however it starts.
-    const base = content_type[0 .. std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len];
-    const trimmed = std.mem.trimEnd(u8, base, " ");
-    if (std.mem.endsWith(u8, trimmed, "+json")) return true;
-    if (std.mem.endsWith(u8, trimmed, "+xml")) return true;
-
-    for ([_][]const u8{
-        "application/json",
-        "application/javascript",
-        "application/xml",
-        "application/wasm",
-        "application/x-ndjson",
-        "image/x-icon",
-        "font/ttf",
-        "font/otf",
-    }) |known| {
-        if (std.mem.eql(u8, trimmed, known)) return true;
-    }
-    return false;
-}
+/// What a file has to be for a gzipped copy to be worth holding: the same
+/// question response compression asks of a body, per request, so the
+/// answer lives there (ADR 0287). `serve.zig` asks the other half, whether
+/// the client takes gzip, of the same module.
+const compressible = compress_mod.compressible;
 
 /// Gzip `bytes`, or null if the result is not smaller than what went in.
 ///
@@ -1502,57 +1429,6 @@ test "what a navigation is, when the client said nothing about it" {
 }
 
 // ---- gzip, done once when the App is built ----
-
-test "Accept-Encoding is read, not searched for the word gzip" {
-    // The plain yes.
-    try testing.expect(acceptsGzip("gzip"));
-    try testing.expect(acceptsGzip("gzip, deflate, br"));
-    try testing.expect(acceptsGzip("deflate, gzip"));
-    try testing.expect(acceptsGzip("GZIP"));
-    try testing.expect(acceptsGzip("gzip;q=1.0"));
-    try testing.expect(acceptsGzip("gzip ; q=0.5"));
-
-    // The header contains "gzip" and means the opposite. A server that
-    // searched for the word would send a body this client cannot read.
-    try testing.expect(!acceptsGzip("gzip;q=0"));
-    try testing.expect(!acceptsGzip("gzip;q=0.0"));
-    try testing.expect(!acceptsGzip("gzip;q=0.000"));
-    try testing.expect(!acceptsGzip("deflate, gzip;q=0"));
-
-    // A wildcard stands in, and an explicit entry outranks it either way.
-    try testing.expect(acceptsGzip("*"));
-    try testing.expect(!acceptsGzip("*;q=0"));
-    try testing.expect(!acceptsGzip("*, gzip;q=0"));
-    try testing.expect(acceptsGzip("*;q=0, gzip"));
-
-    // Nothing asked for it.
-    try testing.expect(!acceptsGzip(null));
-    try testing.expect(!acceptsGzip(""));
-    try testing.expect(!acceptsGzip("identity"));
-    try testing.expect(!acceptsGzip("deflate, br"));
-
-    // A word that merely starts the same way is a different encoding.
-    try testing.expect(!acceptsGzip("gzip-x"));
-    try testing.expect(!acceptsGzip("x-gzip"));
-}
-
-test "only the types that are text get a compressed copy" {
-    try testing.expect(compressible("text/html; charset=utf-8"));
-    try testing.expect(compressible("text/css"));
-    try testing.expect(compressible("application/json"));
-    try testing.expect(compressible("application/javascript"));
-    try testing.expect(compressible("image/svg+xml"));
-    try testing.expect(compressible("application/manifest+json"));
-    try testing.expect(compressible("application/wasm"));
-
-    // Already compressed. A second copy would cost memory to save nothing.
-    try testing.expect(!compressible("image/png"));
-    try testing.expect(!compressible("image/jpeg"));
-    try testing.expect(!compressible("font/woff2"));
-    try testing.expect(!compressible("video/mp4"));
-    try testing.expect(!compressible("application/zip"));
-    try testing.expect(!compressible("application/octet-stream"));
-}
 
 test "a gzipped copy is smaller, and inflates back to exactly the original" {
     const gpa = testing.allocator;

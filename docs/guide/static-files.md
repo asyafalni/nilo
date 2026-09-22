@@ -112,8 +112,10 @@ nilo: loaded 34 static file(s) (2411903 bytes held, 383204 of them gzipped
 A file is skipped when it is under `compress_min_bytes`, when its type is already
 compressed — a PNG, a woff2, an MP4 — when gzip did not actually make it
 smaller, or when it is over `max_file_bytes` and so was never read to be
-compressed at all. **A response body is never compressed**, only files; an
-endpoint returning JSON goes out as it is.
+compressed at all. **A handler's own answer is a different feature**: files
+are gzipped once here, and `app.compress(.{})` gzips an endpoint's JSON per
+request on a compressor borrowed from a pool ([Responses](./responses.md#compression)).
+Off, an endpoint returning JSON goes out as it is.
 
 Three details that are easy to get wrong, and are not:
 

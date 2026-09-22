@@ -11,6 +11,7 @@
 const std = @import("std");
 const body_mod = @import("body.zig");
 const bulkhead = @import("bulkhead.zig");
+const compress_mod = @import("compress.zig");
 const convert = @import("convert.zig");
 const cookie_mod = @import("cookie.zig");
 const encoded = @import("encoded.zig");
@@ -165,6 +166,11 @@ pub const Ctx = struct {
     /// the way `resolve` below does it. `session.zig` asserts the two agree,
     /// so the duplication cannot drift silently.
     _session_key: ?*const [32]u8 = null,
+    /// The compressors `app.compress` gave the App, or null when it never
+    /// did, which is what every App that did not ask for it gets, and a
+    /// test driving a handler by hand. A pointer to the App's, eight bytes
+    /// on the Ctx (ADR 0287).
+    _compressors: ?*const compress_mod.Pool = null,
     _params: []const router.Param,
     /// The route that matched, or null when none did. A pointer into the
     /// App's own table rather than a copy of anything on it — eight bytes on
@@ -1548,6 +1554,15 @@ pub const Ctx = struct {
         std.debug.assert(self.answered() == null); // one request, one response
         self.markAnswered(status);
 
+        // Gzipped, when the App asked for that and this body and this client
+        // both qualify (ADR 0287). Before the wait below rather than inside
+        // it: compressing is the handler's work, and it borrows a compressor
+        // nothing waiting on a client may hold.
+        var outgoing = response_body;
+        if (self._compressors) |pool| {
+            if (try self.squeezed(pool, status, content_type, response_body)) |smaller| outgoing = smaller;
+        }
+
         // Putting the answer on the wire is nilo waiting on the client, not
         // the handler running. A client too slow to take a large response
         // parks this fiber for as long as it takes, and without this that
@@ -1556,14 +1571,15 @@ pub const Ctx = struct {
         defer watchdog.waited(self._watch, w);
 
         // A handler need not know this is a HEAD: it assembles a response
-        // as usual, and what must not go out is filtered here.
+        // as usual, and what must not go out is filtered here. The length
+        // is the one a GET would have carried, compressed or not.
         if (self.method == .HEAD) {
             try http1.writeResponseHeadOnly(
                 self._out,
                 status,
                 http1.statusPhrase(status),
                 content_type,
-                response_body.len,
+                outgoing.len,
                 self.connection(),
                 self.extraHeaders(),
             );
@@ -1573,7 +1589,7 @@ pub const Ctx = struct {
                 status,
                 http1.statusPhrase(status),
                 content_type,
-                response_body,
+                outgoing,
                 self.connection(),
                 self.extraHeaders(),
             );
@@ -1582,6 +1598,31 @@ pub const Ctx = struct {
         // behind this one, in which case it goes out with that one's answer
         // (ADR 0274).
         try http1.settle(self._out, self._in);
+    }
+
+    /// The compressed body, when this answer is one to compress: long
+    /// enough, text, not already encoded by the handler, and going to a
+    /// client that asked. Null otherwise, and the body goes out as it is.
+    ///
+    /// `Vary: Accept-Encoding` goes out on every answer that *could* have
+    /// been compressed, whether or not this client wanted it: a shared cache
+    /// that stored the plain answer without it would hand that answer to the
+    /// next client whatever it asked for (ADR 0089). `Content-Encoding` only
+    /// when it was.
+    fn squeezed(self: *Ctx, pool: *const compress_mod.Pool, status: u16, content_type: []const u8, response_body: []const u8) !?[]const u8 {
+        if (!pool.eligible(status, content_type, response_body.len)) return null;
+        // A handler that gzipped its own body (a cached copy, a file it
+        // read compressed) has said so, and it is not compressed twice.
+        for (self.extraHeaders()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "Content-Encoding")) return null;
+        }
+        try self.setStaticHeader("Vary", "Accept-Encoding");
+        const accept = if (self.header("Accept-Encoding")) |h| h.view() else null;
+        if (!compress_mod.acceptsGzip(accept)) return null;
+
+        const smaller = pool.gzip(self._arena, response_body) orelse return null;
+        try self.setStaticHeader("Content-Encoding", "gzip");
+        return smaller;
     }
 
     pub fn sendText(self: *Ctx, status: u16, text: []const u8) !void {

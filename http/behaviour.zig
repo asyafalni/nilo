@@ -111,6 +111,11 @@ const Harness = struct {
     }
 };
 
+/// Four kilobytes of text a client would rather have gzipped.
+fn sendLongText(c: *Ctx) anyerror!void {
+    try c.send(200, "text/plain", "the quick brown fox jumps over the lazy dog; " ** 96);
+}
+
 fn testGetUser(c: *Ctx) anyerror!void {
     const id = try c.param("id").?.int(u32);
     try c.sendJson(200, .{ .id = id, .name = "tester" });
@@ -3775,6 +3780,99 @@ test "an allowance adds nothing to the allocation budget" {
     // table is sized while compiling rather than kept in a map (ADR 0114).
     // The address is not copied, not hashed into anything that allocates, and
     // the slot it lands in existed before `main` ran.
+    try testing.expectEqual(@as(usize, 1), counting.allocs);
+    try testing.expectEqual(@as(usize, 0), counting.resizes);
+}
+
+test "compression switched on adds nothing to a request under its threshold" {
+    var db = Db{ .rows = &.{.{ .id = 7, .name = "wati" }} };
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&db);
+    try app.get("/users/:id", getUser);
+    try app.use(cors.permissive);
+    try app.compress(.{});
+    try app.resolveChains();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var counting = budget.Counting{ .child = arena.allocator() };
+    var lifetime = str_mod.Lifetime{};
+    var in_flight = fail.InFlight{};
+    var buf: [4096]u8 = undefined;
+
+    // The primary metric's shape, with a client that would take gzip. The
+    // answer is a few dozen bytes, which is under the threshold, so what
+    // it costs has to be exactly what it cost before compression existed.
+    const request = "GET /users/7 HTTP/1.1\r\nHost: example.dev\r\nUser-Agent: wrk\r\n" ++
+        "Accept: */*\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\n";
+
+    const send = struct {
+        fn once(a: *App, gpa: std.mem.Allocator, l: *str_mod.Lifetime, f: *fail.InFlight, b: []u8) void {
+            var in = std.Io.Reader.fixed(request);
+            var out = std.Io.Writer.fixed(b);
+            _ = a.handleRequest(gpa, l, f, &in, &out, .off, .off, .{});
+            l.end();
+        }
+    }.once;
+
+    for (0..3) |_| {
+        send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
+        _ = arena.reset(.{ .retain_with_limit = app_mod.default_arena_keep });
+    }
+
+    counting.reset();
+    send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
+
+    // Still the one, and it is still the JSON body: the compressors were
+    // taken when the chains were resolved, and a request that is not
+    // compressed never reaches for them (ADR 0287).
+    try testing.expectEqual(@as(usize, 1), counting.allocs);
+    try testing.expectEqual(@as(usize, 0), counting.resizes);
+}
+
+test "a compressed answer costs one allocation, and it is the compressed body" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/report", sendLongText);
+    try app.use(cors.permissive);
+    try app.compress(.{});
+    try app.resolveChains();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var counting = budget.Counting{ .child = arena.allocator() };
+    var lifetime = str_mod.Lifetime{};
+    var in_flight = fail.InFlight{};
+    var buf: [8192]u8 = undefined;
+
+    const request = "GET /report HTTP/1.1\r\nHost: example.dev\r\nUser-Agent: wrk\r\n" ++
+        "Accept: */*\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\n";
+
+    const send = struct {
+        fn once(a: *App, gpa: std.mem.Allocator, l: *str_mod.Lifetime, f: *fail.InFlight, b: []u8) []const u8 {
+            var in = std.Io.Reader.fixed(request);
+            var out = std.Io.Writer.fixed(b);
+            _ = a.handleRequest(gpa, l, f, &in, &out, .off, .off, .{});
+            l.end();
+            return out.buffered();
+        }
+    }.once;
+
+    for (0..3) |_| {
+        _ = send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
+        _ = arena.reset(.{ .retain_with_limit = app_mod.default_arena_keep });
+    }
+
+    counting.reset();
+    const response = send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
+    try testing.expect(std.mem.indexOf(u8, response, "Content-Encoding: gzip\r\n") != null);
+
+    // The body here is a literal, so the handler itself allocates nothing;
+    // the one allocation is the compressed copy, sized to fit on the first
+    // try so that it is never grown. A JSON route pays its usual one for
+    // the body on top of this, which is the number `app.compress`'s doc
+    // states (ADR 0287).
     try testing.expectEqual(@as(usize, 1), counting.allocs);
     try testing.expectEqual(@as(usize, 0), counting.resizes);
 }

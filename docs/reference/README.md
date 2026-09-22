@@ -64,6 +64,7 @@ section on it. A name is found here first and read on its page.
   - [`Group`](./app.md#group)
   - [`listen` options](./app.md#listen-options)
   - [`metrics` options](./app.md#metrics-options)
+  - [`compress` options](./app.md#compress-options)
 - [Concurrency](./app.md#concurrency)
 - [Static options](./app.md#static-options)
 - [OpenAPI options](./app.md#openapi-options)

@@ -29,6 +29,7 @@ One page of [the reference](./README.md): the App and its groups, what `listen()
 | `app.health(path)` | a page that says whether this process can do its job — `200 {"status":"ok"}`, or `503` naming the services that are not ready and why, or `503 {"status":"stopping"}` once the server was told to stop. Asks every service that declared `pub fn nilo_ready(self: *T, scope: *nilo_core.AnyScope) ?[]const u8` — null is ready, a sentence is why not ([Deploying](../guide/deploying.md#knowing-whether-it-is-ready), [ADR 0192](../adr/0192-a-health-route-asks-the-services.md)). Described in the document as a `200` of `{"status":…}`, and not counted among the routes that write their own answer ([ADR 0281](../adr/0281-nilos-own-routes-describe-themselves.md)) |
 | `app.metrics(options)` | count every request and serve the numbers at `/metrics`, Prometheus format ([Metrics](../guide/metrics.md), [ADR 0100](../adr/0100-the-route-table-is-the-registry.md)) |
 | `app.expose(name, kind, &atomic)` | publish a `std.atomic.Value(u64)` of your own on that page. `kind` is `.counter` or `.gauge` |
+| `app.compress(options)` | gzip every answer that is text, at least `min_bytes` long and going to a client whose `Accept-Encoding` takes it, per request, on a compressor borrowed from a pool of one per thread; `Content-Encoding: gzip`, `Vary: Accept-Encoding`, the compressed length. A client that did not ask gets the body as it is. Not streams, not event streams, not static files. Once per App; a second is `error.CompressionAlreadyEnabled` ([Responses](../guide/responses.md#compression), [ADR 0287](../adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)) |
 | `app.listen(options)` | run until stopped. Stops the process on a startup error |
 | `app.start(io)` | everything `listen()` does before it accepts anything (services checked, chains resolved, pools opened, the work `before` registered run, every `nilo_check` run after it) for a program that never listens: a test through `testing.Client`, a script, a worker on `jobs.serveOn(io)` ([ADR 0079](../adr/0079-there-is-a-phase-before-the-server.md)). **Not before `listen()`**: a service keeps the `Io` it was started on, so `start(io)` followed by `listen()` is refused when any service took one; the phase between the pool and the server is `app.before` ([ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)). What it does *not* start is `spawn`, which needs a server |
 | `app.shutdown()` | stop, from any thread or from inside a handler |
@@ -42,9 +43,10 @@ One page of [the reference](./README.md): the App and its groups, what `listen()
 **Which of these fail.** Every call in the table returns an error union and
 takes a `try`, except these, which return a value or nothing: `App.init`,
 `app.deinit`, `app.group`, `app.without`, `app.with`, `app.named`,
-`app.docs`, `app.routes`, `app.boundPort` and `app.shutdown`. Two fail in
-one named way, `app.guard` with `error.GuardAlreadyDeclared` and
-`app.failures` with `error.FailureShapeAlreadySet`. `app.listen`,
+`app.docs`, `app.routes`, `app.boundPort` and `app.shutdown`. Three fail in
+one named way, `app.guard` with `error.GuardAlreadyDeclared`,
+`app.failures` with `error.FailureShapeAlreadySet` and `app.compress` with
+`error.CompressionAlreadyEnabled`. `app.listen`,
 `app.route` and the `static` calls stop the process on the errors they can
 explain in one line, and their `try*` twins hand the same errors back
 instead ([ADR 0282](../adr/0282-a-try-call-hands-back-the-error-and-says-nothing.md)).
@@ -143,6 +145,21 @@ Counted per **route**, not per path — `/users/1` and `/users/2` are both
 `/users/:id`. Five slots are not routes: `<unmatched>`, `<method not allowed>`, `<shed>`,
 `<static file>` and `<unparsed>`. A route that has answered nothing has no
 series at all. See [Metrics](../guide/metrics.md).
+
+### `compress` options
+
+`app.compress(.{ … })`.
+
+| | Default |
+|---|---|
+| `min_bytes` | `1024`: bodies shorter than this go out as they are |
+| `level` | `.default`, zlib's level 6. `.fastest` is level 1, `.best` is level 9 |
+
+What it costs: one compressor per thread, `~288 KB` each, taken when the
+chains are resolved; one arena allocation on a request that is compressed;
+tens of microseconds of gzip per body (`zig build bench-compress` has the
+table). Nothing per connection, and nothing on a request that is not
+compressed ([ADR 0287](../adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 
 ## Concurrency
 
