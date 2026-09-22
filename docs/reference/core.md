@@ -50,6 +50,7 @@ const rows = try db.select(User, &run, .{ .where = .{ .age = .{ .gt = 18 } } });
 | `run.str(bytes)` | `Str` — text you allocated from `run.arena()`, stamped with this tick |
 | `run.entropy(n)` | `![n]u8` from the operating system. `error.NoIo` on a Run built by `init` |
 | `run.entropyInto(buf)` | `!void` — the same, at a width nobody said while compiling |
+| `run.loop()` | `?std.Io` — the loop this Run was made on, for a job that writes a file or sleeps between attempts; null for a `Run.init(gpa)` |
 | `run.give(V, value)` | hand this tick a value for something below to ask for |
 | `run.resolve(V)` | `!V` — what `give` put there. `error.NotGiven` if nothing did |
 | `run.reset()` | end the tick: the memory goes back, what was given goes with it, and every `Str` from it goes stale |

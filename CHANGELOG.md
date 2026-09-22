@@ -73,6 +73,10 @@ newest first.
 
 ### Added
 
+- `run.loop()`: the `Io` a `Run` was made on, or null for a `Run.init(gpa)`,
+  for a job that writes a file or sleeps between attempts and has only the
+  Run the worker handed it.
+
 - `examples/sqlite/`: two Rows on one SQLite file, the tables made at boot
   with `createMissing` in `before` and checked after, a list with a
   `Query`, a paged join through `rawPage`, a report through
