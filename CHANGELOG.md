@@ -76,6 +76,10 @@ newest first.
 - `run.loop()`: the `Io` a `Run` was made on, or null for a `Run.init(gpa)`,
   for a job that writes a file or sleeps between attempts and has only the
   Run the worker handed it.
+- `jwt.Keyring` takes `remember_tokens`: how many verified tokens to
+  remember by digest, so a bearer token seen again skips the signature
+  arithmetic and keeps every claims check. A new key set forgets them
+  ([ADR 0285](./docs/adr/0285-a-verified-signature-is-remembered-by-the-tokens-digest.md)).
 
 - `examples/sqlite/`: two Rows on one SQLite file, the tables made at boot
   with `createMissing` in `before` and checked after, a list with a

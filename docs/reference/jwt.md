@@ -115,7 +115,7 @@ fn whoIsThis(c: *nilo.Ctx, google: *jwt.Keyring, api: *fetch.Client, token: []co
 
 | | |
 |---|---|
-| `jwt.Keyring.init(gpa, .{ .url, .issuer, .audience, .leeway_s, .refresh_interval_s })` | `!Keyring`, holding no keys: every verify is `NoSuchKey` until `load` or `refresh`. `refresh_interval_s` is 60 |
+| `jwt.Keyring.init(gpa, .{ .url, .issuer, .audience, .leeway_s, .refresh_interval_s, .remember_tokens })` | `!Keyring`, holding no keys: every verify is `NoSuchKey` until `load` or `refresh`. `refresh_interval_s` is 60. `remember_tokens` (default 0) is how many verified tokens the ring remembers by SHA-256 digest, so one seen again skips the signature arithmetic — 400 µs for ES256 — and not the `exp`/`nbf`/`iss`/`aud` checks; a `load` forgets them all ([ADR 0285](../adr/0285-a-verified-signature-is-remembered-by-the-tokens-digest.md)) |
 | `ring.deinit()` | frees the set it holds |
 | `ring.load(bytes)` | parse a JWKS document and make it the set every verify from now on reads; the old set is freed once its readers are done. A document that does not parse leaves the old set in place |
 | `ring.refresh(scope, client, now_s)` | `client.get(scope, url, .{})` and `load` the body; `error.KeysNotAvailable` for anything but a 2xx, with the old set still held. `client` is anything answering `ok()` and `body.view()`, which `fetch.Client` is. Records `now_s` as the last refresh |
