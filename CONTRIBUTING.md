@@ -1,11 +1,6 @@
 # Contributing to nilo
 
-This is one person's toolkit so far, and it's built to stop being one.
-
-The most useful thing you can bring is not always a patch. A question that turns
-out to have no written answer is a real find, because the whole design of this
-repository rests on the answers being written down somewhere other than my head.
-So "why on earth is it like this?" is a welcome issue, not a rude one.
+This is one person's toolkit so far, and it's built to stop being one. The most useful thing you can bring is not always a patch: a question that turns out to have no written answer is a real find, because the whole design rests on the answers being written down somewhere other than my head. "Why on earth is it like this?" is a welcome issue.
 
 ## Get it running
 
@@ -15,169 +10,76 @@ cd nilo
 zig build test
 ```
 
-You need Zig 0.16 and nothing else. No C library, no system package, no
-database. A `zig build test` that finds nothing to rebuild is about four
-seconds, almost all of it the refusals below; the first one after a clone builds
-everything and takes considerably longer.
+Zig 0.16 and nothing else: no C library, no system package, no database. The first run after a clone builds everything; after that a run that changed nothing is a few seconds, almost all of it the refusals below.
 
-Then read these four, in this order. They're the whole background you need:
+Then read these four, in this order:
 
 | | |
 |---|---|
 | [`README.md`](./README.md) | what this is and what it refuses to be |
 | [`CONTEXT.md`](./CONTEXT.md) | the vocabulary, and the words this project won't use |
-| [`CLAUDE.md`](./CLAUDE.md) | the working brief: layout, commands, invariants, conventions |
-| [`docs/adr/`](./docs/adr/) | 170 decisions, each one naming the alternative it beat |
+| [`CLAUDE.md`](./CLAUDE.md) | the working brief: layout, every command, invariants, conventions |
+| [`docs/adr/`](./docs/adr/) | the decisions, each one naming the alternative it beat |
 
-The ADRs are the important one. Before you propose a design change, check
-whether it already has a file. "Why not X?" usually has an answer on record, and
-if you disagree with it, you get to argue with something specific instead of
-with a vibe.
+The ADRs are the important one. Before you propose a design change, check whether it already has a file: "why not X?" usually has an answer on record, and if you disagree with it you get to argue with something specific instead of with a vibe.
 
 ## The commands
 
 ```
-zig build test         # the loop: the suite in Debug, plus the refusals
-zig build test --watch # the same, left running, rebuilding on save. Not faster, just easier
-zig build test-all     # the above plus the same suite in ReleaseSafe. This is what CI runs
-zig build layering     # check that no module imports upward or sideways
-zig build refusals     # the framework's 166 compile-error checks — NOT the others
-zig build refusals-sql # nilo_sql's 145; refusals-config, -pw, -cache and -s3 for the rest
-zig build snippets     # the documentation's marked snippets, which must compile
-zig build examples     # build all nine examples
-
-zig build test-core    # only nilo_core, both modes. No engine, no module graph
-zig build test-id      # only nilo_id, the same way
-zig build test-config  # only nilo_config, the same way, plus its refusals
-zig build test-pw      # only nilo_pw, the same way, plus its refusals
-zig build test-cache   # only nilo_cache, the same way, plus its refusals
-zig build test-jwt     # only nilo_jwt, both modes — no Engine, no module graph
-zig build test-fetch   # only nilo_fetch, both modes, plus its refusals — a real socket, no Engine
-zig build test-job     # only nilo_job, both modes, plus its refusals — a worker loop on std.Io.Threaded, no Engine
-zig build test-job-sql # nilo_job over a SQLite table, and Postgres if DATABASE_URL reaches one; on test-sql
-zig build test-s3      # only nilo_s3, both modes, plus its refusals
-zig build test-dev     # only nilo-dev's argument parser, both modes — no module graph
-
-zig build run          # the benchmark server
-zig build profile      # where the time inside one request goes
-zig build run-hello    # or rest, orders, forms, spa, stream, chat, outbound
-zig build dev-hello    # the same, restarted on every save (ADR 0259)
+zig build test          # the loop: the suite in Debug, the refusals, every module gate, layering, snippets
+zig build test-all      # the same plus ReleaseSafe and the SQL suite. What CI runs, and the whole gate
+zig build refusals-sql  # one module's refusal table; refusals, -config, -pw, -cache, -s3, -job, -fetch for the others
+zig build examples      # build every example
 zig build fuzz -- --iterations 1000000 --seed 0x…
-zig build bench-ws-server && python3 bench/ws_idle.py both   # what a socket costs idle
 ```
 
-Two things worth knowing before they surprise you:
+The full list, one line each, is in [`CLAUDE.md`](./CLAUDE.md#commands). Three things worth knowing before they surprise you:
 
-**The refusals never cache.** The compiler keeps nothing from a compilation that
-failed, so they get re-analysed on every run: 150 of the 238 on `zig build
-test`, and the SQL table's 139 on top of that for `test-all`. They stay there on
-purpose.
+**The refusals never cache.** The compiler keeps nothing from a compilation that failed, so every one of them is re-analysed on every run. They are the floor of a run rather than its slow part: a run after an edit is longer by whichever single compilation is biggest, because that one cannot be split across cores. [`bench/result/build.md`](./bench/result/build.md) has the numbers and the levers.
 
-They're the *floor* rather than the slow part, and the difference matters if
-you're ever timing this. A run that changed nothing is about as long as they
-are; a run after you edited something is longer, and what makes it longer is
-whichever single compilation is biggest, because that one cannot be split
-across your cores. `bench/result/build.md` has the numbers and the levers.
-
-**The bottom four modules run without the build system.** `zig test core/core.zig`,
-`zig test id/id.zig`, `zig test config/config.zig` and `zig test pw/pw.zig` all
-work on their own, filters and all. That's not a nicety, it's the entry
-condition for that layer. If a change ever stops one of those commands working,
-the layering broke, not the test.
-
-`nilo_fetch` and `nilo_job` are one step short of that and for a stated reason
-— a Fitting borrows the loop
-([ADR 0070](./docs/adr/0070-a-fitting-borrows-the-loop.md)). Each needs
-`nilo_core` in the graph and nothing else:
+**The bottom layer runs without the build system.** `zig test core/core.zig`, and the same for `id/`, `config/`, `pw/`, `cache/` and `jwt/`, work on their own, filters and all. That is the entry condition for the layer, not a nicety: if a change stops one of them working, the layering broke, not the test. A Fitting is one step short because it borrows the loop ([ADR 0070](./docs/adr/0070-a-fitting-borrows-the-loop.md)), and needs `nilo_core` in the graph and nothing else:
 
 ```
 zig test --dep nilo_core -Mroot=fetch/fetch.zig -Mnilo_core=core/core.zig
 zig test --dep nilo_core -Mroot=job/job.zig -Mnilo_core=core/core.zig
 ```
 
-The first opens a real socket at both ends on `std.Io.Threaded`, with no
-engine anywhere, and the second runs a worker loop on it over `job.Memory`.
-Same rule as above: if either ever needs an engine, the module is in the wrong
-layer. `job/live.zig` names `nilo_sql` because the thing it tests is the
-table, and it is its own root — `zig build test-job-sql` — for that reason.
-
-Everything under `http/` reaches the engine and needs the module graph, so
-`zig build test` is the only way to run it. A few files are pure enough to run
-standalone with a filter:
-
-```
-zig test http/range.zig --test-filter "a suffix range"
-```
-
-That works for `cookie`, `patch`, `names`, `json` and `range`. Percent coding
-moved to Core, and runs under `zig test core/core.zig` (ADR 0066).
+**Everything under `http/` needs the module graph**, so `zig build test` is the only way to run it. `cookie`, `patch`, `names`, `json` and `range` are pure enough for `zig test http/range.zig --test-filter "a suffix range"`.
 
 ## What a change has to carry
 
-Four things. They're the same four whether a person or a model wrote the code.
+Four things, the same four whether a person or a model wrote the code. The [pull request template](./.github/PULL_REQUEST_TEMPLATE.md) asks for them in this shape.
 
 ### 1. Which axis it spends, and the number
 
-Performance here isn't one number, it's four, and they don't recover the same
-way ([ADR 0018](./docs/adr/0018-the-trade-budget-has-three-axes.md)):
+Performance here is four numbers, not one, and they don't recover the same way ([ADR 0018](./docs/adr/0018-the-trade-budget-has-three-axes.md)):
 
 | | |
 |---|---|
 | Throughput and p99 | a nicer API wins if it costs under 10% |
-| Allocations per request | fixed. Currently 1, held by a test |
+| Allocations per request | fixed, held by a test in `http/app.zig` |
 | Memory per idle connection | 4,669 bytes is the **floor**, and a handler adds every byte of stack it touches ([ADR 0063](./docs/adr/0063-a-handlers-stack-is-per-connection.md), [ADR 0071](./docs/adr/0071-where-a-connection-waits-is-what-it-costs.md)). Every feature states its own cost |
 | Binary size | anything the linker can't drop states its measured cost, as a stripped `ReleaseFast` number |
 
-Say which one your change spends, and by how much, when you *propose* it. Not
-after it lands, and not because a reviewer asked. If it costs an allocation on a
-path that didn't ask for one, it doesn't go in, and the honest move is to say so
-early rather than build it first.
-
-A feature that can't be made to fit doesn't ship in a worse shape. Response
-compression is the standing example: the shape that would fit is known, it
-hasn't been built, and no allocate-per-request version got shipped in the
-meantime.
+Say which one your change spends, and by how much, when you *propose* it, not after it lands. If it costs an allocation on a path that didn't ask for one, it doesn't go in, and the honest move is to say so early. A feature that can't be made to fit doesn't ship in a worse shape: response compression is the standing example, known shape, not built, no allocate-per-request version shipped meanwhile.
 
 ### 2. Its refusals
 
-If your change adds a compile-time check, the error message it prints is part of
-the feature, and it needs a program that proves the message still says the right
-thing.
+A compile-time check's error message is part of the feature, and it needs a program that proves the message still says the right thing: a file in the module's `refusals/` directory and a row in the matching table in `build.zig`. [`refusals/README.md`](./refusals/README.md) shows how, including how to find the `.says` text (guess, run the step, read what it prints).
 
-That means a file in `refusals/` (or `sql/refusals/`, `config/refusals/`,
-`pw/refusals/`, `cache/refusals/`, `s3/refusals/`, `job/refusals/`, `fetch/refusals/`) and a row in the matching table in `build.zig`.
-[`refusals/README.md`](./refusals/README.md) shows exactly how, including the
-trick for finding out what to put in `.says`: guess, run the **matching** step —
-`refusals`, `refusals-sql`, `refusals-config`, `refusals-pw`, `refusals-cache`,
-`refusals-s3`, `refusals-job` or `refusals-fetch`,
-because each one runs only its own table and a row added to one while another is
-running is a check that silently never ran —
-and read what it prints.
-
-**There are eight tables now.** That warning gets sharper with each one, and the
-failure is silent by construction: the row is there, the file is there, and the
-step you ran never looked at either.
-
-Leave the `nilo: ` prefix off the `.says` text. The build step adds it, which is
-what makes it impossible to record a failure from inside the standard library as
-a passing test.
+There are eight tables and eight steps, one per module, and each step runs only its own table. A row added to one while running another is a check that silently never ran. Leave the `nilo: ` prefix off `.says`; the build step adds it, which is what makes a failure inside the standard library impossible to record as passing.
 
 ### 3. Its tests
 
-Tests go at the bottom of the file they test, and they're named as sentences
-about the behaviour rather than after the function:
+Tests sit at the bottom of the file they test, named as sentences about the behaviour rather than after the function:
 
 ```zig
 test "a path param that is not a number becomes a 400 with a clear message" {
 ```
 
-A new source file under `http/` needs an `_ = @import(...)` line in the
-`test { … }` block at the end of `http/http.zig`, or it never runs at all.
+A new source file under `http/` needs an `_ = @import(...)` line in the `test { … }` block at the end of `http/http.zig`, or it never runs.
 
-Both optimize modes matter, so run `zig build test-all` before you open a pull
-request. Debug is the fast loop. ReleaseSafe is the gate, because a lifetime bug
-passes in Debug, where the bytes a dangling pointer points at happen to still be
-sitting there, and then segfaults in the mode people actually deploy in.
+Run `zig build test-all` before you open a pull request. Debug is the loop; ReleaseSafe is the gate, because a lifetime bug passes in Debug, where the bytes a dangling pointer points at happen to still be there, and segfaults in the mode people deploy in.
 
 ### 4. Its documentation
 
@@ -185,200 +87,63 @@ Documentation is part of the change, not a follow-up:
 
 | What you have | Where it goes |
 |---|---|
-| a design decision | a new file in [`docs/adr/`](./docs/adr/) |
+| a design decision | a new file in [`docs/adr/`](./docs/adr/), naming the alternative it rejected |
 | something you measured, or a guess that turned out wrong | [`docs/history.md`](./docs/history.md) |
-| a benchmark you ran | [`bench/result/`](./bench/result/) — one file an area |
+| a benchmark you ran | [`bench/result/`](./bench/result/), one file an area |
 | something now built | delete its entry from [`docs/roadmap.md`](./docs/roadmap.md) |
-| a question answered, or a feature refused with its reason | [`docs/decided.md`](./docs/decided.md) — and out of the roadmap |
-| something a user has to change | [`CHANGELOG.md`](./CHANGELOG.md) |
+| a question answered, or a feature refused with its reason | [`docs/decided.md`](./docs/decided.md), and out of the roadmap |
+| something a user has to change | [`CHANGELOG.md`](./CHANGELOG.md), under `## Unreleased` |
+| a public API | [`docs/reference/`](./docs/reference/), one page a module, every heading listed once on its `README.md` |
 
-**A snippet you publish is a program, so let the build compile it.** Put
-`<!-- compiles -->` above the fenced `zig` block — `<!-- compiles: body -->` if
-it is a run of statements rather than declarations — and `zig build snippets`
-extracts it, puts [`docs/snippets/types.zig`](./docs/snippets/types.zig) in
-front of it and compiles it. The block in the page stays the only copy. Writing
-that step found seven mistakes in one five-line example, including a
-`db.acquire()` that has never existed; marking the SQL guide later found a
-`db.update` with a number written out in it that did not compile at all
-([ADR 0083](./docs/adr/0083-the-guide-is-the-source-of-its-own-snippets.md)).
-Unlike the refusals these cache, so marking one more costs almost nothing.
+**A snippet you publish is a program, so let the build compile it.** `<!-- compiles -->` above a fenced `zig` block (`<!-- compiles: body -->` for a run of statements) and `zig build snippets` compiles it with [`docs/snippets/types.zig`](./docs/snippets/types.zig) in front. Writing that step found seven mistakes in one five-line example ([ADR 0083](./docs/adr/0083-the-guide-is-the-source-of-its-own-snippets.md)). Unlike the refusals these cache, so marking one more is nearly free.
 
-A page whose own types are the subject may carry a prelude of its own — see
-`Snippets.pages` in `build.zig`, where every page under `docs/guide/sql/` points at
-[`docs/snippets/sql_types.zig`](./docs/snippets/sql_types.zig). Two things the
-step does for you, so that a published snippet reads like one: a declaration
-block's types reach the blocks of statements below it, and a local nothing
-reads is discarded outside the page rather than with an `_ =` inside it.
+**A benchmark that changed a decision gets written down where it can be re-run.** The entry says what was run, on what machine, at what commit, through what transport (the same server measured 197k requests a second across a Docker port and 458k over a unix socket), what the numbers were, and what they changed; and it closes with whether the number can be pushed further, ranked. Build the before rather than quoting it, interleave the runs, pin both sides of a comparison, and quote a margin narrower than its own spread as a range. This is a rule because the repository has already published wrong numbers three times, and all three were found by re-measuring ([ADR 0071](./docs/adr/0071-where-a-connection-waits-is-what-it-costs.md)).
 
-**A benchmark that changed a decision gets written down where it can be
-re-run.** `bench/result/http.md` is the server, `bench/result/sql.md` is the
-database, `bench/result/cache.md` is the cache, and a new area gets a new file rather than a paragraph in an existing
-one. The entry says what was run, on what machine, at what commit, what the
-numbers were, and what they changed — plus what a number was measured
-*through*, because a transport is part of a figure and not a footnote. The same
-`bench-sql` server measured 197k requests a second across a Docker published
-port and 458k over a unix socket. Close with whether the number can be pushed
-further, ranked, so the next person starts where you stopped.
-
-This is a rule because the repository has already published three numbers that
-were wrong: `connect_on_init` was documented in three files and had never
-worked; the flat 8,767 bytes was repeated in four and described a handler
-nobody deploys; and it was then repeated in six more while a page of it was
-being held for no reason at all
-([ADR 0071](./docs/adr/0071-where-a-connection-waits-is-what-it-costs.md)). All
-three were found by re-measuring. A number with no run behind it decays into a
-claim.
-
-Pin both sides of a comparison, too, and start them alternately rather than all
-of one and then all of the other. Unpinned, gws echoes 1,029,308 messages a
-second on the machine in `bench/result/http.md`; pinned to the cores nilo gets,
-1,558,146 against nilo's 1,685,719. Publishing the first would have claimed a
-68% win where the real one is 5–8% — a band, because four runs put it at 7.0,
-8.2, 7.1 and 4.7, and a margin narrower than its own spread is quoted as a
-range or it is quoted wrong.
-
-The roadmap holds nothing that's finished and nothing that's decided. When
-something ships, its entry leaves entirely. No strikethrough, no "done", no
-summary of how it went. When a question gets an answer, the answer goes to
-[`docs/decided.md`](./docs/decided.md) and the question leaves the same way.
-The test is that you can read the roadmap top to bottom as work outstanding.
-
-`docs/history.md` earns its length the hard way. An entry gets in only if it
-would change what somebody does next time: a number that got measured, an
-assumption that turned out false, a design that was tried and lost. Not what
-shipped, which is the changelog's job.
+**The roadmap holds nothing finished and nothing decided.** When something ships its entry leaves entirely: no strikethrough, no "done". **`docs/history.md` stays short**: an entry gets in only if it would change what somebody does next time, not to record what shipped.
 
 ## Writing the code
 
-**Use the project's words.** [`CONTEXT.md`](./CONTEXT.md) is the vocabulary, and
-it lists the words each term refuses. Ctx, not "Context". Str, not "string".
-keep, not "dupe". Refusal, not "negative test". Matching it in code, comments and
-commit messages is most of what makes a patch look like it belongs here.
-
-**Doc comments say why, and name the ADR.** The header comment on every module
-is its design rationale, including the alternatives that got measured and
-dropped. Several of them exist because a number was measured wrong once and
-corrected in place. Keep that habit.
-
-**A `Str` never escapes its request without `.keep()`.** That applies inside the
-framework exactly as much as it does in user code.
-
-**A module imports downward only, and never sideways.** `zig build layering`
-enforces it. Which module a file belongs in comes down to one question: does it
-need the event loop?
-([ADR 0041](./docs/adr/0041-a-module-sits-where-the-loop-puts-it.md),
-[ADR 0042](./docs/adr/0042-the-bottom-layer-holds-more-than-one-module.md))
+- **Use the project's words.** [`CONTEXT.md`](./CONTEXT.md) lists each term and the words it refuses: Ctx not "Context", Str not "string", keep not "dupe", Refusal not "negative test". In code, comments and commit messages.
+- **Doc comments say why, and name the ADR.** The header of every module is its design rationale, including the alternatives measured and dropped.
+- **A `Str` never escapes its request without `.keep()`**, inside the framework as much as in user code.
+- **A module imports downward only, and never sideways.** `zig build layering` enforces it. Which module a file belongs in is one question: does it need the event loop? ([ADR 0041](./docs/adr/0041-a-module-sits-where-the-loop-puts-it.md), [ADR 0042](./docs/adr/0042-the-bottom-layer-holds-more-than-one-module.md))
 
 ## Adding a whole module
 
-Rarer, and it's a design decision before it's a patch, so it starts with an ADR.
-
-Mechanically it's three edits: a row in the `layers` table in `build.zig` saying
-what the module may import, an entry in `shipped_roots`, and a line in `.paths`
-in `build.zig.zon`.
-
-The bar is the same one the README states. A part gets in if you can express it
-as a type the caller already wrote, checked while compiling, with its cost
-written down. It also has to bring its own refusals. Being useful isn't the
-qualification.
-
-And if it sits in the bottom layer, it has to run under a plain `zig test` with
-no module graph. A bottom-layer module whose tests need the build system is in
-the wrong layer.
+A design decision before it's a patch, so it starts with an ADR. Mechanically it's three edits: a row in the `layers` table in `build.zig` saying what the module may import, an entry in `shipped_roots`, and a line in `.paths` in `build.zig.zon`. The bar is the README's: a part gets in if it is expressible as a type the caller already wrote, checked while compiling, with its cost written down, and it brings its own refusals. A bottom-layer module whose tests need the build system is in the wrong layer.
 
 ## Proposing a design change
 
-Open an issue first. Design changes are cheap to argue about and expensive to
-build.
-
-If it lands, it gets an ADR, and an ADR here has a specific shape: it names the
-decision, and it names the alternative that lost and why. A document that only
-describes what was built is a description, not a decision. Read a few of the
-existing ones before writing your first.
-
-[ADR 0043](./docs/adr/0043-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)
-is a good one to start with. It's the first time an earlier rule got tested
-under real pressure, and it shows what happens when the rule wins and the
-convenient thing loses.
+Open an issue first; design changes are cheap to argue and expensive to build. If it lands it gets an ADR, and an ADR names the decision and the alternative that lost and why. A document that only describes what was built is a description, not a decision. [ADR 0043](./docs/adr/0043-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md) is a good first read: an earlier rule tested under real pressure, where the rule won and the convenient thing lost.
 
 ## Commits and pull requests
 
-Conventional commit prefixes, and a short body:
+Conventional prefixes and a short body:
 
 ```
 feat: read settings into a struct of your own
 fix: stop the router reading routes that cannot match
 ```
 
-Use `feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `build` or `chore`, with
-a `!` for a breaking change. Say what changed, not which files. "fix: router.zig"
-tells a reader nothing.
+`feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `build` or `chore`, with a `!` for a break. Say what changed, not which files. The body is optional and earns its place by explaining *why* or naming a number, in a few sentences; the long version belongs in history, an ADR or the changelog, and a body that repeats them is a fourth copy to keep in sync.
 
-The body is optional, and it earns its place by explaining *why* or by naming a
-number. A few sentences, not three paragraphs. The long version belongs in the
-places built for it: history for what got measured, an ADR for the decision, the
-changelog for what a user has to change. A commit body that repeats all three is
-a fourth copy to keep in sync.
-
-Before you open a pull request, run `zig build test-all`, `zig build layering`
-and `zig build examples`. That's what CI runs, plus a million generated requests
-at the parser.
+One decision per pull request. A branch carrying two is two pull requests, and the [template](./.github/PULL_REQUEST_TEMPLATE.md) asks for the four things above. Run `zig build test-all` and `zig build examples` first; that's what CI runs, plus a million generated requests at the parser.
 
 ## Where to start
 
-**Something under [Open questions](./docs/roadmap.md#open-questions) in the
-roadmap.** Those want an argument more than they want a patch, and an argument
-is a cheap thing to contribute. You can write one in an issue in ten minutes —
-each entry ends with what would settle it.
-
-**A module that dials out.** This used to be the biggest thing on the list, and
-for the opposite reason: object storage, mail, a Redis client and an HTTP client
-were four modules blocked on one missing piece, because nothing here had a
-supported way to open an outbound connection. That seam was designed once
-against two callers rather than fitted around the first
-([ADR 0070](./docs/adr/0070-a-fitting-borrows-the-loop.md)), and both callers
-have landed — `nilo_fetch` is the way out and `nilo_s3` is the first module on
-top of it. **Mail and Redis are now ordinary work rather than blocked work**,
-which is what makes them a good place to start: the hard question is already
-answered, and `s3/` is a worked example of the answer.
-
-**The small end, which is real work here.** A refusal whose wording could be
-clearer. A guide page that assumes something it shouldn't. An example covering
-the case you hit and nobody wrote down. Wording is a feature in this repository,
-so improving a sentence is a change, not a chore.
+- **An [open question](./docs/roadmap.md#open-questions) in the roadmap.** Those want an argument more than a patch, and each entry ends with what would settle it.
+- **A module that dials out.** Mail and Redis are ordinary work now: the outbound seam is designed ([ADR 0070](./docs/adr/0070-a-fitting-borrows-the-loop.md)), `nilo_fetch` is the way out and `s3/` is a worked example on top of it.
+- **The small end, which is real work here.** A refusal whose wording could be clearer, a guide page that assumes something it shouldn't, an example for the case you hit. Wording is a feature in this repository, so improving a sentence is a change, not a chore.
 
 ## Working with an agent
 
-Encouraged, and the repository is arranged for it. A model needs the same three
-things a person in a hurry needs: a small surface, no ordering to infer, and a
-build that says what's wrong.
+Encouraged, and the repository is arranged for it. Hand it [`CLAUDE.md`](./CLAUDE.md) for the brief, [`CONTEXT.md`](./CONTEXT.md) for the vocabulary, [`docs/reference/`](./docs/reference/) for the API and [`docs/adr/`](./docs/adr/) for why. Let the build do the first round of review: `zig build test-all` catches a broken behaviour and `zig build layering` catches a broken design.
 
-Hand it [`CLAUDE.md`](./CLAUDE.md) for the working brief,
-[`CONTEXT.md`](./CONTEXT.md) for the vocabulary,
-[`docs/reference/`](./docs/reference/) for the whole API, one page a module, and
-[`docs/adr/`](./docs/adr/) for why any of it is like that.
-
-Then let the build do the first round of reviewing. `zig build test-all` catches
-a broken behaviour and `zig build layering` catches a broken design, which are
-the two things a human reviewer would otherwise have to catch by reading.
-
-One ask: read the diff before you send it. An agent will happily write a
-paragraph into `docs/history.md` that repeats the changelog, or restate an ADR
-in a commit body. Those are the two failure modes worth watching for, and
-they're easier for you to catch than for me.
+One ask: read the diff before you send it. An agent will happily write a paragraph into `docs/history.md` that repeats the changelog, or restate an ADR in a commit body. Those are the two failure modes worth watching for.
 
 ## What gets turned down
 
-Templates, TLS, HTTP/2 and gRPC. These aren't gaps waiting for a volunteer, they
-are decisions with reasoning on file. If you want one of them, the move is to
-argue against the ADR, not to open a pull request adding it.
-
-Anything that needs an annotation to work. Anything that can't say what it
-costs. Anything that adds an allocation to a request path that didn't ask for
-one.
-
-None of that is meant to sound closed. It's meant to save you from writing a
-thousand lines that were never going to land.
+Templates, TLS, HTTP/2 and gRPC. These aren't gaps waiting for a volunteer, they are decisions with reasoning on file; the move is to argue against the ADR, not to open a pull request adding one. Also anything that needs an annotation to work, anything that can't say what it costs, and anything that adds an allocation to a request path that didn't ask for one. None of that is meant to sound closed; it's meant to save you from writing a thousand lines that were never going to land.
 
 ## License
 
