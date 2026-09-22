@@ -222,6 +222,12 @@ newest first.
 
 ### Fixed
 
+- The comptime count of a `raw` select list stopped at `WITHIN GROUP`,
+  reading its `GROUP` as `GROUP BY`, so `percentile_cont(0.5) WITHIN GROUP
+  (ORDER BY v) AS median, count(*) AS n` counted as one column and the Row
+  with two fields was refused. `GROUP` and `ORDER` end the list only with
+  their `BY`.
+
 - `app.tryStatic` and `app.tryStaticWith` on a directory that is not there
   hand back `error.StaticDirNotFound` and log nothing; the `error:` line
   belonged to `static`, which stops the process on it. A problem inside a

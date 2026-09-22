@@ -3986,3 +3986,14 @@ linker error that is not nilo's and stops every quickstart on a new Arch.
 **The first stranger's application is the review the reference cannot give
 itself**, and the shape of every item was the same: the guide said how,
 and not what happens when the other choice is made.
+
+## The select-list counter read `WITHIN GROUP` as `GROUP BY`
+
+`GROUP` at depth 0 ended the list, so a percentile beside a count —
+`percentile_cont(0.5) WITHIN GROUP (ORDER BY v) AS median, count(*) AS n` —
+was one column, and the two-field Row was refused with a message about
+reordering the SELECT. The query engine that hit it worked round it with a
+CTE for a week before the cause was read. The counter now wants the `BY`.
+Same lesson as ADR 0154's `*`: **a keyword is a keyword in a position, and
+the scanner knows positions by depth alone** — a word that means two things
+at one depth needs the next word.
