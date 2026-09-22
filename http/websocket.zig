@@ -2303,7 +2303,7 @@ test "echoes of frames that arrived together leave in one write" {
     var socket = peer.socket();
     socket._out = &wire.writer;
 
-    // The echo loop, as `bench/arena/src/main.zig` writes it. Each send finds
+    // The echo loop, as the HttpArena entry writes it. Each send finds
     // the next frame already in the read buffer and holds its echo; the
     // sixteenth finds nothing behind it and lets them all go.
     var echoed: usize = 0;

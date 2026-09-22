@@ -2305,7 +2305,7 @@ echo-aesni   New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
 echo-v3      New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
 ```
 
-So `bench/arena/Dockerfile`, which builds amd64 with `-Dcpu=x86_64_v3`, puts
+So the entry's `Dockerfile`, which built amd64 with `-Dcpu=x86_64_v3`, put
 software AES on the hot path of every TLS profile. At 50,000 req/s it needs
 about seven cores to decrypt and seven to encrypt on an eight-core box; what
 it does instead is saturate, deliver 39% of the offered rate and answer at a

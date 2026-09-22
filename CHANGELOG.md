@@ -147,11 +147,11 @@ newest first.
   `200` each, and are no longer counted in the "N of M routes hold the Ctx
   and return nothing" line, which is about the application's handlers
   ([ADR 0281](./docs/adr/0281-nilos-own-routes-describe-themselves.md)).
-- nilo's HttpArena entry (`bench/arena/`) subscribes to `echo-ws-pipeline`
+- nilo's HttpArena entry subscribes to `echo-ws-pipeline`
   and `echo-ws-limited`, each held back until the server was right for it:
   the first waited on ADR 0274, the second on ADR 0273 and then ADR 0275,
   because the first of those alone had made the shape three times worse
-  ([`bench/arena/README.md`](./bench/arena/README.md)).
+  ([frameworks/nilo](https://github.com/MDA2AV/HttpArena/tree/main/frameworks/nilo)).
 - A response is flushed before the connection waits, not before `send`
   returns. When the client's next request is already in the read buffer,
   `c.send` leaves the response in the write buffer and it goes out with

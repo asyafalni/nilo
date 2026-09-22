@@ -127,7 +127,7 @@ throttling, at 874K frames a second against 1.68M.
 - `http/websocket.zig`: `fillHeader` checks `between` before the read.
   Two tests, one for a reset between frames and one for a reset inside
   one, on a `Reset` reader that fails the way a reset socket fails.
-- `bench/arena/meta.json` subscribes `echo-ws-limited` and
+- the entry's `meta.json` subscribes `echo-ws-limited` and
   `echo-ws-pipeline`; the README beside it says what each waited on.
 - The rule to carry forward is ADR 0071's, sharpened: **a `std.log` call
   on a per-connection path is one lock every connection queues on**, and

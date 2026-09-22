@@ -161,7 +161,7 @@ save nilo the `@fieldParentPtr`.
   and a close with a frame unread; `live.zig` sends two requests in one
   write over a real socket and reads both answers back with a receive
   timeout, which is the only test that reaches the Engine's half.
-- `bench/arena/meta.json` can now carry `echo-ws-pipeline` (and
+- the entry's `meta.json` can now carry `echo-ws-pipeline` (and
   `echo-ws-limited`, which ADR 0273 made worth entering); the arena's
   `pipelined` column is reference-only and moves regardless.
 - [`http.md`](../../bench/result/http.md#what-a-flush-per-response-costs-a-client-that-pipelines)
