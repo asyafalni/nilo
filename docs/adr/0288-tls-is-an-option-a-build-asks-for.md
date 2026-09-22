@@ -253,12 +253,14 @@ of it has moved (`docs/roadmap.md` carries the rows).
 - **A certificate is read at `listen()` and never again.** Rotation is a
   restart, which for the server this is for is the deployment it already
   has.
-- **A key that is not the certificate's is not caught at `listen()`.** Both
-  files parse, the server comes up, and every handshake fails on the
-  client's side with nothing in the server's log above debug. Tried, with
-  the fixture's certificate and a fresh key: `curl` exit 35. The check is
-  nilo's to add, the certificate's public key against the one derived from
-  the private key, and it is on the roadmap under Next.
+- ~~**A key that is not the certificate's is not caught at `listen()`.**~~
+  It is now: the leaf's public key against the one the private key carries,
+  refused before the port is taken
+  ([ADR 0294](./0294-a-key-is-checked-against-its-certificate-at-listen.md)).
+  What it looked like while it was not caught, which is what put it on this
+  list: both files parse, the server comes up, and every handshake fails on
+  the client's side with nothing in the server's log above debug — tried,
+  with the fixture's certificate and a fresh key, `curl` exit 35.
 
 ## Consequences
 

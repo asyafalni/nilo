@@ -526,11 +526,13 @@ key unencrypted; `certbot` and `step` both write exactly that. Paths are
 relative to the directory the server is started in unless absolute. A
 certificate that cannot be read stops the server before it takes the port,
 in one line saying which file; a `.tls` on a build without the flag is
-refused the same way rather than served as plain HTTP. A key that is not
-the certificate's is not caught there yet: the server comes up and every
-handshake fails, so `curl -k https://…` once after a deploy is the check
-until it is. Rotation is a restart, which is the deployment this server
-already has.
+refused the same way rather than served as plain HTTP. So is a key that is
+not the certificate's, which is the mistake the two files being in
+different `letsencrypt/live/` directories makes: both files parse, so
+without that check the server came up and failed every handshake with the
+reason visible only to the client
+([ADR 0294](../adr/0294-a-key-is-checked-against-its-certificate-at-listen.md)).
+Rotation is a restart, which is the deployment this server already has.
 
 What it costs, so that the choice is a choice ([ADR 0288](../adr/0288-tls-is-an-option-a-build-asks-for.md)
 has the tables):

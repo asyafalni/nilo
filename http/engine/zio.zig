@@ -1006,6 +1006,72 @@ fn callJob(job: *const fn (arg: *anyopaque) void, arg: *anyopaque) void {
     job(arg);
 }
 
+/// Whether the key is the leaf certificate's own.
+///
+/// Two files that each parse are not a pair, and nothing above compares
+/// them: a certificate handed somebody else's key takes the port, comes
+/// up, and fails every handshake at the signature the client checks —
+/// `curl` exit 35, with nothing in nilo's log above debug (ADR 0288).
+/// Both halves are already in hand by the time this is called, so the
+/// comparison costs one parse of the leaf at startup and nothing per
+/// connection.
+///
+/// **A pair this cannot compare is answered `true`.** A scheme with no
+/// prong here is a key `tls.zig` parsed and nilo has no opinion about,
+/// and refusing one would be a server that will not start over a
+/// certificate that is fine. The three prongs are the three the library
+/// signs with.
+fn keyIsTheCertificates(pair: @FieldType(Secured, "auth")) bool {
+    const certs = pair.bundle.bytes.items;
+    if (certs.len == 0) return false;
+    // Leaf first: the order a PEM chain is written in, and the order
+    // `makeCertificate` sends them in.
+    const leaf: std.crypto.Certificate = .{ .buffer = certs, .index = 0 };
+    const parsed = leaf.parse() catch return false;
+    const in_certificate = parsed.pubKey();
+
+    switch (pair.key.signature_scheme) {
+        // The public point, uncompressed SEC1, which is byte for byte what
+        // the certificate carries for an EC key. Derived from the private
+        // key at load and kept, because a server signs with it every
+        // handshake.
+        .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384 => {
+            if (parsed.pub_key_algo != .X9_62_id_ecPublicKey) return false;
+            const derived = pair.ecdsa_key_pair orelse return false;
+            switch (derived) {
+                inline else => |key_pair| {
+                    const point = key_pair.public_key.toUncompressedSec1();
+                    return std.mem.eql(u8, in_certificate, &point);
+                },
+            }
+        },
+        // The modulus, and not the exponent: the exponent is 65537 on
+        // nearly every key ever issued, so comparing it alone would pass
+        // two keys that share nothing.
+        .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => {
+            switch (parsed.pub_key_algo) {
+                .rsaEncryption, .rsassa_pss => {},
+                else => return false,
+            }
+            const derived = pair.key.key.rsa.public;
+            const in_leaf = @TypeOf(derived).fromDer(in_certificate) catch return false;
+            // 4,096 bits is the largest modulus the library holds, and
+            // `toBytes` pads to whatever it is given, so both sides are
+            // written the same width whatever the key size.
+            var from_leaf: [512]u8 = undefined;
+            var from_key: [512]u8 = undefined;
+            in_leaf.modulus.toBytes(&from_leaf, .big) catch return false;
+            derived.modulus.toBytes(&from_key, .big) catch return false;
+            return std.mem.eql(u8, &from_leaf, &from_key);
+        },
+        .ed25519 => {
+            if (parsed.pub_key_algo != .curveEd25519) return false;
+            return std.mem.eql(u8, in_certificate, &pair.key.key.ed25519.public_key.bytes);
+        },
+        else => return true,
+    }
+}
+
 /// The same for a path. `port` is not read at all — there is nowhere for a
 /// port to go on a unix socket, and pretending otherwise would put a number
 /// in the log line that means nothing.
@@ -1325,6 +1391,19 @@ pub fn serve(
                 return error.TlsCertificate;
             };
             secured = .{ .auth = auth, .io = rt.io() };
+            // Assigned first, so the `errdefer` above owns the pair while
+            // this refuses it.
+            if (!keyIsTheCertificates(auth)) {
+                std.log.err(
+                    "the TLS key \"{s}\" is not the certificate \"{s}\"'s own. Both files " ++
+                        "parse, so without this the server would take the port and then fail " ++
+                        "every handshake, with the reason only visible to the client. " ++
+                        "`openssl x509 -in {s} -noout -pubkey` and `openssl pkey -in {s} " ++
+                        "-pubout` print the two public keys, and they have to be the same.",
+                    .{ t.key, t.cert, t.cert, t.key },
+                );
+                return error.TlsCertificate;
+            }
         };
 
         const maybe_server: ?zio.net.Server = if (unix_path) |path|
@@ -2220,6 +2299,27 @@ test "a certificate that is not there is an error, and the suite's own loads wit
     var pair = try readCertKeyPair(gpa, io, "http/testdata/tls/localhost.pem", "http/testdata/tls/localhost-key.pem");
     defer pair.deinit(gpa);
     try testing.expect(pair.ecdsa_key_pair != null);
+}
+
+test "a key that is not the certificate's is caught at listen rather than by the first client" {
+    if (!nilo_build.tls) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The pair every deployment means to have.
+    var own = try readCertKeyPair(gpa, io, "http/testdata/tls/localhost.pem", "http/testdata/tls/localhost-key.pem");
+    defer own.deinit(gpa);
+    try testing.expect(keyIsTheCertificates(own));
+
+    // `other-key.pem` is a second P-256 key, so what is caught here is the
+    // key and not the curve or the file format: both files parse,
+    // `fromFilePath` returns happily, and the handshakes are what fail
+    // (ADR 0288).
+    var stranger = try readCertKeyPair(gpa, io, "http/testdata/tls/localhost.pem", "http/testdata/tls/other-key.pem");
+    defer stranger.deinit(gpa);
+    try testing.expect(!keyIsTheCertificates(stranger));
 }
 
 test "only a socket is ever taken away" {

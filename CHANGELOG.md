@@ -100,6 +100,20 @@ newest first.
   and a kind that writes one is a Refusal naming the levels
   ([ADR 0290](./docs/adr/0290-a-job-says-how-urgent-it-is.md)).
 
+- `listen(.{ .tls = … })` refuses a key that is not its certificate's,
+  before it takes the port, naming both files and the two `openssl`
+  commands that print the two public keys. Both files parsing is not the
+  same as their being a pair: until now a `privkey.pem` from the wrong
+  `letsencrypt/live/` directory bound the port, logged that it was
+  listening, and then failed every handshake with the reason visible only
+  to the client. What is compared is the leaf's public key against the one
+  the private key carries — the SEC1 point for EC, the modulus for RSA,
+  the 32 bytes for Ed25519 — and a scheme with no prong is accepted rather
+  than refused, so a key type the library learns later cannot stop a server
+  that was serving. Nothing on the request path, and nothing in a build
+  without `-Dtls`, where the check is not compiled at all
+  ([ADR 0294](./docs/adr/0294-a-key-is-checked-against-its-certificate-at-listen.md)).
+
 - `listen(.{ .also = &.{ .{ .port = 8081, .tls = … } } })`: more addresses
   to answer on, from one process. An entry is an address, a port and a
   certificate and nothing else; everything else on `listen()` belongs to

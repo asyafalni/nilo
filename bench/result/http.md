@@ -2567,6 +2567,57 @@ The 5 s and 20 s rows put the same total excess on the requests, about 230 reque
 
 Yes, twice. The p99.9 of 29 to 42 ms that is left is the start of the run: cleartext shows 10 to 16 ms of it, so the burst of new connections costs something whatever they speak, and that is the next thing to take apart, for every profile that opens its connections at once. And the signature still costs the CPU it did: 2.6 ms, where OpenSSL signs in 0.22. A fixed-width Montgomery ladder for 1024-bit primes is that lever, and it would move the CPU per request on every TLS profile, not only the tail.
 
+## What checking a key against its certificate costs the binary
+
+[ADR 0294](../../docs/adr/0294-a-key-is-checked-against-its-certificate-at-listen.md)
+is the decision; this is the run behind its size table. The change is a
+comparison at `listen()` of the leaf certificate's public key against the
+one the private key carries, so the only axis it can spend is binary size:
+it runs once at startup, keeps nothing, and adds nothing to a request.
+
+**The machine** is the 2-core box this repository is worked on rather than
+the desktop at the top of this file, which for a `stat -c %s` does not
+matter. **The before was built, not quoted**: `git archive HEAD` into
+`/tmp/nilo-before` with `zig-pkg` hardlinked across, so both trees see the
+same pins. `nilo-hello` (`bench/main.zig`), `ReleaseFast`, `-Dstrip=true`,
+`-Dtarget=x86_64-linux-gnu`, built alternately before/after/before/after.
+
+| build | before | after | delta |
+|---|---|---|---|
+| no `-Dtls` | 968,144 | 968,144 | 0 |
+| `-Dtls`, `.tls` never set | 1,547,728 | 1,538,352 | −9,376 |
+
+Both `-Dtls` rows reproduced **to the byte** on the second round, so the
+number is not build noise.
+
+**The default build is unchanged to the byte**, which is the row the
+decision rests on: the check is inside the comptime `if (nilo_build.tls)`
+the Engine already had, so a build with no module named `tls` never
+analyses it. That two independently built trees produce identical bytes is
+also what says the trees are otherwise the same, which is worth more here
+than the row below it.
+
+**The `-Dtls` build got smaller, and the 9,376 bytes are the inliner's.**
+`.text` is where it moved: 1,376,221 to 1,367,149 on an unstripped pair
+built the same way. Three things say it is not a feature being dropped.
+`keyIsTheCertificates` has no symbol in either binary, so it was inlined
+into the listener loop. The certificate-loading chain beside it is byte for
+byte the same size in both — `CertKeyPair` 145, `Certificate.parse` 9,639,
+the RSA namespace 36,316. And the largest matched move is
+`handshake_server.Handshake.serverFlight`, 22,598 to 21,140, which this
+change does not touch and does not call. One more call in the startup loop
+shifted what LLVM folded, and the rest is spread too thin to name.
+
+**What it did not change:** nothing to re-measure on the other three axes.
+No per-connection state, so `bench/mem.py` was not re-run; the two 512-byte
+buffers the RSA prong compares through are a startup frame and are gone
+before the first accept.
+
+**Can it be pushed further:** there is nothing here to push. The 9,376 is
+not a result to defend — a later change to the same loop could take it back
+without anything being wrong — and the row to hold in a regression check is
+the first one, the default build at 968,144.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings
