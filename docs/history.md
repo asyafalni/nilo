@@ -4034,3 +4034,7 @@ its only expression is a difference nobody diffed. **A pin is a checksum
 against the thing it names, or it is a sentence.** The install line now
 carries the commit, and the release checklist says where the commit comes
 from.
+
+## The dev loop was offered as a watcher of a directory it never reads
+
+Two files said `zig build dev` watching a bundler's output directory would restart the server when the bundle changed, and neither had been run. It cannot: the loop restarts on the binary and on nothing else (ADR 0259), and a save under a front end kept beside the server moves nothing, which is what a project with both wants, and nothing said it had. **A sentence about what a tool watches is a claim until a save is made under it.** The saves are in [`build.md`](../bench/result/build.md#what-a-save-has-to-touch), the line a reader needs is [What a save has to touch](./guide/getting-started.md#what-a-save-has-to-touch), and `bench/devloop.py` is what keeps it from being prose again.

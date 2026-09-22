@@ -451,8 +451,7 @@ On a host whose glibc was built by GCC 16 the native link can stop at
 `.sframe` in `crt1.o`; add `-Dtarget=x86_64-linux-gnu` or `-Dllvm` to the
 line ([why](./docs/guide/getting-started.md#if-the-link-fails-on-sframe)).
 
-`zig build dev-hello` is the same server restarted on every save
-([getting started](./docs/guide/getting-started.md#restarting-on-every-save)).
+`zig build dev-hello` is the same server restarted on every save to the Zig it is built from, and on nothing else in the checkout: a front end kept beside it keeps its own dev server ([getting started](./docs/guide/getting-started.md#restarting-on-every-save)).
 Read **`rest`** first, **`orders`** when you hit "yes, but what about…", and
 **`forms`** if you're building a web page rather than an API.
 

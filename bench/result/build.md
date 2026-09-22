@@ -320,3 +320,24 @@ Debug binary and is Zig's to shrink; what nilo could do about it, delete
 it afterwards, it does. On this machine the LLVM row is bounded by
 LLVM emit on two cores and should divide by the core count elsewhere; that
 is a guess until somebody runs it on the sixteen-core box in the header.
+
+## What a save has to touch
+
+16 cores, x86_64 Linux, Zig 0.16.0, commit `b012502`, Debug, self-hosted backend, cache warm, `-Dtarget=x86_64-linux-gnu` on both `zig build`s because of the host's glibc. The question was whether the dev loop is the back end's or the repository's: a project keeping a front end beside its server should be able to save under the front end without the server going away. ADR 0259 says the loop watches the binary, and the guide had a sentence saying `zig build dev` could watch a bundler's directory, so the two were put to a save each rather than argued.
+
+The loop is `zig build dev-spa`, whose `public/` is served from disk by `staticWith`. Each probe appends a line to one file and reads what the runner and the build print: `nilo-dev` says when it restarts, `--trace` prints the binary's size and mtime every 250 ms, and the build prints a `Build Summary` when a step ran, so a stamp that stood still with no summary under it for fifteen seconds is a save that moved nothing.
+
+| the file saved | what it is to the build | rebuilt | restarted |
+|---|---|---|---|
+| `examples/spa/public/app.js` | served from disk, never read by the build | no, in 15 s | no |
+| `examples/spa/main.zig` | the root | yes | yes, listening 1–2 s after the save |
+| `http/ctx.zig` | nilo's own, imported | yes | yes |
+| `build.zig` | the build's own script | no, in 15 s | no |
+| `examples/hello/orphan.zig`, new | beside the root, imported by nothing | no, in 15 s | no |
+| `public/app.js` in a dependent whose `build.zig` has `installDirectory("public")` and the guide's `dev` step | read by the install step, never by the compiler | the copy step ran, 5/5, in under a second | no |
+
+The first row is the one the question was about, and the last is the same save in the shape a project with a front end would give it: the build reacts, because a step of its own reads the directory, and the server does not, because what `nilo-dev` watches is the binary. The mechanism is why the first holds rather than luck: `std.Build.Watch` on Linux marks with fanotify only the directories that hold a step's inputs, and on an event looks the file's name up in that directory's table, so a save to a name no step reads marks nothing dirty. The last two rows follow from the same table. `build.zig` is not an input of any step, so a change there is a stop and a start; the dev loop does not, and could not, reconfigure.
+
+**What it changed:** the sentence in the static-files guide and the row in `decided.md` that offered `zig build dev` as a way to restart on a bundle were wrong and were corrected; the guide gained [What a save has to touch](../../docs/guide/getting-started.md#what-a-save-has-to-touch), and `bench/devloop.py` runs the first two rows against any dev step so the line is a check. It ran clean here in 25 s against `dev-spa`, and again through `--cmd` against the dependent in the last row; a run with the root as the "outside" file fails the way it should. Building that dependent is also what found that the guide's `dev` step dropped `b.args`, so the `-- --incremental` on the same page never reached the runner; the guide's snippet forwards it now.
+
+**Can it go further:** it does not need to. A second path for `nilo-dev` to watch would let a bundle restart the server, and it is the second reading of which files matter that the ADR rejected; the bundler's own dev server with a proxy is the loop for the front end. What the table does not cover is a front end that reaches the binary some way other than `@embedFile`, a generated `.zig` listing the bundle's names say, which would be inside the line by construction and is untested because nothing here does it.

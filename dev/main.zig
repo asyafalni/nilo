@@ -12,6 +12,14 @@
 //! rebuild are all the build system's — this file spawns two processes and
 //! reads the size and mtime of one file every quarter second.
 //!
+//! **It watches the build, not the checkout.** What `--watch` reacts to is
+//! the set of files the compiler read to make the binary: the `.zig` files
+//! the server imports, nilo's own among them, and anything it `@embedFile`s.
+//! A front end kept beside the server is not in that set, so a save under
+//! it rebuilds nothing and restarts nothing; the front end's own dev server
+//! is the loop for that. Neither is `build.zig`, nor a `.zig` file nothing
+//! imports yet. `bench/devloop.py` is the check that this stays so.
+//!
 //! **A build that fails changes nothing, so nothing restarts.** The watch
 //! prints the errors, the binary on disk is the last one that compiled, and
 //! the server running is the one serving it. There is no code here for

@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
 ```
 
 That is the whole file — `zig build run` after it, and `src/main.zig` next.
-[Restarting on every save](#restarting-on-every-save), below, is three more
+[Restarting on every save](#restarting-on-every-save), below, is four more
 lines once the server exists.
 
 ### If the link fails on `.sframe`
@@ -167,11 +167,12 @@ is instead is a server started again every time the build writes a new one.
 `zig build --watch`, and restarts your server whenever the binary it
 produces changes
 ([ADR 0259](../adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
-Three lines under the `run` step:
+Four lines under the `run` step:
 
 ```zig
 const dev = b.addRunArtifact(nilo.artifact("nilo-dev"));
 dev.addArgs(&.{ "--zig", b.graph.zig_exe, b.getInstallPath(.bin, exe.out_filename) });
+if (b.args) |args| dev.addArgs(args); // what follows `--` on the command line
 b.step("dev", "Rebuild and restart on every save").dependOn(&dev.step);
 ```
 
@@ -184,11 +185,25 @@ info: nilo listening on 127.0.0.1:8787 across 8 thread(s)
 nilo-dev: zig-out/bin/my-app changed; restarted (pid 41107, the old one drained in 100 ms)
 ```
 
+### What a save has to touch
+
+**The loop watches the build, not the repository.** `zig build --watch` reacts to the files the compiler read to make the binary, which is every `.zig` file the server imports, nilo's own among them, and anything it `@embedFile`s; `nilo-dev` then restarts the server when that binary changes, and looks at nothing else. Nothing else in the checkout moves it. In a repository that holds a front end beside the server, a save under `web/` neither rebuilds nor restarts anything: the front end has its own dev server, and this loop is the back end's. Measured on `examples/spa`, whose `public/` is served from disk: a save to `public/app.js` left the loop untouched for the fifteen seconds it was watched, and a save to `main.zig` had the new server listening one to two seconds later ([`build.md`](../../bench/result/build.md#what-a-save-has-to-touch)). Three edges of that line:
+
+- **A file served from disk is not watched, and does not need to be.** With `staticWith(.{ .reload = true })` the edit is served on the next request ([static files](./static-files.md#while-you-are-working-on-it)); without `.reload`, or for a name that did not exist at startup, the server needs a restart and the loop will not give it one. A file that reaches the binary through `@embedFile` is the other way round: it is watched, because saving it changes the binary.
+- **A `.zig` file nothing imports yet is not watched either.** The build reads what the root reaches; write the `@import` first and the next save is seen.
+- **`build.zig` is not watched.** A change there is Ctrl-C and `zig build dev` again.
+
+A build step that reads the front end, an `installDirectory` of its assets say, runs on a save there and copies what changed; the server is not restarted, because the binary did not change. `python3 bench/devloop.py` is the check that all of this stays true, and it runs against any dev step given a file the build reads and one it does not.
+
 **A build that fails changes nothing.** The errors print, the old server keeps
 serving, and the next save that compiles is the one that restarts it. The old
 server is asked with SIGTERM and gets five seconds to finish what it was
-answering before it is killed. Ctrl-C stops all of it. Arguments after `--`
-go to your server; `--build <step>` names a build step other than `install`.
+answering before it is killed. Ctrl-C stops all of it. The fourth line is what
+lets anything after `--` reach `nilo-dev` at all: `-D` options go on to the
+`zig build` it keeps running (`-Dtarget=x86_64-linux-gnu` on the host the
+[link section](#if-the-link-fails-on-sframe) is about), a second `--` and
+what follows go to your server, and `--build <step>` names a build step other
+than `install`.
 
 **Every save writes a whole new binary into `.zig-cache`, and Zig never
 deletes the old one** — 27 MB a save for the smallest example, the size of

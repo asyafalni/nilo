@@ -287,11 +287,7 @@ request-carried string decide when the disk is walked
 - **While developing, serve the frontend from the bundler's own dev server**
   and proxy `/api` to nilo. Every bundler has the proxy option, hot reload
   comes with it, and nilo never sees a hashed name until the build is real.
-- **Or restart nilo when the bundle changes.** `zig build dev` restarts the
-  server on every save it watches
-  ([Getting started](./getting-started.md#restarting-on-every-save)),
-  and a bundler's `--watch` writing into a directory the same command
-  watches gives the same effect for the frontend.
+- **Or restart nilo yourself after each bundle.** `zig build dev` will not do it: it restarts on the binary changing and watches nothing else ([Getting started](./getting-started.md#what-a-save-has-to-touch)), and a bundle landing in `public/` leaves the binary alone.
 
 A production build is written once and the server starts after it, so the
 names are all there and nothing above applies.

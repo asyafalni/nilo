@@ -210,6 +210,7 @@ newest first.
 
 ### Docs
 
+- [Getting started](./docs/guide/getting-started.md#what-a-save-has-to-touch) says what a save has to touch for `zig build dev` to restart the server: a `.zig` the binary is built from, or a file it `@embedFile`s, and nothing else in the checkout, so a front end kept beside the server keeps its own dev server. The static-files guide and `decided.md` said the loop could watch a bundler's directory; it cannot, and both now say so. `bench/devloop.py` is the check: a save the build never reads must leave the server up, a save it reads must restart it. The `dev` step on that page also gained the line that forwards `b.args`, without which the `zig build dev -- --incremental` beside it never reached `nilo-dev`.
 - [Past one table](./docs/guide/sql/raw.md) says what a raw parameter may
   be (an optional binds NULL, and `($1 IS NULL OR …)` is the `sql.given`
   of raw SQL), has a section on reporting statements (`rawExactlyOne`,

@@ -150,6 +150,7 @@ python3 bench/mem.py --port … --path … --hold   # the same for a stream nobo
 python3 bench/shutdown.py --cmd … --port …  # does SIGTERM come back? The regression check for ADR 0098
 python3 bench/fdlimit.py --cmd … --port …   # does a descriptor shortage take the server down? The check for ADR 0265
 python3 bench/burst.py --cmd … --port …     # does a burst of connections get through, or does the kernel drop some? The check for ADR 0271
+python3 bench/devloop.py --step dev-spa     # does a save the build never reads (a front end's) restart the server? It must not. The check for ADR 0259
 python3 bench/paced.py --pid … --port … --rate …   # µs of CPU a request at a fixed rate — what a server that is not busy pays (ADR 0272)
 python3 bench/slowloris.py --port … --path …  # what a body that never finishes holds. Reports VmData, not just VmRSS
 python3 bench/ws_idle.py both            # the same axis for WebSockets, nilo and gws
@@ -159,7 +160,9 @@ bash bench/compare-cache/run.sh          # nilo_cache against go-cache — needs
 zig build run          # the benchmark server (bench/main.zig): GET /users/:id, ~1 KB JSON
 zig build profile      # where the time inside one request goes
 zig build run-{hello,rest,orders,forms,spa,stream,chat,scheduled,outbound,sqlite}  # run one example
-zig build dev-{hello,…}  # the same, restarted on every save, stale builds pruned from .zig-cache (ADR 0259)
+zig build dev-{hello,…}  # the same, restarted on a save to the Zig it is built from and on NOTHING
+                       #   else in the checkout: a front end beside it keeps its own dev server.
+                       #   Stale builds pruned from .zig-cache (ADR 0259)
 ./bench/bench.sh       # wrk/oha against an already-running ReleaseFast server
 ```
 

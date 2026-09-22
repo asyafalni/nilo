@@ -40,6 +40,7 @@ the release-binary constraint met by construction rather than by a flag.
 ```zig
 const dev = b.addRunArtifact(nilo.artifact("nilo-dev"));
 dev.addArgs(&.{ "--zig", b.graph.zig_exe, b.getInstallPath(.bin, exe.out_filename) });
+if (b.args) |args| dev.addArgs(args);
 b.step("dev", "Rebuild and restart on every save").dependOn(&dev.step);
 ```
 
@@ -50,6 +51,8 @@ the build does. Watching the *output* instead of the inputs is also what
 makes a failed build free: the watch prints the errors, the binary on disk
 is the last one that compiled, and the server running is the one serving
 it. There is no code for that case.
+
+**And it reacts only to the files the build read, which is what makes it the back end's loop and not the repository's.** The watch marks the directories holding a step's inputs and answers to those names alone, so a front end kept beside the server is outside it: under `zig build dev-spa`, a save to `public/app.js` moved nothing in the fifteen seconds it was watched, and a save to `main.zig` had the new server listening one to two seconds later. A file the binary `@embedFile`s is inside the line, because saving it changes the binary; `build.zig`, and a `.zig` file nothing imports yet, are outside it. `bench/devloop.py` runs that probe against any dev step, so the line is a check rather than a paragraph ([`build.md`](../../bench/result/build.md#what-a-save-has-to-touch)).
 
 **The old server is asked to stop, in a process group of its own.** SIGTERM
 is what nilo drains on (ADR 0098), and SIGKILL comes only after five
@@ -169,3 +172,4 @@ the one thing nobody runs beside its dev loop.
   "Reloading the server without a restart" and gains the upstream gap.
 - [`bench/result/build.md`](../../bench/result/build.md) carries the table
   and the machine.
+- `bench/devloop.py`: a save the build never reads must leave the server up, and a save it reads must restart it; the guide's [What a save has to touch](../guide/getting-started.md#what-a-save-has-to-touch) is the same line for a reader.
