@@ -37,6 +37,13 @@ const service = @import("service.zig");
 
 pub const content_type = "application/json";
 
+/// The shape of the 200, for the API description: what `write` sends when
+/// every service is ready, read off this struct rather than off a handler
+/// signature nilo cannot see into (ADR 0281). The 503s carry more,
+/// `waiting` or `stopping`, and are failures, which the document does
+/// not promise for any route.
+pub const Page = struct { status: []const u8 };
+
 /// What a probe answered.
 pub const Outcome = enum(u16) { ok = 200, unavailable = 503 };
 

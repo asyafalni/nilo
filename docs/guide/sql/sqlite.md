@@ -20,6 +20,10 @@ Your handler does not change at all — it still takes `db: *Db` and calls
 `db.find`, `db.select`, `db.begin`. That is the point: the driver was always
 behind a seam, and SQLite is the second thing to come through it.
 
+A whole program on one file, tables made at boot, a paged join, a report
+and a transaction, is [`examples/sqlite/`](../../../examples/sqlite/main.zig):
+`zig build run-sqlite`.
+
 ## The one question it makes you answer
 
 `.threading` has **no default**, and leaving it out is a compile error that
@@ -137,6 +141,50 @@ column's declared type is free text — `VARCHAR(255)`, `NVARCHAR` and `CLOB` ar
 all one thing to the database — so the check catches a `Str` field over an
 `INTEGER` column and does not catch an `i32` over a column holding values too
 big for it.
+
+## Raw SQL on this file
+
+A raw statement's text is yours, and the two things that trip a program
+written against the Postgres examples are these. The
+[raw page](./raw.md#what-sqlite-does-differently) has the longer list.
+
+**`$1`, `$2`, … mean the same here.** SQLite's own numbered placeholder is
+`?1`, and `$name` there is a named parameter indexed by first appearance, so
+`WHERE ($2 IS NULL OR x = $2)` with no `$1` before it used to take the
+*first* value. nilo respells `$n` as `?n` while compiling, for every call
+that takes comptime text, so a statement written for Postgres binds by
+number here too and one text serves both
+([ADR 0278](../../adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+`db.exec` takes run-time text and sends it as written; its statements are
+DDL, which has no parameters.
+
+### Dates out of a Timestamp
+
+A `sql.Timestamp` is stored as an INTEGER of **microseconds** since the
+epoch, and SQLite's date functions read seconds. So a report by month
+divides first and says which epoch:
+
+<!-- compiles: body -->
+```zig
+const MonthLine = struct {
+    pub const nilo_table = .projection;
+
+    month: nilo.Str,
+    orders: i64,
+};
+
+const by_month = try db.raw(MonthLine, c,
+    "SELECT strftime('%Y-%m', created_at / 1000000, 'unixepoch') AS month, count(*) " ++
+    "FROM orders GROUP BY 1 ORDER BY 1",
+    .{},
+);
+```
+
+`date(created_at / 1000000, 'unixepoch')` is the day, and
+`created_at >= strftime('%s', 'now', '-30 days') * 1000000` is a window
+compared in the column's own unit, so the index on the column is still
+used. Postgres's spelling of the first is `to_char(date_trunc('month',
+created_at), 'YYYY-MM')`; a `nilo.Str` field takes either.
 
 ## Two things about the filename
 

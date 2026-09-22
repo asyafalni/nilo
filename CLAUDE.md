@@ -69,7 +69,7 @@ Three files carry context this one deliberately does not repeat:
 - **`CONTEXT.md`** — the project's vocabulary, and the words it refuses to use
   (Ctx not "Context", Str not "string", keep not "dupe", Refusal not "negative
   test"). Match it in code, comments, docs and commit messages.
-- **`docs/adr/`** — 275 binding decisions, each naming the alternative it
+- **`docs/adr/`** — 282 binding decisions, each naming the alternative it
   rejected. Check here before proposing a design change; "why not X?" usually
   already has an answer on file. **ADR 0041 decides which module new work goes
   in and ADR 0042 decides what that module may import**, and they are the two
@@ -90,7 +90,7 @@ goes in an ADR, a number goes in `docs/history.md`, a rule goes in a build step.
 
 Two of those rules are build steps rather than paragraphs, and they are the ones
 to lean on: `zig build layering` refuses an import that goes upward or sideways,
-and the eight `refusals` steps check the wording of 372 error messages. Prefer making
+and the eight `refusals` steps check the wording of 378 error messages. Prefer making
 a new rule enforceable that way over writing it down here — a paragraph nobody
 runs is the thing that rots.
 
@@ -123,8 +123,8 @@ zig build test-job-sql # nilo_job over a SQLite table, and Postgres if DATABASE_
 zig build test-s3      # only nilo_s3, both modes, plus its refusals
 zig build test-dev     # only nilo-dev's argument parser, both modes — no module graph
 zig build layering     # check that no module imports upward or sideways
-zig build refusals     # the framework's 166 compile-error checks — NOT the others
-zig build refusals-sql # nilo_sql's 145; also run by test-sql
+zig build refusals     # the framework's 170 compile-error checks — NOT the others
+zig build refusals-sql # nilo_sql's 147; also run by test-sql
 zig build refusals-config  # nilo_config's 9, and refusals-pw for nilo_pw's 4
 zig build refusals-cache   # nilo_cache's 6; also run by test-cache
 zig build refusals-s3  # nilo_s3's 10; also run by test-s3
@@ -132,7 +132,7 @@ zig build refusals-job # nilo_job's 17; also run by test-job
 zig build refusals-fetch # nilo_fetch's 15; also run by test-fetch
 zig build snippets     # the documentation's own marked snippets, which must compile
 zig build smoke-tls -Dnetwork   # a real HTTPS endpoint — NOT part of test
-zig build examples     # build all nine examples
+zig build examples     # build all ten examples
 zig build fuzz -- --iterations 1000000 --seed 0x…   # generated requests at the parser
 zig build bench-cache  # what a cache operation costs, and what an entry weighs
 zig build bench-cache-hitrate  # what fraction of lookups it answers, against the best it could
@@ -158,7 +158,7 @@ python3 bench/compare-s3/drive.py        # nilo_s3 against Go, Rust and Bun — 
 bash bench/compare-cache/run.sh          # nilo_cache against go-cache — needs Go
 zig build run          # the benchmark server (bench/main.zig): GET /users/:id, ~1 KB JSON
 zig build profile      # where the time inside one request goes
-zig build run-{hello,rest,orders,forms,spa,stream,chat,scheduled,outbound}  # run one example
+zig build run-{hello,rest,orders,forms,spa,stream,chat,scheduled,outbound,sqlite}  # run one example
 zig build dev-{hello,…}  # the same, restarted on every save, stale builds pruned from .zig-cache (ADR 0259)
 ./bench/bench.sh       # wrk/oha against an already-running ReleaseFast server
 ```
@@ -166,8 +166,16 @@ zig build dev-{hello,…}  # the same, restarted on every save, stale builds pru
 `-Dstrip=true|false` overrides the per-artifact debug-info default (release
 builds of the two measured binaries strip; examples and tests keep theirs).
 
+**On a host whose glibc was built by GCC 16, the native link of anything with
+libc fails** at `crt1.o:.sframe` with `unhandled relocation type
+R_X86_64_PC64`: Zig 0.16's self-hosted linker does not know the section. Pass
+`-Dtarget=x86_64-linux-gnu` (Zig's own glibc, the self-hosted linker kept, a
+Debug build as fast as before) to every `zig build test*` and `examples` line
+on such a machine, or `-Dllvm` for the examples. The getting-started guide
+says the same to a user.
+
 **The refusals never cache** — the compiler keeps nothing from a compilation
-that failed, so all 166 are re-analysed every run. They stay on `test` on
+that failed, so all 170 are re-analysed every run. They stay on `test` on
 purpose (ADR 0027). They are the *floor*: 2.6s of a 2.9s run that changed
 nothing, and 15.9s of CPU spread over sixteen cores.
 

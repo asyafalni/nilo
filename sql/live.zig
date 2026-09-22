@@ -534,15 +534,17 @@ test "a Db told what to expect boots against a real Postgres and asks its ledger
     defer threaded.deinit();
 
     // The boot a deploy runs, minus the server: `nilo_start` dials the pool
-    // and then asks the ledger, on that pool (ADR 0220). The whole pool is
-    // dialled up front for the reason `Live.open` gives. `expecting(0)` is
-    // level or ahead on any database, so the guard goes through; behind is
-    // pinned on SQLite in `migrate_live.zig`, where the file is fresh.
+    // and `nilo_check` then asks the ledger, on that pool (ADR 0220, ADR
+    // 0277). The whole pool is dialled up front for the reason `Live.open`
+    // gives. `expecting(0)` is level or ahead on any database, so the guard
+    // goes through; behind is pinned on SQLite in `migrate_live.zig`, where
+    // the file is fresh.
     var db = db_mod.Db.init(gpa, url, .{ .size = 2, .connect_on_init = 2, .unchecked = true });
     defer db.deinit();
     db.expecting(0);
     try db.nilo_start(threaded.io(), .off);
     defer db.nilo_stop();
+    try db.nilo_check(threaded.io());
 
     // Boot made the ledger, or this query has no table to read.
     var run: core.Run = .init(gpa);
@@ -1022,7 +1024,7 @@ test "a list condition is one parameter, and Postgres agrees it is an array" {
     try testing.expect(std.mem.indexOf(u8, answer.body, "grace@example.dev") == null);
 }
 
-test "the schema check runs from nilo_start and passes on a table that agrees" {
+test "the schema check a nilo_check runs passes on a table that agrees" {
     const gpa = testing.allocator;
     var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
     defer live.close(gpa);

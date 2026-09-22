@@ -10,18 +10,49 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ## Unreleased
 
-**0.6.0 adds nothing.** It is the release that reads what is already here:
-`http/` scanned line by line for what a stranger on the socket can make it do,
-the public surface read back against the reference before 1.0 freezes it, and
-the ADRs that only correct an older one folded into the one they correct. What
-the scan found lands under `### Fixed` below as it is fixed; what it found and
-cannot hold goes to [`docs/risks.md`](./docs/risks.md).
+**0.6.0 is the release that reads what is already here, and what the first
+application built on 0.5.0 sent back.** `http/` was scanned line by line for
+what a stranger on the socket can make it do; what the scan found lands under
+`### Fixed` below as it is fixed, and what it found and cannot hold goes to
+[`docs/risks.md`](./docs/risks.md). The server then took what the benchmark
+arena asked of it: every executor accepts, and a response is flushed before
+the connection waits rather than on every `send`. And a SQLite application
+built against the guide reported eight things the guide showed working on
+the other database or in the other order, which is where the schema check
+moving after the boot work, `$n` respelled for the dialect, `rawPage`,
+`rawExactlyOne` and `examples/sqlite/` come from. Still to do in it: the
+public surface read back against the reference before 1.0 freezes it, and
+the ADRs that only correct an older one folded into the one they correct.
 
 Work lands here under `### Breaking`, `### Added`, `### Fixed` and `### Docs`,
 newest first.
 
 ### Breaking
 
+- A `Db`'s schema check and version guard run from a new service hook,
+  `nilo_check`, which the App calls after the work `app.before` registered
+  and before the first request; `nilo_start` opens the pool and nothing
+  more. Under an App nothing changes but the order, which is the fix: a
+  first boot with `createMissing` in `before` and `db.checking(schema)`
+  beside it used to fail on the tables the next line would have made. A
+  program driving a `Db` with no App and relying on `nilo_start` to check
+  calls `db.nilo_check(io)` after its own boot work, or `db.checkSchema`
+  ([ADR 0277](./docs/adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+- `app.start(io)` runs the work `before` registered, and every `nilo_check`
+  after it, which its doc comment already promised. A test that registered
+  `createMissing` with `before` and then made the tables itself makes them
+  twice, harmlessly (same ADR).
+- `static.load` takes a fifth argument, `Absent`, saying whether a
+  directory that is not there is reported in one line or handed back
+  alone. Only a caller of the module directly sees it; the four `static`
+  calls on the App pass it
+  ([ADR 0282](./docs/adr/0282-a-try-call-hands-back-the-error-and-says-nothing.md)).
+- `?nilo.Status(code, T)`, `?nilo.Response(T)`, `?nilo.Redirect(code)` and
+  `?nilo.Versioned(T)` as a handler's return type are compile errors naming
+  the shape to write. The first two compiled and sent the wrapper struct
+  itself as JSON, `headers` and all, then crashed; the `?` goes inside,
+  `Status(201, ?T)`
+  ([ADR 0276](./docs/adr/0276-a-question-mark-goes-inside-the-wrapper.md)).
 - `read_buffer` defaults to 16 KiB, up from 8. It is also the ceiling on a
   request head, and 8 KiB was inside what a browser behind a single sign-on
   sends in cookies on every request. An idle connection holds the same 4,669
@@ -32,6 +63,36 @@ newest first.
 
 ### Added
 
+- `examples/sqlite/`: two Rows on one SQLite file, the tables made at boot
+  with `createMissing` in `before` and checked after, a list with a
+  `Query`, a paged join through `rawPage`, a report through
+  `rawExactlyOne` and `raw`, and a transaction. `zig build run-sqlite`;
+  its tests run under `test-sql`.
+- A service may declare `pub fn nilo_check(self: *T, io: std.Io) !void`,
+  run once after `before` and before the first request; a failure is a
+  boot that does not happen. A wrong arity is a Refusal
+  ([ADR 0277](./docs/adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+- `db.rawPage(Row, c, sql, values)` and `tx.rawPage`: a raw statement read
+  as a page, the Row's columns then `count(*) OVER ()` as one more on the
+  end of the list, answering the same `Page(Row)` `db.page` does. A list
+  exactly the Row's width is a Refusal
+  ([ADR 0279](./docs/adr/0279-a-raw-statement-can-carry-its-total.md)).
+- `db.rawExactlyOne(Row, c, sql, values)` and `tx.rawExactlyOne`: `rawOne`
+  for a statement that has one row by construction, an aggregate with no
+  `GROUP BY` or a `RETURNING` on a keyed write, answering the Row and
+  `error.QueryFailed` for none
+  ([ADR 0280](./docs/adr/0280-a-statement-that-always-answers-answers-a-row.md)).
+- The `$n` in a raw statement are respelled for the dialect while
+  compiling, `?n` on SQLite, so `WHERE ($2 IS NULL OR x = $2)` binds the
+  second value on both databases; SQLite read `$2` as a named parameter
+  indexed by first appearance and took the first. A statement naming `$3`
+  and handed two values is a Refusal on both. `exec` sends its run-time
+  text as written
+  ([ADR 0278](./docs/adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+- `app.health` and `app.metrics` describe the routes they register, a
+  `200` each, and are no longer counted in the "N of M routes hold the Ctx
+  and return nothing" line, which is about the application's handlers
+  ([ADR 0281](./docs/adr/0281-nilos-own-routes-describe-themselves.md)).
 - nilo's HttpArena entry (`bench/arena/`) subscribes to `echo-ws-pipeline`
   and `echo-ws-limited`, each held back until the server was right for it:
   the first waited on ADR 0274, the second on ADR 0273 and then ADR 0275,
@@ -131,6 +192,24 @@ newest first.
 
 ### Docs
 
+- [Past one table](./docs/guide/sql/raw.md) says what a raw parameter may
+  be (an optional binds NULL, and `($1 IS NULL OR …)` is the `sql.given`
+  of raw SQL), has a section on reporting statements (`rawExactlyOne`,
+  `raw` per group, `rawPage` for a paged join, dates per dialect) and one
+  on what SQLite does differently. [SQLite](./docs/guide/sql/sqlite.md)
+  has the `strftime(col / 1000000, 'unixepoch')` recipe a microsecond
+  `Timestamp` needs.
+- [Handlers](./docs/guide/handlers.md#where-the--goes) has the table of
+  legal return shapes and the refused ones beside it. The `App` reference
+  says which calls return an error and which return nothing.
+- [Getting started](./docs/guide/getting-started.md#if-the-link-fails-on-sframe)
+  and the README say what to pass when the native link fails at
+  `crt1.o:.sframe` on a glibc built by GCC 16: `-Dtarget=x86_64-linux-gnu`
+  or `-Dllvm`.
+- [Static files](./docs/guide/static-files.md#while-you-are-working-on-it)
+  says why `.reload` does not pick up a bundler's hashed filenames, and
+  the two ways round it. [Writing](./docs/guide/sql/writing.md) says a `Str`
+  column takes a literal, a `[]const u8`, a `[]u8` or a `Str` on insert.
 - `Ctx.body()` says that a gzipped body comes back inflated while
   `header("Content-Encoding")` and `header("Content-Length")` still describe
   the wire, because the head is read in place and nothing rewrites it — and
@@ -143,6 +222,12 @@ newest first.
 
 ### Fixed
 
+- `app.tryStatic` and `app.tryStaticWith` on a directory that is not there
+  hand back `error.StaticDirNotFound` and log nothing; the `error:` line
+  belonged to `static`, which stops the process on it. A problem inside a
+  directory that is there is still said in one line, since the error
+  cannot name the file
+  ([ADR 0282](./docs/adr/0282-a-try-call-hands-back-the-error-and-says-nothing.md)).
 - A WebSocket client that leaves with a reset rather than a FIN, which is
   every load generator that keeps its ports out of `TIME_WAIT` and every
   tab that was killed rather than closed, ends `receive` with `null` the

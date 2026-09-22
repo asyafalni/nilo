@@ -431,7 +431,7 @@ you think a decision is wrong there's something specific to argue with;
 
 ## 🧪 Examples
 
-Nine runnable examples live in [`examples/`](./examples/), and their tests run
+Ten runnable examples live in [`examples/`](./examples/), and their tests run
 in the same suite:
 
 ```console
@@ -444,7 +444,12 @@ $ zig build run-stream     # a streamed report, an event stream, an upload
 $ zig build run-chat       # a WebSocket, browser page included
 $ zig build run-scheduled  # work that is not a request, owned by the server
 $ zig build run-outbound   # calling somebody else's API from inside a handler
+$ zig build run-sqlite     # two Rows on one SQLite file: tables at boot, a paged join, a report, a transaction
 ```
+
+On a host whose glibc was built by GCC 16 the native link can stop at
+`.sframe` in `crt1.o`; add `-Dtarget=x86_64-linux-gnu` or `-Dllvm` to the
+line ([why](./docs/guide/getting-started.md#if-the-link-fails-on-sframe)).
 
 `zig build dev-hello` is the same server restarted on every save
 ([getting started](./docs/guide/getting-started.md#restarting-on-every-save)).

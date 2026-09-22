@@ -26,8 +26,10 @@ const tally = try db.raw(Tally, c,
 ```
 
 `raw` still fills your struct, still uses the arena, still follows the `Str`
-rule. It gives up the compile-time column check and nothing else; the
-`SELECT` list has to line up with the struct's fields by position.
+rule. The `SELECT` list is counted against the struct's fields while
+compiling, and a column that plainly has a name is held against the field in
+its position ([ADR 0148](../../adr/0148-a-raw-statement-is-counted-while-compiling.md));
+what it gives up is nilo writing the text, and nothing else.
 
 It is still a **Row**, so it still carries a `nilo_table` — `raw` never reads
 the name, because it did not write the statement, but the type is the same one
@@ -64,6 +66,52 @@ parsed by `std.json` into `T`'s field names **as written**: a `rename_all`
 on `T` spells the response and not the column, so the `jsonb_build_object`
 names `content_type` and the wire says `contentType`, from one type.
 
+## What a parameter may be
+
+The values are a tuple, one per placeholder, and the placeholders are `$1`,
+`$2`, … in the text: `$n` is the `n`th value, wherever in the statement it
+appears, and a `$n` written twice is one value. The text is comptime, so the
+count is checked while compiling: a statement naming `$3` and handed two
+values is a Refusal, not a run-time error on one database and a silent NULL
+on the other ([ADR 0278](../../adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+
+A parameter is anything a column takes, converted the way a Row's field is
+written: an integer or a float, a `bool`, `[]const u8`, a `nilo.Str` as it
+is (no `.bytes()`), an enum (its tag name goes), `sql.Timestamp` (its
+microseconds), `sql.Date`, `sql.Uuid`, `sql.Json(T)`, `sql.Bytes`. A
+literal `1` or `"open"` is fine in the tuple; a comptime value is given a
+run-time type before it goes.
+
+**An optional binds NULL when it is null**, and that is how a filter a
+screen may or may not have set reaches a statement you wrote. The
+`IS NULL` guard is the `sql.given` of raw SQL, spelled where the database
+can see it:
+
+<!-- compiles: body -->
+```zig
+const Open = struct {
+    pub const nilo_table = .projection;
+
+    id: i64,
+    name: nilo.Str,
+};
+
+const found = try db.raw(Open, c,
+    "SELECT o.id, u.name FROM orders o JOIN users u ON u.id = o.user_id " ++
+    "WHERE o.status = 'open' AND ($1 IS NULL OR u.name ILIKE $1) ORDER BY o.id",
+    .{search},
+);
+```
+
+With `search` absent, `$1` is NULL, the first arm is true and every open
+order comes back; with it set, the second arm filters. One statement, one
+plan, and the same text on both databases.
+
+A list written where it is used, `&.{ 1, 2, 3 }`, binds as an array for
+`= ANY($1)`, which is Postgres's shape and not SQLite's; a named struct of
+values is left to the driver, which is zqlite's `:name` binding
+([ADR 0145](../../adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
+
 ## One column, no Row
 
 A statement that answers one column — a name off the catalogue, an id, a
@@ -83,6 +131,80 @@ Row's field does, so a `Str` is the Scope's and a slice is kept in the
 arena. `rawOne` is the same with the unwrap done. A `SELECT` list of two
 into a scalar is a compile error, the way a short list into a Row is: the
 statement is still counted.
+
+## Reporting statements
+
+Aggregates are most of what a dashboard reads, and every one of them is
+`raw`. Three shapes come up, and each has a call:
+
+**A statement that always has one row.** `SELECT count(*), sum(total) FROM
+invoices` answers one row whatever is in the table, and so does `RETURNING`
+on a keyed write. `rawOne` would hand back a `?Row` for a null that cannot
+happen; `rawExactlyOne` answers the Row, and a statement that answered with
+none is `error.QueryFailed` rather than a zero-filled struct
+([ADR 0280](../../adr/0280-a-statement-that-always-answers-answers-a-row.md)):
+
+<!-- compiles: body -->
+```zig
+const Totals = struct {
+    pub const nilo_table = .projection;
+
+    invoices: i64,
+    open: i64,
+    paid: i64,
+};
+
+const totals = try db.rawExactlyOne(Totals, c,
+    "SELECT count(*), count(*) FILTER (WHERE status = 'open'), " ++
+    "coalesce(sum(total) FILTER (WHERE status = 'paid'), 0)::bigint FROM invoices",
+    .{},
+);
+```
+
+**A line per group.** A `GROUP BY` answers zero or more rows, so it is
+`raw` and a slice, and the Row is the shape of one line. `coalesce` the
+sums: `sum` over no rows is NULL, and a field that is not `?i64` refuses
+one.
+
+**A paged join.** `db.page` reads the rows and the total in one statement
+by putting `count(*) OVER ()` on the `SELECT` list, and a list screen that
+joins two tables wants the same thing. `rawPage` reads your statement as a
+page: the Row's columns, then the window as one more column on the end,
+which becomes `.total`. The `ORDER BY` and the `LIMIT` are yours, for the
+reason `db.page` requires both
+([ADR 0279](../../adr/0279-a-raw-statement-can-carry-its-total.md)):
+
+<!-- compiles: body -->
+```zig
+const Line = struct {
+    pub const nilo_table = .projection;
+
+    id: i64,
+    customer: nilo.Str,
+    total: i64,
+};
+
+const page = try db.rawPage(Line, c,
+    "SELECT i.id, u.name AS customer, i.total, count(*) OVER () " ++
+    "FROM invoices i JOIN users u ON u.id = i.user_id " ++
+    "WHERE ($1 IS NULL OR u.name ILIKE $1) " ++
+    "ORDER BY i.id LIMIT 20 OFFSET $2",
+    .{ search, id },
+);
+```
+
+`page.rows` and `page.total` are what `db.page` answers, and a handler that
+returns the `Page(Line)` is described the same way in the document. A
+`SELECT` list exactly the Row's width, with no window on the end, is a
+Refusal that says what to add.
+
+**Dates in a `GROUP BY` are where the two databases part.** A
+`sql.Timestamp` is microseconds since the epoch. Postgres stores it as
+`timestamptz` and `date_trunc('month', issued_at)` reads it. SQLite stores
+the integer, so a month is `strftime('%Y-%m', issued_at / 1000000,
+'unixepoch')`; the [SQLite page](./sqlite.md#dates-out-of-a-timestamp) has
+the recipe. Read the group key into a `nilo.Str` and the two spellings fill
+the same Row.
 
 ## A statement that answers with nothing
 
@@ -107,6 +229,33 @@ The line is drawn there because a builder's dialect surface grows with the
 builder, and joins and aggregates are where databases disagree most. A
 boundary you can state in a sentence is worth more than one further out,
 because you can predict what it does without opening this guide.
+
+## What SQLite does differently
+
+The text of a raw statement is yours, so the dialect is yours to write in.
+Four things to know when the file is SQLite:
+
+- **`$1`, `$2`, … are the same text on both.** SQLite's own numbered
+  placeholder is `?1`, and a `$name` there is a *named* parameter indexed by
+  first appearance, so `$2` written before `$1` used to bind the first value.
+  nilo respells `$n` as `?n` while compiling for every call that takes
+  comptime text, which is `raw`, `rawOne`, `rawExactlyOne`, `rawPage`,
+  `rawOrdered` and the `Tx` versions
+  ([ADR 0278](../../adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+  `exec` takes its text at run time and sends it as written: write `?1`
+  there, or a bare `?`, or a statement with no parameters, which is what
+  DDL is.
+- **A `Timestamp` is an INTEGER of microseconds**, not a datetime SQLite's
+  date functions read directly. Divide by a million and say `'unixepoch'`:
+  `strftime('%Y-%m', issued_at / 1000000, 'unixepoch')`. A `Date` is its
+  ten characters of text, which `date()` and `strftime` read as they are.
+- **Casts are spelled `CAST(x AS INTEGER)`**, and `::bigint` is Postgres.
+  A `count(*)` is already an integer on both; a `sum` over an INTEGER
+  column is too, and `coalesce(sum(total), 0)` needs no cast.
+- **`ILIKE` is Postgres.** SQLite's `LIKE` ignores case for ASCII already,
+  and `COLLATE NOCASE` on the column is the durable spelling. `FILTER
+  (WHERE …)` on an aggregate and `count(*) OVER ()` both work on the SQLite
+  nilo links.
 
 ## Set operations are conditions, not a second idea
 

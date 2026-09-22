@@ -58,6 +58,32 @@ That is the whole file — `zig build run` after it, and `src/main.zig` next.
 [Restarting on every save](#restarting-on-every-save), below, is three more
 lines once the server exists.
 
+### If the link fails on `.sframe`
+
+On a Linux host whose glibc was built by GCC 16 (Arch and Fedora from
+mid-2026, and their derivatives), a native Debug build can stop at the link
+with
+
+```
+error: fatal linker error: unhandled relocation type R_X86_64_PC64 at offset 0x1c
+    note: in /usr/lib/…/crt1.o:.sframe
+```
+
+That is Zig 0.16's self-hosted linker meeting a section the system's
+`crt1.o` did not have before, and nothing about nilo. Two ways round it,
+both verified:
+
+- **`-Dtarget=x86_64-linux-gnu`** on the `zig build` line. Zig then links
+  against the glibc it ships rather than the host's, the self-hosted linker
+  stays, and a Debug build is as fast as it was. The binary still runs on
+  the host.
+- **`.use_llvm = true`** on the `addExecutable`, or a `-Dllvm` option that
+  sets it, the way nilo's own `zig build examples -Dllvm` does. LLVM's
+  linker path handles the section; a Debug build is slower for it.
+
+The first is the one to reach for while developing; the second is what a
+release build does anyway.
+
 The package is `nilo`; the module is `nilo_http`. **The bare name is the
 project's, not any one module's** — `nilo_sql`, `nilo_id` and `nilo_core` sit
 beside the server, and you add a line here for each one you import and nothing
@@ -243,5 +269,5 @@ which also checks for leaks.
 
 - [Handlers](./handlers.md) — the rule that decides what each argument means.
 - [Routing](./routing.md) — patterns, precedence, and grouping.
-- The nine examples in [`examples/`](../../examples/), each runnable with
+- The ten examples in [`examples/`](../../examples/), each runnable with
   `zig build run-<name>`.

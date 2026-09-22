@@ -112,8 +112,12 @@ try app.provide(&db);
 ```
 
 `db.expecting(version)` refuses to serve a database whose migration ledger is
-behind `version`, checked once at boot on the pool `listen()` just opened
-([ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+behind `version`, checked once at boot, after the work `app.before` registered
+has run and before the first request
+([ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md),
+[ADR 0277](../adr/0277-the-schema-check-runs-after-the-boot-work.md)). The
+same is true of `db.checking`: a `createMissing` or a migration in `before`
+runs first, and the check reads what it made.
 A call rather than an option because an option is read on every boot and
 links the migration module into every program with a `Db`, measured at
 17,296 bytes; a program that never calls this links none of it.
@@ -144,7 +148,13 @@ call that failed rather than by an observer of every call. See
 
 `db.nilo_start(io, limits)` is what `listen()` calls; a program starting a `Db`
 by hand passes `.none` — `.off` is the older spelling of the same value — and
-the pool's waits are bounded by nothing.
+the pool's waits are bounded by nothing. It opens the pool and nothing more.
+`db.nilo_check(io)` is what `listen()` calls next, once the work `app.before`
+registered has run: the `checking` list is held against the live tables and
+the `expecting` version against the ledger, and either disagreeing is a boot
+that fails. A program driving a `Db` by hand calls it after its own boot
+work, or `db.checkSchema(rows)` directly for the tables alone
+([ADR 0277](../adr/0277-the-schema-check-runs-after-the-boot-work.md)).
 `db.nilo_stop()` is the other half, and `listen()` calls that too — after the
 last connection is cut off and before the Engine's loop is torn down, so the
 pool lets go of the loop it was built on
@@ -385,11 +395,22 @@ request ([ADR 0041](../adr/0041-a-module-sits-where-the-loop-puts-it.md)).
 | `db.stream(User, c, .{ … })` | rows one at a time; see below |
 | `db.raw(User, c, sql, .{ … })` | `![]User` — a statement this module will not write. `sql` is **comptime**: the `SELECT` list is counted against the Row's fields and each column that plainly has a name is checked against the field in its position, and the statement is kept prepared like every other ([ADR 0148](../adr/0148-a-raw-statement-is-counted-while-compiling.md)) |
 | `db.rawOne(User, c, sql, .{ … })` | `!?User` — the same, for a statement whose `WHERE` holds a key. **No `LIMIT 1` is added**; see below |
+| `db.rawExactlyOne(Totals, c, sql, .{ … })` | `!Totals`: `rawOne` for a statement that has one row by construction: an aggregate with no `GROUP BY`, a `RETURNING` on a keyed write. No row is `error.QueryFailed`, not a zero-filled Row ([ADR 0280](../adr/0280-a-statement-that-always-answers-answers-a-row.md)) |
+| `db.rawPage(Line, c, sql, .{ … })` | `!Page(Line)`: a raw statement read as a page: the Row's columns, then `count(*) OVER ()` as one more column on the end of the `SELECT` list, which becomes `.total`. The `ORDER BY` and `LIMIT` are yours to write. A list exactly the Row's width is a Refusal ([ADR 0279](../adr/0279-a-raw-statement-can-carry-its-total.md)) |
 | `db.raw([]const u8, c, sql, .{ … })` | `![][]const u8` — column one of every row, with no Row and no marker. `i64`, `?bool`, a `Str`: any one thing a column can be read as. `rawOne` the same, unwrapped. A list of two columns into a scalar is a Refusal ([ADR 0234](../adr/0234-a-scalar-out-of-raw.md)) |
 | `db.liveColumns(c, schema, table)` | `![]const sql.Column` — what the database says the table has, `name`, `udt`, `nullable`. Empty for a table that is not there. What `checkSchema` and `migrate.addMissingColumns` read |
 | `db.rawOrdered(User, c, sql, .{ … }, order)` | `![]User` — a raw statement with `{order}` in it, where the whole `ORDER BY` an `sql.Ordering` chose at run time is written. See *An order chosen at run time* below |
-| `db.exec(c, sql, .{ … })` | `!usize` — a statement that answers with *nothing*, and the rows it changed. `CREATE TABLE`, `CREATE INDEX`, `PRAGMA`, `VACUUM`. No Row, because none is being filled ([ADR 0078](../adr/0078-a-uuid-is-whatever-the-database-stores.md)) |
+| `db.exec(c, sql, .{ … })` | `!usize` — a statement that answers with *nothing*, and the rows it changed. `CREATE TABLE`, `CREATE INDEX`, `PRAGMA`, `VACUUM`. No Row, because none is being filled ([ADR 0078](../adr/0078-a-uuid-is-whatever-the-database-stores.md)). `sql` is run-time text and is sent as written |
+| `db.checkSchema(&.{ User, Order })` | `!usize`: hold these Rows against the live tables now, on a connection of its own, and say what disagrees at `err`. The count is how many problems. What `nilo_check` runs for the `checking` list; for a program that drives a `Db` with no App |
+| `db.nilo_check(io)` | `!void`: the schema check and the version guard, run by `listen()` after `before` ([ADR 0277](../adr/0277-the-schema-check-runs-after-the-boot-work.md)) |
 | `db.begin(c, .{})` | `!Tx`. `.{ .isolation = …, .read_only = … }` rides on the `BEGIN`; see below |
+
+**A raw statement's parameters are `$1`, `$2`, … on every database.** The
+text is respelled for the dialect while compiling (`?1`, `?2` on SQLite),
+so a `$2` that appears before `$1` binds the second value on both, and a
+statement naming `$3` and handed two values is a Refusal. `exec` takes its
+text at run time and sends it as written
+([ADR 0278](../adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
 
 **Set operations are conditions.** Over one table `UNION` is
 `.any = .{ .{ a }, .{ b } }`, `INTERSECT` is `.{ a, b }` and `EXCEPT` is

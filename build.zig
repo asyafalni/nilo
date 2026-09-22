@@ -186,6 +186,11 @@ const examples = [_]Example{
         .about = "Calling somebody else's API from inside a request",
         .needs_fetch = true,
     },
+    .{
+        .name = "sqlite",
+        .about = "Two Rows on one SQLite file: tables made at boot, a paged join, a report, a transaction",
+        .needs_sql = true,
+    },
 };
 
 /// `needs_fetch` rather than handing every example `nilo_fetch`: an example is
@@ -195,6 +200,10 @@ const Example = struct {
     name: []const u8,
     about: []const u8,
     needs_fetch: bool = false,
+    /// Names `nilo_sql`, so it is built and tested only when that module is
+    /// (`-Dsql`, on for this repository), and its tests hang off `test-sql`
+    /// rather than `test` for the reason the module's own do (ADR 0075).
+    needs_sql: bool = false,
 };
 
 /// The same, for `sql/refusals/`. A separate list because they hang off
@@ -393,6 +402,16 @@ const sql_refusals = [_]Refusal{
     .{
         .name = "raw_column_in_another_fields_place",
         .says = "column 1 of the statement handed to `db.raw` is named `owner_id`, and field 1 of raw_column_in_another_fields_place.Person is `id`.",
+    },
+    // The values against the `$n` the text names, and the one column a
+    // paged statement has to carry past its Row (ADR 0278, ADR 0279).
+    .{
+        .name = "raw_with_fewer_values_than_placeholders",
+        .says = "the statement handed to `db.raw` names $2 and was given 1 value.",
+    },
+    .{
+        .name = "raw_page_without_a_total",
+        .says = "the statement handed to `db.rawPage` selects 2 columns, and raw_page_without_a_total.Line has 2 fields and wants one more.",
     },
     // The two shapes a `::text` cannot be hiding in, and the only two this
     // refuses (ADR 0170). Both name the *column* type rather than the Zig one:
@@ -1289,6 +1308,10 @@ const refusals = [_]Refusal{
         .name = "ready_hook_wrong_arity",
         .says = "ready_hook_wrong_arity.Mailer.nilo_ready takes 1 parameters, and it has to take 2.",
     },
+    .{
+        .name = "check_hook_wrong_arity",
+        .says = "check_hook_wrong_arity.Ledger.nilo_check takes 1 parameters, and it has to take 2.",
+    },
     // The two ways to name a Basic realm wrong (ADR 0191).
     .{
         .name = "authorization_realm_empty",
@@ -1487,6 +1510,22 @@ const refusals = [_]Refusal{
     .{
         .name = "versioned_under_a_cached",
         .says = "the handler for route \"/orders\" returns nilo.Versioned([]const versioned_under_a_cached.Order) under a `nilo.Cached`, and a kept answer is sent again as it was kept.",
+    },
+    // A `?` around a wrapper rather than inside it (ADR 0276). Three files
+    // because the way out differs: a `Status` or `Response` takes the `?`
+    // on its body, and a redirect or a versioned answer has nothing for it
+    // to be about.
+    .{
+        .name = "optional_outside_a_status",
+        .says = "the handler for route \"/payments/:id\" returns ?nilo.Status(201,optional_outside_a_status.Receipt), and the `?` has to go inside the wrapper.",
+    },
+    .{
+        .name = "optional_outside_a_redirect",
+        .says = "the handler for route \"/open/:id\" returns ?nilo.Redirect(303), and a redirect has no body for the `?` to be about.",
+    },
+    .{
+        .name = "optional_outside_a_versioned",
+        .says = "the handler for route \"/orders/:id\" returns ?nilo.Versioned(optional_outside_a_versioned.Order), and a thing that is not there has no version.",
     },
     .{
         .name = "form_not_a_struct",
@@ -4200,6 +4239,25 @@ pub fn build(b: *std.Build) void {
         job_live_root.addImport("live_config", under_test.import_table.get("live_config").?);
         const job_live_tests = b.addTest(.{ .root_module = job_live_root, .use_llvm = testBackend(target, mode) });
         test_job_sql_step.dependOn(&b.addRunArtifact(job_live_tests).step);
+
+        // The examples that name `nilo_sql`, tested against the same Db under
+        // test: the one place an example's `db.checking` and `createMissing`
+        // are booted together, which is the shape a first boot got wrong
+        // (ADR 0277).
+        for (examples) |example| {
+            if (!example.needs_sql) continue;
+            const example_root = b.createModule(.{
+                .root_source_file = b.path(b.fmt("examples/{s}/main.zig", .{example.name})),
+                .target = target,
+                .optimize = mode,
+                .imports = &.{
+                    .{ .name = "nilo_http", .module = framework },
+                    .{ .name = "nilo_sql", .module = under_test },
+                },
+            });
+            const example_tests = b.addTest(.{ .root_module = example_root, .use_llvm = testBackend(target, mode) });
+            test_sql_step.dependOn(&b.addRunArtifact(example_tests).step);
+        }
     }
 
     for (test_modes) |mode| {
@@ -4257,8 +4315,10 @@ pub fn build(b: *std.Build) void {
         }
 
         // The examples carry the tests the README promises are possible, so
-        // they run with everything else rather than being decoration.
+        // they run with everything else rather than being decoration. The
+        // one that names `nilo_sql` runs under `test-sql`, above.
         for (examples) |example| {
+            if (example.needs_sql) continue;
             const module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("examples/{s}/main.zig", .{example.name})),
                 .target = target,
@@ -4415,6 +4475,9 @@ pub fn build(b: *std.Build) void {
     // only reason to pay for LLVM here is the flat-cache dev loop.
     const examples_llvm = b.option(bool, "llvm", "Build the examples with LLVM — what `dev-* -- --incremental` needs on 0.16.0") orelse false;
     for (examples) |example| {
+        // An example that names `nilo_sql` is a program that asked for the
+        // module, and `-Dsql=false` is a project that has not.
+        if (example.needs_sql and !want_sql) continue;
         const module = b.createModule(.{
             .root_source_file = b.path(b.fmt("examples/{s}/main.zig", .{example.name})),
             .target = target,
@@ -4426,6 +4489,9 @@ pub fn build(b: *std.Build) void {
         });
         if (example.needs_fetch) {
             module.addImport("nilo_fetch", fetchFor(b, target, optimize, nilo_core));
+        }
+        if (example.needs_sql) {
+            module.addImport("nilo_sql", nilo_sql);
         }
         const built = b.addExecutable(.{
             .name = b.fmt("example-{s}", .{example.name}),

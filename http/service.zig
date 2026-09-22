@@ -62,6 +62,11 @@ pub const Registry = struct {
         /// health route and by nothing else, so a service with none costs
         /// one null test per probe and nothing per request (ADR 0192).
         ready: ?*const fn (*anyopaque, *AnyScope) ?[]const u8 = null,
+        /// Set only for a service that declared `nilo_check`. Run once, after
+        /// the work `app.before` registered and before the first request,
+        /// which is where a check against what that work made belongs
+        /// (ADR 0277). Null is the ordinary case and costs one branch at boot.
+        check: ?*const fn (*anyopaque, std.Io) anyerror!void = null,
     };
 
     /// The `nilo_start` hook, with the type erased so the registry can hold
@@ -211,6 +216,55 @@ pub const Registry = struct {
         }.call;
     }
 
+    /// The `nilo_check` hook, erased the way `nilo_start` is
+    /// ([ADR 0277](../docs/adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+    ///
+    /// **After `before`, not inside `nilo_start`.** A `Db` checks its Rows
+    /// against their tables at boot, and the tables are made by the work
+    /// `app.before` registered (`createMissing`, a migration), which runs
+    /// after every `nilo_start`. Checked from `nilo_start`, a first boot on
+    /// an empty file refused to start over three tables the next line would
+    /// have created. So a service that has something to verify once the boot
+    /// work is done declares this, and the App runs it in that gap.
+    ///
+    /// One arity: `self` and the `Io` the service was started on, which is
+    /// what a check that makes a Scope to run a statement in needs. It may
+    /// fail, and a failure is the boot's: a schema that disagrees with its
+    /// Rows is a server that must not take a request.
+    fn checkHook(comptime T: type) ?*const fn (*anyopaque, std.Io) anyerror!void {
+        if (!@hasDecl(T, "nilo_check")) return null;
+
+        const info = @typeInfo(@TypeOf(T.nilo_check));
+        const shape = comptime "\n  fn nilo_check(self: *" ++ naming.of(T) ++ ", io: std.Io) !void\n" ++
+            "  It runs once, after the work `app.before` registered and before the first request.";
+        if (info != .@"fn") @compileError(
+            "nilo: " ++ naming.of(T) ++ ".nilo_check is not a function, and it has to be one." ++ shape,
+        );
+        const f = info.@"fn";
+        if (f.params.len != 2) @compileError(
+            "nilo: " ++ naming.of(T) ++ ".nilo_check takes " ++
+                std.fmt.comptimePrint("{d}", .{f.params.len}) ++
+                " parameters, and it has to take 2." ++ shape,
+        );
+        if (f.params[0].type != *T) @compileError(
+            "nilo: " ++ naming.of(T) ++ ".nilo_check takes " ++
+                naming.of(f.params[0].type orelse anyopaque) ++
+                " first, and it has to take `*" ++ naming.of(T) ++ "`." ++ shape,
+        );
+        if (f.params[1].type != std.Io) @compileError(
+            "nilo: " ++ naming.of(T) ++ ".nilo_check takes " ++
+                naming.of(f.params[1].type orelse anyopaque) ++
+                " second, and it has to take `std.Io`." ++ shape,
+        );
+
+        return &struct {
+            fn call(erased: *anyopaque, io: std.Io) anyerror!void {
+                const self: *T = @ptrCast(@alignCast(erased));
+                return T.nilo_check(self, io);
+            }
+        }.call;
+    }
+
     pub fn init(gpa: std.mem.Allocator) Registry {
         return .{ .gpa = gpa };
     }
@@ -258,7 +312,18 @@ pub const Registry = struct {
             .start = startHook(info.child),
             .stop = stopHook(info.child),
             .ready = readyHook(info.child),
+            .check = checkHook(info.child),
         });
+    }
+
+    /// Run every service's `nilo_check`, in the order they were provided.
+    /// Once, after the work `before` registered has finished, and before
+    /// anything is accepted (ADR 0277). The first failure stops the rest and
+    /// the boot with it, for the reason `start`'s does.
+    pub fn check(self: *const Registry, io: std.Io) !void {
+        for (self.entries.items) |e| {
+            if (e.check) |hook| try hook(e.ptr, io);
+        }
     }
 
     /// Finish building every service that asked to be finished, in the

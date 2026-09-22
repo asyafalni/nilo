@@ -1240,6 +1240,7 @@ fn checkAnswer(comptime pattern: []const u8, comptime Fn: type) void {
         };
         if (V == void) return;
         verified_mod.checkNotAnswered(pattern, V);
+        checkOptionalInside(pattern, V);
         // Before the `Response` unwrap, because one of the things it
         // refuses is a versioned answer inside a `Response` (ADR 0258).
         versioned_mod.check(pattern, V);
@@ -1255,6 +1256,52 @@ fn checkAnswer(comptime pattern: []const u8, comptime Fn: type) void {
         if (V == void) return;
         if (@typeInfo(V) == .optional) V = @typeInfo(V).optional.child;
         ownbody.check(pattern, V);
+    }
+}
+
+/// A `?` around a wrapper rather than inside it
+/// ([ADR 0276](../docs/adr/0276-a-question-mark-goes-inside-the-wrapper.md)).
+///
+/// `sendResult` reads the wrappers first and `sendValue` unwraps the `?`
+/// after them, so `?Status(201, T)` reached neither: it was an optional of
+/// a struct nobody recognised, and the struct went out as JSON, `headers`
+/// and all. That compiled, answered 200 on the success path, and read
+/// memory that was never a header list. The shape nilo reads is
+/// `Status(201, ?T)`, which is 201 when the value is there and the same
+/// 404 `?T` means everywhere (ADR 0024); a redirect and a versioned answer
+/// have nothing for the `?` to be about, and the thing that is not there is
+/// `fail.notFound`.
+fn checkOptionalInside(comptime pattern: []const u8, comptime V: type) void {
+    comptime {
+        if (@typeInfo(V) != .optional) return;
+        const Inner = @typeInfo(V).optional.child;
+        if (hasNamedDecl(Inner, "nilo_response")) {
+            const Body = Inner.nilo_response;
+            const wrapper = if (hasNamedDecl(Inner, "nilo_status"))
+                "nilo.Status(" ++ num(Inner.nilo_status) ++ ", ?" ++ naming.of(Body) ++ ")"
+            else
+                "nilo.Response(?" ++ naming.of(Body) ++ ")";
+            @compileError(
+                "nilo: the handler for route \"" ++ pattern ++ "\" returns " ++ naming.of(V) ++
+                    ", and the `?` has to go inside the wrapper.\n" ++
+                    "  A `?` is a 404 when the value is not there (ADR 0024), and the value is the " ++
+                    "wrapper's body: write `" ++ wrapper ++ "`, which answers " ++
+                    "the wrapper's status when the value is there and 404 when it is null. Or return " ++
+                    "`nilo.fail.notFound(\"there is no {f}\", .{c.path()})` for the one that is not there.",
+            );
+        }
+        if (hasNamedDecl(Inner, "nilo_redirect")) @compileError(
+            "nilo: the handler for route \"" ++ pattern ++ "\" returns " ++ naming.of(V) ++
+                ", and a redirect has no body for the `?` to be about.\n" ++
+                "  A redirect is an answer the handler decided on. The thing that is not there is " ++
+                "`return nilo.fail.notFound(\"there is no {f}\", .{c.path()})`, said before the redirect.",
+        );
+        if (versioned_mod.isVersioned(Inner)) @compileError(
+            "nilo: the handler for route \"" ++ pattern ++ "\" returns " ++ naming.of(V) ++
+                ", and a thing that is not there has no version.\n" ++
+                "  Return `nilo.fail.notFound(\"there is no {f}\", .{c.path()})` for it, and the " ++
+                "`nilo.Versioned(…)` on its own for the body; `Versioned(?T)` is refused for the same reason.",
+        );
     }
 }
 

@@ -3938,3 +3938,51 @@ it is took the shape to 1.68M
 ([ADR 0275](./adr/0275-a-reset-between-frames-is-a-client-that-has-gone.md),
 [`http.md`](../bench/result/http.md#a-reset-between-frames-is-a-client-that-has-gone)).
 The half-hour it cost is the cheapest measurement in this file.
+
+## The first application, and what its author had to read the source for
+
+An application built on 0.5.0 against SQLite sent back a page of what it
+had hit, and the pattern across the eight items is the lesson rather than
+any one of them: **every one was a case the guide showed working, on the
+other database or in the other order.**
+
+**The guide's own two-line program did not boot.** `db.checking(schema)`
+and `createMissing` in `app.before` are the recommended pair, and the
+check ran from `nilo_start`, before `before`, so a fresh file failed on
+the three tables the next line made; the second boot was clean. A first
+boot is the one boot nobody's test runs twice. The check moved to a hook
+after the boot work
+([ADR 0277](./adr/0277-the-schema-check-runs-after-the-boot-work.md)), and
+the example that could not boot is `examples/sqlite/`, whose tests boot it.
+
+**A statement that was right on Postgres was wrong on SQLite with no
+error.** `$2` before `$1` is what an `IS NULL` guard looks like; SQLite
+reads `$2` as a name, numbers it by first appearance, and the first value
+went into it. The raw guide had been written against Postgres, and every
+statement in it carried the trap. Respelling `$n` for the dialect while
+compiling costs nothing at run time, and the count check beside it turns a
+silent NULL into a Refusal
+([ADR 0278](./adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+
+**A shape that compiled crashed on its success path.** `!?Status(201, T)`
+reached neither the wrapper reading nor the optional unwrap and went out
+as the struct, `headers` and all. A crash on the path a test exercises
+first is the cheapest kind, and the type layer could have refused it for
+the price of one function
+([ADR 0276](./adr/0276-a-question-mark-goes-inside-the-wrapper.md)).
+
+**Two of nilo's own lines were about nilo, and read as being about the
+application.** `app.health` was counted among the routes "that hold the Ctx
+and return nothing", and `app.tryStatic` printed `error:` for the case its
+name says the caller handles. A line the framework prints is read as a
+verdict on the program, and a framework that knows the answer says it or
+says nothing ([ADR 0281](./adr/0281-nilos-own-routes-describe-themselves.md),
+[ADR 0282](./adr/0282-a-try-call-hands-back-the-error-and-says-nothing.md)).
+
+What did not need a change in the code was still half the page: what a raw
+parameter may be, what SQLite stores a `Timestamp` as, which `App` calls
+fail, why `.reload` misses a bundler's hashed names, and a paragraph on a
+linker error that is not nilo's and stops every quickstart on a new Arch.
+**The first stranger's application is the review the reference cannot give
+itself**, and the shape of every item was the same: the guide said how,
+and not what happens when the other choice is made.

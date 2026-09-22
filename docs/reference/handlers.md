@@ -432,6 +432,13 @@ tell which from the signature — so the description says it does not know, and
 empty" says so by returning `Status(200, void)` and is described like anything
 else ([ADR 0150](../adr/0150-a-ctx-handler-that-returns-nothing-may-have-written-it.md)).
 
+**A `?` goes inside a wrapper, never around it.** `Status(201, ?T)` and
+`Response(?T)` are the value or a 404; `?Status(201, T)`, `?Response(T)`,
+`?Redirect(code)` and `?Versioned(T)` are each a compile error naming the
+shape to write, since the `?` is about the body and those have none for it
+to be about ([ADR 0276](../adr/0276-a-question-mark-goes-inside-the-wrapper.md)).
+The [guide](../guide/handlers.md#where-the--goes) has the two tables.
+
 `Redirect` takes 301, 302, 303, 307 or 308; anything else is a compile error.
 303 is the one a form POST wants.
 

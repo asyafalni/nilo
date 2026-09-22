@@ -35,6 +35,12 @@ transactions. The guide says Postgres throughout because that is the longer
 story; [SQLite](./sqlite.md) says what changes, and it is one line of wiring
 and five things SQLite refuses.
 
+**One whole program is [`examples/sqlite/`](../../../examples/sqlite/main.zig)**:
+two Rows on one file, the tables made at boot with `createMissing` and
+checked after, a list with a `Query`, a paged join through `rawPage`, a
+report through `rawExactlyOne` and `raw`, and a transaction. `zig build
+run-sqlite` starts it, and its tests run under `zig build test-sql`.
+
 ## The pages
 
 Read them in order the first time; each assumes the ones above it.
@@ -48,10 +54,11 @@ Read them in order the first time; each assumes the ones above it.
    a row that may already be there.
 4. [Transactions](./transactions.md) — deadlines, isolation, holding the rows
    you read, and undoing one statement without losing the rest.
-5. [Past one table](./raw.md) — `raw`, for the join, the aggregate and the
-   statement that answers with nothing.
+5. [Past one table](./raw.md) — `raw`, what a parameter may be, the join,
+   the aggregate, the paged join, the statement that answers with nothing,
+   and what SQLite does differently.
 6. [SQLite](./sqlite.md) — one line of wiring, the one question it makes you
-   answer, and the five things it refuses.
+   answer, the five things it refuses, and dates out of a Timestamp.
 7. [Making the tables](./migrations.md) — the same struct creates and changes
    the table, a diff that needs no database, and your own `db` command.
 8. [Running it](./running.md) — the check at startup, the stack a handler

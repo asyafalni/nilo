@@ -22,6 +22,14 @@ fills in — a generated key, a `DEFAULT now()` — are exactly the ones you hav
 nothing to say about. What comes back is the whole row, via `RETURNING`, so
 there is no second query to fetch what the database just had in its hand.
 
+**A `Str` column takes text in whatever shape you hold it.** The Row says
+`email: Str`; the insert takes a literal, a `[]const u8`, a `[]u8` an
+allocator handed back, or a `Str` off the request, and each is written the
+same way. There is nothing to convert on the way in, and `made.email` is a
+`Str` on the way out, the Scope's for as long as the request is
+([ADR 0145](../../adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
+An optional column takes `null` and an `?T` of the same shapes.
+
 `update` and `delete` answer with the number of rows they touched, and both
 **require** a condition. An update with no `.where` rewrites the table and a
 delete with none empties it; each is reached by leaving something out rather

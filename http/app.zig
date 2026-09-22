@@ -26,7 +26,7 @@ const password_mod = @import("password.zig");
 const metrics_mod = @import("metrics.zig");
 const serve = @import("serve.zig");
 const wiring = @import("wiring.zig");
-const health = @import("health.zig");
+const health_mod = @import("health.zig");
 const failurebody = @import("failurebody.zig");
 
 /// Say so if the program was built in a mode its log level does not match.
@@ -57,10 +57,10 @@ pub const default_arena_keep = 16 * 1024;
 fn healthRoute(c: *Ctx) anyerror!void {
     var scope = str_mod.AnyScope.of(c);
     var out: std.Io.Writer.Allocating = try .initCapacity(c.arena(), 256);
-    const outcome = try health.write(&out.writer, &scope, c._services.entries.items, c.stopping());
+    const outcome = try health_mod.write(&out.writer, &scope, c._services.entries.items, c.stopping());
     // A health answer a proxy remembers is a health answer about the past.
     try c.setStaticHeader("Cache-Control", "no-store");
-    try c.send(@intFromEnum(outcome), health.content_type, out.written());
+    try c.send(@intFromEnum(outcome), health_mod.content_type, out.written());
 }
 
 pub const App = struct {
@@ -177,6 +177,11 @@ pub const App = struct {
     /// Whether the list above has run. A second `listen()` on the same App
     /// — a test that restarts one — does not migrate twice.
     before_ran: bool = false,
+    /// Whether every service's `nilo_check` has run, once, after the list
+    /// above (ADR 0277). Held apart from `before_ran` for the reason
+    /// `background_started` is: set at a different moment, by either of
+    /// `start` and `listen()`.
+    checks_ran: bool = false,
     /// Work that is not a request, registered before the server exists and
     /// started once it does (ADR 0086). Empty for almost every App.
     background: std.ArrayList(Background) = .empty,
@@ -455,16 +460,23 @@ pub const App = struct {
         dir_path: []const u8,
         opts: static_mod.Options,
     ) !void {
-        self.tryStaticWith(url_prefix, dir_path, opts) catch |err| {
+        self.loadStatic(url_prefix, dir_path, opts, .reported) catch |err| {
             if (static_mod.explained(err)) std.process.exit(1);
             return err;
         };
     }
 
     /// `static`, for a caller that would rather handle a missing directory
-    /// than have the process stopped under it — a test, or a program with a
-    /// fallback. The one-line explanation still goes to the log; what
-    /// changes is that the error comes back as a value.
+    /// than have the process stopped under it: a test, or a program with a
+    /// fallback, a backend that serves without its frontend built. **A
+    /// directory that is not there comes back as `error.StaticDirNotFound`
+    /// and nothing is logged**, because the caller has the path and the
+    /// decision, and a program that handles a case should not read `error:`
+    /// in its own log for it
+    /// ([ADR 0282](../docs/adr/0282-a-try-call-hands-back-the-error-and-says-nothing.md)).
+    /// A problem inside a directory that *is* there (a file that could not
+    /// be read, a path too long) is still said in one line, since the
+    /// error cannot name the file and the line can.
     pub fn tryStatic(self: *App, url_prefix: []const u8, dir_path: []const u8) !void {
         return self.tryStaticWith(url_prefix, dir_path, .{});
     }
@@ -476,7 +488,18 @@ pub const App = struct {
         dir_path: []const u8,
         opts: static_mod.Options,
     ) !void {
-        const set = try static_mod.load(self.gpa, url_prefix, dir_path, opts);
+        return self.loadStatic(url_prefix, dir_path, opts, .returned);
+    }
+
+    /// What the four `static` calls share: the load, and the set kept.
+    fn loadStatic(
+        self: *App,
+        url_prefix: []const u8,
+        dir_path: []const u8,
+        opts: static_mod.Options,
+        absent: static_mod.Absent,
+    ) !void {
+        const set = try static_mod.load(self.gpa, url_prefix, dir_path, opts, absent);
         errdefer {
             var mutable = set;
             mutable.deinit();
@@ -931,6 +954,25 @@ pub const App = struct {
     /// where you mount it.
     pub fn health(self: *App, comptime path: []const u8) !void {
         try self.get(path, healthRoute);
+        // The one thing ADR 0150 cannot read off a `*Ctx` handler is what
+        // it answers, and this handler is nilo's own: a JSON page with a
+        // `status` in it, 200 when everything is ready. Said here so the
+        // document describes the route and the count of routes it cannot
+        // describe is the application's alone (ADR 0281). The 503s are
+        // failures, which the document does not promise for any route.
+        self.describeLast(.{
+            .status = 200,
+            .content_type = health_mod.content_type,
+            .schema = comptime openapi.schemaOf(health_mod.Page),
+        });
+    }
+
+    /// Give the route registered last an answer nilo already knows, for
+    /// the two handlers nilo wrote itself (ADR 0281). A `*Ctx` handler that
+    /// returns nothing is otherwise `written`: undescribed, and counted in
+    /// the line `listen()` prints about them.
+    fn describeLast(self: *App, answer: openapi.Answer) void {
+        self.operations.items[self.operations.items.len - 1].answer = answer;
     }
 
     /// Count every request, and serve the numbers at `/metrics` in the format
@@ -962,6 +1004,13 @@ pub const App = struct {
         // scrape never touches it.
         try self.services.add(&self.metrics_table.?);
         try self.get(opts.path, metrics_mod.readout);
+        // nilo wrote the readout, so it can say what the readout answers:
+        // the text format Prometheus scrapes, as a 200 (ADR 0281).
+        self.describeLast(.{
+            .status = 200,
+            .content_type = metrics_mod.content_type,
+            .schema = comptime openapi.schemaOf([]const u8),
+        });
     }
 
     /// Publish a number of the application's own on the metrics page.
@@ -1127,9 +1176,11 @@ pub const App = struct {
     /// Everything `listen()` does **before it accepts anything**, for a
     /// program that is not going to listen at all.
     ///
-    /// The services are checked, the middleware chains are resolved, and every
-    /// service that declared `nilo_start` is started on `io` — so a `Db` has
-    /// its pool and has had its schema checked, and a query works. A test
+    /// The services are checked, the middleware chains are resolved, every
+    /// service that declared `nilo_start` is started on `io`, the work
+    /// `before` registered runs, and every `nilo_check` runs after it, so a
+    /// `Db` has its pool, its tables if `createMissing` was registered, and
+    /// has had its schema checked against them, and a query works. A test
     /// driving the App through `testing.Client`, a script, a worker process
     /// that runs `jobs.serveOn(io)` and never takes a socket: those are what
     /// this is for, and `std.Io.Threaded` is the `Io` they hold.
@@ -1160,6 +1211,14 @@ pub const App = struct {
         try self.checkServices();
         try self.resolveChains();
         try self.startServices(io, .{}, .start);
+        // The same two phases `listen()` runs after the pool is open, on
+        // the same `Io`: the work `before` registered, then what each
+        // service checks once that work is done (ADR 0277). A test that
+        // registered `createMissing` with `before` gets its tables here, and
+        // a `Db` checks its Rows against them rather than against an empty
+        // file.
+        try self.runBefore(io);
+        try self.checkServiceHooks(io);
     }
 
     /// Finish building the services that could not be finished before the
@@ -1189,14 +1248,15 @@ pub const App = struct {
 
     /// Everything that has to happen once, inside `listen()`, after the port
     /// is taken and before anything is accepted. The hook the Engine is
-    /// handed (ADR 0040), which is three steps rather than one (ADR 0086,
-    /// ADR 0220).
+    /// handed (ADR 0040), which is four steps rather than one (ADR 0086,
+    /// ADR 0220, ADR 0277).
     ///
     /// The order is the only one available: the work registered by `before`
-    /// needs the services, and the work registered by `spawn` may use
-    /// either. The three guards are separate because each is skipped under
-    /// its own condition, and a program that ran `start()` for a test and
-    /// then listened must still get its background work started.
+    /// needs the services, a service's `nilo_check` looks at what that work
+    /// made, and the work registered by `spawn` may use any of it. The four
+    /// guards are separate because each is skipped under its own condition,
+    /// and a program that ran `start()` for a test and then listened must
+    /// still get its background work started.
     ///
     /// **A service started by `start(io)` before this is refused here**, and
     /// this is the one place that can see it: `services_started` is set and
@@ -1232,7 +1292,31 @@ pub const App = struct {
         self.bound_port.store(port orelse 0, .release);
         try self.startServices(io, limits, .listen);
         try self.runBefore(io);
+        try self.checkServiceHooks(io);
         try self.startBackground(io);
+    }
+
+    /// Run what every service declared as `nilo_check`, once, after the
+    /// work `before` registered and before anything is accepted
+    /// ([ADR 0277](../docs/adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+    ///
+    /// **This is the phase the schema check moved into.** A `Db` compares
+    /// its Rows against their tables, and the tables are what
+    /// `createMissing` or a migration in `before` just made; run from
+    /// `nilo_start` the check saw the file before that work and refused a
+    /// first boot over tables the next step would have created. A failure
+    /// here is a boot that does not finish, after one line saying so.
+    fn checkServiceHooks(self: *App, io: std.Io) !void {
+        if (self.checks_ran) return;
+        self.checks_ran = true;
+        self.services.check(io) catch |err| {
+            std.log.err(
+                "nilo will not start: a service's check after the boot work failed with {t}, " ++
+                    "and a server whose services disagree with what they hold must not take a request.",
+                .{err},
+            );
+            return err;
+        };
     }
 
     /// Run what `before` registered, once, in the order it was registered.
@@ -1887,6 +1971,82 @@ test "app.before runs inside the boot, after the services, with a Run on their l
     // And not twice: a second boot on the same App is not a second migration.
     try app.serverStarting(threaded.io(), .{}, null);
     try testing.expectEqual(@as(usize, 1), witness.times);
+}
+
+/// A service with something to verify once the boot work is done: what a
+/// `Db` does with its schema (ADR 0277). Records whether the `before` work
+/// had already run when the check did, which is the whole point of the
+/// phase.
+const Checked = struct {
+    checks: usize = 0,
+    saw_before_done: bool = false,
+    refuse: bool = false,
+    witness: ?*const Witness = null,
+
+    pub fn nilo_start(_: *Checked, _: std.Io) !void {}
+
+    pub fn nilo_check(self: *Checked, io: std.Io) !void {
+        self.checks += 1;
+        _ = io;
+        if (self.witness) |w| self.saw_before_done = w.noted;
+        if (self.refuse) return error.SchemaMismatch;
+    }
+};
+
+test "a service's nilo_check runs after the before work, once, inside the boot" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    var witness: Witness = .{};
+    var checked: Checked = .{ .witness = &witness };
+    try app.provide(&checked);
+    try app.before(Witness.note, .{&witness});
+
+    try app.serverStarting(threaded.io(), .{}, null);
+    // The order is the fix: a `createMissing` in `before` has made its tables
+    // by the time the schema is checked against them.
+    try testing.expectEqual(@as(usize, 1), checked.checks);
+    try testing.expect(checked.saw_before_done);
+
+    // Once, like the before work it follows.
+    try app.serverStarting(threaded.io(), .{}, null);
+    try testing.expectEqual(@as(usize, 1), checked.checks);
+}
+
+test "app.start runs the before work and the checks too, so a test's tables exist" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    var witness: Witness = .{};
+    var checked: Checked = .{ .witness = &witness };
+    try app.provide(&checked);
+    try app.before(Witness.note, .{&witness});
+
+    // Everything `listen()` does before it accepts anything, on the
+    // caller's `Io`: the phase is the same, the loop is theirs.
+    try app.start(threaded.io());
+    try testing.expect(witness.noted);
+    try testing.expectEqual(@as(usize, 1), checked.checks);
+    try testing.expect(checked.saw_before_done);
+}
+
+test "a nilo_check that fails hands its own error to the boot" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    var checked: Checked = .{ .refuse = true };
+    try app.provide(&checked);
+
+    // Through the registry rather than `checkServiceHooks`, which says in
+    // one error line that the server will not start, for the reason the
+    // `before` test below drives its entry directly.
+    try testing.expectError(error.SchemaMismatch, app.services.check(threaded.io()));
 }
 
 test "app.before work that fails hands its own error to the boot" {

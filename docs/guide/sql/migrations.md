@@ -365,10 +365,20 @@ fn makeTables(run: *nilo.Run, db: *sql.Db) !void {
 
 <!-- compiles: body -->
 ```zig
+db.checking(.{ .tables = &.{User} });
 try app.provide(&db);
 try app.before(makeTables, .{&db});
 try app.listen(.{ .port = 8080 });
 ```
+
+**`db.checking` and `createMissing` go together**, and in that order of
+events: the pool opens, `before` makes the tables, and then the schema check
+runs and reads what it made. A first boot on an empty file is clean, and a
+Row that has drifted from a table `createMissing` will not alter is still
+refused at boot. The check is a `nilo_check`, which the App runs after the
+work `before` registered, and `app.start(io)` runs the same three steps for
+a test ([ADR 0277](../../adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+[`examples/sqlite/`](../../../examples/sqlite/main.zig) is this program.
 
 ### A column the shipped file has not got
 

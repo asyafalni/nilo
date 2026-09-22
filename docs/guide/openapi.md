@@ -293,6 +293,13 @@ Holding a `*Ctx` is not itself the disqualification — a handler that reads a
 header and then returns its answer is described like any other. Returning
 nothing while holding one is.
 
+**The count is your routes, not nilo's.** `app.health(path)` and
+`app.metrics(opts)` register handlers of that shape, and both are described:
+the health page as a `200` of `{"status":…}`, the readout as `200` under
+the Prometheus text type. Neither is counted in the line above, so a program
+with a health page and every handler of its own described reads no line at
+all ([ADR 0281](../adr/0281-nilos-own-routes-describe-themselves.md)).
+
 **A handler that really does mean "200, empty" says so.** `Status(200, void)` is
 the return type for it, and the document then carries the 200 rather than the
 `default`. nilo cannot tell the two apart from the signature, which is why the

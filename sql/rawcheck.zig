@@ -297,10 +297,169 @@ fn assertCasts(
     }
 }
 
+/// `assertList` for a statement read as a **page**: the Row's columns and
+/// one more on the end, the `count(*) OVER ()` that `db.rawPage` reads the
+/// total from ([ADR 0279](../docs/adr/0279-a-raw-statement-can-carry-its-total.md)).
+/// The names are checked against the fields as before; the last column is
+/// counted and nothing else, because `count(*) OVER () AS total` and a bare
+/// window are both fine and this file cannot tell them apart.
+pub fn assertPaged(
+    comptime D: type,
+    comptime Row: type,
+    comptime sql: []const u8,
+    comptime call: []const u8,
+) void {
+    comptime {
+        @setEvalBranchQuota(20_000 + 200 * sql.len);
+        const list = scan(sql);
+        const count = list.count orelse return;
+        const fields = columnFields(Row);
+
+        if (count != fields.len + 1) @compileError(std.fmt.comptimePrint(
+            "nilo: the statement handed to `{s}` selects {d} column{s}, and {s} has {d} field{s} " ++
+                "and wants one more.\n" ++
+                "  A paged statement fills the Row by position and reads the total from the " ++
+                "column after the last field: `SELECT …, count(*) OVER () FROM …`. Add the " ++
+                "window on the end, or read the rows with `raw`.",
+            .{ call, count, plural(count), @typeName(Row), fields.len, plural(fields.len) },
+        ));
+
+        // The Row's own columns, checked the way `assertList` checks them;
+        // the total on the end has no field to be held against.
+        const narrowed = List{
+            .count = fields.len,
+            .names = list.names[0..fields.len],
+            .exprs = list.exprs[0..fields.len],
+            .starred = false,
+        };
+        assertCasts(D, Row, narrowed, call);
+        for (narrowed.names, fields, 1..) |name, field, at| {
+            if (name.len == 0) continue;
+            if (std.mem.eql(u8, name, field.name)) continue;
+            @compileError(std.fmt.comptimePrint(
+                "nilo: column {d} of the statement handed to `{s}` is named `{s}`, and " ++
+                    "field {d} of {s} is `{s}`.\n" ++
+                    "  A raw statement fills the Row by position, so column {d} becomes " ++
+                    "field {d}. Reorder the SELECT list, or alias the column: `… AS \"{s}\"`.",
+                .{ at, call, name, at, @typeName(Row), field.name, at, at, field.name },
+            ));
+        }
+    }
+}
+
 /// `s` where a count is not one. Written out because a message that reads
 /// "selects 1 columns" is a message somebody stops trusting.
 fn plural(comptime n: usize) []const u8 {
     return if (n == 1) "" else "s";
+}
+
+// ---- parameters ----
+
+/// The highest `$n` in a statement, or null when it has none
+/// ([ADR 0278](../docs/adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+///
+/// The same walk `scan` does, quotes and comments skipped, reading `$`
+/// followed by digits at a word boundary. A `$` inside a literal is text,
+/// and `$$` has no digits and is left alone.
+pub fn highestParam(comptime sql: []const u8) ?usize {
+    return comptime blk: {
+        @setEvalBranchQuota(200 * sql.len + 10_000);
+        var highest: ?usize = null;
+        var i: usize = 0;
+        while (i < sql.len) {
+            const skipped = skipPast(sql, i);
+            if (skipped != i) {
+                i = skipped;
+                continue;
+            }
+            if (paramAt(sql, i)) |found| {
+                if (highest == null or found.n > highest.?) highest = found.n;
+                i = found.end;
+                continue;
+            }
+            i += 1;
+        }
+        break :blk highest;
+    };
+}
+
+/// A `$n` starting at `i`: its number and where it ends, or null when `i`
+/// is anything else. A `$` glued to a word (`a$1`) is part of the word.
+fn paramAt(comptime sql: []const u8, comptime i: usize) ?struct { n: usize, end: usize } {
+    comptime {
+        if (sql[i] != '$') return null;
+        if (i > 0 and isWordByte(sql[i - 1])) return null;
+        var j = i + 1;
+        while (j < sql.len and std.ascii.isDigit(sql[j])) : (j += 1) {}
+        if (j == i + 1) return null;
+        if (j < sql.len and isWordByte(sql[j])) return null;
+        return .{ .n = std.fmt.parseInt(usize, sql[i + 1 .. j], 10) catch return null, .end = j };
+    }
+}
+
+/// The statement with every `$n` respelled the way `D` spells its `n`th
+/// placeholder ([ADR 0278](../docs/adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+///
+/// **Why a rewrite and not a rule.** `$1` is what the Postgres guide has
+/// always shown, and on SQLite `$1` is a *named* parameter whose index is
+/// the order it first appeared in, while nilo binds by position. A
+/// statement using `$2` alone bound its first value to `$2` and answered
+/// wrong with no error; the same text on Postgres was right. SQLite's
+/// numbered form is `?1`, which is what the Dialect writes for every
+/// statement nilo composes, so a raw statement is put in the same spelling
+/// and one text means one thing on both. The identity for a dialect whose
+/// own spelling is `$n`, so Postgres pays nothing and nothing changes.
+pub fn spelled(comptime D: type, comptime sql: []const u8) []const u8 {
+    return comptime blk: {
+        if (std.mem.eql(u8, D.placeholder(1), "$1")) break :blk sql;
+        @setEvalBranchQuota(200 * sql.len + 10_000);
+        var out: []const u8 = "";
+        var from: usize = 0;
+        var i: usize = 0;
+        while (i < sql.len) {
+            const skipped = skipPast(sql, i);
+            if (skipped != i) {
+                i = skipped;
+                continue;
+            }
+            if (paramAt(sql, i)) |found| {
+                out = out ++ sql[from..i] ++ D.placeholder(found.n);
+                from = found.end;
+                i = found.end;
+                continue;
+            }
+            i += 1;
+        }
+        break :blk out ++ sql[from..];
+    };
+}
+
+/// Hold the values handed to a raw call against the `$n` its text names
+/// ([ADR 0278](../docs/adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+///
+/// The rule is Postgres's own, said while compiling: the placeholders are
+/// `$1` up to `$n` with no gap, and there are `n` values. On Postgres a
+/// mismatch is a run-time error naming the parameter; on SQLite, after
+/// `spelled`, a `?3` with two values bound is NULL and nothing says so,
+/// which is the silent wrong answer this refuses. A statement with no `$n`
+/// at all is left alone: `?1`, a bare `?`, or nothing to bind.
+pub fn assertParams(comptime sql: []const u8, comptime V: type, comptime call: []const u8) void {
+    comptime {
+        // A tuple is one value per placeholder. Anything else (a named
+        // struct, which zqlite binds by `:name`) is the driver's to read.
+        const info = @typeInfo(V);
+        if (info != .@"struct" or !info.@"struct".is_tuple) return;
+        const given = info.@"struct".fields.len;
+        const highest = highestParam(sql) orelse return;
+        if (highest == given) return;
+        @compileError(std.fmt.comptimePrint(
+            "nilo: the statement handed to `{s}` names ${d} and was given {d} value{s}.\n" ++
+                "  Parameters are numbered from $1 with no gaps, and the tuple holds one value " ++
+                "for each: `.{{ a, b }}` for `$1` and `$2`. A `$n` used twice is one value; " ++
+                "on SQLite a placeholder with no value binds NULL and nothing says so.",
+            .{ call, highest, given, plural(given) },
+        ));
+    }
 }
 
 /// Just past the `SELECT` or `RETURNING` that opens the list nilo will read,
@@ -700,4 +859,62 @@ test "a RETURNING inside brackets leaves the outer SELECT as the list" {
     );
     try testing.expectEqual(@as(?usize, 1), found.count);
     try testing.expectEqualStrings("id", found.names[0]);
+}
+
+// ---- parameters (ADR 0278) ----
+
+/// Two dialects for the tests below, spelled the way the real ones spell a
+/// placeholder and nothing else: `rawcheck` reads one function off a
+/// Dialect and `dialect.zig` is a bigger import than the question needs.
+const Dollar = struct {
+    pub fn placeholder(comptime n: usize) []const u8 {
+        return "$" ++ std.fmt.comptimePrint("{d}", .{n});
+    }
+};
+const Question = struct {
+    pub fn placeholder(comptime n: usize) []const u8 {
+        return "?" ++ std.fmt.comptimePrint("{d}", .{n});
+    }
+};
+
+test "the highest $n is read past quotes and comments, and a bare $ is not one" {
+    try testing.expectEqual(@as(?usize, 3), comptime highestParam("SELECT a FROM t WHERE b = $1 AND c IN ($3, $2)"));
+    // The same number twice is one parameter, which is the shape an `IS NULL`
+    // guard takes: `($2 IS NULL OR x = $2)`.
+    try testing.expectEqual(@as(?usize, 2), comptime highestParam("WHERE ($2 IS NULL OR o.kabupaten = $2) AND y = $1"));
+    // Inside a literal or a comment it is text.
+    try testing.expectEqual(@as(?usize, 1), comptime highestParam("SELECT '$9', a -- and $8\nFROM t WHERE b = $1"));
+    // Nothing to bind, and nothing numbered: `?1` and a bare `?` are left to
+    // the driver.
+    try testing.expectEqual(@as(?usize, null), comptime highestParam("SELECT count(*) FROM t"));
+    try testing.expectEqual(@as(?usize, null), comptime highestParam("SELECT a FROM t WHERE b = ?1 AND c = ?"));
+    // Postgres's dollar quoting has no digits after the `$`.
+    try testing.expectEqual(@as(?usize, 1), comptime highestParam("SELECT $$a$$, b FROM t WHERE c = $1"));
+}
+
+test "a $n is respelled for a dialect that numbers with ?, and left alone for one that does not" {
+    const text = "SELECT a FROM t WHERE ($2 IS NULL OR b = $2) AND c = $1 AND d = '$3'";
+    try testing.expectEqualStrings(text, comptime spelled(Dollar, text));
+    try testing.expectEqualStrings(
+        "SELECT a FROM t WHERE (?2 IS NULL OR b = ?2) AND c = ?1 AND d = '$3'",
+        comptime spelled(Question, text),
+    );
+    // A statement with nothing to respell is the same text, not a copy that
+    // differs by a byte somewhere.
+    try testing.expectEqualStrings("SELECT count(*) FROM t", comptime spelled(Question, "SELECT count(*) FROM t"));
+}
+
+test "a paged statement is the Row's columns and one more" {
+    const Line = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        owner: []const u8,
+    };
+    // Held rather than refused: three columns for two fields is the window
+    // on the end, whatever it is called.
+    comptime assertPaged(Dollar, Line, "SELECT o.id, o.owner, count(*) OVER () FROM objects o", "db.rawPage");
+    comptime assertPaged(Dollar, Line, "SELECT id, owner, count(*) OVER () AS total FROM objects", "db.rawPage");
+    // And a list this file cannot count is left to the run-time width check,
+    // the way `assertList` leaves it.
+    comptime assertPaged(Dollar, Line, "SELECT * FROM objects", "db.rawPage");
 }

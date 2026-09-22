@@ -354,6 +354,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// so that a program which never calls `expecting` links nothing
         /// of the migration module.
         expect: ?Guard = null,
+        /// Whether `nilo_start` dialled a connection for the checks and
+        /// could not: said there in one line, and read by `nilo_check` so
+        /// the checks it was for are skipped rather than failed (ADR 0144,
+        /// ADR 0277).
+        check_dial_failed: bool = false,
         /// Who to tell about each statement, or null for nobody — which is
         /// the default and costs one null test per statement
         /// ([ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)).
@@ -527,6 +532,17 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             return comptime statement.planName(sql);
         }
 
+        /// A raw statement's text as this Dialect spells its placeholders,
+        /// with the `$n` in it held against the values handed over
+        /// ([ADR 0278](../docs/adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+        /// Every call that takes comptime text goes through here, so `$1`
+        /// means the first value on both databases; `exec` takes its text at
+        /// run time and sends it as written.
+        fn rawText(comptime sql: []const u8, comptime V: type, comptime call: []const u8) []const u8 {
+            comptime rawcheck.assertParams(sql, V, call);
+            return comptime rawcheck.spelled(D, sql);
+        }
+
         /// One of the Debug-only counters, read the way it is written. Both
         /// are `void` outside Debug, which is why every use of them sits
         /// inside an `if (traps_enabled)` the compiler folds away.
@@ -543,7 +559,9 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         }
 
         /// Check the schema's Rows against the tables they name, once, while
-        /// the server is starting.
+        /// the server is starting: after the work `app.before` registered
+        /// has made or moved the tables, and before the first request
+        /// (ADR 0277).
         ///
         /// The schema cannot be an option on `Opts`, because a `[]const type`
         /// would make the whole struct comptime-only and a `Db` is a
@@ -574,8 +592,9 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// db.expecting(manifest.head);
         /// ```
         ///
-        /// `migrate.expect`, run by `nilo_start` on the pool it just opened:
-        /// one query, and the sentence that says which migration is missing.
+        /// `migrate.expect`, run by `nilo_check` on the pool `nilo_start`
+        /// opened, after the work `app.before` registered (ADR 0277): one
+        /// query, and the sentence that says which migration is missing.
         /// The number is the generated manifest's head, so the guard moves
         /// with the migrations and nobody types it. A database *ahead* of
         /// the binary is allowed and noted, because that is the middle of a
@@ -812,9 +831,29 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 return err;
             };
 
-            // Already said above, in the sentence that names the dial.
-            if (check_dial_failed) return;
+            // Already said above, in the sentence that names the dial. What
+            // the dial was for runs from `nilo_check`, and this is how it
+            // learns there is nothing to run against.
+            self.check_dial_failed = check_dial_failed;
+        }
 
+        /// The schema check and the version guard, once, after the work
+        /// `app.before` registered and before the first request
+        /// ([ADR 0277](../docs/adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+        ///
+        /// **Here and not in `nilo_start`, because of what `before` is for.**
+        /// The guide's single-file program registers `createMissing` with
+        /// `app.before` and calls `db.checking(schema)`, and the two are
+        /// right together: the tables are made at boot, and the Rows are
+        /// checked against them. Run from `nilo_start` the check saw the
+        /// file *before* the tables were made, reported three missing and
+        /// refused a boot the next line would have fixed; the second boot
+        /// was clean, which is the worst shape a bug can have. `listen()`
+        /// and `app.start(io)` both call this after `before`; a `Db` no App
+        /// holds calls it itself, after its own boot work, or calls
+        /// `checkSchema` directly.
+        pub fn nilo_check(self: *Self, io: std.Io) !void {
+            if (self.check_dial_failed) return;
             try self.checkAtBoot();
             try self.expectAtBoot(io);
         }
@@ -1154,11 +1193,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             values: anytype,
         ) ![]Row {
             comptime core.checkScope(@TypeOf(c), "db.raw");
+            const text = comptime rawText(sql, @TypeOf(values), "db.raw");
             // One column and no Row: `db.raw([]const u8, …)`, `db.raw(i64, …)`
             // ([ADR 0234](../docs/adr/0234-a-scalar-out-of-raw.md)).
             if (comptime scalarColumn(Row)) {
                 comptime rawcheck.assertOne(Row, sql, "db.raw");
-                return fillScalar(Row, self, null, c, sql, self.rawPlanOf(sql), try rawValuesOf(values, c));
+                return fillScalar(Row, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c));
             }
             comptime rawcheck.assertList(D, Row, sql, "db.raw");
             // No ceiling: this module did not write the statement and so has
@@ -1169,7 +1209,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // still the one holding a `Uuid`, a `Str` and a `Timestamp`, and a
             // parameter that meant something different here than in
             // `db.select` would be two rules for one type.
-            return fill(Row, null, self, null, c, sql, self.rawPlanOf(sql), try rawValuesOf(values, c));
+            return fill(Row, null, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c));
         }
 
         /// `db.raw` with its `ORDER BY` chosen per request, from a closed set
@@ -1209,7 +1249,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             comptime core.checkScope(@TypeOf(c), "db.rawOrdered");
             comptime rawcheck.assertList(D, Row, sql, "db.rawOrdered");
             comptime ordering.assertFor(@TypeOf(order), Row, "`db.rawOrdered`", false);
-            const parts = comptime ordering.split(sql, "`db.rawOrdered`");
+            const parts = comptime ordering.split(rawText(sql, @TypeOf(values), "db.rawOrdered"), "`db.rawOrdered`");
             const text = try spliced(parts.head, order, parts.tail, c);
             return fill(Row, null, self, null, c, text, null, try rawValuesOf(values, c));
         }
@@ -1245,14 +1285,98 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             values: anytype,
         ) !?Row {
             comptime core.checkScope(@TypeOf(c), "db.rawOne");
+            const text = comptime rawText(sql, @TypeOf(values), "db.rawOne");
             if (comptime scalarColumn(Row)) {
                 comptime rawcheck.assertOne(Row, sql, "db.rawOne");
-                const found = try fillScalar(Row, self, null, c, sql, self.rawPlanOf(sql), try rawValuesOf(values, c));
+                const found = try fillScalar(Row, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c));
                 return if (found.len == 0) null else found[0];
             }
             comptime rawcheck.assertList(D, Row, sql, "db.rawOne");
-            const found = try fill(Row, null, self, null, c, sql, self.rawPlanOf(sql), try rawValuesOf(values, c));
+            const found = try fill(Row, null, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c));
             return if (found.len == 0) null else found[0];
+        }
+
+        /// `db.rawOne` for a statement that answers exactly one row by
+        /// construction (an aggregate with no `GROUP BY`, a `RETURNING` on
+        /// a keyed write), so the answer is the Row and not a `?Row`
+        /// ([ADR 0280](../docs/adr/0280-a-statement-that-always-answers-answers-a-row.md)).
+        ///
+        /// ```zig
+        /// const Totals = struct {
+        ///     pub const nilo_table = .projection;
+        ///     objects: i64,
+        ///     paid: i64,
+        /// };
+        /// const t = try db.rawExactlyOne(Totals, c, "SELECT count(*), coalesce(sum(paid), 0) FROM bills", .{});
+        /// ```
+        ///
+        /// **No row is `error.QueryFailed`**, the way an `insert` whose
+        /// `RETURNING` came back empty is: the statement and the database
+        /// disagree about what was asked, which is not something to paper
+        /// over with a zero. A statement that can honestly answer with no
+        /// rows (a `GROUP BY` over an empty table, a key lookup) is
+        /// `rawOne`, and `?Row` is the truth about it. No `LIMIT 1` is
+        /// added, for the reason `rawOne` adds none.
+        pub fn rawExactlyOne(
+            self: *Self,
+            comptime Row: type,
+            c: anytype,
+            comptime sql: []const u8,
+            values: anytype,
+        ) !Row {
+            comptime core.checkScope(@TypeOf(c), "db.rawExactlyOne");
+            const text = comptime rawText(sql, @TypeOf(values), "db.rawExactlyOne");
+            if (comptime scalarColumn(Row)) {
+                comptime rawcheck.assertOne(Row, sql, "db.rawExactlyOne");
+                const found = try fillScalar(Row, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c));
+                return if (found.len == 0) error.QueryFailed else found[0];
+            }
+            comptime rawcheck.assertList(D, Row, sql, "db.rawExactlyOne");
+            const found = try fill(Row, null, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c));
+            return if (found.len == 0) error.QueryFailed else found[0];
+        }
+
+        /// `db.raw` with the total the statement matched read off the end
+        /// of every row, the way `db.page` reads it
+        /// ([ADR 0279](../docs/adr/0279-a-raw-statement-can-carry-its-total.md)).
+        ///
+        /// ```zig
+        /// const found = try db.rawPage(Line, c,
+        ///     \SELECT o.id, o.owner, count(*) OVER () FROM objects o
+        ///     \JOIN bills b ON b.object_id = o.id
+        ///     \WHERE ($1 IS NULL OR o.district = $1)
+        ///     \ORDER BY o.id LIMIT $2 OFFSET $3
+        /// , .{ district, limit, offset });
+        /// // found.rows is []Line, found.total is every row the WHERE matched.
+        /// ```
+        ///
+        /// **The statement is the caller's, and so is the window.** `db.page`
+        /// writes `count(*) OVER ()` into a statement it composed; this one
+        /// cannot write into a statement it did not, so the caller puts the
+        /// window on the end of the `SELECT` list and this reads it from the
+        /// column after the Row's last field. The list is counted while
+        /// compiling as the Row's fields and one more, and a statement
+        /// without the extra column is a Refusal that says what to add. A
+        /// join with a `LIMIT` was two statements with one `WHERE` pasted into
+        /// both, and they could disagree; this is one.
+        ///
+        /// The total is read once per statement, not per row, and a statement
+        /// matching nothing is an empty page with a total of zero. The
+        /// `ORDER BY` and the `LIMIT` are the caller's to write, for the
+        /// reason `db.page` requires both.
+        pub fn rawPage(
+            self: *Self,
+            comptime Row: type,
+            c: anytype,
+            comptime sql: []const u8,
+            values: anytype,
+        ) !Page(Row) {
+            comptime core.checkScope(@TypeOf(c), "db.rawPage");
+            comptime rawcheck.assertPaged(D, Row, sql, "db.rawPage");
+            const text = comptime rawText(sql, @TypeOf(values), "db.rawPage");
+            var total: i64 = 0;
+            const rows = try filling(Row, null, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c), &total);
+            return .{ .rows = rows, .total = total };
         }
 
         /// A statement that answers with **nothing**, and the number of rows
@@ -1938,12 +2062,13 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 values: anytype,
             ) ![]Row {
                 comptime core.checkScope(@TypeOf(c), "tx.raw");
+                const text = comptime rawText(sql, @TypeOf(values), "tx.raw");
                 if (comptime scalarColumn(Row)) {
                     comptime rawcheck.assertOne(Row, sql, "tx.raw");
-                    return fillScalar(Row, self.db, &self.inner, c, sql, self.db.rawPlanOf(sql), try rawValuesOf(values, c));
+                    return fillScalar(Row, self.db, &self.inner, c, text, self.db.rawPlanOf(text), try rawValuesOf(values, c));
                 }
                 comptime rawcheck.assertList(D, Row, sql, "tx.raw");
-                return fill(Row, null, self.db, &self.inner, c, sql, self.db.rawPlanOf(sql), try rawValuesOf(values, c));
+                return fill(Row, null, self.db, &self.inner, c, text, self.db.rawPlanOf(text), try rawValuesOf(values, c));
             }
 
             /// `db.rawOrdered` inside the transaction: the caller's statement
@@ -1959,7 +2084,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 comptime core.checkScope(@TypeOf(c), "tx.rawOrdered");
                 comptime rawcheck.assertList(D, Row, sql, "tx.rawOrdered");
                 comptime ordering.assertFor(@TypeOf(order), Row, "`tx.rawOrdered`", false);
-                const parts = comptime ordering.split(sql, "`tx.rawOrdered`");
+                const parts = comptime ordering.split(rawText(sql, @TypeOf(values), "tx.rawOrdered"), "`tx.rawOrdered`");
                 const text = try spliced(parts.head, order, parts.tail, c);
                 return fill(Row, null, self.db, &self.inner, c, text, null, try rawValuesOf(values, c));
             }
@@ -1974,14 +2099,55 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 values: anytype,
             ) !?Row {
                 comptime core.checkScope(@TypeOf(c), "tx.rawOne");
+                const text = comptime rawText(sql, @TypeOf(values), "tx.rawOne");
                 if (comptime scalarColumn(Row)) {
                     comptime rawcheck.assertOne(Row, sql, "tx.rawOne");
-                    const found = try fillScalar(Row, self.db, &self.inner, c, sql, self.db.rawPlanOf(sql), try rawValuesOf(values, c));
+                    const found = try fillScalar(Row, self.db, &self.inner, c, text, self.db.rawPlanOf(text), try rawValuesOf(values, c));
                     return if (found.len == 0) null else found[0];
                 }
                 comptime rawcheck.assertList(D, Row, sql, "tx.rawOne");
-                const found = try fill(Row, null, self.db, &self.inner, c, sql, self.db.rawPlanOf(sql), try rawValuesOf(values, c));
+                const found = try fill(Row, null, self.db, &self.inner, c, text, self.db.rawPlanOf(text), try rawValuesOf(values, c));
                 return if (found.len == 0) null else found[0];
+            }
+
+            /// `db.rawExactlyOne` inside the transaction: the one row a
+            /// statement answers by construction, and `error.QueryFailed`
+            /// when it did not (ADR 0280).
+            pub fn rawExactlyOne(
+                self: *Tx,
+                comptime Row: type,
+                c: anytype,
+                comptime sql: []const u8,
+                values: anytype,
+            ) !Row {
+                comptime core.checkScope(@TypeOf(c), "tx.rawExactlyOne");
+                const text = comptime rawText(sql, @TypeOf(values), "tx.rawExactlyOne");
+                if (comptime scalarColumn(Row)) {
+                    comptime rawcheck.assertOne(Row, sql, "tx.rawExactlyOne");
+                    const found = try fillScalar(Row, self.db, &self.inner, c, text, self.db.rawPlanOf(text), try rawValuesOf(values, c));
+                    return if (found.len == 0) error.QueryFailed else found[0];
+                }
+                comptime rawcheck.assertList(D, Row, sql, "tx.rawExactlyOne");
+                const found = try fill(Row, null, self.db, &self.inner, c, text, self.db.rawPlanOf(text), try rawValuesOf(values, c));
+                return if (found.len == 0) error.QueryFailed else found[0];
+            }
+
+            /// `db.rawPage` inside the transaction: the caller's statement
+            /// with `count(*) OVER ()` on the end of its list, read as the
+            /// rows and the total (ADR 0279).
+            pub fn rawPage(
+                self: *Tx,
+                comptime Row: type,
+                c: anytype,
+                comptime sql: []const u8,
+                values: anytype,
+            ) !Page(Row) {
+                comptime core.checkScope(@TypeOf(c), "tx.rawPage");
+                comptime rawcheck.assertPaged(D, Row, sql, "tx.rawPage");
+                const text = comptime rawText(sql, @TypeOf(values), "tx.rawPage");
+                var total: i64 = 0;
+                const rows = try filling(Row, null, self.db, &self.inner, c, text, self.db.rawPlanOf(text), try rawValuesOf(values, c), &total);
+                return .{ .rows = rows, .total = total };
             }
 
             /// `db.exec` inside the transaction: a statement that answers with
@@ -6055,6 +6221,188 @@ test "raw reads one column into a slice, an integer or a Str, with no Row and no
     try testing.expectEqual(@as(usize, 2), in_tx.len);
     try testing.expectEqual(@as(?i64, 1), try tx.rawOne(i64, &run, "SELECT min(id) FROM accounts", .{}));
     try tx.commit();
+}
+
+test "the schema check runs from nilo_check, once the boot work has made the tables" {
+    // The single-file program from the guide: `db.checking(schema)` and
+    // `createMissing` registered with `app.before`. Checked from
+    // `nilo_start` the Rows were held against an empty file and the first
+    // boot refused; the check runs after the boot work now (ADR 0277).
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:checked-after?mode=memory&cache=shared",
+        .{ .size = 2 },
+    );
+    defer db.deinit();
+    db.checking(.{ .tables = &.{SqliteAccount} });
+
+    // An empty file: the pool opens and nothing is held against it yet.
+    try db.nilo_start(threaded.io(), .none);
+
+    // What `before` does, on the pool that is now open.
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, accounts_ddl, .{});
+
+    // And the check sees the table the boot work made.
+    try db.nilo_check(threaded.io());
+    try testing.expectEqual(@as(usize, 0), try db.checkSchema(&.{SqliteAccount}));
+}
+
+test "a $n in a raw statement is the nth value on SQLite too, whatever order it appears in" {
+    // What geotax hit: `WHERE ($2 IS NULL OR o.kabupaten = $2)` with no `$1`
+    // in it. To SQLite `$2` is a *named* parameter, indexed by first
+    // appearance, so it took the first value and answered wrong with no
+    // error. The text is respelled `?2` while compiling, which is what the
+    // Dialect writes for every statement nilo composes (ADR 0278).
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:raw-dollar?mode=memory&cache=shared",
+        .{ .size = 2, .unchecked = true },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, accounts_ddl, .{});
+    _ = try db.insert(SqliteAccount, &run, .{ .public = types.Uuid.nil, .email = "wati@example.dev" });
+    _ = try db.insert(SqliteAccount, &run, .{ .public = types.Uuid.nil, .email = "kid@example.dev" });
+
+    // `$2` first, `$1` second, and `$2` twice: the number is what binds.
+    const filter: ?[]const u8 = "kid@example.dev";
+    const found = try db.raw(nilo.Str, &run,
+        "SELECT email FROM accounts WHERE ($2 IS NULL OR email = $2) AND id >= $1 ORDER BY id",
+        .{ @as(i64, 1), filter },
+    );
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqualStrings("kid@example.dev", found[0].view());
+
+    // And the optional bound as NULL takes the `IS NULL` arm, which is the
+    // `sql.given` of a statement the caller wrote.
+    const none: ?[]const u8 = null;
+    const all = try db.raw(nilo.Str, &run,
+        "SELECT email FROM accounts WHERE ($2 IS NULL OR email = $2) AND id >= $1 ORDER BY id",
+        .{ @as(i64, 1), none },
+    );
+    try testing.expectEqual(@as(usize, 2), all.len);
+
+    // What actually went down the wire is the Dialect's own spelling, so
+    // the statement is prepared and kept the way a `?n` one is.
+    try testing.expectEqualStrings(
+        "SELECT email FROM accounts WHERE (?2 IS NULL OR email = ?2) AND id >= ?1 ORDER BY id",
+        comptime rawcheck.spelled(dialect.SQLite, "SELECT email FROM accounts WHERE ($2 IS NULL OR email = $2) AND id >= $1 ORDER BY id"),
+    );
+}
+
+test "rawPage reads the total off the window the caller put on the end" {
+    // `db.page` writes `count(*) OVER ()` into a statement it composed; a
+    // join with a LIMIT is a statement nilo did not write, and its list ends
+    // in the same window, read from the column after the Row's last field
+    // (ADR 0279).
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:raw-page?mode=memory&cache=shared",
+        .{ .size = 2, .unchecked = true },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, accounts_ddl, .{});
+    for (0..7) |i| {
+        var mail: [16]u8 = undefined;
+        _ = try db.insert(SqliteAccount, &run, .{
+            .public = types.Uuid.nil,
+            .email = try std.fmt.bufPrint(&mail, "n{d}@example.dev", .{i}),
+        });
+    }
+
+    const PageLine = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        email: nilo.Str,
+    };
+    const statement_text =
+        "SELECT id, email, count(*) OVER () FROM accounts WHERE id > $1 ORDER BY id LIMIT $2 OFFSET $3";
+
+    const first = try db.rawPage(PageLine, &run, statement_text, .{ @as(i64, 1), @as(i64, 3), @as(i64, 0) });
+    try testing.expectEqual(@as(usize, 3), first.rows.len);
+    try testing.expectEqual(@as(i64, 6), first.total);
+    try testing.expectEqualStrings("n1@example.dev", first.rows[0].email.view());
+
+    // The last page is short and the total is the same number.
+    const last = try db.rawPage(PageLine, &run, statement_text, .{ @as(i64, 1), @as(i64, 3), @as(i64, 3) });
+    try testing.expectEqual(@as(usize, 3), last.rows.len);
+    try testing.expectEqual(@as(i64, 6), last.total);
+
+    // Nothing matching is an empty page with a total of zero, not a
+    // statement that could not answer.
+    const none = try db.rawPage(PageLine, &run, statement_text, .{ @as(i64, 99), @as(i64, 3), @as(i64, 0) });
+    try testing.expectEqual(@as(usize, 0), none.rows.len);
+    try testing.expectEqual(@as(i64, 0), none.total);
+
+    // And inside a transaction.
+    var tx = try db.begin(&run, .{});
+    errdefer tx.rollback();
+    const in_tx = try tx.rawPage(PageLine, &run, statement_text, .{ @as(i64, 0), @as(i64, 2), @as(i64, 0) });
+    try testing.expectEqual(@as(usize, 2), in_tx.rows.len);
+    try testing.expectEqual(@as(i64, 7), in_tx.total);
+    try tx.commit();
+}
+
+test "rawExactlyOne answers the row an aggregate always has, and refuses a statement with none" {
+    // Five dashboard totals, each `rawOne` followed by an `orelse` that
+    // never ran (ADR 0280).
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:raw-exactly-one?mode=memory&cache=shared",
+        .{ .size = 2, .unchecked = true },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, accounts_ddl, .{});
+    _ = try db.insert(SqliteAccount, &run, .{ .public = types.Uuid.nil, .email = "a@example.dev" });
+    _ = try db.insert(SqliteAccount, &run, .{ .public = types.Uuid.nil, .email = "b@example.dev" });
+
+    const Totals = struct {
+        pub const nilo_table = .projection;
+        accounts: i64,
+        newest: i64,
+    };
+    const totals = try db.rawExactlyOne(Totals, &run, "SELECT count(*), max(id) FROM accounts", .{});
+    try testing.expectEqual(@as(i64, 2), totals.accounts);
+    try testing.expectEqual(@as(i64, 2), totals.newest);
+
+    // A scalar the same way, and inside a transaction.
+    try testing.expectEqual(@as(i64, 2), try db.rawExactlyOne(i64, &run, "SELECT count(*) FROM accounts", .{}));
+    var tx = try db.begin(&run, .{});
+    errdefer tx.rollback();
+    try testing.expectEqual(@as(i64, 1), try tx.rawExactlyOne(i64, &run, "SELECT min(id) FROM accounts", .{}));
+    const in_tx = try tx.rawExactlyOne(Totals, &run, "SELECT count(*), max(id) FROM accounts", .{});
+    try testing.expectEqual(@as(i64, 2), in_tx.accounts);
+    try tx.commit();
+
+    // A statement that can answer with no rows is not what this is for, and
+    // says so the way an insert whose RETURNING came back empty does.
+    try testing.expectError(error.QueryFailed, db.rawExactlyOne(i64, &run, "SELECT id FROM accounts WHERE id = $1", .{@as(i64, 9)}));
+    try testing.expectError(error.QueryFailed, db.rawExactlyOne(Totals, &run, "SELECT count(*), max(id) FROM accounts GROUP BY email HAVING count(*) > $1", .{@as(i64, 5)}));
 }
 
 test "rawOne hands back the first row when a statement matches several" {

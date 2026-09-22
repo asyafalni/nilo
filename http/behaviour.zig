@@ -775,6 +775,39 @@ test "the health route is ok while every service is ready, and names the one tha
     try testing.expect(std.mem.startsWith(u8, head.response, "HTTP/1.1 503"));
 }
 
+test "the health and metrics pages are described, and not counted as routes that write their own answer" {
+    // Both are `*Ctx` handlers returning nothing, which ADR 0150 cannot
+    // describe from a signature, and both are nilo's own, so it knows what
+    // they answer and says so (ADR 0281). Before this, `app.health` alone
+    // made `listen()` print "1 of N routes hold the Ctx and return nothing",
+    // and the reader went looking for a handler of theirs that was not there.
+    var pool = ProbePool{ .up = true };
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.docs(.{});
+    try app.provide(&pool);
+    try app.health("/healthz");
+    try app.metrics(.{});
+
+    for (app.operations.items) |op| try testing.expect(!op.answer.written);
+
+    const json = try docsFor(&app);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const paths = parsed.value.object.get("paths").?.object;
+
+    // A `200` with a body, where a written answer is a `default` with none.
+    const health_responses = paths.get("/healthz").?.object.get("get").?.object.get("responses").?.object;
+    try testing.expect(health_responses.get("default") == null);
+    const health_ok = health_responses.get("200").?.object;
+    try testing.expect(health_ok.get("content").?.object.get("application/json") != null);
+
+    const metrics_responses = paths.get("/metrics").?.object.get("get").?.object.get("responses").?.object;
+    try testing.expect(metrics_responses.get("default") == null);
+    const metrics_ok = metrics_responses.get("200").?.object;
+    try testing.expect(metrics_ok.get("content").?.object.get("text/plain; version=0.0.4; charset=utf-8") != null);
+}
+
 test "the health route says stopping from the moment the server is told to stop" {
     var pool = ProbePool{ .up = true };
     var app = App.init(testing.allocator);

@@ -91,6 +91,9 @@ const Fixture = struct {
         };
         if (expect) |want| self.db.expecting(want);
         try self.db.nilo_start(self.threaded.io(), .off);
+        // The two guards run after the boot work, which a fixture with no
+        // App has none of (ADR 0277): straight after the pool, then.
+        try self.db.nilo_check(self.threaded.io());
         return self;
     }
 
@@ -773,10 +776,12 @@ test "a binary built for a version the database has not reached refuses to serve
 test "a Db told what to expect asks the ledger at boot, on the pool it just opened" {
     // ADR 0220: the version guard is a call on the `Db`, so it runs inside
     // `listen()` on the server's own loop with nothing for the caller to
-    // sequence. What is pinned here is that boot *reaches* the ledger — a
-    // fresh file has none, and after this `nilo_start` it has one — and that
-    // level and ahead go through. Behind is `migrate.expect`'s own refusal,
-    // pinned above through `standing` for the reason given there.
+    // sequence — from `nilo_check`, after the boot work, which is where the
+    // guard sees the ledger a migration in `before` just wrote (ADR 0277).
+    // What is pinned here is that boot *reaches* the ledger — a fresh file
+    // has none, and after this boot it has one — and that level and ahead go
+    // through. Behind is `migrate.expect`'s own refusal, pinned above
+    // through `standing` for the reason given there.
     const gpa = testing.allocator;
     var fx = try Fixture.initWith(gpa, "expect_at_boot", .{ .size = 2, .unchecked = true }, 0);
     defer fx.deinit(gpa);
@@ -795,6 +800,7 @@ test "a Db told what to expect asks the ledger at boot, on the pool it just open
     defer level.deinit();
     level.expecting(3);
     try level.nilo_start(fx.threaded.io(), .off);
+    try level.nilo_check(fx.threaded.io());
 
     // And one built before the migration that is already in: the middle of
     // a two-stage deploy, allowed.
@@ -802,6 +808,7 @@ test "a Db told what to expect asks the ledger at boot, on the pool it just open
     defer ahead.deinit();
     ahead.expecting(2);
     try ahead.nilo_start(fx.threaded.io(), .off);
+    try ahead.nilo_check(fx.threaded.io());
 }
 
 test "the plan a diff produces is the plan that runs, end to end" {

@@ -532,6 +532,19 @@ pub fn fromMemory(gpa: std.mem.Allocator, entries: []const Entry) !Set {
     return set;
 }
 
+/// What `load` does about a directory that is not there: say so in one
+/// line and hand the error back, or hand it back alone
+/// ([ADR 0282](../docs/adr/0282-a-try-call-hands-back-the-error-and-says-nothing.md)).
+///
+/// `app.static` wants the line, because on it the process stops and the
+/// line is the whole explanation. `app.tryStatic` exists so a program can
+/// decide for itself (a backend that serves without its frontend built
+/// is not a broken program), and a program that decided is one that
+/// should not read `error:` in its own log for the case it handles. A
+/// problem *inside* a directory that is there is still said either way:
+/// the error name cannot carry which file, and the line can.
+pub const Absent = enum { reported, returned };
+
 /// Read `dir_path` into memory, mapping every file in it to a URL under
 /// `url_prefix`. Called before `listen()`, so the blocking reads here
 /// happen while nothing is being served.
@@ -544,6 +557,7 @@ pub fn load(
     url_prefix: []const u8,
     dir_path: []const u8,
     options: Options,
+    absent: Absent,
 ) LoadError!Set {
     std.debug.assert(url_prefix.len > 0 and url_prefix[0] == '/');
 
@@ -555,7 +569,7 @@ pub fn load(
     const io = threaded.io();
 
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| {
-        std.log.err(
+        if (absent == .reported) std.log.err(
             "nilo: static directory \"{s}\" could not be opened ({s}) — " ++
                 "the path is relative to the working directory the server runs in",
             .{ dir_path, @errorName(err) },
@@ -573,7 +587,7 @@ pub fn load(
     // alternative is a lazily opened directory on the request path and a
     // branch to go with it.
     const serving = bulkhead.Dir.open(dir_path) catch |err| {
-        std.log.err(
+        if (absent == .reported) std.log.err(
             "nilo: static directory \"{s}\" could not be held open ({s}) — " ++
                 "the path is relative to the working directory the server runs in",
             .{ dir_path, @errorName(err) },
@@ -1670,7 +1684,7 @@ test "a file over the threshold is listed rather than refused, and holds no byte
         .max_file_bytes = 64,
         .max_total_bytes = 128,
         .compress_min_bytes = 16,
-    });
+    }, .reported);
     defer set.deinit();
 
     try testing.expectEqual(@as(usize, 2), set.files.len);
@@ -1725,7 +1739,7 @@ test "a file over the threshold is listed rather than refused, and holds no byte
     // The same directory again with the threshold moved above it: the very
     // same file is now held, hashed and gzipped. So everything asserted
     // above is the spill's doing and not something about this file.
-    var all_held = try load(gpa, "/", tree.path, .{ .compress_min_bytes = 16 });
+    var all_held = try load(gpa, "/", tree.path, .{ .compress_min_bytes = 16 }, .reported);
     defer all_held.deinit();
     const now_held = all_held.find("/big.txt").?.contents.held;
     try testing.expectEqualStrings(big, now_held.bytes);
@@ -1738,7 +1752,7 @@ test "a whole set can spill, and the ETag moves when the file does" {
     var tree = try TmpTree.init(gpa, &.{.{ "video.mp4", "0123456789" }});
     defer tree.deinit(gpa);
 
-    var first = try load(gpa, "/", tree.path, .{ .max_file_bytes = 4 });
+    var first = try load(gpa, "/", tree.path, .{ .max_file_bytes = 4 }, .reported);
     // Freed before the second load, so the two ETags are compared as copies
     // rather than as pointers into a Set that has been thrown away.
     var etag_buf: [64]u8 = undefined;
@@ -1750,7 +1764,7 @@ test "a whole set can spill, and the ETag moves when the file does" {
     // time the filesystem moved.
     try tree.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "video.mp4", .data = "abcdefghijkl" });
 
-    var second = try load(gpa, "/", tree.path, .{ .max_file_bytes = 4 });
+    var second = try load(gpa, "/", tree.path, .{ .max_file_bytes = 4 }, .reported);
     defer second.deinit();
     try testing.expect(!std.mem.eql(u8, before, second.find("/video.mp4").?.etag));
 }
@@ -1987,6 +2001,21 @@ test "an unchanged spilled file is described the same way twice, by two differen
     try testing.expectEqualStrings(at_load, served.header("ETag").?);
 }
 
+test "tryStatic hands back a directory that is not there, and says nothing about it" {
+    // The program this is for decides for itself — a backend that serves
+    // without its frontend built — and the test runner is the witness that
+    // nothing was logged: a logged `err` fails the test whatever level it
+    // prints at (`test_root.zig`), so this test passing *is* the silence
+    // (ADR 0282).
+    const gpa = testing.allocator;
+    var app = App.init(gpa);
+    defer app.deinit();
+
+    try testing.expectError(error.StaticDirNotFound, app.tryStatic("/", "a-directory-nobody-made"));
+    try testing.expectError(error.StaticDirNotFound, app.tryStaticWith("/", "a-directory-nobody-made", .{ .reload = true }));
+    try testing.expectEqual(@as(usize, 0), app.static_sets.items.len);
+}
+
 test "reload leaves every file on the disk, however small it is" {
     // `.reload` is the spill threshold set to zero and nothing else — no
     // watcher, no fiber, no second code path (see `Options.reload`). What it
@@ -2042,7 +2071,7 @@ test "a set with no directory closes cleanly, and one with a directory gives it 
 
     var tree = try TmpTree.init(gpa, &.{.{ "a.txt", "a" }});
     defer tree.deinit(gpa);
-    var loaded = try load(gpa, "/", tree.path, .{});
+    var loaded = try load(gpa, "/", tree.path, .{}, .reported);
     // Held open for the App's lifetime whether or not anything spilled, so
     // that opening one is never something a request has to do.
     try testing.expect(loaded.dir != null);

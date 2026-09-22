@@ -276,6 +276,26 @@ release binary that was built with it on is not silent about it.
 names comes from the directory walk, and resolving a request-carried string
 into a filename is the traversal the design refuses.
 
+**A bundler that renames its output is the case that bites.** Vite, esbuild
+and the rest write `app-3f9a1c.js` and a fresh `index.html` pointing at it on
+every build, so with `.reload` on, the edited `index.html` is served and the
+script it names is a 404, because that name was not there when the server
+started. Two ways out, and neither is a rescan on a miss, which would let a
+request-carried string decide when the disk is walked
+([decided](../decided.md#nilo_http-1)):
+
+- **While developing, serve the frontend from the bundler's own dev server**
+  and proxy `/api` to nilo. Every bundler has the proxy option, hot reload
+  comes with it, and nilo never sees a hashed name until the build is real.
+- **Or restart nilo when the bundle changes.** `zig build dev` restarts the
+  server on every save it watches
+  ([Getting started](./getting-started.md#restarting-on-every-save)),
+  and a bundler's `--watch` writing into a directory the same command
+  watches gives the same effect for the frontend.
+
+A production build is written once and the server starts after it, so the
+names are all there and nothing above applies.
+
 ## The limits
 
 The set of *names* is fixed at startup. Without `.reload`, so are the bytes:

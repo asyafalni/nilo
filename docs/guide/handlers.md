@@ -92,6 +92,33 @@ fn getUser(db: *Db, id: u32) !User {
 What `?T` no longer does is answer `200` with the body `null`. If that really is
 what you mean, return a struct with a nullable field, which says so.
 
+### Where the `?` goes
+
+A `?` composes with the wrappers, and it goes **inside** them: the `?` is
+about the body, so it wraps the body and not the status around it. The
+compiler refuses the other way round, with a message that says which to
+write ([ADR 0276](../adr/0276-a-question-mark-goes-inside-the-wrapper.md)).
+
+| Write | Meaning |
+|---|---|
+| `!?T` | the value, or 404 |
+| `!Status(201, ?T)` | 201 with the value, or 404 |
+| `!Response(?T)` | the status the handler chose, or 404 |
+| `!?FileBody`, `!?Bytes` | the file or the bytes, or 404 |
+| `!Versioned(T)` with `.unchanged(v)` | the value, or a 304; a thing that is not there is `fail.notFound` |
+| `!Status(204, void)` | 204, empty |
+
+| Refused | Why, and what to write |
+|---|---|
+| `?Status(201, T)` | a 201 with no body is not a thing; `Status(201, ?T)` |
+| `?Response(T)` | the same; `Response(?T)` |
+| `?Redirect(303)` | a redirect has no body for the `?` to be about; `Redirect(303)`, and `fail.notFound` |
+| `?Versioned(T)`, `Versioned(?T)` | a thing that is not there has no version; `Versioned(T)` and `fail.notFound` |
+| `*Ctx` and `void` | legal, and undescribed: the document cannot say what the handler wrote ([ADR 0150](../adr/0150-a-ctx-handler-that-returns-nothing-may-have-written-it.md)) |
+
+The `!` goes outermost in every row, and every shape in the first table is
+what the document describes, 404 included.
+
 ### Choosing the status, or adding headers
 
 When the status is part of the contract, put it in the type — the document can
