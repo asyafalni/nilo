@@ -83,7 +83,7 @@ fn listing(rdb: *Replica, c: *nilo.Ctx) ![]Product {     // may be stale
 }
 
 fn buy(db: *sql.Db, c: *nilo.Ctx) !Order {               // must not be
-    return db.insert(Order, c, .{ .user_id = 1, .total = 4200 });
+    return db.insert(Order, c, .{ .user_id = 1, .total = 4200, .status = "new" });
 }
 ```
 
@@ -262,7 +262,7 @@ an error that reads and lets you decide:
 
 <!-- compiles: body -->
 ```zig
-const made = db.insert(User, c, .{ .email = email }) catch |err| switch (err) {
+const made = db.insert(User, c, .{ .email = email, .name = name }) catch |err| switch (err) {
     error.AlreadyExists => return nilo.fail.conflict("{s} is already taken", .{email}),
     else => return err,
 };

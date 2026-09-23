@@ -134,6 +134,10 @@ the case that trap cannot watch.
 
 No mechanism holds these yet. Each says what it needs; until that arrives the comment at the site is what there is.
 
+**A blocking call can queue behind a slow one while holding a connection.** `nilo.blocking` is zio's `blockInPlace`, which does not reserve a pool thread, and zio starts a second worker only once twice as many jobs are queued as are running. Under `.hop`, a SQLite statement takes its connection and then hops, so one slow read on a reader leaves the next statement holding the writer in the queue behind it, and everything after that times out on the writer. Reproduced at one slow read of 25 s with the default pool; `.in_fiber` does not have it. The writer's timeout line now names the holder, and a one-line statement named there is how it is recognised ([ADR 0135](./adr/0135-a-wait-for-a-connection-has-a-bound.md)).
+
+**Needs:** `blockInPlace` to reserve a thread, one line in zio and tested at 2899 ms of queueing down to 0 ([zio#745](https://github.com/lalinsky/zio/issues/745)). Setting the runtime's `min_threads` also holds it, at a thread each kept alive for the life of the process and only up to that many calls at once, which is why it was not taken.
+
 **A fail function in spawned work is safe only because of where a threadlocal gets written.** `bulkhead.slot()` falls back to a threadlocal when a fiber has no slot, which spawned fibers never do. It is null on executor threads only because the one thing that sets it does so from inside `zio.blockInPlace`, which runs on a thread-pool worker. Both ends carry a comment saying so. Nothing enforces it, and if it broke, spawned work would write its message into an unrelated request, which is [ADR 0007](./adr/0007-failure-box-bound-to-the-fiber.md)'s leak by another route.
 
 **Needs:** a design that makes it a rule rather than a comment.

@@ -56,6 +56,8 @@ of an enum's words takes one of them written the way a column is — `.free`, no
 `"free"`. A default the database has to work out, `DEFAULT (lower(x))`, is SQL
 you write in a step.
 
+A column whose default is written in a step, or filled by a trigger, goes in `.filled = .{ … }` as well, so an insert may leave it out: nilo refuses an insert that leaves out a column nothing fills ([writing rows](./writing.md)). `.filled` renders nothing into the table.
+
 `plan: Plan` needs nothing said about it: it is a `text` column with
 `CHECK ("plan" IN ('free', 'team', 'enterprise'))` beside it, and the words are
 in the snapshot — so adding a word to the enum is a migration, rather than an

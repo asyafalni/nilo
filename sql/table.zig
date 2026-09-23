@@ -519,6 +519,7 @@ fn columnsOf(
 ) []const Column {
     comptime {
         assertDefaultsAreColumns(Row, decl);
+        _ = filledOf(Row, decl);
         const fields = @typeInfo(Row).@"struct".fields;
         var out: [fields.len]Column = undefined;
         var n: usize = 0;
@@ -617,6 +618,103 @@ fn assertDefaultsAreColumns(comptime Row: type, comptime decl: anytype) void {
                 "`.default = .{ .created_at = .now, .status = .draft }`.",
         );
         for (fields) |f| checkColumn(Row, "default", f.name);
+    }
+}
+
+/// The columns an insert into `Row` has to write, **with no Dialect
+/// involved**: every column of the table that is not optional, not the key a
+/// sequence fills, not given a `.default`, and not named in `.filled`.
+///
+/// An insert names a subset of the columns on purpose, so the ones the
+/// database fills need not be written. A column that is none of those four
+/// has nothing to fill it, and leaving it out was a `NotNullViolated` on the
+/// first insert that ran, found by whoever ran it: a column added to a table
+/// in one release and missed by an insert the next. So it is a Refusal.
+///
+/// Read off the **owner**, the Row that names the table, because a narrow Row
+/// that borrows it can hide a required column, and an insert through it cannot
+/// write what it cannot see. A table this program does not build answers
+/// nothing: its defaults are the database's, and the marker is not where they
+/// are written (ADR 0162).
+pub fn requiredOf(comptime Row: type) []const []const u8 {
+    return comptime blk: {
+        const owner = row_mod.ownerOf(Row);
+        if (!row_mod.managedOf(owner)) break :blk &.{};
+        const decl = @field(owner, row_mod.marker);
+        const filled = filledOf(owner, decl);
+        const keys = row_mod.keysIfAnyOf(owner);
+        const has_default = @hasField(@TypeOf(decl), "default");
+
+        var out: []const []const u8 = &.{};
+        for (@typeInfo(owner).@"struct".fields) |f| {
+            if (row_mod.isBeside(owner, f.name)) continue;
+            if (@typeInfo(f.type) == .optional) continue;
+            if (has_default and @hasField(@TypeOf(decl.default), f.name)) continue;
+            if (keys.len == 1 and std.mem.eql(u8, keys[0], f.name) and generatedKey(f.type)) continue;
+            if (listed(filled, f.name)) continue;
+            out = out ++ &[_][]const u8{f.name};
+        }
+        break :blk out;
+    };
+}
+
+/// The columns `.filled` names: ones the database fills in by a means the
+/// marker cannot say, a `DEFAULT` written in a step, `gen_random_uuid()`, a
+/// trigger. The word renders nothing. It only tells an insert that leaving
+/// the column out is meant.
+///
+/// Refused on a column that already says how it is filled, because two
+/// answers to one question is how they come apart: a `.default` in the
+/// marker, or the key a sequence fills.
+fn filledOf(comptime Row: type, comptime decl: anytype) []const []const u8 {
+    comptime {
+        if (!@hasField(@TypeOf(decl), "filled")) return &.{};
+        const written = decl.filled;
+        const W = @TypeOf(written);
+        var names: []const []const u8 = &.{};
+        if (W == @TypeOf(.enum_literal)) {
+            names = &.{@tagName(written)};
+        } else if (@typeInfo(W) == .@"struct" and @typeInfo(W).@"struct".is_tuple) {
+            for (written) |one| {
+                if (@TypeOf(one) != @TypeOf(.enum_literal)) filledShape(Row, W);
+                names = names ++ &[_][]const u8{@tagName(one)};
+            }
+        } else filledShape(Row, W);
+
+        const keys = row_mod.keysIfAnyOf(Row);
+        for (names) |name| {
+            checkColumn(Row, "filled", name);
+            if (@hasField(@TypeOf(decl), "default") and @hasField(@TypeOf(decl.default), name)) @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s `." ++ name ++ "` is in both `.default` " ++
+                    "and `.filled`.\n" ++
+                    "  `.default` is a default nilo writes into the table, and `.filled` is " ++
+                    "one the database has by some other means. A column has one of them. " ++
+                    "Take it out of `.filled`.",
+            );
+            if (keys.len == 1 and std.mem.eql(u8, keys[0], name) and
+                generatedKey(@FieldType(Row, name))) @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s `.filled` names `." ++ name ++ "`, the " ++
+                    "key a sequence fills.\n" ++
+                    "  An integer key of one column is filled already and an insert may " ++
+                    "leave it out without saying so. Take it out of `.filled`.",
+            );
+        }
+        return names;
+    }
+}
+
+fn filledShape(comptime Row: type, comptime W: type) noreturn {
+    @compileError(
+        "nilo: " ++ @typeName(Row) ++ "'s `.filled` is a " ++ @typeName(W) ++ ".\n" ++
+            "  It names the columns the database fills in by itself: " ++
+            "`.filled = .{ .id, .created_at }`, or `.filled = .id` for one.",
+    );
+}
+
+fn listed(comptime names: []const []const u8, comptime name: []const u8) bool {
+    comptime {
+        for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
     }
 }
 

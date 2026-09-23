@@ -41,6 +41,7 @@
 
 const std = @import("std");
 const row_mod = @import("row.zig");
+const table_mod = @import("table.zig");
 const where_mod = @import("where.zig");
 const dialect_mod = @import("dialect.zig");
 const types_mod = @import("types.zig");
@@ -679,6 +680,42 @@ fn budget(comptime Row: type, comptime Written: type) void {
     @setEvalBranchQuota(20_000 + 4_000 * (rows + written));
 }
 
+/// An insert that leaves out a column nothing fills is refused, naming every
+/// such column. The subset an insert may write exists for the columns the
+/// database fills; a `NOT NULL` column with no default is not one of them,
+/// and leaving it out failed as `NotNullViolated` on the first run, which
+/// for a column added in a later release was in production.
+fn refuseLeftOut(
+    comptime Row: type,
+    comptime written: []const std.builtin.Type.StructField,
+    comptime what: []const u8,
+) void {
+    comptime {
+        var missing: []const u8 = "";
+        var left_out: usize = 0;
+        for (table_mod.requiredOf(Row)) |column| {
+            const found = for (written) |f| {
+                if (std.mem.eql(u8, f.name, column)) break true;
+            } else false;
+            if (found) continue;
+            missing = missing ++ (if (left_out == 0) "" else ", ") ++ "`" ++ column ++ "`";
+            left_out += 1;
+        }
+        if (left_out == 0) return;
+        const single = left_out == 1;
+        @compileError(
+            "nilo: " ++ what ++ " into " ++ @typeName(Row) ++ " leaves out " ++ missing ++
+                ", and nothing fills " ++ (if (single) "it" else "them") ++ " in.\n" ++
+                "  " ++ (if (single) "The column is" else "Each is") ++
+                " not optional and has no default, so the row would be " ++
+                "refused with `NotNullViolated` when the insert runs. Write it in the " ++
+                "insert, give it a `.default` in the marker or make the field optional; " ++
+                "if the database fills it itself, with a default written in a step or a " ++
+                "trigger, name it in the marker's `.filled`.",
+        );
+    }
+}
+
 /// `INSERT`, with the Row's own column list as the `RETURNING` clause.
 ///
 /// `V` is the type of a struct naming the columns being written, and it is
@@ -717,6 +754,13 @@ pub fn insert(comptime D: type, comptime Row: type, comptime V: type) Statement 
         var places: []const u8 = "";
         var paths: []const where_mod.Path = &.{};
         var params: []const where_mod.Param = &.{};
+
+        // A name that is not a column first: a typo leaves the column it
+        // meant out, and the typo is the thing to say.
+        for (info.fields) |f| {
+            if (!row_mod.hasColumn(Row, f.name)) row_mod.noSuchColumn(Row, f.name, "an insert");
+        }
+        refuseLeftOut(Row, info.fields, "an insert");
 
         for (info.fields, 0..) |f, i| {
             if (!row_mod.hasColumn(Row, f.name)) {
@@ -791,6 +835,13 @@ pub fn insertMany(comptime D: type, comptime Row: type, comptime V: type) Statem
         var arrays: []const u8 = "";
         var paths: []const where_mod.Path = &.{};
         var params: []const where_mod.Param = &.{};
+
+        // A name that is not a column first: a typo leaves the column it
+        // meant out, and the typo is the thing to say.
+        for (info.fields) |f| {
+            if (!row_mod.hasColumn(Row, f.name)) row_mod.noSuchColumn(Row, f.name, "a batch insert");
+        }
+        refuseLeftOut(Row, info.fields, "a batch insert");
 
         for (info.fields, 0..) |f, i| {
             if (!row_mod.hasColumn(Row, f.name)) {
@@ -1618,7 +1669,14 @@ const Pg = dialect_mod.Postgres;
 const Lite = dialect_mod.SQLite;
 
 const User = struct {
-    pub const nilo_table = .{ .name = "users", .key = .id };
+    // `age` has a default nilo would write, and `created_at` one the database
+    // has by other means; either way an insert may leave them out.
+    pub const nilo_table = .{
+        .name = "users",
+        .key = .id,
+        .default = .{ .age = 0 },
+        .filled = .created_at,
+    };
 
     id: i64,
     email: []const u8,
@@ -2032,6 +2090,49 @@ test "an insert names the columns it was given and returns the whole row" {
     try testing.expectEqualStrings("age", found.params[1].column);
 }
 
+test "an insert may leave out what something fills, and only that" {
+    const Bill = struct {
+        pub const nilo_table = .{
+            .name = "bills",
+            .key = .id,
+            .default = .{ .reduction = 0 },
+            .filled = .{ .number, .created_at },
+        };
+
+        id: i64, // the key a sequence fills
+        amount: i64,
+        reduction: i64, // a default nilo writes into the table
+        number: []const u8, // a default written in a step
+        created_at: types_mod.Timestamp, // a trigger, say
+        note: ?[]const u8, // null is what it gets
+    };
+    try testing.expectEqualStrings(
+        "INSERT INTO \"bills\" (\"amount\") VALUES ($1)" ++
+            " RETURNING \"id\", \"amount\", \"reduction\", \"number\", \"created_at\", \"note\"",
+        comptime insert(Pg, Bill, @TypeOf(.{ .amount = 100 })).sql,
+    );
+    try testing.expectEqual(@as(usize, 1), comptime table_mod.requiredOf(Bill).len);
+
+    // A table this program only reads keeps its defaults where it wrote them,
+    // in the database, and the marker cannot say which columns have one.
+    const Theirs = struct {
+        pub const nilo_table = .{ .name = "theirs", .key = .id, .managed = false };
+
+        id: i64,
+        stamped: i64,
+    };
+    try testing.expectEqual(@as(usize, 0), comptime table_mod.requiredOf(Theirs).len);
+
+    // And a join table with no key at all is still written by its columns.
+    const Pair = struct {
+        pub const nilo_table = .{ .name = "pairs", .key = .{ .a, .b } };
+
+        a: i64,
+        b: i64,
+    };
+    try testing.expectEqual(@as(usize, 2), comptime table_mod.requiredOf(Pair).len);
+}
+
 test "an insert writes a subset, because the database fills the rest in" {
     // No `id` and no `created_at`: a generated key and a DEFAULT are exactly
     // the columns a caller has nothing to say about.
@@ -2094,12 +2195,12 @@ test "a batch names the array of what the column is, not of what was written" {
     // `age` is `i32` in the Row and a `comptime_int` in the literal a caller
     // writes. The cast comes from the column, the same way the parameter tuple
     // takes its type from the column.
-    const Ages = struct { age: i32 };
+    const Ages = struct { email: []const u8, age: i32 };
     try testing.expect(std.mem.containsAtLeast(
         u8,
         comptime insertMany(Pg, User, Ages).sql,
         1,
-        "$1::int4[]",
+        "$2::int4[]",
     ));
 
     // And a widened one is named by what the Dialect would accept: a `u32`
@@ -2596,7 +2697,7 @@ test "a Row whose key is one column conflicts on that column" {
 /// A Row as wide as a real table — `rab_lines` in the port that hit this is
 /// twenty columns, and a save writes seventeen of them.
 const RabLine = struct {
-    pub const nilo_table = .{ .name = "rab_lines", .key = .id };
+    pub const nilo_table = .{ .name = "rab_lines", .key = .id, .filled = .{ .created_at, .updated_at } };
 
     id: i64,
     rab_id: i64,

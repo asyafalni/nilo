@@ -373,6 +373,18 @@ pub fn keyList(comptime Row: type) []const u8 {
 /// has never read. That made the tool all-or-nothing on a schema a program
 /// owns part of: usable at 59 tables of 59, unusable at 47 of 59.
 ///
+/// The key the marker names, or `id` when there is a column by that name, or
+/// nothing: `keysOf` without its refusal. For a question that is not "which
+/// row", such as which columns an insert may leave out, where a Row with no
+/// key is still a Row an `insertOrIgnore` may write (ADR 0186).
+pub fn keysIfAnyOf(comptime Row: type) []const []const u8 {
+    return comptime blk: {
+        if (specOf(Row).key) |named| break :blk named;
+        if (hasColumn(Row, "id")) break :blk &[_][]const u8{"id"};
+        break :blk &.{};
+    };
+}
+
 /// What `.managed = false` changes is only who builds it. The Row is still a
 /// Row: `.references` may point at it, `db.checking` still holds it against
 /// the live schema, and every statement reads it the same way. `plan`,
@@ -556,7 +568,7 @@ const Spec = struct {
 const allowed = [_][]const u8{
     "name",    "key",        "unique", "index",
     "default", "references", "was",    "managed",
-    "check",   "trigger",
+    "check",   "trigger",    "filled",
 };
 
 /// The table spec `Row` resolves to, following `nilo_table = OtherRow` until

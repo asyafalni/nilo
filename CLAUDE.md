@@ -96,7 +96,7 @@ goes in an ADR, a number goes in `docs/history.md`, a rule goes in a build step.
 
 Two of those rules are build steps rather than paragraphs, and they are the ones
 to lean on: `zig build layering` refuses an import that goes upward or sideways,
-and the eight `refusals` steps check the wording of 378 error messages. Prefer making
+and the eight `refusals` steps check the wording of 386 error messages. Prefer making
 a new rule enforceable that way over writing it down here — a paragraph nobody
 runs is the thing that rots.
 
@@ -130,11 +130,11 @@ zig build test-s3      # only nilo_s3, both modes, plus its refusals
 zig build test-dev     # only nilo-dev's argument parser, both modes — no module graph
 zig build layering     # check that no module imports upward or sideways
 zig build refusals     # the framework's 170 compile-error checks — NOT the others
-zig build refusals-sql # nilo_sql's 147; also run by test-sql
+zig build refusals-sql # nilo_sql's 154; also run by test-sql
 zig build refusals-config  # nilo_config's 9, and refusals-pw for nilo_pw's 4
 zig build refusals-cache   # nilo_cache's 6; also run by test-cache
 zig build refusals-s3  # nilo_s3's 10; also run by test-s3
-zig build refusals-job # nilo_job's 17; also run by test-job
+zig build refusals-job # nilo_job's 18; also run by test-job
 zig build refusals-fetch # nilo_fetch's 15; also run by test-fetch
 zig build snippets     # the documentation's own marked snippets, which must compile
 zig build smoke-tls -Dnetwork   # a real HTTPS endpoint — NOT part of test

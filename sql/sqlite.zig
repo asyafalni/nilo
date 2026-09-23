@@ -239,6 +239,15 @@ pub fn Wire(comptime opts_in: Options) type {
             /// rather than with the program.
             kept: std.StringHashMapUnmanaged(zqlite.Stmt) = .empty,
             busy: bool = false,
+            /// The statement that took this connection, for the line a
+            /// statement that gave up waiting for it writes. The text is the
+            /// holder's own and is alive for exactly as long as it holds the
+            /// connection, and it is read under the Wire's lock while `busy`,
+            /// so nothing is copied. No time beside it: a clock read per
+            /// statement measured 4.5% of a prepared `find`, and the waiter's
+            /// own `timeout_ms` already says how long it has been held at
+            /// least.
+            holder: []const u8 = "",
 
             fn deinit(self: *Conn, gpa: std.mem.Allocator) void {
                 var it = self.kept.valueIterator();
@@ -522,14 +531,11 @@ pub fn Wire(comptime opts_in: Options) type {
         /// `Bound` costs `core.Limits.slot_size` bytes of this frame either
         /// way, which is stack a handler touches and therefore per
         /// connection (ADR 0063).
-        fn takeWriter(self: *Self) wire.Error!usize {
+        fn takeWriter(self: *Self, holder: []const u8) wire.Error!usize {
             self.lock.lock(self.io) catch return error.TimedOut;
             defer self.lock.unlock(self.io);
 
-            if (!self.conns[0].busy) {
-                self.conns[0].busy = true;
-                return 0;
-            }
+            if (!self.conns[0].busy) return self.hold(0, holder);
 
             var bound: core.Limits.Bound = .idle;
             defer bound.release();
@@ -537,13 +543,19 @@ pub fn Wire(comptime opts_in: Options) type {
 
             while (self.conns[0].busy) self.free_writer.wait(self.io, &self.lock) catch
                 return self.gaveUp(&bound, .writer);
-            self.conns[0].busy = true;
-            return 0;
+            return self.hold(0, holder);
+        }
+
+        /// Mark a connection taken, and by what. Under the lock.
+        fn hold(self: *Self, at: usize, holder: []const u8) usize {
+            self.conns[at].busy = true;
+            self.conns[at].holder = holder;
+            return at;
         }
 
         /// Any free reader, or wait for one — bounded the same way, and armed
         /// only once every reader has turned out to be busy.
-        fn takeReader(self: *Self) wire.Error!usize {
+        fn takeReader(self: *Self, holder: []const u8) wire.Error!usize {
             self.lock.lock(self.io) catch return error.TimedOut;
             defer self.lock.unlock(self.io);
 
@@ -553,8 +565,7 @@ pub fn Wire(comptime opts_in: Options) type {
             while (true) {
                 for (self.conns[1..], 1..) |*conn, i| {
                     if (conn.busy) continue;
-                    conn.busy = true;
-                    return i;
+                    return self.hold(i, holder);
                 }
                 if (!bound.armed) bound.arm(self.limits, self.queue_timeout_ms);
                 self.free_reader.wait(self.io, &self.lock) catch
@@ -571,32 +582,58 @@ pub fn Wire(comptime opts_in: Options) type {
         /// there are only two ways in — this Wire's own timer, or the server
         /// shutting the fiber down — and only the first is worth a line.
         ///
-        /// **The writer's message names the mistake that produces it most
-        /// often.** There is exactly one writer, so a handler holding a `tx`
-        /// and then sending a statement through `db` rather than `tx` queues
-        /// for a connection it is itself holding. What this cannot do is
-        /// *say* that is what happened: telling it apart from an honestly
-        /// busy database means knowing which fiber holds the writer, and
-        /// `std.Io` hands a Service no fiber identity to hold it by
-        /// (ADR 0135).
+        /// **It names the statement holding the connection.** The line used to guess: one writer, so either the database
+        /// is busy or a handler holding a `tx` sent a statement through `db`
+        /// and queued for itself. An application whose `/healthz` failed this
+        /// way behind a thirty-second report went looking for a `tx` it did
+        /// not have. What held the writer was the previous probe's own
+        /// `SELECT 1`, parked in the Engine's thread pool behind the report.
+        /// The holder's text tells those three apart without a fiber
+        /// identity, which `std.Io` does not hand a Service (ADR 0135): a
+        /// `BEGIN` is a transaction, a long `SELECT` is the work itself, and
+        /// a one-line statement held past `timeout_ms` is waiting for a
+        /// thread rather than for the database.
         fn gaveUp(self: *Self, bound: *core.Limits.Bound, want: enum { writer, reader }) wire.Error {
             if (!bound.fired()) return error.TimedOut;
             switch (want) {
                 .writer => std.log.warn(
-                    "nilo_sql: a statement waited {d}ms for the writer connection and gave up. " ++
-                        "There is one writer, so either the database is busy or this fiber is " ++
-                        "queueing for a connection it already holds — a `db.…` call inside a " ++
-                        "handler holding a `tx` waits for itself. `timeout_ms` is the bound.",
-                    .{self.queue_timeout_ms},
+                    "nilo_sql: a statement waited {d}ms for the writer connection and gave up; " ++
+                        "it is held by `{s}`. A `BEGIN` is a transaction, and a `db.…` call " ++
+                        "inside a handler holding a `tx` waits for itself. A short statement " ++
+                        "holding it this long is waiting for a thread, not for the database. " ++
+                        "`timeout_ms` is the bound.",
+                    .{ self.queue_timeout_ms, shown(self.conns[0].holder) },
                 ),
                 .reader => std.log.warn(
                     "nilo_sql: a statement waited {d}ms for a reader connection and gave up, " ++
-                        "with all {d} of them busy. Raise `size`, or shorten what a request " ++
-                        "holds one for. `timeout_ms` is the bound.",
-                    .{ self.queue_timeout_ms, self.conns.len - 1 },
+                        "with all {d} of them busy, held by {f}. Raise `size`, or shorten what " ++
+                        "a request holds one for. `timeout_ms` is the bound.",
+                    .{ self.queue_timeout_ms, self.conns.len - 1, Holders{ .conns = self.conns[1..] } },
                 ),
             }
             return error.TimedOut;
+        }
+
+        /// The readers' holders written straight into the log line, so naming
+        /// four statements costs no buffer on the frame of a fiber that is
+        /// about to be parked (ADR 0063).
+        const Holders = struct {
+            conns: []const Conn,
+
+            pub fn format(self: Holders, w: *std.Io.Writer) std.Io.Writer.Error!void {
+                for (self.conns, 0..) |conn, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try w.print("`{s}`", .{shown(conn.holder)});
+                }
+            }
+        };
+
+        /// A statement as the log line shows it: long enough to recognise,
+        /// short enough that a generated `SELECT` of forty columns stays one
+        /// line.
+        fn shown(text: []const u8) []const u8 {
+            const trimmed = std.mem.trim(u8, text, " \t\r\n");
+            return trimmed[0..@min(trimmed.len, 120)];
         }
 
         /// Uncancelable, and it has to be: this runs from `Rows.close` and
@@ -727,7 +764,7 @@ pub fn Wire(comptime opts_in: Options) type {
             plan: ?[]const u8,
             problem: ?*?wire.Problem,
         ) wire.Error!Rows {
-            const at = if (wantsWriter(sql)) try self.takeWriter() else try self.takeReader();
+            const at = if (wantsWriter(sql)) try self.takeWriter(sql) else try self.takeReader(sql);
             errdefer self.release(at);
             const stmt, const kept = self.stmtOn(at, sql, plan, values) catch |err| {
                 self.said(at, err, arena, problem);
@@ -744,7 +781,7 @@ pub fn Wire(comptime opts_in: Options) type {
             plan: ?[]const u8,
             problem: ?*?wire.Problem,
         ) wire.Error!usize {
-            const at = try self.takeWriter();
+            const at = try self.takeWriter(sql);
             defer self.release(at);
             return self.execOn(at, sql, plan, values) catch |err| {
                 self.said(at, err, arena, problem);
@@ -926,7 +963,8 @@ pub fn Wire(comptime opts_in: Options) type {
             _ = arena;
             comptime checkIsolation(opts_);
 
-            const at = if (opts_.read_only) try self.takeReader() else try self.takeWriter();
+            const begin_text = if (opts_.read_only) "BEGIN" else "BEGIN IMMEDIATE";
+            const at = if (opts_.read_only) try self.takeReader(begin_text) else try self.takeWriter(begin_text);
             errdefer self.release(at);
             try self.command(at, if (opts_.read_only) "BEGIN" else "BEGIN IMMEDIATE");
             return .{ .wire = self, .at = at };
@@ -1340,7 +1378,7 @@ test "a returning reader wakes the fiber that wanted a reader, not the one that 
     // doc. Two parked fibers need two threads to have been asked for.
     try withIoPair(struct {
         fn takeOne(w: *TestWire, want_writer: bool, out: *usize) void {
-            out.* = (if (want_writer) w.takeWriter() else w.takeReader()) catch 99;
+            out.* = (if (want_writer) w.takeWriter("test") else w.takeReader("test")) catch 99;
         }
 
         fn run(io: std.Io) !void {
@@ -1349,9 +1387,9 @@ test "a returning reader wakes the fiber that wanted a reader, not the one that 
             defer w.close();
 
             // Every connection taken, so anybody asking now has to park.
-            try testing.expectEqual(@as(usize, 0), try w.takeWriter());
-            try testing.expectEqual(@as(usize, 1), try w.takeReader());
-            try testing.expectEqual(@as(usize, 2), try w.takeReader());
+            try testing.expectEqual(@as(usize, 0), try w.takeWriter("test"));
+            try testing.expectEqual(@as(usize, 1), try w.takeReader("test"));
+            try testing.expectEqual(@as(usize, 2), try w.takeReader("test"));
 
             var writer_at: usize = 99;
             var reader_at: usize = 99;

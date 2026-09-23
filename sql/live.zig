@@ -4058,7 +4058,7 @@ test "a Db told to keep no plans still answers, one Parse at a time" {
 /// Twenty columns, the width `rab_lines` has in the port that found the
 /// builders running out of branches at seventeen written (ADR 0208).
 const Line = struct {
-    pub const nilo_table = .{ .name = lines_table, .key = .id };
+    pub const nilo_table = .{ .name = lines_table, .key = .id, .filled = .{ .created_at, .updated_at } };
 
     id: i64,
     rab_id: i64,

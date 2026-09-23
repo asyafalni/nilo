@@ -812,6 +812,32 @@ const sql_refusals = [_]Refusal{
             " table_default_word_written_as_text.Priority's words.",
     },
     .{
+        .name = "insert_leaves_out_a_column",
+        .says = "an insert into insert_leaves_out_a_column.User leaves out `age`, `created_at`," ++
+            " and nothing fills them in.",
+    },
+    .{
+        .name = "insert_many_leaves_out_a_column",
+        .says = "a batch insert into insert_many_leaves_out_a_column.Bill leaves out `reduction`," ++
+            " and nothing fills it in.",
+    },
+    .{
+        .name = "table_filled_and_default",
+        .says = "table_filled_and_default.User's `.created_at` is in both `.default` and `.filled`.",
+    },
+    .{
+        .name = "table_filled_on_a_generated_key",
+        .says = "table_filled_on_a_generated_key.User's `.filled` names `.id`, the key a sequence fills.",
+    },
+    .{
+        .name = "table_filled_written_as_text",
+        .says = "table_filled_written_as_text.User's `.filled` is a *const [10:0]u8.",
+    },
+    .{
+        .name = "table_filled_not_a_column",
+        .says = "table_filled_not_a_column.User has no column `creatd_at`, asked for in `.filled`.",
+    },
+    .{
         .name = "table_default_on_a_generated_key",
         .says = "table_default_on_a_generated_key.User's `.default.id` is on the key," ++
             " and the database fills that in itself.",

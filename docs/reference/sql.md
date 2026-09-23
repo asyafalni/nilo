@@ -244,13 +244,7 @@ prepared on its connection under a name derived from its own text — worth
 `.prepared = false` behind a **connection pooler in transaction mode**
 (pgbouncer), which hands out a different server connection per transaction.
 
-A Row may name a **view** or a **materialized view** as well as a table. The
-column types are checked there; nullability is not, because Postgres does not
-track `NOT NULL` through a view
-([ADR 0056](../adr/0056-a-view-is-a-table-that-cannot-say-what-is-not-null.md)).
-An identity key, a sequence default and a generated column need nothing said
-about them — an insert names a subset of the Row's columns and `RETURNING`
-brings the rest back.
+A Row may name a **view** or a **materialized view** as well as a table. The column types are checked there; nullability is not, because Postgres does not track `NOT NULL` through a view ([ADR 0056](../adr/0056-a-view-is-a-table-that-cannot-say-what-is-not-null.md)). An identity key and a generated column, which the Row reads as optional, need nothing said about them: an insert names a subset of the Row's columns and `RETURNING` brings the rest back. A sequence or any other default on another column, written outside the marker, is named in `.filled` so an insert may leave it out ([ADR 0221](../adr/0221-the-marker-has-two-kinds-of-word.md)).
 
 A Row says four things about its schema: `.default`, `.unique`, `.index` and
 `.references` ([ADR 0153](../adr/0153-a-migration-is-a-diff-against-a-snapshot.md),
@@ -382,7 +376,7 @@ request ([ADR 0041](../adr/0041-a-module-sits-where-the-loop-puts-it.md)).
 | `db.page(User, c, .{ .where = …, .order = …, .limit = 20 })` | `!Page(User)` — `.rows` and `.total`, in one statement. `.limit` and `.order` are required; see below |
 | `db.count(User, c, .{ .where = … })` | `!usize`. `.where` only, and optional — no condition counts the table |
 | `db.exists(User, c, .{ .where = … })` | `!bool` — `SELECT EXISTS(…)`, so it stops at the first match |
-| `db.insert(User, c, .{ .email = … })` | `!User` — the stored row, generated key included. A subset of the columns |
+| `db.insert(User, c, .{ .email = … })` | `!User` — the stored row, generated key included. A subset of the columns: what it leaves out has to be filled by something, the key a sequence fills, a `.default`, `null` on an optional field, or `.filled`, and an insert that leaves out a column nothing fills is a Refusal naming it. Not checked on a `.managed = false` Row ([ADR 0221](../adr/0221-the-marker-has-two-kinds-of-word.md)) |
 | `db.insertMany(User, c, rows)` | `![]User` — a whole batch in one statement, back in the order it was sent. `rows` is a `[]const Line`, `Line` a named struct of the columns being written; see below |
 | `db.insertOrIgnore(User, c, .{ … }, .key)` | `!?User` — the stored row, or `null` when one was already there. `ON CONFLICT … DO NOTHING`. `.key` is the Row's own key; a column name is for a unique index that is not the key |
 | `db.insertOrUpdate(User, c, .{ … }, .email)` | `!User` — stored, or the existing row with these values written over it. `ON CONFLICT … DO UPDATE` |
@@ -1095,6 +1089,7 @@ const User = struct {
 | in the marker | what it says |
 |---|---|
 | `.default = .{ .created_at = .now }` | what the database writes when an insert leaves the column out. `.now` is the one word, and only on a `sql.Timestamp`; everything else is a literal of the column's own Zig type, which has to coerce or it does not compile. A column with words of its own takes one of them the way a column is written: `.draft`, not `"draft"`. A default the database has to work out — `DEFAULT (lower(x))` — is still a step, and one on a generated key is a Refusal |
+| `.filled = .{ .number, .created_at }` | columns the database fills by means the marker cannot say: a `DEFAULT` written in a step, `gen_random_uuid()`, a trigger. Renders no DDL; it lets an insert leave them out. `.filled = .created_at` for one. A column also in `.default`, the integer key a sequence fills, and a name that is not a column are each a Refusal ([ADR 0221](../adr/0221-the-marker-has-two-kinds-of-word.md)) |
 | `.unique = .{ .email }` | one column. `.{ .{ .tenant_id, .name } }` is one constraint over two |
 | `.{ .columns = .{.email}, .ignoring_case = true }` | the named form. `.ignoring_case` is `lower(...)` on Postgres and `COLLATE NOCASE` on SQLite, and it is a Refusal on a column that is not text |
 | `.name = "users_one_account_per_address"` | what the constraint is called, on a `.unique`, an `.index` or a `.references`. **The name is the error message**: Postgres reports a violation by constraint name and nothing else, so this is the difference between a sentence and a column list. Text rather than `.a_word`, because that is what the database prints |

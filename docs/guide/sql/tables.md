@@ -7,7 +7,11 @@ these.
 <!-- compiles -->
 ```zig
 const User = struct {
-    pub const nilo_table = .{ .name = "users", .key = .id };
+    pub const nilo_table = .{
+        .name = "users",
+        .key = .id,
+        .default = .{ .age = 0, .orders = 0, .created_at = .now },
+    };
 
     id: i64,
     email: nilo.Str,
@@ -108,7 +112,7 @@ one is the shape you would write anyway:
 
 <!-- compiles: body -->
 ```zig
-_ = try db.insert(Ticket, c, .{ .tags = &.{ "urgent", "billing" }, .scores = null });
+_ = try db.insert(Ticket, c, .{ .tags = &.{ "urgent", "billing" }, .scores = null, .owners = &.{} });
 ```
 
 Two things about arrays that Postgres allows and a Zig slice cannot hold:

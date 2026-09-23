@@ -224,6 +224,18 @@ equal to its default when writing and fills it in when reading, so a
 described. A test holds it, against a hand-written older file rather than
 against one this code round-tripped.
 
+### `.filled`, and an insert that leaves out what nothing fills
+
+**An insert that leaves out a column nothing fills is a Refusal, naming every such column.** An insert writes a subset of the columns on purpose (ADR 0039), so that the ones the database fills need not be written. A column that is not optional, not the integer key a sequence fills, and has no `.default` has nothing to fill it, and leaving it out was a `NotNullViolated` the first time the insert ran. An application found it that way: a column added to `bills` in one release, the seed updated, one insert elsewhere missed, and assessing a new year answered 500, with no warning from the compiler. `insert`, `insertMany` and both upserts ask; the error names the columns and the ways out.
+
+**`.filled` is the word for a column the database fills by a means the marker cannot say**: a `DEFAULT` written in a step, `gen_random_uuid()` on a `Uuid` key, a trigger. `.filled = .{ .number, .created_at }`, or `.filled = .created_at` for one. It renders no DDL and no diff; it tells an insert that leaving the column out is meant. It is not the fourth kind of word refused below, which would be text the database reads. This one is read by nothing but the check, and the compiler can hold it: every name is a column, and a column already filled another way, by a `.default` or by its sequence, is refused rather than said twice.
+
+**A table this program does not build is not checked** (`.managed = false`, ADR 0162). Its defaults are the database's and were never written in the marker, so the marker cannot say which columns an insert may leave out. The check is read off the owner, the Row that names the table, so a narrow Row that borrows it cannot hide a required column it has no field for.
+
+The cost is paid once, by programs that compile today: every managed Row whose table has a default the marker does not carry needs `.filled` or `.default` before its inserts compile again. The guide's own `User` was one of them. Its inserts left out `name`, `orders` and `created_at`, a table made by `createMissing` has no default for any of them, and the page had been teaching an insert that could not run.
+
+None of it runs. The check and the word are comptime, and every statement's text is what it was, so no axis in ADR 0018 moves; what it spends is compile time and six Refusals, one for each mistake it can be handed.
+
 ## What was rejected
 
 **Reading the words back out of `pg_constraint.conbin` at boot.** It would let
@@ -243,6 +255,10 @@ rejected by name.
 **A fourth kind of word for the things neither kind covers** — a generated
 column, a collation, a rule, a policy. Each is a `.data` step until somebody
 brings a case, which is 0153's own rule and is unchanged.
+
+**An insert variant that checks, beside the one that does not**, `insertWhole` say, for the left-out column. Nothing would break, and nothing would be caught either: the insert that was missed is the one nobody thought to switch over.
+
+**Making the column optional as the only way out**, with no word for a default the database has. A `gen_random_uuid()` key or a trigger-stamped column is not null once it is read, and a `?` on it would be a lie told to every reader to satisfy one insert.
 
 **Spelling an enum default as text.** `.priority = "normal"` reads naturally and
 puts the column's type and the default's type out of step; a column that holds

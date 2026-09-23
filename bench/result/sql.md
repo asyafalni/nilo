@@ -1202,6 +1202,23 @@ What is *not* on this list is the ORM. §1 puts the typed layer at ~100 ns on a
 database and the load generator take the rest. **The thing to make faster next
 is the socket, and after that it is somebody else's repository.**
 
+## 13. What naming a connection's holder costs a statement
+
+**Run:** `zig build bench-sql`, the `db.find through the whole module` row with `.prepared = true`, SQLite in a file under `/tmp`, in-process with no socket. Before is `git archive HEAD` at `ae1cb61`; after is the working tree. Three pairs, interleaved, best of five each. AMD Ryzen 7 9700X, 16 threads, Linux 7.2, Zig 0.16.0, 2026-09-23.
+
+**Why:** the line a SQLite statement writes when it gives up on a connection now names the statement holding it (ADR 0135). The first version also stored when the connection was taken, so the line could say for how long.
+
+| | pair 1 | pair 2 | pair 3 |
+|---|---|---|---|
+| before | 708 ns | 710 ns | 718 ns |
+| after, text and a clock read per take | 750 ns | 742 ns | 743 ns |
+| before (second set) | 709 ns | 712 ns | 715 ns |
+| after, text only | 722 ns | 710 ns | 705 ns |
+
+**What it changed:** the clock read was 4.5%, every pair the same way, on the path every statement takes. The text alone is a pointer store under a lock already held, and its margin changes sign between pairs, so it is "unchanged". The timestamp was dropped: the waiter's own `timeout_ms` already bounds how long the holder has had the connection, and a one-line statement named as the holder after that long says enough.
+
+**Can it be pushed further:** there is nothing left to take out. The statement text was already in hand and the lock already taken.
+
 ## What is still missing
 
 - **A second box.** Everything here shares eight physical cores between nilo,

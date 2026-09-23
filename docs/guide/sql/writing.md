@@ -6,7 +6,7 @@ what holds several of these together.
 
 <!-- compiles: body -->
 ```zig
-const made = try db.insert(User, c, .{ .email = "a@b.c", .age = 30 });
+const made = try db.insert(User, c, .{ .email = "a@b.c", .name = "Ada", .age = 30 });
 // made.id is the generated key
 
 const changed = try db.update(User, c, .{
@@ -21,6 +21,8 @@ const gone = try db.delete(User, c, .{ .where = .{ .id = made.id } });
 fills in — a generated key, a `DEFAULT now()` — are exactly the ones you have
 nothing to say about. What comes back is the whole row, via `RETURNING`, so
 there is no second query to fetch what the database just had in its hand.
+
+**A column nothing fills is not yours to leave out, and leaving it out does not compile.** The subset is for the columns something fills: the integer key a sequence fills, a column with a `.default` in the marker, an optional one that gets null, and one named in the marker's `.filled`, which is how you tell nilo the database fills it by means of its own (a `DEFAULT` written in a step, `gen_random_uuid()`, a trigger). Leave out anything else and the insert is refused, naming the columns, rather than failing with `NotNullViolated` the first time it runs. That is how a column added in one release and missed by an insert in the next is found by the compiler instead of by a user ([ADR 0221](../../adr/0221-the-marker-has-two-kinds-of-word.md)). A table this program only reads, `.managed = false`, is not checked: its defaults are the database's, and the marker does not know them.
 
 **A `Str` column takes text in whatever shape you hold it.** The Row says
 `email: Str`; the insert takes a literal, a `[]const u8`, a `[]u8` an
@@ -159,7 +161,7 @@ order they arrive in. `ON CONFLICT` is one statement and has no window.
 <!-- compiles: body -->
 ```zig
 // Leave the row that is there alone. `null` means it was already there.
-const made = try db.insertOrIgnore(User, c, .{ .email = email }, .email);
+const made = try db.insertOrIgnore(User, c, .{ .email = email, .name = name }, .email);
 
 // Or write these values over it. Either way a row comes back.
 const user = try db.insertOrUpdate(User, c, .{

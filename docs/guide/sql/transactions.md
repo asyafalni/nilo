@@ -10,7 +10,7 @@ locks and savepoints are all here; the statements inside one are the ones
 var tx = try db.begin(c, .{});
 defer tx.deinit();                  // rolls back unless committed
 
-const order = try tx.insert(Order, c, .{ .user_id = user.id, .total = 4200 });
+const order = try tx.insert(Order, c, .{ .user_id = user.id, .total = 4200, .status = "new" });
 _ = try tx.update(User, c, .{ .set = .{ .orders = user.orders + 1 }, .where = .{ .id = user.id } });
 
 try tx.commit();
