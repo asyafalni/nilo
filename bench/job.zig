@@ -118,7 +118,7 @@ fn timed(store: anytype, run: *core.Run, what: struct { claims: usize, now: i64 
     const started = core.monotonicMicros();
     var i: usize = 0;
     while (i < what.claims) : (i += 1) {
-        _ = try store.claim(run, what.now, what.now + 60_000_000);
+        _ = try store.claim(run, &.{"bench"}, what.now, what.now + 60_000_000);
         run.reset();
     }
     return @divTrunc(core.monotonicMicros() - started, @as(i64, @intCast(what.claims)));

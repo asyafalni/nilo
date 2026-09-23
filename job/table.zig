@@ -13,8 +13,9 @@
 //! ```sql
 //! UPDATE nilo_jobs SET state = 'running', lease_until = $2, attempts = attempts + 1
 //! WHERE id = (SELECT id FROM nilo_jobs
-//!             WHERE (state = 'queued' AND run_at <= $1) OR (state = 'running' AND lease_until <= $1)
-//!             ORDER BY run_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+//!             WHERE kind = ANY($3)
+//!               AND ((state = 'queued' AND run_at <= $1) OR (state = 'running' AND lease_until <= $1))
+//!             ORDER BY priority, run_at LIMIT 1 FOR UPDATE SKIP LOCKED)
 //! RETURNING …
 //! ```
 //!
@@ -61,6 +62,13 @@ pub fn Table(comptime Db: type) type {
                 .key = .id,
                 .unique = .{.{ .kind, .unique_key }},
                 .index = .{.{ .state, .run_at }},
+                // `priority` may not be null, and a column that may not be
+                // null and has no default is the one ALTER that fails on a
+                // table with rows in it (sql/ddl.zig). It also has to survive
+                // a rolling deploy: an older binary's INSERT does not name
+                // the column, and a sibling binary's — ADR 0291's own case —
+                // never will. The default answers both.
+                .default = .{ .priority = @as(i16, @intFromEnum(contract.Priority.normal)) },
             };
 
             id: i64,
@@ -75,6 +83,17 @@ pub fn Table(comptime Db: type) type {
             /// is not running.
             lease_until: i64,
             attempts: i32,
+            /// Which due row a worker takes first, as the number behind
+            /// `contract.Priority` — `high` is 0, so the claim's ORDER BY is
+            /// ascending on both columns and the index above serves it
+            /// whole.
+            ///
+            /// The integer and not the enum: an enum column is stored as its
+            /// *name*, and `ORDER BY` on text sorts 'high' before 'low'
+            /// before 'normal', which is neither the order asked for nor an
+            /// order at all. A state has no order and is stored as a word; a
+            /// priority is only an order.
+            priority: i16,
             unique_key: ?[]const u8,
             last_error: ?[]const u8,
             created_at: i64,
@@ -113,6 +132,7 @@ pub fn Table(comptime Db: type) type {
                 .run_at = at.run_at,
                 .lease_until = @as(i64, 0),
                 .attempts = @as(i32, 0),
+                .priority = @intFromEnum(at.priority),
                 .unique_key = at.unique,
                 .last_error = @as(?[]const u8, null),
                 .created_at = now,
@@ -126,17 +146,61 @@ pub fn Table(comptime Db: type) type {
             return @intCast(row.id);
         }
 
-        const claim_sql =
-            "UPDATE \"nilo_jobs\" SET \"state\" = 'running', \"lease_until\" = " ++ D.placeholder(2) ++
-            ", \"attempts\" = \"attempts\" + 1 WHERE \"id\" = (SELECT \"id\" FROM \"nilo_jobs\" WHERE " ++
-            "(\"state\" = 'queued' AND \"run_at\" <= " ++ D.placeholder(1) ++ ") OR " ++
-            "(\"state\" = 'running' AND \"lease_until\" <= " ++ D.placeholder(1) ++ ") " ++
-            "ORDER BY \"run_at\" LIMIT 1" ++ (if (on_postgres) " FOR UPDATE SKIP LOCKED" else "") ++ ") " ++
-            "RETURNING \"id\", \"kind\", \"payload\", \"state\", \"run_at\", \"lease_until\", \"attempts\", " ++
-            "\"unique_key\", \"last_error\", \"created_at\", \"finished_at\"";
+        /// The claim, narrowed to the kinds this program can run.
+        ///
+        /// A worker used to claim the most urgent due row whatever its kind,
+        /// and hand a kind it did not know back to the queue. That reads as
+        /// courtesy and behaves as a spin: the row goes back `queued` with the
+        /// `run_at` it already had, so the same worker takes it again on the
+        /// next turn of the loop, forever, and each claim bumps `attempts` —
+        /// so a row nobody can run is eventually declared dead by the binary
+        /// least able to judge it. Narrowing the claim leaves it untouched for
+        /// the binary that does know it.
+        ///
+        /// The kinds are **bound**, not spelled into the statement. The list
+        /// is comptime either way, so the statement still has one shape per
+        /// program; binding is what lets a kind be named anything a program
+        /// already named one — `email:welcome`, `reports/nightly` — instead of
+        /// making this change rename rows that are queued under the old name,
+        /// which is the very loss ADR 0291 is about. Postgres takes the list
+        /// as one array; SQLite has no `ANY`, so it takes a run of
+        /// placeholders as long as the list.
+        fn claimSql(comptime kinds: []const []const u8) []const u8 {
+            comptime {
+                var narrow: []const u8 = "\"kind\" = ANY(" ++ D.placeholder(3) ++ ")";
+                if (!on_postgres) {
+                    narrow = "\"kind\" IN (";
+                    for (kinds, 0..) |_, i| narrow = narrow ++ (if (i == 0) "" else ", ") ++ D.placeholder(3 + i);
+                    narrow = narrow ++ ")";
+                }
+                return "UPDATE \"nilo_jobs\" SET \"state\" = 'running', \"lease_until\" = " ++ D.placeholder(2) ++
+                    ", \"attempts\" = \"attempts\" + 1 WHERE \"id\" = (SELECT \"id\" FROM \"nilo_jobs\" WHERE " ++
+                    narrow ++ " AND (" ++
+                    "(\"state\" = 'queued' AND \"run_at\" <= " ++ D.placeholder(1) ++ ") OR " ++
+                    "(\"state\" = 'running' AND \"lease_until\" <= " ++ D.placeholder(1) ++ ")) " ++
+                    "ORDER BY \"priority\", \"run_at\" LIMIT 1" ++ (if (on_postgres) " FOR UPDATE SKIP LOCKED" else "") ++ ") " ++
+                    "RETURNING \"id\", \"kind\", \"payload\", \"state\", \"run_at\", \"lease_until\", \"attempts\", " ++
+                    "\"priority\", \"unique_key\", \"last_error\", \"created_at\", \"finished_at\"";
+            }
+        }
 
-        pub fn claim(self: *Self, scope: anytype, now: i64, lease_until: i64) !?contract.Claimed {
-            const row = try self.db.rawOne(Row, scope, claim_sql, .{ now, lease_until }) orelse return null;
+        /// `now`, `lease_until`, then the kinds: one array on Postgres, one
+        /// parameter each on SQLite.
+        fn ClaimArgs(comptime n: usize) type {
+            return if (on_postgres) struct { i64, i64, []const []const u8 } else std.meta.Tuple(&([_]type{ i64, i64 } ++ [_]type{[]const u8} ** n));
+        }
+
+        pub fn claim(self: *Self, scope: anytype, comptime kinds: []const []const u8, now: i64, lease_until: i64) !?contract.Claimed {
+            if (kinds.len == 0) return null;
+            var args: ClaimArgs(kinds.len) = undefined;
+            args[0] = now;
+            args[1] = lease_until;
+            if (comptime on_postgres) {
+                args[2] = kinds;
+            } else {
+                inline for (kinds, 0..) |k, i| args[2 + i] = k;
+            }
+            const row = try self.db.rawOne(Row, scope, comptime claimSql(kinds), args) orelse return null;
             return .{
                 .id = @intCast(row.id),
                 .kind = row.kind,

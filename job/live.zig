@@ -90,17 +90,17 @@ test "on SQLite a row is pushed, claimed once, and finished" {
     var table = SqliteTable.open(&f.db);
 
     const id = (try table.push(&f.run, "write-note", "{\"text\":\"a\"}", .{ .run_at = 100 })).?;
-    try testing.expect((try table.claim(&f.run, 50, 1_000)) == null);
+    try testing.expect((try table.claim(&f.run, live_kinds, 50, 1_000)) == null);
 
-    const claimed = (try table.claim(&f.run, 150, 1_000)).?;
+    const claimed = (try table.claim(&f.run, live_kinds, 150, 1_000)).?;
     try testing.expectEqual(id, claimed.id);
     try testing.expectEqualStrings("write-note", claimed.kind);
     try testing.expectEqualStrings("{\"text\":\"a\"}", claimed.payload);
     try testing.expectEqual(@as(u32, 1), claimed.attempts);
     // Running, and leased: not claimable again until the lease is over.
-    try testing.expect((try table.claim(&f.run, 150, 1_000)) == null);
+    try testing.expect((try table.claim(&f.run, live_kinds, 150, 1_000)) == null);
     try testing.expectEqual(@as(u64, 1), (try table.stats(&f.run)).running);
-    const again = (try table.claim(&f.run, 1_001, 2_000)).?;
+    const again = (try table.claim(&f.run, live_kinds, 1_001, 2_000)).?;
     try testing.expectEqual(@as(u32, 2), again.attempts);
 
     try table.done(&f.run, id);
@@ -118,7 +118,7 @@ test "on SQLite a unique key is the index, and is free again once the row is fin
     try testing.expect((try table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "u1" })) == null);
     try testing.expect((try table.push(&f.run, "other", "{}", .{ .run_at = 0, .unique = "u1" })) != null);
 
-    const claimed = (try table.claim(&f.run, 1, 100)).?;
+    const claimed = (try table.claim(&f.run, live_kinds, 1, 100)).?;
     try testing.expect((try table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "u1" })) == null);
     try table.dead(&f.run, claimed.id, "Gone");
     try testing.expect((try table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "u1" })) != null);
@@ -141,7 +141,7 @@ test "on SQLite cancel deletes a queued row and leaves one a worker holds" {
     try testing.expectEqual(@as(u64, 0), (try table.stats(&f.run)).queued);
     // The unique key went with the row, so the same key queues again.
     const again = (try table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "u1" })).?;
-    _ = (try table.claim(&f.run, 1, 100)).?;
+    _ = (try table.claim(&f.run, live_kinds, 1, 100)).?;
     try testing.expect(!(try table.cancel(&f.run, again)));
     try testing.expectEqual(@as(u64, 1), (try table.stats(&f.run)).running);
 }
@@ -263,16 +263,16 @@ test "on Postgres a row is claimed with SKIP LOCKED, once, and a unique key hold
 
     const id = (try table.push(&p.run, "write-note", "{\"text\":\"a\"}", .{ .run_at = 100, .unique = "pg1" })).?;
     try testing.expect((try table.push(&p.run, "write-note", "{}", .{ .run_at = 100, .unique = "pg1" })) == null);
-    try testing.expect((try table.claim(&p.run, 50, 1_000)) == null);
+    try testing.expect((try table.claim(&p.run, live_kinds, 50, 1_000)) == null);
 
-    const claimed = (try table.claim(&p.run, 150, 1_000)).?;
+    const claimed = (try table.claim(&p.run, live_kinds, 150, 1_000)).?;
     try testing.expectEqual(id, claimed.id);
     try testing.expectEqualStrings("{\"text\":\"a\"}", claimed.payload);
-    try testing.expect((try table.claim(&p.run, 150, 1_000)) == null);
+    try testing.expect((try table.claim(&p.run, live_kinds, 150, 1_000)) == null);
 
     try table.retry(&p.run, id, 500, "Later");
-    try testing.expect((try table.claim(&p.run, 200, 1_000)) == null);
-    const again = (try table.claim(&p.run, 600, 1_000)).?;
+    try testing.expect((try table.claim(&p.run, live_kinds, 200, 1_000)) == null);
+    const again = (try table.claim(&p.run, live_kinds, 600, 1_000)).?;
     try testing.expectEqual(@as(u32, 2), again.attempts);
     try table.done(&p.run, id);
     try testing.expect((try table.push(&p.run, "write-note", "{}", .{ .run_at = 100, .unique = "pg1" })) != null);
@@ -291,12 +291,117 @@ test "on Postgres a row is claimed with SKIP LOCKED, once, and a unique key hold
     try tx_b.commit();
 }
 
+test "the priority column carries a default, so it can be added to a table with rows" {
+    // A column that may not be null and has no default is the one ALTER that
+    // fails on a table that already has rows, and the one an older binary's
+    // INSERT — or a sibling binary's, which is ADR 0291's own case — walks
+    // into during a rolling deploy. No database needed: this is the DDL nilo
+    // would write.
+    const created = comptime sql.ddl.createTable(sql.dialect.Postgres, PgTable.Row);
+    try testing.expect(std.mem.indexOf(u8, created, "\"priority\"") != null);
+    try testing.expect(std.mem.indexOf(u8, created, "DEFAULT 1") != null);
+    const lite = comptime sql.ddl.createTable(sql.dialect.SQLite, SqliteTable.Row);
+    try testing.expect(std.mem.indexOf(u8, lite, "DEFAULT 1") != null);
+}
+
+test "on Postgres a kind this program does not know is left in the queue" {
+    const p = (try Pg.open()) orelse return error.SkipZigTest;
+    defer p.close();
+    var table = PgTable.open(&p.db);
+    _ = try p.db.exec(&p.run, "DELETE FROM \"nilo_jobs\"", .{});
+
+    // Due first, and it would win any ordering.
+    _ = try table.push(&p.run, "from-another-binary", "{}", .{ .run_at = 0 });
+    const mine = (try table.push(&p.run, "write-note", "{}", .{ .run_at = 10 })).?;
+
+    const got = (try table.claim(&p.run, live_kinds, 1_000, 5_000)).?;
+    try testing.expectEqual(mine, got.id);
+    // Nothing else for this program: the stranger is not claimed, handed
+    // back and claimed again, which is the loop that used to spin and walk
+    // its `attempts` up to dead.
+    try testing.expect((try table.claim(&p.run, live_kinds, 1_000, 5_000)) == null);
+
+    const Row = PgTable.Row;
+    const left = (try p.db.rawOne(Row, &p.run,
+        "SELECT * FROM \"nilo_jobs\" WHERE \"kind\" = 'from-another-binary'", .{})).?;
+    try testing.expectEqual(job.State.queued, left.state);
+    try testing.expectEqual(@as(i32, 0), left.attempts);
+}
+
+test "on SQLite the claim takes the most urgent due row, not the oldest" {
+    // SQLite has its own branch of `claimSql` — numbered placeholders, `IN`
+    // rather than `ANY`, the i16 priority mapped back through RETURNING — so
+    // the order and the narrowing are worth asserting on both, not just on
+    // whichever one the harness reaches.
+    const f = try Fixture.open("job-priority");
+    defer f.close();
+    var table = SqliteTable.open(&f.db);
+
+    _ = (try table.push(&f.run, "backfill", "{}", .{ .run_at = 10, .priority = .low })).?;
+    _ = (try table.push(&f.run, "sweep", "{}", .{ .run_at = 20 })).?;
+    _ = (try table.push(&f.run, "revalidate-b", "{}", .{ .run_at = 40, .priority = .high })).?;
+    _ = (try table.push(&f.run, "revalidate-a", "{}", .{ .run_at = 30, .priority = .high })).?;
+
+    const order = [_][]const u8{ "revalidate-a", "revalidate-b", "sweep", "backfill" };
+    for (order) |want| {
+        const c = (try table.claim(&f.run, live_kinds, 100, 1_000)).?;
+        try testing.expectEqualStrings(want, c.kind);
+        try table.done(&f.run, c.id);
+    }
+    try testing.expect((try table.claim(&f.run, live_kinds, 100, 1_000)) == null);
+}
+
+test "on SQLite a kind this program does not know is left in the queue" {
+    const f = try Fixture.open("job-foreign");
+    defer f.close();
+    var table = SqliteTable.open(&f.db);
+
+    _ = (try table.push(&f.run, "from-another-binary", "{}", .{ .run_at = 0 })).?;
+    const mine = (try table.push(&f.run, "write-note", "{}", .{ .run_at = 10 })).?;
+
+    const got = (try table.claim(&f.run, live_kinds, 1_000, 5_000)).?;
+    try testing.expectEqual(mine, got.id);
+    try testing.expect((try table.claim(&f.run, live_kinds, 1_000, 5_000)) == null);
+
+    // Untouched: still queued, still at nought attempts, for the binary
+    // that knows the kind.
+    const theirs = (try table.claim(&f.run, &.{"from-another-binary"}, 1_000, 5_000)).?;
+    try testing.expectEqual(@as(u32, 1), theirs.attempts);
+}
+
+test "on Postgres the claim takes the most urgent due row, not the oldest" {
+    const p = (try Pg.open()) orelse return error.SkipZigTest;
+    defer p.close();
+    var table = PgTable.open(&p.db);
+
+    // The order a backfill and the small jobs behind it arrive in. By
+    // `run_at` alone the backfill is claimed first and holds the worker for
+    // as long as it runs, which is the whole complaint.
+    _ = (try table.push(&p.run, "backfill", "{}", .{ .run_at = 10, .priority = .low })).?;
+    _ = (try table.push(&p.run, "sweep", "{}", .{ .run_at = 20 })).?;
+    _ = (try table.push(&p.run, "revalidate-b", "{}", .{ .run_at = 40, .priority = .high })).?;
+    _ = (try table.push(&p.run, "revalidate-a", "{}", .{ .run_at = 30, .priority = .high })).?;
+
+    const order = [_][]const u8{ "revalidate-a", "revalidate-b", "sweep", "backfill" };
+    for (order) |want| {
+        const c = (try table.claim(&p.run, live_kinds, 100, 1_000)).?;
+        try testing.expectEqualStrings(want, c.kind);
+        try table.done(&p.run, c.id);
+    }
+    try testing.expect((try table.claim(&p.run, live_kinds, 100, 1_000)) == null);
+}
+
+/// The kinds these tests push. A worker passes its own `kind_names`; the
+/// claim is narrowed to them, so a row of any other kind is left alone.
+const live_kinds: []const []const u8 = &.{ "write-note", "backfill", "revalidate-a", "revalidate-b", "sweep" };
+
 /// The Table's own statement, spelled again here so the test can hold two
 /// of it open at once — `Table.claim` runs outside a transaction on purpose.
 fn claimSql() []const u8 {
     return "UPDATE \"nilo_jobs\" SET \"state\" = 'running', \"lease_until\" = $2, \"attempts\" = \"attempts\" + 1 " ++
-        "WHERE \"id\" = (SELECT \"id\" FROM \"nilo_jobs\" WHERE (\"state\" = 'queued' AND \"run_at\" <= $1) OR " ++
-        "(\"state\" = 'running' AND \"lease_until\" <= $1) ORDER BY \"run_at\" LIMIT 1 FOR UPDATE SKIP LOCKED) " ++
+        "WHERE \"id\" = (SELECT \"id\" FROM \"nilo_jobs\" WHERE \"kind\" IN ('write-note') AND " ++
+        "((\"state\" = 'queued' AND \"run_at\" <= $1) OR " ++
+        "(\"state\" = 'running' AND \"lease_until\" <= $1)) ORDER BY \"priority\", \"run_at\" LIMIT 1 FOR UPDATE SKIP LOCKED) " ++
         "RETURNING \"id\", \"kind\", \"payload\", \"state\", \"run_at\", \"lease_until\", \"attempts\", " ++
-        "\"unique_key\", \"last_error\", \"created_at\", \"finished_at\"";
+        "\"priority\", \"unique_key\", \"last_error\", \"created_at\", \"finished_at\"";
 }

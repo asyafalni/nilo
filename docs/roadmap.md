@@ -256,10 +256,6 @@ A question nobody has answered. Not a backlog item, and not blocked: what a read
 
 **What would settle it:** a caller with a provider that rate-limits harder than their workers count.
 
-**Whether priority belongs here.** Rows come out in `run_at` order and nothing else. A `priority` column is one more `ORDER BY` term and one more thing every push has to decide.
-
-**What would settle it:** a queue where the emails wait behind the reports.
-
 ### `nilo_http`
 
 **Whether nilo ships the response headers a browser reads as policy.** `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options` and a `Content-Security-Policy` are four constant headers, so a middleware setting them would be `cors.zig`'s shape exactly. The argument against is that [ADR 0028](./adr/0028-tls-is-terminated-in-front.md) puts a proxy in front and the proxy is where an operator already writes these, and a framework that sets half of them invites the belief that it set all of them. HSTS is genuinely the proxy's, because nilo does not speak TLS.

@@ -47,6 +47,7 @@ is copied rather than carried. Three declarations are read while compiling:
 | `pub fn run(self, scope: *nilo.Run, …) !void` | the work: the job by value, the Run, then any service by pointer, found in `.deps` by type — and `tick: job.Tick` by value, if it wants to know which tick it is ([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)) |
 | `pub const final = error{ … }` | optional: the failures that are **final**. A `run` failing with one is dead on that attempt whatever `retry` says, and the row keeps the error's name; a timeout never is. Refused on a kind whose `retry` is `.none` ([ADR 0218](../adr/0218-a-run-can-say-its-failure-is-final.md)) |
 | `pub const timeout_ms` | optional, over the queue's. Also the lease |
+| `pub const priority: job.Priority` | optional; `.high`, `.normal` (the default) or `.low`. A free worker takes the most urgent **due** row, and among equals the one that has been due longest ([ADR 0290](../adr/0290-a-job-says-how-urgent-it-is.md)). A number here is a Refusal naming the three levels |
 | `pub const schedule`, `overlap`, `missed` | for a job that runs on the clock — below |
 
 A field that is a `*T` is a Refusal naming the field; a `run` that asks for a
@@ -127,7 +128,7 @@ of a scheduled job has a default, since nobody pushes one.
 
 | | |
 |---|---|
-| `job.Table(Db)` | the queue as a `nilo_table` Row named `nilo_jobs`, over your `sql.Db` or `sql.Sqlite(…)`. `open(&db)`. Claims with `FOR UPDATE SKIP LOCKED` on Postgres, and without on SQLite, where a claim is a write and `workers` is the number of them |
+| `job.Table(Db)` | the queue as a `nilo_table` Row named `nilo_jobs`, over your `sql.Db` or `sql.Sqlite(…)`. `open(&db)`. Claims with `FOR UPDATE SKIP LOCKED` on Postgres, and without on SQLite, where a claim is a write and `workers` is the number of them. The claim asks only for the kinds this program runs (`kind IN (…)`), so a row another binary pushed under a kind you do not declare is left queued for the binary that does ([ADR 0291](../adr/0291-a-worker-claims-only-what-it-can-run.md)) |
 | `table.sweep(c, before)` | delete `done` rows finished before a moment. Nothing calls it for you |
 | `job.Memory` | the same contract in this process. `open(gpa, .{ .bytes, .max_payload = 4096 })`; a full one is `error.QueueFull`, never a row written over |
 

@@ -64,9 +64,12 @@
 //!
 //! ## What it is not
 //!
-//! Not a priority queue, not a workflow engine, not a rate limiter for a
-//! job kind — `nilo.Gate` inside `run` is that — and not exactly-once.
-//! `docs/roadmap.md` carries each of those with what it is waiting for.
+//! Not a workflow engine, not a rate limiter for a job kind — `nilo.Gate`
+//! inside `run` is that — and not exactly-once. `docs/roadmap.md` carries
+//! each of those with what it is waiting for. A kind does say how urgent it
+//! is, and the claim takes the most urgent due row (ADR 0290), which is as
+//! far towards a priority queue as this goes: three levels, no ageing, no
+//! preemption.
 
 const std = @import("std");
 const core = @import("nilo_core");
@@ -83,6 +86,7 @@ pub const Stats = contract.Stats;
 pub const Dead = contract.Dead;
 pub const Claimed = contract.Claimed;
 pub const Enqueue = contract.Enqueue;
+pub const Priority = contract.Priority;
 
 /// How long to wait before trying again, as a function of how many times it
 /// has already been tried.
@@ -303,6 +307,9 @@ pub fn Jobs(comptime options: anytype) type {
         /// migration. `void` for a store that has no table.
         pub const Row = if (@hasDecl(Store, "Row")) Store.Row else void;
 
+        /// The names as the store sees them. The claim binds these and asks
+        /// only for them, so a row of a kind this program does not know is
+        /// left where it is for the binary that does know it.
         pub const kind_names: [kinds.len][]const u8 = blk: {
             var out: [kinds.len][]const u8 = undefined;
             for (kinds, 0..) |K, i| out[i] = K.nilo_job;
@@ -428,8 +435,9 @@ pub fn Jobs(comptime options: anytype) type {
                 if (!opts.within.putIfAbsent(unique.?, Mark{})) return null;
             }
 
+            const priority: contract.Priority = if (@hasDecl(K, "priority")) K.priority else .normal;
             const bytes = try std.json.Stringify.valueAlloc(scope.arena(), value, .{});
-            const id = try self.store.push(scope, K.nilo_job, bytes, .{ .run_at = run_at, .unique = unique });
+            const id = try self.store.push(scope, K.nilo_job, bytes, .{ .run_at = run_at, .unique = unique, .priority = priority });
             if (o.unique) {
                 if (id) |i| {
                     self.note(i, .queued, 0);
@@ -468,9 +476,10 @@ pub fn Jobs(comptime options: anytype) type {
             const now = core.nowMicros();
             const run_at: i64 = if (@hasField(@TypeOf(opts), "at")) opts.at else now + @as(i64, @intCast(o.after_ms(opts))) * std.time.us_per_ms;
             const unique: ?[]const u8 = if (o.unique) opts.unique else null;
+            const priority: contract.Priority = if (@hasDecl(K, "priority")) K.priority else .normal;
 
             const bytes = try std.json.Stringify.valueAlloc(scope.arena(), value, .{});
-            const id = try self.store.pushIn(tx, scope, K.nilo_job, bytes, .{ .run_at = run_at, .unique = unique });
+            const id = try self.store.pushIn(tx, scope, K.nilo_job, bytes, .{ .run_at = run_at, .unique = unique, .priority = priority });
             if (o.unique) {
                 if (id) |i| self.note(i, .queued, 0);
                 return id;
@@ -685,7 +694,7 @@ pub fn Jobs(comptime options: anytype) type {
                 _ = late_checked;
             }
             comptime core.checkScope(@TypeOf(scope), "jobs.runOne");
-            const claimed = try self.store.claim(scope, now, now + self.leaseMicros()) orelse return false;
+            const claimed = try self.store.claim(scope, &kind_names, now, now + self.leaseMicros()) orelse return false;
             self.execute(scope, claimed, .{ .fixed = now });
             return true;
         }
@@ -737,7 +746,7 @@ pub fn Jobs(comptime options: anytype) type {
                 // the poll on a row that is already there.
                 const seen = self.wakes.load(.acquire);
                 const now = core.nowMicros();
-                const claimed = self.store.claim(&run, now, now + self.leaseMicros()) catch |err| {
+                const claimed = self.store.claim(&run, &kind_names, now, now + self.leaseMicros()) catch |err| {
                     if (err == error.Canceled) return error.Canceled;
                     std.log.scoped(.nilo_job).err("claim: {t}", .{err});
                     try io.sleep(poll.duration.raw, .awake);
@@ -918,9 +927,15 @@ pub fn Jobs(comptime options: anytype) type {
             return scope;
         }
 
+        /// The next turn of a scheduled kind, queued with the same urgency
+        /// as the one that just ran. Dropping it here would let a kind
+        /// declare `.high`, pass every check, and run `.normal` forever —
+        /// the schedule is the only path that pushes a row nobody wrote a
+        /// `push` call for.
         fn pushNext(self: *Self, comptime K: type, scope: anytype, after: i64) void {
             const at = K.schedule.next(after);
-            _ = self.store.push(scope, K.nilo_job, "{}", .{ .run_at = at, .unique = schedule_key }) catch |err| {
+            const priority: contract.Priority = if (@hasDecl(K, "priority")) K.priority else .normal;
+            _ = self.store.push(scope, K.nilo_job, "{}", .{ .run_at = at, .unique = schedule_key, .priority = priority }) catch |err| {
                 std.log.scoped(.nilo_job).err("queueing the next \"{s}\": {t}", .{ K.nilo_job, err });
             };
         }
@@ -1077,6 +1092,12 @@ fn checkKinds(comptime kinds: []const type, comptime Deps: ?type) void {
                 "nilo: the job " ++ name ++ " declares `final`, and its `retry` is `.none`.\n" ++
                     "  With one attempt every failure is final already, so the set decides nothing. " ++
                     "Take it out, or give `retry` some `times` for the failures that are not in it.",
+            );
+        }
+        if (@hasDecl(K, "priority")) {
+            if (@TypeOf(K.priority) != Priority) @compileError(
+                "nilo: the job " ++ name ++ "'s `priority` is " ++ @typeName(@TypeOf(K.priority)) ++ " rather than a `job.Priority`.\n" ++
+                    "  `pub const priority: job.Priority = .high;` — the levels are `.high`, `.normal` and `.low`, and a number is not one of them.",
             );
         }
         if (@hasDecl(K, "timeout_ms")) {
@@ -1395,6 +1416,40 @@ const Hoarder = struct {
     }
 };
 
+/// A scheduled kind that declares its urgency, and a plain one that does not:
+/// the pair the priority-through-`Jobs` test needs. Their own `Jobs` rather
+/// than `TestJobs`, because seeding one more scheduled kind would change what
+/// every schedule test counts.
+const UrgentTick = struct {
+    pub const nilo_job = "urgent-tick";
+    pub const retry: Retry = .none;
+    pub const schedule = every(1);
+    pub const overlap: Overlap = .skip;
+    pub const missed: Missed = .catch_up;
+    pub const priority: Priority = .high;
+    pub fn run(self: UrgentTick, scope: *core.Run, ledger: *Ledger) !void {
+        _ = self;
+        _ = scope;
+        try ledger.add("urgent-tick");
+    }
+};
+
+const PlainWork = struct {
+    pub const nilo_job = "plain";
+    pub const retry: Retry = .none;
+    pub fn run(self: PlainWork, scope: *core.Run, ledger: *Ledger) !void {
+        _ = self;
+        _ = scope;
+        try ledger.add("plain");
+    }
+};
+
+const PriorityJobs = Jobs(.{
+    .kinds = .{ UrgentTick, PlainWork },
+    .store = Memory,
+    .deps = struct { ledger: *Ledger },
+});
+
 const TestJobs = Jobs(.{
     .kinds = .{ Greet, Flaky, Picky, Ticker, Strict, Hoarder },
     .store = Memory,
@@ -1576,6 +1631,32 @@ test "a payload the program cannot read is dead at once rather than retried" {
     const dead_rows = try jobs.deadOnes(&run);
     try testing.expectEqual(@as(usize, 1), dead_rows.len);
     try testing.expectEqualStrings("MissingField", dead_rows[0].err);
+}
+
+test "a scheduled kind's urgency survives the row it queues for next time" {
+    // `seed` and the requeue after a run both go through `pushNext`, which
+    // used to push the next turn with no priority at all: a kind could
+    // declare `.high`, pass every check, and run `.normal` for ever. Nothing
+    // caught it, because every priority test set `Enqueue.priority` on the
+    // store by hand and never went through `Jobs`.
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var ledger: Ledger = .{ .gpa = testing.allocator };
+    defer ledger.deinit();
+    var jobs: PriorityJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{});
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    try jobs.seedAt(&run, 0);
+    // Due earlier than the seeded tick, and only `normal`.
+    _ = try jobs.push(&run, PlainWork{}, .{ .at = 0 });
+
+    // Both are due now. The urgent one goes first although it is due later,
+    // which is only true if `pushNext` carried the kind's priority.
+    const first = (try store.claim(&run, &.{ "urgent-tick", "plain" }, 10_000_000, 20_000_000)).?;
+    try testing.expectEqualStrings("urgent-tick", first.kind);
+    const second = (try store.claim(&run, &.{ "urgent-tick", "plain" }, 10_000_000, 20_000_000)).?;
+    try testing.expectEqualStrings("plain", second.kind);
 }
 
 test "a schedule seeds its next tick, runs it when due, and queues the one after" {
