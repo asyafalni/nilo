@@ -2093,6 +2093,13 @@ pub fn unbindSlot(n: *Binding) void {
     fiber_slot.clear(n);
 }
 
+/// Whether `io` is this Engine's loop. Code handed an `Io` that must bind a
+/// slot asks this first: `bindSlot` panics off a task, and `App.start(io)`
+/// is handed `std.Io.Threaded` by every test that boots an App directly.
+pub fn bindsOn(io: std.Io) bool {
+    return zio.Runtime.fromIo(io) != null;
+}
+
 /// The slot of the fiber currently running, or null if there is no fiber
 /// (a unit test calling App directly, for instance).
 pub fn slot() ?*anyopaque {

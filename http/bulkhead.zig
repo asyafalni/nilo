@@ -72,6 +72,8 @@
 //! - `Binding`/`bindSlot`/`unbindSlot`/`slot` — one pointer bound to the
 //!   unit of work currently running (a fiber, a thread, whatever the
 //!   Engine uses), for hidden per-request state (ADR 0007).
+//! - `bindsOn(io)`: whether `io` is the Engine's own loop, so a slot can be
+//!   bound under it; the boot work asks before it binds one (ADR 0161).
 //! - `monotonicNanos` — a monotonic clock. Zig 0.16's `std.time` carries
 //!   only constants, and the Engine already keeps a clock, so the logger
 //!   asks for it here rather than reaching for a syscall of its own.
@@ -851,6 +853,7 @@ pub const Binding = engine.Binding;
 pub const binding_unset = engine.binding_unset;
 pub const bindSlot = engine.bindSlot;
 pub const unbindSlot = engine.unbindSlot;
+pub const bindsOn = engine.bindsOn;
 pub const monotonicNanos = engine.monotonicNanos;
 
 /// Bytes from the operating system's entropy source, off the event loop.

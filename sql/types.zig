@@ -53,6 +53,11 @@ const id = @import("nilo_id");
 /// keeps in a `timestamptz`, so reading one is a copy rather than a
 /// conversion.
 ///
+/// On SQLite the column is an `INTEGER` of those microseconds (ADR 0136), and
+/// SQLite's date functions read a bare number as a Julian day or, with
+/// `'unixepoch'`, as seconds: `strftime('%m', col)` is NULL. Divide by
+/// 1,000,000 and say `'unixepoch'`.
+///
 /// Writes itself as RFC 3339 in UTC, which is what a JSON body wants and what
 /// `format: date-time` in the generated document promises.
 pub const Timestamp = struct {

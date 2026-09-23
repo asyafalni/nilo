@@ -16,6 +16,10 @@
 //! can never overwrite each other's message (ADR 0007). Called outside a
 //! request there is no Failure, and a fail function just returns a plain
 //! error with no message; handlers stay testable as ordinary functions.
+//! Two places outside a request give it one anyway: `testing.Refusals`, so
+//! a test can read the sentence, and the boot, so work registered with
+//! `app.before` that is refused says why in the line that stops the server
+//! (ADR 0161).
 
 const std = @import("std");
 const bulkhead = @import("bulkhead.zig");

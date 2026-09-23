@@ -112,6 +112,13 @@ fn writesItsOwnScalar(comptime T: type) bool {
 /// Answerable only while compiling — it reads the types of a struct's fields —
 /// so call it as `comptime covers(T)`.
 pub fn covers(comptime T: type) bool {
+    // The walk costs about eight branches a field it passes, so the default
+    // 1,000 ran out near 125 fields whatever the depth: a detail page of
+    // shallow lists stopped compiling in this file, with advice no caller
+    // could act on. Raised here because this is where the work is asked for
+    // (ADR 0157), and 20,000 is `renamedFieldsWithin`'s figure for the same
+    // types: some 2,500 fields.
+    @setEvalBranchQuota(20_000);
     return coversWithin(T, 0);
 }
 
@@ -592,6 +599,62 @@ test "a type that holds a list of itself is std.json's to write" {
     // path, so the ceiling has not quietly swallowed ordinary types.
     try expectSame(struct { a: struct { b: struct { c: struct { d: u32 } } } }{
         .a = .{ .b = .{ .c = .{ .d = 1 } } },
+    });
+}
+
+test "a response as wide as a detail page is still on the fast path" {
+    // Shallow and wide: a record holding a list of bills, each bill holding
+    // eight lists of its own records. Nowhere near eight deep, and it failed to
+    // compile anyway, in this file, with advice to raise a quota no caller can
+    // reach: the default budget is spent by fields walked, not by depth.
+    const Line = struct {
+        fn of(comptime n: u8) type {
+            return struct {
+                const which = n;
+                id: u64,
+                bill_id: u64,
+                amount: i64,
+                paid: bool,
+                note: []const u8,
+                actor: []const u8,
+                reference: ?[]const u8,
+                at: i64,
+                year: u16,
+                month: u8,
+                status: enum { open, closed },
+                reason: ?[]const u8,
+                reduced: ?i64,
+                reviewed: bool,
+            };
+        }
+    };
+    const Bill = struct {
+        bill: Line.of(0),
+        payments: []const Line.of(1),
+        notices: []const Line.of(2),
+        acknowledgments: []const Line.of(3),
+        objection: ?Line.of(4),
+        receipts: []const Line.of(5),
+        delivery: ?Line.of(6),
+        amendments: []const Line.of(7),
+        penalties: []const Line.of(8),
+        total: i64,
+        outstanding: i64,
+    };
+    const Detail = struct {
+        id: u64,
+        name: []const u8,
+        owner: Line.of(9),
+        bills: []const Bill,
+        history: []const Line.of(10),
+    };
+    comptime std.debug.assert(covers(Detail));
+    try expectSame(Detail{
+        .id = 1,
+        .name = "Jl. Sultan Thaha",
+        .owner = .{ .id = 2, .bill_id = 0, .amount = 0, .paid = false, .note = "", .actor = "uji", .reference = null, .at = 0, .year = 2026, .month = 0, .status = .open, .reason = null, .reduced = null, .reviewed = true },
+        .bills = &.{},
+        .history = &.{},
     });
 }
 

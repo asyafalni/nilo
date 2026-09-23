@@ -68,6 +68,10 @@ found the first time it was tried.
 same stamp, 250 ms apart, before a restart, so a binary still being copied
 is not started half way through.
 
+**The first server is the current one, or none.** Before the watch starts, `nilo-dev` runs the same `zig build <step>` once to the end, without `--watch` and with `-fincremental` and every `-D` option it was given. The binary on disk is whatever the last run left, and nothing but a build can say whether it still describes the sources. Started on the first two polls, as this loop first did, it was served before the watch had rebuilt it: an application whose schema changed with the loop stopped had its SQLite file created and seeded by the old binary, one index the edit had removed included, and `listening` printed twice. A server is not a pure function of its binary, so serving a stale one for a moment is not free. When the first build compiles, the watch's first pass is a cache hit that writes nothing, so there is no restart after the start.
+
+**When that first build fails, the stale binary is removed.** Remembering its stamp as already served does not work, and was tried: a fix that puts the sources back to the ones the old binary was built from compiles, the install step finds the file on disk already right and does not write it, the stamp never moves, and the loop waits for ever beside a build that succeeded. Removed, the first build that compiles writes it, whatever it compiles to. A Ctrl-C during that build stops it the way the loop stops the watch.
+
 **After every restart the stale builds are deleted.** One save leaves
 exactly one new file in the cache — `.zig-cache/o/<hash>/<exe>`, the whole
 Debug binary, 27 MB for `examples/hello` and the size of the program for
@@ -152,6 +156,13 @@ upstream, because it is the number this loop wants to be.
 **Watching the sources as well as the binary**, so the restart could be
 announced before the build finished. Nothing to announce: the server keeps
 serving until there is a new one.
+That is true of every save after the first, and was not of the first start, which is why the loop now builds before it serves rather than watching more.
+
+**`dev.step.dependOn(&install.step)` in `build.zig`**, so the outer `zig build dev` builds before `nilo-dev` runs at all. Every dependent's four lines would change, one that never re-reads the guide keeps the stale start through every release, and a tree that does not compile fails `zig build dev` before the loop exists rather than waiting for the save that fixes it.
+
+**Logging that the first server may be stale**, and starting it anyway. The database is seeded by the old schema all the same.
+
+**Waiting for a binary newer than the moment the loop started.** A build with nothing to do does not rewrite `zig-out`, so an up-to-date tree would never start.
 
 **A cache directory of the loop's own**, `--cache-dir .zig-cache/dev`,
 pruned whole on exit. Race-free by construction, and a second copy of
@@ -173,3 +184,4 @@ the one thing nobody runs beside its dev loop.
 - [`bench/result/build.md`](../../bench/result/build.md) carries the table
   and the machine.
 - `bench/devloop.py`: a save the build never reads must leave the server up, and a save it reads must restart it; the guide's [What a save has to touch](../guide/getting-started.md#what-a-save-has-to-touch) is the same line for a reader.
+- The first build before the watch: `bench/devloop.py` makes `--inside` stale with the loop stopped and fails on a restart after the first start. Before, the server started and then restarted into the new binary; after, it started once and stayed up for the six seconds watched. A failed first build deletes the binary at the path the loop was given, which is a build output the loop owns while it runs.

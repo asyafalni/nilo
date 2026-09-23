@@ -178,7 +178,8 @@ b.step("dev", "Rebuild and restart on every save").dependOn(&dev.step);
 
 ```
 $ zig build dev
-nilo-dev: building with `zig build install --watch`; serving zig-out/bin/my-app when it is written
+nilo-dev: building with `zig build install` before starting anything
+nilo-dev: watching with `zig build install --watch`; serving zig-out/bin/my-app when it is written
 nilo-dev: started zig-out/bin/my-app (pid 41022)
 info: nilo listening on 127.0.0.1:8787 across 8 thread(s)
    ← save a file
@@ -194,6 +195,8 @@ nilo-dev: zig-out/bin/my-app changed; restarted (pid 41107, the old one drained 
 - **`build.zig` is not watched.** A change there is Ctrl-C and `zig build dev` again.
 
 A build step that reads the front end, an `installDirectory` of its assets say, runs on a save there and copies what changed; the server is not restarted, because the binary did not change. `python3 bench/devloop.py` is the check that all of this stays true, and it runs against any dev step given a file the build reads and one it does not.
+
+**The first server is the one your sources describe.** Before it watches anything, `nilo-dev` runs the build once to the end, so a binary left in `zig-out` by an earlier session, from sources you have since changed, is never started: it could seed a database with a schema you just removed. If that first build fails, the old binary is deleted and nothing starts until a save compiles ([ADR 0259](../adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
 
 **A build that fails changes nothing.** The errors print, the old server keeps
 serving, and the next save that compiles is the one that restarts it. The old

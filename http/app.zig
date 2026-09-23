@@ -649,7 +649,8 @@ pub const App = struct {
     /// its services. **If it fails, the server does not start**: the error
     /// comes back out of `listen()` after one line saying so, and the
     /// services are put down on the way. A migration that could not run is
-    /// a database this binary must not serve.
+    /// a database this binary must not serve. A fail function called inside
+    /// it keeps its sentence, which that line carries (ADR 0161).
     ///
     /// This is the phase ADR 0079 put *before* `listen()`, as
     /// `app.start(io)` on an `Io` of the caller's, moved inside it. What
@@ -1373,17 +1374,57 @@ pub const App = struct {
     /// saying so: the work's own error is what comes back out of `listen()`,
     /// and a migration that could not run is a database this binary must not
     /// serve.
+    ///
+    /// **The line carries what a fail function said.** Boot work calls the
+    /// same service functions a handler does, and a `fail.unprocessable(…)`
+    /// in one of them used to reach this line as `Failed` and nothing else,
+    /// because outside a request there was no box to write the sentence
+    /// into (ADR 0161). The boot now has one, on this frame, for as long as
+    /// the work runs. Once, at boot: no request and no connection pays for
+    /// it.
     fn runBefore(self: *App, io: std.Io) !void {
         if (self.before_ran) return;
         self.before_ran = true;
-        for (self.before_serving.items) |b| b.start(b.args, self.gpa, io) catch |err| {
-            std.log.err(
-                "nilo will not start: work registered with `app.before` failed with {t}, " ++
-                    "and a server whose boot work did not finish must not take a request.",
-                .{err},
+        var in_flight: fail.InFlight = .{};
+        const n = self.before_serving.items.len;
+        for (self.before_serving.items, 1..) |b, i| runOneBefore(b, self.gpa, io, &in_flight) catch |err| {
+            const f = &in_flight.failure;
+            if (f.isSet()) std.log.err(
+                "nilo will not start: work {d} of {d} registered with `app.before` failed with " ++
+                    "{t}, {d} \"{s}\", and a server whose boot work did not finish must not take a request.",
+                .{ i, n, err, f.status, f.message() },
+            ) else std.log.err(
+                "nilo will not start: work {d} of {d} registered with `app.before` failed with " ++
+                    "{t}, and a server whose boot work did not finish must not take a request.",
+                .{ i, n, err },
             );
             return err;
         };
+    }
+
+    /// One piece of boot work, with `in_flight` where a fail function looks.
+    ///
+    /// **Bound the way a connection binds it, or handed over the way
+    /// `nilo.blocking` hands it, and which one is decided by the loop the
+    /// boot runs on.** On the Engine's loop, which is `listen()`'s, it is
+    /// bound to the task running the boot, and no spawned fiber inherits a
+    /// binding. The fallback slot is a threadlocal, and set on an executor
+    /// thread it is read by every spawned fiber that runs there: ADR 0007's
+    /// leak. Any other `Io` is a caller's own, `app.start(io)` on
+    /// `std.Io.Threaded` in a test or a script, with no task to bind to and
+    /// no spawned fiber reading the threadlocal, so it is the fallback there,
+    /// put back afterwards.
+    fn runOneBefore(b: Background, gpa: std.mem.Allocator, io: std.Io, in_flight: *fail.InFlight) anyerror!void {
+        in_flight.failure.clear();
+        if (bulkhead.bindsOn(io)) {
+            var binding = bulkhead.binding_unset;
+            bulkhead.bindSlot(&binding, in_flight);
+            defer bulkhead.unbindSlot(&binding);
+            return b.start(b.args, gpa, io);
+        }
+        const previous = bulkhead.setFallbackSlot(in_flight);
+        defer _ = bulkhead.setFallbackSlot(previous);
+        return b.start(b.args, gpa, io);
     }
 
     /// The port the server is listening on, once it is: null before
@@ -1990,6 +2031,11 @@ const Witness = struct {
     fn refuse(_: *str_mod.Run, _: *Witness) !void {
         return error.Nope;
     }
+
+    /// Boot work calling what a handler calls, and refused by it.
+    fn refuseInWords(_: *str_mod.Run, _: *Witness) !void {
+        return fail.unprocessable("no suspicious return in {s}", .{"Sekernan"});
+    }
 };
 
 test "app.before runs inside the boot, after the services, with a Run on their loop" {
@@ -2113,4 +2159,29 @@ test "app.before work that fails hands its own error to the boot" {
     // can hand it back as the value it was.
     const entry = app.before_serving.items[0];
     try testing.expectError(error.Nope, entry.start(entry.args, testing.allocator, threaded.io()));
+}
+
+test "a fail function in app.before work leaves its words for the boot's line" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    var witness: Witness = .{};
+    try app.before(Witness.refuseInWords, .{&witness});
+
+    // Driven one piece at a time for the reason the test above gives: what
+    // `runBefore` does with the words is log them at `err`. Outside a
+    // request a fail function used to return `Failed` and drop the
+    // sentence, so the boot said which error and never why.
+    var in_flight: fail.InFlight = .{};
+    const entry = app.before_serving.items[0];
+    try testing.expectError(error.Failed, App.runOneBefore(entry, testing.allocator, threaded.io(), &in_flight));
+    try testing.expectEqual(@as(u16, 422), in_flight.failure.status);
+    try testing.expectEqualStrings("no suspicious return in Sekernan", in_flight.failure.message());
+
+    // And the box was the boot's for as long as the work ran, not after it:
+    // a fallback slot left pointing at this frame would be a dangling
+    // pointer for the next fail function on this thread.
+    try testing.expectEqual(@as(?*anyopaque, null), bulkhead.slot());
 }

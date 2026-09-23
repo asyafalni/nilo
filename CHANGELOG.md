@@ -299,6 +299,9 @@ newest first.
 
 ### Fixed
 
+- A fail function called by work registered with `app.before`, a seed calling the same service functions its handlers call, lost its sentence: the boot said `failed with Failed` and nothing else. The line that stops the boot now carries the status and the message, and which of the registered pieces failed, on both `listen()` and `app.start(io)` ([ADR 0161](./docs/adr/0161-a-refusal-outside-a-request-is-still-a-refusal.md)).
+- `nilo-dev` started the binary left in `zig-out` before its build had finished, so after a change made with the loop stopped the old server ran first: one application had its SQLite file created and seeded with the schema it had just changed. The loop now builds once to the end before it starts anything, and when that build fails it removes the stale binary and starts the first one that compiles. Nothing changes in a dependent's `build.zig` ([ADR 0259](./docs/adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
+- A response type as wide as a detail page, a record holding lists of records of twelve fields or so, failed to compile inside `http/json.zig` with "evaluation exceeded 1000 backwards branches", whatever its depth, and the advice to raise the quota was not something the application could do. `covers` raises it where the walk starts, to 20,000, room for some 2,500 fields.
 - **A worker spun forever on a job kind it did not know.** A row pushed by
   another binary — an older deploy, a sibling service — was claimed, found to
   be of an unknown kind, and handed back at the `run_at` it already had; so

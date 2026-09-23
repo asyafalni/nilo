@@ -250,6 +250,53 @@ test "work registered with before runs inside listen, after the services and bef
     try testing.expect(boot.before_first.load(.acquire));
 }
 
+/// Boot work that calls a fail function and carries on, so the boot
+/// finishes and the test can read what the call found.
+const Refused = struct {
+    words: [64]u8 = undefined,
+    n: std.atomic.Value(usize) = .init(0),
+    status: std.atomic.Value(u16) = .init(0),
+    ticker: Ticker = .{},
+
+    fn seed(_: *nilo.Run, self: *Refused) void {
+        const refused = nilo.fail.unprocessable("no suspicious return in {s}", .{"Sekernan"});
+        if (refused != error.Failed) return;
+        const f = nilo.fail.current() orelse return;
+        const said = f.message();
+        @memcpy(self.words[0..said.len], said);
+        self.n.store(said.len, .release);
+        self.status.store(f.status, .release);
+    }
+};
+
+test "a fail function in before work inside listen finds the boot's box" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var refused: Refused = .{};
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.before(Refused.seed, .{&refused});
+    try app.spawn(Ticker.run, .{&refused.ticker});
+
+    var serving: Serving = .{ .app = &app };
+    const thread = try std.Thread.spawn(.{}, Serving.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+
+    try waitForATick(&refused.ticker);
+
+    // Inside `listen()` the box is bound to the loop's own task, the way a
+    // connection binds its own, rather than put in the threadlocal every
+    // spawned fiber on that thread would read (ADR 0007). Bound there, the
+    // sentence is where the boot's line reads it.
+    try testing.expectEqual(@as(u16, 422), refused.status.load(.acquire));
+    try testing.expectEqualStrings("no suspicious return in Sekernan", refused.words[0..refused.n.load(.acquire)]);
+}
+
 test "the shutdown reaches a fiber that is not serving anybody" {
     hush();
     const gpa = std.heap.smp_allocator;

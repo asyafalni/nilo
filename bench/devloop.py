@@ -14,6 +14,12 @@ is ADR 0098's and `burst.py` is ADR 0271's.
 
     python3 bench/devloop.py --step dev-spa -Dtarget=x86_64-linux-gnu ...  # on a GCC 16 glibc
 
+Before the loop starts it appends a comment to `--inside`, so the binary in
+`zig-out` is older than its sources, and checks that the server the loop
+starts is the one those sources describe: one start and no restart after it.
+The binary left over from the last run must never be served, because it can
+do things the new one would not, like seed a database with the old schema.
+
 It starts the step, waits for the server, then appends a line to `--outside`
 and watches for `--quiet` seconds: a restart is the failure, and a build step
 that ran is reported, because a `build.zig` that installs the front end's
@@ -143,17 +149,28 @@ def main():
     outside = Probe(args.outside, b"\n")
     inside = Probe(args.inside, b"\n// devloop probe\n")
     failures = []
+    stale = Probe(args.inside, b"\n// devloop stale binary\n")
+    stale.touch()
+    print(f"saved {args.inside} with the loop stopped, so zig-out is stale")
     print(f"running `{' '.join(argv)}`")
     loop = Loop(argv, args.verbose)
     try:
         if not loop.wait_for(STARTED, args.patience):
             print("\n".join(loop.lines[-20:]))
             sys.exit(f"the server never started within {args.patience:.0f}s")
-        # The first `--watch` build lands a moment after the first start and
-        # restarts once; let that pass so it is not read as a probe's.
         if not loop.quiet_for(args.settle, args.patience):
             sys.exit("the loop never went quiet after starting")
-        print(f"started; quiet for {args.settle:.0f}s")
+        if loop.seen(RESTARTED):
+            failures.append("the loop served the stale binary first, then restarted into the new one")
+            print("  RESTARTED: the first server was the binary left over from the last run")
+        else:
+            print(f"started once, from the sources as saved; quiet for {args.settle:.0f}s")
+        mark = len(loop.lines)
+        stale.restore()
+        if not loop.wait_for(RESTARTED, args.patience, mark):
+            failures.append(f"putting {args.inside} back did not restart the server")
+        if not loop.quiet_for(args.settle, args.patience):
+            sys.exit("the loop never went quiet after the put-back")
 
         mark = len(loop.lines)
         outside.touch()
@@ -186,13 +203,14 @@ def main():
         # disk is the one the sources describe.
         loop.wait_for(RESTARTED, args.patience, mark)
     finally:
+        stale.restore()
         outside.restore()
         inside.restore()
         loop.stop()
 
     for f in failures:
         print("FAIL: " + f)
-    print("ok: a save the build does not read leaves the server alone; a save it reads restarts it" if not failures else f"{len(failures)} failure(s)")
+    print("ok: the first server is the current one; a save the build does not read leaves it alone; a save it reads restarts it" if not failures else f"{len(failures)} failure(s)")
     sys.exit(1 if failures else 0)
 
 

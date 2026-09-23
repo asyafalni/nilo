@@ -84,9 +84,12 @@ pub fn Table(comptime Db: type) type {
             lease_until: i64,
             attempts: i32,
             /// Which due row a worker takes first, as the number behind
-            /// `contract.Priority` — `high` is 0, so the claim's ORDER BY is
-            /// ascending on both columns and the index above serves it
-            /// whole.
+            /// `contract.Priority`: `high` is 0, so the claim's ORDER BY is
+            /// ascending on both columns. The index above does not carry it.
+            /// `(state, run_at)` bounds the scan to the due rows and a top-N
+            /// sort picks one; widened to `(state, priority, run_at)` it
+            /// stopped bounding anything and measured slower on every queue
+            /// tried (ADR 0290, bench/result/job.md).
             ///
             /// The integer and not the enum: an enum column is stored as its
             /// *name*, and `ORDER BY` on text sorts 'high' before 'low'

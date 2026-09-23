@@ -278,6 +278,33 @@ conversion, and its values are counted against its placeholders at run time
 unnamed — its text is the model's, not the program's. Reach for `raw`
 whenever the statement can be written down.
 
+## What SQLite does differently
+
+The text of a raw statement is yours, so the dialect is yours to write in.
+Four things to know when the file is SQLite:
+
+- **`$1`, `$2`, … are the same text on both.** SQLite's own numbered
+  placeholder is `?1`, and a `$name` there is a *named* parameter indexed by
+  first appearance, so `$2` written before `$1` used to bind the first value.
+  nilo respells `$n` as `?n` while compiling for every call that takes
+  comptime text, which is `raw`, `rawOne`, `rawExactlyOne`, `rawPage`,
+  `rawOrdered` and the `Tx` versions
+  ([ADR 0278](../../adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+  `exec` takes its text at run time and sends it as written: write `?1`
+  there, or a bare `?`, or a statement with no parameters, which is what
+  DDL is.
+- **A `Timestamp` is an INTEGER of microseconds**, not a datetime SQLite's
+  date functions read directly. Divide by a million and say `'unixepoch'`:
+  `strftime('%Y-%m', issued_at / 1000000, 'unixepoch')`. A `Date` is its
+  ten characters of text, which `date()` and `strftime` read as they are.
+- **Casts are spelled `CAST(x AS INTEGER)`**, and `::bigint` is Postgres.
+  A `count(*)` is already an integer on both; a `sum` over an INTEGER
+  column is too, and `coalesce(sum(total), 0)` needs no cast.
+- **`ILIKE` is Postgres.** SQLite's `LIKE` ignores case for ASCII already,
+  and `COLLATE NOCASE` on the column is the durable spelling. `FILTER
+  (WHERE …)` on an aggregate and `count(*) OVER ()` both work on the SQLite
+  nilo links.
+
 ## Set operations are conditions, not a second idea
 
 `UNION`, `INTERSECT` and `EXCEPT` combine two selects with the same column

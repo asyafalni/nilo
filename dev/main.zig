@@ -9,8 +9,8 @@
 //! own code. What it is: one `zig build <step> --watch`, run once and left
 //! running, and the server it produces started again every time the binary
 //! it writes changes. The watching, the rebuilding and the deciding what to
-//! rebuild are all the build system's — this file spawns two processes and
-//! reads the size and mtime of one file every quarter second.
+//! rebuild are all the build system's — this file spawns the build and the
+//! server and reads the size and mtime of one file every quarter second.
 //!
 //! **It watches the build, not the checkout.** What `--watch` reacts to is
 //! the set of files the compiler read to make the binary: the `.zig` files
@@ -25,6 +25,12 @@
 //! the server running is the one serving it. There is no code here for
 //! that case, and that is the point of watching the output rather than the
 //! sources.
+//!
+//! **The first server is the current one, or none.** Before the
+//! watch starts, the same build runs once to the end: the binary on disk is
+//! whatever the last run left, and served first it seeded a database with a
+//! schema the sources no longer had. If that build fails the stale binary is
+//! removed, and the first build that compiles is the first thing started.
 //!
 //! **Every save leaves one file behind, and this file deletes the stale
 //! ones.** A rebuild that is not incremental writes the whole binary into a
@@ -190,16 +196,41 @@ pub fn main(init: std.process.Init) !void {
     const opts = parse(arena, init.minimal.args) orelse usage();
     installSignals();
 
-    // The build, once. `--watch` is the whole of the file watching, and
-    // `-fincremental` is the whole of the difference between 0.12s and
-    // 2.8s (see the header). Its output is the terminal's, so a compile
-    // error lands where the person is looking.
+    // The build, once, the same line with and without `--watch`. `--watch`
+    // is the whole of the file watching, and `-fincremental` is the whole of
+    // the difference between 0.12s and 2.8s (see the header). Its output is
+    // the terminal's, so a compile error lands where the person is looking.
     var build_argv: std.ArrayList([]const u8) = .empty;
     defer build_argv.deinit(gpa);
-    try build_argv.appendSlice(gpa, &.{ opts.zig, "build", opts.step, "--watch" });
+    try build_argv.appendSlice(gpa, &.{ opts.zig, "build", opts.step });
     if (opts.incremental) try build_argv.append(gpa, "-fincremental");
     try build_argv.appendSlice(gpa, opts.build_options);
-    say("building with `{s}`; serving {s} when it is written", .{ joined(arena, build_argv.items), opts.exe });
+
+    // Built through before anything is started. The binary on disk is
+    // whatever the last run left, and nothing but a build can say whether
+    // it is still what the sources describe: `--watch` rewrites it only
+    // once it has compiled, and started first it was served first, seeding
+    // a database with the schema the save had just removed.
+    //
+    // A build that fails says the binary is stale or unknown, and it is
+    // removed rather than remembered as seen. Remembered, a fix that put
+    // the sources back to the ones it was built from never started: the
+    // build compiled, found the file on disk already right, and did not
+    // write it, so its stamp never moved. Removed, the first build that
+    // compiles writes it, whatever it compiles to.
+    say("building with `{s}` before starting anything", .{joined(arena, build_argv.items)});
+    const current = try buildOnce(gpa, io, build_argv.items);
+    if (stopping.load(.acquire)) return;
+    if (!current) {
+        std.Io.Dir.cwd().deleteFile(io, opts.exe) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => say("could not remove the stale {s}: {s}", .{ opts.exe, @errorName(err) }),
+        };
+        say("the build failed; nothing is started until one compiles", .{});
+    }
+
+    try build_argv.insert(gpa, 3, "--watch");
+    say("watching with `{s}`; serving {s} when it is written", .{ joined(arena, build_argv.items), opts.exe });
     const build = try Running.start(gpa, io, build_argv.items);
     defer build.free(gpa);
 
@@ -211,6 +242,7 @@ pub fn main(init: std.process.Init) !void {
     const t_start = now(io);
     var server: ?*Running = null;
     var serving: ?Stamp = null;
+    var started_once = false;
     // A change is acted on once it has been seen twice, so a binary still
     // being written is not started half way through.
     var pending: ?Stamp = null;
@@ -252,7 +284,8 @@ pub fn main(init: std.process.Init) !void {
                         sleep(io, poll_ms);
                         continue;
                     };
-                    if (serving == null) {
+                    if (!started_once) {
+                        started_once = true;
                         say("started {s} (pid {d})", .{ opts.exe, server.?.pid });
                     } else {
                         say("{s} changed; restarted (pid {d}, the old one drained in {d} ms)", .{ opts.exe, server.?.pid, drained });
@@ -281,6 +314,26 @@ pub fn main(init: std.process.Init) !void {
     }
     if (!build.exited()) _ = build.stop(io, build_stop_ms) else build.waiter.join();
     say("done", .{});
+}
+
+/// One `zig build` to the end, and whether it compiled. Waited on the way the
+/// loop waits, so a Ctrl-C during a slow first build stops it rather than
+/// being held until it finishes.
+fn buildOnce(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !bool {
+    const build = try Running.start(gpa, io, argv);
+    defer build.free(gpa);
+    while (!build.exited()) {
+        if (stopping.load(.acquire)) {
+            _ = build.stop(io, build_stop_ms);
+            return false;
+        }
+        sleep(io, 50);
+    }
+    build.waiter.join();
+    return switch (build.exit) {
+        .exited => |code| code == 0,
+        else => false,
+    };
 }
 
 // ---- the small parts ----
