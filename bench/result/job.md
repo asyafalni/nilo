@@ -51,6 +51,34 @@ to write. Not until a program has a memory queue big enough to notice.
 
 ## What is not here, and the ranked levers
 
+## What the claim's index has to be, 2026-09-23
+
+ADR 0290 added `ORDER BY priority, run_at` and widened the table's index to
+`(state, priority, run_at)` on the reasoning that an index matching the sort
+serves it. Measured, on Postgres 16 in Docker, a `nilo_jobs`-shaped table:
+
+| queued rows | index | buffers | time |
+|---|---|---|---|
+| 200 000 future-dated, 1 due | `(state, priority, run_at)` | 988 | 7.9 ms |
+| 200 000 future-dated, 1 due | `(state, run_at)` | 7 | **0.065 ms** |
+| the same plus 50 000 due | `(state, priority, run_at)` | 2 132 | 20.2 ms |
+| the same plus 50 000 due | `(state, run_at)` | 615 | **12.4 ms** |
+
+With `priority` in front of `run_at`, `run_at <= $1` stops being a range bound
+and becomes a filter inside each priority, so the scan walks every future-dated
+queued row — the scheduled next ticks, the `after_ms` pushes, the backoff
+retries — before it reaches a due one. A queue holding work for later is the
+normal case, not the pathological one.
+
+The wide index does not even pay in the regime it was meant for: with a real
+backlog it is still slower, because the narrow index finds the due set first
+and a top-N heapsort orders it, which is cheap for `LIMIT 1`.
+
+The index stayed `(state, run_at)`. The lesson is the ordinary one about
+composite indexes — an equality column may precede a range column, a second
+sort column may not — and it was not caught by reading, because the claim was
+only ever run against tables whose rows were all due.
+
 1. **Several workers against one Postgres.** Everything above is one
    connection. The claim under contention — eight workers, SKIP LOCKED doing
    its job — is the number that would decide batching, and it wants a box with

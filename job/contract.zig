@@ -15,7 +15,7 @@
 //! | | |
 //! |---|---|
 //! | `push(scope, kind, payload, Enqueue) !?Id` | queue one; `null` when `unique` already has a row queued or running |
-//! | `claim(scope, now, lease_until) !?Claimed` | take the next due row, or one whose lease ran out, marking it running and counting the attempt |
+//! | `claim(scope, comptime kinds, now, lease_until) !?Claimed` | take the most urgent due row **of these kinds**, or one whose lease ran out, marking it running and counting the attempt. Urgency first, then how long it has been due; a kind not in the list is left where it is, for the binary that knows it (ADR 0291) |
 //! | `done(scope, id) !void` | it worked |
 //! | `retry(scope, id, run_at, err) !void` | it failed and will be tried again then |
 //! | `dead(scope, id, err) !void` | it failed for the last time |
@@ -52,6 +52,32 @@ pub const Enqueue = struct {
     run_at: i64,
     /// A key that at most one queued-or-running row of this kind may carry.
     unique: ?[]const u8 = null,
+    /// Which due row a free worker takes first.
+    priority: Priority = .normal,
+};
+
+/// Which due row a free worker takes first, when more than one is due.
+///
+/// Workers are few and a long job holds one for as long as it runs, so a
+/// queue that only orders by `run_at` lets a backfill pushed at nine o'clock
+/// stand in front of every small job pushed after it. That is the whole
+/// problem this names: not that the backfill is slow, but that it is *in
+/// front*.
+///
+/// A kind declares it beside its `timeout_ms`, because how urgent a kind is
+/// belongs to the kind rather than to each call site:
+///
+/// ```zig
+/// pub const priority: job.Priority = .high;
+/// ```
+///
+/// The numbers run the other way round on purpose: `high` is 0 so the claim
+/// can order `priority, run_at` ascending and use the same index shape the
+/// table already declares. Nobody writes the number.
+pub const Priority = enum(i16) {
+    high = 0,
+    normal = 1,
+    low = 2,
 };
 
 /// One row a worker has taken.

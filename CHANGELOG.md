@@ -29,6 +29,30 @@ newest first.
 
 ### Breaking
 
+- `Store.claim` takes the kinds the program can run: `claim(scope, comptime
+  kinds: []const []const u8, now, lease_until)`. `job.Jobs` passes its own
+  `kind_names`; a store written outside nilo takes the parameter and narrows
+  its claim by it. The names are bound, not spelled into the statement, so a
+  kind may go on being named whatever it is named
+  ([ADR 0291](./docs/adr/0291-a-worker-claims-only-what-it-can-run.md)).
+
+- `nilo_jobs` gains a `priority smallint NOT NULL DEFAULT 1` column.
+  `job.Table` creates nothing, so a caller adds it beside their own rows:
+
+      ALTER TABLE nilo_jobs ADD COLUMN priority smallint NOT NULL DEFAULT 1;
+
+  The default is not decoration. A column that may not be null and has no
+  default is the one `ADD COLUMN` that fails on a table with rows, and during
+  a rolling deploy an older binary's `INSERT` — or a sibling binary's, which
+  is [ADR 0291](./docs/adr/0291-a-worker-claims-only-what-it-can-run.md)'s own
+  case — never names the column. `createMissing` will not help here: it
+  creates tables that are missing and leaves an existing one alone. A queue
+  that has not been altered is not subtly wrong — the claim names the column,
+  so it fails loudly on the first claim rather than quietly ordering by
+  something else. The index stays `(state, run_at)`; widening it to include
+  `priority` measured 120x slower on a queue holding future-dated rows, which
+  is `bench/result/job.md` ([ADR 0290](./docs/adr/0290-a-job-says-how-urgent-it-is.md)).
+
 - A `Db`'s schema check and version guard run from a new service hook,
   `nilo_check`, which the App calls after the work `app.before` registered
   and before the first request; `nilo_start` opens the pool and nothing
@@ -62,6 +86,18 @@ newest first.
   ([ADR 0268](./docs/adr/0268-a-head-is-mostly-cookies-and-sixteen-kilobytes-of-them.md)).
 
 ### Added
+
+- `pub const priority: job.Priority = .high;` on a job kind, beside its
+  `timeout_ms`: a free worker takes the most urgent **due** row, and among
+  equals the one that has been due longest. `.high`, `.normal` (the default,
+  and what every existing kind gets) and `.low`. The case it came from is a
+  queue where a model backfill running for minutes stood in front of the
+  cache revalidations a person was waiting on — not because the machine was
+  busy, but because the backfill was *in front*. Per kind rather than per
+  push, because how urgent a kind is belongs to the kind; three levels
+  rather than a number, because `2` says nothing about whether it beats `1`,
+  and a kind that writes one is a Refusal naming the levels
+  ([ADR 0290](./docs/adr/0290-a-job-says-how-urgent-it-is.md)).
 
 - `listen(.{ .also = &.{ .{ .port = 8081, .tls = … } } })`: more addresses
   to answer on, from one process. An entry is an address, a port and a
@@ -262,6 +298,18 @@ newest first.
   prose under it was already there; the lookup was not.
 
 ### Fixed
+
+- **A worker spun forever on a job kind it did not know.** A row pushed by
+  another binary — an older deploy, a sibling service — was claimed, found to
+  be of an unknown kind, and handed back at the `run_at` it already had; so
+  the same worker claimed it again on the next turn, forever. One such row
+  left behind by a removed kind ran up **88 210 claim/release pairs**, kept a
+  worker permanently busy and timed out `/health`. Worse than the spin: the
+  claim counts an attempt, so a row nobody here could run was walking towards
+  `dead` in the binary least able to judge it. The claim now asks only for the
+  kinds the program knows, so the row is left queued, untouched and at nought
+  attempts, for the binary that does know it
+  ([ADR 0291](./docs/adr/0291-a-worker-claims-only-what-it-can-run.md)).
 
 - Every binary with a static set in it, which is every binary with the
   API reader page, was 25 KB larger than it needed to be: the

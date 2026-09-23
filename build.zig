@@ -1106,6 +1106,10 @@ const job_refusals = [_]Refusal{
         .says = "the job SendWelcome cannot carry `SendWelcome.user`, which is a pointer.",
     },
     .{
+        .name = "job_priority_is_a_number",
+        .says = "the job Backfill's `priority` is comptime_int rather than a `job.Priority`.",
+    },
+    .{
         .name = "job_without_retry",
         .says = "the job SendWelcome says nothing about `retry`, and a job that fails has to say what happens next.",
     },

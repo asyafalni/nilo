@@ -350,8 +350,9 @@ The claim is one statement, and the second half of its `WHERE` is the lease:
 ```sql
 UPDATE nilo_jobs SET state = 'running', lease_until = $2, attempts = attempts + 1
 WHERE id = (SELECT id FROM nilo_jobs
-            WHERE (state = 'queued' AND run_at <= $1) OR (state = 'running' AND lease_until <= $1)
-            ORDER BY run_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+            WHERE kind = ANY($3)
+              AND ((state = 'queued' AND run_at <= $1) OR (state = 'running' AND lease_until <= $1))
+            ORDER BY priority, run_at LIMIT 1 FOR UPDATE SKIP LOCKED)
 RETURNING …
 ```
 

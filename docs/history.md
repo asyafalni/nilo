@@ -4095,3 +4095,37 @@ claim; the fix is the plain path's and is not in this change.
 ## A handshake measured with our certificate was not the arena's handshake
 
 Every TLS number in this repository was taken with `http/testdata/tls/localhost.pem`, which is an ECDSA key, and put a handshake at 0.3 ms. The benchmark arena mounts an RSA-2048 certificate, and on it tls.zig spent 13.7 ms a handshake, signing with the full-size exponent and discarding the CRT values it had already parsed. That one fact was the arena's 201 ms p99 on `8gbit` and a third of every `json-tls` run spent handshaking, and until the run was reproduced with the arena's own certificate and load-generator images it read as "TLS is slow under load". The first guess, the arena's 1,500-byte loopback MTU, was tried and moved nothing. **A reproduction takes the other side's inputs rather than ours**: its certificate, its load generator's image, and the network settings its script applies. The fix is upstream's to take ([ianic/tls.zig#59](https://github.com/ianic/tls.zig/pull/59)) and is pinned from a fork meanwhile; the numbers are in [`bench/result/http.md`](../bench/result/http.md#what-an-rsa-certificate-costs-a-handshake).
+
+## An enum column sorts by its name, and a released row is claimed again at once
+
+Two premises behind the job queue's urgency work turned out to be false, and
+both were found by a test rather than by reading.
+
+The first was that a `priority` column could simply be the enum. An enum column
+is stored as its *name*, so `ORDER BY priority` put `high` before `low` before
+`normal` — not the order asked for, and not an order at all. The column is the
+integer behind the enum now, with `high` at 0 so both terms of the claim's
+`ORDER BY` ascend. **A state has no order and can be a word; a priority is
+nothing but an order.**
+
+The second was the comment in `execute` that a row of an unknown kind was
+"not ours to run and not ours to lose: back in the queue, where the binary that
+pushed it will find it". The intent was right and the mechanism was not:
+`release` puts the row back `queued` with the `run_at` it already had, so it is
+due, so it is the most urgent due row, so the same worker claims it again on the
+next turn of the loop. An engine that had dropped a kind between deploys left
+one such row behind and logged **88 210 claim/release pairs**, the worker never
+idle, `/health` timing out because the loop never handed the pool back. The
+claim counts an attempt, so the row was also walking towards `dead` in the
+binary least able to judge it. **Handing something back to a queue you are
+still asking is not letting go of it.**
+
+A third premise went the same way in review: that an index matching the claim's
+`ORDER BY` would serve it. Widening `(state, run_at)` to
+`(state, priority, run_at)` stops `run_at <= $1` being a range bound and makes
+it a filter inside each priority, so the scan walks every future-dated queued
+row — scheduled ticks, `after_ms` pushes, backoff retries — before reaching a
+due one: 988 buffers and 7.9 ms against 7 and 0.065 ms, and slower even with a
+real backlog. **An equality column may precede a range column in a composite
+index; a second sort column may not.** The numbers are in
+[`bench/result/job.md`](../bench/result/job.md).
