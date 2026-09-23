@@ -39,12 +39,19 @@
         },
         // The TLS 1.3 server behind `-Dtls` (ADR 0288), and lazy for the
         // reason the drivers are: a program that never asks fetches nothing.
-        // Pure Zig on `std.crypto`, no C, and pinned to a commit on the
-        // library's `zig-0.16.x` branch rather than a tag, because it has
-        // no tags. The commit, not the branch, is the pin.
+        // Pure Zig on `std.crypto`, no C, and pinned to a commit rather than
+        // a tag, because it has no tags. The commit, not the branch, is the
+        // pin.
+        //
+        // **A fork's commit, for now**: upstream's `zig-0.16.x` plus one
+        // commit that signs with the key's CRT form, which takes an RSA-2048
+        // handshake from 13.7 to 2.6 ms of server CPU. It is
+        // ianic/tls.zig#59; once that merges, the pin goes back to upstream
+        // and the fork is not used again (bench/result/http.md, "What an RSA
+        // certificate costs a handshake").
         .tls = .{
-            .url = "git+https://github.com/ianic/tls.zig#e04ae448ce7ee70c136d4d48b059314543203809",
-            .hash = "tls-0.1.0-ER2e0jGpBgCkVC-Yp12NgSdHNUtZr52MleJ8roHlUa54",
+            .url = "git+https://github.com/nevindra/tls.zig#0185b3c058b4813384e3c215513fb211eff8d803",
+            .hash = "tls-0.1.0-ER2e0hTPBgCpbhJ_kDs2c-zXotaMIBpaP1oUvrQKSTF3",
             .lazy = true,
         },
     },

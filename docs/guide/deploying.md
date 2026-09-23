@@ -541,13 +541,7 @@ has the tables):
   not: 9,293 bytes against 5,191. A TLS connection's 33 KB of record buffers
   are not in that figure, because they go back to the kernel at idle the way
   the rest do.
-- **About 300 µs of CPU per new connection** for the handshake, twenty times
-  a plain accept, and half a microsecond per request on a connection kept
-  alive. A service whose clients hold a connection does not notice; one whose
-  clients connect per request pays the handshake per request, and that is the
-  deployment a proxy with session resumption is for, because this listener
-  has none. Build for the CPU you run on: without AES instructions in the
-  target (`-Dcpu`), a request costs six times as much.
+- **About 300 µs of CPU per new connection with an ECDSA certificate, and 2.6 ms with an RSA-2048 one**, for the handshake: twenty times a plain accept for the first, and nine times that for the second, so an ECDSA P-256 certificate is the cheap choice where you pick the key. Half a microsecond per request either way on a connection kept alive. A service whose clients hold a connection does not notice; one whose clients connect per request pays the handshake per request, and that is the deployment a proxy with session resumption is for, because this listener has none. Build for the CPU you run on: without AES instructions in the target (`-Dcpu`), a request costs six times as much.
 - **One certificate per listener**, no client certificates, and no reload
   without a restart. TLS 1.3 only, which every browser and client library of
   the last six years speaks.

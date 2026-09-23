@@ -2332,6 +2332,35 @@ framing and the copies through the cleartext buffers, which is where
 settle it. Nothing here is worth doing for `8gbit`, which the server holds
 at 9% of four cores.
 
+## What an RSA certificate costs a handshake
+
+**The section above was right about its certificate and wrong about the arena's.** Every TLS run in this file used `http/testdata/tls/localhost.pem`, which is ECDSA P-256, and put a handshake at about 0.3 ms. HttpArena mounts an RSA-2048 certificate, and with it a handshake cost **13.7 ms of server CPU**. The arena's reading at `fa0055f` was what showed it: `8gbit` at a rate of 0.94 with a 201 ms p99, and `json-tls` at 421K req/s on 6,287% CPU, about 149 µs a request.
+
+**Where the time went.** tls.zig signed `CertificateVerify` with one full-size `pow(m, d)` on `std.crypto.ff.Modulus(4096)`, and its key parser read the primes, their exponents and the coefficient and dropped them. One 2048-bit private-key operation on one core, from a scratch program on `std.crypto.ff`: 15–23 ms as the library did it, 11.5–12 ms with `d` passed at the modulus's length (`pow` encodes the exponent at the capacity of the type, so half of it was leading zeros), and **3.0–3.5 ms through the CRT form**. OpenSSL's `speed rsa2048` signs in 0.22 ms on the same box.
+
+**The fix is upstream's to take**: [ianic/tls.zig#59](https://github.com/ianic/tls.zig/pull/59), which keeps the CRT values, checks every CRT result against `e` before returning it, and falls back to `d` when the values are missing or wrong. Until it merges, `build.zig.zon` pins `nevindra/tls.zig` at `0185b3c`, which is upstream's `zig-0.16.x` at `e04ae44` plus that one commit.
+
+**The run.** Ryzen 7 9700X, Linux 7.2.5, Zig 0.16.0, loopback. The server is `bench/echo_server.zig` with `ECHO_TLS=1` and eight threads pinned to CPUs 0-3,8-11, started in a directory whose `http/testdata/tls/` holds the arena's `certs/server.crt` and `server.key`. It was built `-Dtls -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3+aes+pclmul --release=fast` twice from `16dc5dc`: once against the old pin and once against the fork, from a `git archive` copy whose `build.zig.zon` points at it. The clients are on CPUs 4-7,12-15: Python's `ssl` doing 300 handshakes one after another, zrk 2.3.0 from the arena's image in the `8gbit` shape (512 connections, a 10,240-byte POST echoed, 50,000 req/s, 5 s), and the arena's own `wrk` image at 4,096 connections on `/health`. Before and after were interleaved, two rounds each, and the rounds agreed to the digit shown.
+
+| | before (`e04ae44`) | after (`0185b3c`) |
+|---|---|---|
+| server CPU per handshake | 13.6–13.7 ms | **2.57 ms** |
+| `8gbit`: rate held | 0.83 | 0.96 |
+| `8gbit`: p50 / p99 / p99.9 | 60 µs / 1,047–1,088 ms / 1,246–1,321 ms | 58 µs / 29 ms / 70 ms |
+| `8gbit`: mean | 96–99 ms | 0.88–0.90 ms |
+| `8gbit`: server CPU per request | 77.4 µs | 23.7 µs |
+| 4,096 connections, 5 s: requests completed | **0** | 2,239K–2,242K (440K req/s) |
+
+**The last row is the handshakes alone.** 4,096 of them at 13.7 ms each is 56 CPU-seconds, and eight threads have 40 in five seconds, so `wrk` never got a first answer.
+
+**The control that isolated it** was the arena's own image (`fa0055f`) with the arena's certificate against a P-256 one and nothing else changed: in the `8gbit` shape, a rate of 0.83 against 0.98, a p99 of 1.05 s against 65 µs, and 75 µs a request against 12.7. The arena also sets the loopback MTU to 1,500. That was tried at 1,500 and at 65,536 and moved nothing.
+
+**The other three axes.** Allocations per request do not move: the change is inside the handshake. Memory per idle TLS connection, `bench/mem.py --tls` at 2,000 and 5,000: 9,411 and 9,435 bytes before, 9,411 and 9,333 after, so it is unchanged. Binary size, stripped `ReleaseFast`: a build without `-Dtls` is byte-identical (`example-hello` 960,376, `example-rest` 1,150,792), and a `-Dtls` build pays **+26,768** and **+26,832** bytes for the second `ff.Modulus` instantiation.
+
+### Can it be pushed further
+
+Yes, and the p99 says where. 2.57 ms is still spent on the executor that accepted the connection, so every other connection on that thread waits behind each handshake. That is the 29 ms left on the `8gbit` p99. It would be closer to 60 ms on the arena's slower cores, and the arena scores `8gbit` a third of a term per decade of p99. The lever is to run the signature somewhere other than the executor, which needs a signer hook in tls.zig, and the roadmap carries it under Waiting on upstream. Below that, the 3 ms itself is `std.crypto.ff`'s constant-time exponentiation, fourteen times OpenSSL's, and a fixed-size Montgomery ladder for 1024-bit primes is the lever there. Neither has been tried.
+
 ## What TLS costs a listener, and what it costs one that never asked
 
 [ADR 0288](../../docs/adr/0288-tls-is-an-option-a-build-asks-for.md) is the

@@ -4091,3 +4091,7 @@ cancel ends the read the connection is parked in, and the loop's next read
 parks again until the client speaks, hangs up, or the idle limit runs out.
 Found by the TLS stop test, which now holds the idle limit rather than the
 claim; the fix is the plain path's and is not in this change.
+
+## A handshake measured with our certificate was not the arena's handshake
+
+Every TLS number in this repository was taken with `http/testdata/tls/localhost.pem`, which is an ECDSA key, and put a handshake at 0.3 ms. The benchmark arena mounts an RSA-2048 certificate, and on it tls.zig spent 13.7 ms a handshake, signing with the full-size exponent and discarding the CRT values it had already parsed. That one fact was the arena's 201 ms p99 on `8gbit` and a third of every `json-tls` run spent handshaking, and until the run was reproduced with the arena's own certificate and load-generator images it read as "TLS is slow under load". The first guess, the arena's 1,500-byte loopback MTU, was tried and moved nothing. **A reproduction takes the other side's inputs rather than ours**: its certificate, its load generator's image, and the network settings its script applies. The fix is upstream's to take ([ianic/tls.zig#59](https://github.com/ianic/tls.zig/pull/59)) and is pinned from a fork meanwhile; the numbers are in [`bench/result/http.md`](../bench/result/http.md#what-an-rsa-certificate-costs-a-handshake).
