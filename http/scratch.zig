@@ -31,6 +31,15 @@
 //! all, and an echo server at 1.7M messages a second does one per socket for
 //! the life of the socket rather than one per message.
 //!
+//! **And a message that arrives whole takes none.** It is unmasked in the
+//! connection's read buffer and handed over from there, so this list only
+//! serves a message that is fragmented, split across reads or bigger than
+//! the read buffer. That is not a saving on the copy. It is the cap below
+//! meeting a short-lived socket: a connection that lives for ten messages
+//! took a buffer and gave it back, and past four open per executor every one
+//! of them was an `mmap` and a `munmap`, and every `munmap` a TLB shootdown on
+//! every core the process runs on (ADR 0292).
+//!
 //! The other half of the same finding is where the *loop* runs, which is
 //! [ADR 0071](../docs/adr/0071-where-a-connection-waits-is-what-it-costs.md):
 //! taking the buffer off the handler's frame is worth nothing if the frame

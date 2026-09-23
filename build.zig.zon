@@ -43,15 +43,17 @@
         // a tag, because it has no tags. The commit, not the branch, is the
         // pin.
         //
-        // **A fork's commit, for now**: upstream's `zig-0.16.x` plus one
-        // commit that signs with the key's CRT form, which takes an RSA-2048
-        // handshake from 13.7 to 2.6 ms of server CPU. It is
-        // ianic/tls.zig#59; once that merges, the pin goes back to upstream
-        // and the fork is not used again (bench/result/http.md, "What an RSA
-        // certificate costs a handshake").
+        // **A fork's commit, for now**: upstream's `zig-0.16.x` plus two
+        // commits. One signs with the key's CRT form, which takes an RSA-2048
+        // handshake from 13.7 to 2.6 ms of server CPU; it is
+        // ianic/tls.zig#59 (bench/result/http.md, "What an RSA certificate
+        // costs a handshake"). The other adds the server's `offload` option,
+        // which the Engine uses to sign on the blocking pool (ADR 0293). Once
+        // both are upstream, the pin goes back to it and the fork is not used
+        // again.
         .tls = .{
-            .url = "git+https://github.com/nevindra/tls.zig#0185b3c058b4813384e3c215513fb211eff8d803",
-            .hash = "tls-0.1.0-ER2e0hTPBgCpbhJ_kDs2c-zXotaMIBpaP1oUvrQKSTF3",
+            .url = "git+https://github.com/nevindra/tls.zig#73290ca7aa5a13c6c2131e5d35676109ac6a73cc",
+            .hash = "tls-0.1.0-ER2e0kvdBgABZ6SYdVWmbLYIb-42yDaDpz9nIzA2OXTB",
             .lazy = true,
         },
     },

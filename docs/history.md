@@ -4129,3 +4129,11 @@ due one: 988 buffers and 7.9 ms against 7 and 0.065 ms, and slower even with a
 real backlog. **An equality column may precede a range column in a composite
 index; a second sort column may not.** The numbers are in
 [`bench/result/job.md`](../bench/result/job.md).
+
+## A cost that scales with cores does not show on eight of them
+
+`echo-ws-limited` sat at 39 of the arena's 64 cores and served less at 4,096 connections than at 512, and on this box the same shape was healthy: 1.5M frames a second at six of eight cores, descriptors tracking the client. What it was paying was one TLB shootdown for every three connections, 409K in eight seconds against 600 for the same shape over HTTP, because a message buffer the executor's free list could not keep was mapped and unmapped per connection. A shootdown interrupts every core the process runs on, so it is nearly free at eight and a stall at sixty-four. **When a many-core reading will not reproduce on fewer cores, count what scales with cores rather than what is slow**: the `TLB` row of `/proc/interrupts` took one command and named the cause, where throughput on this box never moved ([ADR 0292](./adr/0292-a-message-that-arrived-whole-is-handed-over-where-it-lies.md), [`http.md`](../bench/result/http.md#a-short-lived-websocket-and-the-tlb)).
+
+## The signer hook was waiting on nobody
+
+The roadmap carried "a handshake's signature off the executor" under Waiting on upstream, because it needed a hook in tls.zig that nobody had asked for. nilo pins its own fork of tls.zig, and had since the CRT fix one section up, so the hook was one commit in a repository we already publish. It took the `8gbit` mean from about 1 ms to 150 µs on this box ([ADR 0293](./adr/0293-a-handshakes-signature-is-computed-off-the-executor.md)). The measurement that made it worth doing came from reading the load generator's source: zrk anchors each connection's schedule after its own handshake, so the tail was never the handshakes themselves but the open connections waiting behind them. **Before deciding what a latency includes, read how the client that measured it starts its clock** ([`http.md`](../bench/result/http.md#what-a-signature-on-the-executor-costs-the-connections-already-open)).

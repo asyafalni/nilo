@@ -2361,6 +2361,8 @@ at 9% of four cores.
 
 Yes, and the p99 says where. 2.57 ms is still spent on the executor that accepted the connection, so every other connection on that thread waits behind each handshake. That is the 29 ms left on the `8gbit` p99. It would be closer to 60 ms on the arena's slower cores, and the arena scores `8gbit` a third of a term per decade of p99. The lever is to run the signature somewhere other than the executor, which needs a signer hook in tls.zig, and the roadmap carries it under Waiting on upstream. Below that, the 3 ms itself is `std.crypto.ff`'s constant-time exponentiation, fourteen times OpenSSL's, and a fixed-size Montgomery ladder for 1024-bit primes is the lever there. Neither has been tried.
 
+The first was tried, and needed no upstream: nilo pins its own fork. It is [the signature off the executor](#what-a-signature-on-the-executor-costs-the-connections-already-open), below.
+
 ## What TLS costs a listener, and what it costs one that never asked
 
 [ADR 0288](../../docs/adr/0288-tls-is-an-option-a-build-asks-for.md) is the
@@ -2489,6 +2491,81 @@ zig build install -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu -Dcpu=native
 taskset -c 0-3,8-11 ./zig-out/bin/nilo-hello &
 taskset -c 4-7,12-15 gcannon http://127.0.0.1:8787/health -t 8 -d 8 -c 512   # -r 10, -c 256 -p 16
 ```
+
+## A short-lived WebSocket and the TLB
+
+[ADR 0292](../../docs/adr/0292-a-message-that-arrived-whole-is-handed-over-where-it-lies.md) is the decision; these are the runs under it.
+
+**What the arena showed.** `echo-ws-limited` at `baaccf8`: 1.13M frames a second at 512 connections and 945K at 4,096, on 39 of the arena's 64 cores. Every entry above nilo in the column served more at 4,096 than at 512 and used 53 to 60 cores. A server using fewer cores and doing less with more connections is waiting on something rather than working, and this box, at 8 threads, did not show the shape at all.
+
+**The instrument.** The arena's entry (`frameworks/nilo` on the PR branch), built `-Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3+aes+pclmul --release=fast` against this tree through a path dependency, pinned to CPUs 0-3,8-11. gcannon built from the arena's own `docker/gcannon.Dockerfile`, on CPUs 4-7,12-15, `--ws -r 10 -t 8 -d 8s`, which is the arena's shape at eight client threads. Server CPU from `/proc/<pid>/stat`, and TLB shootdowns from the `TLB` row of `/proc/interrupts`, summed over every CPU, before and after each run. Ryzen 7 9700X, Linux 7.2.5, `21890c6`.
+
+**The finding.** The same server, the same shape:
+
+| run, 4,096 connections, 8 s | TLB shootdowns |
+|---|---|
+| WebSocket, ten frames a connection | 409K, 428K |
+| HTTP, ten requests a connection (`/baseline11`) | 550, 632 |
+| WebSocket, `scratch.zig`'s `keep_bytes` raised to 64 MiB | 8,306, 8,581 |
+
+One shootdown for every three connections, and only on the WebSocket. The third row is an experiment, not a candidate: it says the free list is where they come from. Its cap of 64 KiB is four 16 KiB buffers an executor; with 512 sockets open on each of this box's executors, every connection mapped a buffer at its first frame and unmapped it at its last, and every `munmap` in a threaded process interrupts the other cores to flush their TLBs.
+
+**The fix and its pairs.** A whole message already in the read buffer is handed over from there, so no buffer is taken for it. Interleaved:
+
+| run | before | after |
+|---|---|---|
+| 512 connections, frames a second | 1.53M, 1.63M | 1.62M, 1.68M |
+| 512, shootdowns | 274K to 513K | 9.9K to 11.9K |
+| 4,096 connections, frames a second | 1.24M, 1.26M, 1.27M, 1.44M, 1.52M | 0.91M, 1.40M, 1.43M, 1.50M, 1.52M |
+| 4,096, shootdowns | 535K to 1.27M | 10.1K to 16.9K |
+| persistent echo, 4,096 connections, RSS | 94,784 KiB, 94,736 KiB | 78,380 KiB, 78,396 KiB |
+
+The 0.91M is one run that landed while the box was loaded (4.45 cores against 5.8 for the others) and its pair was low too; the three pairs after it agree on the sign. The throughput here is not the claim, because eight threads make a shootdown cheap; it says the change costs nothing on this box. The claim is the shootdown count, and the next arena run is the reading that says what it was worth on sixty-four cores.
+
+**The other axes.** Allocations per request: the HTTP path is untouched. Binary size, stripped `ReleaseFast`: `example-hello` and `example-rest` byte-identical, `example-chat` +656 bytes. Memory per idle WebSocket was not re-measured: an idle socket already gave its buffer back at the 200 ms peek, and nothing on that path moved.
+
+### Can it be pushed further
+
+On the arena's column, the next thing is whatever the next run shows. A short-lived socket that sends messages bigger than its read buffer still maps and unmaps a buffer per connection; nothing has asked about that shape, and `scratch.zig` says so.
+
+## What a signature on the executor costs the connections already open
+
+[ADR 0293](../../docs/adr/0293-a-handshakes-signature-is-computed-off-the-executor.md) is the decision; these are the runs under it.
+
+**What the arena showed.** `8gbit` at `baaccf8`: p50 101 µs, p99 169 µs, mean 267 µs, and p99.9 46 to 68 ms, in five seconds over 512 connections opened once. The mean is a quarter of the score and the field's best is 81.5 µs, so the column's gap was the tail.
+
+**The instrument.** The arena's entry as in the section above, with the arena's `certs/server.crt` and `server.key` (RSA-2048). zrk 2.3.0 from the arena's image on CPUs 4-7,12-15: `-t 8 -c 512 -R 50000 -m POST -b @<10,240 bytes> -k`, which is the arena's `8gbit` at eight client threads. CPU per request from `/proc/<pid>/stat` over zrk's request count. The arena's `wrk` image for `json-tls`: `-t 8 -c 4096 -d 5s -s json-tls-rotate.lua`.
+
+**What zrk counts.** Read out of its source (`src/connection.zig`): each connection anchors its schedule at its first request, after its own handshake. A connection's handshake is never in its own latency. What is in it is the requests of connections already open, timed from when they were due.
+
+**The controls, before anything changed:**
+
+| run, `8gbit` shape | mean | p99 | p99.9 | CPU/req |
+|---|---|---|---|---|
+| RSA-2048, 5 s, three runs | 942 to 1,135 µs | 31 to 45 ms | 72 to 95 ms | 23.6 to 24.3 µs |
+| RSA-2048, 20 s | 289 µs | 132 µs | 56 ms | 16.7 µs |
+| ECDSA P-256 (a fresh key), 5 s, two runs | 234, 248 µs | 172, 377 µs | 35, 38 ms | 15.0, 15.2 µs |
+| cleartext, port 8080, 5 s, two runs | 62, 89 µs | 52, 325 µs | 9.8, 15.8 ms | 6.8, 6.9 µs |
+
+The 5 s and 20 s rows put the same total excess on the requests, about 230 request-seconds, so it is paid once at the start. The P-256 row says most of it is the signature. The cleartext row says some of it is not TLS at all.
+
+**The fix and its pairs**, without and with the signature on the blocking pool, both with ADR 0292, interleaved:
+
+| run | before | after |
+|---|---|---|
+| `8gbit`, 5 s: mean | 1,123, 960, 1,044 µs | **133, 179, 136 µs** |
+| p99 | 45.3, 31.0, 39.7 ms | **465, 546, 311 µs** |
+| p99.9 | 92, 75, 84 ms | 29, 42, 32 ms |
+| rate held | 0.960 to 0.962 | 0.961 to 0.964 |
+| CPU per request | 24.1, 24.9, 24.4 µs | 24.5, 24.4, 23.9 µs |
+| `json-tls`, 4,096 connections: requests a second | 242K, 247K, 238K | 245K, 241K, 232K |
+| mean latency | 34.4, 31.5, 34.4 ms | 13.7, 13.7, 13.9 ms |
+
+**The other axes.** `bench/mem.py --tls` against `bench-tls-server -Dtls`, twice each: 9,415 and 9,334 bytes a connection at 2,000 and 5,000 before, 9,558 and 9,391 after. The marginal from 2,000 to 5,000 is 9,280 bytes in both, so the difference is a flat ~290 KB and not a cost per connection; the pool's threads starting would account for it, and that was not checked. Binary size, stripped `ReleaseFast`: `bench-tls-server -Dtls` 1,606,608 to 1,608,048 bytes (+1,440), and a build without `-Dtls` byte-identical.
+
+### Can it be pushed further
+
+Yes, twice. The p99.9 of 29 to 42 ms that is left is the start of the run: cleartext shows 10 to 16 ms of it, so the burst of new connections costs something whatever they speak, and that is the next thing to take apart, for every profile that opens its connections at once. And the signature still costs the CPU it did: 2.6 ms, where OpenSSL signs in 0.22. A fixed-width Montgomery ladder for 1024-bit primes is that lever, and it would move the CPU per request on every TLS profile, not only the tail.
 
 ## What is still missing
 

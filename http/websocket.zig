@@ -266,13 +266,14 @@ pub const Kind = enum { text, binary };
 
 /// One message, whole.
 ///
-/// **`data` is borrowed, and the loan ends at the next `receive`.** It points
-/// into this socket's message buffer, which the socket does not own either:
-/// `takeScratch` borrows it from the executor's free list and `giveScratch`
-/// hands it straight back when the connection falls quiet (`park`) or ends.
-/// So a slice kept past one turn of the loop is not merely stale, it is
-/// memory another connection may already be filling with somebody else's
-/// message.
+/// **`data` is borrowed, and the loan ends at the next `receive`.** A message
+/// that arrived whole points into the connection's read buffer, which that
+/// `receive` refills. One that did not points into this socket's message
+/// buffer, which the socket does not own either: `takeScratch` borrows it
+/// from the executor's free list and `giveScratch` hands it straight back
+/// when the connection falls quiet (`park`) or ends. So a slice kept past one
+/// turn of the loop is not merely stale, it is memory another message, or
+/// another connection, may already be filling.
 ///
 /// Nothing traps that. A `Str` that outlives its request is caught in Debug
 /// and ReleaseSafe (ADR 0004) and this is not, which makes it the one
@@ -498,19 +499,10 @@ pub const Socket = struct {
             // Something arrived, so the question is answered whatever it was.
             self._awaiting_pong = false;
 
-            // From here there may be bytes to keep, so there has to be
-            // somewhere to keep them. Taken now rather than at the top of the
-            // call: a socket that parks and never hears anything again never
-            // holds one.
-            buf = self.takeScratch() catch {
-                self.closeWith(.internal) catch {};
-                return error.ReadFailed;
-            };
-
-            // What is left of `buf`, not the whole of it: a fragment that
-            // cannot fit beside the ones already collected is refused on what
-            // its header claims, before a byte of it is read.
-            const frame = self.nextHeader(buf.len - filled) catch |err| switch (err) {
+            // What is left of the ceiling, not the whole of it: a fragment
+            // that cannot fit beside the ones already collected is refused on
+            // what its header claims, before a byte of it is read.
+            const frame = self.nextHeader(self._max_message - filled) catch |err| switch (err) {
                 error.EndOfStream => {
                     self._closed = true;
                     self.giveScratch();
@@ -537,6 +529,35 @@ pub const Socket = struct {
                 else => return self.fail(error.ProtocolError),
             }
 
+            // A whole message already sitting in the connection's read buffer
+            // is unmasked where it lies and handed over from there, which is
+            // the loan `Message` describes: the buffer is only refilled by the
+            // next `receive`. No message buffer is taken for it, and that is
+            // the point rather than the copy it saves. A socket that lives
+            // for ten messages took one from the executor's free list and gave
+            // it back, and with more sockets open on an executor than its list
+            // keeps spares for, every connection mapped sixteen kilobytes and
+            // unmapped them again. Each unmapping stops every core the process
+            // runs on to flush its TLB: measured, 420K of those in eight
+            // seconds of `echo-ws-limited` against 600 for the same shape over
+            // HTTP, and on the arena's sixty-four cores the server sat at
+            // thirty-nine of them (ADR 0292).
+            if (filled == 0 and frame.fin and self._in.bufferedLen() >= frame.len) {
+                const data = self._in.buffered()[0..@intCast(frame.len)];
+                unmask(data, frame.mask, 0);
+                self._in.toss(data.len);
+                return self.handOver(kind.?, data);
+            }
+
+            // From here there are bytes to keep, so there has to be somewhere
+            // to keep them. Taken only now: a socket that parks and never
+            // hears anything again never holds one, and neither does one
+            // whose messages all arrived whole.
+            if (buf.len == 0) buf = self.takeScratch() catch {
+                self.closeWith(.internal) catch {};
+                return error.ReadFailed;
+            };
+
             const into = buf[filled..][0..@intCast(frame.len)];
             self.readPayload(into, frame.mask) catch |err| return self.fail(err);
             filled += into.len;
@@ -544,15 +565,19 @@ pub const Socket = struct {
             if (frame.fin) break;
         }
 
-        const data = buf[0..filled];
+        return self.handOver(kind.?, buf[0..filled]);
+    }
+
+    /// A message with every frame in, whichever buffer it was collected in.
+    fn handOver(self: *Socket, kind: Kind, data: []u8) Error!?Message {
         // Text is defined to be UTF-8, and a client is entitled to be told
         // when it is not rather than handed bytes that will break something
         // further along.
-        if (kind.? == .text and !std.unicode.utf8ValidateSlice(data)) {
+        if (kind == .text and !std.unicode.utf8ValidateSlice(data)) {
             self.closeWith(.invalid_payload) catch {};
             return error.ProtocolError;
         }
-        return .{ .kind = kind.?, .data = data };
+        return .{ .kind = kind, .data = data };
     }
 
     /// Send one message. Never fragmented: nilo has it all already, so
@@ -1831,6 +1856,44 @@ test "a message split across frames is put back together" {
 
     const message = (try socket.receive()).?;
     try testing.expectEqualStrings("hello, world", message.data);
+}
+
+test "a message that arrived whole is handed over without taking a message buffer" {
+    // The short-lived socket's case: ten small messages and gone. Taking a
+    // buffer for each connection is what cost every core a TLB flush per
+    // connection on a many-core machine (ADR 0292).
+    var peer: Peer = .{};
+    defer peer.deinit();
+    try peer.frame(true, 2, "\x00\x01\x02\x03\x04\x05\x06\x07\x08");
+    try peer.frame(true, 1, "second");
+    var socket = peer.socket();
+
+    const first = (try socket.receive()).?;
+    try testing.expectEqual(Kind.binary, first.kind);
+    try testing.expectEqualStrings("\x00\x01\x02\x03\x04\x05\x06\x07\x08", first.data);
+    try testing.expect(socket._own_scratch == null);
+
+    // Handed over from the read buffer and still good for what the loan
+    // promises: echoing it back before the next `receive`.
+    try socket.send(first.kind, first.data);
+    try testing.expectEqualStrings("\x82\x09\x00\x01\x02\x03\x04\x05\x06\x07\x08", peer.sent());
+
+    const second = (try socket.receive()).?;
+    try testing.expectEqualStrings("second", second.data);
+    try testing.expect(socket._own_scratch == null);
+}
+
+test "a message in pieces still collects into a message buffer" {
+    var peer: Peer = .{};
+    defer peer.deinit();
+    try peer.frame(false, 1, "hel");
+    try peer.frame(true, 0, "lo");
+    var socket = peer.socket();
+    defer socket.giveScratch();
+
+    const message = (try socket.receive()).?;
+    try testing.expectEqualStrings("hello", message.data);
+    try testing.expect(socket._own_scratch != null);
 }
 
 test "a frame that arrives a few bytes at a time is the same message" {

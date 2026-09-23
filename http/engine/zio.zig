@@ -985,6 +985,27 @@ fn readCertKeyPair(gpa: std.mem.Allocator, io: std.Io, cert_path: []const u8, ke
     return tls.config.CertKeyPair.fromFilePath(gpa, io, std.Io.Dir.cwd(), cert_path, key_path);
 }
 
+/// Where a handshake's signature is computed: the blocking pool, with the
+/// connection's fiber parked until it is done (ADR 0293).
+///
+/// The signature is the one step of a handshake measured in milliseconds,
+/// 2.6 ms for the arena's RSA-2048 key on the machine in `bench/result/`,
+/// and on the executor it held every connection that executor serves. A
+/// burst of new connections is a burst of signatures, so the requests of
+/// the connections already open waited behind all of them, and a paced
+/// client times those requests from when they were due. Only the signature
+/// moves: the rest of a handshake is tens of microseconds, and the hop costs
+/// two wakeups.
+const sign_elsewhere: tls.config.Offload = .{ .run = signOnPool };
+
+fn signOnPool(_: ?*anyopaque, job: *const fn (arg: *anyopaque) void, arg: *anyopaque) void {
+    zio.blockInPlace(callJob, .{ job, arg });
+}
+
+fn callJob(job: *const fn (arg: *anyopaque) void, arg: *anyopaque) void {
+    job(arg);
+}
+
 /// The same for a path. `port` is not read at all — there is nowhere for a
 /// port to go on a unix socket, and pretending otherwise would put a number
 /// in the log line that means nothing.
@@ -1611,6 +1632,7 @@ pub fn serve(
                 .now = std.Io.Clock.real.now(sec.io),
                 .rng = rng_source.interface(),
                 .alpn_protocols = &.{"http/1.1"},
+                .offload = sign_elsewhere,
             } }) catch |err| {
                 // Debug rather than warn: a port on the internet is
                 // handshaken at by scanners all day, and every one of those
