@@ -2415,6 +2415,52 @@ the number, and ADR 0288's guide page says so.
 saturation over `https://` (no load generator with TLS on this box), the
 plain park's headroom under the page boundary, and kernel TLS.
 
+## zzz beside nilo, and the one thing its runtime does that zio does not
+
+Run to settle a premise before planning against it: that [zzz](https://github.com/tardy-org/zzz), which ADR 0002 names as the road not taken (its own io_uring runtime, [tardy](https://github.com/tardy-org/tardy)), is faster than nilo's Engine and has something to port. It is not faster on this box, on any shape tried, and what was worth taking from it is one SQE opcode inside zio rather than anything in the Engine.
+
+**The machine** is the Ryzen 7 9700X of the sections above, now on Linux 7.2.5 (Omarchy), governor `performance`, Zig 0.16.0. **The instrument** is gcannon (`11c802b`, native, liburing 2.15), eight threads on CPUs `4-7,12-15`; the server gets `0-3,8-11`, four physical cores and their siblings, eight threads each (zzz's example patched from `.auto` to `.multi = 8`, nilo takes its count from the affinity mask). Every run is 8 s after a 3 s warm-up that is discarded, the pairs are interleaved, and CPU is `utime + stime` from `/proc/<pid>/stat` across the run. nilo is `nilo-hello` at `16dc5dc` on `/health`, `ReleaseFast`, `-Dtarget=x86_64-linux-gnu -Dcpu=native`. zzz is **v0.3.2**, its last release for Zig 0.16 (main has moved to 0.17-dev), its `basic` example (`Hello, world!`), `ReleaseFast`. The two answers are 116 and 101 bytes on the wire.
+
+| shape | nilo | zzz v0.3.2 |
+|---|---|---|
+| keep-alive, 512 conns | 2.42 / 2.44 / 2.45M req/s, **2.36–2.39 µs CPU a request**, p99 447–490 µs, p99.9 0.93–1.50 ms, peak RSS 15 MB | 1.66 / 1.67 / 1.70M, 3.00–3.08 µs, p99 542–552 µs, p99.9 650–753 µs, peak RSS 787–798 MB |
+| 512 conns × 10 requests | 1.69 / 1.88 / 1.89M, 3.09–3.32 µs, p99 1.5–2.9 ms, p99.9 10.8–13.4 ms, 34–45 MB | 713 / 720 / 739K, 8.7–9.1 µs, p99 2.2–2.4 ms, p99.9 2.7–3.2 ms, **23.1–24.0 GB** |
+| 256 conns, `-p 16` | 11.53 / 11.73 / 11.99M, 0.61–0.64 µs, p99 357–379 µs, 10 MB | 1.81M × 3, 2.83 µs, p99 3.8–5.2 ms, 291–324 MB |
+
+**Neither server was saturated on the keep-alive row**, which is why CPU a request is the column to read there rather than req/s: sampled per thread over six seconds, nilo's eight threads each ran 4.33–4.38 core-seconds and zzz's 3.84–3.90, so both are balanced and both are waiting on the client part of the time. The first guess about zzz's idle share, that a thread-per-core runtime with no stealing had left some threads with more connections than others, was checked this way and is wrong. What zzz spends more on per request was not taken apart; tardy v0.3.2's loop submits and then waits in separate `io_uring_enter` calls where zio does both in one, sets no `DEFER_TASKRUN`, keeps headers in a hash map that lower-cases and hashes each name byte by byte, and formats its status line and headers through `print`. The pipelined row is zzz answering one request per `send`, which is what nilo did before ADR 0274. The 23 GB is `VmHWM` on a 30 GiB box under connection churn and was not investigated; it is written down so nobody mistakes zzz's README figure for a property of its runtime under this shape.
+
+**One row goes zzz's way**, and it is the tail on the churn shape: p99.9 2.7–3.2 ms against nilo's 10.8–13.4 ms. zzz serves that at 40% of nilo's throughput, so it is not a like-for-like tail, but it is the shape where tardy's model differs most from nilo's: tardy's accept task *becomes* the connection and spawns its replacement acceptor, so the first request is served on the thread whose ring completed the accept, with no handoff on its critical path. nilo's acceptor deals the connection to another executor (ADR 0273), which is the upstream row on a spawn homed on the calling executor.
+
+### What tardy does that zio does not: a plain `RECV` and `SEND`
+
+tardy prepares a socket read as `IORING_OP_RECV` and a write as `IORING_OP_SEND`. zio prepares every one as `RECVMSG` / `SENDMSG`, which has the kernel copy a `msghdr` in and import an iovec per operation. Nearly every read and flush nilo makes is one buffer: `readVec` fills the reader's free tail, and `fillBuf` drops empty slices, so a buffered response goes out as a single iovec. A scratch copy of zio v0.18.0 with only those two SQEs changed (one iovec takes `prep_recv` / `prep_send`, anything else keeps the `msg` form; nilo untouched, both builds from a path dependency so the control is built the same way), four interleaved pairs a shape, same split and harness as above:
+
+| shape | CPU a request, recvmsg / sendmsg | CPU a request, recv / send | pairs |
+|---|---|---|---|
+| keep-alive, 512 conns | 2.35 / 2.35 / 2.37 / 2.37 µs | 2.29 / 2.29 / 2.29 / 2.30 µs | 4 of 4 lower, **−2.9%**, throughput +1.6 to +2.0% each pair |
+| keep-alive, 64 conns | 2.50 / 2.51 / 2.47 / 2.44 µs | 2.40 / 2.36 / 2.40 / 2.36 µs | 4 of 4 lower, **−4.0%** |
+| 256 conns, `-p 16` | 0.58 / 0.61 / 0.61 / 0.60 µs | 0.55 / 0.59 / 0.55 / 0.62 µs | sign changes in pair 4: **unchanged** |
+
+Eight pairs of eight the same sign on the two keep-alive shapes, and the ranges do not overlap, so **3–4% of CPU a request** is a result rather than noise. The pipelined row is what the mechanism predicts: sixteen answers share one `send`, so a per-syscall saving is diluted sixteen times. Memory, allocations and binary size do not move (the patched `nilo-hello` is 224 bytes larger, all of it inside zio). It is zio's code, not nilo's: nilo cannot reach an SQE from the Engine, and ADR 0002 is the reason it should not. **Not pursued** (2026-09-23); it is written down so the next person starts from the number rather than re-running it.
+
+### Can it be pushed further
+
+Ranked, and none of it is in zzz's HTTP layer, which has nothing nilo's does not already do more cheaply:
+
+1. **The opcode above, upstream.** Measured, 3–4% on keep-alive, zero cost on every other axis. Not pursued, and no upstream issue was filed.
+2. **An acceptor that becomes its connection**, tardy's shape, inside the Engine and needing nothing upstream: after `accept`, spawn the replacement acceptor (round-robin, as now) and serve the connection in the accepting fiber. It moves the handoff off the first request's critical path rather than removing it, so the thing to measure is the churn row's p50 and tail, not CPU. Two hazards are known before writing it: the acceptors' group is cancelled before the drain, so a connection living in it would be cut off rather than drained (ADR 0273's shutdown order), and the frame under a plain connection's park would grow by the acceptor's, which is under 300 bytes from a page (ADR 0288). `gcannon -r 10`, `bench/mem.py` and `bench/shutdown.py` are the three runs it would need.
+3. **`IORING_RECVSEND_POLL_FIRST` on the read that follows a flush**, where a keep-alive client almost never has its next request already sent, which would skip the inline attempt that returns `EAGAIN`. Also zio's, not measured.
+
+Not taken, each with its number above: a pool of per-connection buffers allocated at startup (zzz's "provisions", 787 MB at 512 connections against nilo's 15 MB, which gives pages back when idle), headers in a hash map, and one `send` per pipelined response.
+
+```
+git clone https://github.com/tardy-org/zzz && git -C zzz checkout v0.3.2   # .multi = 8 in examples/basic
+zig build basic -Doptimize=ReleaseFast
+zig build install -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu -Dcpu=native
+taskset -c 0-3,8-11 ./zig-out/bin/nilo-hello &
+taskset -c 4-7,12-15 gcannon http://127.0.0.1:8787/health -t 8 -d 8 -c 512   # -r 10, -c 256 -p 16
+```
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings
