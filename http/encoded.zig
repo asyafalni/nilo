@@ -15,7 +15,7 @@
 //! The other thing a gzip stream carries is its own answer to "how big":
 //! the last four bytes are the uncompressed length, modulo 2³². Reading
 //! them first is what makes the allocation exact — one `alloc` of the
-//! announced size, no growth loop — and what makes the ceiling a check
+//! announced size and a byte, no growth loop — and what makes the ceiling a check
 //! against a number rather than a limit hit halfway through inflating.
 //! A stream that lies about that number in either direction fails to
 //! decode, and is refused as one that could not be read.
@@ -61,7 +61,14 @@ pub fn inflate(arena: std.mem.Allocator, raw: []const u8, limit: usize) Error![]
     if (announced > raw.len * 1032) return error.BadEncodedBody;
     if (announced > limit) return error.BodyTooLarge;
 
-    const out = try arena.alloc(u8, announced);
+    // One byte past the announced size. The decoder asks the writer for a
+    // byte of room before it reads each block, whether or not the block
+    // holds anything, so a stream ending in an empty block (a sync flush and
+    // then a close, which is how Go's gzip writers end one, the
+    // OpenTelemetry Collector's among them) failed against a buffer that was
+    // already exactly full. The byte is never kept: a stream that writes
+    // into it produced more than it announced, and is refused below.
+    const out = try arena.alloc(u8, @as(usize, announced) + 1);
     var in: std.Io.Reader = .fixed(raw);
     // No window: the destination is the history (see the header).
     var inflating: std.compress.flate.Decompress = .init(&in, .gzip, &.{});
@@ -72,7 +79,7 @@ pub fn inflate(arena: std.mem.Allocator, raw: []const u8, limit: usize) Error![]
     // `ReadFailed`. Both are the stream's fault and one answer.
     _ = inflating.reader.streamRemaining(&w) catch return error.BadEncodedBody;
     if (w.end != announced) return error.BadEncodedBody;
-    return out;
+    return out[0..announced];
 }
 
 const testing = std.testing;
@@ -103,6 +110,20 @@ test "a gzipped body comes back as the bytes that were compressed, in one alloca
     defer arena.deinit();
     const out = try inflate(arena.allocator(), packed_bytes, 1 << 20);
     try testing.expectEqualStrings(text, out);
+}
+
+test "a stream that ends in an empty block, the way a flushed Go writer ends one, inflates whole" {
+    // "flushed, then closed", gzipped with a sync flush before the close:
+    // the data, `00 00 ff ff` (an empty stored block), then `03 00` (an empty
+    // final block). The last is the one that found no room.
+    const flushed = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x4a, 0xcb, 0x29, 0x2d, 0xce, 0x48,
+        0x4d, 0xd1, 0x51, 0x28, 0xc9, 0x48, 0xcd, 0x53, 0x48, 0xce, 0xc9, 0x2f, 0x4e, 0x4d, 0x01, 0x00,
+        0x00, 0x00, 0xff, 0xff, 0x03, 0x00, 0x6e, 0x1a, 0x82, 0x8f, 0x14, 0x00, 0x00, 0x00,
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("flushed, then closed", try inflate(arena.allocator(), &flushed, 1024));
 }
 
 test "an empty body gzips to a frame and inflates to nothing" {
