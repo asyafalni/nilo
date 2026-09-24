@@ -1,0 +1,8 @@
+{
+  "name": "grpc-spike-js-client",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@grpc/grpc-js": "1.14.5"
+  }
+}

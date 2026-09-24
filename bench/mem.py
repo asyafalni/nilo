@@ -17,6 +17,7 @@ compounds does not, and no total will say which you have.
     python3 bench/mem.py --port 8789 --path /call --steps 200,500,1000
     python3 bench/mem.py --port 8790 --path /stream --hold
     python3 bench/mem.py --port 8787 --path /health --tls
+    python3 bench/mem.py --port 50051 --path /pkg.Service/Method --grpc
 
 The server is found by port rather than named, so this works against any of
 them — `nilo-hello`, `nilo-bench-sql-server`, `nilo-bench-fetch-server`, or
@@ -49,6 +50,63 @@ def rss_kb(pid):
             if line.startswith("VmRSS:"):
                 return int(line.split()[1])
     raise SystemExit(f"process {pid} went away")
+
+
+def frame(kind, flags, stream, payload=b""):
+    return len(payload).to_bytes(3, "big") + bytes([kind, flags]) + stream.to_bytes(4, "big") + payload
+
+
+def literal(name, value):
+    """An HPACK literal, never indexed and not Huffman-coded: the one shape
+    that needs no table on either side."""
+    def string(b):
+        assert len(b) < 127
+        return bytes([len(b)]) + b
+    return b"\x10" + string(name.encode()) + string(value.encode())
+
+
+def open_grpc(host, port, path, timeout):
+    """One h2c connection with one unary call already answered on it
+    (ADR 0297): the preface, SETTINGS, a call with an empty message, and
+    every frame read until that call's trailers. What is left is a gRPC
+    connection between calls, which is what a client's channel is nearly
+    all of its life."""
+    s = socket.create_connection((host, port), timeout=timeout)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    block = (
+        b"\x83\x86"  # :method POST, :scheme http
+        + literal(":path", path)
+        + literal(":authority", host)
+        + literal("content-type", "application/grpc")
+        + literal("te", "trailers")
+    )
+    s.sendall(
+        b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+        + frame(0x4, 0, 0)
+        + frame(0x1, 0x4, 1, block)
+        + frame(0x0, 0x1, 1, b"\x00\x00\x00\x00\x00")
+    )
+    buf = b""
+    while True:
+        while len(buf) < 9:
+            chunk = s.recv(65536)
+            if not chunk:
+                raise SystemExit("the server closed the connection")
+            buf += chunk
+        length = int.from_bytes(buf[0:3], "big")
+        while len(buf) < 9 + length:
+            chunk = s.recv(65536)
+            if not chunk:
+                raise SystemExit("the server closed the connection")
+            buf += chunk
+        kind, flags = buf[3], buf[4]
+        buf = buf[9 + length :]
+        if kind == 0x4 and not flags & 0x1:
+            s.sendall(frame(0x4, 0x1, 0))
+        elif kind == 0x7:
+            raise SystemExit("the server sent GOAWAY")
+        elif kind == 0x1 and flags & 0x1:
+            return s
 
 
 def open_one(host, port, path, timeout, hold=False, tls=None):
@@ -139,6 +197,11 @@ def main():
     )
     p.add_argument("--timeout", type=float, default=10.0)
     p.add_argument(
+        "--grpc",
+        action="store_true",
+        help="speak h2c with prior knowledge and make one unary call at --path (ADR 0297)",
+    )
+    p.add_argument(
         "--tls",
         action="store_true",
         help="connect through TLS 1.3, against `zig build bench-tls-server -Dtls`",
@@ -165,7 +228,9 @@ def main():
         for want in steps:
             while len(held) < want:
                 held.append(
-                    open_one(args.host, args.port, args.path, args.timeout, args.hold, tls_ctx)
+                    open_grpc(args.host, args.port, args.path, args.timeout)
+                    if args.grpc
+                    else open_one(args.host, args.port, args.path, args.timeout, args.hold, tls_ctx)
                 )
             time.sleep(args.settle)
             now = rss_kb(pid)

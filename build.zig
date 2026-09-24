@@ -2158,6 +2158,7 @@ const Snippets = struct {
         .{ .path = "docs/guide/metrics.md" },
         .{ .path = "docs/guide/middleware.md" },
         .{ .path = "docs/guide/responses.md" },
+        .{ .path = "docs/guide/grpc.md" },
         // One page per module in the bottom layers, each against the shared
         // world: its `Carts`, its `client` and `run`, its `Doc`.
         .{ .path = "docs/guide/id.md" },
@@ -2781,6 +2782,10 @@ fn s3For(
 /// `wireTls` below, which every instance of the http module goes through.
 var want_tls: bool = false;
 var in_repo: bool = false;
+/// `-Dgrpc` (ADR 0297). No dependency behind it, unlike `-Dtls`: what it
+/// keeps out of a build that did not ask is the code, the binary size ADR 0018
+/// counts, rather than a fetch.
+var want_grpc: bool = false;
 
 /// What every instance of the http module is given so that
 /// `http/engine/zio.zig` can ask `@import("nilo_build").tls` and, when the
@@ -2793,9 +2798,12 @@ var in_repo: bool = false;
 /// carries no import named `tls`, so a `@import("tls")` reached from it is a
 /// compile error rather than a link, and the comptime `if` in the Engine is
 /// what keeps it from being reached.
-fn wireTls(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, mode: std.builtin.OptimizeMode, on: bool) void {
+fn wireTls(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, mode: std.builtin.OptimizeMode, on: bool, grpc: bool) void {
     const opts = b.addOptions();
     opts.addOption(bool, "tls", on);
+    // gRPC rides the same options module. It has no library to fetch, so
+    // there is nothing to wire beyond the flag (ADR 0297).
+    opts.addOption(bool, "grpc", grpc);
     module.addImport("nilo_build", opts.createModule());
     if (on) {
         if (b.lazyDependency("tls", .{ .target = target, .optimize = mode })) |dep| {
@@ -2828,7 +2836,7 @@ fn httpFor(
             .{ .name = "nilo_pw", .module = pwFor(b, target, mode) },
         },
     });
-    wireTls(b, module, target, mode, want_tls);
+    wireTls(b, module, target, mode, want_tls, want_grpc);
     return module;
 }
 
@@ -3259,6 +3267,11 @@ pub fn build(b: *std.Build) void {
         "Build the TLS listener into nilo_http and fetch the library it needs (ADR 0288). Off until a dependent passes `.tls = true`",
     ) orelse false;
     in_repo = b.pkg_hash.len == 0;
+    want_grpc = b.option(
+        bool,
+        "grpc",
+        "Build the gRPC listener into nilo_http: unary calls over h2c (ADR 0297). Off until a dependent passes `.grpc = true`",
+    ) orelse false;
 
     // The bottom layer: what every other one agrees about, and nothing else
     // (ADR 0041). It names no Engine and does no IO, which is why it is the
@@ -3401,7 +3414,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "nilo_pw", .module = nilo_pw },
         },
     });
-    wireTls(b, nilo_http, target, optimize, want_tls);
+    wireTls(b, nilo_http, target, optimize, want_tls, want_grpc);
 
     // The SQL module: a second module beside the library rather than inside
     // it (ADR 0039). It lives in `sql/` rather than under `src/` so that the
@@ -3513,7 +3526,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_fuzzer = b.addRunArtifact(fuzzer);
     if (b.args) |args| run_fuzzer.addArgs(args);
-    b.step("fuzz", "Throw generated requests at the parser").dependOn(&run_fuzzer.step);
+    b.step("fuzz", "Throw generated requests at the parser, or with --frames connections at the gRPC listener").dependOn(&run_fuzzer.step);
 
     // `test` is the loop: Debug, plus the refusals, which are cheap. `test-all`
     // is everything `test` does and the same suite again in ReleaseSafe. Both
@@ -3997,7 +4010,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "nilo_core", .module = bench_core },
         },
     });
-    wireTls(b, bench_http, target, .ReleaseFast, want_tls);
+    wireTls(b, bench_http, target, .ReleaseFast, want_tls, want_grpc);
     const bench_nilo_sql = b.createModule(.{
         .root_source_file = b.path("sql/sql.zig"),
         .target = target,
@@ -4404,7 +4417,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "nilo_core", .module = core_mod },
             },
         });
-        wireTls(b, framework, target, mode, want_tls);
+        wireTls(b, framework, target, mode, want_tls, want_grpc);
 
         // The test build is the one place this module names an App, and it
         // gets both: `nilo_core` for the module itself, `nilo` for the tests
@@ -4555,7 +4568,7 @@ pub fn build(b: *std.Build) void {
         // feature that is not tested (ADR 0033). In-repo only: a dependent
         // running its own tests against nilo is not made to fetch the
         // library for a listener it never asked for.
-        wireTls(b, lib_tests, target, mode, want_tls or in_repo);
+        wireTls(b, lib_tests, target, mode, want_tls or in_repo, want_grpc or in_repo);
 
         const library = b.createModule(.{
             .root_source_file = b.path("http/http.zig"),
@@ -4567,7 +4580,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "nilo_pw", .module = pw_mod },
             },
         });
-        wireTls(b, library, target, mode, want_tls);
+        wireTls(b, library, target, mode, want_tls, want_grpc);
 
         const bench_tests = b.createModule(.{
             .root_source_file = b.path("bench/main.zig"),

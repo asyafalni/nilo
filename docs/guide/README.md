@@ -57,25 +57,27 @@ const nilo = @import("nilo_http");
 9. [Streaming](./streaming.md) — writing an answer whose length nobody knows
    yet, and server-sent events.
 10. [WebSocket](./websocket.md) — a handler that doesn't return for a while.
+11. [gRPC](./grpc.md) — a method as a route, on a listener of its own, in a
+    build that asks for it.
 
 ## Building an application
 
-11. [Middleware](./middleware.md) — the onion, and resolved values for the
+12. [Middleware](./middleware.md) — the onion, and resolved values for the
     signed-in user.
-12. [Services](./services.md) — shared state across threads, locks, and the rule
+13. [Services](./services.md) — shared state across threads, locks, and the rule
     about blocking calls.
-13. [Static files](./static-files.md) — a directory held in memory, with ETags
+14. [Static files](./static-files.md) — a directory held in memory, with ETags
     and range requests, and a file too big to hold opened per request.
-14. [Errors](./errors.md) — failing a request from anywhere, what a client is
+15. [Errors](./errors.md) — failing a request from anywhere, what a client is
     told, and request ids for tying a failure to its log line.
-15. [Settings](./config.md) — `nilo_config`: the environment read into a struct
+16. [Settings](./config.md) — `nilo_config`: the environment read into a struct
     of yours before anything opens, every bad one named at once, and the whole
     of a `main` that reads a `.env` on the way past.
-16. [Work that is not a request](./background.md) — a summary written every
+17. [Work that is not a request](./background.md) — a summary written every
     minute or a cache warmed at startup: a fiber of your own, owned by the
     server, and the shutdown that reaches it. For work that is a row rather
     than a loop, `nilo_job` is below.
-17. [Answering once](./idempotency.md) — the `Idempotency-Key` header as a
+18. [Answering once](./idempotency.md) — the `Idempotency-Key` header as a
     typed argument: a retry gets the kept answer back, the order is placed
     once, and the two refusals that keep a key honest.
 
@@ -86,7 +88,7 @@ what the module is for, the whole of it in one example, every option with
 its default, what it answers instead of a value, what it costs, and what it
 will not do.
 
-18. [Talking to a database](./sql/README.md) — `nilo_sql`: your struct is the
+19. [Talking to a database](./sql/README.md) — `nilo_sql`: your struct is the
     table, the query is a constant, and a misspelled column is a build error.
     Postgres and SQLite, written the same way. Nine pages, in order:
     [tables](./sql/tables.md), [reading](./sql/reading.md),
@@ -94,35 +96,35 @@ will not do.
     [past one table](./sql/raw.md), [SQLite](./sql/sqlite.md),
     [making the tables](./sql/migrations.md) and
     [running it](./sql/running.md).
-19. [Calling somebody else's API](./fetch.md) — `nilo_fetch`: one client for
+20. [Calling somebody else's API](./fetch.md) — `nilo_fetch`: one client for
     the whole program, a deadline on every call, a body that comes back in the
     request's own memory, and an `Exchange` for a body too big to hold.
-20. [Object storage](./s3.md) — `nilo_s3`: a bucket is a type, a key is not.
+21. [Object storage](./s3.md) — `nilo_s3`: a bucket is a type, a key is not.
     Reading, writing, streaming an object through, and a presigned URL or
     POST form for a browser that talks to the bucket itself.
-21. [Work that runs later](./jobs.md) — `nilo_job`: a job is a struct, the
+22. [Work that runs later](./jobs.md) — `nilo_job`: a job is a struct, the
     queue is a table in the database you already have, `pushIn(&tx, …)`
     commits with your rows, and a schedule declares what an overlap and a
     missed tick mean or it does not compile.
-22. [A cache in this process](./cache.md) — `nilo_cache`: a typed keyspace
+23. [A cache in this process](./cache.md) — `nilo_cache`: a typed keyspace
     over one budget of memory, no pointer allowed in a value, a lookup that
     takes no lock, and a `stats()` that says why it is not hitting.
-23. [Checking somebody else's token](./jwt.md) — `nilo_jwt`: a JWT an identity
+24. [Checking somebody else's token](./jwt.md) — `nilo_jwt`: a JWT an identity
     provider signed, verified in the order that is safe and read into a struct
     of yours; the signed-in user as a resolved value; what a key rotation
     looks like from here.
-24. [Identifiers](./id.md) — `nilo_id`: a v7 for a key that sorts by when it
+25. [Identifiers](./id.md) — `nilo_id`: a v7 for a key that sorts by when it
     was made, what it does and does not order, and why the randomness is an
     argument.
 
 ## Shipping it
 
-25. [Testing](./testing.md) — handlers as ordinary functions, and the test
+26. [Testing](./testing.md) — handlers as ordinary functions, and the test
     client for the ones that write their answer.
-26. [OpenAPI](./openapi.md) — an API document written from the signatures.
-27. [Metrics](./metrics.md) — how many requests, at what statuses, how long;
+27. [OpenAPI](./openapi.md) — an API document written from the signatures.
+28. [Metrics](./metrics.md) — how many requests, at what statuses, how long;
     a Prometheus page in one call, and a counter of your own on it.
-28. [Deploying](./deploying.md) — startup errors, panics, graceful shutdown,
+29. [Deploying](./deploying.md) — startup errors, panics, graceful shutdown,
     a health page the balancer can trust, tuning, and what isn't here yet.
 
 ## Also

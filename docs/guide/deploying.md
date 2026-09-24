@@ -490,11 +490,7 @@ request that arrives that way has no client address of its own, so
 nothing remote can open a unix socket
 ([ADR 0130](../adr/0130-a-path-is-an-address-to-listen-on.md)).
 
-Two things go with this decision and are worth knowing before you need them:
-**HTTP/2 is not available** — browsers only speak it over TLS, negotiated during
-the handshake, and the listener below offers only `http/1.1` — and therefore
-**nilo cannot be a gRPC server**, since gRPC is HTTP/2. Neither follows from
-"no TLS" on its own, which is why both are here.
+One thing goes with this decision and is worth knowing before you need it: **HTTP/2 is not available for your routes.** Browsers only speak it over TLS, negotiated during the handshake, and the listener below offers only `http/1.1`. **gRPC is the exception**, because it runs over HTTP/2 without TLS: a build that asks for it serves unary calls on a listener of its own ([gRPC](./grpc.md)).
 
 ### TLS without a proxy
 

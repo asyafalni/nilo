@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const bulkhead = @import("bulkhead.zig");
+const grpc = @import("grpc.zig");
 const http1 = @import("http1.zig");
 const router = @import("router.zig");
 const ctx_mod = @import("ctx.zig");
@@ -1219,6 +1220,7 @@ pub const App = struct {
             serverStarting,
             serverStopping,
             serve.handleConnection,
+            serveGrpc,
         );
     }
 
@@ -1484,6 +1486,53 @@ pub const App = struct {
     /// connection loop wants. A handler that upgrades has its socket loop run
     /// here, on this frame — which is a page deeper than the connection loop
     /// would run it, and does not matter to anything that calls this.
+    /// What a listener with `.grpc = true` runs for each connection, in place
+    /// of `serve.handleConnection` (ADR 0297). Reached only by an Engine
+    /// built with `-Dgrpc`, so a build without it analyses none of `grpc.zig`.
+    fn serveGrpc(
+        self: *App,
+        in: *std.Io.Reader,
+        out: *std.Io.Writer,
+        deadlines: bulkhead.Deadlines,
+        waker: bulkhead.Waker,
+        peer: bulkhead.Peer,
+    ) void {
+        grpc.serveConnection(self.grpcHost(), in, out, deadlines, waker, peer);
+    }
+
+    /// The App as a gRPC connection sees it (ADR 0297). `grpc.zig` is outside
+    /// this core and cannot name `App`, so it is handed the few things it
+    /// uses instead: the router's answer to one path, and `handleRequest`.
+    pub fn grpcHost(self: *App) grpc.Host {
+        const Adapter = struct {
+            fn routes(ptr: *anyopaque, path: []const u8) bool {
+                const app: *App = @ptrCast(@alignCast(ptr));
+                return app.router.match(.POST, path) != null;
+            }
+            fn handle(
+                ptr: *anyopaque,
+                arena: std.mem.Allocator,
+                lifetime: *str_mod.Lifetime,
+                in_flight: *fail.InFlight,
+                in: *std.Io.Reader,
+                out: *std.Io.Writer,
+                peer: bulkhead.Peer,
+                until_ns: u64,
+            ) void {
+                const app: *App = @ptrCast(@alignCast(ptr));
+                _ = app.handleRequest(arena, lifetime, in_flight, in, out, .{ .until_ns = until_ns }, .{}, peer);
+            }
+        };
+        return .{
+            .ptr = self,
+            .gpa = self.gpa,
+            .stop = &self.stop,
+            .max_body = self.limits.max_body,
+            .routes = Adapter.routes,
+            .handle = Adapter.handle,
+        };
+    }
+
     pub fn handleRequest(
         self: *App,
         arena: std.mem.Allocator,

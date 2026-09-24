@@ -78,6 +78,7 @@ Measured stripped, `ReleaseFast`, on the examples in this repository.
 | A TLS listener the build has to ask for ([ADR 0288](./0288-tls-is-an-option-a-build-asks-for.md)); the build that asks pays +573,152 B and +574,320 B on top | +2,872 B | +2,720 B |
 | A server answering on more than one address ([ADR 0289](./0289-a-server-answers-on-more-than-one-address.md)); the `-Dtls` build pays +1,872 B, where a listener's certificate is real | +256 B | +256 B |
 | An RSA key signed through its CRT form, in the pinned tls.zig ([the run](../../bench/result/http.md#what-an-rsa-certificate-costs-a-handshake)); the `-Dtls` build pays +26,768 B and +26,832 B, a second `ff.Modulus` instantiation | +0 | +0 |
+| Unary gRPC over h2c, and over TLS by ALPN, on a listener the build has to ask for ([ADR 0297](./0297-grpc-is-served-over-h2c-behind-a-flag.md)); the `-Dgrpc` build pays +115,720 B and +52,432 B on top | +8 B | +112 B |
 
 `nilo_fetch` is +0 on both examples because neither imports it, and that is the
 whole of the row rather than an accident: a module nothing names is never

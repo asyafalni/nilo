@@ -70,6 +70,8 @@ holds the feature; a dependent's tests are not made to fetch it.
 caches and fails on anything but zio landing. Not on `test`, for the reason
 `smoke-tls` is not: it needs the internet.
 
+**The gRPC listener is the third flag**, `.grpc = true` (`-Dgrpc` here), and it fetches nothing: HTTP/2 and HPACK are nilo's own, in `http/h2.zig`, `http/hpack.zig` and `http/grpc.zig`, and the Engine names the gRPC connection loop only under a comptime `if` on `@import("nilo_build").grpc` (ADR 0297). The http test root is built with it whatever the flag says, as with TLS. `grpc.zig` sits outside the App's core and reaches it through `grpc.Host`, which `App.grpcHost` fills in: a call becomes an in-memory HTTP/1.1 `POST` handed to `App.handleRequest`, so a gRPC method is an ordinary route.
+
 Three files carry context this one deliberately does not repeat:
 
 - **`CONTEXT.md`** — the project's vocabulary, and the words it refuses to use
@@ -142,6 +144,7 @@ mkdocs serve           # the guide as the website, live; `mkdocs build` is the s
 zig build smoke-tls -Dnetwork   # a real HTTPS endpoint — NOT part of test
 zig build examples     # build all ten examples
 zig build fuzz -- --iterations 1000000 --seed 0x…   # generated requests at the parser
+zig build fuzz -- --frames --iterations 250000       # generated HTTP/2 connections at the gRPC listener
 zig build bench-cache  # what a cache operation costs, and what an entry weighs
 zig build bench-cache-hitrate  # what fraction of lookups it answers, against the best it could
 zig build bench-compress  # what gzipping a JSON answer costs at each level, in µs and bytes
@@ -604,8 +607,9 @@ while writing, not later.
 
 ## Refused on the record
 
-Templates, HTTP/2 and gRPC are not gaps — they are decisions (README "What it
+Templates and HTTP/2 for ordinary routes are not gaps — they are decisions (README "What it
 won't do", ADR 0028). Do not add them; propose a change to the ADR instead.
+gRPC was argued and moved the same way, behind `-Dgrpc`, unary only, on a listener of its own (ADR 0297); streaming and h1 plus h2c on one port wait for a caller in the roadmap.
 TLS is the one that was argued and moved, and the shape it moved into is the
 precedent: an option behind a build flag, the default build unchanged to the
 byte on the memory axis and 2.8 KB on the size one, and every number on the

@@ -1,0 +1,384 @@
+//! The tests of a gRPC listener that need a server actually running
+//! ([ADR 0297](../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+//!
+//! `grpc.zig`'s own tests drive a connection through in-memory buffers, and
+//! there every call runs inline: `bulkhead.spawn` answers `error.NoServer`
+//! outside an Engine. What only a running server reaches is the half the
+//! design rests on, a call on a fiber of its own handing its answer back to
+//! the connection's fiber through the waker, and two calls on one connection
+//! in flight at once. That is what these are for.
+//!
+//! The gRPC listener is the second one, on a unix socket beside a plain port
+//! the kernel chose. `boundPort()` answers for the first listener only, and a
+//! server that has answered it has bound every listener, so the socket file is
+//! there to connect to by then. The client is frames written by hand over
+//! std's own socket, with no zio on this side.
+//!
+//! Compiled only into a build with gRPC in it, the way `tls_live.zig` is.
+
+const std = @import("std");
+const nilo = @import("http.zig");
+const h2 = @import("h2.zig");
+const hpack = @import("hpack.zig");
+
+const testing = std.testing;
+
+fn hush() void {
+    std.testing.log_level = .err;
+}
+
+fn echo(c: *nilo.Ctx) anyerror!void {
+    const body = try c.body();
+    try c.send(200, "application/grpc", body.view());
+}
+
+/// Held long enough that a second call on the same connection arrives while
+/// this one is still running, which is what shows the two are not served one
+/// after the other.
+fn slowEcho(c: *nilo.Ctx) anyerror!void {
+    try nilo.sleep(50);
+    return echo(c);
+}
+
+const Serving = struct {
+    app: *nilo.App,
+    path: []const u8,
+    write_timeout_ms: u32 = 30_000,
+    bound: std.atomic.Value(bool) = .init(true),
+
+    fn run(self: *Serving) void {
+        var buf: [std.Io.net.UnixAddress.max_len + 8]u8 = undefined;
+        const beside = std.fmt.bufPrint(&buf, "unix:{s}", .{self.path}) catch unreachable;
+        self.app.tryListen(.{
+            .port = 0,
+            .threads = 2,
+            .stop_on_signal = false,
+            .write_timeout_ms = self.write_timeout_ms,
+            .also = &.{.{ .address = beside, .grpc = true }},
+        }) catch {
+            self.bound.store(false, .release);
+        };
+    }
+
+    /// Bounded, for the reason every wait in `live.zig` is.
+    fn waitUntilUp(self: *const Serving, io: std.Io) !void {
+        for (0..300) |_| {
+            if (self.app.boundPort() != null) return;
+            if (!self.bound.load(.acquire)) return error.ServerNeverCameUp;
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+        }
+        return error.ServerNeverCameUp;
+    }
+};
+
+const SocketDir = struct {
+    tmp: std.testing.TmpDir,
+    path: []u8,
+
+    fn init(gpa: std.mem.Allocator, name: []const u8) !SocketDir {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        return .{
+            .tmp = tmp,
+            .path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name }),
+        };
+    }
+
+    fn deinit(self: *SocketDir, gpa: std.mem.Allocator) void {
+        gpa.free(self.path);
+        self.tmp.cleanup();
+    }
+};
+
+fn writeCall(w: *std.Io.Writer, stream: u31, path: []const u8, message: []const u8) !void {
+    var block_buf: [256]u8 = undefined;
+    var block: std.Io.Writer = .fixed(&block_buf);
+    try hpack.writeInt(&block, 0x80, 7, 3); // :method POST
+    try hpack.writeInt(&block, 0x80, 7, 6); // :scheme http
+    try hpack.writeLiteral(&block, ":path", path);
+    try hpack.writeLiteral(&block, ":authority", "localhost");
+    try hpack.writeLiteral(&block, "content-type", "application/grpc");
+    try hpack.writeLiteral(&block, "te", "trailers");
+    try h2.writeHeaderBlock(w, stream, block.buffered(), false, h2.default_max_frame);
+
+    try h2.writeHeader(w, 5 + message.len, .data, h2.Flags.end_stream, stream);
+    var prefix: [5]u8 = .{ 0, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, prefix[1..5], @intCast(message.len), .big);
+    try w.writeAll(&prefix);
+    try w.writeAll(message);
+}
+
+/// What one call came back with.
+const Call = struct {
+    message: std.ArrayList(u8) = .empty,
+    status: ?[]const u8 = null,
+    /// Where in the connection's frames this call's trailers arrived.
+    finished_at: usize = 0,
+};
+
+/// Read frames until every stream in `calls` has its trailers, decoding
+/// headers as they come. The socket has a receive timeout on it, so a server
+/// that never answers fails here rather than leaving the suite waiting; std's
+/// reader takes the `EAGAIN` that timeout produces for a programmer's mistake
+/// and panics, so the failure is a crashed test rather than a failed one.
+fn readAnswers(a: std.mem.Allocator, r: *std.Io.Reader, w: *std.Io.Writer, calls: []Call) !void {
+    var decoder = hpack.Decoder.init(a);
+    defer decoder.deinit();
+    var frames: usize = 0;
+    var open = calls.len;
+    while (open > 0) {
+        const head = h2.Header.parse(try r.takeArray(h2.header_len));
+        const payload = try r.take(head.len);
+        frames += 1;
+        switch (head.type) {
+            .settings => if (!head.has(h2.Flags.ack)) {
+                try h2.writeSettingsAck(w);
+                try w.flush();
+            },
+            .data => {
+                const call = &calls[(head.stream - 1) / 2];
+                try call.message.appendSlice(a, payload);
+            },
+            .headers => {
+                var fields: std.ArrayList(hpack.Field) = .empty;
+                _ = try decoder.decode(payload, a, &fields, 1 << 16);
+                const call = &calls[(head.stream - 1) / 2];
+                for (fields.items) |f| if (std.mem.eql(u8, f.name, "grpc-status")) {
+                    call.status = f.value;
+                };
+                if (head.has(h2.Flags.end_stream)) {
+                    call.finished_at = frames;
+                    open -= 1;
+                }
+            },
+            .goaway => return error.SentAway,
+            .rst_stream => return error.Reset,
+            else => {},
+        }
+    }
+}
+
+fn connect(io: std.Io, path: []const u8) !std.Io.net.Stream {
+    const address = try std.Io.net.UnixAddress.init(path);
+    const stream = try address.connect(io);
+    const limit: std.posix.timeval = .{ .sec = 5, .usec = 0 };
+    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit));
+    return stream;
+}
+
+test "a gRPC listener answers a unary call on a running server, beside a plain port" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var where = try SocketDir.init(gpa, "grpc.sock");
+    defer where.deinit(gpa);
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.post("/test.Echo/Say", echo);
+
+    var serving: Serving = .{ .app = &app, .path = where.path };
+    const thread = try std.Thread.spawn(.{}, Serving.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    try serving.waitUntilUp(io);
+
+    var stream = try connect(io, where.path);
+    defer stream.close(io);
+    var out_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    var in_buf: [32 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+
+    try writer.interface.writeAll(h2.preface);
+    try h2.writeSettings(&writer.interface, &.{});
+    try writeCall(&writer.interface, 1, "/test.Echo/Say", "over a real socket");
+    try writer.interface.flush();
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var calls: [1]Call = .{.{}};
+    try readAnswers(arena.allocator(), &reader.interface, &writer.interface, &calls);
+    try testing.expectEqualStrings("0", calls[0].status.?);
+    try testing.expectEqualStrings("over a real socket", calls[0].message.items[5..]);
+}
+
+test "two calls on one connection run at once, and the quick one is not held behind the slow one" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var where = try SocketDir.init(gpa, "grpc-two.sock");
+    defer where.deinit(gpa);
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.post("/test.Echo/Slow", slowEcho);
+    try app.post("/test.Echo/Say", echo);
+
+    var serving: Serving = .{ .app = &app, .path = where.path };
+    const thread = try std.Thread.spawn(.{}, Serving.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    try serving.waitUntilUp(io);
+
+    var stream = try connect(io, where.path);
+    defer stream.close(io);
+    var out_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    var in_buf: [32 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+
+    try writer.interface.writeAll(h2.preface);
+    try h2.writeSettings(&writer.interface, &.{});
+    // The slow one first, so served in order the quick one would finish last.
+    try writeCall(&writer.interface, 1, "/test.Echo/Slow", "slow");
+    try writeCall(&writer.interface, 3, "/test.Echo/Say", "quick");
+    try writer.interface.flush();
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var calls: [2]Call = .{ .{}, .{} };
+    try readAnswers(arena.allocator(), &reader.interface, &writer.interface, &calls);
+    try testing.expectEqualStrings("0", calls[0].status.?);
+    try testing.expectEqualStrings("0", calls[1].status.?);
+    try testing.expectEqualStrings("slow", calls[0].message.items[5..]);
+    try testing.expectEqualStrings("quick", calls[1].message.items[5..]);
+    try testing.expect(calls[1].finished_at < calls[0].finished_at);
+}
+
+/// How many handlers are running right now, and the most there have been.
+var inside: std.atomic.Value(u32) = .init(0);
+var most_inside: std.atomic.Value(u32) = .init(0);
+
+fn countedSlow(c: *nilo.Ctx) anyerror!void {
+    const now = inside.fetchAdd(1, .acq_rel) + 1;
+    _ = most_inside.fetchMax(now, .acq_rel);
+    defer _ = inside.fetchSub(1, .acq_rel);
+    try nilo.sleep(100);
+    try c.send(200, "application/grpc", "");
+}
+
+test "rapid reset: a call the client cancels still counts against the cap until its handler returns" {
+    // CVE-2023-44487. A client opens a call and resets it at once, over and
+    // over: the stream is gone from the client's count, and a server that
+    // forgets it as well has started a handler for every one of them.
+    hush();
+    const gpa = std.heap.smp_allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var where = try SocketDir.init(gpa, "grpc-reset.sock");
+    defer where.deinit(gpa);
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.post("/test.Echo/Slow", countedSlow);
+
+    var serving: Serving = .{ .app = &app, .path = where.path };
+    const thread = try std.Thread.spawn(.{}, Serving.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    try serving.waitUntilUp(io);
+
+    var stream = try connect(io, where.path);
+    defer stream.close(io);
+    var out_buf: [64 * 1024]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    var in_buf: [64 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+
+    const nilo_grpc = @import("grpc.zig");
+    const burst = nilo_grpc.max_streams + 50;
+    try writer.interface.writeAll(h2.preface);
+    try h2.writeSettings(&writer.interface, &.{});
+    var id: u31 = 1;
+    for (0..burst) |_| {
+        try writeCall(&writer.interface, id, "/test.Echo/Slow", "");
+        try h2.writeRstStream(&writer.interface, id, .cancel);
+        id += 2;
+    }
+    // Answered after everything above has been read, so every refusal the
+    // burst earned is on the wire in front of it.
+    try h2.writeHeader(&writer.interface, 8, .ping, 0, 0);
+    try writer.interface.writeAll("rapidrst");
+    try writer.interface.flush();
+
+    var refused: usize = 0;
+    while (true) {
+        const head = h2.Header.parse(try reader.interface.takeArray(h2.header_len));
+        const payload = try reader.interface.take(head.len);
+        if (head.type == .rst_stream and
+            std.mem.readInt(u32, payload[0..4], .big) == @intFromEnum(h2.ErrorCode.refused_stream)) refused += 1;
+        if (head.type == .goaway) return error.SentAway;
+        if (head.type == .ping and head.has(h2.Flags.ack)) break;
+    }
+    try testing.expect(most_inside.load(.acquire) <= nilo_grpc.max_streams);
+    try testing.expect(refused >= burst - nilo_grpc.max_streams);
+}
+
+test "a client that holds its window at zero is let go of once the write limit passes" {
+    // The zero-window attack: ask for an answer, then never let it be sent.
+    // What the answer holds is the call's arena and a place in the cap, so
+    // the connection goes when `write_timeout_ms` says a write has waited
+    // long enough, as an HTTP/1.1 write that never drains does.
+    hush();
+    const gpa = std.heap.smp_allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var where = try SocketDir.init(gpa, "grpc-window.sock");
+    defer where.deinit(gpa);
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.post("/test.Echo/Say", echo);
+
+    var serving: Serving = .{ .app = &app, .path = where.path, .write_timeout_ms = 300 };
+    const thread = try std.Thread.spawn(.{}, Serving.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    try serving.waitUntilUp(io);
+
+    var stream = try connect(io, where.path);
+    defer stream.close(io);
+    var out_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    var in_buf: [32 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+
+    try writer.interface.writeAll(h2.preface);
+    try h2.writeSettings(&writer.interface, &.{.{ .initial_window_size, 0 }});
+    try writeCall(&writer.interface, 1, "/test.Echo/Say", "an answer with nowhere to go");
+    try writer.interface.flush();
+
+    // Everything until the server closes; the socket's own five-second
+    // receive limit is what fails this if it never does.
+    const started = std.Io.Clock.awake.now(io);
+    var data_frames: usize = 0;
+    while (true) {
+        const head = h2.Header.parse(reader.interface.takeArray(h2.header_len) catch break);
+        _ = reader.interface.take(head.len) catch break;
+        if (head.type == .data) data_frames += 1;
+    }
+    const took = started.durationTo(std.Io.Clock.awake.now(io));
+    try testing.expectEqual(@as(usize, 0), data_frames);
+    // Not before the limit, which is what says the close was the limit's.
+    try testing.expect(took.toMilliseconds() >= 250);
+    try testing.expect(took.toMilliseconds() < 3000);
+}

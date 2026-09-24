@@ -81,6 +81,7 @@ nav:
       - sessions.md
       - streaming.md
       - websocket.md
+      - grpc.md
   - Building an application:
       - middleware.md
       - services.md

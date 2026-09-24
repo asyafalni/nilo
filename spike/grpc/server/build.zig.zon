@@ -1,0 +1,10 @@
+.{
+    .name = .nilo_grpc_server,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x1bd6e97fbcfce5b3,
+    .dependencies = .{
+        .nilo = .{ .path = "../../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig" },
+}

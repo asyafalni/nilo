@@ -862,9 +862,15 @@ pub const Ctx = struct {
     /// The deadline `listen()` gives every request, applied before the route
     /// runs. Separate from `giveDeadline` because it has to be marked as the
     /// default: a route's own deadline outlives a takeover, this one does not.
+    ///
+    /// A request that arrived with an earlier deadline of its own keeps it:
+    /// a gRPC call's `grpc-timeout` is the client's, and a default is not a
+    /// reason to wait longer than the client will (ADR 0297).
     pub fn giveDefaultDeadline(self: *Ctx, ms: u32) void {
         if (ms == 0) return;
-        self._deadlines.until_ns = bulkhead.monotonicNanos() + @as(u64, ms) * std.time.ns_per_ms;
+        const due = bulkhead.monotonicNanos() + @as(u64, ms) * std.time.ns_per_ms;
+        if (self._deadlines.until_ns != 0 and self._deadlines.until_ns <= due) return;
+        self._deadlines.until_ns = due;
         self._deadline_default = true;
     }
 

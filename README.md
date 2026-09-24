@@ -278,7 +278,7 @@ Against eight other servers returning the same JSON, nilo is 1st on throughput, 
 
 | Module | What it does | Left out |
 |---|---|---|
-| **`nilo_http`** | Routing, typed handlers, middleware, cookies and sessions, static files, streaming, WebSocket, OpenAPI, metrics, rate limiting, gzip, and optional TLS 1.3 | Templates |
+| **`nilo_http`** | Routing, typed handlers, middleware, cookies and sessions, static files, streaming, WebSocket, OpenAPI, metrics, rate limiting, gzip, optional TLS 1.3, and optional unary gRPC over HTTP/2 ([guide](./docs/guide/grpc.md)) | Templates, HTTP/2 for ordinary routes, streaming gRPC |
 | **`nilo_sql`** | Postgres and SQLite: reads, writes, transactions, streaming, schema and migrations | Window functions, CTEs and joins no foreign key names (use `db.raw`), `down` migrations |
 | **`nilo_s3`** | S3, MinIO and R2: get, put, range, stream, list, presigned URLs | `COPY`, multipart |
 | **`nilo_fetch`** | Calling another HTTP API from inside a request | Retries, circuit breaker |
@@ -293,7 +293,7 @@ Against eight other servers returning the same JSON, nilo is 1st on throughput, 
 ## 🚫 What it won't do
 
 - **Templates.** If your app is mostly HTML, [jetzig](https://www.jetzig.dev/) is built for it.
-- **HTTP/2 and gRPC.** Put a proxy in front if you need them. TLS 1.3 is built in behind `.tls = true`, or a proxy can terminate it ([deploying guide](./docs/guide/deploying.md#tls-and-the-proxy-in-front)).
+- **HTTP/2 for your routes.** Put a proxy in front if you need it. TLS 1.3 is built in behind `.tls = true`, or a proxy can terminate it ([deploying guide](./docs/guide/deploying.md#tls-and-the-proxy-in-front)). gRPC is served, unary calls on a listener of its own, behind `.grpc = true` ([gRPC guide](./docs/guide/grpc.md)).
 - **Revoking a session.** Sessions are sealed into the cookie, so there's no session table to delete from.
 
 Each of these was decided on purpose; [`docs/decided.md`](./docs/decided.md) says why.

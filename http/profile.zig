@@ -25,6 +25,9 @@ const body_mod = @import("body.zig");
 const range_mod = @import("range.zig");
 const router = @import("router.zig");
 const service_mod = @import("service.zig");
+const grpc = @import("grpc.zig");
+const h2 = @import("h2.zig");
+const hpack = @import("hpack.zig");
 
 const rounds = 300_000;
 const arena_keep = 16 * 1024;
@@ -194,6 +197,7 @@ pub fn main() !void {
     try longLived(gpa);
     try routerScale(gpa);
     try serviceScale(gpa);
+    try grpcCalls();
 
     if (sink == 0) unreachable; // keeps the work from being optimised away
 }
@@ -602,4 +606,140 @@ fn drainBody(wire: []const u8, head: http1.Request, scratch: []u8) !u64 {
     var total: u64 = 0;
     while (try incoming.read(scratch)) |part| total += part.len;
     return total;
+}
+
+// ---- a unary gRPC call ----
+//
+// What one call costs on the connection's own fiber, with no Engine: the
+// calls run inline, one after another, so this is the protocol's work and the
+// App's and nothing of the scheduler's. The header block is one h2load sent
+// in steady state against a table of 0 (ADR 0297), 89 bytes of Huffman-coded
+// literals; the message is HttpArena's `SumRequest{a=1, b=2}`.
+
+const grpc_calls = 1000;
+const grpc_reps = 30;
+
+const h2load_block = [_]u8{
+    0x04, 0x99, 0x62, 0x32, 0xd4, 0x49, 0xe9, 0x1d, 0x9d, 0x57, 0xba, 0x5a, 0x89, 0x3d, 0x23, 0xb3,
+    0xae, 0xe2, 0xd9, 0xdc, 0xc4, 0x2b, 0x18, 0x8a, 0x9d, 0xd6, 0xd3, 0x86, 0x01, 0x8b, 0x08, 0x9d,
+    0x5c, 0x0b, 0x81, 0x70, 0xdc, 0x6c, 0x00, 0x70, 0x3f, 0x83, 0x0f, 0x2b, 0x8f, 0x9c, 0x54, 0x1c,
+    0x72, 0x29, 0x54, 0xd3, 0xa5, 0x35, 0x89, 0x80, 0xae, 0xdb, 0xeb, 0x83, 0x0f, 0x10, 0x8b, 0x1d,
+    0x75, 0xd0, 0x62, 0x0d, 0x26, 0x3d, 0x4c, 0x4d, 0x65, 0x64, 0x00, 0x02, 0x74, 0x65, 0x86, 0x4d,
+    0x83, 0x35, 0x05, 0xb1, 0x1f, 0x0f, 0x0d, 0x01, 0x39,
+};
+const sum_message = [_]u8{ 0, 0, 0, 0, 4, 0x08, 0x01, 0x10, 0x02 };
+
+/// The request the call becomes, as `grpc.zig` writes it for that block.
+const grpc_as_http1 = "POST /benchmark.BenchmarkService/GetSum HTTP/1.1\r\nhost: 127.0.0.1:50061\r\n" ++
+    "user-agent: h2load nghttp2/1.59.0\r\ncontent-type: application/grpc\r\ncontent-length: 4\r\n\r\n" ++
+    "\x08\x01\x10\x02";
+
+fn getSum(c: *ctx_mod.Ctx) anyerror!void {
+    const body = (try c.body()).view();
+    // Two one-byte varints are all this benchmark ever sends.
+    const reply = [_]u8{ 0x08, body[1] + body[3] };
+    try c.send(200, "application/grpc", &reply);
+}
+
+fn grpcCalls() !void {
+    const gpa = std.heap.smp_allocator;
+    var grpc_app = App.init(gpa);
+    defer grpc_app.deinit();
+    try grpc_app.post("/benchmark.BenchmarkService/GetSum", getSum);
+    try grpc_app.resolveChains();
+
+    // The client's side of one connection: the preface, its SETTINGS, the
+    // ACK of the server's, then the calls. The first block carries the size
+    // update to 0 that the ACK obliges it to send, which h2load sends once.
+    var wire: std.Io.Writer.Allocating = .init(gpa);
+    defer wire.deinit();
+    const w = &wire.writer;
+    try w.writeAll(h2.preface);
+    try h2.writeSettings(w, &.{});
+    try h2.writeSettingsAck(w);
+    var id: u31 = 1;
+    for (0..grpc_calls) |i| {
+        const update: []const u8 = if (i == 0) &.{0x20} else &.{};
+        try h2.writeHeader(w, update.len + h2load_block.len, .headers, h2.Flags.end_headers, id);
+        try w.writeAll(update);
+        try w.writeAll(&h2load_block);
+        try h2.writeHeader(w, sum_message.len, .data, h2.Flags.end_stream, id);
+        try w.writeAll(&sum_message);
+        id += 2;
+    }
+
+    var out: std.Io.Writer.Allocating = try .initCapacity(gpa, 256 * grpc_calls);
+    defer out.deinit();
+    var whole: u64 = std.math.maxInt(u64);
+    for (0..grpc_reps + 3) |rep| {
+        out.clearRetainingCapacity();
+        var in: std.Io.Reader = .fixed(wire.written());
+        const started = clock();
+        grpc.serveConnection(grpc_app.grpcHost(), &in, &out.writer, .off, .off, .{});
+        const took = clock() - started;
+        if (rep >= 3 and took < whole) whole = took;
+    }
+    sink += out.written().len;
+    const per_call = whole / grpc_calls;
+
+    // HPACK: the one block, decoded with the table at 0.
+    var decoder = hpack.Decoder.init(gpa);
+    defer decoder.deinit();
+    var fields: std.ArrayList(hpack.Field) = .empty;
+    defer fields.deinit(gpa);
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    var decode_best: u64 = std.math.maxInt(u64);
+    for (0..grpc_reps) |_| {
+        const started = clock();
+        for (0..grpc_calls) |_| {
+            fields.clearRetainingCapacity();
+            _ = decoder.decode(&h2load_block, scratch.allocator(), &fields, 1 << 16) catch unreachable;
+            _ = scratch.reset(.retain_capacity);
+        }
+        decode_best = @min(decode_best, clock() - started);
+    }
+    sink += fields.items.len;
+
+    // The App's share: the same request as HTTP/1.1, the way a call reaches it.
+    var app_arena = std.heap.ArenaAllocator.init(gpa);
+    defer app_arena.deinit();
+    var app_best: u64 = std.math.maxInt(u64);
+    var answer_buf: [512]u8 = undefined;
+    for (0..grpc_reps) |_| {
+        const started = clock();
+        for (0..grpc_calls) |_| {
+            var in = std.Io.Reader.fixed(grpc_as_http1);
+            var answer_out = std.Io.Writer.fixed(&answer_buf);
+            var request_lifetime = str_mod.Lifetime{};
+            var request_in_flight = fail.InFlight{};
+            sink += @intFromBool(grpc_app.handleRequest(app_arena.allocator(), &request_lifetime, &request_in_flight, &in, &answer_out, .off, .off, .{}));
+            request_lifetime.end();
+            _ = app_arena.reset(.{ .retain_with_limit = arena_keep });
+        }
+        app_best = @min(app_best, clock() - started);
+    }
+
+    std.debug.print(
+        \\
+        \\A unary gRPC call over h2c, {d}ns each end to end on the connection's
+        \\fiber: h2load's header block, HttpArena's GetSum, answered inline.
+        \\
+        \\  HPACK decode of the header block{d:>8}ns {d:>6.1}%
+        \\  the App, as the HTTP/1.1 request{d:>7}ns {d:>6.1}%
+        \\  the rest: frames, translation, answer{d:>3}ns {d:>6.1}%
+        \\
+    , .{
+        per_call,
+        decode_best / grpc_calls,
+        pct(decode_best / grpc_calls, per_call),
+        app_best / grpc_calls,
+        pct(app_best / grpc_calls, per_call),
+        per_call -| (decode_best + app_best) / grpc_calls,
+        pct(per_call -| (decode_best + app_best) / grpc_calls, per_call),
+    });
+}
+
+fn pct(part: u64, whole: u64) f64 {
+    return @as(f64, @floatFromInt(part)) * 100.0 / @as(f64, @floatFromInt(whole));
 }

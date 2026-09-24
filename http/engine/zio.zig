@@ -325,6 +325,10 @@ const Accepting = struct {
     /// Set on a TLS listener and null on a plain one, which is the whole
     /// of how the acceptor tells them apart.
     secured: ?*Secured = null,
+    /// Set on a listener that speaks gRPC (ADR 0297). Read only in a build
+    /// with `-Dgrpc`; every other build refuses the listener before this
+    /// exists.
+    grpc: bool = false,
 
     fn fail(self: *Accepting, err: anyerror) void {
         self.all.fail(err);
@@ -374,6 +378,7 @@ pub fn explained(err: anyerror) bool {
         error.TlsNotBuilt,
         error.TlsOnUnixSocket,
         error.TlsCertificate,
+        error.GrpcNotBuilt,
         => true,
         else => false,
     };
@@ -966,6 +971,36 @@ const TlsRefusal = enum {
     }
 };
 
+/// Why `.grpc` cannot be honoured, decided the way `TlsRefusal` is (ADR 0297).
+/// Beside `.tls` it is gRPC over TLS, `h2` by ALPN, and that is the TLS
+/// refusal's business: a build without TLS is told so by `TlsRefusal` first.
+const GrpcRefusal = enum {
+    not_built,
+
+    fn toError(self: GrpcRefusal) anyerror {
+        return switch (self) {
+            .not_built => error.GrpcNotBuilt,
+        };
+    }
+
+    fn say(self: GrpcRefusal, address: []const u8) void {
+        switch (self) {
+            .not_built => std.log.err(
+                "the listener on \"{s}\" sets `.grpc`, and this build has no gRPC in it. Pass " ++
+                    "`.grpc = true` to `b.dependency(\"nilo\", …)` in build.zig (`-Dgrpc` in " ++
+                    "this repository), or drop `.grpc` from the listener (ADR 0297).",
+                .{address},
+            ),
+        }
+    }
+};
+
+fn grpcRefusal(built: bool, wanted: bool) ?GrpcRefusal {
+    if (!wanted) return null;
+    if (!built) return .not_built;
+    return null;
+}
+
 fn tlsRefusal(built: bool, wanted: bool, over_unix_socket: bool) ?TlsRefusal {
     if (!wanted) return null;
     if (over_unix_socket) return .on_unix_socket;
@@ -1239,6 +1274,7 @@ pub fn serve(
     comptime ready: anytype,
     comptime stopping: anytype,
     comptime handler: anytype,
+    comptime grpc_handler: anytype,
 ) !void {
     const State = @TypeOf(state);
     const Options = @TypeOf(options);
@@ -1292,6 +1328,7 @@ pub fn serve(
         address: []const u8,
         port: u16,
         tls: @TypeOf(options.tls),
+        grpc: bool,
     };
 
     // One address this server answers on, and everything that belongs to
@@ -1310,6 +1347,8 @@ pub fn serve(
         accepting: Accepting,
         /// What `listen()` was told, for the log line.
         address: []const u8,
+        /// Speaks gRPC over h2c rather than HTTP/1.1 (ADR 0297).
+        grpc: bool,
     };
 
     const listeners = try gpa.alloc(Bound, 1 + options.also.len);
@@ -1330,12 +1369,13 @@ pub fn serve(
 
     for (listeners, 0..) |*b, i| {
         const want: Want = if (i == 0)
-            .{ .address = options.address, .port = options.port, .tls = options.tls }
+            .{ .address = options.address, .port = options.port, .tls = options.tls, .grpc = options.grpc }
         else
             .{
                 .address = options.also[i - 1].address,
                 .port = options.also[i - 1].port,
                 .tls = options.also[i - 1].tls,
+                .grpc = options.also[i - 1].grpc,
             };
 
         // A path rather than a port: `.address = "unix:/run/nilo.sock"`. One
@@ -1345,6 +1385,10 @@ pub fn serve(
         const unix_path = unixPathIn(want.address);
 
         if (tlsRefusal(nilo_build.tls, want.tls != null, unix_path != null)) |refusal| {
+            refusal.say(want.address);
+            return refusal.toError();
+        }
+        if (grpcRefusal(nilo_build.grpc, want.grpc)) |refusal| {
             refusal.say(want.address);
             return refusal.toError();
         }
@@ -1423,6 +1467,7 @@ pub fn serve(
             .secured = secured,
             .accepting = undefined,
             .address = want.address,
+            .grpc = want.grpc,
         };
         opened = i + 1;
     }
@@ -1551,6 +1596,16 @@ pub fn serve(
     };
 
     const Conn = struct {
+        /// The plain entry, and the gRPC one (ADR 0297): one body, two
+        /// handlers. A comptime parameter rather than a branch, so `run` is
+        /// the function it was to the byte and a gRPC listener's fiber is a
+        /// copy of it that calls something else. Only `-Dgrpc` analyses the
+        /// second.
+        const run = Entry(handler).run;
+        const runGrpc = Entry(grpc_handler).run;
+
+        fn Entry(comptime connection: anytype) type {
+            return struct {
         fn run(
             st: State,
             stream: zio.net.Stream,
@@ -1628,7 +1683,9 @@ pub fn serve(
             };
             peer._len = writePeer(&peer._text, stream.socket.address);
 
-            handler(st, &link.reader.interface, &link.writer.interface, &clocks, &wake, peer);
+            connection(st, &link.reader.interface, &link.writer.interface, &clocks, &wake, peer);
+        }
+            };
         }
 
         /// The TLS connection's entry (ADR 0288): the same as `run` with a
@@ -1651,7 +1708,15 @@ pub fn serve(
         /// on the same build. The 33 KB of record buffers are page-aligned
         /// and handed back with the cleartext pair at every idle transition,
         /// so they are not in that figure.
-        fn runTls(
+        const runTls = TlsEntry(handler, &.{"http/1.1"}).run;
+        /// gRPC over TLS (ADR 0297): the same entry, offering `h2` and
+        /// nothing else in ALPN, so a client that asked for HTTP/1.1 fails
+        /// the handshake rather than being handed frames it cannot read.
+        const runTlsGrpc = TlsEntry(grpc_handler, &.{"h2"}).run;
+
+        fn TlsEntry(comptime connection: anytype, comptime alpn: []const []const u8) type {
+            return struct {
+        fn run(
             st: State,
             stream: zio.net.Stream,
             conn_gpa: std.mem.Allocator,
@@ -1710,7 +1775,7 @@ pub fn serve(
                 .auth = &sec.auth,
                 .now = std.Io.Clock.real.now(sec.io),
                 .rng = rng_source.interface(),
-                .alpn_protocols = &.{"http/1.1"},
+                .alpn_protocols = alpn,
                 .offload = sign_elsewhere,
             } }) catch |err| {
                 // Debug rather than warn: a port on the internet is
@@ -1735,12 +1800,14 @@ pub fn serve(
                 .leftover = &conn.cleartext_buf,
             };
             wake.raw = &raw;
-            handler(st, &tr.interface, &tw.interface, &clocks, &wake, peer);
+            connection(st, &tr.interface, &tw.interface, &clocks, &wake, peer);
             // The handler is done with the connection: what it wrote goes
             // out as records, then close_notify, so the peer sees an end
             // rather than a reset. A failure here is a peer already gone.
             tw.interface.flush() catch {};
             conn.close() catch {};
+        }
+            };
         }
     };
 
@@ -1760,6 +1827,7 @@ pub fn serve(
     for (listeners) |*b| b.accepting = .{
         .all = &shared,
         .secured = if (b.secured) |*sec| sec else null,
+        .grpc = b.grpc,
     };
 
     // One acceptor. There is one per executor ([ADR 0273](../../docs/adr/0273-every-executor-accepts.md)),
@@ -1853,8 +1921,12 @@ pub fn serve(
                 // Two entries and one argument list, for the reason on
                 // `Conn.runTls`. `nilo_build.tls` first so that a build
                 // without TLS has no reference to `runTls` to analyse.
-                const spawned = if (nilo_build.tls and sh.secured != null)
+                const spawned = if (nilo_build.tls and nilo_build.grpc and sh.secured != null and sh.grpc)
+                    connections.spawn(Conn.runTlsGrpc, .{ st, stream, conn_gpa, sizes, sh })
+                else if (nilo_build.tls and sh.secured != null)
                     connections.spawn(Conn.runTls, .{ st, stream, conn_gpa, sizes, sh })
+                else if (nilo_build.grpc and sh.grpc)
+                    connections.spawn(Conn.runGrpc, .{ st, stream, conn_gpa, sizes, sh })
                 else
                     connections.spawn(Conn.run, .{ st, stream, conn_gpa, sizes, sh });
                 spawned catch |err| {
@@ -2268,6 +2340,13 @@ test "a path is read as a path only when it says unix:" {
     // Said, rather than guessed at: an empty path is refused by `listenOnUnix`
     // with a sentence, not treated as an address.
     try testing.expectEqualStrings("", unixPathIn("unix:").?);
+}
+
+test "`.grpc` is refused by a build without it" {
+    try testing.expectEqual(@as(?GrpcRefusal, null), grpcRefusal(false, false));
+    try testing.expectEqual(@as(?GrpcRefusal, null), grpcRefusal(true, true));
+    try testing.expectEqual(@as(?GrpcRefusal, .not_built), grpcRefusal(false, true));
+    try testing.expect(explained(GrpcRefusal.not_built.toError()));
 }
 
 test "`.tls` is refused, in words, by a build without it and by a listener on a socket file" {

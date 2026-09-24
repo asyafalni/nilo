@@ -3,7 +3,9 @@
 **Status:** accepted, amended by [ADR 0288](./0288-tls-is-an-option-a-build-asks-for.md)
 (TLS 1.3 is a listener option in a build that asked for it with `-Dtls`; the
 default build contains none of it, and the recommendation below stands for a
-server with a proxy in front)
+server with a proxy in front), and by [ADR 0297](./0297-grpc-is-served-over-h2c-behind-a-flag.md)
+(gRPC is served over h2c in a build that asked for it with `-Dgrpc`, because
+it never needed TLS; HTTP/2 for browsers stays refused)
 
 `docs/roadmap.md` carried TLS under "Not decided" with the note that it *may stay out on purpose*. This decides it. **nilo does not speak TLS, and is not going to.** It listens on plaintext HTTP and expects a proxy in front of it wherever the internet is involved.
 
@@ -49,7 +51,7 @@ What is left is a bare VPS wanting to answer `:443` directly, and the answer the
 ## Consequences
 
 - **The client's address stops being obvious, and that is a real cost.** Behind a proxy every connection appears to come from the proxy, so rate limits, audit logs and blocklists are blind unless something reads `X-Forwarded-For`. This ADR is the reason `Ctx.clientIp()` and `listen(.{ .trusted_hops = … })` exist; they are not a separate feature, they are this decision's other half.
-- **HTTP/2 goes with it.** Browsers only speak HTTP/2 over TLS, negotiated with ALPN during the handshake. No handshake, no ALPN, no HTTP/2 — and no gRPC server either, since gRPC is HTTP/2. Somebody reading "no TLS" will not derive "no gRPC" on their own, so both are said out loud in the docs.
+- **HTTP/2 goes with it.** Browsers only speak HTTP/2 over TLS, negotiated with ALPN during the handshake. No handshake, no ALPN, no HTTP/2 — and no gRPC server either, since gRPC is HTTP/2. Somebody reading "no TLS" will not derive "no gRPC" on their own, so both are said out loud in the docs. *The gRPC half of this was wrong*: gRPC runs over h2c, with no TLS and no ALPN, and [ADR 0297](./0297-grpc-is-served-over-h2c-behind-a-flag.md) serves it behind a flag. The browser half stands.
 - **mTLS between services is not available.** A service mesh that wants client certificates has to terminate them in a sidecar.
 - **The deploying guide owes people a working proxy config**, not a suggestion to find one. A refusal that leaves the user to work out the replacement is half a decision.
 - **This is reversible in one direction only.** If Zig's standard library grows a TLS server, or a Zig TLS library acquires the funding and the audits that rustls has, the argument above changes and this ADR should be revisited. The memory argument would still stand, which is why it is written down separately from the trust one.

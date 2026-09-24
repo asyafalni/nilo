@@ -213,6 +213,14 @@ pub const Options = struct {
         /// a plain port and a TLS port in one process is what the field
         /// exists for, and each certificate is that listener's alone.
         tls: ?Tls = null,
+        /// Speak gRPC on this one rather than HTTP/1.1: HTTP/2 with prior
+        /// knowledge (h2c), or with `tls` set as well, HTTP/2 chosen by ALPN
+        /// (`h2`, and nothing else offered). Each unary call is answered by
+        /// the route `app.post` registered at its path
+        /// ([ADR 0297](../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+        /// Needs `.grpc = true` on the dependency, and is refused at
+        /// `listen()` without it.
+        grpc: bool = false,
     };
 
     /// An IPv4 or IPv6 address in the usual notation: `"127.0.0.1"` and
@@ -346,6 +354,13 @@ pub const Options = struct {
     /// client that connects and goes quiet, or speaks plain HTTP to this
     /// port, is dropped when the first of those runs out.
     tls: ?Tls = null,
+
+    /// Speak gRPC on `address` and `port` rather than HTTP/1.1, the way
+    /// `Listener.grpc` does on an entry in `also`: h2c, or HTTP/2 by ALPN when
+    /// `tls` is set. For a server that answers nothing but gRPC; one that
+    /// serves both gives gRPC an entry in `also` instead
+    /// ([ADR 0297](../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+    grpc: bool = false,
 
     /// More addresses to answer on, beside the one `address` and `port`
     /// name ([ADR 0289](../docs/adr/0289-a-server-answers-on-more-than-one-address.md)).
@@ -720,6 +735,7 @@ pub fn serve(
     comptime ready: anytype,
     comptime stopping: anytype,
     comptime handler: anytype,
+    comptime grpc_handler: anytype,
 ) !void {
     const State = @TypeOf(state);
 
@@ -741,6 +757,23 @@ pub fn serve(
             deadlines.target = clocks;
             const waker: Waker = .{ .vtable = &engine_waker, .target = wake };
             handler(carried.state, in, out, deadlines, waker, peer);
+        }
+
+        /// The same for a listener that speaks gRPC (ADR 0297). Its own
+        /// function rather than a flag on `run`, for the reason the Engine
+        /// keeps `runTls` apart: nothing is added to the plain path.
+        fn runGrpc(
+            carried: Carried,
+            in: *std.Io.Reader,
+            out: *std.Io.Writer,
+            clocks: *engine.Clocks,
+            wake: *engine.Wake,
+            peer: Peer,
+        ) void {
+            var deadlines = carried.limits;
+            deadlines.target = clocks;
+            const waker: Waker = .{ .vtable = &engine_waker, .target = wake };
+            grpc_handler(carried.state, in, out, deadlines, waker, peer);
         }
 
         /// The startup hook, unwrapped from what the Engine carries. The
@@ -771,7 +804,7 @@ pub fn serve(
             .body_grace_ms = options.body_grace_ms,
             .write_ms = options.write_timeout_ms,
         },
-    }, Bridge.start, Bridge.winddown, Bridge.run);
+    }, Bridge.start, Bridge.winddown, Bridge.run, Bridge.runGrpc);
 }
 
 const engine_waker: Waker.VTable = .{

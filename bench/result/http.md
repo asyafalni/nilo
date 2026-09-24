@@ -2618,6 +2618,132 @@ not a result to defend — a later change to the same loop could take it back
 without anything being wrong — and the row to hold in a regression check is
 the first one, the default build at 968,144.
 
+## What a gRPC client puts on the wire, and what a stream would cost
+
+Taken for [ADR 0297](../../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md), before any of it is built, because the two numbers that decide whether a gRPC connection fits nilo's memory axis are not in any RFC: what a real client does when the server asks it for less, and what zio charges for a fiber per stream. Ryzen 7 9700X (8 cores, 16 threads), Linux 7.2.5, Zig 0.16.0, zio v0.18.0, commit `dce5d93`, loopback. The harness is `spike/grpc/`: `./run.sh` for the clients, `fiber/` for the fiber.
+
+**The clients.** `spike/grpc/probe/` is a gRPC server written at the frame level with `golang.org/x/net/http2` v0.59.0, so it can count what the client chose rather than what a library decoded. It answers every unary call with an empty message after 20 ms. Each client makes 32 calls, 16 at a time, on one channel: grpc-go 1.84.0, grpc-js 1.14.5, grpcio 1.84.0 (C-core 56.0.0), and tonic 0.14.6 on h2 0.4.19. The fifth row is the OpenTelemetry Collector 0.161.0 with its default `otlp` exporter, fed twenty traces, because a client library called by hand is not the same as a client somebody deployed with defaults.
+
+### The HPACK table a server has to keep
+
+| client | table 4,096: header block, first call / later | offered to the table | table 0: header block, later calls | offered to the table |
+|---|---|---|---|---|
+| grpc-go | 115 / 8 B | 367 B | 117 B | 0 |
+| grpc-js | 143 / 52 B | 348 B | 143 B | 0 |
+| grpcio | 248 / 8 B | 420 B | 248 B | 0 resident (see below) |
+| tonic | 94 / 50 B | 213 B | 96 B | 0 |
+| Collector | 194 / 10–17 B | 1,202 B over 20 calls, still growing | 196 B | 0 |
+
+**Every client honoured `SETTINGS_HEADER_TABLE_SIZE = 0`.** Each sent a dynamic table size update of 0 at the top of its first header block and inserted nothing after. grpcio is the one that looks otherwise: it kept sending literals with incremental indexing, 192 of them. RFC 7541 §4.4 makes an entry bigger than the table empty the table rather than fail, so into a table of size 0 that is 0 bytes resident, and the decoder raised no error. What it costs is bandwidth, about 110 bytes more per call inbound, which against an OTLP export or any real message is noise.
+
+**The Collector is the row that decides it.** `grpc-timeout` is a fresh value on every call and the Collector indexes it, so at the default table its connection inserts about 60 bytes per call: 1,202 over twenty calls, which by arithmetic rather than a longer run fills the 4,096 in about seventy and keeps it full for as long as the connection lives. Advertising 0 is the difference between a gRPC connection that costs a table and one that does not.
+
+### What a cap on streams does
+
+At `SETTINGS_MAX_CONCURRENT_STREAMS = 1`, all four libraries queued on the one connection: grpc-go 651 ms, grpc-js 670 ms, grpcio 653 ms, tonic 632 to 650 ms for 32 calls of 20 ms, against 41 to 56 ms at 100. **None opened a second connection and none failed a call.** A low cap is a throughput knob, never an error.
+
+**But a cap is not a guarantee, because a client may open streams before it has read it.** tonic sends HEADERS before the server's SETTINGS in some runs and not others: in the first run it had two streams open against a cap of 1, in the second it sent two requests ahead of the ACK at the default cap and stayed under 1 at the cap. The other three waited every time. A server that caps has to refuse the excess with `REFUSED_STREAM`, and its decoder has to accept a 4,096-byte table until the size update arrives. Both are transient; neither is idle cost.
+
+**The Collector's defaults are the shape to build for:** `grpc-encoding: gzip` on every call, a `grpc-timeout` of five seconds, at most ten streams open, and a connection held open between exports.
+
+### A fiber per stream
+
+`spike/grpc/fiber/`, ReleaseFast, one cold process per row, because zio keeps a finished fiber's stack in its pool with the pages still resident and a second round in the same process reads zero.
+
+| stack the fiber touched | bytes per parked fiber, 5,000 | marginal to 20,000 |
+|---|---|---|
+| 0 | 4,547 | 4,544 to 4,607 |
+| 1 KiB | 4,547 | 4,544 to 4,611 |
+| 2 KiB | 4,547 | 4,565 to 4,594 |
+| 4 KiB | 8,643 | 8,640 to 8,677 |
+| 8 KiB | 12,739 | 12,736 |
+| 16 KiB | 20,931 | 20,928 to 20,982 |
+
+**A parked fiber costs 4,547 bytes, and every page of stack it touched after the first costs a page.** Marginal met average in every row, so it is a cost and not a transient. It is ADR 0063's rule seen from the other side: that ADR found a handler's stack is charged one for one to the connection holding it, and this is the same charge on a fiber that holds nothing else. [ADR 0029](../../docs/adr/0029-a-spawned-fiber-belongs-to-the-server.md)'s 8,673 bytes for a second fiber was a fiber draining a queue, on a connection whose idle figure was then 66,959; this one has touched under a page, and the two are not the same question.
+
+**What it decided:** that a stream in flight on HTTP/2 costs what a request in flight on HTTP/1.1 already costs, a fiber and its stack, so the idle axis does not move with the number of streams a connection has served. What moves is the worst case of one connection, which becomes the cap times that figure: at 100 streams of the database route in [ADR 0063](../../docs/adr/0063-a-handlers-stack-is-per-connection.md), about 1.7 MB. The cap is the number that bounds it, and it has to be a stated default rather than a library's.
+
+**Can it be pushed further:** the 4,547 is a page and zio's task. Whether the only stream open could run on the connection's own fiber was the open question here, and [the section below](#a-grpc-listener-built) answers it: it could, and it may not.
+
+## A gRPC listener, built
+
+The listener [ADR 0297](../../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md) accepted, measured before it was committed: the working tree on top of `dce5d93`, the same machine as the section above. `spike/grpc/server/` is the server (routes for the Collector, an echo, and HttpArena's `GetSum`), `spike/grpc/throughput.sh` the throughput run.
+
+### Against real clients
+
+grpc-go 1.84.0, grpc-js 1.14.5, grpcio 1.84.0, tonic 0.14.6 and the Collector 0.161.0 (twenty exports, gzip on every one) all complete against nilo: the same client commands `run.sh` gives the probe, pointed at `spike/grpc/server/`, which listens on the probe's port (127.0.0.1:50051), and the Collector with the same `otelcol.yaml`. A 1 MB message goes through and 2 MB is `RESOURCE_EXHAUSTED`, which is `max_body`. Over TLS, grpc-go (plain and gzip) and `curl --http2` reach `GetSum` with ALPN `h2`.
+
+### Memory per idle connection
+
+`bench/mem.py --grpc` opens a connection, makes one call, and leaves it idle.
+
+| listener | bytes per idle connection, converged at 10,000 |
+|---|---|
+| HTTP/1.1, the default build (`bench nilo-hello`, marginal) | 5,183 |
+| HTTP/1.1, the same program built with `-Dgrpc` | 5,183 |
+| HTTP/1.1 on the spike server | 5,322 |
+| gRPC on the spike server, before the optimizations below | 6,029 to 6,044 |
+| gRPC on the spike server, as committed | 5,685 to 5,917 |
+
+**The flag costs a plain connection nothing**, the thing ADR 0288 found `-Dtls` did not manage, and a gRPC connection sits under a page above an HTTP/1.1 one on the same binary: the stream table, the decoder with a table of 0, and the spare streams dropped at the idle release.
+
+### Binary size, stripped `ReleaseFast`
+
+| build | hello | rest |
+|---|---|---|
+| before (`dce5d93`) | 964,952 | 1,155,368 |
+| after, default | 964,960 (+8) | 1,155,480 (+112) |
+| after, `-Dgrpc` | 1,080,680 (+115,720 on the default) | 1,207,912 (+52,432) |
+
+### Throughput
+
+h2load from HttpArena's image POSTing a 9-byte `SumRequest` to `GetSum`, `-m 100`, 5 s, eight h2load threads, interleaved with HttpArena's own grpc-go and tonic entries, server pinned to cores 0-3 (CPUs 0-3,8-11) and h2load to cores 4-7. Loopback, no Docker port for nilo, `--network host` for the others.
+
+| run | c=256 | c=1024 |
+|---|---|---|
+| nilo, as first built | 710k to 750k | 407k to 440k |
+| nilo, as committed, two rounds | 769k to 774k, mean 28 to 29 ms, max 1.40 to 1.44 s | 556k to 567k, mean 111 to 113 ms, max 3.80 to 3.85 s |
+| grpc-go, the same rounds | 589k to 591k, mean 43 ms, max 0.27 to 0.30 s | 578k to 583k, mean 159 to 163 ms, max 1.33 to 1.74 s |
+| tonic, the same rounds | 902k, mean 27 ms, max 0.23 to 0.26 s | 851k to 856k, mean 96 to 97 ms, max 1.05 to 1.11 s |
+| nilo, every call inline on the connection's fiber, as first built (not shipped) | 1.44M | 1.24M to 1.28M |
+| nilo, every call inline, as committed otherwise (not shipped) | 3.12M | 2.95M |
+
+grpc-go and tonic read 4% and 6% higher in these rounds than on the day of the first build (564k and 854k at 256), so the first row is compared to its own day's controls: nilo was 1.26 to 1.33x grpc-go and 0.83 to 0.88x tonic at 256 then, and is 1.30 to 1.31x and 0.85 to 0.86x now. **The worst call is nilo's**, 1.4 s at 256 and 3.8 s at 1,024 against about 1.1 s for tonic, and h2load reports no percentiles to say how many calls are near it.
+
+**A run with the wrong server in it looked like a win.** The first round of the committed row read 908k at 256 and then 0 for every later nilo run: the spike server had gained a TLS listener whose certificate path is relative to the repository root, `throughput.sh` started it from `spike/grpc/`, and it exited at once. The 908k was a server left over from an earlier session answering on the same port. The script now starts it from the root, waits for it to exit, and refuses to start if one is already running.
+
+### Where a call's time goes
+
+CPU per call from `/proc/<pid>/stat` over the run, eight executors, and `zig build profile`'s replay of h2load's steady-state 89-byte header block in process.
+
+| | as first built | as committed |
+|---|---|---|
+| CPU per call, fiber per call, c=256 | 7.29 µs | 4.35 to 4.71 µs |
+| CPU per call, fiber per call, c=1024 | not taken | 6.86 to 7.42 µs |
+| CPU per call, inline, c=256 / c=1024 | 4.37 µs / not taken | 2.50 / 2.65 µs |
+| context switches per call, fiber per call, c=256 / c=1024 | 0.47 / not taken | 0.87 to 0.95 / 0.71 to 0.81 |
+| in process, whole call | 1,500 ns | 973 ns |
+| of which HPACK decode | 563 ns | 247 ns |
+| of which the App (`handleRequest` on the translated text) | 242 ns | 229 ns |
+| of which the rest (frames, translation, answer) | 694 ns | 497 ns |
+| heap allocations, second call on a connection | 4, 3,342 B | 0 |
+
+What moved it: a Huffman decoder reading nine bits at a time from a 64-bit accumulator in place of a bit at a time; the answer's two constant header blocks written as bytes rather than encoded per call; one flush per wake rather than per frame; and a finished call's stream kept with 4 KiB of its arena for the next call.
+
+**On one executor a fiber per call costs 2.74 µs against 2.51 inline**, so the fiber itself is 0.23 µs. The other 2 µs at eight executors is zio dealing every `spawn` round-robin to another executor (`getNextExecutor`) and waking it: a call's fiber runs on another thread, and its answer is posted back. Coalescing those posts (one wake for a batch of finished calls) measured no change and was taken out.
+
+### What it decided
+
+- **The only stream open does not run on the connection's fiber** (ADR 0297's question 5). Inline is 4x the throughput, and a gRPC client puts every call on one connection, so one slow call would hold the rest and the connection's own PINGs behind it. The live test "two calls at once" is what holds that.
+- **Spare streams are dropped when the connection waits with no call in flight**, not at the 200 ms idle release. Kept until then, a burst of 10,000 connections opening at once measured 5 MB more heap, which the allocator then held; dropped at the wait, the idle figure fell to below the unpooled one.
+
+### Can it be pushed further
+
+1. **A spawn on the calling executor.** The gap between 0.8M and 3.1M is almost all the cross-thread hop, and zio has no public call for "here"; the maintainer's proposal for one is [zio#704](https://github.com/lalinsky/zio/issues/704), which is `Placement.here` in the pinned mode nilo already runs. Nothing on nilo's side approaches it.
+2. **The worst call.** 1.4 s at 256 connections is not explained. A per-call latency histogram, which h2load does not give, is the first thing to take; a client with percentiles (`ghz`) against the same build is the run.
+3. **HPACK**, 247 ns of the 973. With a table of 0 every header is Huffman-decoded on every call; the next step is decoding only the fields the translation reads.
+4. **The App's 229 ns** is the HTTP/1.1 parse of text this side just wrote. A request handed over already parsed would skip it, at the price of a second door into `handleRequest`, which is what the translation exists to avoid.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

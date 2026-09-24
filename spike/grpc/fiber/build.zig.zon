@@ -1,0 +1,15 @@
+// Pinned to exactly what ../../../build.zig.zon pins, so the number is the
+// one nilo would pay rather than whatever zio is newest.
+.{
+    .name = .grpc_fiber_spike,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x41d877b986fa0bee,
+    .dependencies = .{
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.18.0#417757935ef6d0f0a2396d4023a44ca82ac1901c",
+            .hash = "zio-0.18.0-xHbVVELgKQAU2hnwYL9MA0iXUydUZYlBfXxOUUM6v_Uv",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig" },
+}

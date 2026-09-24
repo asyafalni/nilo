@@ -1,0 +1,9 @@
+bin/
+r-*.jsonl
+clients/js/node_modules/
+clients/js/package-lock.json
+clients/rs/target/
+fiber/.zig-cache/
+fiber/zig-out/
+server/.zig-cache/
+server/zig-out/
