@@ -37,8 +37,9 @@ and five things SQLite refuses.
 
 **One whole program is [`examples/sqlite/`](../../../examples/sqlite/main.zig)**:
 two Rows on one file, the tables made at boot with `createMissing` and
-checked after, a list with a `Query`, a paged join through `rawPage`, a
-report through `rawExactlyOne` and `raw`, and a transaction. `zig build
+checked after, a list with a `Query`, a page of invoices with their
+customer as a parent, a customer with their invoices as children, a report
+of grouped Rows with one line left to `raw`, and a transaction. `zig build
 run-sqlite` starts it, and its tests run under `zig build test-sql`.
 
 ## The pages

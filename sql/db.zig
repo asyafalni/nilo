@@ -1206,9 +1206,10 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// A statement this module will not write, filling `Row` from the
         /// columns it selects, in order.
         ///
-        /// The way past *one table, conditions that filter rows*: joins,
-        /// aggregates, `HAVING`, window functions, CTEs. It keeps the arena,
-        /// keeps the `Str` rule and keeps the row filling.
+        /// The way past what a Row can declare (ADR 0295): a join no reference
+        /// names, an aggregate over an expression, `FILTER`, window functions,
+        /// CTEs. It keeps the arena, keeps the `Str` rule and keeps the row
+        /// filling.
         ///
         /// **The text is comptime and the `SELECT` list is checked against the
         /// Row** ([ADR 0148](../docs/adr/0148-a-raw-statement-is-counted-while-compiling.md)):

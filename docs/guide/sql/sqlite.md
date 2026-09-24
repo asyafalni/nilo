@@ -20,8 +20,8 @@ Your handler does not change at all — it still takes `db: *Db` and calls
 `db.find`, `db.select`, `db.begin`. That is the point: the driver was always
 behind a seam, and SQLite is the second thing to come through it.
 
-A whole program on one file, tables made at boot, a paged join, a report
-and a transaction, is [`examples/sqlite/`](../../../examples/sqlite/main.zig):
+A whole program on one file, tables made at boot, a page with a parent, a
+customer with their children, a report of grouped Rows and a transaction, is [`examples/sqlite/`](../../../examples/sqlite/main.zig):
 `zig build run-sqlite`.
 
 ## The one question it makes you answer

@@ -312,7 +312,7 @@ $ zig build run-stream     # a streamed report, an event stream, an upload
 $ zig build run-chat       # a WebSocket, browser page included
 $ zig build run-scheduled  # work that is not a request, owned by the server
 $ zig build run-outbound   # calling somebody else's API from inside a handler
-$ zig build run-sqlite     # two Rows on one SQLite file: tables at boot, a paged join, a report, a transaction
+$ zig build run-sqlite     # two Rows on one SQLite file: tables at boot, parents, children, a grouped report, a transaction
 ```
 
 Start with **`rest`**. Swap `run-` for `dev-` to restart the server every time you save.

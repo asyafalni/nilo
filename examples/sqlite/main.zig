@@ -1,8 +1,9 @@
 //! A small internal application on one SQLite file: two Rows, the tables
 //! made at boot, a list read through a query struct, a filter that may be
-//! absent, a paged join with its total, a report of aggregates, and one
-//! transaction. The shape most "small internal tool" programs have, and the
-//! one that needs `nilo_sql` end to end.
+//! absent, a page of invoices with their customer's name, a customer with
+//! their invoices, a report of totals and groups, and one transaction. The
+//! shape most "small internal tool" programs have, and the one that needs
+//! `nilo_sql` end to end.
 //!
 //! ```
 //! zig build run-sqlite
@@ -10,9 +11,10 @@
 //! curl localhost:8787/customers                       # every customer
 //! curl 'localhost:8787/customers?q=wa'                # a filter, when it is set
 //! curl -i -X POST localhost:8787/customers -d '{"name":"kid","email":"kid@example.dev"}'   # 201
-//! curl 'localhost:8787/invoices?status=open&page=1'   # a page of a join, and its total
+//! curl localhost:8787/customers/1                     # a customer and every invoice of theirs
+//! curl 'localhost:8787/invoices?status=open&page=1'   # a page with each customer's name, and its total
 //! curl 'localhost:8787/invoices?status=nunggak'       # 400, in a sentence
-//! curl localhost:8787/report                          # totals and a per-month table
+//! curl localhost:8787/report                          # totals, by status, by customer, by month
 //! curl -i -X POST localhost:8787/invoices/1/pay       # a transaction; 409 the second time
 //! curl localhost:8787/invoices/999                    # 404, because the handler returns ?Invoice
 //! curl localhost:8787/healthz                         # asks the pool with SELECT 1
@@ -159,6 +161,31 @@ fn createCustomer(db: *Db, c: *nilo.Ctx, incoming: NewCustomer) !nilo.Status(201
     return .{ .value = made };
 }
 
+/// A customer with their invoices. `invoices` is a list of another table's
+/// Row, which makes it the **children** of the customer: the rows whose
+/// reference points back here, read by a second statement once the customer
+/// is (ADR 0295). A customer with none has an empty list.
+const CustomerAccount = struct {
+    pub const nilo_table = Customer;
+
+    id: i64,
+    name: Str,
+    email: Str,
+    invoices: []const InvoiceBrief,
+};
+
+const InvoiceBrief = struct {
+    pub const nilo_table = Invoice;
+
+    id: i64,
+    total: i64,
+    status: Status,
+};
+
+fn getCustomer(db: *Db, c: *nilo.Ctx, id: i64) !?CustomerAccount {
+    return db.find(CustomerAccount, c, id);
+}
+
 /// `?Invoice` is the whole 404: null goes out as `404 Not Found`, and the
 /// document says the route answers one (ADR 0024).
 fn getInvoice(db: *Db, c: *nilo.Ctx, id: i64) !?Invoice {
@@ -173,53 +200,88 @@ const InvoiceFilter = struct {
     page: nilo.Within(1, 100_000) = .of(1),
 };
 
-/// A join is past one table, so it is `raw`: this Row is the shape the
-/// statement answers with, and `.projection` says it owns no table
-/// (ADR 0155). The `SELECT` list is counted against these fields while
-/// compiling, and the column after the last one is the total `rawPage`
-/// reads (ADR 0279).
+/// A line of the list, with the customer's name beside the invoice.
+/// `customer` holds a Row of another table, which makes it the invoice's
+/// **parent**: joined in the same statement through the one `.references`
+/// from invoices to customers, and answered in JSON as `"customer":
+/// {"name": …}` (ADR 0295). No SQL is written here, and a page is still ten
+/// invoices, because a reference points at one customer.
 const InvoiceLine = struct {
-    pub const nilo_table = .projection;
+    pub const nilo_table = Invoice;
 
     id: i64,
-    customer: Str,
     total: i64,
     status: Status,
     issued_at: sql.Timestamp,
+    customer: CustomerName,
 };
 
-const page_size: i64 = 10;
+const CustomerName = struct {
+    pub const nilo_table = Customer;
 
-/// `$1` twice is one parameter, and `($1 IS NULL OR …)` is the `sql.given`
-/// of a statement you wrote: the optional binds NULL when the filter is
-/// absent and the guard takes the first arm. The same text runs on
-/// Postgres, and on SQLite the `$n` are respelled `?n` while compiling so
-/// they bind by number there too (ADR 0278).
+    name: Str,
+};
+
+const page_size = 10;
+
+/// `sql.given` makes an absent `?status` no condition at all, the same
+/// statement either way (ADR 0183). `db.page` reads the rows and the total
+/// the filter matched in one statement (ADR 0185).
 fn listInvoices(db: *Db, c: *nilo.Ctx, filter: nilo.Query(InvoiceFilter)) !Db.Page(InvoiceLine) {
     const offset = (@as(i64, filter.value.page.value) - 1) * page_size;
-    return db.rawPage(InvoiceLine, c,
-        \\SELECT i.id, cu.name AS customer, i.total, i.status, i.issued_at, count(*) OVER ()
-        \\FROM invoices i JOIN customers cu ON cu.id = i.customer_id
-        \\WHERE ($1 IS NULL OR i.status = $1)
-        \\ORDER BY i.id LIMIT $2 OFFSET $3
-    , .{ filter.value.status, page_size, offset });
+    return db.page(InvoiceLine, c, .{
+        .where = .{ .status = sql.given(filter.value.status) },
+        .order = .{ .id = .asc },
+        .limit = page_size,
+        .offset = offset,
+    });
 }
 
 // ---- the report -----------------------------------------------------------
 //
-// Aggregates are 80% of an application like this one, and all of them are
-// `raw`. Two shapes: a statement that always answers one row, and one that
-// answers a line per group.
+// Aggregates are most of an application like this one. A count or a sum over
+// a column, grouped by columns or by a parent, is a Row that says so in
+// `nilo_aggregate`; its other fields are what it groups by (ADR 0295). What
+// a Row cannot say, a date computed out of a column, is `raw`.
 
+/// Every field an aggregate, so it is grouped by nothing: exactly one row
+/// whatever matched, read with `exactlyOne`. `billed` is optional because a
+/// sum over no invoices at all is null.
 const Totals = struct {
-    pub const nilo_table = .projection;
+    pub const nilo_table = Invoice;
+    pub const nilo_aggregate = .{ .invoices = .count, .billed = .{ .sum = .total } };
 
     invoices: i64,
-    open: i64,
-    billed: i64,
-    collected: i64,
+    billed: ?i64,
 };
 
+/// One line per status. `status` is not in `nilo_aggregate`, so it is what
+/// the lines are grouped by.
+const StatusLine = struct {
+    pub const nilo_table = Invoice;
+    pub const nilo_aggregate = .{ .invoices = .count, .billed = .{ .sum = .total } };
+
+    status: Status,
+    invoices: i64,
+    billed: i64,
+};
+
+/// One line per customer, grouped by a parent's column: the join and the
+/// `GROUP BY` both follow from `customer`'s type.
+const CustomerLine = struct {
+    pub const nilo_table = Invoice;
+    pub const nilo_aggregate = .{ .invoices = .count, .billed = .{ .sum = .total } };
+
+    customer: CustomerName,
+    invoices: i64,
+    billed: i64,
+};
+
+/// A month is computed out of `issued_at`, and a Row groups by columns, not
+/// by expressions over them, so this one is `raw`. A `sql.Timestamp` is
+/// stored as microseconds since the epoch on SQLite (ADR 0136), so a date
+/// function reads it as `issued_at / 1000000, 'unixepoch'`; on Postgres the
+/// same line is `to_char(issued_at, 'YYYY-MM')`.
 const MonthLine = struct {
     pub const nilo_table = .projection;
 
@@ -230,30 +292,23 @@ const MonthLine = struct {
 
 const Report = struct {
     totals: Totals,
+    by_status: []StatusLine,
+    by_customer: []CustomerLine,
     by_month: []MonthLine,
 };
 
-/// An aggregate with no `GROUP BY` has exactly one row, so it is
-/// `rawExactlyOne` and the answer is the Row rather than a `?Row` to unwrap
-/// (ADR 0280). A `sql.Timestamp` is stored as microseconds since the epoch
-/// on SQLite (ADR 0136), so a date function reads it as
-/// `issued_at / 1000000, 'unixepoch'`; on Postgres the same line is
-/// `to_char(issued_at, 'YYYY-MM')`.
 fn report(db: *Db, c: *nilo.Ctx) !Report {
-    const totals = try db.rawExactlyOne(Totals, c,
-        \\SELECT count(*),
-        \\       count(*) FILTER (WHERE status = 'open'),
-        \\       coalesce(sum(total), 0),
-        \\       coalesce(sum(total) FILTER (WHERE status = 'paid'), 0)
-        \\FROM invoices
-    , .{});
-    const by_month = try db.raw(MonthLine, c,
-        \\SELECT strftime('%Y-%m', issued_at / 1000000, 'unixepoch') AS month,
-        \\       count(*) AS invoices,
-        \\       coalesce(sum(total), 0) AS billed
-        \\FROM invoices GROUP BY month ORDER BY month
-    , .{});
-    return .{ .totals = totals, .by_month = by_month };
+    return .{
+        .totals = try db.exactlyOne(Totals, c, .{}),
+        .by_status = try db.select(StatusLine, c, .{ .order = .{ .status = .asc } }),
+        .by_customer = try db.select(CustomerLine, c, .{ .order = .{ .billed = .desc } }),
+        .by_month = try db.raw(MonthLine, c,
+            \\SELECT strftime('%Y-%m', issued_at / 1000000, 'unixepoch') AS month,
+            \\       count(*) AS invoices,
+            \\       coalesce(sum(total), 0) AS billed
+            \\FROM invoices GROUP BY month ORDER BY month
+        , .{}),
+    };
 }
 
 // ---- the transaction ------------------------------------------------------
@@ -285,6 +340,7 @@ fn payInvoice(db: *Db, c: *nilo.Ctx, id: i64) !Invoice {
 fn routes(app: *nilo.App) !void {
     try app.get("/customers", listCustomers);
     try app.post("/customers", createCustomer);
+    try app.get("/customers/:id", getCustomer);
     try app.get("/invoices", listInvoices);
     try app.get("/invoices/:id", getInvoice);
     try app.post("/invoices/:id/pay", payInvoice);
@@ -414,7 +470,7 @@ test "the invoice page carries the total its filter matched, and a bad filter is
     const open = try stack.client.get(&stack.app, "/invoices?status=open");
     try testing.expectEqual(@as(u16, 200), open.status);
     try testing.expect(std.mem.indexOf(u8, open.body, "\"total\":3") != null);
-    try testing.expect(std.mem.indexOf(u8, open.body, "\"customer\":\"wati\"") != null);
+    try testing.expect(std.mem.indexOf(u8, open.body, "\"customer\":{\"name\":\"wati\"}") != null);
 
     // No filter: every invoice, and the total says so.
     const every = try stack.client.get(&stack.app, "/invoices");
@@ -439,15 +495,48 @@ test "the report adds up, and the per-month table has one line per month" {
 
     const totals = parsed.value.object.get("totals").?.object;
     try testing.expectEqual(@as(i64, 4), totals.get("invoices").?.integer);
-    try testing.expectEqual(@as(i64, 3), totals.get("open").?.integer);
     try testing.expectEqual(@as(i64, 865), totals.get("billed").?.integer);
-    try testing.expectEqual(@as(i64, 90), totals.get("collected").?.integer);
+
+    // One line per status, in the enum's order as text: open, then paid.
+    const by_status = parsed.value.object.get("by_status").?.array;
+    try testing.expectEqual(@as(usize, 2), by_status.items.len);
+    try testing.expectEqualStrings("open", by_status.items[0].object.get("status").?.string);
+    try testing.expectEqual(@as(i64, 3), by_status.items[0].object.get("invoices").?.integer);
+    try testing.expectEqual(@as(i64, 90), by_status.items[1].object.get("billed").?.integer);
+
+    // One line per customer, the one billed most first.
+    const by_customer = parsed.value.object.get("by_customer").?.array;
+    try testing.expectEqual(@as(usize, 2), by_customer.items.len);
+    try testing.expectEqualStrings("wati", by_customer.items[0].object.get("customer").?.object.get("name").?.string);
+    try testing.expectEqual(@as(i64, 650), by_customer.items[0].object.get("billed").?.integer);
+    try testing.expectEqual(@as(i64, 215), by_customer.items[1].object.get("billed").?.integer);
 
     // Three months of invoices, from the microsecond column read through
     // `strftime(…, 'unixepoch')`.
     const by_month = parsed.value.object.get("by_month").?.array;
     try testing.expectEqual(@as(usize, 3), by_month.items.len);
     try testing.expectEqual(@as(i64, 2), by_month.items[1].object.get("invoices").?.integer);
+}
+
+test "a customer comes with their invoices, and one nobody has is a 404" {
+    const gpa = testing.allocator;
+    var stack = try Stack.open(gpa, "account");
+    defer stack.close(gpa);
+
+    const answer = try stack.client.get(&stack.app, "/customers/1");
+    try testing.expectEqual(@as(u16, 200), answer.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, answer.body, .{});
+    defer parsed.deinit();
+
+    // wati was seeded with two invoices, and they come in key order.
+    const invoices = parsed.value.object.get("invoices").?.array;
+    try testing.expectEqualStrings("wati", parsed.value.object.get("name").?.string);
+    try testing.expectEqual(@as(usize, 2), invoices.items.len);
+    try testing.expectEqual(@as(i64, 250), invoices.items[0].object.get("total").?.integer);
+    try testing.expectEqual(@as(i64, 400), invoices.items[1].object.get("total").?.integer);
+
+    const missing = try stack.client.get(&stack.app, "/customers/999");
+    try testing.expectEqual(@as(u16, 404), missing.status);
 }
 
 test "paying an invoice is a transaction, and paying it twice is a 409" {

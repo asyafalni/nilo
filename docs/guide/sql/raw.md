@@ -135,8 +135,12 @@ statement is still counted.
 
 ## Reporting statements
 
-Aggregates are most of what a dashboard reads, and every one of them is
-`raw`. Three shapes come up, and each has a call:
+Aggregates are most of what a dashboard reads. A count, a sum, a min, a
+max or an average over a column, grouped by columns and parents, is a
+[grouped Row](./shapes.md#a-group), and a total over everything is
+`db.exactlyOne`. What is left for `raw` is a report those cannot say: a
+`FILTER`, a `coalesce`, an expression inside the aggregate, a join no
+reference names. Three shapes come up, and each has a call:
 
 **A statement that always has one row.** `SELECT count(*), sum(total) FROM
 invoices` answers one row whatever is in the table, and so does `RETURNING`
@@ -167,9 +171,11 @@ const totals = try db.rawExactlyOne(Totals, c,
 sums: `sum` over no rows is NULL, and a field that is not `?i64` refuses
 one.
 
-**A paged join.** `db.page` reads the rows and the total in one statement
-by putting `count(*) OVER ()` on the `SELECT` list, and a list screen that
-joins two tables wants the same thing. `rawPage` reads your statement as a
+**A paged join.** A join the schema names is [a parent](./shapes.md#a-parent),
+and `db.page` pages it. One it does not, or one with a condition in its `ON`,
+is this. `db.page` reads the rows and the total in one statement by putting
+`count(*) OVER ()` on the `SELECT` list, and a list screen that joins two
+tables that way wants the same thing. `rawPage` reads your statement as a
 page: the Row's columns, then the window as one more column on the end,
 which becomes `.total`. The `ORDER BY` and the `LIMIT` are yours, for the
 reason `db.page` requires both

@@ -31,11 +31,11 @@
 //! .name }, .icontains = q }` — which is the three shapes again with one
 //! parameter named on every column (ADR 0211).
 //!
-//! Everything past that — joins, aggregates, subqueries, `HAVING` — is
-//! `db.raw`. The boundary is one sentence, *one table, conditions that filter
-//! rows*, and a boundary that can be stated is worth more than one that is
-//! further out: a reader can predict what this does without opening the
-//! reference.
+//! A shaped Row adds two more: a parent's name is a way into its columns,
+//! and a grouped Row's condition splits into a `WHERE` and a `HAVING` by what
+//! each name is (`planScoped`, ADR 0295). Everything past that, a join no
+//! reference names, `DISTINCT`, a subquery that is not an `.exists`, is
+//! `db.raw`.
 //!
 //! **A null is written, never held.** `.deleted_at = null` is `IS NULL` and
 //! `.{ .ne = null }` is `IS NOT NULL`, because the compiler can see the null.
