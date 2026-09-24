@@ -8,9 +8,14 @@
   <a href="https://ziglang.org/"><img alt="Zig 0.16" src="https://img.shields.io/badge/zig-0.16-f7a41d?style=flat-square&logo=zig&logoColor=white"></a>
   <a href="./CHANGELOG.md"><img alt="version 0.5.0" src="https://img.shields.io/badge/version-0.5.0-3b82f6?style=flat-square"></a>
   <a href="./docs/reference/"><img alt="11 modules" src="https://img.shields.io/badge/modules-11-8957e5?style=flat-square"></a>
-  <a href="./refusals/README.md"><img alt="372 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-372-e05d44?style=flat-square"></a>
-  <a href="./docs/adr/"><img alt="264 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-264-6b7280?style=flat-square"></a>
+  <a href="./refusals/README.md"><img alt="386 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-386-e05d44?style=flat-square"></a>
+  <a href="./docs/adr/"><img alt="294 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-294-6b7280?style=flat-square"></a>
   <a href="./LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-16a34a?style=flat-square"></a>
+</p>
+
+<p align="center">
+  <a href="https://www.http-arena.com/frameworks/nilo/"><img alt="HTTP Arena H/1.1: #2 of 132" src="https://img.shields.io/static/v1?label=HTTP%20Arena%20H%2F1.1&message=%232%20of%20132&color=e3b341&labelColor=8a5a12&style=flat-square"></a>
+  <a href="https://www.http-arena.com/frameworks/nilo/"><img alt="HTTP Arena WebSocket: #1 of 39" src="https://img.shields.io/static/v1?label=HTTP%20Arena%20WebSocket&message=%231%20of%2039&color=e3b341&labelColor=8a5a12&style=flat-square"></a>
 </p>
 
 <p align="center">
@@ -37,7 +42,7 @@ rest.
 
 - **One rule.** A pointer is a service, a value is request data. There is no second rule.
 - **One allocation** per request. A test fails if it ever becomes two.
-- **372 refusals.** Mistakes that stop the build with a sentence nilo wrote, held by eight build steps.
+- **386 refusals.** Mistakes that stop the build with a sentence nilo wrote, held by eight build steps.
 - **Zero glue.** Routing, the 400, the 404, the OpenAPI document and the SQL all read the same struct.
 
 ## ⚡ Quickstart
@@ -347,6 +352,8 @@ The last one is the honest one. Throughput is the least interesting because
 nilo's own code is about 4% of a request's CPU. The tail latency is a result,
 and so is the build time, against us.
 
+On [HttpArena](https://www.http-arena.com/frameworks/nilo/), an independent board that runs every entry in its own container on the same 64-core machine, nilo's composite is **2nd of 132 on HTTP/1.1** and **1st of 39 on WebSocket**, counted across every tier with engines included (Alpha Round, results of 2026-09-23). The board files nilo as Experimental, and in that tier it leads both families. The entry is [`frameworks/nilo`](https://github.com/MDA2AV/HttpArena/tree/main/frameworks/nilo), and the badges at the top are that reading: they move only when somebody edits them after the next round.
+
 ### Binary size, and how the trade-offs get made
 
 Zig doesn't compile what nothing imports, so an HTTP-only project pays **zero
@@ -376,9 +383,9 @@ have put 99 KB of it.
 ## 🙂 What happens when you get it wrong
 
 An error message is a feature right up until somebody refactors it into mush.
-So this repository has **372 programs that are supposed to fail to compile**,
-and eight build steps checking the wording of every failure: `refusals` (166,
-the framework), `refusals-sql` (145), `refusals-job` (17), `refusals-fetch`
+So this repository has **386 programs that are supposed to fail to compile**,
+and eight build steps checking the wording of every failure: `refusals` (170,
+the framework), `refusals-sql` (154), `refusals-job` (18), `refusals-fetch`
 (15), `refusals-s3` (10), `refusals-config` (9), `refusals-cache` (6) and
 `refusals-pw` (4). Every one says what you did *and* what to do about it:
 
@@ -469,7 +476,7 @@ background work, then one page per module
 metrics, deploying.
 
 - [`docs/reference/`](./docs/reference/) — the entire API surface, one page a module.
-- [`docs/adr/`](./docs/adr/) — 264 decisions, each naming the alternative it rejected.
+- [`docs/adr/`](./docs/adr/) — 294 decisions, each naming the alternative it rejected.
 - [`CONTEXT.md`](./CONTEXT.md) — the vocabulary, and the words this project refuses to use.
 - [`docs/roadmap.md`](./docs/roadmap.md) — what's next, what's waiting for a caller, and what's undecided.
 - [`docs/decided.md`](./docs/decided.md) — what's refused, and what was answered so it isn't asked twice.
