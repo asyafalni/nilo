@@ -1219,6 +1219,22 @@ is the socket, and after that it is somebody else's repository.**
 
 **Can it be pushed further:** there is nothing left to take out. The statement text was already in hand and the lock already taken.
 
+## 14. A Row with a parent, children or a sum costs a program without one nothing
+
+**What it answers.** ADR 0295 let a Row carry a parent, children and aggregates, and to read them it replaced the loop that fills a flat Row with `readRow`, which walks the fields by kind. That loop is on every read any program makes, so the question is whether a program that declares no such Row pays for the generalisation.
+
+**How.** `git archive HEAD | tar -x` at `3713789` into a scratch directory, `zig build size-sql -Dtarget=x86_64-linux-gnu` on both sides, stripped `ReleaseFast`. `bench-sql-server`, a whole server reading Postgres per request, was built the same way as a second reading.
+
+| | before | after | Δ |
+|---|---|---|---|
+| names `sql.Db` (Postgres) | 1,875,080 | 1,875,160 | +80 |
+| names `sql.Sqlite` | 2,297,144 | 2,296,792 | −352 |
+| `bench-sql-server` | 1,884,024 | 1,883,864 | −160 |
+
+**What it changed.** Nothing to decide: the three move in both directions by less than a cache line's worth of instructions each, and `cmp` says they differ, so this is code laid out differently rather than code added. The statements themselves are comptime constants either way. It is the number ADR 0295 quotes for its binary-size axis.
+
+**Can it be pushed further:** not by anything worth doing. The difference is where one `catch` sits: the flat loop caught each column's error, `readRow` returns it and the row is caught once.
+
 ## What is still missing
 
 - **A second box.** Everything here shares eight physical cores between nilo,

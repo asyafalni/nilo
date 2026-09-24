@@ -43,22 +43,23 @@
 //!
 //! ## What it will not do
 //!
-//! Joins, aggregates, `GROUP BY`, `HAVING`, window functions, CTEs. The line
-//! is **one table, conditions that filter rows**, and past it the answer is
-//! `db.raw`, which still fills a Row, still uses the request arena and still
-//! follows the `Str` rule — it gives up the compile-time column check and
-//! nothing else. A boundary that fits in one sentence is worth more than one
-//! that is further out, because it can be predicted without reading the
-//! reference.
+//! A join through a condition rather than a reference, `DISTINCT`, window
+//! functions, CTEs, unions, an aggregate over an expression. Past what a Row
+//! can declare the answer is `db.raw`, which still fills a Row, still uses the
+//! request arena and still follows the `Str` rule: it gives up the
+//! compile-time column check and nothing else.
 //!
-//! **`EXISTS` is the one thing that came back across, and it names the
-//! property the line is really about**
-//! ([ADR 0171](../docs/adr/0171-a-row-over-there-is-a-condition.md)). A
-//! subquery asking whether a row matches over there changes neither the column
-//! list nor the row count, so the Row still describes the answer and `.limit`
-//! still means what the caller thinks. A join changes both. The four above each
-//! break at least one of those, which is why they are still refused and why
-//! that is now a sentence rather than a group.
+//! **What a Row can declare is held to two properties**
+//! ([ADR 0171](../docs/adr/0171-a-row-over-there-is-a-condition.md)): the
+//! Row still describes the answer, and `.limit` still counts what is being
+//! listed. `EXISTS` keeps both and is a condition. A parent keeps both because
+//! a reference points at one row; children keep both because they are never
+//! joined, and are read by a second statement once `.limit` has counted the
+//! parents; a grouped Row keeps both because its rows are its groups and it
+//! says so in its type
+//! ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+//! There is still no `.join` and no `.group_by` at the call site: the Row is
+//! the whole description, and `shape.zig` writes the statement from it.
 //!
 //! Migrations **are** here, and they are the one thing in this module that
 //! writes DDL rather than a statement over a table that already exists
@@ -72,6 +73,7 @@
 //! | Piece | File | What it is |
 //! |---|---|---|
 //! | **Row** | `row.zig` | the marker, the borrow chain, the column list |
+//! | **Shape** | `shape.zig` | a Row with a parent, children or aggregates: the joins, the groups, the children's statement |
 //! | **Dialect** | `dialect.zig` | comptime, writes the SQL, may refuse |
 //! | **where** | `where.zig` | a condition into a fragment and a value list |
 //! | **statements** | `statement.zig` | every one of them, each as a constant |
@@ -122,6 +124,7 @@ pub const wire = @import("wire.zig");
 pub const where = @import("where.zig");
 pub const statement = @import("statement.zig");
 pub const ordering = @import("ordering.zig");
+pub const shape = @import("shape.zig");
 pub const composed = @import("composed.zig");
 pub const schema = @import("schema.zig");
 pub const types = @import("types.zig");
@@ -406,6 +409,19 @@ pub fn findFor(comptime Row: type, comptime Key: type) statement.Statement {
     return comptime statement.find(Postgres, Row, Key);
 }
 
+/// The one-row `SELECT` behind `db.exactlyOne`, for a Row grouped by
+/// nothing: every aggregate it declares, over the rows the condition matched
+/// (ADR 0295).
+pub fn exactlyOneFor(comptime Row: type, comptime Options: type) statement.Statement {
+    return comptime shape.exactlyOne(Postgres, Row, Options);
+}
+
+/// The second statement a children field is read by: every child of every
+/// parent, numbered by the parent it belongs to (ADR 0295).
+pub fn childrenFor(comptime Row: type, comptime field: []const u8) statement.Statement {
+    return comptime shape.children(Postgres, Row, field);
+}
+
 /// The `DELETE`, likewise. It shares the where walker with `selectFor` rather
 /// than having one of its own, so a condition cannot read one way here and
 /// another way there.
@@ -465,7 +481,7 @@ pub fn updateFor(comptime Row: type, comptime Options: type) statement.Statement
     return comptime statement.update(Postgres, Row, Options);
 }
 
-/// The fifteen `…For` functions above, bound to a Dialect of the caller's
+/// The seventeen `…For` functions above, bound to a Dialect of the caller's
 /// choosing: `sql.on(sql.SQLite).selectFor(User, Options)` is what a program
 /// on SQLite compiles to, spelled with `?1` and `LIKE` where the Postgres
 /// version says `$1` and `ILIKE`. The bare `selectFor` is `on(Postgres)`,
@@ -473,7 +489,7 @@ pub fn updateFor(comptime Row: type, comptime Options: type) statement.Statement
 /// reader could ask — so a program on SQLite could not see the constant
 /// ADR 0039 is about.
 ///
-/// A namespace rather than a Dialect parameter on each of the fifteen,
+/// A namespace rather than a Dialect parameter on each of the seventeen,
 /// because every existing call and every refusal names them with two
 /// arguments and nothing about the Postgres default was wrong.
 pub fn on(comptime D: type) type {
@@ -495,6 +511,12 @@ pub fn on(comptime D: type) type {
         }
         pub fn findFor(comptime Row: type, comptime Key: type) statement.Statement {
             return comptime statement.find(D, Row, Key);
+        }
+        pub fn exactlyOneFor(comptime Row: type, comptime Options: type) statement.Statement {
+            return comptime shape.exactlyOne(D, Row, Options);
+        }
+        pub fn childrenFor(comptime Row: type, comptime field: []const u8) statement.Statement {
+            return comptime shape.children(D, Row, field);
         }
         pub fn deleteFor(comptime Row: type, comptime Options: type) statement.Statement {
             return comptime statement.delete(D, Row, Options);
@@ -543,6 +565,7 @@ test {
     _ = where;
     _ = statement;
     _ = ordering;
+    _ = shape;
     _ = composed;
     _ = schema;
     _ = types;

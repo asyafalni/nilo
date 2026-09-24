@@ -4212,3 +4212,143 @@ test "a statement composed at run time fills a Row by position and runs unnamed"
     try testing.expectError(error.NotAnIdentifier, bad.ident("people; DROP TABLE people"));
     try testing.expectError(error.ParamCountMismatch, stack.db.composed(i64, &run, s, .{}));
 }
+
+// -- shaped Rows ---------------------------------------------------------
+//
+// What SQLite cannot say about ADR 0295: that `sum` over a `bigint` comes
+// back as the `numeric` Postgres makes of it unless it is cast, that a list
+// of uuids is one `uuid[]` parameter `unnest` numbers, and that a presence
+// test reads as a `bool`.
+
+const ShapeCustomer = struct {
+    pub const nilo_table = .{ .name = "nilo_shape_customers" };
+    id: i64,
+    name: []const u8,
+};
+
+const ShapeOrder = struct {
+    pub const nilo_table = .{
+        .name = "nilo_shape_orders",
+        .references = .{ .customer_id = .{ ShapeCustomer, .id }, .referrer_id = .{ ShapeCustomer, .id } },
+    };
+    id: types.Uuid,
+    customer_id: i64,
+    referrer_id: ?i64,
+    total: i64,
+    weight: f32,
+};
+
+const ShapeLine = struct {
+    pub const nilo_table = .{ .name = "nilo_shape_lines", .references = .{ .order_id = .{ ShapeOrder, .id } } };
+    id: i64,
+    order_id: types.Uuid,
+    sku: []const u8,
+};
+
+const ShapeCustomerName = struct {
+    pub const nilo_table = ShapeCustomer;
+    name: []const u8,
+};
+
+const ShapeSku = struct {
+    pub const nilo_table = ShapeLine;
+    sku: []const u8,
+};
+
+const ShapeOrderCard = struct {
+    pub const nilo_table = ShapeOrder;
+    pub const nilo_via = .{ .customer = .customer_id, .referrer = .referrer_id };
+    id: types.Uuid,
+    total: i64,
+    customer: ShapeCustomerName,
+    referrer: ?ShapeCustomerName,
+    lines: []const ShapeSku,
+};
+
+const ShapeByCustomer = struct {
+    pub const nilo_table = ShapeOrder;
+    pub const nilo_via = .{ .customer = .customer_id };
+    pub const nilo_aggregate = .{
+        .orders = .count,
+        .revenue = .{ .sum = .total },
+        .mean = .{ .avg = .total },
+        .heaviest = .{ .max = .weight },
+        .weighed = .{ .sum = .weight },
+    };
+    customer: ShapeCustomerName,
+    orders: i64,
+    revenue: i64,
+    mean: f64,
+    heaviest: f32,
+    weighed: f64,
+};
+
+const shape_setup = [_][]const u8{
+    "DROP TABLE IF EXISTS nilo_shape_lines",
+    "DROP TABLE IF EXISTS nilo_shape_orders",
+    "DROP TABLE IF EXISTS nilo_shape_customers",
+    "CREATE TABLE nilo_shape_customers (id bigint PRIMARY KEY, name text NOT NULL)",
+    "CREATE TABLE nilo_shape_orders (id uuid PRIMARY KEY, customer_id bigint NOT NULL, " ++
+        "referrer_id bigint, total bigint NOT NULL, weight real NOT NULL)",
+    "CREATE TABLE nilo_shape_lines (id bigint PRIMARY KEY, order_id uuid NOT NULL, sku text NOT NULL)",
+    "INSERT INTO nilo_shape_customers VALUES (1, 'Acme'), (2, 'Borealis')",
+    "INSERT INTO nilo_shape_orders VALUES " ++
+        "('00000000-0000-7000-8000-000000000001', 1, 2, 100, 1.5), " ++
+        "('00000000-0000-7000-8000-000000000002', 1, NULL, 250, 2.5), " ++
+        "('00000000-0000-7000-8000-000000000003', 2, 1, 40, 0.5)",
+    "INSERT INTO nilo_shape_lines VALUES " ++
+        "(2, '00000000-0000-7000-8000-000000000001', 'b'), (1, '00000000-0000-7000-8000-000000000001', 'a'), " ++
+        "(3, '00000000-0000-7000-8000-000000000003', 'c')",
+};
+
+test "a parent, its children and a sum come back from a real Postgres" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    for (shape_setup) |text| _ = try stack.db.exec(&run, text, .{});
+
+    const cards = try stack.db.select(ShapeOrderCard, &run, .{ .order = .{ .total = .desc } });
+    try testing.expectEqual(@as(usize, 3), cards.len);
+    // 250: Acme's, no referrer, no lines.
+    try testing.expectEqualStrings("Acme", cards[0].customer.name);
+    try testing.expect(cards[0].referrer == null);
+    try testing.expectEqual(@as(usize, 0), cards[0].lines.len);
+    // 100: Acme's, referred by Borealis, two lines in key order.
+    try testing.expectEqualStrings("Borealis", cards[1].referrer.?.name);
+    try testing.expectEqual(@as(usize, 2), cards[1].lines.len);
+    try testing.expectEqualStrings("a", cards[1].lines[0].sku);
+    try testing.expectEqualStrings("b", cards[1].lines[1].sku);
+    // 40: Borealis's, referred by Acme, one line.
+    try testing.expectEqualStrings("Acme", cards[2].referrer.?.name);
+    try testing.expectEqualStrings("c", cards[2].lines[0].sku);
+
+    // A condition through a parent, in a transaction so the two statements
+    // are one snapshot.
+    var tx = try stack.db.begin(&run, .{});
+    defer tx.deinit();
+    const referred = try tx.select(ShapeOrderCard, &run, .{
+        .where = .{ .referrer = .{ .name = "Acme" } },
+    });
+    try testing.expectEqual(@as(usize, 1), referred.len);
+    try testing.expectEqual(@as(i64, 40), referred[0].total);
+    try tx.commit();
+
+    const groups = try stack.db.page(ShapeByCustomer, &run, .{
+        .where = .{ .revenue = .{ .gt = @as(i64, 10) } },
+        .order = .{ .revenue = .desc },
+        .limit = 10,
+    });
+    try testing.expectEqual(@as(i64, 2), groups.total);
+    try testing.expectEqualStrings("Acme", groups.rows[0].customer.name);
+    try testing.expectEqual(@as(i64, 2), groups.rows[0].orders);
+    try testing.expectEqual(@as(i64, 350), groups.rows[0].revenue);
+    try testing.expectEqual(@as(f64, 175), groups.rows[0].mean);
+    try testing.expectEqual(@as(f32, 2.5), groups.rows[0].heaviest);
+    try testing.expectEqual(@as(f64, 4), groups.rows[0].weighed);
+    try testing.expectEqual(@as(i64, 40), groups.rows[1].revenue);
+
+    for (shape_setup[0..3]) |text| _ = try stack.db.exec(&run, text, .{});
+}

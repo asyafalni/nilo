@@ -37,10 +37,12 @@ const User = struct {
 | `pub const nilo_table = Other` | a narrower Row: the same table as `Other`, fewer columns, checked against it while compiling |
 | `pub const nilo_table = .projection` | a Row that owns no table at all — the shape `db.raw` fills. See below |
 | `pub const nilo_beside = .{ .attachments }` | the fields **beside** the columns: on the Row, in its JSON and its document, and in no statement. See below |
+| `pub const nilo_via = .{ .approver = .approver_id }` | on a narrower Row: which column a parent or a list of children follows, when the schema has several or none. See [A parent, children, a group](#a-parent-children-a-group) |
+| `pub const nilo_aggregate = .{ .n = .count, .owed = .{ .sum = .amount } }` | on a narrower Row: the fields that are computed, which makes the Row one row per group. See [A parent, children, a group](#a-parent-children-a-group) |
 
 #### A Row that owns no table
 
-A join, an aggregate or a window function comes back in a shape no table has.
+A window function, a CTE or a join no reference names comes back in a shape no table has.
 `.projection` is a Row that says so
 ([ADR 0155](../adr/0155-a-row-that-owns-no-table.md)):
 
@@ -771,11 +773,11 @@ that is one.
 The entries are a list because a struct cannot carry the same field twice, and
 narrowing on two capabilities is the ordinary case. They are ANDed.
 
-**This is the only place the *one table* line moves**, and
-[ADR 0171](../adr/0171-a-row-over-there-is-a-condition.md) says why: an `EXISTS`
+**An `EXISTS` is a condition rather than a join**, and
+[ADR 0171](../adr/0171-a-row-over-there-is-a-condition.md) says why: it
 changes neither the column list nor the row count, so the Row still describes
-the answer and `.limit` still means what you think. A join changes both, and is
-still `db.raw`.
+the answer and `.limit` still means what you think. A join the Row declares
+keeps both too, and is [a parent](#a-parent-children-a-group).
 
 ### A key of several columns
 
@@ -792,6 +794,65 @@ round would find the wrong row and report nothing. Leaving one out, adding a
 column that is not part of the key, and passing a tuple are all compile errors.
 `updateMany` joins on every column, and `CREATE TABLE` writes a
 `PRIMARY KEY (…)` constraint rather than a clause on one column.
+
+### A parent, children, a group
+
+A narrower Row can carry more than its table's columns, and every read takes it unchanged ([ADR 0295](../adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)). The guide page is [a Row with more in it](../guide/sql/shapes.md).
+
+```zig
+const OrderCard = struct {
+    pub const nilo_table = Order;
+    pub const nilo_via = .{ .approver = .approver_id };
+    id: i64,
+    customer: CustomerName,        // a parent: JOIN, through the one reference to customers
+    approver: ?StaffName,          // an optional parent: LEFT JOIN, because approver_id may be null
+    lines: []const LineBrief,      // children: one more statement for every row at once
+};
+
+const ByCustomer = struct {
+    pub const nilo_table = Order;
+    pub const nilo_aggregate = .{ .orders = .count, .revenue = .{ .sum = .total } };
+    customer: CustomerName,        // a key of the group
+    orders: i64,
+    revenue: i64,
+};
+```
+
+| A field | is | read by |
+|---|---|---|
+| `p: P` or `p: ?P`, `P` a Row of another table | **a parent**: the row a reference of this table points at | a `JOIN` (`LEFT JOIN` for `?P`) in the same statement, aliased by the field's name |
+| `cs: []const C`, `C` a Row of a table pointing here | **children**: every row pointing at this one, in `C`'s key order | a second statement, `unnest(…) WITH ORDINALITY` on Postgres and `json_each(…)` on SQLite, for all the rows at once |
+| a field named in `nilo_aggregate` | **an aggregate** of the rows in its group | `count`, `sum`, `min`, `max`, `avg` in the same statement; every other field is a `GROUP BY` key |
+
+**The link is the schema's.** One `.references` between the two tables is the join; none, or several, is a compile error until `nilo_via` names the column. `nilo_via` may name a column no reference covers, and then it joins the other table's key. A parent is `?P` exactly when its column may be null; the other way round is refused as well.
+
+**Conditions and orders go through the field.** `.where = .{ .customer = .{ .name = "Acme" } }`, `.order = .{ .customer = .{ .name = .asc } }`, and in a `sql.Ordering` the path is a tuple, `.{ .customer, .name }`. On a grouped Row a term on a column is a `WHERE` and a term on an aggregate a `HAVING`, and a grouped Row's condition may name any column of its table.
+
+**What an aggregate reads as:**
+
+| `nilo_aggregate` | field |
+|---|---|
+| `.count`, `.{ .count = .col }`, `.{ .count_distinct = .col }` | `i64` |
+| `.{ .sum = .col }` | `i64` over whole numbers, `f64` over floating ones, the column's type over a text-carried number |
+| `.{ .min = .col }`, `.{ .max = .col }` | the column's type |
+| `.{ .avg = .col }` | `f64` |
+
+Optional exactly when the answer can be null: a nullable column, or `sum`, `min`, `max` and `avg` on a Row with no keys.
+
+| Call | a parent | children | a group | no keys |
+|---|---|---|---|---|
+| `select`, `one`, `page` | ✓ | ✓ | ✓ (a page counts groups) | refused |
+| `find` | ✓ | ✓ | refused | refused |
+| `count`, `exists` | ✓ | ✓ | ✓ (counts groups) | refused |
+| `stream` | ✓ | refused | ✓ | refused |
+| `exactlyOne` | | | | ✓ |
+
+| Call | Returns |
+|---|---|
+| `db.exactlyOne(Totals, c, .{ .where = … })` | `!Totals`: a Row whose every field is an aggregate, over the rows matched. Exactly one row, whatever matched; a `sum` over none is null |
+| `sql.exactlyOneFor(Row, Options)`, `sql.childrenFor(Row, "field")` | the statements behind `exactlyOne` and a children field, while compiling |
+
+Refused: a parent or children on the Row that describes the table, children of children, children through a reference of several columns, a `.lock`, a write, and `db.raw` into a shaped Row. Children are two statements, one snapshot only inside a `Tx`.
 
 ### Streaming
 

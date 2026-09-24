@@ -84,6 +84,7 @@ const dialect = @import("dialect.zig");
 /// none of the migration module — `expectVersion` is the one line that names it.
 const migrate = @import("migrate.zig");
 const ordering = @import("ordering.zig");
+const shape = @import("shape.zig");
 const postgres = @import("postgres.zig");
 const rawcheck = @import("rawcheck.zig");
 const composed_mod = @import("composed.zig");
@@ -1125,6 +1126,32 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             return only(bool, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
         }
 
+        /// The one row a Row grouped by nothing answers: every aggregate it
+        /// declares, over the rows `.where` matched
+        /// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+        ///
+        /// ```zig
+        /// const Totals = struct {
+        ///     pub const nilo_table = Bill;
+        ///     pub const nilo_aggregate = .{ .bills = .count, .owed = .{ .sum = .amount } };
+        ///     bills: i64,
+        ///     owed: ?i64,
+        /// };
+        /// const t = try db.exactlyOne(Totals, c, .{ .where = .{ .paid = false } });
+        /// ```
+        ///
+        /// **The Row is the answer and never `?Row`**, because an aggregate
+        /// with no `GROUP BY` answers one row whether it matched anything or
+        /// not, which is also why a `sum` there is `?i64`: over no rows it is
+        /// null. `db.one` would say null for a case that cannot happen, and
+        /// `db.select` would hand back a list that always holds one.
+        pub fn exactlyOne(self: *Self, comptime Row: type, c: anytype, options: anytype) !Row {
+            comptime core.checkScope(@TypeOf(c), "db.exactlyOne");
+            const stmt = comptime shape.exactlyOne(D, Row, @TypeOf(options));
+            const found = try fill(Row, stmt.reserve, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
+            return if (found.len == 0) error.QueryFailed else found[0];
+        }
+
         /// Rows read one at a time, for a result set too big to hold.
         ///
         /// What comes back is `Borrowed(Row)` and the text in it dies at the
@@ -1442,6 +1469,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             values: anytype,
         ) ![]Row {
             comptime core.checkScope(@TypeOf(c), "db.composed");
+            comptime rawcheck.assertFlat(Row, "db.composed");
             try checkComposed(stmt, @TypeOf(values));
             if (comptime scalarColumn(Row)) {
                 return fillScalar(Row, self, null, c, stmt.view(), null, try rawValuesOf(values, c));
@@ -2016,6 +2044,13 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 return only(bool, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
             }
 
+            pub fn exactlyOne(self: *Tx, comptime Row: type, c: anytype, options: anytype) !Row {
+                comptime core.checkScope(@TypeOf(c), "tx.exactlyOne");
+                const stmt = comptime shape.exactlyOne(D, Row, @TypeOf(options));
+                const found = try fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
+                return if (found.len == 0) error.QueryFailed else found[0];
+            }
+
             pub fn insert(self: *Tx, comptime Row: type, c: anytype, values: anytype) !Row {
                 comptime core.checkScope(@TypeOf(c), "tx.insert");
                 const stmt = comptime statement.insert(D, Row, @TypeOf(values));
@@ -2178,6 +2213,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 values: anytype,
             ) ![]Row {
                 comptime core.checkScope(@TypeOf(c), "tx.composed");
+                comptime rawcheck.assertFlat(Row, "tx.composed");
                 try checkComposed(stmt, @TypeOf(values));
                 if (comptime scalarColumn(Row)) {
                     return fillScalar(Row, self.db, &self.inner, c, stmt.view(), null, try rawValuesOf(values, c));
@@ -2337,15 +2373,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 /// of the row before this returns is invalid afterwards.**
                 pub fn next(self: *Rows) !?row_mod.Borrowed(Row) {
                     if (!try self.w.next(&self.rows)) return null;
-                    var out: row_mod.Borrowed(Row) = undefined;
-                    inline for (comptime row_mod.columnsOf(Row), 0..) |column, i| {
-                        const B = comptime row_mod.ColumnType(row_mod.Borrowed(Row), column);
-                        @field(out, column) = try borrowColumn(self.w, &self.rows, B, i);
-                    }
-                    inline for (comptime row_mod.besideOf(Row)) |beside| {
-                        @field(out, beside) = comptime row_mod.besideDefault(Row, beside);
-                    }
-                    return out;
+                    return try borrowRow(Row, 0, self.w, &self.rows);
                 }
 
                 /// Give the connection back. Wanted on every path out,
@@ -2357,6 +2385,37 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                     self.w.drain(&self.rows);
                 }
             };
+        }
+
+        /// `readRow` with nothing kept: a row whose text points into the read
+        /// buffer, a parent's included.
+        fn borrowRow(comptime Row: type, comptime at: usize, w: *W, rows: *const W.Rows) !row_mod.Borrowed(Row) {
+            const B = row_mod.Borrowed(Row);
+            var out: B = undefined;
+            comptime var col = at;
+            inline for (@typeInfo(Row).@"struct".fields) |f| {
+                const F = @FieldType(B, f.name);
+                switch (comptime row_mod.kindWith(Row, f.name, f.type)) {
+                    .column, .aggregate => {
+                        @field(out, f.name) = try borrowColumn(w, rows, F, col);
+                        col += 1;
+                    },
+                    .parent => {
+                        const P = comptime row_mod.parentRowOf(f.type).?;
+                        if (comptime @typeInfo(f.type) == .optional) {
+                            const present = try w.read(rows, bool, col);
+                            col += 1;
+                            @field(out, f.name) = if (present) try borrowRow(P, col, w, rows) else null;
+                        } else {
+                            @field(out, f.name) = try borrowRow(P, col, w, rows);
+                        }
+                        col += comptime shape.width(P);
+                    },
+                    .children => @field(out, f.name) = &.{},
+                    .beside => @field(out, f.name) = comptime row_mod.besideDefault(Row, f.name),
+                }
+            }
+            return out;
         }
 
         /// One column of a row that is **borrowed** rather than kept.
@@ -2487,6 +2546,28 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         ) ![]Row {
             comptime row_mod.assertRow(Row);
             comptime assertReadable(Row);
+            // Children are a second statement, sent once the first has given
+            // its connection back: inside a transaction there is one
+            // connection, and it answers one statement at a time.
+            if (comptime shape.childFields(Row).len > 0) {
+                const parents = try readParents(Row, reserve, db, tx, c, sql, plan, values, total);
+                try adopt(Row, db, tx, c, parents);
+                return parents;
+            }
+            return readParents(Row, reserve, db, tx, c, sql, plan, values, total);
+        }
+
+        fn readParents(
+            comptime Row: type,
+            reserve: ?usize,
+            db: *Self,
+            tx: ?*W.Tx,
+            c: anytype,
+            sql: []const u8,
+            plan: ?[]const u8,
+            values: anytype,
+            total: ?*i64,
+        ) ![]Row {
             const arena = c.arena();
             // The Db rather than the Wire, so that the one funnel every read
             // goes through is also the one place a watcher is told about it
@@ -2528,7 +2609,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                         w,
                         &rows,
                         i64,
-                        comptime row_mod.columnsOf(Row).len,
+                        comptime shape.width(Row),
                         c,
                     ) catch |err| {
                         db.told(arena, started, sql, plan, null, true, null);
@@ -2536,19 +2617,10 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                     };
                 }
                 while (true) {
-                    var filled: Row = undefined;
-                    inline for (comptime row_mod.columnsOf(Row), 0..) |column, i| {
-                        const F = comptime row_mod.ColumnType(Row, column);
-                        @field(filled, column) = readColumn(w, &rows, F, i, c) catch |err| {
-                            db.told(arena, started, sql, plan, null, true, null);
-                            return err;
-                        };
-                    }
-                    // A field beside the columns is left at its default for
-                    // the caller to fill (ADR 0217).
-                    inline for (comptime row_mod.besideOf(Row)) |beside| {
-                        @field(filled, beside) = comptime row_mod.besideDefault(Row, beside);
-                    }
+                    const filled = readRow(Row, 0, w, &rows, c) catch |err| {
+                        db.told(arena, started, sql, plan, null, true, null);
+                        return err;
+                    };
                     try out.append(arena, filled);
                     if (!try w.next(&rows)) break;
                 }
@@ -2574,7 +2646,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// columns of a wider result is what `SELECT *` into a narrow Row
         /// means, and nothing about it is out of range.
         fn wideEnough(comptime Row: type, extra: usize, w: *W, rows: *const W.Rows) !void {
-            const wanted = comptime row_mod.columnsOf(Row).len;
+            const wanted = comptime shape.width(Row);
             const answered = w.width(rows);
             if (answered >= wanted + extra) return;
             std.log.warn(
@@ -2692,6 +2764,138 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // `rows` gets what a `SELECT` would have given it.
             db.told(arena, started, sql, plan, 1, false, null);
             return answer;
+        }
+
+        /// One row of the answer, from column `at` on, in the order the Row
+        /// declares its fields, which is the order `shape.zig` writes a
+        /// `SELECT` list in, each parent's columns where the parent's field
+        /// is (ADR 0295). A flat Row is the case with no parent in it, and
+        /// reads its columns one after another as it always did.
+        ///
+        /// A field beside the columns is left at its default for the caller
+        /// to fill (ADR 0217), and a list of children empty for `adopt` to.
+        fn readRow(comptime Row: type, comptime at: usize, w: *W, rows: *const W.Rows, c: anytype) !Row {
+            var filled: Row = undefined;
+            comptime var col = at;
+            inline for (@typeInfo(Row).@"struct".fields) |f| {
+                switch (comptime row_mod.kindWith(Row, f.name, f.type)) {
+                    .column, .aggregate => {
+                        @field(filled, f.name) = try readColumn(w, rows, f.type, col, c);
+                        col += 1;
+                    },
+                    .parent => {
+                        const P = comptime row_mod.parentRowOf(f.type).?;
+                        // A parent that may be missing says whether it is
+                        // there in a column of its own, ahead of its columns:
+                        // they can all be null on a parent that exists.
+                        if (comptime @typeInfo(f.type) == .optional) {
+                            const present = try w.read(rows, bool, col);
+                            col += 1;
+                            @field(filled, f.name) = if (present) try readRow(P, col, w, rows, c) else null;
+                        } else {
+                            @field(filled, f.name) = try readRow(P, col, w, rows, c);
+                        }
+                        col += comptime shape.width(P);
+                    },
+                    .children => @field(filled, f.name) = &.{},
+                    .beside => @field(filled, f.name) = comptime row_mod.besideDefault(Row, f.name),
+                }
+            }
+            return filled;
+        }
+
+        /// Every children field of `parents`, read by one statement a field
+        /// (ADR 0295).
+        ///
+        /// **The parents' keys go out as one list and the children come back
+        /// numbered by position in it**, sorted by that number, so the walk
+        /// below hands out contiguous runs of one list and never compares a
+        /// key. What it costs is the keys array, one mark per parent, and the
+        /// children themselves; none of it is per child beyond the child.
+        ///
+        /// Two statements, so two snapshots unless a transaction makes them
+        /// one: outside a `Tx` a child inserted between them can appear under
+        /// a parent that was read before it existed. Inside one it cannot.
+        fn adopt(comptime Row: type, db: *Self, tx: ?*W.Tx, c: anytype, parents: []Row) !void {
+            if (parents.len == 0) return;
+            inline for (comptime shape.childFields(Row)) |field| {
+                try adoptField(Row, field, db, tx, c, parents);
+            }
+        }
+
+        fn adoptField(
+            comptime Row: type,
+            comptime field: []const u8,
+            db: *Self,
+            tx: ?*W.Tx,
+            c: anytype,
+            parents: []Row,
+        ) !void {
+            const Child = comptime row_mod.childRowOf(@FieldType(Row, field)).?;
+            const target = comptime shape.childTarget(Row, field);
+            const stmt = comptime shape.children(D, Row, field);
+            const numbered = comptime shape.width(Child);
+            const arena = c.arena();
+
+            const keys = try arena.alloc(row_mod.ColumnType(Row, target), parents.len);
+            for (keys, parents) |*key, parent| key.* = @field(parent, target);
+            // Where each parent's run ends in `found`. A parent with no
+            // children keeps the end of the one before it.
+            const ends = try arena.alloc(usize, parents.len);
+            @memset(ends, 0);
+
+            const values = try valuesOf(stmt, Row, .{ .keys = keys }, c);
+            const plan = db.planOf(stmt);
+            const w = try db.wireOf();
+            const started = db.timing();
+            var problem: ?wire_mod.Problem = null;
+            var rows = if (tx) |t|
+                t.run(arena, stmt.sql, values, plan, &problem) catch |err| {
+                    db.told(arena, started, stmt.sql, plan, null, true, problem);
+                    return err;
+                }
+            else
+                w.run(arena, stmt.sql, values, plan, &problem) catch |err| {
+                    db.told(arena, started, stmt.sql, plan, null, true, problem);
+                    return err;
+                };
+            defer w.drain(&rows);
+
+            var found: std.ArrayList(Child) = .empty;
+            var last: usize = 0;
+            while (try w.next(&rows)) {
+                const read = readChild(Child, numbered, w, &rows, c) catch |err| {
+                    db.told(arena, started, stmt.sql, plan, null, true, null);
+                    return err;
+                };
+                // The number is the parent's position, counted from where the
+                // Dialect counts. One out of range or out of order means the
+                // statement is not the one this was written against.
+                const at = read.number - D.ordinal_base;
+                if (at < last or at >= parents.len) {
+                    db.told(arena, started, stmt.sql, plan, null, true, null);
+                    return error.QueryFailed;
+                }
+                last = @intCast(at);
+                try found.append(arena, read.child);
+                ends[last] = found.items.len;
+            }
+            db.told(arena, started, stmt.sql, plan, found.items.len, false, null);
+
+            var from: usize = 0;
+            for (parents, ends) |*parent, end| {
+                const stop = @max(from, end);
+                @field(parent.*, field) = found.items[from..stop];
+                from = stop;
+            }
+        }
+
+        fn readChild(comptime Child: type, comptime numbered: usize, w: *W, rows: *const W.Rows, c: anytype) !struct { child: Child, number: i64 } {
+            if (w.width(rows) < numbered + 1) return error.QueryFailed;
+            return .{
+                .child = try readRow(Child, 0, w, rows, c),
+                .number = try w.read(rows, i64, numbered),
+            };
         }
 
         /// One column, with the borrow ended if there was one.
@@ -3471,7 +3675,20 @@ fn enumOf(comptime E: type, raw: []const u8) !E {
 fn assertReadable(comptime Row: type) void {
     comptime {
         for (@typeInfo(Row).@"struct".fields) |f| {
-            if (row_mod.isBeside(Row, f.name)) continue;
+            // A parent's columns and a child's are judged by their own Row,
+            // and a field beside the columns is never read at all.
+            switch (row_mod.kindWith(Row, f.name, f.type)) {
+                .beside => continue,
+                .parent => {
+                    assertReadable(row_mod.parentRowOf(f.type).?);
+                    continue;
+                },
+                .children => {
+                    assertReadable(row_mod.childRowOf(f.type).?);
+                    continue;
+                },
+                .column, .aggregate => {},
+            }
             const Column = switch (@typeInfo(f.type)) {
                 .optional => |o| o.child,
                 else => f.type,
@@ -3547,8 +3764,24 @@ fn readable(comptime T: type) bool {
 fn assertStreamable(comptime Row: type) void {
     comptime {
         for (@typeInfo(Row).@"struct".fields) |f| {
-            // Never read out of the buffer, so it may hold anything.
-            if (row_mod.isBeside(Row, f.name)) continue;
+            switch (row_mod.kindWith(Row, f.name, f.type)) {
+                // Never read out of the buffer, so it may hold anything.
+                .beside => continue,
+                .parent => {
+                    assertStreamable(row_mod.parentRowOf(f.type).?);
+                    continue;
+                },
+                // A second statement per stream, whose rows would have to be
+                // held until the parent they belong to came past (ADR 0295).
+                .children => @compileError(
+                    "nilo: `db.stream` on " ++ @typeName(Row) ++ ", which reads `" ++ f.name ++
+                        "` as children.\n" ++
+                        "  Children are read by a second statement once the rows are in hand, " ++
+                        "and a stream never has them in hand. Stream a Row without the list, " ++
+                        "or read a page of them with `db.select`.",
+                ),
+                .column, .aggregate => {},
+            }
             const Inner = switch (@typeInfo(f.type)) {
                 .optional => |o| o.child,
                 else => f.type,
@@ -6962,4 +7195,307 @@ test "an optional filter narrows when it is set and drops when it is not" {
     });
     try testing.expectEqual(@as(usize, 3), all.rows.len);
     try testing.expectEqual(@as(i64, 3), all.total);
+}
+
+// -- shaped Rows, end to end ----------------------------------------------
+//
+// A parent joined in, children read after, a group summed (ADR 0295). The
+// statement text is held by `shape.zig`'s own tests; what is held here is
+// what only a database can say: that the answer's columns land in the
+// fields they were named for, that a missing parent is a null rather than a
+// row of nulls, and that children reach the parent they belong to whatever
+// order the parents were read in.
+
+const ShopCustomer = struct {
+    pub const nilo_table = .{ .name = "shop_customers" };
+    id: i64,
+    name: []const u8,
+    region: ?[]const u8,
+};
+
+const ShopStaff = struct {
+    pub const nilo_table = .{ .name = "shop_staff" };
+    id: i64,
+    full_name: []const u8,
+};
+
+const ShopOrder = struct {
+    pub const nilo_table = .{
+        .name = "shop_orders",
+        .references = .{
+            .customer_id = .{ ShopCustomer, .id },
+            .owner_id = .{ ShopStaff, .id },
+            .approver_id = .{ ShopStaff, .id },
+        },
+    };
+    id: i64,
+    customer_id: i64,
+    owner_id: i64,
+    approver_id: ?i64,
+    total: i64,
+    discount: ?i64,
+    year: i32,
+};
+
+const ShopLine = struct {
+    pub const nilo_table = .{ .name = "shop_lines", .references = .{ .order_id = .{ ShopOrder, .id } } };
+    id: i64,
+    order_id: i64,
+    sku: []const u8,
+    qty: i32,
+};
+
+const shop_ddl = [_][]const u8{
+    "CREATE TABLE shop_customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL, region TEXT)",
+    "CREATE TABLE shop_staff (id INTEGER PRIMARY KEY, full_name TEXT NOT NULL)",
+    "CREATE TABLE shop_orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, " ++
+        "owner_id INTEGER NOT NULL, approver_id INTEGER, total INTEGER NOT NULL, " ++
+        "discount INTEGER, year INTEGER NOT NULL)",
+    "CREATE TABLE shop_lines (id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, " ++
+        "sku TEXT NOT NULL, qty INTEGER NOT NULL)",
+    "INSERT INTO shop_customers VALUES (1, 'Acme', 'west'), (2, 'Borealis', NULL), (3, 'Cobalt', 'east')",
+    "INSERT INTO shop_staff VALUES (1, 'Wati'), (2, 'Budi')",
+    // Order 12 has no approver; order 13 no lines; order 14 is Cobalt's only
+    // one and is from another year.
+    "INSERT INTO shop_orders VALUES (10, 1, 1, 2, 100, 5, 2026), (11, 1, 2, 1, 250, NULL, 2026), " ++
+        "(12, 2, 1, NULL, 40, NULL, 2026), (13, 2, 2, 2, 60, 10, 2026), (14, 3, 1, NULL, 999, NULL, 2025)",
+    // Out of key order on purpose, so the order they come back in is the
+    // statement's rather than the insert's.
+    "INSERT INTO shop_lines VALUES (3, 10, 'c', 1), (1, 10, 'a', 2), (2, 11, 'b', 5), (4, 12, 'd', 1)",
+};
+
+const ShopCustomerName = struct {
+    pub const nilo_table = ShopCustomer;
+    name: []const u8,
+    region: ?[]const u8,
+};
+
+const ShopStaffName = struct {
+    pub const nilo_table = ShopStaff;
+    full_name: []const u8,
+};
+
+const ShopOrderCard = struct {
+    pub const nilo_table = ShopOrder;
+    pub const nilo_via = .{ .owner = .owner_id, .approver = .approver_id };
+    id: i64,
+    total: i64,
+    customer: ShopCustomerName,
+    owner: ShopStaffName,
+    approver: ?ShopStaffName,
+};
+
+const ShopLineBrief = struct {
+    pub const nilo_table = ShopLine;
+    sku: []const u8,
+    qty: i32,
+};
+
+const ShopOrderLines = struct {
+    pub const nilo_table = ShopOrder;
+    id: i64,
+    customer: ShopCustomerName,
+    lines: []const ShopLineBrief,
+};
+
+const ShopByCustomer = struct {
+    pub const nilo_table = ShopOrder;
+    pub const nilo_aggregate = .{
+        .orders = .count,
+        .revenue = .{ .sum = .total },
+        .off = .{ .sum = .discount },
+        .mean = .{ .avg = .total },
+    };
+    customer: ShopCustomerName,
+    orders: i64,
+    revenue: i64,
+    off: ?i64,
+    mean: f64,
+};
+
+const ShopTotals = struct {
+    pub const nilo_table = ShopOrder;
+    pub const nilo_aggregate = .{ .orders = .count, .revenue = .{ .sum = .total }, .top = .{ .max = .total } };
+    orders: i64,
+    revenue: ?i64,
+    top: ?i64,
+};
+
+fn shopDb(threaded: *std.Io.Threaded, comptime name: []const u8, run: *nilo.Run) !SqliteDb {
+    var db: SqliteDb = .init(testing.allocator, "file:" ++ name ++ "?mode=memory&cache=shared", .{ .size = 2, .unchecked = true });
+    errdefer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+    for (shop_ddl) |statement_text| _ = try db.exec(run, statement_text, .{});
+    return db;
+}
+
+test "a parent is read into its field, and a missing one is null rather than a row of nulls" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = try shopDb(&threaded, "shape-parents", &run);
+    defer db.deinit();
+
+    const cards = try db.select(ShopOrderCard, &run, .{
+        .where = .{ .id = .{ .lt = @as(i64, 14) } },
+        .order = .{ .customer = .{ .name = .desc }, .id = .asc },
+    });
+    try testing.expectEqual(@as(usize, 4), cards.len);
+    // Borealis before Acme, and within each by id.
+    try testing.expectEqual(@as(i64, 12), cards[0].id);
+    try testing.expectEqualStrings("Borealis", cards[0].customer.name);
+    try testing.expect(cards[0].customer.region == null);
+    try testing.expect(cards[0].approver == null);
+    try testing.expectEqualStrings("Wati", cards[0].owner.full_name);
+    try testing.expectEqual(@as(i64, 13), cards[1].id);
+    try testing.expectEqualStrings("Budi", cards[1].approver.?.full_name);
+    try testing.expectEqual(@as(i64, 10), cards[2].id);
+    try testing.expectEqualStrings("west", cards[2].customer.region.?);
+    // Two references to one table, each followed through the column named.
+    try testing.expectEqualStrings("Wati", cards[2].owner.full_name);
+    try testing.expectEqualStrings("Budi", cards[2].approver.?.full_name);
+
+    // A condition through a parent, and a find.
+    const budis = try db.count(ShopOrderCard, &run, .{ .where = .{ .owner = .{ .full_name = "Budi" } } });
+    try testing.expectEqual(@as(usize, 2), budis);
+    try testing.expect(try db.exists(ShopOrderCard, &run, .{ .where = .{ .customer = .{ .name = "Cobalt" } } }));
+    const found = (try db.find(ShopOrderCard, &run, @as(i64, 11))).?;
+    try testing.expectEqualStrings("Acme", found.customer.name);
+    try testing.expectEqualStrings("Wati", found.approver.?.full_name);
+    try testing.expect(try db.find(ShopOrderCard, &run, @as(i64, 99)) == null);
+}
+
+test "children reach the parent they belong to, in the parents' order and their own key order" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = try shopDb(&threaded, "shape-children", &run);
+    defer db.deinit();
+
+    // Descending, so the parents' order is not their keys' order.
+    const orders = try db.select(ShopOrderLines, &run, .{ .order = .{ .id = .desc } });
+    try testing.expectEqual(@as(usize, 5), orders.len);
+    try testing.expectEqual(@as(i64, 14), orders[0].id);
+    try testing.expectEqual(@as(usize, 0), orders[0].lines.len);
+    try testing.expectEqual(@as(i64, 13), orders[1].id);
+    try testing.expectEqual(@as(usize, 0), orders[1].lines.len);
+    try testing.expectEqual(@as(usize, 1), orders[2].lines.len);
+    try testing.expectEqualStrings("d", orders[2].lines[0].sku);
+    try testing.expectEqual(@as(usize, 1), orders[3].lines.len);
+    try testing.expectEqualStrings("b", orders[3].lines[0].sku);
+    try testing.expectEqual(@as(i64, 10), orders[4].id);
+    try testing.expectEqual(@as(usize, 2), orders[4].lines.len);
+    try testing.expectEqualStrings("a", orders[4].lines[0].sku);
+    try testing.expectEqualStrings("c", orders[4].lines[1].sku);
+    try testing.expectEqualStrings("Acme", orders[4].customer.name);
+
+    // A page counts parents, never children, and one reads its own.
+    const page = try db.page(ShopOrderLines, &run, .{ .order = .{ .id = .asc }, .limit = 2 });
+    try testing.expectEqual(@as(i64, 5), page.total);
+    try testing.expectEqual(@as(usize, 2), page.rows.len);
+    try testing.expectEqual(@as(usize, 2), page.rows[0].lines.len);
+    const one = (try db.one(ShopOrderLines, &run, .{ .where = .{ .id = @as(i64, 11) } })).?;
+    try testing.expectEqual(@as(i32, 5), one.lines[0].qty);
+
+    // Inside a transaction the two statements are one snapshot.
+    var tx = try db.begin(&run, .{});
+    defer tx.deinit();
+    const held = (try tx.find(ShopOrderLines, &run, @as(i64, 10))).?;
+    try testing.expectEqual(@as(usize, 2), held.lines.len);
+    try tx.commit();
+
+    // Nothing matched: no second statement, and no list to hand out.
+    const none = try db.select(ShopOrderLines, &run, .{ .where = .{ .id = @as(i64, 99) } });
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "a grouped Row is one row per group, narrowed before and after the grouping" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = try shopDb(&threaded, "shape-groups", &run);
+    defer db.deinit();
+
+    const groups = try db.select(ShopByCustomer, &run, .{
+        .where = .{ .year = @as(i32, 2026) },
+        .order = .{ .revenue = .desc },
+    });
+    try testing.expectEqual(@as(usize, 2), groups.len);
+    try testing.expectEqualStrings("Acme", groups[0].customer.name);
+    try testing.expectEqual(@as(i64, 2), groups[0].orders);
+    try testing.expectEqual(@as(i64, 350), groups[0].revenue);
+    try testing.expectEqual(@as(?i64, 5), groups[0].off);
+    try testing.expectEqual(@as(f64, 175), groups[0].mean);
+    try testing.expectEqualStrings("Borealis", groups[1].customer.name);
+    try testing.expectEqual(@as(?i64, 10), groups[1].off);
+
+    // A condition on an aggregate is a condition on the groups.
+    const big = try db.select(ShopByCustomer, &run, .{
+        .where = .{ .revenue = .{ .gt = @as(i64, 200) } },
+        .order = .{ .customer = .{ .name = .asc } },
+    });
+    try testing.expectEqual(@as(usize, 2), big.len);
+    try testing.expectEqualStrings("Acme", big[0].customer.name);
+    try testing.expectEqualStrings("Cobalt", big[1].customer.name);
+
+    // What a page and a count count is groups.
+    const page = try db.page(ShopByCustomer, &run, .{ .order = .{ .orders = .desc, .customer = .{ .name = .asc } }, .limit = 1 });
+    try testing.expectEqual(@as(i64, 3), page.total);
+    try testing.expectEqualStrings("Acme", page.rows[0].customer.name);
+    try testing.expectEqual(@as(usize, 1), try db.count(ShopByCustomer, &run, .{ .where = .{ .revenue = .{ .gt = @as(i64, 150) }, .year = @as(i32, 2026) } }));
+
+    // An order chosen per request, by an aggregate or through a parent.
+    const Sort = ordering.Ordering(ShopByCustomer, .{ .revenue = .revenue, .who = .{ .customer, .name } });
+    const by_name = try db.select(ShopByCustomer, &run, .{ .order = Sort.by(&.{.{ .key = .who, .direction = .desc }}) });
+    try testing.expectEqualStrings("Cobalt", by_name[0].customer.name);
+    const by_revenue = try db.select(ShopByCustomer, &run, .{ .order = Sort.by(&.{.{ .key = .revenue }}) });
+    try testing.expectEqualStrings("Borealis", by_revenue[0].customer.name);
+}
+
+test "a Row grouped by nothing is exactly one row, with a null sum over no rows" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = try shopDb(&threaded, "shape-tally", &run);
+    defer db.deinit();
+
+    const all = try db.exactlyOne(ShopTotals, &run, .{});
+    try testing.expectEqual(@as(i64, 5), all.orders);
+    try testing.expectEqual(@as(?i64, 1449), all.revenue);
+    try testing.expectEqual(@as(?i64, 999), all.top);
+
+    const none = try db.exactlyOne(ShopTotals, &run, .{ .where = .{ .year = @as(i32, 1999) } });
+    try testing.expectEqual(@as(i64, 0), none.orders);
+    try testing.expect(none.revenue == null);
+    try testing.expect(none.top == null);
+
+    var tx = try db.begin(&run, .{});
+    defer tx.deinit();
+    try testing.expectEqual(@as(i64, 4), (try tx.exactlyOne(ShopTotals, &run, .{ .where = .{ .year = @as(i32, 2026) } })).orders);
+    try tx.commit();
+}
+
+test "a streamed Row with a parent borrows the parent's columns too" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = try shopDb(&threaded, "shape-stream", &run);
+    defer db.deinit();
+
+    var rows = try db.stream(ShopOrderCard, &run, .{ .order = .{ .id = .asc } });
+    defer rows.close();
+    var seen: usize = 0;
+    var missing: usize = 0;
+    while (try rows.next()) |card| {
+        seen += 1;
+        if (card.approver == null) missing += 1;
+        if (card.id == 11) try testing.expectEqualStrings("Acme", card.customer.name);
+    }
+    try testing.expectEqual(@as(usize, 5), seen);
+    try testing.expectEqual(@as(usize, 2), missing);
 }

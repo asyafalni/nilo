@@ -46,6 +46,7 @@ const where_mod = @import("where.zig");
 const dialect_mod = @import("dialect.zig");
 const types_mod = @import("types.zig");
 const ordering = @import("ordering.zig");
+const shape_mod = @import("shape.zig");
 
 /// The direction an order term reads. Always comptime — which way a sort runs
 /// is shape, and a sort direction chosen at runtime is two statements.
@@ -118,7 +119,7 @@ pub fn planName(comptime sql: []const u8) []const u8 {
 /// The Row's table, quoted, with its schema in front when the Row named one.
 /// One function rather than seven call sites, because a `FROM` and an
 /// `INSERT INTO` have to spell the same relation the same way.
-fn relation(comptime D: type, comptime Row: type) []const u8 {
+pub fn relation(comptime D: type, comptime Row: type) []const u8 {
     return comptime blk: {
         const q = row_mod.qualifiedOf(Row);
         break :blk D.qualify(q.schema, q.table);
@@ -213,6 +214,13 @@ fn rowsOf(
 ) Statement {
     return comptime blk: {
         dialect_mod.assertDialect(D);
+        // A Row that carries a parent, children or an aggregate is written by
+        // `shape.zig`, and nothing below applies to it (ADR 0295).
+        if (row_mod.isShaped(Row)) break :blk shape_mod.rows(D, Row, O, switch (answers) {
+            .many => .many,
+            .first => .first,
+            .page => .page,
+        });
         budget(Row, O);
 
         // Said before `assertOptions`, so that a `.limit` written on a `one`
@@ -370,6 +378,7 @@ const known_tally = [_][]const u8{"where"};
 /// table — unlike an update or a delete, a count with no condition is the
 /// obvious thing rather than the dangerous one.
 pub fn count(comptime D: type, comptime Row: type, comptime O: type) Statement {
+    if (comptime row_mod.isShaped(Row)) return comptime shape_mod.tally(D, Row, O, false);
     return comptime tally(D, Row, O, "SELECT count(*) FROM ", "");
 }
 
@@ -379,6 +388,7 @@ pub fn count(comptime D: type, comptime Row: type, comptime O: type) Statement {
 /// that one row settles. What comes back is a `bool`, so the caller has
 /// nothing to compare.
 pub fn exists(comptime D: type, comptime Row: type, comptime O: type) Statement {
+    if (comptime row_mod.isShaped(Row)) return comptime shape_mod.tally(D, Row, O, true);
     return comptime tally(D, Row, O, "SELECT EXISTS(SELECT 1 FROM ", ")");
 }
 
@@ -423,6 +433,7 @@ fn tally(
 pub fn find(comptime D: type, comptime Row: type, comptime K: type) Statement {
     return comptime blk: {
         dialect_mod.assertDialect(D);
+        if (row_mod.isShaped(Row)) break :blk shape_mod.find(D, Row, K);
         const keys = row_mod.keysOf(Row);
         if (keys.len > 1) break :blk findComposite(D, Row, keys, K);
 
@@ -499,7 +510,7 @@ fn findComposite(
 
 /// What a composite key is handed as: a struct naming every one of its
 /// columns, and none that are not.
-fn assertCompositeKey(
+pub fn assertCompositeKey(
     comptime Row: type,
     comptime keys: []const []const u8,
     comptime K: type,
@@ -557,7 +568,7 @@ fn assertCompositeKey(
 /// The check is by type rather than by shape, because the types that *are*
 /// legitimately structs are the column's own: a `Uuid` key is the ordinary
 /// case, and it is exactly `ColumnType(Row, key)`.
-fn assertKeyValue(comptime Row: type, comptime key: []const u8, comptime K: type) void {
+pub fn assertKeyValue(comptime Row: type, comptime key: []const u8, comptime K: type) void {
     comptime {
         if (@typeInfo(K) != .@"struct") return;
         if (K == row_mod.ColumnType(Row, key)) return;
@@ -595,6 +606,7 @@ fn deleting(
 ) Statement {
     return comptime blk: {
         dialect_mod.assertDialect(D);
+        assertWritable(Row, "a delete");
         budget(Row, O);
         assertOptions(Row, O, &[_][]const u8{"where"}, "a delete");
 
@@ -626,6 +638,19 @@ fn deleting(
         if (returning) sql = sql ++ " RETURNING " ++ columnList(D, Row);
         break :blk .{ .sql = sql, .paths = paths, .params = params };
     };
+}
+
+/// **A shaped Row is an answer, and an answer is not written back.** Its
+/// parent's columns belong to another table, its children to a third, and a
+/// sum to no row at all, so an insert or an update through one would have to
+/// pick which of them it meant (ADR 0295).
+fn assertWritable(comptime Row: type, comptime what: []const u8) void {
+    if (comptime row_mod.isShaped(Row)) @compileError(
+        "nilo: " ++ what ++ " through " ++ @typeName(Row) ++ ", which carries a parent, " ++
+            "children or an aggregate.\n" ++
+            "  Those are read, not written. Write through the table's own Row, " ++
+            @typeName(row_mod.ownerOf(Row)) ++ ".",
+    );
 }
 
 /// **A condition that may not be there is not a condition an `UPDATE` or a
@@ -732,6 +757,7 @@ fn refuseLeftOut(
 pub fn insert(comptime D: type, comptime Row: type, comptime V: type) Statement {
     return comptime blk: {
         dialect_mod.assertDialect(D);
+        assertWritable(Row, "an insert");
         row_mod.assertRow(Row);
         budget(Row, V);
 
@@ -813,6 +839,7 @@ pub fn insert(comptime D: type, comptime Row: type, comptime V: type) Statement 
 pub fn insertMany(comptime D: type, comptime Row: type, comptime V: type) Statement {
     return comptime blk: {
         dialect_mod.assertDialect(D);
+        assertWritable(Row, "an insert");
         row_mod.assertRow(Row);
         budget(Row, V);
 
@@ -905,6 +932,7 @@ const batch_source = "v";
 pub fn updateMany(comptime D: type, comptime Row: type, comptime V: type) Statement {
     return comptime blk: {
         dialect_mod.assertDialect(D);
+        assertWritable(Row, "an update");
         row_mod.assertRow(Row);
         budget(Row, V);
 
@@ -1401,6 +1429,7 @@ fn updating(
 ) Statement {
     return comptime blk: {
         dialect_mod.assertDialect(D);
+        assertWritable(Row, "an update");
         budget(Row, O);
         assertOptions(Row, O, &update_known, "an update");
 
@@ -1484,7 +1513,7 @@ fn updating(
 
 /// The `SELECT` list, each column asked for the way its type wants — see
 /// `dialect.readAs`, which is where the one exception lives.
-fn columnList(comptime D: type, comptime Row: type) []const u8 {
+pub fn columnList(comptime D: type, comptime Row: type) []const u8 {
     return comptime columnListFrom(D, Row, "");
 }
 
@@ -1574,7 +1603,7 @@ fn orderBy(comptime D: type, comptime Row: type, comptime T: type) []const u8 {
 /// `.limit` — has none. Getting that wrong meant a written limit only worked
 /// when everything around it was also written out, which is exactly the kind
 /// of rule nobody could have guessed.
-fn writtenValue(comptime T: type, comptime field: []const u8, comptime As: type) As {
+pub fn writtenValue(comptime T: type, comptime field: []const u8, comptime As: type) As {
     comptime {
         for (@typeInfo(T).@"struct".fields) |f| {
             if (!std.mem.eql(u8, f.name, field)) continue;
@@ -1589,7 +1618,7 @@ fn writtenValue(comptime T: type, comptime field: []const u8, comptime As: type)
     }
 }
 
-const Bound = struct {
+pub const Bound = struct {
     text: []const u8,
     path: ?where_mod.Path,
     /// The literal, when there was one. What reads it is `select`, which
@@ -1600,7 +1629,7 @@ const Bound = struct {
 
 /// `LIMIT`/`OFFSET`. A `comptime_int` is written into the statement; anything
 /// else is a value and takes a placeholder.
-fn boundary(
+pub fn boundary(
     comptime D: type,
     comptime O: type,
     comptime field: []const u8,
@@ -1633,7 +1662,7 @@ fn boundary(
     }
 }
 
-fn assertOptions(
+pub fn assertOptions(
     comptime Row: type,
     comptime O: type,
     comptime allowed: []const []const u8,

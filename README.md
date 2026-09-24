@@ -13,8 +13,8 @@
   <a href="https://ziglang.org/"><img alt="Zig 0.16" src="https://img.shields.io/badge/zig-0.16-f7a41d?style=flat-square&logo=zig&logoColor=white"></a>
   <a href="./CHANGELOG.md"><img alt="version 0.5.0" src="https://img.shields.io/badge/version-0.5.0-3b82f6?style=flat-square"></a>
   <a href="./docs/reference/"><img alt="11 modules" src="https://img.shields.io/badge/modules-11-8957e5?style=flat-square"></a>
-  <a href="./refusals/README.md"><img alt="386 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-386-e05d44?style=flat-square"></a>
-  <a href="./docs/adr/"><img alt="294 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-294-6b7280?style=flat-square"></a>
+  <a href="./refusals/README.md"><img alt="411 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-411-e05d44?style=flat-square"></a>
+  <a href="./docs/adr/"><img alt="295 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-295-6b7280?style=flat-square"></a>
   <a href="./LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-16a34a?style=flat-square"></a>
 </p>
 
@@ -51,7 +51,7 @@ Those three lines are a complete route. From them you get:
 - 🏁 **#2 of 79** on [HttpArena](https://www.http-arena.com/frameworks/nilo/)'s HTTP/1.1 board, and **#1 of 22** on WebSocket, among untuned entries.
 - 🪶 **1 allocation** per request. A test fails if it ever becomes 2.
 - 💾 **4,669 bytes** per idle connection.
-- 🧯 **386 mistakes caught while compiling**, each with a sentence that tells you the fix.
+- 🧯 **411 mistakes caught while compiling**, each with a sentence that tells you the fix.
 - 🔌 **Zero glue.** Routing, errors, OpenAPI and SQL all read the same struct.
 
 ## ⚡ Quickstart
@@ -187,7 +187,7 @@ error: nilo: User has no column `agee`, asked for in a condition.
        Did you mean `age`?
 ```
 
-The same struct creates the table and generates migrations from a diff, without opening a database in CI. Postgres and SQLite are written the same way. It isn't an ORM: joins and aggregates go through `db.raw`, which still fills your struct.
+The same struct creates the table and generates migrations from a diff, without opening a database in CI. Postgres and SQLite are written the same way. It isn't an ORM: a struct can carry the row its foreign key points at, the rows that point back, or a sum by group, and every statement behind them is written while compiling. Anything past that goes through `db.raw`, which still fills your struct.
 
 ### Your settings are a struct too
 
@@ -279,7 +279,7 @@ Against eight other servers returning the same JSON, nilo is 1st on throughput, 
 | Module | What it does | Left out |
 |---|---|---|
 | **`nilo_http`** | Routing, typed handlers, middleware, cookies and sessions, static files, streaming, WebSocket, OpenAPI, metrics, rate limiting, gzip, and optional TLS 1.3 | Templates |
-| **`nilo_sql`** | Postgres and SQLite: reads, writes, transactions, streaming, schema and migrations | Joins and aggregates (use `db.raw`), `down` migrations |
+| **`nilo_sql`** | Postgres and SQLite: reads, writes, transactions, streaming, schema and migrations | Window functions, CTEs and joins no foreign key names (use `db.raw`), `down` migrations |
 | **`nilo_s3`** | S3, MinIO and R2: get, put, range, stream, list, presigned URLs | `COPY`, multipart |
 | **`nilo_fetch`** | Calling another HTTP API from inside a request | Retries, circuit breaker |
 | **`nilo_job`** | Background and scheduled work, queued in the database you already have, with three levels of urgency and cron schedules | Exactly-once, time zones |

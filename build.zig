@@ -964,6 +964,131 @@ const sql_refusals = [_]Refusal{
         .says = "reserved_column_exists.Flag has a column named `exists`, which is the" ++
             " word a condition uses for a matching row in another table.",
     },
+    // A Row that carries its parent, its children or a sum (ADR 0295).
+    .{
+        .name = "shape_parent_on_a_table",
+        .says = "shape_parent_on_a_table.Invoice carries a parent, children or an aggregate, and" ++
+            " is not a narrower Row.",
+    },
+    .{
+        .name = "shape_parent_with_no_reference",
+        .says = "shape_parent_with_no_reference.LineCard reads `staff` as a parent, and" ++
+            " shape_parent_with_no_reference.Line declares no `.references` to" ++
+            " shape_parent_with_no_reference.Staff's table `staff`.",
+    },
+    .{
+        .name = "shape_parent_two_references",
+        .says = "shape_parent_two_references.OrderCard reads `staff` as a parent, and" ++
+            " shape_parent_two_references.Order points at" ++
+            " shape_parent_two_references.Staff's table from more than one column:" ++
+            " `owner_id`, `approver_id`.",
+    },
+    .{
+        .name = "shape_parent_may_be_missing",
+        .says = "shape_parent_may_be_missing.OrderCard reads `approver` as" ++
+            " shape_parent_may_be_missing.StaffName, and `approver_id` may be null.",
+    },
+    .{
+        .name = "shape_parent_never_missing",
+        .says = "shape_parent_never_missing.OrderCard reads `customer` as" ++
+            " ?shape_parent_never_missing.CustomerName, and `customer_id` is never null.",
+    },
+    .{
+        .name = "shape_parent_named_like_the_table",
+        .says = "shape_parent_named_like_the_table.OrderCard's parent `orders` would be joined" ++
+            " under the name of the table the statement reads.",
+    },
+    .{
+        .name = "shape_via_on_a_column",
+        .says = "shape_via_on_a_column.OrderCard's nilo_via names `total`, which is not a parent" ++
+            " or a list of children.",
+    },
+    .{
+        .name = "shape_children_key_not_read",
+        .says = "shape_children_key_not_read.OrderLines reads `lines` as children, and does not" ++
+            " read `id`, which is what each child points at.",
+    },
+    .{
+        .name = "shape_children_optional",
+        .says = "shape_children_optional.OrderLines reads `lines` as an optional list of" ++
+            " children.",
+    },
+    .{
+        .name = "shape_children_of_children",
+        .says = "shape_children_of_children.OrderLines's children `lines` are" ++
+            " shape_children_of_children.LineNotes, which has children of its own.",
+    },
+    .{
+        .name = "shape_children_streamed",
+        .says = "`db.stream` on shape_children_streamed.OrderLines, which reads `lines` as" ++
+            " children.",
+    },
+    .{
+        .name = "shape_aggregate_wrong_type",
+        .says = "shape_aggregate_wrong_type.ByCustomer reads `.revenue`, the sum of `total`, as" ++
+            " i32.",
+    },
+    .{
+        .name = "shape_aggregate_can_be_null",
+        .says = "shape_aggregate_can_be_null.Totals reads `.revenue` as i64, and a Row grouped" ++
+            " by nothing answers even when no row matched, and sum over no rows is null.",
+    },
+    .{
+        .name = "shape_aggregate_unknown_word",
+        .says = "shape_aggregate_unknown_word.ByCustomer's nilo_aggregate asks `.revenue` for" ++
+            " `.total`, which is not one it computes.",
+    },
+    .{
+        .name = "shape_aggregate_unknown_field",
+        .says = "shape_aggregate_unknown_field.ByCustomer's nilo_aggregate names `revenu`, which" ++
+            " is not one of its fields.",
+    },
+    .{
+        .name = "shape_tally_listed",
+        .says = "`db.select` on shape_tally_listed.Totals, whose every field is an aggregate.",
+    },
+    .{
+        .name = "shape_tally_condition_on_aggregate",
+        .says = "the condition on shape_tally_condition_on_aggregate.Totals names an aggregate," ++
+            " and the Row is grouped by nothing.",
+    },
+    .{
+        .name = "shape_exactly_one_not_grouped",
+        .says = "`db.exactlyOne` on shape_exactly_one_not_grouped.OrderCard, which is not" ++
+            " grouped by nothing.",
+    },
+    .{
+        .name = "shape_aggregate_inside_any",
+        .says = "`.revenue` is an aggregate of shape_aggregate_inside_any.ByCustomer, named" ++
+            " inside `.any`.",
+    },
+    .{
+        .name = "shape_grouped_find",
+        .says = "`db.find` on shape_grouped_find.ByCustomer, which is grouped.",
+    },
+    .{
+        .name = "shape_locked",
+        .says = "`db.select` on shape_locked.OrderCard was given a `.lock`.",
+    },
+    .{
+        .name = "shape_written",
+        .says = "a delete through shape_written.OrderCard, which carries a parent, children or" ++
+            " an aggregate.",
+    },
+    .{
+        .name = "shape_raw",
+        .says = "`db.raw` into shape_raw.OrderCard, which carries a parent, children or an" ++
+            " aggregate.",
+    },
+    .{
+        .name = "shape_order_through_a_column",
+        .says = "the ordering key `odd` on shape_order_through_a_column.OrderCard goes through" ++
+            " `total`, which is not a parent.",
+    },
+    .{
+        .name = "shape_grouped_children",
+        .says = "shape_grouped_children.ByCustomer is grouped and reads `lines` as children.",
+    },
 };
 
 /// The same, for `s3/refusals/`. The fifth table, hung off `test-s3`.
@@ -2053,6 +2178,7 @@ const Snippets = struct {
         .{ .path = "docs/guide/sql/tables.md", .types = sql_types, .values = sql_values },
         .{ .path = "docs/guide/sql/reading.md", .types = sql_types, .values = sql_values, .carries = &.{"docs/guide/sql/tables.md"} },
         .{ .path = "docs/guide/sql/README.md", .types = sql_types, .values = sql_values, .carries = &.{ "docs/guide/sql/tables.md", "docs/guide/sql/reading.md" } },
+        .{ .path = "docs/guide/sql/shapes.md", .types = sql_types, .values = sql_values, .carries = &.{"docs/guide/sql/tables.md"} },
         .{ .path = "docs/guide/sql/writing.md", .types = sql_types, .values = sql_values, .carries = &.{"docs/guide/sql/tables.md"} },
         .{ .path = "docs/guide/sql/transactions.md", .types = sql_types, .values = sql_values, .carries = &.{"docs/guide/sql/tables.md"} },
         .{ .path = "docs/guide/sql/raw.md", .types = sql_types, .values = sql_values, .carries = &.{"docs/guide/sql/tables.md"} },

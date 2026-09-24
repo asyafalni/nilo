@@ -252,6 +252,18 @@ _Avoid_: export, dump, migration file, plain SQL migration
 One Row read on its own rather than with the rest, its text pointing into the buffer the rows arrive in and valid only until the next one is pulled. That text is a plain slice and not a Str, which is what keeps the Str guarantee free of exceptions.
 _Avoid_: view, ref, unowned, cursor row
 
+**Parent field**:
+A field of a narrower Row whose type is another table's Row: the row a reference points at, joined in the same statement and read into the field. Optional exactly when the reference may be null.
+_Avoid_: relation, association, include, eager load, belongs-to
+
+**Children field**:
+A field of a narrower Row that is a list of another table's Row: every row pointing back at this one, read by one more statement for all the rows at once.
+_Avoid_: has-many, preload, populate, nested query, subcollection
+
+**Grouped Row**:
+A narrower Row that names its computed fields in `nilo_aggregate`, so each of its rows is a group and every other field is a key of it. One with no keys at all is exactly one row, and is read with `exactlyOne`.
+_Avoid_: aggregate query, rollup, report row, group-by
+
 **Statement**:
 A whole piece of SQL and the list of places its values are read from, both worked out while compiling. Which table, which columns, which operators and how many parameters are all settled; only the values are not.
 _Avoid_: query builder, prepared statement, expression tree

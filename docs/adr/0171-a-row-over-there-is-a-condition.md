@@ -132,6 +132,8 @@ number goes.
 
 ## What is still refused
 
+> **Amended by [ADR 0295](./0295-a-row-may-carry-its-parent-its-children-or-a-sum.md).** The two properties above turned out to admit three more shapes, each declared on a Row: a parent joined through a reference, which cannot change the row count; children, which are never joined and so cannot either; and a grouped Row, whose rows are its groups and says so in its type. A parent follows its reference by the rules `.exists` uses here, and `nilo_via` is `.via` spelled on a field.
+
 A test against the **same table**. Both sides would be written as the same
 relation, so every column in the subquery is ambiguous, and telling them apart
 needs an alias. That is `db.raw`, and it is a Refusal that says so.

@@ -143,7 +143,7 @@ pub fn expectationsOf(comptime D: type, comptime Row: type) []const Expectation 
         for (fields) |f| {
             // Carried beside the columns, so there is nothing in the table
             // to expect (ADR 0217).
-            if (row_mod.isBeside(Row, f.name)) continue;
+            if (!row_mod.isColumnField(Row, f.name)) continue;
             const accepts: []const []const u8 = D.accepts(f.type) orelse
                 (if (builds and table_mod.enumValues(f.type).len > 0)
                     D.text_accepts
@@ -258,7 +258,7 @@ pub fn enumColumnsOf(comptime Row: type) []const EnumColumn {
         var out: [fields.len]EnumColumn = undefined;
         var n: usize = 0;
         for (fields) |f| {
-            if (row_mod.isBeside(Row, f.name)) continue;
+            if (!row_mod.isColumnField(Row, f.name)) continue;
             const Inner = switch (@typeInfo(f.type)) {
                 .optional => |o| o.child,
                 else => f.type,

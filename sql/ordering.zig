@@ -341,8 +341,8 @@ fn readKeys(comptime Row: type, comptime keys: anytype) []const Key {
 fn readKey(comptime Row: type, comptime name: []const u8, comptime said: anytype) Key {
     comptime {
         const S = @TypeOf(said);
-        if (S == @TypeOf(.enum_literal)) {
-            return .{ .name = name, .column = columnOf(Row, name, @tagName(said)), .expr = null, .nulls = null };
+        if (S == @TypeOf(.enum_literal) or isPath(S)) {
+            return .{ .name = name, .column = columnOf(Row, name, said), .expr = null, .nulls = null };
         }
         if (isText(S)) {
             return .{ .name = name, .column = null, .expr = textOf(Row, name, said), .nulls = null };
@@ -351,7 +351,7 @@ fn readKey(comptime Row: type, comptime name: []const u8, comptime said: anytype
             var key = Key{ .name = name, .column = null, .expr = null, .nulls = null };
             for (@typeInfo(S).@"struct".fields) |f| {
                 if (std.mem.eql(u8, f.name, "column")) {
-                    key.column = columnOf(Row, name, @tagName(said.column));
+                    key.column = columnOf(Row, name, said.column);
                 } else if (std.mem.eql(u8, f.name, "expr")) {
                     key.expr = textOf(Row, name, said.expr);
                 } else if (std.mem.eql(u8, f.name, "nulls")) {
@@ -384,12 +384,60 @@ fn readKey(comptime Row: type, comptime name: []const u8, comptime said: anytype
     }
 }
 
-fn columnOf(comptime Row: type, comptime name: []const u8, comptime column: []const u8) []const u8 {
+/// The column a key names, spelled the way the answer carries it.
+///
+/// **A shaped Row is ordered by the names in its answer**
+/// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)):
+/// an aggregate by its field, and a parent's column by the path to it,
+/// `.{ .customer, .name }`, answered as `"customer.name"`. A flat Row's
+/// columns are the one-element case of the same thing.
+fn columnOf(comptime Row: type, comptime name: []const u8, comptime said: anytype) []const u8 {
     comptime {
-        if (!row_mod.hasColumn(Row, column)) {
-            row_mod.noSuchColumn(Row, column, "the ordering key `" ++ name ++ "`");
+        const what = "the ordering key `" ++ name ++ "`";
+        if (@TypeOf(said) == @TypeOf(.enum_literal)) {
+            const column = @tagName(said);
+            if (row_mod.hasColumn(Row, column)) return column;
+            if (row_mod.fieldTypeOf(Row, column) != null and row_mod.kindOf(Row, column) == .aggregate) return column;
+            row_mod.noSuchColumn(Row, column, what);
         }
-        return column;
+        if (!isPath(@TypeOf(said))) @compileError(
+            "nilo: " ++ what ++ " on " ++ @typeName(Row) ++ " names its column with a " ++
+                @typeName(@TypeOf(said)) ++ ".\n" ++
+                "  A column is `.due_date`, and a parent's column is the path to it: " ++
+                "`.{ .customer, .name }`.",
+        );
+        var Level = Row;
+        var path: []const []const u8 = &.{};
+        for (said, 0..) |step, i| {
+            const field = @tagName(step);
+            path = path ++ &[_][]const u8{field};
+            if (i + 1 == said.len) {
+                if (!row_mod.hasColumn(Level, field)) row_mod.noSuchColumn(Level, field, what);
+                break;
+            }
+            const T = row_mod.fieldTypeOf(Level, field) orelse row_mod.noSuchColumn(Level, field, what);
+            if (row_mod.kindOf(Level, field) != .parent) @compileError(
+                "nilo: " ++ what ++ " on " ++ @typeName(Row) ++ " goes through `" ++ field ++
+                    "`, which is not a parent.\n" ++
+                    "  A path steps into a field that holds the row a reference points at, and " ++
+                    "ends on one of that row's columns.",
+            );
+            Level = row_mod.parentRowOf(T).?;
+        }
+        return row_mod.pathName(path);
+    }
+}
+
+/// A tuple of two or more enum literals: a path to a parent's column.
+fn isPath(comptime S: type) bool {
+    comptime {
+        const info = switch (@typeInfo(S)) {
+            .@"struct" => |s| s,
+            else => return false,
+        };
+        if (!info.is_tuple or info.fields.len < 2) return false;
+        for (info.fields) |f| if (f.type != @TypeOf(.enum_literal)) return false;
+        return true;
     }
 }
 

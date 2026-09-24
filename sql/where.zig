@@ -244,6 +244,10 @@ pub const Plan = struct {
     paths: []const Path,
     /// What each parameter is for, in that same order — see `Param`.
     params: []const Param,
+    /// The parents the condition named, by the path a statement over a shaped
+    /// Row joins each one under (ADR 0295). A count joins these and no others,
+    /// because a join nothing reads is work the answer does not need.
+    reached: []const []const u8 = &.{},
 
     pub fn isEmpty(self: Plan) bool {
         return self.sql.len == 0;
@@ -282,6 +286,83 @@ pub fn planAt(
         const frozen_params = state.params[0..state.count].*;
         break :blk .{ .sql = sql, .paths = &frozen, .params = &frozen_params };
     };
+}
+
+/// Which half of a grouped Row's condition a walk writes (ADR 0295).
+///
+/// A grouped Row's `.where` is one struct and two clauses: a term on a column
+/// of the table narrows the rows before they are grouped, and a term on an
+/// aggregate narrows the groups. The caller writes neither `WHERE` nor
+/// `HAVING`; the name says which, because the Row says what each name is.
+pub const Phase = enum {
+    /// Every term, for a Row that is not grouped.
+    all,
+    /// The terms on the table's rows: every name but an aggregate.
+    rows,
+    /// The terms on the groups: the aggregates, and nothing else.
+    groups,
+};
+
+/// Where a walk over a shaped Row starts
+/// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+pub const Scope = struct {
+    /// The Row whose parents and aggregates a name in the condition may be.
+    shape: type,
+    /// The Row a plain column's name and type are looked up in: the shaped
+    /// Row itself, or for a grouped one the table it groups, since a
+    /// condition on the rows may name a column no group reports.
+    columns: type,
+    /// The relation the statement reads, as it is written after `FROM`.
+    relation: []const u8,
+    phase: Phase = .all,
+};
+
+/// `planAt` over a shaped Row: the same walk, with every column qualified by
+/// the relation it belongs to, a parent's name read as a way into its
+/// columns, and a grouped Row's condition split by `phase`.
+pub fn planScoped(
+    comptime D: type,
+    comptime W: type,
+    comptime first: usize,
+    comptime prefix: Path,
+    comptime scope: Scope,
+) Plan {
+    return comptime blk: {
+        dialect_mod.assertDialect(D);
+        assertNoReservedColumn(scope.columns);
+        var state = State{
+            .next = first,
+            .shape = scope.shape,
+            .qualifier = scope.relation ++ ".",
+            .outer = scope.relation,
+            .phase = scope.phase,
+            // A grouped Row's rows are the table's, so a parameter's type is
+            // the table's column's; everywhere else it is the Row's own.
+            .inner = if (scope.columns == scope.shape) null else scope.columns,
+        };
+        const sql = walk(D, scope.columns, W, prefix, &state);
+        const frozen = state.paths[0..state.count].*;
+        const frozen_params = state.params[0..state.count].*;
+        const frozen_reached = state.reached[0..state.reached_count].*;
+        break :blk .{
+            .sql = sql,
+            .paths = &frozen,
+            .params = &frozen_params,
+            .reached = &frozen_reached,
+        };
+    };
+}
+
+/// An aggregate as a condition or a column spells it: the call, over the
+/// column qualified by the relation the statement reads. The same text in
+/// the `SELECT` list and the `HAVING`, which is what lets a condition on
+/// `.owed` mean the number the row reports.
+pub fn aggregateCall(
+    comptime D: type,
+    comptime relation: []const u8,
+    comptime aggregate: row_mod.Aggregate,
+) []const u8 {
+    return comptime aggregate.kind.call(if (aggregate.column) |c| relation ++ "." ++ D.quote(c) else null);
 }
 
 /// How many parameters the fragment carries. The same number as
@@ -368,6 +449,11 @@ pub fn ValueAt(comptime W: type, comptime path: Path) type {
 /// stops with a message rather than an eval-quota crash.
 const max_params = 64;
 
+/// The most parents one condition may reach into. The same kind of number as
+/// `max_params`: far past a hand-written condition, there to stop a mistake
+/// with a sentence.
+const max_reached = 16;
+
 const State = struct {
     next: usize,
     paths: [max_params]Path = undefined,
@@ -400,6 +486,40 @@ const State = struct {
     /// and the statement names the same `$n` on every column.
     replay: []const usize = &.{},
     replayed: usize = 0,
+    /// Set while the walk is over a shaped Row (ADR 0295): the Row whose
+    /// parents and aggregates a name at this level may be, the path its
+    /// parent is joined under (empty for the Row itself), and how the Row is
+    /// written when an `.exists` below correlates with it.
+    ///
+    /// **Cleared inside an `.exists`**, whose subquery reads a table of its
+    /// own: a name in there is that table's column, whatever the Row outside
+    /// happens to carry under the same name.
+    shape: ?type = null,
+    alias: []const u8 = "",
+    outer: []const u8 = "",
+    phase: Phase = .all,
+    /// Set while the walk is inside `.any`, where an aggregate may not be
+    /// named: a term on the rows and a term on the groups cannot be ORed,
+    /// because they are two clauses.
+    nested: bool = false,
+    /// What a term writes in place of the quoted column while it is a term on
+    /// a group: the aggregate's call. Empty everywhere else.
+    spelled: []const u8 = "",
+    /// The parents the walk went into, for `Plan.reached`.
+    reached: [max_reached][]const u8 = undefined,
+    reached_count: usize = 0,
+
+    fn reach(self: *State, comptime alias: []const u8) void {
+        for (self.reached[0..self.reached_count]) |seen| {
+            if (std.mem.eql(u8, seen, alias)) return;
+        }
+        if (self.reached_count == max_reached) @compileError(
+            "nilo: a condition reaches more than " ++
+                std.fmt.comptimePrint("{d}", .{max_reached}) ++ " parents.",
+        );
+        self.reached[self.reached_count] = alias;
+        self.reached_count += 1;
+    }
 
     fn take(self: *State, comptime path: Path, comptime param: Param) usize {
         if (self.replay.len > 0) {
@@ -458,29 +578,43 @@ fn walk(
         if (info.fields.len == 0) return "";
 
         var out: []const u8 = "";
-        for (info.fields, 0..) |f, i| {
-            if (i > 0) out = out ++ " AND ";
+        for (info.fields) |f| {
             const path = prefix ++ &[_][]const u8{f.name};
-            if (std.mem.eql(u8, f.name, any_field)) {
-                out = out ++ anyOf(D, Row, f.type, path, state);
-                continue;
-            }
-            if (std.mem.eql(u8, f.name, exists_field)) {
-                out = out ++ existsOf(D, Row, f.type, path, state, false);
-                continue;
-            }
-            if (std.mem.eql(u8, f.name, not_exists_field)) {
-                out = out ++ existsOf(D, Row, f.type, path, state, true);
-                continue;
-            }
-            if (std.mem.eql(u8, f.name, across_field)) {
-                out = out ++ acrossOf(D, Row, f.type, path, state);
-                continue;
-            }
-            if (!row_mod.hasColumn(Row, f.name)) {
-                row_mod.noSuchColumn(Row, f.name, "a condition");
-            }
-            out = out ++ condition(D, Row, f.name, f.type, path, state);
+            const term = term: {
+                // A name on a shaped Row may be something other than a column
+                // (ADR 0295), and which clause it belongs to follows from what
+                // it is.
+                if (state.shape) |Shape| switch (row_mod.kindOf(Shape, f.name)) {
+                    .aggregate => {
+                        if (state.nested) @compileError(
+                            "nilo: `." ++ f.name ++ "` is an aggregate of " ++ @typeName(Shape) ++
+                                ", named inside `.any`.\n" ++
+                                "  A condition on a group is a `HAVING` and one on a row is a " ++
+                                "`WHERE`, and an alternative cannot be half of each. Name the " ++
+                                "aggregate beside the `.any`, where it narrows the groups.",
+                        );
+                        if (state.phase != .groups) continue;
+                        break :term groupTerm(D, Shape, f.name, f.type, path, state);
+                    },
+                    .parent => {
+                        if (state.phase == .groups) continue;
+                        break :term parentTerm(D, Shape, f.name, f.type, path, state);
+                    },
+                    .children => row_mod.noSuchColumn(Shape, f.name, "a condition"),
+                    .column, .beside => {},
+                };
+                if (state.phase == .groups) continue;
+                if (std.mem.eql(u8, f.name, any_field)) break :term anyOf(D, Row, f.type, path, state);
+                if (std.mem.eql(u8, f.name, exists_field)) break :term existsOf(D, Row, f.type, path, state, false);
+                if (std.mem.eql(u8, f.name, not_exists_field)) break :term existsOf(D, Row, f.type, path, state, true);
+                if (std.mem.eql(u8, f.name, across_field)) break :term acrossOf(D, Row, f.type, path, state);
+                if (!row_mod.hasColumn(Row, f.name)) {
+                    row_mod.noSuchColumn(Row, f.name, "a condition");
+                }
+                break :term condition(D, Row, f.name, f.type, path, state);
+            };
+            if (term.len == 0) continue;
+            out = out ++ (if (out.len == 0) "" else " AND ") ++ term;
         }
         return out;
     }
@@ -522,7 +656,10 @@ fn anyOf(
         for (info.fields, 0..) |f, i| {
             if (i > 0) out = out ++ " OR ";
             const before = state.count;
+            const was_nested = state.nested;
+            state.nested = true;
             const sub = walk(D, Row, f.type, path ++ &[_][]const u8{f.name}, state);
+            state.nested = was_nested;
             // **`.any` is OR, and that reverses what dropping a term means**
             // (ADR 0183). Everywhere else a term that is not there widens the
             // answer; an alternative that is not there narrows it, because the
@@ -546,6 +683,91 @@ fn anyOf(
             out = out ++ sub;
         }
         return out ++ ")";
+    }
+}
+
+/// `.customer = .{ .name = … }` on a shaped Row: the conditions on a parent's
+/// columns, written against the alias the statement joins it under
+/// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+///
+/// **The same walk one level down**, with the qualifier and the Row it reads
+/// moved together for the reason `.exists` moves them: a qualifier out of step
+/// with the Row would write one table's column and bind it as another's. A
+/// parent of the parent is reached the same way, so `.org_unit = .{ .customer
+/// = .{ .name = … } }` is two steps of this and nothing new.
+fn parentTerm(
+    comptime D: type,
+    comptime Shape: type,
+    comptime name: []const u8,
+    comptime T: type,
+    comptime path: Path,
+    comptime state: *State,
+) []const u8 {
+    comptime {
+        const Parent = row_mod.parentRowOf(row_mod.fieldTypeOf(Shape, name).?).?;
+        if (@typeInfo(T) == .null) @compileError(
+            "nilo: `." ++ name ++ " = null` on " ++ @typeName(Shape) ++ " asks for rows with no " ++
+                "parent, and a parent is a row rather than a value.\n" ++
+                "  Ask the reference column instead, on a Row that reads it: `.<column> = null`.",
+        );
+        const shape = "  A parent takes conditions on its own columns: `." ++ name ++
+            " = .{ .<column> = … }`.";
+        switch (@typeInfo(T)) {
+            .@"struct" => |s| if (s.is_tuple) @compileError(
+                "nilo: `." ++ name ++ "` on " ++ @typeName(Shape) ++ " is given a list.\n" ++ shape,
+            ),
+            else => @compileError(
+                "nilo: `." ++ name ++ "` on " ++ @typeName(Shape) ++ " is a parent, and is given a " ++
+                    @typeName(T) ++ ".\n" ++ shape,
+            ),
+        }
+
+        const alias = if (state.alias.len == 0) name else state.alias ++ "." ++ name;
+        state.reach(alias);
+
+        const was_shape = state.shape;
+        const was_alias = state.alias;
+        const was_qualifier = state.qualifier;
+        const was_outer = state.outer;
+        const was_inner = state.inner;
+        state.shape = Parent;
+        state.alias = alias;
+        state.qualifier = D.quote(alias) ++ ".";
+        state.outer = D.quote(alias);
+        state.inner = Parent;
+        const inside = walk(D, Parent, T, path, state);
+        state.shape = was_shape;
+        state.alias = was_alias;
+        state.qualifier = was_qualifier;
+        state.outer = was_outer;
+        state.inner = was_inner;
+        return inside;
+    }
+}
+
+/// `.owed = .{ .gt = 0 }` on a grouped Row: a term on the groups, written
+/// against the aggregate the field reports (ADR 0295). The operators and the
+/// binding are a column's; what they compare is the call.
+fn groupTerm(
+    comptime D: type,
+    comptime Shape: type,
+    comptime name: []const u8,
+    comptime T: type,
+    comptime path: Path,
+    comptime state: *State,
+) []const u8 {
+    comptime {
+        const aggregate = row_mod.aggregateOf(Shape, name).?;
+        const was_spelled = state.spelled;
+        const was_inner = state.inner;
+        // The qualifier here is the grouped relation's, because a term on the
+        // groups is only ever written at the top of the walk.
+        state.spelled = aggregateCall(D, state.outer, aggregate);
+        state.inner = Shape;
+        const term = condition(D, Shape, name, T, path, state);
+        state.spelled = was_spelled;
+        state.inner = was_inner;
+        return term;
     }
 }
 
@@ -671,7 +893,9 @@ fn oneExists(
 
         // Before the join is looked for, because a self-reference is a
         // reference in both directions and would be refused as that instead.
-        const outer_rel = relationOf(D, Outer);
+        // The Row outside is written the way the statement wrote it: its
+        // relation, or the alias a parent was joined under (ADR 0295).
+        const outer_rel = if (state.outer.len > 0) state.outer else relationOf(D, Outer);
         const inner_rel = relationOf(D, Inner);
         if (std.mem.eql(u8, outer_rel, inner_rel)) @compileError(
             "nilo: `." ++ word ++ "` names " ++ @typeName(Inner) ++ ", which reads the same " ++
@@ -689,10 +913,14 @@ fn oneExists(
         const was_qualifier = state.qualifier;
         const was_inner = state.inner;
         const was_group = state.in_group;
+        const was_shape = state.shape;
+        const was_outer = state.outer;
         const before = state.count;
         const guard = state.next;
         state.qualifier = inner_rel ++ ".";
         state.inner = Inner;
+        state.shape = null;
+        state.outer = inner_rel;
         // A `given` in here drops the whole subquery rather than one term of
         // it, so the terms write no guards of their own (ADR 0183).
         state.in_group = true;
@@ -709,6 +937,8 @@ fn oneExists(
         state.qualifier = was_qualifier;
         state.inner = was_inner;
         state.in_group = was_group;
+        state.shape = was_shape;
+        state.outer = was_outer;
 
         // **A `given` inside an `.exists` is the whole test, or it is a
         // Refusal** (ADR 0183). Dropping one term of the subquery would leave
@@ -1172,7 +1402,8 @@ fn condition(
     comptime state: *State,
 ) []const u8 {
     comptime {
-        const quoted = state.qualifier ++ D.quote(column);
+        // A term on a group names the aggregate rather than a column (ADR 0295).
+        const quoted = if (state.spelled.len > 0) state.spelled else state.qualifier ++ D.quote(column);
 
         // `.deleted_at = null` is `IS NULL`. It cannot mean anything else:
         // `= NULL` is never true in SQL, so reading it the other way would

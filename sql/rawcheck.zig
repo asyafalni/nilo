@@ -124,6 +124,7 @@ pub fn assertList(
     comptime call: []const u8,
 ) void {
     comptime {
+        assertFlat(Row, call);
         // The framework's own walk, paid for by the framework
         // ([ADR 0157](../docs/adr/0157-a-check-pays-for-its-own-branches.md)).
         // `scan` sizes its own; what this covers is the two comparisons per
@@ -181,6 +182,20 @@ pub fn assertOne(
             .{ call, count, plural(count), @typeName(T) },
         ));
     }
+}
+
+/// **A shaped Row is filled from a statement this module wrote** (ADR 0295):
+/// its parents from columns named for their path, its children from a second
+/// statement keyed by the first. Neither is something a statement handed in
+/// can promise, so a raw call takes a flat Row, and a join written by hand
+/// reads into one with a field per column.
+pub fn assertFlat(comptime Row: type, comptime call: []const u8) void {
+    if (comptime row_mod.isShaped(Row)) @compileError(
+        "nilo: `" ++ call ++ "` into " ++ @typeName(Row) ++ ", which carries a parent, children " ++
+            "or an aggregate.\n" ++
+            "  Those are filled from a statement nilo writes. Read it with `db.select`, " ++
+            "or give the raw statement a Row with one field per column it selects.",
+    );
 }
 
 /// The Row's fields a statement fills, in order: every one but those carried
@@ -310,6 +325,7 @@ pub fn assertPaged(
     comptime call: []const u8,
 ) void {
     comptime {
+        assertFlat(Row, call);
         @setEvalBranchQuota(20_000 + 200 * sql.len);
         const list = scan(sql);
         const count = list.count orelse return;

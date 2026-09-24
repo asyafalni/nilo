@@ -197,6 +197,8 @@ Joins, aggregates, subqueries, `HAVING`, window functions, CTEs. The line is one
 
 That line is drawn where it is because a builder's dialect surface grows with the builder, and joins and aggregates are exactly where databases disagree most. A boundary that can be stated in one sentence is worth more than one that is further out, because a reader can predict what this does without opening the reference.
 
+> **Amended by [ADR 0295](./0295-a-row-may-carry-its-parent-its-children-or-a-sum.md).** A join to one row, children read by a second statement, and `GROUP BY` with its aggregates are on this side of the line now, said by the Row rather than by the call: a field whose type is a Row is a parent, a `[]const` of one is children, and `nilo_aggregate` makes the Row one row per group. What stays refused is the chain of calls this ADR rejected below; there is still no `.join` and no `.group_by` to write, and everything else in the list above is still `db.raw`.
+
 Migrations are not here and are not implied. Nothing about this design forecloses them; they can be added over it without changing anything above.
 
 ## Consequences

@@ -57,6 +57,29 @@
 //! the point: before this, such a Row had to name a table it did not
 //! represent, and `db.checking` would then take that name at its word.
 //!
+//! A narrower Row may also **carry more than its table's columns**
+//! ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)):
+//! a field whose type is another Row is the **parent** its reference points
+//! at, a field whose type is a slice of Rows is the **children** that point
+//! back, and a Row that says `nilo_aggregate` is **grouped**: one row per
+//! value of its other fields, with a count or a sum beside them.
+//!
+//! ```zig
+//! const OrderCard = struct {
+//!     pub const nilo_table = Order;
+//!
+//!     id: i64,
+//!     total: i64,
+//!     customer: CustomerName,
+//!     lines: []const LineBrief,
+//! };
+//! ```
+//!
+//! This file says which field is which and nothing more. The type is the whole
+//! of the declaration: a field is a parent because of what it holds, not
+//! because anything names it, and `shape.zig` is where the joins that follow
+//! from it are written.
+//!
 //! Everything here answers a question about a type rather than about a
 //! request, so all of it is settled before the binary exists — the first half
 //! of ADR 0039's rule.
@@ -68,6 +91,7 @@ const std = @import("std");
 /// (ADR 0041).
 const core = @import("nilo_core");
 const types_mod = @import("types.zig");
+const dialect_mod = @import("dialect.zig");
 
 /// The declaration a Row carries. Named the way `nilo_resolve`,
 /// `nilo_query` and `nilo_response` are, so the markers the compile-time
@@ -201,6 +225,318 @@ fn fieldList(comptime Row: type) []const u8 {
         }
         break :blk out;
     };
+}
+
+// -- what each field is (ADR 0295) --------------------------------------
+
+/// What one field of a Row stands for.
+///
+/// **Read off the field's type, with one exception that is read off a
+/// declaration**, and the exception is the one case a type cannot say: an
+/// `i64` holding a sum looks exactly like an `i64` holding a column.
+pub const Kind = enum {
+    /// A column of the Row's own table, read by position.
+    column,
+    /// Named in `nilo_beside`: on the Row and in no statement (ADR 0217).
+    beside,
+    /// A Row, or an optional one: the row its table's reference points at,
+    /// joined into the same statement.
+    parent,
+    /// A slice of Rows: the rows whose reference points back at this one,
+    /// read by a second statement.
+    children,
+    /// Named in `nilo_aggregate`: a count, a sum, a minimum over the rows of
+    /// the group.
+    aggregate,
+};
+
+/// The declaration that makes a Row grouped
+/// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+///
+/// ```zig
+/// pub const nilo_aggregate = .{ .objects = .count, .owed = .{ .sum = .principal } };
+/// ```
+pub const aggregate_marker = "nilo_aggregate";
+
+/// The declaration that says which reference a parent or children field
+/// follows, when the schema declares more than one between the two tables.
+///
+/// ```zig
+/// pub const nilo_via = .{ .owner = .owner_staff_id, .solution = .solution_staff_id };
+/// ```
+///
+/// The field's twin of `.via` and `.on` on an `.exists`, and needed where
+/// they are: only when the schema has said it twice.
+pub const via_marker = "nilo_via";
+
+/// One entry of `nilo_aggregate`: the field it fills, what it computes, and
+/// over which column (none for `.count`, which counts rows).
+pub const Aggregate = struct {
+    field: []const u8,
+    kind: dialect_mod.Aggregate,
+    column: ?[]const u8,
+};
+
+/// What `name` is on `Row`. A name that is not a field answers `.column`, so
+/// that the caller's own "no such column" is the message it meets.
+pub fn kindOf(comptime Row: type, comptime name: []const u8) Kind {
+    const T = comptime fieldTypeOf(Row, name) orelse return .column;
+    return comptime kindWith(Row, name, T);
+}
+
+/// The same, for a caller already holding the field's type: every loop over
+/// a Row's fields, which would otherwise look each field up by name inside a
+/// walk over the same fields and pay for the square of the Row's width
+/// ([ADR 0157](../docs/adr/0157-a-check-pays-for-its-own-branches.md)).
+pub fn kindWith(comptime Row: type, comptime name: []const u8, comptime T: type) Kind {
+    return comptime blk: {
+        // The two declarations first, and cheaply: a Row with neither, which is every
+        // Row written before ADR 0295, answers from the type alone.
+        if (@hasDecl(Row, beside_marker) and isBeside(Row, name)) break :blk .beside;
+        if (@hasDecl(Row, aggregate_marker) and aggregateNamed(Row, name)) break :blk .aggregate;
+        if (parentRowOf(T) != null) break :blk .parent;
+        if (childRowOf(T) != null) break :blk .children;
+        break :blk .column;
+    };
+}
+
+/// Whether `nilo_aggregate` has an entry for `name`, asked of the
+/// declaration's type so that nothing is parsed to answer it. A declaration of
+/// the wrong shape answers no, and `aggregatesOf` is what says why.
+fn aggregateNamed(comptime Row: type, comptime name: []const u8) bool {
+    const D = @TypeOf(@field(Row, aggregate_marker));
+    return switch (@typeInfo(D)) {
+        .@"struct" => |s| !s.is_tuple and @hasField(D, name),
+        else => false,
+    };
+}
+
+/// Whether `name` is one of the Row's columns rather than anything else a
+/// field can be. What every loop over a Row's fields asks before it treats
+/// one as a column.
+pub fn isColumnField(comptime Row: type, comptime name: []const u8) bool {
+    return comptime kindOf(Row, name) == .column;
+}
+
+/// The Row a parent field holds, with the optional taken off, or null when
+/// `T` is not one.
+pub fn parentRowOf(comptime T: type) ?type {
+    const Inner = switch (@typeInfo(T)) {
+        .optional => |o| o.child,
+        else => T,
+    };
+    return if (isRow(Inner)) Inner else null;
+}
+
+/// The Row a children field holds a slice of, or null when `T` is not one.
+/// An optional slice answers too, so that it reaches the Refusal that says a
+/// list of children is never null rather than a message about decoding.
+pub fn childRowOf(comptime T: type) ?type {
+    const Slice = switch (@typeInfo(T)) {
+        .optional => |o| o.child,
+        else => T,
+    };
+    return switch (@typeInfo(Slice)) {
+        .pointer => |p| if (p.size == .slice and isRow(p.child)) p.child else null,
+        else => null,
+    };
+}
+
+/// The field's type, or null when `Row` has no field by that name.
+pub fn fieldTypeOf(comptime Row: type, comptime name: []const u8) ?type {
+    comptime {
+        for (@typeInfo(Row).@"struct".fields) |f| {
+            if (std.mem.eql(u8, f.name, name)) return f.type;
+        }
+        return null;
+    }
+}
+
+/// Every field of `Row` of one kind, in the order the Row declares them.
+pub fn fieldsOfKind(comptime Row: type, comptime kind: Kind) []const []const u8 {
+    return comptime blk: {
+        const fields = @typeInfo(Row).@"struct".fields;
+        var out: [fields.len][]const u8 = undefined;
+        var n: usize = 0;
+        for (fields) |f| {
+            if (kindWith(Row, f.name, f.type) != kind) continue;
+            out[n] = f.name;
+            n += 1;
+        }
+        const frozen = out[0..n].*;
+        break :blk &frozen;
+    };
+}
+
+/// Whether `Row` carries anything past its table's columns: a parent,
+/// children, or a `nilo_aggregate`. Every statement over such a Row is
+/// written by `shape.zig`; every other one by the flat path it always was.
+pub fn isShaped(comptime Row: type) bool {
+    return comptime blk: {
+        if (!isRow(Row)) break :blk false;
+        if (@hasDecl(Row, aggregate_marker)) break :blk true;
+        for (@typeInfo(Row).@"struct".fields) |f| {
+            switch (kindWith(Row, f.name, f.type)) {
+                .parent, .children => break :blk true,
+                else => {},
+            }
+        }
+        break :blk false;
+    };
+}
+
+/// Whether `Row` is grouped: one row per value of its other fields.
+pub fn isGrouped(comptime Row: type) bool {
+    return comptime isRow(Row) and @hasDecl(Row, aggregate_marker);
+}
+
+/// Whether `Row` is grouped by nothing: every field an aggregate, so the
+/// statement answers exactly one row whatever it matched. `db.exactlyOne`
+/// reads one; everything that reads a list refuses it.
+pub fn isTally(comptime Row: type) bool {
+    return comptime isGrouped(Row) and
+        fieldsOfKind(Row, .column).len == 0 and
+        fieldsOfKind(Row, .parent).len == 0;
+}
+
+/// The entries of `nilo_aggregate`, in the order they were written. Empty for
+/// a Row with none.
+///
+/// **Only the words are checked here.** Whether the column exists on the
+/// table and whether the field's type can hold the answer are `shape.zig`'s,
+/// because both need the table the Row borrows, and asking for it from here
+/// would put this file inside its own borrow chain.
+pub fn aggregatesOf(comptime Row: type) []const Aggregate {
+    return comptime blk: {
+        if (!@hasDecl(Row, aggregate_marker)) break :blk &.{};
+        @setEvalBranchQuota(20_000);
+        const decl = @field(Row, aggregate_marker);
+        const D = @TypeOf(decl);
+        const shape = "\n  It maps a field to what it computes: " ++
+            "`pub const " ++ aggregate_marker ++ " = .{ .orders = .count, .owed = .{ .sum = .principal } };`.";
+        if (@typeInfo(D) != .@"struct" or @typeInfo(D).@"struct".is_tuple) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s " ++ aggregate_marker ++ " is a " ++ @typeName(D) ++ "." ++ shape,
+        );
+        const entries = @typeInfo(D).@"struct".fields;
+        if (entries.len == 0) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s " ++ aggregate_marker ++ " names nothing.\n" ++
+                "  A grouped Row with no aggregate is the distinct values of its other fields, " ++
+                "which is a question this module does not answer. Name what each group " ++
+                "carries, or take the declaration out.",
+        );
+        var out: [entries.len]Aggregate = undefined;
+        for (entries, 0..) |e, i| {
+            if (fieldTypeOf(Row, e.name) == null) {
+                const head = "nilo: " ++ @typeName(Row) ++ "'s " ++ aggregate_marker ++ " names `" ++
+                    e.name ++ "`, which is not one of its fields.";
+                if (nearest(Row, e.name)) |near| @compileError(head ++ "\n  Did you mean `" ++ near ++ "`?");
+                @compileError(head ++ "\n  Its fields are: " ++ fieldList(Row) ++ ".");
+            }
+            if (isBeside(Row, e.name)) @compileError(
+                "nilo: " ++ @typeName(Row) ++ " names `" ++ e.name ++ "` in both " ++
+                    beside_marker ++ " and " ++ aggregate_marker ++ ".\n" ++
+                    "  A field beside the columns is in no statement, and an aggregate is " ++
+                    "read out of one. It is one or the other.",
+            );
+            out[i] = aggregateSpec(Row, e.name, @field(decl, e.name));
+        }
+        const frozen = out;
+        break :blk &frozen;
+    };
+}
+
+/// The one entry of `nilo_aggregate` that fills `name`, or null.
+pub fn aggregateOf(comptime Row: type, comptime name: []const u8) ?Aggregate {
+    return comptime blk: {
+        if (!@hasDecl(Row, aggregate_marker)) break :blk null;
+        if (!aggregateNamed(Row, name)) break :blk null;
+        for (aggregatesOf(Row)) |a| {
+            if (std.mem.eql(u8, a.field, name)) break :blk a;
+        }
+        unreachable;
+    };
+}
+
+fn aggregateSpec(comptime Row: type, comptime field: []const u8, comptime said: anytype) Aggregate {
+    comptime {
+        const S = @TypeOf(said);
+        const words = "`.count`, `.{ .count = .<column> }`, `.{ .count_distinct = .<column> }`, " ++
+            "`.{ .sum = .<column> }`, `.{ .min = .<column> }`, `.{ .max = .<column> }` or " ++
+            "`.{ .avg = .<column> }`";
+        if (S == @TypeOf(.enum_literal)) {
+            if (said == .count) return .{ .field = field, .kind = .count, .column = null };
+            @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s " ++ aggregate_marker ++ " says `." ++ field ++
+                    " = ." ++ @tagName(said) ++ "`.\n" ++
+                    "  Only `.count` stands alone, because it counts rows. Everything else " ++
+                    "computes over a column and names it: " ++ words ++ ".",
+            );
+        }
+        const info = switch (@typeInfo(S)) {
+            .@"struct" => |s| s,
+            else => @compileError(
+                "nilo: " ++ @typeName(Row) ++ "'s " ++ aggregate_marker ++ " gives `." ++ field ++
+                    "` a " ++ @typeName(S) ++ ".\n  It is " ++ words ++ ".",
+            ),
+        };
+        if (info.is_tuple or info.fields.len != 1) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s " ++ aggregate_marker ++ " gives `." ++ field ++
+                "` more than one computation.\n  One field holds one answer: " ++ words ++ ".",
+        );
+        const word = info.fields[0].name;
+        const kind = std.meta.stringToEnum(dialect_mod.Aggregate, word) orelse @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s " ++ aggregate_marker ++ " asks `." ++ field ++
+                "` for `." ++ word ++ "`, which is not one it computes.\n  It is " ++ words ++
+                ". Anything else is `db.raw`.",
+        );
+        const column = @field(said, word);
+        if (@TypeOf(column) != @TypeOf(.enum_literal)) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s " ++ aggregate_marker ++ " gives `." ++ field ++
+                "`'s `." ++ word ++ "` a " ++ @typeName(@TypeOf(column)) ++ ".\n" ++
+                "  It names a column of the table, written as one: `.{ ." ++ word ++ " = .principal }`.",
+        );
+        return .{ .field = field, .kind = kind, .column = @tagName(column) };
+    }
+}
+
+/// The column `nilo_via` names for a parent or children field, or null when
+/// it names none. Only read here; `shape.zig` checks that the field is one
+/// and that the column is where the direction says it is.
+pub fn viaOf(comptime Row: type, comptime field: []const u8) ?[]const u8 {
+    return comptime blk: {
+        if (!@hasDecl(Row, via_marker)) break :blk null;
+        const decl = @field(Row, via_marker);
+        const D = @TypeOf(decl);
+        if (@typeInfo(D) != .@"struct" or @typeInfo(D).@"struct".is_tuple) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s " ++ via_marker ++ " is a " ++ @typeName(D) ++ ".\n" ++
+                "  It maps a parent or children field to the column its join goes through: " ++
+                "`pub const " ++ via_marker ++ " = .{ .owner = .owner_staff_id };`.",
+        );
+        if (!@hasField(D, field)) break :blk null;
+        const column = @field(decl, field);
+        if (@TypeOf(column) != @TypeOf(.enum_literal)) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s " ++ via_marker ++ " gives `." ++ field ++ "` a " ++
+                @typeName(@TypeOf(column)) ++ ".\n" ++
+                "  It is the column the join goes through, written as a name: `." ++ field ++
+                " = .owner_staff_id`.",
+        );
+        break :blk @tagName(column);
+    };
+}
+
+/// The name a column is answered under in a statement over a shaped Row: the
+/// path to its field, parents first, joined by a dot. `"id"` for a column of
+/// the Row itself, `"customer.name"` for one read through a parent.
+///
+/// One function because three things have to agree on it: the `SELECT` list
+/// that writes it, the `ORDER BY` that sorts by it, and the ordering a
+/// request chooses at run time, which writes nothing else.
+pub fn pathName(comptime path: []const []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (path, 0..) |part, i| out = out ++ (if (i == 0) "" else ".") ++ part;
+        return out;
+    }
 }
 
 /// Whether `T` is a **projection**: a Row that reads and owns no table
@@ -402,8 +738,9 @@ pub fn columnsOf(comptime Row: type) []const []const u8 {
         var out: [fields.len][]const u8 = undefined;
         var n: usize = 0;
         for (fields) |f| {
-            // A field beside the columns is not one (ADR 0217).
-            if (isBeside(Row, f.name)) continue;
+            // A field beside the columns is not one (ADR 0217), and neither
+            // is a parent, children or an aggregate (ADR 0295).
+            if (kindWith(Row, f.name, f.type) != .column) continue;
             out[n] = f.name;
             n += 1;
         }
@@ -435,9 +772,23 @@ pub fn Borrowed(comptime Row: type) type {
         var types: [fields.len]type = undefined;
         for (fields, 0..) |f, i| {
             names[i] = f.name;
-            // A field beside the columns is never read out of the buffer,
-            // so it keeps its own type and its default fills it (ADR 0217).
-            types[i] = if (isBeside(Row, f.name)) f.type else borrowedType(f.type);
+            types[i] = switch (kindWith(Row, f.name, f.type)) {
+                // A field beside the columns is never read out of the buffer,
+                // so it keeps its own type and its default fills it (ADR 0217).
+                .beside => f.type,
+                // A parent is borrowed whole, the same rule one level down: its
+                // text dies at the next row like the Row's own (ADR 0295).
+                .parent => if (@typeInfo(f.type) == .optional)
+                    ?Borrowed(parentRowOf(f.type).?)
+                else
+                    Borrowed(f.type),
+                // Read by a second statement after the rows it belongs to,
+                // which a stream never reaches; `db.stream` refuses the Row
+                // before this type is ever built. Kept so the refusal is the
+                // one the caller meets rather than one about this struct.
+                .children => f.type,
+                .column, .aggregate => borrowedType(f.type),
+            };
         }
         const frozen_names = names;
         const frozen_types = types;
@@ -468,11 +819,8 @@ fn borrowedType(comptime T: type) type {
 /// walker asks, and the one that turns a typo into a Refusal.
 pub fn hasColumn(comptime Row: type, comptime column: []const u8) bool {
     return comptime blk: {
-        if (isBeside(Row, column)) break :blk false;
-        for (@typeInfo(Row).@"struct".fields) |f| {
-            if (std.mem.eql(u8, f.name, column)) break :blk true;
-        }
-        break :blk false;
+        if (fieldTypeOf(Row, column) == null) break :blk false;
+        break :blk isColumnField(Row, column);
     };
 }
 
@@ -523,6 +871,30 @@ pub fn noSuchColumn(
                 "the read, and no statement reads or writes it. Take it out of " ++ what ++
                 ", or out of " ++ beside_marker ++ " if it is a column after all.",
         );
+        // A field that is there and is not a column: said as what it is, so
+        // the caller learns the spelling that does reach it (ADR 0295).
+        if (fieldTypeOf(Row, wrong) != null) switch (kindOf(Row, wrong)) {
+            .parent => @compileError(
+                "nilo: `" ++ wrong ++ "` on " ++ @typeName(Row) ++ " is a parent, asked for in " ++
+                    what ++ " as if it were a column.\n" ++
+                    "  A parent is a row, and what " ++ what ++ " can name is one of its columns: `." ++
+                    wrong ++ " = .{ .<column> = … }`.",
+            ),
+            .children => @compileError(
+                "nilo: `" ++ wrong ++ "` on " ++ @typeName(Row) ++ " is a list of children, asked for in " ++
+                    what ++ ".\n" ++
+                    "  The children are read after the rows they belong to, so no statement over " ++
+                    @typeName(Row) ++ " can see them. To keep the rows that have a matching child, " ++
+                    "write `.exists = .{ .{ .in = <ChildRow>, .where = .{ … } } }`.",
+            ),
+            .aggregate => @compileError(
+                "nilo: `" ++ wrong ++ "` on " ++ @typeName(Row) ++ " is an aggregate, asked for in " ++
+                    what ++ ".\n" ++
+                    "  It is computed over each group, so it can be sorted by and filtered on from " ++
+                    "`.order` and `.where`, and from nowhere that reads one row at a time.",
+            ),
+            .column, .beside => {},
+        };
         const head = "nilo: " ++ @typeName(Row) ++ " has no column `" ++ wrong ++
             "`, asked for in " ++ what ++ ".";
         if (nearest(Row, wrong)) |near| {
@@ -624,6 +996,7 @@ pub fn ownerOf(comptime Row: type) type {
                 current = decl;
                 continue;
             }
+            assertDescribesItsTable(current);
             return current;
         }
         @compileError(
@@ -734,15 +1107,50 @@ fn notAKey(comptime Row: type, comptime K: type) noreturn {
     );
 }
 
+/// A Row that names its table describes that table, one field per column,
+/// and that is what the migration tool and the schema check read it as. So a
+/// parent, children, `nilo_aggregate` or `nilo_via` on one is refused: each
+/// belongs to a narrower Row, which reads the table without describing it
+/// (ADR 0295).
+fn assertDescribesItsTable(comptime Row: type) void {
+    comptime {
+        const narrower = "  A Row that names its table describes it column by column, which is what " ++
+            "the migration tool builds from. Read the rest through a narrower Row: " ++
+            "`pub const " ++ marker ++ " = " ++ @typeName(Row) ++ ";`.";
+        for (@typeInfo(Row).@"struct".fields) |f| {
+            const what = switch (kindWith(Row, f.name, f.type)) {
+                .parent => "a parent",
+                .children => "a list of children",
+                else => continue,
+            };
+            @compileError(
+                "nilo: " ++ @typeName(Row) ++ " names its table and reads `" ++ f.name ++ "` as " ++
+                    what ++ ".\n" ++ narrower,
+            );
+        }
+        for ([_][]const u8{ aggregate_marker, via_marker }) |decl| {
+            if (@hasDecl(Row, decl)) @compileError(
+                "nilo: " ++ @typeName(Row) ++ " names its table and says `" ++ decl ++ "`.\n" ++ narrower,
+            );
+        }
+    }
+}
+
 /// Every column a borrowed Row reads has to be one the Row it borrows from
 /// reads, at the same type. This is the check the overload is worth having:
 /// without it a narrower Row's typo would live until a live Postgres saw it.
 fn assertSubset(comptime Narrow: type, comptime Wide: type) void {
     comptime {
+        // The aggregate list first: a field it misspells reads as a column
+        // the table has not got, and the misspelling is the thing to say.
+        if (@hasDecl(Narrow, aggregate_marker)) _ = aggregatesOf(Narrow);
         for (@typeInfo(Narrow).@"struct".fields) |f| {
             // Carried beside the columns rather than read, so the table it
-            // borrows need not have it (ADR 0217).
-            if (isBeside(Narrow, f.name)) continue;
+            // borrows need not have it (ADR 0217). A parent, children and an
+            // aggregate are not columns of this table either, and
+            // `shape.zig` checks each against the table it does read
+            // (ADR 0295).
+            if (kindWith(Narrow, f.name, f.type) != .column) continue;
             if (!hasColumn(Wide, f.name)) {
                 const head = "nilo: " ++ @typeName(Narrow) ++ " reads `" ++ f.name ++
                     "`, which " ++ @typeName(Wide) ++ " does not have.";

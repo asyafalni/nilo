@@ -50,18 +50,20 @@ Read them in order the first time; each assumes the ones above it.
 2. [Reading](./reading.md) — the query is a constant, conditions, a filter
    nobody set, one row or all of them, counting, paging, a deep page without
    `OFFSET`, a query with no server, and a result set too big to hold.
-3. [Writing](./writing.md) — insert, update, delete, many rows at once, and
+3. [A Row with more in it](./shapes.md) — a parent joined in, children read
+   after, a sum by group, and a total over everything.
+4. [Writing](./writing.md) — insert, update, delete, many rows at once, and
    a row that may already be there.
-4. [Transactions](./transactions.md) — deadlines, isolation, holding the rows
+5. [Transactions](./transactions.md) — deadlines, isolation, holding the rows
    you read, and undoing one statement without losing the rest.
-5. [Past one table](./raw.md) — `raw`, what a parameter may be, the join,
+6. [Past one table](./raw.md) — `raw`, what a parameter may be, the join,
    the aggregate, the paged join, the statement that answers with nothing,
    and what SQLite does differently.
-6. [SQLite](./sqlite.md) — one line of wiring, the one question it makes you
+7. [SQLite](./sqlite.md) — one line of wiring, the one question it makes you
    answer, the five things it refuses, and dates out of a Timestamp.
-7. [Making the tables](./migrations.md) — the same struct creates and changes
+8. [Making the tables](./migrations.md) — the same struct creates and changes
    the table, a diff that needs no database, and your own `db` command.
-8. [Running it](./running.md) — the check at startup, the stack a handler
+9. [Running it](./running.md) — the check at startup, the stack a handler
    holds, a second database, prepared statements, seeing what a request sent,
    and the nine errors.
 
@@ -195,8 +197,11 @@ What is left splits three ways.
   ([0059](../../adr/0059-a-round-trip-is-not-the-cost-worth-chasing.md)); automatic
   read-replica routing and a query cache
   ([0060](../../adr/0060-a-second-database-is-a-second-type.md)).
-- **Waiting on the one-table line**: joins, nested rows and aggregates.
-  Subqueries came off this list — `.exists` is a condition and ships
+- **Waiting on a caller**: children two levels deep, and children through a
+  key of several columns. A parent, children one level deep and a group are
+  declared on the Row and ship
+  ([ADR 0295](../../adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)),
+  as does `.exists`
   ([ADR 0171](../../adr/0171-a-row-over-there-is-a-condition.md)). The tooling
   commands still missing are on [the roadmap](../../roadmap.md#next) under
   `nilo_sql`, and they wait on one question rather than on a decision:

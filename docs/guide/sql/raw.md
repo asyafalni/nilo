@@ -1,12 +1,13 @@
 # Past one table
 
-What `nilo_sql` writes for you stops at one table and conditions that filter
-rows. This page is the way past it — `raw`, and the three shapes it takes —
-and it follows [reading](./reading.md).
+What `nilo_sql` writes for you is one table, the parents its references
+point at, the children that point back, and sums by group
+([a Row with more in it](./shapes.md)). This page is the way past that:
+`raw`, and the three shapes it takes. It follows [reading](./reading.md).
 
-Joins, aggregates, subqueries, `HAVING`, window functions, CTEs — none of
-them. The line is one sentence, **one table, conditions that filter rows**,
-and past it the answer is `raw`:
+A join through a condition rather than a reference, `DISTINCT`, window
+functions, CTEs, unions, an aggregate over an expression: none of them. Past
+what a Row can declare, the answer is `raw`:
 
 <!-- compiles: body -->
 ```zig
@@ -226,9 +227,10 @@ no server to have run the DDL somewhere else, so creating the table is your job
 at startup. `tx.exec` is the same call inside a transaction.
 
 The line is drawn there because a builder's dialect surface grows with the
-builder, and joins and aggregates are where databases disagree most. A
-boundary you can state in a sentence is worth more than one further out,
-because you can predict what it does without opening this guide.
+builder, and the statements past it are where databases disagree most. What
+the Row can declare is a join the schema already names and a grouping its
+fields already say; anything else would be a second query language, and a
+boundary you can state in a sentence is worth more than one further out.
 
 ## A statement the program cannot write while compiling
 

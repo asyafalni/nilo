@@ -146,6 +146,7 @@ section on it. A name is found here first and read on its page.
   - [An order chosen at run time](./sql.md#an-order-chosen-at-run-time)
   - [A row in another table](./sql.md#a-row-in-another-table)
   - [A key of several columns](./sql.md#a-key-of-several-columns)
+  - [A parent, children, a group](./sql.md#a-parent-children-a-group)
   - [Streaming](./sql.md#streaming)
   - [`Tx`](./sql.md#tx)
 - [Holding the rows a read matched](./sql.md#holding-the-rows-a-read-matched)

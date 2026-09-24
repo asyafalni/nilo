@@ -82,6 +82,10 @@ Inside the first three, entries are grouped by module, because **two modules tou
 
 **Needs:** a statement list run on every connection at open — which is also where a `PRAGMA` of the caller's own would go.
 
+**Children are one level deep, and only through a reference of one column.** A Row's `[]const C` field is read by one statement for every parent, keyed by each parent's position in a list of one value apiece ([ADR 0295](./adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)); a child with children of its own is refused, and so is a reference of several columns. The second is the list carrying a row of values per parent (`unnest` takes several arrays, `json_each` a list of lists), and the first is the same pass run once more per level over the children just read.
+
+**Needs:** a caller with a screen that nests three deep, or a table keyed by a tenant and an id that has children.
+
 **The SQLite half has no live test against contention.** The Wire's own tests run one process, so the case the reader and writer split exists for has a design and no test: two writers meeting, `busy_timeout` expiring, `Locked` coming back.
 
 **Needs:** a harness — a build step that stands up a second writer, which here is a second process on the same file rather than a socket.
@@ -265,12 +269,6 @@ A question nobody has answered. Not a backlog item, and not blocked: what a read
 **Multipart, streamed.** `Form(T)` reads a multipart body whole, bounded by `max_body` ([ADR 0031](./adr/0031-a-form-is-the-body-read-by-another-rule.md)), which is right for a form with a photo in it and wrong for a 2 GB video. The streaming version wants a parser that resumes across reads and an `Upload` that is a reader rather than bytes; it inherits nothing from `sendfile`, because sending is a descriptor handed to the kernel and receiving is a parser holding its place.
 
 **What would settle it:** somebody designing it. Until then the answer is `c.bodyStream()`, which holds nothing and makes the framing the handler's problem.
-
-### `nilo_sql`
-
-**Whether the line past one table moves further.** It moved once: `.exists` is a condition and ships ([ADR 0171](./adr/0171-a-row-over-there-is-a-condition.md)). What is still refused is joins, nested rows fetched with their parent, aggregates and `GROUP BY`, with `db.raw` as the way out. ADR 0171 names the two properties that let `EXISTS` across — it does not change the column list, so the Row still describes the answer, and it does not change the row count, so `.limit` still means what the caller thinks — and every one of the four breaks at least one. A join to a one-to-many breaks both, and the second is the expensive one: the query runs, the page renders, and some rows never appear. The way out got shorter rather than the line moving: `rawPage` reads a paged join and `rawExactlyOne` an aggregate ([ADR 0279](./adr/0279-a-raw-statement-can-carry-its-total.md), [ADR 0280](./adr/0280-a-statement-that-always-answers-answers-a-row.md)).
-
-**What would settle it:** a shape that keeps those two properties and the statement a comptime constant. Every property in [ADR 0039](./adr/0039-the-shape-of-a-query-is-settled-while-compiling.md) is downstream of the last one.
 
 ---
 

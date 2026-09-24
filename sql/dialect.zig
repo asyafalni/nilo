@@ -121,6 +121,39 @@ pub const Lock = enum {
     share,
 };
 
+/// What a field of a grouped Row reads over the rows of its group
+/// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+///
+/// Six, and they are the six both databases spell alike: `count(*)`,
+/// `count("col")`, `count(DISTINCT "col")`, `sum`, `min`, `max` and `avg` are
+/// the same words in Postgres and SQLite. What differs is the type each one
+/// answers in, and that is `readAggregate`'s question rather than this one's.
+/// `string_agg` and `group_concat` are the same job under two names with two
+/// argument orders, which is the kind of disagreement a Refusal is for, and
+/// they are `db.raw`.
+pub const Aggregate = enum {
+    /// `count(*)` when no column is named, `count("col")` when one is: the
+    /// rows of the group, or the ones where that column is not null.
+    count,
+    count_distinct,
+    sum,
+    min,
+    max,
+    avg,
+
+    /// The call itself, the same text in both Dialects.
+    pub fn call(comptime self: Aggregate, comptime quoted: ?[]const u8) []const u8 {
+        return comptime switch (self) {
+            .count => if (quoted) |q| "count(" ++ q ++ ")" else "count(*)",
+            .count_distinct => "count(DISTINCT " ++ quoted.? ++ ")",
+            .sum => "sum(" ++ quoted.? ++ ")",
+            .min => "min(" ++ quoted.? ++ ")",
+            .max => "max(" ++ quoted.? ++ ")",
+            .avg => "avg(" ++ quoted.? ++ ")",
+        };
+    }
+};
+
 /// Postgres, and for now the only one.
 /// How a database stores a `Uuid`, which is the one column type the two Wires
 /// disagree about (ADR 0078).
@@ -214,6 +247,59 @@ pub const Postgres = struct {
     pub fn offset(comptime placeholder_text: []const u8) []const u8 {
         return " OFFSET " ++ placeholder_text;
     }
+
+    /// An aggregate as a grouped Row reads it, cast to the type its field
+    /// declares
+    /// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+    ///
+    /// **The cast is load-bearing, and `sum` is why.** Postgres answers
+    /// `sum(int4)` as `int8` and `sum(int8)` as `numeric`, and `avg` of any
+    /// integer as `numeric` too, so a field declared `i64` would read binary
+    /// numeric limbs out of one column and an integer out of the next. Casting
+    /// to what the field says makes the answer's type a fact of the Row rather
+    /// than of the column it happened to sum; an overflow is then Postgres's
+    /// own error rather than a wrong number.
+    pub fn readAggregate(comptime call: []const u8, comptime kind: Aggregate, comptime T: type) []const u8 {
+        return comptime blk: {
+            const Bare = switch (@typeInfo(T)) {
+                .optional => |o| o.child,
+                else => T,
+            };
+            switch (kind) {
+                .count, .count_distinct => break :blk call,
+                .sum, .avg => switch (@typeInfo(Bare)) {
+                    .int => break :blk call ++ "::int8",
+                    .float => break :blk call ++ "::float8",
+                    else => break :blk readAs(call, T),
+                },
+                .min, .max => break :blk readAs(call, T),
+            }
+        };
+    }
+
+    /// The keys a children field's statement is joined against, one row each,
+    /// numbered in the order they were bound
+    /// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+    ///
+    /// **Numbered rather than filtered with `= ANY($1)`**, because the number
+    /// is what hands each child to its parent: the rows come back ordered by
+    /// it, so the parents and their children are walked in step and no key is
+    /// ever compared on this side. Comparing would have meant hashing a `Str`,
+    /// a `Uuid` and an integer the way the database does, collation included.
+    ///
+    /// The cast names the array because `unnest($1)` gives Postgres nothing to
+    /// infer a parameter type from, the reason `arrayOf` exists. `null` when
+    /// the key's type has no array form, and the caller refuses.
+    pub fn ordinalList(comptime placeholder_text: []const u8, comptime T: type, comptime alias: []const u8) ?[]const u8 {
+        return comptime blk: {
+            const array = arrayOf(T) orelse break :blk null;
+            break :blk "unnest(" ++ placeholder_text ++ "::" ++ array ++ ") WITH ORDINALITY AS " ++
+                alias ++ "(\"value\", \"key\")";
+        };
+    }
+
+    /// What the first key's number is. `WITH ORDINALITY` counts from one.
+    pub const ordinal_base = 1;
 
     /// Where NULLs sit in an ordered result, or `null` for a database that
     /// cannot be told. Written the same way `lock` is, and for the same
@@ -841,6 +927,25 @@ pub const SQLite = struct {
         return " OFFSET " ++ placeholder_text;
     }
 
+    /// No cast beyond the one `readAs` makes for text: SQLite answers `count`
+    /// and an integer `sum` as an integer, `avg` as a real, and `min`/`max` as
+    /// whatever the column held, which is already what the field reads.
+    pub fn readAggregate(comptime call: []const u8, comptime kind: Aggregate, comptime T: type) []const u8 {
+        _ = kind;
+        return readAs(call, T);
+    }
+
+    /// The same numbered list, out of the JSON array `.in` already binds here:
+    /// `json_each` answers a `key` and a `value` per element without being
+    /// asked, so nothing is renamed.
+    pub fn ordinalList(comptime placeholder_text: []const u8, comptime T: type, comptime alias: []const u8) ?[]const u8 {
+        _ = T;
+        return "json_each(" ++ placeholder_text ++ ") AS " ++ alias;
+    }
+
+    /// `json_each` counts from zero.
+    pub const ordinal_base = 0;
+
     /// The same two words, and **that is the finding rather than the
     /// coincidence.** SQLite has taken `NULLS FIRST`/`NULLS LAST` since 3.30
     /// (2019), so the clause the two databases disagree about by *default* is
@@ -1237,6 +1342,9 @@ pub fn assertDialect(comptime D: type) void {
             "text_accepts",
             "trigger_drop_names_table",
             "trigger_repeatable_head",
+            "readAggregate",
+            "ordinalList",
+            "ordinal_base",
         };
         for (owed) |decl| {
             if (!@hasDecl(D, decl)) @compileError(
