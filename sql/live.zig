@@ -1662,6 +1662,63 @@ test "a statement past its deadline is cancelled by the database" {
     try testing.expect(waited_ms < 5_000);
 }
 
+/// What a task cancelled in the middle of a statement finds once the
+/// statement has answered: its cancellation still pending, or gone.
+const AfterCancel = enum { still_cancelled, lost, finished };
+
+fn slowThenAsk(db: *db_mod.Db, io: std.Io, gpa: std.mem.Allocator) AfterCancel {
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    _ = db.raw(Slept, &run, "SELECT pg_sleep(10) IS NULL", .{}) catch {
+        std.Io.checkCancel(io) catch return .still_cancelled;
+        return .lost;
+    };
+    return .finished;
+}
+
+test "a statement cut off by a cancellation leaves the cancellation to its caller" {
+    // A background loop gets out on `nilo.sleep(..) catch return`. When the
+    // shutdown's one cancellation lands in a statement instead, the statement
+    // reports `QueryFailed` — and unless the cancellation is re-armed the
+    // loop logs that, sleeps on, and the process never exits (ADR 223).
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    const io = stack.live.threaded.io();
+    var task = io.concurrent(slowThenAsk, .{ &stack.db, io, gpa }) catch return error.SkipZigTest;
+    // Long enough to be waiting on the socket, far short of the ten seconds.
+    try std.Io.sleep(io, .fromMilliseconds(300), .awake);
+    try testing.expectEqual(AfterCancel.still_cancelled, task.cancel(io));
+}
+
+fn slowInTxThenAsk(db: *db_mod.Db, io: std.Io, gpa: std.mem.Allocator) AfterCancel {
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    var tx = db.begin(&run, .{}) catch return .lost;
+    _ = tx.raw(Slept, &run, "SELECT pg_sleep(10) IS NULL", .{}) catch {
+        // The rollback a failing handler's `defer` runs. It meets the
+        // re-armed cancellation straight away unless it is held off, and
+        // then logs a failed rollback, which fails this test.
+        tx.rollback();
+        std.Io.checkCancel(io) catch return .still_cancelled;
+        return .lost;
+    };
+    tx.rollback();
+    return .finished;
+}
+
+test "a transaction cut off by a cancellation rolls back without calling it a failure" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    const io = stack.live.threaded.io();
+    var task = io.concurrent(slowInTxThenAsk, .{ &stack.db, io, gpa }) catch return error.SkipZigTest;
+    try std.Io.sleep(io, .fromMilliseconds(300), .awake);
+    try testing.expectEqual(AfterCancel.still_cancelled, task.cancel(io));
+}
+
 test "a deadline ends with its transaction, so the next one starts clean" {
     const gpa = testing.allocator;
     var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;

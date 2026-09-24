@@ -56,7 +56,10 @@ this stops only itself.
 **`error.Canceled` is the shutdown, and it is the only way out.** The fiber is
 owned by the server exactly as a connection is: counted while it runs, and cut
 off when the shutdown grace period ends. Nothing else ends the loop, so `catch
-return` is not tidiness — it is how the process gets to exit.
+return` is not tidiness — it is how the process gets to exit. The cancellation
+is reported once, and it may land in the work rather than the `sleep`; a nilo
+call that turns it into an error of its own hands it back, so the next `sleep`
+still returns `Canceled` ([ADR 223](../adr/223-a-statement-cut-off-by-a-cancellation-hands-it-back.md)).
 
 **It may not fail.** There is no request to answer and nobody to answer it, so
 an error has nowhere to go but the log.

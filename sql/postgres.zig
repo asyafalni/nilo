@@ -43,6 +43,11 @@ const core = @import("nilo_core");
 /// A pool of connections, behind the contract in `wire.zig`.
 pub const Wire = struct {
     pool: *pg.Pool,
+    /// The `Io` the pool was opened on, kept here rather than read back out
+    /// of pg.zig's own fields: a cancellation this file turns into an error
+    /// of its own is re-armed through it, and a connection is given back
+    /// with cancellation held off through it (ADR 223).
+    io: std.Io,
     /// What the Engine handed `nilo_start`: every wait on a connection or
     /// its socket is reported through it, so the watchdog counts the fiber
     /// as parked rather than as a handler holding its thread (ADR 210).
@@ -65,6 +70,8 @@ pub const Wire = struct {
         /// with an open transaction on it — the exact failure the header of
         /// `wire.zig` is about.
         owns_conn: bool = true,
+        /// The Wire's `Io`, for giving the connection back (ADR 223).
+        io: std.Io,
         /// The wait `run` opened and this result is still inside: the
         /// exchange and every row read after it reach the socket, and are
         /// one park to the watchdog rather than one per row (ADR 210).
@@ -77,7 +84,7 @@ pub const Wire = struct {
         /// call — `db.zig` defers this.
         pub fn close(self: *Rows) void {
             self.result.deinit();
-            if (self.owns_conn) self.conn.release();
+            if (self.owns_conn) giveBack(self.io, self.conn);
             self.limits.waited(self.wait);
         }
     };
@@ -161,9 +168,9 @@ pub const Wire = struct {
                 .allocator = arena,
                 .cache_name = plan,
             }) catch |err| {
-                return reported(self.conn, err, arena, problem);
+                return reported(self.wire.io, self.conn, err, arena, problem);
             };
-            return .{ .conn = self.conn, .result = result, .owns_conn = false, .limits = self.wire.limits, .wait = w };
+            return .{ .conn = self.conn, .result = result, .owns_conn = false, .io = self.wire.io, .limits = self.wire.limits, .wait = w };
         }
 
         pub fn exec(
@@ -182,7 +189,7 @@ pub const Wire = struct {
                 .allocator = arena,
                 .cache_name = plan,
             }) catch |err| {
-                return reported(self.conn, err, arena, problem);
+                return reported(self.wire.io, self.conn, err, arena, problem);
             };
             return @intCast(count orelse 0);
         }
@@ -208,7 +215,7 @@ pub const Wire = struct {
                 unreachable;
             const w = self.wire.limits.waiting();
             defer self.wire.limits.waited(w);
-            _ = self.conn.exec(sql, .{}) catch |err| return translate(self.conn, err);
+            _ = self.conn.exec(sql, .{}) catch |err| return translate(self.wire.io, self.conn, err);
         }
 
         /// `SAVEPOINT nilo_sp_3`, and the two ways back out of it.
@@ -247,7 +254,7 @@ pub const Wire = struct {
                 unreachable;
             const w = self.wire.limits.waiting();
             defer self.wire.limits.waited(w);
-            _ = self.conn.exec(sql, .{}) catch |err| return translate(self.conn, err);
+            _ = self.conn.exec(sql, .{}) catch |err| return translate(self.wire.io, self.conn, err);
         }
 
         /// What a savepoint is called on the server. Prefixed so that it
@@ -263,10 +270,10 @@ pub const Wire = struct {
             // beats destroying the connection to avoid asking.
             self.revive();
             self.fresh();
-            defer self.conn.release();
+            defer giveBack(self.wire.io, self.conn);
             const w = self.wire.limits.waiting();
             defer self.wire.limits.waited(w);
-            _ = self.conn.exec("COMMIT", .{}) catch |err| return translate(self.conn, err);
+            _ = self.conn.exec("COMMIT", .{}) catch |err| return translate(self.wire.io, self.conn, err);
         }
 
         /// Cannot fail, because it is called from a `defer` on the way out
@@ -280,10 +287,26 @@ pub const Wire = struct {
             // The path this is here for: a statement failed, which is the
             // usual reason anybody rolls back at all.
             self.revive();
-            defer self.conn.release();
+            defer giveBack(self.wire.io, self.conn);
             const w = self.wire.limits.waiting();
             defer self.wire.limits.waited(w);
+            // Whether a cancellation is what ended the transaction: asked
+            // before holding it off, and put back for the caller (ADR 223).
+            const cancelled = if (std.Io.checkCancel(self.wire.io)) |_| false else |_| blk: {
+                self.wire.io.recancel();
+                break :blk true;
+            };
+            // Held off from cancellation, as giving the connection back is:
+            // a rollback is cleanup, and a re-armed cancellation would stop
+            // the ROLLBACK before it was sent.
+            const was = self.wire.io.swapCancelProtection(.blocked);
+            defer _ = self.wire.io.swapCancelProtection(was);
             _ = self.conn.exec("ROLLBACK", .{}) catch |err| {
+                // A statement a cancellation cut off leaves the connection
+                // mid-answer, so the ROLLBACK cannot be sent at all. The
+                // connection is dropped either way, and the server rolls
+                // back when it goes: that is a shutdown, not a failure.
+                if (cancelled) return;
                 std.log.err(
                     "nilo_sql: a transaction could not be rolled back ({s}). The connection " ++
                         "is being dropped rather than returned to the pool.",
@@ -303,9 +326,9 @@ pub const Wire = struct {
         _ = arena;
         const w = self.limits.waiting();
         defer self.limits.waited(w);
-        var conn = self.pool.acquire() catch return error.Disconnected;
-        errdefer conn.release();
-        _ = conn.exec(comptime beginText(opts), .{}) catch |err| return translate(conn, err);
+        var conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+        errdefer giveBack(self.io, conn);
+        _ = conn.exec(comptime beginText(opts), .{}) catch |err| return translate(self.io, conn, err);
         return .{ .wire = self, .conn = conn };
     }
 
@@ -357,7 +380,7 @@ pub const Wire = struct {
         defer scratch.deinit();
 
         const pool = try pg.Pool.init(io, gpa, try poolOpts(uri, scratch.allocator(), opts));
-        return .{ .pool = pool, .limits = opts.limits };
+        return .{ .pool = pool, .io = io, .limits = opts.limits };
     }
 
     /// Everything `pg.Pool.init` needs, in one value — which is the point:
@@ -648,16 +671,16 @@ pub const Wire = struct {
         // two calls and a clock per row (ADR 210).
         const w = self.limits.waiting();
         errdefer self.limits.waited(w);
-        var conn = self.pool.acquire() catch return error.Disconnected;
-        errdefer conn.release();
+        var conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+        errdefer giveBack(self.io, conn);
 
         const result = conn.queryOpts(sql, opened(values), .{
             .allocator = arena,
             .cache_name = plan,
         }) catch |err| {
-            return reported(conn, err, arena, problem);
+            return reported(self.io, conn, err, arena, problem);
         };
-        return .{ .conn = conn, .result = result, .limits = self.limits, .wait = w };
+        return .{ .conn = conn, .result = result, .io = self.io, .limits = self.limits, .wait = w };
     }
 
     /// The next row, or false when the set is finished. The row itself is
@@ -666,7 +689,7 @@ pub const Wire = struct {
     pub fn next(self: *Wire, rows: *Rows) wire.Error!bool {
         _ = self;
         rows.current = rows.result.next() catch |err| {
-            return translate(rows.conn, err);
+            return translate(rows.io, rows.conn, err);
         } orelse {
             rows.current = null;
             return false;
@@ -812,8 +835,9 @@ pub const Wire = struct {
     /// and dials a new one. A handler that stops reading early is an
     /// ordinary thing to write, so the cost of it must not be a reconnect.
     pub fn drain(self: *Wire, rows: *Rows) void {
-        _ = self;
-        rows.result.drain() catch {};
+        // A cancellation that lands while the rest is thrown away is the
+        // caller's, like any other a statement is cut off by (ADR 223).
+        rows.result.drain() catch |err| if (err == error.Canceled) self.io.recancel();
         rows.close();
     }
 
@@ -835,13 +859,13 @@ pub const Wire = struct {
     ) wire.Error!usize {
         const w = self.limits.waiting();
         defer self.limits.waited(w);
-        var conn = self.pool.acquire() catch return error.Disconnected;
-        defer conn.release();
+        var conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+        defer giveBack(self.io, conn);
         const count = conn.execOpts(sql, opened(values), .{
             .allocator = arena,
             .cache_name = plan,
         }) catch |err| {
-            return reported(conn, err, arena, problem);
+            return reported(self.io, conn, err, arena, problem);
         };
         return @intCast(count orelse 0);
     }
@@ -974,7 +998,40 @@ fn opened(values: anytype) Opened(@TypeOf(values)) {
 /// while the field is about the statement that just ran: the pool clears it
 /// on `release`, and a transaction clears it itself in `Tx.fresh`, which is
 /// where the reasoning is written down.
-fn translate(conn: *pg.Conn, err: anyerror) wire.Error {
+/// Give a connection back to the pool with cancellation held off (ADR 223).
+///
+/// Returning a connection is cleanup, and pg.zig's `release` may dial a
+/// replacement for one a cancelled statement left mid-conversation. That
+/// dial is a cancellation point: unprotected, it takes the cancellation
+/// `translate` has just re-armed, logs "connect error: Canceled", and the
+/// caller is left with a failed statement and no cancellation — the loop
+/// that should have stopped sleeps on.
+fn giveBack(io: std.Io, conn: *pg.Conn) void {
+    const was = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(was);
+    conn.release();
+}
+
+/// A connection that could not be had. A cancellation while waiting for
+/// one is re-armed for the caller, as `translate` does (ADR 223).
+fn acquireFailed(io: std.Io, err: anyerror) wire.Error {
+    if (err == error.Canceled) io.recancel();
+    return error.Disconnected;
+}
+
+fn translate(io: std.Io, conn: *pg.Conn, err: anyerror) wire.Error {
+    // **A cancellation is handed back, not swallowed** (ADR 223). The fiber
+    // was cancelled — a request that went away, a server shutting down — and
+    // the statement was one cancellation point on its way out. `Canceled`
+    // is not in `wire.Error`, so the caller gets `QueryFailed`; re-arming it
+    // is what makes the caller's next cancellation point report it again.
+    // Without this, a background loop whose `nilo.sleep(..) catch return`
+    // is its only way out logs the failure and sleeps on, and the process
+    // never exits.
+    if (err == error.Canceled) {
+        io.recancel();
+        return error.QueryFailed;
+    }
     if (conn.err) |server| {
         if (std.mem.eql(u8, server.code, "23505")) return error.AlreadyExists;
         // The three other codes in class 23 a caller routinely branches on
@@ -1038,6 +1095,7 @@ fn translate(conn: *pg.Conn, err: anyerror) wire.Error {
 /// of memory telling you so" would lose the answer the caller came for. What
 /// cannot be copied is left empty.
 fn reported(
+    io: std.Io,
     conn: *pg.Conn,
     err: anyerror,
     arena: std.mem.Allocator,
@@ -1059,7 +1117,7 @@ fn reported(
             slot.* = .{ .message = @errorName(err) };
         }
     }
-    return translate(conn, err);
+    return translate(io, conn, err);
 }
 
 /// One of the server's strings, in the arena, or empty when it will not fit.
