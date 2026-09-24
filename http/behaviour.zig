@@ -58,6 +58,11 @@ const Harness = struct {
     /// Who these requests come from. No socket by default, which is what
     /// every test that does not care about the address wants.
     peer: bulkhead.Peer = .{},
+    /// The last request, copied so it is writable the way a connection's
+    /// read buffer is: a WebSocket message is unmasked in place (ADR 216),
+    /// and a string literal is read-only under LLVM. Kept until the next
+    /// send, because `in_flight` still points into it.
+    input: []u8 = &.{},
 
     fn init() Harness {
         // Several tests below drive a handler into failure on purpose, and
@@ -75,6 +80,7 @@ const Harness = struct {
 
     fn deinit(self: *Harness) void {
         testing.log_level = self.restore_log_level;
+        testing.allocator.free(self.input);
         self.arena.deinit();
     }
 
@@ -102,7 +108,9 @@ const Harness = struct {
     }
 
     fn send(self: *Harness, app: *App, request: []const u8) struct { response: []const u8, keep_alive: bool } {
-        var in = std.Io.Reader.fixed(request);
+        testing.allocator.free(self.input);
+        self.input = testing.allocator.dupe(u8, request) catch @panic("OOM");
+        var in = std.Io.Reader.fixed(self.input);
         var out = std.Io.Writer.fixed(&self.buf);
         const keep_alive = app.handleRequest(self.arena.allocator(), &self.lifetime, &self.in_flight, &in, &out, .off, .off, self.peer);
         self.lifetime.end();
@@ -6064,7 +6072,9 @@ test "a WebSocket allocates nothing per message, however many it carries" {
 
     const send = struct {
         fn once(a: *App, gpa: std.mem.Allocator, l: *str_mod.Lifetime, f: *fail.InFlight, b: []u8) void {
-            var in = std.Io.Reader.fixed(conversation);
+            // Unmasked in place, so it cannot be the read-only literal.
+            var bytes = conversation.*;
+            var in = std.Io.Reader.fixed(&bytes);
             var out = std.Io.Writer.fixed(b);
             _ = a.handleRequest(gpa, l, f, &in, &out, .off, .off, .{});
             l.end();

@@ -284,6 +284,7 @@ Each of these cost somebody an hour, usually in the wrong file.
 - `@typeName` spells a type from its own module's root, so an application's `room.Room` reads exactly like nilo's.
 - `b.lazyDependency` is a request, not a conditional ([ADR 066](./adr/066-a-lazy-dependency-is-a-request.md)); measuring what a dependent downloads means clearing both `zig-pkg/` and the global cache's `p/`.
 - A build step that succeeds is cached and one that fails is not, which is why the refusals are re-analysed every run and the snippets are nearly free.
+- A string literal is writable under the x86_64 self-hosted backend and read-only under LLVM, so a test that hands `std.Io.Reader.fixed` a literal and the code under test writes into the buffer passes in Linux Debug and bus-errors on a Mac. The first macOS CI run found three, all a WebSocket unmasking in place; forcing `testBackend` to LLVM for Debug reproduces it on Linux.
 - `zig build test --fuzz` does not compile on 0.16; the fetcher does not peel an annotated tag; on aarch64 the default backend is LLVM in both modes.
 - `std.simd.suggestVectorLength` is the register width, not the unroll factor a loop wants (128 measured 30% faster than the suggested 64).
 - SQLite: a URI's `mode=` beats the flags given to `sqlite3_open_v2`; `journal_mode = WAL` in memory answers `memory` instead of failing; `$2` before `$1` is numbered by first appearance.

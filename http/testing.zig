@@ -576,7 +576,13 @@ pub const Client = struct {
         // test that wants the whole gate.
         try app.resolveChains();
 
-        var in = std.Io.Reader.fixed(raw_request);
+        // A copy, because a connection's read buffer is written to: a
+        // WebSocket message is unmasked where it lies (ADR 216). Handed a
+        // string literal, that write lands in a read-only page, which macOS
+        // answers with a bus error and Linux happened not to.
+        const writable = try self.gpa.dupe(u8, raw_request);
+        defer self.gpa.free(writable);
+        var in = std.Io.Reader.fixed(writable);
         var out = std.Io.Writer.fixed(self.buffer);
         const keep_alive = app.handleRequest(
             self.arena.allocator(),
