@@ -1,5 +1,5 @@
 //! HTTP/2 frames (RFC 9113 §4, §6), as far as a gRPC server reads and writes
-//! them ([ADR 0297](../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+//! them ([ADR 220](../docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md)).
 //!
 //! The vocabulary and nothing else: what a frame header is, what the types,
 //! flags, settings and error codes are called, and how to write the frames

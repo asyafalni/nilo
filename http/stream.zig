@@ -1,5 +1,5 @@
 //! Responses written in pieces, because their length is not known when the
-//! head goes out (ADR 0020).
+//! head goes out (ADR 019).
 //!
 //! ```zig
 //! fn report(c: *nilo.Ctx, db: *Db) !void {
@@ -42,7 +42,7 @@ pub const Options = struct {
     /// length nobody knows yet, framed in chunks. Set it and the head carries
     /// a `Content-Length` instead, which is what a browser needs to draw a
     /// progress bar and what makes a `Range` against the response answerable
-    /// ([ADR 0128](../docs/adr/0128-a-stream-that-knows-its-length-says-so.md)).
+    /// ([ADR 101](../docs/adr/101-a-stream-that-knows-its-length-says-so.md)).
     ///
     /// The caller that has this is the one moving bytes out of something that
     /// counted them already — `nilo_s3`'s `bucket.stream` reports `len` before
@@ -53,7 +53,7 @@ pub const Options = struct {
     /// at the flush that would have sent the extra bytes rather than at the
     /// call that buffered them —
     /// for the reason a WebSocket frame that lies about its length is refused
-    /// ([ADR 0097](../docs/adr/0097-a-frame-that-lies-about-its-length-is-not-sent.md)):
+    /// ([ADR 076](../docs/adr/076-a-frame-that-lies-about-its-length-is-not-sent.md)):
     /// the bytes past the promise would be read by the client as the start of
     /// the next response. Finishing short cannot be taken back — the head has
     /// gone — so the connection closes rather than leaving a client waiting
@@ -73,7 +73,7 @@ pub const Open = struct {
     /// True when answering a HEAD: the handler writes as usual and none of
     /// it goes out, so a handler need not know which verb it is answering.
     drop: bool,
-    /// What the head promised, when it promised anything (ADR 0128).
+    /// What the head promised, when it promised anything (ADR 101).
     promised: ?u64 = null,
     /// How much of that promise has been written. Counted rather than
     /// inferred, because the buffer means the writer and the wire are never
@@ -88,7 +88,7 @@ pub const Open = struct {
 /// your own — writes into the response without an intermediate buffer.
 pub const Stream = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Stream";
 
     /// Write here. Everything that lands in this buffer leaves as one chunk.
@@ -105,12 +105,12 @@ pub const Stream = struct {
     /// The `Ctx`'s "this connection cannot carry another request" flag, or
     /// null when nothing owns one — a test driving a Stream against a buffer.
     /// Set when a promised length is not met, which is the one failure here
-    /// that cannot be taken back (ADR 0128).
+    /// that cannot be taken back (ADR 101).
     _force_close: ?*bool = null,
     /// The request's blocking detector, or null when there is no request
     /// behind this — a Stream a test built against a buffer. A stretch of
     /// handler time ends at every write, which is what lets a stream be
-    /// watched rather than excused (ADR 0132).
+    /// watched rather than excused (ADR 013).
     _watch: ?*watchdog.Watch = null,
 
     /// Write `bytes` into the stream. Nothing leaves until the buffer fills
@@ -147,7 +147,7 @@ pub const Stream = struct {
     ///
     /// A long-running loop should check this. `listen()` waits for requests
     /// in flight, and a stream that ignores this holds the shutdown open for
-    /// as long as it runs (ADR 0020).
+    /// as long as it runs (ADR 019).
     ///
     /// The other way a stream ends needs no check at all: when the client
     /// goes away, the next write fails and the error unwinds the handler.
@@ -171,7 +171,7 @@ pub const Stream = struct {
         // bytes are coming, so there is no correcting it: what is left is to
         // stop the client waiting for the rest, and to stop the next response
         // on this connection being read as the tail of this one. A HEAD is not
-        // this case — nothing was going to be written (ADR 0128).
+        // this case — nothing was going to be written (ADR 101).
         if (open.promised) |promised| {
             if (!open.drop and open.written < promised) {
                 // A warning rather than an error, because in this project
@@ -211,7 +211,7 @@ pub const Stream = struct {
 
         // Putting a piece on the wire is nilo waiting on the client, not the
         // handler running — and saying so is what lets a stream be watched at
-        // all rather than excused (ADR 0132). A client too slow to take what
+        // all rather than excused (ADR 013). A client too slow to take what
         // is being sent parks this fiber for as long as it takes.
         const token = watchdog.waiting(self._watch);
         defer watchdog.waited(self._watch, token);
@@ -253,7 +253,7 @@ pub const Stream = struct {
         // read as the beginning of the next response — which is a
         // response-splitting bug rather than a lost tail. Refused for the
         // reason a WebSocket frame that lies about its length is refused
-        // (ADR 0097, ADR 0128), and loudly, because a silent one would leave
+        // (ADR 076, ADR 101), and loudly, because a silent one would leave
         // somebody looking for the missing end of a file. Loudly means
         // `warn`: `err` is reserved for a server that will not start.
         if (open.promised) |promised| {
@@ -318,7 +318,7 @@ pub const Stream = struct {
 /// One message on an event stream.
 pub const Event = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Event";
 
     /// The `event:` name a listener can subscribe to by itself. Empty is the
@@ -347,7 +347,7 @@ pub const Event = struct {
 /// the next one is an event that arrived late for no reason.
 pub const Events = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Events";
 
     stream: Stream,
@@ -648,7 +648,7 @@ test "a stream that promised a length writes its bytes unframed" {
     try body.finish();
 
     // No chunk headers and no terminator: the `Content-Length` in the head is
-    // what says where this stops (ADR 0128).
+    // what says where this stops (ADR 101).
     try testing.expectEqualStrings("hello world", wire.written());
     try testing.expect(!closing);
 }
@@ -670,7 +670,7 @@ test "a stream refuses to write past the length it promised" {
 
     // One byte more than the head promised. A client reading a
     // `Content-Length` stops at five, so this byte would be read as the first
-    // byte of the next response — which is the failure ADR 0097 refuses one
+    // byte of the next response — which is the failure ADR 076 refuses one
     // layer down, and this refuses here.
     //
     // **The refusal arrives at the write that would have sent it**, not at the

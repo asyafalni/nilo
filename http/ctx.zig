@@ -1,10 +1,10 @@
 //! Ctx — one request in flight, and all the control over it. This is
-//! nilo's real API (ADR 0003): the typed layer above it turns into calls
+//! nilo's real API (ADR 002): the typed layer above it turns into calls
 //! to this while compiling.
 //!
 //! Every piece of text coming out of Ctx is a `Str`: it lives as long as
 //! the request, and is copied deliberately with `.keep()` if it needs to
-//! live longer (ADR 0004). Fields prefixed with `_` belong to nilo's
+//! live longer (ADR 003). Fields prefixed with `_` belong to nilo's
 //! internals — the request arena behind them is never touched directly by
 //! users.
 
@@ -43,17 +43,17 @@ const Str = str_mod.Str;
 /// directly gets, and they are `bulkhead.Options`' defaults.
 pub const Limits = struct {
     max_body: usize = 1024 * 1024,
-    /// The most requests answered at once; 0 is no limit (ADR 0197).
+    /// The most requests answered at once; 0 is no limit (ADR 159).
     max_in_flight: u32 = 0,
     trusted_hops: u8 = 0,
     /// The networks `.trusted_proxies` named, parsed once at `listen()` and
-    /// owned by the App (ADR 0129). Empty means the hop count decides, which
+    /// owned by the App (ADR 102). Empty means the hop count decides, which
     /// is what every App that never set it gets.
     trusted_proxies: []const proxies_mod.Cidr = &.{},
     block_warning_ms: u32 = 250,
     /// The deadline every request starts with, in milliseconds; 0 is none.
     /// What `nilo.deadline` gives one route, given to all of them at
-    /// `listen()` (ADR 0267).
+    /// `listen()` (ADR 105).
     request_deadline_ms: u32 = 0,
 };
 
@@ -67,7 +67,7 @@ pub const json_hint = 512;
 /// (`Access-Control-Allow-Origin` and `Vary: Origin`) in front of a gzipped
 /// static file (`ETag`, `Cache-Control`, `Accept-Ranges`, `Vary:
 /// Accept-Encoding`, `Content-Encoding`). It was four until gzip added two,
-/// six until `Vary` stopped replacing itself (ADR 0089), and each of those
+/// six until `Vary` stopped replacing itself (ADR 029), and each of those
 /// moves was made because a test measured the spill rather than because the
 /// arithmetic looked tight — `test "a gzipped file behind a named-origin CORS
 /// still allocates nothing"` is the one that holds this number.
@@ -80,15 +80,15 @@ pub const json_hint = 512;
 ///
 /// Each slot is two slices on a Ctx that lives on the fiber's stack — and on a
 /// frame that is unwound before the connection waits for its next request
-/// (ADR 0071), so this is not memory an idle connection holds. Which is why
+/// (ADR 062), so this is not memory an idle connection holds. Which is why
 /// the trade runs this way at all: 32 bytes of a transient frame against an
-/// allocation on the path nearly every app serves (ADR 0018).
+/// allocation on the path nearly every app serves (ADR 017).
 pub const inline_headers = 7;
 
 /// One resolved value, kept for the rest of the request that asked for it.
 ///
 /// Keyed by type name rather than by anything cleverer for the same reason
-/// the service registry is (ADR 0006): the list is two entries long in
+/// the service registry is (ADR 005): the list is two entries long in
 /// practice, and `@typeName` is normally the very same literal, so finding
 /// one is a pointer compare.
 const Resolved = struct {
@@ -98,7 +98,7 @@ const Resolved = struct {
 
 pub const Ctx = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Ctx";
 
     method: http1.Method,
@@ -122,7 +122,7 @@ pub const Ctx = struct {
     /// the connection for again, which is most of them — see the copy in
     /// `App.handleRequest`, and `aboutToRead` for what keeps it honest.
     _head_borrowed: bool = false,
-    /// This connection's time limits (ADR 0023). Every path that reads from
+    /// This connection's time limits (ADR 022). Every path that reads from
     /// the connection arms the one that applies to it first; `.off` — which
     /// is the default, and what a test driving App directly gets — makes
     /// every one of those calls do nothing.
@@ -136,7 +136,7 @@ pub const Ctx = struct {
     ///
     /// Points at a slot in the *connection* loop's frame, which is the whole
     /// point: the loop runs from there, after this request's machinery has
-    /// unwound (ADR 0071). Null for a `Ctx` built by hand in a test, and for
+    /// unwound (ADR 062). Null for a `Ctx` built by hand in a test, and for
     /// every request that is not a WebSocket, which is all but a few.
     _handover: ?*?websocket.Handover = null,
     /// Who the connection came from, as the socket reports it. Empty when
@@ -147,7 +147,7 @@ pub const Ctx = struct {
     _request_id: ?Str = null,
     /// Where a generated id is written. Sixteen hex characters, on the Ctx
     /// and therefore on the fiber's stack — not on the connection, whose
-    /// 4,669 idle bytes are an invariant rather than a budget (ADR 0018).
+    /// 4,669 idle bytes are an invariant rather than a budget (ADR 017).
     _request_id_buf: [16]u8 = undefined,
     /// What this request may do, from `listen()`. Defaults when App was
     /// never listened on, which is what a test gets.
@@ -169,13 +169,13 @@ pub const Ctx = struct {
     /// The compressors `app.compress` gave the App, or null when it never
     /// did, which is what every App that did not ask for it gets, and a
     /// test driving a handler by hand. A pointer to the App's, eight bytes
-    /// on the Ctx (ADR 0287).
+    /// on the Ctx (ADR 211).
     _compressors: ?*const compress_mod.Pool = null,
     _params: []const router.Param,
     /// The route that matched, or null when none did. A pointer into the
     /// App's own table rather than a copy of anything on it — eight bytes on
     /// a Ctx, which is the number a handler that parks its frame pays per
-    /// connection for this (ADR 0201). The table does not move while the
+    /// connection for this (ADR 162). The table does not move while the
     /// server runs: registration is over before the first request.
     _route: ?*const router.Route = null,
     _services: *const service_mod.Registry,
@@ -191,7 +191,7 @@ pub const Ctx = struct {
     _stopping: ?*const std.atomic.Value(bool) = null,
     _body: ?[]const u8 = null,
     /// Set when the handler asked to read the body in pieces, and how far it
-    /// got. App reads it to discard whatever is left (ADR 0020).
+    /// got. App reads it to discard whatever is left (ADR 019).
     _incoming: ?body_mod.Progress = null,
     /// Set when reading the body went wrong in a way that leaves the
     /// connection at an unknown byte. App reads it and does not reuse the
@@ -199,29 +199,29 @@ pub const Ctx = struct {
     _stream_desynced: bool = false,
     _sent: bool = false,
     /// Set once `100 Continue` has gone out, so it goes out at most once even
-    /// though two body paths can each be the first to read (ADR 0094). App
+    /// though two body paths can each be the first to read (ADR 073). App
     /// reads it with `Request.expect_continue` to tell a body the client is
     /// still holding from one it has already sent.
     _continued: bool = false,
     /// Set between `stream()` and the stream's `finish()`, which clears it.
-    /// App reads it to find a body nobody ended (ADR 0020).
+    /// App reads it to find a body nobody ended (ADR 019).
     _stream: ?stream_mod.Open = null,
     /// The blocking detector's stopwatch for this request, or null when
     /// there is no request behind this Ctx — a handler called straight from
     /// a test. Held here rather than looked up: `Ctx.send` is on the path of
     /// every request, and finding it through the fiber slot instead cost a
-    /// measured 45ns of the 612 a whole request takes (ADR 0034).
+    /// measured 45ns of the 612 a whole request takes (ADR 013).
     _watch: ?*watchdog.Watch = null,
     /// Set when this request took the connection over — a stream, a body
     /// reader, a WebSocket. Once set it stays set, which is what separates
     /// it from `_stream` above: a stream that was finished properly is
     /// still a request that spent its time on the socket, and the blocking
-    /// detector has to leave it alone either way (ADR 0034).
+    /// detector has to leave it alone either way (ADR 013).
     _took_over: bool = false,
     /// Set while the deadline on `_deadlines` is `listen()`'s default rather
     /// than a route's own. A request that takes the connection over drops a
     /// default deadline — a stream or a WebSocket is meant to outlive it —
-    /// and keeps one a route asked for by name (ADR 0267).
+    /// and keeps one a route asked for by name (ADR 105).
     _deadline_default: bool = false,
     /// Set when the response cannot share its connection with another
     /// request whatever the client asked for — an unframed HTTP/1.0 stream,
@@ -239,7 +239,7 @@ pub const Ctx = struct {
     _extra_inline: [inline_headers]http1.Header = undefined,
     _extra_n: usize = 0,
     _extra_spill: std.ArrayList(http1.Header) = .empty,
-    /// Resolved values already worked out for this request (ADR 0016).
+    /// Resolved values already worked out for this request (ADR 015).
     /// Stays empty — and costs nothing — on a request that asks for none.
     _resolved: std.ArrayList(Resolved) = .empty,
 
@@ -248,7 +248,7 @@ pub const Ctx = struct {
     /// Reset when the request ends, so nothing taken from here needs — or
     /// may have — a `free`. It is what `Str` points into, and it is the
     /// reason a `Str` never escapes its request without `.keep()`
-    /// (ADR 0004).
+    /// (ADR 003).
     ///
     /// Public because a module beside the framework has to be able to
     /// allocate for the request without reaching into a field: `nilo_sql`
@@ -265,7 +265,7 @@ pub const Ctx = struct {
     /// for. What it buys over passing the slice around is the Debug-only
     /// trap: a `Str` read after its request has ended says so, instead of
     /// quietly reading whatever is in the arena the next time round
-    /// (ADR 0004).
+    /// (ADR 003).
     ///
     /// The `Lifetime` itself stays private. Handing one out would let a
     /// caller stamp any bytes at all with this request's lifetime, and the
@@ -283,7 +283,7 @@ pub const Ctx = struct {
     }
 
     /// The resolved value of type `V` for this request — worked out now if
-    /// nobody has asked yet, and handed back as-is if they have (ADR 0016).
+    /// nobody has asked yet, and handed back as-is if they have (ADR 015).
     ///
     /// A handler gets these by writing the type in its argument list and
     /// never calls this. What it is here for is middleware, which has no
@@ -315,7 +315,7 @@ pub const Ctx = struct {
 
     /// The resolved value under that type name, untyped — what an erased
     /// Scope reads through its table, where the type cannot be said
-    /// ([ADR 0219](../docs/adr/0219-an-erased-scope-answers-what-was-resolved.md)).
+    /// ([ADR 144](../docs/adr/144-a-scope-that-crosses-a-function-pointer.md)).
     /// Only what has *already* been worked out: an erased Scope cannot run a
     /// resolver. nilo's own; users go through `resolve`.
     pub fn resolvedNamed(self: *const Ctx, type_name: []const u8) ?*const anyopaque {
@@ -354,7 +354,7 @@ pub const Ctx = struct {
 
     /// Whether the client already holds `version` — its `If-None-Match`
     /// names the tag a `nilo.Versioned(T)` with that version goes out under
-    /// (ADR 0258). Asked before building the body, so a handler returning
+    /// (ADR 189). Asked before building the body, so a handler returning
     /// `.unchanged(version)` skips the work as well as the bytes:
     ///
     /// ```zig
@@ -380,7 +380,7 @@ pub const Ctx = struct {
     /// The `operationId` of the route this request matched — what
     /// `app.named` gave it, or the name derived from the method and the
     /// pattern, exactly as the API description prints it
-    /// ([ADR 0201](../docs/adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
+    /// ([ADR 162](../docs/adr/162-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
     ///
     /// ```zig
     /// fn authorize(c: *nilo.Ctx, next: nilo.Next) !void {
@@ -409,7 +409,7 @@ pub const Ctx = struct {
 
     /// The URL of one of this server's routes, built out of the pattern it was
     /// registered under
-    /// ([ADR 0127](../docs/adr/0127-a-route-pattern-is-the-name-of-its-url.md)).
+    /// ([ADR 100](../docs/adr/100-a-route-pattern-is-the-name-of-its-url.md)).
     ///
     /// ```zig
     /// try c.redirect(303, (try c.url("/users/:id", .{ .id = made.id })).view());
@@ -458,7 +458,7 @@ pub const Ctx = struct {
     /// Both halves are `Str` rather than `[]const u8` for the reason the type
     /// exists: the head is usually *borrowed* from the connection's read
     /// buffer, so a name kept past the request points at somebody else's
-    /// request (ADR 0004). A name is as much a slice of the head as a value is.
+    /// request (ADR 003). A name is as much a slice of the head as a value is.
     pub const RequestHeader = struct {
         name: Str,
         value: Str,
@@ -491,7 +491,7 @@ pub const Ctx = struct {
     ///
     /// The two cases `header(name)` cannot serve: a middleware that does not
     /// know the names in advance, and a header sent **twice**, which `header`
-    /// answers the first of and never mentions the second (ADR 0107).
+    /// answers the first of and never mentions the second (ADR 085).
     ///
     /// The same walk `header` does, so it costs the same nothing — no list is
     /// built and a request that never calls this pays for none of it.
@@ -537,7 +537,7 @@ pub const Ctx = struct {
     ///
     /// The case `query(name)` cannot serve: **a filter whose names are data**,
     /// like `?filter[status]=open&filter[owner]=7`, or a request being logged
-    /// or forwarded whole (ADR 0112). A name sent twice appears twice, in the
+    /// or forwarded whole (ADR 090). A name sent twice appears twice, in the
     /// order it was sent, which `query` also cannot report.
     ///
     /// Nothing is allocated. The parameters were split once, into the request
@@ -562,7 +562,7 @@ pub const Ctx = struct {
     /// `"localhost:8080"`.
     ///
     /// The `Host` header, which an HTTP/1.1 request has exactly one of or it
-    /// is a 400 ([ADR 0101](../docs/adr/0101-a-request-nobody-else-would-answer-is-refused.md)) —
+    /// is a 400 ([ADR 070](../docs/adr/070-a-request-nobody-else-would-answer-is-refused.md)) —
     /// **unless `listen(.{ .trusted_hops = … })` says a proxy stands in
     /// front**, in which case an `X-Forwarded-Host` it wrote is the answer.
     /// With the default of zero that header is ignored, because a forged one
@@ -570,7 +570,7 @@ pub const Ctx = struct {
     ///
     /// A target that arrived in absolute form — `GET http://example.com/x` —
     /// is answered from the target instead (RFC 9112 §3.2,
-    /// [ADR 0120](../docs/adr/0120-a-target-is-read-in-the-form-it-arrived-in.md)).
+    /// [ADR 095](../docs/adr/095-a-target-is-read-in-the-form-it-arrived-in.md)).
     /// A trusted proxy still outranks it.
     pub fn host(self: *const Ctx) Str {
         if (self._limits.trusted_hops > 0) {
@@ -592,7 +592,7 @@ pub const Ctx = struct {
     /// is not what nilo saw.
     ///
     /// nilo does not speak TLS
-    /// ([ADR 0028](../docs/adr/0028-tls-is-terminated-in-front.md)), so every
+    /// ([ADR 027](../docs/adr/027-tls-is-terminated-in-front.md)), so every
     /// request it reads arrived in plaintext and there is nothing to observe.
     /// The proxy in front knows, and says so in `X-Forwarded-Proto` — read
     /// only when `trusted_hops` is not zero, for the reason `host()` gives.
@@ -651,7 +651,7 @@ pub const Ctx = struct {
     }
 
     /// `n` bytes from the operating system's entropy source, off the event
-    /// loop (ADR 0046).
+    /// loop (ADR 042).
     ///
     /// ```zig
     /// const key = id.v7(try c.entropy(id.Uuid.v7_entropy), nilo.nowMillis());
@@ -660,7 +660,7 @@ pub const Ctx = struct {
     /// **A method rather than a free function**, because entropy is a syscall
     /// and a syscall straight off a fiber stops every request sharing that
     /// thread. This one parks on the Engine's blocking pool instead
-    /// (ADR 0034). Reaching it only through a `Ctx` is what says the call
+    /// (ADR 013). Reaching it only through a `Ctx` is what says the call
     /// costs a wait — which is why `nilo_id` takes randomness as an argument.
     ///
     /// By value, so it fits in the expression that uses it: `n` is comptime,
@@ -675,7 +675,7 @@ pub const Ctx = struct {
     }
 
     /// `entropy` for a caller that cannot say the length while compiling
-    /// ([ADR 0166](../docs/adr/0166-entropy-a-function-pointer-can-carry.md)).
+    /// ([ADR 134](../docs/adr/134-entropy-a-function-pointer-can-carry.md)).
     ///
     /// The same syscall through the same Bulkhead; what changes is only that
     /// the width is a value. `entropy` returns `![n]u8`, and a **function
@@ -692,7 +692,7 @@ pub const Ctx = struct {
     }
 
     /// Hash a password: salted from `Ctx.entropy`, off the loop, and behind
-    /// the Gate that says how many may run at once (ADR 0048).
+    /// the Gate that says how many may run at once (ADR 044).
     ///
     /// ```zig
     /// const stored = try c.hashPassword(gpa, form.password.view());
@@ -707,7 +707,7 @@ pub const Ctx = struct {
     ///
     /// `gpa` is an argument rather than something nilo reaches for, because
     /// 19 MiB is worth seeing at the call site — and because the request
-    /// arena is the wrong place for it (ADR 0018).
+    /// arena is the wrong place for it (ADR 017).
     pub fn hashPassword(
         self: *const Ctx,
         gpa: std.mem.Allocator,
@@ -744,7 +744,7 @@ pub const Ctx = struct {
     ///
     /// **The request is not used**: the salt is in the stored string. With
     /// no request in hand — a CLI, a job, a test — `nilo.verifyPassword` is
-    /// this call without the `Ctx`, through the same Gate (ADR 0241).
+    /// this call without the `Ctx`, through the same Gate (ADR 044).
     pub fn verifyPassword(
         self: *const Ctx,
         gpa: std.mem.Allocator,
@@ -760,7 +760,7 @@ pub const Ctx = struct {
     /// path does the work of a hash rather than returning early, and the Cost
     /// is what that work is measured out at — left at the default while your
     /// rows are 46 MiB, the two answers take different lengths of time and the
-    /// form is a list of addresses again (ADR 0049). A stored hash is always
+    /// form is a list of addresses again (ADR 044). A stored hash is always
     /// checked at the parameters it carries.
     pub fn verifyPasswordWith(
         self: *const Ctx,
@@ -773,7 +773,7 @@ pub const Ctx = struct {
     }
 
     /// The cookie called `name`, or null if the request carries no such one
-    /// (ADR 0030).
+    /// (ADR 029).
     ///
     /// ```zig
     /// const token = c.cookie("session") orelse
@@ -800,7 +800,7 @@ pub const Ctx = struct {
     }
 
     /// The `Authorization` header, read as one scheme, or a 401 that says
-    /// which ([ADR 0191](../docs/adr/0191-an-authorization-header-a-handler-can-ask-for.md)).
+    /// which ([ADR 153](../docs/adr/153-an-authorization-header-a-handler-can-ask-for.md)).
     /// For a resolver or a middleware, which have a Ctx and no argument
     /// list; a handler writes `nilo.Authorization(.bearer)` in its own and
     /// gets the document entry as well.
@@ -811,7 +811,7 @@ pub const Ctx = struct {
 
     /// The `Authorization` header verified through the `jwt.Verifier` `V`,
     /// or the 401 — with the challenge — that says why not
-    /// ([ADR 0260](../docs/adr/0260-verified-claims-are-a-handler-argument.md)).
+    /// ([ADR 191](../docs/adr/191-verified-claims-are-a-handler-argument.md)).
     /// For a middleware guarding a prefix; a handler writes
     /// `nilo.Verified(V)` in its argument list and gets the document entry
     /// as well. A handler under the guard that asks again verifies again.
@@ -841,21 +841,21 @@ pub const Ctx = struct {
     ///
     /// Normally written as `nilo.deadline(2000)` on a route rather than called
     /// by hand; this is what that middleware does
-    /// ([ADR 0133](../docs/adr/0133-a-route-can-say-how-long-it-has.md)).
+    /// ([ADR 105](../docs/adr/105-a-route-can-say-how-long-it-has.md)).
     ///
     /// **What it bounds is every wait nilo owns**: reading the body, writing
     /// the response, a stream's pieces, a WebSocket's silence. Each of those
     /// has a limit of its own already and each is cut down to whichever comes
     /// first. **What it cannot bound is a handler that is running rather than
     /// waiting** — there is no interruption here, and there deliberately is
-    /// not ([ADR 0104](../docs/adr/0104-a-cleanup-path-is-not-cancellable.md)).
+    /// not ([ADR 082](../docs/adr/082-a-cleanup-path-is-not-cancellable.md)).
     /// A loop that does its own work asks `overdue()`.
     ///
     /// Zero takes the deadline off.
     pub fn giveDeadline(self: *Ctx, ms: u32) void {
         self._deadlines.until_ns = if (ms == 0) 0 else bulkhead.monotonicNanos() + @as(u64, ms) * std.time.ns_per_ms;
         // Asked for by name, so it stays through a takeover; `listen()`'s
-        // default is the one a stream lets go of (ADR 0267).
+        // default is the one a stream lets go of (ADR 105).
         self._deadline_default = false;
     }
 
@@ -865,7 +865,7 @@ pub const Ctx = struct {
     ///
     /// A request that arrived with an earlier deadline of its own keeps it:
     /// a gRPC call's `grpc-timeout` is the client's, and a default is not a
-    /// reason to wait longer than the client will (ADR 0297).
+    /// reason to wait longer than the client will (ADR 220).
     pub fn giveDefaultDeadline(self: *Ctx, ms: u32) void {
         if (ms == 0) return;
         const due = bulkhead.monotonicNanos() + @as(u64, ms) * std.time.ns_per_ms;
@@ -881,7 +881,7 @@ pub const Ctx = struct {
     ///
     /// A default deadline is dropped here: `listen()`'s number is for the
     /// requests that answer and go, and a stream cut off at thirty seconds
-    /// because every other route wanted thirty is the shape ADR 0267 refused.
+    /// because every other route wanted thirty is the shape ADR 105 refused.
     /// A deadline the route asked for by name is kept, since that route knew
     /// what it was.
     fn tookOver(self: *Ctx) void {
@@ -895,7 +895,7 @@ pub const Ctx = struct {
     /// How much body this request may read into the arena, in place of
     /// `listen()`'s `max_body`. `app.with(nilo.maxBody(bytes))` is the way to
     /// say it for a route; this is what that middleware does
-    /// ([ADR 0193](../docs/adr/0194-a-route-can-say-how-much-body-it-takes.md)).
+    /// ([ADR 155](../docs/adr/156-a-route-can-say-how-much-body-it-takes.md)).
     ///
     /// Bounds every read into the arena — `body()`, `json`, a `Form(T)` —
     /// and not `bodyStream()`, which holds nothing there and takes its own
@@ -946,7 +946,7 @@ pub const Ctx = struct {
     /// to.
     ///
     /// **`.trusted_proxies` is the one to use**, and it wins when both are set
-    /// ([ADR 0129](../docs/adr/0129-a-proxy-is-trusted-by-which-one-it-is.md)).
+    /// ([ADR 102](../docs/adr/102-a-proxy-is-trusted-by-which-one-it-is.md)).
     /// The header is read only when the connection came from an address you
     /// named; entries written by addresses you named are skipped from the
     /// right; the first one left is the client. Nothing depends on how many
@@ -956,7 +956,7 @@ pub const Ctx = struct {
     /// It has no address for a rule to name, and nothing but a process on this
     /// machine could have opened it — which is what a `"loopback"` rule
     /// establishes about a proxy over TCP
-    /// ([ADR 0130](../docs/adr/0130-a-path-is-an-address-to-listen-on.md)).
+    /// ([ADR 103](../docs/adr/103-a-path-is-an-address-to-listen-on.md)).
     /// Without `.trusted_proxies` set, `clientIp` on such a connection is
     /// empty, because there is no address and nobody said to read the header.
     ///
@@ -1019,7 +1019,7 @@ pub const Ctx = struct {
         std.debug.assert(!self._head_borrowed);
         // Here for the same reason the assert is, rather than at each call
         // site: a read nobody put a clock on is a fiber a client can park
-        // by going quiet (ADR 0023). One choke point means a new way to
+        // by going quiet (ADR 022). One choke point means a new way to
         // read from the connection gets its limit without anybody
         // remembering to give it one. A WebSocket takes the limit back off,
         // once it is the thing doing the reading.
@@ -1033,7 +1033,7 @@ pub const Ctx = struct {
     /// body and not about a socket: a client that sends it holds the body back
     /// until the server answers, and a server that never answers leaves it
     /// waiting on its own timer — one second, in curl's case, on every upload
-    /// past its threshold (ADR 0094). The handshake path keeps plain
+    /// past its threshold (ADR 073). The handshake path keeps plain
     /// `aboutToRead`, because a WebSocket is about to read frames and has
     /// already decided to write a 101.
     ///
@@ -1061,7 +1061,7 @@ pub const Ctx = struct {
     /// **A gzipped body comes back inflated, and the head still says gzip.**
     /// `header("Content-Encoding")` and `header("Content-Length")` describe
     /// what arrived on the wire, because the head is read in place and
-    /// nothing rewrites it (ADR 0107, ADR 0251). A handler that forwards
+    /// nothing rewrites it (ADR 085, ADR 089). A handler that forwards
     /// this body to another service along with the request's headers would
     /// be sending plain bytes labelled `gzip`, at the wrong length: send
     /// `body().len` as the length and no `Content-Encoding`, or forward the
@@ -1071,7 +1071,7 @@ pub const Ctx = struct {
             // Waiting for a client to finish sending is not the handler
             // holding its thread — the fiber parks and the thread serves
             // somebody else. Said out loud, or a slow uploader would be
-            // reported as a blocking handler (ADR 0034).
+            // reported as a blocking handler (ADR 013).
             const w = watchdog.waiting(self._watch);
             defer watchdog.waited(self._watch, w);
 
@@ -1081,7 +1081,7 @@ pub const Ctx = struct {
                 // is to size a deadline from is the most it may be. That
                 // gives it the same worst case as a body that announced
                 // `max_body` and no more, which is the point: neither framing
-                // is the cheaper way to hold a connection (ADR 0124).
+                // is the cheaper way to hold a connection (ADR 022).
                 self._deadlines.armBodyRun(self._limits.max_body);
                 self._body = http1.readChunkedBody(self._in, self._arena, self._limits.max_body) catch |err| {
                     // The chunk sizes and the stream have come apart, so
@@ -1112,7 +1112,7 @@ pub const Ctx = struct {
             // A gzipped body is the bytes above, inflated once into the arena
             // and held in their place — so `json`, `form` and every reader
             // past this line see the body and not the way it was sent, the
-            // same way they see neither framing (ADR 0251). What was read
+            // same way they see neither framing (ADR 089). What was read
             // above was bounded by `max_body` as compressed bytes; what it
             // inflates to is bounded by the same number, checked against the
             // length the stream announces before a byte is inflated.
@@ -1136,14 +1136,14 @@ pub const Ctx = struct {
     /// Both arrive as `error.ReadFailed` through a `std.Io` interface, and
     /// they deserve different answers: 408 says the request never finished
     /// arriving and inviting a retry is correct, where 500 blames the server
-    /// for something the client did (ADR 0124).
+    /// for something the client did (ADR 022).
     fn slowBody(self: *Ctx, err: anyerror) anyerror {
         if (err == error.ReadFailed and self._deadlines.timedOut()) return error.BodyTooSlow;
         return err;
     }
 
     /// The request body, read in pieces rather than all at once — for the
-    /// ones too big to hold (ADR 0020).
+    /// ones too big to hold (ADR 019).
     ///
     /// ```zig
     /// var incoming = try c.bodyStream();
@@ -1171,7 +1171,7 @@ pub const Ctx = struct {
         // A stream hands the bytes out as they arrive and holds nothing, so
         // there is nowhere to inflate a gzipped body into: the destination
         // that `body()` uses as the inflater's window is the caller's buffer
-        // here, and it is handed back a piece at a time (ADR 0251). Refused
+        // here, and it is handed back a piece at a time (ADR 089). Refused
         // with the status the parser gives every other coding, and the
         // sentence says which side to change.
         if (self._request.content_encoding != .identity) return fail.status(
@@ -1200,20 +1200,20 @@ pub const Ctx = struct {
     ///
     /// `Str` fields get stamped with the request lifetime, so using one
     /// after the request has finished trips the debug trap just like any
-    /// other Str (ADR 0004).
+    /// other Str (ADR 003).
     pub fn json(self: *Ctx, comptime T: type) !T {
         const b = (try self.body()).view();
         var value = std.json.parseFromSliceLeaky(T, self._arena, b, .{}) catch |err|
             return describeBadBody(T, self._arena, b, err);
         str_mod.stamp(&value, self._lifetime);
         // A struct that checks itself is checked once it is whole, and a
-        // rule that did not hold is a 422 naming it (ADR 0264).
+        // rule that did not hold is a 422 naming it (ADR 193).
         try @import("bound.zig").enforce(.body, T, value);
         return value;
     }
 
     /// Parse the request body as an HTML form into `T` — the `*Ctx` way in
-    /// to what `Form(T)` does for a typed handler (ADR 0031).
+    /// to what `Form(T)` does for a typed handler (ADR 030).
     ///
     /// `application/x-www-form-urlencoded` and `multipart/form-data` are
     /// both read; which one arrived is the browser's business, not the
@@ -1222,7 +1222,7 @@ pub const Ctx = struct {
     ///
     /// Every `Str` in the result — a file's bytes included — points into the
     /// request arena and dies with the request, so `keep` is what takes one
-    /// out of it (ADR 0004).
+    /// out of it (ADR 003).
     pub fn form(self: *Ctx, comptime T: type) !T {
         // Read before the body, while it is certain nothing has moved the
         // head: `body()` may read from the connection, and on a request with
@@ -1230,7 +1230,7 @@ pub const Ctx = struct {
         const content_type = if (self.header("Content-Type")) |h| h.view() else null;
         const b = (try self.body()).view();
         const value = try @import("form.zig").readInto(T, self._arena, self._lifetime, content_type, b);
-        // The same check a JSON body gets, in the form's own words (ADR 0264).
+        // The same check a JSON body gets, in the form's own words (ADR 193).
         try @import("bound.zig").enforce(.form, T, value);
         return value;
     }
@@ -1333,13 +1333,13 @@ pub const Ctx = struct {
     }
 
     /// `keepAlive` as the `Connection` line the response will carry — which
-    /// for an HTTP/1.1 connection staying open is no line at all (ADR 0269).
+    /// for an HTTP/1.1 connection staying open is no line at all (ADR 197).
     pub fn connection(self: *const Ctx) http1.Connection {
         return .of(self.keepAlive(), self._request.minor_version);
     }
 
     /// Whether the server has been told to stop and is draining. What the
-    /// health route answers `stopping` on (ADR 0192).
+    /// health route answers `stopping` on (ADR 154).
     pub fn stopping(self: *const Ctx) bool {
         const flag = self._stopping orelse return false;
         return flag.load(.acquire);
@@ -1349,7 +1349,7 @@ pub const Ctx = struct {
 
     /// Add a response header. Set it before sending — a response is
     /// flushed the moment it is sent, so there is nothing left to change
-    /// afterwards (ADR 0009).
+    /// afterwards (ADR 008).
     ///
     /// `name` and `value` are copied into the request arena, so passing a
     /// value you built on the stack is safe. Setting a header the
@@ -1398,7 +1398,7 @@ pub const Ctx = struct {
     /// `setStaticHeader`, `setCookie`, a `Response`'s or a `Redirect`'s
     /// `.headers`, and the built-in middleware. **One choke point on purpose**,
     /// for `aboutToRead`'s reason: a new way to set a header gets the checks
-    /// below without anybody remembering to give it one (ADR 0087).
+    /// below without anybody remembering to give it one (ADR 029).
     ///
     /// All three refusals are a mistake in the server rather than in the
     /// request, so all three are `fail.internal` — a 500 that says which
@@ -1446,7 +1446,7 @@ pub const Ctx = struct {
             // `Vary: Origin, Vary: Origin` off a response when two middlewares
             // both depend on the origin, and keeps the count inside the six
             // held on the Ctx, which is where the allocation budget lives
-            // (ADR 0089). Never reached by `Set-Cookie` in practice: two
+            // (ADR 029). Never reached by `Set-Cookie` in practice: two
             // cookies that agree on name *and* value are one cookie.
             for (self.extraHeaders()) |h| {
                 if (std.ascii.eqlIgnoreCase(h.name, entry.name) and
@@ -1469,7 +1469,7 @@ pub const Ctx = struct {
         self._extra_spill.appendAssumeCapacity(entry);
     }
 
-    /// Send a cookie back with this response (ADR 0030).
+    /// Send a cookie back with this response (ADR 029).
     ///
     /// ```zig
     /// try c.setCookie(.{ .name = "session", .value = token });
@@ -1531,7 +1531,7 @@ pub const Ctx = struct {
         return self.setCookie(cookie_mod.deletion(clearing));
     }
 
-    /// Send the client somewhere else (ADR 0032).
+    /// Send the client somewhere else (ADR 031).
     ///
     /// ```zig
     /// try c.redirect(303, "/welcome");
@@ -1561,7 +1561,7 @@ pub const Ctx = struct {
         self.markAnswered(status);
 
         // Gzipped, when the App asked for that and this body and this client
-        // both qualify (ADR 0287). Before the wait below rather than inside
+        // both qualify (ADR 211). Before the wait below rather than inside
         // it: compressing is the handler's work, and it borrows a compressor
         // nothing waiting on a client may hold.
         var outgoing = response_body;
@@ -1572,7 +1572,7 @@ pub const Ctx = struct {
         // Putting the answer on the wire is nilo waiting on the client, not
         // the handler running. A client too slow to take a large response
         // parks this fiber for as long as it takes, and without this that
-        // would be reported as a handler holding its thread (ADR 0034).
+        // would be reported as a handler holding its thread (ADR 013).
         const w = watchdog.waiting(self._watch);
         defer watchdog.waited(self._watch, w);
 
@@ -1602,7 +1602,7 @@ pub const Ctx = struct {
         }
         // On the wire now, unless the client has pipelined the next request
         // behind this one, in which case it goes out with that one's answer
-        // (ADR 0274).
+        // (ADR 201).
         try http1.settle(self._out, self._in);
     }
 
@@ -1613,7 +1613,7 @@ pub const Ctx = struct {
     /// `Vary: Accept-Encoding` goes out on every answer that *could* have
     /// been compressed, whether or not this client wanted it: a shared cache
     /// that stored the plain answer without it would hand that answer to the
-    /// next client whatever it asked for (ADR 0089). `Content-Encoding` only
+    /// next client whatever it asked for (ADR 029). `Content-Encoding` only
     /// when it was.
     fn squeezed(self: *Ctx, pool: *const compress_mod.Pool, status: u16, content_type: []const u8, response_body: []const u8) !?[]const u8 {
         if (!pool.eligible(status, content_type, response_body.len)) return null;
@@ -1662,7 +1662,7 @@ pub const Ctx = struct {
     }
 
     /// Answer with an open file, without ever holding it in memory
-    /// (ADR 0037).
+    /// (ADR 009).
     ///
     /// ```zig
     /// const invoice = try files.dir.openFile(name);
@@ -1676,12 +1676,12 @@ pub const Ctx = struct {
     /// Everything a static file's answer carries, this carries too: `ETag`,
     /// `Cache-Control`, `Accept-Ranges`, a 304, a 206 with `Content-Range`,
     /// and `If-Range` checked so a resumed download of a changed file starts
-    /// again rather than arriving corrupt (ADR 0021). The bytes go from the
+    /// again rather than arriving corrupt (ADR 020). The bytes go from the
     /// file to the socket without passing through this process.
     ///
     /// A handler that knows it is answering with a file before it runs
     /// returns `nilo.FileBody` instead, which is the same response and
-    /// lets the generated API description say so (ADR 0032's move for
+    /// lets the generated API description say so (ADR 031's move for
     /// redirects, applied here).
     pub fn sendFile(self: *Ctx, contents: sendfile_mod.Contents) !void {
         return sendfile_mod.send(self, contents);
@@ -1690,7 +1690,7 @@ pub const Ctx = struct {
     // ---- answering in pieces ----
 
     /// Start a response whose length is not known yet, and get back
-    /// something to write the pieces into (ADR 0020).
+    /// something to write the pieces into (ADR 019).
     ///
     /// ```zig
     /// var body = try c.stream(200, "text/csv");
@@ -1715,7 +1715,7 @@ pub const Ctx = struct {
     ///
     /// See `stream.Options.length`: a promised length is a `Content-Length`
     /// rather than chunked framing, and it is held to
-    /// ([ADR 0128](../docs/adr/0128-a-stream-that-knows-its-length-says-so.md)).
+    /// ([ADR 101](../docs/adr/101-a-stream-that-knows-its-length-says-so.md)).
     pub fn streamWith(
         self: *Ctx,
         status: u16,
@@ -1760,7 +1760,7 @@ pub const Ctx = struct {
         return out;
     }
 
-    /// Turn this request into a WebSocket connection (ADR 0022, ADR 0071).
+    /// Turn this request into a WebSocket connection (ADR 021, ADR 062).
     ///
     /// ```zig
     /// fn echo(c: *nilo.Ctx) !void {
@@ -1777,7 +1777,7 @@ pub const Ctx = struct {
     /// The loop is a function rather than the tail of the handler so the
     /// request can unwind first: a suspended fiber holds every byte of stack
     /// it ever touched, and that is 9,290 bytes an idle socket against 5,183
-    /// (ADR 0063).
+    /// (ADR 062).
     ///
     /// `state` is what the handler knows and the loop needs — a name off the
     /// query, the room this path belongs to. Pass `{}` when there is nothing.
@@ -1860,7 +1860,7 @@ pub const Ctx = struct {
             // The `Host` header itself, deliberately, and not `host()`: that
             // one reads `X-Forwarded-Host` under `trusted_hops`, and what
             // this compares has to be the authority the request really named
-            // (ADR 0102).
+            // (ADR 080).
             const authority = if (self.header("Host")) |h| h.view() else "";
             if (!websocket.originAllowed(origin.view(), authority, options.origins)) {
                 return fail.forbidden(
@@ -1898,7 +1898,7 @@ pub const Ctx = struct {
         // is a client that has gone away without saying so, and the answer
         // to that is a ping it does not answer — a WebSocket feature, with a
         // frame to send and a reply to wait for, rather than a deadline
-        // (ADR 0023). Writes keep their limit: they are how the server finds
+        // (ADR 022). Writes keep their limit: they are how the server finds
         // out the client stopped listening.
         self._deadlines.readForever();
 
@@ -2078,7 +2078,7 @@ fn collectBadBody(
 
             // A field that parses itself is read the way a query value is:
             // the text handed to `nilo_parse`, and null the same `.not_that_type`
-            // ([ADR 0205](../docs/adr/0205-a-body-field-that-parses-itself.md)).
+            // ([ADR 166](../docs/adr/166-a-body-field-that-parses-itself.md)).
             // Read here rather than through `std.json` so that a type which
             // hands over a `jsonParse` and nothing more is still one outcome
             // among the others, in the same words.
@@ -2222,13 +2222,13 @@ fn describeField(
         }
         // The same for a type that parses itself and said no: what arrived
         // was the right kind and the wrong text, and the sentence is the one
-        // a query value of that type gets, quoting it (ADR 0205).
+        // a query value of that type gets, quoting it (ADR 166).
         if (comptime parsedOf(T)) |P| {
             var buf: [64]u8 = undefined;
             if (textOf(given, &buf)) |text| {
                 // A type that words its own refusal — a `nilo.Text`, which
                 // says the count and never the text — writes the tail
-                // (ADR 0264). Small on purpose: this frame is reached eight
+                // (ADR 193). Small on purpose: this frame is reached eight
                 // deep, and only on the way to a 400.
                 if (comptime @hasDecl(P, convert.explain_marker)) {
                     var tail: [128]u8 = undefined;
@@ -2253,7 +2253,7 @@ fn describeField(
     // **The bottom of the budget, and it used to be silent.** A body nested
     // deeper than this answered a bare 400 with no field, no reason and no
     // hint that depth was what happened — the cliff is documented and how
-    // sheer it looks from the client's side was not (ADR 0081). The walk still
+    // sheer it looks from the client's side was not (ADR 034). The walk still
     // stops, because there is nothing below here it can name; what changes is
     // that the caller is told a ceiling was reached, and says so instead of
     // saying nothing.
@@ -2307,7 +2307,7 @@ fn hasInsides(comptime T: type, given: std.json.Value) bool {
 
 /// The one thing to say about a body nobody can point inside of.
 ///
-/// **A fact rather than a dead end** (ADR 0081). The old answer was
+/// **A fact rather than a dead end** (ADR 034). The old answer was
 /// `{"error":"Bad Request","status":400}` — not a worse sentence, *no*
 /// sentence — and a client holding it had no way to tell a depth ceiling from
 /// a parser that gave up. Raising the ceiling is a separate question with a
@@ -2353,7 +2353,7 @@ pub fn expectedOf(comptime T: type) []const u8 {
         // thing it can be, and that is not a value to describe.
         if (patch_mod.isPatch(T)) return expectedOf(T.nilo_patch) ++ " or null";
         // What the type said it expects, or its name — the words a query
-        // value of the same type is asked for in (ADR 0205).
+        // value of the same type is asked for in (ADR 166).
         if (convert.parsesItself(T)) return convert.expects(T);
         return switch (@typeInfo(T)) {
             .optional => |o| expectedOf(o.child) ++ " or null",
@@ -2411,7 +2411,7 @@ fn fieldList(comptime T: type) []const u8 {
 ///
 /// The base is drawn **once**, on the first request that asks. It goes
 /// through the Bulkhead, which is a syscall, and a syscall made per request
-/// would stop every other request sharing that thread (ADR 0002, ADR 0014).
+/// would stop every other request sharing that thread (ADR 001, ADR 013).
 /// What is left on the request path is one atomic add.
 var id_base: std.atomic.Value(u64) = .init(0);
 var id_next: std.atomic.Value(u64) = .init(0);
@@ -2488,7 +2488,7 @@ fn fits(comptime T: type, value: std.json.Value) bool {
     if (comptime patch_mod.isPatch(T)) return value == .null or fits(T.nilo_patch, value);
     // A type that parses itself decides, from the text — a string, or a
     // number read as its digits, since a bounded integer is one of these
-    // and arrives as a JSON number (ADR 0205).
+    // and arrives as a JSON number (ADR 166).
     if (comptime convert.parsesItself(T)) {
         var buf: [64]u8 = undefined;
         const text = textOf(value, &buf) orelse return false;

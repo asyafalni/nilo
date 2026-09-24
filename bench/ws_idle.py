@@ -5,7 +5,7 @@ Scenarios against `bench/ws_server.zig`, and the same scenarios against
 whose low memory footprint is what put the question. Each on a freshly started
 server so every reading has its own baseline. Open N sockets in steps, do at
 most one message on each, then let them sit and read `VmRSS` — the method
-[ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md) used for
+[ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md) used for
 HTTP, so all of it goes in one table.
 
     zig build bench-ws-server -Doptimize=ReleaseFast

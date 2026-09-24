@@ -163,7 +163,7 @@ the milestone after 16.
 - **`kill` and start again, and `wati@example.dev` signs in with the same
   password and comes back with the same `public`** — the argon2id hash verified
   off the disk. The cookie issued before the restart still worked too, which is
-  the sealed session doing what ADR 0035 says: no server state to lose;
+  the sealed session doing what ADR 033 says: no server state to lose;
 - `WATI@EXAMPLE.DEV` is a 409, because the lookup and the `UNIQUE` are one rule
   (`COLLATE NOCASE`) rather than two that have to agree;
 - an ordinary `sqlite3` client reads the file while nilo holds it open, and finds

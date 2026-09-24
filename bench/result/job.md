@@ -53,7 +53,7 @@ to write. Not until a program has a memory queue big enough to notice.
 
 ## What the claim's index has to be, 2026-09-23
 
-ADR 0290 added `ORDER BY priority, run_at` and widened the table's index to
+ADR 214 added `ORDER BY priority, run_at` and widened the table's index to
 `(state, priority, run_at)` on the reasoning that an index matching the sort
 serves it. Measured, on Postgres 16 in Docker, a `nilo_jobs`-shaped table:
 

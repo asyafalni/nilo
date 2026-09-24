@@ -2,7 +2,7 @@
 #
 # `test` runs in Debug and takes 0.8s, which is the point of it. `test-all`
 # runs the same suite again in ReleaseSafe, because a lifetime bug passes in
-# Debug and segfaults in the mode people deploy in (ADR 0019). That check used
+# Debug and segfaults in the mode people deploy in (ADR 018). That check used
 # to happen on every local test run and now happens here, so being fast locally
 # does not mean shipping without it.
 #

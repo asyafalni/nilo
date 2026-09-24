@@ -1,4 +1,4 @@
-//! Str — text that came from a request (ADR 0004).
+//! Str — text that came from a request (ADR 003).
 //!
 //! It lives only as long as the request does, because its bytes belong to
 //! the request arena. You cannot get at the contents without asking for
@@ -64,7 +64,7 @@ pub const Lifetime = struct {
 
 pub const Str = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Str";
 
     _bytes: []const u8,
@@ -89,7 +89,7 @@ pub const Str = struct {
     // ---- travelling through JSON ----
     //
     // So that `struct { name: Str }` works as an incoming body as well as
-    // an outgoing response, instead of the bare `[]const u8` that ADR 0004
+    // an outgoing response, instead of the bare `[]const u8` that ADR 003
     // exists to avoid.
 
     /// Goes out as a plain JSON string, not as an object of internal
@@ -155,7 +155,7 @@ pub const Str = struct {
     }
 
     /// Whether there is nothing here but whitespace
-    /// ([ADR 0175](../docs/adr/0175-required-text-arrives-as-two-spaces.md)).
+    /// ([ADR 142](../docs/adr/142-required-text-arrives-as-two-spaces.md)).
     ///
     /// **This is the check in front of every write that takes a name, a title
     /// or a body**, because required text arrives as `"  "` in the ordinary
@@ -231,11 +231,11 @@ pub fn stampWith(value: anytype, scope: anytype) void {
 
 /// The same walk, copying the marker off a `Str` that already has one.
 ///
-/// For a type that parses itself out of request text (ADR 0142): its
+/// For a type that parses itself out of request text (ADR 113): its
 /// `nilo_parse` takes bytes and can only build a `Str` with no marker, and
 /// the engine, which holds the `Str` those bytes came from, puts that one's
 /// marker on every `Str` the parse built — so a `nilo.Text` out of a form
-/// goes stale with the form (ADR 0264).
+/// goes stale with the form (ADR 193).
 pub fn stampLike(value: anytype, like: Str) void {
     if (!trap_enabled) return;
     stampInner(value, like, 8);
@@ -329,7 +329,7 @@ test "text that is nothing but whitespace is blank, and the empty string is too"
     try testing.expect(Str.fromRequest("\t", &lifetime).blank());
     // The one a hand-written charset drops, and the one it is dropped from: a
     // comment body that is a single newline is required text that renders as
-    // an empty screen (ADR 0175).
+    // an empty screen (ADR 142).
     try testing.expect(Str.fromRequest("\n", &lifetime).blank());
     try testing.expect(Str.fromRequest("\r\n", &lifetime).blank());
     try testing.expect(Str.fromRequest(" \t\r\n\x0b\x0c", &lifetime).blank());

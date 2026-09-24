@@ -301,7 +301,7 @@ fn fieldOf(auth: []const u8, name: []const u8) ?[]const u8 {
 // for the reason `fetch/live.zig`'s `Canned` gives at length: `async` may run
 // the server on the test's own thread, and does on `Threaded` whenever the
 // pool is momentarily full — which every bounded call through `nilo_fetch`
-// now makes it (ADR 0230). A server on the caller's thread is an `accept`
+// now makes it (ADR 056). A server on the caller's thread is an `accept`
 // nobody connects to.
 fn withIo(comptime body: fn (std.Io) anyerror!void) !void {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -453,7 +453,7 @@ test "a put sends the bytes it signed, and says what they are" {
             try testing.expectEqualStrings("21", canned.seen.header("content-length").?);
 
             // Over `http://` the payload is hashed for real, because there is
-            // no TLS underneath to say the bytes arrived as sent (ADR 0069).
+            // no TLS underneath to say the bytes arrived as sent (ADR 060).
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash("cinta laut dan langit", &digest, .{});
             var hex: [64]u8 = undefined;
@@ -1104,7 +1104,7 @@ test "a presigned POST is a form, and its policy decodes to the document that wa
             // The fields, in the order a form is written against. No token,
             // because these credentials are a static pair. The bucket first,
             // as it is in the policy: Garage refuses a form without the field
-            // and AWS reads it off the URL (ADR 0216).
+            // and AWS reads it off the URL (ADR 177).
             try testing.expectEqual(@as(usize, 8), posted.fields.len);
             try testing.expectEqualStrings("bucket", posted.fields[0].name);
             try testing.expectEqualStrings("files", posted.fields[0].value);
@@ -1136,7 +1136,7 @@ test "a public endpoint is the host in a presigned URL, and the host that is sig
     // Item 77: the process dials a store the browser cannot reach, and a
     // URL rewritten after signing is a 403, because the host is inside the
     // signature. The oracle is a second store that *dials* the public name:
-    // the two must sign byte for byte the same (ADR 0216).
+    // the two must sign byte for byte the same (ADR 177).
     try withIo(struct {
         fn run(io: std.Io) !void {
             var canned = try Canned.open(io);
@@ -1380,7 +1380,7 @@ test "two buckets over one store are two types and one connection pool" {
 /// A copy of `http/budget.zig` rather than a share of it, and deliberately:
 /// `s3/` may not name `nilo_http` — that is sideways, and `zig build layering`
 /// refuses it. Twenty-five duplicated lines for a layer property is the same
-/// trade [ADR 0043](../docs/adr/0043-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)
+/// trade [ADR 039](../docs/adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)
 /// made when `nilo_config` grew its own converter.
 const Counting = struct {
     child: std.mem.Allocator,
@@ -1470,7 +1470,7 @@ const CountedScope = struct {
 };
 
 // A number that is the same on every machine, unlike requests per second, and
-// the first of [ADR 0018](../docs/adr/0018-the-trade-budget-has-three-axes.md)'s
+// the first of [ADR 017](../docs/adr/017-the-trade-budget-has-four-axes.md)'s
 // four axes. Until this test existed the claim lived in three doc comments and
 // nothing checked it — which is the exact shape this repository has now been
 // wrong in five times.

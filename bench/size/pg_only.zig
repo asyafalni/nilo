@@ -1,4 +1,4 @@
-//! Half of the A/B [ADR 0073](../../docs/adr/0073-a-file-has-no-socket-to-wait-on.md)
+//! Half of the A/B [ADR 064](../../docs/adr/064-a-file-has-no-socket-to-wait-on.md)
 //! owes: **what does a program that imports `nilo_sql` and never names SQLite
 //! pay for SQLite being in the module?**
 //!

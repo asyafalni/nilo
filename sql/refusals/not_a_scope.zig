@@ -1,4 +1,4 @@
-//! A query handed something that is not a Scope (ADR 0041).
+//! A query handed something that is not a Scope (ADR 038).
 //!
 //! Every query in this module takes the thing that owns the memory the rows
 //! will live in — a `*Ctx` inside a handler, a `*nilo.Run` in a program with

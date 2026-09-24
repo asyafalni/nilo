@@ -4,7 +4,7 @@ Roadmap #1 and #2, asked as a program. Broadcasting to a WebSocket a handler
 does not hold needs the fiber that already owns a connection to be woken by
 *somebody else* while it sits in a read. Without that, every connection that
 can be broadcast to needs a second fiber, which is 8,673 bytes each — the
-whole of [ADR 0018](../../docs/adr/0018-the-trade-budget-has-three-axes.md)'s
+whole of [ADR 017](../../docs/adr/017-the-trade-budget-has-four-axes.md)'s
 per-connection budget over again.
 
 [zio#668](https://github.com/lalinsky/zio/issues/668) asked for `waitForIo` to

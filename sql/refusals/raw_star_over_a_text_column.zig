@@ -1,7 +1,7 @@
 //! `SELECT *` into a Row with a text column in it. A `*` is a column nobody
 //! named, so nobody could have cast it either — and unlike the count, which
 //! only the database can settle, this half is answerable while compiling
-//! ([ADR 0154](../../docs/adr/0154-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
+//! ([ADR 124](../../docs/adr/124-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
 
 const std = @import("std");
 const nilo = @import("nilo_http");

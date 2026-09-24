@@ -1,7 +1,7 @@
 //! A header asked for as a type request text cannot become. A header arrives
 //! as text, the same as a query param does, so the set of types it can be read
 //! into is the same one
-//! ([ADR 0163](../docs/adr/0163-a-header-a-handler-can-be-given.md)).
+//! ([ADR 131](../docs/adr/131-a-header-a-handler-can-be-given.md)).
 
 const nilo = @import("nilo_http");
 

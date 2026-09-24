@@ -1,7 +1,7 @@
 //! A versioned answer inside a `Status` or a `Response`: the status is
 //! already decided — 200, or 304 — and the headers are a field the versioned
 //! type carries itself
-//! ([ADR 0258](../docs/adr/0258-a-version-a-handler-names-is-an-etag.md)).
+//! ([ADR 189](../docs/adr/189-a-version-a-handler-names-is-an-etag.md)).
 
 const nilo = @import("nilo_http");
 

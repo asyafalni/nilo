@@ -22,25 +22,25 @@ guide's own snippets turned up.
 
 | # | Item | Area | Sev | Closed by |
 |---|---|---|---|---|
-| 16 | [The lazy dependency is fetched by everybody, including an HTTP-only app](#16) | build | **critical** | ADR 0075 — `.sql = true`, and `zig build fetch-check` |
-| 14 | [A type with its own `jsonStringify` gets a schema that contradicts the wire](#14) | openapi | **critical** | ADR 0076 — `nilo_openapi`, with a refusal |
-| 18 | [`sql.Uuid` does not compile against SQLite, and the error is the driver's](#18) | sql | high | ADR 0078 — a Uuid binds as what the dialect stores |
-| 11 | [Three published examples of the password and id API do not compile](#11) | docs | high | ADR 0083 — `zig build snippets`; it found four more |
-| 13 | [There is no way to guard a prefix except two paths in it](#13) | middleware | high | ADR 0080 — `g.without(mw)`, and `mounted_at` |
-| 19 | [There is no phase that is after the pool and before the server](#19) | sql, docs | high | ADR 0079 — `app.start(io)` |
-| 1 | [Identical generic instantiations get two identical schemas](#1) | openapi | high | ADR 0077 — one shape, one component |
-| 2 | [A service you forgot is a 500 in tests, not a name](#2) | services, testing | high | ADR 0079 — named per route, when the handler asks |
-| 3 | [Past eight levels a body error says nothing at all](#3) | convert | high | ADR 0081 — the ceiling says so |
-| 15 | [A 422 has two shapes, and only one of them is nilo's](#15) | convert, docs | medium | ADR 0082 — `b.must(…)` |
+| 16 | [The lazy dependency is fetched by everybody, including an HTTP-only app](#16) | build | **critical** | ADR 066 — `.sql = true`, and `zig build fetch-check` |
+| 14 | [A type with its own `jsonStringify` gets a schema that contradicts the wire](#14) | openapi | **critical** | ADR 016 — `nilo_openapi`, with a refusal |
+| 18 | [`sql.Uuid` does not compile against SQLite, and the error is the driver's](#18) | sql | high | ADR 067 — a Uuid binds as what the dialect stores |
+| 11 | [Three published examples of the password and id API do not compile](#11) | docs | high | ADR 068 — `zig build snippets`; it found four more |
+| 13 | [There is no way to guard a prefix except two paths in it](#13) | middleware | high | ADR 008 — `g.without(mw)`, and `mounted_at` |
+| 19 | [There is no phase that is after the pool and before the server](#19) | sql, docs | high | ADR 180 — `app.start(io)` |
+| 1 | [Identical generic instantiations get two identical schemas](#1) | openapi | high | ADR 016 — one shape, one component |
+| 2 | [A service you forgot is a 500 in tests, not a name](#2) | services, testing | high | ADR 180 — named per route, when the handler asks |
+| 3 | [Past eight levels a body error says nothing at all](#3) | convert | high | ADR 034 — the ceiling says so |
+| 15 | [A 422 has two shapes, and only one of them is nilo's](#15) | convert, docs | medium | ADR 034 — `b.must(…)` |
 | 17 | [A statement that answers with nothing still has to name a Row](#17) | sql | medium | `db.exec` / `tx.exec` |
 | 20 | [Four small things that are wrong on the page](#20) | docs, build | low | all four; the fifth was already right |
 | 4 | [A `union(enum)` has a derivable schema and gets `{}`](#4) | openapi | medium | a `oneOf` written from the tag |
-| 5 | [`Bound(T)` cannot be built from the testing page](#5) | testing | medium | ADR 0082 — `Bound(T).ok(value)` |
+| 5 | [`Bound(T)` cannot be built from the testing page](#5) | testing | medium | ADR 034 — `Bound(T).ok(value)` |
 | 6 | [The `Str`→`Text` walk is unaddressed past two levels](#6) | docs | medium | `guide/services.md`, past two levels |
 | 12 | [Settings are read before the loop, and Zig 0.16 wants a loop to read them](#12) | config, docs | medium | `guide/config.md`, and `main`'s own `Io` |
 | 7 | [An alias does not name a generic instantiation](#7) | openapi docs | low | `guide/openapi.md#named-shapes` |
 | 8 | [The `zig init` template is not the one the guide edits](#8) | docs | low | `guide/getting-started.md`, the whole `build.zig` |
-| 9 | [A mismatched `.optimize` has no warning, but its twin does](#9) | build | low | ADR 0084 — read off std, at `listen()` and in a test |
+| 9 | [A mismatched `.optimize` has no warning, but its twin does](#9) | build | low | ADR 069 — read off std, at `listen()` and in a test |
 | 10 | [A ReleaseSafe build is a minute and 677 MB](#10) | build | open | **open** — nothing measured against a nilo example yet |
 
 ---
@@ -50,7 +50,7 @@ guide's own snippets turned up.
 
 **What happens.** `Meta(Str)` is the body half of a shape and `Meta(Text)` is the
 row half — the split nilo itself asks for
-([ADR 0004](../../docs/adr/0004-request-arena-and-the-str-type.md)). Both end up
+([ADR 003](../../docs/adr/003-request-arena-and-the-str-type.md)). Both end up
 in `components/schemas`, as `Meta_Str` and `Meta_Text`, and they are
 **byte-identical**. Same for `Section_Str` and `Section_Text`. A generated client
 gets four types where two would do, and no field of any of them differs —
@@ -301,7 +301,7 @@ which is where it would actually have caught this.
 
 `guide/testing.md` recommends running your own suite in both modes, and is right
 to — the bug behind
-[ADR 0019](../../docs/adr/0019-a-response-owns-its-headers.md) passed 175 tests
+[ADR 018](../../docs/adr/018-a-response-owns-its-headers.md) passed 175 tests
 in Debug and segfaulted in release. But a minute a run puts the second mode
 outside the loop anybody actually runs.
 
@@ -351,7 +351,7 @@ That is a bigger change than three edits and it is the one that stops the fourth
 
 **What happens.** `nilo_config` is built to run before anything opens — it reads
 the environment where it lies and it opens no file, which is right and is
-[ADR 0064](../../docs/adr/0064-a-dotenv-is-text-somebody-else-read.md). Two things
+[ADR 039](../../docs/adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md). Two things
 then need an `std.Io` that does not exist yet, because the thing that will supply
 one is `listen()`, further down the same function:
 
@@ -374,7 +374,7 @@ itself recommends. The report half hits everybody, because a config failure is t
 one thing you print before you have a server.
 
 **What to change.** Nothing about the layering — `nilo_config` opening a file
-would be the wrong fix and ADR 0064 says why. What is missing is
+would be the wrong fix and ADR 039 says why. What is missing is
 `guide/config.md` showing the whole of a real `main`: the threaded `Io` for the
 read, the fixed writer for the report, and why each is there. Fifteen lines of
 guide against a shape every reader has to rediscover.
@@ -393,7 +393,7 @@ tests at once.
 
 Registering the open routes first does not help and is worth saying out loud:
 chains are resolved in `listen()`, so mounting order carries no meaning
-([ADR 0009](../../docs/adr/0009-middleware-is-an-onion-of-ctx-functions.md)). It
+([ADR 008](../../docs/adr/008-middleware-is-an-onion-of-ctx-functions.md)). It
 looks like it should work, which is the expensive part.
 
 The three ways out, all bad in different ways:
@@ -442,7 +442,7 @@ second thing built after the first CRUD route.
 
 **What happens.** `nilo_id`'s `Uuid` carries a `jsonStringify`, and that is the
 whole reason `nilo_http` needs no knowledge of `nilo_id`
-([ADR 0046](../../docs/adr/0046-entropy-belongs-to-the-loop.md)) — a `Uuid` in a
+([ADR 042](../../docs/adr/042-entropy-belongs-to-the-loop.md)) — a `Uuid` in a
 response comes out as text and the HTTP module never learns the type exists. It
 works. Over the wire:
 
@@ -472,10 +472,10 @@ document is trustworthy enough that nobody checks this field.
 one the reference recommends for public ids. Also every application returning a
 `nilo_sql` `Row` with a `Timestamp` or a `Uuid` in it, for the same reason — those
 two carry `jsonStringify` as well
-([ADR 0039](../../docs/adr/0039-the-shape-of-a-query-is-settled-while-compiling.md)).
+([ADR 036](../../docs/adr/036-the-shape-of-a-query-is-settled-while-compiling.md)).
 
 **What to change.** The repository already has the machinery and pointed it at the
-other half of the problem: ADR 0039's `covers()` decides at comptime which types
+other half of the problem: ADR 036's `covers()` decides at comptime which types
 the generated writer may touch and **sends anything with its own `jsonStringify`
 down the general path**. The same test — `@hasDecl(T, "jsonStringify")` — is what
 `openapi.zig` needs, and there are two honest answers once it has it:
@@ -552,7 +552,7 @@ and the published sentence says all three:
 
 > a project that serves HTTP and never imports `nilo_sql` does not fetch, build
 > or link any of it
-> — `build.zig.zon`, and the same claim in `CLAUDE.md`, `README.md` and ADR 0040.
+> — `build.zig.zon`, and the same claim in `CLAUDE.md`, `README.md` and ADR 037.
 
 **The cause is two lines**, and it is the standard Zig lazy-dependency trap:
 
@@ -588,7 +588,7 @@ shapes are available and both are real work:
    built.
 2. **Split the package.** `nilo_sql` as its own `build.zig.zon` entry, so a
    dependent that does not name it never reads its manifest. That is the shape the
-   layering already describes (ADR 0041 says the repository is modules), and it is
+   layering already describes (ADR 038 says the repository is modules), and it is
    the bigger change.
 
 Whichever is chosen, **the number belongs in a build step**. This repository's own
@@ -643,7 +643,7 @@ separately.
 > Swap two lines and the rest of this page is unchanged.
 > Your handler does not change at all. — `guide/sql.md`
 
-A Row with `public: sql.Uuid` — the type `nilo_sql` exports, the one ADR 0042
+A Row with `public: sql.Uuid` — the type `nilo_sql` exports, the one ADR 038
 moved down a layer so that generating a key and reading a column are one value —
 does not build:
 
@@ -674,7 +674,7 @@ reference recommends for public ids, `sql.Uuid` **is** `nilo_id`'s `Uuid`, and a
 `uuid` primary or secondary key is the most ordinary column in a modern schema.
 
 **What arsip did.** Wrote its own column type, which is the documented escape
-hatch (ADR 0055) used for something that should not have needed one — thirteen
+hatch (ADR 049) used for something that should not have needed one — thirteen
 lines of `nilo_column` / `nilo_read` / `nilo_write` storing the hyphenated text.
 That turned out to be the better shape for SQLite anyway (`sqlite3` shows the id;
 `WHERE public = '…'` is typeable), which is a hint at the fix.

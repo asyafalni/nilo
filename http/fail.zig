@@ -1,5 +1,5 @@
 //! Fail functions — stop a request with a given status and message, from
-//! anywhere, without having to hold a Ctx (ADR 0005).
+//! anywhere, without having to hold a Ctx (ADR 004).
 //!
 //! ```zig
 //! fn getUser(db: *Db, id: u32) !User {
@@ -13,13 +13,13 @@
 //!
 //! The Failure is found through the Bulkhead's slot, which is bound to the
 //! fiber — not to the thread — so two requests taking turns on one thread
-//! can never overwrite each other's message (ADR 0007). Called outside a
+//! can never overwrite each other's message (ADR 006). Called outside a
 //! request there is no Failure, and a fail function just returns a plain
 //! error with no message; handlers stay testable as ordinary functions.
 //! Two places outside a request give it one anyway: `testing.Refusals`, so
 //! a test can read the sentence, and the boot, so work registered with
 //! `app.before` that is refused says why in the line that stops the server
-//! (ADR 0161).
+//! (ADR 129).
 
 const std = @import("std");
 const bulkhead = @import("bulkhead.zig");
@@ -37,17 +37,17 @@ pub const Error = error{Failed};
 /// per connection and clears it at the start of every request.
 pub const Failure = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Failure";
 
     status: u16 = 0,
     /// A `u8` and not a `usize`, so that the pointer below fits in the
     /// padding this struct already had: `@sizeOf(Failure)` is 256 with or
-    /// without it, and a connection holds one (ADR 0191).
+    /// without it, and a connection holds one (ADR 153).
     n: u8 = 0,
     buf: [max_message]u8 = undefined,
     /// What a 401 says in `WWW-Authenticate`, when the failure came from
-    /// an endpoint that takes an `Authorization` header (ADR 0191). A
+    /// an endpoint that takes an `Authorization` header (ADR 153). A
     /// comptime string, so a pointer is the whole of it.
     challenge: ?[*:0]const u8 = null,
 
@@ -77,7 +77,7 @@ pub const Failure = struct {
 
 /// Everything nilo tracks about the request this fiber is serving. It is
 /// what the Bulkhead slot points at, so anything reachable from anywhere —
-/// a fail function, the panic handler (ADR 0008) — finds it here.
+/// a fail function, the panic handler (ADR 007) — finds it here.
 pub const InFlight = struct {
     failure: Failure = .{},
 
@@ -86,7 +86,7 @@ pub const InFlight = struct {
     method: []const u8 = "",
     path: []const u8 = "",
 
-    /// Whether this request is holding its thread (ADR 0034). Here for the
+    /// Whether this request is holding its thread (ADR 013). Here for the
     /// same reason everything else is: `nilo.blocking` has to find it from
     /// inside a call that knows nothing about the request it is part of.
     watch: watchdog.Watch = .{},
@@ -127,7 +127,7 @@ pub fn unauthorized(comptime fmt: []const u8, args: anytype) Error {
 /// A 401 that says what would have been accepted: `with` goes out as the
 /// `WWW-Authenticate` header, which RFC 9110 §15.5.2 says every 401
 /// carries. `nilo.Authorization(…)` supplies it for the header it reads;
-/// `T.refuse` is this with the type's own challenge filled in (ADR 0191).
+/// `T.refuse` is this with the type's own challenge filled in (ADR 153).
 pub fn challenge(comptime with: [:0]const u8, comptime fmt: []const u8, args: anytype) Error {
     if (current()) |f| {
         f.set(401, fmt, args);
@@ -153,7 +153,7 @@ pub fn unprocessable(comptime fmt: []const u8, args: anytype) Error {
 }
 
 /// A 413, for a request body bigger than the endpoint will take. What
-/// `c.bodyStream()` refusing a `Content-Length` wants to become (ADR 0020).
+/// `c.bodyStream()` refusing a `Content-Length` wants to become (ADR 019).
 pub fn tooLarge(comptime fmt: []const u8, args: anytype) Error {
     return status(413, fmt, args);
 }
@@ -178,7 +178,7 @@ pub fn resolveStatus(failure: *const Failure, err: anyerror) u16 {
 
 /// Ordinary Zig errors coming from anywhere — a database, a parser, an
 /// allocator — are mapped through this table. Anything unrecognised
-/// becomes a 500 and is logged with its error name (ADR 0005).
+/// becomes a 500 and is logged with its error name (ADR 004).
 pub fn statusFor(err: anyerror) u16 {
     return switch (err) {
         error.Failed => 500, // should already have been handled via the Failure
@@ -207,7 +207,7 @@ pub fn statusFor(err: anyerror) u16 {
         // whatever the request around it was.
         //
         // **Every other constraint failure stays 500 and the handler
-        // decides**, `ForeignKeyViolated` included (ADR 0039, ADR 0184).
+        // decides**, `ForeignKeyViolated` included (ADR 036, ADR 117).
         // That one is a 409 for a delete that lost a race and a 400 for an
         // insert naming a parent that was never there, and nothing here can
         // tell those apart — which is the reason it has a name rather than a
@@ -219,7 +219,7 @@ pub fn statusFor(err: anyerror) u16 {
         error.Conflict, error.AlreadyExists => 409,
         error.BodyTooLarge => 413,
         // The request never finished arriving, which is not the server's
-        // fault and is worth retrying (ADR 0124).
+        // fault and is worth retrying (ADR 022).
         error.BodyTooSlow => 408,
         error.Timeout, error.Canceled => 503,
 
@@ -293,6 +293,6 @@ test "a challenge is a 401 that remembers what would have been accepted, and cle
 test "the challenge lives in the padding a Failure already had" {
     // The pointer is paid for by shrinking `n` to a byte, which the
     // 240-byte buffer allows. A connection holds one Failure, so this is
-    // the per-connection number the feature must not move (ADR 0191).
+    // the per-connection number the feature must not move (ADR 153).
     try testing.expectEqual(@as(usize, 256), @sizeOf(Failure));
 }

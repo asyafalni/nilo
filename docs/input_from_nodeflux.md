@@ -1,7 +1,7 @@
 # Roadmap input for nilo, from nodeflux-os
 
 Findings from porting a working 59-table Postgres schema to `sql.migrate`
-(ADR 0153), so that the Zig port of **nodeflux-os** owns its schema instead of
+(ADR 123), so that the Zig port of **nodeflux-os** owns its schema instead of
 borrowing the Go binary's goose migrations.
 
 nodeflux-os is an internal ERP: Go + TimescaleDB, 30 goose migrations totalling
@@ -9,10 +9,10 @@ nodeflux-os is an internal ERP: Go + TimescaleDB, 30 goose migrations totalling
 column defaults, 92 indexes of which 34 are partial, 31 `updated_at` triggers,
 one view, one hypertable and 113 rows of reference data. A Zig port
 (`backend-zig/`) has been serving the same API on nilo for some time, with every
-context Row declared `.managed = false` (ADR 0162) and checked at boot.
+context Row declared `.managed = false` (ADR 130) and checked at boot.
 
 Two rounds so far. The first, against **v0.4.0** at `eb545fa`, filed ten
-findings; nilo answered nine of them in ADR 0220 to 0223. The second re-did
+findings; nilo answered nine of them in ADRs 180, 181 and 123. The second re-did
 the whole port on `636d7b6` and found three more. This file is what is still
 open, with the settled items kept to a paragraph each at the end so a number
 cited from an ADR or a commit still resolves. The files are under
@@ -28,16 +28,16 @@ shows it.
 
 | # | Finding | Status |
 |---|---|---|
-| 10 | A version is applicable only from Zig | Done, [ADR 0227](./adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md). `generate` writes the `.sql` twin, ledger row and all; `check` fails on a stale one. |
-| 11 | `--baseline` parses the snapshot it is documented to ignore, and dies with a stack trace on an older one | Done, [ADR 0224](./adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md). Both halves fixed, and an older snapshot is now read and upgraded rather than refused. |
-| 12 | An enum column's `CHECK` cannot be named | Done, [ADR 0226](./adr/0226-the-marker-has-a-word-the-database-checks.md), as `.check = .{ .<name> = .{ .words_of = .<column> } }`. |
-| 13 | A `text[]` column has no default | Done, [ADR 0225](./adr/0225-an-array-column-has-a-default-like-any-other.md). |
-| 14 | The second kind of word: `.check`, `.trigger`, and functions, views and extensions at schema level | **Two of five done**, [ADR 0226](./adr/0226-the-marker-has-a-word-the-database-checks.md). `.check` and `.trigger` ship. Functions, views and extensions wait on a `sql.Schema` that does not exist; see below. |
-| 1, 2, 3, 5 | `.default`, an enum column's `CHECK`, partial and ordered `.index`, `.name` on any constraint and the 63-byte guard | Done, [ADR 0221](./adr/0221-the-marker-has-two-kinds-of-word.md) |
-| 4, 6 | Composite `.references`, and a target named as text | Done, [ADR 0222](./adr/0222-a-foreign-key-is-columns-and-a-table-name.md) |
-| 7 | `--baseline`, and the generated block in a version file | Done, [ADR 0223](./adr/0223-a-version-file-is-a-generated-block-and-the-rest.md) |
-| 8 | `app.start(io)` then `listen()` never exits | Done, [ADR 0220](./adr/0220-work-that-needs-the-services-runs-on-their-loop.md) |
-| 9 | `Date`, `Decimal` and `Jsonb` as `AsText` | Done in ADR 0221: `sql.Date` is a type; `Decimal` stays `AsText` on purpose |
+| 10 | A version is applicable only from Zig | Done, [ADR 123](./adr/123-a-migration-is-a-diff-against-a-snapshot.md). `generate` writes the `.sql` twin, ledger row and all; `check` fails on a stale one. |
+| 11 | `--baseline` parses the snapshot it is documented to ignore, and dies with a stack trace on an older one | Done, [ADR 181](./adr/181-the-marker-has-two-kinds-of-word.md). Both halves fixed, and an older snapshot is now read and upgraded rather than refused. |
+| 12 | An enum column's `CHECK` cannot be named | Done, [ADR 181](./adr/181-the-marker-has-two-kinds-of-word.md), as `.check = .{ .<name> = .{ .words_of = .<column> } }`. |
+| 13 | A `text[]` column has no default | Done, [ADR 181](./adr/181-the-marker-has-two-kinds-of-word.md). |
+| 14 | The second kind of word: `.check`, `.trigger`, and functions, views and extensions at schema level | **Two of five done**, [ADR 181](./adr/181-the-marker-has-two-kinds-of-word.md). `.check` and `.trigger` ship. Functions, views and extensions wait on a `sql.Schema` that does not exist; see below. |
+| 1, 2, 3, 5 | `.default`, an enum column's `CHECK`, partial and ordered `.index`, `.name` on any constraint and the 63-byte guard | Done, [ADR 181](./adr/181-the-marker-has-two-kinds-of-word.md) |
+| 4, 6 | Composite `.references`, and a target named as text | Done, [ADR 181](./adr/181-the-marker-has-two-kinds-of-word.md) |
+| 7 | `--baseline`, and the generated block in a version file | Done, [ADR 123](./adr/123-a-migration-is-a-diff-against-a-snapshot.md) |
+| 8 | `app.start(io)` then `listen()` never exits | Done, [ADR 180](./adr/180-work-that-needs-the-services-runs-on-their-loop.md) |
+| 9 | `Date`, `Decimal` and `Jsonb` as `AsText` | Done in ADR 181: `sql.Date` is a type; `Decimal` stays `AsText` on purpose |
 
 **Every item in this file is answered.** The order was 11, then 13, then 14
 with 12 folded into it, then 10 — which is the order recommended below, with 13
@@ -70,8 +70,8 @@ same reason — nilo has to write something in the middle:
 
 ## The port on `636d7b6`
 
-The fourteen section files under `src/schema/` were rewritten onto ADR 0221,
-0222 and 0223, `db generate --name schema --baseline` re-derived version 1,
+The fourteen section files under `src/schema/` were rewritten onto ADRs 181
+and 123, `db generate --name schema --baseline` re-derived version 1,
 and a fresh database migrated from it was diffed against the goose-migrated
 reference: `pg_dump --schema-only` of both, split into facts (a column with
 its type, nullability and default; a constraint with its name and body; an
@@ -132,7 +132,7 @@ step is the trigger.
 - **`.managed = false` is the right default for a port.** Every context kept
   its Row as a projection and nothing about reading changed.
 - **One transaction per version behind an advisory lock, no `down`,
-  `destructive` named in the header.** No complaints; ADR 0153's argument
+  `destructive` named in the header.** No complaints; ADR 123's argument
   for each holds.
 - **Each section file is self-contained**, its Rows and the steps that
   complete them in one file, and both rounds took one working session each
@@ -153,7 +153,7 @@ This is not a gap in the design; it is the design. The source is a Zig type,
 the diff runs at comptime and `manifest.zig` is a module the server imports,
 so nothing about *authoring* a version can happen without a Zig compiler.
 dbmate, goose and flyway are language-agnostic because their unit is a `.sql`
-file and a ledger table, and that is exactly the trade ADR 0153 makes the
+file and a ledger table, and that is exactly the trade ADR 123 makes the
 other way, for the reasons it gives. Prisma, Django, Ecto and Drizzle make the
 same trade; Atlas is the one tool that diffs *and* stays language-agnostic,
 and it pays with a full SQL parser, which this design rightly refuses.
@@ -199,7 +199,7 @@ outside this one say no, and it is not about the vocabulary at all.
 ### 11. `--baseline` reads the snapshot before it ignores it
 
 `guide/sql/migrations.md` says `--baseline` "ignores `snapshot.zon`
-entirely", and ADR 0222 says a snapshot in the older shape "is refused with a
+entirely", and ADR 181 says a snapshot in the older shape "is refused with a
 parse diagnostic naming `column`". From the CLI, neither is what happens. On
 the round-one snapshot (`.column`/`.target` on every reference):
 
@@ -218,7 +218,7 @@ second (`sql/migrations.zig:293-294`), and `read()` parses the snapshot with
 promises is thrown away before it reaches anybody. This is the one path
 where the old snapshot is guaranteed to be present, because re-deriving is
 what you do after a shape change. The workaround is `rm
-migrations/snapshot.zon` first, which is the shell script ADR 0223 set out
+migrations/snapshot.zon` first, which is the shell script ADR 123 set out
 to retire. Two fixes, both small: skip `read()`'s snapshot half when
 `opts.baseline` is set, and pass a `Diagnostics` so the non-baseline
 `generate` and `check` print the sentence rather than the trace.
@@ -251,7 +251,7 @@ step.
 
 ### 14. The second kind of word
 
-ADR 0221 accepted the principle and built none of it. The principle: a
+ADR 181 accepted the principle and built none of it. The principle: a
 `CHECK` body is a string the compiler cannot read, and it is also a **named
 object with a text**, which a diff owns completely. Same name and same hash,
 nothing to do; same name and a new hash, replace; name gone, drop. The
@@ -272,7 +272,7 @@ five and nothing else in 59 tables asked for a sixth:
 | an extension | `CREATE EXTENSION IF NOT EXISTS`, and it is never dropped |
 
 A generated column, a collation, a rule, a policy, a Postgres `ENUM` type:
-still a `.data` step until somebody brings a case, which is ADR 0153's own
+still a `.data` step until somebody brings a case, which is ADR 123's own
 rule.
 
 **What a table looks like.** Every fact about `work_items` in one place. The
@@ -302,7 +302,7 @@ pub const WorkItem = struct {
         },
         .trigger = .{
             // What shipped is two halves, because nilo writes `ON "work_items"`
-            // between them (ADR 0226).
+            // between them (ADR 181).
             .work_items_updated_at = .{
                 .when = "BEFORE UPDATE",
                 .run = "FOR EACH ROW EXECUTE FUNCTION set_updated_at()",
@@ -366,7 +366,7 @@ as `'1'::numeric` where Go's is `1`. The two are the same default and
 `pg_dump` prints them differently; the comparison above normalises that one
 spelling and nothing else. Not worth a word in the marker.
 
-**ADR 0222's "the context declares its own Row managed" is right, and it has
+**ADR 181's "the context declares its own Row managed" is right, and it has
 a cost this port has not paid yet.** The contexts' Rows double as responses,
 so a managed one carries every column the table has, and 8 of the 59 do not:
 `work.WorkItem`, `sales.Deal` and six others leave out `created_at` and
@@ -386,42 +386,42 @@ One paragraph each, kept so a number cited from an ADR or a commit still
 resolves. The full arguments are in the ADRs that answered them.
 
 **1, 2, 3. `.default`, an enum column's `CHECK`, partial and ordered
-`.index`.** The argument was that ADR 0153's bar ("a word gets into the
+`.index`.** The argument was that ADR 123's bar ("a word gets into the
 marker if the compiler can check it") was right and its line was drawn short
 of it: 126 defaults, 29 `IN (…)` lists and 34 partial indexes were all
 decidable while compiling and all ended up in strings, so the schema was
 *less* checked than the vocabulary would have been. Of the 126 defaults not
 one was the "NOT NULL added to a table with rows" case the ADR reserved the
 word for; 86 were `now()` and 40 were literals every insert relies on. ADR
-0221 accepted it in those words. Two spellings landed differently from what
+181 accepted it in those words. Two spellings landed differently from what
 was proposed, both better: `.{ .ne = null }` for `IS NOT NULL`, because that
 is how the where walker already spells it, and `.priority = .normal` rather
 than `"normal"`, because a column that holds an enum's word takes one.
 
 **4. Composite `.references`.** Two keys in this schema, both the same-board
-rule, both written as `.data` beside a `.unique` they needed. ADR 0222:
+rule, both written as `.data` beside a `.unique` they needed. ADR 181:
 `.columns`/`.to` keyed by a label, written as a table constraint so
 one-column keys are byte-identical to before, and `.exists` joins on every
 column of the key.
 
 **5. `.name` on `.unique`, and 63 bytes.** Six derived names had lost their
 meaning and two were cut down by Postgres at 63 bytes in a `NOTICE` nothing
-reads. ADR 0221: `.name` on any entry, the guard on both dialects, and two
+reads. ADR 181: `.name` on any entry, the guard on both dialects, and two
 entries deriving one name refused. Round two used it 50 times.
 
 **6. `.references` named a type, so a context-per-directory program declared
-every table twice.** ADR 0222: a target may be the table's name, and the
+every table twice.** ADR 181: a target may be the table's name, and the
 type check moved to `orderOf`, where every Row is in one comptime list, so a
 name no Row claims is still a compile error. The port has not folded its
 schema module yet; see the note above for why.
 
 **7. `generate` could not re-derive, and the version file had no slot for a
-hand-written step.** ADR 0223: `before ++ generated ++ after` with the
+hand-written step.** ADR 123: `before ++ generated ++ after` with the
 generated block between two marker lines, `--baseline` rewriting version 1
 in place, three refusals. Item 11 is the one hole in it.
 
 **8. `app.start(io)` then `listen()` never exited with a Postgres pool.**
-ADR 0220: refused with `error.StartedOnAnotherLoop`; `app.before(f, args)`
+ADR 180: refused with `error.StartedOnAnotherLoop`; `app.before(f, args)`
 is the phase, inside `listen()`; `db.expecting(version)` is the guard, a
 call rather than a field because the field cost 17,296 bytes in every
 program with a `Db`. The port's gate `Db` is deleted.

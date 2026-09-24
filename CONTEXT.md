@@ -15,7 +15,7 @@ Where a module sits, decided by one question — does it need the event loop? Co
 _Avoid_: tier, level, ring, package, workspace
 
 **Core**:
-The bottom module: the vocabulary every other layer agrees about, and no IO at all. A file earns its place here by being needed by two layers, not by having nowhere else to live. It names no Engine, so it runs under a plain `zig test` and links into a program with no server in it.
+The bottom module: the vocabulary every other layer agrees about, and no event loop. A file earns its place here by being needed by two layers, not by having nowhere else to live. It names no Engine, so it runs under a plain `zig test` and links into a program with no server in it.
 _Avoid_: utils, common, shared, base, prelude
 
 **Tool module**:
@@ -237,15 +237,15 @@ A struct of the caller's own, one field per column, carrying the marker that nam
 _Avoid_: ORM, model, entity, record, schema, DTO
 
 **Marker**:
-The `pub const nilo_table` on a Row: what the type says about its **table** rather than about a query. Its words are checked while compiling, which is the condition for being a word at all — the name, the key, a column's default, a unique, an index and its predicate, a foreign key and its two sides. A foreign key may name the other table as text rather than its Row, and the check on the two sides then runs against the list every Row is in rather than being given up (ADR 0222). A word whose body only a database can read is a second kind — a **named text** — checked by the database and diffed by name and hash (ADR 0221, ADR 0226); anything that is neither is SQL in a step, and the snapshot marks it as an object nilo does not own.
+The `pub const nilo_table` on a Row: what the type says about its **table** rather than about a query. Its words are checked while compiling, which is the condition for being a word at all — the name, the key, a column's default, a unique, an index and its predicate, a foreign key and its two sides. A foreign key may name the other table as text rather than its Row, and the check on the two sides then runs against the list every Row is in rather than being given up (ADR 181). A word whose body only a database can read is a second kind — a **named text** — checked by the database and diffed by name and hash (ADR 181); anything that is neither is SQL in a step, and the snapshot marks it as an object nilo does not own.
 _Avoid_: annotation, decorator, attribute, tag, metadata, schema DSL
 
 **Named text**:
-The second kind of word: an object whose **name** the compiler checks and whose **body** only the database can read. `.check` and `.trigger` are the two a table has. nilo writes the body, hashes it and never parses it, so a diff is three cases and no fourth — same name and same hash, nothing; a new hash, drop and create; a name the types no longer have, drop. The snapshot records the name and sixteen hex characters, not the body (ADR 0226).
+The second kind of word: an object whose **name** the compiler checks and whose **body** only the database can read. `.check` and `.trigger` are the two a table has. nilo writes the body, hashes it and never parses it, so a diff is three cases and no fourth — same name and same hash, nothing; a new hash, drop and create; a name the types no longer have, drop. The snapshot records the name and sixteen hex characters, not the body (ADR 181).
 _Avoid_: raw SQL, escape hatch, opaque blob, passthrough
 
 **Twin**:
-The `.sql` file `generate` writes beside every version file: the same steps, wrapped in a transaction, with the ledger row on the end, for a database no Zig toolchain can reach. An **output** — nilo reads the `.zig` and never this, and a version written in SQL by somebody else is not picked up (ADR 0227).
+The `.sql` file `generate` writes beside every version file: the same steps, wrapped in a transaction, with the ledger row on the end, for a database no Zig toolchain can reach. An **output** — nilo reads the `.zig` and never this, and a version written in SQL by somebody else is not picked up (ADR 123).
 _Avoid_: export, dump, migration file, plain SQL migration
 
 **Borrowed row**:
@@ -278,7 +278,7 @@ _Avoid_: driver, client, connection layer, bulkhead
 
 **Writer and reader**:
 The two roles a pooled connection can have when the database is a file rather than a server: one connection that may write, and several opened read-only. Not a tuning choice — SQLite serialises writers over the whole database, so the split is what the database is, and a pool of equal connections would be describing something that does not exist.
-_Avoid_: primary and replica, leader and follower, read replica, master — all four name a second database, which is a second type here (ADR 0060), and these are two roles against one file.
+_Avoid_: primary and replica, leader and follower, read replica, master — all four name a second database, which is a second type here (ADR 054), and these are two roles against one file.
 
 **Tx**:
 One transaction in flight, holding a connection until it ends. It ends however the handler leaves — committed, rolled back, or abandoned — because the connection has to go back fit for whoever takes it next.

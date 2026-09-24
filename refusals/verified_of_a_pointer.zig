@@ -1,7 +1,7 @@
 //! `nilo.Verified(*Google)`, written the way a service argument is. The
 //! argument names the type and nilo looks the service up, so the pointer is
 //! one character too many
-//! ([ADR 0260](../docs/adr/0260-verified-claims-are-a-handler-argument.md)).
+//! ([ADR 191](../docs/adr/191-verified-claims-are-a-handler-argument.md)).
 
 const nilo = @import("nilo_http");
 

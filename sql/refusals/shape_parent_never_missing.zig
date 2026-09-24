@@ -1,5 +1,5 @@
 //! `customer_id` is never null, so a `?` on the parent is a branch no caller
-//! will ever take (ADR 0295).
+//! will ever take (ADR 218).
 
 const sql = @import("nilo_sql");
 

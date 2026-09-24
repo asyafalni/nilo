@@ -4,14 +4,14 @@
 //! `fetch/live.zig` proves the Fitting layer's entry condition and pays for it:
 //! `std.Io.Threaded` cannot cancel a fiber, so everything there runs against
 //! `Limits.off` and **no deadline it arms has ever fired**. By
-//! [ADR 0033](../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
+//! [ADR 032](../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
 //! that made the timeout a guard only ever seen to pass, which is the same as
 //! no guard at all.
 //!
 //! So this stands a real server up on a real socket, points a handler at an
 //! endpoint that accepts and then says nothing, and watches
 //! `error.TimedOut` come back through
-//! [ADR 0065](../docs/adr/0065-the-way-out-was-open-the-clock-was-not.md)'s
+//! [ADR 056](../docs/adr/056-the-way-out-was-open-the-clock-was-not.md)'s
 //! whole chain: `Limits.arm` → `zio.AutoCancel` → the timer → the cancelled
 //! fiber → `bound.fired()` → the error a caller actually sees.
 //!
@@ -74,7 +74,7 @@ const Quiet = struct {
     no_port: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     /// What to say before going quiet. `nothing` is the endpoint above;
-    /// the other two are for the silence clock (ADR 0237): a head and three
+    /// the other two are for the silence clock (ADR 056): a head and three
     /// bytes of a ten-byte body and then nothing, or the whole body one
     /// byte every 60 ms, which is slow and is not silence.
     answer: enum { nothing, head_then_stall, trickle } = .nothing,
@@ -180,7 +180,7 @@ fn callQuiet(api: *fetch.Client, c: *nilo.Ctx) !nilo.Str {
 }
 
 /// The same call with no ceiling on the call at all and 200 ms on silence
-/// inside it, the download's shape (ADR 0237). Reports the body when it
+/// inside it, the download's shape (ADR 056). Reports the body when it
 /// arrives, so the trickle test can see the whole of it came.
 fn callPatient(api: *fetch.Client, c: *nilo.Ctx) !nilo.Str {
     const res = api.get(c, quiet_url, .{ .timeout_ms = 0, .stall_ms = 200 }) catch |err| {
@@ -278,7 +278,7 @@ test "silence inside a call with no ceiling is a stall, under the Engine's timer
 
     // The same timer as above, armed for the other bound: a head and three
     // bytes came, then nothing for 200 ms, and the fiber was cancelled with
-    // `stall_armed` saying which clock it was (ADR 0237).
+    // `stall_armed` saying which clock it was (ADR 056).
     try testing.expectEqualStrings("Stalled", body);
 }
 

@@ -1,6 +1,6 @@
 //! A schedule that does not say what happens when a tick arrives while the
 //! last run is still going. Skipping it and queueing it are both right for
-//! somebody, so neither is the default (ADR 0199).
+//! somebody, so neither is the default (ADR 161).
 
 const job = @import("nilo_job");
 const core = @import("nilo_core");

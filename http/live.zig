@@ -6,9 +6,9 @@
 //! it exists precisely because there is a server, it is owned by the group
 //! the Engine's accept loop runs its connections in, and outside one
 //! `nilo.spawn` answers `error.NoServer` by design
-//! ([ADR 0029](../docs/adr/0029-a-spawned-fiber-belongs-to-the-server.md)).
+//! ([ADR 028](../docs/adr/028-a-spawned-fiber-belongs-to-the-server.md)).
 //!
-//! [ADR 0033](../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
+//! [ADR 032](../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
 //! is why this file exists rather than a unit test asserting that a list has
 //! one entry in it: a registration nothing has ever been seen to *run* is not
 //! evidence that anything runs.
@@ -24,8 +24,8 @@
 //! takes std's read-and-drain fallback and produces the right bytes by the
 //! route a platform *without* `sendfile` uses. The splice chain the feature
 //! exists for has never been executed by a test
-//! ([ADR 0037](../docs/adr/0037-a-file-too-big-to-hold-is-opened-not-read.md)),
-//! which by [ADR 0033](../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
+//! ([ADR 009](../docs/adr/009-static-files-are-held-in-memory-or-opened.md)),
+//! which by [ADR 032](../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
 //! is the same standing as a guard only ever seen to pass. A real socket is the
 //! only thing that reaches it.
 //!
@@ -161,12 +161,12 @@ test "work registered before the server still runs when the services were starte
     defer app.deinit();
     try app.spawn(Ticker.run, .{&ticker});
 
-    // `start(io)` and then `listen()`, the order ADR 0079 built and ADR 0220
+    // `start(io)` and then `listen()`, the order ADR 180 first built and now
     // refuses once a service has kept the `Io`. This App has none, so the
     // boot goes ahead: `startServices` is skipped the second time round, and
     // **this is the case that used to take the background work down with
     // it** — the whole reason the two guards in `App` are separate flags
-    // (ADR 0086).
+    // (ADR 028).
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     try app.start(threaded.io());
@@ -241,7 +241,7 @@ test "work registered with before runs inside listen, after the services and bef
     try waitForATick(&boot.ticker);
     try testing.expect(serving.bound.load(.acquire));
 
-    // The order ADR 0220 fixes: the service, then the work that needs it,
+    // The order ADR 180 fixes: the service, then the work that needs it,
     // then the fibers — and the Run that work was handed is on the loop the
     // service was started on, which is what a migration needs from it.
     try testing.expectEqual(@as(u32, 1), boot.ran.load(.acquire));
@@ -291,7 +291,7 @@ test "a fail function in before work inside listen finds the boot's box" {
 
     // Inside `listen()` the box is bound to the loop's own task, the way a
     // connection binds its own, rather than put in the threadlocal every
-    // spawned fiber on that thread would read (ADR 0007). Bound there, the
+    // spawned fiber on that thread would read (ADR 006). Bound there, the
     // sentence is where the boot's line reads it.
     try testing.expectEqual(@as(u16, 422), refused.status.load(.acquire));
     try testing.expectEqualStrings("no suspicious return in Sekernan", refused.words[0..refused.n.load(.acquire)]);
@@ -549,7 +549,7 @@ fn readUntilSeen(
 }
 
 test "two requests sent together are answered together, and the second is not held for a third" {
-    // ADR 0274: a response whose successor is already in the read buffer is
+    // ADR 201: a response whose successor is already in the read buffer is
     // held, and put on the wire before the connection next waits. Only a
     // real socket reaches the second half, which is the Engine's: a fixed
     // reader never parks. If the hold were not made good, the client here
@@ -669,7 +669,7 @@ const SocketDir = struct {
 /// is there before the server is, and the inode of the replacement is
 /// routinely the one just freed. `ServingOnPath` registers a fiber that only
 /// runs once the loop is up and the socket is bound
-/// ([ADR 0029](../docs/adr/0029-a-spawned-fiber-belongs-to-the-server.md)),
+/// ([ADR 028](../docs/adr/028-a-spawned-fiber-belongs-to-the-server.md)),
 /// which is the same fact stated somewhere that can be read.
 ///
 /// Bounded, because a server that never binds has to fail here rather than
@@ -711,7 +711,7 @@ test "a server on a path answers over it, reads the proxy's header, and gives th
         // The deployment this feature is for: nginx in front, reaching the
         // server over the socket. There is no connection address for a rule
         // to name, and the connection is trusted by having arrived at all
-        // (ADR 0130).
+        // (ADR 103).
         .trusted = &.{"private"},
     };
     const thread = try std.Thread.spawn(.{}, ServingOnPath.run, .{&serving});
@@ -800,7 +800,7 @@ test "spawning with no server says so, and the App is what remembers instead" {
 
 /// The server under test answering on two addresses at once: the one
 /// `Options` names, on a port the kernel chose, and a unix socket beside it
-/// ([ADR 0289](../docs/adr/0289-a-server-answers-on-more-than-one-address.md)).
+/// ([ADR 213](../docs/adr/213-a-server-answers-on-more-than-one-address.md)).
 ///
 /// Two *transports* rather than two ports, and that is what makes it a test
 /// rather than a repetition: a second entry that differed only in its number

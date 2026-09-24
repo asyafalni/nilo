@@ -3,7 +3,7 @@
 `nilo_config` reads a struct of your own out of the environment, before
 anything opens. It is a module of its own: no event loop, no allocator, and it
 opens no file
-([ADR 0043](../adr/0043-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)).
+([ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)).
 
 <!-- compiles -->
 ```zig
@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = std.heap.smp_allocator;
 
-    // A `.env` is text somebody else read (ADR 0064), so the program opens
+    // A `.env` is text somebody else read (ADR 039), so the program opens
     // the file. Missing is not an error — that is production.
     const text = std.Io.Dir.cwd().readFileAlloc(io, ".env", gpa, .limited(64 * 1024)) catch "";
     defer if (text.len > 0) gpa.free(text);
@@ -104,7 +104,7 @@ the hard way by an application written against this page before it existed:
 ## What a `.env` may hold
 
 `Dotenv` takes text rather than a path, which is what keeps the module free of
-IO ([ADR 0064](../adr/0064-a-dotenv-is-text-somebody-else-read.md)).
+IO ([ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)).
 
 It reads `NAME=value`, blank lines, `#` comments on their own line, `'` and `"`
 quoting, an optional `export ` prefix, and CRLF. It **refuses** escapes,

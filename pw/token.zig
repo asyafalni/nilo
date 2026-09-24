@@ -1,5 +1,5 @@
 //! A token that is not a password: a password-reset link, an email
-//! verification, an API key (ADR 0241).
+//! verification, an API key (ADR 044).
 //!
 //! Every ordinary application has all three, and the recipe is the class of
 //! thing that runs perfectly and is open: 32 bytes of entropy, base64url to
@@ -47,11 +47,11 @@
 //!
 //! Store, expire, or spend. A reset row has an `expires_at` and a `used_at`,
 //! and both are columns in the caller's table, because where a token lives is
-//! the application's the way a password hash's row is (ADR 0048). What this
+//! the application's the way a password hash's row is (ADR 044). What this
 //! file settles is the three things that are the same in every application
 //! and wrong in most: how wide, how sent, and how compared.
 //!
-//! Entropy arrives as an argument for the reason a salt does (ADR 0046): a
+//! Entropy arrives as an argument for the reason a salt does (ADR 042): a
 //! module in this layer has no Bulkhead to ask through, and being handed the
 //! bytes is what keeps `zig test pw/pw.zig` running with no module graph.
 
@@ -88,7 +88,7 @@ pub const Token = struct {
     /// **`entropy` has to be unguessable, and this cannot check that.** What
     /// it can check is the width, and it does so in its own words: sixteen
     /// bytes is what a UUID holds, and a UUID used as a reset token is the
-    /// mistake ADR 0241 names.
+    /// mistake ADR 044 names.
     pub fn new(entropy: anytype) Token {
         comptime checkWidth(@TypeOf(entropy));
         return .{ ._bytes = entropy };

@@ -38,14 +38,14 @@ any of those is malformed. Pass the content type to `send` instead.
 cookies are two lines because they cannot be folded into one; two `Vary` lines
 happen because the CORS middleware and a gzipped static file each name a
 different axis of the same response, and replacing lost one of them
-([ADR 0089](../adr/0089-two-layers-can-each-name-a-vary-axis.md)). Setting
+([ADR 029](../adr/029-a-header-is-checked-once-and-two-of-them-repeat.md)). Setting
 either with a name and value already there adds nothing.
 
 **A value may not hold a control byte, and a name has to be a token.** A header
 is `name: value\r\n` with no escaping in it, so a value carrying a newline does
 not make a broken header — it makes a second one, and two of them start a second
 response. Both are refused with a 500 naming the header
-([ADR 0087](../adr/0087-a-header-value-cannot-end-its-own-line.md)). This is
+([ADR 029](../adr/029-a-header-is-checked-once-and-two-of-them-repeat.md)). This is
 worth knowing about for the values that did not come from you: a `Location` read
 out of a database, a filename off an upload. Percent-encode those, or strip
 them.
@@ -64,7 +64,7 @@ return .{ .headers = .of(&.{
 
 Eight per response there, and a ninth is a compile error pointing you at
 `c.setHeader`, which has no limit
-([ADR 0019](../adr/0019-a-response-owns-its-headers.md)).
+([ADR 018](../adr/018-a-response-owns-its-headers.md)).
 
 ## Redirects
 
@@ -100,13 +100,13 @@ return .with("/", .of(&.{.{ .name = "Set-Cookie", .value = session }}));
 only known while the request is running.
 
 There is no body. Browsers follow the header and never look
-([ADR 0032](../adr/0032-a-redirect-puts-its-status-in-the-type.md)).
+([ADR 031](../adr/031-a-redirect-puts-its-status-in-the-type.md)).
 
 ## Files
 
 `FileBody` is a file as a return value: the handler names it, nilo opens it,
 and the bytes go from the disk to the socket without passing through your
-process ([ADR 0037](../adr/0037-a-file-too-big-to-hold-is-opened-not-read.md)).
+process ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)).
 
 ```zig
 fn invoice(files: *Files, id: u32) !?nilo.FileBody {
@@ -177,7 +177,7 @@ A proxy that downloads a bundle from another service and hands it to the
 browser with *that* service's `Content-Type` has no file and no `Dir`, and
 its content type is a value it learns per request. `nilo.Bytes` is
 `FileBody`'s shape with the bytes in memory
-([ADR 0212](../adr/0212-bytes-handed-on-are-an-answer.md)):
+([ADR 173](../adr/173-bytes-handed-on-are-an-answer.md)):
 
 <!-- compiles -->
 ```zig
@@ -205,7 +205,7 @@ time, and a handler can say so: `nilo.Versioned(T)` is `T` with a version on
 it, which goes out as a weak `ETag`. A client that sends the tag back as
 `If-None-Match` gets a 304 and no body — and, if the handler asks first, no
 query either
-([ADR 0258](../adr/0258-a-version-a-handler-names-is-an-etag.md)):
+([ADR 189](../adr/189-a-version-a-handler-names-is-an-etag.md)):
 
 <!-- compiles -->
 ```zig
@@ -258,7 +258,7 @@ the rest. The API description puts the `ETag` on the 200 and a 304 beside it.
 A struct is its JSON and an enum is its tag name, and that covers nearly
 everything. Two shapes it doesn't cover are the ones a REST API tends to be full
 of, and a type says which it wants with one declaration
-([ADR 0085](../adr/0085-a-type-says-how-its-json-is-spelled.md)).
+([ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md)).
 
 **A union is externally tagged by default** — `{"metrics":{…}}`, one object with
 one key — which is what `std.json` writes and what nilo sends if you say
@@ -320,7 +320,7 @@ the browser is. Saying so once beats a mapping function written out field by
 field, which is what a DTO layer is — and which nothing holds against the Row it
 came from, so a column added to the Row reaches the wire only if somebody
 remembers the second file
-([ADR 0181](../adr/0181-a-field-name-is-a-spelling-too.md)).
+([ADR 148](../adr/148-a-field-name-is-a-spelling-too.md)).
 
 <!-- compiles -->
 ```zig
@@ -340,7 +340,7 @@ either way.
 **One field that no case reaches is spelled on its own.** A column called
 `estimated_cost_amount_minor` that the frontend knows as `estimatedCostMinor`
 is one `.rename` entry, and the entry wins over the case for that field alone
-([ADR 0207](../adr/0207-one-field-can-be-spelled-on-its-own.md)):
+([ADR 168](../adr/168-one-field-can-be-spelled-on-its-own.md)):
 
 <!-- compiles -->
 ```zig
@@ -380,7 +380,7 @@ those.** `sql.Uuid`, `sql.Timestamp`, `sql.AsText` and `id.Uuid` all carry a
 `nilo_openapi` beside their `jsonStringify`, and a marker may only name a scalar
 — so nilo knows the value is one string or one number and keeps writing the
 object around it
-([ADR 0182](../adr/0182-a-leaf-that-says-what-it-is-can-be-carried.md)). A Row
+([ADR 148](../adr/148-a-field-name-is-a-spelling-too.md)). A Row
 holding uuids can rename its fields, which is the ordinary case and was the
 whole reason this reopened.
 
@@ -418,7 +418,7 @@ client that sends a request and waits for the answer, which is every browser,
 that is the moment `send` returns. A client that pipelines, sending its next
 request before reading this answer, gets the answers in one write rather than
 one each; it was not waiting, and the batch is bounded by `write_buffer`
-([ADR 0274](../adr/0274-a-response-is-flushed-before-the-connection-waits.md)).
+([ADR 201](../adr/201-a-response-is-flushed-before-the-connection-waits.md)).
 
 Sending twice is an assertion failure rather than two responses on the wire. A
 handler that fails *after* sending gets its connection closed, because a
@@ -440,7 +440,7 @@ reason to hang up.
 The response says so only when there is something to say: `Connection: close`
 when it is closing, `Connection: keep-alive` to an HTTP/1.0 client being kept,
 and nothing at all on an HTTP/1.1 connection staying open, because that is
-what HTTP/1.1 means ([ADR 0269](../adr/0269-a-response-says-when-it-was-sent.md)).
+what HTTP/1.1 means ([ADR 197](../adr/197-a-response-says-when-it-was-sent.md)).
 Every response also carries a `Date`, which is what a cache in front reads to
 decide how old the answer is.
 
@@ -476,7 +476,7 @@ gzipped once when the App was built and that copy costs nothing per request
 ([Static files](./static-files.md#compression)). A stream, because it has no
 whole body to compress and would hold a compressor across every write. An event
 stream, because it must never be buffered at all
-([ADR 0287](../adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
+([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 
 **What it costs**, stated because every feature here states it. One compressor
 per thread, about 288 KB each, allocated once when the chains are resolved and
@@ -506,7 +506,7 @@ content_type)` when the length isn't known yet.
 ## A type that writes its own answer
 
 nilo answers JSON, and it is not going to learn XML, CSV or a template
-language ([ADR 0195](../adr/0195-a-type-can-write-its-own-answer.md) says
+language ([ADR 157](../adr/157-a-type-can-write-its-own-answer.md) says
 why). What it will do is send bytes a type of yours wrote, under a label the
 type names — which is what a consumer that only reads XML needs, and what a
 `*Ctx` handler calling `c.send` used to be the only way to get:

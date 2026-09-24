@@ -2,7 +2,7 @@
 
 What a tagged union in a response costs, and what it would cost on nilo's
 generated writer. The run behind
-[ADR 0085](../../docs/adr/0085-a-type-says-how-its-json-is-spelled.md) and the
+[ADR 016](../../docs/adr/016-the-api-description-comes-from-the-signatures.md) and the
 entry in [`bench/result/http.md`](../../bench/result/http.md).
 
 ```
@@ -22,7 +22,7 @@ one long string, one float, two enums.
 
 | | |
 |---|---|
-| **A** | `std.json`, externally tagged. What nilo sent before ADR 0085 |
+| **A** | `std.json`, externally tagged. What nilo sent before ADR 016 |
 | **B** | generated writer, externally tagged. The same bytes, so it isolates covering unions at all |
 | **C** | generated writer, internally tagged. The feature |
 | **D** | **the control.** The same payload with the union flattened into a plain struct by hand, on the generated writer |

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Does a save the build never reads restart the server? It must not.
 
-`zig build dev` watches the binary and nothing else (ADR 0259): the build
+`zig build dev` watches the binary and nothing else (ADR 190): the build
 system reacts to the files the compiler read to make it, and `nilo-dev`
 restarts the server when the file it writes changes. So in a repository
 holding a front end beside its server, a save under the front end moves
 nothing, and a save to any `.zig` the binary is built from rebuilds and
 restarts it. This is the check that it stays that way, the way `shutdown.py`
-is ADR 0098's and `burst.py` is ADR 0271's.
+is ADR 077's and `burst.py` is ADR 198's.
 
     python3 bench/devloop.py --step dev-spa \\
         --outside examples/spa/public/app.js --inside examples/spa/main.zig

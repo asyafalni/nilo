@@ -1,5 +1,5 @@
 //! The compile-time engine — turns a typed handler into an ordinary `Ctx`
-//! handler while compiling (ADR 0003).
+//! handler while compiling (ADR 002).
 //!
 //! ```zig
 //! fn getUser(db: *Db, id: u32) !User { ... }
@@ -14,11 +14,11 @@
 //! | `*Ctx`                | the raw request — the way out when you need full control |
 //! | `*Db`, `*const Cfg`   | a service, matched by its type             |
 //! | `u32`, `Str`, `bool`, a float, an enum | a path param, in the order `:name` (and a trailing `*`) appears in the pattern |
-//! | a type carrying `nilo_parse` | a path param the type reads itself — `sql.Uuid` (ADR 0142) |
+//! | a type carrying `nilo_parse` | a path param the type reads itself — `sql.Uuid` (ADR 113) |
 //! | `Query(T)`            | the query string, read into a struct of yours |
-//! | `Form(T)`             | the body as an HTML form, into a struct of yours (ADR 0031) |
+//! | `Form(T)`             | the body as an HTML form, into a struct of yours (ADR 030) |
 //! | `std.mem.Allocator`   | the request arena, freed when the request ends |
-//! | a type carrying `nilo_resolve` | a resolved value, worked out from the request (ADR 0016) |
+//! | a type carrying `nilo_resolve` | a resolved value, worked out from the request (ADR 015) |
 //! | any other struct      | the request body, parsed from JSON         |
 //!
 //! A `Form(T)` and a plain struct are the same slot — a form *is* the body —
@@ -28,13 +28,13 @@
 //! `Str`/`[]const u8` → text/plain, anything else → JSON. Wrap it in
 //! `Response(T)` when the status is not 200, or when the response carries
 //! headers of its own, and `Redirect(status)` when the answer is a
-//! `Location` (ADR 0032).
+//! `Location` (ADR 031).
 //!
 //! Zig does not keep argument names, so path params are matched **by
 //! position**, not by name. Every mismatch — the param count, a type that
 //! makes no sense, two request bodies — stops compilation with a message
 //! naming the route. That message quality is the only price this layer
-//! charges (ADR 0003), so it is taken seriously here.
+//! charges (ADR 002), so it is taken seriously here.
 
 const std = @import("std");
 const naming = @import("names.zig");
@@ -91,7 +91,7 @@ pub fn Response(comptime T: type) type {
     if (T == void) return struct {
         pub const nilo_response = void;
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = "nilo.Response(void)";
 
         status: u16 = 200,
@@ -101,7 +101,7 @@ pub fn Response(comptime T: type) type {
     return struct {
         pub const nilo_response = T;
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = "nilo.Response(" ++ naming.of(T) ++ ")";
 
         status: u16 = 200,
@@ -130,7 +130,7 @@ pub fn Response(comptime T: type) type {
 /// The two types differ in one thing and it is not the runtime behaviour:
 /// a `Response(T)` picks its status while the request is running, so the
 /// API description can only write `default`, while this one is part of the
-/// signature and comes out as `"201"` (ADR 0024). Reach for `Response(T)`
+/// signature and comes out as `"201"` (ADR 023). Reach for `Response(T)`
 /// when the status genuinely depends on what the handler found — a 200 or a
 /// 201 from the same upsert — and for this one the rest of the time.
 pub fn Status(comptime code: u16, comptime T: type) type {
@@ -138,7 +138,7 @@ pub fn Status(comptime code: u16, comptime T: type) type {
         pub const nilo_response = void;
         pub const nilo_status = code;
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = std.fmt.comptimePrint("nilo.Status({d},void)", .{code});
 
         headers: Headers = .{},
@@ -148,7 +148,7 @@ pub fn Status(comptime code: u16, comptime T: type) type {
         pub const nilo_response = T;
         pub const nilo_status = code;
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = std.fmt.comptimePrint("nilo.Status({d},{s})", .{ code, naming.of(T) });
 
         headers: Headers = .{},
@@ -187,7 +187,7 @@ pub fn Query(comptime T: type) type {
     return struct {
         pub const nilo_query = T;
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = "nilo.Query(" ++ naming.of(T) ++ ")";
 
         value: T,
@@ -195,7 +195,7 @@ pub fn Query(comptime T: type) type {
 }
 
 /// One request header, as a typed argument
-/// ([ADR 0163](../docs/adr/0163-a-header-a-handler-can-be-given.md)).
+/// ([ADR 131](../docs/adr/131-a-header-a-handler-can-be-given.md)).
 ///
 /// ```zig
 /// fn addComment(
@@ -215,12 +215,12 @@ pub fn Query(comptime T: type) type {
 /// the header. Text that will not convert is a query param's 400, word for
 /// word.
 ///
-/// Named `FromHeader` because `nilo.Header` is the response side (ADR 0107).
+/// Named `FromHeader` because `nilo.Header` is the response side (ADR 085).
 pub fn FromHeader(comptime name: []const u8, comptime T: type) type {
     return struct {
         pub const nilo_header = .{ .name = name, .value = T };
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = "nilo.FromHeader(\"" ++ name ++ "\", " ++ naming.of(T) ++ ")";
 
         value: T,
@@ -230,7 +230,7 @@ pub fn FromHeader(comptime name: []const u8, comptime T: type) type {
 /// What `Idempotent(Replays, …)` takes beside the Space.
 pub const IdempotentOptions = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.IdempotentOptions";
 
     /// Whose key it is. A function of one `*Ctx` answering the account, the
@@ -243,7 +243,7 @@ pub const IdempotentOptions = struct {
 
 /// The `Idempotency-Key` header, as a typed argument that makes the route
 /// answer once per key
-/// ([ADR 0193](../docs/adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)).
+/// ([ADR 155](../docs/adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
 ///
 /// ```zig
 /// const Replays = cache.Space("orders-replay", []const u8, .{ .ttl_s = 86_400, .max_bytes = 16 << 10 });
@@ -262,7 +262,7 @@ pub fn Idempotent(comptime Replays: type, comptime options: IdempotentOptions) t
     return struct {
         pub const nilo_idempotent = .{ .replays = Replays, .by = options.by };
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = "nilo.Idempotent(" ++ naming.of(Replays) ++ ", …)";
 
         /// The `Idempotency-Key` the client sent, as sent.
@@ -279,33 +279,33 @@ const Role = union(enum) {
     body,
     query,
     /// One named request header, read into the type it was asked for
-    /// ([ADR 0163](../docs/adr/0163-a-header-a-handler-can-be-given.md)).
+    /// ([ADR 131](../docs/adr/131-a-header-a-handler-can-be-given.md)).
     /// Its own role rather than a flavour of `.query`, because two of them on
     /// one handler is ordinary and two query structs is not.
     header,
     /// The `Authorization` header, read as one scheme and refused with a
-    /// challenge ([ADR 0191](../docs/adr/0191-an-authorization-header-a-handler-can-ask-for.md)).
+    /// challenge ([ADR 153](../docs/adr/153-an-authorization-header-a-handler-can-ask-for.md)).
     /// Not a flavour of `.header`, because absent is a 401 rather than a
     /// 400 and the document carries it as a security scheme, not a
     /// parameter.
     authorization,
     /// The same header, verified: the claims behind a bearer token, read
-    /// through the `jwt.Verifier` the argument names (ADR 0260). Its own
+    /// through the `jwt.Verifier` the argument names (ADR 191). Its own
     /// role rather than a flavour of `.authorization`, because it needs a
     /// service the route then requires, and a flavour of `.resolved` would
     /// need a `*Ctx` a file outside the core cannot name.
     verified,
     /// The `Idempotency-Key` header, and with it the whole of the route
-    /// answering once per key (ADR 0193). Its own role because it is the
+    /// answering once per key (ADR 155). Its own role because it is the
     /// one argument that can end the request before the handler runs with
     /// a *success*, and the one that has to see the handler's answer after.
     idempotent,
     /// A kept answer served again for a time, keyed on the request line
-    /// rather than on a header (ADR 0247). Its own role for the reason
+    /// rather than on a header (ADR 188). Its own role for the reason
     /// `.idempotent` is: it can end the request before the handler runs,
     /// and it sees the answer after. The two are refused together.
     cached,
-    /// The body again, but as an HTML form rather than as JSON (ADR 0031).
+    /// The body again, but as an HTML form rather than as JSON (ADR 030).
     /// A separate role and not a flavour of `.body`, because the two are
     /// the same slot and asking for both has to be refused.
     form,
@@ -313,7 +313,7 @@ const Role = union(enum) {
     /// outlives its own stack frame — a `Location` header, usually.
     arena,
     /// A value nilo works out from the request before the handler runs —
-    /// the signed-in user, usually (ADR 0016).
+    /// the signed-in user, usually (ADR 015).
     resolved,
     /// The same three slots again, read as a binding that hands its failures
     /// to the handler instead of ending the request (`bound.zig`).
@@ -342,7 +342,7 @@ pub fn wrap(comptime pattern: []const u8, comptime f: anytype) router.CtxHandler
             var args: std.meta.ArgsTuple(Fn) = undefined;
             // Before anything else is read, because a replay reads nothing
             // else: the kept answer goes out and the handler never runs
-            // (ADR 0193). `null` here means there is no such argument.
+            // (ADR 155). `null` here means there is no such argument.
             const replaying: ?Begun = if (comptime idempotentAt(roles)) |at|
                 switch (try idempotentBegin(params[at].type.?, c)) {
                     .replayed => return,
@@ -350,7 +350,7 @@ pub fn wrap(comptime pattern: []const u8, comptime f: anytype) router.CtxHandler
                 }
             else
                 null;
-            // The same, keyed on the request line (ADR 0247). Never both:
+            // The same, keyed on the request line (ADR 188). Never both:
             // `rolesOf` refuses a handler that asks for the two.
             const caching: ?cached_mod.Begun = if (comptime cachedAt(roles)) |at|
                 switch (try cachedBegin(params[at].type.?, c)) {
@@ -374,7 +374,7 @@ pub fn wrap(comptime pattern: []const u8, comptime f: anytype) router.CtxHandler
                     const P = p.type.?;
                     switch (comptime roles[i]) {
                         .ctx => args[i] = c,
-                        // **Logged as well as answered** (ADR 0079). `listen()`
+                        // **Logged as well as answered** (ADR 180). `listen()`
                         // refuses to open the socket over this and names the type
                         // and the routes, so a server never reaches here — but
                         // `testing.Client` does not call `listen()`, and a test
@@ -413,7 +413,7 @@ pub fn wrap(comptime pattern: []const u8, comptime f: anytype) router.CtxHandler
                         // The outcomes live here, on the stack of the fiber that
                         // is already serving this request, and are copied into
                         // the binding. Sized while compiling, so a field that did
-                        // not bind costs no allocation (ADR 0018).
+                        // not bind costs no allocation (ADR 017).
                         .bound_body => {
                             var outcomes: P.Outcomes = undefined;
                             const filled = try c.jsonCollecting(P.Value, &outcomes);
@@ -446,7 +446,7 @@ pub fn wrap(comptime pattern: []const u8, comptime f: anytype) router.CtxHandler
 
 /// A kept answer is one the handler returned, so a handler that writes its
 /// own, or answers with a file or a redirect, cannot be kept this way — for
-/// `Idempotent` (ADR 0193) and for `Cached` (ADR 0247) alike. Said at the
+/// `Idempotent` (ADR 155) and for `Cached` (ADR 188) alike. Said at the
 /// route rather than on the first replay. `what` is the argument, with its
 /// article: "an `Idempotent(…)`".
 fn checkKeepable(comptime pattern: []const u8, comptime Fn: type, comptime what: []const u8) void {
@@ -490,14 +490,14 @@ fn cachedAt(comptime roles: []const Role) ?usize {
 
 /// Whether this handler takes a `Cached(…)`. For `App.route`, whose verb
 /// is a runtime value and so cannot be refused while compiling the way
-/// `App.post` refuses it (ADR 0247).
+/// `App.post` refuses it (ADR 188).
 pub fn isCached(comptime pattern: []const u8, comptime handler: anytype) bool {
     const Fn = comptime fnTypeOf(pattern, @TypeOf(handler));
     return comptime cachedAt(rolesOf(pattern, @typeInfo(Fn).@"fn".params)) != null;
 }
 
 /// A `Cached(…)` on a verb that writes, refused at the call that named the
-/// verb (ADR 0247). `App.post`, `put`, `patch`, `delete` and `options` call
+/// verb (ADR 188). `App.post`, `put`, `patch`, `delete` and `options` call
 /// this beside `check`; a GET or a HEAD passes through.
 pub fn checkVerb(comptime method: http1.Method, comptime pattern: []const u8, comptime handler: anytype) void {
     comptime {
@@ -525,7 +525,7 @@ const Begun = struct {
 const BeginOutcome = union(enum) { replayed, fresh: Begun };
 
 /// Read the key, claim it or find what was kept under it, and either send
-/// the kept answer or say the handler may run (ADR 0193).
+/// the kept answer or say the handler may run (ADR 155).
 fn idempotentBegin(comptime P: type, c: *Ctx) !BeginOutcome {
     const Replays = P.nilo_idempotent.replays;
     const replays = c._services.get(*Replays) orelse {
@@ -571,7 +571,7 @@ fn idempotentBegin(comptime P: type, c: *Ctx) !BeginOutcome {
     if (claimed) return .{ .fresh = .{ .key = key, .under = under, .fingerprint = fingerprint } };
 
     // Somebody was first. Into the arena rather than a `Held` on the
-    // stack, which would be `max_bytes` per idle connection (ADR 0063).
+    // stack, which would be `max_bytes` per idle connection (ADR 062).
     const room = try c._arena.alloc(u8, Replays.max_bytes);
     const kept = replays.getInto(under, room) orelse
         // Gone between the claim and the read — evicted, or expired on the
@@ -598,7 +598,7 @@ fn idempotentBegin(comptime P: type, c: *Ctx) !BeginOutcome {
 }
 
 /// What the handler answered, kept and then sent — or not kept, when it
-/// failed, so the next retry runs it again (ADR 0193).
+/// failed, so the next retry runs it again (ADR 155).
 fn idempotentFinish(comptime P: type, c: *Ctx, begun: Begun, result: anytype) !void {
     const Replays = P.nilo_idempotent.replays;
     const replays = c._services.get(*Replays).?; // `idempotentBegin` found it
@@ -633,7 +633,7 @@ fn idempotentFinish(comptime P: type, c: *Ctx, begun: Begun, result: anytype) !v
 
 /// The `Cached(…)` half of what `idempotentBegin` is: claim the key or find
 /// what was kept under it; send the kept answer, wait for one being made, or
-/// say the handler may run (ADR 0247). Here rather than in `cached.zig` so
+/// say the handler may run (ADR 188). Here rather than in `cached.zig` so
 /// that file names nothing in the App's core.
 fn cachedBegin(comptime P: type, c: *Ctx) !cached_mod.Outcome {
     const spec = P.nilo_cached;
@@ -641,7 +641,7 @@ fn cachedBegin(comptime P: type, c: *Ctx) !cached_mod.Outcome {
     const pages = c._services.get(*Pages) orelse {
         // A warning and not an error, for the reason `wrap` gives:
         // `listen()` refuses to start over this, and a test does not call
-        // it (ADR 0079).
+        // it (ADR 180).
         std.log.warn(
             "the Space {s} was never registered, and route \"{s}\" keeps its answers in it. " ++
                 "Call app.provide() on it before serving.",
@@ -664,7 +664,7 @@ fn cachedBegin(comptime P: type, c: *Ctx) !cached_mod.Outcome {
     const cap: u32 = if (c.timeLeftMs()) |left| @min(cached_mod.max_wait_ms, left / 2) else cached_mod.max_wait_ms;
     var waited: u32 = 0;
     // Into the arena rather than a `Held` on the stack, which would be
-    // `max_bytes` per idle connection (ADR 0063) — and only once somebody
+    // `max_bytes` per idle connection (ADR 062) — and only once somebody
     // else was first, so a fresh answer does not pay for it.
     var room: ?[]u8 = null;
 
@@ -709,7 +709,7 @@ fn cachedBegin(comptime P: type, c: *Ctx) !cached_mod.Outcome {
 }
 
 /// What the handler answered, kept for `ttl_s` and then sent — or not kept,
-/// when it failed, so the next request runs it again (ADR 0247).
+/// when it failed, so the next request runs it again (ADR 188).
 fn cachedFinish(comptime P: type, c: *Ctx, begun: cached_mod.Begun, result: anytype) !void {
     const spec = P.nilo_cached;
     const Pages = spec.pages;
@@ -788,7 +788,7 @@ fn cachedJoined(c: *Ctx, vary: ?[]const u8) ![]const u8 {
 }
 
 /// A handler's answer, rendered rather than sent, so it can be kept first.
-/// What `Idempotent` (ADR 0193) and `Cached` (ADR 0247) both put in a
+/// What `Idempotent` (ADR 155) and `Cached` (ADR 188) both put in a
 /// record.
 pub const Rendered = struct {
     kind: idempotent_mod.Kind,
@@ -910,15 +910,15 @@ pub fn requirements(comptime pattern: []const u8, comptime f: anytype) []const s
                     [_]service_mod.Requirement{service_mod.requirementFor(p.type.?, pattern)},
                 // A service used by nothing but a resolver still has to be
                 // caught by `listen()`, or the first request to an
-                // authenticated route finds it instead (ADR 0016).
+                // authenticated route finds it instead (ADR 015).
                 .resolved => list = list ++ resolve.requirements(p.type.?, pattern),
                 // The Space a cached route keeps its answers in is a service
                 // the route needs, so `listen()` names it when it is missing
-                // rather than the first request finding out (ADR 0247).
+                // rather than the first request finding out (ADR 188).
                 .cached => list = list ++
                     [_]service_mod.Requirement{service_mod.requirementFor(*p.type.?.nilo_cached.pages, pattern)},
                 // The Verifier a verified argument reads through, for the
-                // same reason (ADR 0260).
+                // same reason (ADR 191).
                 .verified => list = list ++
                     [_]service_mod.Requirement{service_mod.requirementFor(*p.type.?.nilo_verified, pattern)},
                 else => {},
@@ -929,7 +929,7 @@ pub fn requirements(comptime pattern: []const u8, comptime f: anytype) []const s
 }
 
 /// What this route's signature says about it, for the generated API
-/// description (ADR 0017). Read from the very same argument list `wrap`
+/// description (ADR 016). Read from the very same argument list `wrap`
 /// reads, which is the whole point: there is one contract, not a contract
 /// and a description of it that can drift apart.
 /// The verb is not in here: `App.route` takes it as an ordinary runtime
@@ -941,7 +941,7 @@ pub fn operation(comptime pattern: []const u8, comptime f: anytype) openapi.Oper
         // sharing one branch budget, and the default 1,000 was already nearly
         // spent: most of it goes on `openapi.nameOf` walking a type name
         // character by character to decide what to file the shape under. The
-        // marker check ADR 0142 added per argument is what took the `orders`
+        // marker check ADR 113 added per argument is what took the `orders`
         // example over, and the cost is a compile that stops rather than one
         // that is slow. Raised here because this is where the whole of the
         // work is asked for; the loop that spends it is two files away.
@@ -990,7 +990,7 @@ pub fn operation(comptime pattern: []const u8, comptime f: anytype) openapi.Oper
                 can_reject = true;
             },
             // A header the signature asks for is a header the document can
-            // promise, which is the whole of ADR 0163: `c.header` reads one
+            // promise, which is the whole of ADR 131: `c.header` reads one
             // and appears nowhere, so a generated client could not know the
             // endpoint needed it. `required` follows the optional, the way a
             // query field's does.
@@ -1021,16 +1021,16 @@ pub fn operation(comptime pattern: []const u8, comptime f: anytype) openapi.Oper
             // A security scheme rather than a parameter, which is what a
             // generated client reads to know it has to sign in — and a 401
             // in the responses, since nilo writes one before the handler
-            // runs (ADR 0191).
+            // runs (ADR 153).
             .authorization => security = switch (p.type.?.nilo_authorization) {
                 .bearer => .bearer,
                 .basic => .basic,
             },
             // The same scheme, which is what the document should have said
-            // for a verified token all along (ADR 0260).
+            // for a verified token all along (ADR 191).
             .verified => security = .bearer,
             // A required header parameter, the way a `FromHeader` is, plus
-            // the two answers only this route can give (ADR 0193).
+            // the two answers only this route can give (ADR 155).
             .idempotent => {
                 headers = headers ++ [_]openapi.Field{.{
                     .name = idempotent_mod.header_name,
@@ -1045,7 +1045,7 @@ pub fn operation(comptime pattern: []const u8, comptime f: anytype) openapi.Oper
             // that is the whole difference. nilo no longer refuses this
             // request before the handler runs; what the handler answers
             // instead is a line in a function body, and the document promises
-            // what the signature settles and nothing else (ADR 0024).
+            // what the signature settles and nothing else (ADR 023).
             .bound_body => body = openapi.schemaOf(readInto(roles[i], p.type.?)),
             .bound_form => {
                 const Fields = readInto(roles[i], p.type.?);
@@ -1058,7 +1058,7 @@ pub fn operation(comptime pattern: []const u8, comptime f: anytype) openapi.Oper
 
         var answer = answerOf(Fn);
         // **This is the one thing about a handler nilo cannot read off the
-        // signature** ([ADR 0150](../docs/adr/0150-a-ctx-handler-that-returns-nothing-may-have-written-it.md)).
+        // signature** ([ADR 120](../docs/adr/120-a-ctx-handler-that-returns-nothing-may-have-written-it.md)).
         // A handler holding a `*Ctx` and returning nothing may have written a
         // response itself, or may have taken the Ctx to read a header and left
         // nilo to send 200 with an empty body. Both are ordinary and Zig has
@@ -1099,7 +1099,7 @@ fn queryFields(comptime T: type) []const openapi.Field {
                 // or when the field is optional and absent means null — the
                 // same two exemptions `queryValue` applies at runtime. A list
                 // is never required: nothing sent is the empty list, which is
-                // what `queryValue` does with one (ADR 0164).
+                // what `queryValue` does with one (ADR 132).
                 .required = !is_list and
                     f.default_value_ptr == null and @typeInfo(f.type) != .optional,
                 .list = is_list,
@@ -1137,7 +1137,7 @@ fn answerOf(comptime Fn: type) openapi.Answer {
 
         // A redirect has no body to describe and a status that is part of
         // the type, so it is the most completely described thing a
-        // signature can produce (ADR 0032).
+        // signature can produce (ADR 031).
         if (hasNamedDecl(V, "nilo_redirect")) return .{
             .status = V.nilo_redirect,
             .content_type = "",
@@ -1150,7 +1150,7 @@ fn answerOf(comptime Fn: type) openapi.Answer {
             // so it is not knowable here. Saying "default" is the truth;
             // claiming 200 for a route that answers 201 would not be. A
             // `Status(code, T)` puts the code in the type instead, which is
-            // the whole reason that type exists (ADR 0024).
+            // the whole reason that type exists (ADR 023).
             const status: ?u16 = if (hasNamedDecl(V, "nilo_status")) V.nilo_status else null;
             const Inner = V.nilo_response;
             if (Inner == void) return .{ .status = status, .content_type = "", .schema = null };
@@ -1158,7 +1158,7 @@ fn answerOf(comptime Fn: type) openapi.Answer {
         }
 
         // A versioned answer is the body's answer with an `ETag` on it and
-        // a 304 beside it (ADR 0258).
+        // a 304 beside it (ADR 189).
         if (versioned_mod.isVersioned(V)) {
             var answer = answerWith(200, V.nilo_versioned);
             answer.versioned = true;
@@ -1170,7 +1170,7 @@ fn answerOf(comptime Fn: type) openapi.Answer {
 }
 
 /// The success answer for a handler returning `V`, with `?V` read as "and a
-/// 404 when it is not there" (ADR 0024) — so the body described is the thing
+/// 404 when it is not there" (ADR 023) — so the body described is the thing
 /// itself rather than "the thing or null".
 fn answerWith(comptime status: ?u16, comptime V: type) openapi.Answer {
     comptime {
@@ -1214,7 +1214,7 @@ fn contentTypeFor(comptime T: type) []const u8 {
 // ---- the compile-time side ----
 
 /// Everything that can be wrong with a route's pattern and its handler,
-/// checked from the method the caller actually wrote. See ADR 0027: the
+/// checked from the method the caller actually wrote. See ADR 026: the
 /// message is the same wherever it fires, but the reference trace Zig prints
 /// under it only reaches back two frames, and this is what puts the caller's
 /// own line inside those two.
@@ -1230,7 +1230,7 @@ pub fn check(comptime pattern: []const u8, comptime handler: anytype) void {
 /// What the return type has to get right, said at the route. Today that is
 /// one thing: a type that writes its own answer carries two declarations,
 /// and one without the other is refused here rather than sent as JSON with
-/// a label nobody chose (ADR 0195).
+/// a label nobody chose (ADR 157).
 fn checkAnswer(comptime pattern: []const u8, comptime Fn: type) void {
     comptime {
         const Returned = @typeInfo(Fn).@"fn".return_type orelse return;
@@ -1242,7 +1242,7 @@ fn checkAnswer(comptime pattern: []const u8, comptime Fn: type) void {
         verified_mod.checkNotAnswered(pattern, V);
         checkOptionalInside(pattern, V);
         // Before the `Response` unwrap, because one of the things it
-        // refuses is a versioned answer inside a `Response` (ADR 0258).
+        // refuses is a versioned answer inside a `Response` (ADR 189).
         versioned_mod.check(pattern, V);
         if (hasNamedDecl(V, "nilo_response")) V = V.nilo_response;
         if (versioned_mod.isVersioned(V)) {
@@ -1260,7 +1260,7 @@ fn checkAnswer(comptime pattern: []const u8, comptime Fn: type) void {
 }
 
 /// A `?` around a wrapper rather than inside it
-/// ([ADR 0276](../docs/adr/0276-a-question-mark-goes-inside-the-wrapper.md)).
+/// ([ADR 203](../docs/adr/203-a-question-mark-goes-inside-the-wrapper.md)).
 ///
 /// `sendResult` reads the wrappers first and `sendValue` unwraps the `?`
 /// after them, so `?Status(201, T)` reached neither: it was an optional of
@@ -1268,7 +1268,7 @@ fn checkAnswer(comptime pattern: []const u8, comptime Fn: type) void {
 /// and all. That compiled, answered 200 on the success path, and read
 /// memory that was never a header list. The shape nilo reads is
 /// `Status(201, ?T)`, which is 201 when the value is there and the same
-/// 404 `?T` means everywhere (ADR 0024); a redirect and a versioned answer
+/// 404 `?T` means everywhere (ADR 023); a redirect and a versioned answer
 /// have nothing for the `?` to be about, and the thing that is not there is
 /// `fail.notFound`.
 fn checkOptionalInside(comptime pattern: []const u8, comptime V: type) void {
@@ -1284,7 +1284,7 @@ fn checkOptionalInside(comptime pattern: []const u8, comptime V: type) void {
             @compileError(
                 "nilo: the handler for route \"" ++ pattern ++ "\" returns " ++ naming.of(V) ++
                     ", and the `?` has to go inside the wrapper.\n" ++
-                    "  A `?` is a 404 when the value is not there (ADR 0024), and the value is the " ++
+                    "  A `?` is a 404 when the value is not there (ADR 023), and the value is the " ++
                     "wrapper's body: write `" ++ wrapper ++ "`, which answers " ++
                     "the wrapper's status when the value is there and 404 when it is null. Or return " ++
                     "`nilo.fail.notFound(\"there is no {f}\", .{c.path()})` for the one that is not there.",
@@ -1479,7 +1479,7 @@ fn rolesOf(
 }
 
 /// Refuse a struct that renames its fields where a request is *read*
-/// ([ADR 0181](../docs/adr/0181-a-field-name-is-a-spelling-too.md)).
+/// ([ADR 148](../docs/adr/148-a-field-name-is-a-spelling-too.md)).
 ///
 /// `rename_all` on a struct is a spelling for what goes out: `json.write` sends
 /// the renamed keys and the API description promises them. Nothing renames on
@@ -1497,7 +1497,7 @@ fn checkNotRenamed(comptime pattern: []const u8, comptime T: type, comptime what
         @compileError(
             "nilo: the " ++ what ++ " on route \"" ++ pattern ++ "\" is read into `" ++
                 naming.of(Renamed) ++ "`, which renames its fields — and a renamed field name is a " ++
-                "spelling for what goes out (ADR 0181).\n" ++
+                "spelling for what goes out (ADR 148).\n" ++
                 "  nilo writes the renamed keys and the API description promises them; nothing " ++
                 "renames on the way in, so a client sending what the document says would be a 400 " ++
                 "naming every field.\n" ++
@@ -1508,7 +1508,7 @@ fn checkNotRenamed(comptime pattern: []const u8, comptime T: type, comptime what
 }
 
 /// Refuse a body holding a type that parses itself and has not handed
-/// `std.json` a reader ([ADR 0205](../docs/adr/0205-a-body-field-that-parses-itself.md)).
+/// `std.json` a reader ([ADR 166](../docs/adr/166-a-body-field-that-parses-itself.md)).
 ///
 /// A path param and a query value of the type are read by nilo through
 /// `nilo_parse`; a body is `std.json`'s, and `std.json` reads a struct into
@@ -1587,7 +1587,7 @@ fn roleOf(comptime pattern: []const u8, comptime P: type, comptime i: usize) Rol
     // reason: the two types are both "a file" and point in opposite
     // directions. Read as the request body — which is what a struct by value
     // is — this would land somewhere inside `std.json` being asked to parse a
-    // directory descriptor, which is a message nilo did not write (ADR 0015).
+    // directory descriptor, which is a message nilo did not write (ADR 014).
     if (comptime versioned_mod.isVersioned(P)) @compileError(
         "nilo: argument " ++ num(i + 1) ++ " of the handler for route \"" ++ pattern ++
             "\" is a `" ++ naming.of(P) ++ "`, which is what a handler answers *with* rather " ++
@@ -1615,12 +1615,12 @@ fn roleOf(comptime pattern: []const u8, comptime P: type, comptime i: usize) Rol
     );
     // Before the `.@"struct" => .body` below, which would otherwise swallow
     // it: a resolved value is a struct too, and the marker is what tells the
-    // two apart (ADR 0016).
+    // two apart (ADR 015).
     if (comptime resolve.isResolved(P)) return .resolved;
     // Before the switch entirely, and not only before `.@"struct" => .body`:
     // a type that says it can parse itself is a path param whatever kind it
     // is, and what a type says about itself wins over what its kind would
-    // otherwise have meant (ADR 0142). Reading the marker is also what checks
+    // otherwise have meant (ADR 113). Reading the marker is also what checks
     // its shape, so a `nilo_parse` written wrong is refused here.
     if (comptime convert_mod.parsesItself(P)) return .{ .param = 0 };
 
@@ -1633,7 +1633,7 @@ fn roleOf(comptime pattern: []const u8, comptime P: type, comptime i: usize) Rol
                 "nilo: argument " ++ num(i + 1) ++ " of the handler for route \"" ++ pattern ++
                     "\" is a " ++ naming.of(P) ++ ".\n" ++
                     "  Text from a request is asked for as a `nilo.Str`, not a bare slice: Str is " ++
-                    "what stops the contents from outliving the request (ADR 0004).\n" ++
+                    "what stops the contents from outliving the request (ADR 003).\n" ++
                     "  Inside the handler, `.view()` reads it and `.keep()` holds on to it.",
             ),
             else => @compileError(
@@ -1675,7 +1675,7 @@ fn roleOf(comptime pattern: []const u8, comptime P: type, comptime i: usize) Rol
 }
 
 /// A `FromHeader` has to name a header and ask for something request text can
-/// become (ADR 0163). Checked where the argument is read, so the message
+/// become (ADR 131). Checked where the argument is read, so the message
 /// names the route and the header rather than landing inside `convert`.
 fn checkHeaderValue(comptime pattern: []const u8, comptime P: type, comptime i: usize) void {
     comptime {
@@ -1753,7 +1753,7 @@ fn checkQueryFields(comptime pattern: []const u8, comptime T: type, comptime i: 
         for (info.fields) |f| {
             if (convert_mod.convertible(f.type)) continue;
             // A list of them, which is `?tag=a,b` and `?tag=a&tag=b`
-            // ([ADR 0164](../docs/adr/0164-a-query-parameter-that-is-a-list.md)).
+            // ([ADR 132](../docs/adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)).
             // Checked here rather than in `convertible`, because the answer is
             // different one slot over: a `Form(T)` reads a body this file does
             // not, and promising a list there would compile and fill nothing.
@@ -1789,7 +1789,7 @@ fn checkQueryFields(comptime pattern: []const u8, comptime T: type, comptime i: 
 /// database connection's shape, not a uuid's. That was the only answer there
 /// was before a type could parse itself. Now there is a second one, and a
 /// route with an unclaimed `:id` is exactly where it is the right one
-/// (ADR 0142). Empty on a route with every param taken, because there the
+/// (ADR 113). Empty on a route with every param taken, because there the
 /// sentence above is still the whole truth.
 fn orMeantAsAParam(
     comptime param_names: []const []const u8,
@@ -1859,7 +1859,7 @@ fn paramValue(comptime P: type, c: *const Ctx, comptime name: []const u8) !P {
 }
 
 /// The element of a query field that is a list, or null when it is not one
-/// ([ADR 0164](../docs/adr/0164-a-query-parameter-that-is-a-list.md)).
+/// ([ADR 132](../docs/adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)).
 ///
 /// `convert.zig`'s, because `bound.zig` has to give the same answer when it
 /// words the failure of one — and a list that fills here and reports as
@@ -1882,7 +1882,7 @@ fn countList(c: *const Ctx, comptime name: []const u8) usize {
 }
 
 /// Every value of one repeated or comma-joined query parameter, converted
-/// ([ADR 0164](../docs/adr/0164-a-query-parameter-that-is-a-list.md)).
+/// ([ADR 132](../docs/adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)).
 ///
 /// **Both spellings are read, and that is the decision.** `?type=A,B` is what
 /// nilo writes into the document as `style: form, explode: false`, and it is
@@ -1895,7 +1895,7 @@ fn countList(c: *const Ctx, comptime name: []const u8) usize {
 /// **One allocation, for a route that asked for a list and no other.** The
 /// elements point into the query string, which lives as long as the request;
 /// what is allocated is the slice of them, sized by a first pass, out of the
-/// request arena (ADR 0018).
+/// request arena (ADR 017).
 ///
 /// An empty value contributes nothing, so `?tags=` is an empty list rather
 /// than a list holding one empty string. That is the cost of the separator:
@@ -1928,7 +1928,7 @@ fn collectList(
 }
 
 /// `collectList`, recording what would not convert instead of answering with
-/// it (ADR 0164). The **first** bad value is the one the handler is told
+/// it (ADR 132). The **first** bad value is the one the handler is told
 /// about, and the rest of the list is still read: a filter with one typo in
 /// it is a filter, not a request with nothing in it.
 fn collectListCollecting(
@@ -2001,7 +2001,7 @@ fn queryValue(comptime T: type, c: *const Ctx) !T {
             return fail.badRequest("{s} is required", .{label});
         }
     }
-    // A struct that checks itself is checked once it is whole (ADR 0264).
+    // A struct that checks itself is checked once it is whole (ADR 193).
     try bound_mod.enforce(.query, T, out);
     return out;
 }
@@ -2027,7 +2027,7 @@ fn queryValueCollecting(
         if (comptime queryList(f.type)) |Item| {
             // The same reading as `queryValue`, with the one difference this
             // whole function is: a value that will not convert is recorded
-            // rather than answered (ADR 0164, `bound.zig`).
+            // rather than answered (ADR 132, `bound.zig`).
             const found = collectListCollecting(Item, c, f.name, &outcomes[i]) catch &.{};
             if (found.len == 0) {
                 if (f.defaultValue()) |default| {
@@ -2073,13 +2073,13 @@ fn sendResult(c: *Ctx, result: anytype) !void {
     if (T == void) return;
     // Before `nilo_response`, and carrying no body of its own: a redirect
     // is a status and a Location, and its `headers` are how a sign-in sends
-    // a `Set-Cookie` on the way out (ADR 0032).
+    // a `Set-Cookie` on the way out (ADR 031).
     if (comptime hasNamedDecl(T, "nilo_redirect")) {
         for (value.headers.view()) |h| try c.setHeader(h.name, h.value);
         return c.redirect(T.nilo_redirect, value.location);
     }
     // A version the handler named is an `ETag`, and a client that sent it
-    // back gets a 304 with no body (ADR 0258). The tag and the handler's
+    // back gets a 304 with no body (ADR 189). The tag and the handler's
     // headers go on both answers, because a 304 describes the
     // representation the client is holding. The tag lives in this frame,
     // so it is `setHeader` — copied — and not `setStaticHeader`.
@@ -2115,7 +2115,7 @@ fn sendValue(c: *Ctx, status: u16, value: anytype) !void {
     // type, which is still the truth.
     if (T == void) return c.sendEmpty(status);
     // `?T` is how a signature says "this may not exist", and the only answer
-    // HTTP has for that is a 404 (ADR 0024). The alternative — 200 with the
+    // HTTP has for that is a 404 (ADR 023). The alternative — 200 with the
     // body `null` — is a thing nobody meant and every client crashes on.
     if (comptime @typeInfo(T) == .optional) {
         const present = value orelse return fail.notFound("there is no {s}", .{c._path});
@@ -2125,9 +2125,9 @@ fn sendValue(c: *Ctx, status: u16, value: anytype) !void {
     // the optional is unwrapped. `?Redirect` is not an idiom — a redirect is
     // an answer the handler decided on, so there is nothing for the `?` to
     // mean — while `?FileBody` is the *main* idiom: a file that may not be
-    // there is what "the invoice for this id" almost always is, and ADR 0037
+    // there is what "the invoice for this id" almost always is, and ADR 009
     // leans on `?` meaning a 404 exactly as it does everywhere else
-    // (ADR 0024). Recognised after the unwrap, one line of dispatch serves
+    // (ADR 023). Recognised after the unwrap, one line of dispatch serves
     // both `FileBody` and `?FileBody`.
     //
     // `status` is not passed on, and that is not an oversight: what a file
@@ -2135,10 +2135,10 @@ fn sendValue(c: *Ctx, status: u16, value: anytype) !void {
     // `sendfile.send` — a 200, a 206, a 304 or a 416 — and no field on a
     // `Response(FileBody)` could be right about which.
     if (comptime filebody.isFileBody(T)) return filebody.send(c, value);
-    // Bytes in hand under a label decided per request (ADR 0212): the same
+    // Bytes in hand under a label decided per request (ADR 173): the same
     // place, for the same `?` reason, and this one takes the status.
     if (comptime bytebody.isBytes(T)) return bytebody.send(c, status, value);
-    // A type that writes its own answer, under its own label (ADR 0195).
+    // A type that writes its own answer, under its own label (ADR 157).
     // Dispatched here, after every wrapper is taken apart, so `?T`,
     // `Status(201, T)` and `Response(T)` all reach it the way they reach
     // JSON. What it costs is what JSON costs: the same arena buffer, the
@@ -2171,7 +2171,7 @@ const testing = std.testing;
 /// carries: it reads itself out of request text, writes its own JSON, and
 /// says what that JSON looks like. `http/` may not import `nilo_id`, and each
 /// of the three is a declaration read by name precisely so that it need not
-/// (ADR 0042, ADR 0076, ADR 0142).
+/// (ADR 038, ADR 016, ADR 113).
 const Ticket = struct {
     number: u32,
 
@@ -2193,7 +2193,7 @@ fn showTicket(id: Ticket) Ticket {
 }
 
 test "a type that says it can parse itself is a path param, not the request body" {
-    // The whole of the bug ADR 0142 closes: a struct by value used to be the
+    // The whole of the bug ADR 113 closes: a struct by value used to be the
     // request body whatever it said about itself, so a route could not take
     // one as its `:id` at all.
     const roles = comptime rolesOf("/tickets/:id", @typeInfo(@TypeOf(showTicket)).@"fn".params);
@@ -2204,7 +2204,7 @@ test "a type that says it can parse itself is a path param, not the request body
 test "the third answer is offered only where there is a slot for it" {
     // The sentence itself, because a Refusal can only pin the first line of a
     // message and this one is the third. What it guards is the mistake
-    // ADR 0142 found: the old wording told everybody to write `*Uuid`.
+    // ADR 113 found: the old wording told everybody to write `*Uuid`.
     try testing.expectEqualStrings(
         "\n  Or, if it is meant to be the path param `:sku`: a path param is a number, " ++
             "a `nilo.Str`, a `bool`, an enum, or a type carrying " ++

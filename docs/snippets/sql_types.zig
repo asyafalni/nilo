@@ -1,5 +1,5 @@
 //! The world every checked snippet in [the SQL guide](../guide/sql/README.md) is
-//! compiled against (ADR 0083).
+//! compiled against (ADR 068).
 //!
 //! A prelude of its own rather than the shared
 //! [`types.zig`](./types.zig), because this is the page that *teaches*
@@ -86,7 +86,7 @@ pub const Rename = struct {
 };
 
 /// A pure join table, for the `.key` conflict target: its key is the two
-/// columns and there is no `id` at all, which is the shape ADR 0186 is about.
+/// columns and there is no `id` at all, which is the shape ADR 151 is about.
 pub const UserTag = struct {
     pub const nilo_table = .{ .name = "user_tags", .key = .{ .user_id, .tag } };
 
@@ -117,7 +117,7 @@ pub const PartnerCapability = struct {
 };
 
 /// For the `nilo_beside` snippet in the raw guide: the second read that
-/// fills the field no column holds (ADR 0217).
+/// fills the field no column holds (ADR 178).
 pub const Attachment = struct { id: i64, filename: Str };
 
 pub fn attachmentsOf(scope: *nilo.Ctx, comment_id: i64) ![]const Attachment {

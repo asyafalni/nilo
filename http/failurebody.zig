@@ -1,5 +1,5 @@
 //! The body a failure goes out with, when nilo's is not the one your clients
-//! already read ([ADR 0270](../docs/adr/0270-a-failure-body-is-a-struct-the-application-names.md)).
+//! already read ([ADR 024](../docs/adr/024-every-failure-answers-as-json.md)).
 //!
 //! ```zig
 //! const ApiError = struct {
@@ -17,7 +17,7 @@
 //! Every failure nilo assembles — a fail function's sentence, a 404 for a
 //! route nobody registered, a 400 for a body that did not fit, a 500 for an
 //! error nothing mapped — went out as `{"error":"…","status":400}`, and
-//! ADR 0025 says why one shape is right. It is right for an application
+//! ADR 024 says why one shape is right. It is right for an application
 //! that has no shape yet. An application with three other services and a
 //! frontend that already reads `{"code":…,"detail":…}` from all of them has
 //! one, and the only way to send it was a middleware that caught the error
@@ -37,7 +37,7 @@
 //! **What it costs.** Nothing on a request that succeeds: the shape is read
 //! once, on a failure, from a field on `App` that is null unless `failures`
 //! was called. On a failure it is a JSON write into the same fixed buffer the
-//! default shape uses — no allocation, which is the invariant ADR 0025 names:
+//! default shape uses — no allocation, which is the invariant ADR 024 names:
 //! the failure path must not have a failure path of its own. The buffer has
 //! room for the longest message a Failure can hold, fully escaped, plus 256
 //! bytes for the envelope around it; a shape that needs more is a shape that
@@ -50,7 +50,7 @@
 //! coding nilo cannot read, a request shed past `max_in_flight` — keep
 //! nilo's shape. They are compile-time constants written in one `writeAll`,
 //! answered to a client that did not manage to send an HTTP request nilo
-//! could route, and the reason they are constants (ADR 0197: a shed request
+//! could route, and the reason they are constants (ADR 159: a shed request
 //! costs one write) is worth more than their envelope.
 
 const std = @import("std");
@@ -103,7 +103,7 @@ pub fn check(comptime T: type) void {
                 naming.of(T) ++ "`.\n" ++
                 "  It is handed the status and the sentence, and hands back the struct, and " ++
                 "nothing else: it cannot fail, because the failure path must not have a " ++
-                "failure path of its own (ADR 0025).",
+                "failure path of its own (ADR 024).",
         );
     }
 }

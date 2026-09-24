@@ -1,5 +1,5 @@
 //! A stream never holds its rows, and children are handed to rows that are
-//! held, so a Row with children is read with `db.select` (ADR 0295).
+//! held, so a Row with children is read with `db.select` (ADR 218).
 
 const sql = @import("nilo_sql");
 const nilo = @import("nilo_http");

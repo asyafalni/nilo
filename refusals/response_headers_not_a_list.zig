@@ -1,6 +1,6 @@
 //! Response headers passed as a slice. They have to be written out where
 //! they are set, because a slice would not say how many there are until the
-//! program runs and the response has to hold them itself (ADR 0019).
+//! program runs and the response has to hold them itself (ADR 018).
 
 const nilo = @import("nilo_http");
 

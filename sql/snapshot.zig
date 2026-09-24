@@ -1,5 +1,5 @@
 //! What the last `generate` believed the schema was, as a file the repository
-//! holds ([ADR 0153](../docs/adr/0153-a-migration-is-a-diff-against-a-snapshot.md)).
+//! holds ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 //!
 //! **This is the file that makes `generate` need no database.** A diff has two
 //! sides: the caller's types, which are in the binary, and what the schema was
@@ -49,7 +49,7 @@ pub const Doc = struct {
     /// their whole schema.
     dialect: []const u8,
     tables: []const Desc = &.{},
-    /// The three lists a `sql.Schema` carries beside its tables (ADR 0253),
+    /// The three lists a `sql.Schema` carries beside its tables (ADR 181),
     /// each with a default so a file written before they existed reads as
     /// one with none. A function and a view go in as a name and a hash, the
     /// way a check does.
@@ -150,7 +150,7 @@ pub fn parseWith(
 }
 
 /// v0.4.0's shape, which is the one field rename this module has made
-/// ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 ///
 /// **Read, never written**, and it is here because the alternative is a dead
 /// end rather than an inconvenience. `db generate` is what every page tells
@@ -162,8 +162,8 @@ pub fn parseWith(
 /// One mirror struct per shape that renamed a field, and they go at 1.0 with a
 /// line in the CHANGELOG. Nothing else from v0.4.0 needs one: every other word
 /// the marker gained since arrived as a field with a default, and `std.zon`
-/// fills a missing field from its default, which is the property ADR 0221 was
-/// careful to keep and ADR 0222 was not.
+/// fills a missing field from its default, which is the property every new word
+/// keeps and a renamed field does not (ADR 181).
 fn upgraded(gpa: std.mem.Allocator, text: [:0]const u8) !Doc {
     // A `Diagnostics` nobody reads, because `std.zon.parse.fromSliceAlloc`
     // **leaks on a failing parse when it is handed none** — `zig test` on four
@@ -391,7 +391,7 @@ test "a table is found by its schema as well as its name" {
     try testing.expectEqual(@as(?Desc, null), doc.table("other", "audit"));
 }
 
-// -- the words that live inside one Row (ADR 0221) ------------------------
+// -- the words that live inside one Row (ADR 181) ------------------------
 
 const Level = enum { low, high };
 
@@ -504,8 +504,7 @@ test "a snapshot whose foreign keys are the older single-column shape is upgrade
     // page gives, `db generate`, reads the snapshot before it writes one. So
     // the older shape is read by a mirror struct and handed back as the
     // current one, and the file is rewritten by the generate that follows
-    // ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md),
-    // [ADR 0224](../docs/adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
+    // ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
     const gpa = testing.allocator;
 
     const older =
@@ -725,7 +724,7 @@ test "a snapshot written before a table could carry a check reads back as one wi
     const doc = try parse(gpa, text, null);
     defer free(gpa, doc);
     // `std.zon` fills a missing field from its default, which is the property
-    // ADR 0221 was careful to keep — so a word added to the marker never needs
+    // ADR 181 was careful to keep — so a word added to the marker never needs
     // a mirror struct the way the `.references` rename did.
     const t = doc.table(null, "ledgers").?;
     try testing.expectEqual(@as(usize, 0), t.checks.len);

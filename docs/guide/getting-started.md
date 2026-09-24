@@ -90,8 +90,7 @@ The package is `nilo`; the module is `nilo_http`. **The bare name is the
 project's, not any one module's** — `nilo_sql`, `nilo_id` and `nilo_core` sit
 beside the server, and you add a line here for each one you import and nothing
 for the ones you do not
-([ADR 0041](../adr/0041-a-module-sits-where-the-loop-puts-it.md),
-[ADR 0042](../adr/0042-the-bottom-layer-holds-more-than-one-module.md)). In your
+([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)). In your
 own code the alias goes back:
 
 ```zig
@@ -114,7 +113,7 @@ warning comes out of `nilo.testing.Client` and not only out of `listen()`: a
 suite that loops over both optimize modes fetches the dependency in the same
 place, and a ReleaseSafe suite running against a Debug nilo is checking a
 configuration nobody deploys
-([ADR 0084](../adr/0084-a-library-can-tell-what-mode-the-program-was-built-in.md)).
+([ADR 069](../adr/069-a-library-can-tell-what-mode-the-program-was-built-in.md)).
 
 ## A server that answers
 
@@ -166,7 +165,7 @@ is instead is a server started again every time the build writes a new one.
 `nilo-dev` ships with the package and does that — it runs one
 `zig build --watch`, and restarts your server whenever the binary it
 produces changes
-([ADR 0259](../adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
+([ADR 190](../adr/190-a-restart-on-save-watches-the-binary-not-the-sources.md)).
 Four lines under the `run` step:
 
 ```zig
@@ -196,7 +195,7 @@ nilo-dev: zig-out/bin/my-app changed; restarted (pid 41107, the old one drained 
 
 A build step that reads the front end, an `installDirectory` of its assets say, runs on a save there and copies what changed; the server is not restarted, because the binary did not change. `python3 bench/devloop.py` is the check that all of this stays true, and it runs against any dev step given a file the build reads and one it does not.
 
-**The first server is the one your sources describe.** Before it watches anything, `nilo-dev` runs the build once to the end, so a binary left in `zig-out` by an earlier session, from sources you have since changed, is never started: it could seed a database with a schema you just removed. If that first build fails, the old binary is deleted and nothing starts until a save compiles ([ADR 0259](../adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
+**The first server is the one your sources describe.** Before it watches anything, `nilo-dev` runs the build once to the end, so a binary left in `zig-out` by an earlier session, from sources you have since changed, is never started: it could seed a database with a schema you just removed. If that first build fails, the old binary is deleted and nothing starts until a save compiles ([ADR 190](../adr/190-a-restart-on-save-watches-the-binary-not-the-sources.md)).
 
 **A build that fails changes nothing.** The errors print, the old server keeps
 serving, and the next save that compiles is the one that restarts it. The old

@@ -14,7 +14,7 @@
 //! by the time `listen()` resolves them and the router has already numbered it,
 //! so a counter is an **array index the request is holding anyway** — no hash, no
 //! map, no keys, and `/users/1` and `/users/2` land on `/users/:id` for free
-//! (ADR 0100).
+//! (ADR 079).
 //!
 //! What that buys is the axis this framework will not spend: a request that is
 //! counted allocates nothing. The table is one allocation when the routes are
@@ -27,7 +27,7 @@
 //! or a shard table, and none of that fits. What replaces it is `app.expose`:
 //! you declare the atomic, you increment it, and nilo publishes it. The naming
 //! is paid once at startup and the reading once per scrape — never on the path
-//! of a request that is not the scrape (ADR 0100).
+//! of a request that is not the scrape (ADR 079).
 
 const std = @import("std");
 const Ctx = @import("ctx.zig").Ctx;
@@ -87,7 +87,7 @@ pub const unparsed = 0;
 pub const unmatched = 1;
 pub const method_not_allowed = 2;
 pub const static_file = 3;
-/// A request parsed and refused for load before it was routed (ADR 0197).
+/// A request parsed and refused for load before it was routed (ADR 159).
 pub const shed = 4;
 pub const fixed_slots = 5;
 
@@ -332,7 +332,7 @@ fn classOf(status: u16) usize {
 /// bytes with it and **17,416 without**, so more than half the cost of metrics
 /// was a float printer, for a handful of decimal points on a page that is
 /// scraped every fifteen seconds
-/// ([ADR 0100](../docs/adr/0100-the-route-table-is-the-registry.md)).
+/// ([ADR 079](../docs/adr/079-the-route-table-is-the-registry.md)).
 /// A microsecond count is six decimal places of a second and nothing else, so
 /// this is integer division and a trim.
 fn writeSeconds(w: *std.Io.Writer, micros: u64) !void {

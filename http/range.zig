@@ -1,7 +1,7 @@
 //! `Range: bytes=…` — asking for part of a file rather than all of it.
 //!
 //! What it is for is a video being scrubbed, an audio file being seeked, and
-//! a download being resumed. A file is already in memory (ADR 0010), so
+//! a download being resumed. A file is already in memory (ADR 009), so
 //! answering one is a slice and two headers; all the work is in reading the
 //! header correctly, and in refusing to guess when it does not make sense.
 //!

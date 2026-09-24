@@ -20,19 +20,19 @@
 //! cookie. That is the reason to prefer this over an id pointing at a store
 //! rather than a detail of how it is written: there is no table, no expiry
 //! sweep, no lock, and nothing added to the 4,669 bytes an idle connection
-//! holds ([ADR 0018](../docs/adr/0018-the-trade-budget-has-three-axes.md)).
+//! holds ([ADR 017](../docs/adr/017-the-trade-budget-has-four-axes.md)).
 //! A request that does not ask for a session runs the code it ran before.
 //!
 //! **No sweep is not no expiry.** The seal carries the moment it stops
 //! opening, and `open` refuses it after that
-//! ([ADR 0088](../docs/adr/0088-an-expiry-a-client-can-ignore-is-not-one.md)).
+//! ([ADR 033](../docs/adr/033-a-session-is-sealed-into-the-cookie.md)).
 //! It has to be inside the seal: the cookie's own `Max-Age` is advice to a
 //! browser, and a copy of the cookie taken off the wire does not take advice.
 //! `Options.max_age` sets both, and `default_max_age` is the ceiling when
 //! nobody sets either.
 //!
 //! The cipher comes from `std.crypto`, so this costs no dependency and does
-//! not reopen [ADR 0028](../docs/adr/0028-tls-is-terminated-in-front.md)'s
+//! not reopen [ADR 027](../docs/adr/027-tls-is-terminated-in-front.md)'s
 //! refusal of one-person crypto. The shape is jetzig's; it is the one design
 //! in that framework nilo had no answer to.
 //!
@@ -46,7 +46,7 @@
 //! **A session is not authentication.** It is where a signed-in user's id is
 //! kept once something else has established it; what establishes it is the
 //! application's, the same line
-//! [ADR 0016](../docs/adr/0016-resolved-values-are-declared-by-their-type.md)
+//! [ADR 015](../docs/adr/015-resolved-values-are-declared-by-their-type.md)
 //! draws.
 
 const std = @import("std");
@@ -96,7 +96,7 @@ pub const max_cookie_bytes = 3800;
 /// The format the plaintext is in, so a future change to the layout can be
 /// told from a cookie written before it.
 ///
-/// **2 since the seal carries its own expiry** (ADR 0088). The size check in
+/// **2 since the seal carries its own expiry** (ADR 033). The size check in
 /// `open` would already refuse a version-1 cookie, because the plaintext grew
 /// by eight bytes — this is the guard that says *why* rather than the one that
 /// happens to catch it.
@@ -105,7 +105,7 @@ const format_version: u8 = 2;
 /// How long a session is good for when `Options.max_age` does not say.
 ///
 /// **`Max-Age` is advice to a browser and the seal is the only thing that
-/// binds** (ADR 0088). A session cookie — `max_age = null` — asks the browser
+/// binds** (ADR 033). A session cookie — `max_age = null` — asks the browser
 /// to forget it when the window closes, and a browser will; a copy of the
 /// cookie taken off the wire or out of a backup will not, and before the seal
 /// carried an expiry that copy opened forever.
@@ -134,7 +134,7 @@ pub const Error = error{
 /// expiry, and the fields. Settled while compiling, which is what makes the
 /// cookie ceiling checkable at all.
 ///
-/// The expiry is eight bytes of the 3,800 a cookie has (ADR 0088) — seconds
+/// The expiry is eight bytes of the 3,800 a cookie has (ADR 033) — seconds
 /// rather than milliseconds because a session measured to the millisecond is
 /// a session nobody asked for, and seconds is what `Max-Age` counts anyway.
 pub fn plainSize(comptime T: type) usize {
@@ -354,7 +354,7 @@ fn decode(comptime T: type, in: []const u8) Unreadable!Decoded(T) {
 /// duration, and that is what keeps this function pure: the clock is read by
 /// `Session.setWith`, one layer up, so every arm of the expiry rule can be run
 /// from a test that names its own times instead of one that waits
-/// ([ADR 0033](../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)).
+/// ([ADR 032](../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)).
 /// An expiry check that could only be seen to pass would be exactly the guard
 /// that ADR is about.
 ///
@@ -379,7 +379,7 @@ pub fn seal(comptime T: type, value: T, expires_at: i64, key: Key, out: []u8) ![
     //
     // Through the Bulkhead rather than `std.crypto.random`, because this is
     // a syscall and a syscall made straight from a fiber stops every request
-    // sharing its thread (ADR 0002, ADR 0014).
+    // sharing its thread (ADR 001, ADR 013).
     try bulkhead.randomSecure(nonce);
 
     const body = raw[Cipher.nonce_length..][0..plain.len];
@@ -406,7 +406,7 @@ pub fn open(comptime T: type, text: []const u8, key: Key) ?T {
 /// **The pure half, and it is here so the expiry can be seen to fail.** A
 /// check that can only be exercised by waiting a day is a check that will only
 /// ever be seen to pass, which is the shape
-/// [ADR 0033](../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
+/// [ADR 032](../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
 /// exists to refuse. Every arm below is reached by a test naming two numbers.
 ///
 /// It is also what a test of an application's own can use to stand a session
@@ -440,7 +440,7 @@ pub fn openAt(comptime T: type, text: []const u8, key: Key, now: i64) ?T {
 /// Seconds since the epoch — what an expiry is counted in.
 ///
 /// `nilo_core`'s clock, which is a read from a page the kernel keeps mapped
-/// and needs no event loop (ADR 0045). Read once per request that carries a
+/// and needs no event loop (ADR 041). Read once per request that carries a
 /// session cookie, and not at all by one that does not.
 fn nowSeconds() i64 {
     return @divFloor(core.nowMillis(), std.time.ms_per_s);
@@ -465,7 +465,7 @@ pub fn checkSecret(secret: []const u8) Error!Key {
 /// The session, asked for by writing it in a handler's argument list.
 ///
 /// A resolved value like any other
-/// ([ADR 0016](../docs/adr/0016-resolved-values-are-declared-by-their-type.md)),
+/// ([ADR 015](../docs/adr/015-resolved-values-are-declared-by-their-type.md)),
 /// so the cookie is read and decrypted once per request however many things
 /// ask for it — a middleware guarding a prefix and the handler behind it do
 /// not pay twice.
@@ -504,7 +504,7 @@ pub fn Session(comptime T: type) type {
         pub const nilo_resolve = read;
 
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = "nilo.Session(" ++ naming.of(T) ++ ")";
 
         /// What arrived, if anything readable did.
@@ -514,7 +514,7 @@ pub fn Session(comptime T: type) type {
         /// like every other field a caller has no business touching.
         ///
         /// Optional, and defaulted, so that a handler taking a session is
-        /// still an ordinary function a test can call (ADR 0003):
+        /// still an ordinary function a test can call (ADR 002):
         ///
         /// ```zig
         /// try testing.expect((try me(.{ .value = .{ .user = 7 } })) != null);
@@ -562,7 +562,7 @@ pub fn Session(comptime T: type) type {
             );
             // One number fills both halves: the browser is asked to forget the
             // cookie at `max_age`, and the seal stops opening at the same
-            // moment whether the browser obliged or not (ADR 0088).
+            // moment whether the browser obliged or not (ADR 033).
             const lives_for = options.max_age orelse default_max_age;
             var buf: Sealed(T) = undefined;
             const text = try seal(T, value, nowSeconds() + lives_for, key.*, &buf);
@@ -607,7 +607,7 @@ pub const Options = struct {
     path: []const u8 = "/",
     domain: []const u8 = "",
     /// How long the session lives, in seconds — **in the cookie and inside
-    /// the seal** (ADR 0088). Set it to keep somebody signed in past the
+    /// the seal** (ADR 033). Set it to keep somebody signed in past the
     /// browser closing.
     ///
     /// Null is a session cookie: the browser is asked to forget it at the end
@@ -666,7 +666,7 @@ test "a session stops opening the moment its expiry passes" {
 
     // And nothing after it. **This is the arm that could not be reached
     // before**: an expiry only a wall clock could pass is a guard that would
-    // never be seen to fail (ADR 0033).
+    // never be seen to fail (ADR 032).
     try testing.expect(openAt(Signed, text, key_a, signed_at + good_for) == null);
     try testing.expect(openAt(Signed, text, key_a, signed_at + good_for + 1) == null);
     try testing.expect(openAt(Signed, text, key_a, signed_at + 10 * good_for) == null);
@@ -1010,7 +1010,7 @@ test "asking for a session with no secret set fails with a message, not a wrong 
 }
 
 test "a handler taking a session is still an ordinary function" {
-    // ADR 0003's promise, held for this argument type too: no request, no
+    // ADR 002's promise, held for this argument type too: no request, no
     // cookie, no server — the handler is a function of what it was given.
     try testing.expectEqual(@as(u32, 7), (try whoHandler(.{ .value = .{ .user = 7 } })).?.user);
     try testing.expect(try whoHandler(.{ .value = null }) == null);

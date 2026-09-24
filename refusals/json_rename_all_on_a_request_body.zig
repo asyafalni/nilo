@@ -5,7 +5,7 @@
 //!
 //! So this route would document `fullName`, and answer 400 to a client that
 //! sent it. One direction that works beats two that can disagree about one
-//! field (ADR 0181).
+//! field (ADR 148).
 
 const nilo = @import("nilo_http");
 

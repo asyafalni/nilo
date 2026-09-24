@@ -6,7 +6,7 @@ Sixteen `Range` connections per file, a steal from the longest running one,
 resume on `ETag`, one SQLite file, a TUI on a worker thread that knows nothing
 about a terminal.
 
-This is the second round. The first was the seven items ADR 0229 to 0235
+This is the second round. The first was the seven items in ADRs 160, 056, 182, 183, 123, 125 and 184
 closed, and every one of those has left fdm's source. What is here is what
 stayed behind once they were gone, plus one thing that measuring the
 workaround turned up. Each item is anchored to the lines in fdm that carry
@@ -21,7 +21,7 @@ rather than a gap.
 
 | # | Gap | Module | What it takes out of fdm | Conflicts with a stated non-goal? |
 |---|-----|--------|--------------------------|-----------------------------------|
-| 1 | A bound on progress, not on the call | `nilo_fetch` | the stall half of `supervise`, ~30 lines and two fields per segment | Touches ADR 0230's rejection of per-read timeouts, but is not that |
+| 1 | A bound on progress, not on the call | `nilo_fetch` | the stall half of `supervise`, ~30 lines and two fields per segment | Touches ADR 056's rejection of per-read timeouts, but is not that |
 | 2 | `transfer_buffer` does nothing on the `stream` path, and the buffer that does is not exposed | `nilo_fetch` | 1 MiB of stack per download that buys nothing | No |
 | 3 | An `Exchange` that carries its own small transfer buffer | `nilo_fetch` | one buffer and one field on every call that is not a transfer | No, the cost stays on the caller's stack |
 | 4 | "Do not follow redirects" and "forgot the buffer" are spelled the same | `nilo_fetch` | nothing today; a class of first-week bug | No |
@@ -35,13 +35,13 @@ rather than a gap.
 
 ### What is there
 
-`timeout_ms` bounds a whole call, and since ADR 0230 it fires with or
+`timeout_ms` bounds a whole call, and since ADR 056 it fires with or
 without an Engine. For a download that is the wrong shape of bound: a
 segment's call *is* the transfer, and a transfer may take hours, so the only
 honest value is `0`. That leaves a segment whose peer went quiet with nothing
 to end it.
 
-ADR 0230 rejected per-read timeouts for the right reason: a server sending
+ADR 056 rejected per-read timeouts for the right reason: a server sending
 one byte a second satisfies any per-read limit and never finishes, so an API
 call needs an end-to-end bound. fdm agrees, for an API call. A transfer is
 the case where the end-to-end bound cannot be set and the one-byte-a-second
@@ -59,7 +59,7 @@ segment, compare `seg.have()` to `seg.last_seen`; if it moved, stamp
 `last_moved_ms`; if it has not moved for `settings.stall_ms` (10 s, `--stall`
 on the command line at `src/main.zig:80`), `future.cancel(io)`, count a
 failure, mark the segment idle so the loop restarts it. The two fields are
-`src/download.zig:960-961`. The mechanism under it is the one ADR 0230 now
+`src/download.zig:960-961`. The mechanism under it is the one ADR 056 now
 uses: `Threaded.cancel` sends a signal into the blocking `recv` and the task
 comes out with `error.Canceled`.
 
@@ -77,7 +77,7 @@ long. The two compose: `timeout_ms` is the ceiling on the whole call,
 both.
 
 Under an Engine the `Bound` is re-armed at `now + stall_ms` each time a chunk
-lands. Without one, ADR 0230's `bounded` already runs each step as a task and
+lands. Without one, ADR 056's `bounded` already runs each step as a task and
 waits on a futex with the deadline as the timeout; for `stream`, `pipe` and
 `readInto` the step becomes a loop of chunks, and the wait's timeout is
 `stall_ms` from the last chunk rather than the call's deadline. The chunk is
@@ -100,7 +100,7 @@ connections and nilo sees one.
 ### What it costs
 
 One `i64` on `Exchange` for the moment of the last chunk, which the padding
-ADR 0230 found room in may or may not still have. Without an Engine, one
+ADR 056 found room in may or may not still have. Without an Engine, one
 futex wait per chunk instead of one per step, on the client that has a
 `stall_ms` set and only there. Under an Engine, one `Bound.arm` per chunk.
 No allocation.
@@ -190,7 +190,7 @@ the same as what a caller can do outside.
 
 `@sizeOf(Exchange)` goes from 928 to about 5 KiB. It is on the stack of a
 handler that dials out, for the duration of the call, and a handler's stack
-under the Engine is the number ADR 0230 counted. If 4 KiB is too much there,
+under the Engine is the number ADR 056 counted. If 4 KiB is too much there,
 1 KiB covers a JSON head and the rule holds.
 
 ---
@@ -309,7 +309,7 @@ Nothing per call. The columns are read once either way.
 
 ### What was there
 
-ADR 0237's `Exchange.stream(w, limit)`: one chunk, and "zero is the end of
+ADR 056's `Exchange.stream(w, limit)`: one chunk, and "zero is the end of
 the body", mapped from `error.EndOfStream`. The value it handed back
 otherwise was whatever `std.Io.Reader.stream` returned, and on a TLS
 connection that is zero more often than not at the start: std's

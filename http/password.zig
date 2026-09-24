@@ -1,5 +1,5 @@
 //! Hashing a password from inside a request: the Gate, the blocking pool and
-//! the salt, so that a handler writes one call (ADR 0048).
+//! the salt, so that a handler writes one call (ADR 044).
 //!
 //! `nilo_pw` is the whole of the cryptography and none of this. It is a tool
 //! module with no event loop, so it cannot take entropy, cannot park a fiber
@@ -13,7 +13,7 @@
 //! directly holds its thread for 13 ms per sign-in, every sign-in, and
 //! nothing anywhere says so — not the log, not a test, not the benchmark. It
 //! shows up as p99 on endpoints that have nothing to do with signing in
-//! (ADR 0034 is the detector; this is the gap in it).
+//! (ADR 013 is the detector; this is the gap in it).
 //!
 //! That is why the two functions here exist rather than a paragraph in the
 //! documentation telling people to wrap the call. The wrapping is not
@@ -25,7 +25,7 @@
 //! measurement says not to run. `limit` is set from `Options` by `listen`.
 //!
 //! **Checking needs no request, and `verifyAnywhere` is that half said out
-//! loud** (ADR 0241). Hashing takes a `Ctx` because the salt comes from
+//! loud** (ADR 044). Hashing takes a `Ctx` because the salt comes from
 //! `Ctx.entropy`; verifying reads the salt out of the stored string and
 //! needs nothing from the request at all — `verifyWith` began with `_ = c;`
 //! for a year. What the parameter cost was every caller that has no request:
@@ -69,15 +69,15 @@ pub fn setLimit(at_once: u16) void {
 
 /// Hash a password, off the loop and behind the Gate.
 ///
-/// The salt comes from `Ctx.entropy` (ADR 0046) and the 19 MiB comes from
+/// The salt comes from `Ctx.entropy` (ADR 042) and the 19 MiB comes from
 /// `gpa`, which is an argument because it is a number worth seeing at the
 /// call site. The request arena is the wrong allocator for it: the arena is
 /// reset per request keeping `arena_keep` bytes, and 19 MiB through it would
-/// spend the one axis ADR 0018 treats as an invariant.
+/// spend the one axis ADR 017 treats as an invariant.
 ///
 /// **`pw.huge_pages` is the allocator this call is fastest out of** — the
 /// same 19 MiB in 2 MiB pages rather than 4,864 of 4 KiB, which is 13.6 ms a
-/// hash against 11.0 and nothing held between hashes (ADR 0049). It is opt-in
+/// hash against 11.0 and nothing held between hashes (ADR 044). It is opt-in
 /// for the reason the allocator is an argument at all.
 pub fn hash(c: *const Ctx, gpa: std.mem.Allocator, password: []const u8) !pw.Hash {
     return hashWith(.default, c, gpa, password);
@@ -135,7 +135,7 @@ pub fn verify(
 ///
 /// The Cost is what the no-account path is worked against, so a deployment
 /// that hashes at anything but the default has one call to make rather than a
-/// timing difference to explain (ADR 0049).
+/// timing difference to explain (ADR 044).
 pub fn verifyWith(
     comptime cost: pw.Cost,
     c: *const Ctx,
@@ -144,19 +144,19 @@ pub fn verifyWith(
     password: []const u8,
 ) !bool {
     // The request is not used, and never was: the salt is in `stored`. The
-    // parameter stays because the method shipped with it (ADR 0241).
+    // parameter stays because the method shipped with it (ADR 044).
     _ = c;
     return verifyAnywhereWith(cost, gpa, stored, password);
 }
 
 /// Whether a password matches a stored hash, with no request in hand — a
 /// CLI resetting an account, a job re-hashing at a raised Cost, a test that
-/// wants neither an App nor a Ctx (ADR 0241). `nilo.verifyPassword` is this.
+/// wants neither an App nor a Ctx (ADR 044). `nilo.verifyPassword` is this.
 ///
 /// The same Gate and the same blocking pool as `verify`, so a job checking
 /// passwords on the server's loop holds one of the eight permits like a
 /// sign-in does, and a CLI with no loop at all runs the call inline — which
-/// is what `nilo.blocking` does outside a fiber (ADR 0003). `stored` is
+/// is what `nilo.blocking` does outside a fiber (ADR 002). `stored` is
 /// optional for the reason it is everywhere else: null costs what an
 /// account costs.
 pub fn verifyAnywhere(
@@ -167,7 +167,7 @@ pub fn verifyAnywhere(
     return verifyAnywhereWith(.default, gpa, stored, password);
 }
 
-/// The same, told what a hash of yours costs (ADR 0049).
+/// The same, told what a hash of yours costs (ADR 044).
 pub fn verifyAnywhereWith(
     comptime cost: pw.Cost,
     gpa: std.mem.Allocator,
@@ -208,7 +208,7 @@ const nilo_testing = @import("testing.zig");
 /// The Cost every test here uses: the floor rather than the default, because
 /// the suite runs these on every `zig build test` in two optimize modes and
 /// 19 MiB a time is not what that budget is for. What the default costs is a
-/// measurement, and it lives in ADR 0048 rather than in a test.
+/// measurement, and it lives in ADR 044 rather than in a test.
 const test_cost: pw.Cost = .{ .memory_kib = pw.Cost.floor_memory_kib, .passes = 1 };
 
 fn signsInAndBackOut(c: *Ctx) anyerror!void {
@@ -223,7 +223,7 @@ fn signsInAndBackOut(c: *Ctx) anyerror!void {
     // No account at all, which is the signature that cannot be got wrong. At
     // `test_cost` rather than the default because the Cost is what the
     // no-account path works at — which is the whole of why `verifyWith` takes
-    // one (ADR 0049), and incidentally why this test is 7 MiB and not 19.
+    // one (ADR 044), and incidentally why this test is 7 MiB and not 19.
     if (try verifyWith(test_cost, c, gpa, null, "hunter2"))
         return c.sendText(500, "nobody passed");
 
@@ -249,7 +249,7 @@ test "a handler can hash a password and check it again" {
     // reason the entropy test in `app.zig` is: what is being checked is that
     // the Gate, the blocking pool and `Ctx.entropy` all answer outside a
     // running server, so a handler that signs somebody in stays an ordinary
-    // function (ADR 0003, ADR 0046).
+    // function (ADR 002, ADR 042).
     var app = App.init(testing.allocator);
     defer app.deinit();
     try app.post("/sign-in", signsInAndBackOut);
@@ -267,7 +267,7 @@ test "a stored hash is checked with no request in hand, through the same Gate" {
     // and the one a job re-hashing at a raised Cost has. The hash is made
     // through `nilo_pw` directly because making one needs entropy and this
     // test has no request to draw it from; checking it needs nothing, which
-    // is the whole of what ADR 0241 says.
+    // is the whole of what ADR 044 says.
     const gpa = testing.allocator;
     const salt: [pw.salt_len]u8 = @splat(9);
     const stored = try pw.hashWith(test_cost, gpa, "hunter2", salt);

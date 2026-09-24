@@ -1,4 +1,4 @@
-//! Answering with a file nobody is holding in memory (ADR 0037).
+//! Answering with a file nobody is holding in memory (ADR 009).
 //!
 //! One response, assembled from a descriptor and a length: the head goes
 //! into the connection's write buffer, and the bytes go from the file to the
@@ -11,7 +11,7 @@
 //! static tree, for a file too big to have been read at startup, and a
 //! handler returning a `FileBody`. Sharing it is not tidiness — a second
 //! copy of the `If-Range` handling below is exactly how the corrupt-download
-//! bug ADR 0021 exists to prevent gets back in.
+//! bug ADR 020 exists to prevent gets back in.
 //!
 //! **The caller opens the file; this closes it.** Every way out of `send`
 //! goes through one `defer`, and there are more of them than there look to
@@ -35,7 +35,7 @@ const Ctx = @import("ctx.zig").Ctx;
 /// The text fields are borrowed for as long as the response takes to write,
 /// not copied: they belong to a loaded file, to a Service, or to the
 /// caller's own stack frame, all three of which outlive this call. Nothing
-/// here reaches for the request arena (ADR 0018).
+/// here reaches for the request arena (ADR 017).
 pub const Contents = struct {
     /// Open. Closed by `send`, on every path out of it.
     file: bulkhead.File,
@@ -99,7 +99,7 @@ pub fn send(c: *Ctx, contents: Contents) !void {
     // anything else, and the safe answer is all of it. The comparison is the
     // strong one RFC 9110 §13.1.5 asks for, which is a different function from
     // the `If-None-Match` above and not the same rule spelled twice
-    // (ADR 0094) — a `W/` tag and a bare `*` both mean "close enough", and
+    // (ADR 073) — a `W/` tag and a bare `*` both mean "close enough", and
     // close enough is not what a client stapling these bytes onto a prefix it
     // already holds is entitled to. A file with no tag matches nothing.
     const still_the_same = if (c.header("If-Range")) |sent|
@@ -136,7 +136,7 @@ fn writeBody(c: *Ctx, contents: Contents, status: u16, from: u64, len: u64) !voi
     // would be pages nothing writes to; where they do — a platform with no
     // `sendfile`, or a test with no socket — the Engine lends the
     // connection's write buffer, which is already allocated and already the
-    // right size. The alternative is a per-request allocation (ADR 0018) or
+    // right size. The alternative is a per-request allocation (ADR 017) or
     // a page of a fiber's stack, for bytes that mostly do not exist.
     var no_buffer: [0]u8 = undefined;
     var reader = contents.file.reader(&no_buffer);
@@ -154,7 +154,7 @@ fn writeBody(c: *Ctx, contents: Contents, status: u16, from: u64, len: u64) !voi
     // handler running — `Ctx.send`'s reason, and a two-gigabyte file taken
     // slowly is the case it was written for. Without this, a client on a
     // hotel connection would be reported as a handler holding its thread
-    // (ADR 0034).
+    // (ADR 013).
     const w = watchdog.waiting(c._watch);
     defer watchdog.waited(c._watch, w);
 
@@ -208,7 +208,7 @@ fn writeBody(c: *Ctx, contents: Contents, status: u16, from: u64, len: u64) !voi
     // transfer — and a client told the connection is good will read the next
     // response as the rest of this body. So the framing is not trusted and
     // the connection goes, which is the one recovery left once the head has
-    // already gone out (ADR 0037).
+    // already gone out (ADR 009).
     if (sent < len) {
         c.closeWhenDone();
         std.log.warn(
@@ -463,7 +463,7 @@ test "If-Range matching keeps the range, and not matching sends the whole file" 
     try testing.expectEqualStrings("ghij", resumed.body);
 
     // The file the client started with is gone. Byte 6 of the new one is not
-    // byte 6 of the old one, so the answer is all of it (ADR 0021).
+    // byte 6 of the old one, so the answer is all of it (ADR 020).
     const changed = try client.send(
         &app,
         "GET /file HTTP/1.1\r\nHost: t\r\nRange: bytes=6-\r\nIf-Range: \"stale\"\r\n\r\n",
@@ -560,7 +560,7 @@ test "a file with no ETag answers without one, and ignores a conditional" {
     try testing.expectEqualStrings(alphabet, answer.body);
 
     // And an `If-Range` has nothing to be compared with, so the range is not
-    // honoured — the safe direction, the same one ADR 0021 took for a date.
+    // honoured — the safe direction, the same one ADR 020 took for a date.
     const ranged = try client.send(
         &app,
         "GET /file HTTP/1.1\r\nHost: t\r\nRange: bytes=0-2\r\nIf-Range: *\r\n\r\n",

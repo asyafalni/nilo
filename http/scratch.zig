@@ -10,7 +10,7 @@
 //!
 //! The first reads well and cost 4,096 bytes **per open socket, for as long as it
 //! stayed open**. A suspended fiber holds its stack at the high-water mark it
-//! ever reached ([ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md)),
+//! ever reached ([ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)),
 //! and the handler's frame is live for the whole life of the connection — so
 //! nothing gives those pages back, not even the `madvise` that gives the
 //! connection's own two buffers back, because they are above the stack pointer
@@ -38,10 +38,10 @@
 //! meeting a short-lived socket: a connection that lives for ten messages
 //! took a buffer and gave it back, and past four open per executor every one
 //! of them was an `mmap` and a `munmap`, and every `munmap` a TLB shootdown on
-//! every core the process runs on (ADR 0292).
+//! every core the process runs on (ADR 216).
 //!
 //! The other half of the same finding is where the *loop* runs, which is
-//! [ADR 0071](../docs/adr/0071-where-a-connection-waits-is-what-it-costs.md):
+//! [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md):
 //! taking the buffer off the handler's frame is worth nothing if the frame
 //! itself is what a parked socket is holding.
 //!

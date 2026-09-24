@@ -1,4 +1,4 @@
-//! Static files, held in memory (ADR 0010).
+//! Static files, held in memory (ADR 009).
 //!
 //! ```zig
 //! try app.static("/", "public");
@@ -13,7 +13,7 @@
 //! measures itself on would go with it.
 //!
 //! A tree the binary carries takes the same path from one step further in
-//! (ADR 0249): `embed` is `load` with the read taken out. The bytes are
+//! (ADR 009): `embed` is `load` with the read taken out. The bytes are
 //! borrowed from the binary rather than read from a disk, and everything
 //! after that — the sorted list, the ETag, the gzipped copy, the fallback —
 //! is the same code, which is why a product that compiles its UI in serves
@@ -27,12 +27,12 @@
 //! gets a 304 with no body and no work.
 //!
 //! Range requests come along nearly free once the bytes are in memory — a
-//! range is a slice and two headers (ADR 0021).
+//! range is a slice and two headers (ADR 020).
 //!
 //! A file over `max_file_bytes` is the one exception, and it is a spill
 //! rather than a refusal: it stays in the list with its size and the path
 //! the walk produced, and a request opens it and sends it from the disk
-//! (ADR 0037). Both of the properties above survive that. The name handed
+//! (ADR 009). Both of the properties above survive that. The name handed
 //! to `openat` is the one the walk wrote down and never one a request
 //! carried, so there is still nothing to traverse; the memory is still a
 //! number, because a spilled file holds no bytes at all; and the read that
@@ -57,7 +57,7 @@ pub const Options = struct {
     ///
     /// The name is relative to the directory, e.g. `"index.html"`.
     spa_fallback: []const u8 = "",
-    /// Which requests the fallback answers (ADR 0109).
+    /// Which requests the fallback answers (ADR 087).
     ///
     /// `.navigations` is the default and is the rule every single-page server
     /// arrives at: a request that asked for HTML gets the page, and a request
@@ -76,7 +76,7 @@ pub const Options = struct {
     /// hashed, gzipped if it is worth it, and answered from a slice. Above
     /// it the file is not read at all — it stays in the list with its size,
     /// its modification time and the path the walk produced, and a request
-    /// opens it and sends it from the disk (ADR 0037).
+    /// opens it and sends it from the disk (ADR 009).
     ///
     /// So this is a threshold and not a ceiling. What crossing it costs is
     /// named rather than hidden: no gzipped copy, an ETag made of the
@@ -102,7 +102,7 @@ pub const Options = struct {
     ///
     /// This is the only shape compression can take here without giving up
     /// something the project has measured and published
-    /// ([ADR 0018](../docs/adr/0018-the-trade-budget-has-three-axes.md)). A
+    /// ([ADR 017](../docs/adr/017-the-trade-budget-has-four-axes.md)). A
     /// compressor needs a 64 KB window: one per connection would take an
     /// idle connection from 4,669 bytes to something like fifteen times that,
     /// and one per request would be an allocation on the request path where
@@ -121,8 +121,8 @@ pub const Options = struct {
     ///
     /// This is not a watcher and there is no fiber behind it. A file over
     /// `max_file_bytes` was always left on the disk and opened per request
-    /// (ADR 0037), and since
-    /// [ADR 0125](../docs/adr/0125-a-file-is-described-by-the-descriptor-being-sent.md)
+    /// (ADR 009), and since
+    /// [ADR 098](../docs/adr/098-a-file-is-described-by-the-descriptor-being-sent.md)
     /// that path describes what it is about to send rather than what the walk
     /// saw — so "hold nothing in memory" already *is* reload, and this option
     /// is the name for it rather than machinery beside it. It sets the
@@ -155,7 +155,7 @@ pub const Options = struct {
 
 /// Whether a request that named no file could be a browser opening a page,
 /// which is the question `.navigations` asks before it answers with one
-/// (ADR 0109).
+/// (ADR 087).
 ///
 /// Two tests, in the order a client makes them answerable. First the exact
 /// one: a browser opening a page sends an `Accept` naming `text/html`, and no
@@ -208,7 +208,7 @@ pub const File = struct {
     /// is a rule somebody eventually forgets, and the failure it leads to is
     /// a response promising bytes it never sends. This way asking a spilled
     /// file for bytes it never read is a bug where it is written rather than
-    /// on the wire (ADR 0037).
+    /// on the wire (ADR 009).
     pub const Contents = union(enum) {
         held: Held,
         spilled: Spilled,
@@ -232,10 +232,10 @@ pub const File = struct {
         gzip_etag: []const u8 = &.{},
     };
 
-    /// Left on the disk and opened per request (ADR 0037).
+    /// Left on the disk and opened per request (ADR 009).
     ///
     /// There is no gzipped copy and there never will be: compression here
-    /// happens once, while the App is being built (ADR 0018), and a file
+    /// happens once, while the App is being built (ADR 017), and a file
     /// that is not being held cannot be compressed once. Compressing it per
     /// request is the trade that was already refused for handler responses.
     pub const Spilled = struct {
@@ -257,7 +257,7 @@ pub const File = struct {
         /// What the walk's `stat` said, and **not** what any response
         /// promises. A request describes the file from the descriptor it is
         /// about to send
-        /// ([ADR 0125](../docs/adr/0125-a-file-is-described-by-the-descriptor-being-sent.md)),
+        /// ([ADR 098](../docs/adr/098-a-file-is-described-by-the-descriptor-being-sent.md)),
         /// because a name is all this entry really holds and the file under
         /// that name is free to move while the server runs.
         ///
@@ -343,8 +343,8 @@ pub const Set = struct {
     /// name a request never chose the only name that ever reaches `openat`.
     ///
     /// Null for a Set that has no directory — `fromMemory`, which is bytes
-    /// that were already here (ADR 0017), and `embed`, which is bytes the
-    /// binary carries (ADR 0249). Neither can spill anything.
+    /// that were already here (ADR 016), and `embed`, which is bytes the
+    /// binary carries (ADR 009). Neither can spill anything.
     dir: ?bulkhead.Dir = null,
     /// Whether a held file's bytes are this Set's to free. `load` and
     /// `fromMemory` read or copy them and own them; `embed` borrows them
@@ -366,7 +366,7 @@ pub const Set = struct {
     /// file.
     ///
     /// **The single-page fallback is not here**, and that is the seam
-    /// ADR 0109 moved: a lookup that answers with `index.html` for every
+    /// ADR 087 moved: a lookup that answers with `index.html` for every
     /// path there is cannot tell a caller whether the file was found, so the
     /// caller could not decide anything about the miss. `fallbackFor` is the
     /// other half and the request decides which of the two it gets.
@@ -448,7 +448,7 @@ pub const LoadError = error{
 /// Which of these failures `load` has already put into words, so `App` can
 /// stop the process on them instead of letting the error reach `main` and
 /// print a stack trace through nilo's own files on top of the answer
-/// (ADR 0002). The same rule `bulkhead.explained` states for `listen()`.
+/// (ADR 001). The same rule `bulkhead.explained` states for `listen()`.
 ///
 /// `OutOfMemory` is not on the list: nothing explained it, and there is
 /// nothing useful to say about it that the error name does not.
@@ -477,7 +477,7 @@ pub const Entry = struct {
 
 /// A Set built from bytes already in memory instead of from a directory.
 ///
-/// What this is for is the generated API description (ADR 0017), which is a
+/// What this is for is the generated API description (ADR 016), which is a
 /// file in every way that matters: fixed once the routes are known, worth an
 /// ETag, and a repeat visit should be a 304. Going through the same Set that
 /// serves `public/` means all of that arrives without a second code path,
@@ -535,7 +535,7 @@ pub fn fromMemory(gpa: std.mem.Allocator, entries: []const Entry) !Set {
 
 /// What `load` does about a directory that is not there: say so in one
 /// line and hand the error back, or hand it back alone
-/// ([ADR 0282](../docs/adr/0282-a-try-call-hands-back-the-error-and-says-nothing.md)).
+/// ([ADR 207](../docs/adr/207-a-try-call-hands-back-the-error-and-says-nothing.md)).
 ///
 /// `app.static` wants the line, because on it the process stops and the
 /// line is the whole explanation. `app.tryStatic` exists so a program can
@@ -552,7 +552,7 @@ pub const Absent = enum { reported, returned };
 ///
 /// A file over `options.max_file_bytes` is listed rather than read: it keeps
 /// its place in the set with the path the walk produced, and the request
-/// that asks for it opens it (ADR 0037).
+/// that asks for it opens it (ADR 009).
 pub fn load(
     gpa: std.mem.Allocator,
     url_prefix: []const u8,
@@ -583,7 +583,7 @@ pub fn load(
     // is kept: a spilled file is opened relative to it by every request that
     // asks for one. Opened here rather than at the first request, which is
     // what makes the descriptor older than the socket and the name from the
-    // walk the only name that ever reaches `openat` (ADR 0037). One
+    // walk the only name that ever reaches `openat` (ADR 009). One
     // descriptor per set, whether or not anything spilled today — the
     // alternative is a lazily opened directory on the request path and a
     // branch to go with it.
@@ -671,7 +671,7 @@ pub fn load(
 
         if (stat.size > spill_over) {
             // Over the line, so what goes in the list is where to find it
-            // rather than what is in it (ADR 0037). Nothing is added to
+            // rather than what is in it (ADR 009). Nothing is added to
             // `held_total`: this file holds no memory to be counted.
             const relative = try gpa.dupe(u8, entry.path);
             errdefer gpa.free(relative);
@@ -811,7 +811,7 @@ pub fn load(
 /// the file it is written in and the file has to be inside that module, so
 /// nothing in nilo can name a caller's `dist/`. The list is the whole of
 /// what the caller writes, and a build step that walks a directory into one
-/// is theirs until two of them have written the same one (ADR 0249).
+/// is theirs until two of them have written the same one (ADR 009).
 pub const Embedded = struct {
     /// Where the file sits in the tree, relative and with forward slashes:
     /// `"index.html"`, `"assets/app.js"`. Joined onto the URL prefix the
@@ -841,7 +841,7 @@ pub const EmbedOptions = struct {
 };
 
 /// A Set over bytes the binary carries, mapped to URLs under `url_prefix`
-/// (ADR 0249).
+/// (ADR 009).
 ///
 /// Everything past this call is the path `load` built: the same sorted list,
 /// the same lookup, an ETag per file, a gzipped copy made once for the files
@@ -1018,7 +1018,7 @@ fn lessByUrl(_: void, a: File, b: File) bool {
 /// nothing. It costs plenty: `std.mem.sort` is an in-place stable merge, and
 /// one instantiation of it for `File` is 37 KB of machine code — which
 /// turned out to be 88% of what switching the API description on added to a
-/// binary, before anybody wrote any JSON ([ADR 0017](../docs/adr/0017-the-api-description-comes-from-the-signatures.md)).
+/// binary, before anybody wrote any JSON ([ADR 016](../docs/adr/016-the-api-description-comes-from-the-signatures.md)).
 fn sortByUrl(files: []File) void {
     std.sort.pdq(File, files, {}, lessByUrl);
 }
@@ -1064,7 +1064,7 @@ fn hasDotSegment(rel_path: []const u8) bool {
 
 /// What a file has to be for a gzipped copy to be worth holding: the same
 /// question response compression asks of a body, per request, so the
-/// answer lives there (ADR 0287). `serve.zig` asks the other half, whether
+/// answer lives there (ADR 211). `serve.zig` asks the other half, whether
 /// the client takes gzip, of the same module.
 const compressible = compress_mod.compressible;
 
@@ -1119,7 +1119,7 @@ fn etagFor(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
 /// startup or per request, and both are worse than what is being risked.
 /// What is being risked is two different contents sharing a size and a
 /// modification time to the nanosecond, which is the risk nginx has been
-/// taking by default for twenty years (ADR 0037).
+/// taking by default for twenty years (ADR 009).
 ///
 /// The time goes through `@bitCast` rather than a cast that could fail: a
 /// clock is allowed to say anything, including a negative number, and a
@@ -1139,12 +1139,12 @@ pub const max_spilled_etag = 2 + 1 + 24 + 16;
 /// they have to agree to the byte or a client's `If-None-Match` stops
 /// matching a file that never changed: the directory walk writes one at load,
 /// and `serveSpilledFile` writes one per request from a fresh look at the
-/// descriptor ([ADR 0125](../docs/adr/0125-a-file-is-described-by-the-descriptor-being-sent.md)).
+/// descriptor ([ADR 098](../docs/adr/098-a-file-is-described-by-the-descriptor-being-sent.md)).
 /// Sharing the format string is not tidiness — it is the only reason those
 /// two are the same tag rather than two spellings of one idea.
 ///
 /// The request-path caller writes into its own stack frame, so this costs no
-/// allocation on a path whose budget is one ([ADR 0018](../docs/adr/0018-the-trade-budget-has-three-axes.md)).
+/// allocation on a path whose budget is one ([ADR 017](../docs/adr/017-the-trade-budget-has-four-axes.md)).
 pub fn spilledEtag(buf: *[max_spilled_etag]u8, mtime_ns: i96, size: u64) []const u8 {
     // Cannot overflow: `max_spilled_etag` is what the widest pair of numbers
     // comes to, so the only way past it is a wider integer type.
@@ -1169,7 +1169,7 @@ pub fn etagMatches(if_none_match: []const u8, etag: []const u8) bool {
 }
 
 /// Whether an `If-Range` header matches `etag`, by the **strong** comparison
-/// RFC 9110 §13.1.5 requires there (ADR 0094).
+/// RFC 9110 §13.1.5 requires there (ADR 073).
 ///
 /// Three differences from `etagMatches`, each of them the difference between
 /// resuming a download and corrupting one. **A `W/` tag never matches** — a
@@ -1374,7 +1374,7 @@ test "a fallback answers a page a browser asked for and not an asset that is gon
     const script = "*/*";
 
     // The whole point: a stale build hash is a 404 naming the file rather
-    // than a page a parser then reports a syntax error on (ADR 0109). A
+    // than a page a parser then reports a syntax error on (ADR 087). A
     // `<script src>` is the request that fetches one, and it says `*/*`.
     try testing.expect(set.fallbackFor("/app.abc123.js", script) == null);
     // Nor is a JSON call to a path that is not a route a page.
@@ -1511,7 +1511,7 @@ test "a file with no compressed copy asks for the plain one whatever the client 
     try testing.expectEqualStrings("no", file.representation(true).bytes);
 }
 
-// ---- a file too big to hold (ADR 0037) ----
+// ---- a file too big to hold (ADR 009) ----
 
 const App = @import("app.zig").App;
 const nilo_testing = @import("testing.zig");
@@ -1677,7 +1677,7 @@ test "a spilled file answers whole, in parts, and with a 304" {
 
     // Text, and a client that would take a gzipped copy — but a file nobody
     // is holding has none to give, and nothing here compresses per request
-    // (ADR 0018). No `Vary` either: there is only one representation.
+    // (ADR 017). No `Vary` either: there is only one representation.
     const asked = try client.send(
         &app,
         "GET /alphabet.txt HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n",
@@ -1694,7 +1694,7 @@ test "a spilled file answers whole, in parts, and with a 304" {
     try testing.expectEqualStrings("def", part.body);
 
     // A resumed download, held to the file it started with by the tag it was
-    // given — which is why that tag has to be strong (ADR 0037).
+    // given — which is why that tag has to be strong (ADR 009).
     var request_buf: [256]u8 = undefined;
     const resumed = try client.send(&app, try std.fmt.bufPrint(
         &request_buf,
@@ -1753,7 +1753,7 @@ test "a held file and a spilled one answer a conditional range the same way" {
         try testing.expectEqualStrings("uvwxyz", resumed.body);
 
         // The file the client started with is gone, so byte 20 of this one is
-        // not the byte it wanted: all of it, and no `Content-Range` (ADR 0021).
+        // not the byte it wanted: all of it, and no `Content-Range` (ADR 020).
         const stale = try client.send(
             &app,
             "GET /a.bin HTTP/1.1\r\nHost: t\r\nRange: bytes=20-\r\nIf-Range: \"gone\"\r\n\r\n",
@@ -1764,7 +1764,7 @@ test "a held file and a spilled one answer a conditional range the same way" {
 
         // `If-Range` is the one comparison RFC 9110 §13.1.5 says must be
         // strong, and these are the two shapes `If-None-Match`'s comparison
-        // accepts (ADR 0094). Both get the whole file rather than a range,
+        // accepts (ADR 073). Both get the whole file rather than a range,
         // because "close enough to reuse" is not "the same bytes you already
         // hold the front of". The weak one carries this file's real tag, so
         // only the `W/` decides it.
@@ -1808,7 +1808,7 @@ test "a spilled file that grew on disk goes out whole, under a tag that moved wi
     // had moved on. What went out was a complete, correct-looking response
     // carrying a prefix of the new file under the old file's tag — and a
     // client holding that tag was then told 304 for content that had changed
-    // (ADR 0125).
+    // (ADR 098).
     const gpa = testing.allocator;
     var tree = try TmpTree.init(gpa, &.{.{ "app.js", "0123456789" }});
     defer tree.deinit(gpa);
@@ -1882,7 +1882,7 @@ test "tryStatic hands back a directory that is not there, and says nothing about
     // without its frontend built — and the test runner is the witness that
     // nothing was logged: a logged `err` fails the test whatever level it
     // prints at (`test_root.zig`), so this test passing *is* the silence
-    // (ADR 0282).
+    // (ADR 207).
     const gpa = testing.allocator;
     var app = App.init(gpa);
     defer app.deinit();
@@ -1933,7 +1933,7 @@ test "reload leaves every file on the disk, however small it is" {
 }
 
 test "a set with no directory closes cleanly, and one with a directory gives it back" {
-    // `fromMemory` is the API description (ADR 0017): no directory, nothing
+    // `fromMemory` is the API description (ADR 016): no directory, nothing
     // to spill, and a `deinit` that must not reach for a descriptor that was
     // never opened.
     const gpa = testing.allocator;
@@ -1955,7 +1955,7 @@ test "a set with no directory closes cleanly, and one with a directory gives it 
     try testing.expect(loaded.dir == null);
 }
 
-// ---- embedded trees (ADR 0249) ----
+// ---- embedded trees (ADR 009) ----
 
 /// A tree the way a caller writes one: `@embedFile` on each entry. These
 /// are the repository's own files, because a test cannot embed what the
@@ -1999,7 +1999,7 @@ test "an embedded tree answers the way a directory does: the file, the index, th
     try testing.expectEqualStrings(embedded_tree[0].bytes, index.body);
 
     // The fallback, for a page a browser asked for, and a 404 for an asset
-    // that is not there (ADR 0109) — the same two answers a directory gives.
+    // that is not there (ADR 087) — the same two answers a directory gives.
     const deep = try client.send(&app, "GET /users/42 HTTP/1.1\r\nHost: t\r\nAccept: text/html\r\n\r\n");
     try testing.expectEqual(@as(u16, 200), deep.status);
     try testing.expectEqualStrings(embedded_tree[0].bytes, deep.body);

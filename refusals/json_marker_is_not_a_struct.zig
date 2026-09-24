@@ -1,5 +1,5 @@
 //! A marker written as something other than a struct. `nilo_json` says how a
-//! type's JSON is spelled (ADR 0085), and everything it can say is a field, so
+//! type's JSON is spelled (ADR 016), and everything it can say is a field, so
 //! there is nowhere for a bare value to go.
 
 const nilo = @import("nilo_http");

@@ -22,14 +22,14 @@ fills in — a generated key, a `DEFAULT now()` — are exactly the ones you hav
 nothing to say about. What comes back is the whole row, via `RETURNING`, so
 there is no second query to fetch what the database just had in its hand.
 
-**A column nothing fills is not yours to leave out, and leaving it out does not compile.** The subset is for the columns something fills: the integer key a sequence fills, a column with a `.default` in the marker, an optional one that gets null, and one named in the marker's `.filled`, which is how you tell nilo the database fills it by means of its own (a `DEFAULT` written in a step, `gen_random_uuid()`, a trigger). Leave out anything else and the insert is refused, naming the columns, rather than failing with `NotNullViolated` the first time it runs. That is how a column added in one release and missed by an insert in the next is found by the compiler instead of by a user ([ADR 0221](../../adr/0221-the-marker-has-two-kinds-of-word.md)). A table this program only reads, `.managed = false`, is not checked: its defaults are the database's, and the marker does not know them.
+**A column nothing fills is not yours to leave out, and leaving it out does not compile.** The subset is for the columns something fills: the integer key a sequence fills, a column with a `.default` in the marker, an optional one that gets null, and one named in the marker's `.filled`, which is how you tell nilo the database fills it by means of its own (a `DEFAULT` written in a step, `gen_random_uuid()`, a trigger). Leave out anything else and the insert is refused, naming the columns, rather than failing with `NotNullViolated` the first time it runs. That is how a column added in one release and missed by an insert in the next is found by the compiler instead of by a user ([ADR 181](../../adr/181-the-marker-has-two-kinds-of-word.md)). A table this program only reads, `.managed = false`, is not checked: its defaults are the database's, and the marker does not know them.
 
 **A `Str` column takes text in whatever shape you hold it.** The Row says
 `email: Str`; the insert takes a literal, a `[]const u8`, a `[]u8` an
 allocator handed back, or a `Str` off the request, and each is written the
 same way. There is nothing to convert on the way in, and `made.email` is a
 `Str` on the way out, the Scope's for as long as the request is
-([ADR 0145](../../adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
+([ADR 116](../../adr/116-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
 An optional column takes `null` and an `?T` of the same shapes.
 
 `update` and `delete` answer with the number of rows they touched, and both
@@ -74,7 +74,7 @@ Two placeholders for any number of rows, which is what keeps the statement a
 constant — the `VALUES ($1,$2),($3,$4),…` most libraries generate has the
 batch size *in* it, so the SQL would be rebuilt per call and Postgres would
 plan it again for every distinct size
-([ADR 0053](../../adr/0053-a-batch-is-one-array-per-column.md)).
+([ADR 047](../../adr/047-a-batch-is-one-array-per-column.md)).
 
 It is one statement, so a batch that violates a constraint stores **none** of
 its rows — usually what was wanted, and the opposite of a loop of inserts with
@@ -133,7 +133,7 @@ this module already writes, so none of them costs a statement the compiler did
 not settle.
 
 **`updateReturningOne` is the unwrap, not a narrower statement**
-([ADR 0179](../../adr/0179-a-statement-with-a-key-in-it-has-a-single-row-answer.md)).
+([ADR 146](../../adr/146-a-statement-with-a-key-in-it-has-a-single-row-answer.md)).
 The `.where` is yours: an `UPDATE` matching several rows updates all of them, and
 this hands back the first. What it saves is `if (changed.len == 0) null else
 changed[0]` at every call site — and `!?User` is already a 404 in the typed
@@ -179,7 +179,7 @@ constraint is not a column and a Row cannot name one. Postgres refuses the
 statement if there is none.
 
 **When it *is* the key, write `.key`**
-([ADR 0186](../../adr/0186-a-key-is-named-once.md)):
+([ADR 151](../../adr/151-a-key-is-named-once.md)):
 
 <!-- compiles: body -->
 ```zig

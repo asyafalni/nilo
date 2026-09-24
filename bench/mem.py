@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Memory per idle connection, which is the third row of ADR 0018's budget.
+"""Memory per idle connection, which is the third row of ADR 017's budget.
 
 The method `bench/result/http.md` describes, as something that can be run
 again rather than a paragraph about what was once done: open keep-alive
@@ -67,7 +67,7 @@ def literal(name, value):
 
 def open_grpc(host, port, path, timeout):
     """One h2c connection with one unary call already answered on it
-    (ADR 0297): the preface, SETTINGS, a call with an empty message, and
+    (ADR 220): the preface, SETTINGS, a call with an empty message, and
     every frame read until that call's trailers. What is left is a gRPC
     connection between calls, which is what a client's channel is nearly
     all of its life."""
@@ -117,14 +117,14 @@ def open_one(host, port, path, timeout, hold=False, tls=None):
     then the connection is left alone, which is a handler still suspended
     rather than a connection between requests — and those are different
     numbers, because a suspended handler holds its stack as well as its
-    buffers (ADR 0063). Draining is what the ordinary path does to make sure
+    buffers (ADR 062). Draining is what the ordinary path does to make sure
     nothing is backed up; here there is nothing to back up yet.
     """
     s = socket.create_connection((host, port), timeout=timeout)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     if tls:
         # The same connection through TLS 1.3, for a server built with
-        # -Dtls (ADR 0288). The certificate is not checked because the one
+        # -Dtls (ADR 212). The certificate is not checked because the one
         # the benchmark server presents is the suite's self-signed fixture;
         # one context serves every connection.
         s = tls.wrap_socket(s, server_hostname=host)
@@ -199,7 +199,7 @@ def main():
     p.add_argument(
         "--grpc",
         action="store_true",
-        help="speak h2c with prior knowledge and make one unary call at --path (ADR 0297)",
+        help="speak h2c with prior knowledge and make one unary call at --path (ADR 220)",
     )
     p.add_argument(
         "--tls",

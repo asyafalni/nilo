@@ -20,7 +20,7 @@
 //! **Nothing is allocated per failed field.** `T`'s field count is settled
 //! while compiling, so every outcome lives in one fixed array inside the
 //! value the handler already received — on the fiber's stack, where the
-//! allocation budget cannot see it (ADR 0018).
+//! allocation budget cannot see it (ADR 017).
 //!
 //! **It is not a validation language.** The reasons are exactly the ones
 //! `convert.zig` can already produce. nilo's job stops at "this did not
@@ -29,13 +29,13 @@
 //! validator wearing a smaller name.
 //!
 //! What *is* nilo's job is the answer, and `must` lets the application put
-//! its own sentence into it (ADR 0082). nilo supplies the label, the
+//! its own sentence into it (ADR 034). nilo supplies the label, the
 //! collecting, the status and the order — all things it already supplies to
 //! its own sentences — and the application supplies the words, so a rule and
 //! a conversion cannot come out looking like two different programs wrote
 //! them. It still knows no rule and writes none.
 //!
-//! **A rule about the struct goes on the struct** (ADR 0264). `must` in a
+//! **A rule about the struct goes on the struct** (ADR 193). `must` in a
 //! handler is for a rule that needs the request — "already registered" wants
 //! a database. A rule the struct can settle on its own — "confirm matches
 //! password" — is `pub fn nilo_check(self: T, r: *nilo.Rules(T)) void` on
@@ -68,7 +68,7 @@ pub const Reason = convert.Reason;
 pub const marker = "nilo_bound";
 
 /// The declaration a struct carries to check itself, once every field has
-/// bound (ADR 0264):
+/// bound (ADR 193):
 ///
 /// ```zig
 /// pub fn nilo_check(self: SignUp, r: *nilo.Rules(SignUp)) void {
@@ -78,7 +78,7 @@ pub const marker = "nilo_bound";
 pub const check_marker = "nilo_check";
 
 /// The rules a struct's `nilo_check` writes into: one sentence per field, in
-/// the struct's own order, and `must` in the shape ADR 0082 gave it — the
+/// the struct's own order, and `must` in the shape ADR 034 gave it — the
 /// bool is the rule *holding*, the first sentence about a field wins.
 pub fn Rules(comptime T: type) type {
     const fields = @typeInfo(T).@"struct".fields;
@@ -141,7 +141,7 @@ pub fn hasCheck(comptime T: type) bool {
 /// Run `T`'s `nilo_check` over a value every field of which bound, and
 /// refuse the request with one 422 naming every rule that did not hold —
 /// the way in for the three plain slots, which collect nothing else
-/// (ADR 0264). Nothing for a `T` that declares no check.
+/// (ADR 193). Nothing for a `T` that declares no check.
 pub fn enforce(comptime slot: Slot, comptime T: type, value: T) fail_mod.Error!void {
     if (comptime !hasCheck(T)) return;
     var rules: Rules(T) = .{};
@@ -173,7 +173,7 @@ pub const Failure = struct {
     field: []const u8,
     /// Why the value would not convert — or **null when this is a rule of
     /// the application's own** rather than anything nilo could not do
-    /// (ADR 0082). A rule has no `Reason` because `Reason` is the closed list
+    /// (ADR 034). A rule has no `Reason` because `Reason` is the closed list
     /// of things a conversion can fail at, and the type says so.
     reason: ?Reason,
     /// The text that arrived, or empty when there was none to quote.
@@ -214,7 +214,7 @@ pub fn Bound(comptime W: type) type {
 
         pub const nilo_bound = W;
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = "nilo.Bound(" ++ naming.of(W) ++ ")";
         pub const nilo_bound_slot = slot;
         /// The struct the handler actually asked for.
@@ -222,7 +222,7 @@ pub fn Bound(comptime W: type) type {
         /// What the engine fills in and hands to `from`.
         pub const Outcomes = [fields.len]Outcome;
         /// Whether `T` checks itself, and so whether this binding carries
-        /// room for what its check said (ADR 0264).
+        /// room for what its check said (ADR 193).
         pub const has_check = hasCheck(T);
 
         /// One message per field, in the struct's own order.
@@ -233,7 +233,7 @@ pub fn Bound(comptime W: type) type {
         _outcomes: Outcomes,
         /// What `T.nilo_check` said, when `T` has one; nothing otherwise, so
         /// a binding of a struct that checks nothing is the size it was
-        /// (ADR 0082, ADR 0264).
+        /// (ADR 034, ADR 193).
         _said: if (has_check) Sentences else void,
 
         /// Built by the compile-time engine, which has just filled `T` as
@@ -243,7 +243,7 @@ pub fn Bound(comptime W: type) type {
         /// A `T` that checks itself is checked here, and only when every
         /// field bound: a rule read off a field that never bound would be
         /// read off nothing, so the conversions are answered first and the
-        /// rules on the next attempt (ADR 0264).
+        /// rules on the next attempt (ADR 193).
         pub fn from(filled: T, outcomes: Outcomes) Self {
             var self: Self = .{ ._value = filled, ._outcomes = outcomes, ._said = undefined };
             if (comptime has_check) {
@@ -259,7 +259,7 @@ pub fn Bound(comptime W: type) type {
         ///
         /// `from` is the engine's constructor and wants an outcome per
         /// field; a test that only wants a working binding should not have
-        /// to know `Outcome` exists (ADR 0082). Nothing is quoted back by
+        /// to know `Outcome` exists (ADR 034). Nothing is quoted back by
         /// `given` here, because nothing failed and there is nothing to put
         /// back in a box. `T`'s own check still runs, because a test
         /// handing a handler a value the struct would refuse should find
@@ -338,11 +338,11 @@ pub fn Bound(comptime W: type) type {
         ///
         /// `holds` is the rule *holding*, not failing — read it as the
         /// sentence it makes: password must be at least 10 characters. Still
-        /// not a validation language (ADR 0036): nilo writes no rule and
+        /// not a validation language (ADR 034): nilo writes no rule and
         /// knows none, it only carries the sentence the application wrote
         /// next to the ones it wrote itself. A rule the struct can settle
         /// on its own belongs on the struct instead (`nilo_check`,
-        /// ADR 0264); this is for the one that needs the request.
+        /// ADR 193); this is for the one that needs the request.
         pub fn must(
             self: Self,
             comptime name: []const u8,
@@ -358,7 +358,7 @@ pub fn Bound(comptime W: type) type {
         /// A separate type rather than two more fields on every binding,
         /// because room for the rules is the one thing this costs and a
         /// handler that checks none should not carry it — a handler's stack
-        /// is per-connection (ADR 0063, ADR 0082).
+        /// is per-connection (ADR 062, ADR 034).
         pub const Checked = struct {
             _bound: Self,
             _rules: Sentences = @splat(""),
@@ -428,7 +428,7 @@ pub fn Bound(comptime W: type) type {
         ///
         /// The shortcut for the handler that has nothing more interesting to
         /// say than "these are wrong". The body is the one every failure
-        /// answers with (ADR 0025) — this only fills in the sentence, into
+        /// answers with (ADR 024) — this only fills in the sentence, into
         /// the fixed buffer that already exists, so the failure path still
         /// allocates nothing. A 422 rather than a 400 because the request
         /// was understood and its contents were not.
@@ -453,7 +453,7 @@ fn Wording(comptime slot: Slot, comptime T: type) type {
 
         /// What a binding with nothing said against it points at, so that
         /// carrying room for sentences is the business of the types that
-        /// have some and not every handler's (ADR 0082).
+        /// have some and not every handler's (ADR 034).
         pub const no_sentences: Sentences = @splat("");
         /// Every field bound, for a 422 that is rules and nothing else.
         pub const no_outcomes: Outcomes = @splat(.{});
@@ -499,7 +499,7 @@ fn Wording(comptime slot: Slot, comptime T: type) type {
                         ._say = table[i].say,
                     };
                     // A rule of the application's own, in the same order and
-                    // the same shape as one of nilo's (ADR 0082).
+                    // the same shape as one of nilo's (ADR 034).
                     const said = self._rules[i];
                     if (said.len == 0) continue;
                     return .{
@@ -517,7 +517,7 @@ fn Wording(comptime slot: Slot, comptime T: type) type {
         };
 
         /// The 422 for rules alone — what `enforce` answers when a struct
-        /// out of a plain slot fails its own check (ADR 0264).
+        /// out of a plain slot fails its own check (ADR 193).
         pub fn refuse(rules: *const Sentences) fail_mod.Error {
             var n: usize = 0;
             for (rules) |s| {
@@ -535,7 +535,7 @@ fn Wording(comptime slot: Slot, comptime T: type) type {
 
             // The tail is written out of room kept back for it, so a sentence
             // that runs out of buffer can still say how much of itself is
-            // missing (ADR 0081). It used to stop on the first write that did
+            // missing (ADR 034). It used to stop on the first write that did
             // not fit, which ends a 422 mid-word and leaves the reader to
             // guess whether the list was finished. `fields.len` is the most
             // failures there can be, so the widest tail is known here.
@@ -644,7 +644,7 @@ fn canFail(comptime F: type) bool {
 
 /// The type a field's **value** converts as: its element when the field is a
 /// list, and the field itself otherwise
-/// ([ADR 0164](../docs/adr/0164-a-query-parameter-that-is-a-list.md)).
+/// ([ADR 132](../docs/adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)).
 ///
 /// A list of `Str` cannot fail and a list of enums can, and the difference is
 /// the element rather than the slice. Getting this wrong is not a worse
@@ -715,7 +715,7 @@ fn sayerFor(
                 ),
                 // `convertsAs` rather than `innerOf`: for a list it is the
                 // element that would not convert, and the element is what the
-                // sentence has to name (ADR 0164).
+                // sentence has to name (ADR 132).
                 else => if (comptime canFail(F))
                     try convert.sayWhy(convertsAs(F), slot, f.given, labelFor(slot, name), w)
                 else
@@ -953,7 +953,7 @@ test "a 422 with more failures than fit says how many it could not name" {
 
     // It used to stop on the first write that would not fit, which ends the
     // sentence mid-word and leaves the reader with no way to tell a finished
-    // list from a cut one (ADR 0081). Now the tail says what is missing, and
+    // list from a cut one (ADR 034). Now the tail says what is missing, and
     // the count in it adds up with the ones that were named.
     const cut = std.mem.lastIndexOf(u8, said, "; and ").?;
     const dropped = try std.fmt.parseInt(usize, said[cut + "; and ".len .. said.len - " more".len], 10);
@@ -1086,7 +1086,7 @@ test "a rule out of a query string is labelled the way that slot labels things" 
 test "a binding with no rules against it carries no room for any" {
     // The one thing this feature costs is stack, and a handler that checks
     // no rules does not pay it: the room lives in `Checked`, which such a
-    // handler never builds (ADR 0082).
+    // handler never builds (ADR 034).
     try testing.expect(@sizeOf(Bare.Checked) >= @sizeOf(Bare) + @sizeOf(Bare.Sentences));
     // And the room it costs is one slice per field, not one per rule: three
     // fields, 48 bytes, whether the handler writes one rule or ten.
@@ -1102,7 +1102,7 @@ test "a binding of a form is still a binding of the struct inside it" {
     try testing.expectEqual(Slot.body, Bound(SignUp).nilo_bound_slot);
 }
 
-// ---- a struct that checks itself (ADR 0264) ----
+// ---- a struct that checks itself (ADR 193) ----
 
 const Registration = struct {
     email: Str,
@@ -1147,7 +1147,7 @@ test "a struct whose check holds is a binding like any other" {
 test "a check is not run over a field that never bound" {
     // The conversions are answered first: a rule read off a field that did
     // not bind would be read off nothing, so the rules wait for the next
-    // attempt (ADR 0264).
+    // attempt (ADR 193).
     const b = Checks.from(undefined, .{
         .{ .reason = .missing },
         .{ .given = Str.static("correct horse") },

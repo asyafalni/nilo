@@ -1,5 +1,5 @@
 //! SigV4 — the half of an object-store client that is actually S3
-//! ([ADR 0069](../docs/adr/0069-a-signing-key-changes-once-a-day.md)).
+//! ([ADR 060](../docs/adr/060-a-signing-key-changes-once-a-day.md)).
 //!
 //! Nothing here does IO, allocates, or knows that a connection exists. It
 //! turns a request that is about to go out into two strings — an
@@ -23,7 +23,7 @@
 //! So it is streamed into the hasher instead, through `Hashing` below.
 //! **The canonical request never exists as bytes anywhere.** That is worth
 //! roughly 3 KiB of a handler's stack, which by
-//! [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md) is 3 KiB
+//! [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md) is 3 KiB
 //! per *connection* rather than per request, and it costs one twenty-line
 //! writer.
 //!
@@ -35,7 +35,7 @@
 //! tenth header added in the wrong place is a compile error rather than a 403
 //! from AWS. Walking the fields in declaration order is therefore already
 //! sorted: there is no per-request sort anywhere in this file
-//! ([ADR 0068](../docs/adr/0068-a-bucket-is-a-type-and-a-key-is-not.md)).
+//! ([ADR 059](../docs/adr/059-a-bucket-is-a-type-and-a-key-is-not.md)).
 
 const std = @import("std");
 const core = @import("nilo_core");
@@ -50,7 +50,7 @@ pub const terminator = "aws4_request";
 /// What `x-amz-content-sha256` says when the payload is not hashed. Legal over
 /// `https://` and refused by nothing that matters there, because TLS already
 /// says the bytes arrived as sent — the argument, and the milliseconds it
-/// saves, are in ADR 0069.
+/// saves, are in ADR 060.
 pub const unsigned_payload = "UNSIGNED-PAYLOAD";
 
 /// SHA-256 of nothing, which is what a GET or a DELETE carries. A constant
@@ -241,7 +241,7 @@ pub const Stamp = struct {
     /// It is the same sixteen characters with four punctuation marks put back,
     /// so it is a reshuffle rather than a second date calculation. That is the
     /// whole point: one place in this module can be wrong about what day it is
-    /// instead of two (ADR 0141).
+    /// instead of two (ADR 112).
     pub fn expiration(self: *const Stamp, out: *[expiration_len]u8) []const u8 {
         const t = &self.text;
         return std.fmt.bufPrint(out, "{s}-{s}-{s}T{s}:{s}:{s}Z", .{
@@ -252,7 +252,7 @@ pub const Stamp = struct {
 
 // ---- the derived key ----
 
-/// The four HMACs of ADR 0069, done once a day rather than once a request.
+/// The four HMACs of ADR 060, done once a day rather than once a request.
 ///
 /// `AWS4` + secret, then the date, the region, the service, the terminator.
 /// What comes out signs every request made on that date in that region.
@@ -287,7 +287,7 @@ pub fn scope(out: *[scope_max]u8, date: *const [8]u8, region: []const u8) []cons
 /// `path` is the **raw** key with its prefix — `/photos/wati sari.png` — and
 /// is percent-encoded here, once, per RFC 3986 with `/` left alone. Encoding
 /// it twice is what several AWS services want and S3 does not
-/// ([ADR 0066](../docs/adr/0066-percent-is-needed-by-two-layers.md) says so
+/// ([ADR 057](../docs/adr/057-percent-is-needed-by-two-layers.md) says so
 /// where whoever is signing will be reading).
 pub const Request = struct {
     method: []const u8,
@@ -400,7 +400,7 @@ pub const authorization_max = algorithm.len + " Credential=".len + akid_max + 1 
 /// There is no session token in here, and that is deliberate: it is the only
 /// part whose size is a property of the *deployment* rather than of SigV4, it
 /// is 400–2,000 bytes, and by
-/// [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md) anything
+/// [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md) anything
 /// on this stack is held per connection for as long as that connection lives.
 /// So the buffer for it belongs to whoever knows whether there will be one —
 /// `Bucket`, at compile time, where a program on static credentials declares
@@ -517,7 +517,7 @@ pub fn presignQuery(
 
 // ---- a POST policy ----
 
-/// What a browser's own upload is signed over (ADR 0141).
+/// What a browser's own upload is signed over (ADR 112).
 ///
 /// A presigned URL signs a request nilo has described. A POST policy signs the
 /// **conditions** a request nobody has made yet has to meet, so there is no
@@ -525,7 +525,7 @@ pub fn presignQuery(
 /// the base64 policy with the key `derive` already made for the day. That is
 /// why this is one writer rather than a second signer, and it is the reason the
 /// call belongs in nilo at all. Written in an application, the daily key
-/// derivation of ADR 0069 would exist in two places that have to agree about a
+/// derivation of ADR 060 would exist in two places that have to agree about a
 /// rotation, and the first anybody hears of a disagreement is uploads failing
 /// at 00:00 UTC.
 ///
@@ -571,7 +571,7 @@ const policy_frame =
 /// control character in a key is written as a six-byte escape. That is
 /// generous by a factor of six on the ordinary key, and costs nothing worth
 /// naming: the policy is built in a Scope, and a Scope is reset whole. A stack
-/// buffer is what ADR 0063 says not to size this way.
+/// buffer is what ADR 062 says not to size this way.
 pub fn policySize(p: Policy) usize {
     return policy_frame + Stamp.expiration_len + algorithm.len + p.date.len +
         // `content-length-range`'s ceiling, as decimal.

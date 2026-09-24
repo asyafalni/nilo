@@ -7,7 +7,7 @@
 //! own. Everything below drives a real client against a real loopback server
 //! with **no zio anywhere**, so `zig test fetch/fetch.zig` is the whole suite
 //! and `zig build test-fetch` is only the second optimize mode
-//! ([ADR 0070](../docs/adr/0070-a-fitting-borrows-the-loop.md)).
+//! ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)).
 //!
 //! If a change ever makes this file need the Engine, the module is in the
 //! wrong layer rather than the test being wrong.
@@ -20,7 +20,7 @@ const testing = std.testing;
 
 /// The canned server, exported so a suite of somebody's own can stand one
 /// real exchange without writing the far end again
-/// ([ADR 0243](../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+/// ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)).
 /// Everything about how it is started — `io.concurrent`, never `io.async` —
 /// is on the type.
 const Canned = fetch.testing.Canned;
@@ -36,7 +36,7 @@ fn withIo(comptime body: fn (std.Io) anyerror!void) !void {
 /// A client wired the way a CLI or a worker wires it.
 ///
 /// `.none` rather than the Engine's `Limits`, because there is no Engine here
-/// and that is the whole point of the file. Until ADR 0230 that meant the
+/// and that is the whole point of the file. Until ADR 056 that meant the
 /// timeout was the one behaviour these tests could not reach — arming one
 /// needed something that could cancel a fiber. Now it means the client bounds
 /// the call itself, as a task of this `Io`, and the two tests under "a
@@ -269,7 +269,7 @@ fn countLines(head: []const u8, name: []const u8) usize {
     return n;
 }
 
-// ---- a deadline with no Engine (ADR 0230) ----
+// ---- a deadline with no Engine (ADR 056) ----
 
 /// Wide enough that a slow machine passes, and an order of magnitude under
 /// what an unbounded call would take: the silent server holds until the
@@ -409,7 +409,7 @@ test "a redirect that was followed says where it ended, and one that was not say
     }.run);
 }
 
-// ---- the other clock: silence, not the call (ADR 0237) ----
+// ---- the other clock: silence, not the call (ADR 056) ----
 
 test "silence after the head is a stall, told apart from the call's own clock" {
     try withIo(struct {
@@ -541,7 +541,7 @@ test "one socket read is one chunk, and zero is the end of the body" {
     }.run);
 }
 
-// ---- a redirect is a decision with a name (ADR 0239) ----
+// ---- a redirect is a decision with a name (ADR 183) ----
 
 test "an answer that says go elsewhere is refused unless the call decided otherwise" {
     // The default: a 302 is an error that names what to decide.
@@ -612,7 +612,7 @@ test "an answer that says go elsewhere is refused unless the call decided otherw
     }.run);
 }
 
-// ---- a head that outlives its body (ADR 0240) ----
+// ---- a head that outlives its body (ADR 187) ----
 
 test "a kept head reads the same after the body has been through" {
     try withIo(struct {
@@ -655,7 +655,7 @@ test "a kept head reads the same after the body has been through" {
     }.run);
 }
 
-// ---- the transfer buffer serves nothing here (ADR 0238) ----
+// ---- the transfer buffer serves nothing here (ADR 186) ----
 
 test "no transfer buffer is needed on any framing, and the read size is the client's" {
     // Chunked, the framing that would read through one if any did, into
@@ -712,7 +712,7 @@ test "no transfer buffer is needed on any framing, and the read size is the clie
 
 /// A Scope that has a request id — the shape a `*Ctx` has, without `http/`
 /// in this file. `nilo_fetch` reads the id by declaration and never names
-/// `Ctx`, so this is exactly what it sees (ADR 0196).
+/// `Ctx`, so this is exactly what it sees (ADR 158).
 const Named = struct {
     run: *core.Run,
     id: []const u8,
@@ -1132,7 +1132,7 @@ test "a body decides the framing, not the method: a DELETE with one and a PATCH 
     // Item 73: `std.http.Client` asserts that a DELETE has no body and a
     // PATCH has one, and a real API does both the other way — a bulk delete
     // with `{ids:[…]}`, a `PATCH /users/1/full-suspend` whose whole request
-    // is its path. Either tripped a panic in a worker thread (ADR 0213).
+    // is its path. Either tripped a panic in a worker thread (ADR 174).
     try withIo(struct {
         fn run(io: std.Io) !void {
             var canned = try Canned.open(io);
@@ -1196,7 +1196,7 @@ test "a 204 with no content-length ends at its head, and the connection is still
     // Item 76: Garage (hyper) answers a presigned POST with a 204 and no
     // `content-length`, and std's reader framed that as read-to-EOF — so
     // `client.send` sat until the server reaped the idle socket, 120 s for
-    // an answer complete in 30 ms. S3's own DELETE is a 204 too (ADR 0215).
+    // an answer complete in 30 ms. S3's own DELETE is a 204 too (ADR 176).
     try withIo(struct {
         fn run(io: std.Io) !void {
             var canned = try Canned.open(io);
@@ -1277,7 +1277,7 @@ test "a signed call says its own host and authorization, verbatim" {
 /// Counts what passes through it and forwards the rest.
 ///
 /// `http/budget.zig` has the same twenty lines, and this is not shared with
-/// it: a Fitting may not import `nilo_http` (ADR 0042), and pushing a test
+/// it: a Fitting may not import `nilo_http` (ADR 038), and pushing a test
 /// helper down into Core to avoid writing it twice would put something in the
 /// vocabulary that no shipped code calls. Twenty duplicated lines is the
 /// cheaper of the two.
@@ -1315,7 +1315,7 @@ const Counting = struct {
     }
 };
 
-// ---- the ordinary call: JSON out, headers back (ADR 0243, ADR 0244) ----
+// ---- the ordinary call: JSON out, headers back (ADR 061, ADR 187) ----
 
 test "a JSON body arrives written out, under a content-type the caller did not have to say" {
     try withIo(struct {
@@ -1415,7 +1415,7 @@ test "a response carries its headers, so the Retry-After off a 429 is one call a
     }.run);
 }
 
-// ---- the canned server, for a suite of somebody's own (ADR 0243) ----
+// ---- the canned server, for a suite of somebody's own (ADR 061) ----
 
 test "a canned server answers what reply said, and shows the request that reached it" {
     // The shape a caller's own suite writes, end to end, on nothing but the
@@ -1489,7 +1489,7 @@ test "a call on a warm connection allocates twice: the header block, then the bo
 
             // Two, and they are the header block and the body, in that
             // order: the block is kept into the Scope's arena before the
-            // body reads over it (ADR 0244), and the body is `allocRemaining`
+            // body reads over it (ADR 187), and the body is `allocRemaining`
             // into the same arena. The gate is a semaphore with no allocation
             // behind it, the deadline arms into a slot inside the `Bound` on
             // the stack, and the request head is written into the
@@ -1501,7 +1501,7 @@ test "a call on a warm connection allocates twice: the header block, then the bo
             // and the body's writer then asks for more than what is left of
             // it. It was one for a year, when the body was the first and
             // only thing. Raising this needs a reason. It is the same rule
-            // ADR 0018's second row puts on the inbound path, applied to the
+            // ADR 017's second row puts on the inbound path, applied to the
             // way out.
             try testing.expectEqual(@as(usize, 2), counting.allocs);
         }
@@ -1581,7 +1581,7 @@ test "a pooled connection the peer reset costs one retry too" {
     }.run);
 }
 
-// ---- a target is a type, and a path is a template (ADR 0254) ----
+// ---- a target is a type, and a path is a template (ADR 061) ----
 
 test "a target's standing headers go out on every call, and the call's own line goes instead of one" {
     try withIo(struct {

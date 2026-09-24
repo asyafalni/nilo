@@ -23,7 +23,7 @@ const s3 = @import("nilo_s3");
 
 /// `key_max` matches `bench/s3_server.zig` for the same reason it does there:
 /// it sizes a stack buffer in every call, and a byte of handler stack is a
-/// byte on every idle connection (ADR 0063).
+/// byte on every idle connection (ADR 062).
 const Avatars = s3.Bucket("avatars", .{
     .style = .path,
     .max_bytes = 2 << 20,

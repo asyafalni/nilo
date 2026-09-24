@@ -12,24 +12,24 @@
 //! A `Db` cannot be finished before `listen()`. The pool has to dial, and
 //! dialling needs the event loop, and the loop does not exist until the
 //! server starts — and a pool that dialled without one would block the
-//! thread every request on it shares (ADR 0014). So `init` records what to
+//! thread every request on it shares (ADR 013). So `init` records what to
 //! connect to and opens nothing, and `nilo_start` does the rest once the
-//! loop is up (ADR 0040).
+//! loop is up (ADR 037).
 //!
 //! That is also what makes a server boot with its database switched off:
 //! `connect_on_init` defaults to zero, so startup asks for a pool rather
 //! than for a connection. **That sentence was false for as long as it had
-//! been written** — see `Opts.connect_on_init` and ADR 0062 — and what
+//! been written** — see `Opts.connect_on_init` and ADR 115 — and what
 //! holds it now is `bench/sql_server.zig`, which boots against a port
 //! nothing is listening on. Somebody working on an endpoint that never
 //! touches Postgres does not need Postgres running. The first request that
 //! *does* touch it gets `error.Disconnected`, which reaches the client as a
 //! 500 like any other error a handler did not catch — `AlreadyExists` is
-//! the only one of the four given an answer of its own (ADR 0039), because
+//! the only one of the four given an answer of its own (ADR 036), because
 //! it is the only one whose meaning does not change with the request around
 //! it. A handler that wants a 503 here says so with a fail function.
 //!
-//! **A `Db` with a `checking` list dials one anyway** (ADR 0144). A pool of
+//! **A `Db` with a `checking` list dials one anyway** (ADR 115). A pool of
 //! nothing has nothing for the check to borrow, so on `.{}` the check
 //! answered `Disconnected` and the server started with a warning — a second
 //! way to have no schema check while believing there is one, and the one you
@@ -52,7 +52,7 @@
 //! too big to hold cannot be copied anywhere, so its rows come back as
 //! `Borrowed(Row)` — `Row` with every `Str` replaced by `[]const u8`,
 //! pointing into the driver's buffer and good only until the next one. The
-//! type carries the rule instead of a comment (ADR 0039).
+//! type carries the rule instead of a comment (ADR 036).
 //!
 //! ## Reads and writes are the same shape
 //!
@@ -72,7 +72,7 @@ const std = @import("std");
 const core = @import("nilo_core");
 
 /// **Reached only by the tests at the bottom of this file** — a Service does
-/// not import an App (ADR 0041). It is here rather than unreachable because
+/// not import an App (ADR 038). It is here rather than unreachable because
 /// the test worth having is the one that drives a whole request through a
 /// real App, and Zig makes that free: an import named only from a `test`
 /// block is never analysed in a build that is not a test build, so the
@@ -104,7 +104,7 @@ pub const Db = DbOf(postgres.Wire, dialect.Postgres, "");
 
 /// A **second** database, told apart from the first by its name.
 ///
-/// The Service registry is keyed by type (ADR 0011), so one `*sql.Db` is
+/// The Service registry is keyed by type (ADR 010), so one `*sql.Db` is
 /// all a program could ask for and a read replica had nowhere to live. A
 /// name makes a distinct type, and two distinct types are two services:
 ///
@@ -119,7 +119,7 @@ pub const Db = DbOf(postgres.Wire, dialect.Postgres, "");
 /// list**, which is where the rest of this framework puts that kind of
 /// decision. Nothing routes anything, and that is the design rather than
 /// the first half of one — see
-/// [ADR 0060](../docs/adr/0060-a-second-database-is-a-second-type.md) for
+/// [ADR 054](../docs/adr/054-a-second-database-is-a-second-type.md) for
 /// what a router would have had to know and could not.
 pub fn Named(comptime name: []const u8) type {
     if (name.len == 0) @compileError(
@@ -141,12 +141,12 @@ pub fn Named(comptime name: []const u8) type {
 /// is where it is kept, and the trap messages read it — which is the reason
 /// it is not merely a marker.
 /// One statement that has run, as the thing watching it is told about it
-/// ([ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)).
+/// ([ADR 108](../docs/adr/108-a-statement-can-be-watched.md)).
 ///
 /// **The values are not in it, and that is the decision rather than the first
 /// version.** They are the interesting half and they are a password, an email
 /// address and a card's last four digits — which is what
-/// [ADR 0025](../docs/adr/0025-every-failure-answers-with-the-same-json-body.md)
+/// [ADR 024](../docs/adr/024-every-failure-answers-as-json.md)
 /// is careful about one layer up, where a failure's message never reaches the
 /// client. A log line is read by more people than a response is.
 ///
@@ -160,7 +160,7 @@ pub const Sent = struct {
     sql: []const u8,
     /// The name it is kept prepared under, or null for a statement that is
     /// not kept — which is `db.raw`, `db.exec`, and every statement on a `Db`
-    /// with `prepared = false` (ADR 0057).
+    /// with `prepared = false` (ADR 051).
     plan: ?[]const u8,
     /// How long the database took, from the call going out to the rows being
     /// in hand. Taken from the monotonic clock, so an operator moving the
@@ -179,7 +179,7 @@ pub const Sent = struct {
     failed: bool,
     /// What the database said about refusing it, when it said anything —
     /// null on a statement that worked and on one nobody could get a word out
-    /// of ([ADR 0146](../docs/adr/0146-a-statement-that-failed-says-what-the-database-said.md)).
+    /// of ([ADR 117](../docs/adr/117-a-statement-that-failed-says-what-the-database-said.md)).
     ///
     /// **This is not the reasoning above read backwards.** That paragraph is
     /// about the *Zig error*, which is a set that grows and breaks a switch;
@@ -191,7 +191,7 @@ pub const Sent = struct {
     ///
     /// It lives in the Scope's arena, so a watcher that wants to keep one past
     /// the request has to copy it — the same rule a `Str` follows. And it
-    /// still never reaches the client (ADR 0025).
+    /// still never reaches the client (ADR 024).
     problem: ?wire_mod.Problem = null,
 };
 
@@ -202,7 +202,7 @@ pub const Sent = struct {
 pub const Watcher = *const fn (Sent) void;
 
 /// The last statement's failure, for the fiber that ran it
-/// ([ADR 0184](../docs/adr/0184-a-failure-belongs-to-the-call-that-caused-it.md)).
+/// ([ADR 117](../docs/adr/117-a-statement-that-failed-says-what-the-database-said.md)).
 ///
 /// **A watcher sees every statement and a caller sees one.** That is the split
 /// `db.watching` gets right for logging and wrong for a branch: an observer
@@ -240,7 +240,7 @@ fn remember(arena: std.mem.Allocator, problem: ?wire_mod.Problem) void {
 }
 
 /// What the database said about the last statement **this fiber** ran, or null
-/// when it worked (ADR 0184).
+/// when it worked (ADR 117).
 ///
 /// ```zig
 /// db.delete(Staff, c, .{ .where = .{ .id = id } }) catch |err| switch (err) {
@@ -286,7 +286,7 @@ pub fn lastProblem(c: anytype) ?wire_mod.Problem {
 /// with the default log level pays the branch and prints nothing.
 pub fn logging(sent: Sent) void {
     const how = if (sent.failed) " failed" else "";
-    // The database's own words, when there are any (ADR 0146). A watcher that
+    // The database's own words, when there are any (ADR 117). A watcher that
     // prints the statement and not the reason is the shape this module already
     // shipped once, and it is the one that costs somebody an afternoon.
     if (sent.problem) |said| {
@@ -326,7 +326,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// the whole point of the seam — and a migration has to, because DDL
         /// is the one thing this module generates from a type rather than
         /// from a statement it already knows
-        /// ([ADR 0153](../docs/adr/0153-a-migration-is-a-diff-against-a-snapshot.md)).
+        /// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
         pub const Dialect = D;
 
         /// `db_name` as it goes into a message: the ordinary `Db` is "the
@@ -334,7 +334,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// fires costs nothing to have worded well.
         const whoami = if (name.len == 0) "the database" else "`sql.Named(\"" ++ name ++ "\")`";
 
-        /// What a nilo message calls this type (ADR 0122): the call the
+        /// What a nilo message calls this type (ADR 074): the call the
         /// reader wrote, rather than the `db.DbOf(postgres.Wire,…)` that
         /// `@typeName` spells with three of this module's files in it.
         pub const nilo_type_name = if (D == dialect.SQLite)
@@ -358,19 +358,19 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         expect: ?Guard = null,
         /// Whether `nilo_start` dialled a connection for the checks and
         /// could not: said there in one line, and read by `nilo_check` so
-        /// the checks it was for are skipped rather than failed (ADR 0144,
-        /// ADR 0277).
+        /// the checks it was for are skipped rather than failed (ADR 115,
+        /// ADR 180).
         check_dial_failed: bool = false,
         /// Who to tell about each statement, or null for nobody — which is
         /// the default and costs one null test per statement
-        /// ([ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)).
+        /// ([ADR 108](../docs/adr/108-a-statement-can-be-watched.md)).
         watch: ?Watcher = null,
         /// Debug only: transactions begun and not yet ended. A leak here is
         /// a connection that never goes back, so the count is asserted at
         /// `deinit` — see `begin`.
         ///
         /// **Moved atomically, because a `Db` is a Service and a Service is
-        /// shared across threads** (ADR 0011). A plain `+= 1` here is the
+        /// shared across threads** (ADR 010). A plain `+= 1` here is the
         /// exact race that ADR warns about, and losing a count does not
         /// merely weaken the trap: drift upwards makes `deinit` accuse a
         /// program of a leak that never happened, and drift downwards
@@ -397,7 +397,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             /// header. Raise it to fail fast on a bad URL in production.
             ///
             /// **This did not work until it was measured, and the reason is
-            /// worth knowing** ([ADR 0062](../docs/adr/0062-a-pool-that-dialled-itself-whatever-it-was-told.md)):
+            /// worth knowing** ([ADR 115](../docs/adr/115-a-boot-dials-the-connection-its-work-needs.md)):
             /// `pg.Pool.initUri` dropped the field on the way past, so every
             /// pool dialled itself in full at startup and a server whose
             /// database was down refused to start — the opposite of what the
@@ -413,7 +413,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             /// than on a server.
             ///
             /// **Zero means one dialled now and the rest lazily** (ADR
-            /// 0144, ADR 0284). The schema check, the version guard and
+            /// 115, ADR 115). The schema check, the version guard and
             /// `app.before` all borrow a connection before the first
             /// request, and a pool that dialled none had nothing to lend
             /// them: the check that was meant to stop a bad deploy became a
@@ -433,7 +433,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             /// `checking` never called warns once that the Rows will be
             /// checked by the first request that reads them, which is later
             /// than anybody wanted
-            /// ([ADR 0262](../docs/adr/0262-a-db-with-no-schema-check-says-so-or-is-told.md)).
+            /// ([ADR 192](../docs/adr/192-a-db-with-no-schema-check-says-so-or-is-told.md)).
             /// The two are a decision written down and a decision nobody
             /// made, and until this field existed they looked the same.
             /// A `checking` list that was given still runs whatever this says.
@@ -445,7 +445,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             /// and 15% of a page with a sort** — ~12 µs a query either way,
             /// which is a fixed cost and therefore matters most to the cheap
             /// queries a service runs most of
-            /// ([ADR 0057](../docs/adr/0057-a-statement-that-is-a-constant-can-be-prepared-once.md)).
+            /// ([ADR 051](../docs/adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)).
             ///
             /// What is kept is bounded by the *program* rather than by
             /// traffic: every statement this module sends is settled while
@@ -497,7 +497,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         fn planOf(self: *Self, comptime stmt: statement.Statement) ?[]const u8 {
             if (!self.opts.prepared) return null;
             // A statement whose `ORDER BY` is chosen per request is not one
-            // text, so there is no one name to keep it under (ADR 0204).
+            // text, so there is no one name to keep it under (ADR 165).
             if (comptime stmt.ordered) return null;
             return comptime statement.planName(stmt.sql);
         }
@@ -505,7 +505,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// The text of a statement as it goes to the Wire: the constant, or —
         /// for one whose `ORDER BY` is chosen per request — the head, the
         /// clause the request chose, and the tail, written into the arena
-        /// once at a size settled while compiling (ADR 0204).
+        /// once at a size settled while compiling (ADR 165).
         fn textOf(comptime stmt: statement.Statement, options: anytype, c: anytype) ![]const u8 {
             if (comptime !stmt.ordered) return stmt.sql;
             return spliced(stmt.sql, options.order, stmt.tail, c);
@@ -528,10 +528,10 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// The same, for a statement this module did not write.
         ///
         /// `db.raw` used to be the one call that was never prepared, on
-        /// ADR 0057's reasoning that its text arrived at run time and there
+        /// ADR 051's reasoning that its text arrived at run time and there
         /// was no bound on how many names there would be. Its text is
         /// comptime now, so both halves of that stopped being true and the
-        /// same 12 µs applies ([ADR 0148](../docs/adr/0148-a-raw-statement-is-counted-while-compiling.md)).
+        /// same 12 µs applies ([ADR 051](../docs/adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)).
         fn rawPlanOf(self: *Self, comptime sql: []const u8) ?[]const u8 {
             if (!self.opts.prepared) return null;
             return comptime statement.planName(sql);
@@ -539,7 +539,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// A raw statement's text as this Dialect spells its placeholders,
         /// with the `$n` in it held against the values handed over
-        /// ([ADR 0278](../docs/adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+        /// ([ADR 204](../docs/adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
         /// Every call that takes comptime text goes through here, so `$1`
         /// means the first value on both databases; `exec` takes its text at
         /// run time and sends it as written.
@@ -566,14 +566,14 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// Check the schema's Rows against the tables they name, once, while
         /// the server is starting: after the work `app.before` registered
         /// has made or moved the tables, and before the first request
-        /// (ADR 0277).
+        /// (ADR 180).
         ///
         /// The schema cannot be an option on `Opts`, because a `[]const type`
         /// would make the whole struct comptime-only and a `Db` is a
         /// runtime value a handler holds. So it is a call, and what it
         /// stores is a function with the list already inside it. The same
         /// `sql.Schema` the `db` tool and `createMissing` are given, so the
-        /// three cannot drift (ADR 0253); the functions and views in it are
+        /// three cannot drift (ADR 181); the functions and views in it are
         /// not checked here, only the tables.
         ///
         /// ```zig
@@ -590,7 +590,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// Refuse to serve a database whose ledger is behind `want`, checked
         /// once, while the server is starting
-        /// ([ADR 0220](../docs/adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+        /// ([ADR 180](../docs/adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
         ///
         /// ```zig
         /// var db = sql.Db.init(gpa, url, .{});
@@ -598,14 +598,14 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// ```
         ///
         /// `migrate.expect`, run by `nilo_check` on the pool `nilo_start`
-        /// opened, after the work `app.before` registered (ADR 0277): one
+        /// opened, after the work `app.before` registered (ADR 180): one
         /// query, and the sentence that says which migration is missing.
         /// The number is the generated manifest's head, so the guard moves
         /// with the migrations and nobody types it. A database *ahead* of
         /// the binary is allowed and noted, because that is the middle of a
         /// two-stage deploy. A database that cannot be asked — down, or
         /// `connect_on_init = 0` and the dial for it failed — starts with a
-        /// warning, the way the schema check does (ADR 0039).
+        /// warning, the way the schema check does (ADR 036).
         ///
         /// **A call rather than a field on `Opts`, and the reason is 17,296
         /// bytes.** An `.expect = …` option is read on every boot, so the
@@ -617,7 +617,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// `checking` works.
         ///
         /// Like `checking`, this dials one connection on a `Db` written with
-        /// `connect_on_init = 0`, for the reason ADR 0144 gives: a guard
+        /// `connect_on_init = 0`, for the reason ADR 115 gives: a guard
         /// with nothing to ask never guarded anything.
         pub fn expecting(self: *Self, want: i64) void {
             self.expect = .{ .want = want, .run = &struct {
@@ -635,7 +635,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         };
 
         /// Be told about every statement this `Db` sends
-        /// ([ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)).
+        /// ([ADR 108](../docs/adr/108-a-statement-can-be-watched.md)).
         ///
         /// ```zig
         /// db.watching(sql.logging);   // one debug line per statement
@@ -663,7 +663,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         ///
         /// `problem` is what the Wire left in the slot the caller handed it,
         /// which is null on every path that did not fail and on the failures
-        /// nobody could get a word out of (ADR 0146).
+        /// nobody could get a word out of (ADR 117).
         fn told(
             self: *const Self,
             arena: std.mem.Allocator,
@@ -677,7 +677,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // Before either early return below, because this is not the
             // watcher's half: a `Db` with no watcher and a `Db` with timing off
             // both still owe the caller an answer about the statement it just
-            // ran (ADR 0184).
+            // ran (ADR 117).
             remember(arena, problem);
             const f = self.watch orelse return;
             const at = started orelse return;
@@ -726,17 +726,17 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// Finish building, now that there is an event loop to dial
         /// through. Called by `listen()` before the first connection is
-        /// accepted (ADR 0040).
+        /// accepted (ADR 037).
         ///
         /// **`limits` is what can stop a fiber that is waiting**, and it is
         /// taken for the same reason `nilo_fetch` and `nilo_s3` take one: the
         /// Engine owns the timer and a Service owns the number
         /// (`core/limits.zig`). A `Db` no App holds — a CLI, a migration, a
         /// test — passes `.off` and is bounded by nothing, which is what it
-        /// was before ADR 0135 either way.
+        /// was before ADR 107 either way.
         pub fn nilo_start(self: *Self, io: std.Io, limits: core.Limits) !void {
             // **A check with nothing to check against never ran**
-            // ([ADR 0144](../docs/adr/0144-a-check-dials-the-connection-it-needs.md)).
+            // ([ADR 115](../docs/adr/115-a-boot-dials-the-connection-its-work-needs.md)).
             // `connect_on_init` is 0 by default, so a `Db` written `.{}`
             // reached the schema check with an empty pool, the check
             // answered `Disconnected`, and the server started with a
@@ -745,14 +745,14 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // stopped nothing, and the deploy was green.
             //
             // So a `Db` that has a check to run dials one connection for
-            // it — and a version guard is a check (ADR 0220). What does not
-            // change is ADR 0039's promise that a database which is merely
+            // it — and a version guard is a check (ADR 180). What does not
+            // change is ADR 036's promise that a database which is merely
             // down does not stop the server: a dial that fails here falls
             // back to the pool the caller asked for and says in one line
             // that the check is not happening.
             //
             // **Every `Db` dials the one, not only a checked one**
-            // ([ADR 0284](../docs/adr/0284-a-boot-dials-the-connection-its-work-needs.md)).
+            // ([ADR 115](../docs/adr/115-a-boot-dials-the-connection-its-work-needs.md)).
             // The check is not the only work that runs before the first
             // request: `app.before` is the documented place for a migration
             // or a key set, and it runs a moment after this returns. A pool
@@ -765,12 +765,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             var check_dial_failed = false;
 
             // **The one way to have no schema check is to say so** (ADR
-            // 0262). A `Db` with `check == null` used to be a decision
+            // 192). A `Db` with `check == null` used to be a decision
             // nobody had written down, and the disagreement the check would
             // have caught arrived as a 500 on the first request that read the
             // column. Said before the dial, because it is true whether or not
             // the database is up, and at `warn` for the reason the lines
-            // below are: `err` fails the test runner (ADR 0178).
+            // below are: `err` fails the test runner (ADR 145).
             if (self.forgotTheCheck()) std.log.warn(
                 "{s} is starting with no schema check: `db.checking(schema)` was never " ++
                     "called, so a Row that disagrees with its table is found by the first " ++
@@ -810,14 +810,14 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
             self.wire = opened catch |err| {
                 // Two failures reach here and they want different sentences.
-                // Before ADR 0062 the pool dialled itself whatever
+                // Before ADR 115 the pool dialled itself whatever
                 // `connect_on_init` said, so *both* of them got the one
                 // about the URL — which sent people to check a URL that was
                 // correct while their database was down.
                 //
                 // **`warn` rather than `err`, for the reason `sqlite.read`'s
                 // is one and `wireOf`'s before it**
-                // ([ADR 0178](../docs/adr/0178-a-suite-whose-database-is-down-is-not-a-suite-that-failed.md)):
+                // ([ADR 145](../docs/adr/145-a-suite-whose-database-is-down-is-not-a-suite-that-failed.md)):
                 // `std.log.err` fails the test runner for every test that
                 // provokes it, and this line runs once per test in a suite
                 // whose database is not running. The error is returned and is
@@ -855,7 +855,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// The schema check and the version guard, once, after the work
         /// `app.before` registered and before the first request
-        /// ([ADR 0277](../docs/adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+        /// ([ADR 180](../docs/adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
         ///
         /// **Here and not in `nilo_start`, because of what `before` is for.**
         /// The guide's single-file program registers `createMissing` with
@@ -899,7 +899,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             if (problems != 0 and self.opts.schema_mismatch_is_fatal) {
                 // **This one stays at `err` while the two above dropped to
                 // `warn`, and the line between them is worth stating**
-                // ([ADR 0178](../docs/adr/0178-a-suite-whose-database-is-down-is-not-a-suite-that-failed.md)).
+                // ([ADR 145](../docs/adr/145-a-suite-whose-database-is-down-is-not-a-suite-that-failed.md)).
                 // A database that is not running is a fact about the machine
                 // the suite is on; a Row that disagrees with its table is a
                 // broken program, and a test runner going red for it is the
@@ -923,7 +923,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         }
 
         /// The guard itself, reached only through `expecting`
-        /// ([ADR 0220](../docs/adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+        /// ([ADR 180](../docs/adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
         ///
         /// The one thing `migrate.expect` needs is a Scope, and the boot has
         /// none — so one is made here on the loop the pool was just opened
@@ -947,7 +947,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         }
 
         /// Put the pool down, on the loop it was built on
-        /// ([ADR 0151](../docs/adr/0151-a-service-is-stopped-before-the-loop-is.md)).
+        /// ([ADR 121](../docs/adr/121-a-service-is-stopped-before-the-loop-is.md)).
         ///
         /// `listen()` calls this on the way out, after the last connection
         /// has been cut off and before the Engine's loop is torn down. It has
@@ -966,7 +966,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         }
 
         /// What the health route asks
-        /// ([ADR 0192](../docs/adr/0192-a-health-route-asks-the-services.md)).
+        /// ([ADR 154](../docs/adr/154-a-health-route-asks-the-services.md)).
         /// A pool that is up is a pool that can answer `SELECT 1`, and
         /// nothing short of sending one says so: `connect_on_init = 0` is a
         /// server that starts with its database down, and this is where that
@@ -990,7 +990,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// Every row matching `options`, in the request's arena.
         ///
         /// The statement itself was settled while compiling: `options` only
-        /// carries the values (ADR 0039).
+        /// carries the values (ADR 036).
         pub fn select(self: *Self, comptime Row: type, c: anytype, options: anytype) ![]Row {
             comptime core.checkScope(@TypeOf(c), "db.select");
             comptime assertUnlocked(Row, @TypeOf(options), "db.select", "Begin one and ask there: `var tx = try db.begin(c, .{}); defer tx.deinit();` " ++
@@ -1001,7 +1001,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// The first row matching `options`, or null.
         ///
-        /// `?Row` is already a 404 in the typed layer (ADR 0024), so a
+        /// `?Row` is already a 404 in the typed layer (ADR 023), so a
         /// handler that returns this and nothing else is a whole endpoint.
         ///
         /// The statement carries its own `LIMIT 1`, so a condition on a
@@ -1026,13 +1026,13 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         ///
         /// The column comes from the Row's `.key`, so the same lookup is not
         /// written out at every call site — and `?Row` is already a 404 in
-        /// the typed layer (ADR 0024), which makes the two lines above a
+        /// the typed layer (ADR 023), which makes the two lines above a
         /// whole endpoint. It is `one` with the condition filled in, `LIMIT
         /// 1` included; a struct where the key goes is a Refusal pointing at
         /// `one`.
         ///
         /// **A key of several columns is handed over by name**
-        /// ([ADR 0172](../docs/adr/0172-a-key-is-as-many-columns-as-it-takes.md)):
+        /// ([ADR 139](../docs/adr/139-a-key-is-as-many-columns-as-it-takes.md)):
         ///
         /// ```zig
         /// const seat = try db.find(Seat, c, .{ .tenant_id = tenant, .id = id });
@@ -1067,7 +1067,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// A page of rows, and how many the condition matched before the
         /// `.limit` cut it — in one statement
-        /// ([ADR 0185](../docs/adr/0185-a-page-knows-what-it-left-out.md)).
+        /// ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md)).
         ///
         /// ```zig
         /// const found = try db.page(Order, c, .{
@@ -1128,7 +1128,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// The one row a Row grouped by nothing answers: every aggregate it
         /// declares, over the rows `.where` matched
-        /// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+        /// ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
         ///
         /// ```zig
         /// const Totals = struct {
@@ -1195,7 +1195,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // no row count: the rows are pulled by the handler afterwards and
             // nothing in this call sees the last one. A stream that is slow to
             // *open* is the half worth reporting, and it is the half this can
-            // report honestly (ADR 0137).
+            // report honestly (ADR 108).
             self.told(arena, started, text, self.planOf(stmt), null, false, null);
             // Counted only once the statement is away, so a `stream` that
             // never opened is not a `stream` that was never closed.
@@ -1206,13 +1206,13 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// A statement this module will not write, filling `Row` from the
         /// columns it selects, in order.
         ///
-        /// The way past what a Row can declare (ADR 0295): a join no reference
+        /// The way past what a Row can declare (ADR 218): a join no reference
         /// names, an aggregate over an expression, `FILTER`, window functions,
         /// CTEs. It keeps the arena, keeps the `Str` rule and keeps the row
         /// filling.
         ///
         /// **The text is comptime and the `SELECT` list is checked against the
-        /// Row** ([ADR 0148](../docs/adr/0148-a-raw-statement-is-counted-while-compiling.md)):
+        /// Row** ([ADR 051](../docs/adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)):
         /// the columns are counted against the Row's fields, each column that
         /// plainly has a name is checked against the field in its position,
         /// and a disagreement is a compile error naming both. The statement is
@@ -1227,7 +1227,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// A `*` in the list, and a statement with no `SELECT` and no
         /// `RETURNING`, are counted as "not counted" rather than guessed at —
         /// so `SELECT *` into a narrow Row still compiles, and the run-time
-        /// width check is what holds it (ADR 0134).
+        /// width check is what holds it (ADR 106).
         pub fn raw(
             self: *Self,
             comptime Row: type,
@@ -1238,7 +1238,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             comptime core.checkScope(@TypeOf(c), "db.raw");
             const text = comptime rawText(sql, @TypeOf(values), "db.raw");
             // One column and no Row: `db.raw([]const u8, …)`, `db.raw(i64, …)`
-            // ([ADR 0234](../docs/adr/0234-a-scalar-out-of-raw.md)).
+            // ([ADR 125](../docs/adr/125-a-row-that-owns-no-table.md)).
             if (comptime scalarColumn(Row)) {
                 comptime rawcheck.assertOne(Row, sql, "db.raw");
                 return fillScalar(Row, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c));
@@ -1248,7 +1248,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // nothing to say about how many rows it can answer with.
             //
             // The values still go through the same conversion a Row's do
-            // (ADR 0145). This module did not write the *statement*; it is
+            // (ADR 116). This module did not write the *statement*; it is
             // still the one holding a `Uuid`, a `Str` and a `Timestamp`, and a
             // parameter that meant something different here than in
             // `db.select` would be two rules for one type.
@@ -1257,7 +1257,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// `db.raw` with its `ORDER BY` chosen per request, from a closed set
         /// declared while compiling
-        /// ([ADR 0204](../docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+        /// ([ADR 165](../docs/adr/165-an-order-chosen-at-run-time-from-a-closed-set.md)).
         ///
         /// ```zig
         /// const Sort = sql.Ordering(CommitmentRow, .{
@@ -1280,7 +1280,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// Everything else is `db.raw`: the `SELECT` list counted and named
         /// against the Row, the values converted the way a Row's are. What it
         /// gives up is the plan name — the text differs per request, so it
-        /// runs unnamed, which is the 12 µs ADR 0057 measured.
+        /// runs unnamed, which is the 12 µs ADR 051 measured.
         pub fn rawOrdered(
             self: *Self,
             comptime Row: type,
@@ -1299,7 +1299,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// `db.raw` for a statement whose `WHERE` holds a key: the first row,
         /// or null
-        /// ([ADR 0179](../docs/adr/0179-a-statement-with-a-key-in-it-has-a-single-row-answer.md)).
+        /// ([ADR 146](../docs/adr/146-a-statement-with-a-key-in-it-has-a-single-row-answer.md)).
         ///
         /// ```zig
         /// fn card(db: *sql.Db, c: *nilo.Ctx, id: sql.Uuid) !?WorkItemCard {
@@ -1310,7 +1310,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// **`db.one` is this for the typed select and there was no `rawOne`**,
         /// so the same three lines were written at every call site: take the
         /// slice, test its length, hand back `found[0]`. `?Row` is already a
-        /// 404 in the typed layer (ADR 0024), so what the handler wants is
+        /// 404 in the typed layer (ADR 023), so what the handler wants is
         /// `!?T` and what it had was a slice to unwrap.
         ///
         /// **No `LIMIT 1` is added**, which is the whole of how this differs
@@ -1342,7 +1342,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// `db.rawOne` for a statement that answers exactly one row by
         /// construction (an aggregate with no `GROUP BY`, a `RETURNING` on
         /// a keyed write), so the answer is the Row and not a `?Row`
-        /// ([ADR 0280](../docs/adr/0280-a-statement-that-always-answers-answers-a-row.md)).
+        /// ([ADR 206](../docs/adr/206-a-statement-that-always-answers-answers-a-row.md)).
         ///
         /// ```zig
         /// const Totals = struct {
@@ -1381,7 +1381,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// `db.raw` with the total the statement matched read off the end
         /// of every row, the way `db.page` reads it
-        /// ([ADR 0279](../docs/adr/0279-a-raw-statement-can-carry-its-total.md)).
+        /// ([ADR 205](../docs/adr/205-a-raw-statement-can-carry-its-total.md)).
         ///
         /// ```zig
         /// const found = try db.rawPage(Line, c,
@@ -1424,7 +1424,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// An empty `Composed` that spells its placeholders the way this Db's
         /// dialect does, writing into the Scope's arena
-        /// ([ADR 0283](../docs/adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
+        /// ([ADR 208](../docs/adr/208-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
         /// A statement built elsewhere — a generator with no Db in scope —
         /// is `sql.Composed.init(arena, sql.Spelling.of(Dialect))`, and
         /// `db.composed` checks the two agree.
@@ -1437,7 +1437,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// `db.raw` for a statement composed at run time from pieces that
         /// cannot carry a string — literals, checked identifiers and
         /// parameters
-        /// ([ADR 0283](../docs/adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
+        /// ([ADR 208](../docs/adr/208-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
         ///
         /// ```zig
         /// var s = db.compose(c);
@@ -1453,8 +1453,8 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// ```
         ///
         /// What it keeps of `raw`: the Row filled by position, the run-time
-        /// width check (ADR 0134), the values converted the way a Row's are
-        /// (ADR 0145), one column into a scalar (ADR 0234), and the values
+        /// width check (ADR 106), the values converted the way a Row's are
+        /// (ADR 116), one column into a scalar (ADR 125), and the values
         /// counted against the placeholders — `rawcheck.assertParams` while
         /// compiling for `raw`, `error.ParamCountMismatch` here, since the
         /// text is not there to read until the request is. A statement
@@ -1510,7 +1510,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// shape to describe when nothing is selected — so the only way to say
         /// "no rows" used to be passing a Row that is not being read, which
         /// reads like a mistake and was the recommended path by elimination
-        /// (ADR 0078).
+        /// (ADR 067).
         ///
         /// **A SQLite application needs this and a Postgres one mostly does
         /// not**, which is why it arrived with the second Wire: there is no
@@ -1652,7 +1652,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         ///
         /// **`.key` is the Row's own key**, read off the `nilo_table` that
         /// already declares it, and is what a join table wants
-        /// ([ADR 0186](../docs/adr/0186-a-key-is-named-once.md)):
+        /// ([ADR 151](../docs/adr/151-a-key-is-named-once.md)):
         ///
         /// ```zig
         /// try db.insertOrIgnore(StaffRole, c, .{ .staff_id = id, .role = role }, .key);
@@ -1740,7 +1740,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// The same, for a `.where` that holds a key: the row as it now is, or
         /// null
-        /// ([ADR 0179](../docs/adr/0179-a-statement-with-a-key-in-it-has-a-single-row-answer.md)).
+        /// ([ADR 146](../docs/adr/146-a-statement-with-a-key-in-it-has-a-single-row-answer.md)).
         ///
         /// ```zig
         /// fn rename(db: *sql.Db, c: *nilo.Ctx, id: sql.Uuid, in: Rename) !?Partner {
@@ -1756,7 +1756,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// the same rows coming back; what differs is that the answer is `?Row`
         /// rather than a slice the handler has to unwrap. Null is *no row
         /// matched*, which in a PATCH endpoint is the 404 the typed layer
-        /// already writes for it (ADR 0024).
+        /// already writes for it (ADR 023).
         ///
         /// A `.where` that matches several rows updates all of them and this
         /// hands back the first, exactly as `db.one` does for a condition on a
@@ -1811,7 +1811,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// get wrong — was rejected for being a second dialect: Zig has no
         /// closures, so it means a struct holding a function and every
         /// capture passed by hand, and `Stream`, `Socket` and `Body` are all
-        /// *hold the thing, `defer` the cleanup* (ADR 0039).
+        /// *hold the thing, `defer` the cleanup* (ADR 036).
         pub fn begin(self: *Self, c: anytype, comptime opts: wire_mod.Begin) !Tx {
             comptime core.checkScope(@TypeOf(c), "db.begin");
             const w = try self.wireOf();
@@ -1856,7 +1856,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
             /// Bound how long each statement after this one may run, until
             /// this transaction ends — `error.TimedOut` for one that goes
-            /// past it ([ADR 0047](../docs/adr/0047-a-deadline-needs-a-connection-you-hold.md)).
+            /// past it ([ADR 043](../docs/adr/043-a-deadline-needs-a-connection-you-hold.md)).
             ///
             /// ```zig
             /// var tx = try db.begin(c, .{});
@@ -2097,7 +2097,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }
 
             /// A page of rows and the total behind it, inside the
-            /// transaction (ADR 0185). The reason to want it here is the one
+            /// transaction (ADR 150). The reason to want it here is the one
             /// the call exists for: a repeatable-read transaction is the other
             /// way to make a count and a page agree, and it costs a
             /// transaction where this costs a clause.
@@ -2158,7 +2158,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 return fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
             }
 
-            /// `db.updateReturningOne` inside the transaction (ADR 0179).
+            /// `db.updateReturningOne` inside the transaction (ADR 146).
             pub fn updateReturningOne(self: *Tx, comptime Row: type, c: anytype, options: anytype) !?Row {
                 comptime core.checkScope(@TypeOf(c), "tx.updateReturningOne");
                 const stmt = comptime statement.updateReturning(D, Row, @TypeOf(options));
@@ -2181,7 +2181,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             /// `db.raw` inside the transaction, and the same call in every
             /// other way: comptime text, the `SELECT` list counted and named
             /// against the Row while compiling, and the statement kept
-            /// prepared (ADR 0148). The type check is still the database's,
+            /// prepared (ADR 051). The type check is still the database's,
             /// through `db.checking`.
             pub fn raw(
                 self: *Tx,
@@ -2200,12 +2200,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 return fill(Row, null, self.db, &self.inner, c, text, self.db.rawPlanOf(text), try rawValuesOf(values, c));
             }
 
-            /// `db.compose` inside the transaction (ADR 0283).
+            /// `db.compose` inside the transaction (ADR 208).
             pub fn compose(self: *Tx, c: anytype) composed_mod.Composed {
                 return self.db.compose(c);
             }
 
-            /// `db.composed` inside the transaction (ADR 0283).
+            /// `db.composed` inside the transaction (ADR 208).
             pub fn composed(
                 self: *Tx,
                 comptime Row: type,
@@ -2223,7 +2223,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }
 
             /// `db.rawOrdered` inside the transaction: the caller's statement
-            /// with its `ORDER BY` chosen per request (ADR 0204).
+            /// with its `ORDER BY` chosen per request (ADR 165).
             pub fn rawOrdered(
                 self: *Tx,
                 comptime Row: type,
@@ -2241,7 +2241,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }
 
             /// `db.rawOne` inside the transaction: the first row of a statement
-            /// this module did not write, or null (ADR 0179).
+            /// this module did not write, or null (ADR 146).
             pub fn rawOne(
                 self: *Tx,
                 comptime Row: type,
@@ -2263,7 +2263,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
             /// `db.rawExactlyOne` inside the transaction: the one row a
             /// statement answers by construction, and `error.QueryFailed`
-            /// when it did not (ADR 0280).
+            /// when it did not (ADR 206).
             pub fn rawExactlyOne(
                 self: *Tx,
                 comptime Row: type,
@@ -2285,7 +2285,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
             /// `db.rawPage` inside the transaction: the caller's statement
             /// with `count(*) OVER ()` on the end of its list, read as the
-            /// rows and the total (ADR 0279).
+            /// rows and the total (ADR 205).
             pub fn rawPage(
                 self: *Tx,
                 comptime Row: type,
@@ -2302,7 +2302,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }
 
             /// `db.exec` inside the transaction: a statement that answers with
-            /// nothing, and the rows it changed (ADR 0078).
+            /// nothing, and the rows it changed (ADR 067).
             pub fn exec(self: *Tx, c: anytype, sql: []const u8, values: anytype) !usize {
                 comptime core.checkScope(@TypeOf(c), "tx.exec");
                 return self.db.execTold(&self.inner, c, sql, null, try rawValuesOf(values, c));
@@ -2311,7 +2311,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// What `db.page` answers with: the rows on this page, and how many
         /// the condition matched before the `.limit` cut it
-        /// ([ADR 0185](../docs/adr/0185-a-page-knows-what-it-left-out.md)).
+        /// ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md)).
         ///
         /// A type of its own rather than an out-parameter, for the reason
         /// `db.one` is not `db.select`: the shape of the answer changed, and
@@ -2323,7 +2323,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// and it is never negative.
         pub fn Page(comptime Row: type) type {
             return struct {
-                /// What a nilo compile error calls this type (ADR 0122).
+                /// What a nilo compile error calls this type (ADR 074).
                 pub const nilo_type_name = "nilo.sql.Page";
 
                 rows: []Row,
@@ -2345,7 +2345,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 /// Whether `close` has run.
                 ///
                 /// **A plain `bool` rather than a Debug-only one, and that is
-                /// the fix rather than a tidying** (ADR 0117). This used to be
+                /// the fix rather than a tidying** (ADR 093). This used to be
                 /// `if (traps_enabled) bool else void`, so in ReleaseSafe the
                 /// guard under it compiled away and the whole of `close` ran
                 /// twice: on the Postgres Wire that is `result.deinit()` twice
@@ -2462,7 +2462,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         ///
         /// **A pool that was never opened is a different mistake from a
         /// database that went away**, and they used to be the same silent
-        /// `error.Disconnected` (ADR 0079). The error is still the same value
+        /// `error.Disconnected` (ADR 180). The error is still the same value
         /// — a handler has nothing different to do — but the first one gets a
         /// line saying which of the two it is and how to fix it, once, because
         /// there is no way to reach here twice for that reason and have fixed
@@ -2504,7 +2504,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// a batch knows it only when the slice arrives. What that costs is
         /// one branch per statement, against a doubling per 2ⁿ rows.
         ///
-        /// A ceiling is not a count, and that distinction is the one ADR 0039
+        /// A ceiling is not a count, and that distinction is the one ADR 036
         /// originally got wrong: `.limit = 100` answering with 3 rows reserves
         /// room for 100 and fills 3. What is reserved and unused is
         /// `(ceiling - rows) * @sizeOf(Row)` bytes, and the `toOwnedSlice`
@@ -2527,7 +2527,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         }
 
         /// The same, with somewhere to put the column a page carries past its
-        /// Row ([ADR 0185](../docs/adr/0185-a-page-knows-what-it-left-out.md)).
+        /// Row ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md)).
         ///
         /// **One extra `readColumn`, on the first row only**, because
         /// `count(*) OVER ()` is the same number on every row of the result —
@@ -2572,7 +2572,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             const arena = c.arena();
             // The Db rather than the Wire, so that the one funnel every read
             // goes through is also the one place a watcher is told about it
-            // (ADR 0137). Inside a transaction this is the same `*W` the `Tx`
+            // (ADR 108). Inside a transaction this is the same `*W` the `Tx`
             // is holding, because the `Tx` took it from here.
             const w = try db.wireOf();
             const started = db.timing();
@@ -2597,14 +2597,14 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
             // The first row is pulled out of the loop so the width is asked
             // **once per statement** rather than once per row, and asked at
-            // the first moment both drivers can answer it (ADR 0134).
+            // the first moment both drivers can answer it (ADR 106).
             if (try w.next(&rows)) {
                 wideEnough(Row, if (total == null) 0 else 1, w, &rows) catch |err| {
                     db.told(arena, started, sql, plan, null, true, null);
                     return err;
                 };
                 // Read once rather than per row: `count(*) OVER ()` is the
-                // same number on every row of the result (ADR 0185).
+                // same number on every row of the result (ADR 150).
                 if (total) |slot| {
                     slot.* = readColumn(
                         w,
@@ -2634,12 +2634,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// position.
         ///
         /// **`db.raw` gives up the compile-time column check and nothing
-        /// else** — it does not give up being answerable (ADR 0134). A
+        /// else** — it does not give up being answerable (ADR 106). A
         /// `SELECT` list shorter than the Row otherwise reaches
         /// `pg.Row.get`, which is `self.values[col]` with no bound on `col`:
         /// a panic in ReleaseSafe, taking the whole process down for one
         /// request's mistake, and undefined in ReleaseFast. That is the
-        /// failure ADR 0008 says nilo cannot recover from, and this module
+        /// failure ADR 007 says nilo cannot recover from, and this module
         /// already refuses two others of the same kind — `enumOf` and
         /// `arrayFits`.
         ///
@@ -2661,7 +2661,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// `filling` for a statement read into one value per row rather than
         /// a Row: column one of every row, as `[]T`
-        /// ([ADR 0234](../docs/adr/0234-a-scalar-out-of-raw.md)).
+        /// ([ADR 125](../docs/adr/125-a-row-that-owns-no-table.md)).
         ///
         /// The same funnel — the Db, the watcher, the drain — and the same
         /// `readColumn`, so a `[]const u8` is kept into the arena and a `Str`
@@ -2770,11 +2770,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// One row of the answer, from column `at` on, in the order the Row
         /// declares its fields, which is the order `shape.zig` writes a
         /// `SELECT` list in, each parent's columns where the parent's field
-        /// is (ADR 0295). A flat Row is the case with no parent in it, and
+        /// is (ADR 218). A flat Row is the case with no parent in it, and
         /// reads its columns one after another as it always did.
         ///
         /// A field beside the columns is left at its default for the caller
-        /// to fill (ADR 0217), and a list of children empty for `adopt` to.
+        /// to fill (ADR 178), and a list of children empty for `adopt` to.
         fn readRow(comptime Row: type, comptime at: usize, w: *W, rows: *const W.Rows, c: anytype) !Row {
             var filled: Row = undefined;
             comptime var col = at;
@@ -2806,7 +2806,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         }
 
         /// Every children field of `parents`, read by one statement a field
-        /// (ADR 0295).
+        /// (ADR 218).
         ///
         /// **The parents' keys go out as one list and the children come back
         /// numbered by position in it**, sorted by that number, so the walk
@@ -2956,7 +2956,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 // escape in it back as a slice *into the input* — and the
                 // input is the driver's buffer the comment above says dies
                 // at the next row. The same trap `nilo_jwt` found in its own
-                // parse (ADR 0242); a payload's text is copied the way a
+                // parse (ADR 111); a payload's text is copied the way a
                 // text column's is.
                 return .{
                     .value = std.json.parseFromSliceLeaky(Payload, c.arena(), value, .{
@@ -2989,7 +2989,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         ///
         /// A `Uuid` element takes the same second walk and for a different
         /// reason: the driver hands back the sixteen bytes and the sixteen
-        /// bytes are not the type (ADR 0145). That walk allocates nothing
+        /// bytes are not the type (ADR 116). That walk allocates nothing
         /// extra beyond the `[]Uuid` itself, because a `Uuid` is a value
         /// rather than a view of a buffer.
         fn keptList(
@@ -3015,7 +3015,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// The columns the database says a table has, in the Scope's arena.
         /// What `migrate.addMissingColumns` reads to find out which of a
-        /// Row's fields the shipped table has not got (ADR 0233); the same
+        /// Row's fields the shipped table has not got (ADR 123); the same
         /// question `checkSchema` asks, asked from outside this file. An
         /// empty answer is a table that is not there.
         pub fn liveColumns(self: *Self, c: anytype, schema_name: ?[]const u8, table: []const u8) ![]const wire_mod.Column {
@@ -3093,7 +3093,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// to. `= null` in a condition never reaches here at all, because it
         /// compiled to `IS NULL`, which takes no parameter (`where.zig`).
         /// `c` is here for the one conversion that can need memory: a text
-        /// column that builds its text rather than holding it (ADR 0055).
+        /// column that builds its text rather than holding it (ADR 049).
         /// Everything else is a copy, so the error set this infers is empty
         /// for a Row with no such column and the `try` costs nothing.
         fn valuesOf(
@@ -3106,7 +3106,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             inline for (stmt.paths, 0..) |path, i| {
                 const param = comptime stmt.params[i];
                 // The one parameter that is not one value: a list the Dialect
-                // wants as JSON text rather than as an array (ADR 0119).
+                // wants as JSON text rather than as an array (ADR 067).
                 if (comptime param.list and D.list_form == .json_each) {
                     const Item = comptime WireWrite(D, where_mod.ParamType(Row, param));
                     const value = where_mod.valueAt(options, path);
@@ -3136,7 +3136,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// The values behind a statement **this module did not write**, in the
         /// same shapes a statement it did write would have sent
-        /// ([ADR 0145](../docs/adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
+        /// ([ADR 116](../docs/adr/116-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
         ///
         /// `db.raw` and `db.exec` have no Statement and no Row, so there was
         /// nothing to look a parameter's column up in and the tuple went to the
@@ -3248,7 +3248,7 @@ fn BatchValues(comptime D: type, comptime Row: type, comptime stmt: statement.St
 ///   since the type landed; this is the element that cast applies to.
 ///
 /// **Two callers, and the second is why it is not called `BatchWrite` any
-/// more** (ADR 0145). A batch sends one array per column; an `.in` sends one
+/// more** (ADR 116). A batch sends one array per column; an `.in` sends one
 /// array of the values being matched. Both are `= ANY($1)`-shaped as far as
 /// the driver is concerned, and both had a `Uuid` in them that did not
 /// compile — the batch's was fixed when batches landed and the `.in`'s was
@@ -3333,7 +3333,7 @@ fn batchElement(comptime Row: type, comptime R: type) type {
 
 /// Whether the Debug-only traps are compiled in. The same rule `Str`'s
 /// staleness trap follows: a check that costs something is a check for the
-/// mode people develop in (ADR 0004).
+/// mode people develop in (ADR 003).
 const traps_enabled = builtin.mode == .Debug;
 
 /// The tuple type for a statement's parameters: one field per placeholder,
@@ -3369,7 +3369,7 @@ fn Values(
             // null-safe and the statement says so either way (`where.zig`).
             //
             // **The element is `ArrayElement` rather than `WireWrite`, and a
-            // `Uuid` is the whole reason** (ADR 0145). A scalar one binds as
+            // `Uuid` is the whole reason** (ADR 116). A scalar one binds as
             // `[16]u8`; `[]const [16]u8` is `cannot bind value of type` from
             // inside pg.zig, which is a dependency's compile error reaching a
             // reader who never chose the dependency. Inside an array it is the
@@ -3378,7 +3378,7 @@ fn Values(
             // **Unless the Dialect reads its list out of JSON**, which is what
             // SQLite does: `json_each(?1)` takes one text parameter holding
             // the whole array, so the parameter is bytes rather than a list
-            // (ADR 0119). `jsonList` is what fills it.
+            // (ADR 067). `jsonList` is what fills it.
             fields[i] = if (param.list)
                 (if (D.list_form == .json_each)
                     []const u8
@@ -3392,7 +3392,7 @@ fn Values(
 }
 
 /// The tuple `db.raw` and `db.exec` actually send: the caller's own, with each
-/// field mapped through `WireWrite` ([ADR 0145](../docs/adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
+/// field mapped through `WireWrite` ([ADR 116](../docs/adr/116-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
 ///
 /// **It answers `V` itself when nothing needs converting**, which is most calls
 /// and is what keeps this free: `rawValuesOf` then hands the caller's tuple
@@ -3441,7 +3441,7 @@ fn RawValues(comptime D: type, comptime V: type) type {
 }
 
 /// What one `db.raw` parameter travels as: `WireWrite`, plus the two things
-/// only a hand-written call carries (ADR 0145).
+/// only a hand-written call carries (ADR 116).
 ///
 /// - **A list written where it is used is `&.{ … }`**, a pointer to an array
 ///   rather than the slice a column is declared as, so `WireWrite` — which
@@ -3482,7 +3482,7 @@ fn RawWrite(comptime D: type, comptime F: type) type {
 /// What the Wire is asked for when a column's declared type is not the shape
 /// that travels on it. Everything here is a mapping to a type the driver
 /// already knows, which is what keeps the driver's name inside
-/// `sql/postgres.zig` where ADR 0039 put it — nothing above that file has to
+/// `sql/postgres.zig` where ADR 036 put it — nothing above that file has to
 /// know a wire format to make one of these.
 ///
 /// - `Str` and `[]const u8` are bytes. The first is copied and renamed in
@@ -3511,7 +3511,7 @@ fn WireRead(comptime F: type) type {
         // decoder for the `date` OID at all — `Int32.decode` refuses it — and
         // zqlite hands back the ISO text, so the two Wires read one
         // differently and neither reads it as a number. Keeping the type is
-        // what lets each pick (ADR 0221).
+        // what lets each pick (ADR 181).
         if (types.isDate(F)) return F;
         if (F == core.Str) return []const u8;
         if (F == types.Timestamp) return i64;
@@ -3522,7 +3522,7 @@ fn WireRead(comptime F: type) type {
         // Postgres printed — the Dialect did the conversion in the SELECT
         // list rather than leaving a wire format for this layer to decode.
         // It is the whole of how a type this module has never heard of is
-        // read at all (ADR 0055).
+        // read at all (ADR 049).
         if (types.asText(F) != null) return []const u8;
         return F;
     }
@@ -3535,7 +3535,7 @@ fn WireRead(comptime F: type) type {
 /// back.
 ///
 /// **A `Uuid` element is `[]const u8` in both directions, and that is not the
-/// scalar answer** ([ADR 0145](../docs/adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
+/// scalar answer** ([ADR 116](../docs/adr/116-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
 /// A scalar `Uuid` binds on Postgres as `[16]u8` — the array rather than a
 /// slice — because the parameter tuple is all the driver has to read from and
 /// a slice would point at a copy `where.valueAt` just returned. An array
@@ -3586,7 +3586,7 @@ fn keptElement(comptime Item: type, raw: anytype, c: anytype) !Item {
 }
 
 /// A column's answer read as a `Uuid`, in either of the two shapes a database
-/// stores one in (ADR 0078): **sixteen bytes**, which is what a Postgres
+/// stores one in (ADR 067): **sixteen bytes**, which is what a Postgres
 /// `uuid` is on the wire, or **thirty-six characters**, which is what a SQLite
 /// TEXT column holds because SQLite has no uuid type.
 ///
@@ -3627,10 +3627,10 @@ fn dateText(value: types.Date, c: anytype) ![]const u8 {
 /// has. What stood behind it was the driver's own
 /// `std.meta.stringToEnum(T, str).?`, which made a row added by an
 /// `ALTER TYPE … ADD VALUE` take the whole process down: not this request,
-/// every request, because Zig cannot recover from a panic (ADR 0008).
+/// every request, because Zig cannot recover from a panic (ADR 007).
 ///
 /// A 500 for the one request is the answer, and the value goes in the log
-/// rather than to the client (ADR 0025) — it is the operator who has to go
+/// rather than to the client (ADR 024) — it is the operator who has to go
 /// and add the case, and `moderator` is the whole of what they need to know.
 ///
 /// **`warn` rather than `err`, and the reason is not the level of the
@@ -3668,7 +3668,7 @@ fn enumOf(comptime E: type, raw: []const u8) !E {
 /// answer for an enum whose type name lives in the database, and the wrong
 /// one for a struct nothing can ever read. `listAccepts` closed the array
 /// half of this and said so; this is the scalar half, judged where the Row
-/// is first read rather than where the column is (ADR 0027).
+/// is first read rather than where the column is (ADR 026).
 ///
 /// The list of what reads is `kept`'s, in the same order, with the three
 /// families a value falls through to at the end. A list column is judged by
@@ -3718,7 +3718,7 @@ fn assertReadable(comptime Row: type) void {
 /// Whether `T` is one column rather than a Row: what `db.raw` reads into
 /// when its first argument is `[]const u8`, `i64`, `?bool`, a `Str` — any
 /// one thing `readable` says a column can be, or an optional of one
-/// ([ADR 0234](../docs/adr/0234-a-scalar-out-of-raw.md)). A struct carrying
+/// ([ADR 125](../docs/adr/125-a-row-that-owns-no-table.md)). A struct carrying
 /// `nilo_table` is a Row whatever else it is, and a list column is not here:
 /// `db.raw([]i64, …)` would read as a slice of rows, which is what the
 /// answer already is.
@@ -3773,7 +3773,7 @@ fn assertStreamable(comptime Row: type) void {
                     continue;
                 },
                 // A second statement per stream, whose rows would have to be
-                // held until the parent they belong to came past (ADR 0295).
+                // held until the parent they belong to came past (ADR 218).
                 .children => @compileError(
                     "nilo: `db.stream` on " ++ @typeName(Row) ++ ", which reads `" ++ f.name ++
                         "` as children.\n" ++
@@ -3848,7 +3848,7 @@ fn assertUnlocked(
 /// requiring it would mean `.email = "a@b.c"` did not compile, which is the
 /// shape everybody writes. `Str` is what text is when it comes *back*.
 ///
-/// **A `Uuid` binds as whatever its Dialect stores one as** (ADR 0078), which
+/// **A `Uuid` binds as whatever its Dialect stores one as** (ADR 067), which
 /// is the one place in this function the answer is not the same on both Wires.
 ///
 /// On Postgres it is the sixteen bytes **as an array rather than a slice**, and
@@ -3880,7 +3880,7 @@ fn WireWrite(comptime D: type, comptime F: type) type {
         // encoder, so the only way to send one is the ten characters plus the
         // `::date` the Dialect writes around the placeholder (`bindAs`).
         // SQLite wants exactly the same ten characters, so one answer serves
-        // both (ADR 0221).
+        // both (ADR 181).
         if (F == types.Date) return []const u8;
         if (F == ?types.Date) return ?[]const u8;
         if (F == core.Str) return []const u8;
@@ -3904,7 +3904,7 @@ fn WireWrite(comptime D: type, comptime F: type) type {
         // everybody writes, and it coerces to this and not to `[]const Str`.
         if (types.listElement(F) != null) return WireList(F);
         // **A document and a tag, on a Dialect whose driver takes neither**
-        // (ADR 0119). `WireRead` has always answered `[]const u8` for both, so
+        // (ADR 067). `WireRead` has always answered `[]const u8` for both, so
         // a Row carrying one read correctly and stopped compiling at the first
         // write — inside zqlite, four frames down, about a Zig type it has
         // never heard of. Which way each goes is the Dialect's to say, the
@@ -3935,7 +3935,7 @@ fn forWire(comptime To: type, value: anytype, c: anytype) !To {
     // is the most ordinary thing anybody does with it: `.where = .{ .email =
     // form.email }`. It used to be a type error three layers down naming
     // `forWire`, so the guide's own sign-in snippet did not compile — which
-    // is how the snippet check found it (ADR 0083). It lives exactly as long
+    // is how the snippet check found it (ADR 068). It lives exactly as long
     // as the statement does, so there is nothing to keep.
     if (V == core.Str) return value.view();
     if (V == ?core.Str) return if (value) |text| text.view() else null;
@@ -3951,7 +3951,7 @@ fn forWire(comptime To: type, value: anytype, c: anytype) !To {
     }
     // Which of the two a `Uuid` becomes is `WireWrite`'s decision, made from
     // the Dialect; this reads it back off the type it was asked for, which is
-    // how the conversion stays in one place (ADR 0078). The text is kept in the
+    // how the conversion stays in one place (ADR 067). The text is kept in the
     // arena because the tuple this fills is what the driver reads from, and a
     // pointer into this frame would not outlive the call.
     if (V == types.Uuid) return if (To == []const u8) try uuidText(value, c) else value.bytes;
@@ -3960,14 +3960,14 @@ fn forWire(comptime To: type, value: anytype, c: anytype) !To {
         return if (To == ?[]const u8) try uuidText(held, c) else held.bytes;
     }
     // A **list** of them, which is the one list whose elements are not
-    // themselves on the wire (ADR 0145). `WireList` says why the element is a
+    // themselves on the wire (ADR 116). `WireList` says why the element is a
     // slice rather than the array a scalar binds as; this is where the slices
     // are made, and each one points into the caller's own list rather than at
     // a copy.
     if (comptime givenElement(V)) |Item| {
         if (comptime Item == types.Uuid or Item == ?types.Uuid) return uuidList(To, value, c);
         // And a list of `Str`, which is the same missing branch one type over
-        // ([ADR 0156](../docs/adr/0156-a-list-of-str-is-a-parameter-too.md)).
+        // ([ADR 116](../docs/adr/116-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
         // A scalar `Str` has been handled at the top of this function since the
         // guide's own sign-in snippet failed to compile; a list of them fell
         // through to `return value;` and stopped as a type error naming a line
@@ -3979,14 +3979,14 @@ fn forWire(comptime To: type, value: anytype, c: anytype) !To {
     // A text column writes itself. The arena is here for one that has to
     // build its text rather than hold it; the ones this module ships hold it
     // and never touch the allocator, which is why nothing extra is allocated
-    // by a statement that does not carry such a column (ADR 0055).
+    // by a statement that does not carry such a column (ADR 049).
     //
     // `try` on both, and the second one is load-bearing: `nilo_write` answers
     // `![]const u8`, and an error union does not coerce to `!?[]const u8` the
     // way a bare value coerces to an optional. So a `Date` set into a
     // `?Date` column — the ordinary act of filling a date that was empty —
     // was a type error naming this line, and the workaround at every site was
-    // `@as(?Date, due)` (ADR 0203).
+    // `@as(?Date, due)` (ADR 164).
     if (comptime types.asText(V) != null) {
         if (comptime @typeInfo(V) == .optional) {
             const Inner = comptime @typeInfo(V).optional.child;
@@ -3997,7 +3997,7 @@ fn forWire(comptime To: type, value: anytype, c: anytype) !To {
     // A document and a tag, when the Dialect asked for them as text. Which of
     // the two `To` is was `WireWrite`'s decision, read back off the type here
     // — the same arrangement `Uuid` above makes, and the reason the Dialect is
-    // not threaded into this function (ADR 0119).
+    // not threaded into this function (ADR 067).
     //
     // Keyed on `To` rather than on the Dialect, these also fire in one case
     // that has nothing to do with SQLite: a `Json(T)` or an enum *value*
@@ -4022,7 +4022,7 @@ fn forWire(comptime To: type, value: anytype, c: anytype) !To {
         if (comptime To == ?[]const u8) return if (value) |tag| @tagName(tag) else null;
     }
     // A bare `.admin` written into a `db.exec`, which has no enum type behind
-    // it and therefore no runtime representation at all (ADR 0145). The name
+    // it and therefore no runtime representation at all (ADR 116). The name
     // is what both drivers send for an enum anyway, and zqlite refused the
     // literal outright while compiling.
     if (comptime @typeInfo(V) == .enum_literal) {
@@ -4054,7 +4054,7 @@ fn givenElement(comptime V: type) ?type {
 }
 
 /// A list of `Uuid` as the list of slices the driver's array encoder reads
-/// (ADR 0145).
+/// (ADR 116).
 ///
 /// **One allocation, for the slice headers, and none for the bytes.** Each
 /// element points at the sixteen bytes sitting in the caller's own list, which
@@ -4091,7 +4091,7 @@ fn uuidList(comptime To: type, value: anytype, c: anytype) !To {
 }
 
 /// A list of `Str` as the list of slices the driver's array encoder reads
-/// ([ADR 0156](../docs/adr/0156-a-list-of-str-is-a-parameter-too.md)).
+/// ([ADR 116](../docs/adr/116-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
 ///
 /// `uuidList` above with one line changed, and deliberately not merged with
 /// it: what each does per element is the whole of it — sixteen bytes borrowed
@@ -4131,7 +4131,7 @@ fn strList(comptime To: type, value: anytype, c: anytype) !To {
 /// `"id" IN (SELECT value FROM json_each(?1))` since the second Dialect
 /// landed and nothing anywhere turned the list into the text that statement
 /// reads, so `.in` was a compile error from inside zqlite on the operator
-/// every real schema uses (ADR 0119). Three documents said it worked.
+/// every real schema uses (ADR 067). Three documents said it worked.
 ///
 /// The elements go through `forWire` first, so a list of `Str`, of `Uuid` or
 /// of tags is written as what its column holds rather than as whatever Zig
@@ -4163,7 +4163,7 @@ fn redacted(url: []const u8) []const u8 {
 ///
 /// Getting this wrong is the whole reason it exists: the message that shipped
 /// blamed the URL for every failure, so a database that was merely down sent
-/// somebody to read a URL that was correct (ADR 0062).
+/// somebody to read a URL that was correct (ADR 115).
 fn isUrlProblem(err: anyerror) bool {
     const name = @errorName(err);
     for ([_][]const u8{
@@ -4200,7 +4200,7 @@ test "a password never reaches the log" {
 const FakeDb = DbOf(wire_mod.Fake, dialect.Postgres, "");
 
 /// The same, named — a second service of the same shape, which is the whole
-/// of what a read replica needs from this module (ADR 0060).
+/// of what a read replica needs from this module (ADR 054).
 const FakeReplica = DbOf(wire_mod.Fake, dialect.Postgres, "replica");
 
 const Person = struct {
@@ -4221,7 +4221,7 @@ test "a Db with no checking list has forgotten the check unless it said so" {
     defer forgot.deinit();
     try testing.expect(forgot.forgotTheCheck());
 
-    // The word is the decision written down (ADR 0262).
+    // The word is the decision written down (ADR 192).
     var meant = FakeDb.init(testing.allocator, "postgres://test/test", .{ .unchecked = true });
     defer meant.deinit();
     try testing.expect(!meant.forgotTheCheck());
@@ -4278,9 +4278,9 @@ fn listPeopleOrdered(db: *FakeDb, c: *nilo.Ctx, q: nilo.Query(ListQuery)) ![]Per
 }
 
 test "the order a request chose reads into a query field, and the document says the field is text" {
-    // `?order=age:desc,email` is the type reading itself (ADR 0142), so a key
+    // `?order=age:desc,email` is the type reading itself (ADR 113), so a key
     // that is not one of the two is the same 400 a bad number gets, in the
-    // words the type chose (ADR 0204).
+    // words the type chose (ADR 165).
     var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
     defer db.deinit();
     db.wire = .{ .answers = 1 };
@@ -4355,7 +4355,7 @@ test "a select before the pool exists fails as an error, not as a crash" {
     defer client.deinit();
 
     // 500 rather than 503 on purpose: only `AlreadyExists` carries a
-    // default answer (ADR 0039), so this arrives the way any uncaught
+    // default answer (ADR 036), so this arrives the way any uncaught
     // handler error does. What is being pinned here is that a Db whose
     // `nilo_start` never ran refuses in words instead of reading a null.
     const answer = try client.get(&app, "/people");
@@ -4458,7 +4458,7 @@ test "the three types Zig has no word for are taken apart for the wire" {
 
 test "a Date is read as itself and written as its ten characters" {
     // **The one type here whose two halves disagree**, and the disagreement
-    // is the driver's (ADR 0221). pg.zig has no `date` decoder and no `date`
+    // is the driver's (ADR 181). pg.zig has no `date` decoder and no `date`
     // encoder: the read is the column's own four bytes, taken apart by the
     // Wire, and the write is the text plus the `::date` the Dialect puts
     // around the placeholder.
@@ -4472,7 +4472,7 @@ test "a Date is read as itself and written as its ten characters" {
 }
 
 test "a list of uuids travels as slices, because an array of them is not a shape the driver takes" {
-    // Neither direction compiled before this (ADR 0145). Reading one stopped
+    // Neither direction compiled before this (ADR 116). Reading one stopped
     // in `forWire` with `expected type '…![]const [16]u8'`; writing one
     // stopped inside pg.zig with `cannot bind value of type
     // *const []const [16]u8` — a dependency's compile error reaching a reader
@@ -4497,7 +4497,7 @@ test "a list of Str binds as slices, which is the branch the reference promised"
     // landed. As a column both spellings worked; as a parameter only
     // `[]const []const u8` did, and the first fell through `forWire` to
     // `return value;` and stopped as a type error naming a line in this file
-    // (ADR 0156). The type derivation was never the missing half — the test
+    // (ADR 116). The type derivation was never the missing half — the test
     // above has asserted `WireList([]const core.Str)` all along.
     var run: nilo.Run = .init(testing.allocator);
     defer run.deinit();
@@ -4560,7 +4560,7 @@ test "a raw parameter is taken apart the way a Row's is" {
     // The defect: `db.raw` and `db.exec` have no Statement and no Row, so
     // their tuple went to the driver untouched — and pg.zig answered
     // `error.CannotBindStruct` at run time for the most ordinary key in a
-    // modern schema, with nothing logged anywhere (ADR 0145). The type is what
+    // modern schema, with nothing logged anywhere (ADR 116). The type is what
     // is pinned here, because it is what the driver switches on.
     const bare = .{types.Uuid.nil};
     try testing.expectEqual(
@@ -4568,7 +4568,7 @@ test "a raw parameter is taken apart the way a Row's is" {
         @typeInfo(RawValues(dialect.Postgres, @TypeOf(bare))).@"struct".fields[0].type,
     );
     // And the other Wire, which stores the thirty-six characters — the one
-    // place the two disagree (ADR 0078), and it is the same disagreement
+    // place the two disagree (ADR 067), and it is the same disagreement
     // `WireWrite` already knew about.
     try testing.expectEqual(
         []const u8,
@@ -4603,7 +4603,7 @@ test "a literal beside a value that has to be converted still reaches the driver
     // The mixed tuple, which is the shape an ordinary `INSERT … VALUES ($1,$2)`
     // has: something nilo converts, and something written out. A `1` and a
     // `null` have no runtime representation at all, so the rebuilt tuple gives
-    // each the type both drivers already bind the same way (ADR 0145).
+    // each the type both drivers already bind the same way (ADR 116).
     const mixed = .{ types.Uuid.nil, 42, 1.5, null, "cap" };
     const fields = @typeInfo(RawValues(dialect.Postgres, @TypeOf(mixed))).@"struct".fields;
 
@@ -4901,7 +4901,7 @@ test "a result set closed twice is drained once, in both optimize modes" {
     try testing.expectEqual(@as(u16, 200), answer.status);
 
     // **The assertion that is not behind `traps_enabled`, and that is the
-    // point** (ADR 0117). The guard used to be Debug-only, so this handler
+    // point** (ADR 093). The guard used to be Debug-only, so this handler
     // drained twice in the mode people deploy in — on the Postgres Wire,
     // `result.deinit()` twice and `conn.release()` twice, handing the pool a
     // connection it was already holding.
@@ -4935,7 +4935,7 @@ test "a committed transaction is not rolled back on the way out" {
 
 test "Core is one module, so a Row's Str is the App's Str" {
     // Two modules built from the same root file are two different types to
-    // Zig (ADR 0041). If `build.zig` ever hands this module a Core of its
+    // Zig (ADR 038). If `build.zig` ever hands this module a Core of its
     // own rather than the one the App was given, this is what notices —
     // before `kept` quietly stops recognising a `Str` column and leaves the
     // text pointing into a read buffer that is about to be reused.
@@ -4955,7 +4955,7 @@ const Tick = struct {
 
 /// How many times a `select` of `rows` rows reaches past the arena for more
 /// memory. The arena is what the request holds; what is counted is the pages
-/// underneath it, which is the sense ADR 0018 measures an allocation in.
+/// underneath it, which is the sense ADR 017 measures an allocation in.
 fn allocationsFor(rows: usize, comptime options: anytype) !usize {
     return allocationsOf(Tick, rows, options);
 }
@@ -4974,7 +4974,7 @@ fn allocationsOf(comptime Row: type, rows: usize, comptime options: anytype) !us
     return counting.allocations;
 }
 
-// The number ADR 0039 claims, held rather than asserted — the same job the
+// The number ADR 036 claims, held rather than asserted — the same job the
 // budget test in `http/app.zig` does for the request path, which this module
 // went without until the claim turned out to be false.
 test "a select with a written-out limit reaches past the arena exactly once" {
@@ -4997,7 +4997,7 @@ test "a select with a written-out limit reaches past the arena exactly once" {
 }
 
 // The other half of the same claim, and the reason it is worth writing down:
-// ADR 0039 only ever promised a number for the statement that says how many
+// ADR 036 only ever promised a number for the statement that says how many
 // rows it can answer with. Without a limit there is nothing to build the list
 // to, so it doubles — and this test exists so that the day somebody finds a
 // way to do better, the number moves here rather than staying a surprise.
@@ -5066,7 +5066,7 @@ test "a condition takes the Str a request arrived with, not only its view" {
     // `form.email` is a `Str`, and looking a row up by one is the first thing
     // anybody does with it. This was a type error from inside `forWire`, and
     // the guide's own sign-in snippet was written against the API it should
-    // have had — found by compiling the snippet (ADR 0083).
+    // have had — found by compiling the snippet (ADR 068).
     const email: nilo.Str = .static("wati@example.com");
     _ = try db.one(Person, &run, .{ .where = .{ .email = email } });
     try testing.expectEqualStrings(
@@ -5161,7 +5161,7 @@ test "a write that returns its rows sends one statement, not a write and a read"
 }
 
 test "a Run is a Scope, so a query needs no request around it" {
-    // The half of ADR 0041 that is not tidying: everything this module ever
+    // The half of ADR 038 that is not tidying: everything this module ever
     // wanted from a `Ctx` was `arena()` and `str()`, so a program with no
     // server in it can hand over a `Run` instead and the same calls compile.
     var run = nilo.Run.init(testing.allocator);
@@ -5236,7 +5236,7 @@ test "a deadline reaches the transaction, and only a transaction has one" {
 
     // The other half of the design, asserted rather than described: `Db` has
     // no `deadline`, because a call that takes a connection and gives it
-    // straight back has nothing to set one on (ADR 0047).
+    // straight back has nothing to set one on (ADR 043).
     try testing.expect(!@hasDecl(FakeDb, "deadline"));
 }
 
@@ -5293,7 +5293,7 @@ test "a column holding a value the Zig enum does not have is an error, not a pan
     // What an `ALTER TYPE … ADD VALUE` looks like from this side: a value the
     // table has and `Role` does not. Before this was decoded here it was
     // `std.meta.stringToEnum(T, str).?` inside the driver, and it took the
-    // process down rather than the request (ADR 0008).
+    // process down rather than the request (ADR 007).
     db.wire = .{ .answers = 1, .text = "moderator" };
 
     var run = nilo.Run.init(testing.allocator);
@@ -5496,10 +5496,10 @@ test "a statement this module did not write is prepared too, because its text is
 
     // `db.raw` used to be the one call that was never prepared, on the
     // reasoning that its text arrived at run time and a cache keyed on a
-    // string built per request would grow with traffic (ADR 0057). Its text
+    // string built per request would grow with traffic (ADR 051). Its text
     // is comptime now, so the name is derived the same way every other
     // statement's is and the set of them is still fixed when the binary is
-    // built ([ADR 0148](../docs/adr/0148-a-raw-statement-is-counted-while-compiling.md)).
+    // built ([ADR 051](../docs/adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)).
     _ = try db.raw(Person, &run, "SELECT * FROM people WHERE id = $1", .{@as(i64, 7)});
     const plan = db.wire.?.last_plan orelse return error.NoPlanName;
     try testing.expectEqualStrings(statement.planName("SELECT * FROM people WHERE id = $1"), plan);
@@ -5525,7 +5525,7 @@ test "a Db told to keep no plans keeps none for a raw statement either" {
 ///
 /// A file-scope variable because a `Watcher` is a plain function pointer with
 /// nowhere to put a capture — which is the API's own argument
-/// ([ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)), and testing it
+/// ([ADR 108](../docs/adr/108-a-statement-can-be-watched.md)), and testing it
 /// means living with it.
 var watched: struct {
     count: usize = 0,
@@ -5581,12 +5581,12 @@ test "a statement that failed is reported as failed, with no row count to give" 
 
     var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
     defer db.deinit();
-    // The short `SELECT` list of ADR 0134, which is a failure this module
+    // The short `SELECT` list of ADR 106, which is a failure this module
     // raises itself rather than one the driver reports — so it also pins that
     // a refusal on the way past still reaches the watcher.
     //
     // **`SELECT *`, because a written-out short list no longer compiles**
-    // (ADR 0148). That is not a weaker test: `*` is the shape the run-time
+    // (ADR 051). That is not a weaker test: `*` is the shape the run-time
     // check still exists for, since how many columns it stands for is the
     // database's answer and no comptime pass can have it.
     db.wire = .{ .answers = 1, .columns_back = 2 };
@@ -5601,7 +5601,7 @@ test "a statement that failed is reported as failed, with no row count to give" 
     try testing.expect(watched.failed);
     try testing.expectEqual(@as(?usize, null), watched.rows);
     // And the name it was kept prepared under, which `db.raw` has had since
-    // its text became comptime (ADR 0148).
+    // its text became comptime (ADR 051).
     try testing.expect(watched.plan != null);
 }
 
@@ -5629,7 +5629,7 @@ test "a statement that failed says what the database said, not only that it fail
     var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
     defer db.deinit();
     // What Postgres actually answers a duplicate insert with, which used to
-    // reach `std.log.err` and nowhere a program could read it (ADR 0146).
+    // reach `std.log.err` and nowhere a program could read it (ADR 117).
     db.wire = .{ .refuses = .{
         .message = "duplicate key value violates unique constraint \"people_email_key\"",
         .code = "23505",
@@ -5720,11 +5720,11 @@ test "a raw SELECT list shorter than the Row is refused, not read past the end" 
     defer db.deinit();
     // Two columns came back and `Person` reads four. Without the check the
     // third `read` is `values[2]` on an array of two, which pg.zig does not
-    // bound: a panic in ReleaseSafe rather than an answer (ADR 0134).
+    // bound: a panic in ReleaseSafe rather than an answer (ADR 106).
     //
     // `SELECT *` is what a short list is written as now: counting the list
     // while compiling catches the written-out case before this ever runs
-    // (ADR 0148), and `*` is the half no comptime pass can count.
+    // (ADR 051), and `*` is the half no comptime pass can count.
     db.wire = .{ .answers = 1, .columns_back = 2 };
 
     var run = nilo.Run.init(testing.allocator);
@@ -5786,7 +5786,7 @@ fn readsOneWritesTheOther(db: *FakeDb, rdb: *FakeReplica, c: *nilo.Ctx) ![]Perso
 }
 
 test "two databases are two types, so the registry holds both" {
-    // The registry is keyed by type (ADR 0011), which is why one `*sql.Db`
+    // The registry is keyed by type (ADR 010), which is why one `*sql.Db`
     // was all a program could ask for. A name is what makes the second type
     // — and it has to be a name the struct *keeps*, because Zig memoises a
     // generic on the type it gives back and a parameter the body never
@@ -5837,7 +5837,7 @@ test "a bad URL and a database that is down get different sentences" {
     // Which of the two a startup failure is decides what somebody does next,
     // and the message that shipped said "the URL is the one thing checked
     // here" for both — so a database that was merely down sent people to
-    // read a URL that was correct (ADR 0062).
+    // read a URL that was correct (ADR 115).
     try testing.expect(isUrlProblem(error.InvalidUriScheme));
     try testing.expect(isUrlProblem(error.UnsupportedConnectionParam));
     try testing.expect(isUrlProblem(error.UnsupportedSSLModeValue));
@@ -5858,7 +5858,7 @@ test "a bad URL and a database that is down get different sentences" {
 // Everything above this line runs against `wire.Fake`, which is the whole
 // point of it: `db.zig` is the same code on both Wires and a fake proves that
 // without a database. **The two things below could not be proved that way**,
-// and both shipped broken because of it (ADR 0078) — a `Uuid` column did not
+// and both shipped broken because of it (ADR 067) — a `Uuid` column did not
 // compile against SQLite at all, and there was no call for a statement that
 // answers with nothing. A real in-memory database is what a fake has no
 // opinion about.
@@ -5901,7 +5901,7 @@ test "a Db answers the health page with SELECT 1, and says so before it has star
     var scope = nilo.AnyScope.of(&run);
 
     // Before `listen()` there is no pool, and the page has to say so rather
-    // than answer `ok` over nothing (ADR 0192).
+    // than answer `ok` over nothing (ADR 154).
     try testing.expectEqualStrings("not started: `listen()` has not run", db.nilo_ready(&scope).?);
 
     try db.nilo_start(threaded.io(), .none);
@@ -5963,7 +5963,7 @@ test "a uuid bound bare to db.exec and db.raw reaches the database" {
     // .{ partner_id, tag })` compiled and answered `error.QueryFailed` at run
     // time on Postgres, and did not compile at all here — zqlite refuses a Zig
     // struct while compiling. The workaround was thirty-six characters and
-    // `$1::text::uuid`, which costs an arena allocation per id (ADR 0145).
+    // `$1::text::uuid`, which costs an arena allocation per id (ADR 116).
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -6039,7 +6039,7 @@ test "the schema check agrees with the wire about a uuid column" {
 }
 
 /// A view in an attached database. `UNKNOWN` nullability is the whole
-/// point: a view cannot say what is not null (ADR 0056), so a Row reading
+/// point: a view cannot say what is not null (ADR 050), so a Row reading
 /// its column as non-optional has to pass the check rather than be told the
 /// column is nullable.
 const ArchivedNote = struct {
@@ -6053,7 +6053,7 @@ test "the introspection asks the attached database whether the name is a view" {
     // `columnsOf` qualified `pragma_table_info` with the schema and left
     // `sqlite_master` alone, so a view in an attached database was looked up
     // in `main`, found nothing, and its columns were judged as a table's —
-    // exactly the failure ADR 0056 was written to remove, one schema over.
+    // exactly the failure ADR 050 was written to remove, one schema over.
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -6096,7 +6096,7 @@ test "the introspection asks the attached database whether the name is a view" {
 // the Wire rather than `db.zig`.
 //
 // That is not one gap, it is the reason for three of them, and this is what
-// found them (ADR 0119): a `Json` column, an enum column and `.in` were each
+// found them (ADR 067): a `Json` column, an enum column and `.in` were each
 // a write path nothing had ever asked the compiler about, and each was a
 // compile error four frames inside zqlite.
 
@@ -6137,7 +6137,7 @@ const Streamable = struct {
 /// declared `TEXT` here to get past a startup check that judged it by its
 /// Postgres name — the column that matched what was bound was the one being
 /// refused, and the one that passed stored microseconds as digits
-/// ([ADR 0136](../docs/adr/0136-a-timestamp-is-checked-against-the-column-it-is-bound-into.md)).
+/// ([ADR 067](../docs/adr/067-a-value-is-whatever-the-database-stores.md)).
 const everything_ddl =
     \\CREATE TABLE everything (
     \\  id       INTEGER PRIMARY KEY,
@@ -6244,7 +6244,7 @@ test "every call this module offers is compiled against the SQLite wire too" {
     // And a transaction, with everything that is not a Refusal here. `.lock`,
     // `insertMany`, `updateMany` and `tx.deadline` are all compile errors on
     // this Dialect and stay that way — the seam refusing rather than lying
-    // (ADR 0061).
+    // (ADR 055).
     var tx = try db.begin(&run, .{});
     errdefer tx.rollback();
     _ = try tx.select(Everything, &run, .{ .where = .{ .id = made.id } });
@@ -6275,12 +6275,12 @@ test "every call this module offers is compiled against the SQLite wire too" {
 
 test "an `in` on SQLite is the JSON array json_each reads, and it matches" {
     // **`.in` and `.not_in` did not compile here at all**, and three documents
-    // said they did: `dialect.zig`'s header, ADR 0061, and the guide's table
+    // said they did: `dialect.zig`'s header, ADR 055, and the guide's table
     // of what SQLite will not do, which does not list them. `where.zig` writes
     // `"age" IN (SELECT value FROM json_each(?1))` for `list_form = .json_each`
     // and nothing anywhere turned the list into the text that statement reads,
     // so `WireWrite` handed zqlite a `[]const i64` and zqlite refused to
-    // compile (ADR 0119).
+    // compile (ADR 067).
     //
     // It survived because the only tests were over the SQL *text*, `live.zig`
     // has no SQLite arm, and no example or benchmark binds one.
@@ -6355,7 +6355,7 @@ test "an INTEGER PRIMARY KEY is the rowid, so a correct table no longer stops th
     // own documentation writes. SQLite reports `notnull = 0` for it because
     // the column is an *alias for the rowid* rather than a constraint, and
     // reading that as nullable made `nilo_start` refuse to start over a table
-    // that is right (ADR 0115).
+    // that is right (ADR 050).
     //
     // This never showed up because `accounts_ddl` above says `INTEGER PRIMARY
     // KEY AUTOINCREMENT NOT NULL` — the redundant `NOT NULL` walks around the
@@ -6446,7 +6446,7 @@ test "a Db can be stopped, and stopping it twice or deiniting after is a no-op" 
 
     // `listen()` calls this on the way out, and the caller's own
     // `defer db.deinit()` runs after it. Both have to be safe, and so does a
-    // stop on a `Db` whose `nilo_start` never ran (ADR 0151).
+    // stop on a `Db` whose `nilo_start` never ran (ADR 121).
     db.nilo_stop();
     try testing.expect(db.wire == null);
     db.nilo_stop();
@@ -6466,7 +6466,7 @@ test "a Db that never started can still be stopped" {
 
 test "rawOne answers with the row or with null, so a key lookup is not an unwrap" {
     // What this replaces, written out six times across four files before it
-    // existed (ADR 0179):
+    // existed (ADR 146):
     //
     //     const found = try db.raw(Row, c, "…", .{id});
     //     return if (found.len > 0) found[0] else null;
@@ -6499,7 +6499,7 @@ test "rawOne answers with the row or with null, so a key lookup is not an unwrap
     try testing.expectEqualStrings("wati@example.dev", found.email.view());
 
     // Null rather than an empty slice, which is what makes `!?T` a 404 in the
-    // typed layer with nothing written in the handler (ADR 0024).
+    // typed layer with nothing written in the handler (ADR 023).
     try testing.expectEqual(
         @as(?Card, null),
         try db.rawOne(Card, &run, statement_text, .{types.Uuid.nil}),
@@ -6520,7 +6520,7 @@ test "rawOne answers with the row or with null, so a key lookup is not an unwrap
 test "raw reads one column into a slice, an integer or a Str, with no Row and no marker" {
     // The case that asked for it: `SELECT name FROM pragma_table_info(…)`,
     // one text column, read by a program that wanted a `[][]const u8` and
-    // had to write a one-field projection to get it (ADR 0234).
+    // had to write a one-field projection to get it (ADR 125).
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -6575,7 +6575,7 @@ test "the schema check runs from nilo_check, once the boot work has made the tab
     // The single-file program from the guide: `db.checking(schema)` and
     // `createMissing` registered with `app.before`. Checked from
     // `nilo_start` the Rows were held against an empty file and the first
-    // boot refused; the check runs after the boot work now (ADR 0277).
+    // boot refused; the check runs after the boot work now (ADR 180).
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -6605,7 +6605,7 @@ test "a $n in a raw statement is the nth value on SQLite too, whatever order it 
     // in it. To SQLite `$2` is a *named* parameter, indexed by first
     // appearance, so it took the first value and answered wrong with no
     // error. The text is respelled `?2` while compiling, which is what the
-    // Dialect writes for every statement nilo composes (ADR 0278).
+    // Dialect writes for every statement nilo composes (ADR 204).
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -6651,9 +6651,9 @@ test "a $n in a raw statement is the nth value on SQLite too, whatever order it 
 
 test "a composed statement is spelled for SQLite, and held against its values before it is sent" {
     // `db.compose` hands out a Composed that writes `?n`, the way `rawText`
-    // respells a raw `$n` for this dialect (ADR 0278); and what `rawcheck`
+    // respells a raw `$n` for this dialect (ADR 204); and what `rawcheck`
     // counts while compiling for `raw` is counted here at run time, because
-    // the text is not there to read until the request is (ADR 0283).
+    // the text is not there to read until the request is (ADR 208).
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -6709,7 +6709,7 @@ test "rawPage reads the total off the window the caller put on the end" {
     // `db.page` writes `count(*) OVER ()` into a statement it composed; a
     // join with a LIMIT is a statement nilo did not write, and its list ends
     // in the same window, read from the column after the Row's last field
-    // (ADR 0279).
+    // (ADR 205).
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -6767,7 +6767,7 @@ test "rawPage reads the total off the window the caller put on the end" {
 
 test "rawExactlyOne answers the row an aggregate always has, and refuses a statement with none" {
     // Five dashboard totals, each `rawOne` followed by an `orelse` that
-    // never ran (ADR 0280).
+    // never ran (ADR 206).
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -6812,7 +6812,7 @@ test "rawExactlyOne answers the row an aggregate always has, and refuses a state
 test "rawOne hands back the first row when a statement matches several" {
     // Stated rather than left to be discovered: no `LIMIT 1` is appended,
     // because this module did not write the statement and has nowhere honest
-    // to put one (ADR 0179). It is the shape of the call site, not a promise
+    // to put one (ADR 146). It is the shape of the call site, not a promise
     // about the query.
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -6895,7 +6895,7 @@ test "updateReturningOne is the PATCH shape: the row as it now is, or null" {
 test "the caller can read what the database said about its own statement" {
     // Item 55: a watcher got the whole `Problem` and the call site got
     // `error.QueryFailed`, which is the right split for a log and the wrong
-    // one for a branch (ADR 0184).
+    // one for a branch (ADR 117).
     var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
     defer db.deinit();
     db.wire = .{ .refuses = .{
@@ -6959,7 +6959,7 @@ test "a problem left by somebody else's request is not this one's to read" {
 test "a page carries the total the condition matched, in one statement" {
     // Item 56: a `db.count` beside a `db.select` is two statements against a
     // table somebody else can write between, so the total and the rows can
-    // disagree with nothing saying so (ADR 0185).
+    // disagree with nothing saying so (ADR 150).
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -7031,7 +7031,7 @@ const AccountSort = ordering.Ordering(SqliteAccount, .{
 
 test "an ordering chosen at run time leaves the statement in two constant halves" {
     // The head and the tail are settled while compiling, and there is no plan
-    // name: the text between them differs per request (ADR 0204).
+    // name: the text between them differs per request (ADR 165).
     const stmt = comptime statement.page(dialect.Postgres, SqliteAccount, @TypeOf(.{
         .where = .{ .email = "x" },
         .order = AccountSort.by(&.{.{ .key = .id }}),
@@ -7148,7 +7148,7 @@ test "a page reads the same columns a select does, and one more" {
 test "an optional filter narrows when it is set and drops when it is not" {
     // Items 54 and 56 together, which is the pair the report filed them as:
     // an optional filter and a total in one statement is the ordinary list
-    // endpoint (ADR 0183, ADR 0185).
+    // endpoint (ADR 149, ADR 150).
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
 
@@ -7187,7 +7187,7 @@ test "an optional filter narrows when it is set and drops when it is not" {
 
     // Absent: the same statement, the same parameter list, and the term is
     // not applied — every row, rather than the nothing `= NULL` would have
-    // matched (ADR 0044 is what that refusal was protecting).
+    // matched (ADR 040 is what that refusal was protecting).
     const unset: Filter = .{};
     const all = try db.page(SqliteAccount, &run, .{
         .where = .{ .email = .{ .icontains = where_mod.given(unset.search) } },
@@ -7200,7 +7200,7 @@ test "an optional filter narrows when it is set and drops when it is not" {
 
 // -- shaped Rows, end to end ----------------------------------------------
 //
-// A parent joined in, children read after, a group summed (ADR 0295). The
+// A parent joined in, children read after, a group summed (ADR 218). The
 // statement text is held by `shape.zig`'s own tests; what is held here is
 // what only a database can say: that the answer's columns land in the
 // fields they were named for, that a missing parent is a null rather than a

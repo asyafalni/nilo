@@ -2,7 +2,7 @@
 //!
 //! The ordinary way to reach this is handing a whole Row back to `insert`
 //! after filling the field, and the answer is the same as for a `.where`: no
-//! column holds it, so nothing can be written to one (ADR 0217).
+//! column holds it, so nothing can be written to one (ADR 178).
 
 const sql = @import("nilo_sql");
 

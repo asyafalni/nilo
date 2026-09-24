@@ -3,7 +3,7 @@
 //! Two things are on show here, and the second one is the point. The first is
 //! everything a WebSocket needs — the handshake, frame headers, masking,
 //! pings, the closing handshake, a message ceiling, and shutdown that does not
-//! hang on an idle typist (ADR 0022). The second is a `nilo.Room`: saying
+//! hang on an idle typist (ADR 021). The second is a `nilo.Room`: saying
 //! something to sockets this handler does not hold, which was the honest limit
 //! of 0.1.0 and is no longer.
 //!
@@ -27,7 +27,7 @@ pub const std_options_debug_io = nilo.debug_io;
 /// **The handler returns, and that is deliberate.** A handler that kept the
 /// loop would be suspended inside the request machinery — the `Ctx`, the
 /// parsed head, the route match — for as long as the tab is open, and a
-/// suspended fiber holds every byte of its stack (ADR 0063, ADR 0071).
+/// suspended fiber holds every byte of its stack (ADR 062).
 /// Handing the loop back lets all of that unwind first.
 ///
 /// `room` is a service, so the loop takes it the same way this does. Anything
@@ -39,7 +39,7 @@ fn chat(c: *nilo.Ctx, room: *nilo.Room) !void {
 /// The loop is the same one an echo server writes. Nothing in it mentions the
 /// other connections, and nothing in it handles an incoming broadcast —
 /// `receive` writes those out on the way past, from this fiber, because a
-/// connection's bytes belong to the fiber serving it (ADR 0029).
+/// connection's bytes belong to the fiber serving it (ADR 028).
 fn chatLoop(socket: *nilo.Socket, room: *nilo.Room) !void {
     // `join` takes a seat, `leave` gives it back. The `defer` is not optional
     // and not a nicety: Zig has no destructor, and a seat nobody gives up is
@@ -50,7 +50,7 @@ fn chatLoop(socket: *nilo.Socket, room: *nilo.Room) !void {
 
     // Formatted straight into the post the room was going to allocate
     // anyway — no buffer of ours in between, and nothing to guess the size of
-    // (ADR 0052).
+    // (ADR 046).
     try room.print("welcome, {d} here", .{room.count()});
 
     // No buffer here, and that is the point: the bytes of a message live in
@@ -64,7 +64,7 @@ fn chatLoop(socket: *nilo.Socket, room: *nilo.Room) !void {
     // The loop has no shutdown branch and does not need one: `receive` ends
     // the conversation itself when the server is stopping, and tells the
     // other end why, so a deploy is not held open by whoever is still typing
-    // (ADR 0020, ADR 0052).
+    // (ADR 019, ADR 046).
     while (try socket.receive()) |message| {
         // To everybody, including whoever typed it. One code path, not one
         // for me and another for everyone else.

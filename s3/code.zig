@@ -3,9 +3,9 @@
 //! S3's failures arrive as a small XML document. **Reading it needs no XML
 //! parser** — a scan for `<Code>…</Code>` is twenty lines, and the whole
 //! reason `LIST` is not in v1 is that it is the one operation whose *success*
-//! path is XML ([ADR 0068](../docs/adr/0068-a-bucket-is-a-type-and-a-key-is-not.md)).
+//! path is XML ([ADR 059](../docs/adr/059-a-bucket-is-a-type-and-a-key-is-not.md)).
 //!
-//! The code is logged and does not reach the client (ADR 0025). What reaches
+//! The code is logged and does not reach the client (ADR 024). What reaches
 //! the client is one of seven errors, chosen because a handler would do
 //! something different about each.
 //!
@@ -17,7 +17,7 @@
 const std = @import("std");
 
 /// The failures a handler can tell apart, and the whole list
-/// (ADR 0068). Anything not worth a different response is `Failed`.
+/// (ADR 059). Anything not worth a different response is `Failed`.
 pub const Error = error{
     /// No object at that key. **The one with a default status**, 404, because
     /// its meaning does not change with the request around it.
@@ -32,7 +32,7 @@ pub const Error = error{
     /// S3 answered 5xx. Distinct from `Throttled` because backing off is the
     /// answer to one and not the other.
     Unavailable,
-    /// This call's deadline ran out (ADR 0065).
+    /// This call's deadline ran out (ADR 056).
     TimedOut,
     /// S3 refused the request. **Not a 403 to the client**: telling a caller
     /// they are not allowed, when the truth is that the server's credentials

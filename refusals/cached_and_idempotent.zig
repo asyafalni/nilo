@@ -1,5 +1,5 @@
 //! A handler asking for both an `Idempotent` and a `Cached`: two claims on
-//! two keys for one kept answer ([ADR 0247](../docs/adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)).
+//! two keys for one kept answer ([ADR 188](../docs/adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)).
 
 const nilo = @import("nilo_http");
 

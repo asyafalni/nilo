@@ -1,5 +1,5 @@
 //! Middleware — work that runs before and after a handler, at the Ctx
-//! layer (ADR 0003), assembled as an onion (ADR 0009).
+//! layer (ADR 002), assembled as an onion (ADR 008).
 //!
 //! ```zig
 //! fn timing(c: *Ctx, next: Next) !void {
@@ -9,17 +9,17 @@
 //! }
 //!
 //! try app.use(timing);
-//! try app.use("/api", requireToken);
+//! try app.useOn("/api", requireToken);
 //! ```
 //!
 //! A middleware that does not call `next.run(c)` ends the chain — that is
 //! all short-circuiting is. One that returns an error goes through exactly
 //! the same path a failing handler does, fail functions and mapping table
-//! included (ADR 0005), so there is only ever one error path.
+//! included (ADR 004), so there is only ever one error path.
 //!
 //! Middleware still produces no value for the handler, and it no longer
 //! needs to: the thing it used to be asked for — auth resolving a user — is
-//! a resolved value now (ADR 0016). A middleware guards, a resolved value
+//! a resolved value now (ADR 015). A middleware guards, a resolved value
 //! provides, and `c.resolve(T)` is how a guard reads one without making the
 //! handler behind it work the same thing out twice.
 
@@ -36,7 +36,7 @@ pub const Middleware = *const fn (*Ctx, Next) anyerror!void;
 /// The rest of the onion. Two words, passed by value, allocating nothing.
 pub const Next = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Next";
 
     rest: []const Middleware,
@@ -94,7 +94,7 @@ fn underPrefix(prefix: []const u8, path: []const u8) bool {
 /// require a session to create one. There was nothing that removed a middleware
 /// and nothing that attached one to a single route, so `use(requireOperator)`
 /// on `/v1` guarded `/v1/sign-up` too and sign-up answered 401
-/// ([ADR 0080](../docs/adr/0080-a-route-can-say-it-is-not-covered.md)).
+/// ([ADR 008](../docs/adr/008-middleware-is-an-onion-of-ctx-functions.md)).
 ///
 /// The pattern is **exact** rather than a prefix, and it is the joined one the
 /// route was registered under, produced by the same `joined(prefix, pattern)`
@@ -107,7 +107,7 @@ pub const Exemption = struct {
     /// Which verb on that pattern. `GET /users/:id` and `DELETE /users/:id`
     /// are two routes, and excusing one of them must not excuse the other —
     /// which it did until `with` arrived and needed the same distinction
-    /// ([ADR 0126](../docs/adr/0126-a-route-can-say-what-covers-it.md)).
+    /// ([ADR 099](../docs/adr/099-a-route-can-say-what-covers-it.md)).
     method: http1.Method,
     middleware: Middleware,
 
@@ -120,7 +120,7 @@ pub const Exemption = struct {
 
 /// One route saying a middleware *does* cover it — the other direction of
 /// `Exemption`, and the same shape for the same reason
-/// ([ADR 0126](../docs/adr/0126-a-route-can-say-what-covers-it.md)).
+/// ([ADR 099](../docs/adr/099-a-route-can-say-what-covers-it.md)).
 ///
 /// **The awkward case `use` cannot say** is a route that wants more than its
 /// neighbours: `use`, `useOn` and `group().use` all scope by path, so one
@@ -190,7 +190,7 @@ pub fn chainFor(
 }
 
 /// A middleware the program said reads the session cookie, from `app.guard`
-/// (ADR 0252). The document cannot check that it does; what it can check is
+/// (ADR 153). The document cannot check that it does; what it can check is
 /// which routes the middleware is in front of, and that half is `wraps`.
 pub const Guard = struct {
     middleware: Middleware,
@@ -203,7 +203,7 @@ pub const Guard = struct {
 /// the same two questions, asked without building the chain. What the
 /// document asks at `writeOpenApi`, which runs before `listen()` has
 /// resolved anything and must not allocate a chain per route to find out
-/// ([ADR 0252](../docs/adr/0252-the-document-takes-a-guards-word-for-the-cookie.md)).
+/// ([ADR 153](../docs/adr/153-an-authorization-header-a-handler-can-ask-for.md)).
 pub fn wraps(
     scoped: []const Scoped,
     exemptions: []const Exemption,
@@ -346,7 +346,7 @@ test "a prefix carrying a param covers a pattern and a real path alike" {
 
 test "a middleware a route carries runs inside the ones scoped over it" {
     // The order the nesting means: the group's guard has already run by the
-    // time the route's own guard does (ADR 0126).
+    // time the route's own guard does (ADR 099).
     const scoped = [_]Scoped{.{ .prefix = "", .middleware = markA }};
     const attached = [_]Attached{.{ .pattern = "/v1/orders", .method = .POST, .middleware = markB }};
 
@@ -385,7 +385,7 @@ test "an attached middleware covers its own route and nothing beside it" {
 
 test "an attached middleware covers one verb on its path, not every verb" {
     // `with(adminOnly).delete("/users/:id", …)` must not put `adminOnly` on
-    // the `GET` that reads the same path. They are two routes (ADR 0126).
+    // the `GET` that reads the same path. They are two routes (ADR 099).
     const attached = [_]Attached{.{ .pattern = "/users/:id", .method = .DELETE, .middleware = markA }};
 
     const removing = try chainFor(testing.allocator, &.{}, &.{}, &attached, .DELETE, "/users/:id");

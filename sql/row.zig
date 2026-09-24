@@ -1,5 +1,5 @@
 //! A Row — a struct of the caller's own, one field per column, carrying the
-//! marker that names its table (ADR 0039).
+//! marker that names its table (ADR 036).
 //!
 //! ```zig
 //! const User = struct {
@@ -41,7 +41,7 @@
 //!
 //! And a third shape, for a Row that **no table has**: the merged page of a
 //! `UNION ALL`, a `GROUP BY` rollup, a card joining four tables
-//! ([ADR 0155](../docs/adr/0155-a-row-that-owns-no-table.md)).
+//! ([ADR 125](../docs/adr/125-a-row-that-owns-no-table.md)).
 //!
 //! ```zig
 //! const TimelineRow = struct {
@@ -58,7 +58,7 @@
 //! represent, and `db.checking` would then take that name at its word.
 //!
 //! A narrower Row may also **carry more than its table's columns**
-//! ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)):
+//! ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)):
 //! a field whose type is another Row is the **parent** its reference points
 //! at, a field whose type is a slice of Rows is the **children** that point
 //! back, and a Row that says `nilo_aggregate` is **grouped**: one row per
@@ -82,13 +82,13 @@
 //!
 //! Everything here answers a question about a type rather than about a
 //! request, so all of it is settled before the binary exists — the first half
-//! of ADR 0039's rule.
+//! of ADR 036's rule.
 
 const std = @import("std");
 /// Named here only so that `Borrowed` knows which field type means *text
 /// that lives as long as the work does*. Nothing else in this file asks any
 /// other layer anything — and what it asks is Core, not the framework
-/// (ADR 0041).
+/// (ADR 038).
 const core = @import("nilo_core");
 const types_mod = @import("types.zig");
 const dialect_mod = @import("dialect.zig");
@@ -117,7 +117,7 @@ pub fn isRow(comptime T: type) bool {
 pub const projection_word = "projection";
 
 /// The second declaration a Row may carry: the fields **beside** its columns
-/// ([ADR 0217](../docs/adr/0217-a-row-can-carry-a-field-no-column-holds.md)).
+/// ([ADR 178](../docs/adr/178-a-row-can-carry-a-field-no-column-holds.md)).
 ///
 /// ```zig
 /// const Line = struct {
@@ -227,7 +227,7 @@ fn fieldList(comptime Row: type) []const u8 {
     };
 }
 
-// -- what each field is (ADR 0295) --------------------------------------
+// -- what each field is (ADR 218) --------------------------------------
 
 /// What one field of a Row stands for.
 ///
@@ -237,7 +237,7 @@ fn fieldList(comptime Row: type) []const u8 {
 pub const Kind = enum {
     /// A column of the Row's own table, read by position.
     column,
-    /// Named in `nilo_beside`: on the Row and in no statement (ADR 0217).
+    /// Named in `nilo_beside`: on the Row and in no statement (ADR 178).
     beside,
     /// A Row, or an optional one: the row its table's reference points at,
     /// joined into the same statement.
@@ -251,7 +251,7 @@ pub const Kind = enum {
 };
 
 /// The declaration that makes a Row grouped
-/// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+/// ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
 ///
 /// ```zig
 /// pub const nilo_aggregate = .{ .objects = .count, .owed = .{ .sum = .principal } };
@@ -287,11 +287,11 @@ pub fn kindOf(comptime Row: type, comptime name: []const u8) Kind {
 /// The same, for a caller already holding the field's type: every loop over
 /// a Row's fields, which would otherwise look each field up by name inside a
 /// walk over the same fields and pay for the square of the Row's width
-/// ([ADR 0157](../docs/adr/0157-a-check-pays-for-its-own-branches.md)).
+/// ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)).
 pub fn kindWith(comptime Row: type, comptime name: []const u8, comptime T: type) Kind {
     return comptime blk: {
         // The two declarations first, and cheaply: a Row with neither, which is every
-        // Row written before ADR 0295, answers from the type alone.
+        // Row written before ADR 218, answers from the type alone.
         if (@hasDecl(Row, beside_marker) and isBeside(Row, name)) break :blk .beside;
         if (@hasDecl(Row, aggregate_marker) and aggregateNamed(Row, name)) break :blk .aggregate;
         if (parentRowOf(T) != null) break :blk .parent;
@@ -540,7 +540,7 @@ pub fn pathName(comptime path: []const []const u8) []const u8 {
 }
 
 /// Whether `T` is a **projection**: a Row that reads and owns no table
-/// ([ADR 0155](../docs/adr/0155-a-row-that-owns-no-table.md)).
+/// ([ADR 125](../docs/adr/125-a-row-that-owns-no-table.md)).
 ///
 /// A `UNION ALL` over two tables, a `GROUP BY` rollup, a search across seven
 /// tables, a card joining four — none of them is a table's shape, and until
@@ -562,7 +562,7 @@ pub fn isProjection(comptime T: type) bool {
     if (@TypeOf(decl) != @TypeOf(.enum_literal)) return false;
     // `==` rather than comparing `@tagName` with `std.mem.eql`: the compiler
     // settles two enum literals in one step, and the string version spends a
-    // caller's backwards branches on a ten-byte comparison (ADR 0157 is the
+    // caller's backwards branches on a ten-byte comparison (ADR 126 is the
     // same lesson one module over).
     return decl == .projection;
 }
@@ -597,7 +597,7 @@ pub fn qualifiedOf(comptime Row: type) Qualified {
 
 /// The same split, for a table named as text rather than by a Row — which a
 /// `.references` may do when the Row that owns it cannot be imported
-/// ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 /// `whose` is what the message calls the thing that wrote the name.
 pub fn qualifiedName(comptime written: []const u8, comptime whose: []const u8) Qualified {
     return comptime blk: {
@@ -700,7 +700,7 @@ pub fn keyList(comptime Row: type) []const u8 {
 }
 
 /// Whether this program builds the table `Row` reads, or only reads it
-/// ([ADR 0162](../docs/adr/0162-a-table-this-program-reads-and-does-not-build.md)).
+/// ([ADR 130](../docs/adr/130-a-table-this-program-reads-and-does-not-build.md)).
 ///
 /// **The default is true, and the word exists for a port.** A `.references`
 /// names the Row that owns the table, so a foreign key onto `staff` needs a
@@ -712,7 +712,7 @@ pub fn keyList(comptime Row: type) []const u8 {
 /// The key the marker names, or `id` when there is a column by that name, or
 /// nothing: `keysOf` without its refusal. For a question that is not "which
 /// row", such as which columns an insert may leave out, where a Row with no
-/// key is still a Row an `insertOrIgnore` may write (ADR 0186).
+/// key is still a Row an `insertOrIgnore` may write (ADR 151).
 pub fn keysIfAnyOf(comptime Row: type) []const []const u8 {
     return comptime blk: {
         if (specOf(Row).key) |named| break :blk named;
@@ -738,8 +738,8 @@ pub fn columnsOf(comptime Row: type) []const []const u8 {
         var out: [fields.len][]const u8 = undefined;
         var n: usize = 0;
         for (fields) |f| {
-            // A field beside the columns is not one (ADR 0217), and neither
-            // is a parent, children or an aggregate (ADR 0295).
+            // A field beside the columns is not one (ADR 178), and neither
+            // is a parent, children or an aggregate (ADR 218).
             if (kindWith(Row, f.name, f.type) != .column) continue;
             out[n] = f.name;
             n += 1;
@@ -756,7 +756,7 @@ pub fn columnsOf(comptime Row: type) []const []const u8 {
 /// is pulled. `Str` means *text that lives as long as the request*, with no
 /// asterisk — so text that does not is not called one. The type tells the
 /// truth rather than hiding the rule behind a name that promises safety
-/// (ADR 0039).
+/// (ADR 036).
 ///
 /// It is the same rule `Body.read` already followed by returning `[]u8`.
 /// Nothing here is new; it is applied one layer over.
@@ -774,10 +774,10 @@ pub fn Borrowed(comptime Row: type) type {
             names[i] = f.name;
             types[i] = switch (kindWith(Row, f.name, f.type)) {
                 // A field beside the columns is never read out of the buffer,
-                // so it keeps its own type and its default fills it (ADR 0217).
+                // so it keeps its own type and its default fills it (ADR 178).
                 .beside => f.type,
                 // A parent is borrowed whole, the same rule one level down: its
-                // text dies at the next row like the Row's own (ADR 0295).
+                // text dies at the next row like the Row's own (ADR 218).
                 .parent => if (@typeInfo(f.type) == .optional)
                     ?Borrowed(parentRowOf(f.type).?)
                 else
@@ -836,7 +836,7 @@ pub fn ColumnType(comptime Row: type, comptime column: []const u8) type {
 
 /// The column name closest to `wrong`, when one is close enough to be worth
 /// naming. A message that says what was meant is the difference between a
-/// Refusal that helps and one that only stops you (ADR 0027).
+/// Refusal that helps and one that only stops you (ADR 026).
 pub fn nearest(comptime Row: type, comptime wrong: []const u8) ?[]const u8 {
     return comptime blk: {
         var best: ?[]const u8 = null;
@@ -872,7 +872,7 @@ pub fn noSuchColumn(
                 ", or out of " ++ beside_marker ++ " if it is a column after all.",
         );
         // A field that is there and is not a column: said as what it is, so
-        // the caller learns the spelling that does reach it (ADR 0295).
+        // the caller learns the spelling that does reach it (ADR 218).
         if (fieldTypeOf(Row, wrong) != null) switch (kindOf(Row, wrong)) {
             .parent => @compileError(
                 "nilo: `" ++ wrong ++ "` on " ++ @typeName(Row) ++ " is a parent, asked for in " ++
@@ -926,7 +926,7 @@ const Spec = struct {
     /// multi-tenant one.
     key: ?[]const []const u8,
     /// Whether this program **builds** the table, as against merely reading
-    /// it ([ADR 0162](../docs/adr/0162-a-table-this-program-reads-and-does-not-build.md)).
+    /// it ([ADR 130](../docs/adr/130-a-table-this-program-reads-and-does-not-build.md)).
     /// True unless the Row says otherwise, because that is what every Row
     /// written before this meant.
     managed: bool = true,
@@ -952,7 +952,7 @@ const allowed = [_][]const u8{
 ///
 /// **This is the only Row allowed to describe the table**, which is what keeps
 /// a query type from becoming a migration file in disguise
-/// ([ADR 0153](../docs/adr/0153-a-migration-is-a-diff-against-a-snapshot.md)).
+/// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 /// Nothing enforces it, because the language does: a borrowing Row's marker is
 /// a `type`, and there is nowhere on a type to write `.unique`.
 pub fn ownerOf(comptime Row: type) type {
@@ -964,7 +964,7 @@ pub fn ownerOf(comptime Row: type) type {
             const decl = @field(current, marker);
             // A projection owns no table, so every question that starts
             // "which table" ends here rather than at a live database looking
-            // for a column of a table nobody meant (ADR 0155). This is the
+            // for a column of a table nobody meant (ADR 125). This is the
             // one funnel: `tableOf`, `keyOf` and `qualifiedOf` all come
             // through, and so does everything in `table.zig`.
             if (@TypeOf(decl) == @TypeOf(.enum_literal)) {
@@ -1021,7 +1021,7 @@ fn readSpec(comptime Row: type, comptime decl: anytype) Spec {
         // in it, and every Row in a schema comes through here — so a program
         // with tens of tables spends the default 1,000 backwards branches on
         // `std.mem.eql` alone, and the compile stops in a file of std's
-        // ([ADR 0157](../docs/adr/0157-a-check-pays-for-its-own-branches.md)).
+        // ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)).
         // Generous rather than exact, for the reason that ADR gives: the
         // budget is the caller's whole evaluation and this raises a ceiling
         // rather than spending an allowance.
@@ -1111,7 +1111,7 @@ fn notAKey(comptime Row: type, comptime K: type) noreturn {
 /// and that is what the migration tool and the schema check read it as. So a
 /// parent, children, `nilo_aggregate` or `nilo_via` on one is refused: each
 /// belongs to a narrower Row, which reads the table without describing it
-/// (ADR 0295).
+/// (ADR 218).
 fn assertDescribesItsTable(comptime Row: type) void {
     comptime {
         const narrower = "  A Row that names its table describes it column by column, which is what " ++
@@ -1146,10 +1146,10 @@ fn assertSubset(comptime Narrow: type, comptime Wide: type) void {
         if (@hasDecl(Narrow, aggregate_marker)) _ = aggregatesOf(Narrow);
         for (@typeInfo(Narrow).@"struct".fields) |f| {
             // Carried beside the columns rather than read, so the table it
-            // borrows need not have it (ADR 0217). A parent, children and an
+            // borrows need not have it (ADR 178). A parent, children and an
             // aggregate are not columns of this table either, and
             // `shape.zig` checks each against the table it does read
-            // (ADR 0295).
+            // (ADR 218).
             if (kindWith(Narrow, f.name, f.type) != .column) continue;
             if (!hasColumn(Wide, f.name)) {
                 const head = "nilo: " ++ @typeName(Narrow) ++ " reads `" ++ f.name ++
@@ -1186,7 +1186,7 @@ pub fn assertRow(comptime T: type) void {
                 "  Add `pub const " ++ marker ++ " = .{ .name = \"<table>\" };` to it, " ++
                 "`= <OtherRow>` to read the same table as another Row, or `= ." ++
                 projection_word ++ "` when no table has this shape and `db.raw` is what " ++
-                "fills it (ADR 0155).",
+                "fills it (ADR 125).",
         );
     }
 }
@@ -1255,7 +1255,7 @@ test "a projection is a Row, and is the one Row that names no table" {
     // Both halves matter. It has to pass `assertRow`, or `db.raw` would not
     // take it; and it has to be recognisable as a projection, or everything
     // that writes SQL would go looking for a table called `.projection`
-    // (ADR 0155).
+    // (ADR 125).
     try testing.expect(isRow(Timeline));
     try testing.expect(isProjection(Timeline));
 
@@ -1342,7 +1342,7 @@ test "a borrowed Row keeps its own column list rather than the wider one" {
 const Attachment = struct { id: i64, filename: []const u8 };
 
 /// A comment line on a timeline, carrying its files — which no column holds
-/// and the caller fills after the read (ADR 0217).
+/// and the caller fills after the read (ADR 178).
 const CommentLine = struct {
     pub const nilo_table = .{ .name = "comments", .key = .id };
     pub const nilo_beside = .{ .attachments, .mine };

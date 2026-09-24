@@ -1,5 +1,5 @@
 //! Which addresses in front of this server are allowed to say who the client
-//! is ([ADR 0129](../docs/adr/0129-a-proxy-is-trusted-by-which-one-it-is.md)).
+//! is ([ADR 102](../docs/adr/102-a-proxy-is-trusted-by-which-one-it-is.md)).
 //!
 //! `.trusted_hops` counts entries from the right of `X-Forwarded-For`, which
 //! is sound arithmetic and is all there was. What a count cannot say is that
@@ -30,7 +30,7 @@
 //! **What it costs.** Parsing happens once, at `listen()`. Per request it is a
 //! prefix compare per entry per rule, on requests that call `clientIp()` and
 //! carry the header — nothing at all for everybody else, because `Ctx` reads
-//! this only when asked ([ADR 0018](../docs/adr/0018-the-trade-budget-has-three-axes.md)).
+//! this only when asked ([ADR 017](../docs/adr/017-the-trade-budget-has-four-axes.md)).
 
 const std = @import("std");
 const net = std.Io.net;
@@ -245,7 +245,7 @@ pub const Forwarded = struct {
 /// `local` is that check already answered. A connection that arrived over a
 /// unix socket has no address to test and cannot have come from anywhere but
 /// this machine, which is the thing a `"loopback"` rule is trying to
-/// establish about a proxy over TCP ([ADR 0130](../docs/adr/0130-a-path-is-an-address-to-listen-on.md)).
+/// establish about a proxy over TCP ([ADR 103](../docs/adr/103-a-path-is-an-address-to-listen-on.md)).
 /// It does not make the header trusted on its own: `rules` still has to be
 /// set, because reading it at all is the thing an operator opts into.
 pub fn clientFrom(
@@ -395,7 +395,7 @@ test "a connection over a unix socket may carry a forwarded header" {
     // `unix:/run/nilo.sock`. There is no connection address to put a rule
     // against, and nothing but a process on this machine could have opened
     // the socket — so the check the rules exist to make is already answered
-    // (ADR 0130).
+    // (ADR 103).
     const rules = cidrs(&.{"10.0.0.0/8"});
     try testing.expectEqualStrings(
         "203.0.113.9",

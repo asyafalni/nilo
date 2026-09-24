@@ -2,7 +2,7 @@
 //!
 //! With one attempt every failure is final already, so the set decides
 //! nothing — and a line that does nothing is a line somebody will read as
-//! doing something (ADR 0218).
+//! doing something (ADR 179).
 
 const job = @import("nilo_job");
 const core = @import("nilo_core");

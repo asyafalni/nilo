@@ -1,9 +1,9 @@
 const std = @import("std");
 
-/// The directories a module is rooted in. One per shipped module (ADR 0041),
+/// The directories a module is rooted in. One per shipped module (ADR 038),
 /// and `.paths` in `build.zig.zon` is the one place that has to remember — a
 /// dependent whose `.paths` is missing one gets a package without that module
-/// and finds out at their own build (ADR 0039).
+/// and finds out at their own build (ADR 036).
 ///
 /// Checked here rather than in a test, because a check that runs on every
 /// `zig build` cannot be the thing somebody forgot to run.
@@ -13,7 +13,7 @@ const std = @import("std");
 /// list that does not name a directory cannot check it.
 ///
 /// `dev` is not a module — nothing imports it — but a dependent builds
-/// `nilo.artifact("nilo-dev")` from it, so it ships the same way (ADR 0259).
+/// `nilo.artifact("nilo-dev")` from it, so it ships the same way (ADR 190).
 const shipped_roots = [_][]const u8{ "core", "id", "config", "pw", "cache", "jwt", "fetch", "job", "http", "sql", "s3", "dev" };
 
 comptime {
@@ -34,9 +34,9 @@ comptime {
 }
 
 /// What each module below the App is allowed to name, and the whole of it
-/// (ADR 0042). A module imports downward only, and until now that was a
+/// (ADR 038). A module imports downward only, and until now that was a
 /// sentence in a document — the same shape of rule
-/// [ADR 0027](docs/adr/0027-the-rule-about-error-messages-is-held-by-a-build-step.md)
+/// [ADR 026](docs/adr/026-the-rule-about-error-messages-is-held-by-a-build-step.md)
 /// took away from documents and gave to a build step, for the same reason.
 ///
 /// The lists are short and that is the point: what a row grows by is the
@@ -44,7 +44,7 @@ comptime {
 ///
 /// **`in_tests` is allowed, not verified.** A module's tests may reach one
 /// layer up, because an `@import` referenced only from a `test` block is
-/// never analysed in a build that is not a test build (ADR 0041). Telling
+/// never analysed in a build that is not a test build (ADR 038). Telling
 /// those apart needs a parser rather than a scan, so this file lists the
 /// exception instead of proving it — which still beats a rule that nothing
 /// checks at all, and which is why the lists live here where they can be
@@ -54,19 +54,19 @@ const layers = [_]Layer{
     .{ .root = "id", .may_import = &.{} },
     // A tool module may name Core and this one does not, which is the whole
     // of why it can be read into `[]const u8` rather than a `Str` (ADR
-    // 0043). Settings are read once before the socket opens and held for
+    // 039). Settings are read once before the socket opens and held for
     // the life of the process; the lifetime a `Str` carries would have
     // nothing to say about them, and naming `nilo_core` to get one would
     // cost the property that decides the layer — `zig test
     // config/config.zig`, with no module graph at all.
     .{ .root = "config", .may_import = &.{} },
-    // The third tool module, and it names nothing either (ADR 0048). What it
+    // The third tool module, and it names nothing either (ADR 044). What it
     // wanted from a layer above was entropy, a thread to hold and a count of
     // how many hashes are already running — and all three are arguments or
     // the caller's, which is what keeps `zig test pw/pw.zig` the whole of its
     // suite. `http/password.zig` is the half that has a Bulkhead.
     .{ .root = "pw", .may_import = &.{} },
-    // The fourth, and it names nothing either (ADR 0138). What it wanted from
+    // The fourth, and it names nothing either (ADR 109). What it wanted from
     // a layer above was a clock and a lock, and it has neither: the clock is
     // `clock_gettime` written a second time rather than `nilo_core`'s, and
     // the lock spins because `std.Io.Mutex` needs an `Io` this layer does not
@@ -74,7 +74,7 @@ const layers = [_]Layer{
     // other way round, which is why the row is empty.
     .{ .root = "cache", .may_import = &.{} },
     .{ .root = "jwt", .may_import = &.{} },
-    // The first Fitting (ADR 0070): it borrows the loop and owns no
+    // The first Fitting (ADR 061): it borrows the loop and owns no
     // destination. That is what puts it below a Service and above a tool
     // module — `zig test fetch/fetch.zig` needs `nilo_core` and so needs the
     // module graph, which a tool module may not, and it holds no connection to
@@ -88,11 +88,11 @@ const layers = [_]Layer{
         .may_import = &.{ "nilo_core", "net_config" },
         // `fetch/deadline.zig` names the server, because the one thing it
         // tests is a deadline the Engine has to fire and only a running
-        // server has one (ADR 0065, ADR 0070). Same exception `sql` carries,
+        // server has one (ADR 056, ADR 061). Same exception `sql` carries,
         // and the same weakness: the step cannot see that it is test-only.
         .in_tests = &.{"nilo_http"},
     },
-    // The second Fitting (ADR 0198): a queue borrows the loop to wait on and
+    // The second Fitting (ADR 160): a queue borrows the loop to wait on and
     // owns no destination — the store it runs on is handed to it as a type,
     // which is why `job/table.zig` sits on a `nilo_sql` Db and this row still
     // names no `nilo_sql`. `job/live.zig` is the test root that does, for the
@@ -109,19 +109,19 @@ const layers = [_]Layer{
         .root = "sql",
         // Two drivers, two rows in this list, and both are third-party rather
         // than sideways: a Wire names a driver and nothing above it
-        // (ADR 0039, ADR 0073).
+        // (ADR 036, ADR 064).
         .may_import = &.{ "nilo_core", "nilo_id", "pg", "zqlite", "live_config" },
         .in_tests = &.{"nilo_http"},
     },
     // A Service that dials, and **the first module to name a Fitting**
-    // (ADR 0072). That is downward rather than sideways — a Fitting borrows
+    // (ADR 063). That is downward rather than sideways — a Fitting borrows
     // the loop and owns no destination, a Service holds one — and it is the
-    // import ADR 0070 was built to make legal, which is why this row is one
+    // import ADR 061 was built to make legal, which is why this row is one
     // line rather than an argument.
     //
     // No `pg`-shaped dependency to be lazy about: what would have been an
     // HTTP client and a TLS stack is `std`'s, reached through `nilo_fetch`,
-    // so this module's dependency count is zero (ADR 0067).
+    // so this module's dependency count is zero (ADR 058).
     .{ .root = "s3", .may_import = &.{ "nilo_core", "nilo_fetch", "s3_config" } },
 };
 
@@ -202,13 +202,13 @@ const Example = struct {
     needs_fetch: bool = false,
     /// Names `nilo_sql`, so it is built and tested only when that module is
     /// (`-Dsql`, on for this repository), and its tests hang off `test-sql`
-    /// rather than `test` for the reason the module's own do (ADR 0075).
+    /// rather than `test` for the reason the module's own do (ADR 066).
     needs_sql: bool = false,
 };
 
 /// The same, for `sql/refusals/`. A separate list because they hang off
 /// `test-sql` rather than `test` — the framework's loop does not pay for a
-/// module it does not import (ADR 0039).
+/// module it does not import (ADR 036).
 const sql_refusals = [_]Refusal{
     .{
         .name = "a_second_database_with_no_name",
@@ -217,7 +217,7 @@ const sql_refusals = [_]Refusal{
     // The three the SQLite Wire adds. All three are things the *dialect*
     // cannot do rather than things this module declines to write, which is why
     // each message says what SQLite does instead of what nilo wants
-    // (ADR 0073, ADR 0074).
+    // (ADR 064, ADR 065).
     .{
         .name = "sqlite_wire_without_threading",
         .says = "a sqlite Wire has to say where its statements run.",
@@ -232,7 +232,7 @@ const sql_refusals = [_]Refusal{
     },
     // `nilo_id`'s, and it is here because that module has no table of its own:
     // `sql.Uuid` is the same declaration, and the framework's refusals are built
-    // against `nilo_http` alone (ADR 0176).
+    // against `nilo_http` alone (ADR 143).
     .{
         .name = "uuid_v7now_without_a_scope",
         .says = "`id.v7Now` needs somewhere to get randomness from, and u32 has no `entropy`.",
@@ -277,7 +277,7 @@ const sql_refusals = [_]Refusal{
         .name = "across_on_unknown_column",
         .says = "across_on_unknown_column.Sku has no column `trade_mark`, asked for in an `.across`.",
     },
-    // A field beside the columns: on the Row, in no statement (ADR 0217).
+    // A field beside the columns: on the Row, in no statement (ADR 178).
     .{
         .name = "beside_in_a_where",
         .says = "beside_in_a_where.Comment carries `attachments` beside its columns, and a" ++
@@ -408,7 +408,7 @@ const sql_refusals = [_]Refusal{
         .says = "column 1 of the statement handed to `db.raw` is named `owner_id`, and field 1 of raw_column_in_another_fields_place.Person is `id`.",
     },
     // The values against the `$n` the text names, and the one column a
-    // paged statement has to carry past its Row (ADR 0278, ADR 0279).
+    // paged statement has to carry past its Row (ADR 204, ADR 205).
     .{
         .name = "raw_with_fewer_values_than_placeholders",
         .says = "the statement handed to `db.raw` names $2 and was given 1 value.",
@@ -418,7 +418,7 @@ const sql_refusals = [_]Refusal{
         .says = "the statement handed to `db.rawPage` selects 2 columns, and raw_page_without_a_total.Line has 2 fields and wants one more.",
     },
     // The two shapes a `::text` cannot be hiding in, and the only two this
-    // refuses (ADR 0170). Both name the *column* type rather than the Zig one:
+    // refuses (ADR 138). Both name the *column* type rather than the Zig one:
     // `@typeName` of an `AsText` is `types.AsText("numeric"[0..7])`, and a
     // check whose text ends in a compiler rendering detail breaks when the
     // rendering does.
@@ -431,7 +431,7 @@ const sql_refusals = [_]Refusal{
         .says = "the statement handed to `db.raw` selects `*`, and field 2 of raw_star_over_a_text_column.Invoice is a `numeric` column read as text.",
     },
     // A Row that owns no table, refused by everything that has to name one
-    // (ADR 0155). The second is the near miss: one word is allowed, so a
+    // (ADR 125). The second is the near miss: one word is allowed, so a
     // different one is a typo rather than a Row nobody has implemented yet.
     .{
         .name = "select_on_a_projection",
@@ -527,7 +527,7 @@ const sql_refusals = [_]Refusal{
         .name = "order_on_unknown_column",
         .says = "order_on_unknown_column.User has no column `creted_at`, asked for in `.order`.",
     },
-    // An `ORDER BY` chosen per request from a closed set (ADR 0204). The
+    // An `ORDER BY` chosen per request from a closed set (ADR 165). The
     // keys are checked where they are declared, and an ordering carries the
     // Row it was checked against.
     .{
@@ -563,7 +563,7 @@ const sql_refusals = [_]Refusal{
         .says = "a select on unknown_select_option.User was given `.limti`, which is not one of its options.",
     },
 
-    // The twelve `sql/table.zig` adds (ADR 0153). Every one of them is a
+    // The twelve `sql/table.zig` adds (ADR 123). Every one of them is a
     // schema that would compile, create a table, and be wrong about it later:
     // a key nothing can identify a row by, a unique over a column that has no
     // case, two sides of a foreign key holding different types. A migration
@@ -626,7 +626,7 @@ const sql_refusals = [_]Refusal{
         .says = "these tables point at each other in a ring, so none of them can be" ++
             " created first:",
     },
-    // The five the words that cross tables add (ADR 0222). Four of them are a
+    // The five the words that cross tables add (ADR 181). Four of them are a
     // foreign key that lines up in the Row and not with the table it points
     // at, which is the mistake the type check exists to catch — and the fifth
     // is the check itself, refusing the name it was given nowhere to resolve.
@@ -655,7 +655,7 @@ const sql_refusals = [_]Refusal{
         .says = "table_references_unknown_word.Card's `.references` sets `.on_dlete`," ++
             " which is not part of an entry.",
     },
-    // The fifteen the words inside one Row add (ADR 0221): a default, an enum
+    // The fifteen the words inside one Row add (ADR 181): a default, an enum
     // column's CHECK, a partial and ordered index, and a constraint that can
     // be named. Every one of them is a schema that would compile and then be
     // wrong about itself — a default the column's own CHECK refuses, two
@@ -680,7 +680,7 @@ const sql_refusals = [_]Refusal{
             " `skus_are_unique_per_product_and_per_term_and_per_platform_and_per_region`," ++
             " which is 72 bytes, and 63 is all Postgres keeps.",
     },
-    // The second kind of word (ADR 0226): a `.check` and a `.trigger`, whose
+    // The second kind of word (ADR 181): a `.check` and a `.trigger`, whose
     // body the database reads and the compiler does not. What is checked here
     // is the shape around the body — that it is text, that there is some, and
     // that the name it goes in under fits.
@@ -913,7 +913,7 @@ const sql_refusals = [_]Refusal{
     },
     // `.exists`. The first two are the two ways a schema can fail to say how
     // two tables are joined, and they are different mistakes: nothing said, and
-    // said twice (ADR 0171).
+    // said twice (ADR 218).
     .{
         .name = "exists_without_a_reference",
         .says = "`.exists` names exists_without_a_reference.Capability, which declares" ++
@@ -926,7 +926,7 @@ const sql_refusals = [_]Refusal{
             " `created_by`, `updated_by`.",
     },
     // The reference read from the outer Row's side, and the two words that
-    // tell the directions apart (ADR 0214).
+    // tell the directions apart (ADR 175).
     .{
         .name = "exists_with_two_references_back",
         .says = "`.exists` names exists_with_two_references_back.Region, which" ++
@@ -964,7 +964,7 @@ const sql_refusals = [_]Refusal{
         .says = "reserved_column_exists.Flag has a column named `exists`, which is the" ++
             " word a condition uses for a matching row in another table.",
     },
-    // A Row that carries its parent, its children or a sum (ADR 0295).
+    // A Row that carries its parent, its children or a sum (ADR 218).
     .{
         .name = "shape_parent_on_a_table",
         .says = "shape_parent_on_a_table.Invoice carries a parent, children or an aggregate, and" ++
@@ -1093,7 +1093,7 @@ const sql_refusals = [_]Refusal{
 
 /// The same, for `s3/refusals/`. The fifth table, hung off `test-s3`.
 ///
-/// What is checked here is what ADR 0068 said comptime was *for*: not the
+/// What is checked here is what ADR 059 said comptime was *for*: not the
 /// endpoint or the credentials, which come from a Config at run time, but the
 /// four things a bucket's own type can be wrong about — and the one that is
 /// not a mistake so much as a leak, a credential written where it would be
@@ -1147,7 +1147,7 @@ const s3_refusals = [_]Refusal{
 
 /// The same, for `config/refusals/`. A separate list for the same reason the
 /// SQL one is separate: a module's refusals belong beside the module rather
-/// than in one table every module edits (ADR 0041).
+/// than in one table every module edits (ADR 038).
 const config_refusals = [_]Refusal{
     .{
         .name = "config_not_a_struct",
@@ -1189,7 +1189,7 @@ const config_refusals = [_]Refusal{
 
 /// The same, for `pw/refusals/`. They hang off `test-pw` for the reason the
 /// Config ones hang off `test-config`: a module in the bottom layer keeps its
-/// own (ADR 0048).
+/// own (ADR 044).
 const pw_refusals = [_]Refusal{
     .{
         .name = "pw_cost_below_the_floor",
@@ -1211,7 +1211,7 @@ const pw_refusals = [_]Refusal{
 
 /// The same, for `cache/refusals/`, hanging off `test-cache` for the reason
 /// the Config and Password ones hang off theirs: a module in the bottom layer
-/// keeps its own (ADR 0138).
+/// keeps its own (ADR 109).
 const cache_refusals = [_]Refusal{
     .{
         .name = "cache_value_holds_a_pointer",
@@ -1239,7 +1239,7 @@ const cache_refusals = [_]Refusal{
     },
 };
 
-/// The same, for `job/refusals/`, hanging off `test-job` (ADR 0198, ADR 0199).
+/// The same, for `job/refusals/`, hanging off `test-job` (ADR 160, ADR 161).
 /// Every one of these answers a question a queue would otherwise answer at
 /// three in the morning: a row nobody can run, a schedule with a policy
 /// nobody chose, a payload that cannot be read back.
@@ -1296,7 +1296,7 @@ const job_refusals = [_]Refusal{
         .name = "job_scheduled_field_without_default",
         .says = "the scheduled job Nightly has a field `day` with no default, and nobody pushes a scheduled job.",
     },
-    // A failure the kind says is final (ADR 0218).
+    // A failure the kind says is final (ADR 179).
     .{
         .name = "job_final_not_an_error_set",
         .says = "the job SendWelcome's `final` is not an error set.",
@@ -1306,7 +1306,7 @@ const job_refusals = [_]Refusal{
         .says = "the job SendWelcome declares `final`, and its `retry` is `.none`.",
     },
     // A job that pushes the next one: `.deps` as a function of the queue
-    // type (ADR 0245). The second fires at `open` rather than at
+    // type (ADR 160). The second fires at `open` rather than at
     // `job.Jobs(…)`, because that is when the queue type exists to check
     // a `run` against.
     .{
@@ -1317,14 +1317,14 @@ const job_refusals = [_]Refusal{
         .name = "job_deps_fn_without_what_run_asks",
         .says = "the job SendWelcome's `run` asks for a *job_deps_fn_without_what_run_asks.Mailer, and `job.Jobs`'s `.deps` has no such thing.",
     },
-    // The tick a `run` may ask for is a value (ADR 0246).
+    // The tick a `run` may ask for is a value (ADR 160).
     .{
         .name = "job_run_takes_the_tick_by_pointer",
         .says = "the job SendWelcome's `run` takes a `*job.Tick` at position 2, and a tick is asked for by value.",
     },
 };
 
-/// The same, for `fetch/refusals/`, hanging off `test-fetch` (ADR 0243). The
+/// The same, for `fetch/refusals/`, hanging off `test-fetch` (ADR 061). The
 /// eighth table, and the first this module has had: until the ordinary call
 /// took a struct of the caller's own, nothing here was checked while
 /// compiling. Each one is a mistake that would otherwise reach the wire —
@@ -1342,7 +1342,7 @@ const fetch_refusals = [_]Refusal{
         .name = "fetch_json_body_is_text",
         .says = "fetch.postJson was handed text, and would send it as one JSON string. A body already encoded goes through post, put, patch or send.",
     },
-    // A target is a type, and a path is a template (ADR 0254): what the
+    // A target is a type, and a path is a template (ADR 061): what the
     // template and its arguments can be got wrong about while compiling.
     .{
         .name = "fetch_target_path_not_absolute",
@@ -1398,7 +1398,7 @@ const fetch_refusals = [_]Refusal{
 /// the first line of the error it has to stop with. `says` leaves out the
 /// `nilo: ` prefix because the build step adds it — see the loop in `build`.
 const refusals = [_]Refusal{
-    // The three shapes `app.before` will not run (ADR 0220).
+    // The three shapes `app.before` will not run (ADR 180).
     .{
         .name = "before_not_a_function",
         .says = "app.before() takes a function, not bool.",
@@ -1411,7 +1411,7 @@ const refusals = [_]Refusal{
         .name = "before_returns_a_value",
         .says = "app.before() was given a function that answers with usize, and there is nobody to hand the value to.",
     },
-    // The four ways to ask for an answer nilo cannot keep (ADR 0193).
+    // The four ways to ask for an answer nilo cannot keep (ADR 155).
     .{
         .name = "idempotent_not_a_bytes_space",
         .says = "the `Idempotent(u32, …)` on route \"/orders\" names u32 as where answers are kept, and it is not a Space.",
@@ -1429,7 +1429,7 @@ const refusals = [_]Refusal{
         .says = "the handler for route \"/receipts\" takes an `Idempotent(…)` and returns a nilo.FileBody, which is not an answer nilo can keep.",
     },
     // The eight ways to ask for an answer served again that nilo cannot
-    // serve (ADR 0247).
+    // serve (ADR 188).
     .{
         .name = "cached_not_a_bytes_space",
         .says = "the `Cached(u32, …)` on route \"/pages\" names u32 as where answers are kept, and it is not a Space.",
@@ -1462,7 +1462,7 @@ const refusals = [_]Refusal{
         .name = "cached_and_idempotent",
         .says = "the handler for route \"/orders\" takes both an `Idempotent(…)` (argument 1) and a `Cached(…)` (argument 2), and an answer is kept under one key.",
     },
-    // A readiness hook of the wrong shape (ADR 0192).
+    // A readiness hook of the wrong shape (ADR 154).
     .{
         .name = "ready_hook_wrong_arity",
         .says = "ready_hook_wrong_arity.Mailer.nilo_ready takes 1 parameters, and it has to take 2.",
@@ -1471,7 +1471,7 @@ const refusals = [_]Refusal{
         .name = "check_hook_wrong_arity",
         .says = "check_hook_wrong_arity.Ledger.nilo_check takes 1 parameters, and it has to take 2.",
     },
-    // The two ways to name a Basic realm wrong (ADR 0191).
+    // The two ways to name a Basic realm wrong (ADR 153).
     .{
         .name = "authorization_realm_empty",
         .says = "`Authorization(.{ .basic = \"\" })` names no realm.",
@@ -1565,7 +1565,7 @@ const refusals = [_]Refusal{
         .says = "a body limit of 0 bytes is not a limit, it is a route that refuses every body.",
     },
     // The five ways of writing the pair a type that writes its own answer
-    // carries (ADR 0195).
+    // carries (ADR 157).
     .{
         .name = "ownbody_content_type_without_write",
         .says = "the handler for route \"/invoices/:id\" returns ownbody_content_type_without_write.Invoice, which names a `nilo_content_type` and has no `nilo_write`.",
@@ -1670,7 +1670,7 @@ const refusals = [_]Refusal{
         .name = "versioned_under_a_cached",
         .says = "the handler for route \"/orders\" returns nilo.Versioned([]const versioned_under_a_cached.Order) under a `nilo.Cached`, and a kept answer is sent again as it was kept.",
     },
-    // A `?` around a wrapper rather than inside it (ADR 0276). Three files
+    // A `?` around a wrapper rather than inside it (ADR 203). Three files
     // because the way out differs: a `Status` or `Response` takes the `?`
     // on its body, and a redirect or a versioned answer has nothing for it
     // to be about.
@@ -1758,7 +1758,7 @@ const refusals = [_]Refusal{
         .name = "json_rename_all_collides_on_a_struct",
         .says = "`json_rename_all_collides_on_a_struct.Contact` asks for `.rename_all = .lowercase`, and its fields `full_name` and `fullname` both come out as \"fullname\".",
     },
-    // A whole number inside a range (ADR 0206): the range has to be one, and
+    // A whole number inside a range (ADR 167): the range has to be one, and
     // the default has to be inside it.
     .{
         .name = "within_bounds_reversed",
@@ -1768,7 +1768,7 @@ const refusals = [_]Refusal{
         .name = "within_default_outside_its_range",
         .says = "`Within(1, 200).of(500)` is outside its own range.",
     },
-    // One field spelled on its own (ADR 0207): the entry has to name a field,
+    // One field spelled on its own (ADR 168): the entry has to name a field,
     // has to change it, and must not land it on another field's spelling.
     .{
         .name = "json_rename_of_a_field_it_does_not_have",
@@ -1792,11 +1792,11 @@ const refusals = [_]Refusal{
     },
     .{
         .name = "json_rename_all_on_a_request_body",
-        .says = "the request body on route \"/contacts\" is read into `json_rename_all_on_a_request_body.NewContact`, which renames its fields — and a renamed field name is a spelling for what goes out (ADR 0181).",
+        .says = "the request body on route \"/contacts\" is read into `json_rename_all_on_a_request_body.NewContact`, which renames its fields — and a renamed field name is a spelling for what goes out (ADR 148).",
     },
     .{
         .name = "json_rename_all_on_a_shape_that_falls_back",
-        .says = "`json_rename_all_on_a_shape_that_falls_back.Contact` renames its fields, and this value goes to `std.json`, which does not read the marker (ADR 0181).",
+        .says = "`json_rename_all_on_a_shape_that_falls_back.Contact` renames its fields, and this value goes to `std.json`, which does not read the marker (ADR 148).",
     },
     .{
         .name = "json_rename_all_is_already_zig",
@@ -1915,13 +1915,13 @@ const refusals = [_]Refusal{
         .says = "the field `tags: []const u8` of the `Query(query_field_cannot_convert.Search)` on route \"/users\" is not something a query value can become.",
     },
     // A query field that *is* a list, refused on its element rather than on
-    // its shape (ADR 0164). The message above is still the one a `[]const u8`
+    // its shape (ADR 132). The message above is still the one a `[]const u8`
     // gets, because text is not a list.
     .{
         .name = "query_list_of_something_else",
         .says = "the field `actors: []const query_list_of_something_else.Actor` of the `Query(query_list_of_something_else.Search)` on route \"/users\" is a list of query_list_of_something_else.Actor, which a query value cannot become.",
     },
-    // The three ways to ask for a header wrong (ADR 0163).
+    // The three ways to ask for a header wrong (ADR 131).
     .{
         .name = "header_with_no_name",
         .says = "argument 1 of the handler for route \"/thing\" is a `FromHeader(\"\", …)`, which names no header.",
@@ -2095,7 +2095,7 @@ const refusals = [_]Refusal{
         .says = "the route pattern \"/files/*/raw\" has a `*` that is not the last segment.",
     },
     // The floor on a password Cost, reached through the door with no request
-    // behind it (ADR 0241). The message is `nilo_pw`'s; what this row holds
+    // behind it (ADR 044). The message is `nilo_pw`'s; what this row holds
     // is that `nilo.verifyPasswordWith` still gets there.
     .{
         .name = "password_checked_off_the_loop_below_the_floor",
@@ -2114,7 +2114,7 @@ const Refusal = struct { name: []const u8, says: []const u8 };
 /// that page. The sign-in example was worse: four mistakes in five lines,
 /// including a `db.acquire()` that has never existed. Prose cannot hold this,
 /// and a directory of copies of the snippets would drift from the snippets
-/// (ADR 0083).
+/// (ADR 068).
 ///
 /// So the guide *is* the source. A `zig` block with `<!-- compiles -->` above
 /// it — invisible where the page is read — is extracted while `build.zig`
@@ -2128,7 +2128,7 @@ const Snippets = struct {
     /// **These cache, and the refusals do not.** A compilation that succeeds
     /// leaves something behind, so a warm run of all 54 is ~30ms each and
     /// only a page that changed is re-analysed. That is the opposite of
-    /// `refusals/` (ADR 0027) and it is why this can afford to grow — and it
+    /// `refusals/` (ADR 026) and it is why this can afford to grow — and it
     /// did: marking the SQL guide more than tripled the table.
     const pages = [_]Page{
         .{ .path = "README.md" },
@@ -2422,7 +2422,7 @@ const Snippets = struct {
     /// try db.select(…);` is the line the page is teaching, and the page
     /// should not have to carry a discard beside it to keep this step happy.
     /// A published snippet with `_ = all;` in it is this file leaking into
-    /// the documentation, which is the one thing ADR 0083 was careful not to
+    /// the documentation, which is the one thing ADR 068 was careful not to
     /// do. Taking the address rather than the value also settles a `var`
     /// nothing mutates, which is the same complaint under another name.
     ///
@@ -2534,7 +2534,7 @@ const Snippets = struct {
 /// mode the README tells people to deploy in. Not a hypothetical:
 /// `Response.headers` got away with a use-after-return for a whole stage
 /// because nothing here ever built the tests any other way
-/// ([ADR 0019](docs/adr/0019-a-response-owns-its-headers.md)).
+/// ([ADR 018](docs/adr/018-a-response-owns-its-headers.md)).
 ///
 /// What changed is *when* the second mode is paid for. Measured on Zig 0.16, a
 /// warm suite is 0.8s in `Debug` and 7.8s in both, so both-modes-every-time was
@@ -2550,16 +2550,16 @@ const test_modes = [_]std.builtin.OptimizeMode{ .Debug, .ReleaseSafe };
 /// That is 94.1%, and the `Debug` build of the same root has no such phase at
 /// all. The self-hosted x86_64 backend compiles it in 1.6s with the same 48
 /// tests green, which took `zig build test` from 30.6s to 9.8s after one edit
-/// under `http/`, and `test-all` from 65.9s to 12.5s (ADR 0170).
+/// under `http/`, and `test-all` from 65.9s to 12.5s (ADR 138).
 ///
-/// The safety checks ADR 0019 is here for are inserted by Sema, so they survive
+/// The safety checks ADR 018 is here for are inserted by Sema, so they survive
 /// the swap. What does not survive is LLVM's stack layout, so this is a very
 /// close gate rather than the identical one, and that trade is the ADR's
 /// subject. Every `bench-*` target stays on LLVM: a throughput number measured
 /// through a backend that does not optimise would be fiction.
 ///
 /// **Only on x86_64, because that is the only place it was measured** (ADR
-/// 0189). The same `pw/pw.zig` that LLVM compiles in 290 MB took the
+/// 138). The same `pw/pw.zig` that LLVM compiles in 290 MB took the
 /// self-hosted aarch64 backend past 4 GB in seven seconds and past 15 GB before
 /// it was killed, and `zig build test` at `-j8` is eight of those at once —
 /// which on a 16 GB laptop is not a slow build but a dead machine, three times.
@@ -2600,7 +2600,7 @@ fn stripMeasured(strip: ?bool, optimize: std.builtin.OptimizeMode) ?bool {
     return if (optimize == .ReleaseFast) true else null;
 }
 
-/// A copy of Core for one optimize mode (ADR 0041).
+/// A copy of Core for one optimize mode (ADR 038).
 ///
 /// A module carries the mode it was created with, so every root that reaches
 /// Core needs one of its own — the same reason zio is fetched once per mode
@@ -2618,7 +2618,7 @@ fn coreFor(
     });
 }
 
-/// A copy of `nilo_id` for one optimize mode, for the same reason (ADR 0042).
+/// A copy of `nilo_id` for one optimize mode, for the same reason (ADR 038).
 ///
 /// It has to be *shared* with whatever else in that mode names a `Uuid`, not
 /// merely built from the same file: two modules built from one root are two
@@ -2637,7 +2637,7 @@ fn idFor(
     });
 }
 
-/// A copy of `nilo_config` for one optimize mode (ADR 0043).
+/// A copy of `nilo_config` for one optimize mode (ADR 039).
 ///
 /// Unlike `idFor` this one has nothing to share with: a Config is a struct
 /// of the caller's own and no other module names a type from here, so two
@@ -2656,7 +2656,7 @@ fn configFor(
     });
 }
 
-/// A copy of `nilo_pw` for one optimize mode (ADR 0048).
+/// A copy of `nilo_pw` for one optimize mode (ADR 044).
 ///
 /// Shared rather than merely built from the same file, for the reason `idFor`
 /// is: `http/password.zig` names `pw.Hash` and so does a caller's own row, and
@@ -2673,7 +2673,7 @@ fn pwFor(
     });
 }
 
-/// A copy of `nilo_cache` for one optimize mode (ADR 0138).
+/// A copy of `nilo_cache` for one optimize mode (ADR 109).
 ///
 /// Shared rather than merely built from the same file, for the reason `pwFor`
 /// is: a `Space` is a type, and two modules built from one root are two types
@@ -2691,7 +2691,7 @@ fn cacheFor(
     });
 }
 
-/// A copy of `nilo_jwt` for one optimize mode (ADR 0140).
+/// A copy of `nilo_jwt` for one optimize mode (ADR 111).
 ///
 /// Self contained the way `pwFor` and `cacheFor` are: it names nothing, so
 /// there is no shared type to keep the two modes agreeing about.
@@ -2707,7 +2707,7 @@ fn jwtFor(
     });
 }
 
-/// A copy of `nilo_fetch` for one optimize mode (ADR 0070).
+/// A copy of `nilo_fetch` for one optimize mode (ADR 061).
 ///
 /// The first Fitting, and the first module down here that is not self
 /// contained: it names `nilo_core` for `Limits` and for the Scope a body is
@@ -2729,7 +2729,7 @@ fn fetchFor(
     });
 }
 
-/// A copy of `nilo_job` for one optimize mode (ADR 0198).
+/// A copy of `nilo_job` for one optimize mode (ADR 160).
 ///
 /// The second Fitting, and it takes its Core the way `fetchFor` does and for
 /// the same reason: a job's payload may carry a `Str`, and the `Str` a job
@@ -2748,7 +2748,7 @@ fn jobFor(
     });
 }
 
-/// A copy of `nilo_s3` for one optimize mode (ADR 0072).
+/// A copy of `nilo_s3` for one optimize mode (ADR 063).
 ///
 /// The first module here that takes two imports, and the second has to be the
 /// *same* `nilo_fetch` as anything else in that mode which holds an
@@ -2782,19 +2782,19 @@ fn s3For(
 /// `wireTls` below, which every instance of the http module goes through.
 var want_tls: bool = false;
 var in_repo: bool = false;
-/// `-Dgrpc` (ADR 0297). No dependency behind it, unlike `-Dtls`: what it
-/// keeps out of a build that did not ask is the code, the binary size ADR 0018
+/// `-Dgrpc` (ADR 220). No dependency behind it, unlike `-Dtls`: what it
+/// keeps out of a build that did not ask is the code, the binary size ADR 017
 /// counts, rather than a fetch.
 var want_grpc: bool = false;
 
 /// What every instance of the http module is given so that
 /// `http/engine/zio.zig` can ask `@import("nilo_build").tls` and, when the
-/// answer is yes, `@import("tls")` (ADR 0288).
+/// answer is yes, `@import("tls")` (ADR 212).
 ///
 /// `on` decides both. The library is reached through `lazyDependency`
 /// **inside** the `if`, which is what makes the manifest's `.lazy = true`
 /// mean anything: called unconditionally it would fetch for every dependent
-/// whatever they asked for (ADR 0075). An instance built with `on = false`
+/// whatever they asked for (ADR 066). An instance built with `on = false`
 /// carries no import named `tls`, so a `@import("tls")` reached from it is a
 /// compile error rather than a link, and the comptime `if` in the Engine is
 /// what keeps it from being reached.
@@ -2802,7 +2802,7 @@ fn wireTls(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedT
     const opts = b.addOptions();
     opts.addOption(bool, "tls", on);
     // gRPC rides the same options module. It has no library to fetch, so
-    // there is nothing to wire beyond the flag (ADR 0297).
+    // there is nothing to wire beyond the flag (ADR 220).
     opts.addOption(bool, "grpc", grpc);
     module.addImport("nilo_build", opts.createModule());
     if (on) {
@@ -2903,7 +2903,7 @@ const Layering = struct {
                     if (permits(layer, named)) continue;
                     refused += 1;
                     try s.addError("nilo: {s}/{s}:{d} imports `{s}`, which a module in this layer may not name.\n" ++
-                        "  A module imports downward only (ADR 0042); `{s}/` may name {f}.", .{
+                        "  A module imports downward only (ADR 038); `{s}/` may name {f}.", .{
                         layer.root,
                         entry.path,
                         std.mem.count(u8, source[0..found], "\n") + 1,
@@ -3063,15 +3063,332 @@ const HttpCore = struct {
     }
 };
 
+/// The step that holds `docs/adr/` to its shape and every citation of an ADR
+/// to a file that exists (ADR 221).
+///
+/// The ADRs were renumbered once, from four digits to three, when every amend
+/// chain became one ADR. So a four-digit number is an old one by construction,
+/// and refusing it everywhere but `renumbered.md` is what keeps the two
+/// numberings from ever meaning the same thing twice. A three-digit number with
+/// no file behind it is the other way a citation rots: an ADR merged or deleted
+/// and a comment left pointing at it.
+///
+/// A scan rather than a parse, like `Layering`, and the shapes it reads are the
+/// ones this repository writes: `ADR 123`, `ADRs 052, 061 and 123` across a
+/// line break inside a comment, and a link to `adr/NNN-slug.md` or
+/// `](NNN-slug.md)` from beside it.
+const AdrCheck = struct {
+    const adr_dir = "docs/adr";
+    const design_dir = "docs/design";
+    /// The one file that may name the old numbers: the table from old to new,
+    /// kept so that a commit message written before the renumbering can be read.
+    const old_numbers = "renumbered.md";
+    /// Not walked. A dot directory holds caches and git's own files, and the
+    /// other three are what a build writes or fetches.
+    const skipped = [_][]const u8{ "zig-out", "zig-pkg", "node_modules" };
+
+    fn step(b: *std.Build) *std.Build.Step {
+        const self = b.allocator.create(AdrCheck) catch @panic("OOM");
+        self.* = .{ ._step = .init(.{
+            .id = .custom,
+            .name = "adr-check",
+            .owner = b,
+            .makeFn = make,
+        }) };
+        const named = b.step("adr-check", "Check the ADRs' shape and that every ADR cited exists");
+        named.dependOn(&self._step);
+        return named;
+    }
+
+    _step: std.Build.Step,
+
+    fn make(s: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
+        const b = s.owner;
+        const io = b.graph.io;
+        var refused: usize = 0;
+        var have: std.StaticBitSet(1000) = .initEmpty();
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+
+        // The directory itself: one file a number, each with a title and the
+        // two lines that say whether it is in force and where it belongs.
+        {
+            var dir = b.build_root.handle.openDir(io, adr_dir, .{ .iterate = true }) catch |err|
+                return s.fail("nilo: cannot read `{s}/`: {s}", .{ adr_dir, @errorName(err) });
+            defer dir.close(io);
+            var it = dir.iterate();
+            while (try it.next(io)) |entry| {
+                if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".md")) continue;
+                if (std.mem.eql(u8, entry.name, old_numbers)) continue;
+                const n = numberOf(entry.name) orelse {
+                    refused += 1;
+                    try s.addError("nilo: {s}/{s} is not named `NNN-slug.md`, three digits and a slug.", .{ adr_dir, entry.name });
+                    continue;
+                };
+                if (have.isSet(n)) {
+                    refused += 1;
+                    try s.addError("nilo: two ADRs are numbered {d:0>3}; {s}/{s} is the second.", .{ n, adr_dir, entry.name });
+                }
+                have.set(n);
+                try names.put(b.allocator, try b.allocator.dupe(u8, entry.name), {});
+
+                const source = try dir.readFileAlloc(io, entry.name, b.allocator, .limited(1 << 20));
+                const head = source[0..@min(source.len, 1200)];
+                if (!std.mem.startsWith(u8, source, "# ") or source.len < 3 or std.ascii.isDigit(source[2])) {
+                    refused += 1;
+                    try s.addError("nilo: {s}/{s} does not open with a title, `# ` and a sentence with no number in it.", .{ adr_dir, entry.name });
+                }
+                if (std.mem.indexOf(u8, head, "\n**Status:** ") == null) {
+                    refused += 1;
+                    try s.addError("nilo: {s}/{s} has no `**Status:**` line under its title.", .{ adr_dir, entry.name });
+                }
+                refused += try topic(s, dir, entry.name, head);
+                refused += try relations(s, entry.name, source);
+            }
+        }
+
+        refused += try pages(s);
+
+        // Every citation, everywhere the repository keeps text.
+        var root = try b.build_root.handle.openDir(io, ".", .{ .iterate = true });
+        defer root.close(io);
+        var walker = try root.walkSelectively(b.allocator);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind == .directory) {
+                if (entry.basename[0] != '.' and !listed(entry.basename)) try walker.enter(io, entry);
+                continue;
+            }
+            if (entry.kind != .file) continue;
+            if (!textual(entry.basename)) continue;
+            if (std.mem.eql(u8, entry.path, adr_dir ++ "/" ++ old_numbers)) continue;
+
+            const source = entry.dir.readFileAlloc(io, entry.basename, b.allocator, .limited(8 << 20)) catch continue;
+            refused += try citations(s, entry.path, source, &have);
+            refused += try links(s, entry.path, source, &names);
+        }
+
+        if (refused > 0) return error.MakeFailed;
+    }
+
+    /// The words an ADR's head may use to name another. None of them says
+    /// this ADR revises one: a revision edits the ADR it revises, in place,
+    /// and a head line saying `Amends`, `Supersedes` or `Refines` is the sign
+    /// that a revision was written as a new file instead (ADR 221).
+    const relation_words = [_][]const u8{ "Status", "Topic", "Applies", "Extends", "Carries out", "Closes", "Found by" };
+
+    fn relations(s: *std.Build.Step, name: []const u8, source: []const u8) !usize {
+        const end = std.mem.indexOf(u8, source, "\n## ") orelse source.len;
+        var refused: usize = 0;
+        var lines = std.mem.splitScalar(u8, source[0..end], '\n');
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "**")) continue;
+            const close = std.mem.indexOf(u8, line, ":**") orelse continue;
+            const word = line[2..close];
+            for (relation_words) |allowed| {
+                if (std.mem.eql(u8, word, allowed)) break;
+            } else {
+                refused += 1;
+                try s.addError("nilo: {s}/{s} says `**{s}:**` in its head. A revision edits the ADR it revises, in place; a new ADR is for a new decision, and names older ones with one of: Applies, Extends, Carries out, Closes, Found by.", .{ adr_dir, name, word });
+            }
+        }
+        return refused;
+    }
+
+    /// `**Topic:** slug`, or `**Topic:** [slug](../design/slug.md)` once the
+    /// topic has a page. The link is required as soon as the page exists, so
+    /// writing a topic page and pointing its ADRs at it are one change.
+    fn topic(s: *std.Build.Step, dir: std.Io.Dir, name: []const u8, head: []const u8) !usize {
+        const io = s.owner.graph.io;
+        const at = std.mem.indexOf(u8, head, "\n**Topic:** ") orelse {
+            try s.addError("nilo: {s}/{s} has no `**Topic:**` line under its title.", .{ adr_dir, name });
+            return 1;
+        };
+        const rest = head[at + "\n**Topic:** ".len ..];
+        const linked = std.mem.startsWith(u8, rest, "[");
+        const word = rest[@intFromBool(linked)..];
+        var end: usize = 0;
+        while (end < word.len and (std.ascii.isLower(word[end]) or std.ascii.isDigit(word[end]) or word[end] == '-')) end += 1;
+        const slug = word[0..end];
+        if (slug.len == 0 or (end < word.len and !linked and word[end] != '\n' and word[end] != '.')) {
+            try s.addError("nilo: {s}/{s} names its topic as something other than a lowercase slug.", .{ adr_dir, name });
+            return 1;
+        }
+        const page = try std.fmt.allocPrint(s.owner.allocator, "../design/{s}.md", .{slug});
+        const exists = if (dir.access(io, page, .{})) true else |_| false;
+        if (linked) {
+            const want = try std.fmt.allocPrint(s.owner.allocator, "{s}]({s})", .{ slug, page });
+            if (!std.mem.startsWith(u8, word, want) or !exists) {
+                try s.addError("nilo: {s}/{s} links its topic to a page other than `docs/design/{s}.md`, or to one that does not exist.", .{ adr_dir, name, slug });
+                return 1;
+            }
+            // The page lists every ADR that names it, so a new ADR in a topic
+            // with a page is one change with the page's Decisions table.
+            const text = try dir.readFileAlloc(io, page, s.owner.allocator, .limited(1 << 20));
+            if (std.mem.indexOf(u8, text, name) == null) {
+                try s.addError("nilo: docs/design/{s}.md does not link {s}/{s}, whose topic it is.", .{ slug, adr_dir, name });
+                return 1;
+            }
+        } else if (exists) {
+            try s.addError("nilo: {s}/{s} names topic `{s}`, which has a page; write it `[{s}](../design/{s}.md)`.", .{ adr_dir, name, slug, slug, slug });
+            return 1;
+        }
+        return 0;
+    }
+
+    /// A topic page's relative links resolve. Nothing else reads these pages
+    /// (`mkdocs` builds `docs/guide/` only), so a renamed guide page or reference
+    /// file would otherwise leave them pointing at nothing.
+    fn pages(s: *std.Build.Step) !usize {
+        const b = s.owner;
+        const io = b.graph.io;
+        var dir = b.build_root.handle.openDir(io, design_dir, .{ .iterate = true }) catch return 0;
+        defer dir.close(io);
+        var refused: usize = 0;
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".md")) continue;
+            const text = try dir.readFileAlloc(io, entry.name, b.allocator, .limited(1 << 20));
+            var at: usize = 0;
+            while (std.mem.indexOfPos(u8, text, at, "](")) |open| {
+                at = open + 2;
+                const close = std.mem.indexOfScalarPos(u8, text, at, ')') orelse break;
+                var target = text[at..close];
+                if (std.mem.indexOf(u8, target, "://") != null or target.len == 0 or target[0] == '#') continue;
+                if (std.mem.indexOfScalar(u8, target, '#')) |hash| target = target[0..hash];
+                if (dir.access(io, target, .{})) |_| {} else |_| {
+                    refused += 1;
+                    try s.addError("nilo: {s}/{s}:{d} links to {s}, which does not exist.", .{
+                        design_dir, entry.name, std.mem.count(u8, text[0..open], "\n") + 1, target,
+                    });
+                }
+            }
+        }
+        return refused;
+    }
+
+    fn numberOf(name: []const u8) ?u16 {
+        if (name.len < 5 or name[3] != '-') return null;
+        for (name[0..3]) |c| if (!std.ascii.isDigit(c)) return null;
+        if (std.ascii.isDigit(name[4])) return null;
+        return std.fmt.parseInt(u16, name[0..3], 10) catch null;
+    }
+
+    fn listed(name: []const u8) bool {
+        for (skipped) |one| if (std.mem.eql(u8, one, name)) return true;
+        return false;
+    }
+
+    fn textual(name: []const u8) bool {
+        inline for (.{ ".md", ".zig", ".zon", ".yml", ".yaml", ".txt", ".py", ".sh" }) |ext|
+            if (std.mem.endsWith(u8, name, ext)) return true;
+        return false;
+    }
+
+    /// `ADR 123`, and the numbers a list goes on to name after it. What sits
+    /// between two of them may be a comma, `and` or `or`, and a line break
+    /// followed by a comment's `//`, `///` or `//!`.
+    fn citations(s: *std.Build.Step, path: []const u8, source: []const u8, have: *const std.StaticBitSet(1000)) !usize {
+        var refused: usize = 0;
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, source, at, "ADR")) |found| {
+            at = found + 3;
+            if (found > 0 and std.ascii.isAlphanumeric(source[found - 1])) continue;
+            var i = at;
+            if (i < source.len and source[i] == 's') i += 1;
+            var first = true;
+            while (true) {
+                const start = i;
+                i = skipGap(source, i, first);
+                if (!first) {
+                    // A list goes on only through a separator.
+                    const sep = source[start..i];
+                    if (std.mem.indexOfScalar(u8, sep, ',') == null and
+                        std.mem.indexOf(u8, sep, "and") == null and
+                        std.mem.indexOf(u8, sep, "or") == null) break;
+                }
+                var j = i;
+                while (j < source.len and std.ascii.isDigit(source[j])) j += 1;
+                const digits = source[i..j];
+                if (digits.len == 0 or (j < source.len and std.ascii.isAlphabetic(source[j]))) break;
+                const line = std.mem.count(u8, source[0..i], "\n") + 1;
+                if (digits.len == 4) {
+                    refused += 1;
+                    try s.addError("nilo: {s}:{d} cites ADR {s}, a number from before the renumbering.\n" ++
+                        "  `docs/adr/renumbered.md` says what it is now.", .{ path, line, digits });
+                } else if (digits.len == 3) {
+                    const n = std.fmt.parseInt(u16, digits, 10) catch unreachable;
+                    if (!have.isSet(n)) {
+                        refused += 1;
+                        try s.addError("nilo: {s}:{d} cites ADR {s}, and there is no ADR {s}.", .{ path, line, digits, digits });
+                    }
+                } else break;
+                i = j;
+                first = false;
+            }
+            at = i;
+        }
+        return refused;
+    }
+
+    /// Spaces, and for anything after the first number the separator too:
+    /// a comma, `and`, `or`, and a line break into a comment or a quote.
+    fn skipGap(source: []const u8, from: usize, first: bool) usize {
+        var i = from;
+        while (i < source.len) {
+            const c = source[i];
+            if (c == ' ' or c == '\t' or c == '/' or c == '!' or c == '>' or c == '*') {
+                i += 1;
+            } else if (c == '\n') {
+                i += 1;
+            } else if (!first and c == ',') {
+                i += 1;
+            } else if (!first and std.mem.startsWith(u8, source[i..], "and ")) {
+                i += 4;
+            } else if (!first and std.mem.startsWith(u8, source[i..], "or ")) {
+                i += 3;
+            } else break;
+        }
+        return i;
+    }
+
+    /// A link to an ADR file, from anywhere: `adr/NNN-slug.md`, or
+    /// `](NNN-slug.md)` and `](./NNN-slug.md)` from beside it.
+    fn links(s: *std.Build.Step, path: []const u8, source: []const u8, names: *const std.StringHashMapUnmanaged(void)) !usize {
+        var refused: usize = 0;
+        var at: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, source, at, '-')) |dash| {
+            at = dash + 1;
+            var start = dash;
+            while (start > 0 and std.ascii.isDigit(source[start - 1])) start -= 1;
+            const digits = dash - start;
+            if (digits != 3 and digits != 4) continue;
+            const before = source[0..start];
+            const in_adr = std.mem.endsWith(u8, before, "adr/") or
+                (std.mem.startsWith(u8, path, adr_dir) and
+                    (std.mem.endsWith(u8, before, "](") or std.mem.endsWith(u8, before, "](./")));
+            if (!in_adr) continue;
+            const end = std.mem.indexOfPos(u8, source, dash, ".md") orelse continue;
+            const name = source[start .. end + 3];
+            if (std.mem.indexOfAny(u8, name, " \n)(]") != null) continue;
+            if (names.contains(name)) continue;
+            refused += 1;
+            try s.addError("nilo: {s}:{d} links to {s}, and `{s}/` has no such file.", .{
+                path, std.mem.count(u8, source[0..start], "\n") + 1, name, adr_dir,
+            });
+        }
+        return refused;
+    }
+};
+
 /// What somebody else's project downloads when it names this one.
 ///
-/// `build.zig.zon` has claimed since ADR 0040 that "a project that serves HTTP
+/// `build.zig.zon` has claimed since ADR 037 that "a project that serves HTTP
 /// and never imports `nilo_sql` does not fetch, build or link any of it", and
 /// two thirds of that were true. `strings` and `nm` over such a program find no
 /// SQLite and no libpq, so *link* held. *Fetch* did not: `b.lazyDependency` is
 /// a request rather than a conditional, so both drivers were downloaded by
 /// every dependent whatever they imported — 11.1 MB against 2.7 MB used, found
-/// by an application that had no database in it at all (ADR 0075).
+/// by an application that had no database in it at all (ADR 066).
 ///
 /// The sentence lived in four files and none of them ran. This is the version
 /// that runs: `bench/dependent/` is a project importing `nilo_http` and nothing
@@ -3173,7 +3490,7 @@ const FetchCheck = struct {
                 "nilo: a dependent that imports only `nilo_http` downloaded `{s}`.\n" ++
                     "  Something in build.zig asks for it unconditionally — `b.lazyDependency` is a\n" ++
                     "  request, not a conditional, so it has to sit behind the option that wants it\n" ++
-                    "  (ADR 0075).",
+                    "  (ADR 066).",
                 .{entry.name},
             );
         }
@@ -3227,7 +3544,7 @@ pub fn build(b: *std.Build) void {
     const strip = b.option(bool, "strip", "Leave debug info out: halves a release build, costs nothing measurable at runtime, and leaves a panic without file and line");
 
     // Whether the database drivers are wanted, and it defaults to **who is
-    // asking** rather than to a fixed answer (ADR 0075).
+    // asking** rather than to a fixed answer (ADR 066).
     //
     // `b.lazyDependency` does not mean "fetch this if somebody imports it". It
     // means *request* this: it answers null on the pass that finds the package
@@ -3246,7 +3563,7 @@ pub fn build(b: *std.Build) void {
     const want_sql = b.option(
         bool,
         "sql",
-        "Build nilo_sql and fetch its drivers — on for this repository, off for a dependent until it asks (see ADR 0075)",
+        "Build nilo_sql and fetch its drivers — on for this repository, off for a dependent until it asks (see ADR 066)",
     ) orelse (b.pkg_hash.len == 0);
 
     const zio = b.dependency("zio", .{
@@ -3254,27 +3571,27 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Whether the published module speaks TLS (ADR 0288). Off until asked,
+    // Whether the published module speaks TLS (ADR 212). Off until asked,
     // for everybody: the library it needs is fetched and linked only behind
     // this flag, the same way the drivers sit behind `-Dsql`, and the two
-    // measured binaries stay what ADR 0018 publishes. What is always on is
+    // measured binaries stay what ADR 017 publishes. What is always on is
     // the *test* of it: this repository's own suite builds its `http` test
     // root with TLS in it whatever the flag says, so the feature is held by
     // `zig build test` rather than by whoever remembers to pass `-Dtls`.
     want_tls = b.option(
         bool,
         "tls",
-        "Build the TLS listener into nilo_http and fetch the library it needs (ADR 0288). Off until a dependent passes `.tls = true`",
+        "Build the TLS listener into nilo_http and fetch the library it needs (ADR 212). Off until a dependent passes `.tls = true`",
     ) orelse false;
     in_repo = b.pkg_hash.len == 0;
     want_grpc = b.option(
         bool,
         "grpc",
-        "Build the gRPC listener into nilo_http: unary calls over h2c (ADR 0297). Off until a dependent passes `.grpc = true`",
+        "Build the gRPC listener into nilo_http: unary calls over h2c (ADR 220). Off until a dependent passes `.grpc = true`",
     ) orelse false;
 
     // The bottom layer: what every other one agrees about, and nothing else
-    // (ADR 0041). It names no Engine and does no IO, which is why it is the
+    // (ADR 038). It names no Engine and does no IO, which is why it is the
     // one module here that needs no import of its own — and why
     // `zig test core/core.zig` runs the whole of it without this file.
     const nilo_core = b.addModule("nilo_core", .{
@@ -3284,7 +3601,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // The bottom layer's second module, and the first that is not the
-    // vocabulary (ADR 0042). It needs no event loop, so it sits beside
+    // vocabulary (ADR 038). It needs no event loop, so it sits beside
     // `nilo_core` rather than above it — and it imports nothing at all, which
     // `zig build layering` checks rather than trusts.
     const nilo_id = b.addModule("nilo_id", .{
@@ -3293,13 +3610,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // The second tool module: a Config out of the environment (ADR 0043).
+    // The second tool module: a Config out of the environment (ADR 039).
     // It imports nothing at all, which is what `zig build layering` checks
     // and what makes `zig test config/config.zig` the whole of its suite.
     //
     // Nothing else in this file names it. A project that serves HTTP and
     // reads no settings from here links none of it, which is the same
-    // property ADR 0040 bought for the SQL module pointed at a module with
+    // property ADR 037 bought for the SQL module pointed at a module with
     // no dependency to be lazy about.
     const nilo_config = b.addModule("nilo_config", .{
         .root_source_file = b.path("config/config.zig"),
@@ -3307,7 +3624,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // The third tool module: argon2id as a pure function (ADR 0048). It
+    // The third tool module: argon2id as a pure function (ADR 044). It
     // imports nothing at all, which `zig build layering` checks.
     //
     // Unlike `nilo_config`, `nilo_http` below does name this one — because
@@ -3315,7 +3632,7 @@ pub fn build(b: *std.Build) void {
     // trusted to remember. What a project that never signs anybody in pays
     // for that is a linker question rather than a build one: nothing
     // references `http/password.zig` unless a handler calls it, so argon2 and
-    // blake2b are never analysed. The measured cost is in ADR 0048.
+    // blake2b are never analysed. The measured cost is in ADR 044.
     const nilo_pw = b.addModule("nilo_pw", .{
         .root_source_file = b.path("pw/pw.zig"),
         .target = target,
@@ -3323,7 +3640,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // The fourth tool module: a cache that never leaves the process
-    // (ADR 0138). It imports nothing at all, which `zig build layering`
+    // (ADR 109). It imports nothing at all, which `zig build layering`
     // checks, and `nilo_http` does not name it — a program with no cache in
     // it links no ring, no table and no spin lock. A project that wants one
     // writes `@import("nilo_cache")`.
@@ -3334,7 +3651,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // The fifth tool module: checking somebody else's signed token
-    // (ADR 0140). It imports nothing at all, which `zig build layering`
+    // (ADR 111). It imports nothing at all, which `zig build layering`
     // checks, and `nilo_http` does not name it — a program that signs nobody
     // in with Google links no RSA. A project that wants one writes
     // `@import("nilo_jwt")`. The fetch of the key set is not in here: that is
@@ -3346,10 +3663,10 @@ pub fn build(b: *std.Build) void {
     });
 
     // The first Fitting: it borrows the loop and owns no destination
-    // (ADR 0070). `nilo_http` does **not** name it — a program that calls
+    // (ADR 061). `nilo_http` does **not** name it — a program that calls
     // nobody else's API links no HTTP client, no TLS and no certificate
-    // bundle, which is the same property ADR 0040 bought for the database and
-    // ADR 0048 for password hashing. A project that wants one imports it.
+    // bundle, which is the same property ADR 037 bought for the database and
+    // ADR 044 for password hashing. A project that wants one imports it.
     // Registered rather than bound: nothing inside this repository imports it,
     // and that is the point of the module rather than an omission. A dependent
     // writes `@import("nilo_fetch")`; `nilo_http` never does.
@@ -3360,7 +3677,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "nilo_core", .module = nilo_core }},
     });
 
-    // The second Fitting: a queue, and a schedule (ADR 0198, ADR 0199).
+    // The second Fitting: a queue, and a schedule (ADR 160, ADR 161).
     // Registered rather than bound, like `nilo_fetch`: `nilo_http` never
     // names it, so a program with no queue in it links no worker loop, no
     // cron parser and no table. The store is a type parameter, which is how
@@ -3373,13 +3690,13 @@ pub fn build(b: *std.Build) void {
     });
 
     // The object store: a Service that dials, and the first module to import a
-    // Fitting (ADR 0072). Registered rather than bound, like `nilo_fetch` —
+    // Fitting (ADR 063). Registered rather than bound, like `nilo_fetch` —
     // nothing inside this repository imports it, and that is the point of the
     // module rather than an omission.
     //
     // **No lazy dependency, because there is no dependency.** `nilo_sql` had
     // to hide pg.zig behind `.lazy = true` so that an HTTP-only project would
-    // not fetch it (ADR 0040); here the HTTP client and the TLS underneath it
+    // not fetch it (ADR 037); here the HTTP client and the TLS underneath it
     // are `std`'s, so a project that never imports this fetches, builds and
     // links nothing extra at all.
     const nilo_s3 = b.addModule("nilo_s3", .{
@@ -3397,13 +3714,13 @@ pub fn build(b: *std.Build) void {
     // somebody else's project would.
     //
     // **No module is called `nilo`, and that is the decision rather than an
-    // oversight** (ADR 0041). The word names the project: the `nilo: ` prefix
+    // oversight** (ADR 038). The word names the project: the `nilo: ` prefix
     // every Refusal carries, and the `nilo_table` / `nilo_resolve` /
     // `nilo_start` markers that sit in a reader's own structs. A module
     // holding the bare name would make it mean two things, which is the one
     // thing `CONTEXT.md` exists to prevent. An umbrella module re-exporting
     // the others would bring the name back and cost every project the bytes
-    // of every module, which is the property ADR 0040 bought.
+    // of every module, which is the property ADR 037 bought.
     const nilo_http = b.addModule("nilo_http", .{
         .root_source_file = b.path("http/http.zig"),
         .target = target,
@@ -3417,12 +3734,12 @@ pub fn build(b: *std.Build) void {
     wireTls(b, nilo_http, target, optimize, want_tls, want_grpc);
 
     // The SQL module: a second module beside the library rather than inside
-    // it (ADR 0039). It lives in `sql/` rather than under `src/` so that the
+    // it (ADR 036). It lives in `sql/` rather than under `src/` so that the
     // convention about adding an `_ = @import(…)` line to `src/nilo.zig`
     // cannot pull it into every build by being followed.
     //
     // What it imports is `nilo_core` and **not** `nilo`: a Service sits
-    // beside the App rather than on top of it (ADR 0041), and everything
+    // beside the App rather than on top of it (ADR 038), and everything
     // this module ever wanted from a `Ctx` was `arena()` and `str()`, which
     // is what a Scope is. The tests at the bottom of `sql/db.zig` and
     // `sql/live.zig` do drive a whole request through a real App, and they
@@ -3431,7 +3748,7 @@ pub fn build(b: *std.Build) void {
     // published here links no server. `under_test` below is where that name
     // is supplied.
     // **The module exists either way, and what changes is its root file**
-    // (ADR 0075). A dependent that did not ask for SQL and imports it anyway
+    // (ADR 066). A dependent that did not ask for SQL and imports it anyway
     // gets `sql/unbuilt.zig`, which is a `@compileError` in nilo's own words
     // naming the one line that fixes it. The alternative — leaving the module
     // out of the graph — makes `dep.module("nilo_sql")` a panic from inside
@@ -3449,10 +3766,10 @@ pub fn build(b: *std.Build) void {
 
     // The driver, reached lazily and **behind `want_sql`**, which is what
     // makes the laziness real: see the comment on the option above, and
-    // ADR 0075. `lazyDependency` answers null on the pass that discovers it is
+    // ADR 066. `lazyDependency` answers null on the pass that discovers it is
     // missing and the build re-runs itself after the download, which is why
     // this is an `if` rather than an `orelse unreachable`. Everything above
-    // `sql/postgres.zig` names the Wire, not pg.zig (ADR 0039).
+    // `sql/postgres.zig` names the Wire, not pg.zig (ADR 036).
     if (want_sql) {
         if (b.lazyDependency("pg", .{ .target = target, .optimize = optimize })) |pg| {
             nilo_sql.addImport("pg", pg.module("pg"));
@@ -3461,7 +3778,7 @@ pub fn build(b: *std.Build) void {
         // The other driver, the same way. It compiles the SQLite amalgamation,
         // so the module links libc — and **that is a cost a Postgres-only
         // program pays too**, because both Wires live in one module
-        // (ADR 0073). What it must not cost is the megabyte of C:
+        // (ADR 064). What it must not cost is the megabyte of C:
         // `sql/sqlite.zig` is only analysed when something names it, so a
         // program that does not should link none of it. That is an A/B rather
         // than an argument, and `zig build size-sql` is where the number comes
@@ -3537,7 +3854,7 @@ pub fn build(b: *std.Build) void {
     const test_all_step = b.step("test-all", "Run the tests in Debug and ReleaseSafe — what CI runs");
     test_all_step.dependOn(test_step);
 
-    // Core, on its own, in both modes (ADR 0041). It hangs off `test` rather
+    // Core, on its own, in both modes (ADR 038). It hangs off `test` rather
     // than beside it because it is the fastest thing in this file — no
     // Engine to build, no module graph to walk — and because the claim it
     // holds is one a change to the layering would break silently otherwise:
@@ -3554,7 +3871,7 @@ pub fn build(b: *std.Build) void {
 
     // The same for `nilo_id`, and for the same reason rather than by
     // analogy: a module in the bottom layer that cannot be tested without
-    // the module graph is a module in the wrong layer (ADR 0042).
+    // the module graph is a module in the wrong layer (ADR 038).
     // `zig test id/id.zig` is this without `build.zig` at all.
     const test_id_step = b.step("test-id", "Run nilo_id's tests — no Engine, no module graph");
     for (test_modes) |mode| {
@@ -3563,7 +3880,7 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(test_id_step);
 
-    // And the same again for `nilo_config` (ADR 0043). `zig test
+    // And the same again for `nilo_config` (ADR 039). `zig test
     // config/config.zig` is this without `build.zig` at all, and a change
     // that stops that working has broken the layering rather than the test.
     const test_config_step = b.step(
@@ -3576,15 +3893,15 @@ pub fn build(b: *std.Build) void {
     }
 
     // This module's Refusals, held the way every other module's are (ADR
-    // 0027). They hang off `test-config` rather than `test-sql`'s pattern of
+    // 026). They hang off `test-config` rather than `test-sql`'s pattern of
     // sitting outside the loop, because this module is in the bottom layer
     // and its checks are the ones a Config gets wrong at the moment somebody
     // writes it — a field that is a list, a name that is a typo.
     //
-    // Measured warm on Zig 0.16, all five are **284ms** of `zig build test`:
-    // 30–38ms each except `config_unknown_field` at 149ms, which is the one
+    // Measured warm on Zig 0.16 when the table held five (it holds nine now),
+    // they were **284ms** of `zig build test`: 30–38ms each except `config_unknown_field` at 149ms, which is the one
     // whose `@compileError` is reached through a generic function rather than
-    // from the type itself. That is well under the ~270ms each ADR 0027
+    // from the type itself. That is well under the ~270ms each ADR 026
     // records for the framework's own, and the reason is worth knowing rather
     // than rounding away: these stop while analysing a module that imports
     // nothing, so there is no Engine in front of the failure.
@@ -3606,7 +3923,7 @@ pub fn build(b: *std.Build) void {
     test_config_step.dependOn(refusals_config_step);
     test_step.dependOn(test_config_step);
 
-    // And the same again for `nilo_pw` (ADR 0048). `zig test pw/pw.zig` is
+    // And the same again for `nilo_pw` (ADR 044). `zig test pw/pw.zig` is
     // this without `build.zig` at all — the entry condition for the layer,
     // and a change that stops it working has broken the layering rather than
     // the test.
@@ -3637,7 +3954,7 @@ pub fn build(b: *std.Build) void {
     test_pw_step.dependOn(refusals_pw_step);
     test_step.dependOn(test_pw_step);
 
-    // And the fourth (ADR 0138). `zig test cache/cache.zig` is this without
+    // And the fourth (ADR 109). `zig test cache/cache.zig` is this without
     // `build.zig` at all — the entry condition for the layer, and the reason
     // a program that is not a server can take this module on its own.
     const test_cache_step = b.step(
@@ -3667,7 +3984,7 @@ pub fn build(b: *std.Build) void {
     test_cache_step.dependOn(refusals_cache_step);
     test_step.dependOn(test_cache_step);
 
-    // And the fifth (ADR 0140). `zig test jwt/jwt.zig` is this without
+    // And the fifth (ADR 111). `zig test jwt/jwt.zig` is this without
     // `build.zig` at all: the module names nothing, and a token check needs
     // no socket and no clock — the key set arrives as bytes and the time
     // arrives as a number.
@@ -3681,7 +3998,7 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(test_jwt_step);
 
-    // The Fitting layer's entry condition, as something that runs (ADR 0070).
+    // The Fitting layer's entry condition, as something that runs (ADR 061).
     // A Tool module proves its layer under a plain `zig test`; a Fitting
     // borrows the loop, so it proves its own under `std.Io.Threaded` — std's,
     // not the Engine's. `zig test fetch/fetch.zig` needs the module graph only
@@ -3725,7 +4042,7 @@ pub fn build(b: *std.Build) void {
     // The deadline, watched firing. It needs the Engine, so it is a root of
     // its own rather than a line in `fetch/fetch.zig`'s test block — putting
     // it there would make `zig test fetch/fetch.zig` need a server and cost
-    // the Fitting layer its entry condition (ADR 0070).
+    // the Fitting layer its entry condition (ADR 061).
     //
     // **This is the first test here that opens a real port.** The harness the
     // standing risks have wanted for `sendfile` and the WebSocket is this
@@ -3752,7 +4069,7 @@ pub fn build(b: *std.Build) void {
 
     // The second Fitting, proved the same way as the first: the worker loop
     // runs under `std.Io.Threaded`, with `job.Memory` as its store and no
-    // Engine anywhere (ADR 0198). The half that needs a database is
+    // Engine anywhere (ADR 160). The half that needs a database is
     // `test-job-sql`, below with the SQL module's own steps.
     const test_job_step = b.step(
         "test-job",
@@ -3793,7 +4110,7 @@ pub fn build(b: *std.Build) void {
     // **checks the signature** — `s3/canned.zig` rebuilds the canonical
     // request from the bytes that arrived and answers 403 when it disagrees,
     // which is the only arrangement in which a signature test means anything
-    // (ADR 0072).
+    // (ADR 063).
     //
     // On `test` rather than beside `test-sql`, because there is no container
     // in the way: every test that needs a real MinIO skips when `S3_ENDPOINT`
@@ -3919,16 +4236,19 @@ pub fn build(b: *std.Build) void {
     }
 
     // What a dependent downloads, held by something other than a sentence in
-    // four files (ADR 0075). Not on `test` for the reason `smoke-tls` is not:
+    // four files (ADR 066). Not on `test` for the reason `smoke-tls` is not:
     // it needs a route to the internet, and a gate that goes green because a
     // machine had none is worse than no gate.
     FetchCheck.step(b, network);
 
-    // The layering, held by something other than a paragraph (ADR 0042).
+    // The layering, held by something other than a paragraph (ADR 038).
     test_step.dependOn(Layering.step(b));
 
+    // Every ADR cited is one that exists, and none by its old number (ADR 221).
+    test_step.dependOn(AdrCheck.step(b));
+
     // The SQL module keeps its own step, and `test` does not depend on it
-    // (ADR 0039). Not for speed: it has a tier that cannot run without a
+    // (ADR 036). Not for speed: it has a tier that cannot run without a
     // database at all, and mixing a step that needs Postgres into the one
     // run every thirty seconds is the wrong place for it. What is here is
     // the half that needs nothing — generated SQL and the schema comparison
@@ -3937,10 +4257,10 @@ pub fn build(b: *std.Build) void {
     const test_sql_step = b.step("test-sql", "Run the SQL module's tests — no database needed");
     test_all_step.dependOn(test_sql_step);
 
-    // The queue's table, against a real one (ADR 0198). SQLite in memory
+    // The queue's table, against a real one (ADR 160). SQLite in memory
     // always; Postgres when `DATABASE_URL` says where, the way `sql/live.zig`
     // does. Hung off `test-sql` rather than `test`, because it builds the
-    // drivers `test` deliberately does not (ADR 0075).
+    // drivers `test` deliberately does not (ADR 066).
     const test_job_sql_step = b.step(
         "test-job-sql",
         "Run nilo_job's table against SQLite, and Postgres if reachable",
@@ -3948,7 +4268,7 @@ pub fn build(b: *std.Build) void {
     test_sql_step.dependOn(test_job_sql_step);
 
     // The SQL module's Refusals, held the same way the framework's are (ADR
-    // 0027) and hung off `test-sql` rather than `test`. Every comptime check
+    // 026) and hung off `test-sql` rather than `test`. Every comptime check
     // in `sql/` answers a question a database would otherwise answer at run
     // time, so the wording of these is the whole point of doing it early.
     const refusals_sql_step = b.step(
@@ -3992,8 +4312,8 @@ pub fn build(b: *std.Build) void {
     const live_config = b.addOptions();
     live_config.addOption(?[]const u8, "database_url", database_url);
 
-    // What a per-connection statement cache is worth, which ADR 0001's 10%
-    // needed a number for before anything was built (ADR 0057). Its own step
+    // What a per-connection statement cache is worth, which ADR 017's 10%
+    // needed a number for before anything was built (ADR 051). Its own step
     // rather than part of `profile`, because it needs a database and that
     // one deliberately needs nothing.
     //
@@ -4027,7 +4347,7 @@ pub fn build(b: *std.Build) void {
     bench_nilo_sql.addImport("live_config", bench_live_config);
 
     // What a cache operation costs, and what an entry costs to hold
-    // (ADR 0138). No Engine and no server: the module needs neither, so
+    // (ADR 109). No Engine and no server: the module needs neither, so
     // neither is in the way of the number.
     const bench_cache = b.addExecutable(.{
         .name = "nilo-bench-cache",
@@ -4046,7 +4366,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // **What fraction of lookups the cache answers, which is the number the
-    // other one cannot see** (ADR 0187). `bench-cache` draws its keys
+    // other one cannot see** (ADR 109). `bench-cache` draws its keys
     // uniformly at random, and under uniform random every eviction policy
     // scores the same — so a cache with no policy at all measured perfect
     // there for a year. This one draws them the way traffic does and puts the
@@ -4068,7 +4388,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // What gzipping an answer costs, per level, on the bodies the benchmark
-    // arena asks for (ADR 0287). `ReleaseFast` whatever was asked, because
+    // arena asks for (ADR 211). `ReleaseFast` whatever was asked, because
     // a Debug deflate is a different program.
     const bench_compress = b.addExecutable(.{
         .name = "nilo-bench-compress",
@@ -4095,7 +4415,7 @@ pub fn build(b: *std.Build) void {
     // Behind `want_sql` like the published module's, and for the same reason:
     // this file runs top to bottom in a *dependent's* build too, so a
     // `lazyDependency` call that a benchmark nobody outside this repository
-    // will ever run still bills them for the download (ADR 0075).
+    // will ever run still bills them for the download (ADR 066).
     if (want_sql) {
         if (b.lazyDependency("pg", .{ .target = target, .optimize = .ReleaseFast })) |pg| {
             bench_sql_module.addImport("pg", pg.module("pg"));
@@ -4118,7 +4438,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&b.addRunArtifact(bench_sql).step);
 
     // What a claim costs on each store, which is what `poll_ms` rests on
-    // (ADR 0198). The same benchmark copy of the SQL module, so the drivers
+    // (ADR 160). The same benchmark copy of the SQL module, so the drivers
     // are built once for both.
     const bench_job_module = b.createModule(.{
         .root_source_file = b.path("bench/job.zig"),
@@ -4138,7 +4458,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&b.addRunArtifact(bench_job).step);
 
     // The same question under load, which is the one that decides whether a
-    // Postgres wait costs a fiber or a thread (ADR 0059). Installed rather
+    // Postgres wait costs a fiber or a thread (ADR 053). Installed rather
     // than run: it wants a load generator pointed at it, not a stopwatch.
     const bench_sql_server_module = b.createModule(.{
         .root_source_file = b.path("bench/sql_server.zig"),
@@ -4158,7 +4478,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&b.addInstallArtifact(bench_sql_server, .{}).step);
 
     // The fourth axis, for the module that added a megabyte of C to it
-    // (ADR 0073). Two programs that differ by one line — which database the
+    // (ADR 064). Two programs that differ by one line — which database the
     // one route reads — so the difference between their stripped sizes is
     // what SQLite costs, and `pg_only`'s size against an HTTP-only binary is
     // the claim that a program which never names SQLite links none of it.
@@ -4190,7 +4510,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // The same axis for the object store, which had none until this step
-    // existed: ADR 0018's running total now carries a `nilo_s3` row because
+    // existed: ADR 017's running total now carries a `nilo_s3` row because
     // these two programs can be built and subtracted.
     //
     // Two programs that differ by where one route's bytes come from, so the
@@ -4232,7 +4552,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // What a Fitting costs, against a `std.http.Client` doing the same call
-    // with none of the policy round it (ADR 0070). Installed rather than run,
+    // with none of the policy round it (ADR 061). Installed rather than run,
     // for the reason above — and the number it exists for is memory per idle
     // connection, which `bench/mem.py` reads while it sits there.
     //
@@ -4256,14 +4576,14 @@ pub fn build(b: *std.Build) void {
         .dependOn(&b.addInstallArtifact(bench_fetch_server, .{}).step);
 
     // What an object store costs a server, with the four controls that say how
-    // much of the number is the object store (ADR 0072). Installed rather than
+    // much of the number is the object store (ADR 063). Installed rather than
     // run, for the reason the two above give — and it is the nilo side of
     // `bench/compare-s3/drive.py`, which holds Go, Rust and Bun to the same
     // seven routes.
     //
     // No `s3_config`: the endpoint and the keys are read from the environment
     // at startup, which is right for a benchmark and wrong for a test. The
-    // bucket is compiled in, because it is a type (ADR 0068).
+    // bucket is compiled in, because it is a type (ADR 059).
     const bench_s3_server_module = b.createModule(.{
         .root_source_file = b.path("bench/s3_server.zig"),
         .target = target,
@@ -4298,7 +4618,7 @@ pub fn build(b: *std.Build) void {
     b.step("bench-ws-server", "A server of idle WebSockets, for measuring what one costs")
         .dependOn(&b.addInstallArtifact(bench_ws_server, .{}).step);
 
-    // What an open stream costs, which is the one row of ADR 0018's third axis
+    // What an open stream costs, which is the one row of ADR 017's third axis
     // nobody has taken since v1. Installed rather than run: `bench/mem.py
     // --hold` starts it, holds thousands of streams open against it and reads
     // `VmRSS`, the same arrangement `bench-ws-server` has.
@@ -4335,10 +4655,10 @@ pub fn build(b: *std.Build) void {
         .dependOn(&b.addInstallArtifact(bench_body_server, .{}).step);
 
     // The benchmark target over TLS, so the plain one has a control on the
-    // axes ADR 0288 spends: `bench/mem.py --tls` for the idle connection, and
+    // axes ADR 212 spends: `bench/mem.py --tls` for the idle connection, and
     // `wrk` over `https://` for the request. Only under `-Dtls`, because a
     // step that fetches a lazy dependency is a step that has to be asked for
-    // (ADR 0075); without the flag the step is absent rather than failing.
+    // (ADR 066); without the flag the step is absent rather than failing.
     if (want_tls) {
         const bench_tls_server_module = b.createModule(.{
             .root_source_file = b.path("bench/tls_server.zig"),
@@ -4357,7 +4677,7 @@ pub fn build(b: *std.Build) void {
         // Both directions loaded at once, which is the one thing the server
         // above does not do: a 10 KB body in and the same 10 KB out, with
         // TLS a switch rather than a second binary so the plain run is the
-        // same machine code. The row ADR 0288 left open.
+        // same machine code. The row ADR 212 left open.
         const bench_echo_server_module = b.createModule(.{
             .root_source_file = b.path("bench/echo_server.zig"),
             .target = target,
@@ -4421,7 +4741,7 @@ pub fn build(b: *std.Build) void {
 
         // The test build is the one place this module names an App, and it
         // gets both: `nilo_core` for the module itself, `nilo` for the tests
-        // at the bottom of `db.zig` and `live.zig` (ADR 0041).
+        // at the bottom of `db.zig` and `live.zig` (ADR 038).
         const under_test = b.createModule(.{
             .root_source_file = b.path("sql/sql.zig"),
             .target = target,
@@ -4433,7 +4753,7 @@ pub fn build(b: *std.Build) void {
             },
         });
         // The third and last pair, behind `want_sql` for the reason the other
-        // two are (ADR 0075). This one was the expensive one: a dependent runs
+        // two are (ADR 066). This one was the expensive one: a dependent runs
         // this loop while configuring their own build, so *nilo's own test
         // suite* was what charged them the second copy of both drivers.
         if (want_sql) {
@@ -4453,10 +4773,10 @@ pub fn build(b: *std.Build) void {
         // reason `fetch/deadline.zig` is one: only the Engine can cancel a
         // fiber, so this is the one test here that needs a running server —
         // and putting it in `sql/sql.zig`'s test block would make
-        // `zig build test-sql` need one too (ADR 0135).
+        // `zig build test-sql` need one too (ADR 107).
         //
         // Hung off `test-sql` rather than `test`, because `test` deliberately
-        // does not build this module or fetch its drivers (ADR 0075).
+        // does not build this module or fetch its drivers (ADR 066).
         const deadline_root = b.createModule(.{
             .root_source_file = b.path("sql/deadline.zig"),
             .target = target,
@@ -4471,7 +4791,7 @@ pub fn build(b: *std.Build) void {
         test_sql_step.dependOn(&b.addRunArtifact(deadline_tests).step);
 
         // A transaction whose socket dies under it, through a proxy the test
-        // stands up between the pool and Postgres (ADR 0248). No Engine: it
+        // stands up between the pool and Postgres (ADR 043). No Engine: it
         // runs on `std.Io.Threaded` the way `live.zig` does. A root of its
         // own so that a proxy that wedges is a binary that wedges, with a
         // name of its own in `ps`, rather than one test among a hundred —
@@ -4516,7 +4836,7 @@ pub fn build(b: *std.Build) void {
         // The examples that name `nilo_sql`, tested against the same Db under
         // test: the one place an example's `db.checking` and `createMissing`
         // are booted together, which is the shape a first boot got wrong
-        // (ADR 0277).
+        // (ADR 180).
         for (examples) |example| {
             if (!example.needs_sql) continue;
             const example_root = b.createModule(.{
@@ -4565,7 +4885,7 @@ pub fn build(b: *std.Build) void {
         });
         // TLS is in the http test root whether or not `-Dtls` was passed,
         // because a feature only tested when somebody remembers a flag is a
-        // feature that is not tested (ADR 0033). In-repo only: a dependent
+        // feature that is not tested (ADR 032). In-repo only: a dependent
         // running its own tests against nilo is not made to fetch the
         // library for a listener it never asked for.
         wireTls(b, lib_tests, target, mode, want_tls or in_repo, want_grpc or in_repo);
@@ -4613,13 +4933,13 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    // ADR 0015 says a mistake stops in nilo's own words. Nothing held that
+    // ADR 014 says a mistake stops in nilo's own words. Nothing held that
     // rule until this step: each file in `refusals/` is a program somebody
     // wrote wrong, and each has to fail to compile with the message named
     // above. Note what the loop does with `.says` — it supplies the `nilo: `
     // prefix itself, so a check that stops somewhere inside the standard
     // library cannot be written down as passing, only fixed or deleted
-    // ([ADR 0027](docs/adr/0027-the-rule-about-error-messages-is-held-by-a-build-step.md)).
+    // ([ADR 026](docs/adr/026-the-rule-about-error-messages-is-held-by-a-build-step.md)).
     //
     // **They do not cache, and they are the slow part of `zig build test`.**
     // The compiler keeps nothing from a compilation that failed, so every
@@ -4628,7 +4948,7 @@ pub fn build(b: *std.Build) void {
     //
     // A note here once said the opposite — that Zig 0.16 had started caching
     // them and all 39 were 0.5s. That was measured wrong and is corrected in
-    // [ADR 0027](docs/adr/0027-the-rule-about-error-messages-is-held-by-a-build-step.md);
+    // [ADR 026](docs/adr/026-the-rule-about-error-messages-is-held-by-a-build-step.md);
     // the original entry's number, about 9 seconds, was right all along.
     //
     // They stay on `test` at that price, which is the trade the ADR argues:
@@ -4638,7 +4958,7 @@ pub fn build(b: *std.Build) void {
     // checking.
     // Named for the framework rather than for all of them, because it only
     // runs the framework's 109. The other five tables hang off their own
-    // module's test step (ADR 0027) and have their own `refusals-*` steps —
+    // module's test step (ADR 026) and have their own `refusals-*` steps —
     // and a name that over-promised sent one reader to run this, watch it
     // pass, and believe a `sql/refusals/` file had been checked.
     const refusals_step = b.step(
@@ -4659,7 +4979,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(refusals_step);
 
     // And the mirror of it: the documentation's own snippets, which have to
-    // compile (ADR 0083). Only built when `nilo_sql` is — the running example
+    // compile (ADR 068). Only built when `nilo_sql` is — the running example
     // has a database in it, and `-Dsql=false` is a project that has not asked
     // for one.
     //
@@ -4721,7 +5041,7 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(snippets_step);
 
-    // The server restarted on every save (ADR 0259). Installed so a
+    // The server restarted on every save (ADR 190). Installed so a
     // dependent can `nilo.artifact("nilo-dev")`; it imports `std` and
     // nothing of nilo's, and no server links it. Its tests are the argument
     // parser's and run standalone — `zig test dev/main.zig` — for the reason
@@ -4750,7 +5070,7 @@ pub fn build(b: *std.Build) void {
     // person who copies it.
     const examples_step = b.step("examples", "Build every example");
     // LLVM for the examples, which on Zig 0.16.0 is what `-fincremental`
-    // needs to produce a binary that runs when libc is linked (ADR 0259).
+    // needs to produce a binary that runs when libc is linked (ADR 190).
     // Off by default: the self-hosted backend is the faster build, and the
     // only reason to pay for LLVM here is the flat-cache dev loop.
     const examples_llvm = b.option(bool, "llvm", "Build the examples with LLVM — what `dev-* -- --incremental` needs on 0.16.0") orelse false;
@@ -4792,7 +5112,7 @@ pub fn build(b: *std.Build) void {
 
         // The same, restarted on every save: `nilo-dev` keeps one
         // `zig build example-<name> --watch` running and starts the example
-        // again whenever that build writes it (ADR 0259). The path is
+        // again whenever that build writes it (ADR 190). The path is
         // absolute because the runner's working directory is the example's.
         // `zig build dev-hello -- --incremental -Dllvm` is the flat-cache
         // loop; see `dev/main.zig` for why the two go together on 0.16.0.

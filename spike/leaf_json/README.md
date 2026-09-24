@@ -1,7 +1,7 @@
 # leaf_json
 
 What a response holding a `sql.Uuid` costs, before and after
-[ADR 0182](../../docs/adr/0182-a-leaf-that-says-what-it-is-can-be-carried.md).
+[ADR 148](../../docs/adr/148-a-field-name-is-a-spelling-too.md).
 The run behind that ADR and the entry in
 [`bench/result/http.md`](../../bench/result/http.md).
 
@@ -39,7 +39,7 @@ uuids, four strings, a bool and an integer.
 
 C is the row that stops the headline being over-read: the gap between B and C
 is three `jsonStringify` calls, and no amount of work on the writer closes it.
-The type is `nilo_id`'s and `http/` never learns it exists (ADR 0046).
+The type is `nilo_id`'s and `http/` never learns it exists (ADR 042).
 
 `Uuid` here is a four-byte stand-in carrying the same two declarations the real
 one does — `jsonStringify` and `nilo_openapi` — because the contract between the

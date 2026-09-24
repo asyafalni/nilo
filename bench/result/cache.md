@@ -89,7 +89,7 @@ a queue. Nine reads to a write, 8 threads, 64 MiB store:
 
 **The last row is why there is no seqlock.** Taking the lock out altogether
 buys 1.4% over 256 shards, and nothing at all on one thread — 29.4 ns against
-29.3 ns. ADR 0138's spin lock was right, and the contention it was blamed for
+29.3 ns. ADR 109's spin lock was right, and the contention it was blamed for
 was the shard count.
 
 64 rather than 256 because 256 starts costing retention on small stores: on
@@ -103,7 +103,7 @@ budget measured, so it is free.
 random is the one distribution where an eviction policy provably cannot
 matter**: every key is equally likely next, so knowing which entries were read
 recently says nothing about which will be read again. Under it the cache scored
-100% of the achievable ceiling at every size, which is what produced ADR 0138's
+100% of the achievable ceiling at every size, which is what produced ADR 109's
 "hit rate is ring bytes over working-set bytes, to within a point — there is no
 cliff". That reading was correct and it was about the harness.
 
@@ -196,7 +196,7 @@ operation is not available here, and the concurrency rows are where the
 throughput is.
 
 The two clocks, for the record: `MONOTONIC_COARSE` 1.6 ns, `MONOTONIC` 15.6 ns.
-ADR 0138's choice is worth 14 ns an operation.
+ADR 109's choice is worth 14 ns an operation.
 
 ## 3. Against the Go three
 
@@ -385,7 +385,7 @@ them for free the memory efficiency that is nilo's whole argument.
 
 **nilo beats every Zig cache at every size and loses to both Rust caches by
 0.2–1.1 points at five of six.** Being level with Caffeine's descendant on
-policy, with no ghost queue and no sketch, is the result ADR 0187 was after.
+policy, with no ghost queue and no sketch, is the result ADR 109 was after.
 The Zig side is the one that says the two regions are worth something: zigache
 implements S3-FIFO properly, with a ghost queue and a per-node frequency, and
 is 1.6–3.4 points behind.
@@ -427,7 +427,7 @@ against quick_cache, which is the honest summary of that one.
 quick_cache is the only cache in this comparison that is faster than nilo, so
 its source is worth more than its number. It is a modified Clock-PRO, which the
 crate's own header says is "very similar to the later published S3-FIFO" — the
-same family as ADR 0187's two regions. So the policy is not the difference.
+same family as ADR 109's two regions. So the policy is not the difference.
 Five differences are, and the measurements below say which of them matter.
 
 Everything in this section was measured on the same box with the browser still
@@ -452,7 +452,7 @@ Four builds of `cache/`, identical except where named. `A` is what ships.
 Three things fall out of that table and each one changes what to do next.
 
 **Raising `shards` is not the answer.** Four times the shards buys 5% and
-sixteen times buys 8%, against 32% for changing what a `get` does. ADR 0187 put
+sixteen times buys 8%, against 32% for changing what a `get` does. ADR 109 put
 the shard count at 15% on a 64 MiB store, and on a store sized for its working
 set it is a third of that. The default stays at 64.
 
@@ -497,7 +497,7 @@ next `put`, which forgets a `small` entry only if its `freq` is zero. That is
 what S3-FIFO's paper says to do and what zigache does; nilo promotes eagerly
 instead, and pays a `memcpy` per hit for it. `freq` then becomes an atomic
 bumped under a shared lock, with the saturation guard it already has. Stats move
-to their own cache line or behind a flag. **Costs nothing on ADR 0018's four
+to their own cache line or behind a flag. **Costs nothing on ADR 017's four
 axes** — no allocation, no per-entry byte — but it is a different policy, so
 the hit rate has to be re-measured rather than assumed.
 
@@ -508,7 +508,7 @@ nilo already holds that record. A slot whose fingerprint matches the key being
 inserted but whose `gen` is stale means *this key was here and the ring took
 it* — and `put`'s first loop already walks exactly those ways and `continue`s
 past them. Setting a flag there and sending the entry to `main` instead of
-`small` is the same mechanism for **zero extra memory**. ADR 0187 wrote "the
+`small` is the same mechanism for **zero extra memory**. ADR 109 wrote "the
 ghost is already there" and then did not use it.
 
 **3. Counting hits should be opt-in.** quick_cache's `hits`/`misses` are behind
@@ -567,7 +567,7 @@ both thread counts.
 What replaces the lock is one more read of a word the lookup already reads. A
 region's cursor only goes forwards, `reserve` publishes it before a byte is
 copied, and a lookup that reads it again after its copy and finds it unmoved has
-proved nothing was writing there. [ADR 0188](../../docs/adr/0188-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md)
+proved nothing was writing there. [ADR 152](../../docs/adr/152-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md)
 is the decision and the orderings.
 
 ### What says it is right
@@ -748,9 +748,9 @@ bench/compare-cache/zig/zig-out/bin/cache-zig hitrate   # and `held`, which is �
 efficiency cores, 16 GB, macOS, Zig 0.16.0 — and the first aarch64 machine
 this module's suite ever ran on. It failed: `test "a lookup that holds no lock
 never hands back a value that is not the key's"` reported 1–3 wrong answers in
-five of nine runs, because two of ADR 0188's orderings hold the compiler and
+five of nine runs, because two of ADR 152's orderings hold the compiler and
 not an ARM processor
-([ADR 0190](../../docs/adr/0190-an-ordering-is-proved-on-the-processor-that-runs-it.md)).
+([ADR 152](../../docs/adr/152-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md)).
 
 Three variants of `cache/store.zig`, each its own `ReleaseFast` binary — and
 `ReleaseFast` checked from the binary, because the first set of these numbers
@@ -788,7 +788,7 @@ to be. The comparison is across the columns:
   as **unchanged**.
 
 That is the design: a load-load barrier is exactly the sentence the reader's
-proof was missing, and x86 — where ADR 0188's figures were taken — compiles it
+proof was missing, and x86 — where ADR 152's figures were taken — compiles it
 to nothing.
 
 For the record, `cache/clock.zig`'s clock on this platform: `MONOTONIC_RAW_APPROX`

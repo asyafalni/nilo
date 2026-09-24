@@ -1,4 +1,4 @@
-//! The column types Zig does not have a word for (ADR 0039).
+//! The column types Zig does not have a word for (ADR 036).
 //!
 //! Postgres has `timestamptz`, `uuid` and `jsonb`. Zig has no date type, no
 //! UUID and no opinion about JSON in a column. The gap could have been left
@@ -29,7 +29,7 @@
 //! **`Uuid` is no longer one of these.** It is `nilo_id`'s, imported here and
 //! re-exported, because generating a key and reading one back are the same
 //! sixteen bytes and only one of those two jobs is about a database (ADR
-//! 0042). What stayed is this module's opinion about which column it goes in.
+//! 038). What stayed is this module's opinion about which column it goes in.
 //!
 //! ## The list is not closed
 //!
@@ -43,7 +43,7 @@
 //! are two instances of `AsText`, and **`Decimal` is one too** — which is the
 //! argument for the protocol rather than a coincidence. The hardest column
 //! type this module ships is expressible in it, so the door is wide enough
-//! (ADR 0055).
+//! (ADR 049).
 
 const std = @import("std");
 const core = @import("nilo_core");
@@ -53,7 +53,7 @@ const id = @import("nilo_id");
 /// keeps in a `timestamptz`, so reading one is a copy rather than a
 /// conversion.
 ///
-/// On SQLite the column is an `INTEGER` of those microseconds (ADR 0136), and
+/// On SQLite the column is an `INTEGER` of those microseconds (ADR 067), and
 /// SQLite's date functions read a bare number as a Julian day or, with
 /// `'unixepoch'`, as seconds: `strftime('%m', col)` is NULL. Divide by
 /// 1,000,000 and say `'unixepoch'`.
@@ -70,11 +70,11 @@ pub const Timestamp = struct {
 
     /// What `jsonStringify` below actually sends, so that a document generated
     /// from a Row carrying one describes a string rather than the `micros`
-    /// field nobody sees (ADR 0076). Plain data, so no module has to import
+    /// field nobody sees (ADR 016). Plain data, so no module has to import
     /// `nilo_http` to say it.
     pub const nilo_openapi = .{ .type = "string", .format = "date-time" };
 
-    /// Now, which this could not answer until Core had a clock (ADR 0045).
+    /// Now, which this could not answer until Core had a clock (ADR 041).
     /// A copy rather than a conversion: `nowMicros` counts in the unit this
     /// column stores.
     ///
@@ -120,7 +120,7 @@ pub const Timestamp = struct {
 
     /// The other half of `writeRfc3339`, so that a value this server printed
     /// can be handed back to it
-    /// ([ADR 0159](../docs/adr/0159-what-a-server-prints-it-can-read.md)).
+    /// ([ADR 127](../docs/adr/127-what-a-server-prints-it-can-read.md)).
     ///
     /// **The round trip is the property.** Every keyset cursor is a timestamp
     /// the same server wrote one request ago, and a parser that disagrees
@@ -136,8 +136,8 @@ pub const Timestamp = struct {
     /// runs their browser in Jakarta.
     ///
     /// `nilo_parse` rather than a method with a name of its own: the
-    /// declaration is what makes a type a path param and, since ADR 0158, a
-    /// query field. Nothing here imports `nilo_http` to say so (ADR 0042).
+    /// declaration is what makes a type a path param and, since ADR 113, a
+    /// query field. Nothing here imports `nilo_http` to say so (ADR 038).
     pub fn nilo_parse(text: []const u8) ?Timestamp {
         // `2026-10-01T09:30:00Z` is the shortest thing this accepts, and
         // every index below is inside it.
@@ -249,7 +249,7 @@ pub const Timestamp = struct {
 
     /// The third arrival, read the way `nilo_parse` reads the other two:
     /// `std.json` picks a reader by this name, so a body field of this type
-    /// was read as `{micros: …}` until it existed (ADR 0205). Text that is
+    /// was read as `{micros: …}` until it existed (ADR 166). Text that is
     /// not a moment is `InvalidCharacter`, which `std.fmt` answers for a
     /// digit that is not one; anything that is not text is the wrong kind.
     pub fn jsonParse(
@@ -297,7 +297,7 @@ pub const Timestamp = struct {
 /// value and knows how to write itself; it does not calculate.** There is no
 /// `.addDays` and no `.weekday`. What it owes is that the day which went in is
 /// the day that comes out, and that it can be written and read back
-/// ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 ///
 /// **Read out of the column rather than out of `::text`**, which is the
 /// difference from `sql.AsText("date")` and the reason it exists. A text column
@@ -318,7 +318,7 @@ pub const Date = struct {
     pub const nilo_column = "date";
 
     /// What `jsonStringify` sends, so a generated document describes a date
-    /// rather than the `days` field nobody sees (ADR 0076).
+    /// rather than the `days` field nobody sees (ADR 016).
     pub const nilo_openapi = .{ .type = "string", .format = "date" };
 
     pub fn fromDays(days: i32) Date {
@@ -458,7 +458,7 @@ pub fn isDate(comptime T: type) bool {
 }
 
 /// Sixteen bytes, in the order Postgres stores them — `nilo_id`'s type
-/// rather than one of this module's own (ADR 0042).
+/// rather than one of this module's own (ADR 038).
 ///
 /// It moved down a layer because two modules wanted it and only one of them
 /// is about databases: reading a `uuid` column and generating a key are the
@@ -532,7 +532,7 @@ pub const Decimal = AsText("numeric");
 /// itself** rather than using this: any struct or enum with `nilo_column`,
 /// `nilo_read(text, arena)` and `nilo_write(arena)` is a column type, and
 /// this is that protocol's smallest instance
-/// ([ADR 0055](../docs/adr/0055-a-column-type-can-come-from-outside-this-module.md)).
+/// ([ADR 049](../docs/adr/049-a-column-type-can-come-from-outside-this-module.md)).
 pub fn AsText(comptime column: []const u8) type {
     return struct {
         const Self = @This();
@@ -544,7 +544,7 @@ pub fn AsText(comptime column: []const u8) type {
         pub const nilo_column = column;
 
         /// Text on the wire, and said out loud so a generated client is told
-        /// so (ADR 0076). No `format`: what `AsText("money")` holds is
+        /// so (ADR 016). No `format`: what `AsText("money")` holds is
         /// whatever Postgres printed, and naming a format would be a claim
         /// about a column this type deliberately knows nothing about.
         pub const nilo_openapi = .{ .type = "string" };
@@ -722,7 +722,7 @@ pub fn jsonPayload(comptime T: type) ?type {
 /// ```
 pub fn declaredColumn(comptime T: type) ?[]const u8 {
     // `Uuid` comes from `nilo_id`, which knows nothing about databases, so
-    // the answer for it is here rather than on the type (ADR 0042). Every
+    // the answer for it is here rather than on the type (ADR 038). Every
     // type this module owns says so itself.
     if (T == Uuid) return "uuid";
     return switch (@typeInfo(T)) {
@@ -795,7 +795,7 @@ test "what a Timestamp prints, a Timestamp reads back to the same microsecond" {
     // The property, asserted as a pair rather than as two halves: every
     // keyset cursor in a paged list is a value this same writer produced, so
     // a parser that agrees with a spec and not with the writer still pages
-    // wrong (ADR 0159).
+    // wrong (ADR 127).
     var buf: [40]u8 = undefined;
     for ([_]i64{
         0, // the epoch itself
@@ -890,7 +890,7 @@ test "a Timestamp in a JSON body is read from the text a response writes it as" 
     try testing.expectEqual(Timestamp.nilo_parse("2026-08-16T09:30:00Z").?.micros, from_value.value.micros);
 }
 
-// -- a day, which is not a moment (ADR 0221) ------------------------------
+// -- a day, which is not a moment (ADR 181) ------------------------------
 
 fn isoOf(value: Date, buf: []u8) ![]const u8 {
     var w = std.Io.Writer.fixed(buf);
@@ -1024,7 +1024,7 @@ test "a uuid column and a generated key are the same type" {
     // Not a tautology: two modules built from the same root file are two
     // different modules to Zig, so a second `nilo_id` in the build graph
     // would make `id.v7()` something `db.insert` refuses to bind. Nothing
-    // would fail to compile in either module on its own (ADR 0042).
+    // would fail to compile in either module on its own (ADR 038).
     try testing.expectEqual(id.Uuid, Uuid);
 }
 

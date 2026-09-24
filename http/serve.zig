@@ -3,7 +3,7 @@
 //! Split from `app.zig` because the two halves of that file are paid for at
 //! different times. Everything here runs per request and is what the
 //! allocation budget and the per-connection stack figures are about
-//! (ADR 0018, ADR 0063); `wiring.zig` next door runs once, inside `listen()`.
+//! (ADR 017, ADR 062); `wiring.zig` next door runs once, inside `listen()`.
 //! `App` still owns them both — these are its methods, called as
 //! `serve.serveRequest(app, …)` rather than `app.serveRequest(…)`.
 
@@ -40,7 +40,7 @@ pub fn handleConnection(
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
     // A span of its own, so a Str this connection hands out cannot pass
-    // for one of the next connection's (ADR 0004).
+    // for one of the next connection's (ADR 003).
     var lifetime = str_mod.Lifetime.init();
     defer lifetime.deinit();
 
@@ -50,7 +50,7 @@ pub fn handleConnection(
     deadlines.armWrite();
 
     // What this fiber is serving is bound to it once, then reused by
-    // every request on the same connection (ADR 0007).
+    // every request on the same connection (ADR 006).
     var in_flight = fail.InFlight{};
     var binding = bulkhead.binding_unset;
     bulkhead.bindSlot(&binding, &in_flight);
@@ -74,7 +74,7 @@ pub fn handleConnection(
         var served = serveRequest(self, arena.allocator(), &lifetime, &in_flight, in, out, deadlines, waker, peer);
         // A handler that upgraded runs its loop here rather than inside
         // `serveRequest`, so that the request's 1,608 bytes are unwound
-        // before a socket suspends for the next hour (ADR 0071).
+        // before a socket suspends for the next hour (ADR 062).
         runHandover(&served);
         // The request is done: every Str of its goes stale, then the
         // bag is emptied in one go.
@@ -88,13 +88,13 @@ pub fn handleConnection(
         // Which way that trade goes is the caller's, because the answer
         // depends on how big their responses are and how many connections
         // they hold: below this figure the block is reused, above it the
-        // pages are handed back and faulted in again next time (ADR 0096).
+        // pages are handed back and faulted in again next time (ADR 075).
         lifetime.end();
         _ = arena.reset(.{ .retain_with_limit = self.arena_keep });
         if (!served.keep_alive) {
             // The last answer on this connection may still be buffered: a
             // response is flushed when the connection next reads, and this
-            // connection never reads again (ADR 0274). Before the FIN below,
+            // connection never reads again (ADR 201). Before the FIN below,
             // for the same reason the FIN comes before the close.
             out.flush() catch {};
             if (served.linger) hangUp(in, deadlines, waker);
@@ -117,7 +117,7 @@ const linger_ms: u32 = 1000;
 /// error before the data. So the send side is shut first, which tells the
 /// peer there is nothing more to wait for, and what it sent is thrown away
 /// until it hangs up, or `linger_ms` passes, or `linger_limit` bytes of a
-/// peer that keeps sending ([ADR 0266](../docs/adr/0266-a-refused-request-is-hung-up-on-with-a-fin.md)).
+/// peer that keeps sending ([ADR 195](../docs/adr/195-a-refused-request-is-hung-up-on-with-a-fin.md)).
 ///
 /// Only on the paths that set `Served.linger`, which is where unread input
 /// is possible; an ordinary `Connection: close` has nothing queued and closes
@@ -155,7 +155,7 @@ pub const idle_peek_ms = 200;
 /// measured cost per connection did not move by a byte. Waiting at this
 /// frame is what makes the release stick — 8,753 bytes an idle keep-alive
 /// connection to 4,657, and the difference is exactly one page
-/// ([ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md)).
+/// ([ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)).
 ///
 /// Every error is swallowed: a broken connection is `handleRequest`'s to
 /// diagnose and report, and it will meet the same failure one call later
@@ -196,14 +196,14 @@ pub fn waitForRequest(
 /// `handover` is set when the handler turned the connection into a
 /// WebSocket: the socket is open, the handshake is answered, and the loop
 /// that is going to read it has not started. Running it is the caller's,
-/// so that it runs from the caller's frame (ADR 0071).
+/// so that it runs from the caller's frame (ADR 062).
 pub const Served = struct {
     keep_alive: bool,
     handover: ?websocket.Handover = null,
     /// Set with `keep_alive` false when the client's bytes may still be on
     /// the socket unread — a head that was refused, a body nobody took. The
     /// connection loop then hangs up with a FIN first rather than a reset,
-    /// so the answer reaches the peer (ADR 0266). Never set for a peer that
+    /// so the answer reaches the peer (ADR 195). Never set for a peer that
     /// is already gone, or one that stalled: there is nothing to wait for.
     linger: bool = false,
 };
@@ -214,7 +214,7 @@ pub const Served = struct {
 /// parsed head, the route match — is 1,608 bytes that the connection loop
 /// must not be holding while it waits for the next request, and a frame
 /// the compiler inlines is a frame that lives as long as its host's
-/// (ADR 0063).
+/// (ADR 062).
 pub noinline fn serveRequest(
     self: *App,
     arena: std.mem.Allocator,
@@ -230,7 +230,7 @@ pub noinline fn serveRequest(
     // Started here rather than after the head is read, so that a request
     // whose head never arrived is timed from the same instant as one that
     // was answered. On a server that never called `metrics()` this is a
-    // null pointer and no clock read at all (ADR 0100).
+    // null pointer and no clock read at all (ADR 079).
     var record = metrics_mod.Record.begin(if (self.metrics_table) |*t| t else null);
     const failure = &in_flight.failure;
     in_flight.startRequest("", "");
@@ -244,7 +244,7 @@ pub noinline fn serveRequest(
         switch (err) {
             error.EndOfStream => {},
             // A timeout arrives as a read failure like any other, so
-            // which one it was has to be asked (ADR 0023). The bytes
+            // which one it was has to be asked (ADR 022). The bytes
             // that did turn up are still buffered, and they are what
             // separates the two cases worth telling apart: a client
             // halfway through a head gets a 408, a connection that sat
@@ -274,8 +274,8 @@ pub noinline fn serveRequest(
     http1.parseHead(raw_head, &r) catch |err| {
         // One of these is not a malformed request: a body under a
         // `Content-Encoding` nilo cannot decode is a request everybody
-        // understands and this server cannot read (ADR 0111). gzip is not
-        // one of them any more (ADR 0251).
+        // understands and this server cannot read (ADR 089). gzip is not
+        // one of them any more.
         const answer, const status: u16 = switch (err) {
             error.UnsupportedContentEncoding => .{ RESPONSE_415, 415 },
             else => .{ RESPONSE_400, 400 },
@@ -288,7 +288,7 @@ pub noinline fn serveRequest(
     };
 
     // Past the limit on requests in flight, and said so now rather than
-    // after a queue (ADR 0197). `already` is what the atomic above handed
+    // after a queue (ADR 159). `already` is what the atomic above handed
     // back for free, so this is one comparison and no second load. Before
     // the head is copied, before the router is asked: a shed request costs
     // one write of a constant.
@@ -320,7 +320,7 @@ pub noinline fn serveRequest(
         // comes off `r.target`, so moving these moves all of it.
         r.method = rebase(raw_head, copied, r.method);
         r.target = rebase(raw_head, copied, r.target);
-        // Empty unless the target arrived in absolute form (ADR 0120), and
+        // Empty unless the target arrived in absolute form (ADR 095), and
         // an empty slice has no offset into the head to move — `""` points
         // at a static byte, and rebasing that lands anywhere.
         if (r.authority.len > 0) r.authority = rebase(raw_head, copied, r.authority);
@@ -333,7 +333,7 @@ pub noinline fn serveRequest(
     const raw_query = if (qmark) |i| r.target[i + 1 ..] else "";
 
     // From here on the panic handler can name what was being served
-    // (ADR 0008). Both slices live in the request arena.
+    // (ADR 007). Both slices live in the request arena.
     in_flight.startRequest(r.method, path);
 
     var c = Ctx{
@@ -368,26 +368,26 @@ pub noinline fn serveRequest(
         ._stopping = &self.stop.requested,
         // Where a handler that upgrades leaves the socket. The slot is
         // this frame's, and what is in it is copied out on the way back —
-        // the caller runs the loop from *its* frame (ADR 0071).
+        // the caller runs the loop from *its* frame (ADR 062).
         ._handover = &handover,
     };
 
     // `listen()`'s deadline for every request, before the chain runs so a
     // route's own `nilo.deadline` replaces it rather than the other way
-    // round. One clock read when set, none when it is not (ADR 0267).
+    // round. One clock read when set, none when it is not (ADR 105).
     c.giveDefaultDeadline(self.limits.request_deadline_ms);
 
     // Every way out of here from this point on — a clean answer, a
     // failure, a stream abandoned, a socket handed over — goes past this,
     // which is the reason the counting is not a middleware. The status a
     // request really had is only settled here, and a second place working
-    // it out again is a second place to get it wrong (ADR 0100).
+    // it out again is a second place to get it wrong (ADR 079).
     defer record.finish(c.answered() orelse 0);
 
     // A request that matched no route still runs the middleware: a
     // logger that cannot see 404s and a CORS that cannot answer a
     // preflight for an unknown path are both useless exactly when you
-    // need them. What changes is only the innermost call (ADR 0009).
+    // need them. What changes is only the innermost call (ADR 008).
     var chain: []const mw.Middleware = &.{};
     var terminal: mw.CtxHandler = notFoundHandler;
 
@@ -411,7 +411,7 @@ pub noinline fn serveRequest(
         // served with a logger or a CORS in front of it allocates
         // nothing — which is the shape nearly every app deploys, and
         // the one the budget test used to step around rather than
-        // measure (ADR 0018).
+        // measure (ADR 017).
         c._static_file = found.file;
         terminal = serveStaticFile;
         chain = found.chain;
@@ -447,7 +447,7 @@ pub noinline fn serveRequest(
     // The one mistake the compiler cannot catch and everybody else pays
     // for: a handler that waits on the operating system directly holds
     // the thread every other request on it is being served by
-    // (ADR 0034). Bracketed around the whole chain rather than around
+    // (ADR 013). Bracketed around the whole chain rather than around
     // the terminal handler, because a middleware that blocks stops the
     // thread just as dead as a handler that does.
     watchdog.begin(&in_flight.watch, self.limits.block_warning_ms, @tagName(c.method), path);
@@ -517,7 +517,7 @@ pub const StaticHit = struct {
 /// stylesheet would hide that.
 /// The file this request names, or the page a single-page directory
 /// answers a miss with — in that order, and the order is the point
-/// (ADR 0109).
+/// (ADR 087).
 pub fn findStatic(self: *const App, c: *const Ctx, path: []const u8) ?StaticHit {
     if (findStaticFile(self, c.method, path)) |found| return found;
     if (c.method != .GET and c.method != .HEAD) return null;
@@ -571,17 +571,17 @@ pub fn hit(
 }
 
 /// The three answers that go out before there is a Ctx to assemble one with.
-/// They carry the same JSON shape every other failure does (ADR 0025), so a
+/// They carry the same JSON shape every other failure does (ADR 024), so a
 /// client has one thing to parse and not two.
 const RESPONSE_400 = http1.staticResponse(400, "Bad Request", failure_content_type, staticFailure(400, "malformed request"), .close);
 const RESPONSE_431 = http1.staticResponse(431, "Request Header Fields Too Large", failure_content_type, staticFailure(431, "head too long"), .close);
 /// Sent when a body arrives under a `Content-Encoding` nilo cannot decode,
-/// which is all of them but `identity` and `gzip` (ADR 0111, ADR 0251). The
+/// which is all of them but `identity` and `gzip` (ADR 089). The
 /// message names the header, because the mistake is one line of client
 /// configuration and the alternative — a 400 about malformed JSON — sends
 /// the reader to the body.
 const RESPONSE_415 = http1.staticResponse(415, "Unsupported Media Type", failure_content_type, staticFailure(415, "this server decodes Content-Encoding: gzip and nothing else — send the body as identity or gzip"), .close);
-/// Sent when a request head started arriving and then stopped (ADR 0023).
+/// Sent when a request head started arriving and then stopped (ADR 022).
 /// Not when a keep-alive connection simply sat idle: that client has not
 /// asked for anything, and a status answering nothing is noise a proxy has
 /// to decide what to do with.
@@ -590,7 +590,7 @@ const RESPONSE_408 = http1.staticResponse(408, "Request Timeout", failure_conten
 const failure_content_type = "application/json";
 
 /// Sent when the server is already answering `max_in_flight` requests
-/// (ADR 0197). Assembled here rather than through `staticResponse` for the
+/// (ADR 159). Assembled here rather than through `staticResponse` for the
 /// one header that function does not write: `Retry-After`, which is what
 /// tells a client and a balancer this is load rather than a fault.
 const RESPONSE_503_SHED: http1.Static = blk: {
@@ -607,7 +607,7 @@ const RESPONSE_503_SHED: http1.Static = blk: {
 /// Room for the longest failure body there can be: a message at the Failure's
 /// ceiling where every byte needs the six-character `\u00xx` escape, plus the
 /// wrapper around it — nilo's own is 32 bytes, and a shape the application
-/// named (ADR 0270) gets 256 for its envelope.
+/// named (ADR 024) gets 256 for its envelope.
 const failure_body_max = fail.max_message * 6 + 256;
 
 /// A failure body for a message known while compiling — no escaping, because
@@ -617,7 +617,7 @@ fn staticFailure(comptime status: u16, comptime message: []const u8) []const u8 
 }
 
 /// The body of a failure response: the sentence a fail function wrote, in the
-/// one shape every client can read (ADR 0025).
+/// one shape every client can read (ADR 024).
 ///
 /// A frontend calling `res.json()` on a 4xx used to throw, which is the
 /// worst moment to lose the message that says what went wrong. The message
@@ -654,12 +654,12 @@ fn drain(c: *Ctx, in: *std.Io.Reader, r: *const http1.Request) bool {
     // The client said `Expect: 100-continue` and nothing here ever answered
     // it, so the body is still on its side and discarding one would be waiting
     // for bytes nobody is going to send until their own timer fires
-    // (ADR 0094). The final status has gone out, which is the whole of what
+    // (ADR 073). The final status has gone out, which is the whole of what
     // RFC 9110 §10.1.1 asks for; what this connection cannot do is carry
     // another request, because the one it has is unfinished.
     if (r.expect_continue and !c._continued) return false;
     // Reading here as well as in the handler, so the clock goes on here as
-    // well (ADR 0023). Without it these reads would inherit whatever limit
+    // well (ADR 022). Without it these reads would inherit whatever limit
     // was last set — the header deadline, which by now has passed — and a
     // client with a body left to send would have its connection dropped for
     // no reason. Only where something is really read, though: arming it on a
@@ -669,7 +669,7 @@ fn drain(c: *Ctx, in: *std.Io.Reader, r: *const http1.Request) bool {
     // The handler read the body in pieces and may have stopped part way —
     // a `while (try incoming.read(…))` that breaks early is an ordinary
     // thing to write. What is left of it goes here, so the next request on
-    // this connection starts where it should (ADR 0020).
+    // this connection starts where it should (ADR 019).
     if (c._incoming) |*progress| {
         if (progress.finished()) return true;
         c._deadlines.armBody();
@@ -689,7 +689,7 @@ fn drain(c: *Ctx, in: *std.Io.Reader, r: *const http1.Request) bool {
 ///
 /// It fails rather than answering, so this 404 goes out through the one
 /// place that assembles a failure and gets the same body shape as every
-/// other (ADR 0025).
+/// other (ADR 024).
 fn notFoundHandler(c: *Ctx) anyerror!void {
     return fail.notFound("there is no {s}", .{c._path});
 }
@@ -744,7 +744,7 @@ fn allowList(arena: std.mem.Allocator, allowed: router.MethodSet) ![]const u8 {
 /// CORS included, which is what an asset served to another origin needs.
 ///
 /// The one branch is here, at the top, and it is the only place either arm
-/// knows the other exists (ADR 0037).
+/// knows the other exists (ADR 009).
 fn serveStaticFile(c: *Ctx) anyerror!void {
     const file = c._static_file.?;
     switch (file.contents) {
@@ -760,7 +760,7 @@ fn serveStaticFile(c: *Ctx) anyerror!void {
 ///
 /// **Everything in the head comes from the descriptor about to be sent**, not
 /// from what the directory walk wrote down
-/// ([ADR 0125](../docs/adr/0125-a-file-is-described-by-the-descriptor-being-sent.md)).
+/// ([ADR 098](../docs/adr/098-a-file-is-described-by-the-descriptor-being-sent.md)).
 /// A held file cannot go stale, because its bytes are the copy in memory; a
 /// spilled file is only a name, and the file under that name is free to move
 /// while the server runs. Describing it from the walk meant a file that grew
@@ -773,7 +773,7 @@ fn serveSpilledFile(
 ) anyerror!void {
     // The name was written down by the directory walk before the socket
     // opened, and the descriptor it is resolved against was too. Nothing a
-    // request carried is being turned into a path (ADR 0037).
+    // request carried is being turned into a path (ADR 009).
     const open = on_disk.dir.openFile(on_disk.path) catch |err| switch (err) {
         // The list said the file was there and the disk disagrees, which
         // from the client's side is indistinguishable from asking for
@@ -795,12 +795,12 @@ fn serveSpilledFile(
 
     // Written into this frame and borrowed until `sendFile` returns, which is
     // after the head is on the wire — the request arena is not touched, and
-    // the budget of one allocation per request is unchanged (ADR 0018).
+    // the budget of one allocation per request is unchanged (ADR 017).
     var etag_buf: [static_mod.max_spilled_etag]u8 = undefined;
     const etag = static_mod.spilledEtag(&etag_buf, @as(i96, now.mtime_ns), now.size);
 
     // No `Vary`, because there is nothing to vary on: a spilled file has one
-    // representation and no gzipped copy to negotiate against (ADR 0018 —
+    // representation and no gzipped copy to negotiate against (ADR 017 —
     // nothing compresses per request). No `defer open.close()` either: the
     // file belongs to `sendFile` from here, on every path out of it.
     return c.sendFile(.{
@@ -816,7 +816,7 @@ fn serveSpilledFile(
 /// `max_file_bytes`, which is nearly every file a web tree has.
 ///
 /// **What this shares with the spilled arm, and what it does not.** Shared,
-/// and it is the part ADR 0021 exists to protect: `range_mod.parse` is the
+/// and it is the part ADR 020 exists to protect: `range_mod.parse` is the
 /// only thing anywhere that decides what a `Range` means, including the rule
 /// that turns a 206 back into a 200 when `If-Range` does not match — both
 /// arms hand it that decision as a flag and neither implements it.
@@ -883,7 +883,7 @@ fn serveHeldFile(c: *Ctx, file: *const static_mod.File) anyerror!void {
     // anything else and the safe answer is all of it. Strong comparison, which
     // is `etagMatchesStrong` and not the `etagMatches` above — the two arms of
     // static-file serving used to disagree about this, with `sendfile.send`
-    // carrying half the rule as a guard of its own (ADR 0094).
+    // carrying half the rule as a guard of its own (ADR 073).
     const still_the_same = if (c.header("If-Range")) |sent|
         static_mod.etagMatchesStrong(sent.view(), sending.etag)
     else
@@ -923,7 +923,7 @@ fn headerValue(c: *const Ctx, name: []const u8) ?[]const u8 {
 /// in a state the next request can start from. What cannot be recovered is
 /// anything still in the stream's buffer — that lived in the handler's own
 /// frame and went with it — which is why this says so out loud rather than
-/// quietly tidying up (ADR 0020).
+/// quietly tidying up (ADR 019).
 noinline fn endAbandonedStream(c: *Ctx) bool {
     const open = c._stream.?;
     c._stream = null;
@@ -938,7 +938,7 @@ noinline fn endAbandonedStream(c: *Ctx) bool {
     // A promised length that was never met cannot be tidied up the way a
     // missing zero-length chunk can: the head has gone out saying how many
     // bytes are coming, and this connection has to close rather than let the
-    // next response be read as the rest of them (ADR 0128).
+    // next response be read as the rest of them (ADR 101).
     if (open.promised) |promised| {
         if (!open.drop and open.written < promised) return false;
     }
@@ -955,7 +955,7 @@ noinline fn endAbandonedStream(c: *Ctx) bool {
 /// nobody hits put kilobytes on every idle browser tab. Measured across the
 /// cold paths, moving them out took `handleConnection` from 3,704 bytes to
 /// 1,976; the connection loop is where that is worth counting, not here
-/// (see [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md)).
+/// (see [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)).
 noinline fn warnFailedAfterAnswering(
     c: *Ctx,
     path: []const u8,
@@ -964,7 +964,7 @@ noinline fn warnFailedAfterAnswering(
 ) void {
     // A write that ran out of time is the ordinary way a response to a client
     // that stopped reading ends, and "handler failed" sends whoever reads the
-    // log looking for a bug in a handler that did nothing wrong (ADR 0023).
+    // log looking for a bug in a handler that did nothing wrong (ADR 022).
     if (deadlines.timedOut()) {
         std.log.warn(
             "{s} {s}: gave up writing after {d}ms — the client stopped reading",
@@ -995,7 +995,7 @@ fn sendFinal(out: *std.Io.Writer, response: http1.Static) void {
 fn sendDirect(c: *Ctx, status: u16, content_type: []const u8, body: []const u8) !void {
     c.markAnswered(status);
     // `Ctx.send`'s reason, and the other half of the same accounting: this
-    // is nilo waiting on the client, not a handler running (ADR 0034).
+    // is nilo waiting on the client, not a handler running (ADR 013).
     const w = watchdog.waiting(c._watch);
     defer watchdog.waited(c._watch, w);
     const connection = c.connection();
@@ -1026,8 +1026,8 @@ fn sendDirect(c: *Ctx, status: u16, content_type: []const u8, body: []const u8) 
 /// Turn a handler failure into a response. A fail function's message is
 /// used if there is one; otherwise the error goes through the mapping
 /// table, and anything unrecognised becomes a 500 logged with its error
-/// name (ADR 0005). The body is nilo's own shape, or the one the
-/// application named with `app.failures` (ADR 0270).
+/// name (ADR 004). The body is nilo's own shape, or the one the
+/// application named with `app.failures` (ADR 024).
 noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror, shape: ?failurebody.Write) !void {
     const status = fail.resolveStatus(failure, err);
     const message: []const u8 = if (failure.isSet()) failure.message() else blk: {
@@ -1045,7 +1045,7 @@ noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror, sh
 
     // Every 401 carries `WWW-Authenticate` (RFC 9110 §15.5.2), and the
     // endpoint that read the header is the one that knows what to say in
-    // it (ADR 0191). A comptime string, so `setStaticHeader` is right.
+    // it (ADR 153). A comptime string, so `setStaticHeader` is right.
     if (failure.challenge) |with| {
         c.setStaticHeader("WWW-Authenticate", std.mem.span(with)) catch {};
     }

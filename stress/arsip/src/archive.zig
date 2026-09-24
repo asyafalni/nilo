@@ -19,7 +19,7 @@
 //!
 //! `nilo.Mutex` rather than `std.Thread.Mutex`: many requests share one OS
 //! thread, so the std one would stop every other request being served on it
-//! (ADR 0011).
+//! (ADR 010).
 
 const std = @import("std");
 const nilo = @import("nilo_http");

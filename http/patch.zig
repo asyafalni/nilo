@@ -1,5 +1,5 @@
 //! `Patch(T)` — a body field that can tell "not sent" from "sent as null"
-//! (ADR 0026).
+//! (ADR 025).
 //!
 //! ```zig
 //! const EditTodo = struct {
@@ -42,7 +42,7 @@ pub fn Patch(comptime T: type) type {
         pub const nilo_patch = T;
 
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = "nilo.Patch(" ++ naming.of(T) ++ ")";
 
         const Self = @This();

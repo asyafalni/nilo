@@ -1,5 +1,5 @@
 //! An `Idempotent` that names something other than a bytes Space as where
-//! answers are kept ([ADR 0193](../docs/adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)).
+//! answers are kept ([ADR 155](../docs/adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
 
 const nilo = @import("nilo_http");
 

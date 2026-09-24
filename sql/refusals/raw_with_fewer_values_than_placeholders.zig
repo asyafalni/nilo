@@ -2,7 +2,7 @@
 //! is a run-time error; on SQLite the placeholder with no value binds NULL
 //! and the statement answers wrong with nothing said. The tuple is one
 //! value per `$n`, and the count is read while compiling
-//! ([ADR 0278](../../docs/adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+//! ([ADR 204](../../docs/adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
 
 const std = @import("std");
 const nilo = @import("nilo_http");

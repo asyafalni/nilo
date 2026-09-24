@@ -1,8 +1,8 @@
 //! nilo_jwt — checking somebody else's signed token, and nothing that needs a
-//! loop ([ADR 0140](../docs/adr/0140-nilo-verifies-a-token-and-does-not-fetch-one.md)).
+//! loop ([ADR 111](../docs/adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 //!
 //! A **tool module**: one job, no event loop, and it imports nothing at all,
-//! which is why `zig test jwt/jwt.zig` runs the whole of it (ADR 0042).
+//! which is why `zig test jwt/jwt.zig` runs the whole of it (ADR 038).
 //!
 //! ```zig
 //! const jwt = @import("nilo_jwt");
@@ -28,7 +28,7 @@
 //! HTTPS GET, which `nilo_fetch` already sends, and a `Keyring` borrows that
 //! client through a parameter to hold the answer and swap it under readers
 //! without a race — the one part of a rotation that is concurrency rather
-//! than policy (ADR 0255). When to refresh is still the caller's, the way
+//! than policy (ADR 111). When to refresh is still the caller's, the way
 //! policy is everywhere else here. What a caller cannot already write
 //! safely is this module — and the reason is the same one that justifies
 //! `nilo_pw` when `std.crypto.argon2` is right there. A password hash written
@@ -46,7 +46,7 @@
 //!   looked up, so `{"alg":"none"}` and an HMAC signed with the published
 //!   RSA modulus are refused before anything else, and against the key's
 //!   own name after, so `ES256` over an RSA key is a mismatch and not a
-//!   request (ADR 0242).
+//!   request (ADR 111).
 //! - **Nothing in the payload is read until the signature has passed.** An
 //!   `exp` off an unverified token is a number somebody chose.
 //!   `exp` is required, because a credential with no end is not one.
@@ -64,11 +64,11 @@
 //! **What it does not do**: HS256, any curve but P-256, encrypted tokens
 //! (JWE), signing, discovery, PKCE, and the nonce. Signing is not here
 //! because a server that issues its own sessions has `Session(T)` sealed into
-//! a cookie (ADR 0035) and does not need a token; the rest is the sign-in
+//! a cookie (ADR 033) and does not need a token; the rest is the sign-in
 //! flow, which is the caller's.
 //!
 //! **Everything about time is an argument**, for the reason `nilo_id` takes a
-//! millisecond as one (ADR 0042): a module with no event loop has no clock,
+//! millisecond as one (ADR 038): a module with no event loop has no clock,
 //! and a test that cannot choose the time cannot test an expiry.
 
 const std = @import("std");
@@ -102,14 +102,14 @@ pub const parseKeys = jwks.parse;
 /// A key set that rotates under its readers: `load` swaps a new document
 /// in and frees the old one after the verifies reading it are done, and
 /// `verifyOrRefresh` fetches on an unknown `kid` at most once an interval
-/// ([ADR 0255](../docs/adr/0255-a-key-set-is-swapped-whole-and-freed-after-its-readers.md)).
+/// ([ADR 111](../docs/adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 /// The client is a parameter, so the module still imports nothing.
 pub const Keyring = keyring_mod.Keyring;
 
 /// A ring, the client its refresh needs and a claims type, as one Service —
 /// what `nilo.Verified(T)` names to hand a handler the claims behind a
 /// bearer token, or a 401 before it runs
-/// ([ADR 0260](../docs/adr/0260-verified-claims-are-a-handler-argument.md)).
+/// ([ADR 191](../docs/adr/191-verified-claims-are-a-handler-argument.md)).
 /// The client is a type parameter, so the module still imports nothing.
 pub const Verifier = verifier_mod.Verifier;
 

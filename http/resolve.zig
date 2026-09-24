@@ -1,5 +1,5 @@
 //! Resolved values — things nilo works out from the request before the
-//! handler runs, chief among them the signed-in user (ADR 0016).
+//! handler runs, chief among them the signed-in user (ADR 015).
 //!
 //! A type says how it is worked out, by carrying the function that does it:
 //!
@@ -21,7 +21,7 @@
 //! fn me(user: CurrentUser) !Profile { ... }   // and that is the whole wiring
 //! ```
 //!
-//! This is ADR 0009's one admitted gap: middleware can reject a request but
+//! This is ADR 008's one admitted gap: middleware can reject a request but
 //! cannot hand the handler the user it just looked up. The shape refused
 //! there was a `c.locals` map — untyped state smuggled in through the side
 //! door — and this is the shape taken instead. The value is *declared*, not
@@ -39,7 +39,7 @@
 //! Worked out **once per request** and shared by everyone who asks, so a
 //! middleware guarding a prefix and a handler taking the value do not
 //! authenticate twice. A request that asks for none of this allocates
-//! nothing and runs the code it ran before (ADR 0018).
+//! nothing and runs the code it ran before (ADR 017).
 
 const std = @import("std");
 const naming = @import("names.zig");
@@ -127,7 +127,7 @@ fn valueWithin(comptime V: type, comptime being_resolved: []const type, c: *Ctx)
 
 /// Every service the chain behind `V` needs, so a service used only by a
 /// resolver is still caught by `listen()` rather than by the first request
-/// that touches that route (ADR 0006).
+/// that touches that route (ADR 005).
 pub fn requirements(comptime V: type, comptime route: []const u8) []const service_mod.Requirement {
     comptime {
         const nothing: []const type = &.{};
@@ -167,7 +167,7 @@ const Role = enum { ctx, service, arena, resolved };
 
 /// Everything that has to be true of `V` before it can be worked out, said
 /// while compiling. The check runs before anything else in both entry
-/// points, so a mistake here is never a runtime surprise (ADR 0015: the
+/// points, so a mistake here is never a runtime surprise (ADR 014: the
 /// failure mode to avoid is a wall of errors from four frames down).
 fn checkResolvable(comptime V: type, comptime being_resolved: []const type) void {
     comptime {
@@ -343,7 +343,7 @@ const Standin = struct {
         };
     }
 
-    /// Fail functions write into the box bound to the fiber (ADR 0007), and
+    /// Fail functions write into the box bound to the fiber (ADR 006), and
     /// there is no fiber here — so the fallback slot stands in for one, the
     /// same way `App.handleRequest` sets it up for a test.
     fn start(self: *Standin) void {

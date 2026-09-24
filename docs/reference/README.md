@@ -7,8 +7,7 @@ For what any of it is *for*, see [the guide](../guide/); for a name, the
 ## The modules
 
 Eleven ship, and a project links only what it imports
-([ADR 0041](../adr/0041-a-module-sits-where-the-loop-puts-it.md),
-[ADR 0042](../adr/0042-the-bottom-layer-holds-more-than-one-module.md)).
+([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)).
 
 | | | |
 |---|---|---|

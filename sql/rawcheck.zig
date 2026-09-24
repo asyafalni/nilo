@@ -1,5 +1,5 @@
 //! Reading the `SELECT` list of a statement this module did not write, while
-//! compiling ([ADR 0148](../docs/adr/0148-a-raw-statement-is-counted-while-compiling.md)).
+//! compiling ([ADR 051](../docs/adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)).
 //!
 //! `db.raw` fills a Row **by position**, and until its text was comptime that
 //! was the whole of the contract: a `SELECT` list and a struct agreeing by
@@ -22,14 +22,14 @@
 //!
 //! **What it cannot check is types**, because a comptime pass has no schema.
 //! That is what `db.checking` is for, and the two halves are different
-//! (ADR 0148 argues why closing only one of them is still worth doing).
+//! (ADR 051 argues why closing only one of them is still worth doing).
 
 const std = @import("std");
 /// For `asText` alone: which Row fields are read as the text the database
-/// printed, and therefore have to be asked for that way (ADR 0154).
+/// printed, and therefore have to be asked for that way (ADR 124).
 const types = @import("types.zig");
 /// For `columnsOf`: which of the Row's fields a statement fills, which is
-/// every one but those carried beside the columns (ADR 0217).
+/// every one but those carried beside the columns (ADR 178).
 const row_mod = @import("row.zig");
 
 /// What one pass over a statement found.
@@ -43,7 +43,7 @@ pub const List = struct {
     /// The text of each column, trimmed, in the same order — what the caller
     /// actually wrote, alias and all. `names` is what it is *called*; this is
     /// what it *is*, and a text column has to be asked for as text
-    /// ([ADR 0154](../docs/adr/0154-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
+    /// ([ADR 124](../docs/adr/124-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
     exprs: []const []const u8,
     /// Whether a `*` stands at the top level of the list. Reported rather than
     /// folded into `count = null`, because a `*` is countable by the database
@@ -101,14 +101,14 @@ pub fn scan(comptime sql: []const u8) List {
         // `*` cannot be counted: how many columns it stands for is the
         // database's answer, not this file's. It is still reported, because
         // what a `*` cannot do is carry a cast, and that is a different
-        // question from how many columns it stands for (ADR 0154).
+        // question from how many columns it stands for (ADR 124).
         if (starred) break :blk .{ .count = null, .names = &.{}, .exprs = &.{}, .starred = true };
         break :blk .{ .count = n, .names = names, .exprs = exprs, .starred = false };
     };
 }
 
 /// Hold a raw statement against the Row it fills, while compiling
-/// ([ADR 0148](../docs/adr/0148-a-raw-statement-is-counted-while-compiling.md)).
+/// ([ADR 051](../docs/adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)).
 ///
 /// `call` is the name the caller reads in the message — `db.raw` or `tx.raw`
 /// — because the wrong one sends somebody looking at the wrong line.
@@ -126,7 +126,7 @@ pub fn assertList(
     comptime {
         assertFlat(Row, call);
         // The framework's own walk, paid for by the framework
-        // ([ADR 0157](../docs/adr/0157-a-check-pays-for-its-own-branches.md)).
+        // ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)).
         // `scan` sizes its own; what this covers is the two comparisons per
         // column below and the `comptimePrint` a refusal builds, both of which
         // are spent out of the caller's budget for every raw statement in the
@@ -162,7 +162,7 @@ pub fn assertList(
 }
 
 /// `assertList` for a statement read into **one value** rather than a Row
-/// ([ADR 0234](../docs/adr/0234-a-scalar-out-of-raw.md)): the list, when it
+/// ([ADR 125](../docs/adr/125-a-row-that-owns-no-table.md)): the list, when it
 /// can be counted, is one column. Nothing to match a name against, and no
 /// cast to check — a scalar has no field for a `::text` to have been left
 /// off.
@@ -184,7 +184,7 @@ pub fn assertOne(
     }
 }
 
-/// **A shaped Row is filled from a statement this module wrote** (ADR 0295):
+/// **A shaped Row is filled from a statement this module wrote** (ADR 218):
 /// its parents from columns named for their path, its children from a second
 /// statement keyed by the first. Neither is something a statement handed in
 /// can promise, so a raw call takes a flat Row, and a join written by hand
@@ -199,7 +199,7 @@ pub fn assertFlat(comptime Row: type, comptime call: []const u8) void {
 }
 
 /// The Row's fields a statement fills, in order: every one but those carried
-/// beside the columns (ADR 0217).
+/// beside the columns (ADR 178).
 fn columnFields(comptime Row: type) []const std.builtin.Type.StructField {
     comptime {
         const all = @typeInfo(Row).@"struct".fields;
@@ -217,10 +217,10 @@ fn columnFields(comptime Row: type) []const std.builtin.Type.StructField {
 
 /// Hold the columns a **text column** is filled from against the one thing
 /// they have to be: asked for as text
-/// ([ADR 0154](../docs/adr/0154-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
+/// ([ADR 124](../docs/adr/124-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
 ///
 /// A text column — `Decimal`, `Interval`, `Inet`, and anything a project
-/// declared the same way with `AsText` (ADR 0055) — is read as the text the
+/// declared the same way with `AsText` (ADR 049) — is read as the text the
 /// database printed. In every statement this module writes, the Dialect adds
 /// the cast that makes that true. In a statement it did not write, nobody
 /// does: the driver hands over whatever wire format it chose, and `nilo_read`
@@ -254,7 +254,7 @@ fn assertCasts(
                 // type**, and that is not only for reading: `@typeName` of an
                 // `AsText` renders as `types.AsText("numeric"[0..7])`, and the
                 // build step matches the whole first line of a refusal
-                // (ADR 0027), so a message ending in a compiler rendering
+                // (ADR 026), so a message ending in a compiler rendering
                 // detail is a check that breaks when the rendering changes.
                 @compileError(std.fmt.comptimePrint(
                     "nilo: the statement handed to `{s}` selects `*`, and field {d} of {s} is " ++
@@ -314,7 +314,7 @@ fn assertCasts(
 
 /// `assertList` for a statement read as a **page**: the Row's columns and
 /// one more on the end, the `count(*) OVER ()` that `db.rawPage` reads the
-/// total from ([ADR 0279](../docs/adr/0279-a-raw-statement-can-carry-its-total.md)).
+/// total from ([ADR 205](../docs/adr/205-a-raw-statement-can-carry-its-total.md)).
 /// The names are checked against the fields as before; the last column is
 /// counted and nothing else, because `count(*) OVER () AS total` and a bare
 /// window are both fine and this file cannot tell them apart.
@@ -372,7 +372,7 @@ fn plural(comptime n: usize) []const u8 {
 // ---- parameters ----
 
 /// The highest `$n` in a statement, or null when it has none
-/// ([ADR 0278](../docs/adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+/// ([ADR 204](../docs/adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
 ///
 /// The same walk `scan` does, quotes and comments skipped, reading `$`
 /// followed by digits at a word boundary. A `$` inside a literal is text,
@@ -414,7 +414,7 @@ fn paramAt(comptime sql: []const u8, comptime i: usize) ?struct { n: usize, end:
 }
 
 /// The statement with every `$n` respelled the way `D` spells its `n`th
-/// placeholder ([ADR 0278](../docs/adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+/// placeholder ([ADR 204](../docs/adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
 ///
 /// **Why a rewrite and not a rule.** `$1` is what the Postgres guide has
 /// always shown, and on SQLite `$1` is a *named* parameter whose index is
@@ -451,7 +451,7 @@ pub fn spelled(comptime D: type, comptime sql: []const u8) []const u8 {
 }
 
 /// Hold the values handed to a raw call against the `$n` its text names
-/// ([ADR 0278](../docs/adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+/// ([ADR 204](../docs/adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
 ///
 /// The rule is Postgres's own, said while compiling: the placeholders are
 /// `$1` up to `$n` with no gap, and there are `n` values. On Postgres a
@@ -659,7 +659,7 @@ fn aliasAt(comptime text: []const u8) ?usize {
 }
 
 /// The column with its `AS name` taken off — what the database is actually
-/// being asked for, which is the half a cast would be in (ADR 0154).
+/// being asked for, which is the half a cast would be in (ADR 124).
 fn beforeAlias(comptime column: []const u8) []const u8 {
     comptime {
         const at = aliasAt(column) orelse return column;
@@ -905,7 +905,7 @@ test "a RETURNING inside brackets leaves the outer SELECT as the list" {
     try testing.expectEqualStrings("id", found.names[0]);
 }
 
-// ---- parameters (ADR 0278) ----
+// ---- parameters (ADR 204) ----
 
 /// Two dialects for the tests below, spelled the way the real ones spell a
 /// placeholder and nothing else: `rawcheck` reads one function off a

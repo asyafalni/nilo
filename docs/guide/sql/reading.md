@@ -77,7 +77,7 @@ and `.not_like` are Refusals naming `.ilike` and `.not_ilike`: that
 database's `LIKE` folds ASCII case and cannot be told not to by a
 statement, so the case-sensitive spelling would have matched more than it
 said, on one database only — the same reason `.contains` is refused there
-([ADR 0263](../../adr/0263-like-on-sqlite-is-refused-the-way-contains-is.md)).
+([ADR 055](../../adr/055-the-second-dialect-is-the-test-of-the-seam.md)).
 
 ### A null is written, never held
 
@@ -121,7 +121,7 @@ else
 Only the value you write is judged. A `?[]const u8` column compared against a
 plain `[]const u8` is an ordinary condition, and so is every `.set` and every
 `insert` — `SET handle = $1` with NULL in it means exactly one thing
-([ADR 0044](../../adr/0044-a-condition-holds-a-value-not-a-maybe.md)).
+([ADR 040](../../adr/040-a-condition-holds-a-value-not-a-maybe.md)).
 
 ## A filter nobody set
 
@@ -132,7 +132,7 @@ other matches every one.
 
 `sql.given` is that, and it is a word rather than an optional so the two stay
 tellable apart
-([ADR 0183](../../adr/0183-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)):
+([ADR 149](../../adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)):
 
 <!-- compiles: body -->
 ```zig
@@ -182,7 +182,7 @@ The join came out of `PartnerCapability`'s `.references`. It is read off
 either Row, so the same question from the other side — the capability rows
 whose partner matches, where the key is `partner_id` on the Row the statement
 is over — is the same line with the two swapped
-([ADR 0214](../../adr/0214-an-exists-reads-the-reference-from-either-side.md)):
+([ADR 175](../../adr/175-an-exists-reads-the-reference-from-either-side.md)):
 
 <!-- compiles: body -->
 ```zig
@@ -206,7 +206,7 @@ table.
 absent value sits on every column, and the whole bracket should drop as one —
 which is `.across`, one condition tested against each column it names, with
 **one parameter** taken once and named on every column
-([ADR 0211](../../adr/0211-one-condition-over-several-columns-is-one-parameter.md)):
+([ADR 172](../../adr/172-one-condition-over-several-columns-is-one-parameter.md)):
 
 <!-- compiles: body -->
 ```zig
@@ -307,7 +307,7 @@ SELECT "id", "status", count(*) OVER () FROM "orders"
 `db.select` is two statements against a table somebody else can write between,
 so the screen says *"20 of 47"* while holding 20 of 46 and nothing says so.
 `count(*) OVER ()` rides on the page and cannot come apart from it
-([ADR 0185](../../adr/0185-a-page-knows-what-it-left-out.md)). It costs one integer
+([ADR 150](../../adr/150-a-page-knows-what-it-left-out.md)). It costs one integer
 read per statement rather than per row: the window function answers the same
 number on every row, so only the first is read.
 
@@ -324,7 +324,7 @@ one statement. `tx.page` is the same call inside a transaction.
 `.order = .{ .id = .asc }` is settled while compiling. A list sorted from its
 column headings is not, and the way to let a request choose without letting a
 request write SQL is to declare the set it chooses from
-([ADR 0204](../../adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)):
+([ADR 165](../../adr/165-an-order-chosen-at-run-time-from-a-closed-set.md)):
 
 <!-- compiles -->
 ```zig
@@ -405,7 +405,7 @@ second.
 
 `DISTINCT` is not part of this and is not coming: over one table with a key
 every row appears once anyway, which is the same argument
-[ADR 0058](../../adr/0058-a-set-operation-over-one-table-is-a-condition.md)
+[ADR 052](../../adr/052-a-set-operation-over-one-table-is-a-condition.md)
 makes for `UNION`.
 
 ## Why writing the limit out is worth it
@@ -429,7 +429,7 @@ held until the request ends. The number you wrote is believed.
 
 What a call actually asks the `Ctx` for is two calls — `arena()` and `str()` — so
 what it takes is a **Scope**, and a `*Ctx` is one
-([ADR 0041](../../adr/0041-a-module-sits-where-the-loop-puts-it.md)). Where there
+([ADR 038](../../adr/038-a-module-sits-where-the-loop-puts-it.md)). Where there
 is no request there is `nilo.Run`, which owns an arena and a lifetime of its
 own:
 
@@ -447,7 +447,7 @@ Same query, same rows, no server in the process.
 pool is opened by `nilo_start`, and until something calls it every query answers
 `error.Disconnected` — so a script, a migration, or a test needs one more line
 than the snippet above
-([ADR 0079](../../adr/0079-there-is-a-phase-before-the-server.md)):
+([ADR 180](../../adr/180-work-that-needs-the-services-runs-on-their-loop.md)):
 
 <!-- compiles: body -->
 ```zig
@@ -462,7 +462,7 @@ defer run.deinit();
 Inside a program that also serves, the same work goes in `app.before`, which
 `listen()` runs on the server's own loop after the pools are open and before
 the first request
-([ADR 0220](../../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)):
+([ADR 180](../../adr/180-work-that-needs-the-services-runs-on-their-loop.md)):
 
 <!-- compiles -->
 ```zig
@@ -489,7 +489,7 @@ machine has to do it.
 `app.start(io)` — services checked, pools open on an `Io` of yours — is for a
 program that never listens: a test through `testing.Client`, a script. Followed
 by `listen()` it is refused, because a pool dialled through one loop cannot be
-driven from another (ADR 0220).
+driven from another (ADR 180).
 
 
 ## Streaming a result set too big to hold

@@ -2,7 +2,7 @@
 //! message used to offer one fix — make one of them a `*Service` — and that
 //! sent somebody with a `Uuid` argument to write `*Uuid`. A type that parses
 //! itself is the third answer, and this is the route where it is the right
-//! one (ADR 0142).
+//! one (ADR 113).
 
 const nilo = @import("nilo_http");
 

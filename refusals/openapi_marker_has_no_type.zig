@@ -1,5 +1,5 @@
 //! A type that writes its own JSON and says so wrong. `nilo_openapi` exists to
-//! name the JSON the custom writer sends (ADR 0076), and `type` is the one
+//! name the JSON the custom writer sends (ADR 016), and `type` is the one
 //! thing it has to carry — without it nothing has been said.
 
 const nilo = @import("nilo_http");

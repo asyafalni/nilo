@@ -104,7 +104,7 @@ surprise:
 | `tx.deadline(ms)` | a deadline has to be enforced by the database, and there is no server. `busy_timeout_ms` covers the case that actually happens |
 | a `[]const T` column | no array type. A list belongs in its own table, or in a TEXT column your own code encodes |
 | `.isolation` below `.serializable` | SQLite gives every transaction a snapshot and serialises the writers. There is nothing weaker to ask for |
-| `.like`, `.not_like`, `.contains`, `.starts_with`, `.ends_with` | its `LIKE` folds ASCII case and cannot be told not to by a statement, so a case-sensitive match would depend on how the file was opened. Each Refusal names the folding spelling — `.ilike`, `.icontains` — which is what this database does ([ADR 0263](../../adr/0263-like-on-sqlite-is-refused-the-way-contains-is.md)) |
+| `.like`, `.not_like`, `.contains`, `.starts_with`, `.ends_with` | its `LIKE` folds ASCII case and cannot be told not to by a statement, so a case-sensitive match would depend on how the file was opened. Each Refusal names the folding spelling — `.ilike`, `.icontains` — which is what this database does ([ADR 055](../../adr/055-the-second-dialect-is-the-test-of-the-seam.md)) |
 
 **So a program that batches does not compile against both.** That is the seam
 refusing rather than quietly doing something else, and it is worth knowing
@@ -124,14 +124,14 @@ the thirty-six hyphenated characters into a TEXT column — which is what
 `sqlite3` shows you and what `WHERE public = '…'` takes. Postgres still sends
 sixteen bytes. Your Row says `public: sql.Uuid` either way, and neither the
 insert nor the read changes
-([ADR 0078](../../adr/0078-a-uuid-is-whatever-the-database-stores.md)).
+([ADR 067](../../adr/067-a-value-is-whatever-the-database-stores.md)).
 
 **A `sql.Json(T)` column, an enum column and `.in` are not on it either**, and
 for a while they were on it in practice without being written down: SQLite has
 no `jsonb` and no enum type, so each of the three binds as text, and `.in` binds
 its whole list as one JSON array that `json_each` reads. Your Row and your
 condition are the same on both
-([ADR 0119](../../adr/0119-the-sqlite-write-path-is-compiled.md)). `.in` is the
+([ADR 067](../../adr/067-a-value-is-whatever-the-database-stores.md)). `.in` is the
 one that costs something here — one arena allocation per condition, on SQLite
 only — because the array has to be written out where Postgres sends a native
 one.
@@ -154,7 +154,7 @@ written against the Postgres examples are these. The
 *first* value. nilo respells `$n` as `?n` while compiling, for every call
 that takes comptime text, so a statement written for Postgres binds by
 number here too and one text serves both
-([ADR 0278](../../adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+([ADR 204](../../adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
 `db.exec` takes run-time text and sends it as written; its statements are
 DDL, which has no parameters.
 

@@ -1,7 +1,7 @@
 //! Two columns of the same type, the other way round from the Row's fields.
 //! `db.raw` fills by position, so both decode cleanly and every row answers
 //! wrong — there is no run-time symptom at all. On a schema with 145 `uuid`
-//! columns that is the mistake worth catching while compiling (ADR 0148).
+//! columns that is the mistake worth catching while compiling (ADR 051).
 
 const std = @import("std");
 const nilo = @import("nilo_http");

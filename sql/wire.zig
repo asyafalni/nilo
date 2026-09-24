@@ -1,6 +1,6 @@
 //! The half that speaks to the database — the entire contract this module
 //! asks of a driver, listed here the way `bulkhead.zig` lists the Engine's
-//! (ADR 0039).
+//! (ADR 036).
 //!
 //! **This is not a Bulkhead, and the difference is worth stating.** The
 //! Bulkhead is a wall: user code never names zio, and exactly one file does.
@@ -9,7 +9,7 @@
 //! it. Calling this a Bulkhead would promise a guarantee it does not make. It
 //! is a seam inside this module, for this module's own use.
 //!
-//! What it buys is the thing ADR 0002 bought by fitting its seam before it was
+//! What it buys is the thing ADR 001 bought by fitting its seam before it was
 //! needed: pg.zig is a fork maintained by the same person as zio, which is
 //! already the project's first standing risk. If it stops, one file is
 //! rewritten rather than every call site.
@@ -19,24 +19,24 @@
 //! - `open(io, gpa, url, opts)` / `close()` — build a pool that dials
 //!   through the given event loop, and take it down. The `std.Io` is the
 //!   whole reason a `Db` is built in two halves: it does not exist until
-//!   `listen()` has started the loop (ADR 0040).
+//!   `listen()` has started the loop (ADR 037).
 //! - `run(arena, sql, values, plan, problem)` — a statement and its
 //!   parameters, in placeholder order, giving back something rows can be
 //!   pulled from one at a time. The arena is the request's, and is where the
 //!   driver reads into when a row does not fit its own buffer — so a big row
 //!   costs the request arena rather than the general allocator, and is freed
-//!   by the reset that ends the request (ADR 0004).
+//!   by the reset that ends the request (ADR 003).
 //!
 //!   `plan` is the name to keep this statement prepared under on the
 //!   connection, or **null for do not keep it**. Null is not a hint: it is
 //!   the answer for `db.raw`, whose text arrives at run time, and a Wire that
 //!   cached it anyway would grow a map with traffic instead of with the
-//!   program (ADR 0057). Everything else hands over a name derived from the
+//!   program (ADR 051). Everything else hands over a name derived from the
 //!   statement, which is a comptime constant and therefore so is the name.
 //!
 //!   `problem` is where the failure's own words go — a `?*?Problem`, filled
 //!   only when the statement fails and only when somebody passed a slot for
-//!   it ([ADR 0146](../docs/adr/0146-a-statement-that-failed-says-what-the-database-said.md)).
+//!   it ([ADR 117](../docs/adr/117-a-statement-that-failed-says-what-the-database-said.md)).
 //!   An out-parameter rather than a richer error, because the error set is
 //!   what a handler switches on and a set that grows breaks every switch:
 //!   the seven stay, and the text rides beside them. Null is what a caller
@@ -50,14 +50,14 @@
 //!   position. By position and not by name because the caller wrote the
 //!   `SELECT` list itself and therefore already knows the order at compile
 //!   time; a name lookup would be paying at run time for something that
-//!   stopped being a question while compiling (ADR 0039).
+//!   stopped being a question while compiling (ADR 036).
 //! - `width(rows)` — how many columns the row `next` stopped on has. Asked
 //!   **once per statement, on the first row**, so that a `SELECT` list
 //!   shorter than the Row is an error rather than an index past the end of
 //!   the driver's own array. pg.zig's `Row.get` is `self.values[col]` with no
 //!   bound on `col`, which is a panic in ReleaseSafe and undefined in
-//!   ReleaseFast — the failure ADR 0008 says nilo cannot recover from, for
-//!   one request's mistake (ADR 0134).
+//!   ReleaseFast — the failure ADR 007 says nilo cannot recover from, for
+//!   one request's mistake (ADR 106).
 //!
 //!   On the first row rather than on the result set, and that is the two
 //!   drivers disagreeing rather than a preference: zqlite's `columnCount` is
@@ -109,7 +109,7 @@
 //!   statement otherwise takes every statement around it with it.
 //! - `Tx.deadline(ms)` — bound how long the statements after it may run,
 //!   for as long as this transaction lasts. **On the Tx rather than on the
-//!   Wire, and that is the design rather than a limitation** (ADR 0047): a
+//!   Wire, and that is the design rather than a limitation** (ADR 043): a
 //!   deadline has to be set on the same connection the statement will travel
 //!   down, and holding one connection across two statements is the whole of
 //!   what a transaction is. A Wire whose `run` takes a fresh connection each
@@ -157,7 +157,7 @@ const types_mod = @import("types.zig");
 
 /// What a Wire may fail with. Deliberately short: this module turns these
 /// into errors a handler can read, and a long list here would be a long list
-/// there (ADR 0039).
+/// there (ADR 036).
 pub const Error = error{
     /// A unique constraint was violated. The one error given a default answer
     /// — 409 — because it is the one whose meaning does not change with the
@@ -165,7 +165,7 @@ pub const Error = error{
     AlreadyExists,
     /// A foreign key was violated — a row this statement names is not there,
     /// or a row it removes is still named by another
-    /// ([ADR 0184](../docs/adr/0184-a-failure-belongs-to-the-call-that-caused-it.md)).
+    /// ([ADR 117](../docs/adr/117-a-statement-that-failed-says-what-the-database-said.md)).
     ///
     /// **The one class-23 failure that is routinely a race rather than a bug**,
     /// and the reason it has a name of its own: a delete guarded by a count is
@@ -211,19 +211,19 @@ pub const Error = error{
     /// 200 with less in it for a page that has a fallback.
     TimedOut,
     /// The database said no in a way this module does not translate. The text
-    /// is logged; it does not reach the client (ADR 0025).
+    /// is logged; it does not reach the client (ADR 024).
     QueryFailed,
 };
 
 /// What the database said about a statement it refused
-/// ([ADR 0146](../docs/adr/0146-a-statement-that-failed-says-what-the-database-said.md)).
+/// ([ADR 117](../docs/adr/117-a-statement-that-failed-says-what-the-database-said.md)).
 ///
 /// **The error set above is what a handler switches on, and this is the half
 /// no program could reach.** `error.QueryFailed` was the whole debugging
 /// surface for a failed statement: the text went to `std.log.err` and nowhere
 /// else, so an operator with a log reader had it and a program did not. A
 /// watcher gets one of these on `Sent.problem`; it still never reaches the
-/// client, which is ADR 0025's rule and this does not move it.
+/// client, which is ADR 024's rule and this does not move it.
 ///
 /// **Every field is copied into the arena the statement ran with**, because
 /// the strings come off the driver's connection and the connection goes
@@ -312,14 +312,14 @@ pub const OpenOpts = struct {
     size: u16 = 10,
     /// How many connections to dial while opening. Zero means the pool is
     /// created without reaching the database at all, which is what lets a
-    /// server boot with Postgres switched off (ADR 0039).
+    /// server boot with Postgres switched off (ADR 036).
     connect_on_init: u16 = 0,
     /// How long a caller may wait for a connection out of the pool before it
     /// gives up with `TimedOut`. Zero is no bound at all.
     ///
     /// **It is about the queue rather than about the statement.** Postgres
     /// hands it to pg.zig's own pool; SQLite has to bound its own wait, and
-    /// until ADR 0135 it did not bound it at all — `takeWriter` waited on a
+    /// until ADR 107 it did not bound it at all — `takeWriter` waited on a
     /// `std.Io.Condition` with no deadline, so a fiber queueing for the one
     /// writer waited for as long as the process lived.
     timeout_ms: u32 = 10 * std.time.ms_per_s,
@@ -328,7 +328,7 @@ pub const OpenOpts = struct {
     ///
     /// A Wire cannot bound a wait on its own: `std.Io.Condition` has no timed
     /// wait, and the way nilo stops a fiber is the Engine's timer wheel
-    /// reaching it as a cancellation (`core/limits.zig`, ADR 0065). So the
+    /// reaching it as a cancellation (`core/limits.zig`, ADR 056). So the
     /// bound arrives the same way `fetch`'s does, and under
     /// `std.Io.Threaded` — a test with no server around it — there is nothing
     /// that can cancel a fiber and the wait is unbounded exactly as it was.
@@ -346,7 +346,7 @@ pub const OpenOpts = struct {
 /// conversion each way and which nothing anywhere pointed at.
 ///
 /// **A struct rather than a second protocol beside `nilo_column`.** That
-/// protocol is text on the wire by definition (ADR 0055): it hands the driver
+/// protocol is text on the wire by definition (ADR 049): it hands the driver
 /// a `[]const u8` and casts it back to the named type, which is precisely what
 /// bytes must not do. So this is one more type both Wires know by name, the
 /// way `Uuid` and `Timestamp` already are — no new mechanism, one more row in
@@ -386,7 +386,7 @@ pub const Column = struct {
     /// with `schema_mismatch_is_fatal` at its default that is a server that
     /// does not start. Answering `false` would claim something nobody checked.
     /// So there are three answers and the check skips the third
-    /// ([ADR 0056](../docs/adr/0056-a-view-is-a-table-that-cannot-say-what-is-not-null.md)).
+    /// ([ADR 050](../docs/adr/050-a-view-or-a-rowid-alias-is-not-a-nullable-column.md)).
     nullable: ?bool,
 };
 
@@ -429,7 +429,7 @@ pub const Fake = struct {
     last_sql: []const u8 = "",
     /// Where that text is kept. A statement nilo wrote is a constant, but one
     /// an `Ordering` chose is assembled in the request's arena and gone with
-    /// it (ADR 0204), so the Fake copies rather than points.
+    /// it (ADR 165), so the Fake copies rather than points.
     copied: [1024]u8 = undefined,
     /// The name the last statement asked to be kept under, or null when it
     /// asked not to be. `db.raw` is the one that asks not to be, and a test
@@ -442,7 +442,7 @@ pub const Fake = struct {
     /// How many columns a result set says it has, or **null for as many as
     /// the Row asks for**. Null rather than a number so that a Fake set up
     /// before this existed goes on answering every Row it is given; a test
-    /// that wants the short `SELECT` list of ADR 0134 names the number.
+    /// that wants the short `SELECT` list of ADR 106 names the number.
     columns_back: ?usize = null,
     /// What every text column answers with. A field rather than a literal
     /// because a column whose bytes have to *mean* something — an enum's tag
@@ -465,7 +465,7 @@ pub const Fake = struct {
     kept: usize = 0,
     /// How many times a result set was given back. **Counted rather than
     /// flagged**, because `Rows.drained` cannot tell one drain from two and
-    /// the second one is the whole subject of ADR 0117: on a real Wire it is
+    /// the second one is the whole subject of ADR 093: on a real Wire it is
     /// a pool connection released twice.
     drains: usize = 0,
     /// What this Fake refuses every statement with, or null to answer them.
@@ -473,7 +473,7 @@ pub const Fake = struct {
     /// The one thing a Fake can say about a failure that a real database
     /// cannot be made to say on demand: *the driver said this*. It is what
     /// lets the path from a Wire's `problem` out-parameter to `Sent.problem`
-    /// be tested with nothing installed (ADR 0146).
+    /// be tested with nothing installed (ADR 117).
     refuses: ?Problem = null,
 
     pub const Rows = struct {

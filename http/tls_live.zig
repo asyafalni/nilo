@@ -14,7 +14,7 @@
 //! file under `@import("nilo_build").tls`, and `build.zig` sets that for the
 //! repository's own http test root whether or not `-Dtls` was passed, so the
 //! feature is held by `zig build test` and not by whoever remembers a flag
-//! ([ADR 0288](../docs/adr/0288-tls-is-an-option-a-build-asks-for.md)).
+//! ([ADR 212](../docs/adr/212-tls-is-an-option-a-build-asks-for.md)).
 //!
 //! Every port is 0 and read back, the way `live.zig` does it. The
 //! certificate is `testdata/tls/localhost.pem`, a self-signed ECDSA P-256
@@ -220,7 +220,7 @@ test "a TLS connection kept alive answers again after idling past the peek, on t
     const first = try client.ask(gpa, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     defer gpa.free(first);
     // Longer than the 200ms peek a connection between requests waits before
-    // it gives its pages back (ADR 0071). What is being checked is that the
+    // it gives its pages back (ADR 062). What is being checked is that the
     // record layer under those pages is still a record layer afterwards:
     // the release must not have discarded a byte the next record needs.
     try std.Io.sleep(io, .fromMilliseconds(450), .awake);
@@ -278,7 +278,7 @@ test "plain HTTP sent to a TLS port is refused rather than answered" {
     // record's length from the first bytes before it looks at what they
     // are, so "GET /" is taken as a 12 KB record that never finishes rather
     // than refused on sight; the deadline is what turns that into a hang-up
-    // rather than a fiber held for ever (ADR 0288, the section on what the
+    // rather than a fiber held for ever (ADR 212, the section on what the
     // library does not do yet).
     var serving: ServingTls = .{ .app = &app, .header_timeout_ms = 200 };
     const thread = try std.Thread.spawn(.{}, ServingTls.run, .{&serving});
@@ -361,7 +361,7 @@ test "a stop comes back with an idle TLS connection still open, within the idle 
 /// The shape a server behind no proxy actually wants, and the one the
 /// benchmark arena's profiles ask for: **HTTPS and cleartext at the same
 /// time, from one process, over one set of routes**
-/// ([ADR 0289](../docs/adr/0289-a-server-answers-on-more-than-one-address.md)).
+/// ([ADR 213](../docs/adr/213-a-server-answers-on-more-than-one-address.md)).
 ///
 /// TLS on the listener `Options` itself names, because that is the one
 /// `boundPort()` answers for and the client below needs a number. The

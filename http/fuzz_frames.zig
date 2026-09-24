@@ -1,5 +1,5 @@
 //! What the gRPC listener has to be true for, whatever a stranger sends it
-//! ([ADR 0297](../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+//! ([ADR 220](../docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md)).
 //!
 //! `fuzz.zig` holds the HTTP/1.1 parser to its properties; this holds the
 //! other thing a stranger feeds directly, a connection speaking HTTP/2. The

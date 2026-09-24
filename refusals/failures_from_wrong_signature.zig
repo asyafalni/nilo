@@ -1,5 +1,5 @@
 //! A `nilo_failure` that can fail. The failure path must not have a failure
-//! path of its own (ADR 0025), so the function that fills the struct is given
+//! path of its own (ADR 024), so the function that fills the struct is given
 //! the status and the sentence and hands the struct back, and nothing else.
 
 const nilo = @import("nilo_http");

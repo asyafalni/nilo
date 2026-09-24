@@ -1,9 +1,9 @@
 //! What a WebSocket connection costs while nobody is typing.
 //!
-//! [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md) measured
+//! [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md) measured
 //! memory per idle connection for **HTTP** keep-alive and found two things: a
 //! floor — 8,767 bytes then, 4,669 since
-//! [ADR 0071](../docs/adr/0071-where-a-connection-waits-is-what-it-costs.md) —
+//! [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md) —
 //! and a handler that adds every byte of stack it ever touched. Neither number
 //! was ever taken for a WebSocket, and the WebSocket path differs in one way
 //! that should matter: a socket is parked somewhere the request loop's idle
@@ -21,7 +21,7 @@
 //! ## Five routes, because a number needs something standing next to it
 //!
 //! - `/health` — HTTP, a constant `[]const u8`, no `Ctx`, no upgrade. The
-//!   floor ADR 0063 already published, re-taken on this binary so the
+//!   floor ADR 062 already published, re-taken on this binary so the
 //!   WebSocket rows are compared against a number from the same run rather
 //!   than a number from another document.
 //! - `/ws/small` — upgrade, the default 16 KiB ceiling, echo. The ordinary
@@ -31,7 +31,7 @@
 //!   anything, which `VmRSS` says it should not: pages are counted when they
 //!   are touched, and a 6-byte message touches one of them.
 //! - `/ws/deep` — 64 KiB of stack touched once inside the loop, before the
-//!   first `receive`. ADR 0063's `/deep/:id` control, on this path, and the
+//!   first `receive`. ADR 062's `/deep/:id` control, on this path, and the
 //!   one cost the framework still cannot give back: the frame holding it is
 //!   live for as long as the loop is.
 //! - `/ws/idle` — nothing is ever sent to it. What the handshake alone costs,
@@ -87,7 +87,7 @@ fn wsBig(c: *nilo.Ctx) !void {
 /// 64 KiB touched on the handler's own stack and then finished with. The
 /// control that keeps the rest honest: it is the one cost the framework still
 /// cannot give back, because the frame holding it stays live for as long as
-/// the loop does (ADR 0063).
+/// the loop does (ADR 062).
 fn wsDeep(c: *nilo.Ctx) !void {
     return c.upgradeWith(deepEcho, {}, .{ .idle_ms = idle_ms });
 }

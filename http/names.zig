@@ -11,7 +11,7 @@
 //! to be a table of `file.Type` substrings, which matched on the reader's file
 //! name exactly as readily as on nilo's: an application with `src/room.zig` in
 //! it was told its `Room` was `nilo.Room`, which is this file's own failure
-//! running backwards ([ADR 0122](../docs/adr/0122-a-type-says-its-own-name.md)).
+//! running backwards ([ADR 074](../docs/adr/074-a-type-says-its-own-name.md)).
 //! Nothing in a name can tell the two apart — `@typeName` spells a type as its
 //! path from *its own module's root*, so a project rooted at `src/main.zig`
 //! spells a sibling's type `room.Room`, byte for byte what nilo spells its own.
@@ -85,7 +85,7 @@ fn declared(comptime T: type) ?[]const u8 {
 ///
 /// The question `http.zig`'s suite asks of every type this module exports, so
 /// that a new one shipped without a name is a compile error rather than a
-/// message naming a file the reader never imported (ADR 0095).
+/// message naming a file the reader never imported (ADR 074).
 pub fn covers(comptime T: type) bool {
     comptime {
         return ours(T) != null;
@@ -107,7 +107,7 @@ test "a nilo type is named the way the import line names it" {
 }
 
 test "a type of the reader's own keeps the file they wrote it in" {
-    // The whole of ADR 0122 in two lines: these two types are spelled the same
+    // The whole of ADR 074 in two lines: these two types are spelled the same
     // way by `@typeName` in a real project, and only one of them is nilo's.
     try testing.expectEqualStrings(@typeName(TheirRoom), comptime of(TheirRoom));
     try testing.expect(!comptime covers(TheirRoom));

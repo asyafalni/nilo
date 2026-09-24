@@ -5,7 +5,7 @@
 //! fetch-check -Dnetwork` points `zig build --fetch` at it with an empty
 //! package cache and asserts that only zio landed — which is the claim
 //! `build.zig.zon` makes about `.lazy = true` and which was false for a year
-//! (ADR 0075). Four lines is the whole of it because the fetch happens while
+//! (ADR 066). Four lines is the whole of it because the fetch happens while
 //! *configuring* the build; nothing here has to compile for the check to mean
 //! something.
 

@@ -1,5 +1,5 @@
 //! A key set that rotates under its readers
-//! ([ADR 0255](../docs/adr/0255-a-key-set-is-swapped-whole-and-freed-after-its-readers.md)).
+//! ([ADR 111](../docs/adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 //!
 //! ```zig
 //! var google: jwt.Keyring = try .init(gpa, .{
@@ -31,11 +31,11 @@
 //! are done — the readers never wait.** A verify pins the set it is about
 //! to read, verifies, and unpins; a swap publishes the new set, waits for
 //! the old set's pins to reach zero, and frees it. `std.Io.Mutex` needs an
-//! `Io` a tool module has none of (ADR 0138), so the one wait here is the
+//! `Io` a tool module has none of (ADR 109), so the one wait here is the
 //! writer's spin on a count, bounded by the length of one verify — CPU
 //! work with nothing in it that waits — and it runs once per rotation.
 //! `nilo_cache` answers the same lifetime question by copying the value and
-//! checking a generation afterwards (ADR 0188); a key set is not flat, so
+//! checking a generation afterwards (ADR 152); a key set is not flat, so
 //! the answer here is a pin rather than a copy.
 //!
 //! **An unknown `kid` is a fetch at most once per `refresh_interval_s`.**
@@ -89,7 +89,7 @@ pub const Keyring = struct {
         /// none. A service whose callers hold a handful of long-lived
         /// tokens wants a few hundred; a site with a token per user wants
         /// enough for the users on at once. A lookup costs the same at any
-        /// size; the memory is 66 bytes a token (ADR 0285).
+        /// size; the memory is 66 bytes a token (ADR 209).
         remember_tokens: u16 = 0,
     };
 
@@ -145,7 +145,7 @@ pub const Keyring = struct {
         // has been seen at zero, every pin on `old` there will ever be is
         // already counted, and the old set's own count is the truth. Both
         // waits are bounded by one verify's worth of CPU, and a swap is
-        // once per rotation, so the spin is the right wait here (ADR 0138).
+        // once per rotation, so the spin is the right wait here (ADR 109).
         while (self.crossing.load(.seq_cst) != 0) std.atomic.spinLoopHint();
         while (old.readers.load(.acquire) != 0) std.atomic.spinLoopHint();
 

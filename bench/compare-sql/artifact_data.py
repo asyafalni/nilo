@@ -3,7 +3,7 @@
 The page draws bars from data rather than from hand-typed numbers, so a rerun
 is a regenerated blob and not eleven tables edited by hand. Getting that wrong
 is how `connect_on_init` ended up documented in three files and working in
-none (ADR 0062).
+none (ADR 115).
 
     python3 artifact_data.py > /tmp/ops.json
     python3 artifact_data.py results/ops-tcp.json

@@ -1,6 +1,6 @@
 //! A parent the schema never said how to reach. `lines` declares no
 //! reference to `staff`, and a join guessed from a column name would answer
-//! a question nobody asked (ADR 0295).
+//! a question nobody asked (ADR 218).
 
 const sql = @import("nilo_sql");
 

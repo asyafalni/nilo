@@ -1,8 +1,8 @@
-//! nilo_pw — hashing a password, and nothing that needs a loop (ADR 0048).
+//! nilo_pw — hashing a password, and nothing that needs a loop (ADR 044).
 //!
 //! A **tool module**, the third: one job, no event loop, and it imports
 //! nothing at all — which is why `zig test pw/pw.zig` runs the whole of it
-//! (ADR 0042).
+//! (ADR 038).
 //!
 //! ```zig
 //! const pw = @import("nilo_pw");
@@ -24,12 +24,12 @@
 //!
 //! **`pw.huge_pages` is what to hand it for `gpa`.** The 19 MiB is asked for
 //! in the 2 MiB pages argon2 walks it in rather than 4,864 of 4 KiB, which is
-//! 13.6 ms a hash against 11.0 and nothing held between them (ADR 0049).
+//! 13.6 ms a hash against 11.0 and nothing held between them (ADR 044).
 //!
 //! **The salt and the allocator are arguments**, for the reason `nilo_id`
-//! takes entropy and a millisecond as arguments (ADR 0042): both are things a
+//! takes entropy and a millisecond as arguments (ADR 038): both are things a
 //! module in this layer cannot reach. Entropy comes through the Bulkhead so
-//! the syscall parks the fiber (ADR 0046), and 19 MiB is not a number a
+//! the syscall parks the fiber (ADR 042), and 19 MiB is not a number a
 //! framework should be spending without saying so.
 //!
 //! **This is the pure half, and it is not the half a handler calls.** One
@@ -39,20 +39,20 @@
 //! be in flight at once. `Ctx.hashPassword` and `Ctx.verifyPassword` are that
 //! half: they take the Gate, park the fiber and call in here. Calling these
 //! functions from a handler directly is legal, compiles, works, and holds the
-//! thread — which is the reason the Ctx methods exist and why ADR 0048 spends
+//! thread — which is the reason the Ctx methods exist and why ADR 044 spends
 //! most of its length on them.
 //!
 //! **What it will not do is store anything.** No user table, no sign-in, no
 //! session — a hash is a value, and where it lives is the application's. The
 //! session that follows a successful check is `Session(T)` and already built
-//! (ADR 0035).
+//! (ADR 033).
 //!
 //! **`Token` is the other secret an application has**, and it is not a
 //! password: a reset link, an email verification, an API key. Thirty-two
 //! bytes of entropy, 43 characters to send, a SHA-256 digest to store, a
 //! constant-time compare when it comes back — and no argon2 anywhere near it,
 //! because a 256-bit token needs no stretching and a reset endpoint that
-//! answers in 13 ms is one that can be walked (ADR 0241).
+//! answers in 13 ms is one that can be walked (ADR 044).
 //!
 //! ```zig
 //! const token = pw.Token.new(try c.entropy(pw.token_len));
@@ -92,7 +92,7 @@ pub const hashWith = argon2id.hashWith;
 pub const verify = argon2id.verify;
 
 /// The same, told what a hash of yours costs — which is what the no-account
-/// path is timed against (ADR 0049).
+/// path is timed against (ADR 044).
 pub const verifyWith = argon2id.verifyWith;
 
 /// Whether a stored hash is weaker than one made now would be, for the sign-in
@@ -100,12 +100,12 @@ pub const verifyWith = argon2id.verifyWith;
 pub const needsRehash = argon2id.needsRehash;
 
 /// The 19 MiB, asked for in the 2 MiB pages argon2 walks it in: -19% on one
-/// hash, and nothing held between them (ADR 0049).
+/// hash, and nothing held between them (ADR 044).
 pub const huge_pages = pages.huge_pages;
 
 /// A token that is not a password — a reset link, an email verification, an
 /// API key. Sent as text, stored as a digest, compared in constant time, and
-/// never stretched (ADR 0241).
+/// never stretched (ADR 044).
 pub const Token = token.Token;
 
 /// Bytes of entropy a Token is made from, and what to ask `Ctx.entropy` for.

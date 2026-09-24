@@ -1,5 +1,5 @@
 //! A whole number inside a range, as a type
-//! ([ADR 0206](../docs/adr/0206-a-whole-number-inside-a-range-is-a-type.md)).
+//! ([ADR 167](../docs/adr/167-a-whole-number-inside-a-range-is-a-type.md)).
 //!
 //! ```zig
 //! const ListQuery = struct {
@@ -20,7 +20,7 @@
 //! either a validation — the type has a range and the text did not fit it.
 //! This is that, with the range chosen rather than inherited from a width.
 //! It is read everywhere a `u8` is read: a path param, a query value, a form
-//! field, and a JSON body (ADR 0205), with one sentence for all four.
+//! field, and a JSON body (ADR 166), with one sentence for all four.
 //!
 //! **The value is read as `.value`**, which is the cost. The integer inside is
 //! the narrowest that holds the range, so `Within(1, 200)` is a `u8` and
@@ -53,7 +53,7 @@ pub fn Within(comptime min: comptime_int, comptime max: comptime_int) type {
         pub const lowest: Int = min;
         pub const highest: Int = max;
 
-        /// What a nilo compile error calls this type (ADR 0122).
+        /// What a nilo compile error calls this type (ADR 074).
         pub const nilo_type_name = std.fmt.comptimePrint("nilo.Within({d}, {d})", .{ min, max });
 
         /// What a 400 asks for, in place of the type's name.
@@ -64,7 +64,7 @@ pub fn Within(comptime min: comptime_int, comptime max: comptime_int) type {
         pub const nilo_within = .{ .min = min, .max = max };
 
         /// A number on the wire, and said so, so that a response carrying
-        /// one is written by nilo's own writer around it (ADR 0182).
+        /// one is written by nilo's own writer around it (ADR 148).
         pub const nilo_openapi = .{ .type = "integer" };
 
         value: Int,
@@ -83,7 +83,7 @@ pub fn Within(comptime min: comptime_int, comptime max: comptime_int) type {
 
         /// The digits, read the way a `u32` is read from request text —
         /// `+7` and `1_0` are not numbers here either — and refused outside
-        /// the range with the same null a bad number gets (ADR 0142).
+        /// the range with the same null a bad number gets (ADR 113).
         pub fn nilo_parse(text: []const u8) ?Self {
             if (!convert.spelledAsNumber(text, min < 0, false)) return null;
             const n = std.fmt.parseInt(i128, text, 10) catch return null;
@@ -92,7 +92,7 @@ pub fn Within(comptime min: comptime_int, comptime max: comptime_int) type {
         }
 
         /// The third arrival, a JSON body: the same digits, as a number or
-        /// as text (ADR 0205).
+        /// as text (ADR 166).
         pub const jsonParse = mark.parseFor(Self);
 
         pub fn jsonStringify(self: Self, jw: anytype) !void {

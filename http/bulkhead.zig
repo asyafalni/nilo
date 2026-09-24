@@ -18,7 +18,7 @@
 //!   for a caller rather than for nilo: a connection pool cannot be built
 //!   before `listen()`, because the event loop it has to dial through does
 //!   not exist yet, and a pool built without one blocks the thread every
-//!   request shares (ADR 0040). The type is std's, not zio's, so this hands
+//!   request shares (ADR 037). The type is std's, not zio's, so this hands
 //!   out nothing that names the Engine. `port` is the one actually bound —
 //!   the kernel's answer when `Options.port` was 0 — and null for a unix
 //!   socket; it is how a test asks for any free port instead of walking a
@@ -30,14 +30,14 @@
 //!   the loop cannot be shut down at all. It takes no `Io` and cannot fail
 //!   — a service is stopped on the loop it was started on, and there is
 //!   nobody left to hand an error to. It runs on the failure paths too,
-//!   including a `ready` that refused the boot (ADR 0151).
+//!   including a `ready` that refused the boot (ADR 121).
 //! - `Limits.arm`/`release`/`fired` — put a time limit on an operation that
 //!   is *not* a read or write of a connection nilo holds, and say afterwards
 //!   whether that limit is what cancelled it. `Deadlines` below covers
 //!   inbound, where nilo owns the socket and can set a timeout on it;
 //!   outbound the socket belongs to a driver, so the only thing left to bound
 //!   is the unit of work itself. An Engine that cannot cancel an operation in
-//!   flight can no longer meet this contract (ADR 0065). The type is
+//!   flight can no longer meet this contract (ADR 056). The type is
 //!   `nilo_core`'s, because the caller is a Service and a Service may not
 //!   import `nilo_http`.
 //! - `Peer` — who is at the other end of a connection. `accept` already
@@ -46,7 +46,7 @@
 //!   read or write of one connection, and say afterwards whether that limit
 //!   is what a failure was. An Engine that waits on sockets already has to
 //!   be able to wait with a limit, so this asks for nothing new of it
-//!   (ADR 0023).
+//!   (ADR 022).
 //! - `Waker.wait`/`Waker.post` — park a connection until its socket is
 //!   readable *or* another fiber has something to say to it, and wake one
 //!   from anywhere. Everything else in nilo is woken by the client at the
@@ -59,11 +59,11 @@
 //!   the flush on a response whose successor is already in the read buffer,
 //!   so a pipelined batch leaves as one write, and this is what makes the
 //!   skip safe rather than a bet: no read can park a connection with a
-//!   response still in memory (ADR 0274). One load of the writer's fill on
+//!   response still in memory (ADR 201). One load of the writer's fill on
 //!   each read that reaches the socket, and nothing on a read that does not.
 //! - `Waker.halfClose` — send the peer a FIN without closing the socket, so
 //!   a refused request's answer reaches it before the reset that closing on
-//!   unread input would send (ADR 0266). One `shutdown(2)`; an Engine that
+//!   unread input would send (ADR 195). One `shutdown(2)`; an Engine that
 //!   owns a socket has it.
 //! - `Stop`/`explained` — the flag that ends `serve`, and which startup
 //!   failures it has already explained in words.
@@ -71,9 +71,9 @@
 //!   does not block the event loop.
 //! - `Binding`/`bindSlot`/`unbindSlot`/`slot` — one pointer bound to the
 //!   unit of work currently running (a fiber, a thread, whatever the
-//!   Engine uses), for hidden per-request state (ADR 0007).
+//!   Engine uses), for hidden per-request state (ADR 006).
 //! - `bindsOn(io)`: whether `io` is the Engine's own loop, so a slot can be
-//!   bound under it; the boot work asks before it binds one (ADR 0161).
+//!   bound under it; the boot work asks before it binds one (ADR 129).
 //! - `monotonicNanos` — a monotonic clock. Zig 0.16's `std.time` carries
 //!   only constants, and the Engine already keeps a clock, so the logger
 //!   asks for it here rather than reaching for a syscall of its own.
@@ -87,7 +87,7 @@
 //! - `blocking`/`sleep` — the general form of that same problem. A handler
 //!   that calls anything blocking stops every other request sharing its
 //!   thread, and the Engine is the only layer that knows how to wait
-//!   without doing that (ADR 0014).
+//!   without doing that (ADR 013).
 //! - `Dir`/`File` — open a directory, open a file inside it by name, ask
 //!   what it is, close either, and replace a whole file with bytes
 //!   already in hand. Five calls, and deliberately no sixth: no seek, no
@@ -97,7 +97,7 @@
 //!   the bytes leave through `sendFile`, which is a slot in the
 //!   `std.Io.Writer` vtable the Engine fills in anyway — so an Engine that
 //!   has a `std.Io` has these already and owes nothing it was not going to
-//!   write (ADR 0037, ADR 0123).
+//!   write (ADR 009, ADR 097).
 //!
 //! The Reader/Writer handed to the handler are plain std types
 //! (`*std.Io.Reader`, `*std.Io.Writer`), so the HTTP layer has no idea
@@ -111,10 +111,10 @@ const watchdog = @import("watchdog.zig");
 
 /// Re-exported so nothing above has to know that the type came from a layer
 /// below rather than from here. It lives in `nilo_core` because a Service
-/// holds one and a Service may not import `nilo_http` (ADR 0065).
+/// holds one and a Service may not import `nilo_http` (ADR 056).
 pub const Limits = @import("nilo_core").Limits;
 
-// The check ADR 0065 says this file owes. Core declares a fixed slot for the
+// The check ADR 056 says this file owes. Core declares a fixed slot for the
 // Engine's arming state and cannot measure what goes in it, because it may
 // not name an Engine; this is the one place that can do both.
 comptime {
@@ -148,7 +148,7 @@ const engine_limits: Limits.VTable = .{
     }.f,
     // A service's wait on its own socket parks the fiber like any other
     // wait; the watchdog learns of it here, or charges it to the handler
-    // (ADR 0286).
+    // (ADR 210).
     .waiting = struct {
         fn f(_: ?*anyopaque) u64 {
             return watchdog.waitingAnywhere();
@@ -175,14 +175,14 @@ pub const Stat = engine.Stat;
 /// Everything `listen()` takes.
 ///
 /// Declared here rather than in the Engine, even though most of it is the
-/// Engine's to read: this is the struct a user writes by hand, and ADR 0002
+/// Engine's to read: this is the struct a user writes by hand, and ADR 001
 /// promises the Engine can be swapped without touching user code. An
 /// options struct owned by zio would have broken that promise the first
 /// time zio was replaced. The Engine reads the fields it knows and never
 /// names the rest.
 pub const Options = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Options";
 
     /// What `tls` names: the two PEM files a TLS listener presents. Paths,
@@ -200,9 +200,9 @@ pub const Options = struct {
     /// second listener can differ in and no others: everything else about
     /// a connection — its buffers, its deadlines, how many the process
     /// holds — is the server's rather than the port's
-    /// ([ADR 0289](../docs/adr/0289-a-server-answers-on-more-than-one-address.md)).
+    /// ([ADR 213](../docs/adr/213-a-server-answers-on-more-than-one-address.md)).
     pub const Listener = struct {
-        /// What a nilo compile error calls this type (ADR 0122).
+        /// What a nilo compile error calls this type (ADR 074).
         pub const nilo_type_name = "nilo.Listener";
 
         /// Read exactly as `Options.address` is, `unix:` spelling included.
@@ -217,7 +217,7 @@ pub const Options = struct {
         /// knowledge (h2c), or with `tls` set as well, HTTP/2 chosen by ALPN
         /// (`h2`, and nothing else offered). Each unary call is answered by
         /// the route `app.post` registered at its path
-        /// ([ADR 0297](../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+        /// ([ADR 220](../docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md)).
         /// Needs `.grpc = true` on the dependency, and is refused at
         /// `listen()` without it.
         grpc: bool = false,
@@ -230,9 +230,9 @@ pub const Options = struct {
     /// business rather than yours.
     ///
     /// **`"unix:/run/nilo.sock"` listens on a path instead**, which is what
-    /// the proxy ADR 0028 puts in front should reach the server over: there
+    /// the proxy ADR 027 puts in front should reach the server over: there
     /// is no port to leave open, and the file's permissions are who may
-    /// connect ([ADR 0130](../docs/adr/0130-a-path-is-an-address-to-listen-on.md)).
+    /// connect ([ADR 103](../docs/adr/103-a-path-is-an-address-to-listen-on.md)).
     /// `port` is not read at all then. A socket left behind by a server that
     /// was killed is taken away on the next start when `reuse_address` is on,
     /// and the path is removed when this server stops.
@@ -272,7 +272,7 @@ pub const Options = struct {
     /// At 128, 623 of a thousand connections opened at once took that
     /// second; at 1,024 none did, and a burst of four thousand still lost
     /// some; at 4,096 none did either
-    /// ([ADR 0271](../docs/adr/0271-a-backlog-is-sized-for-the-burst-not-the-load.md)).
+    /// ([ADR 198](../docs/adr/198-a-backlog-is-sized-for-the-burst-not-the-load.md)).
     ///
     /// 4,096 is `net.core.somaxconn` on a current Linux, which is also
     /// what Go listens with; the kernel caps this at that sysctl silently,
@@ -290,7 +290,7 @@ pub const Options = struct {
     ///
     /// The consequence is that handlers really do run at the same time on
     /// different threads, so a Service that gets written to needs
-    /// `nilo.Mutex` (ADR 0011). Set this to 1 and that stops being true —
+    /// `nilo.Mutex` (ADR 010). Set this to 1 and that stops being true —
     /// but so does using the machine.
     threads: u8 = 0,
 
@@ -302,22 +302,22 @@ pub const Options = struct {
     /// and a browser behind a single sign-on carries several kilobytes of
     /// them — an identity token in a cookie is 4–8 KB on its own, and the
     /// 431 it earned under the old default was answered to the one client
-    /// least able to do anything about it (ADR 0268). It is what Go's
+    /// least able to do anything about it (ADR 196). It is what Go's
     /// `net/http` and nginx's `large_client_header_buffers` allow too.
     /// What it costs is paid only while a connection is busy: an idle one
-    /// gives the pages back (ADR 0071), so the 4,669 bytes per idle
+    /// gives the pages back (ADR 062), so the 4,669 bytes per idle
     /// connection do not move, and an active one holds two more pages than
     /// it did.
     read_buffer: usize = 16 * 1024,
 
     /// Serve HTTPS on this listener: TLS 1.3, with the certificate chain
     /// and private key read from these two PEM files when `listen()` is
-    /// called ([ADR 0288](../docs/adr/0288-tls-is-an-option-a-build-asks-for.md)).
+    /// called ([ADR 212](../docs/adr/212-tls-is-an-option-a-build-asks-for.md)).
     /// Set it and every connection is handshaken before its first request;
     /// the routes, the handlers and the `Ctx` see nothing different.
     ///
     /// **Off is still the recommendation** for a server that has a proxy in
-    /// front of it, and ADR 0028 says why. This is for the server that has
+    /// front of it, and ADR 027 says why. This is for the server that has
     /// nothing in front of it: an internal tool on a VM, a service on a
     /// private network that its policy says must be encrypted, a machine
     /// with one port and a certificate and nobody who wants to run a
@@ -328,7 +328,7 @@ pub const Options = struct {
     /// `b.dependency("nilo", …)` (`-Dtls` in this repository), and a
     /// build without that refuses this option at `listen()` in one line
     /// rather than serving plain HTTP on a port the caller believed was
-    /// encrypted. What that build costs, measured (ADR 0288): **560 KB** of
+    /// encrypted. What that build costs, measured (ADR 212): **560 KB** of
     /// binary, before a single certificate is loaded, and **one page per
     /// idle connection** on every listener of that build, TLS or not,
     /// 9,293 bytes against 5,191. A TLS connection then costs what a plain
@@ -359,11 +359,11 @@ pub const Options = struct {
     /// `Listener.grpc` does on an entry in `also`: h2c, or HTTP/2 by ALPN when
     /// `tls` is set. For a server that answers nothing but gRPC; one that
     /// serves both gives gRPC an entry in `also` instead
-    /// ([ADR 0297](../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+    /// ([ADR 220](../docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md)).
     grpc: bool = false,
 
     /// More addresses to answer on, beside the one `address` and `port`
-    /// name ([ADR 0289](../docs/adr/0289-a-server-answers-on-more-than-one-address.md)).
+    /// name ([ADR 213](../docs/adr/213-a-server-answers-on-more-than-one-address.md)).
     ///
     /// ```zig
     /// try app.listen(.{
@@ -388,7 +388,7 @@ pub const Options = struct {
     /// measured), which is about 5.3 KB a thread rather than the 4 KB the
     /// stack alone would suggest. Nothing per connection and nothing per request: an idle
     /// connection measured 9,300 bytes with one listener and 9,300 with
-    /// two, at ten thousand of them. Both numbers are in ADR 0289.
+    /// two, at ten thousand of them. Both numbers are in ADR 213.
     ///
     /// A TLS listener here still needs the build to have asked for TLS
     /// (`.tls = true` on the dependency), and is refused at `listen()` the
@@ -413,7 +413,7 @@ pub const Options = struct {
     /// kernel zeroes, for every 4 KiB of it. On a route answering a megabyte
     /// that is 257 minor faults a request, and lifting this past the response
     /// took the same route from 7,908 req/s to 11,069
-    /// ([ADR 0096](../docs/adr/0096-a-response-larger-than-the-arena-keep-is-a-page-fault-per-page.md)).
+    /// ([ADR 075](../docs/adr/075-a-response-larger-than-the-arena-keep-is-a-page-fault-per-page.md)).
     ///
     /// The default is small because the memory is **per connection**, not per
     /// thread: raising it to a megabyte on a server holding ten thousand
@@ -426,7 +426,7 @@ pub const Options = struct {
     /// in it, which is most of them.
     arena_keep: usize = 16 * 1024,
 
-    // ---- deadlines (ADR 0023) ----
+    // ---- deadlines (ADR 022) ----
     //
     // Zero turns any one of these off. All four off is what nilo did
     // before 0.1.0, and it meant a client could hold a fiber by opening a
@@ -446,7 +446,7 @@ pub const Options = struct {
     ///
     /// This is the number that decides how much memory idle clients hold —
     /// 4,669 bytes each, whatever the buffers are set to, because a connection
-    /// that has gone quiet gives them back (ADR 0071) — so a server with many
+    /// that has gone quiet gives them back (ADR 062) — so a server with many
     /// visitors and few of them active wants it lower than a server with a
     /// handful of chatty ones. Above what browsers hold a connection for on
     /// their own (Chrome and Firefox let go at around a minute), so in
@@ -466,7 +466,7 @@ pub const Options = struct {
     /// This is what `body_timeout_ms` cannot do. A per-read limit is satisfied
     /// by any client that sends *something* often enough, so one byte every
     /// twenty-nine seconds holds a fiber and a step of the arena for as long
-    /// as it likes ([ADR 0124](../docs/adr/0124-a-buffered-body-arrives-at-a-rate.md)).
+    /// as it likes ([ADR 022](../docs/adr/022-a-deadline-belongs-to-an-operation-not-to-a-request.md)).
     /// A rate turns the announced length into a deadline —
     /// `body_grace_ms + bytes / body_min_rate` — so how long a body may take
     /// is a function of how big it said it was.
@@ -494,14 +494,14 @@ pub const Options = struct {
     /// How long any request has, in total, from its head arriving to its
     /// answer leaving — counted the way `nilo.deadline(ms)` counts for one
     /// route, given here to every route at once. 0, the default, means no
-    /// such limit ([ADR 0267](../docs/adr/0267-a-deadline-every-request-starts-with.md)).
+    /// such limit ([ADR 105](../docs/adr/105-a-route-can-say-how-long-it-has.md)).
     ///
     /// **What it bounds is every wait nilo owns** — reading the body, writing
     /// the response — each cut down to whichever of this and its own limit
     /// comes first, and `c.overdue()` answers a handler doing its own work.
     /// What it does not do is interrupt a handler that is running rather
     /// than waiting; there is no cancellation here, and deliberately none
-    /// ([ADR 0104](../docs/adr/0104-a-cleanup-path-is-not-cancellable.md)).
+    /// ([ADR 082](../docs/adr/082-a-cleanup-path-is-not-cancellable.md)).
     ///
     /// **A request that takes the connection over lets go of it** — a
     /// stream, a WebSocket, a body read in pieces — because those are meant
@@ -547,7 +547,7 @@ pub const Options = struct {
     /// `Retry-After: 1` at once, and the connection is closed, so the
     /// balancer in front can send the retry somewhere with room. Nothing
     /// waits: a request over the limit costs one write of a constant and
-    /// is gone ([ADR 0197](../docs/adr/0197-a-server-past-its-limit-says-so-at-once.md)).
+    /// is gone ([ADR 159](../docs/adr/159-a-server-past-its-limit-says-so-at-once.md)).
     ///
     /// Requests, not connections — `max_connections` is the other one. Ten
     /// thousand idle keep-alive connections hold no work; a hundred requests
@@ -619,7 +619,7 @@ pub const Options = struct {
 
     /// Which addresses in front of this server are allowed to say who the
     /// client is
-    /// ([ADR 0129](../docs/adr/0129-a-proxy-is-trusted-by-which-one-it-is.md)).
+    /// ([ADR 102](../docs/adr/102-a-proxy-is-trusted-by-which-one-it-is.md)).
     ///
     /// ```zig
     /// try app.listen(.{ .trusted_proxies = &.{"private"} });
@@ -649,7 +649,7 @@ pub const Options = struct {
     /// The text is borrowed and has to outlive the App, which a literal does.
     trusted_proxies: []const []const u8 = &.{},
 
-    /// How many password hashes may be in flight at once (ADR 0048).
+    /// How many password hashes may be in flight at once (ADR 044).
     ///
     /// Eight, and the number is measured rather than picked. Argon2id at the
     /// default Cost is bound by memory bandwidth, not by cores: on a 16-core
@@ -671,7 +671,7 @@ pub const Options = struct {
     password_hashes_at_once: u16 = 8,
 
     /// How long a handler may run without yielding before nilo says so in
-    /// the log. 0 turns it off (ADR 0034).
+    /// the log. 0 turns it off (ADR 013).
     ///
     /// Many requests share one OS thread, so a handler that waits on the
     /// operating system directly stops all of them. `nilo.blocking` is the
@@ -718,7 +718,7 @@ pub const Options = struct {
 /// How many OS threads `options` means: `threads` when it was set, one per
 /// core when it was left at 0. The Engine's own reading of its own field,
 /// so that anything the App sizes to the thread count (the compressors
-/// `app.compress` keeps, one per thread, ADR 0287) is sized to the number
+/// `app.compress` keeps, one per thread, ADR 211) is sized to the number
 /// the Engine starts.
 pub const threadCount = engine.threadCount;
 
@@ -759,7 +759,7 @@ pub fn serve(
             handler(carried.state, in, out, deadlines, waker, peer);
         }
 
-        /// The same for a listener that speaks gRPC (ADR 0297). Its own
+        /// The same for a listener that speaks gRPC (ADR 220). Its own
         /// function rather than a flag on `run`, for the reason the Engine
         /// keeps `runTls` apart: nothing is added to the plain path.
         fn runGrpc(
@@ -780,14 +780,14 @@ pub fn serve(
         /// deadlines travelling beside `state` are a connection's business
         /// and there is no connection yet, so only the state goes through —
         /// along with the one clock that is not a connection's, which is what
-        /// a Service bounds an outbound call with (ADR 0065).
+        /// a Service bounds an outbound call with (ADR 056).
         fn start(carried: Carried, io: std.Io, port: ?u16) anyerror!void {
             return ready(carried.state, io, engine_limits_value, port);
         }
 
         /// The shutdown hook, unwrapped the same way. No `io` and no error:
         /// a service is stopped on the loop it was started on, and there is
-        /// nobody left to hand a failure to (ADR 0151).
+        /// nobody left to hand a failure to (ADR 121).
         fn winddown(carried: Carried) void {
             return stopping(carried.state);
         }
@@ -831,7 +831,7 @@ const engine_waker: Waker.VTable = .{
             // caller just released, 33 KB of it, and it goes back too, on
             // the same two checks: nothing buffered in either direction.
             // The third check, cleartext decrypted and not yet read, is the
-            // Engine's, because only it knows where that lives (ADR 0288).
+            // Engine's, because only it knows where that lives (ADR 212).
             // A plain connection has no such layer and this is one branch.
             if (target) |t| {
                 const wake: *engine.Wake = @ptrCast(@alignCast(t));
@@ -894,7 +894,7 @@ pub const monotonicNanos = engine.monotonicNanos;
 ///
 /// Wrapped rather than re-exported for the reason `Mutex` and `sleep` below
 /// are: this parks the fiber on the Engine's blocking pool, so the thread is
-/// off serving somebody else and the detector has to be told (ADR 0034).
+/// off serving somebody else and the detector has to be told (ADR 013).
 /// Without this, sealing a session cookie would be charged to the handler as
 /// time it spent holding its thread.
 pub fn randomSecure(buffer: []u8) !void {
@@ -907,7 +907,7 @@ pub fn randomSecure(buffer: []u8) !void {
 ///
 /// `monotonicNanos` costs a measured 27ns, because `CLOCK_MONOTONIC` does
 /// the full timekeeping arithmetic on every read. The blocking detector
-/// (ADR 0034) reads a clock four times per request and compares the answer
+/// (ADR 013) reads a clock four times per request and compares the answer
 /// against a quarter of a second, so it wants the opposite trade — and gets
 /// it: 5ns, from a reading that only moves once a millisecond.
 ///
@@ -923,7 +923,7 @@ pub fn coarseNanos() u64 {
         // recorded 5ns one way and 600ns the other, on the grounds that
         // only the libc path reached the vDSO. **Re-measured on Zig 0.16
         // and it is no longer true** — `std.os.linux` reaches the vDSO
-        // too, and `CLOCK_MONOTONIC_COARSE` is 1–2ns either way (ADR 0045).
+        // too, and `CLOCK_MONOTONIC_COARSE` is 1–2ns either way (ADR 041).
         // What survives is the reason the *coarse* clock is here at all:
         // it is 2ns against 15ns for `CLOCK_MONOTONIC` read the same way,
         // which is the sort of gap that turns a cheap check into the most
@@ -943,11 +943,11 @@ pub fn coarseNanos() u64 {
 ///
 /// A wrapper rather than a re-export for one reason: waiting on a lock is
 /// not the handler holding its thread, and the detector has to be told so
-/// or a busy lock would be reported as a blocking handler (ADR 0034). The
+/// or a busy lock would be reported as a blocking handler (ADR 013). The
 /// three methods are the Engine's, in the order it defines them.
 pub const Mutex = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Mutex";
 
     _inner: engine.Mutex = .init,
@@ -993,17 +993,17 @@ pub const Mutex = struct {
 ///
 /// A wrapper rather than a re-export for the reason `Mutex` is: waiting for a
 /// turn is not the handler holding its thread, and the detector has to be
-/// told or a busy Gate reads as a blocking handler (ADR 0034).
+/// told or a busy Gate reads as a blocking handler (ADR 013).
 ///
 /// **What it is for is a call that is expensive rather than slow.**
 /// `nilo.blocking` already keeps a slow call off the loop, and the Engine's
 /// pool already caps how many run at once — at twice the core count, which is
 /// the right ceiling for a call that is waiting on a disk and the wrong one
 /// for a call that is eating 19 MiB and a core. Password hashing is the
-/// caller this exists for and the numbers are in ADR 0048.
+/// caller this exists for and the numbers are in ADR 044.
 pub const Gate = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Gate";
 
     _inner: engine.Semaphore,
@@ -1037,17 +1037,17 @@ pub fn sleep(ms: u64) error{Canceled}!void {
 }
 
 /// Somewhere to put work that is not a request, owned by the server that
-/// is running rather than by the fiber that started it (ADR 0029).
+/// is running rather than by the fiber that started it (ADR 028).
 pub const spawn = engine.spawn;
 
-// ---- files (ADR 0037) ----
+// ---- files (ADR 009) ----
 //
 // A file too big to hold is opened rather than read, and this is the whole
 // of what that costs the Bulkhead. Both types are wrappers rather than
 // re-exports for the reason `Mutex` and `randomSecure` are: every call
 // below parks the fiber on the Engine, so the thread is off serving
 // somebody else and the blocking detector has to be told, or opening a file
-// would be reported as a handler holding its thread (ADR 0034). Wrapped
+// would be reported as a handler holding its thread (ADR 013). Wrapped
 // here rather than at each call site so that nobody has to remember.
 
 /// A directory, opened once and held open.
@@ -1055,12 +1055,12 @@ pub const spawn = engine.spawn;
 /// The long way round to a file's bytes, on purpose. A name is opened
 /// relative to a descriptor that was chosen before the socket was, so
 /// nothing carried by a request is ever resolved as a path — which is the
-/// property ADR 0010 bought by refusing disk IO outright, kept here by the
+/// property ADR 009 bought by refusing disk IO outright, kept here by the
 /// shape of the type rather than by a normalisation step somebody has to
 /// get right.
 pub const Dir = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Dir";
 
     _inner: engine.Dir,
@@ -1088,7 +1088,7 @@ pub const Dir = struct {
     /// kernel against this directory's descriptor. A symlink inside the
     /// directory is followed, because refusing them breaks ordinary
     /// deployments and no static server on the internet refuses them by
-    /// default (ADR 0037).
+    /// default (ADR 009).
     ///
     /// `error.FileNotFound` is the one failure with an answer better than a
     /// 500 — from the client's side, a file the list promised and the disk
@@ -1102,7 +1102,7 @@ pub const Dir = struct {
     /// Write `bytes` to `name` inside this directory, replacing what was
     /// there. Either the whole file lands or none of it does: a reader of
     /// `name` never sees it half-written
-    /// ([ADR 0123](../docs/adr/0123-a-file-is-written-by-the-engine.md)).
+    /// ([ADR 097](../docs/adr/097-a-file-is-written-by-the-engine.md)).
     ///
     /// **The name is not checked here.** `filebody.checkName` is what refuses
     /// a `..`, an absolute path, a NUL and a Windows drive letter, and the
@@ -1129,7 +1129,7 @@ pub const File = struct {
     /// remembered: how many bytes, and when it last changed.
     ///
     /// Both numbers together rather than a `size` on its own, and that is the
-    /// whole of ADR 0125. A file response writes a length and an ETag, and
+    /// whole of ADR 098. A file response writes a length and an ETag, and
     /// nilo's ETag for a file nobody read is made of exactly these two
     /// numbers — so asking twice, or asking for one and remembering the
     /// other, is how a response comes to promise a length from one file and a
@@ -1153,7 +1153,7 @@ pub const File = struct {
     /// the point rather than an implementation detail: `sendFileAll` takes
     /// exactly this, so the bytes reach the socket through a vtable slot the
     /// Engine already fills in, and the HTTP layer sends a file without ever
-    /// naming the Engine (ADR 0037). Nothing here does any IO — it is a
+    /// naming the Engine (ADR 009). Nothing here does any IO — it is a
     /// struct being built — so there is no wait to forgive.
     pub fn reader(self: File, buffer: []u8) std.Io.File.Reader {
         return self._inner.reader(buffer);
@@ -1170,7 +1170,7 @@ pub const File = struct {
 /// bytes, after a 6-byte response 16,955, after a 982-byte response 21,114.
 ///
 /// The allocation itself stays, which is the point — nothing here allocates or
-/// frees, so ADR 0018's per-request invariant is untouched and the pages fault
+/// frees, so ADR 017's per-request invariant is untouched and the pages fault
 /// back in as zeroes. It costs one syscall per idle transition, which is why
 /// the caller only does this when the connection is about to wait.
 ///
@@ -1189,7 +1189,7 @@ pub fn releaseIdlePages(in: *std.Io.Reader, out: *std.Io.Writer) void {
 ///
 /// A WebSocket's message ceiling is a buffer the *handler* declared, usually on
 /// its own stack, and a suspended fiber holds every page it ever touched
-/// ([ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md)) — a
+/// ([ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)) — a
 /// socket that once received a 60 KiB message measured 74,809 bytes idle
 /// against 13,375 for one that never saw one.
 ///
@@ -1229,14 +1229,14 @@ fn dontNeed(buf: []u8) void {
     std.posix.madvise(ptr, end - start, std.posix.MADV.DONTNEED) catch {};
 }
 
-// ---- deadlines (ADR 0023) ----
+// ---- deadlines (ADR 022) ----
 
 /// Which half of a connection a limit is being put on.
 pub const Side = enum { read, write };
 
 /// How long the Engine may wait for one read, or one write.
 pub const Limit = union(enum) {
-    /// As long as it takes. What every wait in nilo did before ADR 0023,
+    /// As long as it takes. What every wait in nilo did before ADR 022,
     /// and what a connection that has stopped being HTTP goes back to.
     none,
     /// This operation gets this many milliseconds to itself. The next one
@@ -1282,7 +1282,7 @@ pub const Waker = struct {
         /// looks like from up here: the thing that parks it, wakes it, and now
         /// gives back what parking it costs. nilo has no other handle on a
         /// fiber and is not getting one — naming the Engine anywhere but the
-        /// Engine is what ADR 0002 refuses.
+        /// Engine is what ADR 001 refuses.
         release_stack: *const fn (target: ?*anyopaque) void,
         /// Shut the send side of this connection's socket, and nothing else.
         /// See `halfClose`.
@@ -1349,7 +1349,7 @@ pub const Waker = struct {
     /// Send the peer a FIN and keep the socket open to read from. For a
     /// connection about to be closed with input still unread — a refused head,
     /// a body nobody took — so the answer already written reaches the peer
-    /// before the close (ADR 0266). Nothing happens with no Engine underneath.
+    /// before the close (ADR 195). Nothing happens with no Engine underneath.
     pub fn halfClose(self: Waker) void {
         self.vtable.half_close(self.target);
     }
@@ -1383,7 +1383,7 @@ pub const Deadlines = struct {
     /// Set by `nilo.deadline` and read here rather than at each call site:
     /// every limit armed below is clamped to it, so a handler waiting on a
     /// client cannot wait past the deadline whichever of the four it is
-    /// waiting under ([ADR 0133](../docs/adr/0133-a-route-can-say-how-long-it-has.md)).
+    /// waiting under ([ADR 105](../docs/adr/105-a-route-can-say-how-long-it-has.md)).
     until_ns: u64 = 0,
 
     pub const VTable = struct {
@@ -1438,11 +1438,11 @@ pub const Deadlines = struct {
     /// `armBody`'s per-read limit is the wrong shape for this and the reason
     /// is `armHeader`'s: a client sending a byte every twenty-nine seconds is
     /// inside a thirty-second per-read limit indefinitely. What is different
-    /// here — and what makes a deadline possible where ADR 0023 says a
+    /// here — and what makes a deadline possible where ADR 022 says a
     /// request may not have one — is that the client has said how many bytes
     /// are coming, so the deadline is sized from the work rather than
     /// guessed: `body_grace_ms` plus what `bytes` need at `body_min_rate`
-    /// ([ADR 0124](../docs/adr/0124-a-buffered-body-arrives-at-a-rate.md)).
+    /// ([ADR 022](../docs/adr/022-a-deadline-belongs-to-an-operation-not-to-a-request.md)).
     ///
     /// Armed per run rather than once for the body, because `readSizedBody`
     /// takes the step before it commits the rest and the two are separately
@@ -1515,7 +1515,7 @@ fn msToNanos(ms: u32) u64 {
 }
 
 /// Run a blocking call on the Engine's thread pool, parking this fiber
-/// until it comes back (ADR 0014).
+/// until it comes back (ADR 013).
 ///
 /// The slot travels with it. Without that, a fail function called inside
 /// the blocking call would find no request — the worker is a plain thread,
@@ -1526,10 +1526,10 @@ fn msToNanos(ms: u32) u64 {
 /// looking at the InFlight.
 ///
 /// The `setFallbackSlot` below must keep happening on a thread-pool worker
-/// and never on an executor thread. `spawn` (ADR 0029) runs fibers with no
+/// and never on an executor thread. `spawn` (ADR 028) runs fibers with no
 /// slot of their own, and those fall through to the threadlocal; if this
 /// assignment ever landed on the thread they run on, spawned work would
-/// write its failure message into an unrelated request — ADR 0007's leak,
+/// write its failure message into an unrelated request — ADR 006's leak,
 /// by another route. It lands on a worker because `engine.blocking` is
 /// `zio.blockInPlace`, which submits the call to the thread pool.
 pub fn blocking(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) ReturnType(func) {
@@ -1544,7 +1544,7 @@ pub fn blocking(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) ReturnTy
     // Opened and closed on this side of the hand-off on purpose. Inside
     // `Carrier.run` the slot points at the same InFlight, so the arithmetic
     // would be the same — but that code runs on a thread-pool worker, and
-    // two threads writing `waited_ns` is a race for no gain (ADR 0034).
+    // two threads writing `waited_ns` is a race for no gain (ADR 013).
     const w = watchdog.waitingAnywhere();
     defer watchdog.waitedAnywhere(w);
     return engine.blocking(Carrier.run, .{ slot(), args });
@@ -1559,11 +1559,11 @@ fn ReturnType(comptime func: anytype) type {
 /// server a connection's fiber slot always exists and wins, so what is
 /// stored here is never read by one.
 ///
-/// A fiber from `spawn` (ADR 0029) has no slot, so it *does* read this. It
+/// A fiber from `spawn` (ADR 028) has no slot, so it *does* read this. It
 /// is safe only because the one place that writes it — `blocking` above —
 /// does so on a thread-pool worker, and spawned fibers run on executor
 /// threads. Anything that starts setting this on an executor thread
-/// reintroduces the cross-request leak ADR 0007 exists to prevent.
+/// reintroduces the cross-request leak ADR 006 exists to prevent.
 threadlocal var fallback_slot: ?*anyopaque = null;
 
 /// Install the fallback slot, returning the previous one so it can be

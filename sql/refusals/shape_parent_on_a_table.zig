@@ -1,6 +1,6 @@
 //! A parent field on the Row that describes the table. That Row is the
 //! table's columns and nothing else, or its DDL would have a column for the
-//! parent; a parent belongs on a narrower Row that borrows it (ADR 0295).
+//! parent; a parent belongs on a narrower Row that borrows it (ADR 218).
 
 const sql = @import("nilo_sql");
 

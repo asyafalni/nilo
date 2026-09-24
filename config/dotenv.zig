@@ -1,5 +1,5 @@
 //! A `.env`, read as a source — and the file is somebody else's to open
-//! (ADR 0064).
+//! (ADR 039).
 //!
 //! ```zig
 //! // Read it however you like. An arena that lives as long as the program
@@ -24,7 +24,7 @@
 //! module opens no file, so it allocates nothing, imports nothing, and
 //! `zig test config/dotenv.zig` runs every line below against string
 //! literals — which is the entry condition for this layer rather than a
-//! nicety (ADR 0042). A `.env` is a format, and the refusal ADR 0043 wrote
+//! nicety (ADR 038). A `.env` is a format, and the refusal ADR 039 wrote
 //! was never about formats: it was about the parser every importer would
 //! carry. Fifty lines that need no dependency are on the other side of that.
 //!

@@ -1,5 +1,5 @@
 //! A Row grouped by nothing is exactly one row, so a list of it would always
-//! hold one. It is read with `db.exactlyOne` (ADR 0295).
+//! hold one. It is read with `db.exactlyOne` (ADR 218).
 
 const sql = @import("nilo_sql");
 

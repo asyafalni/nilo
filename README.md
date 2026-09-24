@@ -255,7 +255,7 @@ And while the server runs, a handler that blocks its thread is named in the log:
 ```
 warning: handler GET /report held its thread for 412ms. Every other request being served
          on that thread waited the whole time. Hand the call that waits to
-         nilo.blocking (ADR 0014).
+         nilo.blocking (ADR 013).
 ```
 
 The same things make nilo easy for coding agents: a small API, no ordering to guess, and a build that explains itself. Point one at [`docs/reference/`](./docs/reference/).
@@ -333,7 +333,7 @@ Nilo was my cat. She was quick, the kind of quick you notice from across a room,
 
 Questions, issues and "why on earth is it like this?" are all welcome. [CONTRIBUTING.md](./CONTRIBUTING.md) covers where to start, and [the roadmap](./docs/roadmap.md) has what's open. Mail is the most useful module nobody has written yet.
 
-nilo borrows from FastAPI, Elysia, Elm and Drizzle; [ADR 0015](./docs/adr/0015-what-nilo-borrows-and-from-whom.md) says what came from where.
+nilo borrows from FastAPI, Elysia, Elm and Drizzle; [ADR 014](./docs/adr/014-what-nilo-borrows-and-from-whom.md) says what came from where.
 
 ## License
 

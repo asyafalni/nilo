@@ -2,7 +2,7 @@
 
 Programs written wrong on purpose. Each one has to fail to compile with a
 message that nilo wrote, and `zig build test` checks that it does
-([ADR 0027](../docs/adr/0027-the-rule-about-error-messages-is-held-by-a-build-step.md)).
+([ADR 026](../docs/adr/026-the-rule-about-error-messages-is-held-by-a-build-step.md)).
 
 Nothing here is ever run, and nothing here compiles.
 

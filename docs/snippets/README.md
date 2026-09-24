@@ -1,7 +1,7 @@
 # snippets
 
 The world every checked block in the guide, the reference and the README
-compiles against ([ADR 0083](../adr/0083-the-guide-is-the-source-of-its-own-snippets.md)).
+compiles against ([ADR 068](../adr/068-the-guide-is-the-source-of-its-own-snippets.md)).
 `zig build snippets` finds a fenced ```` ```zig ```` block with a marker on the
 line above it, puts a prelude in front, and compiles the result. The block in
 the page is the only copy; there is no file here that mirrors it.

@@ -1,6 +1,6 @@
 //! `nilo.Text(.{ .check = … })` with no `.said`. Text the check refuses would
 //! get a 400 that cannot say why, so the sentence is required beside the check
-//! ([ADR 0264](../docs/adr/0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)).
+//! ([ADR 193](../docs/adr/193-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)).
 
 const std = @import("std");
 const nilo = @import("nilo_http");

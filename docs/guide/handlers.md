@@ -97,7 +97,7 @@ what you mean, return a struct with a nullable field, which says so.
 A `?` composes with the wrappers, and it goes **inside** them: the `?` is
 about the body, so it wraps the body and not the status around it. The
 compiler refuses the other way round, with a message that says which to
-write ([ADR 0276](../adr/0276-a-question-mark-goes-inside-the-wrapper.md)).
+write ([ADR 203](../adr/203-a-question-mark-goes-inside-the-wrapper.md)).
 
 | Write | Meaning |
 |---|---|
@@ -114,7 +114,7 @@ write ([ADR 0276](../adr/0276-a-question-mark-goes-inside-the-wrapper.md)).
 | `?Response(T)` | the same; `Response(?T)` |
 | `?Redirect(303)` | a redirect has no body for the `?` to be about; `Redirect(303)`, and `fail.notFound` |
 | `?Versioned(T)`, `Versioned(?T)` | a thing that is not there has no version; `Versioned(T)` and `fail.notFound` |
-| `*Ctx` and `void` | legal, and undescribed: the document cannot say what the handler wrote ([ADR 0150](../adr/0150-a-ctx-handler-that-returns-nothing-may-have-written-it.md)) |
+| `*Ctx` and `void` | legal, and undescribed: the document cannot say what the handler wrote ([ADR 120](../adr/120-a-ctx-handler-that-returns-nothing-may-have-written-it.md)) |
 
 The `!` goes outermost in every row, and every shape in the first table is
 what the document describes, 404 included.
@@ -154,7 +154,7 @@ fn upsertUser(db: *Db, id: u32, incoming: NewUser) !Response(User) {
 ```
 
 The two behave identically at runtime. The difference is what the API
-description can say ([ADR 0024](../adr/0024-a-failure-mode-belongs-in-the-return-type.md)).
+description can say ([ADR 023](../adr/023-a-failure-mode-belongs-in-the-return-type.md)).
 
 A `std.mem.Allocator` argument is the request arena — the thing to build a header
 value in, since it lives exactly as long as the response needs it to and is
@@ -165,7 +165,7 @@ handler's stack frame, and nilo reads the headers after the handler has
 returned; `of` copies them into the response while the list is still there. Up to
 eight per response — a ninth is a compile error pointing at `c.setHeader`, which
 has no limit.
-[ADR 0019](../adr/0019-a-response-owns-its-headers.md) has the whole story,
+[ADR 018](../adr/018-a-response-owns-its-headers.md) has the whole story,
 including why the slice this replaced passed every test and crashed in release.
 
 ## The way out: `*Ctx`
@@ -190,7 +190,7 @@ request gets one response, and sending a second is an assertion failure rather
 than two responses on the wire.
 
 See [Responses](./responses.md) for everything a `Ctx` can send, and
-[ADR 0003](../adr/0003-typed-handlers-are-a-thin-layer-over-ctx.md) for why the
+[ADR 002](../adr/002-typed-handlers-are-a-thin-layer-over-ctx.md) for why the
 typed layer is a thin one.
 
 ## `Str`, and text that belongs to the request
@@ -228,4 +228,4 @@ pointer nilo never walked — inside a const slice, inside an untagged union —
 carries no marker and is not watched. Release builds drop the whole mechanism,
 at no cost.
 
-See [ADR 0004](../adr/0004-request-arena-and-the-str-type.md).
+See [ADR 003](../adr/003-request-arena-and-the-str-type.md).

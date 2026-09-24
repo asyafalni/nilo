@@ -100,12 +100,12 @@ registered with. If it fails, the server does not start: a migration that
 could not run is a database this binary must not serve. The order between
 `before` and `spawn` is fixed rather than a matter of which line comes first:
 the services, then `before`, then the fibers
-([ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
 
 `app.start(io)` is for a program that never listens — a test, a script, a
 worker on `jobs.serveOn(io)`. Followed by `listen()` it is refused, because a
 service keeps the `Io` it was started on and `listen()` runs on a loop of its
-own (ADR 0220).
+own (ADR 180).
 
 ## Two things must not travel in
 
@@ -128,7 +128,7 @@ and one of these is one fiber for the whole process rather than one per socket.
 
 The fiber itself is not free. A suspended fiber holds its stack at the
 high-water mark it ever reached for as long as it lives
-([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)), which for a
+([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)), which for a
 fiber like this one is a few kilobytes that never come back — paid once per
 thing you spawn. Spawn a handful, not one per row in a table.
 

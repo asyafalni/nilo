@@ -5,7 +5,7 @@ One page of [the reference](./README.md): UUIDs.
 ## `nilo_id`
 
 UUIDs, as a module of their own
-([ADR 0042](../adr/0042-the-bottom-layer-holds-more-than-one-module.md)). The
+([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)). The
 same `Uuid` `nilo_sql` reads a `uuid` column into, so a generated key goes
 straight into an insert. Nothing here allocates and nothing here does IO.
 
@@ -33,7 +33,7 @@ where `Doc.id` is a `sql.Uuid`, which is this same type.
 | `id.Uuid.byte_len`, `.text_len`, `.v4_entropy`, `.v7_entropy` | 16, 36, 16, 10 |
 
 **`{f}` prints one**, which is what a refusal naming the record it could not find
-wants ([ADR 0176](../adr/0176-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)):
+wants ([ADR 143](../adr/143-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)):
 
 ```zig
 return nilo.fail.notFound("partner {f} not found", .{id});
@@ -56,7 +56,7 @@ numbers, and one in a Row is written and read as the `uuid` column.
 bytes are the clock and the other ten are the entropy you passed, with no
 counter — so two keys minted in the same millisecond come back in random order
 relative to each other, and RFC 9562 allows a counter there deliberately not
-taken ([ADR 0042](../adr/0042-the-bottom-layer-holds-more-than-one-module.md)):
+taken ([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)):
 a counter is a threadlocal or an atomic, and having no state is what lets `v7`
 be called from any fiber without a lock.
 
@@ -76,6 +76,6 @@ two things that happened at the same instant have no *when* to be ordered by.
 and a module in the bottom layer has no Bulkhead to reach through, so `v4` and
 `v7` take what they need rather than fetching it — inside a request that is
 `c.entropy(n)`, outside one it is `std.Io.randomSecure`
-([ADR 0046](../adr/0046-entropy-belongs-to-the-loop.md)). A v4 built from a
+([ADR 042](../adr/042-entropy-belongs-to-the-loop.md)). A v4 built from a
 seeded `std.Random.DefaultPrng` is fine in a test and is a session token anybody
 can predict in production; nothing here can tell the difference.

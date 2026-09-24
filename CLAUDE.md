@@ -6,31 +6,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **nilo is a toolkit for Zig 0.16: eleven modules, of which the largest is an HTTP server.** What they share is one idea: **your types are the contract, and the compiler is the check.** A plain Zig function is a route, and its argument list produces routing, typed input, a 400 for anything that does not fit, and an OpenAPI document. A plain struct is a table, and its fields produce the SQL before the program starts. Nothing is annotated.
 
-**A module gets built because the job is common, not because it is interesting**, and it gets in only if it is expressible as a type the caller already wrote, checked while compiling, with its cost written down (ADR 0018). The README's three words, helpful, quick, cheerful, are the order the trades are made in.
+**A module gets built because the job is common, not because it is interesting**, and it gets in only if it is expressible as a type the caller already wrote, checked while compiling, with its cost written down (ADR 017). The README's three words, helpful, quick, cheerful, are the order the trades are made in.
 
 Three files carry context this one does not repeat:
 
 - **`CONTEXT.md`**: the vocabulary and the words the project refuses (Ctx not "Context", Str not "string", keep not "dupe", Refusal not "negative test"). Match it in code, comments, docs and commit messages.
-- **`docs/adr/`**: the binding decisions, each naming the alternative it rejected. Check here before proposing a design change; "why not X?" usually has an answer on file. **ADR 0041 decides which module new work goes in and ADR 0042 what that module may import**; read both before adding a file anywhere but `http/`, and ADR 0043 and 0072 before adding a module.
+- **`docs/adr/`**: the binding decisions, each naming the alternative it rejected, and each the rule in force: a change to a decision edits its ADR in place, and a new number is for a new decision (ADR 221). Every ADR names its topic; a topic with a page in `docs/design/` is where to start reading it. Check here before proposing a design change; "why not X?" usually has an answer on file. The ADRs were renumbered once to three digits, so a four-digit number is an old one: `docs/adr/renumbered.md` translates it, and `zig build adr-check` refuses it anywhere else. **ADR 038 decides which module new work goes in and what that module may import**; read it before adding a file anywhere but `http/`, and ADR 039 and 063 before adding a module.
 - **`docs/reference/`**: the whole public API, one page a module.
 
 ## Who works here
 
-The repository is written to be worked on by somebody who did not write it, a person or a model. **Nothing load-bearing may live only in the author's head, only in a commit body, or only in this session.** A decision goes in an ADR, a lesson in `docs/history.md`, a rule in a build step. **Prefer making a rule enforceable over writing it down here**: a paragraph nobody runs is the thing that rots. `zig build layering` and the refusal steps are the two to lean on.
+The repository is written to be worked on by somebody who did not write it, a person or a model. **Nothing load-bearing may live only in the author's head, only in a commit body, or only in this session.** A decision goes in an ADR, a lesson in `docs/history.md`, a rule in a build step. **Prefer making a rule enforceable over writing it down here**: a paragraph nobody runs is the thing that rots. `zig build layering`, `adr-check` and the refusal steps are the ones to lean on.
 
 `CONTRIBUTING.md` is the outward-facing half: the four things a change carries (which axis it spends and the number, its refusals, its tests in both optimize modes, its documentation). Propose work in that shape. A change to those rules, the commands or the layout changes there and here together.
 
 ## Layout
 
-**The repository is modules, not one library** (ADR 0041), and one question decides where a file goes: does it need the event loop? **A module imports downward only, and never a sibling**, which is what lets two of them be worked on at once. A Service reaches request-lifetime memory through a Scope, never a `Ctx`.
+**The repository is modules, not one library** (ADR 038), and one question decides where a file goes: does it need the event loop? **A module imports downward only, and never a sibling**, which is what lets two of them be worked on at once. A Service reaches request-lifetime memory through a Scope, never a `Ctx`.
 
 | Layer | Files | What it is |
 |---|---|---|
-| **Core** | `core/` | `Str`, the Scope, the clock, percent coding: the vocabulary every layer agrees about. Needs no loop, names no Engine, so `zig test core/core.zig` runs all of it. A file gets in by being needed by two layers (ADR 0066). |
-| **Tools** | `id/`, `config/`, `pw/`, `cache/`, `jwt/` | one job each, no event loop. They *may* name `nilo_core` and none does: that would cost running under a plain `zig test`, the property that decides the layer (ADR 0042, ADR 0043). `cache/` spins because `std.Io.Mutex.lock` takes an `Io` this layer has none of, so nothing that waits goes inside its critical section. |
-| **Fitting** | `fetch/`, `job/` | borrows the loop, owns no destination: an HTTP client, and a queue whose store is handed to it (`job.Table(Db)` takes the caller's Db type, ADR 0198). Import `nilo_core` only; tests run on `std.Io.Threaded` with no Engine, which is the layer's entry condition (ADR 0070). |
-| **Services** | `sql/`, `s3/` | borrow the loop and hold a named system: a Postgres pool, a SQLite file, an object store. A SQLite statement blocks with nothing to wait on, which is why `sqlite.Options.threading` has no default (ADR 0073). `s3/` imports a Fitting (ADR 0072). Neither may name `nilo_http`. |
-| **Engine** | `http/engine/zio.zig` | accept, read, write. **The only file allowed to name zio** (ADR 0002). |
+| **Core** | `core/` | `Str`, the Scope, the clock, percent coding: the vocabulary every layer agrees about. Needs no loop, names no Engine, so `zig test core/core.zig` runs all of it. A file gets in by being needed by two layers (ADR 057). |
+| **Tools** | `id/`, `config/`, `pw/`, `cache/`, `jwt/` | one job each, no event loop. They *may* name `nilo_core` and none does: that would cost running under a plain `zig test`, the property that decides the layer (ADR 038, ADR 039). `cache/` spins because `std.Io.Mutex.lock` takes an `Io` this layer has none of, so nothing that waits goes inside its critical section. |
+| **Fitting** | `fetch/`, `job/` | borrows the loop, owns no destination: an HTTP client, and a queue whose store is handed to it (`job.Table(Db)` takes the caller's Db type, ADR 160). Import `nilo_core` only; tests run on `std.Io.Threaded` with no Engine, which is the layer's entry condition (ADR 061). |
+| **Services** | `sql/`, `s3/` | borrow the loop and hold a named system: a Postgres pool, a SQLite file, an object store. A SQLite statement blocks with nothing to wait on, which is why `sqlite.Options.threading` has no default (ADR 064). `s3/` imports a Fitting (ADR 063). Neither may name `nilo_http`. |
+| **Engine** | `http/engine/zio.zig` | accept, read, write. **The only file allowed to name zio** (ADR 001). |
 | **Bulkhead** | `http/bulkhead.zig` | the whole contract nilo asks of an Engine, listed in its header. `Options` lives here so swapping engines cannot change what a user writes. |
 | **HTTP + App** | `http/http1.zig`, `http/router.zig`, `http/app.zig` | parse, match, dispatch. `App.handleRequest` takes only a `*std.Io.Reader` and `*std.Io.Writer`, so almost every HTTP behaviour is tested on in-memory buffers. |
 | **Ctx** | `http/ctx.zig` | one request in flight, and nilo's real API. |
@@ -38,7 +38,7 @@ The repository is written to be worked on by somebody who did not write it, a pe
 
 **The layering rule is a build step**: `zig build layering` reads the `@import`s of every module but `http/` and refuses one missing from that module's row of `layers` in `build.zig`. Adding a module means a row there, in `shipped_roots`, and in `.paths` in `build.zig.zon`.
 
-A request: `readHead` → `parseHead` → the head is *borrowed* from the read buffer unless the request will read again, when it is copied into the arena (read `borrowed` in `app.zig` before touching that path) → route match → middleware chain → resolved values → handler → response. The arena is reset per request, keeping `arena_keep` bytes. The rest of `http/`, by what it serves: `str` (request-lifetime text and the Debug-only use-after-request trap), `fail` (ADR 0007), `resolve`, `service`, `middleware`, `form`/`bound`/`convert`/`patch`, `session`/`cookie`, `password` (the Gate in front of `nilo_pw`, ADR 0048), `static`/`sendfile`/`filebody`/`range`, `stream`/`body`/`websocket`, `openapi`, `watchdog`, `logger`, `cors`.
+A request: `readHead` → `parseHead` → the head is *borrowed* from the read buffer unless the request will read again, when it is copied into the arena (read `borrowed` in `app.zig` before touching that path) → route match → middleware chain → resolved values → handler → response. The arena is reset per request, keeping `arena_keep` bytes. The rest of `http/`, by what it serves: `str` (request-lifetime text and the Debug-only use-after-request trap), `fail` (ADR 006), `resolve`, `service`, `middleware`, `form`/`bound`/`convert`/`patch`, `session`/`cookie`, `password` (the Gate in front of `nilo_pw`, ADR 044), `static`/`sendfile`/`filebody`/`range`, `stream`/`body`/`websocket`, `openapi`, `watchdog`, `logger`, `cors`.
 
 ### Dependencies and build flags
 
@@ -46,9 +46,9 @@ A request: `readHead` → `parseHead` → the head is *borrowed* from the read b
 
 | flag | brings | ADR |
 |---|---|---|
-| `.sql = true` (`-Dsql`) | pg.zig (with buffer, metrics, xsync, tls) and zqlite (the SQLite amalgamation) | 0075 |
-| `.tls = true` (`-Dtls`) | tls.zig; without it there is no `tls` module and the Engine's every use is under `@import("nilo_build").tls` | 0288 |
-| `.grpc = true` (`-Dgrpc`) | nothing: HTTP/2, HPACK and gRPC are `http/h2.zig`, `hpack.zig`, `grpc.zig`. A call becomes an in-memory HTTP/1.1 `POST` to `App.handleRequest`, so a gRPC method is an ordinary route | 0297 |
+| `.sql = true` (`-Dsql`) | pg.zig (with buffer, metrics, xsync, tls) and zqlite (the SQLite amalgamation) | 066 |
+| `.tls = true` (`-Dtls`) | tls.zig; without it there is no `tls` module and the Engine's every use is under `@import("nilo_build").tls` | 212 |
+| `.grpc = true` (`-Dgrpc`) | nothing: HTTP/2, HPACK and gRPC are `http/h2.zig`, `hpack.zig`, `grpc.zig`. A call becomes an in-memory HTTP/1.1 `POST` to `App.handleRequest`, so a gRPC method is an ordinary route | 220 |
 
 It is the flag, not `.lazy = true`, that keeps a dependency out: `b.lazyDependency` is a request, and called unconditionally it ran for every dependent. This repository's own http test root is built with TLS and gRPC whatever the flags say. `zig build fetch-check -Dnetwork` builds `bench/dependent/` against two cold caches and fails on anything but zio landing; it needs the internet, so it is not on `test`.
 
@@ -56,7 +56,7 @@ It is the flag, not `.lazy = true`, that keeps a dependency out: `b.lazyDependen
 
 ```
 zig build test         # the loop: the suite in Debug, the refusals, every module's gate but
-                       #   test-sql, plus layering and snippets
+                       #   test-sql, plus layering, adr-check and snippets
 zig build test-all     # the above, the suite in ReleaseSafe, test-sql and refusals-sql.
                        #   What CI runs, and the whole gate
 zig build test-{core,id,config,pw,cache,jwt,fetch,job,s3,dev}   # one module, both modes,
@@ -64,13 +64,14 @@ zig build test-{core,id,config,pw,cache,jwt,fetch,job,s3,dev}   # one module, bo
 zig build test-fetch-engine  # an outbound deadline firing against a real port; on `test`
 zig build test-sql     # nilo_sql, with test-job-sql and refusals-sql; Postgres if DATABASE_URL reaches one
 zig build layering     # no module imports upward or sideways
+zig build adr-check    # ADR files, their Topic lines, and every ADR cited exists; on test
 zig build refusals     # the framework's table only; refusals-{sql,config,pw,cache,s3,job,fetch} for the others
 zig build snippets     # the documentation's marked snippets, which must compile
 zig build examples     # build every example; run-{hello,rest,orders,forms,spa,stream,chat,scheduled,outbound,sqlite}
-zig build dev-{hello,…}  # an example restarted on a save to its Zig, and on nothing else (ADR 0259)
+zig build dev-{hello,…}  # an example restarted on a save to its Zig, and on nothing else (ADR 190)
 zig build fuzz -- --iterations 1000000 --seed 0x…   # generated requests at the parser; --frames for gRPC
 zig build smoke-tls -Dnetwork   # a real HTTPS endpoint; not on test
-mkdocs serve           # the guide as the website; `mkdocs build` is CI's strict check (ADR 0296)
+mkdocs serve           # the guide as the website; `mkdocs build` is CI's strict check (ADR 219)
 ```
 
 Benchmarks and their scripts are in [`bench/README.md`](bench/README.md). `-Dstrip=true|false` overrides the per-artifact debug-info default.
@@ -81,9 +82,9 @@ Benchmarks and their scripts are in [`bench/README.md`](bench/README.md). `-Dstr
 
 **Read the exit code, not the word "failed".** A passing `test` prints several `failed command: …` lines and exits 0, because `zig build` prints one for every step that wrote to stderr. The exit code and a `Build Summary` reporting a failed step are what count.
 
-**The refusals never cache**: the compiler keeps nothing from a failed compilation, so they are re-analysed every run and are the floor of a run that changed nothing (ADR 0027). They are not the slow part of a run that changed something; that is the largest single compilation ([`bench/result/build.md`](bench/result/build.md)).
+**The refusals never cache**: the compiler keeps nothing from a failed compilation, so they are re-analysed every run and are the floor of a run that changed nothing (ADR 026). They are not the slow part of a run that changed something; that is the largest single compilation ([`bench/result/build.md`](bench/result/build.md)).
 
-**Take a stuck build's CPU time before believing it is slow.** `ps -o etime,cputime -C zig`: minutes of wall against seconds of CPU is a deadlock or something waiting on you (`--time-report` stands up a web server), and a documented slow path is the best hiding place for one. Suspect first the tests that open a real socket at both ends (`test-fetch`, `test-s3`, `http/live.zig`). **A wait on a flag needs a bound, and the giving-up path needs to set something**; a listener a test connects to is started with `io.concurrent`, because `io.async` may run it on the calling thread (ADR 0230). A genuinely slow build gets the same treatment: compare CPU against wall. The other readings (OOM, a piped log, a green run about an edited tree) are tabled in [`docs/history.md`](docs/history.md#a-suite-that-hangs-and-a-build-that-looks-stuck).
+**Take a stuck build's CPU time before believing it is slow.** `ps -o etime,cputime -C zig`: minutes of wall against seconds of CPU is a deadlock or something waiting on you (`--time-report` stands up a web server), and a documented slow path is the best hiding place for one. Suspect first the tests that open a real socket at both ends (`test-fetch`, `test-s3`, `http/live.zig`). **A wait on a flag needs a bound, and the giving-up path needs to set something**; a listener a test connects to is started with `io.concurrent`, because `io.async` may run it on the calling thread (ADR 056). A genuinely slow build gets the same treatment: compare CPU against wall. The other readings (OOM, a piped log, a green run about an edited tree) are tabled in [`docs/history.md`](docs/history.md#a-suite-that-hangs-and-a-build-that-looks-stuck).
 
 ### Running one test
 
@@ -100,12 +101,12 @@ Everything else under `http/` needs the module graph, so `zig build test` is the
 
 ## Invariants that are load-bearing
 
-ADR 0018 splits performance into four axes that do not recover the same way:
+ADR 017 splits performance into four axes that do not recover the same way:
 
-- **Allocations per request** (hard). Held by `test "the request path stays inside its allocation budget"` in `http/app.zig`. A DX feature may not add one to a path that did not ask for it.
-- **Memory per idle connection** (hard). 4,669 bytes for the framework and 5,183 for an idle WebSocket, and that is a **floor, not a total**: a suspended fiber holds its stack at its high-water mark, so a handler adds every byte of stack it ever touched for the life of the connection (ADR 0063). **In this framework the arena is cheaper than the stack**, and **where a fiber is suspended is what it costs**: the framework's frames are kept under a page, and a `std.log` call inlined into a connection loop puts its format machinery there (ADR 0071). Every feature that costs per-connection memory states the number in its own ADR. A `-Dtls` build pays a page per idle connection on every listener, because the plain park sits under 300 bytes short of a page boundary; `bench/mem.py` is what notices.
+- **Allocations per request** (hard). Held by `test "the request path stays inside its allocation budget"` in `http/behaviour.zig`. A DX feature may not add one to a path that did not ask for it.
+- **Memory per idle connection** (hard). 4,669 bytes for the framework and 5,183 for an idle WebSocket, and that is a **floor, not a total**: a suspended fiber holds its stack at its high-water mark, so a handler adds every byte of stack it ever touched for the life of the connection (ADR 062). **In this framework the arena is cheaper than the stack**, and **where a fiber is suspended is what it costs**: the framework's frames are kept under a page, and a `std.log` call inlined into a connection loop puts its format machinery there (ADR 062). Every feature that costs per-connection memory states the number in its own ADR. A `-Dtls` build pays a page per idle connection on every listener, because the plain park sits under 300 bytes short of a page boundary; `bench/mem.py` is what notices.
 - **Throughput and p99**: DX wins below 10%.
-- **Binary size**: a feature the linker cannot drop states its stripped `ReleaseFast` cost in the running total in ADR 0018.
+- **Binary size**: a feature the linker cannot drop states its stripped `ReleaseFast` cost in the running total in ADR 017.
 
 **Every change is put against all four before it is written**, the axis it spends and the number, in a design argued in a session as much as in a diff. **A feature that cannot be made to fit does not ship in a worse shape**: it waits for the shape that fits.
 
@@ -122,13 +123,13 @@ The habits, each of which caught something here (the cases are under *Measuring*
 - **Take a per-connection figure out until marginal meets average**, on both sides of a comparison.
 - **Pin both sides to physical cores**, or the number is about the scheduler.
 
-**A conclusion of "blocked on somebody else" gets one more hour than it feels like it needs, and one blocked on "a design" gets two.** Nothing downstream ever re-tests a blocker, and a requirement written as one mechanism reads as a blocker where written as what it has to catch it reads as a choice (ADR 0063, last section).
+**A conclusion of "blocked on somebody else" gets one more hour than it feels like it needs, and one blocked on "a design" gets two.** Nothing downstream ever re-tests a blocker, and a requirement written as one mechanism reads as a blocker where written as what it has to catch it reads as a choice (ADR 062, last section).
 
 ## Conventions
 
-**Error messages are a feature, and a build step holds them.** Each file in `refusals/` (and `<module>/refusals/`) is a program written wrong on purpose that must fail with a message nilo wrote. Adding a comptime check means adding **both** a file and a row in the matching table in `build.zig`. **There are eight tables and eight steps**, one per module, and adding a row to one while running another is a check that silently never ran. Leave the `nilo: ` prefix off `.says`; the step supplies it, so a failure inside std cannot be recorded as passing. `.says` is matched with `endsWith`, so it is the whole tail of the message's first line. See `refusals/README.md` and ADR 0027.
+**Error messages are a feature, and a build step holds them.** Each file in `refusals/` (and `<module>/refusals/`) is a program written wrong on purpose that must fail with a message nilo wrote. Adding a comptime check means adding **both** a file and a row in the matching table in `build.zig`. **There are eight tables and eight steps**, one per module, and adding a row to one while running another is a check that silently never ran. Leave the `nilo: ` prefix off `.says`; the step supplies it, so a failure inside std cannot be recorded as passing. `.says` is matched with `endsWith`, so it is the whole tail of the message's first line. See `refusals/README.md` and ADR 026.
 
-**A published snippet is a program, and a build step compiles it.** `<!-- compiles -->` above a fenced `zig` block in the README, the reference or a guide page makes `zig build snippets` compile it after `docs/snippets/types.zig`; `<!-- compiles: body -->` wraps loose statements in a function with `values.zig`. The block in the page is the only copy. These cache, so marking one is nearly free (ADR 0083).
+**A published snippet is a program, and a build step compiles it.** `<!-- compiles -->` above a fenced `zig` block in the README, the reference or a guide page makes `zig build snippets` compile it after `docs/snippets/types.zig`; `<!-- compiles: body -->` wraps loose statements in a function with `values.zig`. The block in the page is the only copy. These cache, so marking one is nearly free (ADR 068).
 
 **Tests sit at the bottom of the file they test**, named as sentences about the behaviour: `test "a path param that is not a number becomes a 400 with a clear message"`. A new file under `http/` gets an `_ = @import(...)` line in the `test { … }` block at the end of `http/http.zig`, or it never runs. The examples carry tests and run in the same suite.
 
@@ -140,11 +141,14 @@ The habits, each of which caught something here (the cases are under *Measuring*
 
 **Commits are conventional-commit prefixes with a short body.** The subject is `type: imperative sentence about the effect` (`feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `build`, `chore`, `!` for a break), and says what changed, not which files: `fix: stop the router reading routes that cannot match`. The body is optional, a few sentences explaining why or naming a number; the long account belongs in the files below, and a body that repeats them is a fourth copy. Commits before `b662f01` follow an older convention.
 
+**A revision never makes a new ADR.** Changing, narrowing, widening, correcting or reversing a decision edits its ADR in place: the Decision says the rule as it holds now, and the position it replaced moves under "What was rejected" with the evidence that moved it. A new number is only for a decision that did not exist before; if it changes part of an older one, edit the older one in the same change so each says the rule in force, and name it with `**Extends:**`. `zig build adr-check` refuses `Amends`, `Supersedes`, `Refines` or any head word outside `Applies`, `Extends`, `Carries out`, `Closes` and `Found by` (ADR 221). Before writing an ADR, look for the one it would revise: its topic page in `docs/design/` lists every ADR on that topic.
+
 **Documentation is part of the change**, not a follow-up:
 
 | what | where |
 |---|---|
-| a design decision and the alternative it rejected | a new file in `docs/adr/` |
+| a design decision and the alternative it rejected | a new file in `docs/adr/`, or an edit to the ADR it changes |
+| how a topic's decisions fit together | its page in `docs/design/`, linked from each ADR's `**Topic:**` line |
 | a lesson: a number measured, a premise that turned out false, a design tried and lost | `docs/history.md`, as one paragraph under the theme it teaches (its header has the rules) |
 | what a user has to change | `CHANGELOG.md`, under `## Unreleased` |
 | what is still open | `docs/roadmap.md` (its own rules are under [How this file is written](docs/roadmap.md#how-this-file-is-written)) |
@@ -159,7 +163,7 @@ Cutting a release (the version bumps, the pinned `?ref=#commit`, the release pag
 
 ## Refused on the record
 
-Templates and HTTP/2 for ordinary routes are decisions, not gaps (README "What it won't do", ADR 0028); propose a change to the ADR instead of adding them. gRPC moved the same way: behind `-Dgrpc`, unary only, on a listener of its own (ADR 0297), with streaming and h1 plus h2c on one port waiting for a caller. TLS is the precedent for moving one: an option behind a build flag, the default build unchanged on the memory axis and 2.8 KB on the size one, and every number on the record before it shipped (ADR 0288).
+Templates and HTTP/2 for ordinary routes are decisions, not gaps (README "What it won't do", ADR 027); propose a change to the ADR instead of adding them. gRPC moved the same way: behind `-Dgrpc`, unary only, on a listener of its own (ADR 220), with streaming and h1 plus h2c on one port waiting for a caller. TLS is the precedent for moving one: an option behind a build flag, the default build unchanged on the memory axis and 2.8 KB on the size one, and every number on the record before it shipped (ADR 212).
 
 <!-- devrun:begin -->
 ## Running this project's services

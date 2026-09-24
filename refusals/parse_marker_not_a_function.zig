@@ -1,5 +1,5 @@
 //! A type saying it parses itself with something that cannot be called.
-//! `nilo_parse` is the function nilo hands the request text to (ADR 0142), so
+//! `nilo_parse` is the function nilo hands the request text to (ADR 113), so
 //! a constant under that name says the type can do something it cannot.
 
 const nilo = @import("nilo_http");

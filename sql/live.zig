@@ -1,5 +1,5 @@
 //! The tests that need a database, and the only ones in this module that
-//! do (ADR 0039).
+//! do (ADR 036).
 //!
 //! Everything else in `sql/` is a pure function — SQL text out of types,
 //! a schema comparison, a Row filled from a Fake — and runs in
@@ -30,7 +30,7 @@
 //! ## Why there is no event loop here
 //!
 //! pg.zig wants a `std.Io`, and the one nilo runs on belongs to zio, which
-//! nothing outside `src/engine/` may name (ADR 0002). It does not have to
+//! nothing outside `src/engine/` may name (ADR 001). It does not have to
 //! be zio's: `std.Io.Threaded` is std's own implementation, so these tests
 //! build one, hand it to `nilo_start` exactly as `listen()` would, and
 //! never start a server at all. That the Wire cannot tell the difference is
@@ -98,7 +98,7 @@ const list_table = "nilo_live_tickets_" ++ mode_suffix;
 /// A view earns a fixture of its own because it is the one relation where the
 /// *check* was wrong rather than the read: Postgres does not track `NOT NULL`
 /// through one, so every non-optional field of a Row over a view used to be
-/// reported as a disagreement and the server refused to start (ADR 0056). A
+/// reported as a disagreement and the server refused to start (ADR 050). A
 /// materialized view earns one because `information_schema` cannot see it at
 /// all.
 const adults_view = "nilo_live_adults_" ++ mode_suffix;
@@ -170,7 +170,7 @@ const setup =
     // Two column types this module has never had a Zig word for, and the
     // reason they are here rather than in a table of their own: they are read
     // through the same protocol a project's own column type uses, so a test
-    // that they round-trip is a test that the protocol does (ADR 0055).
+    // that they round-trip is a test that the protocol does (ADR 049).
     "  stay interval," ++
     "  origin inet," ++
     // A real `date`, written by Postgres and never by nilo, so the four bytes
@@ -202,7 +202,7 @@ const setup =
     "  scores integer[]," ++
     // `uuid[]` is the array a schema of 145 uuid columns has as many of as it
     // has parent tables, and it is the one the module had no case for at all
-    // (ADR 0145). Nullable, so the four rows written before it still say what
+    // (ADR 116). Nullable, so the four rows written before it still say what
     // they meant.
     "  owners uuid[]" ++
     ");" ++
@@ -234,7 +234,7 @@ const setup =
     "INSERT INTO " ++ scoped_table ++ " (id, label) VALUES (1, 'in another schema');" ++
     // A table as wide as a real one — twenty columns, of which a save
     // writes seventeen — because a batch that compiled at nine columns and
-    // not at seventeen was found by a port and not by a test (ADR 0208).
+    // not at seventeen was found by a port and not by a test (ADR 169).
     "DROP TABLE IF EXISTS " ++ lines_table ++ ";" ++
     "CREATE TABLE " ++ lines_table ++ " (" ++
     "  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY," ++
@@ -298,7 +298,7 @@ const Live = struct {
         // Under the engine it is fine: zio parks across threads, and
         // `bench/sql_server.zig` boots with the database switched off,
         // connects when it comes up and shuts down clean
-        // ([ADR 0062](../docs/adr/0062-a-pool-that-dialled-itself-whatever-it-was-told.md)).
+        // ([ADR 115](../docs/adr/115-a-boot-dials-the-connection-its-work-needs.md)).
         // So this is a constraint on the *test harness*, and it is written
         // where the harness is.
         var wire = try postgres.Wire.open(threaded.io(), gpa, url, .{
@@ -534,8 +534,8 @@ test "a Db told what to expect boots against a real Postgres and asks its ledger
     defer threaded.deinit();
 
     // The boot a deploy runs, minus the server: `nilo_start` dials the pool
-    // and `nilo_check` then asks the ledger, on that pool (ADR 0220, ADR
-    // 0277). The whole pool is dialled up front for the reason `Live.open`
+    // and `nilo_check` then asks the ledger, on that pool (ADR 180, ADR
+    // 180). The whole pool is dialled up front for the reason `Live.open`
     // gives. `expecting(0)` is level or ahead on any database, so the guard
     // goes through; behind is pinned on SQLite in `migrate_live.zig`, where
     // the file is fresh.
@@ -561,7 +561,7 @@ test "an unchecked Db on the defaults has a connection to lend the moment it sta
 
     // `connect_on_init` left at 0 and nothing to check: the shape a program
     // whose tables are its own DDL writes, and then hands `app.before` a
-    // migration. Before ADR 0284 the pool reached that hook with nothing
+    // migration. Before ADR 115 the pool reached that hook with nothing
     // dialled and the hook got `Disconnected`, every cold boot. `size = 1`
     // so that the one connection the boot dials is the whole pool, and the
     // reconnector has nothing to fill from an OS thread `std.Io.Threaded`
@@ -610,7 +610,7 @@ test "every wait on the database is reported through the Limits the wire was sta
     waits_reported = 0;
     waits_closed = 0;
     // One statement is one wait, from the exchange to the close, however
-    // many rows come off the socket in between (ADR 0286).
+    // many rows come off the socket in between (ADR 210).
     var rows = try wire.run(arena.allocator(), "SELECT generate_series(1, 1000)", .{}, null, null);
     var n: usize = 0;
     while (try wire.next(&rows)) n += 1;
@@ -727,7 +727,7 @@ fn insertDuplicateDirect(
 
     const answer = try client.post(app, "/dup", "");
     _ = db;
-    // ADR 0005's table gives `AlreadyExists` a 409 and nothing else a
+    // ADR 004's table gives `AlreadyExists` a 409 and nothing else a
     // default, which is the whole of what "the one whose meaning does not
     // change with the request" buys.
     if (answer.status == 409) return error.AlreadyExists;
@@ -979,7 +979,7 @@ test "find takes a key, and the column it compares comes from the Row" {
     try testing.expectEqualStrings("ada@example.dev", ada.?.email);
 
     // Nothing there is null rather than an error, which is what makes
-    // `!?Person` a whole endpoint (ADR 0024).
+    // `!?Person` a whole endpoint (ADR 023).
     try testing.expectEqual(
         @as(?Person, null),
         try stack.db.find(Person, &run, @as(i64, 99)),
@@ -1745,7 +1745,7 @@ test "a view is a relation a Row can read and a check can judge" {
     try testing.expect(columns.len == 3);
     // Nothing, and not three `unexpected_null`s: the database does not know
     // whether a view column can be null, and a check that does not know says
-    // nothing rather than guessing (ADR 0056).
+    // nothing rather than guessing (ADR 050).
     try testing.expectEqual(@as(usize, 0), try schema.compare(
         dialect.Postgres,
         Adult,
@@ -1919,7 +1919,7 @@ test "an interval and an inet round-trip as the text postgres prints" {
     // A value that is not optional, set into the column that is: the ordinary
     // act of filling in a date that was empty. It used to stop as a type
     // error inside `forWire`, and `@as(?Interval, …)` at every site was the
-    // workaround (ADR 0203).
+    // workaround (ADR 164).
     const filled = try stack.db.updateReturning(Booking, &run, .{
         .set = .{ .stay = types.Interval{ .text = "5 days" } },
         .where = .{ .id = @as(i64, 720) },
@@ -2301,7 +2301,7 @@ test "a savepoint rolled back takes its work with it, and released keeps it" {
 ///
 /// `.managed = false` because the fixture's `role` really is a Postgres
 /// `ENUM`, and a plain Zig enum on a Row nilo builds is a `text` column with a
-/// check over its words (ADR 0221). Saying the program only reads this table
+/// check over its words (ADR 181). Saying the program only reads this table
 /// is what leaves the column type to the database, which is where it is.
 const Staff = struct {
     pub const nilo_table = .{ .name = table, .key = .id, .managed = false };
@@ -2415,7 +2415,7 @@ test "an enum value the Zig enum does not have is a 500, not a dead process" {
     // Before the decode moved out of the driver this was
     // `std.meta.stringToEnum(T, str).?` and the third row took the process
     // down — every in-flight request with it, because Zig cannot recover from
-    // a panic (ADR 0008). One request failing is the whole of the fix.
+    // a panic (ADR 007). One request failing is the whole of the fix.
     try testing.expectEqual(@as(u16, 500), answer.status);
 }
 
@@ -2626,7 +2626,7 @@ test "a uuid bound bare to db.exec reaches the column without a text cast" {
 
     // What the report was: this compiled and answered `error.QueryFailed`,
     // with nothing logged at any level and nothing in Postgres's own log
-    // because the statement never arrived (ADR 0145, ADR 0146). The workaround
+    // because the statement never arrived (ADR 116, ADR 117). The workaround
     // was sending thirty-six characters and writing `$1::text::uuid`, which
     // costs an arena allocation per id and twenty bytes on the wire.
     const token = try types.Uuid.parse("550e8400-e29b-41d4-a716-446655440009");
@@ -2673,7 +2673,7 @@ test "a uuid array goes out to a column and comes back the same array" {
 
     // Written, which is the half that stopped inside pg.zig: `[]const [16]u8`
     // is `cannot bind value of type`, four frames down and about a type the
-    // caller never wrote (ADR 0145).
+    // caller never wrote (ADR 116).
     const made = try stack.db.insert(Owned, &run, .{
         .id = @as(i64, 810),
         .tags = &.{"written"},
@@ -2730,7 +2730,7 @@ test "an `in` over uuids is the one statement that stops an N+1" {
 
 /// What the watcher below was told. A file-scope variable because a `Watcher`
 /// is a plain function pointer with nowhere to put a capture, which is
-/// [ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)'s own argument.
+/// [ADR 108](../docs/adr/108-a-statement-can-be-watched.md)'s own argument.
 var said: ?db_mod.Sent = null;
 
 fn recordSent(sent: db_mod.Sent) void {
@@ -2754,7 +2754,7 @@ test "a failed statement carries what Postgres said, not only that it failed" {
     // failed run (`http/test_root.zig`). What is being pinned is the same slot
     // either way: `error.AlreadyExists` used to be the whole of what a program
     // could see, and the constraint that was violated is the field that names
-    // the thing to go and fix (ADR 0146).
+    // the thing to go and fix (ADR 117).
     try testing.expectError(error.AlreadyExists, stack.db.exec(
         &run,
         "INSERT INTO \"" ++ table ++ "\" (id, email, age) VALUES ($1, $2, $3)",
@@ -2806,7 +2806,7 @@ test "the schema comparison judges an array by the array it holds" {
 
 /// A table whose array columns are given their defaults by the marker rather
 /// than by a hand-written `ALTER`
-/// ([ADR 0225](../docs/adr/0225-an-array-column-has-a-default-like-any-other.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 ///
 /// **The five elements are the five ways an array literal can be read as more
 /// or fewer elements than it holds**: a comma, a brace, a double quote, a
@@ -2931,7 +2931,7 @@ const Widened = struct {
 
 const shipped_table = "nilo_live_shipped_" ++ mode_suffix;
 
-/// The three schema-level objects on a real Postgres (ADR 0253): a function
+/// The three schema-level objects on a real Postgres (ADR 181): a function
 /// a trigger calls, a table carrying that trigger, and a view over the
 /// table — made by `createMissing` in the order the tool owns.
 const touched_table = "nilo_live_touched_" ++ mode_suffix;
@@ -3034,7 +3034,7 @@ test "addMissingColumns widens a Postgres table the way createMissing would have
     _ = try db.insert(Shipped, &run, .{ .url = "http://a/1" });
 
     // Through `pg_catalog` rather than `pragma_table_info`, which is the
-    // half of ADR 0233 the SQLite file cannot reach.
+    // half of ADR 123 the SQLite file cannot reach.
     try testing.expectEqual(@as(usize, 3), try migrate.addMissingColumns(&db, &run, .{ .tables = &.{Widened} }));
     try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&db, &run, .{ .tables = &.{Widened} }));
 
@@ -3046,7 +3046,7 @@ test "addMissingColumns widens a Postgres table the way createMissing would have
     try testing.expectEqual(@as(usize, 0), try db.checkSchema(&.{Widened}));
 
     // And a scalar read off the catalogue, the way the SQLite test reads
-    // `pragma_table_info` (ADR 0234).
+    // `pragma_table_info` (ADR 125).
     const names = try db.raw(
         []const u8,
         &run,
@@ -3057,7 +3057,7 @@ test "addMissingColumns widens a Postgres table the way createMissing would have
     try testing.expectEqualStrings("tries", names[4]);
 }
 
-// -- the second kind of word, against a database that reads it (ADR 0226) --
+// -- the second kind of word, against a database that reads it (ADR 181) --
 
 /// A table whose `CHECK` and whose trigger come out of the marker rather than
 /// out of a hand-written step.
@@ -3648,7 +3648,7 @@ test "bytes go out to a bytea through every statement that binds one" {
     try testing.expectEqualSlices(u8, &other, after.device.?.bytes);
 
     // `db.raw`, where the caller wrote the cast and the tuple is mapped
-    // through the same rule (ADR 0145).
+    // through the same rule (ADR 116).
     const raw = try stack.db.raw(
         Session,
         &run,
@@ -3718,7 +3718,7 @@ const Filtered = struct {
 };
 
 test "a filter that is absent runs on Postgres in every shape a guard takes" {
-    // ADR 0183's guard was `($1 IS NULL OR "name" = $1)`, and every comptime
+    // ADR 149's guard was `($1 IS NULL OR "name" = $1)`, and every comptime
     // test asserted that string and passed. pg.zig sends a `Parse` with no
     // parameter types, so Postgres works each one out from its first use —
     // and `$1 IS NULL` is a null test on an unknown, which is `could not
@@ -3816,7 +3816,7 @@ test "a search over several columns is one statement on Postgres, with the box e
     // Item 72: the fourth most common WHERE a list screen has is
     // `(q IS NULL OR code ILIKE q OR name ILIKE q OR …)` beside a handful of
     // guarded filters, and on nilo it was two `db.select` calls with the
-    // filters written twice (ADR 0211). One parameter named on every column;
+    // filters written twice (ADR 172). One parameter named on every column;
     // Postgres is what says the shared placeholder types once and reads
     // three times.
     const gpa = testing.allocator;
@@ -3867,7 +3867,7 @@ test "a search over several columns is one statement on Postgres, with the box e
 test "an exists from the child's side reads the parent's key off the child's own reference" {
     // Item 75: `staff WHERE EXISTS (departments WHERE …)`, where the key is on
     // the outer Row. Here the session points at the person, and the query is
-    // over sessions asking about the person (ADR 0214).
+    // over sessions asking about the person (ADR 175).
     const gpa = testing.allocator;
     var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
     defer stack.close(gpa);
@@ -3910,7 +3910,7 @@ test "an exists from the child's side reads the parent's key off the child's own
 }
 
 /// A person carrying the ids of their sessions — which no column holds, and
-/// the handler fills after the read (ADR 0217).
+/// the handler fills after the read (ADR 178).
 const Carried = struct {
     pub const nilo_table = Person;
     pub const nilo_beside = .{.sessions};
@@ -4010,7 +4010,7 @@ test "statements interleaved on one connection keep their own prepared plans" {
     // `bench/sql.zig` did by accident, and Postgres answered the *second*
     // statement's parameters against the *first* statement's describe. Two
     // statements with the same arity would not have said anything at all
-    // (ADR 0057), which is why the round trip below asserts the answers
+    // (ADR 051), which is why the round trip below asserts the answers
     // rather than only that nothing errored.
     var round: usize = 0;
     while (round < 8) : (round += 1) {
@@ -4056,7 +4056,7 @@ test "a Db told to keep no plans still answers, one Parse at a time" {
 // -- a Row as wide as a real table -----------------------------------------
 
 /// Twenty columns, the width `rab_lines` has in the port that found the
-/// builders running out of branches at seventeen written (ADR 0208).
+/// builders running out of branches at seventeen written (ADR 169).
 const Line = struct {
     pub const nilo_table = .{ .name = lines_table, .key = .id, .filled = .{ .created_at, .updated_at } };
 
@@ -4199,7 +4199,7 @@ test "a statement composed at run time fills a Row by position and runs unnamed"
     const exact = try stack.db.rawOne(i64, &run, "SELECT sum(age)::bigint FROM " ++ table ++ " WHERE age > 0", .{});
     try testing.expectEqual(exact.?, sum);
 
-    // One column into a scalar, the way `raw` allows (ADR 0234).
+    // One column into a scalar, the way `raw` allows (ADR 125).
     var one = stack.db.compose(&run);
     try one.text("SELECT count(*)::bigint FROM ");
     try one.ident(table);
@@ -4215,7 +4215,7 @@ test "a statement composed at run time fills a Row by position and runs unnamed"
 
 // -- shaped Rows ---------------------------------------------------------
 //
-// What SQLite cannot say about ADR 0295: that `sum` over a `bigint` comes
+// What SQLite cannot say about ADR 218: that `sum` over a `bigint` comes
 // back as the `numeric` Postgres makes of it unless it is cast, that a list
 // of uuids is one `uuid[]` parameter `unnest` numbers, and that a presence
 // test reads as a `bool`.

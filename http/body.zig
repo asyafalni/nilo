@@ -1,4 +1,4 @@
-//! Reading a request body in pieces, for the ones too big to hold (ADR 0020).
+//! Reading a request body in pieces, for the ones too big to hold (ADR 019).
 //!
 //! ```zig
 //! fn upload(c: *nilo.Ctx, store: *Store) !Receipt {
@@ -94,7 +94,7 @@ pub const Progress = struct {
 /// A request body, arriving in pieces.
 pub const Body = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Body";
 
     /// The body as a `std.Io.Reader`, for handing to something in the
@@ -109,7 +109,7 @@ pub const Body = struct {
     _progress: *Progress,
     /// The request's blocking detector, or null when there is no request
     /// behind this — a Body a test built against a fixed reader. A stretch of
-    /// handler time ends at every read (ADR 0132).
+    /// handler time ends at every read (ADR 013).
     _watch: ?*watchdog.Watch = null,
 
     /// The next piece of the body, or null once there is none.
@@ -247,7 +247,7 @@ pub const Body = struct {
         const self: *Body = @alignCast(@fieldParentPtr("reader", r));
         // Waiting for the client to send more is not the handler holding its
         // thread, and saying so is what lets a body reader be watched at all
-        // rather than excused (ADR 0132). Through the slot rather than a
+        // rather than excused (ADR 013). Through the slot rather than a
         // pointer on `Body`, because a read is a syscall and the lookup is
         // not.
         const token = watchdog.waiting(self._watch);

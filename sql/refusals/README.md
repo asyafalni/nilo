@@ -10,7 +10,7 @@ mistake and the thing it contradicts without opening anything else.
 
 **They hang off `zig build test-sql`, not `zig build test`**, and the table is
 `sql_refusals` in `build.zig` rather than `refusals`. The framework's loop does
-not pay for a module it does not import ([ADR 0039](../../docs/adr/0039-the-shape-of-a-query-is-settled-while-compiling.md)).
+not pay for a module it does not import ([ADR 036](../../docs/adr/036-the-shape-of-a-query-is-settled-while-compiling.md)).
 
 `zig build refusals-sql` runs only these.
 

@@ -13,7 +13,7 @@
 # `zig build -Doptimize=ReleaseFast` then `./zig-out/bin/nilo-hello`.
 #
 # The load test for fail-function message leakage lives separately in
-# bench/mixed.lua (see ADR 0007) — that one tests correctness, not speed.
+# bench/mixed.lua (see ADR 006) — that one tests correctness, not speed.
 
 set -euo pipefail
 

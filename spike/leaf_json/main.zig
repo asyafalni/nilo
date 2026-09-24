@@ -1,4 +1,4 @@
-//! What a response holding a `sql.Uuid` costs, before and after ADR 0182.
+//! What a response holding a `sql.Uuid` costs, before and after ADR 148.
 //!
 //! `covers()` used to answer false for any type carrying `jsonStringify`, and
 //! it is answered for the **whole value** — so one `Uuid` field anywhere in a

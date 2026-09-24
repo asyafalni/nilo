@@ -4,7 +4,7 @@ Ten programs written wrong on purpose. Each must fail to compile with a message
 `nilo_s3` wrote; `zig build refusals-s3` checks the wording, and
 `zig build test-s3` depends on it.
 
-What is checked here is what [ADR 0068](../../docs/adr/0068-a-bucket-is-a-type-and-a-key-is-not.md)
+What is checked here is what [ADR 059](../../docs/adr/059-a-bucket-is-a-type-and-a-key-is-not.md)
 said comptime was *for* — the things a bucket's own type can be wrong about,
 plus the one that is a leak rather than a mistake:
 

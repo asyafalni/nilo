@@ -1,6 +1,6 @@
 // The request in flight, for a snippet that is a run of statements rather
 // than a declaration — the `c`, `db` and `form` such a snippet says without
-// introducing (ADR 0083).
+// introducing (ADR 068).
 //
 // Not a file that compiles on its own: it is pasted after `types.zig` and
 // before the snippet, which is where these names have to be.

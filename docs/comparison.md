@@ -47,7 +47,7 @@ the wire run from 1,099 (http.zig) to 1,171 (Node) against nilo's 1,110. That
 is a 6% spread on a ~1.1 KB response and it is part of what is being measured,
 not an error in it. nilo's 1,110 was 13 bytes light: it sent no `Date` and a
 `Connection: keep-alive` HTTP/1.1 does not need. Since
-[ADR 0269](./adr/0269-a-response-says-when-it-was-sent.md) it sends 1,123,
+[ADR 197](./adr/197-a-response-says-when-it-was-sent.md) it sends 1,123,
 the same as Go, axum, Fiber and Bun; the table below predates that and has
 not been re-run.
 
@@ -119,7 +119,7 @@ evenly. These are the same 64 connections and the same 4 client threads for
 every row, so unlike the saturation table in `bench/result/http.md`, none of this is
 client queueing.
 
-This is the result that matters, and it is the one ADR 0018 already said to care
+This is the result that matters, and it is the one ADR 017 already said to care
 about: the budget's first row is "throughput **and** p99", not throughput.
 
 ## Memory per idle connection
@@ -153,7 +153,7 @@ The flatness is the part that has not changed and is worth as much as the level:
 marginal cost is within 20 bytes of average from 1,000 connections to 10,000.
 Nothing steps and no pool doubles in the background, which is what makes the
 figure safe to multiply and what
-[ADR 0018](./adr/0018-the-trade-budget-has-three-axes.md)'s third row is really
+[ADR 017](./adr/017-the-trade-budget-has-four-axes.md)'s third row is really
 asking for. Bun gets to a smaller number a different way — uSockets allocates
 lazily and pays with a 33 MB floor per process, 258 MB across eight.
 
@@ -217,7 +217,7 @@ project does when you do not tell it anything.
 
 **In the loop that a developer actually sits in, nilo is last by 0.2 seconds**
 — 0.4s against Go's 0.2s. That is a difference nobody will feel, and it is the
-column that ADR 0001's "developer experience comes first" is about.
+column that ADR 017's "developer experience comes first" is about.
 
 nilo is still last in a release build, by 2.7s against axum and 3.5s against
 http.zig. But it was 15.0s against 4.8s before this measurement was taken, and
@@ -293,7 +293,7 @@ The test step had the same shape of problem and was split for the same reason:
 | `zig build refusals` (included in both) | 0.5s |
 
 Running the suite in both modes costs 12× running it in one, and
-[ADR 0019](./adr/0019-a-response-owns-its-headers.md) is why it is still run
+[ADR 018](./adr/018-a-response-owns-its-headers.md) is why it is still run
 both ways: a use-after-return passed in `Debug` for a whole stage and only
 failed in a release build. What changed is when it is paid. `test-all` runs on
 every push, so the rule is held by CI rather than by the edit loop.

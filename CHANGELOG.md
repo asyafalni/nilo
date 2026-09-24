@@ -29,13 +29,13 @@ newest first.
 
 ### Breaking
 
-- **An insert that leaves out a column nothing fills no longer compiles.** `insert`, `insertMany`, `insertOrIgnore` and `insertOrUpdate` name the columns and refuse, where the same insert used to fail with `NotNullViolated` the first time it ran. What an insert may leave out is the integer key a sequence fills, a column with a `.default`, an optional one, and one named in the new marker word `.filled`, which says the database fills it by means of its own (a `DEFAULT` written in a step, `gen_random_uuid()`, a trigger) and renders nothing. A Row with `.managed = false` is not checked. To upgrade: for each refusal, write the column, move its default into `.default`, or name it in `.filled` ([ADR 0221](./docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+- **An insert that leaves out a column nothing fills no longer compiles.** `insert`, `insertMany`, `insertOrIgnore` and `insertOrUpdate` name the columns and refuse, where the same insert used to fail with `NotNullViolated` the first time it ran. What an insert may leave out is the integer key a sequence fills, a column with a `.default`, an optional one, and one named in the new marker word `.filled`, which says the database fills it by means of its own (a `DEFAULT` written in a step, `gen_random_uuid()`, a trigger) and renders nothing. A Row with `.managed = false` is not checked. To upgrade: for each refusal, write the column, move its default into `.default`, or name it in `.filled` ([ADR 181](./docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 - `Store.claim` takes the kinds the program can run: `claim(scope, comptime
   kinds: []const []const u8, now, lease_until)`. `job.Jobs` passes its own
   `kind_names`; a store written outside nilo takes the parameter and narrows
   its claim by it. The names are bound, not spelled into the statement, so a
   kind may go on being named whatever it is named
-  ([ADR 0291](./docs/adr/0291-a-worker-claims-only-what-it-can-run.md)).
+  ([ADR 215](./docs/adr/215-a-worker-claims-only-what-it-can-run.md)).
 
 - `nilo_jobs` gains a `priority smallint NOT NULL DEFAULT 1` column.
   `job.Table` creates nothing, so a caller adds it beside their own rows:
@@ -45,14 +45,14 @@ newest first.
   The default is not decoration. A column that may not be null and has no
   default is the one `ADD COLUMN` that fails on a table with rows, and during
   a rolling deploy an older binary's `INSERT` — or a sibling binary's, which
-  is [ADR 0291](./docs/adr/0291-a-worker-claims-only-what-it-can-run.md)'s own
+  is [ADR 215](./docs/adr/215-a-worker-claims-only-what-it-can-run.md)'s own
   case — never names the column. `createMissing` will not help here: it
   creates tables that are missing and leaves an existing one alone. A queue
   that has not been altered is not subtly wrong — the claim names the column,
   so it fails loudly on the first claim rather than quietly ordering by
   something else. The index stays `(state, run_at)`; widening it to include
   `priority` measured 120x slower on a queue holding future-dated rows, which
-  is `bench/result/job.md` ([ADR 0290](./docs/adr/0290-a-job-says-how-urgent-it-is.md)).
+  is `bench/result/job.md` ([ADR 214](./docs/adr/214-a-job-says-how-urgent-it-is.md)).
 
 - A `Db`'s schema check and version guard run from a new service hook,
   `nilo_check`, which the App calls after the work `app.before` registered
@@ -62,7 +62,7 @@ newest first.
   beside it used to fail on the tables the next line would have made. A
   program driving a `Db` with no App and relying on `nilo_start` to check
   calls `db.nilo_check(io)` after its own boot work, or `db.checkSchema`
-  ([ADR 0277](./docs/adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+  ([ADR 180](./docs/adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
 - `app.start(io)` runs the work `before` registered, and every `nilo_check`
   after it, which its doc comment already promised. A test that registered
   `createMissing` with `before` and then made the tables itself makes them
@@ -71,26 +71,26 @@ newest first.
   directory that is not there is reported in one line or handed back
   alone. Only a caller of the module directly sees it; the four `static`
   calls on the App pass it
-  ([ADR 0282](./docs/adr/0282-a-try-call-hands-back-the-error-and-says-nothing.md)).
+  ([ADR 207](./docs/adr/207-a-try-call-hands-back-the-error-and-says-nothing.md)).
 - `?nilo.Status(code, T)`, `?nilo.Response(T)`, `?nilo.Redirect(code)` and
   `?nilo.Versioned(T)` as a handler's return type are compile errors naming
   the shape to write. The first two compiled and sent the wrapper struct
   itself as JSON, `headers` and all, then crashed; the `?` goes inside,
   `Status(201, ?T)`
-  ([ADR 0276](./docs/adr/0276-a-question-mark-goes-inside-the-wrapper.md)).
+  ([ADR 203](./docs/adr/203-a-question-mark-goes-inside-the-wrapper.md)).
 - `read_buffer` defaults to 16 KiB, up from 8. It is also the ceiling on a
   request head, and 8 KiB was inside what a browser behind a single sign-on
   sends in cookies on every request. An idle connection holds the same 4,669
-  bytes — the pages go back while it waits (ADR 0071) — and a connection
+  bytes — the pages go back while it waits (ADR 062) — and a connection
   inside a request holds two pages more. A server that wants the old number
   passes `.read_buffer = 8 * 1024`
-  ([ADR 0268](./docs/adr/0268-a-head-is-mostly-cookies-and-sixteen-kilobytes-of-them.md)).
+  ([ADR 196](./docs/adr/196-a-head-is-mostly-cookies-and-sixteen-kilobytes-of-them.md)).
 
 ### Added
 
-- **A listener can answer gRPC**, in a build that passes `.grpc = true` to the dependency (`-Dgrpc` in this repository). `.grpc = true` on an entry in `also`, or on `listen()`'s own options for a server that speaks nothing else, serves unary calls over h2c, or over TLS with ALPN `h2` when the listener has `.tls` as well. A method is an ordinary route, `app.post("/package.Service/Method", handler)`: `c.body()` is the message, unframed and gunzipped, `c.send(200, "application/grpc", bytes)` is the answer, and a route that fails goes back as the `grpc-status` its status means, with the failure's `error` as `grpc-message`. `grpc-timeout` is the request's deadline, and `limits.request_deadline_ms` no longer lengthens one a request brought. The codec is the caller's: a zig-protobuf type decodes `c.body()`. A build without the flag contains none of it; the one with it is 116 KB larger on `examples/hello`, and an idle gRPC connection costs under a page more than an HTTP/1.1 one. Streaming calls and HTTP/2 for ordinary routes are not served ([ADR 0297](./docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+- **A listener can answer gRPC**, in a build that passes `.grpc = true` to the dependency (`-Dgrpc` in this repository). `.grpc = true` on an entry in `also`, or on `listen()`'s own options for a server that speaks nothing else, serves unary calls over h2c, or over TLS with ALPN `h2` when the listener has `.tls` as well. A method is an ordinary route, `app.post("/package.Service/Method", handler)`: `c.body()` is the message, unframed and gunzipped, `c.send(200, "application/grpc", bytes)` is the answer, and a route that fails goes back as the `grpc-status` its status means, with the failure's `error` as `grpc-message`. `grpc-timeout` is the request's deadline, and `limits.request_deadline_ms` no longer lengthens one a request brought. The codec is the caller's: a zig-protobuf type decodes `c.body()`. A build without the flag contains none of it; the one with it is 116 KB larger on `examples/hello`, and an idle gRPC connection costs under a page more than an HTTP/1.1 one. Streaming calls and HTTP/2 for ordinary routes are not served ([ADR 220](./docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md)).
 - `zig build fuzz -- --frames` throws generated HTTP/2 connections at the gRPC listener, and `zig build test` replays its corpus.
-- **A Row can carry the row its foreign key points at, the rows that point back, or a sum by group**, and `db.select`, `db.one`, `db.find`, `db.page`, `db.count`, `db.exists` and `db.stream` read it with no new option ([ADR 0295](./docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)). On a narrower Row, a field whose type is another table's Row is a **parent**, joined through the `.references` between the two tables (`LEFT JOIN` when it is `?P`, which it has to be exactly when the column may be null); a `[]const C` field is **children**, read by one more statement for every row at once, so a page of twenty is two statements rather than twenty-one; and `pub const nilo_aggregate = .{ .n = .count, .owed = .{ .sum = .amount } }` makes the Row one row per group, its other fields the keys. `pub const nilo_via` names the column when the schema has several references or none. Conditions and orders reach through a parent's field (`.where = .{ .customer = .{ .name = "Acme" } }`), a condition on an aggregate is a `HAVING`, and `sql.Ordering` takes a path, `.{ .customer, .name }`. New: `db.exactlyOne` and `tx.exactlyOne` for a Row whose every field is an aggregate, and `sql.exactlyOneFor` and `sql.childrenFor`. Twenty-five new Refusals hold the rules, including the type each aggregate has to be read as. A program with no such Row is the same size, within 352 bytes either way. The guide page is [a Row with more in it](./docs/guide/sql/shapes.md).
+- **A Row can carry the row its foreign key points at, the rows that point back, or a sum by group**, and `db.select`, `db.one`, `db.find`, `db.page`, `db.count`, `db.exists` and `db.stream` read it with no new option ([ADR 218](./docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)). On a narrower Row, a field whose type is another table's Row is a **parent**, joined through the `.references` between the two tables (`LEFT JOIN` when it is `?P`, which it has to be exactly when the column may be null); a `[]const C` field is **children**, read by one more statement for every row at once, so a page of twenty is two statements rather than twenty-one; and `pub const nilo_aggregate = .{ .n = .count, .owed = .{ .sum = .amount } }` makes the Row one row per group, its other fields the keys. `pub const nilo_via` names the column when the schema has several references or none. Conditions and orders reach through a parent's field (`.where = .{ .customer = .{ .name = "Acme" } }`), a condition on an aggregate is a `HAVING`, and `sql.Ordering` takes a path, `.{ .customer, .name }`. New: `db.exactlyOne` and `tx.exactlyOne` for a Row whose every field is an aggregate, and `sql.exactlyOneFor` and `sql.childrenFor`. Twenty-five new Refusals hold the rules, including the type each aggregate has to be read as. A program with no such Row is the same size, within 352 bytes either way. The guide page is [a Row with more in it](./docs/guide/sql/shapes.md).
 - `pub const priority: job.Priority = .high;` on a job kind, beside its
   `timeout_ms`: a free worker takes the most urgent **due** row, and among
   equals the one that has been due longest. `.high`, `.normal` (the default,
@@ -101,7 +101,7 @@ newest first.
   push, because how urgent a kind is belongs to the kind; three levels
   rather than a number, because `2` says nothing about whether it beats `1`,
   and a kind that writes one is a Refusal naming the levels
-  ([ADR 0290](./docs/adr/0290-a-job-says-how-urgent-it-is.md)).
+  ([ADR 214](./docs/adr/214-a-job-says-how-urgent-it-is.md)).
 
 - `listen(.{ .tls = … })` refuses a key that is not its certificate's,
   before it takes the port, naming both files and the two `openssl`
@@ -115,7 +115,7 @@ newest first.
   than refused, so a key type the library learns later cannot stop a server
   that was serving. Nothing on the request path, and nothing in a build
   without `-Dtls`, where the check is not compiled at all
-  ([ADR 0294](./docs/adr/0294-a-key-is-checked-against-its-certificate-at-listen.md)).
+  ([ADR 212](./docs/adr/212-tls-is-an-option-a-build-asks-for.md)).
 
 - `listen(.{ .also = &.{ .{ .port = 8081, .tls = … } } })`: more addresses
   to answer on, from one process. An entry is an address, a port and a
@@ -129,9 +129,9 @@ newest first.
   `boundPort()` still answers for `port`, the first listener. Costs 82 KB
   of resident memory per extra listener on sixteen threads and nothing per
   connection: an idle connection measured 9,300 bytes before and after
-  ([ADR 0289](./docs/adr/0289-a-server-answers-on-more-than-one-address.md),
+  ([ADR 213](./docs/adr/213-a-server-answers-on-more-than-one-address.md),
   [deploying](./docs/guide/deploying.md#more-than-one-address)).
-- `listen(.{ .tls = .{ .cert = "…pem", .key = "…pem" } })`: HTTPS, TLS 1.3, on a build that asked for it with `.tls = true` on the dependency (`-Dtls` in this repository). The library behind it, ianic/tls.zig, is fetched and linked only behind that flag, so every other build is what it was, and refuses the option at `listen()` in one line rather than serving plain HTTP on the port. What it costs is stated where the option is: 560 KB of binary and a page per idle connection in the build that asked, about 300 µs of CPU per handshake with an ECDSA certificate and 2.6 ms with an RSA-2048 one, no session resumption, one certificate per listener, a restart to reload it, and no audit behind the library, which is why a proxy in front stays the recommendation for anything on the internet ([ADR 0288](./docs/adr/0288-tls-is-an-option-a-build-asks-for.md), amending ADR 0028; [deploying](./docs/guide/deploying.md#tls-without-a-proxy)). The handshake is bounded by `header_timeout_ms`. `zig build bench-tls-server -Dtls` and `bench/mem.py --tls` are the benchmark server and the idle reading for it. Until [ianic/tls.zig#59](https://github.com/ianic/tls.zig/pull/59) merges, the library is pinned to a fork that adds one commit to upstream's `zig-0.16.x`: it signs through the key's CRT form, which takes an RSA-2048 handshake from 13.7 ms of CPU to 2.6 ([the run](./bench/result/http.md#what-an-rsa-certificate-costs-a-handshake)).
+- `listen(.{ .tls = .{ .cert = "…pem", .key = "…pem" } })`: HTTPS, TLS 1.3, on a build that asked for it with `.tls = true` on the dependency (`-Dtls` in this repository). The library behind it, ianic/tls.zig, is fetched and linked only behind that flag, so every other build is what it was, and refuses the option at `listen()` in one line rather than serving plain HTTP on the port. What it costs is stated where the option is: 560 KB of binary and a page per idle connection in the build that asked, about 300 µs of CPU per handshake with an ECDSA certificate and 2.6 ms with an RSA-2048 one, no session resumption, one certificate per listener, a restart to reload it, and no audit behind the library, which is why a proxy in front stays the recommendation for anything on the internet ([ADR 212](./docs/adr/212-tls-is-an-option-a-build-asks-for.md), amending ADR 027; [deploying](./docs/guide/deploying.md#tls-without-a-proxy)). The handshake is bounded by `header_timeout_ms`. `zig build bench-tls-server -Dtls` and `bench/mem.py --tls` are the benchmark server and the idle reading for it. Until [ianic/tls.zig#59](https://github.com/ianic/tls.zig/pull/59) merges, the library is pinned to a fork that adds one commit to upstream's `zig-0.16.x`: it signs through the key's CRT form, which takes an RSA-2048 handshake from 13.7 ms of CPU to 2.6 ([the run](./bench/result/http.md#what-an-rsa-certificate-costs-a-handshake)).
 - `app.compress(.{})`: every answer that is text, at least `min_bytes`
   (1 KB) long and going to a client whose `Accept-Encoding` takes gzip goes
   out gzipped, per request, with `Content-Encoding: gzip`, `Vary:
@@ -142,21 +142,21 @@ newest first.
   allocation for the compressed body and nothing per connection. Streams,
   event streams and static files are not touched: files were gzipped once
   at load. `nilo.compress.Options`, `zig build bench-compress`
-  ([ADR 0287](./docs/adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
+  ([ADR 211](./docs/adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 - `sql.Composed`, `db.compose` and `db.composed` / `db.composedOne` /
   `tx.composed`: a statement composed at run time from literals, checked
   identifiers and parameters — the pieces a query engine has — and from
   nothing that can carry a run-time string. Placeholders are spelled for the
   Db's dialect; the values are counted against them at run time. `raw` is
   unchanged
-  ([ADR 0283](./docs/adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
+  ([ADR 208](./docs/adr/208-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
 - `run.loop()`: the `Io` a `Run` was made on, or null for a `Run.init(gpa)`,
   for a job that writes a file or sleeps between attempts and has only the
   Run the worker handed it.
 - `jwt.Keyring` takes `remember_tokens`: how many verified tokens to
   remember by digest, so a bearer token seen again skips the signature
   arithmetic and keeps every claims check. A new key set forgets them
-  ([ADR 0285](./docs/adr/0285-a-verified-signature-is-remembered-by-the-tokens-digest.md)).
+  ([ADR 209](./docs/adr/209-a-verified-signature-is-remembered-by-the-tokens-digest.md)).
 - `examples/sqlite/`: two Rows on one SQLite file, the tables made at boot
   with `createMissing` in `before` and checked after, a list with a
   `Query`, a paged join through `rawPage`, a report through
@@ -165,31 +165,31 @@ newest first.
 - A service may declare `pub fn nilo_check(self: *T, io: std.Io) !void`,
   run once after `before` and before the first request; a failure is a
   boot that does not happen. A wrong arity is a Refusal
-  ([ADR 0277](./docs/adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+  ([ADR 180](./docs/adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
 - `db.rawPage(Row, c, sql, values)` and `tx.rawPage`: a raw statement read
   as a page, the Row's columns then `count(*) OVER ()` as one more on the
   end of the list, answering the same `Page(Row)` `db.page` does. A list
   exactly the Row's width is a Refusal
-  ([ADR 0279](./docs/adr/0279-a-raw-statement-can-carry-its-total.md)).
+  ([ADR 205](./docs/adr/205-a-raw-statement-can-carry-its-total.md)).
 - `db.rawExactlyOne(Row, c, sql, values)` and `tx.rawExactlyOne`: `rawOne`
   for a statement that has one row by construction, an aggregate with no
   `GROUP BY` or a `RETURNING` on a keyed write, answering the Row and
   `error.QueryFailed` for none
-  ([ADR 0280](./docs/adr/0280-a-statement-that-always-answers-answers-a-row.md)).
+  ([ADR 206](./docs/adr/206-a-statement-that-always-answers-answers-a-row.md)).
 - The `$n` in a raw statement are respelled for the dialect while
   compiling, `?n` on SQLite, so `WHERE ($2 IS NULL OR x = $2)` binds the
   second value on both databases; SQLite read `$2` as a named parameter
   indexed by first appearance and took the first. A statement naming `$3`
   and handed two values is a Refusal on both. `exec` sends its run-time
   text as written
-  ([ADR 0278](./docs/adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+  ([ADR 204](./docs/adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
 - `app.health` and `app.metrics` describe the routes they register, a
   `200` each, and are no longer counted in the "N of M routes hold the Ctx
   and return nothing" line, which is about the application's handlers
-  ([ADR 0281](./docs/adr/0281-nilos-own-routes-describe-themselves.md)).
+  ([ADR 120](./docs/adr/120-a-ctx-handler-that-returns-nothing-may-have-written-it.md)).
 - nilo's HttpArena entry subscribes to `echo-ws-pipeline`
   and `echo-ws-limited`, each held back until the server was right for it:
-  the first waited on ADR 0274, the second on ADR 0273 and then ADR 0275,
+  the first waited on ADR 201, the second on ADR 200 and then ADR 202,
   because the first of those alone had made the shape three times worse
   ([frameworks/nilo](https://github.com/MDA2AV/HttpArena/tree/main/frameworks/nilo)).
 - A response is flushed before the connection waits, not before `send`
@@ -207,7 +207,7 @@ newest first.
   Keep-alive and one-frame-at-a-time shapes are unchanged. What a
   pipelining client gives up is that a fast answer queued behind a slow
   handler now arrives with the slow one, bounded by `write_buffer`
-  ([ADR 0274](./docs/adr/0274-a-response-is-flushed-before-the-connection-waits.md)).
+  ([ADR 201](./docs/adr/201-a-response-is-flushed-before-the-connection-waits.md)).
 - Every executor accepts. `listen()` used to take connections on one fiber,
   which capped a server at ~43,000 connections a second whatever its thread
   count — the arena's short-lived profile read 426K req/s on 18 of 64 cores,
@@ -218,7 +218,7 @@ newest first.
   fiber per thread for the life of the server, nothing per connection, and
   one timer per server fewer per connection accepted. Nothing changes in
   what `listen()` takes
-  ([ADR 0273](./docs/adr/0273-every-executor-accepts.md)).
+  ([ADR 200](./docs/adr/200-every-executor-accepts.md)).
 - `listen()` takes `backlog`: how many completed handshakes the kernel holds
   for `accept`. 4,096 — `net.core.somaxconn`'s default, what Go listens with —
   up from zio's 128, which nilo had been passing without saying so. Past the
@@ -227,7 +227,7 @@ newest first.
   against 128 put 623 of them on that one-second retry, against 4,096 none.
   A queue capacity, so it costs nothing on a quiet server. `bench/burst.py`
   is the regression check
-  ([ADR 0271](./docs/adr/0271-a-backlog-is-sized-for-the-burst-not-the-load.md)).
+  ([ADR 198](./docs/adr/198-a-backlog-is-sized-for-the-burst-not-the-load.md)).
 - `app.failures(T)`: the body every failure goes out with, when nilo's
   `{"error":…,"status":…}` is not the one your clients already read. `T` is a
   struct whose fields are the JSON, with a `pub fn nilo_failure(status: u16,
@@ -239,7 +239,7 @@ newest first.
   request to route — a malformed head, a head too long or too slow, an
   unreadable coding, a shed 503 — keep nilo's own. Nothing changes for an
   App that does not call it. Three refusals
-  ([ADR 0270](./docs/adr/0270-a-failure-body-is-a-struct-the-application-names.md)).
+  ([ADR 024](./docs/adr/024-every-failure-answers-as-json.md)).
 - Every response carries a `Date`, second after the status line — RFC 9110
   §6.6.1's MUST, which nilo had never met, and what a cache in front does its
   freshness arithmetic from. Formatted once a second per thread, lazily, from
@@ -251,14 +251,14 @@ newest first.
   response goes from 1,110 bytes on the wire to 1,123, which is what every
   other server in `bench/compare/` sends for the same body. `Ctx.connection()`
   is the new way to ask; `Ctx.keepAlive()` still answers the bool
-  ([ADR 0269](./docs/adr/0269-a-response-says-when-it-was-sent.md)).
+  ([ADR 197](./docs/adr/197-a-response-says-when-it-was-sent.md)).
 - `listen()` takes `request_deadline_ms`: a deadline every request starts
   with, what `nilo.deadline(ms)` gives one route given to all of them. Every
   wait nilo owns is cut to it and `c.overdue()` reads it; a route's own
   `nilo.deadline` replaces it, and a request that takes the connection over —
   a stream, a WebSocket, `bodyStream()` — lets a default go and keeps a
-  route's own. Off by default. ADR 0133 had rejected the option; ADR 0267
-  is why it is back ([ADR 0267](./docs/adr/0267-a-deadline-every-request-starts-with.md)).
+  route's own. Off by default. The option had been rejected once, and
+  why it is back is in the same ADR ([ADR 105](./docs/adr/105-a-route-can-say-how-long-it-has.md)).
 - The accept loop waits out a descriptor shortage instead of returning.
   `ProcessFdQuotaExceeded`, `SystemFdQuotaExceeded` and `SystemResources`
   from `accept` now sleep 5 ms, doubling to a second, and try again, with one
@@ -267,7 +267,7 @@ newest first.
   well short of `max_connections`. `listen()` also warns at startup when the
   process's descriptor limit is below `max_connections`, with both numbers and
   the `ulimit -n` / `LimitNOFILE=` to change. `bench/fdlimit.py` is the
-  regression check ([ADR 0265](./docs/adr/0265-an-accept-loop-that-is-out-of-descriptors-waits.md)).
+  regression check ([ADR 194](./docs/adr/194-an-accept-loop-that-is-out-of-descriptors-waits.md)).
 - A refused request is hung up on with a FIN before the close, so its answer
   reaches the client. A 431, a 400 or 415 with a body behind it, a 413 for a
   body past `max_body`, a shed 503 — each left the client's bytes unread on
@@ -275,7 +275,7 @@ newest first.
   client answers by throwing the buffered 431 away. The send side is shut
   first and what arrives is discarded, bounded at 64 KiB and one second. An
   ordinary `Connection: close` is untouched. The Engine contract gains
-  `Waker.halfClose` ([ADR 0266](./docs/adr/0266-a-refused-request-is-hung-up-on-with-a-fin.md)).
+  `Waker.halfClose` ([ADR 195](./docs/adr/195-a-refused-request-is-hung-up-on-with-a-fin.md)).
 - Every crafted request in the parser's tests — the framing conflicts, the
   strict chunk sizes, the absolute-form target, the head that never ends — is
   now also run split at every byte and trickled a few bytes a read, and has to
@@ -286,7 +286,7 @@ newest first.
 
 ### Docs
 
-- The guide is a website: [nevindra.github.io/nilo](https://nevindra.github.io/nilo/), one copy per minor release, published when the release is tagged ([ADR 0296](./docs/adr/0296-the-guide-is-published-once-a-release.md)).
+- The guide is a website: [nevindra.github.io/nilo](https://nevindra.github.io/nilo/), one copy per minor release, published when the release is tagged ([ADR 219](./docs/adr/219-the-guide-is-published-once-a-release.md)).
 - [Getting started](./docs/guide/getting-started.md#what-a-save-has-to-touch) says what a save has to touch for `zig build dev` to restart the server: a `.zig` the binary is built from, or a file it `@embedFile`s, and nothing else in the checkout, so a front end kept beside the server keeps its own dev server. The static-files guide and `decided.md` said the loop could watch a bundler's directory; it cannot, and both now say so. `bench/devloop.py` is the check: a save the build never reads must leave the server up, a save it reads must restart it. The `dev` step on that page also gained the line that forwards `b.args`, without which the `zig build dev -- --incremental` beside it never reached `nilo-dev`.
 - [Past one table](./docs/guide/sql/raw.md) says what a raw parameter may
   be (an optional binds NULL, and `($1 IS NULL OR …)` is the `sql.given`
@@ -309,7 +309,7 @@ newest first.
 - `Ctx.body()` says that a gzipped body comes back inflated while
   `header("Content-Encoding")` and `header("Content-Length")` still describe
   the wire, because the head is read in place and nothing rewrites it — and
-  what a handler forwarding the body should send instead. ADR 0251 carries
+  what a handler forwarding the body should send instead. ADR 089 carries
   the same note.
 - [Deploying](./docs/guide/deploying.md#when-a-bound-is-hit) has one table
   for every bound `listen()` takes: what a client sees past it, what the log
@@ -320,12 +320,12 @@ newest first.
 
 - A request body sent with `Content-Encoding: gzip` by a writer that flushes before it closes, the way Go's does, is read. Such a stream ends in an empty final block, and the decompressor asks for a byte of room before reading even that one, so every such body was refused as one that could not be read.
 - `bucket.list` against a real server read a key with a space in it back with a `+` in its place (`b c.txt` came back as `b+c.txt`), and against MinIO handed back an ETag that `getIf` never matched. Under `encoding-type=url` AWS and MinIO both write a space as `+` and a plus as `%2B`, and the key was decoded as a path; MinIO's XML is Go's, which writes a quote as `&#34;`, and only `&quot;` was read. Both were found the first time CI ran `nilo_s3`'s live tests against a real MinIO rather than skipping them.
-- A WebSocket that lives for a few messages no longer maps and unmaps a message buffer. A message that arrives whole is handed over from the connection's read buffer; with more short-lived sockets open on a thread than its free list keeps, every connection used to `mmap` 16 KiB and `munmap` it again, and each `munmap` stopped every core the process runs on to flush its TLB. `Message.data` is borrowed until the next `receive`, as before. A busy socket whose messages fit the read buffer also holds no message buffer now, about 4 KiB less resident a connection ([ADR 0292](./docs/adr/0292-a-message-that-arrived-whole-is-handed-over-where-it-lies.md)).
+- A WebSocket that lives for a few messages no longer maps and unmaps a message buffer. A message that arrives whole is handed over from the connection's read buffer; with more short-lived sockets open on a thread than its free list keeps, every connection used to `mmap` 16 KiB and `munmap` it again, and each `munmap` stopped every core the process runs on to flush its TLB. `Message.data` is borrowed until the next `receive`, as before. A busy socket whose messages fit the read buffer also holds no message buffer now, about 4 KiB less resident a connection ([ADR 216](./docs/adr/216-a-message-that-arrived-whole-is-handed-over-where-it-lies.md)).
 - pg.zig is pinned at `ec8cf27`, lalinsky's `master` rebuilt on karlseguin's. The old pin, `91d0705`, had been left on no branch by that rebuild, so a cold `-Dsql` fetch depended on GitHub still serving an unreachable commit. The move brings upstream's fixes: an authentication error is copied before the reader lets go of it, a failed query always hands its pooled connection back, and a `numeric` with leading zero groups prints correctly (nilo reads `numeric` as text, so the last never reached a `sql.Decimal`).
-- A TLS handshake signs on the blocking pool rather than on the executor that accepted the connection. An RSA-2048 signature is milliseconds, and a burst of new connections held up the requests of every connection already open on the same thread: on the benchmark arena's `8gbit` shape the mean went from about 1 ms to 150 µs on the machine in `bench/result/`. The pin on the tls.zig fork moves with it ([ADR 0293](./docs/adr/0293-a-handshakes-signature-is-computed-off-the-executor.md)).
-- The line a SQLite statement writes when it gives up waiting for a connection names the statement holding it, as in *it is held by `SELECT 1`*. It used to guess at a `tx` waiting for itself, and sent the one application that hit it looking for a transaction it did not have; what held the writer was a statement queued for a thread behind a slow read ([ADR 0135](./docs/adr/0135-a-wait-for-a-connection-has-a-bound.md), [zio#745](https://github.com/lalinsky/zio/issues/745)).
-- A fail function called by work registered with `app.before`, a seed calling the same service functions its handlers call, lost its sentence: the boot said `failed with Failed` and nothing else. The line that stops the boot now carries the status and the message, and which of the registered pieces failed, on both `listen()` and `app.start(io)` ([ADR 0161](./docs/adr/0161-a-refusal-outside-a-request-is-still-a-refusal.md)).
-- `nilo-dev` started the binary left in `zig-out` before its build had finished, so after a change made with the loop stopped the old server ran first: one application had its SQLite file created and seeded with the schema it had just changed. The loop now builds once to the end before it starts anything, and when that build fails it removes the stale binary and starts the first one that compiles. Nothing changes in a dependent's `build.zig` ([ADR 0259](./docs/adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
+- A TLS handshake signs on the blocking pool rather than on the executor that accepted the connection. An RSA-2048 signature is milliseconds, and a burst of new connections held up the requests of every connection already open on the same thread: on the benchmark arena's `8gbit` shape the mean went from about 1 ms to 150 µs on the machine in `bench/result/`. The pin on the tls.zig fork moves with it ([ADR 217](./docs/adr/217-a-handshakes-signature-is-computed-off-the-executor.md)).
+- The line a SQLite statement writes when it gives up waiting for a connection names the statement holding it, as in *it is held by `SELECT 1`*. It used to guess at a `tx` waiting for itself, and sent the one application that hit it looking for a transaction it did not have; what held the writer was a statement queued for a thread behind a slow read ([ADR 107](./docs/adr/107-a-wait-for-a-connection-has-a-bound.md), [zio#745](https://github.com/lalinsky/zio/issues/745)).
+- A fail function called by work registered with `app.before`, a seed calling the same service functions its handlers call, lost its sentence: the boot said `failed with Failed` and nothing else. The line that stops the boot now carries the status and the message, and which of the registered pieces failed, on both `listen()` and `app.start(io)` ([ADR 129](./docs/adr/129-a-refusal-outside-a-request-is-still-a-refusal.md)).
+- `nilo-dev` started the binary left in `zig-out` before its build had finished, so after a change made with the loop stopped the old server ran first: one application had its SQLite file created and seeded with the schema it had just changed. The loop now builds once to the end before it starts anything, and when that build fails it removes the stale binary and starts the first one that compiles. Nothing changes in a dependent's `build.zig` ([ADR 190](./docs/adr/190-a-restart-on-save-watches-the-binary-not-the-sources.md)).
 - A response type as wide as a detail page, a record holding lists of records of twelve fields or so, failed to compile inside `http/json.zig` with "evaluation exceeded 1000 backwards branches", whatever its depth, and the advice to raise the quota was not something the application could do. `covers` raises it where the walk starts, to 20,000, room for some 2,500 fields.
 - **A worker spun forever on a job kind it did not know.** A row pushed by
   another binary — an older deploy, a sibling service — was claimed, found to
@@ -337,18 +337,18 @@ newest first.
   `dead` in the binary least able to judge it. The claim now asks only for the
   kinds the program knows, so the row is left queued, untouched and at nought
   attempts, for the binary that does know it
-  ([ADR 0291](./docs/adr/0291-a-worker-claims-only-what-it-can-run.md)).
+  ([ADR 215](./docs/adr/215-a-worker-claims-only-what-it-can-run.md)).
 
 - Every binary with a static set in it, which is every binary with the
   API reader page, was 25 KB larger than it needed to be: the
   `Accept-Encoding` reader answered "is this `q=0`" with
   `std.fmt.parseFloat(f32, …)`. A digit scan now; `hello` is −24,608 bytes
-  stripped, `rest` −3,648 ([ADR 0287](./docs/adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
+  stripped, `rest` −3,648 ([ADR 211](./docs/adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 - A `Db` on the default `connect_on_init = 0` dials one connection at boot
   whether or not it has a schema check, so `app.before` — a migration, a
   key set — finds a pool with something to lend. An `unchecked` `Db` with
   a `before` hook got `Disconnected` on every cold boot with the database
-  up ([ADR 0284](./docs/adr/0284-a-boot-dials-the-connection-its-work-needs.md)).
+  up ([ADR 115](./docs/adr/115-a-boot-dials-the-connection-its-work-needs.md)).
 - The comptime count of a `raw` select list stopped at `WITHIN GROUP`,
   reading its `GROUP` as `GROUP BY`, so `percentile_cont(0.5) WITHIN GROUP
   (ORDER BY v) AS median, count(*) AS n` counted as one column and the Row
@@ -359,14 +359,14 @@ newest first.
   routes them to the watchdog, and the Postgres wire reports every
   statement through them, once from the exchange to the result's close. A
   handler that computes without parking is still reported
-  ([ADR 0286](./docs/adr/0286-a-services-wait-on-its-own-socket-is-a-park.md)).
+  ([ADR 210](./docs/adr/210-a-services-wait-on-its-own-socket-is-a-park.md)).
 
 - `app.tryStatic` and `app.tryStaticWith` on a directory that is not there
   hand back `error.StaticDirNotFound` and log nothing; the `error:` line
   belonged to `static`, which stops the process on it. A problem inside a
   directory that is there is still said in one line, since the error
   cannot name the file
-  ([ADR 0282](./docs/adr/0282-a-try-call-hands-back-the-error-and-says-nothing.md)).
+  ([ADR 207](./docs/adr/207-a-try-call-hands-back-the-error-and-says-nothing.md)).
 - A WebSocket client that leaves with a reset rather than a FIN, which is
   every load generator that keeps its ports out of `TIME_WAIT` and every
   tab that was killed rather than closed, ends `receive` with `null` the
@@ -376,7 +376,7 @@ newest first.
   `max_connections`, and the server began refusing at accept. 512
   WebSocket connections closed after ten frames each: 461K → 1.68M
   frames a second, descriptors mid-run 10,024 → 560
-  ([ADR 0275](./docs/adr/0275-a-reset-between-frames-is-a-client-that-has-gone.md)).
+  ([ADR 202](./docs/adr/202-a-reset-between-frames-is-a-client-that-has-gone.md)).
 - A server that is not busy spends a third less CPU per request. zio's
   scheduler dozes for 100 µs before each park so that work stealing does not
   churn, and on a thread with nothing coming that is a second context switch
@@ -384,7 +384,7 @@ newest first.
   stealing off, and +3% at saturation. Stealing is now off, and a handler
   runs on one OS thread from its first line to its last, across every wait
   in it. `bench/paced.py` is the instrument
-  ([ADR 0272](./docs/adr/0272-a-connection-is-served-by-the-thread-it-was-dealt-to.md)).
+  ([ADR 199](./docs/adr/199-a-connection-is-served-by-the-thread-it-was-dealt-to.md)).
 - `c.clientIp()` reads every `X-Forwarded-For` field, as one list in wire
   order, rather than the first. HAProxy's `option forwardfor` adds a field of
   its own instead of appending to the client's, so a forged header arrived as
@@ -393,7 +393,7 @@ newest first.
   the tests passed. Both the rules and `.trusted_hops` now walk
   `proxies.Forwarded`, from the last field's right end; more than eight
   fields is answered with the socket's address. No allocation
-  ([ADR 0129](./docs/adr/0129-a-proxy-is-trusted-by-which-one-it-is.md), the
+  ([ADR 102](./docs/adr/102-a-proxy-is-trusted-by-which-one-it-is.md), the
   closing section).
 - A client that connects and gives up before the server reaches it in the
   backlog no longer stops the server. zio v0.17.0 surfaced that as

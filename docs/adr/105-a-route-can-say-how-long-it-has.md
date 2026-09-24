@@ -1,0 +1,72 @@
+# A route can say how long it has
+
+**Status:** accepted
+**Topic:** [deadlines](../design/deadlines.md)
+
+## Context
+
+[ADR 022](022-a-deadline-belongs-to-an-operation-not-to-a-request.md) gave the Engine several deadlines, and every one of them bounds an *operation*: a head, one read of a body, one write, a gap between requests. None of them bounds the **request**. A handler that reads a body slowly, calls two services and writes a large response is inside all of them all afternoon. Fiber has a `timeout` middleware and Gin has the request context; nilo had `block_warning_ms`, which only ever logs ([ADR 013](013-handlers-must-not-block-the-thread.md)).
+
+Reading [dusty](https://github.com/lalinsky/dusty)'s `ServerConfig.timeout.request`, one number, 30 seconds, on by default, against nilo's route-level deadline surfaced a second gap. The per-route mechanism answers "what is the right budget for this route", and the question a deployment actually has is **which routes have no budget at all**, the answer being every route whose author did not think about it, which in an application of forty routes is most of them. A route with no deadline is not a route that chose "unbounded", it is a route nobody looked at.
+
+## Decision
+
+```zig
+try app.with(nilo.deadline(2000)).get("/report", buildReport);
+```
+
+**`Deadlines.set` is the one clamp, and every `arm*` goes through it**: a limit is whichever of the two comes first, and `none` ("as long as it takes", what an idle connection and a WebSocket ask for) becomes the deadline itself. Nothing has to be remembered at the call sites, and a wait added later gets the deadline without anybody wiring it up. The clamp only ever shortens: a deadline that lengthened a limit would loosen the server's own protection against a slow client.
+
+### A running handler is not interrupted, and deliberately is not
+
+This is the half worth being plain about, because it is what Fiber's middleware does and this does not. Fiber runs the handler in a goroutine and abandons it; Zig has no runtime to abandon it into, and the alternative, cancelling the fiber, is a cancel that **every** handler, every `nilo.Mutex`, every `nilo.sleep` and every Service would have to survive at every line, and [ADR 082](082-a-cleanup-path-is-not-cancellable.md) has already had to carve the cleanup path out of cancellation once, for a narrower case.
+
+So what this catches is the two shapes a request actually overruns in: a client that is slow, on either side (the read and the write are clamped), and a response that is large (the stream's pieces are clamped one at a time, and the deadline is what ends the sequence). The third, a handler doing its own work, is handed to the handler as a question:
+
+```zig
+while (try rows.next()) |row| {
+    if (c.overdue()) return fail.status(503, "too many rows to do in time", .{});
+    try out.json(row);
+}
+```
+
+`c.timeLeftMs()` is the same answer as a number, for a handler with a budget to pass on to somebody else, an outbound call that should not be given longer than the request has. Both answer safely on a route with no deadline: `overdue()` is false and `timeLeftMs()` is null, so asking does not require knowing what the route was registered with.
+
+### What happens when it runs out
+
+A handler that fails while overdue, with nothing sent, gets a 503 naming the budget rather than whatever the failed read or write happened to raise, which is a status an operator can act on. A handler that fails while overdue after sending is left alone: a half-sent response cannot be taken back and turned into a 503. A handler that finishes late without noticing still answers, and the lateness is a `std.log.warn`: the answer on the wire is correct, what is over budget is the route or the work in it, and throwing away work that is already done would be the worse of the two.
+
+### `listen()` sets the floor every request starts with
+
+**`listen()` takes `request_deadline_ms`, the deadline every request starts with**, applied before the middleware chain runs, through the same `until_ns` above, so a route's own `with(nilo.deadline(ms))` replaces it: the route's number is set later and wins, and everything above still holds (every wait is clamped to it, `c.overdue()` and `c.timeLeftMs()` read it, a handler that is running rather than waiting is not interrupted). A request that arrived with an earlier deadline of its own keeps it rather than having the floor lengthen it: a gRPC call's `grpc-timeout` is the client's own number, and a default is not a reason to wait longer than the client will.
+
+**A request that takes the connection over lets the default go.** `c.stream()`, `c.events()`, `c.upgrade()` and `c.bodyStream()` are the four ways a request stops being one that answers and goes, and they are the four where "an upload and a health check do not have the same budget" is exactly right: a default chosen for the health check would cut an event stream off at the same second every time. So a **default** deadline is dropped at the takeover, and a deadline the route asked for **by name** is kept, because that route knew it was going to stream and said thirty seconds anyway. The distinction is one flag on `Ctx`, `_deadline_default`, set by `giveDefaultDeadline` and cleared by `giveDeadline`; the three call sites that used to set the takeover flag by hand now go through one function, `tookOver`, so the rule cannot be forgotten at a fourth.
+
+**Zero, off, is the default.** dusty's thirty seconds is a reasonable number for an API and the wrong number for a report, and the operation deadlines already answer the case ADR 022 was written for, a client that stalls. What is left is a policy about the handlers behind the server, which their author is the one to set; the option's doc comment says thirty seconds is where to start.
+
+## What was rejected
+
+**Cancelling the fiber.** Above.
+
+**A `request_timeout_ms` in `listen()`, one number for every route, full stop.** The first position, on the grounds that an upload and a health check do not have the same budget and a number loose enough for the slowest route bounds none of the others. That argument stands, and it is why the floor that shipped is one a route's own `nilo.deadline(ms)` replaces and a takeover lets go of, rather than the single non-overridable number this rejected. What was wrong was concluding from it that no floor should exist: the gap was never "what is the right budget for this route", it was "which routes have none at all", and the stress application's forty routes made that concrete, most bounded by nothing because nobody had looked, not because unbounded was chosen ([ADR 099](099-a-route-can-say-what-covers-it.md)).
+
+**Thirty seconds on by default**, dusty's own shape. Refused for the same reason a total was refused above: a default that cuts a first user's report route off at thirty seconds with a 408 they did not configure is a worse first day than one where nothing is bounded and `block_warning_ms` says so. The four operation deadlines already hold the line against a hostile client; what a default-on total would add is a policy about the handlers behind the server, which is the application's to set.
+
+**Keeping the default deadline through a takeover and letting the route re-arm it**, dusty's own shape (`req.setTimeout(...)` before each WebSocket message). Puts the rule in every streaming handler instead of in one place; a handler that forgets is a WebSocket cut off at thirty seconds. Dropping the default at the takeover puts the decision where the takeover is.
+
+**A separate `stream_deadline_ms`**, a second number for the routes the first is dropped from. A route that wants one already has `nilo.deadline`, kept, which is one number in one place rather than two in `listen()`.
+
+**Refusing the request at the start of every framework call once overdue**: `c.send` returning an error because the clock ran out. Turns a correct response that was late into no response at all, and puts a branch on the hottest path in the framework for a case that is rare.
+
+**A deadline that also covers `nilo.sleep` and `nilo.Mutex.lock`.** They park and would honour one, and it is the obvious next step. Not here because the two of them return `error.Canceled` today and a caller cannot tell a shutdown from a deadline apart by that name, which wants a second error and a pass over every handler that catches the first. Worth doing; worth doing on purpose.
+
+## What it costs
+
+| Axis | Cost |
+|---|---|
+| Allocations per request | None. |
+| Memory per idle connection | None for a route with no deadline: `until_ns` is zero and `clamped` returns its argument on the first line. `Deadlines` carries one `u64` and the `_deadline_default` flag lives on the `Ctx`, which is on the fiber's frame and unwound before the connection waits ([ADR 062](062-where-a-connection-waits-is-what-it-costs.md)). |
+| Throughput and p99 | For a route with a deadline: one comparison and, on the `within_ms` arm, one clock read per limit armed (per body read and per write), next to a syscall already there. One `monotonicNanos()` per request when `request_deadline_ms` is set (the same read `block_warning_ms` already makes), none when it is zero. |
+| Binary size | `deadline.with` is generic on `ms`, so a program that never calls it links none of it; `giveDefaultDeadline` and `tookOver` are two small functions. |
+
+**Nothing here tells a handler its client has gone**, which is the other half of the gap this ADR answers and is not simply unbuilt: the obvious implementation is wrong. A read-side EOF is *not* "the client left", because a client that sent `Connection: close` and then `shutdown(SHUT_WR)` produces exactly that byte pattern and is still waiting for its response, so answering "peer gone" from it would abandon correct requests. What is real is a write that fails, which a handler already sees; what would be worth building is a signal that separates "the client half-closed and is waiting" from "the socket is gone", and that is a design rather than a call to make. `docs/roadmap.md` keeps it.

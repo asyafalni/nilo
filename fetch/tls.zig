@@ -11,7 +11,7 @@
 //! different call. Twelve canned tests passed over that bug because `Canned`
 //! never compresses anything. So `send` now asks for identity, and this file is
 //! what would notice if that line were ever deleted
-//! ([ADR 0033](../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
+//! ([ADR 032](../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
 //! applies to a default as much as to a guard).
 //!
 //! TLS is the other half. `std.crypto.tls.Client` is 1,670 lines that no test
@@ -53,7 +53,7 @@ const testing = std.testing;
 
 /// The whole harness: a loop, a client, a Scope. No Engine — TLS is
 /// `std.crypto.tls.Client` reading through whatever `Io` it was handed, so the
-/// Fitting's entry condition holds here too (ADR 0070).
+/// Fitting's entry condition holds here too (ADR 061).
 fn withClient(comptime body: fn (*fetch.Client, *core.Run) anyerror!void) !void {
     if (!net_config.enabled) return error.SkipZigTest;
 

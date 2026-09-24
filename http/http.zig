@@ -8,34 +8,34 @@ pub const App = @import("app.zig").App;
 /// takes instead of using `anytype`.
 pub const Group = @import("app.zig").Group;
 /// A group and the middlewares its routes are excused from — what `without`
-/// hands back (ADR 0080). Named here because a plugin taking one by type
+/// hands back (ADR 008). Named here because a plugin taking one by type
 /// rather than as `anytype` has to be able to write it down.
 pub const GroupOf = @import("app.zig").GroupOf;
 
 /// A group, the middlewares its routes are excused from, and the ones they
-/// carry of their own — what `with` hands back (ADR 0126). `GroupOf` is this
+/// carry of their own — what `with` hands back (ADR 099). `GroupOf` is this
 /// with nothing carried.
 pub const GroupWith = @import("app.zig").GroupWith;
 
-/// One route, as `app.routes()` reports it (ADR 0127).
+/// One route, as `app.routes()` reports it (ADR 100).
 pub const Registered = @import("app.zig").Registered;
 pub const Routes = @import("app.zig").Routes;
 
 /// Building a URL out of a route pattern, checked while compiling. `Ctx.url`
-/// is the same call with the request arena behind it (ADR 0127).
+/// is the same call with the request arena behind it (ADR 100).
 pub const url = @import("url.zig");
 
 pub const Ctx = @import("ctx.zig").Ctx;
 pub const Str = @import("nilo_core").Str;
 
 /// A Scope for work that is not a request — a CLI run, the tick of a
-/// scheduled task, a test (ADR 0041). A `Ctx` is the Scope a handler has;
+/// scheduled task, a test (ADR 038). A `Ctx` is the Scope a handler has;
 /// this is the one a program with no request in it hands to a module that
 /// wants one, `nilo_sql` included.
 pub const Run = @import("nilo_core").Run;
 
 /// A Scope with its type erased, for a callback stored as a function pointer
-/// ([ADR 0177](../docs/adr/0177-a-scope-that-crosses-a-function-pointer.md)).
+/// ([ADR 144](../docs/adr/144-a-scope-that-crosses-a-function-pointer.md)).
 ///
 /// ```zig
 /// const Reaction = *const fn (scope: *nilo.AnyScope, payload: []const u8) anyerror!void;
@@ -51,13 +51,13 @@ pub const Run = @import("nilo_core").Run;
 /// rewritten per caller.
 ///
 /// **The ordinary Scope is unchanged**: `db.select(Row, c, …)` still takes
-/// `anytype` and still costs no indirect call (ADR 0041). The vtable is paid
+/// `anytype` and still costs no indirect call (ADR 038). The vtable is paid
 /// for only where somebody erases one, and it borrows — an `AnyScope` may not
 /// outlive the `Ctx` or `Run` it was made from.
 pub const AnyScope = @import("nilo_core").AnyScope;
 
 /// Percent coding, both directions
-/// ([ADR 0066](../docs/adr/0066-percent-is-needed-by-two-layers.md)).
+/// ([ADR 057](../docs/adr/057-percent-is-needed-by-two-layers.md)).
 ///
 /// The framework decodes with it on the way in, and it is re-exported here
 /// because the caller who needs the *other* direction is a handler: anything
@@ -68,7 +68,7 @@ pub const percent = @import("nilo_core").percent;
 
 /// The reader a type marked with `nilo_json` hands to `std.json`, so that a
 /// body carrying an internally tagged union or a renamed enum can be read back
-/// ([ADR 0085](../docs/adr/0085-a-type-says-how-its-json-is-spelled.md)):
+/// ([ADR 016](../docs/adr/016-the-api-description-comes-from-the-signatures.md)):
 ///
 /// ```zig
 /// const Condition = union(enum) {
@@ -139,7 +139,7 @@ pub const std_options: std.Options = .{
 pub const Mutex = @import("bulkhead.zig").Mutex;
 
 /// A Mutex with a number bigger than one: `n` fibers through at once and the
-/// rest park (ADR 0048).
+/// rest park (ADR 044).
 ///
 /// For a call that is *expensive* rather than slow. `nilo.blocking` already
 /// keeps a slow call off the loop and the Engine's pool already caps how many
@@ -159,7 +159,7 @@ pub const Mutex = @import("bulkhead.zig").Mutex;
 pub const Gate = @import("bulkhead.zig").Gate;
 
 /// A deadline for an operation that is not a read or a write of a connection
-/// nilo holds — an outbound call, in practice (ADR 0065).
+/// nilo holds — an outbound call, in practice (ADR 056).
 ///
 /// A Service asks for one by taking a third parameter on its start hook, and
 /// bounds one call with it:
@@ -181,7 +181,7 @@ pub const Gate = @import("bulkhead.zig").Gate;
 pub const Limits = @import("bulkhead.zig").Limits;
 
 /// Somewhere to put work that is not a request: a fiber of its own, owned
-/// by the server rather than by whatever started it (ADR 0029).
+/// by the server rather than by whatever started it (ADR 028).
 ///
 /// ```zig
 /// try nilo.spawn(flushMetrics, .{&exporter});
@@ -207,7 +207,7 @@ pub const spawn = @import("bulkhead.zig").spawn;
 /// Many requests share one OS thread, so a handler that blocks stops all of
 /// them — a database driver, `std.fs`, `std.http.Client`, anything that
 /// waits on a syscall. Hand it to this instead and only the one request
-/// waits (ADR 0014):
+/// waits (ADR 013):
 ///
 /// ```zig
 /// fn getUser(db: *Db, id: u32) !User {
@@ -218,7 +218,7 @@ pub const spawn = @import("bulkhead.zig").spawn;
 /// The return value is whatever the function returns, errors included. It
 /// allocates nothing, and outside a running server it simply calls the
 /// function — so a handler using it is still testable as an ordinary
-/// function (ADR 0003).
+/// function (ADR 002).
 pub const blocking = @import("bulkhead.zig").blocking;
 
 /// Wait, without stopping the thread. `std.Thread.sleep` would park every
@@ -230,7 +230,7 @@ pub const sleep = @import("bulkhead.zig").sleep;
 
 /// Bytes from the operating system's entropy source, off the event loop —
 /// what `Ctx.entropy` is underneath, for a buffer you are already holding
-/// or for work outside a request (ADR 0046).
+/// or for work outside a request (ADR 042).
 ///
 /// Inside a handler prefer `c.entropy(n)`, which answers by value and so
 /// fits in the expression that wants it.
@@ -239,7 +239,7 @@ pub const randomSecure = @import("bulkhead.zig").randomSecure;
 /// Whether a password matches a stored hash, with no request in hand — what
 /// `c.verifyPassword` is underneath, for a CLI resetting an account, a job
 /// re-hashing at a raised Cost, or a test with neither an App nor a Ctx
-/// (ADR 0241).
+/// (ADR 044).
 ///
 /// ```zig
 /// if (!try nilo.verifyPassword(pw.huge_pages, row.password, typed)) return error.WrongPassword;
@@ -254,11 +254,11 @@ pub const randomSecure = @import("bulkhead.zig").randomSecure;
 /// everywhere.
 pub const verifyPassword = @import("password.zig").verifyAnywhere;
 
-/// The same, told what a hash of yours costs (ADR 0049).
+/// The same, told what a hash of yours costs (ADR 044).
 pub const verifyPasswordWith = @import("password.zig").verifyAnywhereWith;
 
 /// What time it is: microseconds and milliseconds since the epoch, from
-/// `nilo_core` (ADR 0045). Reading the wall clock needs no event loop, so
+/// `nilo_core` (ADR 041). Reading the wall clock needs no event loop, so
 /// this is a plain function rather than a call on the `Ctx` — nobody owns
 /// the time, and there is nothing to ask permission for.
 ///
@@ -269,7 +269,7 @@ pub const nowMicros = @import("nilo_core").nowMicros;
 pub const nowMillis = @import("nilo_core").nowMillis;
 
 /// Fail functions — `fail.notFound("no user {d}", .{id})` and friends,
-/// callable from anywhere (ADR 0005).
+/// callable from anywhere (ADR 004).
 pub const fail = @import("fail.zig");
 
 /// A response whose status the handler picks while it runs, headers of its
@@ -279,11 +279,11 @@ pub const fail = @import("fail.zig");
 ///
 /// The status being a runtime field is why the API description can only
 /// write `default` for one of these. Where the status is part of the
-/// contract rather than a decision, `Status` below says so (ADR 0024).
+/// contract rather than a decision, `Status` below says so (ADR 023).
 pub const Response = @import("typed.zig").Response;
 
 /// A response whose status is part of the signature, so the API description
-/// can name it: `Status(201, User)`, `Status(204, void)` (ADR 0024).
+/// can name it: `Status(201, User)`, `Status(204, void)` (ADR 023).
 ///
 /// ```zig
 /// fn createUser(incoming: NewUser) !nilo.Status(201, User) {
@@ -297,22 +297,22 @@ pub const Header = @import("typed.zig").Header;
 
 /// The headers a `Response` carries, held by value: `.headers = .of(&.{…})`.
 /// Copying is the point — a list written in a handler dies with the handler
-/// (ADR 0019).
+/// (ADR 018).
 pub const Headers = @import("typed.zig").Headers;
 
 /// A response written in pieces, from `c.stream(status, content_type)` —
-/// for a body whose length nobody knows when the head goes out (ADR 0020).
+/// for a body whose length nobody knows when the head goes out (ADR 019).
 pub const Stream = @import("stream.zig").Stream;
 
 /// A stream of server-sent events, from `c.events()`.
 pub const Events = @import("stream.zig").Events;
 
 /// A request body read in pieces, from `c.bodyStream()` — for the ones too
-/// big to hold in the request arena (ADR 0020).
+/// big to hold in the request arena (ADR 019).
 pub const Body = @import("body.zig").Body;
 
 /// An open WebSocket connection. A loop handed to `c.upgrade(loop, state)` is
-/// given one and reads it until the conversation ends (ADR 0022, ADR 0071).
+/// given one and reads it until the conversation ends (ADR 021, ADR 062).
 pub const Socket = @import("websocket.zig").Socket;
 
 /// Everything else WebSocket: `Message`, `Kind`, `Close`, `Options`.
@@ -344,7 +344,7 @@ pub const Query = @import("typed.zig").Query;
 
 /// A whole number inside a range, as a type — for the `limit` every list
 /// endpoint bounds and every document should say it bounds
-/// ([ADR 0206](../docs/adr/0206-a-whole-number-inside-a-range-is-a-type.md)).
+/// ([ADR 167](../docs/adr/167-a-whole-number-inside-a-range-is-a-type.md)).
 ///
 /// ```zig
 /// const ListQuery = struct { limit: nilo.Within(1, 200) = .of(50), offset: u32 = 0 };
@@ -357,7 +357,7 @@ pub const Within = @import("within.zig").Within;
 
 /// One request header, as a typed argument — the same family as `Query(T)`
 /// and `Form(T)`, on a header
-/// ([ADR 0163](../docs/adr/0163-a-header-a-handler-can-be-given.md)).
+/// ([ADR 131](../docs/adr/131-a-header-a-handler-can-be-given.md)).
 ///
 /// ```zig
 /// fn addComment(actor: nilo.FromHeader("X-Staff-Id", Uuid), body: NewComment) !Comment { … }
@@ -374,7 +374,7 @@ pub const FromHeader = @import("typed.zig").FromHeader;
 
 /// The `Authorization` header, as a typed argument that reads one scheme
 /// and refuses with the challenge a 401 has to carry
-/// ([ADR 0191](../docs/adr/0191-an-authorization-header-a-handler-can-ask-for.md)).
+/// ([ADR 153](../docs/adr/153-an-authorization-header-a-handler-can-ask-for.md)).
 ///
 /// ```zig
 /// fn me(auth: nilo.Authorization(.bearer), issuer: *const Issuer) !Profile { … auth.value … }
@@ -393,7 +393,7 @@ pub const Authorization = @import("authorization.zig").Authorization;
 /// The same header verified: the claims behind a bearer token, read through
 /// the `jwt.Verifier` the argument names, or a 401 with the challenge before
 /// the handler runs
-/// ([ADR 0260](../docs/adr/0260-verified-claims-are-a-handler-argument.md)).
+/// ([ADR 191](../docs/adr/191-verified-claims-are-a-handler-argument.md)).
 ///
 /// ```zig
 /// const Google = jwt.Verifier(Claims, fetch.Client);
@@ -405,18 +405,18 @@ pub const Authorization = @import("authorization.zig").Authorization;
 /// `nilo.Verified(Google).refuse("…", .{})`. A middleware reads the same
 /// thing with `c.verified(Google)`.
 pub const Verified = @import("verified.zig").Verified;
-/// Text with a shape (ADR 0264): a `Str` with a length, a check of your own,
+/// Text with a shape (ADR 193): a `Str` with a length, a check of your own,
 /// or both, refused with one sentence in every slot and described in the
 /// document. `Email` and `Url` are presets.
 pub const Text = @import("text.zig").Text;
 pub const Email = @import("text.zig").Email;
 pub const Url = @import("text.zig").Url;
-/// What a struct's `nilo_check` writes into (ADR 0264).
+/// What a struct's `nilo_check` writes into (ADR 193).
 pub const Rules = @import("bound.zig").Rules;
 
 /// The `Idempotency-Key` header, as a typed argument that makes the route
 /// answer once per key
-/// ([ADR 0193](../docs/adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)).
+/// ([ADR 155](../docs/adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
 ///
 /// ```zig
 /// const Replays = cache.Space("orders-replay", []const u8, .{ .ttl_s = 86_400, .max_bytes = 16 << 10 });
@@ -436,7 +436,7 @@ pub const IdempotentOptions = @import("typed.zig").IdempotentOptions;
 
 /// A kept answer served again for a time, as a typed argument that makes
 /// a GET say "cache this for a minute" in its signature
-/// ([ADR 0247](../docs/adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)).
+/// ([ADR 188](../docs/adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)).
 ///
 /// ```zig
 /// const Pages = cache.Space("pages", []const u8, .{ .max_bytes = 64 << 10 });
@@ -457,7 +457,7 @@ pub const CachedOptions = @import("cached.zig").Options;
 pub const CachedBy = @import("cached.zig").By;
 
 /// An HTML form body, read into a struct of yours — the same idea as
-/// `Query(T)`, on the body instead of the query string (ADR 0031).
+/// `Query(T)`, on the body instead of the query string (ADR 030).
 ///
 /// ```zig
 /// const SignUp = struct { email: Str, password: Str, avatar: ?nilo.Upload = null };
@@ -505,7 +505,7 @@ pub const Upload = @import("form.zig").Upload;
 pub const Bound = @import("bound.zig").Bound;
 
 /// A response that sends the client somewhere else, with the status in the
-/// type so the API description can name it (ADR 0032).
+/// type so the API description can name it (ADR 031).
 ///
 /// ```zig
 /// fn signUp(incoming: nilo.Form(SignUp)) !nilo.Redirect(303) {
@@ -519,7 +519,7 @@ pub const Bound = @import("bound.zig").Bound;
 pub const Redirect = @import("redirect.zig").Redirect;
 
 /// An answer that is a file on disk, named by the handler and never held in
-/// memory (ADR 0037).
+/// memory (ADR 009).
 ///
 /// ```zig
 /// fn invoice(files: *Files, id: u32) !?nilo.FileBody {
@@ -530,7 +530,7 @@ pub const Redirect = @import("redirect.zig").Redirect;
 ///
 /// A return type rather than a call, for `Redirect`'s reason: the signature
 /// is the contract, so the generated API description says the endpoint
-/// answers with bytes — and the `?` says it answers 404 (ADR 0024).
+/// answers with bytes — and the `?` says it answers 404 (ADR 023).
 ///
 /// The file is opened relative to `dir` and never resolved as a path, so a
 /// name is checked and then handed to the kernel rather than joined onto
@@ -542,12 +542,12 @@ pub const Redirect = @import("redirect.zig").Redirect;
 pub const FileBody = @import("filebody.zig").FileBody;
 /// An answer that is bytes already in hand, under a label decided per
 /// request — somebody else's download passed on with their `Content-Type`
-/// ([ADR 0212](../docs/adr/0212-bytes-handed-on-are-an-answer.md)).
+/// ([ADR 173](../docs/adr/173-bytes-handed-on-are-an-answer.md)).
 pub const Bytes = @import("bytebody.zig").Bytes;
 pub const Versioned = @import("versioned.zig").Versioned;
 
 /// A directory, opened once and held open — what a Service hands a
-/// `FileBody` (ADR 0037).
+/// `FileBody` (ADR 009).
 ///
 /// ```zig
 /// const Files = struct { dir: nilo.Dir };
@@ -564,7 +564,7 @@ pub const Versioned = @import("versioned.zig").Versioned;
 pub const Dir = @import("bulkhead.zig").Dir;
 
 /// A cookie on the way out: `c.setCookie(.{ .name = "session", .value = t })`
-/// (ADR 0030). Its defaults are `Secure`, `HttpOnly`, `SameSite=Lax` and
+/// (ADR 029). Its defaults are `Secure`, `HttpOnly`, `SameSite=Lax` and
 /// `Path=/`, so a plain one is already the careful one.
 pub const Cookie = @import("cookie.zig").Cookie;
 
@@ -603,7 +603,7 @@ pub const Session = @import("session.zig").Session;
 pub const session = @import("session.zig");
 
 /// A body field that can tell "not sent" from "sent as null" — what a PATCH
-/// needs and `?T` cannot say (ADR 0026).
+/// needs and `?T` cannot say (ADR 025).
 ///
 /// ```zig
 /// const EditTodo = struct { title: nilo.Patch(nilo.Str) = .absent };
@@ -646,14 +646,14 @@ pub const metrics = @import("metrics.zig");
 
 /// Gzip every answer worth gzipping, per request, for a client that asked:
 /// `try app.compress(.{})`. `nilo.compress.Options` is what it takes
-/// ([ADR 0287](../docs/adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
+/// ([ADR 211](../docs/adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 pub const compress = @import("compress.zig");
 
 /// How many requests one address may make inside a window, and a 429 when it
 /// asks for more: `app.useOn("/api", nilo.allowance.with(.{ .per_window = 100,
 /// .window_s = 60 }))`. The table is sized while compiling and lives in
 /// `.bss`, so it costs no allocation at startup and none per request
-/// ([ADR 0114](../docs/adr/0114-an-allowance-is-a-table-sized-while-compiling.md)).
+/// ([ADR 092](../docs/adr/092-an-allowance-is-a-table-sized-while-compiling.md)).
 pub const allowance = @import("allowance.zig");
 
 /// How long a route gets: `app.with(nilo.deadline(2000)).get("/report", …)`.
@@ -661,7 +661,7 @@ pub const allowance = @import("allowance.zig");
 /// Every wait nilo owns — the body, the write, a stream's pieces, a
 /// WebSocket's silence — is cut down to it, and a handler doing its own work
 /// asks `c.overdue()`. A running handler is not interrupted, and deliberately
-/// is not ([ADR 0133](../docs/adr/0133-a-route-can-say-how-long-it-has.md)).
+/// is not ([ADR 105](../docs/adr/105-a-route-can-say-how-long-it-has.md)).
 pub const deadline = @import("deadline.zig").with;
 
 /// How much body a route takes: `app.with(nilo.maxBody(50 << 20)).post("/import", …)`.
@@ -669,15 +669,15 @@ pub const deadline = @import("deadline.zig").with;
 /// `listen()`'s `max_body` is one number for every route, and an import and
 /// a sign-in do not have the same budget. Bounds every read into the arena
 /// and not `c.bodyStream()`, which has its own
-/// ([ADR 0193](../docs/adr/0194-a-route-can-say-how-much-body-it-takes.md)).
+/// ([ADR 155](../docs/adr/156-a-route-can-say-how-much-body-it-takes.md)).
 pub const maxBody = @import("maxbody.zig").with;
 
-/// Static files, held in memory (ADR 0010). Used through `app.static()`;
+/// Static files, held in memory (ADR 009). Used through `app.static()`;
 /// the module itself is here for its `Options`.
 /// What an `Accept` header says about one media type: `.named`, `.anything`,
 /// `.unsaid` or `.refused`. `nilo.accept.asks(c.header("Accept"), "text/html")`
 /// — the reader the single-page fallback decides with
-/// ([ADR 0109](../docs/adr/0109-a-fallback-answers-a-navigation-not-a-missing-asset.md)),
+/// ([ADR 087](../docs/adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)),
 /// exported because a handler answering two content types wants the same
 /// question answered and there is no reason to make it parse the header again.
 pub const accept = @import("accept.zig");
@@ -685,10 +685,10 @@ pub const accept = @import("accept.zig");
 pub const static = @import("static.zig");
 
 /// Which addresses in front of this server may say who the client is —
-/// what `listen(.{ .trusted_proxies = … })` is parsed into (ADR 0129).
+/// what `listen(.{ .trusted_proxies = … })` is parsed into (ADR 102).
 pub const proxies = @import("proxies.zig");
 
-/// The API description, worked out from the handler signatures (ADR 0017).
+/// The API description, worked out from the handler signatures (ADR 016).
 /// Switched on with `app.docs(.{ .title = "…" })`; the module is here for
 /// its `Options` and for the `Schema` a test might want to look at.
 pub const openapi = @import("openapi.zig");
@@ -701,7 +701,7 @@ pub const openapi = @import("openapi.zig");
 /// ```
 ///
 /// Zig cannot recover from a panic — the process is going down either way
-/// (ADR 0008). What this buys is knowing which endpoint took it down, so
+/// (ADR 007). What this buys is knowing which endpoint took it down, so
 /// `panic while handling GET /users/42` replaces a day of guessing.
 pub const panic = std.debug.FullPanic(panicNamingRequest);
 
@@ -742,7 +742,7 @@ fn doubleOrFail(n: u32) !u32 {
 
 test "blocking runs the call, keeps its errors, and needs no Engine under it" {
     // Outside a server this runs inline, which is the property that keeps a
-    // handler using `blocking` testable as an ordinary function (ADR 0003).
+    // handler using `blocking` testable as an ordinary function (ADR 002).
     try std.testing.expectEqual(@as(u32, 42), try blocking(doubleOrFail, .{21}));
     try std.testing.expectError(error.Failed, blocking(doubleOrFail, .{0}));
 }
@@ -754,7 +754,7 @@ fn neverRuns(ran: *bool) void {
 test "spawn with no server says so, rather than starting something nothing owns" {
     // The counterpart of the Mutex test above, and the opposite answer on
     // purpose. A lock with no Engine can do its job alone; a fiber cannot,
-    // and there would be nothing to count it or stop it (ADR 0029). Better
+    // and there would be nothing to count it or stop it (ADR 028). Better
     // an error the caller can see than work that quietly never happens.
     var ran = false;
     try std.testing.expectError(error.NoServer, spawn(neverRuns, .{&ran}));
@@ -765,14 +765,14 @@ test "a fail function in spawned work has no request to fail" {
     // Spawned work has no slot of its own, so it falls through to the
     // threadlocal — which is null here and on an executor thread, and is
     // only ever set on a thread-pool worker. If that ever stops being true
-    // this keeps passing and ADR 0007's leak comes back, so the comments in
+    // this keeps passing and ADR 006's leak comes back, so the comments in
     // bulkhead.zig are the real guard; this pins the visible half.
     try std.testing.expect(fail.inFlight() == null);
     try std.testing.expectError(error.Failed, doubleOrFail(0));
 }
 
 test "a fail function inside blocking reaches the request that made the call" {
-    // The half of ADR 0014 that has to be got right: on a real server the
+    // The half of ADR 013 that has to be got right: on a real server the
     // call runs on a pool worker, which is not the fiber the failure box is
     // bound to, so `blocking` carries the slot across. Here there is no
     // fiber at all and the fallback stands in for one — enough to hold the
@@ -799,7 +799,7 @@ test "a fail function inside blocking reaches the request that made the call" {
 test "a Ctx can be erased, and a callback allocates through it into the request" {
     // The half `core/scope.zig` cannot check: `Ctx.arena` and `Ctx.str` take a
     // `*const Ctx`, and the erasure casts a `*anyopaque` back to `*Ctx` — a
-    // coercion that either works here or nowhere (ADR 0177). Driven through a
+    // coercion that either works here or nowhere (ADR 144). Driven through a
     // real request rather than asserted about, because what is being tested is
     // that the memory really is the request's.
     const Reaction = *const fn (scope: *AnyScope, note: []const u8) anyerror![]const u8;
@@ -837,10 +837,10 @@ test "every type this module exports is named the way the import line names it" 
     // `refusals/` and not one of them was, because a refusal only covers the
     // message somebody thought to write a refusal for.
     //
-    // This is the rule instead of the paragraph (ADR 0095). It walks what the
+    // This is the rule instead of the paragraph (ADR 074). It walks what the
     // module actually exports rather than a second list, so a type added to
     // `http.zig` and forgotten fails the suite the day it lands. What it asks
-    // has changed with ADR 0122: not whether a table matches the type's *name*,
+    // has changed with ADR 074: not whether a table matches the type's *name*,
     // which matched the reader's file names too, but whether the type carries
     // `nilo_type_name` and so says what it is called itself.
     //
@@ -885,7 +885,7 @@ test "every type this module exports is named the way the import line names it" 
 
 test {
     // Core is not listed here. It is a module of its own now, with a step of
-    // its own (ADR 0041) — running it from inside the framework's suite would
+    // its own (ADR 038) — running it from inside the framework's suite would
     // hide the property that step exists to hold: that it passes with nothing
     // above it.
     _ = @import("names.zig");
@@ -956,10 +956,10 @@ test {
     _ = @import("wiring.zig");
     _ = @import("behaviour.zig");
     // Last, and the only one here that stands a real server up. Nothing else
-    // in this suite opens a socket at all (ADR 0086).
+    // in this suite opens a socket at all (ADR 028).
     _ = @import("live.zig");
     // Except this, in a build that has TLS in it: the same server with a
-    // certificate, talked to by std's own TLS client (ADR 0288). Under a
+    // certificate, talked to by std's own TLS client (ADR 212). Under a
     // comptime `if` because the file names the option's machinery, which a
     // build without `-Dtls` does not have; the repository's own test root
     // always does (see `wireTls` in build.zig).

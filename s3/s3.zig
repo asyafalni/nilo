@@ -29,12 +29,12 @@
 //!
 //! It is HTTP, TLS, a connection pool and the policy round them, and none of
 //! that is this module's subject
-//! ([ADR 0067](../docs/adr/0067-most-of-an-s3-client-is-not-s3.md) counted:
+//! ([ADR 058](../docs/adr/058-most-of-an-s3-client-is-not-s3.md) counted:
 //! sharing nilo's *server* parser would have covered 24% of the framing and
 //! none of the two expensive parts). So the client is `nilo_fetch`, which is
 //! `std.http.Client` with a gate, a deadline and a bounded drain in front of
 //! it, and **what is left here is signing and the bucket**
-//! ([ADR 0072](../docs/adr/0072-an-object-store-is-a-service-that-dials.md)).
+//! ([ADR 063](../docs/adr/063-an-object-store-is-a-service-that-dials.md)).
 //!
 //! | file | what it is |
 //! |---|---|
@@ -54,7 +54,7 @@
 //! `LIST` was the third of these for a cycle, and what let it in is the
 //! observation `code.zig` had already made about error bodies: a fixed, flat
 //! document with five interesting names in it is a scan rather than a parser
-//! (ADR 0250). It is bounded — one page, a cursor handed back, and no helper
+//! (ADR 058). It is bounded — one page, a cursor handed back, and no helper
 //! that follows it — because the call with unbounded output is the one that
 //! invites reading a bucket as a database. The other two are on the roadmap
 //! with the reason attached.
@@ -80,7 +80,7 @@ pub const bucket = @import("bucket.zig");
 
 /// The type a handler asks for. Two buckets are two types, therefore two
 /// Services, and which one a handler reaches is written in its argument list
-/// (ADR 0068).
+/// (ADR 059).
 pub const Bucket = bucket.Bucket;
 
 /// What every bucket in the program shares: the endpoint, the region, the
@@ -91,7 +91,7 @@ pub const Source = store.Source;
 pub const Options = store.Options;
 
 /// Open the Store. **It dials nothing here** — a Service that needs the loop
-/// is finished when the loop exists (ADR 0040), so the first credential fetch
+/// is finished when the loop exists (ADR 037), so the first credential fetch
 /// happens in `nilo_start`, which `listen()` calls before it accepts anything.
 pub fn open(gpa: std.mem.Allocator, options: Options) store.OpenError!Store {
     return Store.open(gpa, options);
@@ -104,7 +104,7 @@ pub const Listed = bucket.Listed;
 pub const Page = bucket.Page;
 pub const Presigned = bucket.Presigned;
 /// A browser's own upload: what to ask for, and the form that comes back
-/// (ADR 0141).
+/// (ADR 112).
 pub const Post = bucket.Post;
 pub const Posted = bucket.Posted;
 pub const Field = bucket.Field;
@@ -114,7 +114,7 @@ pub const Sse = bucket.Sse;
 
 /// The seven failures a handler can tell apart, and the whole list. Exactly
 /// one carries a default status — `NotFound` is a 404 — because it is the one
-/// whose meaning does not change with the request around it (ADR 0068).
+/// whose meaning does not change with the request around it (ADR 059).
 pub const Error = code.Error;
 
 test {

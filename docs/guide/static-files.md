@@ -11,7 +11,7 @@ try app.staticWith("/assets", "dist", .{
 
 The directory is read into memory when the server starts, so nothing touches the
 disk while requests are being served
-([ADR 0010](../adr/0010-static-files-are-held-in-memory.md)). Each file gets an
+([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)). Each file gets an
 ETag at load, so a repeat visit is a 304 with no body. Path traversal isn't
 possible, because there is no path to resolve — just a name looked up in a fixed
 list.
@@ -47,7 +47,7 @@ there.
 `spa_fallback` is what makes a browser reload on `/users/42` reach your
 client-side router instead of a 404. **It answers a request that could be
 somebody opening a page, and nothing else**
-([ADR 0109](../adr/0109-a-fallback-answers-a-navigation-not-a-missing-asset.md)):
+([ADR 087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)):
 
 | The request | The answer |
 |---|---|
@@ -97,7 +97,7 @@ That timing is the whole design, not an optimisation on top of it. A gzip
 compressor needs a 64 KB window: one per connection would take an idle
 connection from 4,669 bytes to roughly fifteen times that, and one per request would
 put an allocation on the path where the budget is one
-([ADR 0018](../adr/0018-the-trade-budget-has-three-axes.md)). A file that never
+([ADR 017](../adr/017-the-trade-budget-has-four-axes.md)). A file that never
 changes escapes both, because it can be compressed before the socket is open.
 
 What it costs instead is memory that stays: the compressed copy sits beside the
@@ -147,7 +147,7 @@ goes out on every file response so a client knows it may ask.
 
 The rule for everything else is that **a `Range` that can't be understood is
 ignored and the whole file goes out**
-([ADR 0021](../adr/0021-a-range-is-a-slice-and-two-headers.md)). That is a
+([ADR 020](../adr/020-a-range-is-a-slice-and-two-headers.md)). That is a
 correct answer to every request, so `bytes=abc-def` or `bytes=99-10` gets a 200
 rather than an error. The one case worth refusing is a range starting past the
 end of the file: that's a client with the wrong idea about the size, and a `416`
@@ -163,7 +163,7 @@ gets: a tag wrapped in `W/` and a bare `*` both get the whole file rather than a
 range. A weak validator promises the representation is equivalent, not that it is
 the same bytes, and the same bytes is exactly what a client stapling this onto a
 prefix it already holds needs
-([ADR 0094](../adr/0094-a-header-is-answered-as-asked-or-refused.md)).
+([ADR 073](../adr/073-a-header-is-answered-as-asked-or-refused.md)).
 
 A request that asks for a range gets the **uncompressed** file, whatever it said
 about `Accept-Encoding`. A range is an offset into a representation, and the
@@ -178,7 +178,7 @@ body nilo doesn't assemble — so it gets the whole file too. Nothing sends them
 A file over `max_file_bytes` is left where it is. It keeps its place in the list
 with its size, its modification time and the path the directory walk produced,
 and the request that asks for it opens the file and sends it from the disk
-([ADR 0037](../adr/0037-a-file-too-big-to-hold-is-opened-not-read.md)). A
+([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)). A
 directory with a video in it serves rather than failing to load.
 
 Below the line nothing has changed: read at load, hashed, gzipped if it is worth
@@ -196,7 +196,7 @@ it, answered from a slice. Three things change above it.
   numbers come from one look at the descriptor whose bytes are about to go out,
   so a file that changed on disk cannot be sent with a length and a tag that
   describe different versions of it
-  ([ADR 0125](../adr/0125-a-file-is-described-by-the-descriptor-being-sent.md)).
+  ([ADR 098](../adr/098-a-file-is-described-by-the-descriptor-being-sent.md)).
 - **One file descriptor is held for as long as the response takes.** One per
   request in flight, which `max_connections` already bounds — the number an
   operator was already multiplying.
@@ -234,7 +234,7 @@ try app.embeddedWith("/", &.{
 
 A product that is one binary has no `dist/` on the machine it runs on. `embedded`
 is `static` with the read taken out
-([ADR 0249](../adr/0249-a-tree-the-binary-carries-is-served-as-a-directory-is.md)):
+([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)):
 the bytes come from `@embedFile` rather than from a disk, and everything after
 that is the same code — the sorted list, an ETag per file, a gzipped copy made
 once for the files worth it, the fallback, and nothing per request. What a

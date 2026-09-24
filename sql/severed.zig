@@ -8,11 +8,11 @@
 //! way round: a set `err` means the server answered *this* statement and the
 //! socket was alive to carry the answer, so an aborted transaction can be let
 //! out of pg.zig's `.fail` and rolled back rather than destroyed
-//! ([ADR 0047](../docs/adr/0047-a-deadline-needs-a-connection-you-hold.md)).
+//! ([ADR 043](../docs/adr/043-a-deadline-needs-a-connection-you-hold.md)).
 //! The live half of that has a test in `live.zig`, which reads
 //! `pg_pool_dirty` and watches it not move. The dead half needed a socket the
 //! suite never opened, and this file opens it
-//! ([ADR 0248](../docs/adr/0248-a-dead-socket-is-a-proxy-in-the-test.md)).
+//! ([ADR 043](../docs/adr/043-a-deadline-needs-a-connection-you-hold.md)).
 //!
 //! ## A proxy, in the test
 //!
@@ -48,7 +48,7 @@
 //! `readv` on does not wake that thread, and the socket it names stays open
 //! underneath until the read returns — which it never would, so no RST would
 //! ever go out. `Future.cancel` sends the signal that gets a task out of a
-//! blocking syscall (ADR 0230), and only once both pumps have returned does
+//! blocking syscall (ADR 056), and only once both pumps have returned does
 //! the descriptor get closed.
 //!
 //! **Every wait here has a bound.** The accept loop and the pumps wait on
@@ -212,7 +212,7 @@ const Proxy = struct {
     /// The accept loop. A task of the `Io`, started with `io.concurrent` for
     /// the reason `fetch/live.zig` gives: `io.async` may run this on the
     /// calling thread, and the caller is about to dial the port this is
-    /// meant to be listening on (ADR 0230).
+    /// meant to be listening on (ADR 056).
     ///
     /// It returns when cancelled, which is how `close` stops it, or when
     /// something went wrong that the test should hear about — and then it

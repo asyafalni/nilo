@@ -1,9 +1,9 @@
 //! A statement composed at run time from pieces that cannot carry a string
-//! ([ADR 0283](../docs/adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
+//! ([ADR 208](../docs/adr/208-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)).
 //!
-//! `db.raw` takes comptime text (ADR 0148), and the property that decision
+//! `db.raw` takes comptime text (ADR 051), and the property that decision
 //! protects is narrower than "the text is a constant": **no run-time string
-//! reaches the statement** (ADR 0204). A query engine — a semantic layer
+//! reaches the statement** (ADR 165). A query engine — a semantic layer
 //! that turns a model into SQL — cannot write its statements while
 //! compiling, because the model is data, but it never needs a run-time
 //! *string* in them either: what varies is which table, which column,
@@ -20,12 +20,12 @@
 //!
 //! Nothing else has a method, so nothing else can be written. A `Composed`
 //! is then handed to `db.composed` like the text of a `db.raw` would be:
-//! the Row is filled by position, the run-time width check (ADR 0134)
-//! holds, the values are converted the way a Row's are (ADR 0145), and the
+//! the Row is filled by position, the run-time width check (ADR 106)
+//! holds, the values are converted the way a Row's are (ADR 116), and the
 //! values are counted against the placeholders the way `rawcheck` counts
 //! them for `raw` — at run time here, because the text is. What it gives
 //! up is the comptime column count and the plan name — its text differs
-//! per model, so it runs unnamed, which is the 12 µs ADR 0057 measured,
+//! per model, so it runs unnamed, which is the 12 µs ADR 051 measured,
 //! spent once per statement rather than once per request.
 
 const std = @import("std");

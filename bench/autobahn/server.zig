@@ -1,9 +1,9 @@
 //! The server the Autobahn suite is run against.
 //!
-//! [ADR 0033](../../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
+//! [ADR 032](../../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
 //! is the whole reason this file exists. Every framing test under `http/` was
 //! written from RFC 6455 by the person who wrote the framing, so the close-code
-//! and UTF-8 rules ([ADR 0052](../../docs/adr/0052-a-message-is-copied-once-and-framed-once.md))
+//! and UTF-8 rules ([ADR 046](../../docs/adr/046-a-message-is-copied-once-and-framed-once.md))
 //! had only ever been seen to pass. `wstest` is the suite every implementation
 //! of that RFC is measured by, and it is written by somebody who has never read
 //! this code.

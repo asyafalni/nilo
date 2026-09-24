@@ -1,5 +1,5 @@
 //! Response compression: a body gzipped per request, on a compressor
-//! borrowed from a pool sized to the thread count (ADR 0287).
+//! borrowed from a pool sized to the thread count (ADR 211).
 //!
 //! ```zig
 //! try app.compress(.{});                                   // gzip, bodies of 1 KB and up
@@ -13,7 +13,7 @@
 //! Accept-Encoding`, and its `Content-Length` is the compressed size. A
 //! client that said nothing, or said `gzip;q=0`, gets the body as it is and
 //! no `Content-Encoding` at all. A static file is not this: it was gzipped
-//! once when the App was built (ADR 0010). A stream and an event stream are
+//! once when the App was built (ADR 009). A stream and an event stream are
 //! not this either, and deliberately; the ADR says why.
 //!
 //! **Where the compressor lives is the whole design, and three places were
@@ -21,11 +21,11 @@
 //! table and token buffer plus a 64 KB window. One per *connection* would
 //! multiply the 4,669 bytes an idle connection holds by sixty. One per
 //! *request*, allocated, breaks the budget of one allocation a request
-//! (ADR 0018). And one on the *handler's stack*, the obvious shape and
+//! (ADR 017). And one on the *handler's stack*, the obvious shape and
 //! the one `Compress.init` writes, is the worst of the three: the standard
 //! library builds its token buffer as a 96 KB temporary before copying it
 //! into place, and a fiber keeps its stack at the high-water mark it ever
-//! reached, for the life of the connection (ADR 0063). Measured from the
+//! reached, for the life of the connection (ADR 062). Measured from the
 //! assembly: **99,048 bytes of stack** for one call to `Compress.init`,
 //! which on four thousand keep-alive connections is four hundred megabytes
 //! of resident memory for a feature that was meant to save bandwidth.

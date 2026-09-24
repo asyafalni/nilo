@@ -4,7 +4,7 @@ Two sessions hit the same wall from opposite sides. `nilo_s3` needs to speak
 HTTP to an object store; a handler needs to speak HTTP to Stripe; and a Service
 may not import `nilo_http`, because that is sideways and `zig build layering`
 refuses it. The proposal on the table was **a fourth layer between Core and
-Service**, which costs amendments to ADR 0041 and ADR 0042 — the two ADRs that
+Service**, which costs amendments to ADR 038 — the two ADRs that
 decide where every file in the repository goes.
 
 Nobody had asked how big the thing being housed is. This spike asks, with a
@@ -52,7 +52,7 @@ no pool.
 ## And it needs no engine
 
 The entry condition proposed for the fourth layer was `zig test <m>/<m>.zig`
-under `std.Io.Threaded` — ADR 0042's shape, one tier up. Nobody had checked
+under `std.Io.Threaded` — ADR 038's shape, one tier up. Nobody had checked
 whether an HTTP client can pass it, so this spike is built to fail loudly if it
 cannot: **`build.zig.zon` declares no dependencies at all.**
 
@@ -64,7 +64,7 @@ condition is satisfiable — that half of the layer design holds up.
 
 Two things are deliberately absent, and neither moves the answer much:
 
-- **The deadline.** ADR 0065 does not exist as code yet. Where it would be
+- **The deadline.** ADR 056 does not exist as code yet. Where it would be
   armed is marked in `fetch` — one bind around the block, released with the
   permit. Call it a handful of lines.
 - **TLS.** It is a field on `std.http.Client`, not code here. Enabling it costs
@@ -77,7 +77,7 @@ A finished version wires results into a Scope and returns `Str` rather than
 ## What this does not decide
 
 Whether the fourth layer is worth it. That is a repository-level decision and
-it belongs to the people who own ADR 0041 and 0042, not to this file. What this
+it belongs to the people who own ADR 038, not to this file. What this
 file removes is the option of deciding it without knowing the size of the first
 tenant — **a layer whose first tenant is 65 lines has to justify itself on
 something other than volume**, and it may well be able to: the argument for a

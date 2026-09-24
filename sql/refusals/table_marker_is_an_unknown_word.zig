@@ -1,6 +1,6 @@
 //! A word in the marker that is not `.projection`. There is exactly one, and
 //! a near miss is a typo rather than a new kind of Row
-//! ([ADR 0155](../../docs/adr/0155-a-row-that-owns-no-table.md)).
+//! ([ADR 125](../../docs/adr/125-a-row-that-owns-no-table.md)).
 
 const std = @import("std");
 const nilo = @import("nilo_http");

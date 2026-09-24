@@ -25,7 +25,7 @@ fn signOut(s: nilo.Session(Signed)) !nilo.Redirect(303) {
 and signed, and handed to the browser as one cookie. There is no table, no
 expiry sweep, no lock, and nothing added to what an idle connection costs —
 which is the reason to prefer it, not a detail of how it is written
-([ADR 0035](../adr/0035-a-session-is-sealed-into-the-cookie.md)).
+([ADR 033](../adr/033-a-session-is-sealed-into-the-cookie.md)).
 
 A request that does not ask for a session runs the code it ran before.
 
@@ -118,7 +118,7 @@ try s.setWith(.{ .user = id }, .{ .max_age = 30 * 24 * 60 * 60 });   // 30 days
 the cookie — out of a proxy log, a `curl -v` pasted into a ticket, a backup —
 obeys nothing. So the same thirty days is sealed *inside* the cookie, where the
 client cannot reach it, and after thirty days it stops opening for anybody
-([ADR 0088](../adr/0088-an-expiry-a-client-can-ignore-is-not-one.md)).
+([ADR 033](../adr/033-a-session-is-sealed-into-the-cookie.md)).
 
 A session cookie has a ceiling too, for exactly that reason: leaving `max_age`
 unset asks the browser to forget the cookie at the end of the window, and seals
@@ -206,8 +206,7 @@ fn signIn(
 ```
 
 Three things about that call are the whole reason it exists
-([ADR 0048](../adr/0048-a-password-hash-is-gated-because-forgetting-is-silent.md),
-[ADR 0049](../adr/0049-a-hash-asks-for-the-pages-it-walks.md)):
+([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)):
 
 - **The stored hash is optional, and `null` means there is no such account.**
   It does the work anyway and answers false. Returning early when the address
@@ -254,7 +253,7 @@ Cost, a test that wants neither an App nor a `Ctx`: none of them has a
 request, and none of them needs one, because the salt is in the stored
 string. `nilo.verifyPassword` is the method without the `Ctx` — the same
 Gate and the same blocking pool, run inline when there is no loop at all
-([ADR 0241](../adr/0241-a-token-is-not-a-password-and-a-check-needs-no-request.md)):
+([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)):
 
 <!-- compiles -->
 ```zig
@@ -275,7 +274,7 @@ has all three, and the recipe is small enough that everybody writes it and
 wrong in enough places that most get one of them: the token stored as it was
 sent, so that a copy of the table is a set of working links; `std.mem.eql` on
 the compare; a UUID used as the token. `pw.Token` is the recipe written once
-([ADR 0241](../adr/0241-a-token-is-not-a-password-and-a-check-needs-no-request.md)).
+([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)).
 
 <!-- compiles -->
 ```zig

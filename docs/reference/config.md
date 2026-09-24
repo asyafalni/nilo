@@ -5,7 +5,7 @@ One page of [the reference](./README.md): settings out of the environment.
 ## `nilo_config`
 
 Settings, read into a struct of your own before the socket opens
-([ADR 0043](../adr/0043-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)).
+([ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)).
 Nothing here allocates and nothing here does IO.
 
 ```zig
@@ -67,7 +67,7 @@ whether the port is one this machine may bind is your question.
 ### A `.env`
 
 `Dotenv` takes text, not a path
-([ADR 0064](../adr/0064-a-dotenv-is-text-somebody-else-read.md)), so the module
+([ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)), so the module
 still opens no file and still allocates nothing. **The text has to outlive the
 Config** — a `[]const u8` field points into it, exactly as it points into the
 environment block.

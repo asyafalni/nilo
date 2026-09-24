@@ -2,7 +2,7 @@
 //! Dialect adds `::text` to every `SELECT` list this module builds, and to
 //! none that a caller builds — so the driver hands over the wire format and
 //! `nilo_read` keeps those bytes as if they were the digits
-//! ([ADR 0154](../../docs/adr/0154-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
+//! ([ADR 124](../../docs/adr/124-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
 
 const std = @import("std");
 const nilo = @import("nilo_http");

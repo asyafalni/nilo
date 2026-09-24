@@ -44,18 +44,18 @@ from the type as well: a `Uuid` publishes `{"type":"string","format":"uuid"}`
 through its `nilo_openapi`, so a generated client gets the format rather than a
 bare string. The declaration is looked for by name and never imported, which is
 what lets a module in the bottom layer offer it
-([ADR 0142](../adr/0142-a-path-param-can-parse-itself.md)).
+([ADR 113](../adr/113-a-path-param-can-parse-itself.md)).
 
 **A `Query(T)` or `Form(T)` field takes one too**, and for the same reason: one
 arrival has one answer, so `/deals/:id` and `?actor=<uuid>` cannot read the same
 type two different ways
-([ADR 0158](../adr/0158-one-arrival-one-answer.md)). So a field is a `Str`, a
+([ADR 113](../adr/113-a-path-param-can-parse-itself.md)). So a field is a `Str`, a
 number, a `bool`, an enum, **or a type with `nilo_parse`** — `sql.Uuid` and
 `sql.Timestamp` both are — optionally in a `?`, and a `Form(T)` field may also
 be an `Upload`.
 
 **A body field takes one as well** — the third arrival
-([ADR 0205](../adr/0205-a-body-field-that-parses-itself.md)). `std.json` reads a
+([ADR 166](../adr/166-a-body-field-that-parses-itself.md)). `std.json` reads a
 body, and it picks the reader by looking for `jsonParse` on the type; `sql.Uuid`
 and `sql.Timestamp` carry one, and a `[]const sql.Uuid` reads a list of them. A
 type of your own that parses itself writes one line beside `nilo_parse`:
@@ -71,7 +71,7 @@ say more than its name says it with `pub const nilo_expects = "a ticket number
 like T-1234"`, which every slot then asks for in those words.
 
 **`Within(min, max)` is a whole number inside a range**
-([ADR 0206](../adr/0206-a-whole-number-inside-a-range-is-a-type.md)): a type that
+([ADR 167](../adr/167-a-whole-number-inside-a-range-is-a-type.md)): a type that
 parses itself, so it is read wherever a `u8` is, refused outside the range with
 `?limit has to be a whole number from 1 to 200, not "500"`, and described in
 the document with `minimum` and `maximum`. The number is `.value`; the default
@@ -87,7 +87,7 @@ const ListQuery = struct {
 
 **`Text(.{ .min, .max, .check, .said })` is text with a shape**, and
 **`Email`** and **`Url`** are presets of it
-([ADR 0264](../adr/0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)):
+([ADR 193](../adr/193-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)):
 a `Str` that parses itself, read wherever a `Str` is, refused with one
 sentence in every slot, and described with `minLength`, `maxLength` and
 `format`. `min` and `max` count code points; `check` is a
@@ -131,13 +131,13 @@ value contributes nothing, and a comma is data because a browser never
 joins a group with one, so there is no second spelling as there is for a
 query. A list of `Upload` is a Refusal. Under `Bound(Form(T))` the first
 value that will not convert is the one reported and the rest are still read
-([ADR 0256](../adr/0256-a-form-list-is-a-repeated-name-and-nothing-else.md)).
+([ADR 132](../adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)).
 See [Forms](../guide/forms.md#a-checkbox-group-is-a-list).
 
 ### `FromHeader(name, T)`
 
 One request header, as an argument the signature declares
-([ADR 0163](../adr/0163-a-header-a-handler-can-be-given.md)):
+([ADR 131](../adr/131-a-header-a-handler-can-be-given.md)):
 
 <!-- compiles -->
 ```zig
@@ -167,7 +167,7 @@ been since 0.2.0.
 ### `Authorization(scheme)`
 
 The `Authorization` header, read as the one scheme the endpoint takes
-([ADR 0191](../adr/0191-an-authorization-header-a-handler-can-ask-for.md)):
+([ADR 153](../adr/153-an-authorization-header-a-handler-can-ask-for.md)):
 
 <!-- compiles -->
 ```zig
@@ -208,7 +208,7 @@ in a query string is a token in every access log on the way here.
 The same header, verified: the claims behind a bearer token, read through
 the `jwt.Verifier` the argument names, or a 401 with the challenge before
 the handler runs
-([ADR 0260](../adr/0260-verified-claims-are-a-handler-argument.md)):
+([ADR 191](../adr/191-verified-claims-are-a-handler-argument.md)):
 
 <!-- compiles -->
 ```zig
@@ -241,7 +241,7 @@ allocation, into the arena, and the signature check is the work.
 ### `Idempotent(Replays, options)`
 
 The `Idempotency-Key` header, as the argument that makes a route answer once
-per key ([ADR 0193](../adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)):
+per key ([ADR 155](../adr/155-a-request-answered-once-is-answered-the-same-way-again.md)):
 
 <!-- compiles -->
 ```zig
@@ -288,7 +288,7 @@ kept, and the JSON buffer the answer was taking anyway. Nothing on the stack.
 
 A kept answer served again for a time, as the argument that makes a GET say
 so in its signature
-([ADR 0247](../adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)):
+([ADR 188](../adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)):
 
 <!-- compiles -->
 ```zig
@@ -331,7 +331,7 @@ Nothing on the stack.
 ### A query field that is a list
 
 A `Query(T)` field may be a slice, and every arrival of that name is one
-element ([ADR 0164](../adr/0164-a-query-parameter-that-is-a-list.md)):
+element ([ADR 132](../adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)):
 
 <!-- compiles -->
 ```zig
@@ -389,13 +389,13 @@ A `Failure` carries `field`, `reason`, `given`, `kind`, `expected`, `said`, and
 **null when the failure is a rule of yours**; that is the whole list, and it is
 not a validator. Nothing is allocated per failed field. See
 [Forms](../guide/forms.md#when-one-field-is-wrong-and-the-rest-are-fine)
-and [ADR 0036](../adr/0036-a-binding-hands-its-failures-to-the-handler.md).
+and [ADR 034](../adr/034-a-binding-hands-its-failures-to-the-handler.md).
 
 `must` returns a `Checked`, which has the same `value`, `failed`,
 `failedCount`, `given`, `failures` and `fail`, and one more `must` to chain.
 `holds` is the rule holding, not failing. A handler that checks no rules never
 builds one and pays nothing
-([ADR 0082](../adr/0082-a-rule-of-your-own-joins-the-answer.md)).
+([ADR 034](../adr/034-a-binding-hands-its-failures-to-the-handler.md)).
 
 ## Handler returns
 
@@ -409,8 +409,8 @@ builds one and pays nothing
 | `Response(T)` | a status chosen at runtime; the description says `default` |
 | `Redirect(code)` | that status and a `Location`, no body |
 | `FileBody` | a file on disk, opened and sent without being held in memory |
-| `Bytes` | bytes already in hand, under a content type chosen per request — somebody else's download passed on ([ADR 0212](../adr/0212-bytes-handed-on-are-an-answer.md)) |
-| `Versioned(T)` | `T` under a weak `ETag` made from a `u64` the handler names; **304** with no body when `If-None-Match` carries it ([ADR 0258](../adr/0258-a-version-a-handler-names-is-an-etag.md)) |
+| `Bytes` | bytes already in hand, under a content type chosen per request — somebody else's download passed on ([ADR 173](../adr/173-bytes-handed-on-are-an-answer.md)) |
+| `Versioned(T)` | `T` under a weak `ETag` made from a `u64` the handler names; **304** with no body when `If-None-Match` carries it ([ADR 189](../adr/189-a-version-a-handler-names-is-an-etag.md)) |
 | a type with `nilo_content_type` and `nilo_write` | 200, the bytes `nilo_write` wrote, under that content type — [below](#a-type-that-writes-its-own-answer) |
 
 ```zig
@@ -430,13 +430,13 @@ wrote nothing, and whatever the handler wrote if it did, and nilo has no way to
 tell which from the signature — so the description says it does not know, and
 `listen()` says how many routes are in that state. A handler that means "200,
 empty" says so by returning `Status(200, void)` and is described like anything
-else ([ADR 0150](../adr/0150-a-ctx-handler-that-returns-nothing-may-have-written-it.md)).
+else ([ADR 120](../adr/120-a-ctx-handler-that-returns-nothing-may-have-written-it.md)).
 
 **A `?` goes inside a wrapper, never around it.** `Status(201, ?T)` and
 `Response(?T)` are the value or a 404; `?Status(201, T)`, `?Response(T)`,
 `?Redirect(code)` and `?Versioned(T)` are each a compile error naming the
 shape to write, since the `?` is about the body and those have none for it
-to be about ([ADR 0276](../adr/0276-a-question-mark-goes-inside-the-wrapper.md)).
+to be about ([ADR 203](../adr/203-a-question-mark-goes-inside-the-wrapper.md)).
 The [guide](../guide/handlers.md#where-the--goes) has the two tables.
 
 `Redirect` takes 301, 302, 303, 307 or 308; anything else is a compile error.
@@ -482,7 +482,7 @@ and a `304` beside it. See
 XML for a consumer that will not change, CSV for a spreadsheet, HTML from a
 template of your own: a type carrying two declarations goes out as whatever it
 writes, under the label it names
-([ADR 0195](../adr/0195-a-type-can-write-its-own-answer.md)).
+([ADR 157](../adr/157-a-type-can-write-its-own-answer.md)).
 
 <!-- compiles -->
 ```zig
@@ -522,7 +522,7 @@ in; a body arriving in one of those is `c.body()`.
 
 A struct is its fields and an enum is its tag name. A type that wants something
 else says so with `nilo_json`, which is plain data and is read while compiling
-([ADR 0085](../adr/0085-a-type-says-how-its-json-is-spelled.md)).
+([ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md)).
 
 <!-- compiles -->
 ```zig
@@ -542,7 +542,7 @@ const Condition = union(enum) {
 |---|---|
 | `.tag` | the discriminator's key. A `union(enum)` only: the variant's name goes under it, and the variant's own fields go beside it in the same object |
 | `.rename_all` | how a name is spelled on the wire — an enum's tag, a union's variant, or **a struct's field names** |
-| `.rename` | the names spelled one at a time — `.{ .amount_minor = "amountMinor" }` — which win over `.rename_all` ([ADR 0207](../adr/0207-one-field-can-be-spelled-on-its-own.md)) |
+| `.rename` | the names spelled one at a time — `.{ .amount_minor = "amountMinor" }` — which win over `.rename_all` ([ADR 168](../adr/168-one-field-can-be-spelled-on-its-own.md)) |
 
 `.rename_all` takes `.lowercase`, `.UPPERCASE`, `.camelCase`, `.PascalCase`,
 `.SCREAMING_SNAKE_CASE` and `.@"kebab-case"`. The first two join the words
@@ -556,7 +556,7 @@ compile error, in every shape: it would put the same key in an object twice.
 A Row is snake_case because Postgres is and a wire is camelCase because the
 browser is. Saying so once beats a mapping function written out field by field,
 which is what a DTO layer is and which nothing holds against the Row it came from
-([ADR 0181](../adr/0181-a-field-name-is-a-spelling-too.md)):
+([ADR 148](../adr/148-a-field-name-is-a-spelling-too.md)):
 
 <!-- compiles -->
 ```zig
@@ -574,7 +574,7 @@ server sends. It costs nothing per request: the name is a comptime string either
 way, written as part of the same call the punctuation is in.
 
 **One field that no case reaches is spelled on its own**, beside the case, and
-the entry wins ([ADR 0207](../adr/0207-one-field-can-be-spelled-on-its-own.md)):
+the entry wins ([ADR 168](../adr/168-one-field-can-be-spelled-on-its-own.md)):
 
 <!-- compiles -->
 ```zig
@@ -609,7 +609,7 @@ the whole value to `std.json`, which does not read the marker.
 **A type that writes its own JSON *and says what it looks like* is a leaf rather
 than one of those**, and that is the difference between a marker that can be used
 here and one that cannot
-([ADR 0182](../adr/0182-a-leaf-that-says-what-it-is-can-be-carried.md)). A
+([ADR 148](../adr/148-a-field-name-is-a-spelling-too.md)). A
 `nilo_openapi` may only name `"string"`, `"integer"`, `"number"` or `"boolean"`,
 so a type carrying one has promised its JSON is a single scalar — which is the
 promise the writer needs to keep writing the object around it. `sql.Uuid`,
@@ -640,7 +640,7 @@ struct's own marker; a nested struct that says nothing keeps its own spelling.
 `std.json` picks the parser for a type and nothing can add a declaration to a
 type you wrote. Only needed if the type arrives in a request; sending needs
 nothing. On a type with `nilo_parse` it is the reader that hands the string to
-that ([ADR 0205](../adr/0205-a-body-field-that-parses-itself.md)). Adding it to a
+that ([ADR 166](../adr/166-a-body-field-that-parses-itself.md)). Adding it to a
 type with neither a `nilo_json` nor a `nilo_parse` is a compile error, and so is
 adding it to a struct that only renames — there is nothing for the reader to do
 differently.
@@ -660,6 +660,6 @@ plus a per-arm `allOf` for a tagged one. See
 byte values** — `{"name":[255]}` — because JSON has no way to carry a byte that
 is not text. That is what `std.json` does with the same value, and this writer's
 whole contract is to write what `std.json` writes
-([ADR 0121](../adr/0121-a-byte-that-is-not-text-is-not-a-string.md)). The
+([ADR 096](../adr/096-a-byte-that-is-not-text-is-not-a-string.md)). The
 description still calls the field a string, since the type is text and only the
 value is not.

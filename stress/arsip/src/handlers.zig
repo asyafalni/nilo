@@ -132,7 +132,7 @@ fn editDoc(store: *Archive, arena: Allocator, id: u32, incoming: domain.EditDoc)
 
 /// A state machine that answers 409 — the one failure a signature cannot
 /// state, so it is a `fail` function and the API description does not claim it
-/// (ADR 0024).
+/// (ADR 023).
 fn advanceDoc(store: *Archive, arena: Allocator, id: u32, incoming: domain.Advance) !Doc {
     const done = try store.advance(arena, id, incoming.to) orelse
         return fail.notFound("no document {d}", .{id});

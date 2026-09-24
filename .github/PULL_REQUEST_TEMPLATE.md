@@ -18,7 +18,7 @@ ADR:
 
 ## What it spends
 
-<!-- ADR 0018. Performance is four axes and they do not recover the same way. Fill the rows this change touches, with the number and what it was measured through (a Docker port and a unix socket are different figures). "Nothing" is an answer, once the allocation budget test in http/app.zig still passes and nothing per-connection moved. A `docs:` or `test:` change replaces the table with that one line. -->
+<!-- ADR 017. Performance is four axes and they do not recover the same way. Fill the rows this change touches, with the number and what it was measured through (a Docker port and a unix socket are different figures). "Nothing" is an answer, once the allocation budget test in http/app.zig still passes and nothing per-connection moved. A `docs:` or `test:` change replaces the table with that one line. -->
 
 | Axis | Before | After | Measured through |
 |---|---|---|---|

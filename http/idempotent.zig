@@ -1,5 +1,5 @@
 //! A request answered once is answered the same way again
-//! ([ADR 0193](../docs/adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)).
+//! ([ADR 155](../docs/adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
 //!
 //! ```zig
 //! const Replays = cache.Space("orders-replay", []const u8, .{ .ttl_s = 86_400, .max_bytes = 16 << 10 });
@@ -38,7 +38,7 @@
 //! encode the answer being kept, and the JSON buffer the handler's answer
 //! was going to take anyway. Two cache writes and one read per fresh
 //! request; one read per replay. Nothing on the stack — a `Held` there would
-//! be `max_bytes` per idle connection for the life of it (ADR 0063).
+//! be `max_bytes` per idle connection for the life of it (ADR 062).
 //!
 //! **The Space is yours** and this module names no cache: `Replays` is any
 //! type with `getInto`, `putIfAbsent`, `put`, `del` and `max_bytes`, which
@@ -64,7 +64,7 @@ pub const Kind = enum(u8) {
     text = 2,
     json = 3,
     /// A body the handler's type wrote itself, under a label of its own
-    /// (ADR 0195). The label is in the record, ahead of the body, because
+    /// (ADR 157). The label is in the record, ahead of the body, because
     /// no kind implies it.
     own = 4,
 

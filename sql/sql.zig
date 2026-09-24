@@ -1,5 +1,5 @@
 //! nilo's SQL module — a query is a struct of your own, checked while
-//! compiling (ADR 0039).
+//! compiling (ADR 036).
 //!
 //! ```zig
 //! const sql = @import("nilo_sql");
@@ -50,22 +50,22 @@
 //! compile-time column check and nothing else.
 //!
 //! **What a Row can declare is held to two properties**
-//! ([ADR 0171](../docs/adr/0171-a-row-over-there-is-a-condition.md)): the
+//! ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)): the
 //! Row still describes the answer, and `.limit` still counts what is being
 //! listed. `EXISTS` keeps both and is a condition. A parent keeps both because
 //! a reference points at one row; children keep both because they are never
 //! joined, and are read by a second statement once `.limit` has counted the
 //! parents; a grouped Row keeps both because its rows are its groups and it
 //! says so in its type
-//! ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+//! ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
 //! There is still no `.join` and no `.group_by` at the call site: the Row is
 //! the whole description, and `shape.zig` writes the statement from it.
 //!
 //! Migrations **are** here, and they are the one thing in this module that
 //! writes DDL rather than a statement over a table that already exists
-//! ([ADR 0153](../docs/adr/0153-a-migration-is-a-diff-against-a-snapshot.md)).
+//! ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 //! They are also the one part that is not in a server: a diff is a tool, so it
-//! spends nothing on any of ADR 0018's four axes because it is not in the
+//! spends nothing on any of ADR 017's four axes because it is not in the
 //! process those axes measure.
 //!
 //! ## How it is put together
@@ -92,8 +92,8 @@
 //! independently: swapping the driver changes how bytes reach the socket,
 //! adding a database changes the SQL itself. **Both are filled in twice
 //! now** — Postgres over a socket and SQLite over a file
-//! ([ADR 0073](../docs/adr/0073-a-file-has-no-socket-to-wait-on.md),
-//! [ADR 0074](../docs/adr/0074-one-writer-is-not-a-setting-it-is-the-database.md)) —
+//! ([ADR 064](../docs/adr/064-a-file-has-no-socket-to-wait-on.md),
+//! [ADR 065](../docs/adr/065-one-writer-is-not-a-setting-it-is-the-database.md)) —
 //! and the second of each is what turned the claim that the seams were in the
 //! right place into evidence.
 //!
@@ -101,19 +101,19 @@
 //! does not know this module exists.** That is what makes the feature cost
 //! exactly zero to a project that does not import it — measured, not
 //! assumed: the HTTP-only binary contains no pg or TLS content, and pg.zig
-//! is `.lazy = true`, so it is not even downloaded (ADR 0040).
+//! is `.lazy = true`, so it is not even downloaded (ADR 037).
 //!
 //! What it costs the projects that *do* import it is 733 KB, of which the
 //! whole write half is 53 KB and the rest is pg.zig's TLS dependency. ADR
-//! 0040 has the numbers and the argument for why being a TLS client is not
-//! the thing ADR 0028 refused.
+//! 037 has the numbers and the argument for why being a TLS client is not
+//! the thing ADR 027 refused.
 //!
 //! **SQLite is 524,840 bytes on top of that, and only for a program that
 //! names it.** Both drivers live here, so both are fetched and this module
 //! links libc whichever one you use — but `sql/sqlite.zig` is analysed only
 //! when something names it, so the amalgamation is dropped outright by the
 //! linker. A binary holding `sql.Db` and nothing else contains zero SQLite
-//! strings; `zig build size-sql` is the A/B, and ADR 0073 has both numbers.
+//! strings; `zig build size-sql` is the A/B, and ADR 064 has both numbers.
 
 const std = @import("std");
 
@@ -138,7 +138,7 @@ pub const cli = @import("cli.zig");
 
 /// Migrations: the diff between the types and a snapshot the repository holds,
 /// and the record of what has been applied
-/// ([ADR 0153](../docs/adr/0153-a-migration-is-a-diff-against-a-snapshot.md)).
+/// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 ///
 /// **Nothing here is on the request path and nothing here is in a server.** A
 /// program that never names it links none of it, the same way `sqlite.zig` is
@@ -152,19 +152,19 @@ pub const migrate = @import("migrate.zig");
 
 /// What a handler holds. `*sql.Db` in a signature is a service like any
 /// other, so `listen()` checks it is registered before the first request
-/// rather than after (ADR 0006).
+/// rather than after (ADR 005).
 pub const Db = db.Db;
 pub const Schema = migrate.Schema;
 
 /// One statement that has run, as `db.watching`'s function is told about it
-/// ([ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)). The text,
+/// ([ADR 108](../docs/adr/108-a-statement-can-be-watched.md)). The text,
 /// the plan name, how long it took and how many rows moved — and not the
 /// values, which is the decision rather than the first version.
 pub const Sent = db.Sent;
 
 /// What `db.page` answers with: the rows on this page and how many the
 /// condition matched before the `.limit` cut it
-/// ([ADR 0185](../docs/adr/0185-a-page-knows-what-it-left-out.md)).
+/// ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md)).
 ///
 /// Naming it is for a caller keeping one in a struct of their own — a handler
 /// returning `!sql.Page(Order)` sends `{"rows":[…],"total":47}`.
@@ -189,10 +189,10 @@ pub const logging = db.logging;
 /// fn listing(rdb: *Replica, c: *nilo.Ctx) ![]Product { … }
 /// ```
 ///
-/// Two names are two types and two types are two services (ADR 0011), so
+/// Two names are two types and two types are two services (ADR 010), so
 /// which pool a statement takes is written where a reader will see it: the
 /// handler's argument list
-/// ([ADR 0060](../docs/adr/0060-a-second-database-is-a-second-type.md)).
+/// ([ADR 054](../docs/adr/054-a-second-database-is-a-second-type.md)).
 pub const Named = db.Named;
 
 /// The same thing over SQLite: a database in a file rather than behind a
@@ -209,7 +209,7 @@ pub const Named = db.Named;
 /// Everything above this line is the same — the same Row, the same
 /// conditions, the same `Str` rule — because the Dialect writes the SQL and
 /// the Wire carries it, and a handler names neither
-/// ([ADR 0061](../docs/adr/0061-the-second-dialect-is-the-test-of-the-seam.md)).
+/// ([ADR 055](../docs/adr/055-the-second-dialect-is-the-test-of-the-seam.md)).
 /// What is *not* the same is written where it happens rather than here:
 /// `insertMany` and `tx.deadline` are Refusals, `.lock` is a Refusal, and a
 /// list column has nowhere to live.
@@ -218,14 +218,14 @@ pub const Named = db.Named;
 /// line longer than `sql.Db` is. SQLite runs inside this process, so a
 /// statement either holds the executor thread it is on or pays a hop to the
 /// Engine's thread pool, and which is right is a fact about a deployment
-/// ([ADR 0073](../docs/adr/0073-a-file-has-no-socket-to-wait-on.md)).
+/// ([ADR 064](../docs/adr/064-a-file-has-no-socket-to-wait-on.md)).
 pub fn Sqlite(comptime opts: sqlite.Options) type {
     return db.DbOf(sqlite.Wire(opts), dialect.SQLite, "");
 }
 
 /// A second SQLite database, named the way `Named` names a second Postgres
 /// one — and the same call to reach for when a program holds both kinds at
-/// once, which [ADR 0060](../docs/adr/0060-a-second-database-is-a-second-type.md)
+/// once, which [ADR 054](../docs/adr/054-a-second-database-is-a-second-type.md)
 /// already made expressible.
 pub fn SqliteNamed(comptime name: []const u8, comptime opts: sqlite.Options) type {
     if (name.len == 0) @compileError(
@@ -238,15 +238,15 @@ pub fn SqliteNamed(comptime name: []const u8, comptime opts: sqlite.Options) typ
 
 /// The Dialect used unless something says otherwise. `sql.SQLite` is the
 /// second, and what building it found is in
-/// [ADR 0061](../docs/adr/0061-the-second-dialect-is-the-test-of-the-seam.md).
+/// [ADR 055](../docs/adr/055-the-second-dialect-is-the-test-of-the-seam.md).
 /// This comment said for a year that SQLite was "SQL half only"; it has had
-/// a Wire since ADR 0073.
+/// a Wire since ADR 064.
 pub const Postgres = dialect.Postgres;
 pub const SQLite = dialect.SQLite;
 
 pub const Timestamp = types.Timestamp;
 /// A calendar day, read out of the column rather than out of a `::text`
-/// ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 pub const Date = types.Date;
 pub const Uuid = types.Uuid;
 pub const Json = types.Json;
@@ -263,14 +263,14 @@ pub const Bytes = types.Bytes;
 /// struct or enum with `nilo_column`, `nilo_read(text, arena)` and
 /// `nilo_write(arena)`. `AsText("money")` is the smallest instance of that
 /// protocol — the value *is* the text Postgres prints
-/// ([ADR 0055](../docs/adr/0055-a-column-type-can-come-from-outside-this-module.md)).
+/// ([ADR 049](../docs/adr/049-a-column-type-can-come-from-outside-this-module.md)).
 pub const AsText = types.AsText;
 
 pub const Column = wire.Column;
 pub const Error = wire.Error;
 
 /// What the database said about a statement it refused, as `Sent.problem`
-/// carries it ([ADR 0146](../docs/adr/0146-a-statement-that-failed-says-what-the-database-said.md)).
+/// carries it ([ADR 117](../docs/adr/117-a-statement-that-failed-says-what-the-database-said.md)).
 ///
 /// `Error` is what a handler switches on; this is the text behind it, and
 /// before it existed the whole of that text was a `std.log.err` line no
@@ -280,7 +280,7 @@ pub const Problem = wire.Problem;
 
 /// What the database said about the last statement **this fiber** ran, or
 /// null when it worked
-/// ([ADR 0184](../docs/adr/0184-a-failure-belongs-to-the-call-that-caused-it.md)).
+/// ([ADR 117](../docs/adr/117-a-statement-that-failed-says-what-the-database-said.md)).
 ///
 /// ```zig
 /// db.delete(Staff, c, .{ .where = .{ .id = id } }) catch |err| switch (err) {
@@ -304,7 +304,7 @@ pub const problem = db.lastProblem;
 /// struct of their own.
 /// A value a condition only has *sometimes*: the term is in the statement
 /// when the filter carried one, and out of it when it did not
-/// ([ADR 0183](../docs/adr/0183-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
+/// ([ADR 149](../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
 ///
 /// ```zig
 /// const found = try db.page(Partner, c, .{
@@ -333,7 +333,7 @@ pub const given = where.given;
 pub const Given = where.Given;
 
 /// An `ORDER BY` chosen per request from a closed set declared while
-/// compiling ([ADR 0204](../docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+/// compiling ([ADR 165](../docs/adr/165-an-order-chosen-at-run-time-from-a-closed-set.md)).
 ///
 /// ```zig
 /// const Sort = sql.Ordering(Commitment, .{
@@ -357,7 +357,7 @@ pub const Given = where.Given;
 pub const Ordering = ordering.Ordering;
 
 /// A statement composed at run time from literals, checked identifiers and
-/// parameters — what a query engine hands `db.composed` (ADR 0283).
+/// parameters — what a query engine hands `db.composed` (ADR 208).
 /// `db.compose(c)` makes one spelled for the Db; `Composed.init(arena,
 /// Spelling.of(Dialect))` where no Db is in scope.
 pub const Composed = composed.Composed;
@@ -372,7 +372,7 @@ pub const Lock = dialect.Lock;
 pub const table_marker = row.marker;
 
 /// The `SELECT` a Row and a set of options compile to. The headline of ADR
-/// 0039 in one call: what comes back exists before the program runs.
+/// 036 in one call: what comes back exists before the program runs.
 pub fn selectFor(comptime Row: type, comptime Options: type) statement.Statement {
     return comptime statement.select(Postgres, Row, Options);
 }
@@ -385,7 +385,7 @@ pub fn oneFor(comptime Row: type, comptime Options: type) statement.Statement {
 }
 
 /// The same `SELECT` with `count(*) OVER ()` on the end of its column list,
-/// which is what `db.page` compiles (ADR 0185). `.limit` and `.order` are
+/// which is what `db.page` compiles (ADR 150). `.limit` and `.order` are
 /// both required and `.lock` is refused.
 pub fn pageFor(comptime Row: type, comptime Options: type) statement.Statement {
     return comptime statement.page(Postgres, Row, Options);
@@ -411,13 +411,13 @@ pub fn findFor(comptime Row: type, comptime Key: type) statement.Statement {
 
 /// The one-row `SELECT` behind `db.exactlyOne`, for a Row grouped by
 /// nothing: every aggregate it declares, over the rows the condition matched
-/// (ADR 0295).
+/// (ADR 218).
 pub fn exactlyOneFor(comptime Row: type, comptime Options: type) statement.Statement {
     return comptime shape.exactlyOne(Postgres, Row, Options);
 }
 
 /// The second statement a children field is read by: every child of every
-/// parent, numbered by the parent it belongs to (ADR 0295).
+/// parent, numbered by the parent it belongs to (ADR 218).
 pub fn childrenFor(comptime Row: type, comptime field: []const u8) statement.Statement {
     return comptime shape.children(Postgres, Row, field);
 }
@@ -487,7 +487,7 @@ pub fn updateFor(comptime Row: type, comptime Options: type) statement.Statement
 /// version says `$1` and `ILIKE`. The bare `selectFor` is `on(Postgres)`,
 /// which is the default Dialect and was, until this existed, the only one a
 /// reader could ask — so a program on SQLite could not see the constant
-/// ADR 0039 is about.
+/// ADR 036 is about.
 ///
 /// A namespace rather than a Dialect parameter on each of the seventeen,
 /// because every existing call and every refusal names them with two
@@ -550,7 +550,7 @@ pub fn on(comptime D: type) type {
 
 /// A Row with every `Str` replaced by `[]const u8` — what `db.stream` hands
 /// back, and a type that says its text dies at the next row rather than
-/// leaving that to a comment (ADR 0039).
+/// leaving that to a comment (ADR 036).
 pub const Borrowed = row.Borrowed;
 
 test {

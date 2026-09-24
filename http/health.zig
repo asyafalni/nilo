@@ -1,6 +1,6 @@
 //! The health route: one page that says whether this process can do its
 //! job, by asking the services that know
-//! ([ADR 0192](../docs/adr/0192-a-health-route-asks-the-services.md)).
+//! ([ADR 154](../docs/adr/154-a-health-route-asks-the-services.md)).
 //!
 //! ```zig
 //! try app.health("/healthz");
@@ -22,7 +22,7 @@
 //! **Stopping is unavailable.** From the moment SIGTERM arrives the page
 //! answers 503 with `stopping`, which is how a balancer learns to drain this
 //! instance before its listener closes rather than after — the flag a draining
-//! response reads to say `Connection: close` (ADR 0020). Every
+//! response reads to say `Connection: close` (ADR 019). Every
 //! answer carries `Cache-Control: no-store`, because a health answer that a
 //! proxy remembers is a health answer about the past.
 //!
@@ -39,7 +39,7 @@ pub const content_type = "application/json";
 
 /// The shape of the 200, for the API description: what `write` sends when
 /// every service is ready, read off this struct rather than off a handler
-/// signature nilo cannot see into (ADR 0281). The 503s carry more,
+/// signature nilo cannot see into (ADR 120). The 503s carry more,
 /// `waiting` or `stopping`, and are failures, which the document does
 /// not promise for any route.
 pub const Page = struct { status: []const u8 };

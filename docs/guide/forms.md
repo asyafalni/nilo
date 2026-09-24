@@ -60,7 +60,7 @@ Three boxes named `tags` post `tags=zig&tags=http` when two are ticked, and a
 `<select multiple>` posts the same shape. A field that is a slice takes
 every value sent under its name, in the order the browser put them, and
 each one is converted the way a single field would be
-([ADR 0256](../adr/0256-a-form-list-is-a-repeated-name-and-nothing-else.md)):
+([ADR 132](../adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)):
 
 <!-- compiles -->
 ```zig
@@ -148,7 +148,7 @@ client's claim, not a fact — sniff the bytes if it matters.
 nilo reads the plain `filename` and not RFC 6266's `filename*=UTF-8''…`, which
 is the encoded form a browser sends *alongside* it for a name that is not
 Latin-1. A part carrying **only** the encoded one is a 400 naming the part
-([ADR 0094](../adr/0094-a-header-is-answered-as-asked-or-refused.md)) — refused
+([ADR 073](../adr/073-a-header-is-answered-as-asked-or-refused.md)) — refused
 rather than read as a text field full of upload bytes, which is what it used to
 become. No browser sends that shape; a hand-rolled HTTP client can.
 
@@ -179,7 +179,7 @@ one, which is the case `saveTo` is careful about. **The file is replaced or it
 is not touched**: the bytes go to a temporary name beside it and one rename
 puts them in place, so a request serving that name while this one writes reads
 the old file rather than a truncated one
-([ADR 0123](../adr/0123-a-file-is-written-by-the-engine.md)).
+([ADR 097](../adr/097-a-file-is-written-by-the-engine.md)).
 
 Passing `image.filename` in as the name is `error.NameNotAllowed` rather than a
 path resolved against the directory — the same check `sendFile` makes on the way
@@ -267,7 +267,7 @@ The reasons above are exactly the conversions nilo performs: `.missing`,
 `.not_a_number`, `.not_true_or_false`, `.not_a_choice`, `.wrong_kind`. **This
 is not a validator.** But a `u8` refuses 300 and nobody calls that one, and
 text can have a shape the same way a number has a range
-([ADR 0264](../adr/0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)):
+([ADR 193](../adr/193-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)):
 
 <!-- compiles -->
 ```zig
@@ -357,7 +357,7 @@ words in `said`; conversion failures still come first, because a rule checked
 against a field that never bound was checked against nothing.
 
 A handler that checks no rules never builds a `Checked` and pays nothing for
-this ([ADR 0082](../adr/0082-a-rule-of-your-own-joins-the-answer.md)).
+this ([ADR 034](../adr/034-a-binding-hands-its-failures-to-the-handler.md)).
 
 And three things stay a plain 400, because none of them leaves a binding to
 hand back: a body that is not a form at all, text that is not JSON, and a field
@@ -430,9 +430,9 @@ See [OpenAPI](./openapi.md).
 - [`examples/forms`](../../examples/forms/main.zig) — a form, a session cookie,
   an upload and a redirect, end to end.
 - [Cookies](./cookies.md), which is what a sign-in does next.
-- [ADR 0031](../adr/0031-a-form-is-the-body-read-by-another-rule.md) — why
+- [ADR 030](../adr/030-a-form-is-the-body-read-by-another-rule.md) — why
   `Form(T)` is explicit rather than sniffed, and what the multipart parser is
   careful about.
-- [ADR 0036](../adr/0036-a-binding-hands-its-failures-to-the-handler.md) — why
+- [ADR 034](../adr/034-a-binding-hands-its-failures-to-the-handler.md) — why
   `value()` is an optional, why the reason list stops where it does, and what
   stays a plain 400.

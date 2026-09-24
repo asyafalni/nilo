@@ -1,5 +1,5 @@
 //! The two halves of `bucket.list` that are neither a socket nor a signature
-//! ([ADR 0250](../docs/adr/0250-a-list-is-a-page-with-a-cursor-and-nothing-that-follows-it.md)):
+//! ([ADR 058](../docs/adr/058-most-of-an-s3-client-is-not-s3.md)):
 //! the query a `ListObjectsV2` request carries, and the five element names
 //! read back out of what it answers.
 //!

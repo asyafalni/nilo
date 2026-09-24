@@ -5,12 +5,12 @@
 //! refresh policy — how long a key set is good for, what to do when a `kid`
 //! misses — is the caller's, the way every other policy here is. What a
 //! caller *cannot* already write safely is the rest of this module, and
-//! ADR 0140 is where that line is argued.
+//! ADR 111 is where that line is argued.
 //!
 //! Two key types are read: `RSA`, as `n` and `e`, and `EC`, as `crv`, `x`
 //! and `y`. **The type of the key is what decides how a token is checked**
 //! — `token.zig` picks RS256 or ES256 from the key it found, never from the
-//! token's `alg` (ADR 0242). A key set usually carries keys this cannot use
+//! token's `alg` (ADR 111). A key set usually carries keys this cannot use
 //! — an Ed25519 key beside the others, a key marked `"use": "enc"`. Those
 //! are **skipped rather than refused**: a document nilo cannot fully read is
 //! still a document with the right key in it, and an issuer adding a key type

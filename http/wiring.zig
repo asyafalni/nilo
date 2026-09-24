@@ -27,7 +27,7 @@ const App = app_mod.App;
 /// can be tested without provoking the `std.log.err` registration writes
 /// — a logged error is a failed test run, and the noise would sit in
 /// `zig build test` forever. This is the shape `router.conflicting`
-/// already has, for the same reason (ADR 0149).
+/// already has, for the same reason (ADR 119).
 pub fn nameTaken(self: *const App, given: []const u8) ?openapi.Operation {
     for (self.operations.items) |existing| {
         const taken = existing.name orelse continue;
@@ -37,7 +37,7 @@ pub fn nameTaken(self: *const App, given: []const u8) ?openapi.Operation {
 }
 
 /// Turn `listen(.{ .trusted_proxies = … })` into the networks `clientIp`
-/// compares against, once (ADR 0129).
+/// compares against, once (ADR 102).
 ///
 /// A rule that is not an address stops the server here rather than being
 /// quietly ignored, because "ignored" means answering with the wrong
@@ -73,7 +73,7 @@ pub fn missingService(self: *const App) ?service_mod.Requirement {
 /// Like `missingService`, but logs everything that is missing and then
 /// fails. Called automatically by `listen()` — this is what makes a
 /// forgotten service show up before a single request is served, rather
-/// than at three in the morning (ADR 0006).
+/// than at three in the morning (ADR 005).
 pub fn checkServices(self: *const App) error{MissingService}!void {
     if (missingService(self) == null) return;
 
@@ -120,7 +120,7 @@ pub fn checkServices(self: *const App) error{MissingService}!void {
 /// Doing this here rather than when each route is registered is what
 /// makes `use` and `get` order-independent — Fiber's most reported
 /// gotcha is middleware registered after a route silently not applying
-/// to it (ADR 0009).
+/// to it (ADR 008).
 pub fn resolveChains(self: *App) !void {
     freeChains(self);
     for (self.router.routes.items) |*r| {
@@ -141,7 +141,7 @@ pub fn resolveChains(self: *App) !void {
 
 /// Give `compress()` its pool, here rather than at `compress()`, because
 /// the thread count is not known until `listen()` says it, and one per
-/// thread is the whole design (ADR 0287).
+/// thread is the whole design (ADR 211).
 ///
 /// Once. The test client resolves the chains before every request, and
 /// `~288 KB` a slot is not something to take again each time; a pool
@@ -194,7 +194,7 @@ pub fn chainsFor(self: *App, set: *const static_mod.Set) ![]const []const mw.Mid
 }
 
 /// Write the API description to `w`, with no server and no port
-/// ([ADR 0167](../docs/adr/0167-the-document-is-a-build-artefact.md)).
+/// ([ADR 135](../docs/adr/135-the-document-is-a-build-artefact.md)).
 ///
 /// ```zig
 /// var app = nilo.App.init(gpa);
@@ -226,7 +226,7 @@ pub fn writeOpenApi(self: *const App, w: *std.Io.Writer) !void {
     // Which routes the guard is in front of is settled here, from the
     // same wiring `resolveChains` reads, rather than when the route was
     // registered — a `without` or a `with` written after the route would
-    // otherwise be missed (ADR 0252). On a copy, because the operations
+    // otherwise be missed (ADR 153). On a copy, because the operations
     // are the App's and this is a `*const` view of it.
     info.cookie = guard.cookie;
     const ops = try self.gpa.dupe(openapi.Operation, self.operations.items);
@@ -259,7 +259,7 @@ pub fn buildDocs(self: *App) !void {
     defer document.deinit();
     // Through the public door rather than beside it: a checked-in file
     // and a served one that came from two calls are two things to keep
-    // in step (ADR 0167).
+    // in step (ADR 135).
     try self.writeOpenApi(&document.writer);
 
     var page: std.Io.Writer.Allocating = .init(self.gpa);
@@ -328,7 +328,7 @@ pub fn countUndescribed(self: *App) void {
     std.log.info(
         "{d} of {d} routes hold the Ctx and return nothing, so the API description " ++
             "cannot say what they answer — a handler that means \"200, empty\" says so " ++
-            "by returning `Status(200, void)` (ADR 0150)",
+            "by returning `Status(200, void)` (ADR 120)",
         .{ written, self.operations.items.len },
     );
 }
@@ -380,7 +380,7 @@ pub const program_mode: ?std.builtin.OptimizeMode =
 ///
 /// `program_mode` is one value per compilation, so the `ReleaseFast` arm could
 /// only ever be *not run* — and that is how it shipped wrong
-/// ([ADR 0033](../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)).
+/// ([ADR 032](../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)).
 pub fn modeFrom(level: std.log.Level, safety: bool) ?std.builtin.OptimizeMode {
     return switch (level) {
         .debug => .Debug,
@@ -395,7 +395,7 @@ pub fn modeFrom(level: std.log.Level, safety: bool) ?std.builtin.OptimizeMode {
 }
 
 /// Nilo built in `Debug` under a `ReleaseFast` program: legal, slow, and
-/// silent until now (ADR 0084).
+/// silent until now (ADR 069).
 ///
 /// It happens by leaving `.optimize` out of `b.dependency("nilo", …)`, and it
 /// has the same symptom as forgetting `std_options_debug_io` — a server that

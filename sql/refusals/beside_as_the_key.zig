@@ -1,7 +1,7 @@
 //! A key naming a field the Row carries beside its columns.
 //!
 //! A key is what a statement finds a row by, and a field in no statement
-//! cannot be one (ADR 0217).
+//! cannot be one (ADR 178).
 
 const sql = @import("nilo_sql");
 

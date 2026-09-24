@@ -12,7 +12,7 @@
 //!
 //! **Refusing a size is the point of the `else`.** A key nilo does not have a
 //! branch for is an error rather than a best effort, because "verified" and
-//! "did not check" have to be different answers (ADR 0140).
+//! "did not check" have to be different answers (ADR 111).
 
 const std = @import("std");
 const rsa = std.crypto.Certificate.rsa;

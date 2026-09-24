@@ -2,7 +2,7 @@
 //!
 //! `nilo_fetch` is one call away from `std.http.Client`, so the only honest
 //! question is what the sixty-five lines wrapped round it cost — and by
-//! [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md) the
+//! [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md) the
 //! answer that matters is not throughput. **A handler's stack is held per
 //! connection at its high-water mark**, and `send` puts a 2 KB redirect
 //! buffer, a 4 KB transfer buffer and a 216-byte `Bound` on it. Every one of
@@ -119,7 +119,7 @@ fn bare(client: *Bare, c: *nilo.Ctx) !nilo.Str {
 /// request arena instead — the obvious lever, and **it does not work.**
 ///
 /// The reasoning was sound: by
-/// [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md) a byte
+/// [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md) a byte
 /// of handler stack is held per *connection* at the high-water mark, while a
 /// byte of arena is held per *request*. Moving 6 KB across that line should
 /// have been worth 6 KB on every idle connection.
@@ -153,7 +153,7 @@ fn arena(client: *Bare, c: *nilo.Ctx) !nilo.Str {
 /// This route serves the same 1,008 bytes out of the same arena and cost
 /// **2,048**, so the arena was not where the 16 KB went. What was left is the
 /// fiber stack, at the depth `std.http.Client` drives it to, held per
-/// connection exactly as ADR 0063 says — and once `releaseIdleStack` started
+/// connection exactly as ADR 062 says — and once `releaseIdleStack` started
 /// handing those pages back, the 16,495 fell to 4,139 and this route to 2,054.
 /// The control kept its answer across a change that moved everything else,
 /// which is the strongest thing a control can do.

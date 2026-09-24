@@ -1,7 +1,7 @@
 //! A `$1` written into a composed statement as text. A placeholder in a
 //! `Composed` is `param(n)`: that is what spells it for the dialect — `$n` on
 //! Postgres, `?n` on SQLite — and what `db.composed` counts the values
-//! against (ADR 0283). One written as text would be spelled for one database
+//! against (ADR 208). One written as text would be spelled for one database
 //! and counted by nobody. The person meant `text(" WHERE id = ")` then
 //! `param(1)`.
 

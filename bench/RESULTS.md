@@ -5,8 +5,8 @@ commit body, not a sentence in a session — here, where somebody can re-run it.
 
 The rule and the reasoning are in `CLAUDE.md`. The short version: a number with
 no run behind it decays into a claim, and this repository has already published
-two that were wrong ([ADR 0062](../docs/adr/0062-a-pool-that-dialled-itself-whatever-it-was-told.md),
-[ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md)). Each entry
+two that were wrong ([ADR 115](../docs/adr/115-a-boot-dials-the-connection-its-work-needs.md),
+[ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)). Each entry
 says what was run, on what, at which commit, and which decision the numbers
 moved. A run that changed nothing still earns an entry if somebody would
 otherwise repeat it.
@@ -16,7 +16,7 @@ otherwise repeat it.
 ## `.env` as a source — binary size
 
 **What it decided:** the binary-size row of
-[ADR 0064](../docs/adr/0064-a-dotenv-is-text-somebody-else-read.md), and whether
+[ADR 039](../docs/adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md), and whether
 `Dotenv` and `Layered` being `pub` in `config.zig` costs a project that never
 names them.
 
@@ -41,7 +41,7 @@ zig build-exe -OReleaseFast -fstrip --dep nilo_config \
 | The same source; `nilo_config` with this change | 237,528 |
 | Plus `config.Dotenv` and `config.layered`, with `Dotenv.report` reachable | 243,976 |
 
-**What moved:** the first two being byte for byte is what let ADR 0064 state
+**What moved:** the first two being byte for byte is what let ADR 039 state
 **zero** for a non-user rather than "negligible" — Zig does not analyse a `pub`
 declaration nobody names, and this is the reading that shows it rather than
 assuming it. The third gives the **6,448 bytes** the ADR quotes.
@@ -52,8 +52,8 @@ and no way to tell whether existing users were paying part of it.
 
 ## `.env` as a source — Refusal build time
 
-**What it decided:** the Refusal-cost paragraph of ADR 0064, and it confirmed a
-pattern ADR 0043 recorded rather than establishing a new one.
+**What it decided:** the Refusal-cost paragraph of ADR 039, and it confirmed a
+pattern ADR 039 recorded rather than establishing a new one.
 
 - Same machine, Zig and commit as above. Measured warm — built once, then timed
   on the second build.
@@ -66,7 +66,7 @@ pattern ADR 0043 recorded rather than establishing a new one.
 | `config_layered_not_a_source` | 111ms |
 
 **What moved:** nothing was redesigned, but the ten-to-one spread is the finding.
-ADR 0043 saw the same shape — `config_unknown_field` at 149ms against 30–38ms for
+ADR 039 saw the same shape — `config_unknown_field` at 149ms against 30–38ms for
 the rest — and gave the same cause: a `@compileError` reached *through a generic
 function* costs an order of magnitude more than one reached from the type. Three
 of these four stop at the type; `config_layered_not_a_source` walks into

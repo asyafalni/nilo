@@ -1,5 +1,5 @@
 //! What gzipping an answer costs, per level, on the bodies the benchmark
-//! arena's `json-comp` profile asks for (ADR 0287).
+//! arena's `json-comp` profile asks for (ADR 211).
 //!
 //! ```
 //! zig build bench-compress

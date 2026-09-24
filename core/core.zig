@@ -1,4 +1,4 @@
-//! nilo_core — what every layer of nilo agrees about (ADR 0041).
+//! nilo_core — what every layer of nilo agrees about (ADR 038).
 //!
 //! Four things live here. Text that belongs to a piece of work, the Scope
 //! that hands out the memory it lives in, what time it is, and percent
@@ -9,7 +9,7 @@
 //! is left.
 //!
 //! `percent` is the first file that arrived by passing that test rather than
-//! by being here from the start (ADR 0066): the App layer decodes every path
+//! by being here from the start (ADR 057): the App layer decodes every path
 //! param, a Service signing a URL encodes one, and a Service cannot import
 //! `nilo_http` to share the App layer's copy.
 //!
@@ -19,7 +19,7 @@
 //! server in it link this and nothing else.
 //!
 //! That sentence used to read *nothing here does IO*, and the clock is why
-//! it does not (ADR 0045): reading it is a syscall by the letter and a read
+//! it does not (ADR 041): reading it is a syscall by the letter and a read
 //! from a mapped page in practice, so there is nothing for a fiber to wait
 //! on. **Needing the loop is the question the layering has always actually
 //! been asking**, and it is the one to keep asking of a fourth.
@@ -38,12 +38,12 @@ pub const trap_enabled = str_mod.trap_enabled;
 pub const Run = scope_mod.Run;
 pub const checkScope = scope_mod.check;
 /// A Scope's request id as an optional, whichever way the Scope declares it —
-/// and null for one that declares none (ADR 0196).
+/// and null for one that declares none (ADR 158).
 pub const requestIdOf = scope_mod.requestIdOf;
 
 /// A Scope with its type erased, for the one place a shape checked while
 /// compiling cannot reach: the other side of a function pointer
-/// ([ADR 0177](../docs/adr/0177-a-scope-that-crosses-a-function-pointer.md)).
+/// ([ADR 144](../docs/adr/144-a-scope-that-crosses-a-function-pointer.md)).
 /// The ordinary Scope is unchanged and still costs nothing.
 pub const AnyScope = scope_mod.AnyScope;
 

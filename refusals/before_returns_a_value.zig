@@ -1,6 +1,6 @@
 //! Work registered with `app.before` that answers with a value. It runs
 //! inside `listen()`, where nobody is waiting for one: an error stops the
-//! boot, and anything else has nowhere to go (ADR 0220).
+//! boot, and anything else has nowhere to go (ADR 180).
 
 const nilo = @import("nilo_http");
 

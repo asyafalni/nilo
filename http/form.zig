@@ -1,5 +1,5 @@
 //! HTML forms — `application/x-www-form-urlencoded` and
-//! `multipart/form-data`, read into a struct of your own (ADR 0031).
+//! `multipart/form-data`, read into a struct of your own (ADR 030).
 //!
 //! ```zig
 //! const SignUp = struct {
@@ -29,7 +29,7 @@
 //! (1 MB by default), because a form is read into a struct and a struct is
 //! not something you can have half of. That is the same trade `c.json` makes
 //! and the same ceiling. An upload too big for it is `c.bodyStream()`'s job,
-//! where the handler drives the reading and nothing is held (ADR 0020).
+//! where the handler drives the reading and nothing is held (ADR 019).
 
 const std = @import("std");
 
@@ -58,7 +58,7 @@ pub fn Form(comptime T: type) type {
     return struct {
         pub const nilo_form = T;
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = "nilo.Form(" ++ naming.of(T) ++ ")";
 
         value: T,
@@ -68,7 +68,7 @@ pub fn Form(comptime T: type) type {
 /// One file out of a multipart form.
 ///
 /// The three pieces are `Str`s, so they live exactly as long as the request
-/// does and `keep` is what takes one out of it (ADR 0004) — including
+/// does and `keep` is what takes one out of it (ADR 003) — including
 /// `bytes`, which is doing lifetime duty rather than claiming the contents
 /// are text.
 ///
@@ -78,7 +78,7 @@ pub fn Form(comptime T: type) type {
 /// somebody, never as a path.
 pub const Upload = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Upload";
 
     /// What the browser called the file on the machine it came from.
@@ -111,7 +111,7 @@ pub const Upload = struct {
     /// **`name` is yours to choose and `filename` is the client's.** Handing
     /// `filename` straight in is `error.NameNotAllowed`, not a path resolved
     /// against the directory
-    /// ([ADR 0123](../docs/adr/0123-a-file-is-written-by-the-engine.md)).
+    /// ([ADR 097](../docs/adr/097-a-file-is-written-by-the-engine.md)).
     ///
     /// **The file is replaced, or it is not touched.** A temporary name beside
     /// it and one rename, so a request serving that same name reads the old
@@ -119,7 +119,7 @@ pub const Upload = struct {
     ///
     /// The fiber parks for the write and its thread goes on serving. Nothing
     /// is buffered — one write of `len()` bytes, and no buffer on a stack the
-    /// connection would then hold (ADR 0063).
+    /// connection would then hold (ADR 062).
     pub fn saveTo(self: Upload, dir: bulkhead.Dir, name: []const u8) !void {
         if (filebody.checkName(name) != null) return error.NameNotAllowed;
         try dir.writeFileAtomic(name, self.bytes.view());
@@ -157,7 +157,7 @@ pub const Fields = struct {
     /// because a repeated name is a checkbox group, and taking the last
     /// would quietly answer with whichever the browser put at the end. A
     /// field declared as a list reads every occurrence instead
-    /// ([ADR 0256](../docs/adr/0256-a-form-list-is-a-repeated-name-and-nothing-else.md)).
+    /// ([ADR 132](../docs/adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)).
     pub fn find(self: Fields, name: []const u8) ?[]const u8 {
         for (self.text) |p| {
             if (std.mem.eql(u8, p.name, name)) return p.value;
@@ -168,7 +168,7 @@ pub const Fields = struct {
     /// How many non-empty values arrived under `name`: the size of the
     /// list a field of that name becomes. An empty value is what an
     /// unticked box never sends and an empty text box does, and it
-    /// contributes nothing, the rule ADR 0164 set for a query.
+    /// contributes nothing, the rule ADR 132 set for a query.
     pub fn count(self: Fields, name: []const u8) usize {
         var n: usize = 0;
         for (self.text) |p| {
@@ -306,7 +306,7 @@ fn fill(comptime T: type, arena: std.mem.Allocator, fields: Fields, lifetime: *c
 
         if (comptime convert.listElement(f.type)) |Item| {
             // A list is never missing: a checkbox group with nothing ticked
-            // sends nothing, and that is the empty list (ADR 0256).
+            // sends nothing, and that is the empty list (ADR 132).
             @field(out, f.name) = try collectList(Item, arena, fields, f.name, lifetime, label);
         } else if (Inner == Upload) {
             if (fields.file(f.name)) |part| {
@@ -403,19 +403,19 @@ fn fillCollecting(
 }
 
 /// Every value that arrived under a repeated name, converted
-/// ([ADR 0256](../docs/adr/0256-a-form-list-is-a-repeated-name-and-nothing-else.md)).
+/// ([ADR 132](../docs/adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)).
 ///
 /// **A repeated name and nothing else.** A browser sends a `<select
 /// multiple>` and a checkbox group as the same name once per value and
 /// never comma-joined, so there is no second spelling to read: a comma in
 /// a form value is a value with a comma in it. That is where this stops
-/// being the query case one slot over (ADR 0164), whose comma is a
+/// being the query case one slot over (ADR 132), whose comma is a
 /// contract written into the document for a client to send back.
 ///
 /// **One allocation, for a form that asked for a list and no other.** The
 /// elements point into the parsed body, which lives as long as the request;
 /// what is allocated is the slice of them, sized by `count`, out of the
-/// request arena (ADR 0018). An empty value contributes nothing, so a row of
+/// request arena (ADR 017). An empty value contributes nothing, so a row of
 /// empty text boxes is an empty list rather than a list of empty strings.
 fn collectList(
     comptime Item: type,
@@ -442,7 +442,7 @@ fn collectList(
 
 /// `collectList`, recording what would not convert instead of answering
 /// with it. The **first** bad value is the one the handler is told about,
-/// and the rest of the list is still read, the rule ADR 0164 set: a group
+/// and the rest of the list is still read, the rule ADR 132 set: a group
 /// with one bad box in it is a group, not a form with nothing in it.
 fn collectListCollecting(
     comptime Item: type,
@@ -479,7 +479,7 @@ fn collectListCollecting(
 /// `what` names the thing being complained about — the typed engine passes
 /// the `Form(T)` and the route it is on, `c.form(T)` passes the type alone —
 /// so one message serves both ways in without either of them guessing at the
-/// other's context (ADR 0027).
+/// other's context (ADR 026).
 pub fn checkFields(comptime T: type, comptime what: []const u8) void {
     comptime {
         const info = switch (@typeInfo(T)) {
@@ -504,7 +504,7 @@ pub fn checkFields(comptime T: type, comptime what: []const u8) void {
             if (convert.convertible(f.type)) continue;
             // A list of anything a form value can become, filled from the
             // repeated name a checkbox group or a `<select multiple>` sends
-            // (ADR 0256). A list of files is not one: `Upload` is a part
+            // (ADR 132). A list of files is not one: `Upload` is a part
             // rather than a value, and a field takes one.
             if (convert.listElement(f.type)) |Item| {
                 if (Item != Upload and convert.convertible(Item) and @typeInfo(Item) != .optional) continue;
@@ -571,7 +571,7 @@ pub fn holdsAFile(comptime T: type) bool {
 pub const max_parts = 256;
 
 /// The wall said out loud rather than walked past
-/// ([ADR 0081](../docs/adr/0081-a-ceiling-that-is-reached-is-said-out-loud.md)).
+/// ([ADR 034](../docs/adr/034-a-binding-hands-its-failures-to-the-handler.md)).
 ///
 /// Reading 256 parts of a 300-part form and stopping would hand the handler a
 /// form whose other 44 fields look exactly like fields the browser never
@@ -647,7 +647,7 @@ fn parseMultipart(arena: std.mem.Allocator, boundary: []const u8, body: []const 
         const name = parameterOf(disposition, "name") orelse continue;
 
         // A part that names its file **only** with `filename*` is refused
-        // rather than read (ADR 0094). `parameterOf` compares the key exactly,
+        // rather than read (ADR 073). `parameterOf` compares the key exactly,
         // so `filename*` does not match `filename` — which was right, and the
         // fallthrough was not: the part became a *text* field whose value is
         // the raw bytes of the upload, and the `Upload` the endpoint asked for
@@ -656,7 +656,7 @@ fn parseMultipart(arena: std.mem.Allocator, boundary: []const u8, body: []const 
         //
         // The doc on `parameterOf` says the plain `filename` is always sent
         // alongside, and that is true of browsers and not of every HTTP
-        // library. Refusing is the same call ADR 0081 makes about a ceiling:
+        // library. Refusing is the same call ADR 034 makes about a ceiling:
         // nilo need not read RFC 6266's encoding, it only has to stop
         // pretending the part was something else.
         if (parameterOf(disposition, "filename") == null and
@@ -820,7 +820,7 @@ const SignUp = struct {
 /// One lifetime for the tests below, at file scope rather than inside the
 /// helper. A `Lifetime` on `read`'s own stack dies when `read` returns and
 /// every `Str` it stamped goes stale on the next line — which is the staleness
-/// trap working exactly as ADR 0004 intends, and not what these tests are
+/// trap working exactly as ADR 003 intends, and not what these tests are
 /// about.
 var test_lifetime: str_mod.Lifetime = .{};
 
@@ -938,7 +938,7 @@ test "a body that is not a form at all says what it was" {
     );
 }
 
-// ---- a form list is a repeated name and nothing else (ADR 0256) ----
+// ---- a form list is a repeated name and nothing else (ADR 132) ----
 
 const Kind2 = enum { comment, mention };
 
@@ -1281,7 +1281,7 @@ test "a form past that bound is refused rather than quietly cut short" {
     // A body made of nothing but boundaries: the arrays are sized from the
     // count, and this is what stops that count being the client's to choose.
     // It used to bind the first 256 and walk past the rest, which a handler
-    // reads as 256 fields sent and the others left blank (ADR 0081).
+    // reads as 256 fields sent and the others left blank (ADR 034).
     var body = try formOfParts(testing.allocator, max_parts * 2);
     defer body.deinit(testing.allocator);
 

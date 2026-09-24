@@ -1,6 +1,6 @@
 //! A `nilo_ready` that takes no Scope, so it could never send the statement
 //! that says whether the service is up
-//! ([ADR 0192](../docs/adr/0192-a-health-route-asks-the-services.md)).
+//! ([ADR 154](../docs/adr/154-a-health-route-asks-the-services.md)).
 
 const nilo = @import("nilo_http");
 

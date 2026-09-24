@@ -1,5 +1,5 @@
 //! `approver_id` may be null, and a row whose reference is null has no
-//! parent to fill a non-optional field from (ADR 0295).
+//! parent to fill a non-optional field from (ADR 218).
 
 const sql = @import("nilo_sql");
 

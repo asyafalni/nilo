@@ -1,8 +1,8 @@
 //! The SQL that changes a table's shape, written from a `Desc`
-//! ([ADR 0153](../docs/adr/0153-a-migration-is-a-diff-against-a-snapshot.md)).
+//! ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 //!
 //! **`CREATE` is settled while compiling and only `ALTER` is not**, which is
-//! ADR 0039's rule arriving one layer over and is worth stating because it is
+//! ADR 036's rule arriving one layer over and is worth stating because it is
 //! not obvious. A table that does not exist yet is described entirely by the
 //! caller's types, so its whole `CREATE TABLE` is a constant in the binary
 //! before the program runs. An `ALTER` is a sentence about the difference
@@ -105,14 +105,14 @@ pub fn createTable(comptime D: type, comptime Row: type) []const u8 {
         // reason: `REFERENCES` on a column clause says *this column*, and a key
         // of two has nowhere to write the second. A key of one stays inline,
         // which is what keeps every table written before this unchanged
-        // ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+        // ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
         for (desc.references) |r| {
             if (r.columns.len == 1) continue;
             out = out ++ ",\n  " ++ foreignKeyClause(D, r);
         }
         // And a `CHECK` the marker named, for the third time for the same
         // reason: written at creation or not written at all, on SQLite
-        // ([ADR 0226](../docs/adr/0226-the-marker-has-a-word-the-database-checks.md)).
+        // ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
         for (desc.checks) |ck| {
             out = out ++ ",\n  " ++ checkConstraintClause(D, ck);
         }
@@ -334,7 +334,7 @@ fn checkClause(comptime D: type, comptime desc: Desc, comptime c: Column) []cons
 
 /// The name the check over a column's words goes in under: the one `.check`
 /// gave it, or `<table>_<column>_check`, which is what Postgres would have
-/// called it anyway ([ADR 0226](../docs/adr/0226-the-marker-has-a-word-the-database-checks.md)).
+/// called it anyway ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 pub fn checkName(comptime desc: Desc, comptime c: Column) []const u8 {
     comptime {
         if (c.check.len > 0) return c.check;
@@ -412,7 +412,7 @@ fn quotedList(comptime D: type, comptime columns: []const []const u8) []const u8
 ///
 /// A `.default` in the marker closes that case rather than flagging it: the
 /// clause goes in here, the rows already there get the value, and there is
-/// nothing left to backfill. That is the case ADR 0153 named as the one where a
+/// nothing left to backfill. That is the case ADR 123 named as the one where a
 /// default is load-bearing, answered by the word rather than by a warning.
 pub fn addColumn(comptime D: type, gpa: std.mem.Allocator, desc: Desc, c: Column) Error![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
@@ -643,7 +643,7 @@ pub fn createTrigger(
 }
 
 /// `CREATE EXTENSION IF NOT EXISTS "n"`, as a constant — what `createMissing`
-/// sends (ADR 0253).
+/// sends (ADR 181).
 pub fn createExtensionIfMissing(comptime D: type, comptime name: []const u8) []const u8 {
     comptime {
         return "CREATE EXTENSION IF NOT EXISTS " ++ D.quote(name);
@@ -987,7 +987,7 @@ test "both databases take the same composite key clause" {
         "PRIMARY KEY (\"tenant_id\", \"id\")",
     ) != null);
     // And no column carries `INTEGER PRIMARY KEY`, which on SQLite would be
-    // the rowid alias and a second, contradicting key (ADR 0115).
+    // the rowid alias and a second, contradicting key (ADR 050).
     try testing.expect(std.mem.indexOf(
         u8,
         comptime createTable(Lite, Seat),
@@ -1112,7 +1112,7 @@ test "an identifier that would end its own quoting is refused rather than concat
     try testing.expectError(error.BadIdentifier, writeIdent(&w, ""));
 }
 
-// -- the words that live inside one Row (ADR 0221) ------------------------
+// -- the words that live inside one Row (ADR 181) ------------------------
 
 const Priority = enum { urgent, normal };
 
@@ -1153,7 +1153,7 @@ test "a default and a column's words are written inline, beside the type and the
 
 test "the same table on SQLite moves only what SQLite spells differently" {
     // The literal defaults are the same text. `now()` is not: a Timestamp
-    // there is microseconds in an INTEGER column (ADR 0136), so the Dialect
+    // there is microseconds in an INTEGER column (ADR 067), so the Dialect
     // spells the clock.
     const sql = comptime createTable(Lite, Task);
     try testing.expect(std.mem.indexOf(u8, sql, "\"done\" INTEGER NOT NULL DEFAULT FALSE") != null);
@@ -1268,7 +1268,7 @@ test "the IF NOT EXISTS form is the same statement with four words moved in" {
     );
 }
 
-// -- the second kind of word (ADR 0226) ----------------------------------
+// -- the second kind of word (ADR 181) ----------------------------------
 
 const Audited = struct {
     pub const nilo_table = .{

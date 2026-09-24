@@ -4,7 +4,7 @@
 //! points back at `staff`. Asking from `staff` whether a department matches
 //! could mean "my department" or "the department I head", and the two answer
 //! different questions with the same shape. `.on` names the inner column and
-//! `.via` the outer one, so saying which is one word (ADR 0214).
+//! `.via` the outer one, so saying which is one word (ADR 175).
 
 const sql = @import("nilo_sql");
 

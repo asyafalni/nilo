@@ -3,7 +3,7 @@
 `wstest` is what every implementation of RFC 6455 is measured by. Until this
 directory existed, nilo's WebSocket had never been run against it: every framing
 test under `http/` was written from the RFC by whoever wrote the framing, which
-by [ADR 0033](../../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
+by [ADR 032](../../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
 makes the close-code and UTF-8 rules guards only ever seen to pass.
 
 ```

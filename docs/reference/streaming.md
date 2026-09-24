@@ -68,7 +68,7 @@ the 404 a file that was never there gets.
 
 `receive` returns `null` when the server is stopping, after telling the client
 so with a 1001 — a message loop needs no shutdown branch of its own
-([ADR 0052](../adr/0052-a-message-is-copied-once-and-framed-once.md)). `live()` is
+([ADR 046](../adr/046-a-message-is-copied-once-and-framed-once.md)). `live()` is
 for a handler doing work of its own between messages. Sending on a socket that
 has already closed writes nothing rather than failing.
 
@@ -83,7 +83,7 @@ announcing more is refused with a 1009 before a byte of it is read.
 alone.** A browser applies no CORS to a WebSocket — no preflight, and it ignores
 `Access-Control-Allow-Origin` — so the handshake is an ordinary GET that arrives
 carrying the session cookie, and nothing but the server can refuse it
-([ADR 0102](../adr/0102-a-websocket-handshake-is-same-origin-unless-the-route-says-otherwise.md)).
+([ADR 080](../adr/080-a-websocket-handshake-is-same-origin-unless-the-route-says-otherwise.md)).
 An `Origin` that does not name the authority the request's `Host` named is a
 403. The scheme is not compared, because TLS is terminated in front. A request
 with no `Origin` at all — `curl`, a native client — is allowed, because the
@@ -102,7 +102,7 @@ return c.upgradeWith(feedLoop, {}, .{ .origins = &.{"*"} });
 ## `Room`
 
 Saying something to sockets a handler does not hold
-([ADR 0038](../adr/0038-a-broadcast-rings-a-bell-it-does-not-write.md)). A
+([ADR 035](../adr/035-a-broadcast-rings-a-bell-it-does-not-write.md)). A
 service like any other: provide one, take it by type.
 
 ```zig
@@ -150,4 +150,4 @@ nobody gives up is one the next connection cannot have.
 Sizing a room generously is a memory decision and nothing else: `join` and
 `say` both cost what the room *holds*, not what it was sized for, and a `say`
 into an empty room allocates nothing at all
-([ADR 0052](../adr/0052-a-message-is-copied-once-and-framed-once.md)).
+([ADR 046](../adr/046-a-message-is-copied-once-and-framed-once.md)).

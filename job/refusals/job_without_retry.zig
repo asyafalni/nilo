@@ -1,6 +1,6 @@
 //! A job that says nothing about what happens when it fails. How many times
 //! an email is tried is a promise about that email, and a default nobody
-//! read is not one (ADR 0199).
+//! read is not one (ADR 161).
 
 const job = @import("nilo_job");
 const core = @import("nilo_core");

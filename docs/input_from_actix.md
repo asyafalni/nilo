@@ -61,13 +61,13 @@ front — a CDN, nginx's `proxy_cache`, a browser — computes freshness from
 receipt, which is what the RFC calls "the recipient's best guess". Every
 candidate in `bench/compare/` but http.zig sends one.
 
-**What it costs, against ADR 0018.** Allocations per request: none — the text
+**What it costs, against ADR 017.** Allocations per request: none — the text
 lives in a per-thread or per-engine buffer. Memory per idle connection: none.
 Throughput: 37 more bytes per response, about 3% of the wire on the 1,110-byte
 benchmark response and to be measured rather than estimated. Binary size: a
 date formatter, a few hundred bytes.
 
-**What it needs.** A wall clock in the Bulkhead (ADR 0002 — the Engine is the
+**What it needs.** A wall clock in the Bulkhead (ADR 001 — the Engine is the
 only file that names zio, and `zio.Timestamp.now(.realtime)` is where it
 comes from), and a cache so the formatting is not per request: either actix's
 interval task or the cheaper shape — format lazily, and reformat only when the
@@ -203,7 +203,7 @@ thirty lines.
 the pattern, so a redirect after a `POST` does not spell the path twice.
 
 **What nilo does.** Routes have no names; a `Redirect` takes a string
-(`nilo.Redirect(status)`, ADR 0032). With templates refused (ADR 0028) there
+(`nilo.Redirect(status)`, ADR 031). With templates refused (ADR 027) there
 is no template engine asking for `url_for`, which is where most frameworks'
 demand for it comes from.
 
@@ -236,14 +236,14 @@ Kept so the next reader does not re-derive them.
 - **Request smuggling.** Both refuse a second `Content-Length`, a
   `Transfer-Encoding` beside a `Content-Length`, a `Transfer-Encoding` on
   HTTP/1.0, and treat `Content-Length: 0` as no body (`decoder.rs:305`;
-  nilo's `http1.zig:285–335`, ADR 0101). nilo additionally refuses a second
+  nilo's `http1.zig:285–335`, ADR 070). nilo additionally refuses a second
   `Host` (`http1.zig:738`); actix does not check.
 
 - **`Expect: 100-continue`.** actix's default `expect` service answers
   `100 Continue` *before* the handler runs (`dispatcher.rs`, `ExpectCall`), so
   a handler that would refuse on the head — a 401, a 413 — has already invited
   the body. nilo sends the interim response at the moment something reads the
-  body (ADR 0094), which is what the mechanism is for.
+  body (ADR 073), which is what the mechanism is for.
 
 - **An unread body.** actix closes the connection after any response to a
   request whose `Content-Length` body the handler never read, and drains only
@@ -254,7 +254,7 @@ Kept so the next reader does not re-derive them.
 - **Idle memory.** actix's read buffer starts at 8 KiB and grows to 128 KiB
   as a head demands (`dispatcher.rs:39–40`, `:1209`); the write buffer is
   32 KiB (`config.rs:51`). nilo's are 16 KiB and 4 KiB and both are handed
-  back to the kernel while a connection is idle (ADR 0071,
+  back to the kernel while a connection is idle (ADR 062,
   `bulkhead.releaseIdlePages`), which is how it holds 4,669 bytes a connection
   where actix's grows with the largest head it ever saw. The 4 KiB write
   buffer is not a limit on response size: zio's writer drains buffered head
@@ -266,7 +266,7 @@ Kept so the next reader does not re-derive them.
   the read buffer and answers in order. The order on the wire is the same; the
   number of writes was not, because nilo flushed each response and actix
   flushes once its loop has nothing left to decode. Closed by
-  [ADR 0274](./adr/0274-a-response-is-flushed-before-the-connection-waits.md):
+  [ADR 201](./adr/201-a-response-is-flushed-before-the-connection-waits.md):
   nilo now holds a response whose successor is already buffered, and the
   Engine flushes before any read that could wait.
 
@@ -283,7 +283,7 @@ Kept so the next reader does not re-derive them.
 
 - **Metrics by route.** actix's `match_pattern()` (`request.rs:226`) builds a
   `String` per call; nilo's counter is the route index the request already
-  holds (`http/metrics.zig:15`, ADR 0100).
+  holds (`http/metrics.zig:15`, ADR 079).
 
 - **Extractors.** actix's `FromRequest` tuples reach 16 arguments
   (`extract.rs:422`) with `Option<T>` and `Result<T, E>` wrappers
@@ -299,14 +299,14 @@ Kept so the next reader does not re-derive them.
 
 - **Middleware on the response.** actix middleware sees the `ServiceResponse`
   and can rewrite it, which is how `DefaultHeaders`, `ErrorHandlers` and
-  `Compress` are built. nilo flushes on `send` (ADR 0009), so a header is set
+  `Compress` are built. nilo flushes on `send` (ADR 008), so a header is set
   before `next.run` — `logger.request_id` is the worked example — and the
-  error page is a fail function (ADR 0005). This is a decision, not a gap.
+  error page is a fail function (ADR 004). This is a decision, not a gap.
 
 - **Compression.** actix ships `Compress` with a 64 KiB deflate window per
   response in flight. nilo's shape for the same thing is on the roadmap with
   its cost written down, and it is not being shipped in a worse shape
-  meanwhile (ADR 0018).
+  meanwhile (ADR 017).
 
 - **Streamed multipart.** `actix-multipart` streams fields and offers a
   `MultipartForm` derive with `TempFile` and per-field limits. nilo's entry is
@@ -322,7 +322,7 @@ Kept so the next reader does not re-derive them.
   far as the state machine reads, a client that sends half of its *second*
   request head and stops holds the connection with no timer running. nilo's
   `header_timeout_ms` is armed for every head, counted from its first byte
-  (`bulkhead.zig:272`, ADR 0023). Keep that.
+  (`bulkhead.zig:272`, ADR 022). Keep that.
 
 - **Keep-alive is five seconds.** `KeepAlive::default()` is 5 s
   (`keep_alive.rs`, `config.rs:200`), below what any browser holds a
@@ -341,4 +341,4 @@ Kept so the next reader does not re-derive them.
   other.** `ServiceConfig` says `client_disconnect_timeout: 0`
   (`config.rs`), `HttpServer` says 1 s (`server.rs:128`). nilo's is one
   number, `linger_ms = 1000` beside `linger_limit = 64 KiB`
-  (`http/serve.zig:103–104`), and ADR 0266 says why both.
+  (`http/serve.zig:103–104`), and ADR 195 says why both.

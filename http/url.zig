@@ -1,5 +1,5 @@
 //! Building a URL out of the route pattern it belongs to, checked while
-//! compiling ([ADR 0127](../docs/adr/0127-a-route-pattern-is-the-name-of-its-url.md)).
+//! compiling ([ADR 100](../docs/adr/100-a-route-pattern-is-the-name-of-its-url.md)).
 //!
 //! ```zig
 //! const where = try c.url("/users/:id/posts/:slug", .{ .id = 42, .slug = title });

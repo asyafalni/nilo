@@ -1,7 +1,7 @@
 //! A ring, a client and a claims type, held as one value — so that the layer
 //! with a request can ask for "the user behind this bearer token" by naming
 //! one type
-//! ([ADR 0260](../docs/adr/0260-verified-claims-are-a-handler-argument.md)).
+//! ([ADR 191](../docs/adr/191-verified-claims-are-a-handler-argument.md)).
 //!
 //! ```zig
 //! const Google = jwt.Verifier(Claims, fetch.Client);
@@ -21,7 +21,7 @@
 //! resolver reaches the client, given that the argument names the ring.
 //!
 //! **The client is a type parameter, so this file still imports nothing**
-//! — the arrangement `job.Table(Db)` uses for a store (ADR 0198), and the
+//! — the arrangement `job.Table(Db)` uses for a store (ADR 160), and the
 //! one `Keyring.refresh` already asks of its `client: anytype`. What it is
 //! asked for is one `get(scope, url, .{})` answering `ok()` and
 //! `body.view()`, which is what `fetch.Client` answers and what a test's

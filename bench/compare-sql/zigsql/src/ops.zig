@@ -75,7 +75,7 @@ const wide_scan_sql = "SELECT " ++ wide_cols ++ " FROM \"" ++ wide_table ++ "\""
 const insert_sql = "INSERT INTO \"" ++ write_table ++ "\" (" ++ four_cols ++
     ") VALUES ($1, $2, $3, $4) RETURNING " ++ four_cols;
 /// One array per column, `unnest` on the server — the shape `insertMany`
-/// compiles to (ADR 0053), written out here so the control sends the same
+/// compiles to (ADR 047), written out here so the control sends the same
 /// statement rather than a hand-rolled multi-VALUES that would be a different
 /// benchmark.
 const batch_sql = "INSERT INTO \"" ++ write_table ++ "\" (" ++ four_cols ++
@@ -285,7 +285,7 @@ const Deleted = struct {
     created_at: sql.Timestamp,
 };
 
-/// The element type `insertMany` compiles its statement from (ADR 0053).
+/// The element type `insertMany` compiles its statement from (ADR 047).
 const Line = struct {
     id: i64,
     email: []const u8,

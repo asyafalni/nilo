@@ -1,7 +1,7 @@
 //! An ordering whose key is the caller's own SQL, handed to a statement nilo
 //! writes. A typed select orders by columns it checked; text it did not write
 //! is for `db.rawOrdered`
-//! ([ADR 0204](../../docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+//! ([ADR 165](../../docs/adr/165-an-order-chosen-at-run-time-from-a-closed-set.md)).
 
 const sql = @import("nilo_sql");
 

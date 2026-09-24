@@ -1,7 +1,7 @@
 //! A `.rename` entry naming a field the struct does not have. The entry is
 //! keyed by the field as it is written, so a typo here is a spelling that
 //! would never apply, refused where it was written
-//! ([ADR 0207](../docs/adr/0207-one-field-can-be-spelled-on-its-own.md)).
+//! ([ADR 168](../docs/adr/168-one-field-can-be-spelled-on-its-own.md)).
 
 const nilo = @import("nilo_http");
 

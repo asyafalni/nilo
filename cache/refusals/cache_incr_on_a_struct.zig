@@ -1,6 +1,6 @@
 //! `incr` on a Space that holds a struct. A count is an integer, and a Space
 //! of anything else has nothing to add one to — the Refusal names the type
-//! and the Space that would count (ADR 0261).
+//! and the Space that would count (ADR 109).
 
 const cache = @import("nilo_cache");
 

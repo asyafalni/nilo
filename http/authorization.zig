@@ -1,5 +1,5 @@
 //! The `Authorization` header, read once and refused with a challenge
-//! ([ADR 0191](../docs/adr/0191-an-authorization-header-a-handler-can-ask-for.md)).
+//! ([ADR 153](../docs/adr/153-an-authorization-header-a-handler-can-ask-for.md)).
 //!
 //! ```zig
 //! fn me(auth: nilo.Authorization(.bearer), issuer: *const Issuer, c: *nilo.Ctx) !Profile {
@@ -60,7 +60,7 @@ pub fn Authorization(comptime scheme: Scheme) type {
         .bearer => struct {
             pub const nilo_authorization = scheme;
             /// What a nilo compile error calls this type, which is the name
-            /// the reader's own import line gives it (ADR 0122).
+            /// the reader's own import line gives it (ADR 074).
             pub const nilo_type_name = "nilo.Authorization(.bearer)";
             /// What a 401 from this endpoint says in `WWW-Authenticate`.
             pub const challenge: [:0]const u8 = "Bearer";

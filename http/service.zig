@@ -7,7 +7,7 @@
 //! fn getUser(db: *Db, id: u32) !User   // asked for by argument type
 //! ```
 //!
-//! The registry is a runtime one, keyed by type name. ADR 0006 explains
+//! The registry is a runtime one, keyed by type name. ADR 005 explains
 //! why: `App` stays one ordinary type, and a handler asking for a service
 //! that was never registered is caught by `listen()` — before a single
 //! request is served, rather than at three in the morning.
@@ -45,7 +45,7 @@ pub const Registry = struct {
     pub const Entry = struct {
         type_name: []const u8,
         /// The same type as the reader's own import line spells it, for the
-        /// health page (ADR 0192). `type_name` is what the lookup compares.
+        /// health page (ADR 154). `type_name` is what the lookup compares.
         name: []const u8,
         ptr: *anyopaque,
         is_const: bool,
@@ -56,16 +56,16 @@ pub const Registry = struct {
         /// Set only for a service that declared `nilo_stop`. The mirror of
         /// `start`, and the reason it exists is that a service which put
         /// work on the Engine's loop has to take it off again before the
-        /// loop is torn down (ADR 0151).
+        /// loop is torn down (ADR 121).
         stop: ?*const fn (*anyopaque) void = null,
         /// Set only for a service that declared `nilo_ready`. Asked by the
         /// health route and by nothing else, so a service with none costs
-        /// one null test per probe and nothing per request (ADR 0192).
+        /// one null test per probe and nothing per request (ADR 154).
         ready: ?*const fn (*anyopaque, *AnyScope) ?[]const u8 = null,
         /// Set only for a service that declared `nilo_check`. Run once, after
         /// the work `app.before` registered and before the first request,
         /// which is where a check against what that work made belongs
-        /// (ADR 0277). Null is the ordinary case and costs one branch at boot.
+        /// (ADR 180). Null is the ordinary case and costs one branch at boot.
         check: ?*const fn (*anyopaque, std.Io) anyerror!void = null,
     };
 
@@ -75,12 +75,12 @@ pub const Registry = struct {
     /// A service that needs the event loop cannot be built before
     /// `listen()`, because the loop does not exist until then — and a
     /// connection pool dialled without one blocks the thread every request
-    /// on it shares (ADR 0014). Declaring `nilo_start` says "finish
+    /// on it shares (ADR 013). Declaring `nilo_start` says "finish
     /// building me once there is a loop", and `listen()` calls it before
-    /// accepting anything (ADR 0040).
+    /// accepting anything (ADR 037).
     /// **Two arities, and the older one is not deprecated.** A Service that
     /// only wants the loop writes `nilo_start(self, io)` and is untouched by
-    /// ADR 0065; one that also wants to bound an outbound call writes
+    /// ADR 056; one that also wants to bound an outbound call writes
     /// `nilo_start(self, io, limits)`. Both erase to the same three-argument
     /// pointer, so the registry holds one kind of thing and the branch is a
     /// `comptime` one paid once per service type.
@@ -118,7 +118,7 @@ pub const Registry = struct {
     /// putting something down logs it and carries on, which is what every
     /// `deinit` in this repository already does. And it takes no `std.Io`:
     /// the loop it was started on is the loop it is still on, and a service
-    /// that needed to remember it kept it in `nilo_start` (ADR 0151).
+    /// that needed to remember it kept it in `nilo_start` (ADR 121).
     ///
     /// A service with no `nilo_stop` is the ordinary case and costs one
     /// branch, once, on the way out.
@@ -164,7 +164,7 @@ pub const Registry = struct {
     }
 
     /// The `nilo_ready` hook, erased the way `nilo_start` is
-    /// ([ADR 0192](../docs/adr/0192-a-health-route-asks-the-services.md)).
+    /// ([ADR 154](../docs/adr/154-a-health-route-asks-the-services.md)).
     ///
     /// **Null is ready, and a string is why not.** A bool would have made the
     /// 503 a list of type names, and what an operator wants at three in the
@@ -176,7 +176,7 @@ pub const Registry = struct {
     /// `SELECT 1` — and a statement wants somewhere to put its answer. The
     /// hook takes the erased one so a Service can keep naming `anytype`
     /// everywhere else and this registry can hold one kind of pointer
-    /// (ADR 0166).
+    /// (ADR 134).
     fn readyHook(comptime T: type) ?*const fn (*anyopaque, *AnyScope) ?[]const u8 {
         if (!@hasDecl(T, "nilo_ready")) return null;
 
@@ -217,7 +217,7 @@ pub const Registry = struct {
     }
 
     /// The `nilo_check` hook, erased the way `nilo_start` is
-    /// ([ADR 0277](../docs/adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+    /// ([ADR 180](../docs/adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
     ///
     /// **After `before`, not inside `nilo_start`.** A `Db` checks its Rows
     /// against their tables at boot, and the tables are made by the work
@@ -278,7 +278,7 @@ pub const Registry = struct {
     ///
     /// Two services of the same type (two databases, say) have to be told
     /// apart with named wrappers; the second one is rejected here
-    /// (ADR 0003).
+    /// (ADR 002).
     pub fn add(self: *Registry, ptr: anytype) !void {
         const P = @TypeOf(ptr);
         const info = switch (@typeInfo(P)) {
@@ -318,7 +318,7 @@ pub const Registry = struct {
 
     /// Run every service's `nilo_check`, in the order they were provided.
     /// Once, after the work `before` registered has finished, and before
-    /// anything is accepted (ADR 0277). The first failure stops the rest and
+    /// anything is accepted (ADR 180). The first failure stops the rest and
     /// the boot with it, for the reason `start`'s does.
     pub fn check(self: *const Registry, io: std.Io) !void {
         for (self.entries.items) |e| {
@@ -328,7 +328,7 @@ pub const Registry = struct {
 
     /// Finish building every service that asked to be finished, in the
     /// order they were provided. Run once, from inside `listen()`, before
-    /// the first connection is accepted (ADR 0040).
+    /// the first connection is accepted (ADR 037).
     ///
     /// The first failure stops the rest: a server whose database is
     /// unreachable should not go on to open anything else and then answer
@@ -341,7 +341,7 @@ pub const Registry = struct {
 
     /// How many services declared `nilo_start` — which is how many kept the
     /// `Io` they were started on as their loop, and therefore how many are
-    /// wrong once a second loop appears (ADR 0220).
+    /// wrong once a second loop appears (ADR 180).
     pub fn startedCount(self: *const Registry) usize {
         var n: usize = 0;
         for (self.entries.items) |e| {
@@ -376,7 +376,7 @@ pub const Registry = struct {
     /// order, so a service built on top of another is taken down first.
     ///
     /// Run from inside `listen()`, after the last connection has been cut
-    /// off and before the Engine's loop is torn down (ADR 0151). It cannot
+    /// off and before the Engine's loop is torn down (ADR 121). It cannot
     /// fail and it cannot be skipped: a service that put work on the loop
     /// and did not take it off is a loop that cannot be deinitialised, and
     /// zio says so with an assert on the way out.
@@ -538,7 +538,7 @@ test "services are stopped in the reverse of the order they were provided" {
     try r.add(&third);
 
     // The ordinary unwinding order, so a service built on top of another is
-    // put down before the one underneath it (ADR 0151).
+    // put down before the one underneath it (ADR 121).
     r.stopAll();
     try testing.expectEqual(@as(usize, 3), stopped_count);
     try testing.expectEqualSlices(u8, "321", stop_order[0..3]);

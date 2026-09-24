@@ -41,7 +41,7 @@ pub fn write(w: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
 
 /// A struct that renames its fields cannot be written by `std.json`, which does
 /// not read the marker
-/// ([ADR 0181](../docs/adr/0181-a-field-name-is-a-spelling-too.md)).
+/// ([ADR 148](../docs/adr/148-a-field-name-is-a-spelling-too.md)).
 ///
 /// **The fallback is the hole this closes.** `covers` errs narrow on purpose:
 /// one field it does not recognise — an array of bytes, an untagged union, a
@@ -51,14 +51,14 @@ pub fn write(w: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
 /// promised the renamed keys, and nothing would fail.
 ///
 /// So it is a compile error rather than a quiet disagreement, which is the same
-/// answer ADR 0076 reached for a type that writes its own JSON and describes its
+/// answer ADR 016 reached for a type that writes its own JSON and describes its
 /// fields.
 fn refuseRenameOnTheFallback(comptime T: type) void {
     comptime {
         const Renamed = mark.renamedFieldsWithin(T) orelse return;
         @compileError(
             "nilo: `" ++ @import("names.zig").of(Renamed) ++ "` renames its fields, and this " ++
-                "value goes to `std.json`, which does not read the marker (ADR 0181).\n" ++
+                "value goes to `std.json`, which does not read the marker (ADR 148).\n" ++
                 "  `covers` sends the whole value to `std.json` when one shape in it is not " ++
                 "nilo's to write: a tuple, an array of bytes, an untagged union, a type with " ++
                 "its own `jsonStringify`, or anything nested more than eight deep.\n" ++
@@ -71,14 +71,14 @@ fn refuseRenameOnTheFallback(comptime T: type) void {
 
 /// Whether `T` writes its own JSON **and says what that JSON looks like** —
 /// `jsonStringify` beside a `nilo_openapi` naming a scalar
-/// ([ADR 0182](../docs/adr/0182-a-leaf-that-says-what-it-is-can-be-carried.md)).
+/// ([ADR 148](../docs/adr/148-a-field-name-is-a-spelling-too.md)).
 ///
 /// Such a type is a **leaf**: the generated writer hands the value itself to
 /// `std.json` and keeps writing the object around it, rather than giving up on
 /// the whole response. `sql.Uuid`, `sql.Timestamp`, `sql.AsText` and `id.Uuid`
 /// are all one, which is what makes the difference: a product whose every key
 /// is a uuid had no response this file could write at all, so `rename_all` was
-/// refused on every one of them (ADR 0181) and the fast writer never ran.
+/// refused on every one of them (ADR 148) and the fast writer never ran.
 ///
 /// **`nilo_openapi` is the gate rather than `jsonStringify` alone**, and the
 /// two halves are the same sentence read twice. A marker may only name
@@ -116,7 +116,7 @@ pub fn covers(comptime T: type) bool {
     // 1,000 ran out near 125 fields whatever the depth: a detail page of
     // shallow lists stopped compiling in this file, with advice no caller
     // could act on. Raised here because this is where the work is asked for
-    // (ADR 0157), and 20,000 is `renamedFieldsWithin`'s figure for the same
+    // (ADR 126), and 20,000 is `renamedFieldsWithin`'s figure for the same
     // types: some 2,500 fields.
     @setEvalBranchQuota(20_000);
     return coversWithin(T, 0);
@@ -133,7 +133,7 @@ pub fn covers(comptime T: type) bool {
 /// type while compiling, so the fallback this fell off is the one that works.
 ///
 /// Eight, the same as `openapi.schemaWithin`'s and for the same reason
-/// (ADR 0081). The two walk the same types and disagreeing about how deep is
+/// (ADR 034). The two walk the same types and disagreeing about how deep is
 /// how a response and its description come apart.
 const max_depth = 8;
 
@@ -141,15 +141,15 @@ fn coversWithin(comptime T: type, comptime depth: usize) bool {
     if (depth >= max_depth) return false;
     // Asked first, and before the depth of anything inside it matters: a leaf
     // is written by `std.json` whole, so what its fields look like is not this
-    // walk's business (ADR 0182).
+    // walk's business (ADR 148).
     if (writesItsOwnScalar(T)) return true;
-    // A document is its value ([ADR 0202](../docs/adr/0202-a-document-is-its-value.md)):
+    // A document is its value ([ADR 163](../docs/adr/163-a-document-is-its-value.md)):
     // covered when the value is a shape this writer walks — and when it is
     // not, the value is a leaf handed to `std.json` whole with the object
     // around it still this writer's, on the promise every `jsonStringify`
     // makes anyway, that it writes one JSON value. `sql.Json(std.json.Value)`
     // is that case. What is still refused is a marker inside the value that
-    // `std.json` would not read, which is the fallback's own rule (ADR 0181)
+    // `std.json` would not read, which is the fallback's own rule (ADR 148)
     // applied one level down.
     if (comptime mark.documentOf(T)) |Inner| {
         if (coversWithin(Inner, depth + 1)) return true;
@@ -183,12 +183,12 @@ fn coversWithin(comptime T: type, comptime depth: usize) bool {
         //
         // Internally tagged — `{"signal":"metrics",…}` — is what the type asks
         // for with `nilo_json`, and `std.json` has no way to write it at all
-        // (ADR 0085). An empty variant is only writable in that encoding: there
+        // (ADR 016). An empty variant is only writable in that encoding: there
         // is a name to send and no object to put it in.
         .@"union" => |u| covered: {
             if (hasDecl(T, "jsonStringify")) break :covered false;
             // Nothing in an untagged union says which arm is live, so nothing
-            // can write it. Same reading `openapi.zig` gives it (ADR 0077).
+            // can write it. Same reading `openapi.zig` gives it (ADR 016).
             if (u.tag_type == null) break :covered false;
             // Reading the marker is also what checks it, so a `.tag` on the
             // wrong shape is refused the moment the type reaches a response.
@@ -226,10 +226,10 @@ fn coversWithin(comptime T: type, comptime depth: usize) bool {
 fn writeValue(comptime T: type, w: *std.Io.Writer, value: T) std.Io.Writer.Error!void {
     // A leaf writes itself, and `std.json` is what calls it — so the bytes are
     // the ones this file's contract promises, and the object around it stays
-    // this file's to write (ADR 0182).
+    // this file's to write (ADR 148).
     if (comptime writesItsOwnScalar(T)) return std.json.Stringify.value(value, .{}, w);
     // A document as its value — walked here when it can be, and otherwise the
-    // same bytes its own `jsonStringify` would have written (ADR 0202).
+    // same bytes its own `jsonStringify` would have written (ADR 163).
     if (comptime mark.documentOf(T)) |Inner| {
         if (comptime covers(Inner)) return writeValue(Inner, w, value.value);
         return std.json.Stringify.value(value.value, .{}, w);
@@ -291,7 +291,7 @@ fn writeValue(comptime T: type, w: *std.Io.Writer, value: T) std.Io.Writer.Error
                         // union's — a union's `rename_all` renames variants and
                         // stops there, which is the line `a tag and a case
                         // together rename the variant but not its fields` holds
-                        // (ADR 0085, ADR 0181).
+                        // (ADR 016, ADR 148).
                         const inner = comptime mark.of(Payload);
                         inline for (@typeInfo(Payload).@"struct".fields) |f| {
                             try w.writeAll(comptime ",\"" ++ mark.wire(f.name, inner) ++ "\":");
@@ -312,7 +312,7 @@ fn writeValue(comptime T: type, w: *std.Io.Writer, value: T) std.Io.Writer.Error
         .@"struct" => |s| {
             if (s.fields.len == 0) return w.writeAll("{}");
             // What the type said its keys are spelled as
-            // ([ADR 0181](../docs/adr/0181-a-field-name-is-a-spelling-too.md)).
+            // ([ADR 148](../docs/adr/148-a-field-name-is-a-spelling-too.md)).
             // Null for the types that said nothing, which is nearly all of them
             // and costs the same as it always did: the name is settled while
             // compiling either way, so a renamed struct writes exactly as much
@@ -339,7 +339,7 @@ fn writeValue(comptime T: type, w: *std.Io.Writer, value: T) std.Io.Writer.Error
 /// `\xff` was written inside quotes and the response was not valid JSON — the
 /// one place left where this file's contract, that the output is byte-for-byte
 /// what `std.json` would have written, was untrue
-/// ([ADR 0121](../docs/adr/0121-a-byte-that-is-not-text-is-not-a-string.md)).
+/// ([ADR 096](../docs/adr/096-a-byte-that-is-not-text-is-not-a-string.md)).
 /// `std.json` asks `utf8ValidateSlice` first and falls back to `[104,101]`, so
 /// that is what this asks and that is what this writes.
 ///
@@ -499,7 +499,7 @@ test "a string with nothing to escape, and one with everything" {
 test "a run of bytes that is not text is a list of numbers, not a string" {
     // JSON has no way to carry a byte that is not text, and `std.json` answers
     // that by writing the array instead. Written inside quotes, as this used
-    // to, the response is simply not valid JSON (ADR 0121).
+    // to, the response is simply not valid JSON (ADR 096).
     try expectSame(@as([]const u8, "\xff"));
     try expectSame(@as([]const u8, "caf\xe9")); // latin-1, not UTF-8
     try expectSame(@as([]const u8, "\xc3")); // a lead byte with nothing after it
@@ -575,7 +575,7 @@ test "a type that holds a list of itself is std.json's to write" {
     // out wrong: it failed to compile, with a message in this file whose
     // advice was to raise the branch quota, which buys more recursion rather
     // than an answer. Eight deep and then no, the same ceiling
-    // `openapi.schemaWithin` has (ADR 0081).
+    // `openapi.schemaWithin` has (ADR 034).
     const Comment = struct {
         body: []const u8,
         replies: []const @This(),
@@ -694,7 +694,7 @@ test "a type that writes itself is left alone, and so is a tuple" {
     comptime std.debug.assert(!covers(Custom));
     comptime std.debug.assert(!covers(struct { u32, u32 }));
     // Nothing in an untagged union says which arm is live, so nothing can
-    // write it — the same reading `openapi.zig` gives it (ADR 0077).
+    // write it — the same reading `openapi.zig` gives it (ADR 016).
     comptime std.debug.assert(!covers(union { a: u32, b: bool }));
     // A struct holding one of those falls back with it.
     comptime std.debug.assert(!covers(struct { inner: Custom }));
@@ -814,7 +814,7 @@ test "a struct that says its case sends its field names in it" {
     // What this replaces, counted in one caller's port: 10 response structs, 77
     // fields, 5 mapping functions written out field by field and 5 arena loops,
     // and the whole job of all of it was `full_name` becoming `fullName`
-    // (ADR 0181).
+    // (ADR 148).
     const Contact = struct {
         pub const nilo_json = .{ .rename_all = .camelCase };
 
@@ -934,7 +934,7 @@ test "every case a struct can ask for, on one field" {
 }
 
 test "the payload of a tagged variant is renamed by its own marker, not by the union's" {
-    // The line ADR 0085 drew and ADR 0181 kept: a union's `rename_all` renames
+    // The line ADR 016 drew and ADR 148 kept: a union's `rename_all` renames
     // variants, and a payload's own marker is what renames the payload's
     // fields. Two markers, each about its own type.
     const Inner = struct {
@@ -983,7 +983,7 @@ test "a union with a variant the writer cannot touch falls back whole" {
 /// A stand-in for the four types item 46 was actually about — `sql.Uuid`,
 /// `sql.Timestamp`, `sql.AsText` and `id.Uuid`. Spelled out here rather than
 /// imported because `http/` may not name `sql/`, and the contract between them
-/// is two declarations by name and nothing else (ADR 0046, ADR 0076).
+/// is two declarations by name and nothing else (ADR 042, ADR 016).
 const Key = struct {
     bytes: [4]u8,
 
@@ -999,7 +999,7 @@ const Key = struct {
 };
 
 test "a type that writes its own JSON and says what it looks like is a leaf, not a wall" {
-    // The whole of ADR 0182: this used to answer false, and one such field
+    // The whole of ADR 148: this used to answer false, and one such field
     // anywhere sent the entire response to `std.json`.
     comptime std.debug.assert(covers(Key));
     comptime std.debug.assert(covers(struct { id: Key, name: []const u8 }));
@@ -1030,7 +1030,7 @@ fn Doc(comptime T: type) type {
 test "a document is written as its value, inside a struct that renames its fields" {
     // Item 63: a Row with a `jsonb` column could not rename its fields, because
     // `Json(T)` writes itself and does not say it is a scalar — it is not one.
-    // It says something stronger, which type it is exactly (ADR 0202).
+    // It says something stronger, which type it is exactly (ADR 163).
     const Theme = struct { theme: []const u8, contrast: u8 };
     const Row = struct {
         pub const nilo_json = .{ .rename_all = .camelCase };
@@ -1086,7 +1086,7 @@ test "a document whose value renames its own fields is walked, and one std.json 
 
     // A value the writer cannot walk, holding a renamed struct: the leaf path
     // would hand it to `std.json`, which writes `full_name` — so `covers` says
-    // no and the ordinary fallback refusal (ADR 0181) is what the caller sees.
+    // no and the ordinary fallback refusal (ADR 148) is what the caller sees.
     const Wall = struct {
         inner: Inner,
         raw: [3]u8,
@@ -1124,7 +1124,7 @@ test "a leaf that says nothing about its JSON still takes the value with it" {
 test "a struct of keys can say how its fields are spelled" {
     // Item 46, reopened: every response in the reporting product holds at
     // least one `sql.Uuid`, so `rename_all` was refused on every one of them
-    // while the document promised the renamed keys (ADR 0181, ADR 0182).
+    // while the document promised the renamed keys (ADR 148).
     const Contact = struct {
         pub const nilo_json = .{ .rename_all = .camelCase };
 
@@ -1147,7 +1147,7 @@ test "one field can be spelled on its own, and the entry wins over the case" {
     // Item 67: `estimated_cost_amount_minor` is `estimatedCostMinor` on the
     // wire — the frontend's schema, three screens and the generated client
     // all say so — and `rename_all` cannot get there from the column name
-    // (ADR 0207).
+    // (ADR 168).
     const Summary = struct {
         pub const nilo_json = .{
             .rename_all = .camelCase,

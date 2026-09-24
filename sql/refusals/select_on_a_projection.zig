@@ -1,7 +1,7 @@
 //! A projection handed to a call that writes its own SQL. `db.select` has to
 //! put a table after `FROM`, and a Row that says `.projection` has said there
 //! is not one
-//! ([ADR 0155](../../docs/adr/0155-a-row-that-owns-no-table.md)).
+//! ([ADR 125](../../docs/adr/125-a-row-that-owns-no-table.md)).
 
 const std = @import("std");
 const nilo = @import("nilo_http");

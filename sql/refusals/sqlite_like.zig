@@ -1,6 +1,6 @@
 //! `like` on SQLite, whose `LIKE` folds ASCII case and cannot be told not to
 //! by a statement — the same fact `contains` is refused for there, caught
-//! up with (ADR 0263).
+//! up with (ADR 055).
 //!
 //! Until it was, `.like` compiled on SQLite and matched `Ada@` against
 //! `ada@`, on that database only; a program that wanted the folding writes

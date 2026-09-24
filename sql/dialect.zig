@@ -1,6 +1,6 @@
 //! The half that writes the SQL — the entire contract this module asks of a
 //! database's grammar, listed here the way `bulkhead.zig` lists the Engine's
-//! (ADR 0039).
+//! (ADR 036).
 //!
 //! There are two seams rather than one, because two different things get
 //! replaced and they get replaced independently. Swapping the Postgres driver
@@ -24,7 +24,7 @@
 //! placeholders. That was right about the constraint and wrong about the
 //! conclusion: SQLite binds the list as one JSON document and takes it apart
 //! in the statement, which keeps the text a constant. **The prediction
-//! survived a year because nobody wrote the Dialect** (ADR 0061).
+//! survived a year because nobody wrote the Dialect** (ADR 055).
 //!
 //! **Two Dialects ship and both now have a Wire.** `SQLite` below began as
 //! the SQL half only, written to answer whether this seam is in the right
@@ -33,7 +33,7 @@
 //! database and no event loop. Twelve of its thirteen declarations fitted with
 //! nothing changed outside it; the thirteenth is why `ListForm` has four
 //! values instead of three
-//! ([ADR 0061](../docs/adr/0061-the-second-dialect-is-the-test-of-the-seam.md)).
+//! ([ADR 055](../docs/adr/055-the-second-dialect-is-the-test-of-the-seam.md)).
 //!
 //! **The three declarations after those thirteen each arrived the same way**,
 //! and it is worth knowing what that way is before adding a fourteenth.
@@ -42,9 +42,9 @@
 //! rather than by reading this file: the read half had mapped every one of them
 //! to `[]const u8` while the write half handed the driver a Zig value it could
 //! not bind. Twice that was a `@compileError` from inside zqlite naming a Zig
-//! issue ([ADR 0078](../docs/adr/0078-a-uuid-is-whatever-the-database-stores.md),
-//! [ADR 0119](../docs/adr/0119-the-sqlite-write-path-is-compiled.md)).
-//! A `Timestamp` is the one still outstanding.
+//! issue ([ADR 067](../docs/adr/067-a-value-is-whatever-the-database-stores.md)).
+//! `Timestamp` was the fourth, found the other way round: the startup check
+//! wanted TEXT where the write binds an integer (the same ADR).
 
 const std = @import("std");
 const core = @import("nilo_core");
@@ -63,7 +63,7 @@ pub const ListForm = enum {
     /// JSON array as text. SQLite's own idiom, and the reason this enum has
     /// four values rather than three: it keeps the statement a constant on a
     /// database with no array type, which `.expanded` does not and
-    /// `.unsupported` gives up on (ADR 0061).
+    /// `.unsupported` gives up on (ADR 055).
     ///
     /// What it asks of a Wire is the one thing that is not free — the list
     /// has to arrive as JSON text rather than as a native array.
@@ -93,7 +93,7 @@ pub const Nulls = enum { first, last };
 /// memory, which is the decision this whole family turns on. `'%' || $1 || '%'`
 /// with the `%` and `_` inside `$1` escaped by the database costs no allocation
 /// at all, where building the pattern on this side costs one per condition — in
-/// a module whose headline claim is that a statement costs none (ADR 0018).
+/// a module whose headline claim is that a statement costs none (ADR 017).
 pub const Pattern = enum { contains, starts_with, ends_with };
 
 /// How a read holds on to the rows it matched, until the transaction around
@@ -122,7 +122,7 @@ pub const Lock = enum {
 };
 
 /// What a field of a grouped Row reads over the rows of its group
-/// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+/// ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
 ///
 /// Six, and they are the six both databases spell alike: `count(*)`,
 /// `count("col")`, `count(DISTINCT "col")`, `sum`, `min`, `max` and `avg` are
@@ -156,7 +156,7 @@ pub const Aggregate = enum {
 
 /// Postgres, and for now the only one.
 /// How a database stores a `Uuid`, which is the one column type the two Wires
-/// disagree about (ADR 0078).
+/// disagree about (ADR 067).
 pub const UuidForm = enum {
     /// Sixteen bytes, which is what a Postgres `uuid` column is.
     bytes,
@@ -172,7 +172,7 @@ pub const UuidForm = enum {
 /// Wires disagree about, and it is here for the same reason: it was answered
 /// only for the *read* side. `WireRead` has always mapped both to `[]const u8`,
 /// so a Row carrying one compiled for `db.select` and stopped compiling at
-/// `db.insert`, four frames inside zqlite (ADR 0119).
+/// `db.insert`, four frames inside zqlite (ADR 067).
 pub const ValueForm = enum {
     /// The database has the type and the driver has an encoder for it: a
     /// Postgres `jsonb` written through `std.json`, or a Postgres enum.
@@ -236,7 +236,7 @@ pub const Postgres = struct {
     /// Whether this database's plain `LIKE` already folds ASCII case. Postgres
     /// has two words for the two behaviours; a Dialect whose one word folds
     /// answers `.ilike` with it, since `ILIKE` would be a syntax error there
-    /// (`where.zig`, ADR 0061).
+    /// (`where.zig`, ADR 055).
     pub const like_folds = false;
 
     /// `LIMIT`/`OFFSET`, which most dialects agree on and one day one will not.
@@ -250,7 +250,7 @@ pub const Postgres = struct {
 
     /// An aggregate as a grouped Row reads it, cast to the type its field
     /// declares
-    /// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+    /// ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
     ///
     /// **The cast is load-bearing, and `sum` is why.** Postgres answers
     /// `sum(int4)` as `int8` and `sum(int8)` as `numeric`, and `avg` of any
@@ -279,7 +279,7 @@ pub const Postgres = struct {
 
     /// The keys a children field's statement is joined against, one row each,
     /// numbered in the order they were bound
-    /// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+    /// ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
     ///
     /// **Numbered rather than filtered with `= ANY($1)`**, because the number
     /// is what hands each child to its parent: the rows come back ordered by
@@ -384,7 +384,7 @@ pub const Postgres = struct {
     /// Everything is asked for as itself except a **text column** — a type
     /// that reads and writes itself as the text Postgres prints, which is
     /// `Decimal`, `Interval`, `Inet` and anything a project declared the same
-    /// way (ADR 0055). Those are asked for as `::text`, because that is the
+    /// way (ADR 049). Those are asked for as `::text`, because that is the
     /// one representation every Postgres type has and the only one a module
     /// that does not know the type can decode.
     ///
@@ -398,7 +398,7 @@ pub const Postgres = struct {
     /// both sides.
     ///
     /// Column *names* do not matter here: this module reads by position
-    /// because the caller wrote the `SELECT` list (ADR 0039), so a cast that
+    /// because the caller wrote the `SELECT` list (ADR 036), so a cast that
     /// changes what Postgres would have called the column changes nothing.
     pub fn readAs(comptime quoted: []const u8, comptime T: type) []const u8 {
         // A `Bytes` is asked for as itself. It is the one column here whose
@@ -438,7 +438,7 @@ pub const Postgres = struct {
             // is the one place this file has to know what the driver cannot
             // do: pg.zig has no `date` encoder, so without the cast Postgres
             // infers `text` for the parameter and refuses the insert
-            // (ADR 0221). The read half needs no cast at all, which is the
+            // (ADR 181). The read half needs no cast at all, which is the
             // whole difference from `sql.AsText("date")`.
             if (types.isDate(T)) break :blk placeholder_text ++
                 "::date" ++ if (list) "[]" else "";
@@ -528,7 +528,7 @@ pub const Postgres = struct {
             }
             // **A Zig enum that has not named a database type is a `text`
             // column**, and the words it may hold become a `CHECK` beside it
-            // ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+            // ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
             // `accepts` still declines for one, and the two are not in
             // disagreement: creating a column is a decision nilo makes, and
             // reading one is a judgement about a column somebody else may have
@@ -608,7 +608,7 @@ pub const Postgres = struct {
     /// at all.
     pub const trigger_repeatable_head = "CREATE OR REPLACE TRIGGER ";
 
-    /// The three lists a `sql.Schema` carries beside its tables (ADR 0253).
+    /// The three lists a `sql.Schema` carries beside its tables (ADR 181).
     /// Postgres has all three; the head is what `createMissing` sends for a
     /// view, and `CREATE OR REPLACE VIEW` is the one form Postgres has —
     /// there is no `IF NOT EXISTS` on a view — so a view whose columns went
@@ -651,7 +651,7 @@ pub const Postgres = struct {
     /// then means whatever `search_path` resolves to, and the relation.
     ///
     /// **`pg_catalog` rather than `information_schema`, for three reasons that
-    /// each showed up as a wrong answer** (ADR 0056):
+    /// each showed up as a wrong answer** (ADR 050):
     ///
     /// - A **materialized view** is not in `information_schema.columns` at
     ///   all. A Row over one was reported as a table that does not exist,
@@ -725,7 +725,7 @@ pub const Postgres = struct {
         // Text, in the spelling this framework prefers. `Str` comes from Core,
         // which knows nothing about databases, so the answer for it is here
         // rather than on the type — the same arrangement `declaredColumn`
-        // makes for `Uuid`, and for the same reason (ADR 0042).
+        // makes for `Uuid`, and for the same reason (ADR 038).
         if (Inner == core.Str) return text_accepts;
 
         // Bytes, which is the one type here that is neither text nor a
@@ -790,7 +790,7 @@ pub const Postgres = struct {
 
         // `uuid[]`, which is what `WHERE id = ANY($1::uuid[])` needs and the
         // one array type a modern schema has as many of as it has ids
-        // ([ADR 0145](../docs/adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
+        // ([ADR 116](../docs/adr/116-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
         // Postgres's own name for it is `_uuid`, the same underscore prefix
         // every other array type here carries.
         if (Bare == types.Uuid) return &.{"_uuid"};
@@ -833,7 +833,7 @@ pub const Postgres = struct {
 };
 
 /// SQLite, which is here to answer whether the seam holds
-/// ([ADR 0061](../docs/adr/0061-the-second-dialect-is-the-test-of-the-seam.md)).
+/// ([ADR 055](../docs/adr/055-the-second-dialect-is-the-test-of-the-seam.md)).
 ///
 /// **It writes SQL and there is no Wire behind it**, which is the honest
 /// scope: a Dialect is comptime and touches no I/O, so it can be finished and
@@ -848,7 +848,7 @@ pub const Postgres = struct {
 pub const SQLite = struct {
     pub const name = "sqlite";
 
-    /// Text, and this row is why `sql.Uuid` compiles here at all (ADR 0078).
+    /// Text, and this row is why `sql.Uuid` compiles here at all (ADR 067).
     /// SQLite has no uuid type; `acceptsSqlite` routes the column to TEXT
     /// because `Uuid` declares one, and the write half used to disagree with
     /// it by trying to send sixteen raw bytes — which zqlite refuses while
@@ -857,7 +857,7 @@ pub const SQLite = struct {
     pub const uuid_form: UuidForm = .text;
 
     /// Text, both of them, and the two rows `uuid_form` should have been
-    /// followed by (ADR 0119). SQLite has no `jsonb` and no enum type, so
+    /// followed by (ADR 067). SQLite has no `jsonb` and no enum type, so
     /// `acceptsSqlite` has always routed both columns to TEXT — while the
     /// write half handed zqlite the `Json(T)` wrapper struct and the Zig enum
     /// itself, neither of which its `_bind` takes. That is a compile error
@@ -896,7 +896,7 @@ pub const SQLite = struct {
 
     /// **The one that did not fit.** SQLite has no array type, so `= ANY($1)`
     /// is not available and expanding the list into placeholders breaks
-    /// ADR 0039. Before this Dialect existed the seam had three answers and
+    /// ADR 036. Before this Dialect existed the seam had three answers and
     /// SQLite would have taken the third, `.unsupported` — `.in` refused
     /// outright, on a database where every real schema uses it.
     ///
@@ -963,7 +963,7 @@ pub const SQLite = struct {
     /// without `PRAGMA case_sensitive_like`, and a pragma is a property of the
     /// connection rather than of the statement. So the folding operators are
     /// this database's plain `LIKE`, and the case-sensitive ones are a Refusal
-    /// naming it (ADR 0061). A match that quietly ignored case on one of the
+    /// naming it (ADR 055). A match that quietly ignored case on one of the
     /// two databases is exactly the kind of lie the seam exists not to tell.
     pub fn pattern(
         comptime quoted: []const u8,
@@ -1027,7 +1027,7 @@ pub const SQLite = struct {
     /// no array parameter; the batch form it *does* have is
     /// `VALUES (…), (…), (…)`, whose text grows with the batch — a statement
     /// that is no longer a constant, which is the rule this module is built
-    /// on rather than a preference (ADR 0039).
+    /// on rather than a preference (ADR 036).
     ///
     /// A row at a time inside one transaction is the answer, and on SQLite
     /// it is a cheaper answer than it sounds: there is no round trip to pay
@@ -1043,7 +1043,7 @@ pub const SQLite = struct {
     /// What comes out is an affinity name rather than a precise type, which is
     /// what SQLite has: `INTEGER`, `TEXT`, `REAL`. A `Timestamp` writes
     /// `INTEGER` and not `TEXT`, which is the column it is actually bound into
-    /// ([ADR 0136](../docs/adr/0136-a-timestamp-is-checked-against-the-column-it-is-bound-into.md)).
+    /// ([ADR 067](../docs/adr/067-a-value-is-whatever-the-database-stores.md)).
     pub fn columnType(comptime T: type) ?[]const u8 {
         return comptime blk: {
             const named = acceptsSqlite(T) orelse break :blk null;
@@ -1063,7 +1063,7 @@ pub const SQLite = struct {
     ///
     /// SQLite serialises writers over the whole database, and the Wire here
     /// holds exactly one writing connection
-    /// ([ADR 0074](../docs/adr/0074-one-writer-is-not-a-setting-it-is-the-database.md)),
+    /// ([ADR 065](../docs/adr/065-one-writer-is-not-a-setting-it-is-the-database.md)),
     /// so two fibers in one process cannot migrate at once. **Two separate
     /// processes still can**, and what stops them is the database's own write
     /// lock plus `busy_timeout`: the second one waits for the first
@@ -1086,7 +1086,7 @@ pub const SQLite = struct {
     /// So the diff refuses rather than emitting something that means something
     /// else, and the Refusal spells the four statements out. That is the same
     /// answer `.lock` and `insertMany` already give here, one layer up
-    /// ([ADR 0061](../docs/adr/0061-the-second-dialect-is-the-test-of-the-seam.md)).
+    /// ([ADR 055](../docs/adr/055-the-second-dialect-is-the-test-of-the-seam.md)).
     pub const can_alter_column = false;
 
     /// SQLite keeps trigger names per database rather than per table, so
@@ -1101,7 +1101,7 @@ pub const SQLite = struct {
     /// callback registered on the connection, and an extension is a shared
     /// library loaded into it. Neither is a statement, so `sql.Schema`
     /// refuses both lists here rather than sending text the database
-    /// cannot read (ADR 0253). Views it has, with `IF NOT EXISTS`.
+    /// cannot read (ADR 181). Views it has, with `IF NOT EXISTS`.
     pub const has_extensions = false;
     pub const has_functions = false;
     pub const view_repeatable_head = "CREATE VIEW IF NOT EXISTS ";
@@ -1120,7 +1120,7 @@ pub const SQLite = struct {
     ///
     /// **Milliseconds, and the three zeros on the end are the cost being
     /// stated.** A `Timestamp` is microseconds since the epoch in an `INTEGER`
-    /// column (ADR 0136), and SQLite has no clock that reads finer than a
+    /// column (ADR 067), and SQLite has no clock that reads finer than a
     /// millisecond in an expression every version of it has: `unixepoch('subsec')`
     /// arrived in 3.42 and `julianday` is a double, which loses digits long
     /// before it reaches microseconds. So this counts milliseconds in a double
@@ -1137,7 +1137,7 @@ pub const SQLite = struct {
     /// `NOT NULL` is not decoration either: without it `pragma_table_info`
     /// reports the column as nullable and `schema.compare` stops a server whose
     /// table is correct, which is exactly what
-    /// [ADR 0115](../docs/adr/0115-an-integer-primary-key-is-the-rowid.md) is
+    /// [ADR 050](../docs/adr/050-a-view-or-a-rowid-alias-is-not-a-nullable-column.md) is
     /// about and what `stress/arsip` was bitten by.
     ///
     /// `AUTOINCREMENT` costs a `sqlite_sequence` row and buys the one thing
@@ -1169,10 +1169,10 @@ pub const SQLite = struct {
     /// The three columns are the same three: name, type, and a nullability
     /// with three answers. `notnull` is 0 or 1 and a SQLite view answers 0
     /// for every column exactly as a Postgres view does, so `UNKNOWN` is
-    /// reached the same way (ADR 0056) — through `sqlite_master.type`.
+    /// reached the same way (ADR 050) — through `sqlite_master.type`.
     ///
     /// **The third branch is the rowid, and it is here because without it a
-    /// correct table stopped the server** (ADR 0115). `id INTEGER PRIMARY KEY`
+    /// correct table stopped the server** (ADR 050). `id INTEGER PRIMARY KEY`
     /// is an *alias for the rowid* rather than a constraint, so SQLite reports
     /// `notnull = 0` for it — meaning "there is no NOT NULL clause here",
     /// not "this may be null", because a rowid never is. Reading that 0 as
@@ -1241,7 +1241,7 @@ pub const SQLite = struct {
         if (Inner == core.Str) return text_accepts;
 
         // **A `Timestamp` is bound as an integer, so it is checked against
-        // one** (ADR 0136). It declares `timestamptz` like the rest and is the
+        // one** (ADR 067). It declares `timestamptz` like the rest and is the
         // one declared column type this module does not send as text:
         // `WireWrite` answers `i64` whatever the Dialect is. Judging it as
         // TEXT is what made `created_at INTEGER` — the column that matches
@@ -1303,10 +1303,10 @@ pub const SQLite = struct {
 pub fn assertDialect(comptime D: type) void {
     comptime {
         // The last five arrived with the schema half: `now_default`,
-        // `can_alter_constraint` and `text_accepts` from ADR 0221 — what `.now`
+        // `can_alter_constraint` and `text_accepts` from ADR 181 — what `.now`
         // writes, whether a table constraint can be replaced in place, and the
         // text list `columnType` and the startup check both read — and the two
-        // trigger words from ADR 0226: whether dropping one names the table,
+        // trigger words from ADR 181: whether dropping one names the table,
         // and how one is written when it may already be there.
         //
         // One a line rather than four, because a comment between two rows of a
@@ -1501,7 +1501,7 @@ test "the three column types the two databases store differently each say so" {
     // does a driver refuse to bind on its own" rather than a style choice.
     // Every one of these was found by compiling a *write* — the read half had
     // mapped all three to `[]const u8` while the write half handed the driver
-    // a Zig value (ADR 0078, ADR 0119).
+    // a Zig value (ADR 067).
     try testing.expectEqual(UuidForm.bytes, Postgres.uuid_form);
     try testing.expectEqual(ValueForm.native, Postgres.json_form);
     try testing.expectEqual(ValueForm.native, Postgres.enum_form);
@@ -1522,7 +1522,7 @@ test "a Timestamp is checked against the column it is actually bound into" {
     // `i64` on both Wires. Judging it by its declared Postgres name put it
     // with the other three, so the column that matches what is bound —
     // `created_at INTEGER` — failed the startup check while a TEXT column
-    // passed it and stored microseconds as digits (ADR 0136).
+    // passed it and stored microseconds as digits (ADR 067).
     const accepts = SQLite.accepts(types.Timestamp).?;
     try testing.expectEqualStrings("INTEGER", accepts[0]);
 
@@ -1580,7 +1580,7 @@ test "a numeric is bound as digits and cast back, so nothing goes through a floa
 
 test "a date is read as the column and written as text, which is the driver's shape" {
     // **The read half carries no cast**, which is the whole difference from
-    // `sql.AsText("date")` and the reason `sql.Date` exists (ADR 0221): a
+    // `sql.AsText("date")` and the reason `sql.Date` exists (ADR 181): a
     // `db.raw` statement over one needs nothing written around the column.
     try testing.expectEqualStrings("\"due\"", Postgres.readAs(Postgres.quote("due"), types.Date));
     try testing.expectEqualStrings("\"due\"", Postgres.readAs(Postgres.quote("due"), ?types.Date));
@@ -1614,7 +1614,7 @@ test "a list column reads out of the array of what it holds" {
     try testing.expectEqualStrings("_float8", Postgres.accepts([]const f64).?[0]);
     // `uuid[]`, which had no case at all and fell to the `else` — so a Row
     // reading one was refused at startup by the check rather than by anything
-    // that had looked at the column (ADR 0145).
+    // that had looked at the column (ADR 116).
     try testing.expectEqualStrings("_uuid", Postgres.accepts([]const types.Uuid).?[0]);
     try testing.expectEqualStrings("_uuid", Postgres.accepts([]const ?types.Uuid).?[0]);
     try testing.expectEqualStrings("_uuid", Postgres.accepts(?[]const types.Uuid).?[0]);
@@ -1711,7 +1711,7 @@ test "a list column is created with brackets, and read out of the catalog's name
 }
 
 test "an enum is a text column to create, and a column no dialect will judge to read" {
-    // **The two halves answer differently on purpose** (ADR 0221). Creating a
+    // **The two halves answer differently on purpose** (ADR 181). Creating a
     // column is a decision nilo makes: an enum with nothing to say about its
     // column is `text`, and the words it may hold become a CHECK beside it.
     // Reading one is a judgement about a column somebody else may have made a

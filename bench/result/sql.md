@@ -234,7 +234,7 @@ past the point where the pool has more connections than the database has cores
 to serve them, extra connections buy queueing rather than concurrency.
 
 The 128 row is not a footnote. It is how [ADR
-0062](../../docs/adr/0062-a-pool-that-dialled-itself-whatever-it-was-told.md)
+115](../../docs/adr/115-a-boot-dials-the-connection-its-work-needs.md)
 was found — `connect_on_init` was 8 and the pool still exhausted a hundred
 backends, which is arithmetic that does not work unless the option is being
 ignored. It was. Every pool nilo had ever opened dialled itself in full, and
@@ -253,7 +253,7 @@ sit idle.
 | `/people/:id` | the same, plus one `db.find` | **17,022** |
 | `/deep/:id` | `/fixed` plus 8 KiB of stack touched — **no database** | **17,932** |
 
-The first row confirms ADR 0018's 8,767 to within eighteen bytes, which is what
+The first row confirms ADR 017's 8,767 to within eighteen bytes, which is what
 a floor should do. **The fourth row is the finding**: a handler that does
 nothing but `@memset` an 8 KiB array holds *more* per idle connection than one
 that runs a query. The 7.3 kB the database route looked like it cost is not the
@@ -268,7 +268,7 @@ database — it is how deep pg.zig's protocol code goes.
 One for one. A suspended fiber holds its stack at its high-water mark for the
 life of the connection, so **every byte a handler ever touches is a byte held
 until that connection closes**. The write-up is [ADR
-0063](../../docs/adr/0063-a-handlers-stack-is-per-connection.md); the guidance
+062](../../docs/adr/062-where-a-connection-waits-is-what-it-costs.md); the guidance
 it produces is the opposite of the usual Zig instinct — *in this framework the
 arena is cheaper than the stack.*
 
@@ -421,7 +421,7 @@ call crosses before it becomes a statement.
 
 **The batch shape measures two strategies, not two implementations.** pg.zig and
 `nilo_sql` send one array per column and `unnest` server-side, so the statement
-text is a constant whatever the batch size (ADR 0053). GORM, Diesel, Drizzle and
+text is a constant whatever the batch size (ADR 047). GORM, Diesel, Drizzle and
 Prisma build a multi-row VALUES, so the text grows with the batch and Postgres
 parses a new statement every time: 1.3 µs a row against 14 µs.
 
@@ -521,13 +521,13 @@ One writer and eight readers over a 2.9 MB table, 50,000 rows:
 | after every reader has scanned the whole table | 16,892 KiB | **1,876 KiB** |
 
 `PRAGMA cache_size` defaults to `-2000` — 2,000 KiB — and **it is a ceiling,
-not an allocation**. ADR 0074's first draft said a connection holds "roughly
+not an allocation**. ADR 065's first draft said a connection holds "roughly
 2 MB … for the life of the pool" and that is only true of the second row. The
 correction is the useful part: a service doing primary-key lookups pays the
 first row, and the number a deployment sees is its working set.
 
 Two numbers not to confuse with these: **an idle HTTP connection is unaffected**
-(a pool connection is not a request's), and the prepared statements ADR 0057
+(a pool connection is not a request's), and the prepared statements ADR 051
 keeps are on top of both and are still unmeasured.
 
 ### What the page cache buys, in reads
@@ -565,7 +565,7 @@ line — which database the single route reads. Stripped:
 | names `sql.Sqlite` | 2,202,304 |
 | **SQLite's cost to a program that uses it** | **524,840** |
 
-**Re-run after the twenty-findings pass** (ADRs 0075–0084), same machine, same
+**Re-run after the twenty-findings pass** (ADRs 066–0084), same machine, same
 command, both trees built from a `git archive` so the before is built rather
 than quoted:
 
@@ -581,7 +581,7 @@ the growth is not SQLite's — `example-hello`, which has no database in it at
 all, moved 881,296 → 892,696 on the same pass, so the framework grew by about
 11 KB and both probes carry it. SQLite's own share went *down* by 1,488 bytes,
 which is the Dialect learning what form a uuid takes
-([ADR 0078](../../docs/adr/0078-a-uuid-is-whatever-the-database-stores.md))
+([ADR 067](../../docs/adr/067-a-value-is-whatever-the-database-stores.md))
 replacing what the SQLite Wire used to do about it.
 
 `strings … | grep -ci sqlite` still answers 0 against the Postgres-only binary,
@@ -602,7 +602,7 @@ zero SQLite.**
 
 ### Five behavioural claims, and the one that was wrong
 
-ADR 0074 was written from SQLite's documentation and said so. Running it held
+ADR 065 was written from SQLite's documentation and said so. Running it held
 five claims — `:memory:` is private per connection, the shared URI form is one
 database, WAL is unavailable in memory and *answers `memory` rather than
 failing*, a shared in-memory database dies with its last connection, and a
@@ -624,7 +624,7 @@ memory is a correctness requirement rather than a coverage preference.
 `zig build bench-sql` now has a SQLite half. It needs no server — a file in
 `/tmp`, made and dropped by the program — and it asks the same question §1 asks
 of Postgres, in the same three statement shapes, plus a write arm at both
-`synchronous` settings because [ADR 0074](../../docs/adr/0074-one-writer-is-not-a-setting-it-is-the-database.md)
+`synchronous` settings because [ADR 065](../../docs/adr/065-one-writer-is-not-a-setting-it-is-the-database.md)
 will not let a SQLite number be published without its durability beside it.
 
 **It was run, and the run's finding is about the machine.** Three consecutive
@@ -678,7 +678,7 @@ run has to be repeated on.
 ### What is missing from this section, and it is most of a benchmark
 
 - **Every timing that means anything**, for the reason §9.5 gives. And the one
-  ADR 0073 is explicitly waiting for is not even in the harness: `.hop` against
+  ADR 064 is explicitly waiting for is not even in the harness: `.hop` against
   `.in_fiber` needs the Engine and a load generator — a run of `bench-sql-server`
   with each — rather than a single-threaded program.
 - **A comparison.** §8 puts `nilo_sql` beside nine Postgres clients. The
@@ -695,7 +695,7 @@ run has to be repeated on.
 ## 10. The migration module costs the server nothing, and that is measured
 
 **What it answers.** `sql/migrate.zig` and the four files under it landed with
-ADR 0153. The claim in the ADR's cost table is that a server which imports
+ADR 123. The claim in the ADR's cost table is that a server which imports
 `nilo_sql` and never calls a migration function carries none of it. That is the
 one axis of the four this module could plausibly spend, so it is the one with a
 number.
@@ -734,7 +734,7 @@ is built rather than quoted.
 
 ### 10b. The marker's new words cost the same nothing, re-measured
 
-**What it answers.** ADR 0221 put `.default`, an enum column's `CHECK`, a
+**What it answers.** ADR 181 put `.default`, an enum column's `CHECK`, a
 partial and ordered `.index`, a `.name` on any constraint and `sql.Date` into
 the marker. The first four are comptime and reachable only from `migrate`; the
 fifth is a type, and both Wires gained a branch for it. The question is whether
@@ -754,17 +754,17 @@ directory, `zig build size-sql` on both sides, stripped `ReleaseFast`, and
 `sql.Date` in it never compiles them, and the rest never leaves `table.zig`.
 
 **What it changed.** Nothing, which is the answer that was wanted: the cost
-table in ADR 0221 says 0 on all four axes and the fourth is measured rather than
+table in ADR 181 says 0 on all four axes and the fourth is measured rather than
 reasoned. The two absolutes moved again since 10 above, `pg_only` +14,960 and
 `sqlite_only` +13,888 over what shipped between, which is the same standing
 reason to build the before.
 
 ### 10c. The words that cross tables, and the version file, cost nothing either
 
-**What it answers.** ADR 0222 made a foreign key a *list* of columns and let it
-name its table as text; ADR 0223 reshaped the generated version file and added
+**What it answers.** ADR 181 made a foreign key a *list* of columns and let it
+name its table as text; ADR 123 reshaped the generated version file and added
 `generate --baseline`. The first of those is the one worth measuring: unlike
-ADR 0221's words, it changes a runtime comparison — `Reference.sameAs` now walks
+ADR 181's words, it changes a runtime comparison — `Reference.sameAs` now walks
 two lists where it used to compare two names — and `where.zig` builds a join
 fragment in a loop. The second touches `migrations.zig`, which is the half of
 the module that opens files.
@@ -791,10 +791,10 @@ composite `.exists` costs a longer string literal and no instructions.
 
 ### 10d. The second kind of word, an array default and the `.sql` twin: nothing again
 
-**What it answers.** ADR 0226 put `.check` and `.trigger` in the marker, which
-adds two lists to `Desc` and two new diff functions to `migrate.zig`; ADR 0225
-made an array column's default a list; ADR 0227 has `generate` write a `.sql`
-file beside every version and `check` compare the two. ADR 0224 added a mirror
+**What it answers.** ADR 181 put `.check` and `.trigger` in the marker, which
+adds two lists to `Desc` and two new diff functions to `migrate.zig`; ADR 181
+made an array column's default a list; ADR 123 has `generate` write a `.sql`
+file beside every version and `check` compare the two. ADR 181 added a mirror
 struct to `snapshot.zig` for an older file. The question is the same one 10b and
 10c asked, and the reason to ask it again is that this round is the first to
 put new code in the *runtime* half of the diff rather than only in `table.zig`.
@@ -852,8 +852,8 @@ control: the `.sql` twin applied by `psql -f` to a third, empty database, with
 no nilo in the loop, which has to come out identical and has to leave a ledger
 row `db verify` accepts.
 
-**The three rounds.** v0.4.0 at `eb545fa`; `636d7b6` after ADR 0220 to 0223;
-`87759b1` after ADR 0224 to 0227.
+**The three rounds.** v0.4.0 at `eb545fa`; `636d7b6` after ADR 180 to 0223;
+`87759b1` after ADR 181 to 0227.
 
 | | `eb545fa` | `636d7b6` | `87759b1` |
 |---|---|---|---|
@@ -939,10 +939,10 @@ The row nilo loses outright is authoring, and it loses it to the two SQL-first
 tools only. The twin fixes applying, and it fixes it more completely than
 Prisma's `.sql` does, because it carries the ledger row and Prisma's needs
 `migrate resolve` after a manual apply. But a DBA cannot write a version in
-SQL and have nilo pick it up, and ADR 0153 says why not on purpose. goose and
+SQL and have nilo pick it up, and ADR 123 says why not on purpose. goose and
 Atlas can. That is the first question a team whose database is shared with
 another language will ask, and the answer is no. The `down` row is not a loss:
-it is refused, and §10's ADR 0153 gives the reason.
+it is refused, and §10's ADR 123 gives the reason.
 
 ### The score
 
@@ -960,7 +960,7 @@ with. Out of five.
 | Outside Zig | 3.5 | The twin: 1,473 lines, `psql -f`, 875 of 875, ledger row included. Authoring stays Zig. Django, Ecto and Alembic make the same trade; goose, dbmate, Flyway and Atlas do not. |
 | Errors and documentation | 5 | Every refusal is a sentence that says what to do. Nine assistants converted thirteen files from a one-page recipe and the first build compiled. `guide/sql/migrations.md` grew 153 lines for four ADRs. |
 | The loop | 4 | 1.7 s to rebuild after one file, no database for `check`. Off a point because `zig build db -- check` buries a non-zero exit under `failed command` and a Build Summary; that is the Zig build runner, not nilo, and it is paid daily. Calling `./zig-out/bin/db` directly is the answer. |
-| Maturity | 2.5 | Three `feat!` in three rounds; the snapshot changed shape once (ADR 0224 reads the old one). Postgres and SQLite only. No introspection of an existing database, no studio, no seed. Version 1 of this port is three committed files, 80.0 + 67.7 + 119.6 KB, where goose is one file of 1,483 lines. |
+| Maturity | 2.5 | Three `feat!` in three rounds; the snapshot changed shape once (ADR 181 reads the old one). Postgres and SQLite only. No introspection of an existing database, no studio, no seed. Version 1 of this port is three committed files, 80.0 + 67.7 + 119.6 KB, where goose is one file of 1,483 lines. |
 
 **Eight of ten overall.** On the work that is most of a migration tool's
 life (writing the schema, the diff, the guard, the errors) nilo is level with
@@ -971,7 +971,7 @@ written as strings.
 
 For a Zig program there is nothing to compare it to and it should be used.
 For a program whose database another language also writes to, it works
-since ADR 0227 and the person writing versions still needs Zig. For
+since ADR 123 and the person writing versions still needs Zig. For
 nodeflux-os the answer is yes, because the binary now knows its schema and
 the Go one never did.
 
@@ -980,7 +980,7 @@ hand-written steps from 15 to 12, item 15 is one branch, and a vocabulary
 that stops changing is what maturity means. On the port's side, not nilo's:
 `src/schema/` declares 59 tables a second time because 8 of the 59 context
 Rows leave out `created_at` and `updated_at`, and folding the two is what
-ADR 0222's by-name `.references` was for.
+ADR 181's by-name `.references` was for.
 
 ## 12. The arena's query at one connection
 
@@ -1011,7 +1011,7 @@ rows are meant), the arena's own `pgdb-seed.sql`, the routes in
 
 Postgres's own log (`log_min_duration_statement = 0`) puts its side of a
 `limit=50` query at **bind 0.11 ms + execute 0.15–0.28 ms**, after the one
-`parse` that ADR 0057's statement cache makes. The bind is the part worth a
+`parse` that ADR 051's statement cache makes. The bind is the part worth a
 sentence: it is 0.11 ms on the thirty-sixth execution as on the sixth,
 because `LIMIT $3` as a parameter is a plan Postgres cannot make generic —
 the generic plan's cost assumes ten per cent of the rows, the custom plan
@@ -1064,7 +1064,7 @@ Not slow: 1.5M handoffs a second with stealing on, and the arena needs 66k.
 **But four times faster with stealing off**, three of three, which is the
 scheduler churning the very wakes the pool makes — a `yield` or a
 `Condition.signal` puts a task on a ring, a searcher steals it, its next
-wait hands it back. ADR 0272 turned stealing off for the reason `http.md`
+wait hands it back. ADR 199 turned stealing off for the reason `http.md`
 gives, and this is a second reason from a second instrument. The arena run
 that produced the 66k had it on.
 
@@ -1076,7 +1076,7 @@ count a bigger pool buys queueing rather than concurrency, and the arena's
 under load is Postgres's, the rank is the database's; if it is nilo's, the
 pool is the next thing to read, and the shape is one lane of connections
 per executor with a local wait queue — a connection that never crosses a
-thread, which is what ADR 0272 already made of a request.
+thread, which is what ADR 199 already made of a request.
 
 
 ## Reproducing this
@@ -1167,7 +1167,7 @@ Docker port is measuring iptables.
 **2. One wasted round trip in pg.zig, ~2.6 µs, upstream but small.** This lever
 was written as "pipelining, unavailable" and §8 splits it in two. Pipelining
 proper is still unavailable and [ADR
-0059](../../docs/adr/0059-a-round-trip-is-not-the-cost-worth-chasing.md) was
+053](../../docs/adr/053-a-round-trip-is-not-the-cost-worth-chasing.md) was
 right to refuse it: the round trip is mostly kernel, and only pipelining
 amortises it. But **half of what pg.zig spends is not the round trip being
 expensive, it is pg.zig taking two where pgx and tokio-postgres take one.**
@@ -1184,7 +1184,7 @@ buffers back with `MADV_DONTNEED` when a connection goes quiet, and the stack
 belongs beside them at no extra cost. What blocks it is one number zio does not
 expose — the low end of the running fiber's stack. Guessing is not an option:
 zio carves 64 stacks from one slab, so an `madvise` a page past the limit would
-silently zero another connection's live stack. ADR 0063 has it in those terms.
+silently zero another connection's live stack. ADR 062 has it in those terms.
 
 **4. `result_state_size`, small and free.** pg.zig allocates result state for
 32 columns per connection whether a query has 32 or 2. `nilo_sql` knows the
@@ -1206,7 +1206,7 @@ is the socket, and after that it is somebody else's repository.**
 
 **Run:** `zig build bench-sql`, the `db.find through the whole module` row with `.prepared = true`, SQLite in a file under `/tmp`, in-process with no socket. Before is `git archive HEAD` at `ae1cb61`; after is the working tree. Three pairs, interleaved, best of five each. AMD Ryzen 7 9700X, 16 threads, Linux 7.2, Zig 0.16.0, 2026-09-23.
 
-**Why:** the line a SQLite statement writes when it gives up on a connection now names the statement holding it (ADR 0135). The first version also stored when the connection was taken, so the line could say for how long.
+**Why:** the line a SQLite statement writes when it gives up on a connection now names the statement holding it (ADR 107). The first version also stored when the connection was taken, so the line could say for how long.
 
 | | pair 1 | pair 2 | pair 3 |
 |---|---|---|---|
@@ -1221,7 +1221,7 @@ is the socket, and after that it is somebody else's repository.**
 
 ## 14. A Row with a parent, children or a sum costs a program without one nothing
 
-**What it answers.** ADR 0295 let a Row carry a parent, children and aggregates, and to read them it replaced the loop that fills a flat Row with `readRow`, which walks the fields by kind. That loop is on every read any program makes, so the question is whether a program that declares no such Row pays for the generalisation.
+**What it answers.** ADR 218 let a Row carry a parent, children and aggregates, and to read them it replaced the loop that fills a flat Row with `readRow`, which walks the fields by kind. That loop is on every read any program makes, so the question is whether a program that declares no such Row pays for the generalisation.
 
 **How.** `git archive HEAD | tar -x` at `3713789` into a scratch directory, `zig build size-sql -Dtarget=x86_64-linux-gnu` on both sides, stripped `ReleaseFast`. `bench-sql-server`, a whole server reading Postgres per request, was built the same way as a second reading.
 
@@ -1231,7 +1231,7 @@ is the socket, and after that it is somebody else's repository.**
 | names `sql.Sqlite` | 2,297,144 | 2,296,792 | −352 |
 | `bench-sql-server` | 1,884,024 | 1,883,864 | −160 |
 
-**What it changed.** Nothing to decide: the three move in both directions by less than a cache line's worth of instructions each, and `cmp` says they differ, so this is code laid out differently rather than code added. The statements themselves are comptime constants either way. It is the number ADR 0295 quotes for its binary-size axis.
+**What it changed.** Nothing to decide: the three move in both directions by less than a cache line's worth of instructions each, and `cmp` says they differ, so this is code laid out differently rather than code added. The statements themselves are comptime constants either way. It is the number ADR 218 quotes for its binary-size axis.
 
 **Can it be pushed further:** not by anything worth doing. The difference is where one `catch` sits: the flat loop caught each column's error, `readRow` returns it and the row is caught once.
 

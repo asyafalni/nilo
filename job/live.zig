@@ -1,8 +1,8 @@
 //! The tests that need a database, and the one place `job/` names `nilo_sql`
-//! (ADR 0198). A root of its own rather than a line in `job/job.zig`'s test
+//! (ADR 160). A root of its own rather than a line in `job/job.zig`'s test
 //! block, for the reason `fetch/deadline.zig` is one: putting it there would
 //! make `zig test job/job.zig` need a driver and cost the Fitting layer its
-//! entry condition (ADR 0070).
+//! entry condition (ADR 061).
 //!
 //! SQLite in memory is always here, so `zig build test-job-sql` needs nothing
 //! installed. Postgres runs when `DATABASE_URL` or `-Ddatabase-url=…` says
@@ -294,7 +294,7 @@ test "on Postgres a row is claimed with SKIP LOCKED, once, and a unique key hold
 test "the priority column carries a default, so it can be added to a table with rows" {
     // A column that may not be null and has no default is the one ALTER that
     // fails on a table that already has rows, and the one an older binary's
-    // INSERT — or a sibling binary's, which is ADR 0291's own case — walks
+    // INSERT — or a sibling binary's, which is ADR 215's own case — walks
     // into during a rolling deploy. No database needed: this is the DDL nilo
     // would write.
     const created = comptime sql.ddl.createTable(sql.dialect.Postgres, PgTable.Row);

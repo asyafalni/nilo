@@ -1,11 +1,11 @@
-//! How long a route gets (ADR 0133).
+//! How long a route gets (ADR 105).
 //!
 //! ```zig
 //! try app.with(nilo.deadline(2000)).get("/report", buildReport);
 //! ```
 //!
 //! `listen()`'s four deadlines bound one operation each — a head, a read of a
-//! body, a write, a gap between requests (ADR 0023) — and none of them bounds
+//! body, a write, a gap between requests (ADR 022) — and none of them bounds
 //! the request. A handler that reads a body slowly, calls two services and
 //! writes a large response can be inside every one of them all afternoon.
 //!
@@ -19,7 +19,7 @@
 //! **A handler that is running rather than waiting is not interrupted.** There
 //! is no cancellation here and deliberately none: a cancel that fires
 //! mid-handler is a cancel every handler, every `nilo.Mutex` and every Service
-//! has to survive, and [ADR 0104](../docs/adr/0104-a-cleanup-path-is-not-cancellable.md)
+//! has to survive, and [ADR 082](../docs/adr/082-a-cleanup-path-is-not-cancellable.md)
 //! has already had to carve the cleanup path out of cancellation once. A loop
 //! doing its own work asks `c.overdue()`.
 //!
@@ -70,7 +70,7 @@ pub fn with(comptime ms: u32) mw.Middleware {
         }
 
         /// `noinline` for the reason `allowance.sayIfEverybodyLooksTheSame` is
-        /// ([ADR 0071](../docs/adr/0071-where-a-connection-waits-is-what-it-costs.md)):
+        /// ([ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)):
         /// inlined, `std.log.warn`'s format machinery would sit on the frame
         /// of every request this covers, and a suspended fiber holds its stack
         /// at its high-water mark for the life of the connection.
@@ -225,7 +225,7 @@ test "every limit nilo arms is cut down to the deadline, and none is lengthened"
     try testing.expectEqual(@as(u32, 30_000), caught.within_ms);
 }
 
-// ---- listen()'s default deadline (ADR 0267) ----
+// ---- listen()'s default deadline (ADR 105) ----
 
 fn hasTheDefault(c: *Ctx) anyerror!void {
     // What `listen()` gave every request, seen from a route that set none.

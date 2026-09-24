@@ -1,7 +1,7 @@
 //! `db.rawPage` over a statement with no `count(*) OVER ()` on the end of
 //! its list. The total is read from the column after the Row's last
 //! field, and a list exactly the Row's width has no such column
-//! ([ADR 0279](../../docs/adr/0279-a-raw-statement-can-carry-its-total.md)).
+//! ([ADR 205](../../docs/adr/205-a-raw-statement-can-carry-its-total.md)).
 
 const std = @import("std");
 const nilo = @import("nilo_http");

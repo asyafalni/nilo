@@ -107,7 +107,7 @@ then on, which is what a suite behind a bearer token wants.
 deliberately malformed one. **There, write the `Host` yourself**: every other
 entry point puts one in for you, and an HTTP/1.1 request without one is a 400
 before it reaches a route
-([ADR 0101](../adr/0101-a-request-nobody-else-would-answer-is-refused.md)).
+([ADR 070](../adr/070-a-request-nobody-else-would-answer-is-refused.md)).
 `send` also applies neither `setHeader` nor the jar — the bytes are yours,
 exactly as given.
 
@@ -131,7 +131,7 @@ const answer = try client.get(&app, "/me");
 
 It is off by default so that a suite written before it existed keeps asserting
 what it always asserted
-([ADR 0108](../adr/0108-the-test-client-can-do-what-a-client-does.md)).
+([ADR 086](../adr/086-the-test-client-can-do-what-a-client-does.md)).
 `client.cookie("session")` is what the jar is holding, for a test that wants to
 look rather than only send.
 
@@ -153,7 +153,7 @@ look rather than only send.
 **`answer.json` is there because nilo already decided how the value was
 written** — walking a `std.json.Value` to pull one field out of a create was four
 lines at every call site
-([ADR 0180](../adr/0180-a-response-is-read-back-the-way-it-was-written.md)):
+([ADR 147](../adr/147-a-response-is-read-back-the-way-it-was-written.md)):
 
 ```zig
 const made = try answer.json(struct { id: []const u8 }, arena);
@@ -204,7 +204,7 @@ None of this is on the request path, and none of it exists in a running server.
 needs a service nobody registered, and names the type and the routes. A test
 driving the App itself gets a 500 on those routes instead — with the type in the
 log, since
-[ADR 0079](../adr/0079-there-is-a-phase-before-the-server.md), rather than in
+[ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md), rather than in
 silence. `try app.checkServices();` after the `provide` calls is the whole gate,
 and it is worth one line in a test that registers a lot of routes.
 
@@ -226,7 +226,7 @@ sake: a Row that disagrees with its table passes an entire suite otherwise.
 It is for a program that never listens, which a test is. In a program that
 does, the same work goes in `app.before` and `listen()` runs it on its own
 loop; `app.start` followed by `listen()` is refused
-([ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
 
 ## Running the suite
 
@@ -241,7 +241,7 @@ levers when they move.
 
 nilo's own suite runs **in both `Debug` and `ReleaseSafe`**, and `-Doptimize=`
 cannot change that. That is not decoration: the bug that made
-[ADR 0019](../adr/0019-a-response-owns-its-headers.md) necessary passed 175
+[ADR 018](../adr/018-a-response-owns-its-headers.md) necessary passed 175
 tests in `Debug` and segfaulted in release, because a stack temporary still holds
 the right bytes until something reuses the stack. A suite that only runs in one
 mode can't see that class of bug at all.

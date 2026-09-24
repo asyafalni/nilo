@@ -5,7 +5,7 @@ requests: send the welcome email after the user is created, try it again
 when the mail provider is down, send the reminder tomorrow, and run the
 report at three in the morning. A job is a struct of yours; the queue is a
 table in the database you already have; a worker is a fiber the server owns
-([ADR 0198](../adr/0198-a-queue-is-a-table-in-the-database-you-already-have.md)).
+([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 
 It is a **Fitting**, like `nilo_fetch`: it borrows the event loop and owns
 no destination. The store is handed to it — a `job.Table` over your
@@ -125,7 +125,7 @@ put back untouched, with a warning, for the program that does.
 
 **`retry` has no default.** How many times an email is tried is a promise
 about that email, and a default nobody read is not one
-([ADR 0199](../adr/0199-a-schedule-is-a-type-that-makes-the-caller-choose.md)).
+([ADR 161](../adr/161-a-schedule-is-a-type-that-makes-the-caller-choose.md)).
 
 | | |
 |---|---|
@@ -143,7 +143,7 @@ is different in ten seconds; a 4xx saying *invalid from address* is the same
 4xx in an hour, and both come back through the same error set. `final` is
 the error set a `run` can fail with and be dead at once, whatever `retry`
 says
-([ADR 0218](../adr/0218-a-run-can-say-its-failure-is-final.md)):
+([ADR 179](../adr/179-a-run-can-say-its-failure-is-final.md)):
 
 ```zig
 pub const retry: job.Retry = .{ .times = 5, .backoff = .{ .exponential = .{ .from_ms = 10_000, .to_ms = 3_600_000 } } };
@@ -170,7 +170,7 @@ a value is the tick. It carries the row's `id`, the attempt this is
 (`attempts`, `1` the first time), when the row was due (`run_at`), and
 whether this is the last attempt `retry` allows (`last`) — all of it in
 the worker's hand from the claim, so asking costs nothing
-([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)):
+([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)):
 
 ```zig
 pub fn run(self: SendWelcome, scope: *nilo.Run, tick: job.Tick, mail: *Mailer) !void {
@@ -244,7 +244,7 @@ interrupts a `run` and a half-cancelled row would be the worse outcome. One
 statement, so a worker claiming in the same instant either got it or did
 not. The `unique` key goes with the row, which is how "move it to tomorrow"
 is written — a cancel and a push
-([ADR 0257](../adr/0257-a-queued-row-can-be-taken-back.md)):
+([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)):
 
 <!-- compiles -->
 ```zig
@@ -280,7 +280,7 @@ try tx.commit();
 If the commit fails, there is no job; if the job is pushed, the user exists.
 That is the outbox pattern with no outbox, and it is the reason the queue is
 a table rather than a Redis
-([ADR 0198](../adr/0198-a-queue-is-a-table-in-the-database-you-already-have.md)).
+([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 `pushIn` on a `job.Memory` is a compile error — a row in memory has nothing
 to commit with — and so is `pushIn` with `.within`, because a cache cannot
 roll back.
@@ -289,7 +289,7 @@ roll back.
 the commit, so a worker woken at the `pushIn` would claim nothing and go
 back to sleep. Call `jobs.wake()` after `tx.commit()` and the row starts at
 once; leave it and the next poll finds it, a second later at the default
-([ADR 0229](../adr/0229-a-push-wakes-a-worker.md)).
+([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 
 ### From inside a job
 
@@ -300,7 +300,7 @@ any other, with one wrinkle. `Jobs` does not exist while its own `.deps`
 is being read, so a struct naming `*Jobs` in a field is a `dependency
 loop` in the compiler's words. Write `.deps` as a function of the queue
 type instead, and nilo hands it the finished type
-([ADR 0245](../adr/0245-a-job-can-push-the-next-one.md)):
+([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)):
 
 ```zig
 fn deps(comptime Queue: type) type {
@@ -372,7 +372,7 @@ claim about your mail provider.
 
 A job with a `schedule` runs on the clock and nobody pushes it. It also has
 to say two more things, and neither has a default
-([ADR 0199](../adr/0199-a-schedule-is-a-type-that-makes-the-caller-choose.md)):
+([ADR 161](../adr/161-a-schedule-is-a-type-that-makes-the-caller-choose.md)):
 
 ```zig
 const Nightly = struct {
@@ -449,8 +449,8 @@ sit on `nilo_cache`. `.max_payload` (4 KiB) is the largest row it holds.
 
 | Field | Default | |
 |---|---|---|
-| `workers` | 4 | rows running at once in this process. Each is a fiber, and a fiber holds its stack at its high-water mark for the life of it ([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)), so this is paid per worker rather than per row |
-| `poll_ms` | 1,000 | how long a worker with nothing to do waits before asking again, **when nothing wakes it first**. A `push` from this process wakes a worker itself, so this is the latency only of a row *another* process pushed — and the cost of an idle queue, one claim per worker per interval ([ADR 0229](../adr/0229-a-push-wakes-a-worker.md)) |
+| `workers` | 4 | rows running at once in this process. Each is a fiber, and a fiber holds its stack at its high-water mark for the life of it ([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)), so this is paid per worker rather than per row |
+| `poll_ms` | 1,000 | how long a worker with nothing to do waits before asking again, **when nothing wakes it first**. A `push` from this process wakes a worker itself, so this is the latency only of a row *another* process pushed — and the cost of an idle queue, one claim per worker per interval ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
 | `timeout_ms` | 60,000 | how long one run may take, for a kind that names no `timeout_ms` of its own. Also the lease |
 
 A third store is nine methods, listed in `job/contract.zig` for whoever
@@ -491,7 +491,7 @@ every second should not be a query every second.
 asks for its `job.Tick` and for `*Jobs` writes `jobs.progress(tick.id, n)`
 as it goes — rows imported, a percentage, a step; the kind decides what
 the number means — and the route polling `status(id)` reads it beside the
-state ([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)):
+state ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)):
 
 ```zig
 pub fn run(self: Import, scope: *nilo.Run, tick: job.Tick, db: *Db, jobs: *Jobs) !void {
@@ -588,7 +588,7 @@ whether a row is due, when a failed run is tried again, when a schedule's
 next tick is — reads that number. So the reminder for tomorrow, the third
 attempt of a backoff, and the report at three in the morning are each a
 call rather than a sleep
-([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)):
+([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)):
 
 ```zig
 test "the nudge goes out three days later and not before" {
@@ -621,7 +621,7 @@ ticks take.
 
 ## What it costs
 
-Against [ADR 0018](../adr/0018-the-trade-budget-has-three-axes.md)'s axes,
+Against [ADR 017](../adr/017-the-trade-budget-has-four-axes.md)'s axes,
 with the numbers in [`bench/result/job.md`](../../bench/result/job.md):
 
 **Per request, nothing on a route that does not push.** A route that does
@@ -634,7 +634,7 @@ Postgres a second, which is 0.035% of one connection and where the default
 comes from. A claim that takes a row is 140 µs and 1.2 ms. **Per push, one
 atomic and one futex wake**, which is what takes the whole of `poll_ms` off
 the latency of a row this process pushed
-([ADR 0229](../adr/0229-a-push-wakes-a-worker.md)).
+([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 
 **Per connection, nothing.** A worker is a fiber per process, and its stack
 is paid once and held at the high-water mark of whatever `run` touches.
@@ -643,7 +643,7 @@ is paid once and held at the high-water mark of whatever `run` touches.
 three words and a bool on the worker's stack — and a tag test on the
 clock for each of the three or four times a tick reads it, which is what
 lets `drainAt` hand a test's number to every one of them
-([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)).
+([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 
 ## What it will not do
 
@@ -660,6 +660,6 @@ for.
   for work that is a loop rather than a row.
 - [Transactions](./sql/transactions.md) — what `pushIn` joins.
 - [A cache in this process](./cache.md) — the Space a status lives in.
-- [ADR 0198](../adr/0198-a-queue-is-a-table-in-the-database-you-already-have.md)
-  — why a table and not a Redis; [ADR 0199](../adr/0199-a-schedule-is-a-type-that-makes-the-caller-choose.md)
+- [ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)
+  — why a table and not a Redis; [ADR 161](../adr/161-a-schedule-is-a-type-that-makes-the-caller-choose.md)
   — why `overlap` and `missed` have no default.

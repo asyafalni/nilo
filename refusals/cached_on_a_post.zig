@@ -1,5 +1,5 @@
 //! A `Cached` on a POST. A kept answer is served to whoever asks next, and
-//! the second client's request was not the first client's ([ADR 0247](../docs/adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)).
+//! the second client's request was not the first client's ([ADR 188](../docs/adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)).
 
 const nilo = @import("nilo_http");
 

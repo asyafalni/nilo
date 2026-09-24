@@ -35,8 +35,8 @@ one longer than that is truncated rather than refused. It is written for the
 person reading the response, so say what was wrong and what would work:
 `fail.notFound("no user {d}", .{id})` beats `fail.notFound("not found", .{})`.
 
-See [ADR 0005](../adr/0005-http-errors-via-fail-functions.md) and
-[ADR 0007](../adr/0007-failure-box-bound-to-the-fiber.md) for how the message
+See [ADR 004](../adr/004-http-errors-via-fail-functions.md) and
+[ADR 006](../adr/006-failure-box-bound-to-the-fiber.md) for how the message
 finds its way back without a `Ctx`.
 
 ## Any other error
@@ -78,7 +78,7 @@ One shape for every failure, from every source: a `fail` function, an error out
 of a handler, a body nilo refused, a request head that never finished arriving.
 Nothing to configure and nothing to negotiate — a frontend calls `res.json()` in
 the same `catch` where it shows the user what went wrong, and it works
-([ADR 0025](../adr/0025-every-failure-answers-with-the-same-json-body.md)).
+([ADR 024](../adr/024-every-failure-answers-as-json.md)).
 
 A failure with no message of its own gets the status phrase. Nothing about
 nilo's internals goes out — no stack trace, no file name, no Zig error name
@@ -127,7 +127,7 @@ too long, a shed 503 — because those are constants written in one call. The
 body is written into a fixed buffer with 256 bytes of room for the envelope
 around the sentence; a shape that needs more gets nilo's own shape instead,
 sentence intact, which the first failure in development shows
-([ADR 0270](../adr/0270-a-failure-body-is-a-struct-the-application-names.md)).
+([ADR 024](../adr/024-every-failure-answers-as-json.md)).
 
 In tests, read the field rather than matching the wire:
 
@@ -140,7 +140,7 @@ try expectEqualStrings("no user 99", parsed.value.object.get("error").?.string);
 ## Tying a failure to its log line
 
 Behind the proxy that nilo assumes in front
-([ADR 0028](../adr/0028-tls-is-terminated-in-front.md)), the one thing you
+([ADR 027](../adr/027-tls-is-terminated-in-front.md)), the one thing you
 cannot reconstruct afterwards is *which* log lines belong to the request that
 went wrong. Switch on request ids and the answer is on the response:
 
@@ -162,7 +162,7 @@ log yourself can carry it too — and it works whether or not the logger is
 installed. A call the handler makes through `nilo_fetch` carries it as well,
 as `X-Request-Id` on the outbound request, so the service on the other end
 can grep for the same string
-([ADR 0196](../adr/0196-a-request-id-goes-out-with-the-call.md)).
+([ADR 158](../adr/158-a-request-id-goes-out-with-the-call.md)).
 
 If the proxy already sent an `X-Request-Id`, that one is used, so the id is the
 same on both sides. **A client's id is checked, not trusted**: up to 64 bytes of
@@ -203,4 +203,4 @@ An integer overflow or an out-of-bounds index is not an error a handler returns 
 it takes the whole process down, every in-flight connection with it. There is no
 `recover` middleware because there cannot be one. See
 [Deploying](./deploying.md#panics) and
-[ADR 0008](../adr/0008-no-recover-middleware.md).
+[ADR 007](../adr/007-no-recover-middleware.md).

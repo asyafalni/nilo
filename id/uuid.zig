@@ -1,21 +1,21 @@
 //! A UUID: sixteen bytes, the way they are written, and the two layouts
-//! anybody uses (ADR 0042).
+//! anybody uses (ADR 038).
 //!
 //! `nilo_sql` has read a `uuid` column since 0.2.0 and could not make one, so
 //! a service that wanted a key either asked Postgres for it and waited for
 //! the answer to come back, or wrote sixteen bytes by hand. Both halves
 //! belong to the same type, and this is where that type lives now — below the
 //! module with an opinion about which column it goes in rather than inside
-//! it, which is the whole of what ADR 0042 decides.
+//! it, which is the whole of what ADR 038 decides.
 //!
 //! **`v4` and `v7` are given their randomness rather than fetching it.** In
 //! Zig 0.16 entropy is IO: `std.crypto.random` is gone and `std.Io.randomSecure`
 //! wants an `Io`. nilo reaches it through the Bulkhead precisely because a
 //! syscall made straight from a fiber stops every request sharing that thread
-//! (ADR 0002, ADR 0014), and a module in the bottom layer has no Bulkhead to
+//! (ADR 001, ADR 013), and a module in the bottom layer has no Bulkhead to
 //! reach through. So what is here is the *format* — where the version bits
 //! go, which six bytes hold the millisecond — and the source stays with
-//! whoever has one. ADR 0042 records what that costs and what the seam would
+//! whoever has one. ADR 038 records what that costs and what the seam would
 //! be; it is not built here.
 //!
 //! **Nothing else is imported, not even `nilo_core`**, and that is a fact
@@ -78,7 +78,7 @@ pub const Uuid = struct {
     /// **`entropy` has to be unguessable, and this cannot check that.** A
     /// v4 made from a seeded `std.Random.DefaultPrng` is fine in a test and
     /// is a session token anybody can predict in production. Where a server
-    /// gets the real thing is the gap ADR 0042 records.
+    /// gets the real thing is the gap ADR 038 records.
     pub fn v4(entropy: [v4_entropy]u8) Uuid {
         const out: Uuid = .{ .bytes = entropy };
         return out.marked(4);
@@ -90,7 +90,7 @@ pub const Uuid = struct {
     /// Sortable *across* milliseconds and not within one — two made in the
     /// same millisecond come out in random order relative to each other. RFC
     /// 9562 allows a counter there and this has none, which is a decision
-    /// rather than an omission (ADR 0042): a counter is a threadlocal or an
+    /// rather than an omission (ADR 038): a counter is a threadlocal or an
     /// atomic, it buys ordering inside a millisecond that nobody asked for,
     /// and having no state is what lets this be called from any fiber
     /// without a lock.
@@ -105,7 +105,7 @@ pub const Uuid = struct {
     }
 
     /// The same key, from the Scope that is already in hand
-    /// ([ADR 0176](../docs/adr/0176-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)).
+    /// ([ADR 143](../docs/adr/143-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)).
     ///
     /// ```zig
     /// const key = try id.v7Now(c);   // or a `nilo.Run` built with `initIo`
@@ -120,7 +120,7 @@ pub const Uuid = struct {
     ///
     /// **The clock is read here rather than borrowed from `nilo_core`**, which
     /// is the whole of what this call costs. This module imports nothing at all
-    /// and that is what keeps `zig test id/id.zig` true (ADR 0043), so the
+    /// and that is what keeps `zig test id/id.zig` true (ADR 039), so the
     /// alternative to twelve lines of `clock_gettime` is an import that moves
     /// the module out of its layer. `http/bulkhead.zig` reads the monotonic
     /// clock beside `core/clock.zig` for the same reason and says so.
@@ -177,7 +177,7 @@ pub const Uuid = struct {
     }
 
     /// Print it: `std.log.info("partner {f}", .{id})`
-    /// ([ADR 0176](../docs/adr/0176-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)).
+    /// ([ADR 143](../docs/adr/143-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)).
     ///
     /// `writeText` above is the same thirty-six characters and is a *method*,
     /// so it answers a caller who already holds a writer and answers nothing at
@@ -221,12 +221,12 @@ pub const Uuid = struct {
 
     /// The same reading, said the way a request asks for it: null rather than
     /// an error, because a path param that will not parse is a 400 and nilo
-    /// has nothing to do with `error.InvalidUuid` (ADR 0142).
+    /// has nothing to do with `error.InvalidUuid` (ADR 113).
     ///
     /// This is what makes `fn show(id: sql.Uuid)` a route: the HTTP module
     /// looks for the declaration by name and never learns this module exists,
     /// exactly as `jsonStringify` and `nilo_openapi` above let it write a
-    /// `Uuid` into a response without importing one (ADR 0046). A tool module
+    /// `Uuid` into a response without importing one (ADR 042). A tool module
     /// imports nothing, so a shape checked by name is the only kind of
     /// contract it can offer.
     pub fn nilo_parse(text: []const u8) ?Uuid {
@@ -243,7 +243,7 @@ pub const Uuid = struct {
     /// which picks the reader itself by looking for this name — so a body
     /// field of this type was read as the `{bytes: …}` struct it is and
     /// refused the 36 characters the server writes in every response
-    /// ([ADR 0205](../docs/adr/0205-a-body-field-that-parses-itself.md)).
+    /// ([ADR 166](../docs/adr/166-a-body-field-that-parses-itself.md)).
     ///
     /// The same reading `nilo_parse` makes, from the one string token a
     /// uuid is. Anything that is not a string is the wrong kind of value,
@@ -284,16 +284,16 @@ pub const Uuid = struct {
     /// What the line above sends, said in a form that needs no import.
     ///
     /// `jsonStringify` is the whole reason `nilo_http` needs no knowledge of
-    /// this module ([ADR 0046](../docs/adr/0046-entropy-belongs-to-the-loop.md)):
+    /// this module ([ADR 042](../docs/adr/042-entropy-belongs-to-the-loop.md)):
     /// a `Uuid` in a response comes out as text and the HTTP module never
     /// learns the type exists. The API description had the other half of that
     /// and it was wrong — it reflected `bytes: [16]u8` and told every
     /// generated client to expect an object, while the server sent 36
     /// characters. This is the sentence that reconciles them
-    /// ([ADR 0076](../docs/adr/0076-a-type-that-writes-its-own-json-says-so.md)),
+    /// ([ADR 016](../docs/adr/016-the-api-description-comes-from-the-signatures.md)),
     /// and it is plain data on purpose: a tool module imports nothing, so it
     /// cannot name a `Schema` to say this any other way.
-    /// What a nilo compile error and a 400 call this type (ADR 0122). Bare
+    /// What a nilo compile error and a 400 call this type (ADR 074). Bare
     /// rather than qualified, because both `id.Uuid` and `sql.Uuid` are real
     /// import lines for the same declaration and neither is the reader's.
     pub const nilo_type_name = "Uuid";
@@ -336,7 +336,7 @@ fn checkMints(comptime T: type) void {
             @typeName(T) ++ " has no `entropy`.\n" ++
             "  A v7 key is a millisecond and 74 random bits; the clock is this module's and" ++
             " the randomness is the caller's, because entropy is IO and nothing down here" ++
-            " owns an event loop (ADR 0042)." ++ advice);
+            " owns an event loop (ADR 038)." ++ advice);
     }
 }
 
@@ -344,7 +344,7 @@ fn checkMints(comptime T: type) void {
 ///
 /// **A second copy of `core/clock.zig`'s, on purpose.** This module imports
 /// nothing at all — that is what `zig build layering` holds and what keeps
-/// `zig test id/id.zig` running with no module graph (ADR 0043) — so naming
+/// `zig test id/id.zig` running with no module graph (ADR 039) — so naming
 /// `nilo_core` to save twelve lines would cost the property that decides which
 /// layer this is in. `http/bulkhead.zig` keeps its own monotonic clock beside
 /// Core's for the same reason.
@@ -356,7 +356,7 @@ fn nowMillis() i64 {
         "nilo: `id.v7Now` cannot read the wall clock on Windows.\n" ++
             "  The rest of this module works there; this call is the one thing that needs" ++
             " an operating system. `id.v7(entropy, ms)` takes the millisecond from you" ++
-            " instead (ADR 0045).",
+            " instead (ADR 041).",
     );
 
     var ts: std.posix.timespec = undefined;
@@ -473,7 +473,7 @@ test "a Uuid reads itself from request text, and says no rather than erroring" {
     try testing.expectEqualStrings(text, &Uuid.nilo_parse(text).?.toText());
 
     // Null is the whole of what nilo needs: it becomes the same 400 a path
-    // param that is not a number gets (ADR 0142).
+    // param that is not a number gets (ADR 113).
     try testing.expectEqual(@as(?Uuid, null), Uuid.nilo_parse("550e8400"));
     try testing.expectEqual(@as(?Uuid, null), Uuid.nilo_parse("not-a-uuid"));
     try testing.expectEqual(@as(?Uuid, null), Uuid.nilo_parse(""));
@@ -541,7 +541,7 @@ test "a Uuid prints with {f}, which is what a refusal naming a record needs" {
 
 /// A stand-in for a Scope, which is the most this module can hold: `Ctx` is
 /// `nilo_http`'s and `Run` is `nilo_core`'s, and importing either is the thing
-/// that would move this module out of its layer (ADR 0043). What `v7Now` uses
+/// that would move this module out of its layer (ADR 039). What `v7Now` uses
 /// is `entropy` and nothing else, which is exactly what this has.
 const Minting = struct {
     seed: u64,

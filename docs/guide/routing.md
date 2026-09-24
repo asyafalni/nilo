@@ -29,7 +29,7 @@ A pattern that can't work — no leading slash, a `:` with no name, a `*` that
 isn't last, the same param name twice — is a build error naming the route, not
 something you find out at startup.
 
-See [ADR 0013](../adr/0013-the-most-specific-route-wins-and-duplicates-are-refused.md).
+See [ADR 012](../adr/012-the-most-specific-route-wins-and-duplicates-are-refused.md).
 
 ## Methods you didn't register
 

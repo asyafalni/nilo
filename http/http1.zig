@@ -17,7 +17,7 @@ const date = @import("date.zig");
 
 pub const Method = enum {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Method";
 
     GET,
@@ -39,7 +39,7 @@ pub const ParseError = error{
     BadHeader,
     UnsupportedVersion,
     /// A body arrived under a `Content-Encoding` nilo cannot decode, which is
-    /// every one of them but `identity` and `gzip` (ADR 0111, ADR 0251). A 415
+    /// every one of them but `identity` and `gzip` (ADR 089). A 415
     /// rather than a 400: the request is well formed and the server cannot
     /// read what it carries.
     UnsupportedContentEncoding,
@@ -62,12 +62,12 @@ pub const Request = struct {
     /// Slices into the reader's buffer. Valid until the next read from the
     /// same connection (including `discardBody`) — after that the contents
     /// may be overwritten. Longer lifetimes come from the request arena and
-    /// `Str` (ADR 0004).
+    /// `Str` (ADR 003).
     method: []const u8 = "",
     target: []const u8 = "",
     /// The authority out of an absolute-form target — `example.com:8080` from
     /// `GET http://example.com:8080/users/7` — and empty for the origin-form
-    /// every browser sends (ADR 0120).
+    /// every browser sends (ADR 095).
     ///
     /// It is the `Host` for this request when it is there. RFC 9112 §3.2 does
     /// not offer a choice about that: an origin server **must** ignore the
@@ -89,7 +89,7 @@ pub const Request = struct {
     has_content_length: bool = false,
     /// Which `Content-Encoding` the body is under. `.other` is read by
     /// `finish`, which turns it into a 415 when there is a body under it;
-    /// `.gzip` is read by `Ctx.body`, which inflates (ADR 0251). Free in
+    /// `.gzip` is read by `Ctx.body`, which inflates (ADR 089). Free in
     /// memory for the reason `has_content_length` is: it lands in padding
     /// the struct already had.
     content_encoding: Encoding = .identity,
@@ -104,14 +104,14 @@ pub const Request = struct {
     /// `has_content_length` is: it lands in padding the struct already had.
     has_host: bool = false,
     /// Whether `Connection` mentions an upgrade — so this connection may stop
-    /// being HTTP and start being read by something else (ADR 0022).
+    /// being HTTP and start being read by something else (ADR 021).
     ///
     /// Deliberately looser than `websocket.isUpgrade`, which also insists on
     /// `Upgrade: websocket`: what this answers is "might this connection be
     /// read from again", and the only wrong answer is a false negative.
     upgrade: bool = false,
     /// Whether the client said `Expect: 100-continue` and is holding its body
-    /// back until the server answers (ADR 0094). `Ctx` sends the interim
+    /// back until the server answers (ADR 073). `Ctx` sends the interim
     /// response at the moment it commits to reading, and `App` reads this to
     /// know that a body it never asked for is still on the client's side.
     ///
@@ -151,7 +151,7 @@ pub fn readRequest(in: *std.Io.Reader) !Request {
 /// a client that has worked out we will sit here reading it; a Content-Length
 /// body over the limit would be read in full only to be thrown away, as many
 /// bytes as a stranger cared to announce — where `max_body` caps every other
-/// way a body arrives (ADR 0020). Both are `error.BodyTooLarge`, and the
+/// way a body arrives (ADR 019). Both are `error.BodyTooLarge`, and the
 /// caller closes the connection rather than serving the next request behind a
 /// body nobody asked for.
 pub fn discardBody(in: *std.Io.Reader, r: *const Request, limit: u64) !void {
@@ -210,7 +210,7 @@ const sized_body_step = 4096;
 /// `Content-Length` is a number a stranger typed, and committing it up front
 /// let one connection hold a megabyte on the strength of a header — times the
 /// default `max_connections` of 10,000, ten gigabytes
-/// ([ADR 0023](../docs/adr/0023-a-deadline-belongs-to-an-operation-not-to-a-request.md)
+/// ([ADR 022](../docs/adr/022-a-deadline-belongs-to-an-operation-not-to-a-request.md)
 /// says why a per-read deadline does not catch it).
 ///
 /// **One page of proof, then the announcement.** A client gets a page for
@@ -233,7 +233,7 @@ pub fn readSizedBody(
 ) ![]const u8 {
     // Each run gets a deadline sized from the bytes it is waiting for, which
     // is what stops a client dribbling inside the per-read limit forever
-    // (ADR 0124). Two runs, so two arms: the step is bounded before the rest
+    // (ADR 022). Two runs, so two arms: the step is bounded before the rest
     // is committed, exactly as the allocation is.
     if (length <= sized_body_step) {
         deadlines.armBodyRun(length);
@@ -324,7 +324,7 @@ fn takeLine(in: *std.Io.Reader) ![]const u8 {
 
 pub const Header = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Header";
 
     name: []const u8,
@@ -354,7 +354,7 @@ pub fn isReservedHeader(name: []const u8) bool {
 /// the last cookie set. `Vary` may be folded, but two layers each name their
 /// own axis — CORS writes `Vary: Origin` and a gzipped file writes
 /// `Vary: Accept-Encoding` — and replacing throws the first away, which lets a
-/// shared cache hand one origin's response to another (ADR 0089).
+/// shared cache hand one origin's response to another (ADR 029).
 pub fn repeats(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "set-cookie") or
         std.ascii.eqlIgnoreCase(name, "vary");
@@ -380,7 +380,7 @@ pub fn headerNameOk(name: []const u8) bool {
 /// Whether a value can be written as a header field value — RFC 9110 §5.5's
 /// `field-value`: printable ASCII, space and horizontal tab, plus `obs-text`.
 ///
-/// **What this exists to refuse is CR and LF** (ADR 0087). A response header
+/// **What this exists to refuse is CR and LF** (ADR 029). A response header
 /// is terminated by `\r\n` and there is no escaping in this grammar, so a
 /// value carrying one does not produce a broken header — it produces a
 /// *second header*, and a value carrying two produces a second **response**.
@@ -437,7 +437,7 @@ pub const HeaderIterator = struct {
 /// do it for a minute. From the first byte on, the clock is the header
 /// deadline: an absolute one, shared by every read, because a client
 /// sending a byte at a time satisfies any per-read limit forever
-/// (ADR 0023). The caller arms the idle limit; this arms the switch.
+/// (ADR 022). The caller arms the idle limit; this arms the switch.
 pub fn readHead(in: *std.Io.Reader, deadlines: bulkhead.Deadlines) ![]const u8 {
     // Where the search got to last time round. Without it, a client that
     // dribbles the head in a byte at a time makes the server rescan
@@ -598,13 +598,13 @@ pub fn parseHead(head: []const u8, r: *Request) ParseError!void {
 ///
 /// There is one such rule and it is `Host`. **RFC 9112 §3.2 requires a 400 for
 /// an HTTP/1.1 request that carries none**, and serving one anyway is nilo
-/// agreeing to answer a request no front end would (ADR 0101). It matters a
+/// agreeing to answer a request no front end would (ADR 070). It matters a
 /// layer up too: `Ctx.handshake` compares an `Origin` against this.
 ///
 /// HTTP/1.0 is left alone — `Host` was not required until 1.1.
 ///
 /// An absolute-form target answers the rule on its own, because it **is** the
-/// authority (ADR 0120). A `Host` beside one is still read and a second one is
+/// authority (ADR 095). A `Host` beside one is still read and a second one is
 /// still a 400.
 fn finish(r: *const Request) ParseError!void {
     if (r.minor_version == 1 and !r.has_host and r.authority.len == 0) return error.BadHeader;
@@ -613,7 +613,7 @@ fn finish(r: *const Request) ParseError!void {
     //
     // A body nilo cannot decode is refused rather than parsed as though the
     // bytes were what they claim to be — the same failure `Transfer-Encoding`
-    // used to have, one header over (ADR 0111). A `Content-Encoding` on a
+    // used to have, one header over (ADR 089). A `Content-Encoding` on a
     // request with no body says nothing about anything and is left alone.
     if (r.content_encoding == .other and (r.chunked or r.content_length > 0)) return error.UnsupportedContentEncoding;
 }
@@ -658,7 +658,7 @@ pub fn parseRequestLine(line: []const u8, r: *Request) ParseError!void {
 /// proxy sends it. nilo handed the whole thing to the router as a path, which
 /// split it into `http:`, ``, `example.com`, `users` and `7`, and matched
 /// nothing: a 404 on a route that plainly exists
-/// ([ADR 0120](../docs/adr/0120-a-target-is-read-in-the-form-it-arrived-in.md)).
+/// ([ADR 095](../docs/adr/095-a-target-is-read-in-the-form-it-arrived-in.md)).
 ///
 /// The two forms left are passed through untouched, because neither names a
 /// route here: **asterisk-form** (`OPTIONS *`) is server-wide OPTIONS, and
@@ -786,7 +786,7 @@ fn applyHeaderAt(buf: []const u8, from: usize, colon: usize, end: usize, r: *Req
         "content-encoding".len => {
             if (!std.ascii.eqlIgnoreCase(name, "content-encoding")) return;
             // `identity` means "these are the bytes"; `gzip` is the one
-            // coding nilo inflates (ADR 0251). Anything else — br, deflate,
+            // coding nilo inflates (ADR 089). Anything else — br, deflate,
             // zstd, two codings stacked — would reach `c.json` as a
             // compressed stream and be reported as a malformed body, which
             // is true of the bytes and useless to whoever sent them. The
@@ -813,7 +813,7 @@ fn applyHeaderAt(buf: []const u8, from: usize, colon: usize, end: usize, r: *Req
             // request with no body at all: answered immediately, with the bytes
             // the client sent as a body still in the read buffer for the next
             // request to be parsed out of. That is the fifth way the two
-            // parsers ADR 0090 is about can disagree, and the four it closed
+            // parsers ADR 070 is about can disagree, and the four it closed
             // were closed for this reason.
             if (!saysChunked(headerValue(buf, colon, end))) return error.BadHeader;
             if (r.has_content_length) return error.BadHeader;
@@ -830,7 +830,7 @@ fn headerValue(buf: []const u8, colon: usize, end: usize) []const u8 {
 /// A digits-only number. `std.fmt.parseInt` accepts `+5`, `-0` and `1_0`, and
 /// a `Content-Length` is none of those: RFC 9112 §6.2 says the value is
 /// `1*DIGIT` and nothing else. What makes that matter rather than merely
-/// being wrong is that the proxy in front (ADR 0028) very likely refuses the
+/// being wrong is that the proxy in front (ADR 027) very likely refuses the
 /// same bytes, so accepting them is nilo agreeing to read a request nobody
 /// else agreed to.
 ///
@@ -888,7 +888,7 @@ pub fn statusPhrase(status: u16) []const u8 {
 }
 
 /// What a response's `Connection` line says — or that there is none
-/// ([ADR 0269](../docs/adr/0269-a-response-says-when-it-was-sent.md)).
+/// ([ADR 197](../docs/adr/197-a-response-says-when-it-was-sent.md)).
 ///
 /// The line carries information in two cases and none in the third. An
 /// HTTP/1.1 connection is persistent unless somebody says otherwise (RFC
@@ -1021,7 +1021,7 @@ pub fn writeResponse(
 /// Skipping is safe because of the Engine, not because of anything the
 /// caller promises: a socket read flushes what is pending before it can
 /// park, so a response is never left in memory while the connection waits
-/// for its client ([ADR 0274](../docs/adr/0274-a-response-is-flushed-before-the-connection-waits.md)).
+/// for its client ([ADR 201](../docs/adr/201-a-response-is-flushed-before-the-connection-waits.md)).
 /// The write buffer bounds the batch; a run of responses longer than it
 /// drains as it fills, the way any write does.
 pub fn settle(out: *std.Io.Writer, in: *const std.Io.Reader) !void {
@@ -1038,7 +1038,7 @@ pub fn settle(out: *std.Io.Writer, in: *const std.Io.Reader) !void {
 /// being moved out of something that counted them first. It is a
 /// `Content-Length` like any other response, which is what lets a browser draw
 /// a progress bar and a client ask for a `Range`
-/// ([ADR 0128](../docs/adr/0128-a-stream-that-knows-its-length-says-so.md)).
+/// ([ADR 101](../docs/adr/101-a-stream-that-knows-its-length-says-so.md)).
 ///
 /// `chunked` is the ordinary case for an HTTP/1.1 client whose handler does
 /// not know: each piece is framed with its own length and a zero-length one
@@ -1046,7 +1046,7 @@ pub fn settle(out: *std.Io.Writer, in: *const std.Io.Reader) !void {
 ///
 /// HTTP/1.0 has neither, and the only thing left to mark the end of the body
 /// with is the end of the connection — so there both are off, `connection`
-/// must be `.close` with them, and the pieces go out unframed (ADR 0020).
+/// must be `.close` with them, and the pieces go out unframed (ADR 019).
 pub fn writeStreamHead(
     out: *std.Io.Writer,
     status: u16,
@@ -1107,7 +1107,7 @@ pub fn writeResponseHeadOnly(
 }
 
 /// The head of a response whose body is about to be sent straight from a
-/// file (ADR 0037).
+/// file (ADR 009).
 ///
 /// `sendFile` takes whatever the writer already has buffered as the first
 /// thing to put on the wire, so leaving the head there is what makes the
@@ -1147,7 +1147,7 @@ fn writeStatusLine(out: *std.Io.Writer, status: u16, phrase: []const u8) !void {
 
 /// `body_len` is a `u64` rather than a `usize` because a response body no
 /// longer has to be something this process could hold: a file being sent
-/// from disk is longer than memory on purpose (ADR 0037), and on a 32-bit
+/// from disk is longer than memory on purpose (ADR 009), and on a 32-bit
 /// build a `usize` would silently be the wrong number.
 fn writeHead(
     out: *std.Io.Writer,
@@ -1160,7 +1160,7 @@ fn writeHead(
 ) !void {
     try writeStatusLine(out, status, phrase);
     // `Date` is second, straight after the status line, on every response
-    // that reaches here (ADR 0269). The interim ones — a 100, a 101 — are
+    // that reaches here (ADR 197). The interim ones — a 100, a 101 — are
     // written elsewhere and carry none, which RFC 9110 §6.6.1 allows.
     try writeDate(out, extra);
     if (bodyless(status)) {
@@ -1681,7 +1681,7 @@ test "two Host lines are a 400 even when they say the same thing" {
 test "an absolute-form target is split into an authority and a path" {
     // What a client talking to what it believes is a proxy sends, and what
     // RFC 9112 §3.2.2 says a server must accept. The router matches on the
-    // path, so the path is what it has to be handed (ADR 0120).
+    // path, so the path is what it has to be handed (ADR 095).
     var r = Request{};
     try parseHead("GET http://example.com/users/7?x=1 HTTP/1.1\r\nHost: example.com\r\n\r\n", &r);
     try testing.expectEqualStrings("example.com", r.authority);
@@ -2380,7 +2380,7 @@ test "the two headers a response may carry more than one of" {
     try testing.expect(repeats("Set-Cookie"));
     try testing.expect(repeats("set-cookie"));
     // Folding is allowed for this one, and two layers each name their own
-    // axis — so replacing threw one of them away (ADR 0089).
+    // axis — so replacing threw one of them away (ADR 029).
     try testing.expect(repeats("Vary"));
     try testing.expect(repeats("vary"));
 
@@ -2449,7 +2449,7 @@ test "the redirect statuses all have a phrase, and it is written from the consta
 }
 
 /// A writer that counts how many times it put bytes on the wire, and keeps
-/// them. What ADR 0274 changes is how many writes a batch of responses costs,
+/// them. What ADR 201 changes is how many writes a batch of responses costs,
 /// which a fixed writer cannot say: its flush is a no-op.
 const Wire = struct {
     buffer: [1024]u8 = undefined,

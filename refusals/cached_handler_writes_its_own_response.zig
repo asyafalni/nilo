@@ -1,6 +1,6 @@
 //! A cached handler that holds the Ctx and returns nothing — a stream, or
 //! an answer written by hand — so there is no answer for nilo to keep
-//! ([ADR 0247](../docs/adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)).
+//! ([ADR 188](../docs/adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)).
 
 const nilo = @import("nilo_http");
 

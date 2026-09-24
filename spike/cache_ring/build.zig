@@ -7,7 +7,7 @@ const std = @import("std");
 /// **No dependencies at all, and that is half the finding.** The module this
 /// spike is for needs no event loop, so it needs no zio — which is the entry
 /// condition for the layer `nilo_id`, `nilo_config` and `nilo_pw` sit in
-/// (ADR 0042). If this file ever grows a `b.dependency`, the module belongs
+/// (ADR 038). If this file ever grows a `b.dependency`, the module belongs
 /// somewhere else.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});

@@ -33,7 +33,7 @@ costs while it waits. A handler that looped in place would be parked *inside*
 the request — holding the `Ctx`, the parsed head and the route match, none of
 which the loop can reach — for as long as the tab is open. Returning first lets
 all of that unwind: an idle socket costs **5,183 bytes** instead of 9,290
-([ADR 0071](../adr/0071-where-a-connection-waits-is-what-it-costs.md)).
+([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)).
 
 ### Carrying something into the loop
 
@@ -81,7 +81,7 @@ The ceiling is `upgradeWith(loop, state, .{ .max_message = … })` and defaults
 to 16 KiB. A frame announcing more than that is refused before a byte of its
 payload is read, with a `1009`. Nothing is allocated per message, and no byte
 of one is copied twice
-([ADR 0052](../adr/0052-a-message-is-copied-once-and-framed-once.md)).
+([ADR 046](../adr/046-a-message-is-copied-once-and-framed-once.md)).
 
 `receive` returns `null` three ways: the client closed politely, the client
 vanished — a tab closed, a network gone — or the server is stopping, in which
@@ -196,7 +196,7 @@ next connection can't have.
 the room *holds* rather than what it was sized for, so an extra thousand empty
 seats is a memory decision and nothing else — and a `say` into a room with
 nobody in it doesn't even allocate
-([ADR 0052](../adr/0052-a-message-is-copied-once-and-framed-once.md)).
+([ADR 046](../adr/046-a-message-is-copied-once-and-framed-once.md)).
 
 **Why it isn't a lock around a loop**, which is worth knowing before you write
 one in your own code. A connection's write buffer belongs to the fiber serving
@@ -214,11 +214,11 @@ fiber does the writing — which is why one client that stops reading costs that
 client and nobody else, and why a full backlog is a policy named at the room
 (`.drop_oldest` by default, or `.drop_newest`, with `room.missed(&socket)` saying
 how many went) rather than a disconnect
-([ADR 0038](../adr/0038-a-broadcast-rings-a-bell-it-does-not-write.md)). It adds
+([ADR 035](../adr/035-a-broadcast-rings-a-bell-it-does-not-write.md)). It adds
 4 measured bytes per idle connection. The design that needed a second fiber per
 connection was 8,673 bytes against a per-connection budget that was 8,767 at the
 time, which is what kept this off the list for two stages
-([ADR 0029](../adr/0029-a-spawned-fiber-belongs-to-the-server.md)).
+([ADR 028](../adr/028-a-spawned-fiber-belongs-to-the-server.md)).
 
 What else came out of that work is [`nilo.spawn`](../reference/app.md#concurrency),
 for work that is not a request at all.
@@ -239,7 +239,7 @@ return c.upgradeWith(chatLoop, room, .{ .idle_ms = 60_000 });
 
 Thirty seconds costs a dead connection about a minute to notice and a live one
 two frames a minute. Proxies that drop quiet connections usually do so at sixty
-([ADR 0023](../adr/0023-a-deadline-belongs-to-an-operation-not-to-a-request.md)).
+([ADR 022](../adr/022-a-deadline-belongs-to-an-operation-not-to-a-request.md)).
 
 ## Which pages may open it
 
@@ -265,14 +265,14 @@ The scheme isn't compared — TLS is terminated in front, so nilo never learns
 which one the browser used — and a request with **no** `Origin` is allowed,
 because that isn't a browser and has no ambient cookie to be borrowed. `curl`,
 `wstest` and every native client send none
-([ADR 0102](../adr/0102-a-websocket-handshake-is-same-origin-unless-the-route-says-otherwise.md)).
+([ADR 080](../adr/080-a-websocket-handshake-is-same-origin-unless-the-route-says-otherwise.md)).
 
 ## Testing one
 
 A handler that upgrades never returns a value, so there's nothing for
 `testing.Client` to read. `testing.Conversation` queues the frames a client
 would send, runs the handshake and the loop, and hands back what the server said
-([ADR 0113](../adr/0113-a-websocket-route-can-be-driven-from-a-test.md)):
+([ADR 091](../adr/091-a-websocket-route-can-be-driven-from-a-test.md)):
 
 ```zig
 test "the chat echoes what it is told" {

@@ -4,7 +4,7 @@
 //! which is what makes the whole feature cost no new vocabulary — and what
 //! makes a schema that has not said how the two tables relate a Refusal rather
 //! than a guess. `.on = .<column>` is the way out when the foreign key is not
-//! declared (ADR 0171).
+//! declared (ADR 218).
 
 const sql = @import("nilo_sql");
 

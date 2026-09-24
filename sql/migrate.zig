@@ -1,5 +1,5 @@
 //! Migrations: the diff, the plan, and the record of what has been applied
-//! ([ADR 0153](../docs/adr/0153-a-migration-is-a-diff-against-a-snapshot.md)).
+//! ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 //!
 //! ```zig
 //! const desired = comptime sql.migrate.desiredOf(Db.Dialect, .{ .tables = &.{ Org, User, Post } });
@@ -73,7 +73,7 @@ pub const Table = struct {
 
 /// What a program's database is: every table, and the three kinds of object
 /// that hang off the schema rather than off a table
-/// ([ADR 0253](../docs/adr/0253-a-schema-is-one-value-and-the-tool-owns-the-order.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 ///
 /// ```zig
 /// pub const schema = sql.Schema{
@@ -96,7 +96,7 @@ pub const Table = struct {
 ///
 /// `@embedFile` is the point of the two named lists: a sixty-line view belongs
 /// in a `.sql` file with highlighting rather than in sixty `\\` lines, and the
-/// snapshot records its name and a hash rather than the text (ADR 0226).
+/// snapshot records its name and a hash rather than the text (ADR 181).
 pub const Schema = struct {
     /// Every Row whose table this program reads or builds, in any order.
     tables: []const type,
@@ -142,7 +142,7 @@ pub fn desiredOf(comptime D: type, comptime schema: Schema) Desired {
 
 /// The three lists a Dialect can refuse, and the two shapes an entry can be
 /// written wrong in. Run from `orderOf`, the one place every schema reaches,
-/// for the reason the foreign-key check runs there (ADR 0222).
+/// for the reason the foreign-key check runs there (ADR 181).
 fn assertSchema(comptime D: type, comptime schema: Schema) void {
     comptime {
         if (schema.extensions.len > 0 and !D.has_extensions) @compileError(
@@ -260,7 +260,7 @@ pub fn orderOf(comptime D: type, comptime schema: Schema) []const type {
         // **The one place every Row is in one list**, which is why the check
         // for a foreign key that named its table as text runs here rather than
         // inside the Row that wrote it
-        // ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+        // ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
         // After the `Desc`s, so that an entry written wrong stops with what
         // `table.zig` says about its shape rather than with a missing field;
         // before the sort, because a name that resolves to nothing would
@@ -315,7 +315,7 @@ pub fn missingOf(comptime D: type, comptime schema: Schema) []const ddl.Created 
         var n: usize = 0;
         for (ordered) |R| {
             // A table this program reads and does not build is not missing —
-            // it is somebody else's (ADR 0162). `createMissing` is the one
+            // it is somebody else's (ADR 130). `createMissing` is the one
             // call that would otherwise create it, `IF NOT EXISTS` and all,
             // which is the same silence a `CREATE TABLE` for a table with
             // twenty columns this program never reads would leave behind.
@@ -397,7 +397,7 @@ pub fn snapshotOf(
 /// a `.zon` file carrying sixty lines of SQL stops being readable — which is
 /// the property the format was chosen for. What a diff needs to know is whether
 /// it moved, and a hash answers that in one line
-/// ([ADR 0226](../docs/adr/0226-the-marker-has-a-word-the-database-checks.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 fn hashedOnly(
     gpa: std.mem.Allocator,
     list: []const table_mod.NamedText,
@@ -439,7 +439,7 @@ pub const Kind = enum {
     create_trigger,
     drop_trigger,
     /// The three kinds that hang off the schema rather than off a table
-    /// (ADR 0253). An extension is made if missing and dropped when it
+    /// (ADR 181). An extension is made if missing and dropped when it
     /// leaves the list; a function is one `CREATE OR REPLACE` whether it is
     /// new or moved, and dropped by name; a view is dropped and remade when
     /// its text moves, because `CREATE OR REPLACE VIEW` refuses a column
@@ -578,7 +578,7 @@ pub fn plan(
 
     for (desired.tables) |t| {
         // A table this program reads and does not build
-        // ([ADR 0162](../docs/adr/0162-a-table-this-program-reads-and-does-not-build.md)).
+        // ([ADR 130](../docs/adr/130-a-table-this-program-reads-and-does-not-build.md)).
         // It stays in `desired` rather than being filtered out before the
         // call, because the drop loop below reads this same list: a Row that
         // stops being managed would otherwise look like a Row that was
@@ -719,7 +719,7 @@ fn diffTable(
                 .why = try std.fmt.allocPrint(gpa, "add {s}.{s}", .{ t.desc.table, c.name }),
                 // A required column with a default fills the rows already
                 // there as it is added, which is the whole of what the flag
-                // was warning about ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+                // was warning about ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
                 .needs_backfill = !c.nullable and c.default == null,
             });
             continue;
@@ -1033,7 +1033,7 @@ fn diffIndexes(
 
 /// A `CHECK` the marker named, matched by name and compared by hash.
 ///
-/// **Three cases and nothing else**, which is the whole claim ADR 0226 makes
+/// **Three cases and nothing else**, which is the whole claim ADR 181 makes
 /// about this kind of word: same name and same hash, nothing to do; same name
 /// and a different hash, drop and add; a name the types no longer have, drop.
 /// nilo never reads the body, so there is no fourth case where it decides the
@@ -1415,7 +1415,7 @@ fn DialectOf(comptime Db: type) type {
 /// Every byte it sends is a constant in the binary, including the order the
 /// tables go in. This is the whole of what a small SQLite application needs at
 /// startup, and it replaces the ten hand-written lines
-/// [ADR 0079](../docs/adr/0079-there-is-a-phase-before-the-server.md) found:
+/// [ADR 180](../docs/adr/180-work-that-needs-the-services-runs-on-their-loop.md) found:
 ///
 /// ```zig
 /// fn makeTables(run: *nilo.Run, db: *sql.Db) !void {
@@ -1427,7 +1427,7 @@ fn DialectOf(comptime Db: type) type {
 /// ```
 ///
 /// Inside `listen()` rather than before it, because the pool is dialled
-/// through the loop `listen()` builds (ADR 0220).
+/// through the loop `listen()` builds (ADR 180).
 ///
 /// **It is not a migration runner and does not pretend to be one.** It creates
 /// what is missing and never alters what is there, so a table whose shape has
@@ -1441,7 +1441,7 @@ pub fn createMissing(db: anytype, scope: anytype, comptime schema: Schema) !void
     var tx = try db.begin(scope, .{});
     errdefer tx.rollback();
 
-    // The order the tool owns: extensions, functions, tables, views (ADR 0253).
+    // The order the tool owns: extensions, functions, tables, views (ADR 181).
     for (comptime leadingOf(D, schema)) |sql| _ = try tx.exec(scope, sql, .{});
     for (comptime missingOf(D, schema)) |made| {
         _ = try tx.exec(scope, made.table, .{});
@@ -1455,7 +1455,7 @@ pub fn createMissing(db: anytype, scope: anytype, comptime schema: Schema) !void
 /// The step between `createMissing` and `apply`: one `ALTER TABLE … ADD
 /// COLUMN` per field a shipped table has not got, typed the way
 /// `createMissing` would have typed it, and how many were added
-/// ([ADR 0233](../docs/adr/0233-a-column-a-shipped-table-has-not-got.md)).
+/// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 ///
 /// ```zig
 /// try sql.migrate.createMissing(&db, &run, schema);
@@ -1642,7 +1642,7 @@ pub fn apply(
     // Core's monotonic clock rather than the wall one. A duration read off a
     // wall clock can come back negative when an operator moves it, and the
     // number here goes in a column an operator reads to find the slow
-    // migration ([ADR 0045](../docs/adr/0045-core-knows-what-time-it-is.md)).
+    // migration ([ADR 041](../docs/adr/041-core-knows-what-time-it-is.md)).
     const started = core.monotonicMicros();
     var tx = try db.begin(scope, .{});
     errdefer tx.rollback();
@@ -1773,7 +1773,7 @@ test "a schema that has never been generated is one CREATE TABLE per Row" {
 
 /// The table this program reads and does not build: a `Staff` that exists so
 /// that `.references` can point at it, on a schema another tool owns
-/// (ADR 0162).
+/// (ADR 130).
 const Staff = struct {
     pub const nilo_table = .{ .name = "staff", .key = .id, .managed = false };
     id: i64,
@@ -1813,7 +1813,7 @@ test "a table this program only reads is never created, and the one pointing at 
     try testing.expect(std.mem.indexOf(u8, change.steps[0].sql, "staff") != null);
 }
 
-// ---- the schema-level objects (ADR 0253) ----
+// ---- the schema-level objects (ADR 181) ----
 
 const touch_v1 = "CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$ BEGIN NEW.updated_at = now(); RETURN NEW; END $$ LANGUAGE plpgsql";
 const touch_v2 = "CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$ BEGIN NEW.updated_at = clock_timestamp(); RETURN NEW; END $$ LANGUAGE plpgsql";
@@ -1932,7 +1932,7 @@ test "a table this program only reads is not created by createMissing either" {
     try testing.expect(std.mem.indexOf(u8, missing[0].table, "comments") != null);
 }
 
-// -- the words that live inside one Row (ADR 0221) ------------------------
+// -- the words that live inside one Row (ADR 181) ------------------------
 
 const Level = enum { low, high };
 const WiderLevel = enum { low, mid, high };
@@ -2069,7 +2069,7 @@ test "a required column added with a default fills the rows that are there, so i
     try testing.expectEqual(@as(usize, 1), change.steps.len);
     try testing.expectEqual(Kind.add_column, change.steps[0].kind);
     try testing.expect(std.mem.indexOf(u8, change.steps[0].sql, "DEFAULT 0") != null);
-    // The case ADR 0153 named as the one where a default is load-bearing,
+    // The case ADR 123 named as the one where a default is load-bearing,
     // answered by the word rather than by a warning.
     try testing.expect(!change.needsBackfill());
 }
@@ -2503,7 +2503,7 @@ test "the ledger is an ordinary Row, so the same machinery creates and checks it
     try testing.expect(std.mem.indexOf(u8, comptime ddl.createTable(Lite, Applied), "INTEGER PRIMARY KEY") != null);
 }
 
-// -- the second kind of word (ADR 0226) ----------------------------------
+// -- the second kind of word (ADR 181) ----------------------------------
 
 const Ledger = struct {
     pub const nilo_table = .{

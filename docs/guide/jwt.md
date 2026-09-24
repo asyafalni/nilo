@@ -6,7 +6,7 @@ Supabase session — and reads the claims into a struct of your own. RS256
 and ES256, which between them are what those issuers sign with. It is a
 tool module: no event loop, no allocator of its own, and it imports
 nothing, so `zig test jwt/jwt.zig` runs the whole of it
-([ADR 0140](../adr/0140-nilo-verifies-a-token-and-does-not-fetch-one.md)).
+([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 
 **It is for a token somebody else issued.** A sign-in your own server keeps
 is a [`Session(T)`](./sessions.md), sealed into a cookie, and needs no token
@@ -92,7 +92,7 @@ paragraph pointing at `std.crypto`:
   that is EC — is `error.WrongAlgorithm` before any arithmetic runs. A key
   set holding both kinds, which is what an issuer mid-migration publishes,
   cannot be talked into checking one with the other
-  ([ADR 0242](../adr/0242-the-key-decides-the-algorithm.md)).
+  ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 - **Nothing in the payload is read until the signature has passed.** An `exp`
   off an unverified token is a number somebody chose.
 - **`exp` is required.** A credential with no end is not one, so a token
@@ -180,7 +180,7 @@ is not a request, which a startup path is. Since `nilo_fetch` is finished by
 inside `listen()` once the client is up and before the first request, exactly
 as a database migration does ([A query with no
 server](./sql/reading.md#a-query-with-no-server),
-[ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+[ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
 The ring asks the client for one call — `get(scope, url, .{})` — and holds
 the module to importing nothing: the client is an argument, the way a
 [`job.Table`](./jobs.md) takes your Db.
@@ -208,7 +208,7 @@ module's own vector is RFC 7515's, which sidesteps the question.
 ## The signed-in user
 
 With the keys held, the claims behind a bearer token are one argument
-([ADR 0260](../adr/0260-verified-claims-are-a-handler-argument.md)):
+([ADR 191](../adr/191-verified-claims-are-a-handler-argument.md)):
 
 <!-- compiles -->
 ```zig
@@ -318,7 +318,7 @@ until a restart, an unbounded refetch is one GET to the issuer per forged
 `kid`, and swapping a set another thread is reading is a use-after-free the
 Debug build has no trap for. The last one is concurrency rather than policy,
 and it is why the ring is in the module
-([ADR 0255](../adr/0255-a-key-set-is-swapped-whole-and-freed-after-its-readers.md)).
+([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 
 **`verifyOrRefresh` is `verify`, and on `NoSuchKey` one fetch at most per
 `refresh_interval_s`**, then `verify` again. Whichever request sees the miss
@@ -344,7 +344,7 @@ spin bounded by the length of one verify, once per rotation — a
 `std.Io.Mutex` needs an `Io` a tool module does not have, which is the
 same reason the [cache](./cache.md) spins. `nilo_cache` answers the same
 lifetime question with a copy and a generation
-([ADR 0188](../adr/0188-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md));
+([ADR 152](../adr/152-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md));
 a key set is not flat, so here it is a pin.
 
 When a `kid` miss should mean *refuse* rather than *fetch* is still yours:
@@ -397,7 +397,7 @@ yours.
 - [Sessions](./sessions.md) — what a signed-in user becomes after the first
   verified request.
 - [Calling somebody else's API](./fetch.md) — the fetch that gets the key set.
-- [ADR 0140](../adr/0140-nilo-verifies-a-token-and-does-not-fetch-one.md) —
+- [ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md) —
   why verifying is here and fetching is not.
-- [ADR 0242](../adr/0242-the-key-decides-the-algorithm.md) — why the key
+- [ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md) — why the key
   picks the algorithm, and what ES256 costs.

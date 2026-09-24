@@ -60,11 +60,11 @@ python3 bench/mem.py --port … --path … --hold   # the same for a stream nobo
 python3 bench/mem.py --port … --path … --tls    # the same through TLS 1.3, against bench-tls-server
 python3 bench/slowloris.py --port … --path …    # what a body that never finishes holds (VmData, not just VmRSS)
 python3 bench/ws_idle.py both                   # memory per idle WebSocket, nilo and gws
-python3 bench/paced.py --pid … --port … --rate …  # µs of CPU a request at a fixed rate: a server that is not busy (ADR 0272)
-python3 bench/shutdown.py --cmd … --port …      # does SIGTERM come back? (ADR 0098)
-python3 bench/fdlimit.py --cmd … --port …       # does a descriptor shortage take the server down? (ADR 0265)
-python3 bench/burst.py --cmd … --port …         # does a burst of connections get through? (ADR 0271)
-python3 bench/devloop.py --step dev-spa         # does a save the build never reads restart the server? It must not (ADR 0259)
+python3 bench/paced.py --pid … --port … --rate …  # µs of CPU a request at a fixed rate: a server that is not busy (ADR 199)
+python3 bench/shutdown.py --cmd … --port …      # does SIGTERM come back? (ADR 077)
+python3 bench/fdlimit.py --cmd … --port …       # does a descriptor shortage take the server down? (ADR 194)
+python3 bench/burst.py --cmd … --port …         # does a burst of connections get through? (ADR 198)
+python3 bench/devloop.py --step dev-spa         # does a save the build never reads restart the server? It must not (ADR 190)
 python3 bench/s3_setup.py                       # the bucket and objects the S3 server wants
 python3 bench/compare-s3/drive.py               # nilo_s3 against Go, Rust and Bun; needs MinIO
 bash bench/compare-cache/run.sh                 # nilo_cache against go-cache; needs Go

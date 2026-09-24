@@ -16,4 +16,4 @@ The version follows the size of the change: a fix or any small change is a patch
 
 **Tagging moves the section onto that tag's release page**: `gh release create vX.Y.Z --verify-tag --notes-file …`, with every `](./` link rewritten to a blob URL pinned to the tag, because a relative link does not resolve on a release page. What stays in `CHANGELOG.md` is one line under `## Released` pointing at the page, and any README link into the section becomes a link to that page. The file is then the next release again, and never grows past one.
 
-**Pushing the tag also publishes the guide.** `.github/workflows/docs.yml` builds `docs/guide/` into the `X.Y` copy of the site and moves `latest` only when the tag is the newest ([ADR 0296](./adr/0296-the-guide-is-published-once-a-release.md)).
+**Pushing the tag also publishes the guide.** `.github/workflows/docs.yml` builds `docs/guide/` into the `X.Y` copy of the site and moves `latest` only when the tag is the newest ([ADR 219](./adr/219-the-guide-is-published-once-a-release.md)).

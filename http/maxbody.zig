@@ -1,4 +1,4 @@
-//! How much body a route takes (ADR 0194).
+//! How much body a route takes (ADR 156).
 //!
 //! ```zig
 //! try app.with(nilo.maxBody(50 << 20)).post("/import", importCsv);
@@ -8,7 +8,7 @@
 //! the wrong shape: an import that takes fifty megabytes and a sign-in that
 //! takes two hundred bytes do not have the same budget, and a number loose
 //! enough for the first is no bound on the second. It is the same argument
-//! ADR 0133 made about time, and it gets the same answer — a route that wants
+//! ADR 105 made about time, and it gets the same answer — a route that wants
 //! its own limit says so, through `with`.
 //!
 //! ## What it bounds

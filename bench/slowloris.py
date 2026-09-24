@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """What a server holds for bodies that are announced and never delivered.
 
-The third row of ADR 0018's budget, asked about a request that is still
+The third row of ADR 017's budget, asked about a request that is still
 arriving rather than one that is idle — which is what `bench/mem.py` measures.
 The difference is the whole point: an idle keep-alive connection holds its
 buffers, and a connection halfway through a body it announced as a megabyte

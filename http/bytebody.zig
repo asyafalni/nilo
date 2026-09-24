@@ -1,6 +1,6 @@
 //! An answer that is bytes already in hand, under a label decided while the
 //! request is running
-//! ([ADR 0212](../docs/adr/0212-bytes-handed-on-are-an-answer.md)).
+//! ([ADR 173](../docs/adr/173-bytes-handed-on-are-an-answer.md)).
 //!
 //! ```zig
 //! fn bundle(licences: *Licences, c: *nilo.Ctx, id: u32) !?nilo.Bytes {
@@ -41,7 +41,7 @@ pub const marker = "nilo_bytes";
 
 /// An answer that is bytes in hand.
 pub const Bytes = struct {
-    /// What a nilo compile error calls this type (ADR 0122).
+    /// What a nilo compile error calls this type (ADR 074).
     pub const nilo_type_name = "nilo.Bytes";
 
     /// Presence is the whole message, as with `FileBody.nilo_file`.
@@ -57,7 +57,7 @@ pub const Bytes = struct {
     content_type: []const u8 = "application/octet-stream",
 
     /// Headers to send with the bytes, held by value for the reason
-    /// `Response.headers` are (ADR 0019). This is where a download's
+    /// `Response.headers` are (ADR 018). This is where a download's
     /// `Content-Disposition` goes; `FileBody.headers` says why there is no
     /// `download_as` field, and the same reasons hold here.
     headers: headers_mod.Headers = .{},

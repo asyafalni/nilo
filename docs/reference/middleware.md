@@ -37,7 +37,7 @@ answers anyone and reads no header at all; anything else also sends
 **`cors.reading` is the same middleware with the list read at run time**, for
 the deployment fact `with` cannot express — the front end at one address in
 staging and another in production
-([ADR 0110](../adr/0110-an-origin-is-a-fact-about-the-deployment.md)).
+([ADR 088](../adr/088-an-origin-is-a-fact-about-the-deployment.md)).
 Everything but the list stays comptime.
 
 | | |
@@ -78,7 +78,7 @@ weighed by how far into the current one the request arrived — so a hundred at
 11:59:59 and a hundred at 12:00:00 is not two hundred through.
 
 Two things it does on purpose
-([ADR 0114](../adr/0114-an-allowance-is-a-table-sized-while-compiling.md)):
+([ADR 092](../adr/092-an-allowance-is-a-table-sized-while-compiling.md)):
 a bucket with no room **forgets its stalest address** rather than letting two
 share one allowance, and a slot under contention **lets the request through**.
 Both are the same trade — being loose for one window beats refusing somebody who
@@ -116,7 +116,7 @@ try app.useOn("/api", nilo.allowance.keyed(account, .{
 The first argument is a function of one `*Ctx` returning `?[]const u8` or
 `?nilo.Str`. **Its bytes are not kept** — they live in the request arena — so
 what goes in the table is a 64-bit tag from a keyed hash, in a word of its own
-beside the counters ([ADR 0131](../adr/0131-a-key-the-application-knows-is-a-word-of-its-own.md)).
+beside the counters ([ADR 104](../adr/104-a-key-the-application-knows-is-a-word-of-its-own.md)).
 
 | | |
 |---|---|
@@ -150,7 +150,7 @@ stream's pieces, a WebSocket's silence — to whichever comes first.
 **A running handler is not interrupted**, and deliberately is not: a cancel
 firing mid-handler is a cancel every handler, every `nilo.Mutex` and every
 Service has to survive
-([ADR 0104](../adr/0104-a-cleanup-path-is-not-cancellable.md)). A loop doing its
+([ADR 082](../adr/082-a-cleanup-path-is-not-cancellable.md)). A loop doing its
 own work asks `c.overdue()`:
 
 ```zig
@@ -163,7 +163,7 @@ while (try rows.next()) |row| {
 A handler that fails while overdue with nothing sent gets a 503 naming the
 budget. One that finishes late still answers — the work is done and correct —
 and the lateness is a log line
-([ADR 0133](../adr/0133-a-route-can-say-how-long-it-has.md)). `deadline(0)` is a
+([ADR 105](../adr/105-a-route-can-say-how-long-it-has.md)). `deadline(0)` is a
 compile error.
 
 ### `nilo.maxBody`
@@ -184,14 +184,14 @@ Lowering is as ordinary as raising.
 
 **It does not touch `c.bodyStream()`**, which holds nothing in the arena and
 takes a `max_bytes` of its own
-([ADR 0194](../adr/0194-a-route-can-say-how-much-body-it-takes.md)).
+([ADR 156](../adr/156-a-route-can-say-how-much-body-it-takes.md)).
 `maxBody(0)` is a compile error.
 
 ## `nilo.accept`
 
 What the request's `Accept` header says about one media type. One call, no
 allocation, and the reader the single-page fallback decides with
-([ADR 0109](../adr/0109-a-fallback-answers-a-navigation-not-a-missing-asset.md)).
+([ADR 087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)).
 
 ```zig
 switch (nilo.accept.asks(c.header("Accept"), "text/html")) {

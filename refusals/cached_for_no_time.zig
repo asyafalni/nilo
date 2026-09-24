@@ -1,5 +1,5 @@
 //! A `Cached` with a `ttl_s` of 0 — an answer kept for no time, which is
-//! a handler that runs every time ([ADR 0247](../docs/adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)).
+//! a handler that runs every time ([ADR 188](../docs/adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)).
 
 const nilo = @import("nilo_http");
 

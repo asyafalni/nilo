@@ -1,7 +1,7 @@
 //! The bytes, the table that points at them, and the lock over both.
 //!
 //! One `Store` is one pool of memory, sized once when it opens and never grown
-//! ([ADR 0138](../docs/adr/0138-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)).
+//! ([ADR 109](../docs/adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)).
 //! Every `Space` in the program shares it, the way every bucket in `nilo_s3`
 //! shares one `Store` — so "how much memory does my cache use" has one answer
 //! and it is the number the caller wrote.
@@ -19,7 +19,7 @@
 //! been written over. **Eviction is what writing does** — no free list to
 //! fragment, no size class to waste, and no sweep.
 //!
-//! **There are two regions and that is the eviction policy** (ADR 0187). A new
+//! **There are two regions and that is the eviction policy** (ADR 109). A new
 //! entry goes into `small`, a tenth of the ring, so a key nobody asks for
 //! twice is gone in a tenth of the time; one asked for again while it is still
 //! there is copied into `main` and gets the other nine tenths. Without that,
@@ -36,7 +36,7 @@
 //! ## Why a write takes a lock and a read takes nothing
 //!
 //! Writers hold a spin lock against each other, because two cursors moving at
-//! once is two entries in one place. **A lookup holds nothing** (ADR 0188). It
+//! once is two entries in one place. **A lookup holds nothing** (ADR 152). It
 //! reads the slot, copies the value out, and then reads the region's cursor a
 //! second time: if the cursor has passed the entry since, some `put` was
 //! writing over those bytes while they were being read, and the answer is
@@ -60,7 +60,7 @@
 //! waits, so a holder always finishes and releases. The rule is about waiting
 //! and not about copying: `add` does one integer add under the same lock the
 //! `memcpy` is under, which is how a count survives two writers
-//! ([ADR 0261](../docs/adr/0261-a-count-is-added-to-under-the-lock-the-copy-is-under.md)).
+//! ([ADR 109](../docs/adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -117,7 +117,7 @@ const Slot = packed struct(u64) {
     freq: u2 = 0,
 
     /// **Every read and every write of a slot goes through here**, because
-    /// `get` holds nothing (ADR 0188) and so a slot is always being read while
+    /// `get` holds nothing (ADR 152) and so a slot is always being read while
     /// somebody may be writing it. It costs nothing: eight bytes, aligned, is
     /// one `mov` either way. What it buys is that the compiler may not invent a
     /// second read of a word another thread is storing to, which is the thing
@@ -248,7 +248,7 @@ pub const OpenError = error{
 /// a guess. Summed across shards on demand.
 ///
 /// **This is a sum over a moving target rather than a snapshot**, because a
-/// lookup takes no lock (ADR 0188) and so neither does this. The counters are
+/// lookup takes no lock (ADR 152) and so neither does this. The counters are
 /// exact; what is not exact is that they were not all read at the same instant.
 ///
 /// `evicted` therefore also counts the rare read whose bytes a `put` overwrote
@@ -328,7 +328,7 @@ const Counters = struct {
 /// A spin lock, and not by preference — see the header. One to a cache line,
 /// or two shards would share one and the sharding would buy nothing.
 ///
-/// **Only writers take it** (ADR 0188). `put`, `del`, `clear` and the promotion
+/// **Only writers take it** (ADR 152). `put`, `del`, `clear` and the promotion
 /// a read hands back are serialised against each other; a `get` takes nothing
 /// at all and validates afterwards instead. A reader-writer version of this
 /// lock was built first and measured: sharing it was worth 11% on eight threads
@@ -368,7 +368,7 @@ const Entry = struct {
 /// there is copied into `main` and gets the rest of the ring to live in; one
 /// that is never asked for again never leaves the tenth it came in through.
 /// **The doorkeeper is a second question rather than a data structure**, which
-/// is why it costs no memory (ADR 0181).
+/// is why it costs no memory (ADR 148).
 /// Where a region's write cursor is, and how many times it has been round —
 /// **in one word, so a reader takes both in one load and can never see half of
 /// a move.** Two separate fields would let a lookup read the offset from before
@@ -412,7 +412,7 @@ const Region = struct {
     /// acquire load lets the compiler sink the copy below it.
     ///
     /// **The compiler is not the only thing that reorders, and `seq_cst` on
-    /// this one load does not hold the processor** (ADR 0190). An acquire —
+    /// this one load does not hold the processor** (ADR 152). An acquire —
     /// which is all a `seq_cst` load is to the hardware — keeps what comes
     /// *after* it from moving up; it says nothing about the copy that came
     /// *before* it moving down, and on aarch64 that is an ordinary thing for
@@ -421,7 +421,7 @@ const Region = struct {
     /// is the missing sentence: every load before it is complete before any
     /// load after it. Measured at no cost on an M1 Pro — three interleaved
     /// rounds, one and eight threads, inside the spread on every row — and it
-    /// compiles to nothing on x86, so ADR 0188's figures stand as taken.
+    /// compiles to nothing on x86, so ADR 152's figures stand as taken.
     inline fn settled(r: *const Region) Mark {
         if (comptime builtin.cpu.arch.isAARCH64()) asm volatile ("dmb ishld" ::: .{ .memory = true });
         return @bitCast(r.cursor.load(.seq_cst));
@@ -448,7 +448,7 @@ const Region = struct {
     /// cursor that lied. Sequentially consistent is what says so to the
     /// compiler.
     ///
-    /// **It does not say so to every processor** (ADR 0190). To the hardware a
+    /// **It does not say so to every processor** (ADR 152). To the hardware a
     /// `seq_cst` store is a release: what came before it stays before it, and
     /// the `memcpy` that comes *after* is free to land first — which on
     /// aarch64 it does, and on x86, which keeps stores in order, it cannot.
@@ -491,7 +491,7 @@ const Region = struct {
 
     /// Whether the cursor wrote over this entry **inside the last lap**.
     ///
-    /// This is a ghost queue that costs nothing (ADR 0188). A dead slot is
+    /// This is a ghost queue that costs nothing (ADR 152). A dead slot is
     /// already a record that some key hashing here was in the ring and the
     /// write cursor took it, which is exactly the fact quick_cache keeps a
     /// separate list of non-resident entries to remember — and pays half its
@@ -603,7 +603,7 @@ const Shard = struct {
     /// rest of the ring. **A second chance** keeps a warm entry in `main` by
     /// putting it back at the head before the cursor reaches it. Both are one
     /// `memcpy` inside a lock that was already held, which is the only thing
-    /// this module is allowed to do in there (ADR 0138).
+    /// this module is allowed to do in there (ADR 109).
     ///
     /// **It is given the slot's value as well as its address**, because the
     /// lock it holds keeps other writers out and no longer keeps lookups out: a
@@ -646,7 +646,7 @@ const Shard = struct {
     }
 
     /// The write half of a read, and the reason `get` can hold nothing at all
-    /// (ADR 0188).
+    /// (ADR 152).
     ///
     /// A hit that proved something — a second ask inside the doorkeeper, or a
     /// warm entry the cursor is about to reach — wants its entry copied to
@@ -862,7 +862,7 @@ pub const Store = struct {
     /// For the caller that has to do something exactly once per key — an
     /// idempotency record, a lock over a job — and needs the cache to be the
     /// thing that decides who was first
-    /// ([ADR 0193](../docs/adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)).
+    /// ([ADR 155](../docs/adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
     pub fn putIfAbsent(self: *Store, space: u32, key: []const u8, value: []const u8, ttl_s: u32) Claim {
         return self.write(.claim, space, key, value, ttl_s, {});
     }
@@ -876,7 +876,7 @@ pub const Store = struct {
     /// The read, the add and the write happen under the shard's lock, the
     /// same lock `put`'s `memcpy` is under, so two callers adding one each
     /// answer two rather than one. That is what makes this a count and not a
-    /// `get` followed by a `put` (ADR 0261). The value already there has to
+    /// `get` followed by a `put` (ADR 109). The value already there has to
     /// be exactly `@sizeOf(Int)` long, or it is treated as absent — which
     /// cannot happen inside one Space.
     pub fn add(self: *Store, comptime Int: type, space: u32, key: []const u8, delta: Int, ttl_s: u32) Int {
@@ -940,7 +940,7 @@ pub const Store = struct {
         // The clock and the header are built **before** the lock. Nothing that
         // waits may happen inside a critical section this module holds by
         // spinning, and `clock_gettime` is the one call in here that could
-        // (ADR 0138). A claim reads it once more for the same reason: the
+        // (ADR 109). A claim reads it once more for the same reason: the
         // expiry test it makes inside the lock has to use a clock read
         // outside it.
         const now: u32 = if (ttl_s == 0 and mode == .put) 0 else self.elapsed();
@@ -1116,7 +1116,7 @@ pub const Store = struct {
         const bucket = shard.bucketOf(hash);
         @prefetch(bucket.ptr, .{ .rw = .read, .locality = 3, .cache = .data });
 
-        // **A lookup takes nothing** (ADR 0188). It reads the slot, reads the
+        // **A lookup takes nothing** (ADR 152). It reads the slot, reads the
         // bytes, and then asks the region's cursor whether anything wrote over
         // those bytes while it was reading them — which is the same question
         // `live` already answers, asked a second time. Nothing here is
@@ -1304,7 +1304,7 @@ pub const Store = struct {
     /// zero means the way was never written, which is why it is part of the
     /// test rather than a separate one.
     /// **The eight loads are atomic because somebody is always writing this
-    /// line** (ADR 0188), and `unordered` because that is the weakest thing
+    /// line** (ADR 152), and `unordered` because that is the weakest thing
     /// that is still not a race. A plain 64-byte read of the bucket is what
     /// this wants to be and it measured 16% faster on one thread; it is also a
     /// data race beside a `put`'s slot store, and this module's answer to "is
@@ -1607,7 +1607,7 @@ test "a region that cannot fit an entry before its end starts again at its start
 
 test "a slot the cursor has just passed is a ghost, and one from long ago is not" {
     // The ghost queue this cache does not pay for: a dead slot is already a
-    // record that the key was here and the ring took it (ADR 0188).
+    // record that the key was here and the ring took it (ADR 152).
     var r: Region = .init(0, 1000);
     _ = r.reserve(400); // off 0, pass 1
     _ = r.reserve(400); // off 400, pass 1
@@ -1761,7 +1761,7 @@ test "every shard the cache allocated is one a key can reach" {
             }
             // Every shard's ring cursor moved, which is the same statement as
             // "a key reached it" and is per shard, which the counters are not:
-            // they are per thread now (ADR 0188).
+            // they are per thread now (ADR 152).
             for (store.shards) |*s| {
                 const moved = s.small.mark().head != s.small.from or
                     s.main.mark().head != s.main.from or s.main.mark().gen != 1;
@@ -1825,7 +1825,7 @@ const Racer = struct {
 };
 
 test "a lookup that holds no lock never hands back a value that is not the key's" {
-    // **The test the lock-free read path exists to survive** (ADR 0188). A
+    // **The test the lock-free read path exists to survive** (ADR 152). A
     // `get` copies bytes out of the ring with nothing held and then asks the
     // region's cursor whether a `put` was writing over them while it read. This
     // is what says that second question is load-bearing rather than decoration.

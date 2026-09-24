@@ -3,7 +3,7 @@
 //! Until M2 this file held defaults in Zig. It now holds the same struct read by
 //! `nilo_config`, and the difference is worth stating: **a field with no default
 //! is required, and every setting that failed is named at once** rather than the
-//! first one stopping the program (ADR 0043).
+//! first one stopping the program (ADR 039).
 //!
 //! Registered as a service and asked for as a **`*const Settings`**, which is a
 //! different type from `*Settings` and is looked up as such — a read-only
@@ -11,7 +11,7 @@
 //!
 //! `[]const u8` rather than `Str`, and that is not a slip: a bottom-layer module
 //! that named `nilo_core` would give up running under a plain `zig test`, which
-//! is the entry condition for its layer (ADR 0042, ADR 0043). The text these
+//! is the entry condition for its layer (ADR 038, ADR 039). The text these
 //! fields point at is the environment block, so it outlives everything.
 
 const std = @import("std");
@@ -58,7 +58,7 @@ pub const Settings = struct {
 
     /// Connections held open, and **one of them is the writer** — SQLite allows
     /// one at a time, so this is `1 + readers` rather than a pool size in the
-    /// usual sense (ADR 0074).
+    /// usual sense (ADR 065).
     db_pool: u16 = 4,
 };
 
@@ -66,7 +66,7 @@ pub const Settings = struct {
 /// confused with somebody else's `PORT`.
 pub const prefix = "ARSIP_";
 
-/// A `.env` is text somebody else read (ADR 0064) — the module opens no file, so
+/// A `.env` is text somebody else read (ADR 039) — the module opens no file, so
 /// this does, and hands over the bytes. They have to outlive the Settings,
 /// because a `[]const u8` field points into them.
 pub const Sources = struct {

@@ -1,6 +1,6 @@
 //! A `.deps` function that answers a struct without the service a `run`
 //! asks for. The checks on a `run`'s signature wait until the queue type
-//! exists when `.deps` is a function (ADR 0245), so this one fires at the
+//! exists when `.deps` is a function (ADR 160), so this one fires at the
 //! first thing the program does with the queue rather than at
 //! `job.Jobs(…)` — and it is the same sentence the struct shape gets.
 

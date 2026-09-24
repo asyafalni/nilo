@@ -1,5 +1,5 @@
 //! What a Row says about the **table** rather than about a query
-//! ([ADR 0153](../docs/adr/0153-a-migration-is-a-diff-against-a-snapshot.md)).
+//! ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 //!
 //! `row.zig` answers what a `SELECT` needs: the name, the key, the column
 //! list. That is not enough to create anything. A table also has a unique
@@ -52,7 +52,7 @@
 //! and `.trigger` are a second kind of word rather than a refusal, and the
 //! list of object kinds whose replace is mechanical is what closes that kind.
 //! That is its own decision and is not made here
-//! ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)). Until
+//! ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)). Until
 //! it is, those go in a step as SQL, and the snapshot marks them as objects
 //! nilo does not own so that a diff never tries to drop one.
 //!
@@ -79,7 +79,7 @@ pub const max_identifier = 63;
 ///
 /// Four, and they are the four the standard has that mean something different.
 /// `SET DEFAULT` is left out, and the reason moved when `.default` arrived
-/// (ADR 0221): the marker can express the default now, and what it cannot
+/// (ADR 181): the marker can express the default now, and what it cannot
 /// express is the part that matters, which is that the default has to be a row
 /// that exists over there. A default naming a row nobody kept turns the delete
 /// it was meant to survive into a foreign-key violation. Nobody has brought a
@@ -128,7 +128,7 @@ pub const Column = struct {
     /// string is both what the `CREATE` writes and what the diff compares —
     /// and two of those cannot fall out of step. The checking happens before
     /// the rendering: a literal that is not the column's own Zig type does not
-    /// compile ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+    /// compile ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
     default: ?[]const u8 = null,
     /// The words this column may hold, when the Row reads it as a Zig enum
     /// that has not said which database type it is. Empty for every other
@@ -141,7 +141,7 @@ pub const Column = struct {
     /// The name that check goes in under, when `.check` gave it one. Empty
     /// means the derived `<table>_<column>_check`, which is also what Postgres
     /// would have called it
-    /// ([ADR 0226](../docs/adr/0226-the-marker-has-a-word-the-database-checks.md)).
+    /// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
     ///
     /// In the snapshot, so that renaming it is a migration: the constraint in
     /// the database still has the old name, and dropping it by the new one
@@ -229,7 +229,7 @@ pub const Reference = struct {
     /// **A list rather than a name, and it is not an edge case**: "an Epic has
     /// to be on the same board" is `(epic_id, department_id)` pointing at
     /// `work_epics (id, department_id)`, and a rule like that has nowhere else
-    /// as cheap to live ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+    /// as cheap to live ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
     columns: []const []const u8,
     /// The table pointed at, split the same way the Row's own name is, so that
     /// the create order is worked out by comparing two names rather than by
@@ -266,9 +266,9 @@ pub fn sameOptionalText(a: ?[]const u8, b: ?[]const u8) bool {
 
 /// An object whose **name** the compiler checks and whose **body** only the
 /// database can read
-/// ([ADR 0226](../docs/adr/0226-the-marker-has-a-word-the-database-checks.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 ///
-/// This is the second kind of word ADR 0221 named and did not build. A `CHECK`
+/// This is the second kind of word ADR 181 named and did not build. A `CHECK`
 /// body is a string nilo will not parse, and it is also a named object with a
 /// text — which a diff owns completely: same name and same hash, nothing to do;
 /// same name and a new hash, replace; name gone, drop. The compiler holds the
@@ -371,7 +371,7 @@ pub const Desc = struct {
     indexes: []const Index = &.{},
     references: []const Reference = &.{},
     /// `CHECK` constraints the marker named, plus the one an enum column
-    /// generates when `.check` gave it a name (ADR 0226).
+    /// generates when `.check` gave it a name (ADR 181).
     checks: []const NamedText = &.{},
     /// `CREATE TRIGGER` clauses, by trigger name. The two halves are what goes
     /// either side of the `ON "table"` nilo writes in the middle.
@@ -380,7 +380,7 @@ pub const Desc = struct {
     /// not part of where it is.
     renames: []const Rename = &.{},
     /// Whether this program builds the table
-    /// ([ADR 0162](../docs/adr/0162-a-table-this-program-reads-and-does-not-build.md)).
+    /// ([ADR 130](../docs/adr/130-a-table-this-program-reads-and-does-not-build.md)).
     /// Written to a snapshot, unlike the two above: a table this program
     /// starts or stops building is a change somebody should see in the file's
     /// diff, and `std.zon` omits a field equal to its default — so `false` is
@@ -499,7 +499,7 @@ fn claim(
 /// no name for, in the middle of a question that has nothing to do with column
 /// types. The where walker asks this one, to find how two tables are joined
 /// for an `.exists`, and it has no Dialect's opinion to spend
-/// ([ADR 0171](../docs/adr/0171-a-row-over-there-is-a-condition.md)).
+/// ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
 pub fn foreignKeysOf(comptime Row: type) []const Reference {
     return comptime blk: {
         const owner = row_mod.ownerOf(Row);
@@ -524,7 +524,7 @@ fn columnsOf(
         var out: [fields.len]Column = undefined;
         var n: usize = 0;
         for (fields) |f| {
-            // A field beside the columns has no column to describe (ADR 0217).
+            // A field beside the columns has no column to describe (ADR 178).
             if (row_mod.isBeside(Row, f.name)) continue;
             defer n += 1;
             const i = n;
@@ -587,7 +587,7 @@ fn columnsOf(
 /// Postgres `ENUM` the database owns, whose words are added with `ALTER TYPE`
 /// and are none of nilo's business. An enum that says nothing is a `text`
 /// column nilo creates, and then the words are the type's
-/// ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 pub fn enumValues(comptime T: type) []const []const u8 {
     comptime {
         const Inner = switch (@typeInfo(T)) {
@@ -635,7 +635,7 @@ fn assertDefaultsAreColumns(comptime Row: type, comptime decl: anytype) void {
 /// that borrows it can hide a required column, and an insert through it cannot
 /// write what it cannot see. A table this program does not build answers
 /// nothing: its defaults are the database's, and the marker is not where they
-/// are written (ADR 0162).
+/// are written (ADR 130).
 pub fn requiredOf(comptime Row: type) []const []const u8 {
     return comptime blk: {
         const owner = row_mod.ownerOf(Row);
@@ -720,13 +720,13 @@ fn listed(comptime names: []const []const u8, comptime name: []const u8) bool {
 
 /// What this column's `DEFAULT` is, as the Dialect writes it.
 ///
-/// **ADR 0153 put a default in the step and not in the type**, on the grounds
+/// **ADR 123 put a default in the step and not in the type**, on the grounds
 /// that the moment one is load-bearing is narrow — a `NOT NULL` column added to
 /// a table that already has rows — and that such a default is dropped
 /// afterwards. A 59-table schema settled it the other way: of its 126 defaults,
 /// none is that case. Eighty-six are `now()` on a `created_at`, forty are
 /// literals the program's every insert relies on for its whole life
-/// ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 ///
 /// What can be checked while compiling is all of it. `.now` on a column that is
 /// not a `sql.Timestamp` does not compile; a literal that is not the column's
@@ -830,7 +830,7 @@ fn literalText(
 
         // An array column, whose default is the one thing a schema written by
         // hand nearly always gives it: the empty array
-        // ([ADR 0225](../docs/adr/0225-an-array-column-has-a-default-like-any-other.md)).
+        // ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
         // `&.{}` rather than `"{}"`, because a value written into the schema is
         // of the column's own type everywhere else in this word.
         if (types.listElement(Inner)) |Item| return quoteLiteral(arrayLiteral(what, mine, T, Item, written));
@@ -1411,14 +1411,14 @@ fn indexesOf(
 
 /// The `WHERE` of a partial index, as SQL.
 ///
-/// **ADR 0153 refused this and refused it as `.where = "deleted_at IS NULL"`,
+/// **ADR 123 refused this and refused it as `.where = "deleted_at IS NULL"`,
 /// a string** — and the refusal was right about the string. This is not one.
 /// It is the same grammar the where walker already has, checked the same way:
 /// a column that is not one is a Refusal naming the near miss, and a literal
 /// that is not the column's own Zig type does not compile. What comes out is
 /// SQL because an index predicate has nowhere to put a parameter — the
 /// database stores it, and it is part of the schema rather than of a statement
-/// ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 ///
 /// Four terms, which is every shape a real schema turned out to need:
 ///
@@ -1521,7 +1521,7 @@ fn referencesOf(
 /// reads one shape. `row` is the Row when the marker named a type and null
 /// when it named the table as text, and it is the only field the difference
 /// survives into: what the type check needs, and nothing else
-/// ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 const Target = struct {
     row: ?type,
     schema: ?[]const u8,
@@ -1684,7 +1684,7 @@ fn oneReference(
         // insert, in a message about a cast rather than about a design. It runs
         // here when the target is a type, and in `assertTargetsResolve` when it
         // is a name — the same check, one level up, where every Row is in one
-        // list (ADR 0222).
+        // list (ADR 181).
         if (target.row) |Pointed| {
             for (columns, target.columns) |c, t| {
                 if (!row_mod.hasColumn(Pointed, t))
@@ -1778,7 +1778,7 @@ pub const NamedTarget = struct {
 /// **Not a field on `Reference`**, and that is deliberate: how the Zig source
 /// spelled a target is not a fact about the schema, and `Reference` is what the
 /// snapshot holds. So it is asked for separately, by the one caller that has
-/// every Row in one list (ADR 0222).
+/// every Row in one list (ADR 181).
 pub fn namedTargetsOf(comptime Row: type) []const NamedTarget {
     return comptime blk: {
         if (row_mod.isProjection(Row)) break :blk &.{};
@@ -1821,7 +1821,7 @@ pub fn namedTargetsOf(comptime Row: type) []const NamedTarget {
 /// of Rows the migrator was given.
 ///
 /// **This is the check that moved rather than the check that was dropped**
-/// (ADR 0222). A foreign key naming a Zig type is checked inside the Row,
+/// (ADR 181). A foreign key naming a Zig type is checked inside the Row,
 /// because the type is right there. A program whose contexts may not import
 /// each other cannot write that type, and the answer is not to give the check
 /// up: every Row is in one comptime list one level up, so the name is resolved
@@ -1951,7 +1951,7 @@ fn namedEntries(
 /// The text of a named object, as it will be written.
 ///
 /// **This is the word the database checks rather than the compiler**, which is
-/// the whole of the second kind ADR 0221 named and ADR 0226 built. nilo does
+/// the whole of the second kind of word in ADR 181. nilo does
 /// not read it: it writes it, hashes it, and notices when the hash moves. What
 /// it does check is that it is text and that there is some.
 fn namedBody(
@@ -2224,7 +2224,7 @@ test "the same type describes two databases, and only the column types move" {
     try testing.expectEqualStrings("int8", pg.column("id").?.sql_type);
     try testing.expectEqualStrings("INTEGER", lite.column("id").?.sql_type);
     try testing.expectEqualStrings("timestamptz", pg.column("created_at").?.sql_type);
-    // The one SQLite stores as an integer rather than as text (ADR 0136).
+    // The one SQLite stores as an integer rather than as text (ADR 067).
     try testing.expectEqualStrings("INTEGER", lite.column("created_at").?.sql_type);
 }
 
@@ -2416,7 +2416,7 @@ test "a narrower Row describes the table it borrows, not a table of its own" {
     try testing.expectEqual(@as(usize, 2), desc.uniques.len);
 }
 
-// -- the words that live inside one Row (ADR 0221) ------------------------
+// -- the words that live inside one Row (ADR 181) ------------------------
 
 const Priority = enum { urgent, high, normal, low };
 
@@ -2547,7 +2547,7 @@ test "a column says what the database writes when an insert leaves it out" {
 
 test "the same default is spelled by the database it is for" {
     // `now()` is one word on Postgres and an expression on SQLite, because a
-    // Timestamp there is microseconds in an INTEGER column (ADR 0136). A
+    // Timestamp there is microseconds in an INTEGER column (ADR 067). A
     // literal is the same text on both.
     const lite = comptime descOf(Lite, WorkItem);
     try testing.expectEqualStrings(Lite.now_default, lite.column("created_at").?.default.?);
@@ -2630,7 +2630,7 @@ test "a schema-qualified table keeps the schema out of its constraint names" {
     try testing.expectEqualStrings("audit_at_idx", desc.indexes[0].name);
 }
 
-// -- the second kind of word (ADR 0226) ----------------------------------
+// -- the second kind of word (ADR 181) ----------------------------------
 
 test "a check the marker names is a name and a body, and nilo reads neither half of the body" {
     const desc = comptime descOf(Pg, WorkItem);
@@ -2666,7 +2666,7 @@ test "an enum column's check takes the name `.check` gave it, and keeps its word
 
     try testing.expectEqualStrings("work_items_priority_is_known", priority.check);
     // The words are still the type's. Naming the constraint says nothing about
-    // what it holds ([ADR 0226](../docs/adr/0226-the-marker-has-a-word-the-database-checks.md)).
+    // what it holds ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
     try testing.expectEqual(@as(usize, 4), priority.values.len);
 
     // And a column nobody named keeps the derived one, which is empty here and

@@ -6,12 +6,12 @@ somebody else's API that does not change for five minutes. A tool module: no
 event loop, no allocator after `open`, and it imports nothing, so `zig test
 cache/cache.zig` runs the whole of it and a program that is not a server can
 take it on its own
-([ADR 0138](../adr/0138-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)).
+([ADR 109](../adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)).
 
 **It does not leave this process.** Two instances of your program have two
 caches that do not agree, neither survives a restart, and nothing here reaches
 a network. That is the trade the module is for, and
-[ADR 0139](../adr/0139-an-in-process-cache-and-a-redis-client-are-two-modules.md)
+[ADR 110](../adr/110-an-in-process-cache-and-a-redis-client-are-two-modules.md)
 is where the other answer — a Redis client — was named and not built.
 
 ```zig
@@ -126,7 +126,7 @@ fn page(pages: *Pages, path: []const u8) ![]const u8 {
 ```
 
 **`Held` is your stack, and stack is held per connection for the life of
-it** ([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)). A
+it** ([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)). A
 handler declaring a 4 KiB `Held` has added 4 KiB to every connection that
 reaches it. It is written as an array you declare rather than a buffer the
 cache hides because that is the only way the number is yours to see. A
@@ -178,7 +178,7 @@ are what say so: nothing allocates per operation.
 Five OTPs per phone number an hour, failed sign-ins per email, a quota per
 API key: a count under a key, and `get` then `put` loses one whenever two
 requests land between them. A Space whose value is an integer has `incr`
-([ADR 0261](../adr/0261-a-count-is-added-to-under-the-lock-the-copy-is-under.md)):
+([ADR 109](../adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)):
 
 <!-- compiles -->
 ```zig
@@ -195,7 +195,7 @@ fn signIn(attempts: *Attempts, email: []const u8) !void {
 `incr(key, delta)` answers the new count, and the read, the add and the
 write happen under the shard's lock — the same lock a `put`'s copy is
 under, and one add is not a wait, which is the sentence the rule in
-[ADR 0138](../adr/0138-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)
+[ADR 109](../adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)
 turned out to be about. Two requests arriving at once count two. A key
 nobody wrote counts from zero and lives `ttl_s`; one already there **keeps
 the expiry it had**, so the hour above is the hour of the first attempt
@@ -248,7 +248,7 @@ and the key. 64.3 bytes an entry on 200,000 of them, against go-cache's
 100.2, freecache's 132.0 and bigcache's 149.4.
 
 **A new entry has to be asked for twice before it gets the run of the ring**
-([ADR 0187](../adr/0187-a-cache-that-admits-everything-forgets-what-mattered.md)). It lands in a
+([ADR 109](../adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)). It lands in a
 tenth of the ring and is copied into the rest when something reads it again,
 so a flood of keys nobody asks for twice cannot flush what the cache is
 holding. Two things follow that are worth knowing rather than discovering:
@@ -279,7 +279,7 @@ summed, because a lookup takes no lock either.
 ## What it costs
 
 **A `get` takes no lock at all**
-([ADR 0188](../adr/0188-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md)):
+([ADR 152](../adr/152-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md)):
 it copies the value out and then asks the ring's write cursor whether
 anything wrote over those bytes while it read them. Readers do not queue
 behind each other — 124.5M reads a second on eight threads, against 108.8M
@@ -337,7 +337,7 @@ kept; the next request runs it again.
 service, the way [`Replays`](./idempotency.md#wiring-it-up) is — the record
 in it is the same record, and `Cached` is `Idempotent` with the key made of
 the request line instead of a header
-([ADR 0247](../adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)).
+([ADR 188](../adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)).
 The TTL is the route's rather than the Space's, so one Space may hold a
 page kept a minute beside one kept an hour.
 
@@ -398,5 +398,5 @@ own suite does it once so that yours need not.
 - [`bench/result/cache.md`](../../bench/result/cache.md) — every number
   above, how it was run, and the single-threaded rows where go-cache is
   faster.
-- [ADR 0138](../adr/0138-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)
+- [ADR 109](../adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)
   — why the value may hold no pointer and why the lock spins.

@@ -71,7 +71,7 @@ which interface you land on is never a lookup's decision.
 The two buffers are what a connection costs **while it is being served**, not
 while it waits: a connection that has gone quiet gives both of them back, along
 with its stack pages, and waits at the shallowest frame it ever has
-([ADR 0071](../adr/0071-where-a-connection-waits-is-what-it-costs.md)). So size
+([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)). So size
 them for the responses you send rather than for the connections you hold —
 **an idle connection is 4,669 bytes whatever these two say.**
 
@@ -82,12 +82,12 @@ connection is served by the thread it was dealt to, and a handler runs on
 that one OS thread from its first line to its last, across every wait in
 it — no work stealing between threads, because what stealing cost was a
 second wakeup on every request of a server that is not busy
-([ADR 0272](../adr/0272-a-connection-is-served-by-the-thread-it-was-dealt-to.md)).
+([ADR 199](../adr/199-a-connection-is-served-by-the-thread-it-was-dealt-to.md)).
 Every thread also accepts: one fiber per thread sits in `accept` on the
 listening socket, so how fast the server takes new connections grows with
 `threads` rather than being what one fiber can do — about 43,000 a second,
 which is where a server that closes connections after a few requests used
-to stop ([ADR 0273](../adr/0273-every-executor-accepts.md)).
+to stop ([ADR 200](../adr/200-every-executor-accepts.md)).
 
 On the request path, a routed GET returning JSON with CORS installed makes
 **one allocation** — the JSON body, and nothing else. A test holds it there.
@@ -103,19 +103,19 @@ follow say why each one is shaped the way it is.
 | Bound | Default | Past it | What lets it go again |
 |---|---|---|---|
 | `max_connections` | 10,000 | The connection is accepted and closed at once — nothing read, no status written, so the client usually sees a reset. The log says so once a minute with a running count | A held connection ends: a keep-alive one idles out, a WebSocket tab closes, a stream finishes |
-| the process's descriptor limit (`ulimit -n`) | usually 1,024 | `accept` fails with `ProcessFdQuotaExceeded`; the loop waits — 5 ms, doubling to a second — and tries again, and the log says so once per shortage. Connections meanwhile wait in the kernel's backlog. `listen()` warned at startup if this was below `max_connections` ([ADR 0265](../adr/0265-an-accept-loop-that-is-out-of-descriptors-waits.md)) | A held connection ends |
-| `backlog` | 4,096 | The kernel drops the SYN — no reset, no log line here — and the client's TCP retries it one second later, so the connection succeeds late. `ListenOverflows` in `/proc/net/netstat` is the only trace; `bench/burst.py` reads it ([ADR 0271](../adr/0271-a-backlog-is-sized-for-the-burst-not-the-load.md)) | An acceptor takes the next handshake; there is one per thread, so the queue drains at the rate all of them accept ([ADR 0273](../adr/0273-every-executor-accepts.md)) |
+| the process's descriptor limit (`ulimit -n`) | usually 1,024 | `accept` fails with `ProcessFdQuotaExceeded`; the loop waits — 5 ms, doubling to a second — and tries again, and the log says so once per shortage. Connections meanwhile wait in the kernel's backlog. `listen()` warned at startup if this was below `max_connections` ([ADR 194](../adr/194-an-accept-loop-that-is-out-of-descriptors-waits.md)) | A held connection ends |
+| `backlog` | 4,096 | The kernel drops the SYN — no reset, no log line here — and the client's TCP retries it one second later, so the connection succeeds late. `ListenOverflows` in `/proc/net/netstat` is the only trace; `bench/burst.py` reads it ([ADR 198](../adr/198-a-backlog-is-sized-for-the-burst-not-the-load.md)) | An acceptor takes the next handshake; there is one per thread, so the queue drains at the rate all of them accept ([ADR 200](../adr/200-every-executor-accepts.md)) |
 | `max_in_flight` | off | The head is read, then `503` with `Retry-After: 1` and `Connection: close` — one write of a constant, no queue. Counted under `<shed>` on the metrics page | A request inside its handler finishes |
 | `header_timeout_ms` | 10,000 | A client partway through a head gets a `408` and the connection is closed. One that sent nothing is closed without a status — there is nothing to answer | Nothing to release: the connection is gone |
-| `read_buffer` | 16 KiB | A head that does not fit is a `431`, and the connection is closed — send side first, so the `431` reaches a client that would otherwise see a reset ([ADR 0266](../adr/0266-a-refused-request-is-hung-up-on-with-a-fin.md)) | Nothing to release |
+| `read_buffer` | 16 KiB | A head that does not fit is a `431`, and the connection is closed — send side first, so the `431` reaches a client that would otherwise see a reset ([ADR 195](../adr/195-a-refused-request-is-hung-up-on-with-a-fin.md)) | Nothing to release |
 | `idle_timeout_ms` | 75,000 | A keep-alive connection that has asked for nothing is closed, no status | Nothing to release |
 | `body_timeout_ms` | 30,000 | A read of the body that outlasts it fails the handler's `c.body()` with a `408`, and the connection is closed. `c.bodyStream()` sees the same read fail | Nothing to release |
 | `body_min_rate` after `body_grace_ms` | 8 KiB/s after 10,000 | A body `c.body()` is assembling gets a deadline worked out from its announced length; too slow is a `408` however steady the bytes were. `c.bodyStream()` is not under it | Nothing to release |
-| `max_body`, or `nilo.maxBody` on the route | 1 MiB | `c.body()` refuses with a `413` before reading past it. A body nobody read that is over it is not drained after the answer: the response goes out and the connection is closed rather than read to the end — send side first, so the `413` arrives ([ADR 0266](../adr/0266-a-refused-request-is-hung-up-on-with-a-fin.md)) | Nothing to release — the next request needs a new connection |
-| `request_deadline_ms` | off | Every wait of the request — body reads, the write — is cut to it, and `c.overdue()` says so to a handler doing its own work; the failure is the wait's own (`408`, or the write given up), the same as `nilo.deadline(ms)` on one route. A stream, a WebSocket or a `bodyStream()` lets go of it ([ADR 0267](../adr/0267-a-deadline-every-request-starts-with.md)) | — |
+| `max_body`, or `nilo.maxBody` on the route | 1 MiB | `c.body()` refuses with a `413` before reading past it. A body nobody read that is over it is not drained after the answer: the response goes out and the connection is closed rather than read to the end — send side first, so the `413` arrives ([ADR 195](../adr/195-a-refused-request-is-hung-up-on-with-a-fin.md)) | Nothing to release — the next request needs a new connection |
+| `request_deadline_ms` | off | Every wait of the request — body reads, the write — is cut to it, and `c.overdue()` says so to a handler doing its own work; the failure is the wait's own (`408`, or the write given up), the same as `nilo.deadline(ms)` on one route. A stream, a WebSocket or a `bodyStream()` lets go of it ([ADR 105](../adr/105-a-route-can-say-how-long-it-has.md)) | — |
 | `write_timeout_ms` | 30,000 | One write to the client that outlasts it gives the response up: no status can be sent by then, the connection is closed, and the log says `gave up writing after 30000ms — the client stopped reading` rather than blaming the handler | Nothing to release |
 | `shutdown_grace_ms` | 10,000 | A stop waits this long for requests inside their handlers. Idle connections are closed at once, not waited for. Past it the rest are cut off and the log says how many | — |
-| `arena_keep` | 16 KiB | Not a refusal: a response assembled in `c.arena()` that is larger than this is built in memory the arena gives back after the request, so the next one faults it in a page at a time ([ADR 0096](../adr/0096-a-response-larger-than-the-arena-keep-is-a-page-fault-per-page.md)) | Raise it just past the largest response, and no further — it is held per connection |
+| `arena_keep` | 16 KiB | Not a refusal: a response assembled in `c.arena()` that is larger than this is built in memory the arena gives back after the request, so the next one faults it in a page at a time ([ADR 075](../adr/075-a-response-larger-than-the-arena-keep-is-a-page-fault-per-page.md)) | Raise it just past the largest response, and no further — it is held per connection |
 
 Two things are true of every row. **A status goes out only when nothing has
 been written yet**: a `408` or `413` reached mid-response cannot take back the
@@ -130,7 +130,7 @@ The four `_timeout_ms` knobs above bound how long the server waits on a client,
 and they are on by default. Zero turns one off.
 
 They are limits on one wait for the network, not on a request
-([ADR 0023](../adr/0023-a-deadline-belongs-to-an-operation-not-to-a-request.md)),
+([ADR 022](../adr/022-a-deadline-belongs-to-an-operation-not-to-a-request.md)),
 which is what makes them safe to leave on: a stream that runs for an hour, a
 WebSocket, and a 4 GB upload are all requests, and none of them is hurried by
 any of this. What gets cut off is a client that has stopped talking.
@@ -148,7 +148,7 @@ arrives on time — so a body nilo is assembling in the arena gets a deadline
 worked out from the length the client announced: `body_grace_ms` plus what those
 bytes need at `body_min_rate`. A megabyte has 138 seconds at the defaults, and a
 client slower than 8 KiB/s is a 408 however honest it is
-([ADR 0124](../adr/0124-a-buffered-body-arrives-at-a-rate.md)).
+([ADR 022](../adr/022-a-deadline-belongs-to-an-operation-not-to-a-request.md)).
 
 If your clients upload from places where that is not generous, lower the rate
 rather than raising the timeout — `body_min_rate = 0` turns it off entirely and
@@ -176,7 +176,7 @@ asked for anything**, so the default is around 45 MB of connections and no more.
 That figure is a **floor, not a total**. A suspended fiber holds its stack at
 its high-water mark, so a handler adds every byte of stack it ever touched, for
 the life of the connection — an ordinary database route measures 17,022
-([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)). Budget from
+([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)). Budget from
 4,669 only for connections that are idle between requests; budget from what
 your own handlers measure for the ones in flight.
 
@@ -218,7 +218,7 @@ existed.
 It is also what bounds file descriptors. A response that sends a file — a static
 file over `max_file_bytes`, or a handler returning a `FileBody` — holds one open
 for as long as the send takes, and there is one of those per request in flight
-([ADR 0037](../adr/0037-a-file-too-big-to-hold-is-opened-not-read.md)). So it is
+([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)). So it is
 a number that was already being multiplied rather than a second one to budget
 for.
 
@@ -230,7 +230,7 @@ that many are already inside their handlers is answered `503` with
 `Retry-After: 1` at once and the connection closed — no queue, no wait, one
 write of a constant — so a balancer in front sends the retry to a replica with
 room and the requests already running finish on time
-([ADR 0197](../adr/0197-a-server-past-its-limit-says-so-at-once.md)).
+([ADR 159](../adr/159-a-server-past-its-limit-says-so-at-once.md)).
 
 ```zig
 try app.listen(.{ .max_in_flight = 256 });
@@ -270,7 +270,7 @@ try app.with(nilo.maxBody(50 << 20)).post("/import", importCsv);
 ```
 
 It goes both ways — a route can say it takes *less* than `listen()` allows
-([ADR 0194](../adr/0194-a-route-can-say-how-much-body-it-takes.md)).
+([ADR 156](../adr/156-a-route-can-say-how-much-body-it-takes.md)).
 
 ## Who the client is
 
@@ -298,7 +298,7 @@ carrier-grade NAT, link-local, unique-local v6 and the loopback, and
 connection came from one of them; entries written by one of them are skipped
 from the right; the first one left is the client. A rule that is not an address
 stops the server at `listen()` with a sentence naming it
-([ADR 0129](../adr/0129-a-proxy-is-trusted-by-which-one-it-is.md)).
+([ADR 102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md)).
 
 The reason to prefer it over a count is that **a wrong count says nothing**.
 Add a CDN in front of the load balancer and the number is one short from that
@@ -370,7 +370,7 @@ smaller, faster-to-build one and can give up the line numbers.
 Zig cannot recover from a panic: an integer overflow or an out-of-bounds index
 takes the whole process down, every in-flight connection with it. There is no
 `recover` middleware because there cannot be one — see
-[ADR 0008](../adr/0008-no-recover-middleware.md).
+[ADR 007](../adr/007-no-recover-middleware.md).
 
 Handler *errors* are a different thing and are already handled — see
 [Errors](./errors.md). For the rest: run behind a supervisor that restarts, and
@@ -436,7 +436,7 @@ try app.post("/admin/quit", quit);
 ## TLS, and the proxy in front
 
 **nilo does not speak TLS unless the build asks for it, and a proxy in front
-is still the recommendation** ([ADR 0028](../adr/0028-tls-is-terminated-in-front.md)).
+is still the recommendation** ([ADR 027](../adr/027-tls-is-terminated-in-front.md)).
 Zig's standard library can be a TLS client and not a TLS server; the
 alternatives were a one-person crypto dependency or a C toolchain in the
 install story. The first of those is now an option, below, for the server
@@ -488,7 +488,7 @@ nginx, `reverse_proxy unix//run/nilo.sock` in Caddy. `port` is not read. A
 request that arrives that way has no client address of its own, so
 `.trusted_proxies` is what `clientIp()` reads, and it is allowed to because
 nothing remote can open a unix socket
-([ADR 0130](../adr/0130-a-path-is-an-address-to-listen-on.md)).
+([ADR 103](../adr/103-a-path-is-an-address-to-listen-on.md)).
 
 One thing goes with this decision and is worth knowing before you need it: **HTTP/2 is not available for your routes.** Browsers only speak it over TLS, negotiated during the handshake, and the listener below offers only `http/1.1`. **gRPC is the exception**, because it runs over HTTP/2 without TLS: a build that asks for it serves unary calls on a listener of its own ([gRPC](./grpc.md)).
 
@@ -498,7 +498,7 @@ For the server with nothing in front of it: an internal tool on a VM, a
 service on a private network whose policy says encrypted, a machine with one
 port and a certificate and nobody who wants to run a second process. It is
 TLS 1.3, on [ianic/tls.zig](https://github.com/ianic/tls.zig), and it has to
-be built in ([ADR 0288](../adr/0288-tls-is-an-option-a-build-asks-for.md)):
+be built in ([ADR 212](../adr/212-tls-is-an-option-a-build-asks-for.md)):
 
 ```zig
 // build.zig
@@ -527,10 +527,10 @@ not the certificate's, which is the mistake the two files being in
 different `letsencrypt/live/` directories makes: both files parse, so
 without that check the server came up and failed every handshake with the
 reason visible only to the client
-([ADR 0294](../adr/0294-a-key-is-checked-against-its-certificate-at-listen.md)).
+([ADR 212](../adr/212-tls-is-an-option-a-build-asks-for.md)).
 Rotation is a restart, which is the deployment this server already has.
 
-What it costs, so that the choice is a choice ([ADR 0288](../adr/0288-tls-is-an-option-a-build-asks-for.md)
+What it costs, so that the choice is a choice ([ADR 212](../adr/212-tls-is-an-option-a-build-asks-for.md)
 has the tables):
 
 - **560 KB of binary**, before a certificate is loaded, in every build that
@@ -543,7 +543,7 @@ has the tables):
 - **One certificate per listener**, no client certificates, and no reload
   without a restart. TLS 1.3 only, which every browser and client library of
   the last six years speaks.
-- **The library has no audit.** ADR 0028's trust argument is unchanged, and a
+- **The library has no audit.** ADR 027's trust argument is unchanged, and a
   deployment choosing this is choosing an unaudited TLS stack over an audited
   one, on purpose, for a server that would otherwise have none. On the
   internet, put Caddy in front and leave this off.
@@ -559,7 +559,7 @@ proxy is in the way.
 ### More than one address
 
 A server answers on one address by default and on as many as you list
-([ADR 0289](../adr/0289-a-server-answers-on-more-than-one-address.md)). The
+([ADR 213](../adr/213-a-server-answers-on-more-than-one-address.md)). The
 case this exists for is the other half of the section above: HTTPS for the
 people outside and cleartext for whatever is already inside.
 
@@ -624,7 +624,7 @@ declared `nilo_ready`, and the three modules that hold something answer:
 `sql.Db` sends `SELECT 1` down the pool and says what came back, an `s3`
 Store says whether it started, and a service with no hook — a config struct,
 a cache — is assumed ready. A service of your own joins in with one function
-([ADR 0192](../adr/0192-a-health-route-asks-the-services.md)):
+([ADR 154](../adr/154-a-health-route-asks-the-services.md)):
 
 <!-- compiles -->
 ```zig

@@ -6,7 +6,7 @@ One page of [the reference](./README.md): calling somebody else's HTTP API.
 
 An HTTP client for calling somebody else's API from inside a request. A
 **Fitting**: it borrows the event loop and owns no destination
-([ADR 0070](../adr/0070-a-fitting-borrows-the-loop.md)).
+([ADR 061](../adr/061-a-fitting-borrows-the-loop.md)).
 
 `std.http.Client` is the client — pool, HTTP/1.1, TLS. What this adds is the
 policy a server needs and a script does not, in about sixty lines.
@@ -32,13 +32,13 @@ fn charge(api: *fetch.Client, c: *nilo.Ctx) !Receipt {
 | `client.put(c, url, body, .{})` | `Response` |
 | `client.delete(c, url, .{})` | `Response` |
 | `client.patch(c, url, body_or_null, .{})` | `Response` — `null` for the verb endpoint whose whole request is its path |
-| `client.send(c, method, url, body_or_null, .{})` | for a method the five above do not name. **The body decides the framing, not the method** ([ADR 0213](../adr/0213-the-body-decides-not-the-method.md)): a DELETE with a body sends it under its `content-length`, a POST with `null` sends `content-length: 0`. `error.HeadTooLong` is a body on a method std frames none for whose head did not fit the connection's buffer |
-| `client.postJson(c, url, value, .{})` | `Response` — `value` written out with `std.json` into the Scope and sent under `content-type: application/json`, unless `headers` names one. `putJson`, `patchJson` and `sendJson(c, method, url, value, .{})` beside it. Text handed here is a Refusal: it would go out as one JSON string ([ADR 0243](../adr/0243-the-ordinary-call-sends-json-and-a-query.md)) |
-| `fetch.withQuery(c, base, .{ .page = 2, .q = "a b" })` | `[]const u8` — `base?page=2&q=a%20b`, in the Scope, one allocation sized exactly. A field is an int, a bool, text or an optional of one (null left out); anything else is a Refusal naming the field. `&` after a base that has a `?` already ([ADR 0243](../adr/0243-the-ordinary-call-sends-json-and-a-query.md)) |
+| `client.send(c, method, url, body_or_null, .{})` | for a method the five above do not name. **The body decides the framing, not the method** ([ADR 174](../adr/174-the-body-decides-not-the-method.md)): a DELETE with a body sends it under its `content-length`, a POST with `null` sends `content-length: 0`. `error.HeadTooLong` is a body on a method std frames none for whose head did not fit the connection's buffer |
+| `client.postJson(c, url, value, .{})` | `Response` — `value` written out with `std.json` into the Scope and sent under `content-type: application/json`, unless `headers` names one. `putJson`, `patchJson` and `sendJson(c, method, url, value, .{})` beside it. Text handed here is a Refusal: it would go out as one JSON string ([ADR 061](../adr/061-a-fitting-borrows-the-loop.md)) |
+| `fetch.withQuery(c, base, .{ .page = 2, .q = "a b" })` | `[]const u8` — `base?page=2&q=a%20b`, in the Scope, one allocation sized exactly. A field is an int, a bool, text or an optional of one (null left out); anything else is a Refusal naming the field. `&` after a base that has a `?` already ([ADR 061](../adr/061-a-fitting-borrows-the-loop.md)) |
 | `res.ok()` | `bool` — 2xx |
 | `res.status` | `std.http.Status` |
 | `res.body` | `Str`, in the Scope you passed. Goes when the request does |
-| `res.headers` | `[]const u8`, the header block the answer arrived with, kept into the Scope ([ADR 0244](../adr/0244-a-response-carries-its-headers.md)) |
+| `res.headers` | `[]const u8`, the header block the answer arrived with, kept into the Scope ([ADR 187](../adr/187-a-head-that-outlives-its-body.md)) |
 | `res.header(name)` | `?[]const u8` — case-insensitively; null when the answer did not carry it. `Retry-After` off a 429, `ETag` for the next conditional GET, `Location` on a 201 |
 | `res.json(T, c)` | `T`, parsed into the same Scope |
 
@@ -50,23 +50,23 @@ no request. Handing over something that is neither is a Refusal naming the call.
 | Field | Default | |
 |---|---|---|
 | `max_in_flight` | 32 | calls at once, across every host. Past it a caller waits for a permit rather than opening another connection — an HTTPS one holds 59,151 bytes |
-| `timeout_ms` | 30,000 | how long one whole call may take. `0` is no limit. It fires with or without an Engine: under `listen()` the Engine cancels the fiber; on a client started with `nilo_start(io, .none)` each step of the call runs as a task of that `Io` and the task is cancelled — one thread hop per step, paid only there ([ADR 0230](../adr/0230-a-deadline-with-no-engine-cancels-a-task.md)) |
-| `stall_ms` | 0 | how long the far end may say **nothing** before the call is `error.Stalled`: time since the last byte, not since the call began. `0` is no such bound. Composes with `timeout_ms`; the Engine's timer re-armed on every chunk, or the engineless wait re-read from the last byte ([ADR 0237](../adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)) |
+| `timeout_ms` | 30,000 | how long one whole call may take. `0` is no limit. It fires with or without an Engine: under `listen()` the Engine cancels the fiber; on a client started with `nilo_start(io, .none)` each step of the call runs as a task of that `Io` and the task is cancelled — one thread hop per step, paid only there ([ADR 056](../adr/056-the-way-out-was-open-the-clock-was-not.md)) |
+| `stall_ms` | 0 | how long the far end may say **nothing** before the call is `error.Stalled`: time since the last byte, not since the call began. `0` is no such bound. Composes with `timeout_ms`; the Engine's timer re-armed on every chunk, or the engineless wait re-read from the last byte ([ADR 056](../adr/056-the-way-out-was-open-the-clock-was-not.md)) |
 | `max_body` | 8 MiB | a longer body is `error.BodyTooLarge`, enforced while reading |
 | `max_drain` | 64 KiB | how much of an unread body is worth reading to keep a pooled connection. Past it the connection is dropped |
-| `read_buffer_size` | 8 KiB | each connection's socket read buffer, and so how much one read brings in. std's default, passed through ([ADR 0238](../adr/0238-the-transfer-buffer-serves-nothing-here.md)) |
-| `forward_request_id` | true | a call made under a `*Ctx` sends the request's id as `X-Request-Id`, so the other side's log lines up with this one. A `Run` has no id and sends none; a call naming its own `X-Request-Id` in `headers` keeps it ([ADR 0196](../adr/0196-a-request-id-goes-out-with-the-call.md)) |
+| `read_buffer_size` | 8 KiB | each connection's socket read buffer, and so how much one read brings in. std's default, passed through ([ADR 186](../adr/186-the-transfer-buffer-serves-nothing-here.md)) |
+| `forward_request_id` | true | a call made under a `*Ctx` sends the request's id as `X-Request-Id`, so the other side's log lines up with this one. A `Run` has no id and sends none; a call naming its own `X-Request-Id` in `headers` keeps it ([ADR 158](../adr/158-a-request-id-goes-out-with-the-call.md)) |
 
 **`Client.Call`**, given per call: `headers`, and `timeout_ms` / `stall_ms` /
 `max_body` to override the settings above for one call. A header in `headers` that std has
 a slot for — `host`, `authorization`, `user-agent`, `content-type`,
 `connection`, `accept-encoding` — is sent **once**, the caller's copy, rather
-than beside std's ([ADR 0231](../adr/0231-a-header-std-owns-goes-out-once.md)).
+than beside std's ([ADR 182](../adr/182-a-header-std-owns-goes-out-once.md)).
 
 **An answer with no body by rule ends at its head.** A HEAD's answer, a 1xx,
 a 204 and a 304 are complete at the blank line whatever `content-length` or
 `transfer-encoding` say, so `send` returns an empty body at once and the
-connection is kept ([ADR 0215](../adr/0215-an-answer-with-no-body-ends-at-its-head.md)).
+connection is kept ([ADR 176](../adr/176-an-answer-with-no-body-ends-at-its-head.md)).
 
 **Errors worth naming.** `error.TimedOut` is this call's own deadline;
 `error.Stalled` is `stall_ms` of nothing arriving while the peer holds the
@@ -86,13 +86,13 @@ and then returns the compressed bytes from `Response.reader` — decompressing i
 a separate call there, and a caller who does not make it gets unreadable bytes
 and no error. Decompressing here would cost a 32 KiB flate window on the
 handler's stack, which is per *connection*
-([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)), so identity is
+([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)), so identity is
 the trade taken. A server that ignores the header and gzips anyway is an error
 rather than a `Str` full of noise.
 
 `examples/outbound/` is the whole of this against a real API, and
 [`bench/result/fetch.md`](../../bench/result/fetch.md) is what it costs on each of
-ADR 0018's four axes.
+ADR 017's four axes.
 
 **What it is not**: a retry policy, a circuit breaker or a rate limiter. Those
 are decisions about somebody else's service and belong to whoever knows what
@@ -102,7 +102,7 @@ that service promises.
 
 A service's base URL, standing headers and ceilings as a type of its own,
 opened once on the client and asked for by type. Two services are two types
-([ADR 0254](../adr/0254-a-target-is-a-type-and-a-path-is-a-template.md)).
+([ADR 061](../adr/061-a-fitting-borrows-the-loop.md)).
 
 <!-- compiles -->
 ```zig
@@ -142,7 +142,7 @@ path not beginning with `/` are each a Refusal.
 
 **Standing headers, and the call's over them.** `authorization` and
 `user_agent` go through std's slot; a line in `Call.headers` naming either
-goes instead ([ADR 0231](../adr/0231-a-header-std-owns-goes-out-once.md)).
+goes instead ([ADR 182](../adr/182-a-header-std-owns-goes-out-once.md)).
 A line naming any other standing header shadows it. No allocation unless a
 call with headers of its own meets a target with some, and then one.
 
@@ -164,13 +164,13 @@ _ = try ex.pipe(&body.writer);   // straight out, allocating nothing
 
 | | |
 |---|---|
-| `ex.begin(client, .{…})` | `Head`: status, `content_length`, `content_type`, `header(name)` (case-insensitive), `ok()`, and `redirected` / `location(&buf)`: the `std.Uri` a followed redirect ended at, or null, and the same as one string. Its text lives in the `.follow` buffer the call was given ([ADR 0232](../adr/0232-a-followed-redirect-says-where-it-ended.md)) |
-| `head.keep(c)` | the same `Head` copied into the Scope, good after the body: one arena allocation the size of the header block ([ADR 0240](../adr/0240-a-head-that-outlives-its-body.md)) |
+| `ex.begin(client, .{…})` | `Head`: status, `content_length`, `content_type`, `header(name)` (case-insensitive), `ok()`, and `redirected` / `location(&buf)`: the `std.Uri` a followed redirect ended at, or null, and the same as one string. Its text lives in the `.follow` buffer the call was given ([ADR 183](../adr/183-a-redirect-is-a-decision-with-a-name.md)) |
+| `head.keep(c)` | the same `Head` copied into the Scope, good after the body: one arena allocation the size of the header block ([ADR 187](../adr/187-a-head-that-outlives-its-body.md)) |
 | `ex.take(c, max)` | the rest of the body as a `Str` in the Scope, refusing over `max` |
 | `ex.readInto(buf)` | exactly `buf.len` bytes, or `error.BodyTooShort` |
 | `ex.pipe(w)` | the rest into a `*std.Io.Writer`, and how many bytes |
 | `ex.stream(w, limit)` | one chunk into `w`, at most `limit`, and how many bytes; `0` is the end. What one socket read handed over; inside both clocks, where the same call on `ex.reader` is not |
-| `ex.discard()` | "I will not read this body; close the connection" — for the probe that got the whole file. `max_drain` stays a policy rather than a lever ([ADR 0235](../adr/0235-a-caller-that-knows-says-discard.md)) |
+| `ex.discard()` | "I will not read this body; close the connection" — for the probe that got the whole file. `max_drain` stays a policy rather than a lever ([ADR 184](../adr/184-a-caller-that-knows-says-discard.md)) |
 | `ex.end()` | required, and safe twice |
 
 `Begin` takes `headers`, `host`, `authorization`, `content_type`, `user_agent`,
@@ -178,14 +178,14 @@ _ = try ex.pipe(&body.writer);   // straight out, allocating nothing
 `redirects`: `.refuse` (the default; a 3xx with a `Location` is
 `error.RedirectRefused`), `.follow = &buf` (walked, three deep, resolved in
 the buffer) or `.expose` (the 3xx as itself, which is what a signed request
-and an S3 client want) ([ADR 0239](../adr/0239-a-redirect-is-a-decision-with-a-name.md)).
+and an S3 client want) ([ADR 183](../adr/183-a-redirect-is-a-decision-with-a-name.md)).
 A name in `headers` that std has a slot for tells std to leave
 the slot out, so the line goes once; the explicit fields are the form for a
 caller who has the value and not a line, and a field *and* the line is two
-lines ([ADR 0231](../adr/0231-a-header-std-owns-goes-out-once.md)).
+lines ([ADR 182](../adr/182-a-header-std-owns-goes-out-once.md)).
 `transfer_buffer` is for a caller who reads buffered off `ex.reader` and for
 nothing else: `take`, `readInto`, `pipe` and `stream` never fill it, and the
-empty default is the ordinary call ([ADR 0238](../adr/0238-the-transfer-buffer-serves-nothing-here.md)).
+empty default is the ordinary call ([ADR 186](../adr/186-the-transfer-buffer-serves-nothing-here.md)).
 
 **It must not be copied once begun**: it holds a `std.http.Client.Request`.
 Declare it, fill it where it stands, leave it there.
@@ -194,7 +194,7 @@ Declare it, fill it where it stands, leave it there.
 
 A canned server for a suite of your own: one real exchange over a loopback
 socket on `std.Io.Threaded`, with no Engine anywhere. What the module's own
-tests drive, exported ([ADR 0243](../adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+tests drive, exported ([ADR 061](../adr/061-a-fitting-borrows-the-loop.md)).
 
 <!-- compiles -->
 ```zig
@@ -231,4 +231,4 @@ fn oneExchange(io: std.Io, gpa: std.mem.Allocator) !void {
 
 The client is finished with `nilo_start(io, .none)`, as `listen()` would
 have done it; `.none` is "no Engine to arm a deadline on", and the client
-then bounds the call itself ([ADR 0230](../adr/0230-a-deadline-with-no-engine-cancels-a-task.md)).
+then bounds the call itself ([ADR 056](../adr/056-the-way-out-was-open-the-clock-was-not.md)).

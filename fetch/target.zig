@@ -1,5 +1,5 @@
 //! A target is a type, and a path is a template
-//! ([ADR 0254](../docs/adr/0254-a-target-is-a-type-and-a-path-is-a-template.md)).
+//! ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)).
 //!
 //! ```zig
 //! const Stripe = fetch.Target("stripe", .{ .timeout_ms = 5_000, .max_in_flight = 8 });
@@ -22,12 +22,12 @@
 //! `authorization: Bearer …`, and gets five seconds", and every call
 //! repeated all three. A target is that sentence as a type: two services
 //! are two types, therefore two Services, and which one a handler reaches is
-//! in its argument list, the shape ADR 0060 chose for a second database and
-//! ADR 0068 for a second bucket.
+//! in its argument list, the shape ADR 054 chose for a second database and
+//! ADR 059 for a second bucket.
 //!
 //! ## What is settled while compiling, and what is not
 //!
-//! The rule is ADR 0068's: **whatever is a property of the service rather
+//! The rule is ADR 059's: **whatever is a property of the service rather
 //! than of the deployment.** The name, the ceilings and the clocks are the
 //! service's and sit on the type. The base URL and the credential are the
 //! deployment's — a sandbox host and a test key in development, the real
@@ -68,7 +68,7 @@ pub const Options = struct {
     /// `Settings.max_body` for this service, or null for the client's.
     max_body: ?usize = null,
     /// A path the health route GETs on every probe, with 2xx as ready
-    /// ([ADR 0192](../docs/adr/0192-a-health-route-asks-the-services.md)).
+    /// ([ADR 154](../docs/adr/154-a-health-route-asks-the-services.md)).
     /// Null, the default, is started-is-ready, for the reason `s3.Store`
     /// gives: a balancer asks every second, and a call to somebody else's
     /// API at that rate is a bill and a rate limit rather than a check. A
@@ -145,7 +145,7 @@ pub fn Target(comptime name: []const u8, comptime opts: Options) type {
         }
 
         /// Finished when the loop exists, by finishing the client
-        /// (ADR 0040). Starting a client twice sets the same `Io` twice, so
+        /// (ADR 037). Starting a client twice sets the same `Io` twice, so
         /// providing the client beside two targets over it is the ordinary
         /// case rather than a mistake.
         pub fn nilo_start(self: *Self, io: std.Io, limits: core.Limits) !void {
@@ -153,7 +153,7 @@ pub fn Target(comptime name: []const u8, comptime opts: Options) type {
         }
 
         /// What the health route asks
-        /// ([ADR 0192](../docs/adr/0192-a-health-route-asks-the-services.md)).
+        /// ([ADR 154](../docs/adr/154-a-health-route-asks-the-services.md)).
         /// With no `ready` path, started is ready; with one, a GET to it on
         /// every probe, and anything but a 2xx is the target's name and
         /// what went wrong.
@@ -197,7 +197,7 @@ pub fn Target(comptime name: []const u8, comptime opts: Options) type {
         }
 
         /// `Client.send` with a path: for a method the five above do not
-        /// name, and for a DELETE with a body (ADR 0213).
+        /// name, and for a DELETE with a body (ADR 174).
         pub fn send(self: *Self, c: anytype, method: std.http.Method, comptime path: []const u8, args: anytype, body: ?[]const u8, call: Client.Call) Error!Response {
             comptime core.checkScope(@TypeOf(c), "target.send");
             return self.through(c, method, path, args, body, null, call);

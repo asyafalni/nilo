@@ -1,10 +1,10 @@
-//! What time it is, in the layer that has no event loop (ADR 0045).
+//! What time it is, in the layer that has no event loop (ADR 041).
 //!
 //! Two layers wanted this and neither could have it. A handler had no way to
 //! ask, so `id.v7` took a millisecond a caller could not produce; `nilo_sql`
 //! had `Timestamp` and no `Timestamp.now()`, so a service filling `created_at`
 //! wrote the column by hand or left it to a database default. Being wanted by
-//! two layers is the rule for living here (ADR 0041), and this clears it.
+//! two layers is the rule for living here (ADR 038), and this clears it.
 //!
 //! **A free function rather than a call on a Scope**, which is the whole
 //! shape of the decision. `arena()` and `str()` are on a Scope because
@@ -17,7 +17,7 @@
 //! page the kernel keeps mapped — no context switch, nothing to wait for, so
 //! nothing for a fiber to be parked on. `http/bulkhead.zig` reads the
 //! monotonic clock exactly this way and for exactly this reason. That does
-//! amend ADR 0041's *no IO at all* to **needs no event loop**, which was the
+//! amend ADR 038's *no IO at all* to **needs no event loop**, which was the
 //! question the layering has always actually been asking.
 //!
 //! What is *not* here is arithmetic, for the reason `sql/types.zig` gives at
@@ -46,12 +46,12 @@ const builtin = @import("builtin");
 /// name a lie while `nowMillis` below would be entirely happy with it. The
 /// 13ns buys a branch, a Linux-only path and two clocks to explain. The
 /// framework does now make this call once per response — `http/date.zig`
-/// reads it for the `Date` header (ADR 0269) — and 15ns on a request that
+/// reads it for the `Date` header (ADR 197) — and 15ns on a request that
 /// takes microseconds is where the 13ns went; the note stays so nobody
 /// re-derives the trade.
 pub fn nowMicros() i64 {
     // The same page-read argument holds on Windows: `RtlGetSystemTimePrecise`
-    // reads KUSER_SHARED_DATA, in 100 ns units from 1601 (ADR 0228).
+    // reads KUSER_SHARED_DATA, in 100 ns units from 1601 (ADR 041).
     if (builtin.os.tag == .windows) {
         const epoch_us: i64 = std.time.epoch.windows * std.time.us_per_s;
         return @divFloor(@as(i64, @intCast(std.os.windows.ntdll.RtlGetSystemTimePrecise())), 10) + epoch_us;
@@ -87,7 +87,7 @@ pub fn nowMillis() i64 {
 /// `timedatectl` in the middle of a query would otherwise be reported as a
 /// query that took an hour or as one that finished before it started. The
 /// duration a watcher is shown is a fact about the database
-/// ([ADR 0137](../docs/adr/0137-a-statement-can-be-watched.md)), so it is
+/// ([ADR 108](../docs/adr/108-a-statement-can-be-watched.md)), so it is
 /// taken from the clock that only goes forwards.
 ///
 /// Same cost as `nowMicros` and by the same route — `CLOCK_MONOTONIC` is in
@@ -153,7 +153,7 @@ test "the monotonic clock measures a duration, and only that" {
     const second = monotonicMicros();
     // Forwards, always — that is the whole of what this clock promises, and
     // the reason a statement's duration is taken from it rather than from
-    // `nowMicros` (ADR 0137).
+    // `nowMicros` (ADR 108).
     try testing.expect(second >= first);
 
     // And it is a different origin from the wall clock's, which is what says

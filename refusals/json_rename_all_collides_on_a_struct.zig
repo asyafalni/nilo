@@ -4,7 +4,7 @@
 //! the reader met last.
 //!
 //! The sibling of `json_rename_all_collides_on_an_enum`, one type shape over:
-//! a mistake that corrupts the wire rather than failing (ADR 0181).
+//! a mistake that corrupts the wire rather than failing (ADR 148).
 
 const nilo = @import("nilo_http");
 

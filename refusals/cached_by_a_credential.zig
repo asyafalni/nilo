@@ -1,6 +1,6 @@
 //! A `Cached` keyed on the `Cookie` header: every caller an entry of their
 //! own with the secret in the key, which is a session store and not a
-//! cache ([ADR 0247](../docs/adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)).
+//! cache ([ADR 188](../docs/adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)).
 
 const nilo = @import("nilo_http");
 

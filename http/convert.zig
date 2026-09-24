@@ -8,7 +8,7 @@
 //! nothing else.
 //!
 //! A fifth kind arrives the same way and is not on that list: **a type that
-//! says it can parse itself**, by declaring `nilo_parse` (ADR 0142). A `uuid`
+//! says it can parse itself**, by declaring `nilo_parse` (ADR 113). A `uuid`
 //! is the one everybody has — `sql.Uuid` is a path param now instead of text
 //! the handler parses by hand — and nilo's part of it is small on purpose. It
 //! calls the function, and null is the same 400 a bad number gets.
@@ -51,7 +51,7 @@ pub const Reason = enum {
     not_a_choice,
     /// A type that parses itself said no. nilo does not know what the type
     /// wanted, so the sentence names the type and quotes what arrived —
-    /// which is the whole of what it is entitled to say (ADR 0142).
+    /// which is the whole of what it is entitled to say (ADR 113).
     not_that_type,
     /// The value is the wrong kind of thing altogether — a list where an
     /// object was wanted. Only a JSON body can produce this: a path param, a
@@ -91,7 +91,7 @@ pub const Outcome = struct {
     kind: []const u8 = "",
 };
 
-/// The declaration a type parses itself with (ADR 0142):
+/// The declaration a type parses itself with (ADR 113):
 ///
 /// ```zig
 /// pub fn nilo_parse(text: []const u8) ?Uuid { … }
@@ -109,7 +109,7 @@ pub const Outcome = struct {
 pub const parse_marker = @import("jsonmark.zig").parse_marker;
 
 /// The declaration a type that parses itself may add to say what a 400
-/// should ask for in place of its name (ADR 0205):
+/// should ask for in place of its name (ADR 166):
 ///
 /// ```zig
 /// pub const nilo_expects = "a whole number from 1 to 200";
@@ -117,14 +117,14 @@ pub const parse_marker = @import("jsonmark.zig").parse_marker;
 ///
 /// Without it the sentence names the type — `has to be a Uuid` — which is
 /// the whole of what nilo is entitled to say about a type it did not write
-/// (ADR 0142). A type that can say more says it here, with its article, and
+/// (ADR 113). A type that can say more says it here, with its article, and
 /// the sentence reads `?limit has to be a whole number from 1 to 200, not
 /// "500"`.
 pub const expects_marker = "nilo_expects";
 
 /// The declaration a type that parses itself may carry to word the tail of
 /// its own refusal — `has to be text of 10 to 72 characters, not 6` — in
-/// place of the sentence `sayWhy` writes for one that does not (ADR 0264).
+/// place of the sentence `sayWhy` writes for one that does not (ADR 193).
 ///
 /// ```zig
 /// pub fn nilo_explain(text: []const u8, w: *std.Io.Writer) !void { … }
@@ -165,10 +165,10 @@ fn isText(comptime S: type) bool {
 /// Whether `T` says it can turn request text into itself.
 ///
 /// **Reading the marker is what checks it**, which is the rule
-/// `openapi.schemaWithin` already follows for `nilo_openapi` (ADR 0085): a
+/// `openapi.schemaWithin` already follows for `nilo_openapi` (ADR 016): a
 /// `nilo_parse` of the wrong shape is refused here, where the type is named,
 /// rather than surfacing as a message from three frames down inside
-/// `tryConvert` about a line of nilo's (ADR 0015).
+/// `tryConvert` about a line of nilo's (ADR 014).
 pub fn parsesItself(comptime T: type) bool {
     comptime {
         const says = switch (@typeInfo(T)) {
@@ -225,7 +225,7 @@ fn wrongParse(comptime T: type, comptime wrong: []const u8) noreturn {
 /// **A type that parses itself is on this list**, because one arrival cannot
 /// mean two things: `/deals/:id` and `?actor=<uuid>` read the same type off
 /// the same request line
-/// ([ADR 0158](../docs/adr/0158-one-arrival-one-answer.md)). A JSON body is
+/// ([ADR 113](../docs/adr/113-a-path-param-can-parse-itself.md)). A JSON body is
 /// not this file's — `std.json` fills that.
 pub fn convertible(comptime T: type) bool {
     const Inner = switch (@typeInfo(T)) {
@@ -243,7 +243,7 @@ pub fn convertible(comptime T: type) bool {
 }
 
 /// The element of a field that is a **list of values**, or null when it is not
-/// one ([ADR 0164](../docs/adr/0164-a-query-parameter-that-is-a-list.md)).
+/// one ([ADR 132](../docs/adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)).
 ///
 /// `Str` is a struct and `[]const u8` is text, so neither is a list here — the
 /// same reading `std.json` and `sql/types.zig` both give a slice of bytes.
@@ -283,12 +283,12 @@ pub fn tryConvert(comptime P: type, comptime slot: Slot, s: Str, out: *P) ?Reaso
     const text = s.view();
     // Before the switch, because a type that parses itself may be an enum as
     // readily as a struct, and what a type says about itself wins over what
-    // its kind would otherwise have meant (ADR 0142).
+    // its kind would otherwise have meant (ADR 113).
     if (comptime parsesItself(P)) {
         out.* = P.nilo_parse(text) orelse return .not_that_type;
         // A parse takes bytes, so a `Str` it built has no lifetime marker;
         // the one on the text it was built from goes on it here, and a
-        // `nilo.Text` out of a form goes stale with the form (ADR 0264).
+        // `nilo.Text` out of a form goes stale with the form (ADR 193).
         str_mod.stampLike(out, s);
         return null;
     }
@@ -342,10 +342,10 @@ pub fn sayWhy(
     // The type is the only thing that knows what it takes, so the sentence
     // names it and stops there. `names.of` is what puts the reader's own
     // import line in front of the name rather than a file of nilo's
-    // (ADR 0122).
+    // (ADR 074).
     if (comptime parsesItself(P)) {
         // A type that words its own refusal — a `nilo.Text`, which says the
-        // count and never the text (ADR 0264) — writes the tail itself.
+        // count and never the text (ADR 193) — writes the tail itself.
         if (comptime @hasDecl(P, explain_marker)) {
             try w.writeAll(label ++ " ");
             return @field(P, explain_marker)(text, w);
@@ -393,7 +393,7 @@ pub fn convert(comptime P: type, comptime slot: Slot, s: Str, comptime label: []
     // place the sentence exists. This is the failure path — the request is
     // over either way — and 240 bytes of a stack that is two pages is not a
     // trade worth thinking about. Nothing is allocated, which is the part
-    // that matters (ADR 0025).
+    // that matters (ADR 024).
     var buf: [fail.max_message]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     sayWhy(P, slot, s, label, &w) catch {};
@@ -431,7 +431,7 @@ fn boolFrom(text: []const u8, comptime slot: Slot) ?bool {
 /// was a `f64` that loses every comparison it is ever in. None of the four is a
 /// thing a client types by accident, and each of them is two clients disagreeing
 /// about what was asked for — the same shape as a body framed twice, which
-/// [ADR 0090](../docs/adr/0090-a-body-framed-twice-is-refused.md) refused one
+/// [ADR 070](../docs/adr/070-a-request-nobody-else-would-answer-is-refused.md) refused one
 /// layer up. `http1.digitsOnly` and `range.zig`'s copy are that rule for a
 /// header; this is it for the one place a *user's* number arrives.
 ///
@@ -490,7 +490,7 @@ fn given(bytes: []const u8) Str {
 
 /// A type of the reader's own that parses itself, standing in for `sql.Uuid`.
 /// `http/` may not import `nilo_id`, and the protocol is a declaration read by
-/// name precisely so that it need not (ADR 0042, ADR 0142).
+/// name precisely so that it need not (ADR 038, ADR 113).
 const Sku = struct {
     letters: [3]u8,
 
@@ -601,7 +601,7 @@ test "the types request text can become" {
     try testing.expect(!convertible([4]u8));
 
     // And a type that parses itself, which used to be the one thing
-    // `tryConvert` could do and `convertible` would not promise (ADR 0158).
+    // `tryConvert` could do and `convertible` would not promise (ADR 113).
     // `/deals/:id` read a `Sku` and `?sku=ABC` refused one, off the same
     // request line.
     try testing.expect(convertible(Sku));

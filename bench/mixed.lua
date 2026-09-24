@@ -1,4 +1,4 @@
--- Exercises the fail-function Failure under load (ADR 0007).
+-- Exercises the fail-function Failure under load (ADR 006).
 --
 -- Not a benchmark: what is measured is not speed but whether a fail
 -- function's message ever gets crossed between requests running at the
@@ -42,6 +42,6 @@ done = function(summary, latency, requests)
     io.write(string.format(
         "\nwrong or crossed responses: %d out of %d\n", wrong, summary.requests))
     if wrong > 0 then
-        io.write("FAIL-FUNCTION MESSAGES LEAKED BETWEEN REQUESTS — see ADR 0007\n")
+        io.write("FAIL-FUNCTION MESSAGES LEAKED BETWEEN REQUESTS — see ADR 006\n")
     end
 end

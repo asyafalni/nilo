@@ -1,10 +1,10 @@
 //! Turning one environment value into the type a Config asked for.
 //!
 //! The App has a converter of its own (`http/convert.zig`) and this is
-//! deliberately not it. [ADR 0041](../docs/adr/0041-a-module-sits-where-the-loop-puts-it.md)
+//! deliberately not it. [ADR 038](../docs/adr/038-a-module-sits-where-the-loop-puts-it.md)
 //! named that file "the interesting refusal" and left the question open for
 //! whoever turned up as its second caller — and the answer this module gives
-//! is that it is *not* that caller (ADR 0043). Sharing it would mean naming
+//! is that it is *not* that caller (ADR 039). Sharing it would mean naming
 //! `nilo_core` for `Str`, and a tool module that cannot run under a plain
 //! `zig test` is in the wrong layer. What is here is the same four reasons
 //! against `[]const u8` instead, in forty lines.

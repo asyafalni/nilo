@@ -3,7 +3,7 @@
 //! Most handlers need none of this: a handler is an ordinary function, so a
 //! test calls it and looks at what came back. That stops working the moment
 //! a handler *writes* its answer rather than returning one — a stream has to
-//! have somewhere to write to (ADR 0020) — and it was already awkward for
+//! have somewhere to write to (ADR 019) — and it was already awkward for
 //! anything that wanted to check a header or a status.
 //!
 //! ```zig
@@ -85,7 +85,7 @@ pub const Header = struct {
 /// `Host`, `Content-Type` and `Content-Length` are written for you and only
 /// if `headers` does not already name them. That is not tidiness: a second
 /// `Content-Length` is a 400 now, and so is a second `Host`
-/// ([ADR 0101](../docs/adr/0101-a-request-nobody-else-would-answer-is-refused.md)),
+/// ([ADR 070](../docs/adr/070-a-request-nobody-else-would-answer-is-refused.md)),
 /// so a helper that added its own on top of yours would answer 400 to a test
 /// that looked correct.
 pub const Request = struct {
@@ -95,7 +95,7 @@ pub const Request = struct {
     headers: []const Header = &.{},
     /// Written as `Content-Type` when it is not empty. A form has to have one,
     /// because `application/x-www-form-urlencoded` and `multipart/form-data`
-    /// are told apart by nothing else (ADR 0031).
+    /// are told apart by nothing else (ADR 030).
     content_type: []const u8 = "",
     body: []const u8 = "",
 };
@@ -120,12 +120,12 @@ pub const Answer = struct {
     /// A real client reads one and keeps waiting, which is what the fields
     /// above do too: `status` is the final status whether or not an interim
     /// arrived. This is here so a test can assert the interim was sent, and so
-    /// that one arriving cannot be mistaken for the answer (ADR 0094).
+    /// that one arriving cannot be mistaken for the answer (ADR 073).
     interim: ?[]const u8 = null,
     /// Which request on the client this answered, and where the client keeps
     /// its count — so a body read after a later request on the same client
     /// is refused rather than read as that request's bytes
-    /// ([ADR 0210](../docs/adr/0210-an-answer-knows-which-request-it-was.md)).
+    /// ([ADR 171](../docs/adr/171-an-answer-knows-which-request-it-was.md)).
     /// `raw`, `head` and `body` point into the client's one response buffer,
     /// which the next request writes over; `status` is a value and goes on
     /// reading as it did. Null for an answer parsed with no client behind it,
@@ -186,7 +186,7 @@ pub const Answer = struct {
     /// attributes and all — or null if the response sets no such cookie.
     ///
     /// A response may set several, so asking by name is the only way to ask
-    /// (ADR 0030).
+    /// (ADR 029).
     pub fn setCookie(self: Answer, name: []const u8) ?[]const u8 {
         var n: usize = 0;
         while (self.headerAt("Set-Cookie", n)) |line| : (n += 1) {
@@ -222,7 +222,7 @@ pub const Answer = struct {
 
     /// The body as the client sees it, into memory the caller owns — `text`
     /// without having to size a buffer for it first
-    /// ([ADR 0180](../docs/adr/0180-a-response-is-read-back-the-way-it-was-written.md)).
+    /// ([ADR 147](../docs/adr/147-a-response-is-read-back-the-way-it-was-written.md)).
     ///
     /// A chunked body decodes to fewer bytes than it was framed in, so one
     /// allocation the size of the framed body is always enough and there is no
@@ -233,7 +233,7 @@ pub const Answer = struct {
     }
 
     /// The body read back as `T`
-    /// ([ADR 0180](../docs/adr/0180-a-response-is-read-back-the-way-it-was-written.md)).
+    /// ([ADR 147](../docs/adr/147-a-response-is-read-back-the-way-it-was-written.md)).
     ///
     /// ```zig
     /// const made = try answer.json(struct { id: []const u8 }, arena);
@@ -262,7 +262,7 @@ pub const Answer = struct {
 
 /// A value rendered the way it goes over the wire, for a failure message
 /// somebody can read
-/// ([ADR 0169](../docs/adr/0169-a-failed-assertion-that-can-be-read.md)).
+/// ([ADR 137](../docs/adr/137-a-failed-assertion-that-can-be-read.md)).
 ///
 /// ```zig
 /// errdefer std.debug.print("row: {f}\n", .{nilo.testing.show(row)});
@@ -299,7 +299,7 @@ pub fn Shown(comptime T: type) type {
 }
 
 /// What a fail function said, read back where there was no request
-/// ([ADR 0161](../docs/adr/0161-a-refusal-outside-a-request-is-still-a-refusal.md)).
+/// ([ADR 129](../docs/adr/129-a-refusal-outside-a-request-is-still-a-refusal.md)).
 pub const Refused = struct {
     /// The status the fail function was given: 409, 422, whatever it wrote.
     status: u16,
@@ -395,13 +395,13 @@ pub const Client = struct {
     jar: std.ArrayList(Header) = .empty,
     keep_cookies: bool = false,
     /// How many requests this client has answered. Each `Answer` carries the
-    /// number it was, and refuses its body once the two differ (ADR 0210).
+    /// number it was, and refuses its body once the two differ (ADR 171).
     made: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, options: Options) !Client {
         // The one warning `listen()` gives that a test can also earn, and the
         // place it is worth most: a suite that runs in both optimize modes
-        // and passes neither through to `b.dependency` is the case ADR 0084
+        // and passes neither through to `b.dependency` is the case ADR 069
         // was written about. Once per process, because a suite makes one of
         // these per test and the answer cannot change between them.
         if (!said_the_mode) {
@@ -476,7 +476,7 @@ pub const Client = struct {
 
     /// A POST that says what its body is — which a form has to, because
     /// `application/x-www-form-urlencoded` and `multipart/form-data` are told
-    /// apart by nothing else (ADR 0031).
+    /// apart by nothing else (ADR 030).
     ///
     /// ```zig
     /// const answer = try client.postWith(
@@ -566,7 +566,7 @@ pub const Client = struct {
         // What `listen()` would have done. Idempotent, so calling it once
         // per request costs nothing after the first.
         //
-        // **`checkServices` is deliberately not here** (ADR 0079). It was, for
+        // **`checkServices` is deliberately not here** (ADR 180). It was, for
         // an afternoon, and it refused a test that drives an App to fetch
         // `/openapi.json` and never touches the routes whose services are
         // missing — which is a fair thing to write and not a mistake. The
@@ -612,7 +612,7 @@ pub const Client = struct {
     ///
     /// **Attributes are read for one thing only: whether the cookie is being
     /// removed.** `Max-Age` of zero or less is what `Cookie.remove` sends
-    /// (ADR 0030), and it is the whole of what a test can produce. `Path`,
+    /// (ADR 029), and it is the whole of what a test can produce. `Path`,
     /// `Domain` and `Secure` are ignored, which a browser would not do — this
     /// is a jar for driving one App on one host, and a jar that guessed at
     /// scope would be a second implementation of a browser to be wrong in.
@@ -660,7 +660,7 @@ pub const Client = struct {
 
 /// An App and a Client, held together, so a test that drives requests is three
 /// lines of setup rather than eight
-/// ([ADR 0180](../docs/adr/0180-a-response-is-read-back-the-way-it-was-written.md)).
+/// ([ADR 147](../docs/adr/147-a-response-is-read-back-the-way-it-was-written.md)).
 ///
 /// ```zig
 /// var wired = try nilo.testing.Wired.init(testing.allocator, .{});
@@ -684,7 +684,7 @@ pub const Client = struct {
 /// with `Client.init`, exactly as before. This is the shape nine tests in ten
 /// have, offered once rather than written per file.
 pub const Wired = struct {
-    /// What a nilo compile error calls this type (ADR 0122).
+    /// What a nilo compile error calls this type (ADR 074).
     pub const nilo_type_name = "nilo.testing.Wired";
 
     app: App,
@@ -710,7 +710,7 @@ pub const Wired = struct {
         return self.client.post(&self.app, path, body);
     }
 
-    /// A POST that says what its body is — what a form has to send (ADR 0031).
+    /// A POST that says what its body is — what a form has to send (ADR 030).
     pub fn postWith(
         self: *Wired,
         path: []const u8,
@@ -808,7 +808,7 @@ fn parse(raw: []const u8, keep_alive: bool) !Answer {
     return answer;
 }
 
-// ---- a WebSocket, driven from a test (ADR 0113) ----
+// ---- a WebSocket, driven from a test (ADR 091) ----
 
 /// What one frame carries. The four a handler ever sees, plus the two it
 /// answers control frames with.
@@ -887,7 +887,7 @@ pub const Talk = struct {
 /// a `Client` can read — it reads frames until they stop. So the only way to
 /// test one was to hand `handleRequest` a buffer with hand-masked bytes in it
 /// and index into the answer, which is how every WebSocket test in nilo's own
-/// suite was written (ADR 0113).
+/// suite was written (ADR 091).
 ///
 /// ```zig
 /// var chat: nilo.testing.Conversation = try .init(testing.allocator, .{});
@@ -1077,7 +1077,7 @@ pub const Conversation = struct {
 ///
 /// Written here rather than borrowed from `websocket.zig` on purpose: a
 /// decoder that shares code with the encoder it is checking agrees with it by
-/// construction, which is the property ADR 0090 says is not the one worth
+/// construction, which is the property ADR 070 says is not the one worth
 /// having.
 fn decode(arena: std.mem.Allocator, response: []const u8) !Talk {
     const blank = std.mem.indexOf(u8, response, "\r\n\r\n") orelse
@@ -1135,7 +1135,7 @@ fn decode(arena: std.mem.Allocator, response: []const u8) !Talk {
 
 const testing = std.testing;
 
-// ---- the WebSocket harness (ADR 0113) ----
+// ---- the WebSocket harness (ADR 091) ----
 
 const websocket = @import("websocket.zig");
 
@@ -1272,7 +1272,7 @@ test "a handshake the route refuses is a status and no frames at all" {
 
     var chat: Conversation = try .init(testing.allocator, .{});
     defer chat.deinit();
-    // A page nobody named, on a host that is not this one (ADR 0102).
+    // A page nobody named, on a host that is not this one (ADR 080).
     try chat.setHeader("Origin", "https://elsewhere.example.com");
     try chat.text("hello");
 
@@ -1366,7 +1366,7 @@ test "an answer is read back as a value, not walked as a std.json.Value" {
     try testing.expectEqual(@as(u32, 3), whole.seats);
 
     // ...and the one field a test usually wants out of a create, which was
-    // four lines and an `.?.string` before this (ADR 0180).
+    // four lines and an `.?.string` before this (ADR 147).
     const id = (try answer.json(struct { id: []const u8 }, arena.allocator())).id;
     try testing.expectEqualStrings("01a01077-5ce8-7932-b42b-a05431a5c4c8", id);
 
@@ -1424,7 +1424,7 @@ test "an answer asked for its body after the next request says so, rather than r
     // into the buffer the second request wrote over. A test that read one and
     // then the other failed three frames down in `std.json`, and the version
     // that costs more passes because the second body has the same key
-    // (ADR 0210).
+    // (ADR 171).
     var app = App.init(testing.allocator);
     defer app.deinit();
     try app.post("/partners", created);
@@ -1533,7 +1533,7 @@ test "a header can be sent for one request, or for every request" {
     try testing.expect(std.mem.indexOf(u8, two.body, "X-One") == null);
 
     // A `Host` of the caller's own replaces the default rather than joining
-    // it, which two `Host` lines would make a 400 (ADR 0101).
+    // it, which two `Host` lines would make a 400 (ADR 070).
     const three = try client.sendRequest(&app, .{
         .path = "/echo",
         .headers = &.{.{ .name = "Host", .value = "elsewhere" }},
@@ -1621,7 +1621,7 @@ fn editComment(author_matches: bool, empty: bool) fail.Error!void {
 test "a refusal outside a request keeps its status and its sentence" {
     // Before this, both were dropped: `current()` is null with no request in
     // flight, so four different refusals were four identical `error.Failed`s
-    // and a test could only say "it failed" (ADR 0161).
+    // and a test could only say "it failed" (ADR 129).
     var refusals: Refusals = .{};
     refusals.begin();
     defer refusals.end();
@@ -1667,7 +1667,7 @@ test "the slot goes back to whatever held it, so one test cannot leak into the n
 
 test "show calls a type's own rendering where {any} refuses to" {
     // Stands in for `Uuid`, which this module may not import — `http/` sees
-    // `nilo_core` and no other tool module (ADR 0042). What is being held is
+    // `nilo_core` and no other tool module (ADR 038). What is being held is
     // the property, not the type: a value that knows how to write itself
     // gets to, where `{any}` prints the bytes it is made of.
     const Key = struct {

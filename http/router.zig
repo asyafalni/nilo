@@ -46,7 +46,7 @@ pub const Match = struct {
     /// Where this route sits in `routes`, which is what metrics count
     /// against — an index the scan is already holding rather than the
     /// pattern, so counting a request needs no string and no hash
-    /// (ADR 0100).
+    /// (ADR 079).
     index: usize = 0,
 };
 
@@ -91,7 +91,7 @@ pub const Route = struct {
     /// derived from the method and the pattern, exactly as the API
     /// description prints it. `Ctx.routeName` hands it to a middleware, which
     /// is what lets one authorisation table sit in front of every route
-    /// ([ADR 0201](../docs/adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
+    /// ([ADR 162](../docs/adr/162-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
     /// Owned by whoever registered the route; the Router only points at it.
     name: []const u8 = "",
     /// `pattern`, split up once at registration. Owned by the Router.
@@ -127,7 +127,7 @@ pub const Route = struct {
 
     /// How specific this route is, so that `/users/new` wins over
     /// `/users/:id` no matter which was registered first — the same
-    /// order-independence `use` and `get` already have (ADR 0009).
+    /// order-independence `use` and `get` already have (ADR 008).
     ///
     /// Two bits per segment, most significant first: a literal beats a
     /// param beats a `*`, and an earlier segment outranks every later one.
@@ -502,7 +502,7 @@ pub fn validatePattern(comptime pattern: []const u8) void {
             // `{id}` is what OpenAPI writes, what nilo's own document emits,
             // and what every framework a porter arrives from spells. Without
             // this it is five literal characters and the only symptom is a
-            // 404 on a URL the generated document promises (ADR 0147).
+            // 404 on a URL the generated document promises (ADR 118).
             if (std.mem.indexOfScalar(u8, seg, '{') != null or
                 std.mem.indexOfScalar(u8, seg, '}') != null) @compileError(
                 "nilo: the segment \"" ++ seg ++ "\" of route \"" ++ pattern ++ "\" is written " ++

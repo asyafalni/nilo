@@ -1,6 +1,6 @@
 //! A version on nothing: there is no body for the client to hold, so there
 //! is nothing for the tag to name
-//! ([ADR 0258](../docs/adr/0258-a-version-a-handler-names-is-an-etag.md)).
+//! ([ADR 189](../docs/adr/189-a-version-a-handler-names-is-an-etag.md)).
 
 const nilo = @import("nilo_http");
 

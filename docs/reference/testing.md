@@ -23,8 +23,8 @@ One page of [the reference](./README.md): an App and a Client wired together, wi
 | `answer.setCookie(name)` | the whole `Set-Cookie` line that sets it |
 | `answer.text(&buf)` | the body with chunk framing undone, into a buffer you sized |
 | `answer.bytes(arena)` | the same, into memory the arena owns |
-| `answer.json(T, arena)` | `!T` — the body read back as a value ([ADR 0180](../adr/0180-a-response-is-read-back-the-way-it-was-written.md)) |
-| `error.AnswerStale` | what the three above answer once the client has answered a later request: `.body` borrows the client's one buffer, `.status` is a value, and the two would otherwise disagree in silence ([ADR 0210](../adr/0210-an-answer-knows-which-request-it-was.md)) |
+| `answer.json(T, arena)` | `!T` — the body read back as a value ([ADR 147](../adr/147-a-response-is-read-back-the-way-it-was-written.md)) |
+| `error.AnswerStale` | what the three above answer once the client has answered a later request: `.body` borrows the client's one buffer, `.status` is a value, and the two would otherwise disagree in silence ([ADR 171](../adr/171-an-answer-knows-which-request-it-was.md)) |
 
 **`answer.json` is there because nilo already decided how the value was
 written**, so a test asking what came back should not have to reach for
@@ -70,7 +70,7 @@ no database is assumed. `Client` is unchanged and is still the answer when a tes
 needs two of them against one App — two addresses, two cookie jars.
 
 A WebSocket route has no answer to read, so it has a driver of its own
-([ADR 0113](../adr/0113-a-websocket-route-can-be-driven-from-a-test.md)):
+([ADR 091](../adr/091-a-websocket-route-can-be-driven-from-a-test.md)):
 
 ```zig
 var chat: nilo.testing.Conversation = try .init(gpa, .{});
@@ -110,7 +110,7 @@ broadcast included, needs two connections and is out of reach here.
 means *do not call the type's own formatter* — so a `Uuid` prints as sixteen
 decimal numbers and a `[]const u8` as its bytes. On a schema with many uuid
 columns nearly every row asserted on comes out as noise
-([ADR 0169](../adr/0169-a-failed-assertion-that-can-be-read.md)):
+([ADR 137](../adr/137-a-failed-assertion-that-can-be-read.md)):
 
 ```zig
 errdefer std.debug.print("row: {f}\n", .{nilo.testing.show(row)});
@@ -136,7 +136,7 @@ A service function called from a CLI, a seed or a plain test refuses through the
 same fail functions, and outside a request there is nowhere to park the status —
 so four different refusals arrive at the caller as four identical
 `error.Failed`. `Refusals` gives the test the status and the sentence back
-([ADR 0161](../adr/0161-a-refusal-outside-a-request-is-still-a-refusal.md)):
+([ADR 129](../adr/129-a-refusal-outside-a-request-is-still-a-refusal.md)):
 
 ```zig
 var refusals: nilo.testing.Refusals = .{};

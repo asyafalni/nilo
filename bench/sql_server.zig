@@ -10,7 +10,7 @@
 //! 24 µs is latency and the server's capacity is `pool size / 24 µs`. If it
 //! blocks the OS thread, capacity is `threads / 24 µs` and the database
 //! layer is the bottleneck of every application built on it — which is the
-//! failure mode ADR 0014 names and the reason `nilo_start` exists at all.
+//! failure mode ADR 013 names and the reason `nilo_start` exists at all.
 //!
 //! Reading the source says it suspends: pg.zig holds an `Io.net.Stream` and
 //! reads through the `Io` it was handed, which under the engine is zio's.
@@ -39,7 +39,7 @@
 //! `POOL_SIZE` and `PREPARED=0` are the two knobs. Memory per idle
 //! connection is measured by opening N keep-alive connections, doing one
 //! request on each, and reading `VmRSS` while they sit there
-//! ([ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md)).
+//! ([ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)).
 //!
 //! ## And the arena's route, with its own two controls
 //!
@@ -110,7 +110,7 @@ fn health() []const u8 {
 /// shape `/people/:id` does, from a constant, through the same serialiser —
 /// so the difference between *this* and `/people/:id` is the database and
 /// nothing else, and the difference between this and `/health` is what a
-/// handler that does ordinary work costs (ADR 0063).
+/// handler that does ordinary work costs (ADR 062).
 fn fixedPerson(c: *nilo.Ctx, id: i64) !Person {
     return .{
         .id = id,
@@ -125,7 +125,7 @@ fn fixedPerson(c: *nilo.Ctx, id: i64) !Person {
 /// handler that only *touches* eight kilobytes of its own stack holds the
 /// same extra memory per idle connection, then memory per connection is a
 /// function of the deepest stack that connection's fiber ever reached, and
-/// not of anything the database did (ADR 0063).
+/// not of anything the database did (ADR 062).
 fn deepStack(c: *nilo.Ctx, id: i64) !Person {
     var pad: [8192]u8 = undefined;
     @memset(&pad, @truncate(@as(u64, @bitCast(id))));
@@ -263,13 +263,13 @@ pub fn main(init: std.process.Init) !void {
     //
     // `POOL_SIZE` overrides it, because "how many connections" turned out to
     // be the one knob users are told to raise and nobody had measured the
-    // curve behind it (ADR 0062).
+    // curve behind it (ADR 115).
     const size: u16 = if (init.minimal.environ.getPosix("POOL_SIZE")) |text|
         std.fmt.parseInt(u16, text, 10) catch 64
     else
         64;
     // `PREPARED=0` turns the statement cache off, which is how the memory
-    // it costs per connection was measured (ADR 0057).
+    // it costs per connection was measured (ADR 051).
     const prepared = if (init.minimal.environ.getPosix("PREPARED")) |text|
         !std.mem.eql(u8, text, "0")
     else

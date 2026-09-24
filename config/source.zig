@@ -4,7 +4,7 @@
 //! it is a shape checked while compiling rather than an interface with a
 //! function table. Four are supplied, and `Layered` puts them in an order.
 //!
-//! **None of them opens a file, and that is the decision** (ADR 0064).
+//! **None of them opens a file, and that is the decision** (ADR 039).
 //! `Dotenv` reads text somebody else read; `Fixed` takes pairs somebody else
 //! parsed. What this module refuses is the filesystem, not a format — which
 //! is why reading TOML is a dependency the program chooses rather than one

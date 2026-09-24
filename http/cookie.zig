@@ -1,5 +1,5 @@
 //! Cookies: reading the `Cookie` header a request arrives with, and writing
-//! the `Set-Cookie` headers a response leaves with (ADR 0030).
+//! the `Set-Cookie` headers a response leaves with (ADR 029).
 //!
 //! ```zig
 //! fn signIn(c: *nilo.Ctx, sessions: *Sessions) !void {
@@ -38,7 +38,7 @@ pub const SameSite = enum {
     unset,
 
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.SameSite";
 };
 
@@ -55,7 +55,7 @@ pub const SameSite = enum {
 /// server sets and receives these normally.
 pub const Cookie = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Cookie";
 
     name: []const u8,

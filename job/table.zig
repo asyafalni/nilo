@@ -1,5 +1,5 @@
 //! The queue as a table in the database the program already has
-//! ([ADR 0198](../docs/adr/0198-a-queue-is-a-table-in-the-database-you-already-have.md)).
+//! ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 //!
 //! `Table(Db)` takes the `nilo_sql` Db *type* and calls `insert`, `update`,
 //! `select` and `rawOne` on it — the same nine questions `contract.zig`
@@ -23,7 +23,7 @@
 //! a row one of them is claiming is skipped by the rest rather than waited
 //! for. SQLite has no such clause and needs none — it has one writer, so the
 //! same statement without it is already serial
-//! ([ADR 0074](../docs/adr/0074-one-writer-is-not-a-setting-it-is-the-database.md)).
+//! ([ADR 065](../docs/adr/065-one-writer-is-not-a-setting-it-is-the-database.md)).
 //! The second arm of the `WHERE` is the lease: a worker that died holding a
 //! row gives it up when `lease_until` passes, to whoever asks next.
 //!
@@ -66,7 +66,7 @@ pub fn Table(comptime Db: type) type {
                 // null and has no default is the one ALTER that fails on a
                 // table with rows in it (sql/ddl.zig). It also has to survive
                 // a rolling deploy: an older binary's INSERT does not name
-                // the column, and a sibling binary's — ADR 0291's own case —
+                // the column, and a sibling binary's — ADR 215's own case —
                 // never will. The default answers both.
                 .default = .{ .priority = @as(i16, @intFromEnum(contract.Priority.normal)) },
             };
@@ -89,7 +89,7 @@ pub fn Table(comptime Db: type) type {
             /// `(state, run_at)` bounds the scan to the due rows and a top-N
             /// sort picks one; widened to `(state, priority, run_at)` it
             /// stopped bounding anything and measured slower on every queue
-            /// tried (ADR 0290, bench/result/job.md).
+            /// tried (ADR 214, bench/result/job.md).
             ///
             /// The integer and not the enum: an enum column is stored as its
             /// *name*, and `ORDER BY` on text sorts 'high' before 'low'
@@ -165,7 +165,7 @@ pub fn Table(comptime Db: type) type {
         /// program; binding is what lets a kind be named anything a program
         /// already named one — `email:welcome`, `reports/nightly` — instead of
         /// making this change rename rows that are queued under the old name,
-        /// which is the very loss ADR 0291 is about. Postgres takes the list
+        /// which is the very loss ADR 215 is about. Postgres takes the list
         /// as one array; SQLite has no `ANY`, so it takes a run of
         /// placeholders as long as the list.
         fn claimSql(comptime kinds: []const []const u8) []const u8 {
@@ -278,7 +278,7 @@ pub fn Table(comptime Db: type) type {
         /// `false` when the row is running, finished or absent — one
         /// statement, so a worker that claims it in the same instant is
         /// the one that wins, and the row is then its to finish
-        /// ([ADR 0257](../docs/adr/0257-a-queued-row-can-be-taken-back.md)).
+        /// ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
         pub fn cancel(self: *Self, scope: anytype, id: contract.Id) !bool {
             const n = try self.db.delete(Row, scope, .{
                 .where = .{ .id = @as(i64, @intCast(id)), .state = contract.State.queued },

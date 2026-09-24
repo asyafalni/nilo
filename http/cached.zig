@@ -1,5 +1,5 @@
 //! A route can say "cache this answer for a minute"
-//! ([ADR 0247](../docs/adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)).
+//! ([ADR 188](../docs/adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)).
 //!
 //! ```zig
 //! const Pages = cache.Space("pages", []const u8, .{ .max_bytes = 32 << 10 });
@@ -26,7 +26,7 @@
 //! with what it made; nothing is refused for the server's own tardiness.
 //! This is done here rather than in `nilo_cache` because this is the layer
 //! with an `Io` to wait on — the cache's lock spins and nothing that waits
-//! may go inside it (ADR 0138).
+//! may go inside it (ADR 109).
 //!
 //! **What is kept is what the handler returned, whatever the status.** A
 //! `Status(404, Missing)` the handler chose is kept and served again; a
@@ -40,7 +40,7 @@
 //! kept answer into, one to encode the answer being kept, and the JSON
 //! buffer the handler's answer was going to take anyway — and one more to
 //! join the path and the query when there is a query. Nothing on the stack
-//! (ADR 0063). The allocation-budget test in `app.zig` runs a route with no
+//! (ADR 062). The allocation-budget test in `app.zig` runs a route with no
 //! `Cached` on it and is untouched: a route that did not ask runs the code
 //! it ran before.
 //!
@@ -74,7 +74,7 @@ pub const max_wait_ms: u32 = 2_000;
 /// What the key is made of.
 pub const By = union(enum) {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.CachedBy";
 
     /// The path alone. `?page=2` and `?page=3` are one entry, which is
@@ -93,7 +93,7 @@ pub const By = union(enum) {
 /// What `Cached(Pages, …)` takes beside the Space.
 pub const Options = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.CachedOptions";
 
     /// How long a kept answer is served before the handler runs again, in
@@ -117,7 +117,7 @@ pub fn Cached(comptime Pages: type, comptime options: Options) type {
     return struct {
         pub const nilo_cached = .{ .pages = Pages, .ttl_s = options.ttl_s, .by = options.by };
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = "nilo.Cached(" ++ naming.of(Pages) ++ ", …)";
 
         /// What the answer is kept under.

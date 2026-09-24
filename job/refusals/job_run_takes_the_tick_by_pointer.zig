@@ -1,7 +1,7 @@
 //! A `run` asking for the tick by pointer. After the job and the Run, a
 //! pointer is a service looked up in `.deps`, and the tick is not one: it
 //! is the row's id, attempt and due time, and it is handed over by value
-//! (ADR 0246). Left to the deps lookup this would say `.deps` has no
+//! (ADR 160). Left to the deps lookup this would say `.deps` has no
 //! `*job.Tick`, which is true and points the wrong way.
 
 const job = @import("nilo_job");

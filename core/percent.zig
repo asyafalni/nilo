@@ -1,7 +1,7 @@
 //! Percent-encoding and -decoding, RFC 3986.
 //!
 //! **This is in Core because two layers need it**
-//! ([ADR 0066](../docs/adr/0066-percent-is-needed-by-two-layers.md)). The App
+//! ([ADR 057](../docs/adr/057-percent-is-needed-by-two-layers.md)). The App
 //! layer decodes: every path param and every query value goes through here on
 //! the way in. A Service encodes: signing a URL is a canonical form built out
 //! of escaped pieces. A Service may not import `nilo_http` — that is sideways,

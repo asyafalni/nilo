@@ -1,6 +1,6 @@
 //! A `nilo_parse` that wants more than the text. A path param is one segment
 //! and nilo has nothing else to hand over — no Scope, no allocator, no route
-//! (ADR 0142). A type that needs any of those is doing work a handler does.
+//! (ADR 113). A type that needs any of those is doing work a handler does.
 
 const nilo = @import("nilo_http");
 

@@ -1,7 +1,7 @@
 //! `db.rawOrdered` handed a statement with nowhere to write the clause. The
 //! statement is the caller's, and appending to somebody else's SQL is the
 //! thing `db.raw` exists not to do — so the caller says where, with `{order}`
-//! ([ADR 0204](../../docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+//! ([ADR 165](../../docs/adr/165-an-order-chosen-at-run-time-from-a-closed-set.md)).
 
 const std = @import("std");
 const nilo = @import("nilo_http");

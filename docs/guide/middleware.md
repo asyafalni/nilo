@@ -51,7 +51,7 @@ CORS can answer a preflight for a path that has no route.
 `group("/api").use(mw)` is the same thing said better — see
 [Routing](./routing.md#groups).
 
-See [ADR 0009](../adr/0009-middleware-is-an-onion-of-ctx-functions.md).
+See [ADR 008](../adr/008-middleware-is-an-onion-of-ctx-functions.md).
 
 ### The two routes that can't be guarded
 
@@ -77,11 +77,11 @@ remembered. And the exception is written where the route is, so renaming
 `/sign-up` moves it — where the alternative, a list of paths compared against
 `c.path()` inside the middleware, would go on guarding a route that no longer
 exists while the real one went open, with nothing failing to compile
-([ADR 0080](../adr/0080-a-route-can-say-it-is-not-covered.md)).
+([ADR 008](../adr/008-middleware-is-an-onion-of-ctx-functions.md)).
 
 Registering the open routes before the `use` call does **not** work and it looks
 like it should: chains are resolved in `listen()`, so mount order carries no
-meaning at all (ADR 0009).
+meaning at all (ADR 008).
 
 ### And the one route that wants more
 
@@ -109,7 +109,7 @@ its middleware with it, `/v1/orders` does not cover `/v1/orders/:id`, and a
 guard on `DELETE /users/:id` does not cover the `GET` beside it. That last part
 is the difference between this and `useOn`, where the prefix is a string
 somebody has to keep in step
-([ADR 0126](../adr/0126-a-route-can-say-what-covers-it.md)).
+([ADR 099](../adr/099-a-route-can-say-what-covers-it.md)).
 
 ## The ones that come with it
 
@@ -151,7 +151,7 @@ The address of your front end is a fact about *where this was deployed*, not
 about the program, so staging and production naming different ones is the
 ordinary case rather than an awkward one. `cors.reading` is the same middleware
 with its list read from somewhere you fill before `listen()`
-([ADR 0110](../adr/0110-an-origin-is-a-fact-about-the-deployment.md)):
+([ADR 088](../adr/088-an-origin-is-a-fact-about-the-deployment.md)):
 
 ```zig
 var origins: nilo.cors.Origins = .empty;      // outlives the App
@@ -222,7 +222,7 @@ RFC 1918 ranges plus the loopback and their v6 equivalents, `"loopback"` for the
 loopback alone. `trusted_hops = 1` still works and is the older shape; the
 description wins when both are set, because a count goes wrong the day somebody
 puts a CDN in front and nothing says so
-([ADR 0129](../adr/0129-a-proxy-is-trusted-by-which-one-it-is.md)).
+([ADR 102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md)).
 
 Leave it at zero behind a proxy and every request looks like it came from the
 proxy — one address, one slot, and the first busy second locks out everybody.
@@ -254,10 +254,10 @@ try app.useOn("/api", nilo.allowance.keyed(account, .{
 goes in the table is a tag computed from them. `.on_null` has no default and
 that is deliberate: on a sign-in route a silent "not counted" leaves every
 *failed* sign-in uncounted, which is the attack the route exists to stop
-([ADR 0131](../adr/0131-a-key-the-application-knows-is-a-word-of-its-own.md)).
+([ADR 104](../adr/104-a-key-the-application-knows-is-a-word-of-its-own.md)).
 
 Two things it does on purpose, both the same trade
-([ADR 0114](../adr/0114-an-allowance-is-a-table-sized-while-compiling.md)). A
+([ADR 092](../adr/092-an-allowance-is-a-table-sized-while-compiling.md)). A
 table with no room left **forgets whichever of its addresses has been quiet longest**
 rather than making two addresses share one allowance, and a slot two requests
 reach at the same instant **lets them both through**. Being loose for one window
@@ -327,7 +327,7 @@ authenticated. `useOn` is what makes a rule apply whether the handler cooperates
 or not, and `c.resolve` is how the two meet: the middleware's lookup and the
 handler's argument are the same one lookup.
 
-See [ADR 0016](../adr/0016-resolved-values-are-declared-by-their-type.md).
+See [ADR 015](../adr/015-resolved-values-are-declared-by-their-type.md).
 
 ## One table over every route
 
@@ -362,7 +362,7 @@ A route registered without `named` still has a name — the derived one, so
 `getApiPartners` is what the table sees and what the document says. `app.routes()`
 publishes the same name per entry, for the test that checks every key is a
 route and every route is a key without going through the document
-([ADR 0201](../adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
+([ADR 162](../adr/162-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
 
 ## Writing your own middleware
 

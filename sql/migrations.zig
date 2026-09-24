@@ -1,5 +1,5 @@
 //! The `migrations/` directory: reading it, and writing the next version into
-//! it ([ADR 0153](../docs/adr/0153-a-migration-is-a-diff-against-a-snapshot.md)).
+//! it ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 //!
 //! `migrate.zig` is values. This is the half that touches a disk, and it is a
 //! file of its own for that reason: nothing above it opens anything, so a
@@ -72,7 +72,7 @@ pub const max_snapshot = 8 * 1024 * 1024;
 pub const max_version = 8 * 1024 * 1024;
 
 /// The two lines around the steps `generate` wrote
-/// ([ADR 0223](../docs/adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)).
+/// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 ///
 /// `--baseline` replaces what is between them and keeps every byte outside, so
 /// a port can re-derive version 1 forty times without losing the hand-written
@@ -150,7 +150,7 @@ pub const Read = struct {
     /// parse is exactly the one a shape change has just invalidated. Reading
     /// it first made the one command that exists to get out of that state the
     /// one command that could not run
-    /// ([ADR 0224](../docs/adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
+    /// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
     snapshot: bool = true,
     /// Where `std.zon` writes the line, the column and the offending text of a
     /// parse failure. Worth passing wherever a person will read the result.
@@ -265,7 +265,7 @@ pub const Options = struct {
     /// versions. Without this the loop is a shell script that deletes the
     /// snapshot, deletes the version file and resets the manifest by hand,
     /// which is what the nodeflux port wrote and what
-    /// [ADR 0223](../docs/adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)
+    /// [ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)
     /// is about. Everything outside the version file's generated block is kept.
     baseline: bool = false,
     /// The versions this binary was built with, from the generated manifest.
@@ -275,7 +275,7 @@ pub const Options = struct {
     /// being written is the one version not yet compiled into anything. Empty
     /// means no twin is written, which is what a library caller with no
     /// manifest to hand gets
-    /// ([ADR 0227](../docs/adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).
+    /// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
     versions: []const Version = &.{},
 };
 
@@ -299,7 +299,7 @@ pub const Outcome = struct {
     /// hand-written steps either side of it are in the new `.zig` and not in
     /// anything running. One rebuild and one more `db generate` or `db check`
     /// closes it, and `check` refuses until then
-    /// ([ADR 0227](../docs/adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).
+    /// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
     twins_deferred: bool = false,
 
     /// The schema and the types already agree.
@@ -350,7 +350,7 @@ pub fn generate(
     // **The snapshot is not read at all under `--baseline`**, and reading it
     // first was the whole of the bug: the one command that gets a repository
     // out of a snapshot it can no longer parse was the one command that
-    // stopped on it (ADR 0224).
+    // stopped on it (ADR 181).
     const state = try readWith(gpa, io, dir, D, .{ .snapshot = !opts.baseline });
     if (opts.baseline) return baseline(gpa, io, dir, D, desired, opts, state);
 
@@ -523,8 +523,8 @@ fn writeManifestAndSnapshot(
 /// The `.sql` beside `NNNN_name.zig`, as text. Caller frees.
 ///
 /// **An output and never an input**
-/// ([ADR 0227](../docs/adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).
-/// Authoring stays Zig, for every reason ADR 0153 gives; what does not have to
+/// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
+/// Authoring stays Zig, for every reason ADR 123 gives; what does not have to
 /// be Zig is *applying* a version, and today it is — `status --sql` opens a
 /// database to work out which versions are waiting, so somebody with `psql` and
 /// no toolchain cannot get the statements at all.
@@ -1408,7 +1408,7 @@ test "a baseline does not read the snapshot it is there to replace" {
     // `snapshot.parse`. A test one layer under the bug is what let this ship:
     // `snapshot.zig` proved the parse refused an older file and stayed green
     // while no caller could act on the refusal
-    // ([ADR 0224](../docs/adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
+    // ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
     const gpa = testing.allocator;
     var box = try Sandbox.init(gpa);
     defer box.deinit(gpa);
@@ -1593,7 +1593,7 @@ test "the splice keeps every byte outside the two markers, and only those" {
     );
 }
 
-// -- the `.sql` twin (ADR 0227) -------------------------------------------
+// -- the `.sql` twin (ADR 123) -------------------------------------------
 
 test "a version written with no manifest to hand gets no twin, and says nothing about one" {
     const gpa = testing.allocator;

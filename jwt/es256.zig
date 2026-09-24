@@ -6,7 +6,7 @@
 //! signature, `Signature.verify` for the arithmetic. This file writes none
 //! of that. What it adds is the three refusals in front of it — the curve,
 //! the coordinate length, the signature length — because "verified" and
-//! "did not check" have to be different answers (ADR 0140), and the one
+//! "did not check" have to be different answers (ADR 111), and the one
 //! fact that a first attempt at this gets wrong:
 //!
 //! **A JWS signature is raw `r || s`, sixty-four bytes, and not DER.** Every
@@ -16,7 +16,7 @@
 //! two integers back to back, each padded to the curve's width. So the
 //! decoder here is `Signature.fromBytes` and never `fromDer`, and a DER
 //! signature arrives as `error.SignatureWrongLength` rather than as a
-//! `BadSignature` somebody spends an afternoon on ([ADR 0242](../docs/adr/0242-the-key-decides-the-algorithm.md)).
+//! `BadSignature` somebody spends an afternoon on ([ADR 111](../docs/adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 //!
 //! **Which key type this is for is the key's business, not the token's.**
 //! `token.zig` calls this because the key it found says `EC`, and only after

@@ -17,7 +17,7 @@
 //! This module is 4% of that and none of it is protocol: it is the policy std
 //! leaves to the caller, and every piece of it closes a hole that is real on a
 //! server rather than in a script
-//! ([ADR 0070](../docs/adr/0070-a-fitting-borrows-the-loop.md)).
+//! ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)).
 //!
 //! - **A gate.** `std.http.Client`'s pool bounds *idle* connections
 //!   (`free_size`, 32 by default) and does not bound in-use ones at all. 500
@@ -26,16 +26,16 @@
 //! - **A deadline.** An endpoint that accepts a connection and then says
 //!   nothing holds a handler until the process dies. `std.http.Client` has no
 //!   deadline field, so the bound is on the fiber
-//!   ([ADR 0065](../docs/adr/0065-the-way-out-was-open-the-clock-was-not.md))
+//!   ([ADR 056](../docs/adr/056-the-way-out-was-open-the-clock-was-not.md))
 //!   — and where there is no fiber, because the `Io` is a plain
 //!   `std.Io.Threaded` with no Engine over it, the call is run as a task of
 //!   that `Io` and the task is what gets cancelled
-//!   ([ADR 0230](../docs/adr/0230-a-deadline-with-no-engine-cancels-a-task.md)).
+//!   ([ADR 056](../docs/adr/056-the-way-out-was-open-the-clock-was-not.md)).
 //!   `timeout_ms` means the same thing at either end. And a second clock
 //!   beside it, on silence rather than on the call: `stall_ms` ends a call
 //!   whose peer has sent nothing for that long, which is the bound a
 //!   transfer can set when the only honest `timeout_ms` is zero
-//!   ([ADR 0237](../docs/adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)).
+//!   ([ADR 056](../docs/adr/056-the-way-out-was-open-the-clock-was-not.md)).
 //! - **A bounded drain, and the drain itself.** `std.http.Client.Request.deinit`
 //!   does two different things depending on the state the body was left in, and
 //!   both of them are wrong for a client that refuses bodies. From
@@ -57,7 +57,7 @@
 //!   URL and the headers it always wants, as a type opened once on the client
 //!   and asked for by type in a handler, with a path template whose segments
 //!   are encoded on the way in — `stripe.get(c, "/v1/charges/{}", .{id}, .{})`
-//!   ([ADR 0254](../docs/adr/0254-a-target-is-a-type-and-a-path-is-a-template.md)).
+//!   ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)).
 //!
 //! Two shapes, and the second is the first with the middle left out. An
 //! `Exchange` is one call held open — the response head readable, the body
@@ -67,8 +67,8 @@
 //! out and says `content-type`, `withQuery` puts a struct on the URL
 //! percent-encoded, and the `Response` keeps its header block so the
 //! `Retry-After` off a 429 is one call away
-//! ([ADR 0243](../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md),
-//! [ADR 0244](../docs/adr/0244-a-response-carries-its-headers.md)).
+//! ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md),
+//! [ADR 187](../docs/adr/187-a-head-that-outlives-its-body.md)).
 //!
 //! ## Where it sits
 //!
@@ -95,18 +95,18 @@ const Str = core.Str;
 /// A canned server for a suite of your own: `fetch.testing.Canned`, which
 /// answers what `reply` told it to over a real loopback socket on
 /// `std.Io.Threaded`. What the module's own tests drive, exported
-/// ([ADR 0243](../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+/// ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)).
 pub const testing = @import("testing.zig");
 
 /// A service's base URL and standing headers as a type of its own, opened
 /// once on the client: `const Stripe = fetch.Target("stripe", .{});`
-/// ([ADR 0254](../docs/adr/0254-a-target-is-a-type-and-a-path-is-a-template.md)).
+/// ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)).
 /// `fetch.target.Options` is what the type carries and `fetch.target.Open`
 /// what `open` takes.
 pub const target = @import("target.zig");
 pub const Target = target.Target;
 
-/// The header a request's id travels under (ADR 0196). nilo's own spelling,
+/// The header a request's id travels under (ADR 158). nilo's own spelling,
 /// the one `Ctx.requestId` reads on the way in and the logger writes on the
 /// way out.
 pub const request_id_header = "X-Request-Id";
@@ -147,7 +147,7 @@ pub const Client = struct {
         /// step of the call runs as a task of that `Io`, and the task is
         /// cancelled when the clock runs out. What that costs is one thread
         /// hop per step, paid only by a client with no Engine and a
-        /// non-zero timeout (ADR 0230).
+        /// non-zero timeout (ADR 056).
         timeout_ms: u32 = 30_000,
 
         /// How long the far end may say **nothing** before the call is
@@ -161,9 +161,9 @@ pub const Client = struct {
         /// dropped the mapping) with nothing to end it. The two compose:
         /// `timeout_ms` is the ceiling on the whole call, this is the
         /// ceiling on silence inside it, and a caller sets either or both
-        /// ([ADR 0237](../docs/adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)).
+        /// ([ADR 056](../docs/adr/056-the-way-out-was-open-the-clock-was-not.md)).
         ///
-        /// It is not a per-read timeout, which ADR 0230 rejected and still
+        /// It is not a per-read timeout, which ADR 056 rejected and still
         /// does: a server sending one byte a second is *slow*, satisfies this
         /// bound, and is the caller's to judge against its other connections.
         /// What this catches is a server sending nothing.
@@ -180,7 +180,7 @@ pub const Client = struct {
         /// and the wrong place for a handler's one call, so the default is
         /// std's. `Begin.transfer_buffer` is not this and does not change
         /// the read size, which is the mistake this field is here to spare
-        /// the next reader (ADR 0238).
+        /// the next reader (ADR 186).
         read_buffer_size: usize = 8 << 10,
 
         /// How much of an unread body is worth reading to keep a pooled
@@ -190,7 +190,7 @@ pub const Client = struct {
 
         /// Whether a call made under a request sends that request's id as
         /// `X-Request-Id`, so the other side's log lines up with this one
-        /// ([ADR 0196](../docs/adr/0196-a-request-id-goes-out-with-the-call.md)).
+        /// ([ADR 158](../docs/adr/158-a-request-id-goes-out-with-the-call.md)).
         ///
         /// Read off the Scope: a `*Ctx` has an id and a `nilo.Run` has none,
         /// so a call from a CLI or a scheduled tick sends nothing whatever
@@ -205,7 +205,7 @@ pub const Client = struct {
         /// Sent verbatim, in this order. A name std writes for itself —
         /// `host`, `authorization`, `user-agent`, `content-type`,
         /// `connection`, `accept-encoding` — is sent **once**, the caller's
-        /// copy, rather than beside std's (ADR 0231).
+        /// copy, rather than beside std's (ADR 182).
         headers: []const std.http.Header = &.{},
         /// Overrides `Settings.timeout_ms` for this call — a health check that
         /// should give up in 500ms, an upload that may take a minute.
@@ -241,7 +241,7 @@ pub const Client = struct {
         NotStarted,
         /// A body on a method std frames no body for — a DELETE with one —
         /// and the head was too long for its length to be written after it
-        /// (ADR 0213). The connection buffers a head of several kilobytes;
+        /// (ADR 174). The connection buffers a head of several kilobytes;
         /// this is a request carrying more headers than that.
         HeadTooLong,
         OutOfMemory,
@@ -262,13 +262,13 @@ pub const Client = struct {
     }
 
     /// Finished once the event loop exists, like every service that needs one
-    /// (ADR 0040). The third parameter is what bounds a call in time
-    /// (ADR 0065); a Fitting that did not take it could open a connection and
+    /// (ADR 037). The third parameter is what bounds a call in time
+    /// (ADR 056); a Fitting that did not take it could open a connection and
     /// never give up on it.
     ///
     /// `.none` for the limits is not "no deadline": it is "no Engine to arm
     /// one on", and the client then bounds the call itself, as a task of
-    /// `io` it can cancel (ADR 0230).
+    /// `io` it can cancel (ADR 056).
     pub fn nilo_start(self: *Client, io: std.Io, limits: core.Limits) !void {
         self.inner.io = io;
         self.limits = limits;
@@ -296,7 +296,7 @@ pub const Client = struct {
     }
 
     /// A PATCH; `null` for the verb endpoint whose whole request is its path
-    /// (ADR 0213). A DELETE with a body is `send(c, .DELETE, url, body, call)`.
+    /// (ADR 174). A DELETE with a body is `send(c, .DELETE, url, body, call)`.
     pub fn patch(self: *Client, c: anytype, url: []const u8, body: ?[]const u8, call: Call) Error!Response {
         comptime core.checkScope(@TypeOf(c), "fetch.patch");
         return self.send(c, .PATCH, url, body, call);
@@ -306,7 +306,7 @@ pub const Client = struct {
     /// application/json` said for you — unless `call.headers` names one,
     /// which is then the one that goes. What `res.json(T, c)` is for the way
     /// in, this is for the way out
-    /// ([ADR 0243](../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+    /// ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)).
     ///
     /// One arena allocation for the text, which is the one every caller was
     /// already paying to `std.json.Stringify.valueAlloc` by hand. Text is
@@ -332,7 +332,7 @@ pub const Client = struct {
     }
 
     /// The whole of what the three above do, for a method they do not name
-    /// — a DELETE with `{ids:[…]}` in it (ADR 0213).
+    /// — a DELETE with `{ids:[…]}` in it (ADR 174).
     pub fn sendJson(
         self: *Client,
         c: anytype,
@@ -368,9 +368,9 @@ pub const Client = struct {
 
     /// What a `Target` sends on every call it makes: the headers a service
     /// always wants, held once at `open` rather than repeated at every
-    /// call site (ADR 0254). `send` and its siblings pass `.{}`, which is
+    /// call site (ADR 061). `send` and its siblings pass `.{}`, which is
     /// nothing. A line in `Call.headers` naming `authorization` or
-    /// `user-agent` goes instead of the standing value, the rule ADR 0231
+    /// `user-agent` goes instead of the standing value, the rule ADR 182
     /// already sets for std's own slot; a line naming any other standing
     /// header shadows it, so a call can say `accept: text/csv` under a
     /// target that says `accept: application/json`.
@@ -397,7 +397,7 @@ pub const Client = struct {
     ) Error!Response {
         // The one buffer this call needs, declared where a reader can see
         // what it costs. It is stack, and by
-        // [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md) a
+        // [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md) a
         // handler's stack is held for the life of the *inbound* connection — so
         // 2 KiB here is 2 KiB on every connection that ever dials out. An
         // `Exchange` takes it as an argument rather than holding it as a field
@@ -406,7 +406,7 @@ pub const Client = struct {
         //
         // There used to be a 4 KiB transfer buffer beside it, and it bought
         // nothing: the body goes from the connection's own read buffer to the
-        // arena without touching it, on every framing (ADR 0238).
+        // arena without touching it, on every framing (ADR 186).
         var redirect_buffer: [2 << 10]u8 = undefined;
 
         var ex: Exchange = .idle;
@@ -414,12 +414,12 @@ pub const Client = struct {
 
         // A target's standing headers under the call's own, which shadow
         // them by name: nothing to do for the ordinary call, one arena
-        // allocation when both lists have something in them (ADR 0254).
+        // allocation when both lists have something in them (ADR 061).
         const lines = try withStanding(c, standing.headers, call.headers);
 
         // The request's id, when there is a request. One header, and for the
         // ordinary call — no headers of its own — it lives in this array
-        // rather than in the arena (ADR 0196).
+        // rather than in the arena (ADR 158).
         var one: [1]std.http.Header = undefined;
         const headers = if (self.settings.forward_request_id)
             try withRequestId(c, lines, &one)
@@ -428,7 +428,7 @@ pub const Client = struct {
 
         // The caller's own line wins over the value the call or the target
         // decided, and std's slot is then left out so it goes once
-        // (ADR 0231).
+        // (ADR 182).
         const given = Exchange.Given.of(lines);
         const head = try ex.begin(self, .{
             .method = method,
@@ -446,7 +446,7 @@ pub const Client = struct {
         // The header block, kept before the body reads over it: the second
         // arena allocation of a whole-body call, beside the body's own, so
         // that `res.header("retry-after")` is there to read after the call
-        // ([ADR 0244](../docs/adr/0244-a-response-carries-its-headers.md)).
+        // ([ADR 187](../docs/adr/187-a-head-that-outlives-its-body.md)).
         const kept = try c.arena().dupe(u8, head.bytes);
 
         return .{
@@ -462,7 +462,7 @@ pub const Client = struct {
     /// A call with no headers of its own costs nothing here — the one header
     /// goes in `one`. A call that passes headers spends one bump of the
     /// Scope's arena on the merge, which is the one allocation this decision
-    /// makes and the reason it is written down (ADR 0196).
+    /// makes and the reason it is written down (ADR 158).
     fn withRequestId(c: anytype, given: []const std.http.Header, one: *[1]std.http.Header) Error![]const std.http.Header {
         const S = @typeInfo(@TypeOf(c)).pointer.child;
         const id = core.requestIdOf(S, c) orelse return given;
@@ -483,7 +483,7 @@ pub const Client = struct {
     /// The ordinary call has no standing headers and costs nothing here; a
     /// call on a target that passes headers of its own spends one bump of
     /// the Scope's arena on the merge, the way `withRequestId` does for the
-    /// id (ADR 0254).
+    /// id (ADR 061).
     fn withStanding(c: anytype, standing: []const std.http.Header, given: []const std.http.Header) Error![]const std.http.Header {
         if (standing.len == 0) return given;
         if (given.len == 0) return standing;
@@ -517,7 +517,7 @@ pub const Client = struct {
     /// it and keeps the cause in a field it does not return. Any client that
     /// pattern-matches on `error.Canceled` therefore reports its own timeouts
     /// as read failures — which is what nilo did, and what only an Engine
-    /// could show ([ADR 0033](../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)).
+    /// could show ([ADR 032](../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)).
     ///
     /// Asking the bound instead needs nothing of the error: if this call's own
     /// timer expired, every failure after it is downstream of that. A
@@ -526,9 +526,9 @@ pub const Client = struct {
     /// that mattered in the first place.
     ///
     /// `expired` and `stalled` are the same answers from the other clock,
-    /// the one an Exchange keeps itself when there is no Engine (ADR 0230);
+    /// the one an Exchange keeps itself when there is no Engine (ADR 056);
     /// `stall_armed` says which of the two bounds the Engine's one timer was
-    /// standing in for when it fired (ADR 0237).
+    /// standing in for when it fired (ADR 056).
     fn blame(_: *Client, bound: *core.Limits.Bound, stall_armed: bool, expired: bool, stalled: bool, err: anytype) Error {
         if (stalled) return error.Stalled;
         if (expired) return error.TimedOut;
@@ -584,16 +584,16 @@ pub const Exchange = struct {
     /// The same deadline kept by the Exchange itself, when there is not:
     /// an absolute time on Core's monotonic clock, in microseconds, that
     /// every step of the call is run against, as a task of the `Io` that is
-    /// cancelled when the clock passes it (ADR 0230). Zero under an Engine,
+    /// cancelled when the clock passes it (ADR 056). Zero under an Engine,
     /// and for a timeout of zero. An `i64` rather than an `std.Io.Timeout`
     /// because the latter is 48 bytes and this struct sits on the stack of
-    /// every handler that dials out, which by ADR 0063 is per connection.
+    /// every handler that dials out, which by ADR 062 is per connection.
     deadline_us: i64 = 0,
     /// Whether `deadline` is what stopped the call. The engineless half of
     /// what `Bound.fired` answers, and read by `blame` the same way.
     expired: bool = false,
     /// The ceiling on silence, in milliseconds, or zero for none. The
-    /// other clock (ADR 0237): where `deadline_us` counts from the start of
+    /// other clock (ADR 056): where `deadline_us` counts from the start of
     /// the call, this counts from `last_byte`, which every chunk moves.
     stall_ms: u32 = 0,
     /// When the last byte of body reached this side, on Core's monotonic
@@ -644,7 +644,7 @@ pub const Exchange = struct {
         /// `user-agent` pasted off a `curl` command went out twice. Now a
         /// name here that matches a slot tells std to leave the slot out, and
         /// the six names are known in one place, which is this file rather
-        /// than every caller with a header it did not choose (ADR 0231).
+        /// than every caller with a header it did not choose (ADR 182).
         ///
         /// `accept-encoding` is the one to know about: the line goes out as
         /// written, but the client still decodes nothing, so an answer that
@@ -668,7 +668,7 @@ pub const Exchange = struct {
         user_agent: ?[]const u8 = null,
 
         timeout_ms: ?u32 = null,
-        /// Overrides `Settings.stall_ms` for this call (ADR 0237).
+        /// Overrides `Settings.stall_ms` for this call (ADR 056).
         stall_ms: ?u32 = null,
 
         /// What a 3xx with a `Location` means to this call. **`.refuse`, the
@@ -679,7 +679,7 @@ pub const Exchange = struct {
         /// `.expose` is handed the 3xx as itself: for a signed request
         /// checking where an object moved, or a client that reads the
         /// body of the answer, which is what S3 puts its reason in
-        /// ([ADR 0239](../docs/adr/0239-a-redirect-is-a-decision-with-a-name.md)).
+        /// ([ADR 183](../docs/adr/183-a-redirect-is-a-decision-with-a-name.md)).
         ///
         /// Not following is the right default for anything signed: a
         /// signature is computed over one host and one path, so following a
@@ -692,7 +692,7 @@ pub const Exchange = struct {
         /// connection's own read buffer straight to the destination on every
         /// framing and never fill it, so the empty default is the ordinary
         /// call and costs nothing. It does not change how much one socket
-        /// read brings in; `Settings.read_buffer_size` does (ADR 0238).
+        /// read brings in; `Settings.read_buffer_size` does (ADR 186).
         transfer_buffer: []u8 = &.{},
     };
 
@@ -704,7 +704,7 @@ pub const Exchange = struct {
         expose,
         /// Followed, at most three deep, with the `Location` resolved in
         /// this buffer; `head.redirected` says where it ended, and its text
-        /// lives here (ADR 0232).
+        /// lives here (ADR 183).
         follow: []u8,
 
         fn buffer(self: Redirects) []u8 {
@@ -748,7 +748,7 @@ pub const Exchange = struct {
         /// `Location` on the way. **Its text lives in the `redirect_buffer`
         /// the call was given**, which the caller owns, so it is good for as
         /// long as that buffer is and not for a moment longer. `location`
-        /// writes it out as one string (ADR 0232).
+        /// writes it out as one string (ADR 183).
         redirected: ?std.Uri = null,
 
         /// A header by name, case-insensitively. Null when it is absent —
@@ -761,7 +761,7 @@ pub const Exchange = struct {
         /// when the answer came from the URL that was asked for. What a
         /// caller that will open more connections to the same object wants:
         /// the sixteen after the probe go to where it landed rather than
-        /// walking the chain sixteen more times (ADR 0232).
+        /// walking the chain sixteen more times (ADR 183).
         ///
         /// `error.NoSpaceLeft` when `buf` is shorter than the URL, which is
         /// a URL longer than the redirect buffer that held it.
@@ -780,7 +780,7 @@ pub const Exchange = struct {
         /// the body has been through. For the caller who needs an `etag`
         /// *after* `pipe`: the next run compares against it, and until this
         /// every such caller wrote a `[512]u8` and a length of its own
-        /// ([ADR 0240](../docs/adr/0240-a-head-that-outlives-its-body.md)).
+        /// ([ADR 187](../docs/adr/187-a-head-that-outlives-its-body.md)).
         /// One arena allocation the size of the header block, on the calls
         /// that ask and no other; the borrowed head stays the default.
         pub fn keep(self: Head, c: anytype) error{OutOfMemory}!Head {
@@ -828,9 +828,9 @@ pub const Exchange = struct {
         // One deadline, held by whichever of the two can enforce it. Under an
         // Engine that is the Bound, which cancels the fiber; with none, it is
         // an absolute time every step below is run against as a task that
-        // gets cancelled (ADR 0230). Zero is no limit either way.
+        // gets cancelled (ADR 056). Zero is no limit either way.
         // The other clock counts from the last byte, and until one arrives
-        // that is now: a head that never comes is silence too (ADR 0237).
+        // that is now: a head that never comes is silence too (ADR 056).
         const ms = opts.timeout_ms orelse client.settings.timeout_ms;
         self.stall_ms = opts.stall_ms orelse client.settings.stall_ms;
         self.last_byte.store(core.monotonicMicros(), .release);
@@ -853,9 +853,9 @@ pub const Exchange = struct {
         // This happens when a keep-alive connection is finally closed" — so
         // **nothing was answered and nothing reached anybody.** Sending it
         // again on a fresh connection is transport hygiene, which is why
-        // [ADR 0067](../docs/adr/0067-most-of-an-s3-client-is-not-s3.md)
+        // [ADR 058](../docs/adr/058-most-of-an-s3-client-is-not-s3.md)
         // called it correctness while refusing every other retry, and why
-        // [ADR 0070](../docs/adr/0070-a-fitting-borrows-the-loop.md)'s "no
+        // [ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)'s "no
         // retries" is about somebody else's *service* rather than about a
         // socket this one had already stopped using.
         //
@@ -887,7 +887,7 @@ pub const Exchange = struct {
         //   written here: a reaped connection arrives as a FIN or as an RST
         //   depending on a race nobody runs, and reading only the first spelling
         //   is what
-        //   [ADR 0091](../docs/adr/0091-a-reaped-connection-arrives-two-ways.md)
+        //   [ADR 058](../docs/adr/058-most-of-an-s3-client-is-not-s3.md)
         //   fixed.
         // - **Only a body still where it was.** A `.stream` body has had its
         //   reader consumed, so re-sending it would put fewer bytes on the
@@ -933,7 +933,7 @@ pub const Exchange = struct {
 
         // A 3xx that says where to go, under the default that made no
         // decision about it. A 304 has no `Location` and is an answer, so
-        // it is not this (ADR 0239). The Exchange stays open, and the
+        // it is not this (ADR 183). The Exchange stays open, and the
         // caller's `end` drops the connection or drains the body the way it
         // would for any answer it did not read.
         if (opts.redirects == .refuse and head.status.class() == .redirect and self.res.head.location != null) {
@@ -948,7 +948,7 @@ pub const Exchange = struct {
         // is whenever the server reaps the idle socket: 120 seconds against
         // Garage, for an answer that was complete in 30 ms. Marked read here,
         // so `take` returns empty and `deinit` drains nothing
-        // ([ADR 0215](../docs/adr/0215-an-answer-with-no-body-ends-at-its-head.md)).
+        // ([ADR 176](../docs/adr/176-an-answer-with-no-body-ends-at-its-head.md)).
         if (bodiless(opts.method, head.status)) {
             self.req.reader.state = .ready;
             self.announced = 0;
@@ -966,7 +966,7 @@ pub const Exchange = struct {
     /// what is left of the call or `stall_ms`, and remember which. Called
     /// at `begin` and again from `tap` on every chunk, so a moving transfer
     /// never fires it and a silent one fires it `stall_ms` after the last
-    /// byte (ADR 0237).
+    /// byte (ADR 056).
     fn armNearer(self: *Exchange) void {
         self.bound.release();
         var ms = self.stall_ms;
@@ -1030,7 +1030,7 @@ pub const Exchange = struct {
         // each. A slot the caller wrote a line for is left out, so the line
         // is the one copy on the wire — no allocation and no filtered slice,
         // because std writes `extra_headers` verbatim either way and the
-        // only thing that had to move was its own (ADR 0231).
+        // only thing that had to move was its own (ADR 182).
         const given = Given.of(opts.headers);
         self.req = try client.inner.request(opts.method, uri, .{
             .extra_headers = opts.headers,
@@ -1059,7 +1059,7 @@ pub const Exchange = struct {
         //
         // The alternative is `readerDecompressing`, and it is not free: a
         // `http.Decompress` plus a 32 KiB flate window, which by
-        // [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md)
+        // [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)
         // is held per *connection* on the handler's stack — twice what the
         // whole call already costs there — and it links flate into every
         // binary that dials out. Identity costs nothing, is understood
@@ -1068,7 +1068,7 @@ pub const Exchange = struct {
         //
         // Making it a setting would be the worst of both: the branch would be
         // at runtime, so flate would link in whether or not anybody chose it
-        // (ADR 0018's complaint about `docs()`, exactly).
+        // (ADR 017's complaint about `docs()`, exactly).
         // Both halves, and they do different jobs. The override is what goes
         // on the wire — the bool array alone emits a malformed
         // `accept-encoding\r\n` with no value, because std's writer skips
@@ -1086,7 +1086,7 @@ pub const Exchange = struct {
         self.req.accept_encoding[@intFromEnum(std.http.ContentEncoding.identity)] = true;
 
         // **The body decides, not the method**
-        // ([ADR 0213](../docs/adr/0213-the-body-decides-not-the-method.md)).
+        // ([ADR 174](../docs/adr/174-the-body-decides-not-the-method.md)).
         // `std.http.Client` asserts that a POST, PUT or PATCH sends a body
         // and that anything else sends none, and a real API does both the
         // other way: a bulk DELETE with `{ids:[…]}` in it, a PATCH whose
@@ -1232,7 +1232,7 @@ pub const Exchange = struct {
     /// who knows what `end` would otherwise have to weigh: a probe that
     /// asked for one byte of a file and was answered with the whole file
     /// says this rather than lowering `max_drain` for every call the client
-    /// makes, and `max_drain` stays a policy rather than a lever (ADR 0235).
+    /// makes, and `max_drain` stays a policy rather than a lever (ADR 184).
     ///
     /// Nothing is read after it. `end` still gives the permit back, and the
     /// connection goes with the body — one handshake, which is what the
@@ -1288,7 +1288,7 @@ pub const Exchange = struct {
     ///
     /// The same call on `ex.reader` directly is outside both clocks on a
     /// client with no Engine, because there is nothing there to cancel the
-    /// read; this one is inside them (ADR 0237).
+    /// read; this one is inside them (ADR 056).
     pub fn stream(self: *Exchange, w: *std.Io.Writer, limit: std.Io.Limit) Client.Error!usize {
         const reader = self.reader orelse unreachable; // begin first, then stream
         // std's TLS reader answers zero for a record that carried no
@@ -1331,7 +1331,7 @@ pub const Exchange = struct {
     /// blocking read, and `Future.cancel` returns only once the task has
     /// come out of it, so nothing is still reading when this returns. The
     /// error the task came back with is passed up and `blame` names it a
-    /// timeout, the way it does under an Engine (ADR 0230).
+    /// timeout, the way it does under an Engine (ADR 056).
     ///
     /// **What it costs**: one `io.concurrent` per step — the head, the body
     /// — which on Threaded is a thread hop each way. Paid only on the path
@@ -1366,7 +1366,7 @@ pub const Exchange = struct {
             // Whichever clock is nearer is the wait. The silence clock is
             // read fresh each time round, because the task moves it with
             // every chunk: a transfer that keeps moving wakes this loop once
-            // per `stall_ms` and never fires it (ADR 0237).
+            // per `stall_ms` and never fires it (ADR 056).
             const now = core.monotonicMicros();
             var wait: i64 = std.math.maxInt(i64);
             if (self.deadline_us != 0) {
@@ -1408,7 +1408,7 @@ pub const Exchange = struct {
     const max_redirects = 3;
 
     /// Which of std's own six headers `Begin.headers` carries, so the slot
-    /// can be left out and the caller's line sent once (ADR 0231).
+    /// can be left out and the caller's line sent once (ADR 182).
     const Given = struct {
         host: bool = false,
         authorization: bool = false,
@@ -1570,7 +1570,7 @@ pub const Response = struct {
     /// the blank line — kept into the Scope the way `head.keep(c)` keeps it,
     /// so it reads the same after the body has been through. One arena
     /// allocation its own size, on the whole-body calls only
-    /// ([ADR 0244](../docs/adr/0244-a-response-carries-its-headers.md)).
+    /// ([ADR 187](../docs/adr/187-a-head-that-outlives-its-body.md)).
     /// `header(name)` is the way to read it; a `Response` built by hand in
     /// a test leaves it empty and every lookup then answers null.
     headers: []const u8 = "",
@@ -1625,7 +1625,7 @@ pub const Response = struct {
 /// A function that answers a URL rather than a `.query` field on `Call`,
 /// because `Call` is a plain struct and a struct of the caller's own cannot
 /// sit in a field of it — and the same reason it is not an arm of
-/// `Exchange.Body` ([ADR 0243](../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+/// `Exchange.Body` ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)).
 /// The URL is what every call takes, `Exchange.begin` included, so one
 /// function serves all of them.
 ///
@@ -1651,7 +1651,7 @@ pub fn withQuery(c: anytype, base: []const u8, params: anytype) error{OutOfMemor
 /// The Refusal for params that are not a struct with one field per param,
 /// and for any field no query string can carry. `skip` names the fields
 /// that are not the query's — a target's path segments — so they are held
-/// to a segment's rules instead (ADR 0254).
+/// to a segment's rules instead (ADR 061).
 pub fn checkQuery(comptime P: type, comptime called: []const u8, comptime skip: []const []const u8) void {
     const info = @typeInfo(P);
     // `.{}` is the empty tuple to Zig and "no params" to a caller, so it
@@ -1716,7 +1716,7 @@ fn among(comptime names: []const []const u8, comptime name: []const u8) bool {
 
 /// One query param's value, on its way out: digits and the two words go as
 /// they are, text is percent-encoded. A path segment of a target is written
-/// the same way, which is why the type is shared (ADR 0254).
+/// the same way, which is why the type is shared (ADR 061).
 pub const QueryValue = union(enum) {
     /// An int, formatted. Forty bytes holds a 128-bit one with its sign.
     number: struct { buf: [40]u8, len: usize },
@@ -1909,7 +1909,7 @@ test "silence is blamed before the call's clock, and the Engine's one timer says
     try std.testing.expectEqual(Client.Error.TimedOut, client.blame(&theirs, false, true, false, error.ReadFailed));
 
     // Under an Engine there is one timer, armed for whichever bound was
-    // nearer, and `stall_armed` is what remembers which (ADR 0237).
+    // nearer, and `stall_armed` is what remembers which (ADR 056).
     var mine: core.Limits.Bound = .idle;
     defer mine.release();
     mine.arm(always_fired, 1_000);
@@ -1936,7 +1936,7 @@ test "a streamed body is not replayed, because its reader is spent" {
     // must not happen in. Re-sending a `.stream` body would put fewer bytes
     // on the wire than the `content-length` announced, which is a corrupted
     // request rather than a recovered one
-    // ([ADR 0067](../docs/adr/0067-most-of-an-s3-client-is-not-s3.md)).
+    // ([ADR 058](../docs/adr/058-most-of-an-s3-client-is-not-s3.md)).
     try std.testing.expect(Exchange.replayable(.none));
     try std.testing.expect(Exchange.replayable(.{ .slice = "x" }));
 
@@ -1944,7 +1944,7 @@ test "a streamed body is not replayed, because its reader is spent" {
     try std.testing.expect(!Exchange.replayable(.{ .stream = .{ .reader = &empty, .len = 0 } }));
 }
 
-// ---- the ordinary call: a query on the URL (ADR 0243) ----
+// ---- the ordinary call: a query on the URL (ADR 061) ----
 
 test "a query struct becomes a percent-encoded query string, in one allocation" {
     var run: core.Run = .init(std.testing.allocator);
@@ -1997,7 +1997,7 @@ test "a query is written into exactly the bytes it was measured at" {
     try std.testing.expectEqualStrings("http://h/x?a=0&b=&c=true&d=%25", url);
 }
 
-// ---- a response carries its headers (ADR 0244) ----
+// ---- a response carries its headers (ADR 187) ----
 
 test "a response answers a header case-insensitively, and null for one it did not carry" {
     const res: Response = .{

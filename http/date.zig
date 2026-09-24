@@ -1,5 +1,5 @@
 //! The `Date` every response carries, formatted once a second rather than
-//! once a response ([ADR 0269](../docs/adr/0269-a-response-says-when-it-was-sent.md)).
+//! once a response ([ADR 197](../docs/adr/197-a-response-says-when-it-was-sent.md)).
 //!
 //! RFC 9110 §6.6.1: an origin server with a clock **must** send `Date` on
 //! every 2xx, 3xx and 4xx response. A cache in front — a CDN, nginx's

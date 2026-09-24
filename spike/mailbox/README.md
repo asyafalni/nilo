@@ -1,9 +1,9 @@
 # What does a connection you can broadcast to cost?
 
-[ADR 0029](../../docs/adr/0029-a-spawned-fiber-belongs-to-the-server.md) killed
+[ADR 028](../../docs/adr/028-a-spawned-fiber-belongs-to-the-server.md) killed
 the only broadcast shape that worked at the time with one number: a second
 fiber per connection, **8,673 bytes**, against a whole-connection budget of
-8,767 in [ADR 0018](../../docs/adr/0018-the-trade-budget-has-three-axes.md).
+8,767 in [ADR 017](../../docs/adr/017-the-trade-budget-has-four-axes.md).
 Doubling the per-connection cost of every connection, for a feature most
 applications do not use, was not a trade to make on a user's behalf.
 
@@ -14,7 +14,7 @@ because zio exported no way to park a fiber on a completion.
 [`spike/completion_queue/`](../completion_queue/) settled that it is reachable:
 `zio.CompletionQueue` is public in the pinned v0.17.0, its cancel path holds,
 and re-arming across a broadcast is lossless as long as only the completion is
-rebuilt. So the question came back to the one ADR 0029 asked, and it is a
+rebuilt. So the question came back to the one ADR 028 asked, and it is a
 number again.
 
 ## Run it
@@ -75,9 +75,9 @@ So a four-slot mailbox held inline is **384 bytes**, and the 512 in the table is
 
 ## Against the budget that rejected the last shape
 
-| shape | bytes per idle connection | of ADR 0018's 8,767 |
+| shape | bytes per idle connection | of ADR 017's 8,767 |
 |---|---|---|
-| a second fiber per connection (ADR 0029, rejected) | 8,673 | 98.9% |
+| a second fiber per connection (ADR 028, rejected) | 8,673 | 98.9% |
 | mailbox, own allocation, 16 slots | 1,024 | 11.7% |
 | mailbox, own allocation, 4 slots | 512 | 5.8% |
 | **mailbox, inline in the connection, 4 slots** | **384** | **4.4%** |
@@ -92,13 +92,13 @@ size for a number that goes in an ADR.
 - **nilo's connection, rather than a zio server's.** The delta is the
   machinery's marginal cost, and that is what transfers; the per-connection
   total for a real nilo server has to be re-measured on the real server when
-  the feature lands, the way ADR 0029 measured the fiber.
+  the feature lands, the way ADR 028 measured the fiber.
 - **A mailbox with anything in it.** The ring is written so its pages are
   resident, but the posts it would point at are somebody else's memory, and
   whose is exactly the question this spike does not answer. A post copied out
   of a request arena has to live somewhere, and that somewhere is not counted
   here.
 - **Any policy.** A full mailbox has to do something — drop oldest, drop
-  newest, disconnect — and [ADR 0020](../../docs/adr/0020-a-request-that-lasts-is-still-one-request.md)
+  newest, disconnect — and [ADR 019](../../docs/adr/019-a-request-that-lasts-is-still-one-request.md)
   refuses to have such a queue at all. That refusal needs amending before any
   of this ships, and the amendment is a decision rather than a measurement.

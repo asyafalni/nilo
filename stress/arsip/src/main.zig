@@ -55,7 +55,7 @@ fn health() struct { status: []const u8, milestone: u8 } {
 
 /// `std.process.Init` rather than a bare `main`, because that is where the
 /// environment block lives and `nilo_config` reads it where it lies rather than
-/// copying it (ADR 0043).
+/// copying it (ADR 039).
 pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.smp_allocator;
 
@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
     var report_buf: [8192]u8 = undefined;
 
     // The settings, before anything else opens. A `.env` is text somebody else
-    // read (ADR 0064) — the module opens no file, so this does. The text has to
+    // read (ADR 039) — the module opens no file, so this does. The text has to
     // outlive the Settings, which is why it comes off the long-lived allocator
     // and is never freed.
     const dotenv = readDotenv(gpa);

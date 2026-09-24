@@ -1,4 +1,4 @@
-//! Comparing a Row to the table it claims to read (ADR 0039).
+//! Comparing a Row to the table it claims to read (ADR 036).
 //!
 //! The struct describes what it reads; the database owns what is there. When
 //! they disagree, somebody has to be told, and the question is only when.
@@ -127,7 +127,7 @@ pub const Expectation = struct {
 /// Postgres `ENUM` whose type name lives in the database and cannot be derived
 /// from this side. On a managed Row it can: nilo wrote the `CREATE TABLE`, and
 /// what it wrote was `text` plus a check over the enum's words
-/// ([ADR 0221](../docs/adr/0221-the-marker-has-two-kinds-of-word.md)). So the
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)). So the
 /// gap closes exactly where the answer is known, and stays open where it is not.
 ///
 /// What this does *not* read is the constraint's body. Holding the enum's words
@@ -142,7 +142,7 @@ pub fn expectationsOf(comptime D: type, comptime Row: type) []const Expectation 
         var n: usize = 0;
         for (fields) |f| {
             // Carried beside the columns, so there is nothing in the table
-            // to expect (ADR 0217).
+            // to expect (ADR 178).
             if (!row_mod.isColumnField(Row, f.name)) continue;
             const accepts: []const []const u8 = D.accepts(f.type) orelse
                 (if (builds and table_mod.enumValues(f.type).len > 0)
@@ -235,7 +235,7 @@ fn problemFor(
         return out;
     }
     // `null` is the database saying it does not know, which a view is
-    // (ADR 0056). Nothing is claimed either way, so nothing is reported.
+    // (ADR 050). Nothing is claimed either way, so nothing is reported.
     if ((column.nullable orelse false) and !want.optional) {
         var out = base;
         out.kind = .unexpected_null;
@@ -487,7 +487,7 @@ test "an enum column is judged on a table this program builds and not on one it 
     // A Dialect declines to judge a Zig enum, because the column may be a
     // Postgres `ENUM` whose type name lives in the database. On a Row this
     // program built the table for it does not have to guess: what nilo wrote
-    // was `text` plus a check over the enum's words (ADR 0221).
+    // was `text` plus a check over the enum's words (ADR 181).
     const Role = enum { admin, user };
     const Member = struct {
         pub const nilo_table = .{ .name = "members", .key = .id };

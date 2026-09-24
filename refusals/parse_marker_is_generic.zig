@@ -1,6 +1,6 @@
 //! A `nilo_parse` left generic. nilo has to know what it takes before it can
 //! promise the route compiles, and an `anytype` says the type has not decided
-//! either (ADR 0142) — the same reason a handler may not be generic.
+//! either (ADR 113) — the same reason a handler may not be generic.
 
 const nilo = @import("nilo_http");
 

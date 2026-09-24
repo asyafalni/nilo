@@ -5,7 +5,7 @@ One page of [the reference](./README.md): Postgres and SQLite: a Row, a Db, quer
 ## `nilo_sql`
 
 A second module, imported separately. A project that never imports it links
-none of it ([ADR 0040](../adr/0040-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md)).
+none of it ([ADR 037](../adr/037-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md)).
 
 **Two databases, one API.** `sql.Db` is Postgres and `sql.Sqlite(…)` is SQLite;
 everything on the rest of this page is written once and works against either.
@@ -44,7 +44,7 @@ const User = struct {
 
 A window function, a CTE or a join no reference names comes back in a shape no table has.
 `.projection` is a Row that says so
-([ADR 0155](../adr/0155-a-row-that-owns-no-table.md)):
+([ADR 125](../adr/125-a-row-that-owns-no-table.md)):
 
 <!-- compiles -->
 ```zig
@@ -72,7 +72,7 @@ compiled and then said nothing when somebody wrote `db.select` against it.
 A Row that is the response sometimes carries what the program adds to it —
 a comment line and its files, read in a second statement or handed over by
 a service. `nilo_beside` names those fields
-([ADR 0217](../adr/0217-a-row-can-carry-a-field-no-column-holds.md)):
+([ADR 178](../adr/178-a-row-can-carry-a-field-no-column-holds.md)):
 
 <!-- compiles -->
 ```zig
@@ -116,8 +116,7 @@ try app.provide(&db);
 `db.expecting(version)` refuses to serve a database whose migration ledger is
 behind `version`, checked once at boot, after the work `app.before` registered
 has run and before the first request
-([ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md),
-[ADR 0277](../adr/0277-the-schema-check-runs-after-the-boot-work.md)). The
+([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)). The
 same is true of `db.checking`: a `createMissing` or a migration in `before`
 runs first, and the check reads what it made.
 A call rather than an option because an option is read on every boot and
@@ -128,21 +127,21 @@ links the migration module into every program with a `Db`, measured at
 the plan name it is kept under, how long the database took, how many rows moved
 and whether it failed. **Not the values it bound**, which are somebody's
 password as often as they are an id
-([ADR 0137](../adr/0137-a-statement-can-be-watched.md)). `sql.logging` is a
+([ADR 108](../adr/108-a-statement-can-be-watched.md)). `sql.logging` is a
 ready-made one that writes a debug line. A `Db` nobody watches pays one null
 test per statement.
 
 A statement that failed also carries `sent.problem`: the database's own
 `message`, its SQLSTATE `code`, `severity`, `detail`, `hint` and the
 `constraint` that was violated
-([ADR 0146](../adr/0146-a-statement-that-failed-says-what-the-database-said.md)).
+([ADR 117](../adr/117-a-statement-that-failed-says-what-the-database-said.md)).
 Fields a given database does not answer are empty rather than null — SQLite has
 no SQLSTATE and does not invent one. When the driver refused the statement
 before it left the process, `message` is the Zig error's name, which is the case
 this exists for: `error.QueryFailed` used to be the whole of what a program
 could see. It lives in the request's arena, so a watcher keeping one past the
 request copies it, and it still never reaches the client
-([ADR 0025](../adr/0025-every-failure-answers-with-the-same-json-body.md)).
+([ADR 024](../adr/024-every-failure-answers-as-json.md)).
 
 **`sql.problem(c)` is the same struct asked for from the other end** — by the
 call that failed rather than by an observer of every call. See
@@ -156,11 +155,11 @@ registered has run: the `checking` list is held against the live tables and
 the `expecting` version against the ledger, and either disagreeing is a boot
 that fails. A program driving a `Db` by hand calls it after its own boot
 work, or `db.checkSchema(rows)` directly for the tables alone
-([ADR 0277](../adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
 `db.nilo_stop()` is the other half, and `listen()` calls that too — after the
 last connection is cut off and before the Engine's loop is torn down, so the
 pool lets go of the loop it was built on
-([ADR 0151](../adr/0151-a-service-is-stopped-before-the-loop-is.md)). **A `Db`
+([ADR 121](../adr/121-a-service-is-stopped-before-the-loop-is.md)). **A `Db`
 is not usable after `listen()` returns.** A program driving one by hand calls
 `deinit` as it always did.
 
@@ -168,7 +167,7 @@ is not usable after `listen()` returns.** A program driving one by hand calls
 and the reason when it did not come back — so a server started with
 `connect_on_init = 0` over a database that is down is a 503 on its health
 page rather than a 200 over an empty pool
-([ADR 0192](../adr/0192-a-health-route-asks-the-services.md)). An `s3` Store
+([ADR 154](../adr/154-a-health-route-asks-the-services.md)). An `s3` Store
 answers the same question with whether it started.
 
 `init` opens nothing. The pool is built by `listen()`, which is the only
@@ -200,15 +199,15 @@ A query string is split before it is percent-decoded, so `password=p%26w` is
 | `Opts` | |
 |---|---|
 | `size` | connections held open. Default 10. The knob with a real curve behind it: 8 → 133k req/s, 16 → 148k, 32 → 180k, 64 → 206k, with p99 best at 32. Each one is a Postgres backend and a slot against `max_connections` |
-| `connect_on_init` | how many to dial during `listen()`. Default 0, which dials one anyway — for the schema check, the version guard and `app.before`, all of which run before the first request — and fills the rest lazily; the one is allowed to fail ([ADR 0062](../adr/0062-a-pool-that-dialled-itself-whatever-it-was-told.md), [ADR 0144](../adr/0144-a-check-dials-the-connection-it-needs.md), [ADR 0284](../adr/0284-a-boot-dials-the-connection-its-work-needs.md)). Set it to `size` when driving a `Db` from a `std.Io.Threaded` |
-| `timeout_ms` | how long a caller waits for a free connection. Default 10,000. Bounded on SQLite too since [ADR 0135](../adr/0135-a-wait-for-a-connection-has-a-bound.md), where it needs the Engine to enforce it |
+| `connect_on_init` | how many to dial during `listen()`. Default 0, which dials one anyway — for the schema check, the version guard and `app.before`, all of which run before the first request — and fills the rest lazily; the one is allowed to fail ([ADR 115](../adr/115-a-boot-dials-the-connection-its-work-needs.md)). Set it to `size` when driving a `Db` from a `std.Io.Threaded` |
+| `timeout_ms` | how long a caller waits for a free connection. Default 10,000. Bounded on SQLite too since [ADR 107](../adr/107-a-wait-for-a-connection-has-a-bound.md), where it needs the Engine to enforce it |
 | `schema_mismatch_is_fatal` | whether a Row that disagrees with its table stops startup. Default true |
-| `unchecked` | say so when this `Db` has no `checking` list on purpose. Default false, and then a `Db` that starts with `checking` never called warns once that the Rows will be checked by the first request that reads them ([ADR 0262](../adr/0262-a-db-with-no-schema-check-says-so-or-is-told.md)) |
+| `unchecked` | say so when this `Db` has no `checking` list on purpose. Default false, and then a `Db` that starts with `checking` never called warns once that the Rows will be checked by the first request that reads them ([ADR 192](../adr/192-a-db-with-no-schema-check-says-so-or-is-told.md)) |
 | `prepared` | whether a statement is kept prepared on the connection it went down. Default true |
 
 **A suite whose database is not running: turn the log level down, and do it with
 `std.testing.log_level`.** A `Db` that cannot dial says so at `warn` and returns
-the error ([ADR 0178](../adr/0178-a-suite-whose-database-is-down-is-not-a-suite-that-failed.md)),
+the error ([ADR 145](../adr/145-a-suite-whose-database-is-down-is-not-a-suite-that-failed.md)),
 but pg.zig logs its own connect failure at `err` — and the Zig test runner counts
 a logged `err` as a failed test, so a suite that skipped 95 tests exactly as it
 meant to still exits 1.
@@ -233,25 +232,25 @@ the step and skips the binary.
 second service and which pool a statement takes is written in the handler's
 argument list. Nothing routes between them: an automatic reader needs health
 checking, lag awareness and read-after-write safety, and the last fails
-silently ([ADR 0060](../adr/0060-a-second-database-is-a-second-type.md)).
+silently ([ADR 054](../adr/054-a-second-database-is-a-second-type.md)).
 `sql.Named("")` is a Refusal. There is no query cache — invalidation cannot
 be right from a module that sees only its own writes.
 
 Every statement this module sends is a comptime constant, so it is kept
 prepared on its connection under a name derived from its own text — worth
 **30% of a key lookup and 14% of a page with a sort**, ~12 µs either way
-([ADR 0057](../adr/0057-a-statement-that-is-a-constant-can-be-prepared-once.md)).
+([ADR 051](../adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)).
 `db.raw` is prepared too, since its text is comptime
-([ADR 0148](../adr/0148-a-raw-statement-is-counted-while-compiling.md)). Set
+([ADR 051](../adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)). Set
 `.prepared = false` behind a **connection pooler in transaction mode**
 (pgbouncer), which hands out a different server connection per transaction.
 
-A Row may name a **view** or a **materialized view** as well as a table. The column types are checked there; nullability is not, because Postgres does not track `NOT NULL` through a view ([ADR 0056](../adr/0056-a-view-is-a-table-that-cannot-say-what-is-not-null.md)). An identity key and a generated column, which the Row reads as optional, need nothing said about them: an insert names a subset of the Row's columns and `RETURNING` brings the rest back. A sequence or any other default on another column, written outside the marker, is named in `.filled` so an insert may leave it out ([ADR 0221](../adr/0221-the-marker-has-two-kinds-of-word.md)).
+A Row may name a **view** or a **materialized view** as well as a table. The column types are checked there; nullability is not, because Postgres does not track `NOT NULL` through a view ([ADR 050](../adr/050-a-view-or-a-rowid-alias-is-not-a-nullable-column.md)). An identity key and a generated column, which the Row reads as optional, need nothing said about them: an insert names a subset of the Row's columns and `RETURNING` brings the rest back. A sequence or any other default on another column, written outside the marker, is named in `.filled` so an insert may leave it out ([ADR 181](../adr/181-the-marker-has-two-kinds-of-word.md)).
 
 A Row says four things about its schema: `.default`, `.unique`, `.index` and
-`.references` ([ADR 0153](../adr/0153-a-migration-is-a-diff-against-a-snapshot.md),
+`.references` ([ADR 123](../adr/123-a-migration-is-a-diff-against-a-snapshot.md),
 which amends the older refusal that it may say none, and
-[ADR 0221](../adr/0221-the-marker-has-two-kinds-of-word.md), which adds the
+[ADR 181](../adr/181-the-marker-has-two-kinds-of-word.md), which adds the
 first). Only the Row that names a table may say them, and nothing enforces that
 because the language does — a borrowed Row's marker is a `type`, and there is
 nowhere on a type to write `.unique`. Where the line falls is where the compiler
@@ -278,7 +277,7 @@ try app.provide(&db);
 `threading` **has no default and the compiler will not let you leave it out**.
 SQLite is a library reading a file rather than a server on a socket, so there
 is no wait for the event loop to park on and the choice cannot be made for you
-([ADR 0073](../adr/0073-a-file-has-no-socket-to-wait-on.md)):
+([ADR 064](../adr/064-a-file-has-no-socket-to-wait-on.md)):
 
 | | |
 |---|---|
@@ -300,7 +299,7 @@ Which is the better default is unmeasured and is an open question in
 and the rest are written the same way. **`size` is one writer and `size - 1`
 readers**, and that is the database rather than a setting: SQLite allows one
 writer at a time, so writes queue on a single connection and reads run beside
-them under WAL ([ADR 0074](../adr/0074-one-writer-is-not-a-setting-it-is-the-database.md)).
+them under WAL ([ADR 065](../adr/065-one-writer-is-not-a-setting-it-is-the-database.md)).
 `connect_on_init` is ignored — a file is opened or it is not.
 
 Every connection is primed with `journal_mode = WAL` and `foreign_keys = ON`.
@@ -332,14 +331,14 @@ build pinned rather than what the machine had.
 | `.isolation` other than `.serializable` | SQLite gives every transaction a snapshot and serialises the writers. There is no weaker level to ask for |
 
 A `sql.Uuid` is **not** on that list, and only stopped being on it in
-[ADR 0078](../adr/0078-a-uuid-is-whatever-the-database-stores.md). SQLite has no
+[ADR 067](../adr/067-a-value-is-whatever-the-database-stores.md). SQLite has no
 uuid type, so one travels as the thirty-six hyphenated characters into a TEXT
 column — which is what the schema check has always asked for, and what makes
 `sqlite3` show the id and `WHERE public = '…'` typeable. Postgres still sends
 sixteen bytes. Your Row says `public: sql.Uuid` either way.
 
 **Nor are `.in`, a `sql.Json(T)` column or an enum column**, though until
-[ADR 0119](../adr/0119-the-sqlite-write-path-is-compiled.md) all three behaved as
+[ADR 067](../adr/067-a-value-is-whatever-the-database-stores.md) all three behaved as
 if they were: each read correctly and failed to *compile* on the way in, from
 inside the driver. SQLite has neither a `jsonb` nor an enum type, so a document
 and a tag both bind as text, and `.in` binds its whole list as one JSON array
@@ -368,7 +367,7 @@ compile their SQL to a constant.
 
 The Scope is why this module names no App: `arena()` and `str()` were the only
 things it ever asked a `Ctx` for, so a query runs the same in a CLI as in a
-request ([ADR 0041](../adr/0041-a-module-sits-where-the-loop-puts-it.md)).
+request ([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)).
 
 | | |
 |---|---|
@@ -378,7 +377,7 @@ request ([ADR 0041](../adr/0041-a-module-sits-where-the-loop-puts-it.md)).
 | `db.page(User, c, .{ .where = …, .order = …, .limit = 20 })` | `!Page(User)` — `.rows` and `.total`, in one statement. `.limit` and `.order` are required; see below |
 | `db.count(User, c, .{ .where = … })` | `!usize`. `.where` only, and optional — no condition counts the table |
 | `db.exists(User, c, .{ .where = … })` | `!bool` — `SELECT EXISTS(…)`, so it stops at the first match |
-| `db.insert(User, c, .{ .email = … })` | `!User` — the stored row, generated key included. A subset of the columns: what it leaves out has to be filled by something, the key a sequence fills, a `.default`, `null` on an optional field, or `.filled`, and an insert that leaves out a column nothing fills is a Refusal naming it. Not checked on a `.managed = false` Row ([ADR 0221](../adr/0221-the-marker-has-two-kinds-of-word.md)) |
+| `db.insert(User, c, .{ .email = … })` | `!User` — the stored row, generated key included. A subset of the columns: what it leaves out has to be filled by something, the key a sequence fills, a `.default`, `null` on an optional field, or `.filled`, and an insert that leaves out a column nothing fills is a Refusal naming it. Not checked on a `.managed = false` Row ([ADR 181](../adr/181-the-marker-has-two-kinds-of-word.md)) |
 | `db.insertMany(User, c, rows)` | `![]User` — a whole batch in one statement, back in the order it was sent. `rows` is a `[]const Line`, `Line` a named struct of the columns being written; see below |
 | `db.insertOrIgnore(User, c, .{ … }, .key)` | `!?User` — the stored row, or `null` when one was already there. `ON CONFLICT … DO NOTHING`. `.key` is the Row's own key; a column name is for a unique index that is not the key |
 | `db.insertOrUpdate(User, c, .{ … }, .email)` | `!User` — stored, or the existing row with these values written over it. `ON CONFLICT … DO UPDATE` |
@@ -389,19 +388,19 @@ request ([ADR 0041](../adr/0041-a-module-sits-where-the-loop-puts-it.md)).
 | `db.delete(User, c, .{ .where = … })` | `!usize` — rows deleted. `.where` required |
 | `db.deleteReturning(User, c, .{ .where = … })` | `![]User` — the rows that were removed |
 | `db.stream(User, c, .{ … })` | rows one at a time; see below |
-| `db.raw(User, c, sql, .{ … })` | `![]User` — a statement this module will not write. `sql` is **comptime**: the `SELECT` list is counted against the Row's fields and each column that plainly has a name is checked against the field in its position, and the statement is kept prepared like every other ([ADR 0148](../adr/0148-a-raw-statement-is-counted-while-compiling.md)) |
+| `db.raw(User, c, sql, .{ … })` | `![]User` — a statement this module will not write. `sql` is **comptime**: the `SELECT` list is counted against the Row's fields and each column that plainly has a name is checked against the field in its position, and the statement is kept prepared like every other ([ADR 051](../adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)) |
 | `db.rawOne(User, c, sql, .{ … })` | `!?User` — the same, for a statement whose `WHERE` holds a key. **No `LIMIT 1` is added**; see below |
-| `db.rawExactlyOne(Totals, c, sql, .{ … })` | `!Totals`: `rawOne` for a statement that has one row by construction: an aggregate with no `GROUP BY`, a `RETURNING` on a keyed write. No row is `error.QueryFailed`, not a zero-filled Row ([ADR 0280](../adr/0280-a-statement-that-always-answers-answers-a-row.md)) |
-| `db.rawPage(Line, c, sql, .{ … })` | `!Page(Line)`: a raw statement read as a page: the Row's columns, then `count(*) OVER ()` as one more column on the end of the `SELECT` list, which becomes `.total`. The `ORDER BY` and `LIMIT` are yours to write. A list exactly the Row's width is a Refusal ([ADR 0279](../adr/0279-a-raw-statement-can-carry-its-total.md)) |
-| `db.raw([]const u8, c, sql, .{ … })` | `![][]const u8` — column one of every row, with no Row and no marker. `i64`, `?bool`, a `Str`: any one thing a column can be read as. `rawOne` the same, unwrapped. A list of two columns into a scalar is a Refusal ([ADR 0234](../adr/0234-a-scalar-out-of-raw.md)) |
+| `db.rawExactlyOne(Totals, c, sql, .{ … })` | `!Totals`: `rawOne` for a statement that has one row by construction: an aggregate with no `GROUP BY`, a `RETURNING` on a keyed write. No row is `error.QueryFailed`, not a zero-filled Row ([ADR 206](../adr/206-a-statement-that-always-answers-answers-a-row.md)) |
+| `db.rawPage(Line, c, sql, .{ … })` | `!Page(Line)`: a raw statement read as a page: the Row's columns, then `count(*) OVER ()` as one more column on the end of the `SELECT` list, which becomes `.total`. The `ORDER BY` and `LIMIT` are yours to write. A list exactly the Row's width is a Refusal ([ADR 205](../adr/205-a-raw-statement-can-carry-its-total.md)) |
+| `db.raw([]const u8, c, sql, .{ … })` | `![][]const u8` — column one of every row, with no Row and no marker. `i64`, `?bool`, a `Str`: any one thing a column can be read as. `rawOne` the same, unwrapped. A list of two columns into a scalar is a Refusal ([ADR 125](../adr/125-a-row-that-owns-no-table.md)) |
 | `db.liveColumns(c, schema, table)` | `![]const sql.Column` — what the database says the table has, `name`, `udt`, `nullable`. Empty for a table that is not there. What `checkSchema` and `migrate.addMissingColumns` read |
 | `db.rawOrdered(User, c, sql, .{ … }, order)` | `![]User` — a raw statement with `{order}` in it, where the whole `ORDER BY` an `sql.Ordering` chose at run time is written. See *An order chosen at run time* below |
-| `db.compose(c)` | `sql.Composed` — an empty composed statement in the Scope's arena, spelling its placeholders the way this Db's dialect does (`$n`, or `?n` on SQLite). `sql.Composed.init(arena, sql.Spelling.of(Dialect))` builds one where no Db is in scope ([ADR 0283](../adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)) |
-| `db.composed(User, c, stmt, .{ … })` | `![]User` — a statement composed at run time from pieces that cannot carry a string: `sql.Composed` is literals (`text`, comptime), checked identifiers (`ident`, `qualified`) and parameters (`param`, `number`), and nothing else. Filled by position, width-checked at run time, its tuple counted against its placeholders (`error.ParamCountMismatch`) and its spelling against the Db (`error.WrongDialect`), unnamed. For a query engine that turns a model into SQL; `raw` for everything that can be written while compiling ([ADR 0283](../adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)) |
+| `db.compose(c)` | `sql.Composed` — an empty composed statement in the Scope's arena, spelling its placeholders the way this Db's dialect does (`$n`, or `?n` on SQLite). `sql.Composed.init(arena, sql.Spelling.of(Dialect))` builds one where no Db is in scope ([ADR 208](../adr/208-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)) |
+| `db.composed(User, c, stmt, .{ … })` | `![]User` — a statement composed at run time from pieces that cannot carry a string: `sql.Composed` is literals (`text`, comptime), checked identifiers (`ident`, `qualified`) and parameters (`param`, `number`), and nothing else. Filled by position, width-checked at run time, its tuple counted against its placeholders (`error.ParamCountMismatch`) and its spelling against the Db (`error.WrongDialect`), unnamed. For a query engine that turns a model into SQL; `raw` for everything that can be written while compiling ([ADR 208](../adr/208-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)) |
 | `db.composedOne(User, c, stmt, .{ … })` | `!?User` — the same, unwrapped |
-| `db.exec(c, sql, .{ … })` | `!usize` — a statement that answers with *nothing*, and the rows it changed. `CREATE TABLE`, `CREATE INDEX`, `PRAGMA`, `VACUUM`. No Row, because none is being filled ([ADR 0078](../adr/0078-a-uuid-is-whatever-the-database-stores.md)). `sql` is run-time text and is sent as written |
+| `db.exec(c, sql, .{ … })` | `!usize` — a statement that answers with *nothing*, and the rows it changed. `CREATE TABLE`, `CREATE INDEX`, `PRAGMA`, `VACUUM`. No Row, because none is being filled ([ADR 067](../adr/067-a-value-is-whatever-the-database-stores.md)). `sql` is run-time text and is sent as written |
 | `db.checkSchema(&.{ User, Order })` | `!usize`: hold these Rows against the live tables now, on a connection of its own, and say what disagrees at `err`. The count is how many problems. What `nilo_check` runs for the `checking` list; for a program that drives a `Db` with no App |
-| `db.nilo_check(io)` | `!void`: the schema check and the version guard, run by `listen()` after `before` ([ADR 0277](../adr/0277-the-schema-check-runs-after-the-boot-work.md)) |
+| `db.nilo_check(io)` | `!void`: the schema check and the version guard, run by `listen()` after `before` ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)) |
 | `db.begin(c, .{})` | `!Tx`. `.{ .isolation = …, .read_only = … }` rides on the `BEGIN`; see below |
 
 **A raw statement's parameters are `$1`, `$2`, … on every database.** The
@@ -409,17 +408,17 @@ text is respelled for the dialect while compiling (`?1`, `?2` on SQLite),
 so a `$2` that appears before `$1` binds the second value on both, and a
 statement naming `$3` and handed two values is a Refusal. `exec` takes its
 text at run time and sends it as written
-([ADR 0278](../adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+([ADR 204](../adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
 
 **Set operations are conditions.** Over one table `UNION` is
 `.any = .{ .{ a }, .{ b } }`, `INTERSECT` is `.{ a, b }` and `EXCEPT` is
 `.{ a, not_b }` — every leaf has a negation and `.any` nests, so the boolean
 algebra is closed. Over two tables it is a view, and a Row may name one
-([ADR 0058](../adr/0058-a-set-operation-over-one-table-is-a-condition.md)).
+([ADR 052](../adr/052-a-set-operation-over-one-table-is-a-condition.md)).
 There is no pipelining: a round trip is 24 µs, the query inside it is 2, and
 a server here serves 215,000 requests a second with a query in every one
 because a waiting fiber frees its thread
-([ADR 0059](../adr/0059-a-round-trip-is-not-the-cost-worth-chasing.md)).
+([ADR 053](../adr/053-a-round-trip-is-not-the-cost-worth-chasing.md)).
 Statements that must land together are a data-modifying CTE through `db.raw`.
 
 **A statement you wrote is one nilo does not cast.** `Decimal`, `Interval`,
@@ -430,7 +429,7 @@ driver hands back a `numeric` the reader cannot parse — at run time, on one
 route, with no compile error anywhere near it. So `db.raw` now refuses it while
 compiling: a bare column, or a `*`, in the position of an as-text field is a
 Refusal naming the column, the field and the field's column type
-([ADR 0154](../adr/0154-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
+([ADR 124](../adr/124-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
 Writing the cast yourself is the fix, and the message says so:
 
 ```zig
@@ -442,7 +441,7 @@ rather than a column path, so it passes. What the check refuses is the shape
 that could only ever be wrong.
 
 **`rawOne` and `updateReturningOne` are the unwrap, not a narrower statement**
-([ADR 0179](../adr/0179-a-statement-with-a-key-in-it-has-a-single-row-answer.md)).
+([ADR 146](../adr/146-a-statement-with-a-key-in-it-has-a-single-row-answer.md)).
 A statement whose `WHERE` holds a primary key answers with one row or none, and
 what the handler wants is `!?T` — `?Row` is already a 404 in the typed layer. So
 this:
@@ -464,7 +463,7 @@ updates all of them, and what changes is the shape of the answer.
 Both exist on a `Tx` too.
 
 **`db.page` is a `select` carrying the count the condition matched before the
-`.limit` cut it** ([ADR 0185](../adr/0185-a-page-knows-what-it-left-out.md)):
+`.limit` cut it** ([ADR 150](../adr/150-a-page-knows-what-it-left-out.md)):
 
 ```zig
 const found = try db.page(Order, c, .{
@@ -503,7 +502,7 @@ without `db.page`'s running total.
 
 `insertMany` sends one array per column and lets Postgres `unnest` them, so
 the statement text is a constant and the batch size is data
-([ADR 0053](../adr/0053-a-batch-is-one-array-per-column.md)). One round trip
+([ADR 047](../adr/047-a-batch-is-one-array-per-column.md)). One round trip
 whatever the size, one allocation per column, and — because it is one
 statement — a batch that violates a constraint stores none of its rows.
 
@@ -569,7 +568,7 @@ Different fields are ANDed. Several operators on one field are ANDed too.
 | `.id = 7` | `"id" = $1` |
 | `.age = .{ .gt = 18, .lt = 65 }` | `"age" > $1 AND "age" < $2` |
 | `.eq` `.ne` `.gt` `.gte` `.lt` `.lte` | |
-| `.like` / `.ilike` | and `.not_like` / `.not_ilike`. **These do not escape the text you give them**; the row below is the one to reach for. On SQLite `.ilike` is spelled `LIKE`, because that database's `LIKE` already folds ASCII case — and `.like` is a Refusal there naming `.ilike`, for the reason `.contains` is ([ADR 0263](../adr/0263-like-on-sqlite-is-refused-the-way-contains-is.md)) |
+| `.like` / `.ilike` | and `.not_like` / `.not_ilike`. **These do not escape the text you give them**; the row below is the one to reach for. On SQLite `.ilike` is spelled `LIKE`, because that database's `LIKE` already folds ASCII case — and `.like` is a Refusal there naming `.ilike`, for the reason `.contains` is ([ADR 055](../adr/055-the-second-dialect-is-the-test-of-the-seam.md)) |
 | `.contains` `.starts_with` `.ends_with` | the pattern is built *and* escaped by the statement, so `%` and `_` in a search term match themselves. `i` in front folds case (`.icontains`), `not_` in front negates — twelve in all. On SQLite the case-sensitive half is a Refusal: its `LIKE` folds ASCII case and cannot be told not to |
 | `.in = &.{ 1, 2, 3 }` | `= ANY($1)` — one parameter, so the statement stays a constant |
 | `.not_in = &.{ 1, 2, 3 }` | `<> ALL($1)` — one parameter likewise |
@@ -590,7 +589,7 @@ depend on a value that arrives after the statement is a constant — and
 `= NULL` is never true in SQL, so the query would run and answer nothing.
 Reach for `.not_distinct_from` — one statement that means what you wanted —
 or branch
-([ADR 0044](../adr/0044-a-condition-holds-a-value-not-a-maybe.md)). The
+([ADR 040](../adr/040-a-condition-holds-a-value-not-a-maybe.md)). The
 null-safe pair is the exception because its statement does **not** change
 when the value turns out to be null: `"handle" IS NOT DISTINCT FROM $1` is
 the same six words either way, so nothing is left until run time.
@@ -600,7 +599,7 @@ the same six words either way, so nothing is left until run time.
 search box and three dropdowns wants *no condition on status at all*, which is
 the opposite. `sql.given` is that, and it is a word rather than an optional so
 the two stay tellable apart
-([ADR 0183](../adr/0183-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)):
+([ADR 149](../adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)):
 
 ```zig
 const found = try db.page(Partner, c, .{
@@ -639,7 +638,7 @@ in one `.exists`, and in the condition of an `UPDATE` or a `DELETE` — where a
 term that may not be there is the whole table.
 
 **A search box over several columns is `.across`, and a `sql.given` on it
-guards the bracket** ([ADR 0211](../adr/0211-one-condition-over-several-columns-is-one-parameter.md)).
+guards the bracket** ([ADR 172](../adr/172-one-condition-over-several-columns-is-one-parameter.md)).
 The refusal inside `.any` is about one absent alternative among present ones;
 the same absent value on every column is one condition, and it is written as
 one:
@@ -669,7 +668,7 @@ column (an ordinary condition), columns of two types (two conditions, in
 `.order = .{ .created_at = .desc }` is settled while compiling. A list screen
 sorted from its headings — `?order=due:desc,title` — chooses at run time, and
 the choice is from a set the server declares
-([ADR 0204](../adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)):
+([ADR 165](../adr/165-an-order-chosen-at-run-time-from-a-closed-set.md)):
 
 ```zig
 const Sort = sql.Ordering(Commitment, .{
@@ -722,7 +721,7 @@ the request chose with the one hole. Both exist on a `Tx`.
 
 **What it costs.** The text is assembled per request, so an ordered statement
 runs **unnamed** — Parse, Bind and Execute on every call, the ~12 µs a prepared
-name is worth ([ADR 0057](../adr/0057-a-statement-that-is-a-constant-can-be-prepared-once.md))
+name is worth ([ADR 051](../adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md))
 — and one arena allocation for the text, sized while compiling. A statement
 whose `.order` is a literal is exactly what it was.
 
@@ -751,7 +750,7 @@ correctly and answer a wider question than the schema asked. So the query the
 other way round,
 from the child asking about its parent, is the same line with the Rows
 swapped
-([ADR 0214](../adr/0214-an-exists-reads-the-reference-from-either-side.md)):
+([ADR 175](../adr/175-an-exists-reads-the-reference-from-either-side.md)):
 
 ```zig
 db.select(Staff, c, .{ .where = .{
@@ -774,7 +773,7 @@ The entries are a list because a struct cannot carry the same field twice, and
 narrowing on two capabilities is the ordinary case. They are ANDed.
 
 **An `EXISTS` is a condition rather than a join**, and
-[ADR 0171](../adr/0171-a-row-over-there-is-a-condition.md) says why: it
+[ADR 218](../adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md) says why: it
 changes neither the column list nor the row count, so the Row still describes
 the answer and `.limit` still means what you think. A join the Row declares
 keeps both too, and is [a parent](#a-parent-children-a-group).
@@ -797,7 +796,7 @@ column that is not part of the key, and passing a tuple are all compile errors.
 
 ### A parent, children, a group
 
-A narrower Row can carry more than its table's columns, and every read takes it unchanged ([ADR 0295](../adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)). The guide page is [a Row with more in it](../guide/sql/shapes.md).
+A narrower Row can carry more than its table's columns, and every read takes it unchanged ([ADR 218](../adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)). The guide page is [a Row with more in it](../guide/sql/shapes.md).
 
 ```zig
 const OrderCard = struct {
@@ -902,7 +901,7 @@ const rows = try tx.select(Report, c, .{ .where = … });
 ```
 
 **Only a transaction has one**, and that is the design
-([ADR 0047](../adr/0047-a-deadline-needs-a-connection-you-hold.md)): a deadline
+([ADR 043](../adr/043-a-deadline-needs-a-connection-you-hold.md)): a deadline
 is always a second command, so it has to go down the same connection as the
 statement it bounds. `db.select` takes whichever connection is free and gives
 it straight back, so there is nothing to set one on. Postgres undoes it when
@@ -936,7 +935,7 @@ of one row is `tx.one(Row, c, .{ .where = .{ .id = id }, .lock = .update })`.
 statement in a transaction of its own and ends it immediately, so the lock
 would be taken and dropped before the handler read a row: the statement works,
 and the promise it was written for is missing
-([ADR 0054](../adr/0054-contention-is-what-a-transaction-is-for.md)).
+([ADR 048](../adr/048-contention-is-what-a-transaction-is-for.md)).
 
 #### Savepoints
 
@@ -974,14 +973,14 @@ than asking the server to release a mark it no longer has.
 | | |
 |---|---|
 | `sql.Timestamp` | microseconds since the epoch, written as RFC 3339 in JSON. `timestamptz` on Postgres; on SQLite an `INTEGER` holding those microseconds, **which SQLite's date functions do not read as a date**: `strftime('%m', paid_at)` is NULL, and a Row field filled from it fails the query. Divide first, `strftime('%m', paid_at / 1000000, 'unixepoch')`, or work the month out in Zig ([Dates out of a Timestamp](../guide/sql/sqlite.md#dates-out-of-a-timestamp)). `.now()`, `.fromSeconds(s)`, `.seconds()`, `.nilo_parse(text)` |
-| `sql.Date` | a calendar day: `days` since 1970-01-01, written as `2026-09-17` in JSON and described as `format: date`. `date` on Postgres, `TEXT` on SQLite, and **read out of the column rather than out of a `::text`**, so a `db.raw` reading one needs no cast. `.fromDays(n)`, `.nilo_parse(text)`, `.utcOf(ts)`, `.atMidnightUtc()`. A day is not a moment: a due date read into a `timestamptz` gets a midnight, a midnight has a zone, and the date then moves by a day for a reader in Jakarta ([ADR 0221](../adr/0221-the-marker-has-two-kinds-of-word.md)). It carries a value and does not calculate — no `.addDays`, no `.weekday` — and the two conversions it does offer are named for the zone they assume. A day before 1970 is ordinary and prints normally; the range is year 0 to 9999, which is what four digits spell and what `nilo_parse` reads back |
+| `sql.Date` | a calendar day: `days` since 1970-01-01, written as `2026-09-17` in JSON and described as `format: date`. `date` on Postgres, `TEXT` on SQLite, and **read out of the column rather than out of a `::text`**, so a `db.raw` reading one needs no cast. `.fromDays(n)`, `.nilo_parse(text)`, `.utcOf(ts)`, `.atMidnightUtc()`. A day is not a moment: a due date read into a `timestamptz` gets a midnight, a midnight has a zone, and the date then moves by a day for a reader in Jakarta ([ADR 181](../adr/181-the-marker-has-two-kinds-of-word.md)). It carries a value and does not calculate — no `.addDays`, no `.weekday` — and the two conversions it does offer are named for the zone they assume. A day before 1970 is ordinary and prints normally; the range is year 0 to 9999, which is what four digits spell and what `nilo_parse` reads back |
 | `sql.Uuid` | `nilo_id`'s [`Uuid`](./id.md#nilo_id), re-exported — the same type either import gives you. `uuid` |
-| `sql.Json(T)` | a `T` stored as `jsonb`, parsed per row into the request arena. Not available in `db.stream`, which allocates nothing. In a response it is written and described as the `T` — a **document**, `nilo_json_of = T` beside `value: T` — so a Row with one can still `rename_all` ([ADR 0202](../adr/0202-a-document-is-its-value.md)). **It is also the intended shape for a list on a row**: a `db.raw` projection with `COALESCE(jsonb_agg(jsonb_build_object(…)), '[]'::jsonb) AS labels` read into `labels: sql.Json([]const Label)` is one statement where a list of labels per row was a round trip per row, and the document says `Label`. **The column is parsed by `std.json` into the field names as written** — a `rename_all` on `T` spells the response, not the column, so a `jsonb_build_object` names `content_type` and the wire says `contentType` |
-| `sql.Decimal` | a `numeric`, held as its digits. `.text` is the value; there is no arithmetic. Writes itself into JSON as a **string**, so a consumer's `JSON.parse` cannot round it into an `f64` ([ADR 0050](../adr/0050-a-numeric-is-digits-and-a-string-in-json.md)) |
+| `sql.Json(T)` | a `T` stored as `jsonb`, parsed per row into the request arena. Not available in `db.stream`, which allocates nothing. In a response it is written and described as the `T` — a **document**, `nilo_json_of = T` beside `value: T` — so a Row with one can still `rename_all` ([ADR 163](../adr/163-a-document-is-its-value.md)). **It is also the intended shape for a list on a row**: a `db.raw` projection with `COALESCE(jsonb_agg(jsonb_build_object(…)), '[]'::jsonb) AS labels` read into `labels: sql.Json([]const Label)` is one statement where a list of labels per row was a round trip per row, and the document says `Label`. **The column is parsed by `std.json` into the field names as written** — a `rename_all` on `T` spells the response, not the column, so a `jsonb_build_object` names `content_type` and the wire says `contentType` |
+| `sql.Decimal` | a `numeric`, held as its digits. `.text` is the value; there is no arithmetic. Writes itself into JSON as a **string**, so a consumer's `JSON.parse` cannot round it into an `f64` ([ADR 049](../adr/049-a-column-type-can-come-from-outside-this-module.md)) |
 | `sql.Interval`, `sql.Inet` | an `interval` and an `inet`, held as the text Postgres prints. `.text` is the value |
-| `sql.Bytes` | bytes rather than text: `bytea` on Postgres, `BLOB` on SQLite. `.bytes` is the value, `sql.Bytes.of(hash)` writes one. The slice a read hands back lives in the request arena, the way a `Str` does. This is what to reach for instead of `sql.AsText("bytea")`, which goes through hex printing and costs a conversion each way ([ADR 0174](../adr/0174-bytes-are-a-type-not-a-second-protocol.md)) |
+| `sql.Bytes` | bytes rather than text: `bytea` on Postgres, `BLOB` on SQLite. `.bytes` is the value, `sql.Bytes.of(hash)` writes one. The slice a read hands back lives in the request arena, the way a `Str` does. This is what to reach for instead of `sql.AsText("bytea")`, which goes through hex printing and costs a conversion each way ([ADR 141](../adr/141-bytes-are-a-type-not-a-second-protocol.md)) |
 | `sql.AsText("money")` | any Postgres type at all, held as its text — the door out of this table. A column type of your own is any struct or enum with `nilo_column`, `nilo_read(text, arena)` and `nilo_write(arena)`; see below |
-| a slice | an array column, with no wrapper: `[]const Str` is `text[]`, `[]const i32` is `int4[]`, `?[]const i32` a nullable one, `[]const ?i32` one whose elements may be NULL ([ADR 0051](../adr/0051-an-array-is-a-slice-and-a-slice-is-one-deep.md)). `[]const u8` is text, so a list of text is `[]const Str` or `[]const []const u8`. `[]const sql.Uuid` is `uuid[]`, in both directions and as an `.in` list ([ADR 0145](../adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)). Not available in `db.stream` |
+| a slice | an array column, with no wrapper: `[]const Str` is `text[]`, `[]const i32` is `int4[]`, `?[]const i32` a nullable one, `[]const ?i32` one whose elements may be NULL ([ADR 045](../adr/045-an-array-is-a-slice-and-a-slice-is-one-deep.md)). `[]const u8` is text, so a list of text is `[]const Str` or `[]const []const u8`. `[]const sql.Uuid` is `uuid[]`, in both directions and as an `.in` list ([ADR 116](../adr/116-a-raw-parameter-is-converted-the-way-a-rows-is.md)). Not available in `db.stream` |
 | an enum | read out of `text`, a `varchar` or a Postgres enum. A value the Zig enum does not have fails the request. Add `pub const nilo_column = "user_role"` to it and the column is checked at startup — its type name, and on Postgres its values too, so a label the Zig enum lacks or a tag the type lacks is reported before the first request rather than by it — and can be batched. On a table this program builds, a plain enum is a `text` column and its tags become that column's `CHECK`; one that names its own type is the database's to grow with `ALTER TYPE`, and nilo writes none of its words — it only reads them back at startup and says which side is behind |
 
 #### A column type of your own
@@ -1003,7 +1002,7 @@ const Cents = struct {
 It travels as the text Postgres prints — `"col"::text` on the way out,
 `$1::numeric` on the way in — which is the one representation every Postgres
 type has, including the ones that arrive with an extension
-([ADR 0055](../adr/0055-a-column-type-can-come-from-outside-this-module.md)).
+([ADR 049](../adr/049-a-column-type-can-come-from-outside-this-module.md)).
 The column is judged at startup like any other, and the type works everywhere
 a column type does: conditions, `.set`, `insert`, a batch.
 
@@ -1015,10 +1014,9 @@ vector this module has no reason to parse.
 
 **A `Timestamp` reads back what it prints.** `Timestamp.nilo_parse(text)` is
 `?Timestamp`, and it is the same declaration that makes a type a path param
-([ADR 0142](../adr/0142-a-path-param-can-parse-itself.md)) and, since
-[ADR 0158](../adr/0158-one-arrival-one-answer.md), a query field — so a keyset
+and a query field ([ADR 113](../adr/113-a-path-param-can-parse-itself.md)) — so a keyset
 cursor the server printed one request ago is an ordinary typed argument
-([ADR 0159](../adr/0159-what-a-server-prints-it-can-read.md)):
+([ADR 127](../adr/127-what-a-server-prints-it-can-read.md)):
 
 ```zig
 const Page = struct { after: ?sql.Timestamp = null, limit: u32 = 50 };
@@ -1055,14 +1053,14 @@ than the process.
 | `error.Disconnected` | the database went away, or was never there |
 | `error.TimedOut` | a statement ran past `tx.deadline`. No default status — what a deadline means is the handler's to decide |
 | `error.Locked` | a `.lock = .update_nowait` found a row somebody else is holding. No default status — a held row is a 409, a 503 or a retry depending on the endpoint |
-| `error.QueryFailed` | anything else. The server's own words are on `Sent.problem` for a watcher and in the log; they never reach the client ([ADR 0146](../adr/0146-a-statement-that-failed-says-what-the-database-said.md)) |
+| `error.QueryFailed` | anything else. The server's own words are on `Sent.problem` for a watcher and in the log; they never reach the client ([ADR 117](../adr/117-a-statement-that-failed-says-what-the-database-said.md)) |
 
 Both Wires answer the same word for the same failure. SQLite's extended result
 codes name the three above natively, which is what lets a handler tested against
 SQLite branch on what Postgres will send it.
 
 **`sql.problem(c)` is what the name cannot carry** — *which* unique index fired
-([ADR 0184](../adr/0184-a-failure-belongs-to-the-call-that-caused-it.md)):
+([ADR 117](../adr/117-a-statement-that-failed-says-what-the-database-said.md)):
 
 ```zig
 db.delete(Staff, c, .{ .where = .{ .id = id } }) catch |err| switch (err) {
@@ -1150,7 +1148,7 @@ const User = struct {
 | in the marker | what it says |
 |---|---|
 | `.default = .{ .created_at = .now }` | what the database writes when an insert leaves the column out. `.now` is the one word, and only on a `sql.Timestamp`; everything else is a literal of the column's own Zig type, which has to coerce or it does not compile. A column with words of its own takes one of them the way a column is written: `.draft`, not `"draft"`. A default the database has to work out — `DEFAULT (lower(x))` — is still a step, and one on a generated key is a Refusal |
-| `.filled = .{ .number, .created_at }` | columns the database fills by means the marker cannot say: a `DEFAULT` written in a step, `gen_random_uuid()`, a trigger. Renders no DDL; it lets an insert leave them out. `.filled = .created_at` for one. A column also in `.default`, the integer key a sequence fills, and a name that is not a column are each a Refusal ([ADR 0221](../adr/0221-the-marker-has-two-kinds-of-word.md)) |
+| `.filled = .{ .number, .created_at }` | columns the database fills by means the marker cannot say: a `DEFAULT` written in a step, `gen_random_uuid()`, a trigger. Renders no DDL; it lets an insert leave them out. `.filled = .created_at` for one. A column also in `.default`, the integer key a sequence fills, and a name that is not a column are each a Refusal ([ADR 181](../adr/181-the-marker-has-two-kinds-of-word.md)) |
 | `.unique = .{ .email }` | one column. `.{ .{ .tenant_id, .name } }` is one constraint over two |
 | `.{ .columns = .{.email}, .ignoring_case = true }` | the named form. `.ignoring_case` is `lower(...)` on Postgres and `COLLATE NOCASE` on SQLite, and it is a Refusal on a column that is not text |
 | `.name = "users_one_account_per_address"` | what the constraint is called, on a `.unique`, an `.index` or a `.references`. **The name is the error message**: Postgres reports a violation by constraint name and nothing else, so this is the difference between a sentence and a column list. Text rather than `.a_word`, because that is what the database prints |
@@ -1158,10 +1156,10 @@ const User = struct {
 | `.{ .created_at = .desc }` | one column of an index read downwards. `.asc` is the default and needs no saying; a direction on a `.unique` is a Refusal, since a unique index is not read in order |
 | `.where = .{ .deleted_at = null }` | a partial index. The same grammar a `db.select` condition uses, not a string: `null` is `IS NULL`, `.{ .ne = null }` is `IS NOT NULL`, a literal is `=` and `.{ .ne = lit }` is `<>`. A name that is not a column is a Refusal and a literal of the wrong type does not compile. An index over an expression — `lower(btrim(site))` — is still a step |
 | `.references = .{ .org_id = .{ Org, .id } }` | keyed by the column doing the pointing, and it names the **Row** rather than a table, so renaming the table moves the key with it. A third entry says what happens on delete: `.cascade`, `.restrict` or `.set_null` |
-| `.{ "orgs", .id, .cascade }` | the same key with the table named as text, for a program whose files may not import each other's Rows. **The type check is not given up**: it runs against the Row list the tool was given, and a table no Row in that list claims is a Refusal ([ADR 0222](../adr/0222-a-foreign-key-is-columns-and-a-table-name.md)) |
+| `.{ "orgs", .id, .cascade }` | the same key with the table named as text, for a program whose files may not import each other's Rows. **The type check is not given up**: it runs against the Row list the tool was given, and a table no Row in that list claims is a Refusal ([ADR 181](../adr/181-the-marker-has-two-kinds-of-word.md)) |
 | `.epic = .{ .columns = .{ .epic_id, .department_id }, .to = .{ WorkEpic, .{ .id, .department_id } } }` | a foreign key over two columns, which is how "the Epic has to be on the same board" gets said once instead of in a `.data` step and two `.unique` entries. Keyed by a label rather than a column, because a Zig field name cannot be a tuple. `.to` takes a Row or a name, and `.on_delete` and `.name` belong in the same entry. A composite key is written as a table constraint; a one-column key stays inline, so nothing generated before this changed |
-| `.tags = &.{ "a", "b" }` | an array column's default, written as a list. Each element goes through the column's own element type, and a comma, a brace, a quote, a backslash or an apostrophe inside one is escaped so it does not change how many elements there are ([ADR 0225](../adr/0225-an-array-column-has-a-default-like-any-other.md)) |
-| `.check = .{ .users_seats_are_positive = "seats > 0" }` | a `CHECK`, keyed by the name it goes into the database under. **nilo does not read the body**: it writes it, hashes it, and notices when the hash moves — so a changed body is one drop and one create, and a name the types no longer have is a drop. Written inside the `CREATE TABLE`, so SQLite takes it; changing one there is the same rebuild every other table constraint needs ([ADR 0226](../adr/0226-the-marker-has-a-word-the-database-checks.md)) |
+| `.tags = &.{ "a", "b" }` | an array column's default, written as a list. Each element goes through the column's own element type, and a comma, a brace, a quote, a backslash or an apostrophe inside one is escaped so it does not change how many elements there are ([ADR 181](../adr/181-the-marker-has-two-kinds-of-word.md)) |
+| `.check = .{ .users_seats_are_positive = "seats > 0" }` | a `CHECK`, keyed by the name it goes into the database under. **nilo does not read the body**: it writes it, hashes it, and notices when the hash moves — so a changed body is one drop and one create, and a name the types no longer have is a drop. Written inside the `CREATE TABLE`, so SQLite takes it; changing one there is the same rebuild every other table constraint needs ([ADR 181](../adr/181-the-marker-has-two-kinds-of-word.md)) |
 | `.users_state_is_known = .{ .words_of = .state }` | the same word, naming the `CHECK` an enum column already generates, instead of `users_state_check`. Moving that name is a migration: the constraint in the database still has the old one |
 | `.trigger = .{ .users_touch = .{ .when = …, .run = … } }` | a trigger, in two halves, because nilo writes `ON "users"` between them. The table is the one thing the marker already knows, and a second copy of it stops matching the day the table is renamed. Both databases create, replace and drop one |
 | `.was = .{ .email = "handle" }` | this column used to be called that. The old name is text, because it is not a column any more |
@@ -1201,7 +1199,7 @@ comptime {
 Everything else about the Row is unchanged — `.references` may point at it,
 `db.checking` still holds it against the live schema, and every statement reads
 it the same way. What changes is only who *builds* it
-([ADR 0162](../adr/0162-a-table-this-program-reads-and-does-not-build.md)). The
+([ADR 130](../adr/130-a-table-this-program-reads-and-does-not-build.md)). The
 word is written into `migrations/snapshot.zon`, where `managed: true` is silence
 and `managed: false` is a line, so a program that starts or stops building a
 table is a visible change in a reviewed file.
@@ -1243,7 +1241,7 @@ pub const schema = sql.Schema{
 
 One value, and the one value `db.checking`, `cli.Tool`, `createMissing`,
 `addMissingColumns` and the diff are all given — so the three cannot drift
-([ADR 0253](../adr/0253-a-schema-is-one-value-and-the-tool-owns-the-order.md)).
+([ADR 181](../adr/181-the-marker-has-two-kinds-of-word.md)).
 `.tables` is every Row, in any order. The other three lists hang off the
 schema rather than off a table, and each has a default of none:
 
@@ -1282,7 +1280,7 @@ shipped and added a field: one `ALTER TABLE … ADD COLUMN` per column a table
 lacks, from the same `Desc` the create reads, in one transaction, and how many
 were added. A required column with no default is `error.NeedsBackfill` with
 the statement in the log and nothing sent; a table that is not there is
-skipped ([ADR 0233](../adr/0233-a-column-a-shipped-table-has-not-got.md)).
+skipped ([ADR 123](../adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 
 ```zig
 try sql.migrate.createMissing(&db, &run, .{ .tables = &.{ Download, Segment } });
@@ -1323,7 +1321,7 @@ because what it needs is one rewrite and not three.
 
 `Plan.destructive()` and `Plan.needsBackfill()` are the two questions a command
 asks before writing a file out. A column added `NOT NULL` **with a `.default`
-needs no backfill**, which is the case ADR 0153 named as the one moment a
+needs no backfill**, which is the case ADR 123 named as the one moment a
 default is load-bearing.
 
 #### The ledger, and applying
@@ -1349,14 +1347,14 @@ not read as tampering and changing a statement does.
 
 `nilo_migrations` is an ordinary Row — `migrate.Applied` — and **its columns are
 a contract**, because a program in another language may have to write a row into
-it ([ADR 0227](../adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)):
+it ([ADR 123](../adr/123-a-migration-is-a-diff-against-a-snapshot.md)):
 
 | Column | Postgres | SQLite | What it holds |
 |---|---|---|---|
 | `version` | `int8 PRIMARY KEY` | `INTEGER PRIMARY KEY` | the number in the file name. Supplied, never generated |
 | `name` | `text NOT NULL` | `TEXT NOT NULL` | the rest of the file name, `a-z`, `0-9` and `_` |
 | `hash` | `text NOT NULL` | `TEXT NOT NULL` | 64 hex characters: SHA-256 of the steps, chained onto the version before |
-| `applied_at` | `timestamptz NOT NULL` | `INTEGER NOT NULL` | when. SQLite holds microseconds since the epoch (ADR 0136) |
+| `applied_at` | `timestamptz NOT NULL` | `INTEGER NOT NULL` | when. SQLite holds microseconds since the epoch (ADR 067) |
 | `ms` | `int8 NOT NULL` | `INTEGER NOT NULL` | how long it took. `0` is allowed and means nobody timed it |
 
 `migrate.expect` reads the highest `version`; `migrate.drift` compares `hash`
@@ -1428,7 +1426,7 @@ that has gone stale, which is the one thing it reports that is not in the
 
 **Every version file has a `.sql` twin beside it**, written by the same
 `generate` and regenerated whenever the `.zig` is
-([ADR 0227](../adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)):
+([ADR 123](../adr/123-a-migration-is-a-diff-against-a-snapshot.md)):
 
 ```
 migrations/0007_work_items_get_a_priority.zig
@@ -1471,15 +1469,15 @@ else wrote the file named in `.file`.
 
 A version file is **one `.zig` file holding a list of steps**, because a
 prepared statement is one statement and nilo prepares everything it sends
-(ADR 0057). Splitting a `.sql` file into statements means a lexer that knows
+(ADR 051). Splitting a `.sql` file into statements means a lexer that knows
 about `;` inside a string literal and inside `$$…$$`, and getting it subtly
 wrong runs three quarters of a migration. The list is already split.
-[ADR 0153](../adr/0153-a-migration-is-a-diff-against-a-snapshot.md) is the
+[ADR 123](../adr/123-a-migration-is-a-diff-against-a-snapshot.md) is the
 argument, including what the layout costs.
 
 **Only one declaration in that file is generated.** The rest is the caller's,
 and it survives a rerun
-([ADR 0223](../adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)):
+([ADR 123](../adr/123-a-migration-is-a-diff-against-a-snapshot.md)):
 
 ```zig
 pub const before: []const migrate.Step = &.{};   // yours, runs first

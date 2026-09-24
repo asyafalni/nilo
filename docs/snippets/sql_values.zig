@@ -1,6 +1,6 @@
 // The request in flight, for a snippet in the SQL guide that is a run of
 // statements rather than a declaration — the `c`, `db` and `tx` such a
-// snippet says without introducing (ADR 0083).
+// snippet says without introducing (ADR 068).
 //
 // Not a file that compiles on its own: it is pasted after
 // `sql_types.zig` and the declarations the page has made so far, and before
@@ -40,7 +40,7 @@ pub var url: []const u8 = undefined;
 
 // The filters a screen may or may not have set, for the `sql.given` block —
 // optionals on purpose, because that is the whole subject of that section
-// (ADR 0183).
+// (ADR 149).
 pub var search: ?[]const u8 = undefined;
 pub var least_age: ?i32 = undefined;
 pub var capability: ?Str = undefined;
@@ -49,7 +49,7 @@ pub var capability: ?Str = undefined;
 // Not `tag`, which two snippets further down already use as a loop capture.
 pub var tag_name: []const u8 = undefined;
 
-// What a query engine holds when it composes a statement (ADR 0283): names
+// What a query engine holds when it composes a statement (ADR 208): names
 // out of a model, a range and a ceiling out of a request.
 pub var dimension: []const u8 = undefined;
 pub var measure: []const u8 = undefined;

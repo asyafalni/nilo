@@ -220,7 +220,7 @@ const service_rounds = 1_000_000;
 const service_counts = [_]usize{ 1, 4, 8, 16, 32 };
 
 /// A family of distinct types, because the registry holds one of each and
-/// rejects a second of the same (ADR 0003).
+/// rejects a second of the same (ADR 002).
 fn Svc(comptime n: usize) type {
     return struct { v: usize = n };
 }
@@ -613,7 +613,7 @@ fn drainBody(wire: []const u8, head: http1.Request, scratch: []u8) !u64 {
 // What one call costs on the connection's own fiber, with no Engine: the
 // calls run inline, one after another, so this is the protocol's work and the
 // App's and nothing of the scheduler's. The header block is one h2load sent
-// in steady state against a table of 0 (ADR 0297), 89 bytes of Huffman-coded
+// in steady state against a table of 0 (ADR 220), 89 bytes of Huffman-coded
 // literals; the message is HttpArena's `SumRequest{a=1, b=2}`.
 
 const grpc_calls = 1000;

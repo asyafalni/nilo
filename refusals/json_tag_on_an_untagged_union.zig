@@ -1,6 +1,6 @@
 //! A discriminator on a union with no tag. Nothing in the value says which arm
 //! is live, so there is nothing for nilo to write the name of — the same reason
-//! the API description gives one `{}` (ADR 0077).
+//! the API description gives one `{}` (ADR 016).
 
 const nilo = @import("nilo_http");
 

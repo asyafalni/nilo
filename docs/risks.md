@@ -13,11 +13,11 @@ points here rather than repeating them.
 
 **zio is a one-person project, and it could stop when Zig 0.17 lands.** The
 Bulkhead, fitted from the first stage rather than patched on later
-([ADR 0002](./adr/0002-zio-as-the-engine-behind-the-bulkhead.md)). It is the
+([ADR 001](./adr/001-zio-as-the-engine-behind-the-bulkhead.md)). It is the
 entire contract nilo asks of an Engine, listed in one file's header.
 
 **The `Str` guarantee cannot be complete.** The debug-build staleness trap, on
-from day one ([ADR 0004](./adr/0004-request-arena-and-the-str-type.md)). It
+from day one ([ADR 003](./adr/003-request-arena-and-the-str-type.md)). It
 missed the case anybody would actually test it with, two separate `curl` calls
 where the next connection started counting from the same number the stashed
 `Str` held, until every connection was given a generation span of its own. What
@@ -34,27 +34,27 @@ Floats are handed to `std.json` field by field rather than reimplemented.
 at.** `[:0]const u8` was recognised by neither and went out as a JSON array of
 byte values under an `application/json` label, while the generated document
 described it as a string
-([ADR 0103](./adr/0103-one-file-decides-what-counts-as-text.md)). The tests did
+([ADR 081](./adr/081-one-file-decides-what-counts-as-text.md)). The tests did
 not catch it because every value in them was a type somebody sat down and
 wrote. The one case that was still open after it — a byte slice that is not valid
 UTF-8 — went the same way, as the array of byte values `std.json` writes
-([ADR 0121](./adr/0121-a-byte-that-is-not-text-is-not-a-string.md)).
+([ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md)).
 
 **Deadlines are on by default, so a client on a genuinely bad link could be cut
 off where it used to be served.** The numbers are generous and each bounds one
 wait rather than a whole request, so nothing legitimate and slow is hurried by
 any of them: not a big upload, not an hour-long stream
-([ADR 0023](./adr/0023-a-deadline-belongs-to-an-operation-not-to-a-request.md)).
+([ADR 022](./adr/022-a-deadline-belongs-to-an-operation-not-to-a-request.md)).
 The one that does bound a whole request, `request_deadline_ms`, is off unless
 set, and a stream or a WebSocket lets it go
-([ADR 0267](./adr/0267-a-deadline-every-request-starts-with.md)).
+([ADR 105](./adr/105-a-route-can-say-how-long-it-has.md)).
 
 **A WebSocket has no read limit, so a client that vanishes without a FIN holds
 a fiber.** Caught by the write limit as soon as the server sends anything, and
 a connection nobody writes to is caught by `.idle_ms`, 30 seconds by default,
 `0` waiting forever. It is a ping rather than a deadline, because a quiet
 WebSocket is a working one
-([ADR 0022](./adr/0022-a-websocket-is-a-handler-that-does-not-return.md)).
+([ADR 021](./adr/021-a-websocket-is-a-handler-that-does-not-return.md)).
 
 **The request head is the one thing a stranger writes directly, and every test
 of it was an input somebody thought of.** `http/fuzz.zig` states properties
@@ -69,7 +69,7 @@ is fixed.
 **What it cannot catch is a reading both sides share**, and it did not: the
 reference parser read `Transfer-Encoding: gzip` exactly as wrongly as
 `http1.zig` did, so the corpus entry for it passed
-([ADR 0101](./adr/0101-a-request-nobody-else-would-answer-is-refused.md)). A
+([ADR 070](./adr/070-a-request-nobody-else-would-answer-is-refused.md)). A
 differential test proves the two implementations agree, which is not the same
 as either being right. Only the RFC settles that.
 
@@ -83,7 +83,7 @@ queues on the pool and every request in it is late.** `.max_in_flight`, off by
 default because the right number is the pool's and not nilo's. Past it the
 request is answered with a 503, `Retry-After: 1` and a closed connection before
 the router is asked, so the balancer moves on and the ones already running
-finish on time ([ADR 0197](./adr/0197-a-server-past-its-limit-says-so-at-once.md)).
+finish on time ([ADR 159](./adr/159-a-server-past-its-limit-says-so-at-once.md)).
 The gauge `nilo_requests_in_flight` is how an operator picks the number.
 
 **A file response holds a descriptor for as long as the send takes.** One per
@@ -91,7 +91,7 @@ request in flight, so `.max_connections` bounds it, which is the same number an
 operator already multiplies for memory. It is closed on every exit from
 `sendfile.send` including the error ones, and a test counts `/proc/self/fd`
 across a request so it stays that way
-([ADR 0037](./adr/0037-a-file-too-big-to-hold-is-opened-not-read.md)).
+([ADR 009](./adr/009-static-files-are-held-in-memory-or-opened.md)).
 
 **A spilled file's ETag is its mtime and size, so two different contents could
 share one.** Accepted, and argued rather than assumed. The alternative is
@@ -114,18 +114,18 @@ one. The instance that surfaced it, `docs/guide/openapi.md`, is on the list.
 **A panic in any handler takes the whole process down, and Go people will
 assume otherwise.** Cannot be fixed in Zig. Said plainly in the docs, with
 `ReleaseSafe` and a supervisor recommended, and the in-flight request named in
-the crash ([ADR 0008](./adr/0008-no-recover-middleware.md)).
+the crash ([ADR 007](./adr/007-no-recover-middleware.md)).
 
 **A Service is shared across threads and nothing makes a user notice.**
 `nilo.Mutex`, in the guide and in the example everyone copies. Nothing forces
 it, because Zig has no ownership tracking to force it with
-([ADR 0011](./adr/0011-shared-services-need-a-lock-from-the-bulkhead.md)).
+([ADR 010](./adr/010-shared-services-need-a-lock-from-the-bulkhead.md)).
 
 **Spawned work can capture a `Str`, or call a fail function, and both compile.**
 Neither can be caught: Zig has no ownership tracking, and `spawn` takes a plain
 function that nothing marks as being outside a request. Documented at the
 function, in the reference and in
-[ADR 0029](./adr/0029-a-spawned-fiber-belongs-to-the-server.md), and `spawn`
+[ADR 028](./adr/028-a-spawned-fiber-belongs-to-the-server.md), and `spawn`
 takes its arguments by value so the copy is at least the obvious thing to
 write. A `Str` that escapes this way is the staleness trap's problem, and it is
 the case that trap cannot watch.
@@ -134,15 +134,15 @@ the case that trap cannot watch.
 
 No mechanism holds these yet. Each says what it needs; until that arrives the comment at the site is what there is.
 
-**A blocking call can queue behind a slow one while holding a connection.** `nilo.blocking` is zio's `blockInPlace`, which does not reserve a pool thread, and zio starts a second worker only once twice as many jobs are queued as are running. Under `.hop`, a SQLite statement takes its connection and then hops, so one slow read on a reader leaves the next statement holding the writer in the queue behind it, and everything after that times out on the writer. Reproduced at one slow read of 25 s with the default pool; `.in_fiber` does not have it. The writer's timeout line now names the holder, and a one-line statement named there is how it is recognised ([ADR 0135](./adr/0135-a-wait-for-a-connection-has-a-bound.md)).
+**A blocking call can queue behind a slow one while holding a connection.** `nilo.blocking` is zio's `blockInPlace`, which does not reserve a pool thread, and zio starts a second worker only once twice as many jobs are queued as are running. Under `.hop`, a SQLite statement takes its connection and then hops, so one slow read on a reader leaves the next statement holding the writer in the queue behind it, and everything after that times out on the writer. Reproduced at one slow read of 25 s with the default pool; `.in_fiber` does not have it. The writer's timeout line now names the holder, and a one-line statement named there is how it is recognised ([ADR 107](./adr/107-a-wait-for-a-connection-has-a-bound.md)).
 
 **Needs:** `blockInPlace` to reserve a thread, one line in zio and tested at 2899 ms of queueing down to 0 ([zio#745](https://github.com/lalinsky/zio/issues/745)). Setting the runtime's `min_threads` also holds it, at a thread each kept alive for the life of the process and only up to that many calls at once, which is why it was not taken.
 
-**A fail function in spawned work is safe only because of where a threadlocal gets written.** `bulkhead.slot()` falls back to a threadlocal when a fiber has no slot, which spawned fibers never do. It is null on executor threads only because the one thing that sets it does so from inside `zio.blockInPlace`, which runs on a thread-pool worker. Both ends carry a comment saying so. Nothing enforces it, and if it broke, spawned work would write its message into an unrelated request, which is [ADR 0007](./adr/0007-failure-box-bound-to-the-fiber.md)'s leak by another route.
+**A fail function in spawned work is safe only because of where a threadlocal gets written.** `bulkhead.slot()` falls back to a threadlocal when a fiber has no slot, which spawned fibers never do. It is null on executor threads only because the one thing that sets it does so from inside `zio.blockInPlace`, which runs on a thread-pool worker. Both ends carry a comment saying so. Nothing enforces it, and if it broke, spawned work would write its message into an unrelated request, which is [ADR 006](./adr/006-failure-box-bound-to-the-fiber.md)'s leak by another route.
 
 **Needs:** a design that makes it a rule rather than a comment.
 
-**Nothing checks that a completion handed to the loop is given back before its frame goes.** `Wake` submitted two and never did, and the cost was a server that would not come back from a SIGTERM three runs in four ([ADR 0098](./adr/0098-a-completion-the-loop-holds-outlives-the-frame-that-submitted-it.md)). What makes it a standing risk rather than a closed bug is that the fix is one `defer` and the next `submit` anybody writes is under no obligation to match it.
+**Nothing checks that a completion handed to the loop is given back before its frame goes.** `Wake` submitted two and never did, and the cost was a server that would not come back from a SIGTERM three runs in four ([ADR 077](./adr/077-a-completion-the-loop-holds-outlives-the-frame-that-submitted-it.md)). What makes it a standing risk rather than a closed bug is that the fix is one `defer` and the next `submit` anybody writes is under no obligation to match it.
 
 The failure gives nothing away at the place it happens: the loop writes into memory that has been handed on, and what arrives is a spinning thread somewhere else entirely, after a shutdown that has already logged success. Only the Engine may name zio, so the whole surface is one file — but one file is what the threadlocal entry above says too.
 

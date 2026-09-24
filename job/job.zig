@@ -34,7 +34,7 @@
 //! no fail function to call.
 //!
 //! **The queue is a table in the database the program already has**
-//! ([ADR 0198](../docs/adr/0198-a-queue-is-a-table-in-the-database-you-already-have.md)).
+//! ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 //! That is what makes `pushIn(&tx, …)` possible — the job row commits with
 //! the order row or not at all — and what lets several instances share one
 //! queue with `SKIP LOCKED` and no second service. `job.Memory` is the same
@@ -42,9 +42,9 @@
 //! queue at a restart and says so.
 //!
 //! **A schedule is a type that makes the caller choose**
-//! ([ADR 0199](../docs/adr/0199-a-schedule-is-a-type-that-makes-the-caller-choose.md)):
+//! ([ADR 161](../docs/adr/161-a-schedule-is-a-type-that-makes-the-caller-choose.md)):
 //! whether two runs may overlap and whether a missed run is caught up are
-//! declared on the job or it does not compile, which is the shape ADR 0086
+//! declared on the job or it does not compile, which is the shape ADR 028
 //! said would be worth having and `every(ms, f)` was refused for lacking.
 //!
 //! **At least once.** A worker that dies mid-run leaves a row whose lease
@@ -55,7 +55,7 @@
 //! ## Where it sits
 //!
 //! A **Fitting**: it borrows the loop and owns no destination
-//! ([ADR 0070](../docs/adr/0070-a-fitting-borrows-the-loop.md)). It imports
+//! ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)). It imports
 //! `nilo_core` and nothing else. The store it runs on is a type parameter,
 //! so a `job.Table` over a `nilo_sql` Db never costs `job/` an import, and
 //! the worker loop is written against `std.Io` — `zig build test-job` runs
@@ -67,7 +67,7 @@
 //! Not a workflow engine, not a rate limiter for a job kind — `nilo.Gate`
 //! inside `run` is that — and not exactly-once. `docs/roadmap.md` carries
 //! each of those with what it is waiting for. A kind does say how urgent it
-//! is, and the claim takes the most urgent due row (ADR 0290), which is as
+//! is, and the claim takes the most urgent due row (ADR 214), which is as
 //! far towards a priority queue as this goes: three levels, no ageing, no
 //! preemption.
 
@@ -175,7 +175,7 @@ pub const Status = struct {
     /// What the run last said through `jobs.progress(tick.id, n)`: a count,
     /// a percentage, a step — the kind decides what the number means. `0`
     /// until it says anything, starts over on every retry, and is kept on
-    /// a row that finished ([ADR 0246](../docs/adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)).
+    /// a row that finished ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
     progress: u32 = 0,
 };
 
@@ -184,7 +184,7 @@ pub const Status = struct {
 /// By value, the way request data is in a handler: a pointer is a service,
 /// a value is the tick. Everything here was already in the worker's hand
 /// when it claimed the row, so asking costs nothing
-/// ([ADR 0246](../docs/adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)).
+/// ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 pub const Tick = struct {
     /// The row's id — what `jobs.status` and `jobs.progress` take.
     id: Id,
@@ -207,7 +207,7 @@ pub const Mark = struct {};
 pub const Settings = struct {
     /// How many rows may run at once in this process. Each is a fiber, and a
     /// fiber holds its stack at its high-water mark for as long as it lives
-    /// ([ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md)),
+    /// ([ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)),
     /// so this is paid per worker rather than per row.
     workers: u16 = 4,
     /// How long a worker with nothing to do waits before asking the store
@@ -215,7 +215,7 @@ pub const Settings = struct {
     /// wakes a worker itself, so this is the latency only of a row pushed by
     /// *another* process — a second binary on the same table — and the cost
     /// of an idle queue: one query per worker per interval
-    /// ([ADR 0229](../docs/adr/0229-a-push-wakes-a-worker.md)).
+    /// ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
     poll_ms: u32 = 1_000,
     /// How long one run may take, for a kind that names no `timeout_ms` of
     /// its own. Past it the run is cancelled and the row goes back to the
@@ -236,7 +236,7 @@ const schedule_key = "schedule";
 /// |---|---|
 /// | `.kinds` | a tuple of job types, each with `nilo_job`, `retry` and `run` |
 /// | `.store` | `job.Memory`, `job.Table(Db)`, or anything carrying the contract in `contract.zig` |
-/// | `.deps` | optional: a struct of pointers a `run` may ask for by type — or a `fn (comptime Jobs: type) type` answering one, for a `run` that takes `*Jobs` (ADR 0245) |
+/// | `.deps` | optional: a struct of pointers a `run` may ask for by type — or a `fn (comptime Jobs: type) type` answering one, for a `run` that takes `*Jobs` (ADR 160) |
 /// | `.status` | optional: a `cache.Space` of `job.Status`, kept per row for a route to poll |
 pub fn Jobs(comptime options: anytype) type {
     const Options = @TypeOf(options);
@@ -274,7 +274,7 @@ pub fn Jobs(comptime options: anytype) type {
     // compiler says `dependency loop` — so the function is handed `Self`
     // once there is one, and everything that reads a `run`'s signature
     // waits for the same moment, because a `run` taking `*Jobs` has the
-    // same loop in it ([ADR 0245](../docs/adr/0245-a-job-can-push-the-next-one.md)).
+    // same loop in it ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
     const deps_is_fn = comptime depsIsFn(@TypeOf(deps_option));
     const DepsNow: ?type = if (deps_is_fn) null else deps_option;
     const StatusSpace = if (@hasField(Options, "status")) options.status else void;
@@ -286,7 +286,7 @@ pub fn Jobs(comptime options: anytype) type {
     return struct {
         const Self = @This();
 
-        /// What a nilo compile error calls this type (ADR 0122).
+        /// What a nilo compile error calls this type (ADR 074).
         pub const nilo_type_name = "job.Jobs";
 
         /// The struct of pointers a `run` may ask for: `.deps` as written,
@@ -330,7 +330,7 @@ pub fn Jobs(comptime options: anytype) type {
         /// sleeps on. A worker reads it before it asks the store and sleeps
         /// only while it is still that number, so a push that lands between
         /// the empty answer and the sleep is not missed
-        /// ([ADR 0229](../docs/adr/0229-a-push-wakes-a-worker.md)).
+        /// ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
         wakes: std.atomic.Value(u32) = .init(0),
         /// How many worker loops are alive, for the health page.
         alive: std.atomic.Value(u32) = .init(0),
@@ -384,15 +384,15 @@ pub fn Jobs(comptime options: anytype) type {
 
         // -- as a service ---------------------------------------------------
 
-        /// Finished when the loop exists, like every service (ADR 0040). The
+        /// Finished when the loop exists, like every service (ADR 037). The
         /// `Io` is what `serve` runs the workers on and the limits are what
-        /// bound one run in time (ADR 0065).
+        /// bound one run in time (ADR 056).
         pub fn nilo_start(self: *Self, io: std.Io, limits: core.Limits) !void {
             self.io = io;
             self.limits = limits;
         }
 
-        /// What `app.health` asks (ADR 0192): the store, if it can be down,
+        /// What `app.health` asks (ADR 154): the store, if it can be down,
         /// and whether any worker is alive once `serve` has been started.
         pub fn nilo_ready(self: *Self, scope: *core.AnyScope) ?[]const u8 {
             _ = scope;
@@ -563,7 +563,7 @@ pub fn Jobs(comptime options: anytype) type {
         /// from inside `run` with a `job.Tick` and a `*Jobs` beside it. The
         /// number means what the kind says it means. Nothing happens when
         /// there is no Space; a row the Space has forgotten is remembered
-        /// again as `running` ([ADR 0246](../docs/adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)).
+        /// again as `running` ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
         pub fn progress(self: *Self, id: Id, n: u32) void {
             if (StatusSpace == void) return;
             var buf: [20]u8 = undefined;
@@ -593,7 +593,7 @@ pub fn Jobs(comptime options: anytype) type {
         /// finished or absent, because a row a worker holds is that
         /// worker's to finish and nothing here interrupts a `run`. With a
         /// `unique` key, a cancel and a push is how "move it to tomorrow"
-        /// is written ([ADR 0257](../docs/adr/0257-a-queued-row-can-be-taken-back.md)).
+        /// is written ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
         pub fn cancel(self: *Self, scope: anytype, id: Id) !bool {
             comptime core.checkScope(@TypeOf(scope), "jobs.cancel");
             comptime if (!@hasDecl(Store, "cancel")) @compileError(
@@ -615,7 +615,7 @@ pub fn Jobs(comptime options: anytype) type {
 
         /// The worker loop, for `app.spawn(Jobs.serve, .{&jobs})`. It may not
         /// fail — there is nobody to answer — and `error.Canceled` from the
-        /// loop is the shutdown, which is the one way out (ADR 0086).
+        /// loop is the shutdown, which is the one way out (ADR 028).
         pub fn serve(self: *Self) void {
             comptime {
                 _ = late_checked;
@@ -674,7 +674,7 @@ pub fn Jobs(comptime options: anytype) type {
         /// is due, whether a schedule's tick is missed, when a failed run is
         /// tried again, when the next tick is. A test moves time by calling
         /// this with a later number, and nothing is slept
-        /// ([ADR 0246](../docs/adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)).
+        /// ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
         pub fn drainAt(self: *Self, scope: anytype, now: i64) !usize {
             comptime core.checkScope(@TypeOf(scope), "jobs.drain");
             var n: usize = 0;
@@ -852,7 +852,7 @@ pub fn Jobs(comptime options: anytype) type {
                 // A failure the kind said is final is dead on this attempt,
                 // whatever the count says; a timeout never is, because the
                 // next attempt may finish
-                // ([ADR 0218](../docs/adr/0218-a-run-can-say-its-failure-is-final.md)).
+                // ([ADR 179](../docs/adr/179-a-run-can-say-its-failure-is-final.md)).
                 if (claimed.attempts > retry.times or (!bound.fired() and isFinal(K, err))) {
                     self.finishDead(scope, claimed.id, K, name, claimed.attempts, clock);
                     return;
@@ -978,7 +978,7 @@ fn scheduled(comptime K: type) bool {
 /// again after the run, so a `.skip` schedule counts from when the run
 /// ended; `drainAt` hands every read the one number it was given, so a
 /// test can say what time it is and a tick cannot drift past it
-/// ([ADR 0246](../docs/adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)).
+/// ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 /// One tag test per read, per row — nothing a request pays.
 const Clock = union(enum) {
     wall,
@@ -1008,7 +1008,7 @@ fn depsIsFn(comptime T: type) bool {
         "nilo: `job.Jobs`'s `.deps` is a function, and it does not have the shape `fn (comptime Jobs: type) type`.\n" ++
             "  A `run` that pushes the next job asks for `*Jobs`, and `Jobs` does not exist while its own `.deps` is being read, " ++
             "so the function is handed the finished type instead:\n" ++
-            "  `fn deps(comptime Queue: type) type { return struct { jobs: *Queue, mail: *Mailer }; }` and `.deps = deps` (ADR 0245).",
+            "  `fn deps(comptime Queue: type) type { return struct { jobs: *Queue, mail: *Mailer }; }` and `.deps = deps` (ADR 160).",
     );
     return true;
 }
@@ -1035,7 +1035,7 @@ fn depField(comptime name: []const u8, comptime Deps: type, comptime P: type) []
 /// is null for a queue whose `.deps` is a function: then the deps and every
 /// `run`'s signature are read by `checkLate` instead, once the queue type
 /// exists, because a `run` that names `*Jobs` cannot be read before it does
-/// ([ADR 0245](../docs/adr/0245-a-job-can-push-the-next-one.md)).
+/// ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 fn checkKinds(comptime kinds: []const type, comptime Deps: ?type) void {
     if (kinds.len == 0) @compileError(
         "nilo: `job.Jobs`'s `.kinds` is empty, so this queue could run nothing.\n" ++
@@ -1086,7 +1086,7 @@ fn checkKinds(comptime kinds: []const type, comptime Deps: ?type) void {
             if (@TypeOf(K.final) != type or @typeInfo(K.final) != .error_set or @typeInfo(K.final).error_set == null) @compileError(
                 "nilo: the job " ++ name ++ "'s `final` is not an error set.\n" ++
                     "  It names the failures that are final: `pub const final = error{ Rejected };` — " ++
-                    "a `run` that fails with one of them is dead on that attempt, whatever `retry` says (ADR 0218).",
+                    "a `run` that fails with one of them is dead on that attempt, whatever `retry` says (ADR 179).",
             );
             if (@as(Retry, K.retry).times == 0) @compileError(
                 "nilo: the job " ++ name ++ " declares `final`, and its `retry` is `.none`.\n" ++
@@ -1117,7 +1117,7 @@ fn checkKinds(comptime kinds: []const type, comptime Deps: ?type) void {
             if (!@hasDecl(K, "overlap")) @compileError(
                 "nilo: the scheduled job " ++ name ++ " does not say what happens when a tick arrives while the last one is still running.\n" ++
                     "  `pub const overlap: job.Overlap = .skip;` drops it; `.queue` starts it on another worker. " ++
-                    "Neither is right for everybody, so neither is the default (ADR 0199).",
+                    "Neither is right for everybody, so neither is the default (ADR 161).",
             );
             if (@TypeOf(K.overlap) != Overlap) @compileError(
                 "nilo: the scheduled job " ++ name ++ "'s `overlap` is not a `job.Overlap`.\n" ++
@@ -1126,7 +1126,7 @@ fn checkKinds(comptime kinds: []const type, comptime Deps: ?type) void {
             if (!@hasDecl(K, "missed")) @compileError(
                 "nilo: the scheduled job " ++ name ++ " does not say what happens to a tick that was missed while the process was down.\n" ++
                     "  `pub const missed: job.Missed = .drop;` forgets it; `.catch_up` runs once for it. " ++
-                    "Neither is right for everybody, so neither is the default (ADR 0199).",
+                    "Neither is right for everybody, so neither is the default (ADR 161).",
             );
             if (@TypeOf(K.missed) != Missed) @compileError(
                 "nilo: the scheduled job " ++ name ++ "'s `missed` is not a `job.Missed`.\n" ++
@@ -1227,7 +1227,7 @@ fn checkRun(comptime K: type, comptime name: []const u8, comptime Deps: type) vo
         );
         // The tick is the one thing after the Run that is not a service,
         // and it is asked for by value for the reason request data is in
-        // a handler: a pointer is a service, a value is the tick (ADR 0246).
+        // a handler: a pointer is a service, a value is the tick (ADR 160).
         if (P == Tick) continue;
         if (P == *Tick or P == *const Tick) @compileError(
             "nilo: the job " ++ name ++ "'s `run` takes a `*job.Tick` at position " ++
@@ -1355,7 +1355,7 @@ const Flaky = struct {
     }
 };
 
-/// Retries on one failure and is dead at once on the other (ADR 0218).
+/// Retries on one failure and is dead at once on the other (ADR 179).
 const Picky = struct {
     pub const nilo_job = "picky";
     pub const retry: Retry = .{ .times = 5, .backoff = .{ .fixed_ms = 0 } };
@@ -1761,7 +1761,7 @@ test "the worker loop runs under std.Io.Threaded and stops when cancelled" {
 
 /// How long the test thread waits for a worker to run a row before it
 /// gives up. The worker's own poll is a minute, so anything that arrives
-/// inside this bound arrived because it was woken (ADR 0229).
+/// inside this bound arrived because it was woken (ADR 160).
 const wake_bound_ms = 2_000;
 
 fn waitForLine(io: std.Io, ledger: *Ledger, count: usize) !void {
@@ -1833,7 +1833,7 @@ test "wake reaches a worker for a row nilo did not push" {
     try waitForLine(io, &ledger, 1);
 }
 
-// -- a job that pushes the next one (ADR 0245) -----------------------------
+// -- a job that pushes the next one (ADR 160) -----------------------------
 
 /// The first half of a pipeline: it asks for `*PipelineJobs` — the queue it
 /// is itself a kind of — and pushes the second half. Its `run` names the
@@ -1901,7 +1901,7 @@ test "a job can push the next kind through a *Jobs dep, and two drains run both"
     try testing.expectEqual(@as(u64, 0), (try jobs.stats(&run)).queued);
 }
 
-// -- a test that moves the clock (ADR 0246) --------------------------------
+// -- a test that moves the clock (ADR 160) --------------------------------
 
 /// Fails three times with a backoff long enough that only a moved clock
 /// reaches the fourth attempt.
@@ -2018,7 +2018,7 @@ test "a cron schedule fires when the clock is moved to three in the morning" {
     try testing.expectEqual(@as(usize, 2), ledger.lines.items.len);
 }
 
-// -- a run that knows which tick it is (ADR 0246) --------------------------
+// -- a run that knows which tick it is (ADR 160) --------------------------
 
 /// Asks for the tick and records it. Fails until the attempt the ledger
 /// says, so the test can watch `attempts` climb and `last` turn.
@@ -2102,7 +2102,7 @@ const FakeSpace = struct {
 };
 
 /// Reports how far it is through its tick, which takes the tick's id and
-/// the queue itself — ADR 0246 and ADR 0245 in one signature.
+/// the queue itself — ADR 160 in one signature.
 const Exporting = struct {
     pub const nilo_job = "exporting";
     pub const retry: Retry = .none;

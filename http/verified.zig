@@ -1,6 +1,6 @@
 //! The claims behind a bearer token, as a handler argument — or a 401 with
 //! the challenge on it before the handler runs
-//! ([ADR 0260](../docs/adr/0260-verified-claims-are-a-handler-argument.md)).
+//! ([ADR 191](../docs/adr/191-verified-claims-are-a-handler-argument.md)).
 //!
 //! ```zig
 //! const Google = jwt.Verifier(Claims, fetch.Client);
@@ -62,7 +62,7 @@ pub fn Verified(comptime V: type) type {
         /// The Verifier this reads through, which `listen()` checks was
         /// provided and the typed engine looks up.
         pub const nilo_verified = V;
-        /// What a nilo compile error calls this type (ADR 0122).
+        /// What a nilo compile error calls this type (ADR 074).
         pub const nilo_type_name = "nilo.Verified(" ++ naming.of(V) ++ ")";
         /// What a 401 from this endpoint says in `WWW-Authenticate`.
         pub const challenge: [:0]const u8 = "Bearer";

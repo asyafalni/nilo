@@ -1,7 +1,7 @@
 //! An `.exists` whose `.via` names a column the outer Row does not have.
 //!
 //! `.via` is a column of *this* Row, and a name it lacks is a typo — or the
-//! inner column written on the wrong word, which `.on` is for (ADR 0214).
+//! inner column written on the wrong word, which `.on` is for (ADR 175).
 
 const sql = @import("nilo_sql");
 

@@ -2,7 +2,7 @@
 //!
 //! The field is on the Row and in no statement, so a condition on it would ask
 //! the database for a column it has never had. Refused by name rather than
-//! as "no such column", because the field is plainly there (ADR 0217).
+//! as "no such column", because the field is plainly there (ADR 178).
 
 const sql = @import("nilo_sql");
 

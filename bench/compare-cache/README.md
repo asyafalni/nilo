@@ -109,7 +109,7 @@ memory, which is the property the module exists for.
 **go-cache hands back a pointer into memory a garbage collector owns.**
 `nilo_cache` hands back a copy, because there is no collector to hold the other
 end — which is also why it cannot store a pointer in an entry at all (ADR
-0138). On a 512-byte value that is sixteen bytes of string header against a
+109). On a 512-byte value that is sixteen bytes of string header against a
 512-byte `memcpy`, and it is the design rather than the tuning.
 
 **freecache floors at 512 KiB and bigcache at 1 MiB.** Neither can be asked the

@@ -7,7 +7,7 @@
 //! assembles its SQL per request — the key can be the statement's own
 //! identity, and the number of distinct keys is fixed when the binary is
 //! built. What nobody knew is the number, and
-//! [ADR 0001](../docs/adr/0001-dx-wins-below-the-10-percent-threshold.md)'s
+//! [ADR 017](../docs/adr/017-the-trade-budget-has-four-axes.md)'s
 //! 10% cuts both ways: a feature that buys less than that is not worth the
 //! surface either.
 //!
@@ -30,7 +30,7 @@
 //!
 //! ## The SQLite half
 //!
-//! The same question again, against the second Wire (ADR 0073), and it needs
+//! The same question again, against the second Wire (ADR 064), and it needs
 //! nothing: a file in `/tmp`, made and dropped by this program. Same three
 //! statement shapes, same `db.find`, same prepared-against-not comparison, so
 //! the two halves of the printout answer one question in two dialects.
@@ -42,7 +42,7 @@
 //!    them is the *ratio*: what preparing a statement once is worth, which is
 //!    a property of the work rather than of the transport.
 //! 2. **The write arm is a disk measurement and belongs to whatever machine
-//!    ran it.** It is here because ADR 0074 will not let a SQLite number be
+//!    ran it.** It is here because ADR 065 will not let a SQLite number be
 //!    published without its durability beside it: `synchronous = NORMAL` is
 //!    this module's default and `FULL` is one word away, and the gap between
 //!    them is an `fsync`, not a database. Both are printed rather than one,
@@ -50,13 +50,13 @@
 //! 3. **`insertMany` has no SQLite arm at all, and that is the Dialect
 //!    refusing rather than this file skipping.** There is no `unnest` and no
 //!    array parameter, so the batch form SQLite has grows its own statement
-//!    text and `arrayOf` answers null (ADR 0061). The shape that replaces it
+//!    text and `arrayOf` answers null (ADR 055). The shape that replaces it
 //!    — a row at a time inside one transaction — is cheaper here than it
 //!    sounds, because there is no round trip to pay per statement, and it is
 //!    a different measurement rather than the same one in another dialect.
 //!
 //! What is **not** here is `.in_fiber` against `.{ .hop = nilo }`, which is
-//! the choice ADR 0073 left to the caller and the one number that would make
+//! the choice ADR 064 left to the caller and the one number that would make
 //! one of them advice. That wants the Engine and a load generator — a run of
 //! `bench-sql-server` with each — and it is `docs/roadmap.md`'s Next 1 for
 //! this module rather than something this single-threaded program can answer.
@@ -96,7 +96,7 @@ const page_sql =
 
 /// `SELECT 1` prepared: as close to a bare round trip as the extended
 /// protocol gets, and the number the pipelining question turns on
-/// (ADR 0059). Whatever a statement costs, this is the floor under it.
+/// (ADR 053). Whatever a statement costs, this is the floor under it.
 const empty_sql = "SELECT 1";
 
 const rounds = 20_000;
@@ -234,7 +234,7 @@ const Shape = enum { key, page, empty };
 /// *cached* describe without looking at the SQL again. Two statements with
 /// the same parameter count would not have said anything at all — which is
 /// why the name `nilo_sql` derives has to be unique by construction rather
-/// than by luck (ADR 0057).
+/// than by luck (ADR 051).
 fn report(
     gpa: std.mem.Allocator,
     conn: *pg.Conn,
@@ -359,7 +359,7 @@ const SqliteDb = sql.Sqlite(.{ .threading = .in_fiber });
 
 /// The durability arm's other half. `synchronous` is a comptime option on the
 /// Wire, so measuring both settings means compiling both — which is itself
-/// worth knowing: it is not a runtime knob an operator can turn, and ADR 0074
+/// worth knowing: it is not a runtime knob an operator can turn, and ADR 065
 /// chose that on purpose.
 const SqliteFullWire = sql.sqlite.Wire(.{ .threading = .in_fiber, .synchronous = .full });
 
@@ -415,7 +415,7 @@ const write_warmup = 50;
 /// `db.find` lines below were not the same work. The reason was that
 /// `acceptsSqlite` judged a `Timestamp` as TEXT while `WireWrite` bound an
 /// integer, so the honest column failed the startup check
-/// ([ADR 0136](../docs/adr/0136-a-timestamp-is-checked-against-the-column-it-is-bound-into.md)).
+/// ([ADR 067](../docs/adr/067-a-value-is-whatever-the-database-stores.md)).
 /// Both arms read the same shape out of the same integer column now, so the
 /// two numbers below compare what they say they compare.
 const SqlitePerson = struct {
@@ -439,7 +439,7 @@ fn sqliteArm(gpa: std.mem.Allocator, io: std.Io) !void {
     );
 
     // The Wire lives in a block so it is shut before the module opens its own
-    // pool on the same file. One writer is the whole design (ADR 0074), and
+    // pool on the same file. One writer is the whole design (ADR 065), and
     // two pools on one file would be two of them — which is the case
     // `busy_timeout_ms` exists for and not what is being measured here.
     {
@@ -582,7 +582,7 @@ fn sqliteFindRounds(gpa: std.mem.Allocator, io: std.Io, prepared: bool) !u64 {
     return @intCast(@divTrunc(monotonicNanos() - started, @as(i128, rounds)));
 }
 
-/// What `synchronous` costs, which is what ADR 0074 will not let a SQLite
+/// What `synchronous` costs, which is what ADR 065 will not let a SQLite
 /// number be published without.
 ///
 /// Both arms write to their own file, because the setting is baked into the

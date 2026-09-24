@@ -76,7 +76,7 @@ const Stage = enum { draft, placed, @"packed", shipped, cancelled };
 /// One shape, written once, used on both sides of the wire.
 ///
 /// A stored address owns its text and is freed with the row; an incoming one
-/// borrows the request's and is gone when the request ends. [ADR 0004] is
+/// borrows the request's and is gone when the request ends. [ADR 003] is
 /// the reason those cannot be the same type — but they can be the same
 /// *declaration*, with the text type as a parameter. Six lines instead of
 /// twelve, and a field added to one is a field added to both.
@@ -86,7 +86,7 @@ const Stage = enum { draft, placed, @"packed", shipped, cancelled };
 /// name matters more than the six lines, write the pair out instead;
 /// `Customer` and `NewCustomer` below are the other half of the comparison.
 ///
-/// [ADR 0004]: ../../docs/adr/0004-request-arena-and-the-str-type.md
+/// [ADR 003]: ../../docs/adr/003-request-arena-and-the-str-type.md
 fn Addressed(comptime Text: type) type {
     return struct {
         line1: Text,
@@ -568,7 +568,7 @@ const Caller = struct {
 
 fn identify(c: *nilo.Ctx, keys: *const Keys) !Caller {
     // The header read as one scheme: absent or not `Bearer` is a 401 with
-    // `WWW-Authenticate` on it, before this line (ADR 0191).
+    // `WWW-Authenticate` on it, before this line (ADR 153).
     const auth = try c.authorization(.bearer);
     const key = keys.lookUp(auth.value.view()) orelse
         return fail.forbidden("that token is not one of ours", .{});
@@ -760,9 +760,9 @@ fn advanceOrder(
 /// `Response(T)` rather than `Status(code, T)`, because which status this
 /// answers with is not knowable until it has run. The generated document
 /// says `default` for it, and that is the trade: a runtime status cannot be
-/// in a type that is fixed at compile time ([ADR 0024]).
+/// in a type that is fixed at compile time ([ADR 023]).
 ///
-/// [ADR 0024]: ../../docs/adr/0024-a-failure-mode-belongs-in-the-return-type.md
+/// [ADR 023]: ../../docs/adr/023-a-failure-mode-belongs-in-the-return-type.md
 fn putCustomer(
     orders: *Orders,
     arena: Allocator,
@@ -790,10 +790,10 @@ fn customerOrders(
 
 /// The one call in this file that would stop every other request sharing its
 /// thread if it were made directly. `blocking` hands it to a pool and parks
-/// only this request ([ADR 0014]) — and outside a server it simply calls the
+/// only this request ([ADR 013]) — and outside a server it simply calls the
 /// function, so the test at the bottom is an ordinary call.
 ///
-/// [ADR 0014]: ../../docs/adr/0014-handlers-must-not-block-the-thread.md
+/// [ADR 013]: ../../docs/adr/013-handlers-must-not-block-the-thread.md
 fn daily(orders: *Orders) !Summary {
     return nilo.blocking(Orders.summarise, .{orders});
 }
@@ -904,11 +904,11 @@ const testing = std.testing;
 /// tidiness. `&.{ … }` inside a function is a pointer to that function's
 /// stack, and a `NewOrder` carrying one outlives the frame it points into:
 /// the values are still there in a `Debug` build and are not in a release
-/// one. That is [ADR 0019]'s bug, met from the other side — the suite runs
+/// one. That is [ADR 018]'s bug, met from the other side — the suite runs
 /// in both modes precisely so this fails somewhere rather than in
 /// production.
 ///
-/// [ADR 0019]: ../../docs/adr/0019-a-response-owns-its-headers.md
+/// [ADR 018]: ../../docs/adr/018-a-response-owns-its-headers.md
 const sample_lines = [_]NewLine{
     .{ .sku = .static("kopi-250"), .quantity = 2 },
     .{ .sku = .static("gula-1kg"), .quantity = 1 },
@@ -1162,7 +1162,7 @@ test "the document names every shape that has a name, and the paths that have pa
 
     // And `Addressed(Str)` and `Addressed(Text)` are **one** shape here, not
     // two: what separates them is a Zig lifetime, and a lifetime has no
-    // rendering in JSON, so a client gets one `Addressed` (ADR 0077).
+    // rendering in JSON, so a client gets one `Addressed` (ADR 016).
     try testing.expect(std.mem.indexOf(u8, document, "#/components/schemas/Addressed\"") != null);
     try testing.expect(std.mem.indexOf(u8, document, "Addressed_Str") == null);
     try testing.expect(std.mem.indexOf(u8, document, "Addressed_Text") == null);
@@ -1177,6 +1177,6 @@ test "the document names every shape that has a name, and the paths that have pa
 
     // And the route holding the Ctx says the document cannot settle what it
     // answers, rather than claiming the empty 200 its return type implies
-    // (ADR 0150).
+    // (ADR 120).
     try testing.expect(std.mem.indexOf(u8, document, "may write its own response") != null);
 }

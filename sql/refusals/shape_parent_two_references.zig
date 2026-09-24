@@ -1,6 +1,6 @@
 //! `orders` points at `staff` twice, as its owner and its approver. Which
 //! of them a field called `staff` means is a question about meaning, so it is
-//! asked rather than guessed (ADR 0295).
+//! asked rather than guessed (ADR 218).
 
 const sql = @import("nilo_sql");
 

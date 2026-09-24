@@ -1,5 +1,5 @@
 //! A file as a return value — the handler names it, nilo opens it, and the
-//! bytes never enter this process (ADR 0037).
+//! bytes never enter this process (ADR 009).
 //!
 //! ```zig
 //! fn invoice(files: *Files, id: u32) !?nilo.FileBody {
@@ -9,15 +9,15 @@
 //! ```
 //!
 //! A return type rather than a `c.sendFile(…)` call, and for `Redirect`'s
-//! reason (ADR 0032): the signature is the whole contract, and an answer
+//! reason (ADR 031): the signature is the whole contract, and an answer
 //! written by a side effect is an answer the generated API description
 //! cannot see. `?` means here what it means everywhere else — a 404, and a
-//! document that says so (ADR 0024).
+//! document that says so (ADR 023).
 //!
 //! The `dir` is not decoration. A handler serves out of a directory
 //! something opened on purpose and holds as a Service, and the name is
 //! opened relative to that descriptor rather than resolved as a path. That
-//! is the property ADR 0010 bought by refusing disk IO outright, and it is
+//! is the property ADR 009 bought by refusing disk IO outright, and it is
 //! kept here by the shape of the type: there is nowhere to put a path, so
 //! there is no normalisation step to get wrong. What is left — a `..`
 //! segment inside the name — is checked below, once, before anything is
@@ -25,7 +25,7 @@
 //!
 //! A symlink inside the directory is followed. Refusing them breaks ordinary
 //! deployments and no static server on the internet refuses them by default
-//! (ADR 0037), so `O_NOFOLLOW` is deliberately absent.
+//! (ADR 009), so `O_NOFOLLOW` is deliberately absent.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -43,7 +43,7 @@ pub const marker = "nilo_file";
 /// An answer that is a file on disk.
 pub const FileBody = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.FileBody";
 
     /// There is nothing for the marker to carry: unlike `Redirect(status)`
@@ -73,7 +73,7 @@ pub const FileBody = struct {
     cache_control: []const u8 = "",
 
     /// Headers to send with the file, held by value for the reason
-    /// `Response.headers` are (ADR 0019): a list written in the handler dies
+    /// `Response.headers` are (ADR 018): a list written in the handler dies
     /// with the handler.
     ///
     /// This is where a download's filename goes:
@@ -186,7 +186,7 @@ pub fn checkName(name: []const u8) ?Wrong {
 ///
 /// Called from `typed.sendValue`, after the optional has been unwrapped.
 /// Nothing is allocated here: the header values are copied into the request
-/// arena by `setHeader`, exactly as a `Response`'s are (ADR 0019), and the
+/// arena by `setHeader`, exactly as a `Response`'s are (ADR 018), and the
 /// rest is borrowed for the length of the call.
 pub fn send(c: *Ctx, body: FileBody) !void {
     if (checkName(body.name)) |wrong| return refuse(c, wrong);
@@ -194,7 +194,7 @@ pub fn send(c: *Ctx, body: FileBody) !void {
     const file = body.dir.openFile(body.name) catch |err| switch (err) {
         // The one open failure with an answer better than a 500: from the
         // client's side, a file the application named and the disk does not
-        // have is indistinguishable from one that never existed (ADR 0037).
+        // have is indistinguishable from one that never existed (ADR 009).
         error.FileNotFound => return notThere(c),
         else => return err,
     };
@@ -379,7 +379,7 @@ test "a handler returning a FileBody answers with the file" {
 test "a range against a FileBody is answered by the shared primitive" {
     // Not a second copy of `sendfile.zig`'s range tests: what this pins is
     // that a FileBody goes *through* that primitive rather than around it,
-    // which is the whole reason there is one (ADR 0021).
+    // which is the whole reason there is one (ADR 020).
     var files = try Files.init();
     defer files.deinit();
 
@@ -468,7 +468,7 @@ test "the document describes a FileBody as bytes, and `?` as the 404" {
 
     // `application/octet-stream` and not `application/pdf`: the content type
     // is a field the handler fills in while the request is running, so naming
-    // it here would be a guess (ADR 0037).
+    // it here would be a guess (ADR 009).
     try testing.expect(std.mem.indexOf(u8, document,
         \\"200":{"description":"the file's bytes","content":{"application/octet-stream":{"schema":{"type":"string","format":"binary"}}}}
     ) != null);

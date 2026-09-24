@@ -1,7 +1,7 @@
 //! The signatures a ring has already checked, by the token's digest — so a
 //! bearer token that comes back on the next request costs a hash rather
 //! than the elliptic-curve arithmetic again
-//! ([ADR 0285](../docs/adr/0285-a-verified-signature-is-remembered-by-the-tokens-digest.md)).
+//! ([ADR 209](../docs/adr/209-a-verified-signature-is-remembered-by-the-tokens-digest.md)).
 //!
 //! What is remembered is exactly "these bytes verified under the set the
 //! ring held". The claims are still read and checked on every call — `exp`,

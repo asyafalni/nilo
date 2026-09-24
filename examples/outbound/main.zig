@@ -11,9 +11,9 @@
 //! a struct this program declared. GitHub is a *target* — its base URL, the
 //! `user-agent` it insists on and the two seconds it gets are written once,
 //! on a type, and the handler asks for that type the way it would ask for a
-//! database ([ADR 0254](../../docs/adr/0254-a-target-is-a-type-and-a-path-is-a-template.md));
+//! database ([ADR 061](../../docs/adr/061-a-fitting-borrows-the-loop.md));
 //! the client under it is registered once in `main`, the way every service
-//! is ([ADR 0070](../../docs/adr/0070-a-fitting-borrows-the-loop.md)).
+//! is ([ADR 061](../../docs/adr/061-a-fitting-borrows-the-loop.md)).
 //!
 //! It calls GitHub's public API, which needs no key and allows 60 requests an
 //! hour from one address. Past that it answers 403, and this program says so
@@ -71,14 +71,14 @@ fn card(repo: Repo) Card {
 
 /// A pointer is a service; a value is request data. `owner` and `name` come
 /// from `:owner` and `:name` **by position**, because Zig does not keep
-/// argument names (ADR 0003).
+/// argument names (ADR 002).
 fn getCard(github: *GitHub, c: *nilo.Ctx, owner: nilo.Str, name: nilo.Str) !Card {
     // Two segments of somebody else's text going into a URL. `%2e%2e%2f` in a
     // path param is how a caller reaches an endpoint this program never meant
     // to offer, so each `{}` is percent-encoded on the way in, with `/` as
     // data — `nilo_core`'s `percent`, which is in Core precisely so both a
     // Service and a handler can reach it
-    // ([ADR 0066](../../docs/adr/0066-percent-is-needed-by-two-layers.md)).
+    // ([ADR 057](../../docs/adr/057-percent-is-needed-by-two-layers.md)).
     // The count of segments against the count of arguments is checked while
     // compiling; a query would be a struct in their place, `.{ .page = 2 }`.
     const res = github.get(c, "/repos/{}/{}", .{ owner, name }, .{}) catch |err| switch (err) {
@@ -94,7 +94,7 @@ fn getCard(github: *GitHub, c: *nilo.Ctx, owner: nilo.Str, name: nilo.Str) !Card
     // headers came back with it, so the one that says *when* — `Retry-After`
     // on a 429, or GitHub's own `X-RateLimit-Reset` on its 403 — goes into
     // the message rather than being lost with the head
-    // ([ADR 0244](../../docs/adr/0244-a-response-carries-its-headers.md)).
+    // ([ADR 187](../../docs/adr/187-a-head-that-outlives-its-body.md)).
     if (!res.ok()) return switch (@intFromEnum(res.status)) {
         404 => fail.notFound("no repository {s}/{s}", .{ owner.view(), name.view() }),
         403, 429 => fail.status(502, "github is rate-limiting this address; retry after {s}", .{

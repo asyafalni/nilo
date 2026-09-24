@@ -1,7 +1,7 @@
 //! An ordering key naming a column the Row does not read. The same check
 //! `.order` makes, made where the keys are declared rather than on the first
 //! request that chooses one
-//! ([ADR 0204](../../docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+//! ([ADR 165](../../docs/adr/165-an-order-chosen-at-run-time-from-a-closed-set.md)).
 
 const sql = @import("nilo_sql");
 

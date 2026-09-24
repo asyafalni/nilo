@@ -22,7 +22,7 @@
 //! free of an allocator.
 //!
 //! Anything else is refused by name, with the field that did it
-//! ([ADR 0138](../docs/adr/0138-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)).
+//! ([ADR 109](../docs/adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)).
 
 const std = @import("std");
 
@@ -43,7 +43,7 @@ pub fn kindOf(comptime V: type, comptime what: []const u8) Kind {
     if (@sizeOf(V) > max_value) @compileError(std.fmt.comptimePrint(
         "nilo: a cached {s} is {d} bytes, and a cache entry holds at most {d}.\n" ++
             "  The length is stored in 16 bits so that four ways of a bucket are one" ++
-            " cache line, which is what keeps a lookup to one line touched (ADR 0138).\n" ++
+            " cache line, which is what keeps a lookup to one line touched (ADR 109).\n" ++
             "  Something this size wants a `Space` of `[]const u8` and an encoding" ++
             " of your own, or it wants to be smaller.",
         .{ what, @sizeOf(V), max_value },

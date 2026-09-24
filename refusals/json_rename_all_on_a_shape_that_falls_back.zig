@@ -5,7 +5,7 @@
 //!
 //! `std.json` does not read `nilo_json`, so the keys would go out spelled the
 //! way they are written while the API description promised the renamed ones.
-//! Nothing would fail (ADR 0181).
+//! Nothing would fail (ADR 148).
 
 const nilo = @import("nilo_http");
 

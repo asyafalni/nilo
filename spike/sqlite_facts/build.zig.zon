@@ -1,5 +1,5 @@
-// Five claims about SQLite that ADR 0074 makes and had not run. The
-// dependency is the one ADR 0073 chose, so this measures the library nilo
+// Five claims about SQLite that ADR 065 makes and had not run. The
+// dependency is the one ADR 064 chose, so this measures the library nilo
 // would actually ship against rather than SQLite in the abstract.
 .{
     .name = .sqlite_facts_spike,

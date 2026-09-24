@@ -29,7 +29,7 @@ const Allocator = std.mem.Allocator;
 /// `.hop` rather than `.in_fiber`, and it is not a default — the compiler will
 /// not let this line be written without an answer, because SQLite is a library
 /// reading a file and there is no socket for the loop to park on
-/// ([ADR 0073](../../../docs/adr/0073-a-file-has-no-socket-to-wait-on.md)).
+/// ([ADR 064](../../../docs/adr/064-a-file-has-no-socket-to-wait-on.md)).
 ///
 /// The guide's advice is to take `.hop` unless you have measured otherwise: its
 /// bad case is microseconds a statement, `.in_fiber`'s is a stalled thread. arsip
@@ -59,7 +59,7 @@ pub const Db = sql.Sqlite(.{ .threading = .{ .hop = nilo } });
 /// `[16]u8`, which pg.zig takes and zqlite refuses. Item 18 in `DX.md`.
 ///
 /// So this is the documented escape hatch used for something that should not
-/// have needed it — three declarations make anything a column type (ADR 0055).
+/// have needed it — three declarations make anything a column type (ADR 049).
 /// Text rather than a blob, and that is the better shape here anyway: a
 /// `sqlite3` shell shows the id, and `WHERE public = '…'` is typeable.
 pub const PublicId = struct {
@@ -275,7 +275,7 @@ const testing = std.testing;
 
 /// A v4 out of a seeded PRNG. Fine here and a session token anybody can predict
 /// in production — the reference says so, and nothing in `nilo_id` can tell the
-/// difference, because the randomness is an argument (ADR 0046).
+/// difference, because the randomness is an argument (ADR 042).
 fn testId(seed: u64) uuid.Uuid {
     var prng: std.Random.DefaultPrng = .init(seed);
     var bytes: [uuid.Uuid.v4_entropy]u8 = undefined;

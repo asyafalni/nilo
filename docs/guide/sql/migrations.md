@@ -128,7 +128,7 @@ comptime {
 
 You do not lose the type check by naming the table; it moves. A table no Row in
 that list claims is a compile error naming both spellings
-([ADR 0222](../../adr/0222-a-foreign-key-is-columns-and-a-table-name.md)), and
+([ADR 181](../../adr/181-the-marker-has-two-kinds-of-word.md)), and
 `.managed = false` is how a table this program only reads gets into the list
 without the tool offering to create it.
 
@@ -206,14 +206,14 @@ Each element goes through the column's own element type, so a number where a
 word goes does not compile. A comma, a brace, a quote, a backslash or an
 apostrophe inside an element is escaped, so the array Postgres stores has as
 many elements as you wrote
-([ADR 0225](../../adr/0225-an-array-column-has-a-default-like-any-other.md)).
+([ADR 181](../../adr/181-the-marker-has-two-kinds-of-word.md)).
 
 ## The two words nilo does not read
 
 Everything above is checked by the compiler. Two words are not, on purpose: a
 `CHECK` body and a trigger are SQL, and reading them means shipping a SQL
 parser. What nilo does instead is **own the name and hash the body**
-([ADR 0226](../../adr/0226-the-marker-has-a-word-the-database-checks.md)):
+([ADR 181](../../adr/181-the-marker-has-two-kinds-of-word.md)):
 
 <!-- compiles -->
 ```zig
@@ -281,7 +281,7 @@ cases.
 Every call on this page is given the same thing: a `sql.Schema`, which is
 every Row and the three kinds of object that hang off the schema rather than
 off a table
-([ADR 0253](../../adr/0253-a-schema-is-one-value-and-the-tool-owns-the-order.md)).
+([ADR 181](../../adr/181-the-marker-has-two-kinds-of-word.md)).
 
 <!-- compiles -->
 ```zig
@@ -356,7 +356,7 @@ missing and never alters what is there.
 In a program that serves, the boot is where it goes, and the boot is inside
 `listen()`: register it with `app.before` and it runs once the pool is open,
 on the server's own loop, before the first request
-([ADR 0220](../../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+([ADR 180](../../adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
 
 <!-- compiles -->
 ```zig
@@ -379,7 +379,7 @@ runs and reads what it made. A first boot on an empty file is clean, and a
 Row that has drifted from a table `createMissing` will not alter is still
 refused at boot. The check is a `nilo_check`, which the App runs after the
 work `before` registered, and `app.start(io)` runs the same three steps for
-a test ([ADR 0277](../../adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+a test ([ADR 180](../../adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
 [`examples/sqlite/`](../../../examples/sqlite/main.zig) is this program.
 
 ### A column the shipped file has not got
@@ -389,7 +389,7 @@ a Row with eight does not want a ledger and version files for three `ADD
 COLUMN`s, and writing the three by hand copies a type mapping that drifts
 the next time nilo's moves. `addMissingColumns` is the step after
 `createMissing` for exactly that program
-([ADR 0233](../../adr/0233-a-column-a-shipped-table-has-not-got.md)):
+([ADR 123](../../adr/123-a-migration-is-a-diff-against-a-snapshot.md)):
 
 <!-- compiles: body -->
 ```zig
@@ -506,7 +506,7 @@ it fails, the server does not start: a migration that could not run is a
 database this binary must not serve. Do not open the pool yourself with
 `app.start(io)` and then call `listen()` — that hands the pool one loop and
 the requests another, and it is refused
-([ADR 0220](../../adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+([ADR 180](../../adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
 
 ## Refusing to serve a database that is behind
 
@@ -674,10 +674,10 @@ next boot refuses to serve.
 
 **It is an output.** nilo reads the `.zig` and never this, and a version written
 in SQL by somebody else is not picked up — authoring stays Zig, for the reasons
-[ADR 0153](../../adr/0153-a-migration-is-a-diff-against-a-snapshot.md) gives.
+[ADR 123](../../adr/123-a-migration-is-a-diff-against-a-snapshot.md) gives.
 `db check` fails when a twin no longer matches the version beside it, so it
 cannot go stale in a branch nobody rebuilt, and any `db generate` writes it
-again ([ADR 0227](../../adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).
+again ([ADR 123](../../adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 
 One case writes nothing and says so: `--baseline` rewriting a version 1 whose
 `before` or `after` hold steps of your own. Those are Zig nothing has compiled
@@ -708,7 +708,7 @@ about it, diffs against it anyway and writes the current shape out. You do not
 have to delete anything, which matters because deleting the snapshot at version
 7 makes the next `generate` write a version 8 that creates every table you
 already have
-([ADR 0224](../../adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
+([ADR 181](../../adr/181-the-marker-has-two-kinds-of-word.md)).
 
 It refuses in three places rather than doing something you cannot undo: when the
 directory holds a version it is not re-deriving (version 2 is a diff against
@@ -716,7 +716,7 @@ what version 1 left behind), when `--name` disagrees with the version 1 already
 there, and when the file it would rewrite has no generated block. Each message
 names the files.
 
-[ADR 0223](../../adr/0223-a-version-file-is-a-generated-block-and-the-rest.md)
+[ADR 123](../../adr/123-a-migration-is-a-diff-against-a-snapshot.md)
 is why the file is shaped that way.
 
 **One file to write before the first run.** The tool imports
@@ -724,5 +724,5 @@ is why the file is shaped that way.
 before the first build. Create it with `head` at 0 and an empty list — the
 reference has the seven lines — and from then on the tool owns it.
 
-[ADR 0153](../../adr/0153-a-migration-is-a-diff-against-a-snapshot.md) is the
+[ADR 123](../../adr/123-a-migration-is-a-diff-against-a-snapshot.md) is the
 design, including why a version is one `.zig` file and not a `.sql` one.

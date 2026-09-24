@@ -4,7 +4,7 @@
 //! `work_region` both pointing at `regions`, and the query asking whether the
 //! region matches. Which of the two is a question about what the query means,
 //! and `.via = .<column>` is how it is answered — a column of the outer Row,
-//! named so it cannot be read as `.on`'s inner one (ADR 0214).
+//! named so it cannot be read as `.on`'s inner one (ADR 175).
 
 const sql = @import("nilo_sql");
 

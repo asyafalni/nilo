@@ -120,7 +120,7 @@ const Sessions = struct {
 
 // ---- who is signed in ----
 
-/// A resolved value that reads the session cookie (ADR 0016). Writing
+/// A resolved value that reads the session cookie (ADR 015). Writing
 /// `SignedIn` in an argument list is the whole of the wiring — no
 /// middleware, no header parsing in the handler.
 const SignedIn = struct {
@@ -149,7 +149,7 @@ const SignIn = struct {
     /// sent at all, so the default is the answer for one half and `on` for
     /// the other. Both are a `bool` here: a form is the one slot that reads
     /// `on`, because it is the only one a browser writes
-    /// (ADR 0092).
+    /// (ADR 071).
     remember: bool = false,
 };
 
@@ -555,7 +555,7 @@ test "signing in and then uploading is one client, with no cookie copied by hand
 
     // The jar is what makes this one test rather than two: every other test in
     // this file that needs a signed-in request reaches into `Sessions` for a
-    // token and writes the `Cookie` header itself, because until ADR 0108
+    // token and writes the `Cookie` header itself, because until ADR 086
     // there was no other way.
     var client = try nilo.testing.Client.init(testing.allocator, .{ .cookies = true });
     defer client.deinit();

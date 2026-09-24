@@ -1,7 +1,7 @@
 //! A versioned answer under a `Cached`: the kept answer is replayed as it
 //! was kept, so a 304 decided for the first client would be sent to every
 //! client after it, whether they hold the version or not
-//! ([ADR 0258](../docs/adr/0258-a-version-a-handler-names-is-an-etag.md)).
+//! ([ADR 189](../docs/adr/189-a-version-a-handler-names-is-an-etag.md)).
 
 const nilo = @import("nilo_http");
 

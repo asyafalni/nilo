@@ -2,7 +2,7 @@
 //!
 //! The imports list grows one line per milestone and started at one, on purpose:
 //! `nilo_sql` drags pg.zig and four transitive dependencies behind a
-//! `.lazy = true` flag (ADR 0040), and the only way to find out whether that
+//! `.lazy = true` flag (ADR 037), and the only way to find out whether that
 //! property survives contact with a real project is to have a project that does
 //! not name it yet. Adding a module should be the whole cost of adopting it.
 //! When it is not, that goes in `DX.md`.
@@ -25,7 +25,7 @@ fn niloFor(
 ) []const std.Build.Module.Import {
     // `.sql = true` is what fetches pg.zig and zqlite, and leaving it out is
     // what stops them being fetched — which is the fix for item 16 in `DX.md`
-    // and is the whole of what adopting it cost here (ADR 0075).
+    // and is the whole of what adopting it cost here (ADR 066).
     const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize, .sql = true });
     return b.allocator.dupe(std.Build.Module.Import, &.{
         .{ .name = "nilo_http", .module = nilo.module("nilo_http") },

@@ -20,7 +20,7 @@ const json_mod = @import("json.zig");
 /// How much of a line is written before it is handed to `std.log`. A path is
 /// the long part and a request head bounds it; past this the line is cut
 /// rather than dropped, on the same reasoning a failure message is
-/// ([ADR 0005](../docs/adr/0005-http-errors-via-fail-functions.md)).
+/// ([ADR 004](../docs/adr/004-http-errors-via-fail-functions.md)).
 const max_line = 1024;
 
 pub const Format = enum {
@@ -42,7 +42,7 @@ pub const Options = struct {
     ///
     /// The one thing a proxy in front cannot reconstruct afterwards is which
     /// log lines belong to the request that timed out
-    /// ([ADR 0028](../docs/adr/0028-tls-is-terminated-in-front.md)). Off by
+    /// ([ADR 027](../docs/adr/027-tls-is-terminated-in-front.md)). Off by
     /// default because it costs a header on every response; `c.requestId()`
     /// works either way.
     request_id: bool = false,
@@ -59,7 +59,7 @@ pub fn with(comptime options: Options) mw.Middleware {
             if (options.request_id) {
                 // Set before the handler runs, not after: a response is
                 // flushed the moment it is sent, so a header put on
-                // afterwards would never leave the building (ADR 0009).
+                // afterwards would never leave the building (ADR 008).
                 //
                 // Static rather than copied — the id is either the Ctx's own
                 // buffer or a slice of the request head, and both outlive the
@@ -88,7 +88,7 @@ pub fn with(comptime options: Options) mw.Middleware {
         }
 
         /// `noinline` for the reason
-        /// [ADR 0071](../docs/adr/0071-where-a-connection-waits-is-what-it-costs.md)
+        /// [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)
         /// §3 gives, and this is the same mistake it found in
         /// `handleConnection`: the `max_line` buffer below is a local, `run`
         /// above is live across `next.run(c)`, and a frame that is live while a

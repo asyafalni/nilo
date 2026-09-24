@@ -10,7 +10,7 @@
 //!
 //! Two Spaces are two types, therefore two services, and which one a handler
 //! reaches is written in its argument list — the rule `nilo_s3` states for a
-//! Bucket (ADR 0068). They share one `Store`, so the memory the cache holds is
+//! Bucket (ADR 059). They share one `Store`, so the memory the cache holds is
 //! one number rather than one per Space.
 //!
 //! ## Two shapes, and the value type picks
@@ -35,7 +35,7 @@
 //! ```
 //!
 //! **`Held` is the caller's stack, and stack is held per connection for the
-//! life of it** ([ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md)).
+//! life of it** ([ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)).
 //! A handler that declares a 4 KiB `Held` has added 4 KiB to every connection
 //! that reaches it, and that is the caller's number rather than this module's
 //! — which is exactly why it is written as an array the caller declares
@@ -54,7 +54,7 @@
 //!
 //! `incr` is one add under the shard's lock, so two requests arriving at
 //! once count two — the `get` then `put` it replaces lost one of them
-//! ([ADR 0261](../docs/adr/0261-a-count-is-added-to-under-the-lock-the-copy-is-under.md)).
+//! ([ADR 109](../docs/adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)).
 //! A key nobody wrote counts from zero and lives `ttl_s`; one already there
 //! keeps the expiry it had, so the hour above is the hour of the first
 //! attempt rather than a window that slides with every one. Saturating: a
@@ -105,7 +105,7 @@ pub fn Space(comptime name: []const u8, comptime V: type, comptime opts: Options
     if (kind == .bytes and opts.max_bytes > flat.max_value) @compileError(std.fmt.comptimePrint(
         "nilo: the cache Space \"{s}\" asks to hold {d} bytes, and an entry holds at most {d}.\n" ++
             "  The length is stored in 16 bits so four ways of a bucket are one cache" ++
-            " line (ADR 0138). Something larger wants a store of its own.",
+            " line (ADR 109). Something larger wants a store of its own.",
         .{ name, opts.max_bytes, flat.max_value },
     ));
 
@@ -158,7 +158,7 @@ pub fn Space(comptime name: []const u8, comptime V: type, comptime opts: Options
                     ", and `incr` adds to an integer.\n" ++
                     "  A count is a Space of its own: `cache.Space(\"" ++ name ++
                     "\", u64, .{ .ttl_s = … })`, and `incr(key, 1)` on that is the " ++
-                    "new count under the lock a `put` already takes (ADR 0261).",
+                    "new count under the lock a `put` already takes (ADR 109).",
             );
             return self.store.add(V, id, key, delta, opts.ttl_s);
         }
@@ -171,12 +171,12 @@ pub fn Space(comptime name: []const u8, comptime V: type, comptime opts: Options
         ///
         /// A value too large is `error.TooLarge` the way `put` says it, and a
         /// flat value cannot be. `nilo.Idempotent` is what this was built for
-        /// ([ADR 0193](../docs/adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)).
+        /// ([ADR 155](../docs/adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
         pub const putIfAbsent = if (kind == .flat) claimFlat else claimBytes;
 
         /// The same read as `get`, into a buffer of the caller's choosing
         /// rather than into a `Held` — for a caller whose buffer is an arena
-        /// and whose stack is per connection (ADR 0063). `out` shorter than
+        /// and whose stack is per connection (ADR 062). `out` shorter than
         /// the entry is a miss, the way `Held` can never be.
         pub fn getInto(self: Self, key: []const u8, out: []u8) ?[]const u8 {
             const n = self.store.get(id, key, out) orelse return null;

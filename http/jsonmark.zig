@@ -16,7 +16,7 @@
 //! ```
 //!
 //! **The marker is plain data, and it has to be** — the same rule and the same
-//! reason as `nilo_openapi` ([ADR 0076](../docs/adr/0076-a-type-that-writes-its-own-json-says-so.md)):
+//! reason as `nilo_openapi` ([ADR 016](../docs/adr/016-the-api-description-comes-from-the-signatures.md)):
 //! a type in a module that imports nothing at all still has to be able to write
 //! it, so there is no shared type to coerce it to and every field is read by
 //! name. `rename_all` arrives as an enum literal for the same reason.
@@ -55,7 +55,7 @@ const naming = @import("names.zig");
 pub const marker = "nilo_json";
 
 /// The declaration a type writes to say it parses itself from request text
-/// (ADR 0142). `convert.zig` is the reader of it for a path param and a
+/// (ADR 113). `convert.zig` is the reader of it for a path param and a
 /// query value, and re-exports this name; it is declared here because this
 /// file is the one that hands `std.json` a reader, and `convert.zig` imports
 /// the fail path, which this file may not.
@@ -95,7 +95,7 @@ pub const Mark = struct {
     /// How a name is spelled on the wire.
     rename_all: ?Case = null,
     /// The names spelled one at a time, which win over `rename_all`
-    /// ([ADR 0207](../docs/adr/0207-one-field-can-be-spelled-on-its-own.md)).
+    /// ([ADR 168](../docs/adr/168-one-field-can-be-spelled-on-its-own.md)).
     renames: []const Rename = &.{},
 
     /// Whether the marker changes how any field is spelled.
@@ -121,7 +121,7 @@ pub fn marked(comptime T: type) bool {
 
 /// The declaration a type writes to say it is exactly another type, held
 /// under `.value` — a **document**
-/// ([ADR 0202](../docs/adr/0202-a-document-is-its-value.md)).
+/// ([ADR 163](../docs/adr/163-a-document-is-its-value.md)).
 pub const document_marker = "nilo_json_of";
 
 /// What `T` is a document of: `pub const nilo_json_of = Inner;` beside
@@ -135,11 +135,11 @@ pub const document_marker = "nilo_json_of";
 /// `T` is a shape the generated writer can walk itself — and honour a
 /// `rename_all` inside. So `json.write` writes a document as its value, and
 /// `openapi.schemaWithin` describes it as one, rather than either treating the
-/// wrapper as a wall the way ADR 0182 drew the line for a type that writes
+/// wrapper as a wall the way ADR 148 drew the line for a type that writes
 /// itself and says nothing.
 ///
 /// Read by name rather than by type for the reason every marker here is: the
-/// type declaring it lives in a module `http/` may not import (ADR 0042).
+/// type declaring it lives in a module `http/` may not import (ADR 038).
 pub fn documentOf(comptime T: type) ?type {
     comptime {
         if (@typeInfo(T) != .@"struct") return null;
@@ -165,7 +165,7 @@ pub fn documentOf(comptime T: type) ?type {
 ///
 /// Every way of writing this wrong gets a sentence here rather than a compiler
 /// message pointing at a line of nilo's — the same reason `toldOf` in
-/// `openapi.zig` reads `nilo_openapi` by hand (ADR 0027).
+/// `openapi.zig` reads `nilo_openapi` by hand (ADR 026).
 pub fn of(comptime T: type) ?Mark {
     comptime {
         if (!marked(T)) return null;
@@ -242,7 +242,7 @@ fn caseOf(comptime T: type, comptime said: anytype) Case {
 /// checked against the type: every name has to be one of its fields, every
 /// spelling has to be text, and a spelling that is the name itself changes
 /// nothing and is refused the way `.snake_case` is
-/// ([ADR 0207](../docs/adr/0207-one-field-can-be-spelled-on-its-own.md)).
+/// ([ADR 168](../docs/adr/168-one-field-can-be-spelled-on-its-own.md)).
 fn renamesOf(comptime T: type, comptime said: anytype) []const Rename {
     comptime {
         const Said = @TypeOf(said);
@@ -338,7 +338,7 @@ fn checkTag(comptime T: type, comptime key: []const u8) void {
             );
             // Compared against the name the field goes out under rather than
             // the one it is written as, because a payload struct may rename its
-            // own fields (ADR 0181) — and it is the wire spelling that would
+            // own fields (ADR 148) — and it is the wire spelling that would
             // land on the tag's key.
             for (payload.@"struct".fields, wireNames(Payload)) |f, on_the_wire| {
                 if (std.mem.eql(u8, on_the_wire, key)) @compileError(
@@ -365,14 +365,14 @@ fn checkTag(comptime T: type, comptime key: []const u8) void {
 ///
 /// On a struct it is the same mistake with the same shape: two fields under one
 /// key means the object carries that key twice, and which one a reader takes is
-/// its business ([ADR 0181](../docs/adr/0181-a-field-name-is-a-spelling-too.md)).
+/// its business ([ADR 148](../docs/adr/148-a-field-name-is-a-spelling-too.md)).
 ///
 /// `O(n²)` over the names the type already produces, all of it while
 /// compiling, on a path that never reaches a binary. A union of eight variants
 /// is 28 comparisons of short literals, once.
 ///
 /// **Each name is spelled once, and the check sizes its own branch budget**
-/// ([ADR 0157](../docs/adr/0157-a-check-pays-for-its-own-branches.md)). As
+/// ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)). As
 /// first written the inner loop called `wire` on both names of every pair —
 /// `n(n−1)/2` pairs, two names, a loop over every character building a
 /// comptime string — and a Row of **ten** snake_case fields was `evaluation
@@ -391,7 +391,7 @@ fn checkRenames(comptime T: type, comptime m: Mark) void {
             .@"union" => |u| u.fields,
             // A struct renames its own fields and nothing else — the payload
             // struct of a renamed *variant* is still left alone, which is the
-            // line `json.zig`'s own test names (ADR 0181).
+            // line `json.zig`'s own test names (ADR 148).
             .@"struct" => |s| s.fields,
             else => return,
         };
@@ -453,7 +453,7 @@ fn renamedOnItsOwn(comptime m: Mark, comptime name: []const u8) bool {
 pub fn wire(comptime name: []const u8, comptime mark: ?Mark) []const u8 {
     comptime {
         const m = mark orelse return name;
-        // A name spelled on its own wins over the case (ADR 0207).
+        // A name spelled on its own wins over the case (ADR 168).
         for (m.renames) |r| if (std.mem.eql(u8, r.field, name)) return r.wire;
         const c = m.rename_all orelse return name;
         var out: []const u8 = "";
@@ -487,7 +487,7 @@ pub fn wire(comptime name: []const u8, comptime mark: ?Mark) []const u8 {
 
 /// The names of `T`'s fields as they go out, in declaration order. What the
 /// API description lists as an enum's choices, what the reader matches against,
-/// and — since [ADR 0181](../docs/adr/0181-a-field-name-is-a-spelling-too.md) —
+/// and — since [ADR 148](../docs/adr/148-a-field-name-is-a-spelling-too.md) —
 /// the keys a struct's own object carries.
 pub fn wireNames(comptime T: type) []const []const u8 {
     comptime {
@@ -510,7 +510,7 @@ pub fn wireNames(comptime T: type) []const []const u8 {
 }
 
 /// The first struct at or inside `T` that renames its own fields, or null
-/// ([ADR 0181](../docs/adr/0181-a-field-name-is-a-spelling-too.md)).
+/// ([ADR 148](../docs/adr/148-a-field-name-is-a-spelling-too.md)).
 ///
 /// **What it is for: refusing one on the way *in*.** `rename_all` on a struct
 /// is a write spelling — `json.write` sends the renamed keys and the API
@@ -520,7 +520,7 @@ pub fn wireNames(comptime T: type) []const []const u8 {
 /// document got a 400 naming every field.
 ///
 /// A *union* is not this, and neither is an enum: both read back through
-/// `jsonParseFor`, which is the supported way in (ADR 0085). Only a struct has
+/// `jsonParseFor`, which is the supported way in (ADR 016). Only a struct has
 /// no reader, and only a struct is answered here.
 ///
 /// Eight deep, the same ceiling `covers` and `schemaWithin` have and for the
@@ -530,7 +530,7 @@ pub fn renamedFieldsWithin(comptime T: type) ?type {
         // This walk and `unreadableWithin` run inside the body slot's own
         // evaluation, and `of` reading `.rename` on every struct they pass
         // took a plain body over the default 1,000. Raised here because this
-        // is where the work is asked for (ADR 0157): eight deep over every
+        // is where the work is asked for (ADR 126): eight deep over every
         // field is bounded by the type, and 20,000 is `typed.wrap`'s figure.
         @setEvalBranchQuota(20_000);
         return renamedWithin(T, 0);
@@ -568,7 +568,7 @@ fn renamedWithin(comptime T: type, comptime depth: usize) ?type {
 }
 
 /// The first type at or inside `T` that parses itself and has not handed
-/// `std.json` a reader, or null ([ADR 0205](../docs/adr/0205-a-body-field-that-parses-itself.md)).
+/// `std.json` a reader, or null ([ADR 166](../docs/adr/166-a-body-field-that-parses-itself.md)).
 ///
 /// A path param and a query value are read through `nilo_parse` by nilo; a
 /// body is read by `std.json`, which reads a struct into its fields unless
@@ -636,7 +636,7 @@ pub fn parseFor(comptime T: type) ParserFor(T) {
     comptime {
         // A type that parses itself from text has said how it is read, and
         // it is the same reading a path param gets: the one string, handed
-        // to `nilo_parse` ([ADR 0205](../docs/adr/0205-a-body-field-that-parses-itself.md)).
+        // to `nilo_parse` ([ADR 166](../docs/adr/166-a-body-field-that-parses-itself.md)).
         if (parsesItself(T) and !marked(T)) return Parsed(T).parse;
         const m = of(T) orelse @compileError(
             "nilo: `" ++ naming.of(T) ++ "` asks for nilo's JSON reader and has no `" ++ marker ++
@@ -648,13 +648,13 @@ pub fn parseFor(comptime T: type) ParserFor(T) {
         // Checked here rather than where it is used, so it fires on the line
         // somebody wrote instead of on the first request that carries one.
         //
-        // A struct gets its own sentence, because since ADR 0181 it is a thing
+        // A struct gets its own sentence, because since ADR 148 it is a thing
         // somebody can reasonably have written — a response type with
         // `rename_all` on it — and the answer is not "add a tag".
         if (m.tag == null and @typeInfo(T) == .@"struct") @compileError(
             "nilo: `" ++ naming.of(T) ++ "` hands nilo's JSON reader a `" ++ marker ++
                 "` that only renames its fields, and renaming a struct's fields is a **write**" ++
-                " spelling (ADR 0181, ADR 0207).\n" ++
+                " spelling (ADR 148, ADR 168).\n" ++
                 "  There is nothing for the reader to do differently: nilo writes the renamed" ++
                 " keys and `std.json` reads the body into the field names as they are written.\n" ++
                 "  Take the `jsonParse` line off, and keep this type for what goes out. A body" ++
@@ -709,7 +709,7 @@ fn Parsed(comptime T: type) type {
             };
             // An allocated token — a string with an escape in it — is not
             // freed: `gpa` is the request arena here, and a type that keeps
-            // the text it was parsed from (a `nilo.Text`, ADR 0264) points
+            // the text it was parsed from (a `nilo.Text`, ADR 193) points
             // at it for the rest of the request.
             return T.nilo_parse(text) orelse error.InvalidCharacter;
         }

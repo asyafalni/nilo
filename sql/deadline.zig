@@ -4,9 +4,9 @@
 //! Everything under `zig build test-sql` runs on `std.Io.Threaded`, which
 //! **cannot cancel a fiber** — so every `Limits` those tests hand a Wire is
 //! `.off`, and a bound armed there has never fired. By
-//! [ADR 0033](../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
+//! [ADR 032](../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
 //! that is the same standing as no bound at all, which is exactly what
-//! `takeWriter` had before [ADR 0135](../docs/adr/0135-a-wait-for-a-connection-has-a-bound.md):
+//! `takeWriter` had before [ADR 107](../docs/adr/107-a-wait-for-a-connection-has-a-bound.md):
 //! a `std.Io.Condition` with no deadline on it, and a fiber that queued for
 //! the one writer waited for as long as the process lived.
 //!
@@ -19,12 +19,12 @@
 //!
 //! **No port is coordinated here.** The server asks for port 0 and nothing
 //! ever connects: the work under test is a spawned fiber, which the server
-//! starts once it is up (ADR 0086), so the three loopback ranges the other
+//! starts once it is up (ADR 028), so the three loopback ranges the other
 //! live files keep apart do not gain a fourth.
 //!
 //! This file names `nilo_http`, which is upward, and `sql`'s row in the
 //! `layers` table already carries the `in_tests` exception for `sql/db.zig`
-//! (ADR 0042). It is deliberately not imported by `sql/sql.zig`'s test block:
+//! (ADR 038). It is deliberately not imported by `sql/sql.zig`'s test block:
 //! if it were, `zig build test-sql` would need the Engine and the module's
 //! tests would stop being runnable without one.
 
@@ -39,7 +39,7 @@ const testing = std.testing;
 /// `.in_fiber` because nothing here is waiting on SQLite to do work — the
 /// statement under test never reaches SQLite at all. The wait being measured
 /// is the queue in front of the writer, which parks the fiber whichever
-/// `threading` is set (ADR 0073).
+/// `threading` is set (ADR 064).
 const Db = sql.Sqlite(.{ .threading = .in_fiber });
 
 /// Quieten the log for one test.
@@ -62,7 +62,7 @@ fn hush() void {
 /// `db.exec` rather than `tx.exec` is the whole scenario: one character, no
 /// compile error, and on Postgres it merely runs outside the transaction —
 /// there is a second pool connection to run it on. On SQLite there is exactly
-/// one writer, this fiber is holding it, and before ADR 0135 the queue it
+/// one writer, this fiber is holding it, and before ADR 107 the queue it
 /// joined had no bound and nothing in the log.
 const Attempt = struct {
     db: *Db,
@@ -156,7 +156,7 @@ test "a fiber queueing for the writer it already holds gives up, rather than wai
     var app = nilo.App.init(gpa);
     defer app.deinit();
     // `provide` before `spawn` for no reason but reading order: the App
-    // starts services first either way (ADR 0079), which is what hands this
+    // starts services first either way (ADR 180), which is what hands this
     // `Db` the Engine's `Limits` and is half of what is being tested.
     try app.provide(&db);
     try app.spawn(Attempt.run, .{&attempt});

@@ -1,5 +1,5 @@
 //! The commands, so that a project's migration tool is a `main` of ten lines
-//! ([ADR 0153](../docs/adr/0153-a-migration-is-a-diff-against-a-snapshot.md)).
+//! ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 //!
 //! ```zig
 //! pub fn main() !u8 {
@@ -181,7 +181,7 @@ pub fn usage(w: *std.Io.Writer) !void {
 /// is the `sql.Schema` — every Row whose table this tool owns, and the
 /// extensions, functions and views beside them — the same value `db.checking`
 /// and `createMissing` are given, which is what keeps the three from drifting
-/// apart (ADR 0253).
+/// apart (ADR 181).
 pub fn Tool(comptime Db: type, comptime schema: migrate.Schema) type {
     return struct {
         const D = Db.Dialect;
@@ -317,7 +317,7 @@ pub fn Tool(comptime Db: type, comptime schema: migrate.Schema) type {
         ///
         /// The directory is read a second time to get them: an error value
         /// carries nothing, and the alternative is the forty-line stack trace
-        /// that reached a user once (ADR 0224).
+        /// that reached a user once (ADR 181).
         fn snapshotRefused(
             a: std.mem.Allocator,
             io: Io,
@@ -548,7 +548,7 @@ pub fn Tool(comptime Db: type, comptime schema: migrate.Schema) type {
 /// A `CREATE TABLE` is six lines, and printing it with one `{s}` puts five of
 /// them hard against column zero, where they read as five separate steps.
 /// What `generate` says about the `.sql` twins it wrote, or did not
-/// ([ADR 0227](../docs/adr/0227-a-version-has-a-sql-twin-nobody-reads-back.md)).
+/// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 fn writeTwins(w: *std.Io.Writer, req: Request, out: migrations.Outcome) !void {
     if (out.twins_deferred) {
         try w.print(
@@ -673,7 +673,7 @@ fn writeBaselineRefusal(
 /// `Db` — and this one is the reason the rule matters. The version of this that
 /// did not exist let a forty-line stack trace out of `db generate`, and the
 /// test that should have caught it was calling `snapshot.parse` directly
-/// ([ADR 0224](../docs/adr/0224-a-snapshot-an-older-nilo-wrote-is-still-read.md)).
+/// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 fn writeSnapshotRefusal(
     w: *std.Io.Writer,
     req: Request,

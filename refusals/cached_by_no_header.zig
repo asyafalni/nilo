@@ -1,4 +1,4 @@
-//! A `Cached` keyed on a header and naming none ([ADR 0247](../docs/adr/0247-a-route-can-say-cache-this-answer-for-a-minute.md)).
+//! A `Cached` keyed on a header and naming none ([ADR 188](../docs/adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)).
 
 const nilo = @import("nilo_http");
 

@@ -18,7 +18,7 @@
 //!   client costs, and `/warm/1k` on its own is what the HTTP server costs.
 //! - `/presign` — the signer, and nothing else. No socket, no permit, no
 //!   round trip. The one route where the number is *entirely* SigV4, which is
-//!   the part of this module that is actually nilo's code (ADR 0069).
+//!   the part of this module that is actually nilo's code (ADR 060).
 //! - `/o/1k`, `/o/64k`, `/o/1m` — one `bucket.get` each, bounded, held whole.
 //!   Three sizes because the interesting question is where the cost stops
 //!   being per-call and starts being per-byte.
@@ -60,7 +60,7 @@ pub const std_options_debug_io = nilo.debug_io;
 pub const panic = nilo.panic;
 
 /// **The bucket is compiled in, and that is the design rather than a shortcut**
-/// (ADR 0068). `S3_BUCKET` would make this a runtime string and every URL a
+/// (ADR 059). `S3_BUCKET` would make this a runtime string and every URL a
 /// concatenation; a name known here is a `host` and a `prefix` built once in
 /// `open` and never again.
 const bucket_name = "nilo-test";
@@ -71,7 +71,7 @@ const bucket_name = "nilo-test";
 /// `max_bytes` is 2 MB so `/o/1m` fits with room to spare — a ceiling exactly
 /// on the object would make the benchmark a test of the ceiling. `key_max` is
 /// 128 rather than the default 512 because it sizes a stack buffer in every
-/// call, and by [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md)
+/// call, and by [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)
 /// a byte of handler stack is a byte on every idle connection.
 const Files = s3.Bucket(bucket_name, .{
     .style = .path,
@@ -200,7 +200,7 @@ fn get1m(files: *Files, c: *nilo.Ctx) !void {
 /// The signer with everything else taken away: no socket, no permit, no
 /// deadline, no round trip.
 ///
-/// A derived key changes once a day and is cached for the day (ADR 0069), so
+/// A derived key changes once a day and is cached for the day (ADR 060), so
 /// what this measures per request is one SHA-256 over the canonical request,
 /// one HMAC over the string to sign, and the hex. Every SDK in the comparison
 /// has a presign of its own, every one of them caches the same way or does
@@ -216,7 +216,7 @@ fn presign(files: *Files, c: *nilo.Ctx) !nilo.Str {
 /// The megabyte, from the store to the client, never held whole.
 ///
 /// `/o/1m` puts a megabyte in the request arena; this puts 64 KB on the stack
-/// and moves the object through it. By ADR 0063 that trade is the wrong way
+/// and moves the object through it. By ADR 062 that trade is the wrong way
 /// round for an idle connection — arena is per request, stack is per
 /// connection at the high-water mark — and the point of having both routes is
 /// that `bench/mem.py` can price it rather than argue about it.

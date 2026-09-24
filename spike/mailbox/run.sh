@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Hold N idle connections two ways and read what the difference costs.
 #
-# The protocol is ADR 0029's, because the number has to be comparable with the
+# The protocol is ADR 028's, because the number has to be comparable with the
 # 8,673 bytes that ADR rejected: idle connections, one fiber each, RSS read at
 # steady state, repeated until it stops moving. Repeats are printed rather than
 # averaged — a number that wobbles between runs is not a per-connection cost,

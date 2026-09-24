@@ -1,13 +1,13 @@
 # What SQLite actually does, before a Wire is written against it
 
-[ADR 0074](../../docs/adr/0074-one-writer-is-not-a-setting-it-is-the-database.md)
+[ADR 065](../../docs/adr/065-one-writer-is-not-a-setting-it-is-the-database.md)
 was written from SQLite's documentation and said so:
 
 > Both SQLite behaviours above are stated from its documentation and are to be
 > confirmed by a twelve-line program before this ADR is cited as evidence.
 
 This is that program, run against zqlite 0.0.1 / SQLite 3.53.0 — the library
-[ADR 0073](../../docs/adr/0073-a-file-has-no-socket-to-wait-on.md) chose, so
+[ADR 064](../../docs/adr/064-a-file-has-no-socket-to-wait-on.md) chose, so
 what it reports is what nilo would ship with rather than SQLite in the
 abstract.
 
@@ -53,7 +53,7 @@ SQLite's URI `mode=` parameter takes precedence over the flags handed to
 `sqlite3_open_v2`, so `mode=memory` hands back a writable connection whatever
 `SQLITE_OPEN_READONLY` said.
 
-That matters because ADR 0074 routes `db.raw` by its first keyword and calls
+That matters because ADR 065 routes `db.raw` by its first keyword and calls
 the read-only reader the backstop under that guess. **In memory there is no
 backstop.** The Wire's own test asserted the refusal against an in-memory
 database, failed, and that is how this was found — a reminder that the
@@ -61,7 +61,7 @@ in-memory shortcut is not merely a faster version of the real thing.
 
 ## What did not hold, and changed the ADR
 
-**ADR 0074 said a pool connection holds "roughly 2 MB of page cache … held for
+**ADR 065 said a pool connection holds "roughly 2 MB of page cache … held for
 the life of the pool". That is the ceiling, not the cost.** `cache_size`
 defaults to `-2000` — 2,000 KiB — and SQLite grows the cache as pages are
 touched, never past it.
@@ -121,5 +121,5 @@ that lowering the ceiling for a scan-heavy service is close to free.
 - **A database larger than RAM**, which is where SQLite's own page cache stops
   being a duplicate of the operating system's and starts being the only one.
 - **Contention.** One process throughout. What `busy_timeout` does when two
-  writers meet is the case ADR 0074's reader/writer split exists for, and it
+  writers meet is the case ADR 065's reader/writer split exists for, and it
   needs the Wire before it can be staged.

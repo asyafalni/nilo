@@ -1,6 +1,6 @@
 //! HPACK, the header compression HTTP/2 carries its headers in (RFC 7541),
 //! and only the half a gRPC server needs
-//! ([ADR 0297](../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+//! ([ADR 220](../docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md)).
 //!
 //! **The decoder is whole; the encoder never indexes.** A client decides what
 //! goes into the table this side keeps, so reading has to understand every
@@ -166,7 +166,7 @@ const fast: [1 << fast_bits]Fast = blk: {
 /// Up to 64 bits of input are held at once and a symbol is taken off the top
 /// of them, rather than a bit at a time: measured at 563ns for the 89-byte
 /// header block h2load sends, 37% of a whole call, before this was written
-/// (ADR 0297).
+/// (ADR 220).
 pub fn huffmanDecode(in: []const u8, out: *std.ArrayList(u8), gpa: std.mem.Allocator) Error!void {
     // Every symbol is at least five bits, so this is the most it can be.
     try out.ensureUnusedCapacity(gpa, in.len * 8 / 5 + 1);

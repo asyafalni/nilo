@@ -1,6 +1,6 @@
 //! A query field that is a list of something a query value cannot become. The
 //! list is read, so the element is what has to convert
-//! ([ADR 0164](../docs/adr/0164-a-query-parameter-that-is-a-list.md)).
+//! ([ADR 132](../docs/adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)).
 
 const nilo = @import("nilo_http");
 

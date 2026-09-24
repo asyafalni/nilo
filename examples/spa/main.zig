@@ -6,7 +6,7 @@
 //! ```
 //!
 //! `public/` is read into memory when the server starts, not per request
-//! (ADR 0010). Every file gets an ETag at load, so a reload costs a 304
+//! (ADR 009). Every file gets an ETag at load, so a reload costs a 304
 //! and no body.
 
 const std = @import("std");

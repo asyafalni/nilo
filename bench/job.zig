@@ -1,5 +1,5 @@
 //! What a claim costs, which is the number `nilo_job`'s `poll_ms` default
-//! rests on (ADR 0198).
+//! rests on (ADR 160).
 //!
 //! A worker with nothing to do asks the store once per `poll_ms`, so an idle
 //! queue costs one claim per worker per interval, forever. This times that

@@ -36,7 +36,7 @@ pub const panic = nilo.panic;
 
 /// The one question SQLite makes you answer: where a statement runs. `.hop`
 /// hands each one to the Engine's thread pool so no statement can stall a
-/// thread that is serving other connections (ADR 0073).
+/// thread that is serving other connections (ADR 064).
 const Db = sql.Sqlite(.{ .threading = .{ .hop = nilo } });
 
 // ---- the Rows -------------------------------------------------------------
@@ -82,17 +82,17 @@ const Invoice = struct {
 };
 
 /// One value: the tables the program has, handed to `createMissing` and to
-/// `db.checking`, so the two cannot drift (ADR 0253).
+/// `db.checking`, so the two cannot drift (ADR 181).
 const schema: sql.Schema = .{ .tables = &.{ Customer, Invoice } };
 
 // ---- the boot -------------------------------------------------------------
 
 /// Registered with `app.before`, so it runs once the pool is open and before
-/// the first request, on the server's own loop (ADR 0220). `createMissing`
+/// the first request, on the server's own loop (ADR 180). `createMissing`
 /// is one `CREATE TABLE IF NOT EXISTS` per Row plus its indexes, in one
 /// transaction, and a second boot does nothing. The schema check runs
 /// *after* this, which is what lets `db.checking` and `createMissing` live
-/// in the same program (ADR 0277).
+/// in the same program (ADR 180).
 fn makeTables(run: *nilo.Run, db: *Db) !void {
     try sql.migrate.createMissing(db, run, schema);
     if (try db.count(Customer, run, .{}) == 0) try seed(run, db);
@@ -130,7 +130,7 @@ fn seed(run: *nilo.Run, db: *Db) !void {
 // everything else is request data: a path param, a query struct, a body.
 
 /// `?Str` in a query struct is "absent is null", and `sql.given` turns that
-/// null into *no condition at all* rather than `= NULL` (ADR 0183).
+/// null into *no condition at all* rather than `= NULL` (ADR 149).
 const CustomerFilter = struct {
     q: ?Str = null,
     limit: nilo.Within(1, 200) = .of(50),
@@ -164,7 +164,7 @@ fn createCustomer(db: *Db, c: *nilo.Ctx, incoming: NewCustomer) !nilo.Status(201
 /// A customer with their invoices. `invoices` is a list of another table's
 /// Row, which makes it the **children** of the customer: the rows whose
 /// reference points back here, read by a second statement once the customer
-/// is (ADR 0295). A customer with none has an empty list.
+/// is (ADR 218). A customer with none has an empty list.
 const CustomerAccount = struct {
     pub const nilo_table = Customer;
 
@@ -187,7 +187,7 @@ fn getCustomer(db: *Db, c: *nilo.Ctx, id: i64) !?CustomerAccount {
 }
 
 /// `?Invoice` is the whole 404: null goes out as `404 Not Found`, and the
-/// document says the route answers one (ADR 0024).
+/// document says the route answers one (ADR 023).
 fn getInvoice(db: *Db, c: *nilo.Ctx, id: i64) !?Invoice {
     return db.find(Invoice, c, id);
 }
@@ -204,7 +204,7 @@ const InvoiceFilter = struct {
 /// `customer` holds a Row of another table, which makes it the invoice's
 /// **parent**: joined in the same statement through the one `.references`
 /// from invoices to customers, and answered in JSON as `"customer":
-/// {"name": …}` (ADR 0295). No SQL is written here, and a page is still ten
+/// {"name": …}` (ADR 218). No SQL is written here, and a page is still ten
 /// invoices, because a reference points at one customer.
 const InvoiceLine = struct {
     pub const nilo_table = Invoice;
@@ -225,8 +225,8 @@ const CustomerName = struct {
 const page_size = 10;
 
 /// `sql.given` makes an absent `?status` no condition at all, the same
-/// statement either way (ADR 0183). `db.page` reads the rows and the total
-/// the filter matched in one statement (ADR 0185).
+/// statement either way (ADR 149). `db.page` reads the rows and the total
+/// the filter matched in one statement (ADR 150).
 fn listInvoices(db: *Db, c: *nilo.Ctx, filter: nilo.Query(InvoiceFilter)) !Db.Page(InvoiceLine) {
     const offset = (@as(i64, filter.value.page.value) - 1) * page_size;
     return db.page(InvoiceLine, c, .{
@@ -241,7 +241,7 @@ fn listInvoices(db: *Db, c: *nilo.Ctx, filter: nilo.Query(InvoiceFilter)) !Db.Pa
 //
 // Aggregates are most of an application like this one. A count or a sum over
 // a column, grouped by columns or by a parent, is a Row that says so in
-// `nilo_aggregate`; its other fields are what it groups by (ADR 0295). What
+// `nilo_aggregate`; its other fields are what it groups by (ADR 218). What
 // a Row cannot say, a date computed out of a column, is `raw`.
 
 /// Every field an aggregate, so it is grouped by nothing: exactly one row
@@ -279,7 +279,7 @@ const CustomerLine = struct {
 
 /// A month is computed out of `issued_at`, and a Row groups by columns, not
 /// by expressions over them, so this one is `raw`. A `sql.Timestamp` is
-/// stored as microseconds since the epoch on SQLite (ADR 0136), so a date
+/// stored as microseconds since the epoch on SQLite (ADR 067), so a date
 /// function reads it as `issued_at / 1000000, 'unixepoch'`; on Postgres the
 /// same line is `to_char(issued_at, 'YYYY-MM')`.
 const MonthLine = struct {
@@ -400,7 +400,7 @@ const Stack = struct {
         try self.app.before(makeTables, .{&self.db});
         try routes(&self.app);
         // Opens the pool, makes the tables, seeds them, and checks the
-        // Rows against what was made, in that order (ADR 0277).
+        // Rows against what was made, in that order (ADR 180).
         try self.app.start(self.threaded.io());
         return self;
     }

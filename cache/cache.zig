@@ -1,10 +1,10 @@
 //! nilo_cache — an expiring cache in this process, and nothing that needs a
-//! loop (ADR 0138, ADR 0139).
+//! loop (ADR 109, ADR 110).
 //!
 //! A **tool module**, the fourth: one job, no event loop, and it imports
 //! nothing at all — which is why `zig test cache/cache.zig` runs the whole of
 //! it, and why a program that is not a server can take this module and leave
-//! the rest (ADR 0042).
+//! the rest (ADR 038).
 //!
 //! ```zig
 //! const cache = @import("nilo_cache");
@@ -45,7 +45,7 @@
 //! keeping, and it is most of what the cache is worth: on Zipf 0.99 at 512 KiB
 //! it answers 75.4% of lookups where forgetting in write order alone answered
 //! 67.0%, which is **two to three times less memory for the same hit rate**
-//! (ADR 0187). `Stats.rescued` counts it happening.
+//! (ADR 109). `Stats.rescued` counts it happening.
 //!
 //! Two consequences to know about rather than discover:
 //!
@@ -92,22 +92,22 @@
 //! produced it and not of traffic: it drew its keys uniformly at random, and
 //! under uniform random every policy scores the same and that score is the
 //! ratio. It is kept here as a warning rather than deleted, because that
-//! sentence stood for a year (ADR 0187).
+//! sentence stood for a year (ADR 109).
 //!
 //! ## What it will not do
 //!
 //! **It is this process's memory and no more than that.** Two instances of
 //! your program have two caches that do not agree, they do not survive a
 //! restart, and nothing here reaches a network. That is the trade the module
-//! is for; ADR 0139 is where it is argued, and where `nilo_redis` is the other
+//! is for; ADR 110 is where it is argued, and where `nilo_redis` is the other
 //! answer nobody has needed yet.
 //!
 //! **And it is safe to hold under a fiber, because of a rule this module
 //! keeps**: a lock is held across a `memcpy` and nothing else, ever. Zig
 //! 0.16's `std.Io.Mutex` needs an `Io` a module in this layer does not have,
 //! so the lock spins — and a critical section with nothing in it that waits
-//! always finishes and releases (ADR 0138). **A `get` does not take it at
-//! all** (ADR 0188): it copies the value out and then asks the ring's write
+//! always finishes and releases (ADR 109). **A `get` does not take it at
+//! all** (ADR 152): it copies the value out and then asks the ring's write
 //! cursor whether anything wrote over those bytes while it read them.
 
 const std = @import("std");
@@ -131,7 +131,7 @@ pub const OpenError = store.OpenError;
 pub const Stats = store.Stats;
 
 /// A keyspace with a name, a value type and a life. Two Spaces are two types,
-/// therefore two services (ADR 0068).
+/// therefore two services (ADR 059).
 pub const Space = space.Space;
 
 /// The one thing a `put` of bytes can fail at.
@@ -155,7 +155,7 @@ test {
     _ = store;
 }
 
-// -- the property ADR 0138 is about --------------------------------------
+// -- the property ADR 109 is about --------------------------------------
 
 const testing = std.testing;
 
@@ -181,7 +181,7 @@ const Marks = Space("marks", Marked, .{});
 const Racer = struct {
     marks: Marks,
     /// Anything but zero in `wrong` and the design is wrong rather than the
-    /// tuning — which is what ADR 0138 found the first time this was written.
+    /// tuning — which is what ADR 109 found the first time this was written.
     wrong: u64 = 0,
     hits: u64 = 0,
 

@@ -1,6 +1,6 @@
 //! The Store — one endpoint, one region, one set of credentials, and the
 //! derived key they turn into
-//! ([ADR 0069](../docs/adr/0069-a-signing-key-changes-once-a-day.md)).
+//! ([ADR 060](../docs/adr/060-a-signing-key-changes-once-a-day.md)).
 //!
 //! A `Bucket` is what a handler holds; this is what every Bucket in the
 //! program shares. It owns three things a bucket does not: the connection
@@ -40,7 +40,7 @@ pub const Source = union(enum) {
     /// Called once at startup, and again when the ones in hand are within
     /// `refresh_margin_s` of expiring. **Called lazily, on the request that
     /// notices** — there is no background task here, which is the same reason
-    /// ADR 0060 gave for refusing automatic replica routing.
+    /// ADR 054 gave for refusing automatic replica routing.
     ///
     /// Whatever it allocates from `gpa` is freed by the Store when the next
     /// refresh replaces it.
@@ -53,7 +53,7 @@ pub const Options = struct {
     ///
     /// **The scheme decides whether payloads are hashed** — `UNSIGNED-PAYLOAD`
     /// over TLS, a real SHA-256 over plaintext. There is nothing to configure
-    /// and the reasoning is in ADR 0069.
+    /// and the reasoning is in ADR 060.
     endpoint: []const u8,
     /// The endpoint a *browser* reaches, when it is not the one this process
     /// dials — a store on a Docker network or a Tailscale address behind a
@@ -63,7 +63,7 @@ pub const Options = struct {
     /// **signed as that host**, which is why rewriting `url` after the fact
     /// cannot do this job: the host is inside the signature, and a presigned
     /// GET with a rewritten host is a 403 that reads like a signing bug
-    /// ([ADR 0216](../docs/adr/0216-a-presigned-url-names-the-host-the-browser-reaches.md)).
+    /// ([ADR 177](../docs/adr/177-a-presigned-url-names-the-host-the-browser-reaches.md)).
     /// The scheme, host and port, like `endpoint`; no path.
     public_endpoint: ?[]const u8 = null,
     region: []const u8 = "us-east-1",
@@ -116,7 +116,7 @@ pub const Store = struct {
     ///
     /// The lock is a plain shared/exclusive one and there is nothing clever
     /// in here on purpose: a `tryLock` pair is about 30 ns against a network
-    /// round trip of 5–50 ms, which is 0.00015%, and ADR 0001 puts the bar at
+    /// round trip of 5–50 ms, which is 0.00015%, and ADR 017 puts the bar at
     /// ten per cent. The number is written down so nobody re-derives the
     /// temptation.
     lock: std.Io.RwLock = .init,
@@ -133,7 +133,7 @@ pub const Store = struct {
     /// Everything that can be settled without an event loop.
     ///
     /// **The credentials are not fetched here**, and that differs from the
-    /// sketch in ADR 0069 for the reason ADR 0040 exists: a Service that dials
+    /// sketch in ADR 060 for the reason ADR 037 exists: a Service that dials
     /// cannot dial before `listen()`, because there is no loop to dial on.
     /// `nilo_start` is where the first fetch happens.
     pub fn open(gpa: std.mem.Allocator, options: Options) OpenError!Store {
@@ -190,7 +190,7 @@ pub const Store = struct {
         if (self.owned.len != 0) self.gpa.free(self.owned);
     }
 
-    /// Finished once the loop exists (ADR 0040), and idempotent: two Buckets
+    /// Finished once the loop exists (ADR 037), and idempotent: two Buckets
     /// over one Store both start it, and a program that also provides the
     /// Store itself starts it a third time.
     pub fn nilo_start(self: *Store, io: std.Io, limits: core.Limits) !void {
@@ -203,7 +203,7 @@ pub const Store = struct {
     }
 
     /// What the health route asks
-    /// ([ADR 0192](../docs/adr/0192-a-health-route-asks-the-services.md)).
+    /// ([ADR 154](../docs/adr/154-a-health-route-asks-the-services.md)).
     /// Started is ready: `nilo_start` fetched the first credentials, so a
     /// Store that reached here can sign. Not a request to the endpoint on
     /// every probe — a balancer asks every second, and a HEAD to somebody
@@ -366,11 +366,11 @@ pub const Store = struct {
     }
 
     /// What `x-amz-content-sha256` says, decided by the scheme and nothing
-    /// else (ADR 0069).
+    /// else (ADR 060).
     ///
     /// Over `https://` it is `UNSIGNED-PAYLOAD`: hashing buys integrity TLS
     /// has already provided, at 5 ms per 10 MB with SHA-NI and 20 ms without —
-    /// on a fiber, where ADR 0014 says a handler must not hold its thread.
+    /// on a fiber, where ADR 013 says a handler must not hold its thread.
     /// Over `http://` it is the only integrity there is, and that path is a
     /// development MinIO rather than production load, so it is paid.
     ///

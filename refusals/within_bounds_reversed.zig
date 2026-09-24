@@ -1,6 +1,6 @@
 //! `Within(max, min)`: a range nothing is inside. Refused where it is written
 //! rather than answering 400 to every request
-//! ([ADR 0206](../docs/adr/0206-a-whole-number-inside-a-range-is-a-type.md)).
+//! ([ADR 167](../docs/adr/167-a-whole-number-inside-a-range-is-a-type.md)).
 
 const nilo = @import("nilo_http");
 

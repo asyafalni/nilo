@@ -62,7 +62,7 @@ Files discovered by that one compilation: 712. Analysed: 296.
 ## What changed the decision
 
 `.use_llvm = false` on the `ReleaseSafe` test builds, at all fourteen
-`addTest` sites (ADR 0170).
+`addTest` sites (ADR 138).
 
 | | LLVM | self-hosted |
 |---|---|---|
@@ -92,7 +92,7 @@ second of CPU, which reads as a deadlock and is not one. See above.
 
 ## Where the time is now
 
-Re-measured after ADR 0170, same edit, `--summary all`. 11.65s of wall against
+Re-measured after ADR 138, same edit, `--summary all`. 11.65s of wall against
 84.6s of CPU, and **no single step is longer than 1.00s any more.** The shape
 of the problem changed: it was one compilation running alone, and now it is a
 lot of small ones against sixteen cores.
@@ -139,7 +139,7 @@ After an edit under `http/` all 66 re-analyse, and it was 727ms each.
 
 **`refusals`, 17.5s of CPU and the whole of the 2.6s floor.** These cannot
 cache, because the compiler keeps nothing from a compilation that failed
-(ADR 0027). The only way down is fewer refusals, which is the wrong trade.
+(ADR 026). The only way down is fewer refusals, which is the wrong trade.
 
 **`layering`, 7.1s of CPU.** 8% of the total, longest step 1.00s. Nothing
 measured suggests it is worth opening.
@@ -198,7 +198,7 @@ rebuild starting the moment a file is saved. Do not sell it as faster.
 0.16.0 (Homebrew `0.16.0_1`), commit `abb465a`. Recorded because the x86_64
 figures above were applied here unmeasured and the result was not a slower build
 but a dead machine, three times, before any output
-([ADR 0189](../../docs/adr/0189-a-backend-is-trusted-where-it-was-measured.md)).
+([ADR 138](../../docs/adr/138-a-test-does-not-need-the-optimiser.md)).
 
 The compile is `pw/pw.zig`, a leaf with no module graph, a binary emitted, the
 machine otherwise quiet. Footprint is `top`'s physical footprint sampled once a
@@ -267,7 +267,7 @@ file split.
 **Not the machine in the header.** 2 cores, 7.9 GB, x86_64 Linux, Zig
 0.16.0, commit `b99a5b4`. Taken before `nilo-dev` was designed rather than
 after, because the question that decided its shape was "does this eat the
-disk?" ([ADR 0259](../../docs/adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
+disk?" ([ADR 190](../../docs/adr/190-a-restart-on-save-watches-the-binary-not-the-sources.md)).
 
 The edit is one string literal in `examples/hello/main.zig`, changed three
 to five times in a row; the build is `zig build examples` (all nine, of which
@@ -323,7 +323,7 @@ is a guess until somebody runs it on the sixteen-core box in the header.
 
 ## What a save has to touch
 
-16 cores, x86_64 Linux, Zig 0.16.0, commit `b012502`, Debug, self-hosted backend, cache warm, `-Dtarget=x86_64-linux-gnu` on both `zig build`s because of the host's glibc. The question was whether the dev loop is the back end's or the repository's: a project keeping a front end beside its server should be able to save under the front end without the server going away. ADR 0259 says the loop watches the binary, and the guide had a sentence saying `zig build dev` could watch a bundler's directory, so the two were put to a save each rather than argued.
+16 cores, x86_64 Linux, Zig 0.16.0, commit `b012502`, Debug, self-hosted backend, cache warm, `-Dtarget=x86_64-linux-gnu` on both `zig build`s because of the host's glibc. The question was whether the dev loop is the back end's or the repository's: a project keeping a front end beside its server should be able to save under the front end without the server going away. ADR 190 says the loop watches the binary, and the guide had a sentence saying `zig build dev` could watch a bundler's directory, so the two were put to a save each rather than argued.
 
 The loop is `zig build dev-spa`, whose `public/` is served from disk by `staticWith`. Each probe appends a line to one file and reads what the runner and the build print: `nilo-dev` says when it restarts, `--trace` prints the binary's size and mtime every 250 ms, and the build prints a `Build Summary` when a step ran, so a stamp that stood still with no summary under it for fifteen seconds is a save that moved nothing.
 

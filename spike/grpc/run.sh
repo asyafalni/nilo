@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # What does a real gRPC client put on the wire, and what does it do when the
-# server asks it for less? ADR 0297 needed both before it could say what a
+# server asks it for less? ADR 220 needed both before it could say what a
 # gRPC connection would cost nilo, and neither is written down anywhere a
 # reader can trust: the RFC says what a client *may* do, not what grpc-go,
 # grpc-js, grpcio and tonic *do*.

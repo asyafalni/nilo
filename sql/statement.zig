@@ -1,4 +1,4 @@
-//! A whole statement, built while compiling (ADR 0039).
+//! A whole statement, built while compiling (ADR 036).
 //!
 //! `SELECT`, `INSERT`, `UPDATE`, `DELETE` and the aggregates, in one file
 //! because they share more than they differ: the same column list, the same
@@ -26,16 +26,16 @@
 //! At runtime what is sent is that constant and one value. Drizzle, whose
 //! spine this borrows, reassembles its string on every request because
 //! JavaScript has no other moment to do it in. Zig has one, so nothing is
-//! built per request and the axis ADR 0018 guards is never touched by the
+//! built per request and the axis ADR 017 guards is never touched by the
 //! statement itself.
 //!
 //! **A literal limit is baked in; a limit held in a variable is a parameter.**
-//! That is the rule of ADR 0039 read strictly rather than an inconsistency:
+//! That is the rule of ADR 036 read strictly rather than an inconsistency:
 //! `10` written in the source is shape, and shape is settled while compiling.
 //! It also gives Postgres a number to plan with, which `LIMIT $2` does not.
 //!
 //! The options are a flat struct rather than a chain of calls, and the reason
-//! is in ADR 0039: a chain carries its state in its return type, and what a
+//! is in ADR 036: a chain carries its state in its return type, and what a
 //! reader gets when it does not fit is Diesel's tower rather than a sentence.
 //! One flat type means one message that can name the field.
 
@@ -90,7 +90,7 @@ pub const Direction = enum {
 /// The name a statement is prepared under, on a connection that keeps plans.
 ///
 /// **Derived from the text, which is what makes it possible at all.** Every
-/// statement this module sends is a comptime constant (ADR 0039), so the same
+/// statement this module sends is a comptime constant (ADR 036), so the same
 /// query always hashes to the same name and the set of names a program can
 /// ever use is fixed when the binary is built. A library that assembles its
 /// SQL per request has neither property: its cache would be keyed on a string
@@ -104,7 +104,7 @@ pub const Direction = enum {
 /// nothing at all when they match. At 128 bits, a thousand distinct
 /// statements collide with probability around 10⁻³⁴; at 64 it would be 10⁻¹⁴,
 /// which is small and is not the same kind of small as impossible
-/// ([ADR 0057](../docs/adr/0057-a-statement-that-is-a-constant-can-be-prepared-once.md)).
+/// ([ADR 051](../docs/adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)).
 ///
 /// 37 characters, comfortably inside Postgres's 63-byte identifier limit.
 pub fn planName(comptime sql: []const u8) []const u8 {
@@ -141,10 +141,10 @@ pub const Statement = struct {
     ///
     /// This is a *ceiling* and not a count — knowing it bounds the list the
     /// rows go into but never says how many arrive, which is the sentence
-    /// ADR 0039 originally got wrong. `fill` in `db.zig` is the only reader.
+    /// ADR 036 originally got wrong. `fill` in `db.zig` is the only reader.
     reserve: ?usize = null,
     /// Whether `.order` is chosen per request rather than settled here
-    /// ([ADR 0204](../docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+    /// ([ADR 165](../docs/adr/165-an-order-chosen-at-run-time-from-a-closed-set.md)).
     /// When it is, `sql` stops where the clause goes and `tail` is the rest
     /// — the `LIMIT`, the `OFFSET`, the lock — and `db.zig` writes the three
     /// out per request, unnamed. Everything else about the statement is
@@ -174,7 +174,7 @@ const known_page = [_][]const u8{ "where", "order", "limit", "offset" };
 /// why writing a second one is a Refusal instead of a silent argument.
 ///
 /// `page` is a select carrying the count the condition matched before the
-/// `LIMIT` cut it ([ADR 0185](../docs/adr/0185-a-page-knows-what-it-left-out.md)).
+/// `LIMIT` cut it ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md)).
 const Answers = enum { many, first, page };
 
 /// Compile a `SELECT` for `Row` in `D`'s grammar from the options type `O`.
@@ -183,7 +183,7 @@ pub fn select(comptime D: type, comptime Row: type, comptime O: type) Statement 
 }
 
 /// The same statement with `count(*) OVER ()` on the end of the column list,
-/// for `db.page` ([ADR 0185](../docs/adr/0185-a-page-knows-what-it-left-out.md)).
+/// for `db.page` ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md)).
 ///
 /// **One statement rather than two, and that is the property rather than the
 /// round trip.** A `db.count` beside a `db.select` is two statements against a
@@ -215,7 +215,7 @@ fn rowsOf(
     return comptime blk: {
         dialect_mod.assertDialect(D);
         // A Row that carries a parent, children or an aggregate is written by
-        // `shape.zig`, and nothing below applies to it (ADR 0295).
+        // `shape.zig`, and nothing below applies to it (ADR 218).
         if (row_mod.isShaped(Row)) break :blk shape_mod.rows(D, Row, O, switch (answers) {
             .many => .many,
             .first => .first,
@@ -232,7 +232,7 @@ fn rowsOf(
                 "`LIMIT 1`. A page of rows is `db.select`.",
         );
         // A page with no ceiling is the whole table, and the window function
-        // it paid for answers `rows.len` (ADR 0185).
+        // it paid for answers `rows.len` (ADR 150).
         if (answers == .page and !@hasField(O, "limit")) @compileError(
             "nilo: `db.page` on " ++ @typeName(Row) ++ " was given no `.limit`.\n" ++
                 "  A page is a slice of the rows and a total for the rest of them. With no " ++
@@ -301,7 +301,7 @@ fn rowsOf(
 
         // An ordering chosen at run time splits the statement here: what
         // was built so far is the head, and everything from here on is the
-        // tail (ADR 0204). The clause between them is the request's.
+        // tail (ADR 165). The clause between them is the request's.
         var ordered = false;
         var head: []const u8 = "";
         if (@hasField(O, "order")) {
@@ -643,7 +643,7 @@ fn deleting(
 /// **A shaped Row is an answer, and an answer is not written back.** Its
 /// parent's columns belong to another table, its children to a third, and a
 /// sum to no row at all, so an insert or an update through one would have to
-/// pick which of them it meant (ADR 0295).
+/// pick which of them it meant (ADR 218).
 fn assertWritable(comptime Row: type, comptime what: []const u8) void {
     if (comptime row_mod.isShaped(Row)) @compileError(
         "nilo: " ++ what ++ " through " ++ @typeName(Row) ++ ", which carries a parent, " ++
@@ -655,7 +655,7 @@ fn assertWritable(comptime Row: type, comptime what: []const u8) void {
 
 /// **A condition that may not be there is not a condition an `UPDATE` or a
 /// `DELETE` may narrow itself with**
-/// ([ADR 0183](../docs/adr/0183-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
+/// ([ADR 149](../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
 ///
 /// `sql.given` drops its term when the value is null, and the whole point of
 /// the two refusals above is that what stands between one of these statements
@@ -683,15 +683,15 @@ fn assertNothingDroppable(
 }
 
 /// The branch budget a builder needs, raised where the work is asked for
-/// ([ADR 0157](../docs/adr/0157-a-check-pays-for-its-own-branches.md)).
+/// ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)).
 ///
 /// Every loop below walks the columns written against the Row's columns —
 /// `hasColumn` and `ColumnType` scan the Row per value, `quote` walks each
 /// name, `columnList` spells the whole Row for the `RETURNING` — so a wide
 /// Row multiplies them, and a twenty-column table with seventeen written
 /// did not compile on the default
-/// ([ADR 0208](../docs/adr/0208-a-statement-pays-for-the-width-of-its-row.md)).
-/// Generous rather than exact, for the reason ADR 0157 gives: the budget is
+/// ([ADR 169](../docs/adr/169-a-statement-pays-for-the-width-of-its-row.md)).
+/// Generous rather than exact, for the reason ADR 126 gives: the budget is
 /// the caller's whole evaluation, and a larger one set by them still wins.
 fn budget(comptime Row: type, comptime Written: type) void {
     const rows = switch (@typeInfo(Row)) {
@@ -829,7 +829,7 @@ pub fn insert(comptime D: type, comptime Row: type, comptime V: type) Statement 
 ///
 /// **One parameter per column, holding that column for every row** — so the
 /// text does not depend on how many rows there are, which is what keeps it a
-/// comptime constant (ADR 0039). `VALUES ($1,$2),($3,$4),…` is the shape most
+/// comptime constant (ADR 036). `VALUES ($1,$2),($3,$4),…` is the shape most
 /// libraries generate and it is the shape this cannot have: the placeholder
 /// count is the batch size, so the SQL would have to be built per call, and
 /// Postgres would re-plan it every time the batch size changed.
@@ -1036,7 +1036,7 @@ pub fn updateMany(comptime D: type, comptime Row: type, comptime V: type) Statem
 /// `what` is the caller's verb — "a batch insert into", "a batch update of" —
 /// because the first line used to say *insert* from both and blame the column
 /// type from SQLite, where the true reason is that the database has no array
-/// parameter at all (ADR 0061). A message that sends the reader to
+/// parameter at all (ADR 055). A message that sends the reader to
 /// `dialect.accepts` to find the sentence was false is worse than no message.
 fn noArrayForm(
     comptime D: type,
@@ -1056,7 +1056,7 @@ fn noArrayForm(
             D.name ++ " dialect.\n" ++
             "  A batch sends one array per column and the database takes it apart with " ++
             "`unnest`; this one has no array parameter and no `unnest`, and the batch " ++
-            "form it does have grows its statement text with the batch (ADR 0061).\n" ++
+            "form it does have grows its statement text with the batch (ADR 055).\n" ++
             "  Write the rows one at a time inside one transaction — there is no round " ++
             "trip to pay per statement here.",
     );
@@ -1129,7 +1129,7 @@ pub const key_target = "key";
 /// case, and there is no third spelling.
 ///
 /// **`.key` is the Row's own key, read off the `nilo_table` that declares it**
-/// ([ADR 0186](../docs/adr/0186-a-key-is-named-once.md)). Before it, a join
+/// ([ADR 151](../docs/adr/151-a-key-is-named-once.md)). Before it, a join
 /// table spelled its composite key twice — once in `nilo_table` and once at
 /// every call site — and the two copies could disagree. A key that gains a
 /// column and a call site that does not is a statement conflicting on the
@@ -1232,7 +1232,7 @@ fn upserting(
         // **`DO NOTHING` writes no `SET` clause, so it has no key to leave
         // out** — and asking for one refused a pure join table, which has a
         // composite primary key and no `id` at all
-        // ([ADR 0143](../docs/adr/0143-do-nothing-has-no-key-to-leave-out.md)).
+        // ([ADR 114](../docs/adr/114-do-nothing-has-no-key-to-leave-out.md)).
         // The comptime `if` prunes the call, so the Row never has to answer a
         // question this statement does not ask.
         const keys: []const []const u8 = if (action == .update) row_mod.keysOf(Row) else &.{};
@@ -1367,7 +1367,7 @@ fn setOperator(
 /// `SET "views" = "views" + $1` with `views` NULL stores NULL: the statement
 /// runs, reports one row changed, and the counter is gone. That is the same
 /// shape as `= NULL` in a condition — legal SQL, no error, wrong answer — and
-/// it is refused here for the same reason (ADR 0039).
+/// it is refused here for the same reason (ADR 036).
 fn assertCountable(
     comptime Row: type,
     comptime column: []const u8,
@@ -2340,7 +2340,7 @@ test "an upsert that ignores a conflict adds four words and no parameters" {
 test "a join table with no id can still be inserted-or-ignored" {
     // A pure join table has a composite primary key and no `id`, so it has
     // nothing to answer `keyOf` with — and `DO NOTHING` never asks, because
-    // it writes no `SET` clause (ADR 0143). The conflict target was given
+    // it writes no `SET` clause (ADR 114). The conflict target was given
     // explicitly, which is the only identity this statement needs.
     const Capability = struct {
         pub const nilo_table = .{ .name = "partner_capabilities" };
@@ -2568,7 +2568,7 @@ test "a plan name is an identifier Postgres will accept" {
 //
 // The seam's whole claim is that the SQL is written through a Dialect rather
 // than spelled inline, and until a second one existed nothing tested it
-// (ADR 0061). These run the same compiler over `SQLite` and read what comes
+// (ADR 055). These run the same compiler over `SQLite` and read what comes
 // out — no database, because a Dialect touches no I/O.
 
 test "the second dialect owes everything the first does" {
@@ -2597,7 +2597,7 @@ test "a list is one parameter in both dialects, by two different routes" {
     // The one that did not fit the seam. Postgres binds an array; SQLite has
     // no array type, so it binds a JSON document and takes it apart in the
     // statement. **Both keep the text a constant however long the list is**,
-    // which is the property ADR 0039 is about and the reason `.expanded` was
+    // which is the property ADR 036 is about and the reason `.expanded` was
     // never an option for either.
     const options = .{ .where = .{ .id = .{ .in = &[_]i64{ 1, 2, 3 } } } };
     try testing.expectEqualStrings(
@@ -2686,7 +2686,7 @@ test "the two dialects judge a column against the types their database has" {
 
 test "an upsert can conflict on the key the Row already declares" {
     // Item 57: the tuple was written twice, once in `nilo_table` and once at
-    // the call site, and the two could disagree (ADR 0186).
+    // the call site, and the two could disagree (ADR 151).
     const StaffRole = struct {
         pub const nilo_table = .{
             .name = "staff_roles",
@@ -2773,7 +2773,7 @@ const Saved = struct {
 test "a write seventeen columns wide on a twenty-column Row compiles, and its text is what a narrow one's would be" {
     // Every builder that walks the values against the Row multiplies its
     // branches by both widths, and none of them had a quota of its own until
-    // a real table would not compile (ADR 0208).
+    // a real table would not compile (ADR 169).
     const single = comptime insert(Pg, RabLine, Saved);
     try testing.expect(std.mem.startsWith(u8, single.sql, "INSERT INTO \"rab_lines\" (\"rab_id\", \"section_id\","));
     try testing.expect(std.mem.containsAtLeast(u8, single.sql, 1, "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::numeric, $9,"));

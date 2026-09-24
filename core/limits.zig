@@ -1,5 +1,5 @@
 //! When an operation gives up, as vocabulary two layers agree about
-//! ([ADR 0065](../docs/adr/0065-the-way-out-was-open-the-clock-was-not.md)).
+//! ([ADR 056](../docs/adr/056-the-way-out-was-open-the-clock-was-not.md)).
 //!
 //! A Service can dial out — `std.Io.net` does it and `ready(state, io)` hands
 //! over the `std.Io` to do it with. What it could not do is **stop**.
@@ -14,14 +14,14 @@
 //! neither has to know the other's half. It lives here rather than beside
 //! `Deadlines` because the caller is a **Service**, and a Service may not
 //! import `nilo_http` — the same wall that sent `percent` down a layer
-//! ([ADR 0066](../docs/adr/0066-percent-is-needed-by-two-layers.md)). It earns
+//! ([ADR 057](../docs/adr/057-percent-is-needed-by-two-layers.md)). It earns
 //! the layer the way every file here does: the App fills it, a Service reads
 //! it. No IO, no allocation, no engine named, and `zig test core/core.zig`
 //! is unchanged.
 //!
 //! ## A Bound must not be copied once it is armed
 //!
-//! ADR 0065 sketched this as `var bound = limits.arm(2_000);` — a `Bound`
+//! ADR 056 sketched this as `var bound = limits.arm(2_000);` — a `Bound`
 //! returned by value. **That sketch cannot be implemented safely and this API
 //! deliberately differs from it.** The Engine's arming state is address
 //! sensitive: zio's `AutoCancel` stores `&self` as its timer's userdata and
@@ -42,7 +42,7 @@
 //! };
 //! ```
 //!
-//! Note what that does *not* do: it does not look at the error first. ADR 0065
+//! Note what that does *not* do: it does not look at the error first. ADR 056
 //! and the first draft of this file both wrote `error.Canceled => if
 //! (bound.fired())`, and `fetch/deadline.zig` — the first test here to watch a
 //! real timer fire — got `error.ReadFailed` instead. `std.Io.Reader`'s error
@@ -60,7 +60,7 @@ const std = @import("std");
 
 pub const Limits = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Limits";
 
     target: ?*anyopaque = null,
@@ -82,7 +82,7 @@ pub const Limits = struct {
     ///
     /// 192 rather than 176 so that a second Engine has somewhere to stand
     /// without a number in Core changing. Every byte is stack a handler
-    /// touches, and by [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md)
+    /// touches, and by [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)
     /// that is per *connection* rather than per request — so this is 192 bytes
     /// on a connection whose handler arms one, and nothing at all on a
     /// connection whose handler does not.
@@ -97,7 +97,7 @@ pub const Limits = struct {
         /// own `Io` — a socket the driver reads, a pool a caller queues on.
         /// The fiber parks there like anywhere else, and the Engine's
         /// watchdog has to be told, or the wait is charged to the handler
-        /// as time it held its thread (ADR 0286). `waiting` returns a token
+        /// as time it held its thread (ADR 210). `waiting` returns a token
         /// `waited` takes back.
         waiting: *const fn (target: ?*anyopaque) u64,
         waited: *const fn (target: ?*anyopaque, token: u64) void,

@@ -1,11 +1,11 @@
 //! The benchmark target again, over TLS: the same routes, the same handlers,
 //! the same ~1KB answer, with a TLS 1.3 handshake in front of the first
-//! request on every connection. Built only under `-Dtls` (ADR 0288).
+//! request on every connection. Built only under `-Dtls` (ADR 212).
 //!
 //! It exists so the plain one has a control. `bench/mem.py --tls` reads
 //! what an idle TLS connection holds against what a plain one holds, and
 //! `wrk` over `https://` reads what the encryption costs a request; both
-//! numbers are in `bench/result/http.md`, and the ones ADR 0288 quotes came
+//! numbers are in `bench/result/http.md`, and the ones ADR 212 quotes came
 //! from here. Nothing is registered that `bench/main.zig` does not
 //! register, because anything added here would be measured as TLS.
 //!

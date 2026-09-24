@@ -16,7 +16,7 @@ page faults per request beside it, since those are where the µs go.
     ./zig-out/bin/nilo-hello &
     python3 bench/paced.py --pid $! --port 8787 --path /health --conns 64 --rate 2000 --secs 10
 
-It is the instrument behind ADR 0272 (a second context switch per request
+It is the instrument behind ADR 199 (a second context switch per request
 at low load, from the scheduler's doze) and the idle-page reading in
 `bench/result/http.md`. Python paces to about a hundred microseconds, so
 keep `--rate` under ~10,000; the server's CPU is what is measured, not the

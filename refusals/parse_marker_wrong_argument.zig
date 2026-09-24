@@ -1,6 +1,6 @@
 //! A `nilo_parse` that takes something other than the text. What arrives from
 //! a request is bytes, and it is `[]const u8` rather than a `nilo.Str`
-//! because a tool module has no Str to name (ADR 0042, ADR 0142).
+//! because a tool module has no Str to name (ADR 038, ADR 113).
 
 const nilo = @import("nilo_http");
 

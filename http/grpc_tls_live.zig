@@ -1,5 +1,5 @@
 //! gRPC over TLS: a listener with `.grpc` and `.tls` both set offers `h2` by
-//! ALPN and nothing else ([ADR 0297](../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+//! ALPN and nothing else ([ADR 220](../docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md)).
 //!
 //! The client is tls.zig's own, the library the server runs on, because std's
 //! TLS client sends no ALPN. That makes this evidence that the protocol was

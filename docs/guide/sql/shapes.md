@@ -8,7 +8,7 @@ A Row can say three more things about itself:
 - **children**: a field `[]const C` of rows that point back at this one, read by one more statement for every row at once;
 - **a sum**: `nilo_aggregate`, which makes the Row one row per group.
 
-All three go on a narrower Row, one with `pub const nilo_table = <TheTablesRow>`. The Row that describes the table stays the table's columns and nothing else, because that is what migrations read ([ADR 0295](../../adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+All three go on a narrower Row, one with `pub const nilo_table = <TheTablesRow>`. The Row that describes the table stays the table's columns and nothing else, because that is what migrations read ([ADR 218](../../adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
 
 ## The tables
 

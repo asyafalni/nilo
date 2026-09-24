@@ -1,8 +1,8 @@
 //! A `SELECT` list with fewer columns than the Row it fills. `db.raw` fills
 //! by position, so a short list leaves the last fields reading a column that
 //! is not there — which used to be a panic in ReleaseSafe on the first row
-//! ([ADR 0134](../../docs/adr/0134-a-select-list-shorter-than-the-row-is-refused.md))
-//! and is now counted while compiling (ADR 0148).
+//! ([ADR 106](../../docs/adr/106-a-select-list-shorter-than-the-row-is-refused.md))
+//! and is now counted while compiling (ADR 051).
 
 const std = @import("std");
 const nilo = @import("nilo_http");

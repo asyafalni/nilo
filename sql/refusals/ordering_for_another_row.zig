@@ -1,7 +1,7 @@
 //! An ordering declared for one Row, used on another. Its columns were checked
 //! against the Row it was declared for, so on any other Row the check said
 //! nothing
-//! ([ADR 0204](../../docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+//! ([ADR 165](../../docs/adr/165-an-order-chosen-at-run-time-from-a-closed-set.md)).
 
 const sql = @import("nilo_sql");
 

@@ -1,9 +1,9 @@
 //! nilo_config — settings out of the environment, and nothing that needs a
-//! loop (ADR 0043).
+//! loop (ADR 039).
 //!
 //! A **tool module**: one job, no event loop, and it imports nothing at all
 //! — not even `nilo_core`, which is why `zig test config/config.zig` runs
-//! the whole of it (ADR 0042).
+//! the whole of it (ADR 038).
 //!
 //! ```zig
 //! const config = @import("nilo_config");
@@ -30,18 +30,18 @@
 //! module's: `std.Io.File.stderr().writer(init.io, &buf)`, and `.interface`
 //! is the writer. The `io` comes from `main`'s own argument, which is also
 //! what opens a `.env` — `docs/guide/config.md` writes the whole `main` out,
-//! and that page's version is compiled by `zig build snippets` (ADR 0083).
+//! and that page's version is compiled by `zig build snippets` (ADR 068).
 //!
 //! **A field is a setting and its name is the variable.** `database_url` is
 //! read from `DATABASE_URL`; a default is what "not set" means; a `?T` is a
 //! setting that may be absent. That is the same sentence
-//! [ADR 0012](../docs/adr/0012-the-query-string-is-a-struct-of-your-own.md)
+//! [ADR 011](../docs/adr/011-the-query-string-is-a-struct-of-your-own.md)
 //! wrote about a query string, and the same one
-//! [ADR 0036](../docs/adr/0036-a-binding-hands-its-failures-to-the-handler.md)
+//! [ADR 034](../docs/adr/034-a-binding-hands-its-failures-to-the-handler.md)
 //! wrote about a binding — which is the argument for this module existing
 //! at all. A person who has read a `Query(T)` has already read this.
 //!
-//! **What it will not do is open a file** (ADR 0064). No path is passed to
+//! **What it will not do is open a file** (ADR 039). No path is passed to
 //! anything here and `std.fs` is not imported, which is what keeps the
 //! module allocation-free and runnable under a plain `zig test`. A `.env` is
 //! read as *text somebody else read*, and TOML or YAML arrive as pairs
@@ -96,7 +96,7 @@ pub const Map = source_mod.Map;
 /// own parsed values through.
 pub const Fixed = source_mod.Fixed;
 /// A `.env`'s text, read as a source. The file is the caller's to open
-/// (ADR 0064).
+/// (ADR 039).
 pub const Dotenv = dotenv_mod.Dotenv;
 /// One line of a `.env` that meant to be a setting and is not.
 pub const BadLine = dotenv_mod.BadLine;

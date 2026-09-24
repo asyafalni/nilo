@@ -1,5 +1,5 @@
 //! A bucket is a type, and a key is not
-//! ([ADR 0068](../docs/adr/0068-a-bucket-is-a-type-and-a-key-is-not.md)).
+//! ([ADR 059](../docs/adr/059-a-bucket-is-a-type-and-a-key-is-not.md)).
 //!
 //! ```zig
 //! const Avatars = s3.Bucket("avatars", .{ .max_bytes = 5 << 20 });
@@ -13,7 +13,7 @@
 //! ```
 //!
 //! Two buckets are two types, therefore two Services, and which one a handler
-//! reaches is written in its argument list — the shape ADR 0060 already chose
+//! reaches is written in its argument list — the shape ADR 054 already chose
 //! for a second database. The type-keyed registry resolves `*Avatars` with
 //! nothing added to it, and a program registering two buckets of the same type
 //! is refused by the check that is already there.
@@ -24,7 +24,7 @@
 //! than of the deployment.** The name, the addressing style, the ceilings and
 //! the encryption are the bucket's; the endpoint, the region and the
 //! credentials are the deployment's, and they come from a `Config` so that
-//! development and production are one binary (ADR 0043).
+//! development and production are one binary (ADR 039).
 //!
 //! That looks like it gives up what putting the bucket in a type was for, and
 //! it does not: **the win was never comptime, it was not formatting a host per
@@ -71,7 +71,7 @@ pub const Sse = enum {
 };
 
 /// A slice of an object, as two numbers rather than a string
-/// ([ADR 0021](../docs/adr/0021-a-range-is-a-slice-and-two-headers.md) settled
+/// ([ADR 020](../docs/adr/020-a-range-is-a-slice-and-two-headers.md) settled
 /// the vocabulary). `s3` declares its own rather than duck-typing one: duck
 /// typing earns its place for a three-field `Upload` a caller already holds,
 /// not for two integers.
@@ -98,7 +98,7 @@ pub const Options = struct {
     /// The longest key this bucket will build a URL for.
     ///
     /// It is a comptime number because it is stack: a key is percent-encoded
-    /// into a buffer sized `3 × key_max`, and by ADR 0063 a handler's stack is
+    /// into a buffer sized `3 × key_max`, and by ADR 062 a handler's stack is
     /// held per *connection*. S3's own ceiling is 1,024 bytes and paying 3 KiB
     /// per connection for keys that are almost always under 100 is the wrong
     /// default, so the default is 512 and a program with longer keys says so.
@@ -127,7 +127,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         pub const bucket = name;
         pub const options = settings;
 
-        /// The seven failures of ADR 0068, plus the two every Zig call can
+        /// The seven failures of ADR 059, plus the two every Zig call can
         /// have. Nothing else escapes this module: a TLS handshake that failed
         /// and a socket that was refused are both `Failed`, with the real
         /// cause in the log, because no handler does anything different about
@@ -135,7 +135,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         pub const Error = code.Error || error{OutOfMemory} || std.Io.Cancelable;
 
         /// The same list plus the one answer that is a success and therefore
-        /// may not be one of them (ADR 0024). It exists for exactly the
+        /// may not be one of them (ADR 023). It exists for exactly the
         /// distance between `bounded` and `getIf`, and never reaches a caller.
         const Bounded = Error || error{NotModified};
 
@@ -150,7 +150,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         base: []const u8,
         /// The same two built from the Store's `public_endpoint`, for a URL
         /// handed to a browser — or the two above when there is none. What
-        /// `presign` signs and `presignPost` posts to (ADR 0216).
+        /// `presign` signs and `presignPost` posts to (ADR 177).
         public_host: []const u8,
         public_base: []const u8,
         owned: []u8,
@@ -237,7 +237,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             self.store.gpa.free(self.owned);
         }
 
-        /// Finished when the loop exists, by finishing the Store (ADR 0040).
+        /// Finished when the loop exists, by finishing the Store (ADR 037).
         /// Starting a Store twice is a no-op, so providing two buckets over
         /// one Store is the ordinary case rather than a mistake.
         pub fn nilo_start(self: *Self, io: std.Io, limits: core.Limits) !void {
@@ -277,7 +277,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// A get that may answer *nothing has changed*.
         ///
         /// A 304 is a **success**, so it is a union rather than an error
-        /// (ADR 0024), and the compiler makes the second case unforgettable in
+        /// (ADR 023), and the compiler makes the second case unforgettable in
         /// a way a nullable return would not.
         pub fn getIf(
             self: *Self,
@@ -333,7 +333,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// move through: it goes from the connection's own read buffer to
         /// the writer `pipe` is given, and the buffer this used to take was
         /// a page of stack per connection that no byte ever crossed
-        /// (ADR 0238).
+        /// (ADR 186).
         pub fn stream(
             self: *Self,
             c: anytype,
@@ -363,7 +363,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .headers = headers.slice(),
                 // A 301 from S3 is a bucket in another region, and the
                 // reason is in its body: handed over as itself, so
-                // `failure` reads it (ADR 0239). Never followed, because a
+                // `failure` reads it (ADR 183). Never followed, because a
                 // signature is over one host.
                 .redirects = .expose,
             }) catch |err| return blame(err);
@@ -546,7 +546,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
 
         /// One page of the bucket's keys under a prefix, and where the next
         /// page starts
-        /// ([ADR 0250](../docs/adr/0250-a-list-is-a-page-with-a-cursor-and-nothing-that-follows-it.md)).
+        /// ([ADR 058](../docs/adr/058-most-of-an-s3-client-is-not-s3.md)).
         ///
         /// ```zig
         /// var cursor: ?[]const u8 = null;
@@ -706,7 +706,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .query = query,
                 .payload = sign.unsigned_payload,
                 // The host the browser will send, which is the public one
-                // when there is one: it is inside the signature (ADR 0216).
+                // when there is one: it is inside the signature (ADR 177).
                 .headers = .{ .host = self.public_host },
             }, "host");
 
@@ -742,9 +742,9 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// conditions a request the browser has not made yet has to meet, so it
         /// touches no socket either and the two share everything but the last
         /// step: the signature is one HMAC of the base64 policy with the day's
-        /// key rather than one over a canonical request (ADR 0141). It is in
+        /// key rather than one over a canonical request (ADR 112). It is in
         /// nilo rather than in an application because the alternative puts
-        /// ADR 0069's daily key derivation in two places that have to agree
+        /// ADR 060's daily key derivation in two places that have to agree
         /// about a rotation, and the first anybody hears of a disagreement is
         /// every upload failing at 00:00 UTC.
         ///
@@ -768,8 +768,8 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// `presign` already allocates about 9 KiB in the second case, so this
         /// is the same order rather than a new cost. The stack is 366 bytes of
         /// named buffers plus `session_token_max`, which is less than
-        /// `presign`'s, and deliberately: the policy is arena and by ADR 0063
-        /// a stack buffer is held per *connection* (ADR 0018's second axis).
+        /// `presign`'s, and deliberately: the policy is arena and by ADR 062
+        /// a stack buffer is held per *connection* (ADR 017's second axis).
         pub fn presignPost(self: *Self, c: anytype, key: []const u8, post: Post) Error!Posted {
             comptime core.checkScope(@TypeOf(c), "bucket.presignPost");
             if (key.len > settings.key_max) return error.Rejected;
@@ -809,7 +809,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
 
             // One allocation, holding the document, the base64 of it, the
             // signature and every field value. The policy is up to 3 KiB with a
-            // long key, and by ADR 0063 a stack buffer that size is held per
+            // long key, and by ADR 062 a stack buffer that size is held per
             // *connection*, so it goes in the arena the way `presign`'s URL
             // does. The ceiling is taken and the used part handed back: the
             // arena is reset whole per request, so a second pass to measure
@@ -856,7 +856,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             // off the URL and ignores the field; Garage refuses the form
             // without it — *Key 'bucket' is required in policy, but no value
             // was provided* — and the value is a constant in the binary, so
-            // it is sent everywhere (ADR 0216).
+            // it is sent everywhere (ADR 177).
             fields[n] = .{ .name = "bucket", .value = name };
             n += 1;
             fields[n] = .{ .name = "key", .value = cut(room, &at, key) };
@@ -895,7 +895,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// One place rather than two. `presign` and `presignPost` both hand
         /// back a number somebody will store in a database, and two copies of
         /// this arithmetic is two chances to clamp against a different pair
-        /// (ADR 0141).
+        /// (ADR 112).
         fn life(wanted_seconds: u32, signing: Store.Signing, now_s: i64) Error!u32 {
             var expires = @min(wanted_seconds, settings.presign_max);
             if (signing.expires_at) |dies_at| {
@@ -1163,7 +1163,7 @@ pub const Listed = struct {
 
 /// One page of a listing. `next` is the cursor to hand back as
 /// `Listing.cursor` for the page after this one, and null when this was
-/// the last — the loop that follows it is the caller's (ADR 0250).
+/// the last — the loop that follows it is the caller's (ADR 058).
 pub const Page = struct {
     objects: []const Listed,
     next: ?Str,
@@ -1179,7 +1179,7 @@ pub const Presigned = struct {
 
 /// What one presigned POST asks for. Run time rather than compile time, unlike
 /// a bucket's own options, because a form is built per request and the key it
-/// is built around is data (ADR 0068).
+/// is built around is data (ADR 059).
 pub const Post = struct {
     /// How long the form is good for, clamped the way `presign`'s seconds are.
     seconds: u32,
@@ -1224,7 +1224,7 @@ pub const Posted = struct {
 };
 
 /// The headers that go out beside a signature. A fixed array because the set
-/// is fixed (ADR 0068), so there is nothing to allocate and nothing to sort.
+/// is fixed (ADR 059), so there is nothing to allocate and nothing to sort.
 const Headers = struct {
     items: [10]std.http.Header = undefined,
     len: usize = 0,
@@ -1475,7 +1475,7 @@ test "a bucket's host and prefix are built once, and by the style" {
 test "a public endpoint gives a bucket a second host and base, and none gives it the first" {
     // The process dials the store on a Docker network; the browser reaches
     // it through a proxy on a name. Both are built once at `open`, the way
-    // the dialled pair is (ADR 0216).
+    // the dialled pair is (ADR 177).
     var store = try Store.open(testing.allocator, .{
         .endpoint = "http://garage:3900",
         .public_endpoint = "https://files.example.com/",

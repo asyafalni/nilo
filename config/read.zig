@@ -9,9 +9,9 @@
 //! ```
 //!
 //! **Every bad setting is named at once, and that is the whole feature**
-//! (ADR 0043). A reader that stopped at the first one costs an operator a
+//! (ADR 039). A reader that stopped at the first one costs an operator a
 //! restart per mistake: fix `DATABASE_URL`, run again, discover `PORT`, run
-//! again. The shape is [ADR 0036](../docs/adr/0036-a-binding-hands-its-failures-to-the-handler.md)'s
+//! again. The shape is [ADR 034](../docs/adr/034-a-binding-hands-its-failures-to-the-handler.md)'s
 //! — `value() orelse` and a list of failures — pointed at startup instead of
 //! at a handler, and it is the same shape on purpose: a person who has read
 //! one has read the other.
@@ -22,7 +22,7 @@
 //! `getPosix` hands back a slice of the block the operating system gave the
 //! process, so a Config of `[]const u8` fields points into memory that
 //! outlives every use of it and no copy is made
-//! ([ADR 0018](../docs/adr/0018-the-trade-budget-has-three-axes.md) — this
+//! ([ADR 017](../docs/adr/017-the-trade-budget-has-four-axes.md) — this
 //! module spends nothing on any of the four axes, being over before the
 //! socket opens).
 //!
@@ -115,7 +115,7 @@ pub fn Read(comptime T: type) type {
     // Here rather than in `fill`, because a return type is analysed before
     // the body that would have checked it — `fill(u32, …)` would otherwise
     // stop inside `@typeInfo` with a message about a union field, which is
-    // exactly the kind of failure ADR 0027 exists to stop being acceptable.
+    // exactly the kind of failure ADR 026 exists to stop being acceptable.
     checkConfig(T);
     const fields = @typeInfo(T).@"struct".fields;
 
@@ -137,7 +137,7 @@ pub fn Read(comptime T: type) type {
         /// The Config, or null when any setting could not be read.
         ///
         /// Optional on purpose, and for the reason
-        /// [ADR 0036](../docs/adr/0036-a-binding-hands-its-failures-to-the-handler.md)
+        /// [ADR 034](../docs/adr/034-a-binding-hands-its-failures-to-the-handler.md)
         /// gives: a field that did not convert holds nothing worth reading,
         /// and there is deliberately no way to reach past this into a
         /// half-filled struct. A program that forgot to check would
@@ -243,7 +243,7 @@ pub fn Read(comptime T: type) type {
 /// Fill a `T` from anything that answers `get(name) ?[]const u8`.
 ///
 /// The source is a comptime shape rather than an interface with a function
-/// table, for the reason [ADR 0041](../docs/adr/0041-a-module-sits-where-the-loop-puts-it.md)
+/// table, for the reason [ADR 038](../docs/adr/038-a-module-sits-where-the-loop-puts-it.md)
 /// gives about a Scope: the check refuses an unsuitable type in a sentence
 /// and generates the code a direct call generates.
 pub fn fill(comptime T: type, comptime prefix: []const u8, source: anytype) Read(T) {
@@ -294,7 +294,7 @@ pub fn fill(comptime T: type, comptime prefix: []const u8, source: anytype) Read
 /// A rule with one step is a rule somebody can predict without reading this
 /// file, and the field name is already the shape an environment variable
 /// wants. What it cannot spell is a name that is not the field's own, and
-/// that is a known gap rather than a decision (ADR 0043).
+/// that is a known gap rather than a decision (ADR 039).
 fn envName(comptime prefix: []const u8, comptime field: []const u8) []const u8 {
     comptime {
         var upper: [field.len]u8 = undefined;

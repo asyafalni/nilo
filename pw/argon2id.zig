@@ -1,11 +1,11 @@
 //! Argon2id, and the PHC string it is stored as.
 //!
 //! Everything here is a pure function of its arguments. The salt is one of
-//! them for the reason `nilo_id` takes entropy as one (ADR 0042): entropy
+//! them for the reason `nilo_id` takes entropy as one (ADR 038): entropy
 //! comes from the operating system, and a module in this layer has no
 //! Bulkhead to ask through. So is the allocator, because one hash asks for
 //! **19 MiB** and a number that size is not something a framework hides
-//! (ADR 0048).
+//! (ADR 044).
 //!
 //! ## The Io that is not one
 //!
@@ -42,7 +42,7 @@ pub const hash_len = 32;
 ///
 /// A struct rather than three arguments because it is chosen once for an
 /// application and then never mentioned again, and because a floor can be
-/// checked against one thing (ADR 0048).
+/// checked against one thing (ADR 044).
 pub const Cost = struct {
     /// Kibibytes of memory. The axis that costs an attacker with a GPU.
     memory_kib: u32,
@@ -53,7 +53,7 @@ pub const Cost = struct {
 
     /// OWASP's first recommendation, and what `hash` uses when it is not told
     /// otherwise: 19 MiB, two passes, one lane. Measured at **13.3 ms** on a
-    /// 16-core desktop (ADR 0048).
+    /// 16-core desktop (ADR 044).
     pub const default: Cost = .{ .memory_kib = 19 * 1024, .passes = 2 };
 
     /// The weakest configuration OWASP still publishes — 7 MiB and five
@@ -199,7 +199,7 @@ pub fn hashWith(
 /// such account exists has no hash to check, and returning early there is
 /// what turns a login form into a list of which addresses are registered: the
 /// answer comes back in a millisecond instead of thirteen. Passing null does
-/// the work anyway, against a hash of nothing, and answers false (ADR 0048).
+/// the work anyway, against a hash of nothing, and answers false (ADR 044).
 /// There is no way to write the fast wrong version.
 pub fn verify(gpa: std.mem.Allocator, stored: ?[]const u8, password: []const u8) Error!bool {
     return verifyWith(.default, gpa, stored, password);
@@ -212,7 +212,7 @@ pub fn verify(gpa: std.mem.Allocator, stored: ?[]const u8, password: []const u8)
 /// there is nothing to check, and work at 19 MiB against a deployment that
 /// stores 46 MiB hashes is a stopwatch away from being the same early return
 /// the optional exists to make impossible. Pass the Cost you hash with
-/// (ADR 0049).
+/// (ADR 044).
 ///
 /// A stored hash is checked at the parameters *it* carries either way — that
 /// is what makes an old hash still readable after the Cost goes up.
@@ -400,7 +400,7 @@ test "two hashes of one password differ, because the salt does" {
 
 test "no account is checked anyway, and answers false" {
     // The point is that it does the work rather than returning early. What is
-    // asserted here is the answer; the timing is what ADR 0048 records.
+    // asserted here is the answer; the timing is what ADR 044 records.
     const cheap: Cost = .{ .memory_kib = 8 * 1024, .passes = 1 };
     try testing.expect(!try verifyWith(cheap, testing.allocator, null, "hunter2"));
 }
@@ -409,7 +409,7 @@ test "the work done for an account that is not there is the work a Cost is" {
     // The claim `verifyWith` exists to keep, checked by the one thing about a
     // hash that can be observed without timing it: argon2 asks for `m` KiB
     // and nothing else, so the size of that allocation says which Cost ran.
-    // Before ADR 0049 the no-account path was always `.default` — 19 MiB of
+    // Before ADR 044 the no-account path was always `.default` — 19 MiB of
     // work against a deployment storing 8 MiB hashes, which is a stopwatch
     // away from the early return the optional exists to prevent.
     const cost: Cost = .{ .memory_kib = 8 * 1024, .passes = 1 };
@@ -500,7 +500,7 @@ test "a stored string that is not a hash says so rather than answering false" {
 test "a hash made at another parallelism is still readable" {
     // The property the lone Io buys, and the reason it is not a dodge: a hash
     // that arrived from a library defaulting to p=4 verifies here, run one
-    // lane after another (ADR 0048).
+    // lane after another (ADR 044).
     const gpa = testing.allocator;
     var threaded: std.Io.Threaded = undefined;
     const io = loneIo(&threaded);
@@ -550,7 +550,7 @@ test "the lone Io agrees with a real one" {
 }
 
 test "what one hash asks the allocator for is known before it is asked" {
-    // The number ADR 0048 spends its argument on, and `bytesFor` is where a
+    // The number ADR 044 spends its argument on, and `bytesFor` is where a
     // caller reads it rather than working it out from the parameters.
     try testing.expectEqual(@as(usize, 19_922_944), bytesFor(.default));
     try testing.expectEqual(@as(usize, 8 * 1024 * 1024), bytesFor(.{

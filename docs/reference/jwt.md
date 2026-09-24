@@ -5,7 +5,7 @@ One page of [the reference](./README.md): checking somebody else's signed token.
 ## `nilo_jwt`
 
 Checking somebody else's signed token, and nothing that needs a loop
-([ADR 0140](../adr/0140-nilo-verifies-a-token-and-does-not-fetch-one.md)). A
+([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)). A
 tool module: it imports nothing, so `zig test jwt/jwt.zig` runs the whole of
 it.
 
@@ -70,7 +70,7 @@ verifier that passes every test and is open:
   only compared: `{"alg":"none"}` and an HMAC signed with the RSA modulus
   you published are refused before a key is looked up, and `ES256` over an
   RSA key is a mismatch rather than a request
-  ([ADR 0242](../adr/0242-the-key-decides-the-algorithm.md)).
+  ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 - **Nothing in the payload is read until the signature has passed.** An `exp`
   off an unverified token is a number somebody chose.
 - **`exp` is required.** A credential with no end is not one.
@@ -97,7 +97,7 @@ Strings in the returned claims point into the allocator you passed. Hand it
 A key set that rotates under its readers: the set is swapped whole, the old
 one freed after the verifies reading it are done, and an unknown `kid` is a
 fetch at most once an interval
-([ADR 0255](../adr/0255-a-key-set-is-swapped-whole-and-freed-after-its-readers.md)).
+([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
 The client is a parameter, so the module still imports nothing.
 
 <!-- compiles -->
@@ -115,7 +115,7 @@ fn whoIsThis(c: *nilo.Ctx, google: *jwt.Keyring, api: *fetch.Client, token: []co
 
 | | |
 |---|---|
-| `jwt.Keyring.init(gpa, .{ .url, .issuer, .audience, .leeway_s, .refresh_interval_s, .remember_tokens })` | `!Keyring`, holding no keys: every verify is `NoSuchKey` until `load` or `refresh`. `refresh_interval_s` is 60. `remember_tokens` (default 0) is how many verified tokens the ring remembers by SHA-256 digest, so one seen again skips the signature arithmetic — 400 µs for ES256 — and not the `exp`/`nbf`/`iss`/`aud` checks; a `load` forgets them all ([ADR 0285](../adr/0285-a-verified-signature-is-remembered-by-the-tokens-digest.md)) |
+| `jwt.Keyring.init(gpa, .{ .url, .issuer, .audience, .leeway_s, .refresh_interval_s, .remember_tokens })` | `!Keyring`, holding no keys: every verify is `NoSuchKey` until `load` or `refresh`. `refresh_interval_s` is 60. `remember_tokens` (default 0) is how many verified tokens the ring remembers by SHA-256 digest, so one seen again skips the signature arithmetic — 400 µs for ES256 — and not the `exp`/`nbf`/`iss`/`aud` checks; a `load` forgets them all ([ADR 209](../adr/209-a-verified-signature-is-remembered-by-the-tokens-digest.md)) |
 | `ring.deinit()` | frees the set it holds |
 | `ring.load(bytes)` | parse a JWKS document and make it the set every verify from now on reads; the old set is freed once its readers are done. A document that does not parse leaves the old set in place |
 | `ring.refresh(scope, client, now_s)` | `client.get(scope, url, .{})` and `load` the body; `error.KeysNotAvailable` for anything but a 2xx, with the old set still held. `client` is anything answering `ok()` and `body.view()`, which `fetch.Client` is. Records `now_s` as the last refresh |
@@ -132,7 +132,7 @@ or hold it in a `Verifier` and ask for the claims.
 The ring, the client its refresh needs and the claims type, as one service
 — what [`nilo.Verified(V)`](./handlers.md#verifiedv) names to hand a handler
 the claims behind a bearer token
-([ADR 0260](../adr/0260-verified-claims-are-a-handler-argument.md)). The
+([ADR 191](../adr/191-verified-claims-are-a-handler-argument.md)). The
 client is a type parameter, so the module still imports nothing.
 
 <!-- compiles -->

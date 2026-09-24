@@ -1,6 +1,6 @@
 //! A foreign key naming its table as text, pointing at a table no Row in the
 //! list names. The type check moved one level up rather than away, so the list
-//! is where the name has to resolve (ADR 0222).
+//! is where the name has to resolve (ADR 181).
 
 const sql = @import("nilo_sql");
 

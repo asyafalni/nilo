@@ -1,7 +1,7 @@
 //! What does one more stream cost, if a stream is a fiber of its own?
 //!
 //! HTTP/2 puts many requests on one connection, and nilo serves a request on
-//! a fiber. So the question ADR 0297 has to answer before it can say what a
+//! a fiber. So the question ADR 220 has to answer before it can say what a
 //! gRPC connection costs is what zio charges for a fiber that is parked in the
 //! middle of a handler: spawn them, let each touch K bytes of stack and wait
 //! on an Event, and read VmRSS before and after.

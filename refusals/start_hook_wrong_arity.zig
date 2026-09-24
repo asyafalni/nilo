@@ -1,7 +1,7 @@
 //! A `nilo_start` that takes neither of the two shapes a start hook may have.
 //!
 //! Two are allowed — `(self, io)` for a service that only wants the loop, and
-//! `(self, io, limits)` for one that bounds an outbound call (ADR 0065). A
+//! `(self, io, limits)` for one that bounds an outbound call (ADR 056). A
 //! fourth parameter is a hook nilo would have to guess how to call, and
 //! guessing wrong means a service that never finishes being built.
 

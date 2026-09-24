@@ -4,7 +4,7 @@
 provider, a geocoder, a webhook, somebody's JSON API. It is
 `std.http.Client` — the pool, HTTP/1.1, TLS — with the policy a server needs
 and a script does not put in front of it, in about sixty lines
-([ADR 0070](../adr/0070-a-fitting-borrows-the-loop.md)).
+([ADR 061](../adr/061-a-fitting-borrows-the-loop.md)).
 
 It is a **Fitting**: it borrows the event loop and owns no destination. A
 `sql.Db` holds a pool to one database named in its URL; a `fetch.Client` is
@@ -69,7 +69,7 @@ out with `std.json` into the Scope's arena — the one allocation every caller
 was already paying to `std.json.Stringify.valueAlloc` by hand — and says
 `content-type: application/json`, unless your `headers` name one, which then
 goes instead. What `res.json(T, c)` is for the way in, this is for the way
-out ([ADR 0243](../adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+out ([ADR 061](../adr/061-a-fitting-borrows-the-loop.md)).
 
 <!-- compiles -->
 ```zig
@@ -122,7 +122,7 @@ The last argument is a `Call` — per-call overrides, every field null, so
 
 | Field | |
 |---|---|
-| `headers` | `[]const std.http.Header`, written to the wire in this order. One that std has a slot for — `host`, `authorization`, `user-agent`, `content-type`, `connection`, `accept-encoding` — is sent once, this copy, rather than beside std's own ([ADR 0231](../adr/0231-a-header-std-owns-goes-out-once.md)) |
+| `headers` | `[]const std.http.Header`, written to the wire in this order. One that std has a slot for — `host`, `authorization`, `user-agent`, `content-type`, `connection`, `accept-encoding` — is sent once, this copy, rather than beside std's own ([ADR 182](../adr/182-a-header-std-owns-goes-out-once.md)) |
 | `timeout_ms` | this call's own deadline, over the client's |
 | `stall_ms` | this call's own ceiling on silence, over the client's |
 | `max_body` | this call's own body ceiling, over the client's |
@@ -155,7 +155,7 @@ because the block was kept into the Scope before the body read over it. It
 is the same copy `head.keep(c)` makes on an `Exchange`, made for you here
 because a whole-body call has no other moment to make it — one arena
 allocation the size of the block, beside the body's own
-([ADR 0244](../adr/0244-a-response-carries-its-headers.md)).
+([ADR 187](../adr/187-a-head-that-outlives-its-body.md)).
 
 **A 4xx or a 5xx is a `Response`, not an error.** The call worked and the
 service said no; only the caller knows which of those matters and what to
@@ -198,7 +198,7 @@ going into a URL is percent-encoded**, never pasted — `%2e%2e%2f` in a path
 param is how a caller reaches an endpoint you never meant to offer, and each
 `{}` in a target's path is encoded on the way in with `/` as data, by the
 same `nilo.percent` a query goes through
-([ADR 0066](../adr/0066-percent-is-needed-by-two-layers.md)). **`error.TimedOut`
+([ADR 057](../adr/057-percent-is-needed-by-two-layers.md)). **`error.TimedOut`
 gets its own arm**, because it is the one failure every caller of anything
 has to have an answer for, and 504 says *the thing I asked is slow* where 500
 would say *I am broken*. **A refusal says when to come back**, because the
@@ -218,7 +218,7 @@ the client to write them once — the client is one for the whole program,
 because the pool is in it. **A target is that sentence as a type**: two
 services are two types, opened once on the client, and a handler asks for
 the one it wants the way it asks for a database
-([ADR 0254](../adr/0254-a-target-is-a-type-and-a-path-is-a-template.md)).
+([ADR 061](../adr/061-a-fitting-borrows-the-loop.md)).
 
 <!-- compiles -->
 ```zig
@@ -302,7 +302,7 @@ compiling, in a sentence that says what to write instead.
 **The call's own headers win.** A `Call` on a target is the same `Call`,
 and a line in its `headers` naming `authorization` or `user-agent` goes
 instead of the standing value — one line on the wire, yours, the rule
-[ADR 0231](../adr/0231-a-header-std-owns-goes-out-once.md) already sets for
+[ADR 182](../adr/182-a-header-std-owns-goes-out-once.md) already sets for
 std's own slot. A line naming any other standing header shadows it, so a
 target that says `accept: application/json` can be asked for `text/csv` on
 one call. The ordinary call has no standing headers and costs nothing here;
@@ -329,7 +329,7 @@ Given to `init`, once:
 | `max_body` | 8 MiB | a longer body is `error.BodyTooLarge`, enforced while reading, so a `content-length` that lies cannot get past it |
 | `max_drain` | 64 KiB | how much of an unread body is worth reading to keep a pooled connection. Past it the connection is dropped instead |
 | `read_buffer_size` | 8 KiB | the buffer each connection reads the socket through, and so how much one read brings in. std's own default, passed through; per connection, on the heap beside it |
-| `forward_request_id` | true | a call made under a `*Ctx` carries the request's id as `X-Request-Id`, so the service you called can log the same id you did. Under a `nilo.Run` there is no request and nothing is sent; a call that names its own `X-Request-Id` keeps it ([ADR 0196](../adr/0196-a-request-id-goes-out-with-the-call.md)) |
+| `forward_request_id` | true | a call made under a `*Ctx` carries the request's id as `X-Request-Id`, so the service you called can log the same id you did. Under a `nilo.Run` there is no request and nothing is sent; a call that names its own `X-Request-Id` keeps it ([ADR 158](../adr/158-a-request-id-goes-out-with-the-call.md)) |
 
 **`max_in_flight` is the one that is not a nicety.** `std.http.Client`'s pool
 bounds *idle* connections and does not bound in-use ones at all, so without
@@ -346,12 +346,12 @@ name and never finishes. It is the same reasoning the server's own
 
 **And it fires with or without an Engine.** Under a server the deadline is
 armed on the fiber
-([ADR 0065](../adr/0065-the-way-out-was-open-the-clock-was-not.md)), and
+([ADR 056](../adr/056-the-way-out-was-open-the-clock-was-not.md)), and
 `app.provide` is what hands the client the Engine's `Limits`. A client
 started with `nilo_start(io, .none)` — a test, a CLI, a worker with no server
 around it — has no fiber to arm, so each step of the call runs as a task of
 that `Io` and the task is what gets cancelled when the clock runs out
-([ADR 0230](../adr/0230-a-deadline-with-no-engine-cancels-a-task.md)). The
+([ADR 056](../adr/056-the-way-out-was-open-the-clock-was-not.md)). The
 cost is one thread hop per step, paid only there. Until 0.5 that client had
 `timeout_ms` written down and nothing to fire it, and the first CLI on nilo
 wrote its own watchdog to cover for it; `.off`, the older name for `.none`,
@@ -367,7 +367,7 @@ is the ceiling on silence inside a call**: nothing arriving for that long is
 `error.Stalled`, counted from the last byte that reached you rather than
 from the start. The two compose (`timeout_ms` on the whole, `stall_ms` on
 the gaps) and a caller sets either or both
-([ADR 0237](../adr/0237-a-bound-on-silence-is-not-a-bound-on-the-call.md)).
+([ADR 056](../adr/056-the-way-out-was-open-the-clock-was-not.md)).
 
 <!-- compiles -->
 ```zig
@@ -391,7 +391,7 @@ fn pull(api: *fetch.Client, c: *nilo.Ctx) !void {
 }
 ```
 
-It is not a per-read timeout, which ADR 0230 refused and still refuses: a
+It is not a per-read timeout, which ADR 056 refused and still refuses: a
 server sending one byte a second is *slow*, satisfies this bound, and
 whether slow is acceptable is yours to judge against your other connections.
 What this catches is a server sending nothing. `Stalled` is told apart from
@@ -400,7 +400,7 @@ transfer is restarted on a fresh connection, a call that blew its whole
 budget is given up on.
 
 Under a server it is the Engine's timer, re-armed on every chunk; on a
-client with no Engine it is the same task-and-cancel ADR 0230 built, with
+client with no Engine it is the same task-and-cancel ADR 056 built, with
 the wait re-read from the last byte. Either way a transfer that keeps moving
 never fires it.
 
@@ -431,7 +431,7 @@ and then hands back the compressed bytes — decompressing is a separate call
 there, and a caller who does not make it gets unreadable bytes and no error.
 Decompressing here would cost a 32 KiB flate window on the handler's stack,
 which is held per *connection*
-([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)), so identity
+([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)), so identity
 is the trade taken. A server that ignores the header and gzips anyway is an
 error rather than a `Str` full of noise.
 
@@ -493,19 +493,19 @@ back with `head.redirected` set to the URL it actually came from, so the
 connections after a probe can go straight there rather than walking the
 chain again; the text lives in your buffer, which is why
 `head.location(&buf)` takes one to write into rather than handing back a
-slice ([ADR 0232](../adr/0232-a-followed-redirect-says-where-it-ended.md)).
+slice ([ADR 183](../adr/183-a-redirect-is-a-decision-with-a-name.md)).
 `.expose` is handed the 3xx as itself, which is what a signed request wants
 (a signature is computed over one host and one path, and following would
 send the `authorization` header somewhere it was never meant to go) and
 what a client that reads the body of a 301 wants, which is where S3 puts
-its reason ([ADR 0239](../adr/0239-a-redirect-is-a-decision-with-a-name.md)).
+its reason ([ADR 183](../adr/183-a-redirect-is-a-decision-with-a-name.md)).
 
 **Everything in `Head` points into the connection's read buffer, and the
 first byte of body read overwrites it.** Read what you need before `take` or
 `pipe`, or `head.keep(c)` for a copy in the Scope that reads the same
 afterwards: the `etag` the next run compares against, taken before the body
 and needed after it
-([ADR 0240](../adr/0240-a-head-that-outlives-its-body.md)). That is the
+([ADR 187](../adr/187-a-head-that-outlives-its-body.md)). That is the
 bargain a [borrowed row](./sql/raw.md) makes, for the same reason: the
 alternative is an allocation per call for text most callers glance at once,
 so the borrowed head is the default and the copy is one line where it is
@@ -519,7 +519,7 @@ else. It does not change how much one socket read brings in, which is
 `read_buffer_size` on the client. Until 0.5 the guide said bigger was fewer
 trips, a download manager gave sixteen segments 64 KiB each on the strength
 of it, and the syscall count did not move
-([ADR 0238](../adr/0238-the-transfer-buffer-serves-nothing-here.md)).
+([ADR 186](../adr/186-the-transfer-buffer-serves-nothing-here.md)).
 
 **An `Exchange` must not be copied once begun** — it holds a live
 `std.http.Client.Request`. Declare it, fill it where it stands, leave it
@@ -530,7 +530,7 @@ a `Range` probe that was answered with the whole object — `ex.discard()`
 before the `end` says so, and the connection goes with the body whatever
 `max_drain` would have decided. That keeps `max_drain` a policy for every
 call rather than a lever pulled for one
-([ADR 0235](../adr/0235-a-caller-that-knows-says-discard.md)).
+([ADR 184](../adr/184-a-caller-that-knows-says-discard.md)).
 
 **A body with no length cannot be sent streamed.** `.stream` takes the
 length because HTTP can frame an unknown length only as chunked, and the
@@ -542,19 +542,19 @@ status code.
 
 On the request path, nothing that was not already there: one call is one
 permit, two arena allocations — the header block, then the body
-([ADR 0244](../adr/0244-a-response-carries-its-headers.md)) — the JSON
+([ADR 187](../adr/187-a-head-that-outlives-its-body.md)) — the JSON
 written out or the URL assembled if you asked for either, and the parse if
 you asked for that. **What it costs is per idle connection**, and it is stack: a handler
 that has made one call holds 4,139 bytes more than one that has not, for the
 life of the connection, at the depth `std.http.Client` drives the fiber to
-([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)). That is
+([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)). That is
 still the largest per-connection figure in the toolkit, and the levers left
 are small: taking the 4 KiB transfer buffer out of `send` moved it by 14
 bytes, because a buffer no byte ever touched was never a resident page.
 
 Everything measured is `http://`;
 [`bench/result/fetch.md`](../../bench/result/fetch.md) has the numbers on all
-four of [ADR 0018](../adr/0018-the-trade-budget-has-three-axes.md)'s axes and
+four of [ADR 017](../adr/017-the-trade-budget-has-four-axes.md)'s axes and
 says plainly that nothing has been put on a scale through TLS yet.
 
 ## What it is not
@@ -585,7 +585,7 @@ have done. It binds port 0 and reads the kernel's answer back, so there is
 no port range to keep apart from anybody's; `serveOne` reads the request
 whole and `request()` and `requestBody()` show what reached it, which is
 what a test about a POST wants
-([ADR 0243](../adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+([ADR 061](../adr/061-a-fitting-borrows-the-loop.md)).
 
 <!-- compiles -->
 ```zig
@@ -616,7 +616,7 @@ fn retryAfterIsRead(io: std.Io, gpa: std.mem.Allocator) !void {
 `threaded.io()`. `concurrent` rather than `async`, because `async` may run
 the server on your own thread and sit in `accept` waiting for the connection
 that thread was about to make; the module's tests found that at zero CPU
-([ADR 0230](../adr/0230-a-deadline-with-no-engine-cancels-a-task.md)).
+([ADR 056](../adr/056-the-way-out-was-open-the-clock-was-not.md)).
 
 ## See also
 
@@ -625,5 +625,5 @@ that thread was about to make; the module's tests found that at zero CPU
   it, and the only module that imports a Fitting.
 - [Checking somebody else's token](./jwt.md) — the fetch that gets a JWKS
   document.
-- [ADR 0065](../adr/0065-the-way-out-was-open-the-clock-was-not.md) — why the
+- [ADR 056](../adr/056-the-way-out-was-open-the-clock-was-not.md) — why the
   deadline is on the fiber rather than in std.

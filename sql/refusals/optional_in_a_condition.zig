@@ -2,7 +2,7 @@
 //! `IS NULL`, because the compiler can see the null; an optional that might
 //! be null cannot be read the same way, because whether the statement says
 //! `= $1` or `IS NULL` would then depend on a value that only exists at run
-//! time — and the statement is a constant by then (ADR 0039).
+//! time — and the statement is a constant by then (ADR 036).
 //!
 //! Sending `= $1` with NULL in it is legal SQL and never true, so the query
 //! runs, matches nothing and reports no error. The same failure

@@ -10,7 +10,7 @@
 //! routed by its first keyword and an in-memory database's URI `mode=` beats
 //! the flags a reader was opened with, so a statement that goes the wrong way
 //! quietly succeeds there and fails on a file
-//! ([ADR 0074](../docs/adr/0074-one-writer-is-not-a-setting-it-is-the-database.md)).
+//! ([ADR 065](../docs/adr/065-one-writer-is-not-a-setting-it-is-the-database.md)).
 //! A test that cannot fail the way production does is worse than no test.
 //!
 //! **No Engine anywhere.** `.in_fiber` means a statement runs on the thread it
@@ -92,7 +92,7 @@ const Fixture = struct {
         if (expect) |want| self.db.expecting(want);
         try self.db.nilo_start(self.threaded.io(), .off);
         // The two guards run after the boot work, which a fixture with no
-        // App has none of (ADR 0277): straight after the pool, then.
+        // App has none of (ADR 180): straight after the pool, then.
         try self.db.nilo_check(self.threaded.io());
         return self;
     }
@@ -497,7 +497,7 @@ test "createMissing creates every table the types describe, in reference order" 
 /// The rule a composite foreign key exists to hold: a Card belongs to a Board,
 /// and both belong to the same org. One column cannot say that, and the
 /// alternative is a `.data` step beside the `.unique` it needs — one rule in
-/// two files and a string ([ADR 0222](../docs/adr/0222-a-foreign-key-is-columns-and-a-table-name.md)).
+/// two files and a string ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 const Board = struct {
     pub const nilo_table = .{ .name = "boards", .key = .{ .org_id, .id } };
 
@@ -774,10 +774,10 @@ test "a binary built for a version the database has not reached refuses to serve
 }
 
 test "a Db told what to expect asks the ledger at boot, on the pool it just opened" {
-    // ADR 0220: the version guard is a call on the `Db`, so it runs inside
+    // ADR 180: the version guard is a call on the `Db`, so it runs inside
     // `listen()` on the server's own loop with nothing for the caller to
     // sequence — from `nilo_check`, after the boot work, which is where the
-    // guard sees the ledger a migration in `before` just wrote (ADR 0277).
+    // guard sees the ledger a migration in `before` just wrote (ADR 180).
     // What is pinned here is that boot *reaches* the ledger — a fresh file
     // has none, and after this boot it has one — and that level and ahead go
     // through. Behind is `migrate.expect`'s own refusal, pinned above
@@ -1075,7 +1075,7 @@ test "`status` says `edited` for a version whose file no longer matches what ran
     try testing.expect(std.mem.indexOf(u8, text, "`db verify`") != null);
 }
 
-// -- the `.sql` twin, applied by something that is not nilo (ADR 0227) -----
+// -- the `.sql` twin, applied by something that is not nilo (ADR 123) -----
 
 test "a twin brings a database to head on its own, ledger row and all" {
     // **The one test that makes the twin a file rather than a claim.** Every

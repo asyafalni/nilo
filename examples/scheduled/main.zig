@@ -59,7 +59,7 @@ fn summarise(hits: *Hits) void {
         const delta = hits.sinceLast() catch return;
         // A `std.log` call brings its format machinery onto the stack of
         // whatever fiber it is inlined into, and a suspended fiber holds its
-        // stack at the high-water mark for as long as it lives (ADR 0071).
+        // stack at the high-water mark for as long as it lives (ADR 062).
         // Here that is one fiber for the whole process rather than one per
         // connection, which is the difference between a cost and a budget.
         std.log.info("{d} request(s) in the last five seconds", .{delta});

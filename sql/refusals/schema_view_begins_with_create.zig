@@ -1,6 +1,6 @@
 //! A view written as the whole `CREATE VIEW`. nilo writes that head itself,
 //! for the reason a trigger is two words: the name is the thing the schema
-//! already knows, and a second copy of it stops matching (ADR 0253).
+//! already knows, and a second copy of it stops matching (ADR 181).
 
 const sql = @import("nilo_sql");
 

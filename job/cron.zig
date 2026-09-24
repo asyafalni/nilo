@@ -8,7 +8,7 @@
 //!
 //! The text is comptime and the parse is comptime, so a field out of range or
 //! a stray character is a compile error naming the field rather than a job
-//! that never runs ([ADR 0199](../docs/adr/0199-a-schedule-is-a-type-that-makes-the-caller-choose.md)).
+//! that never runs ([ADR 161](../docs/adr/161-a-schedule-is-a-type-that-makes-the-caller-choose.md)).
 //! What comes out is five bitsets, and `next` walks forward from a moment to
 //! the first minute they all admit.
 //!
@@ -114,7 +114,7 @@ fn bitSet(comptime T: type, set: T, n: anytype) bool {
 ///
 /// Comptime only: there is no run-time parser, because a schedule read out of
 /// a config file at start-up would be a schedule the compiler cannot check,
-/// and the whole reason this is a type is that it can (ADR 0199).
+/// and the whole reason this is a type is that it can (ADR 161).
 pub fn parse(comptime text: []const u8) Cron {
     return comptime blk: {
         @setEvalBranchQuota(20_000);

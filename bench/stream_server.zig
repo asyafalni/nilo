@@ -2,9 +2,9 @@
 //!
 //! `docs/guide/streaming.md` used to say **~21 KB** a stream and tell the
 //! reader to plan ten thousand of them around it. That figure predates both
-//! [ADR 0063](../docs/adr/0063-a-handlers-stack-is-per-connection.md), which
+//! [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md), which
 //! found that a handler holds its stack at its high-water mark, and
-//! [ADR 0071](../docs/adr/0071-where-a-connection-waits-is-what-it-costs.md),
+//! [ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md),
 //! which took an idle connection to 4,669 bytes. A stream is neither of those:
 //! it is a handler that has not returned, so it holds its buffers **and** its
 //! stack, and neither finding says what the total is. The guide says nothing
@@ -34,9 +34,9 @@
 //!   held stream costs, logger and all.
 //! - `/stream/quiet` — the same, with **no middleware in front of it**, which
 //!   is the control for the logger itself
-//!   ([ADR 0071](../docs/adr/0071-where-a-connection-waits-is-what-it-costs.md)
+//!   ([ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)
 //!   §3: a format string costs stack whether or not it is ever printed).
-//! - `/stream/deep` — 32 KiB of stack touched before the first wait. ADR 0063's
+//! - `/stream/deep` — 32 KiB of stack touched before the first wait. ADR 062's
 //!   `/deep/:id` control on this path: the cost the framework cannot give back,
 //!   because the frame holding it is live for as long as the stream is.
 //!
@@ -103,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
 
     // The control for the logger itself. **Registration order buys nothing
     // here** — `use` says so in as many words, because chains are resolved in
-    // `listen()` — so the exemption is the one ADR 0080 built, attached to the
+    // `listen()` — so the exemption is the one ADR 008 built, attached to the
     // route rather than typed as a second string somewhere else.
     const quiet = app.without(nilo.logger.standard);
     try quiet.get("/stream/quiet", held);

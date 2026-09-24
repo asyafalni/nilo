@@ -4,7 +4,7 @@
 //! the domain. **Text arriving from a request is a `Str` and text a service
 //! owns is a `[]const u8`**, so every shape that is both a body and a row
 //! exists twice — written once as a generic over the text type, which is what
-//! `Meta` and `Section` are ([ADR 0004], guide/openapi.md#named-shapes). And
+//! `Meta` and `Section` are ([ADR 003], guide/openapi.md#named-shapes). And
 //! **the signature is the whole contract**, so anything the API refuses is
 //! spelled as a type here rather than as a check in a handler.
 //!
@@ -90,7 +90,7 @@ pub const NewDoc = Filing(Str);
 /// A PATCH needs three answers where an optional has two: not sent, sent as
 /// null, sent with a value. `Patch(T)` is the field type that keeps all three,
 /// and `= .absent` is not decoration — it is what "the field was not in the
-/// body" means (ADR 0026).
+/// body" means (ADR 025).
 pub const EditDoc = struct {
     title: nilo.Patch(Str) = .absent,
     visibility: nilo.Patch(Visibility) = .absent,

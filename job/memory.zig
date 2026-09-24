@@ -5,7 +5,7 @@
 //! allocated per operation, and when the slots are gone `push` fails with
 //! `error.QueueFull` — **it does not write over an older row**, which is the
 //! one thing separating this from `nilo_cache` and the reason the two are
-//! not one module ([ADR 0198](../docs/adr/0198-a-queue-is-a-table-in-the-database-you-already-have.md)).
+//! not one module ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 //! A cache that forgets is doing its job; a queue that forgets has lost
 //! somebody's email.
 //!
@@ -265,7 +265,7 @@ pub const Memory = struct {
     /// Take a queued row out before it runs. `true` when a `queued` row was
     /// removed; `false` when it is running, finished or absent, since a
     /// row a worker holds is that worker's to finish
-    /// ([ADR 0257](../docs/adr/0257-a-queued-row-can-be-taken-back.md)).
+    /// ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
     pub fn cancel(self: *Memory, scope: anytype, id: contract.Id) !bool {
         _ = scope;
         self.lock.take();

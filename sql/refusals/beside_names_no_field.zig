@@ -1,7 +1,7 @@
 //! A `nilo_beside` naming a field the Row does not have.
 //!
 //! A typo here would otherwise be a marker that quietly names nothing, and
-//! the field it meant would be read as a column (ADR 0217).
+//! the field it meant would be read as a column (ADR 178).
 
 const sql = @import("nilo_sql");
 

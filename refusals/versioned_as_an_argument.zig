@@ -2,7 +2,7 @@
 //! body — which is what a struct by value is — it would land inside
 //! `std.json` being asked to parse a version and a body, which is a message
 //! nilo did not write
-//! ([ADR 0258](../docs/adr/0258-a-version-a-handler-names-is-an-etag.md)).
+//! ([ADR 189](../docs/adr/189-a-version-a-handler-names-is-an-etag.md)).
 
 const nilo = @import("nilo_http");
 

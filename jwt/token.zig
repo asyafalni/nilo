@@ -6,7 +6,7 @@
 //! it published. So `alg` is not an instruction here, it is one more thing
 //! compared — first against the two names this file knows, before any key
 //! is looked up, and then against the one the key that was found answers to
-//! (ADR 0242). A token saying `ES256` over an RSA key is not "try ECDSA"; it
+//! (ADR 111). A token saying `ES256` over an RSA key is not "try ECDSA"; it
 //! is a mismatch, and it is refused the way `none` is.
 //!
 //! **Nothing in the payload is looked at until the signature has passed.**
@@ -15,7 +15,7 @@
 //! The claims come back as a struct of the caller's own — the same bargain
 //! the rest of nilo makes, and the reason `sub` and `email` are fields with
 //! types rather than lookups into a map. The registered claims are checked
-//! whether or not that struct names them (ADR 0140).
+//! whether or not that struct names them (ADR 111).
 
 const std = @import("std");
 const b64 = @import("b64.zig");

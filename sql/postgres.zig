@@ -1,6 +1,6 @@
 //! The Wire, filled in with pg.zig. **The only file in this module allowed
 //! to name pg.zig** — the same rule `src/engine/zio.zig` lives under, for
-//! the same reason (ADR 0002, ADR 0039).
+//! the same reason (ADR 001, ADR 036).
 //!
 //! Everything above this file talks to `wire.zig`'s contract. If pg.zig
 //! stops being maintained, or a second driver turns up, this file is what
@@ -13,7 +13,7 @@
 //! what it is for. So a row that needs to allocate allocates in the request
 //! arena and is freed by the arena reset that ends the request — no `free`,
 //! no leak, and nothing added to the request's allocation budget that the
-//! arena was not already going to do (ADR 0004).
+//! arena was not already going to do (ADR 003).
 //!
 //! **Text in a row is valid only until the next `next()`.** That is pg.zig's
 //! rule, and `wire.zig` passes it along unwrapped rather than hiding it
@@ -45,7 +45,7 @@ pub const Wire = struct {
     pool: *pg.Pool,
     /// What the Engine handed `nilo_start`: every wait on a connection or
     /// its socket is reported through it, so the watchdog counts the fiber
-    /// as parked rather than as a handler holding its thread (ADR 0286).
+    /// as parked rather than as a handler holding its thread (ADR 210).
     limits: core.Limits = .off,
 
     /// One result set, and the connection it is being read from. Both go
@@ -67,7 +67,7 @@ pub const Wire = struct {
         owns_conn: bool = true,
         /// The wait `run` opened and this result is still inside: the
         /// exchange and every row read after it reach the socket, and are
-        /// one park to the watchdog rather than one per row (ADR 0286).
+        /// one park to the watchdog rather than one per row (ADR 210).
         /// Closed by `close`, where the handler has the whole result.
         limits: core.Limits = .off,
         wait: u64 = 0,
@@ -138,7 +138,7 @@ pub const Wire = struct {
         ///
         /// Delete this when pg.zig tells an aborted transaction apart from a
         /// broken connection. It is the only place in nilo that reads
-        /// `_state`, and `postgres.zig` is the one file allowed to (ADR 0039).
+        /// `_state`, and `postgres.zig` is the one file allowed to (ADR 036).
         fn revive(self: *Tx) void {
             if (self.conn.err == null) return;
             if (self.conn._state != .fail) return;
@@ -192,7 +192,7 @@ pub const Wire = struct {
         /// the caller who asked for it.
         ///
         /// **The statement is built rather than a constant, and that does not
-        /// move ADR 0039's line.** The rule is about the shape of a query
+        /// move ADR 036's line.** The rule is about the shape of a query
         /// being settled while compiling; this is a session command with a
         /// `u32` this module printed itself. Nothing a request supplies
         /// reaches it, and there is no `SET` that takes a placeholder — the
@@ -334,7 +334,7 @@ pub const Wire = struct {
     /// off.
     ///
     /// **`pg.Pool.initUri` cannot be used, and finding out why is
-    /// [ADR 0062](../docs/adr/0062-a-pool-that-dialled-itself-whatever-it-was-told.md).**
+    /// [ADR 115](../docs/adr/115-a-boot-dials-the-connection-its-work-needs.md).**
     /// It copies exactly two fields of the `Opts` it is given onto the ones
     /// it parsed out of the URI — `size` and `timeout` — and drops
     /// `connect_on_init_count`, which then defaults to `orelse size` inside
@@ -363,7 +363,7 @@ pub const Wire = struct {
     /// Everything `pg.Pool.init` needs, in one value — which is the point:
     /// `initUri` builds this internally and lets three of its fields be
     /// overwritten, so the fourth is silently whatever it parsed. Built here
-    /// it is one struct literal a test can read (ADR 0062).
+    /// it is one struct literal a test can read (ADR 115).
     fn poolOpts(
         uri: std.Uri,
         arena: std.mem.Allocator,
@@ -381,7 +381,7 @@ pub const Wire = struct {
         // than failing, so a value chosen from the Rows would be paid for
         // again by the first `insertMany` whose tuple is wider than any Row.
         // A few hundred bytes a connection, held for the life of the pool,
-        // against a stack that costs kilobytes (ADR 0063).
+        // against a stack that costs kilobytes (ADR 062).
         return out;
     }
 
@@ -418,7 +418,7 @@ pub const Wire = struct {
     /// The refusals log at `warn` rather than `err` for the reason `wireOf`
     /// in `db.zig` does: the error is returned and is what the caller acts
     /// on, and `std.log.err` fails the test runner for every test that
-    /// provokes it (ADR 0178).
+    /// provokes it (ADR 145).
     fn dialOpts(uri: std.Uri, arena: std.mem.Allocator) !pg.Pool.Opts {
         if (!std.mem.eql(u8, uri.scheme, "postgresql") and
             !std.mem.eql(u8, uri.scheme, "postgres")) return error.InvalidUriScheme;
@@ -645,7 +645,7 @@ pub const Wire = struct {
     ) wire.Error!Rows {
         // The wait stays open until `Rows.close`: the rows are read off the
         // socket one `next` at a time, and a pair around each read would be
-        // two calls and a clock per row (ADR 0286).
+        // two calls and a clock per row (ADR 210).
         const w = self.limits.waiting();
         errdefer self.limits.waited(w);
         var conn = self.pool.acquire() catch return error.Disconnected;
@@ -680,7 +680,7 @@ pub const Wire = struct {
     /// A property of the result set here, so the row `next` stopped on makes
     /// no difference to it — the answer would be the same before the first
     /// one. `fill` asks after the first `next` regardless, because SQLite
-    /// cannot answer any earlier (ADR 0134).
+    /// cannot answer any earlier (ADR 106).
     pub fn width(self: *Wire, rows: *const Rows) usize {
         _ = self;
         return rows.result.number_of_columns;
@@ -712,7 +712,7 @@ pub const Wire = struct {
         // the type: `Int32.decode` verifies the OID is `int4` and refuses
         // `date` (1082). The bytes are a big-endian day count from 2000-01-01,
         // which is the same conversion its `Timestamp` makes for micros, so
-        // this is one shift rather than a parse (ADR 0221).
+        // this is one shift rather than a parse (ADR 181).
         //
         // `row.values[col]` is the raw slice, which `readList` already reads
         // the same way — so this is a seam the driver has rather than a hole
@@ -766,7 +766,7 @@ pub const Wire = struct {
 
     /// The two array shapes pg.zig asserts on rather than refuses, checked
     /// here so they answer with a 500 for one request instead of taking the
-    /// process down (ADR 0008, and the same argument as `db.zig`'s `enumOf`).
+    /// process down (ADR 007, and the same argument as `db.zig`'s `enumOf`).
     ///
     /// This reads the array header out of the column's own bytes, which is
     /// reaching past pg.zig's API — the second place in this file that does,
@@ -961,7 +961,7 @@ fn opened(values: anytype) Opened(@TypeOf(values)) {
 }
 
 /// A pg.zig error, plus whatever the server said about it, as one of the
-/// four this module admits to (ADR 0039).
+/// four this module admits to (ADR 036).
 ///
 /// The mapping is by SQLSTATE rather than by message, because the message
 /// is localised and the code is not. Class 23 is "integrity constraint
@@ -978,7 +978,7 @@ fn translate(conn: *pg.Conn, err: anyerror) wire.Error {
     if (conn.err) |server| {
         if (std.mem.eql(u8, server.code, "23505")) return error.AlreadyExists;
         // The three other codes in class 23 a caller routinely branches on
-        // (ADR 0184). `23503` is the one that matters most: it is the only
+        // (ADR 117). `23503` is the one that matters most: it is the only
         // member of the class that is ordinarily a race rather than a bug, and
         // it used to arrive as `ConstraintViolated` beside a check somebody
         // wrote and a null the code should never have sent.
@@ -997,7 +997,7 @@ fn translate(conn: *pg.Conn, err: anyerror) wire.Error {
         // `NOWAIT` that found the row held. It is the answer the statement
         // was written to get rather than a failure, so it gets a name.
         if (std.mem.eql(u8, server.code, "55P03")) return error.Locked;
-        // The text never reaches the client (ADR 0025); it goes here, where
+        // The text never reaches the client (ADR 024); it goes here, where
         // whoever is reading the log is the person who can fix it.
         std.log.err("nilo_sql: {s} [{s}]", .{ server.message, server.code });
         return error.QueryFailed;
@@ -1005,7 +1005,7 @@ fn translate(conn: *pg.Conn, err: anyerror) wire.Error {
     return switch (err) {
         error.ConnectionBusy, error.ConnectionResetByPeer, error.BrokenPipe => error.Disconnected,
         // **Named rather than silent, and that is the fix**
-        // ([ADR 0146](../docs/adr/0146-a-statement-that-failed-says-what-the-database-said.md)).
+        // ([ADR 117](../docs/adr/117-a-statement-that-failed-says-what-the-database-said.md)).
         // `conn.err` is null whenever the statement never left the process —
         // pg.zig refusing to bind a value is the ordinary way there — so this
         // branch used to log nothing at all and hand back `QueryFailed`. The
@@ -1025,7 +1025,7 @@ fn translate(conn: *pg.Conn, err: anyerror) wire.Error {
 }
 
 /// `translate`, plus the server's own words left where a program can read
-/// them (ADR 0146).
+/// them (ADR 117).
 ///
 /// The copy is not optional: `server.message` points into memory pg.zig owns
 /// per connection, and the connection goes back to the pool on the next line.
@@ -1076,7 +1076,7 @@ fn keepText(arena: std.mem.Allocator, text: []const u8) []const u8 {
 /// replacement on the spot, so a caller sees the same rows either way and the
 /// pool's own `stats()` reads the same too. A test written against behaviour
 /// therefore passes whether or not `revive` above is doing anything, which is
-/// the shape [ADR 0033](../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
+/// the shape [ADR 032](../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
 /// is about. Reading the counter is what makes the fix falsifiable.
 ///
 /// Parsed out of the metrics text because that is the only way pg.zig hands
@@ -1134,7 +1134,7 @@ test "how many connections to dial reaches the pool, which it did not" {
     // falls to `orelse size` inside `Pool.init`. So every pool nilo opened
     // dialled itself in full at startup and died on the first refusal —
     // which made `connect_on_init = 0`, the default, mean the opposite of
-    // what three files said it meant (ADR 0062).
+    // what three files said it meant (ADR 115).
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 

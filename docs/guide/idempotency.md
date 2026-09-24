@@ -133,7 +133,7 @@ extra answers.
 `Status(409, Problem)` the handler chose — all kept, all replayed. So is an
 answer a type wrote itself with `nilo_write`: the record carries its
 `nilo_content_type`, and the replay goes out under the same label
-([ADR 0195](../adr/0195-a-type-can-write-its-own-answer.md)). **What the
+([ADR 157](../adr/157-a-type-can-write-its-own-answer.md)). **What the
 handler failed with is not.** A `fail.conflict(…)`, a `fail.unprocessable(…)`,
 an `error.Disconnected` from the database: the answer goes out, the key is
 released, and the next retry runs the handler again — which is what a retry
@@ -152,14 +152,14 @@ one arena allocation to encode the answer, one cache write, and the JSON
 buffer the answer was going to take anyway. A replay: one cache read into an
 arena allocation of `max_bytes`. **Nothing on the stack** — a `Held` there
 would be `max_bytes` per idle connection for the life of it
-([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)), which is why
+([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)), which is why
 the cache grew `getInto`.
 
 The claim is the part worth knowing about: `putIfAbsent` takes the shard's
 lock around the scan and the write, so two requests racing for one key get
 one handler run between them wherever their threads are. A `get` followed by
 a `put` would have run both
-([ADR 0193](../adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)).
+([ADR 155](../adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
 
 ## Testing
 
@@ -177,5 +177,5 @@ answer carries `Idempotent-Replayed` and the counter moved once.
   and how to size it.
 - [Checking somebody else's token](./jwt.md) — where `.by` usually gets its
   answer.
-- [ADR 0193](../adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)
+- [ADR 155](../adr/155-a-request-answered-once-is-answered-the-same-way-again.md)
   — why it is an argument and not a middleware, and what was refused.

@@ -1,6 +1,6 @@
 //! A type that says it is exactly a `Payload` (`nilo_json_of`) and holds it
 //! under some other name. A document is written as its `value`, so the field
-//! has to be there and has to be that type (ADR 0202).
+//! has to be there and has to be that type (ADR 163).
 
 const nilo = @import("nilo_http");
 

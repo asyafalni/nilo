@@ -2,7 +2,7 @@
 //! type rather than a Row — `[]const u8`, `i64`, `?bool` — and it reads
 //! column one. A `SELECT` list of two into a scalar is one column nobody
 //! reads, so it is counted while compiling the way a Row's list is
-//! ([ADR 0234](../../docs/adr/0234-a-scalar-out-of-raw.md)).
+//! ([ADR 125](../../docs/adr/125-a-row-that-owns-no-table.md)).
 
 const std = @import("std");
 const nilo = @import("nilo_http");

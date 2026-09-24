@@ -1,6 +1,6 @@
 //! A partial index comparing a column against a literal of another type. The
 //! predicate is checked exactly as a condition is, which is what makes it a
-//! vocabulary rather than the string ADR 0153 refused.
+//! vocabulary rather than the string ADR 123 refused.
 
 const sql = @import("nilo_sql");
 

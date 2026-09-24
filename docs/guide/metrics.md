@@ -34,7 +34,7 @@ nilo_requests_in_flight 3
 because the counter is the route's place in the table rather than something
 keyed by the path that arrived. That is why a crawler cannot make you a million
 series, and why counting a request costs no allocation
-([ADR 0100](../adr/0100-the-route-table-is-the-registry.md)).
+([ADR 079](../adr/079-the-route-table-is-the-registry.md)).
 
 **The class is per route and the exact code is per service.** Whether *this*
 route is erroring is a question about the route, and 4xx answers it. Which codes
@@ -54,7 +54,7 @@ that says which kind:
 | `<method not allowed>` | the path exists, the verb does not — a 405 |
 | `<static file>` | served out of a directory loaded by `static()` |
 | `<unparsed>` | a head that never became a request — a 400, 408 or 431 |
-| `<shed>` | a request refused for load: parsed, past `max_in_flight`, answered 503 before it was routed ([ADR 0197](../adr/0197-a-server-past-its-limit-says-so-at-once.md)) |
+| `<shed>` | a request refused for load: parsed, past `max_in_flight`, answered 503 before it was routed ([ADR 159](../adr/159-a-server-past-its-limit-says-so-at-once.md)) |
 
 They are told apart rather than added together because a spike against one
 unnamed bucket answers nothing. A wave of `<unmatched>` is a scanner or a deploy
@@ -77,7 +77,7 @@ try app.metrics(.{ .path = "/internal/metrics" });
 ```
 
 Or leave it on `/metrics` and let the thing in front of you — the proxy that is
-already terminating TLS ([ADR 0028](../adr/0028-tls-is-terminated-in-front.md))
+already terminating TLS ([ADR 027](../adr/027-tls-is-terminated-in-front.md))
 — refuse it from outside.
 
 ## Numbers of your own
@@ -146,7 +146,7 @@ live at different scales wants a longer list, not two lists.
 A counted request does one clock read at each end, walks the bucket boundaries,
 and adds to four counters. It allocates nothing — the test that holds the
 allocation budget for the primary route
-([ADR 0018](../adr/0018-the-trade-budget-has-three-axes.md)) is run a second
+([ADR 017](../adr/017-the-trade-budget-has-four-axes.md)) is run a second
 time with metrics switched on, and still reads one allocation.
 
 The table is allocated when the routes are resolved and never grows: 160 bytes a

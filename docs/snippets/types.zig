@@ -1,5 +1,5 @@
 //! The world every checked snippet in the documentation is compiled against
-//! (ADR 0083).
+//! (ADR 068).
 //!
 //! `zig build snippets` finds each fenced `zig` block in the guide, the
 //! reference and the README that carries a `<!-- compiles -->` line above it,
@@ -54,7 +54,7 @@ pub const Signed = struct { user: u32, admin: bool = false };
 
 /// The row a password-reset link points at, for the `pw.Token` section of
 /// the sessions guide: whose it is, the digest and never the text, and when
-/// it stops working (ADR 0241).
+/// it stops working (ADR 044).
 pub const Reset = struct {
     pub const nilo_table = .{ .name = "password_resets", .key = .id };
 
@@ -65,7 +65,7 @@ pub const Reset = struct {
 };
 
 /// What the cache page keeps: a flat value, because a cache entry outlives the
-/// request that wrote it and so may hold no pointer (ADR 0138).
+/// request that wrote it and so may hold no pointer (ADR 109).
 pub const Cart = struct {
     owner: u64,
     items: u16,
@@ -117,7 +117,7 @@ pub fn sendMail(scope: *nilo.Run, to: Str, subject: []const u8) !void {
 }
 
 /// And the one that runs at three in the morning, with the two choices
-/// ADR 0199 makes the caller make.
+/// ADR 161 makes the caller make.
 pub const Nightly = struct {
     pub const nilo_job = "nightly-report";
     pub const retry: job.Retry = .none;

@@ -1,6 +1,6 @@
 //! gRPC over h2c: one listener's connections, spoken as HTTP/2 with prior
 //! knowledge, each unary call handed to the App as the HTTP/1.1 request it
-//! would have been ([ADR 0297](../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+//! would have been ([ADR 220](../docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md)).
 //!
 //! **A gRPC method is an ordinary route.** `POST /package.Service/Method`,
 //! registered with `app.post`, reached through the same router, middleware,
@@ -16,7 +16,7 @@
 //!
 //! **Unary only.** A call carries one message each way. Streaming calls hold
 //! a stream open for their whole life, which is the one shape that costs a
-//! fiber for as long as it lasts, and they wait for a caller (ADR 0297).
+//! fiber for as long as it lasts, and they wait for a caller (ADR 220).
 //!
 //! **One fiber reads and writes the socket; each call runs on a fiber of its
 //! own.** The connection's fiber parses frames, collects a call's message,
@@ -66,7 +66,7 @@ pub const Host = struct {
     /// `App.handleRequest`, with no waker and no read limits: a call's fiber
     /// never reads from the socket, so there is nothing for either to arm.
     /// `until_ns` is the call's `grpc-timeout` as a `monotonicNanos` reading,
-    /// or 0, and it is the request's deadline (ADR 0133).
+    /// or 0, and it is the request's deadline (ADR 105).
     handle: *const fn (
         ptr: *anyopaque,
         arena: std.mem.Allocator,
@@ -82,7 +82,7 @@ pub const Host = struct {
 /// How many calls one connection may have in flight at once, advertised as
 /// `SETTINGS_MAX_CONCURRENT_STREAMS`. A call is a fiber and the stack its
 /// route touches, so this times that is the most one connection can hold:
-/// about 1.7 MB on a route that reads a database (ADR 0297). Every client
+/// about 1.7 MB on a route that reads a database (ADR 220). Every client
 /// measured queues past it rather than failing, so it caps what a connection
 /// costs and never what it can do.
 pub const max_streams = 100;
@@ -174,7 +174,7 @@ const Shared = struct {
 
     /// A spin, not a lock that parks: what is inside is a pointer or two, and
     /// the waiting it would save costs more than it does. The same trade the
-    /// cache makes, for the same reason (ADR 0138).
+    /// cache makes, for the same reason (ADR 109).
     fn acquire(s: *Shared) void {
         while (s.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
     }
@@ -412,7 +412,7 @@ const Conn = struct {
             }
             if (c.in.bufferedLen() == 0) {
                 // Everything answered since the last wait goes out in one
-                // write, rather than a write for every frame read (ADR 0297).
+                // write, rather than a write for every frame read (ADR 220).
                 c.out.flush() catch break;
                 // Spares are for a connection with calls in flight. One that
                 // is about to wait with none gives them back now rather than
@@ -705,7 +705,7 @@ const Conn = struct {
             // thrown away and nothing is said. §5.1 has a stream this side
             // reset ignore what was already in flight, and an RST for every
             // frame would be a client making this side write, uncounted.
-            // The zig build fuzz -- --frames property found it (ADR 0297).
+            // The zig build fuzz -- --frames property found it (ADR 220).
             try c.discard(len + pad);
             return;
         };
@@ -997,7 +997,7 @@ fn runCall(s: *Stream, on_engine: bool) void {
     defer shared.finish(s);
 
     // The box a fail function writes into, bound to this fiber the way a
-    // connection binds its own (ADR 0007). With no Engine there is no fiber
+    // connection binds its own (ADR 006). With no Engine there is no fiber
     // to bind to, and the fallback slot is the one a test uses.
     var in_flight = fail.InFlight{};
     var binding = bulkhead.binding_unset;
@@ -1834,7 +1834,7 @@ test "a unary call stays inside its budget of heap allocations" {
     }
     // None: the second call reuses the first one's stream and the arena it
     // kept (`spare_arena_keep`). It was four allocations and 3,342 bytes
-    // before streams were kept (ADR 0297).
+    // before streams were kept (ADR 220).
     try testing.expectEqual(@as(usize, 0), results[1].allocs - results[0].allocs);
     try testing.expectEqual(@as(usize, 0), results[1].bytes - results[0].bytes);
 }

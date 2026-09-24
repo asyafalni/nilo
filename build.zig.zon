@@ -11,14 +11,14 @@
         // The driver behind `nilo_sql`, and lazy on purpose: it brings four
         // transitive dependencies of its own (buffer, metrics, xsync, tls),
         // and a project that serves HTTP and never imports the SQL module
-        // should not fetch, build or link any of them (ADR 0039).
+        // should not fetch, build or link any of them (ADR 036).
         //
         // **`.lazy = true` is half of that and the smaller half.** It stops
         // Zig fetching this package while reading the manifest; it does
         // nothing about `build.zig` asking for it, and `b.lazyDependency`
         // *asks* — it answers null on the pass that finds the package missing
         // and enqueues the download. So the calls sit behind `-Dsql`, which is
-        // off for a dependent until they pass `.sql = true`. ADR 0075 is where
+        // off for a dependent until they pass `.sql = true`. ADR 066 is where
         // that was found, a year after the sentence above was published.
         .pg = .{
             .url = "git+https://github.com/lalinsky/pg.zig#ec8cf27d2667a5e0652ebdb9494185f0d7b11c1b",
@@ -29,7 +29,7 @@
         // Unlike pg.zig it brings **no dependencies of its own** — it bundles
         // and statically links the SQLite amalgamation, which is what makes it
         // the whole of the C question rather than the start of it
-        // (ADR 0073). Three files and 47 KB of Zig over the top, which is also
+        // (ADR 064). Three files and 47 KB of Zig over the top, which is also
         // the answer to "what if it stops": `sql/wire.zig` is a seam, and one
         // file gets rewritten rather than every call site.
         .zqlite = .{
@@ -37,7 +37,7 @@
             .hash = "zqlite-0.0.1-RWLaY8M8nAB4m0tlSpT9A5PGUwX_JfWC5VlPjLe7lG2Q",
             .lazy = true,
         },
-        // The TLS 1.3 server behind `-Dtls` (ADR 0288), and lazy for the
+        // The TLS 1.3 server behind `-Dtls` (ADR 212), and lazy for the
         // reason the drivers are: a program that never asks fetches nothing.
         // Pure Zig on `std.crypto`, no C, and pinned to a commit rather than
         // a tag, because it has no tags. The commit, not the branch, is the
@@ -48,7 +48,7 @@
         // handshake from 13.7 to 2.6 ms of server CPU; it is
         // ianic/tls.zig#59 (bench/result/http.md, "What an RSA certificate
         // costs a handshake"). The other adds the server's `offload` option,
-        // which the Engine uses to sign on the blocking pool (ADR 0293). Once
+        // which the Engine uses to sign on the blocking pool (ADR 217). Once
         // both are upstream, the pin goes back to it and the fork is not used
         // again.
         .tls = .{
@@ -57,7 +57,7 @@
             .lazy = true,
         },
     },
-    // One directory per module that ships (ADR 0041), and this list is the
+    // One directory per module that ships (ADR 038), and this list is the
     // one place that has to remember they exist — held by a comptime check
     // in `build.zig`, because a dependent whose package is missing a
     // directory finds out at their own build rather than ours.

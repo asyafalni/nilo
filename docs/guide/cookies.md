@@ -181,6 +181,6 @@ POST /me HTTP/1.1\r\nHost: t\r\nCookie: session=abc123\r\n\r\n
 
 ## See also
 
-- [ADR 0030](../adr/0030-a-cookie-is-a-header-and-set-cookie-is-the-one-that-repeats.md)
+- [ADR 029](../adr/029-a-header-is-checked-once-and-two-of-them-repeat.md)
   — why nothing is decoded, why `Set-Cookie` breaks the replace rule, and why a
   bad value is refused rather than escaped.

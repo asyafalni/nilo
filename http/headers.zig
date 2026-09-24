@@ -20,7 +20,7 @@ const Header = @import("http1.zig").Header;
 /// handler has returned. With every value a literal the compiler puts the
 /// list in static memory and it happens to work; with a computed one — and a
 /// `Location` never is a literal — `Debug` gets away with it and release
-/// segfaults ([ADR 0019](../docs/adr/0019-a-response-owns-its-headers.md)).
+/// segfaults ([ADR 018](../docs/adr/018-a-response-owns-its-headers.md)).
 ///
 /// `of` copies while the list is still alive, which is why it has to be
 /// called where the list is written:
@@ -37,7 +37,7 @@ const Header = @import("http1.zig").Header;
 /// way to set a header without a count to think about.
 pub const Headers = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Headers";
 
     /// How many one response can carry. Enough for the ones a handler
@@ -57,7 +57,7 @@ pub const Headers = struct {
     pub fn of(list: anytype) Headers {
         // The `.one` is doing work: a slice is a pointer too, and
         // dereferencing one is an error from inside this function rather
-        // than the message below — the exact failure ADR 0015 is about.
+        // than the message below — the exact failure ADR 014 is about.
         const items = switch (@typeInfo(@TypeOf(list))) {
             .pointer => |p| if (p.size == .one) list.* else notAList(@TypeOf(list)),
             else => list,

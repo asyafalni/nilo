@@ -1,6 +1,6 @@
 //! A function written as a plain `CREATE FUNCTION`. Applied twice it fails
 //! the second time, and a moved body could not be one step, so the entry has
-//! to open `CREATE OR REPLACE FUNCTION <name>` (ADR 0253).
+//! to open `CREATE OR REPLACE FUNCTION <name>` (ADR 181).
 
 const sql = @import("nilo_sql");
 

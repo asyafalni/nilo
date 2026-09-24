@@ -1,8 +1,8 @@
-//! Scope — one lifetime, and the memory that belongs to it (ADR 0041).
+//! Scope — one lifetime, and the memory that belongs to it (ADR 038).
 //!
 //! A request is the Scope a handler runs in. `Ctx` hands out the request
 //! arena and stamps text with the request's lifetime, and
-//! [ADR 0040](../docs/adr/0040-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md)
+//! [ADR 037](../docs/adr/037-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md)
 //! added those two calls for exactly one reason: a module beside the
 //! framework needed a supported way to allocate for a request and to say
 //! how long the result lives. Naming the pair is all it takes for such a
@@ -11,7 +11,7 @@
 //!
 //! It is a shape checked while compiling, not an interface with a function
 //! table. A vtable would put an indirect call on every allocation a module
-//! makes, which is the path [ADR 0018](../docs/adr/0018-the-trade-budget-has-three-axes.md)
+//! makes, which is the path [ADR 017](../docs/adr/017-the-trade-budget-has-four-axes.md)
 //! guards hardest, to buy a polymorphism nobody has asked for. What is here
 //! instead costs nothing at run time and refuses the wrong type in a
 //! sentence.
@@ -36,7 +36,7 @@ pub fn check(comptime T: type, comptime called: []const u8) void {
 
         // The continuation lines are indented the way every other refusal in
         // nilo indents them, because the build step that holds these messages
-        // matches the first line (ADR 0027).
+        // matches the first line (ADR 026).
         const advice =
             "\n  Pass the `*Ctx` the handler was given, or a `nilo.Run` if there is no request.";
 
@@ -85,7 +85,7 @@ pub fn check(comptime T: type, comptime called: []const u8) void {
 /// which is the point of it being a Scope rather than a bare allocator.
 pub const Run = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Run";
 
     _arena: std.heap.ArenaAllocator,
@@ -99,7 +99,7 @@ pub const Run = struct {
     /// not make.
     _io: ?std.Io = null,
     /// What `give` put here, for `resolve` to hand back
-    /// ([ADR 0165](../docs/adr/0165-a-value-that-reaches-the-bottom.md)).
+    /// ([ADR 133](../docs/adr/133-a-value-that-reaches-the-bottom.md)).
     ///
     /// Keyed by `@typeName`, exactly as `Ctx` keys the values it works out
     /// per request, so the two answer the same question the same way and a
@@ -118,7 +118,7 @@ pub const Run = struct {
     }
 
     /// A Run that can also mint a key
-    /// ([ADR 0160](../docs/adr/0160-a-scope-that-can-mint-a-key.md)).
+    /// ([ADR 128](../docs/adr/128-a-scope-that-can-mint-a-key.md)).
     ///
     /// The same Io a `nilo_sql` pool or an `std.Io.Threaded` was started
     /// with, which a CLI, a seed and a test all have in hand by the time they
@@ -141,7 +141,7 @@ pub const Run = struct {
     }
 
     /// `n` bytes from the operating system's entropy source
-    /// ([ADR 0160](../docs/adr/0160-a-scope-that-can-mint-a-key.md)).
+    /// ([ADR 128](../docs/adr/128-a-scope-that-can-mint-a-key.md)).
     ///
     /// ```zig
     /// const key = id.v7(try scope.entropy(id.Uuid.v7_entropy), nilo.nowMillis());
@@ -157,7 +157,7 @@ pub const Run = struct {
     ///
     /// **What it does is not what `Ctx.entropy` does, and that is the point.**
     /// There the call goes through the Bulkhead, because a syscall straight
-    /// from a fiber stops every request sharing that thread (ADR 0046). Here
+    /// from a fiber stops every request sharing that thread (ADR 042). Here
     /// there is no fiber and nothing to park: this is `std.Io.randomSecure`,
     /// which is the same bytes. The two agree about the *signature*, which is
     /// all a caller written against a Scope can see, and disagree about the
@@ -174,7 +174,7 @@ pub const Run = struct {
     }
 
     /// `entropy` for a caller that cannot say the length while compiling
-    /// ([ADR 0166](../docs/adr/0166-entropy-a-function-pointer-can-carry.md)).
+    /// ([ADR 134](../docs/adr/134-entropy-a-function-pointer-can-carry.md)).
     ///
     /// `entropy` answers `![n]u8`, which is the right shape for the call it
     /// was built for — a v7 key, in the expression that uses it. It is the
@@ -200,7 +200,7 @@ pub const Run = struct {
     }
 
     /// Hand this tick a value, for something further down to ask for
-    /// ([ADR 0165](../docs/adr/0165-a-value-that-reaches-the-bottom.md)).
+    /// ([ADR 133](../docs/adr/133-a-value-that-reaches-the-bottom.md)).
     ///
     /// ```zig
     /// var run = nilo.Run.init(gpa);
@@ -211,7 +211,7 @@ pub const Run = struct {
     /// **This is the half a request does not need.** Under a server the same
     /// value is declared with `nilo_resolve` and worked out from the request
     /// itself, which is what makes "was it set?" a question the compiler
-    /// answers (ADR 0016). A seed and a CLI have no request to work it out
+    /// answers (ADR 015). A seed and a CLI have no request to work it out
     /// from, so somebody has to say it — and saying it once, here, is what
     /// keeps it off the sixty call sites in between.
     ///
@@ -237,12 +237,12 @@ pub const Run = struct {
     }
 
     /// The value of type `V` for this tick, or `error.NotGiven`
-    /// ([ADR 0165](../docs/adr/0165-a-value-that-reaches-the-bottom.md)).
+    /// ([ADR 133](../docs/adr/133-a-value-that-reaches-the-bottom.md)).
     ///
     /// **Spelled the same as `Ctx.resolve` so that one function body compiles
     /// under both**, which is the property the whole Scope exists for and the
     /// second call to be found missing from this side of it — `entropy` was
-    /// the first (ADR 0160). What differs is where the value comes from: a
+    /// the first (ADR 128). What differs is where the value comes from: a
     /// request works it out from a declared resolver, a tick is told.
     ///
     /// `error.NotGiven` rather than a silent null, for the reason a NULL
@@ -255,7 +255,7 @@ pub const Run = struct {
 
     /// The value given under that type name, untyped — what an erased Scope
     /// reads through its table, where the type cannot be said
-    /// ([ADR 0219](../docs/adr/0219-an-erased-scope-answers-what-was-resolved.md)).
+    /// ([ADR 144](../docs/adr/144-a-scope-that-crosses-a-function-pointer.md)).
     /// nilo's own; callers go through `resolve`.
     pub fn resolvedNamed(self: *const Run, type_name: []const u8) ?*const anyopaque {
         for (self._given.items) |entry| {
@@ -283,7 +283,7 @@ pub const Run = struct {
 
 /// A Scope that has been type-erased, for the one place a shape checked while
 /// compiling cannot reach: the other side of a function pointer
-/// ([ADR 0177](../docs/adr/0177-a-scope-that-crosses-a-function-pointer.md)).
+/// ([ADR 144](../docs/adr/144-a-scope-that-crosses-a-function-pointer.md)).
 ///
 /// ```zig
 /// // The bus stores this, and it is one type whether it is called from a
@@ -300,7 +300,7 @@ pub const Run = struct {
 /// ```
 ///
 /// **This is not a second way to write a handler, and it is not the Scope
-/// getting a vtable.** ADR 0041 keeps the ordinary Scope a shape checked while
+/// getting a vtable.** ADR 038 keeps the ordinary Scope a shape checked while
 /// compiling because a vtable would put an indirect call on every allocation a
 /// module makes; every call in nilo and in `nilo_sql` still takes `anytype` and
 /// still costs nothing. This is one erased wrapper, made by whoever is about to
@@ -308,7 +308,7 @@ pub const Run = struct {
 ///
 /// **Why anything needs it.** Zig has no closures, so a callback is a function
 /// pointer and a function pointer cannot be generic over the Scope it runs
-/// under (ADR 0166). Anything with a bus, a queue or a job registry hits this,
+/// under (ADR 134). Anything with a bus, a queue or a job registry hits this,
 /// and the alternative is that each of them writes the same fifty lines of
 /// pointer-and-vtable — each copy a fresh chance to hand a handler the wrong
 /// lifetime.
@@ -326,10 +326,10 @@ pub const Run = struct {
 /// services and a function pointer cannot carry a type to look them up by;
 /// by the time a Scope is erased the middleware that needed the value has
 /// resolved it, and a value nobody resolved is `error.NotGiven`
-/// ([ADR 0219](../docs/adr/0219-an-erased-scope-answers-what-was-resolved.md)).
+/// ([ADR 144](../docs/adr/144-a-scope-that-crosses-a-function-pointer.md)).
 pub const AnyScope = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.AnyScope";
 
     _scope: *anyopaque,
@@ -340,13 +340,13 @@ pub const AnyScope = struct {
     /// third because minting a key is what a reaction does that a query does
     /// not, and it is spelled `Into` rather than `entropy` because a function
     /// pointer names one return type and `![n]u8` is a different one per width
-    /// (ADR 0166). `requestId` is the fourth, and the second that is optional
+    /// (ADR 134). `requestId` is the fourth, and the second that is optional
     /// on the Scope behind it: a `Ctx` has one and a `Run` has none, and a
     /// reaction that dials out wants to name the request that fired it
-    /// ([ADR 0196](../docs/adr/0196-a-request-id-goes-out-with-the-call.md)).
+    /// ([ADR 158](../docs/adr/158-a-request-id-goes-out-with-the-call.md)).
     /// `resolved` is the fifth, by type name for the reason `entropyInto` is
     /// by buffer: the value a request resolved or a tick was given, so that
-    /// who is acting reaches the far side of the pointer (ADR 0219).
+    /// who is acting reaches the far side of the pointer (ADR 144).
     pub const Table = struct {
         arena: *const fn (*anyopaque) std.mem.Allocator,
         str: *const fn (*anyopaque, []const u8) Str,
@@ -373,7 +373,7 @@ pub const AnyScope = struct {
                 "nilo: `nilo.AnyScope.of` needs a Scope with `entropyInto`, and " ++
                     @typeName(P) ++ " has `entropy` alone.\n" ++
                     "  A function pointer names one return type, so the erased call is the one" ++
-                    " that takes a buffer rather than the one that answers `![n]u8` (ADR 0166).\n" ++
+                    " that takes a buffer rather than the one that answers `![n]u8` (ADR 134).\n" ++
                     "  `*Ctx` and `nilo.Run` both have it.",
             );
         }
@@ -421,7 +421,7 @@ pub const AnyScope = struct {
     }
 
     /// The id of the request this Scope was made from, or null when it was
-    /// made from something that is not a request (ADR 0196).
+    /// made from something that is not a request (ADR 158).
     pub fn requestId(self: *AnyScope) ?Str {
         return self._table.requestId(self._scope);
     }
@@ -438,14 +438,14 @@ pub const AnyScope = struct {
     }
 
     /// The same bytes at a width nobody said while compiling — what the vtable
-    /// actually carries (ADR 0166).
+    /// actually carries (ADR 134).
     pub fn entropyInto(self: *AnyScope, buf: []u8) !void {
         return self._table.entropyInto(self._scope, buf);
     }
 
     /// The value of type `V` the Scope behind this one already holds — given
     /// to a `Run`, or resolved for a request before it was erased — or
-    /// `error.NotGiven` ([ADR 0219](../docs/adr/0219-an-erased-scope-answers-what-was-resolved.md)).
+    /// `error.NotGiven` ([ADR 144](../docs/adr/144-a-scope-that-crosses-a-function-pointer.md)).
     ///
     /// The same spelling `Ctx.resolve` and `Run.resolve` have, so a function
     /// body written against either compiles here. What differs is that this
@@ -463,7 +463,7 @@ pub const AnyScope = struct {
 /// What a Scope's `requestId` answers, as an optional whichever way it was
 /// declared. `Ctx.requestId` answers a `Str` — it mints one if it has to — and
 /// `AnyScope` answers `?Str`, so a caller that takes either Scope reads both
-/// through this ([ADR 0196](../docs/adr/0196-a-request-id-goes-out-with-the-call.md)).
+/// through this ([ADR 158](../docs/adr/158-a-request-id-goes-out-with-the-call.md)).
 ///
 /// Null for a Scope with no such declaration, which is what a `Run` is.
 pub fn requestIdOf(comptime S: type, scope: *S) ?Str {
@@ -594,7 +594,7 @@ test "a value given as null is given, and not-given is neither" {
     // ordinary case — a person, not a bot — and an actor nobody set is a bug
     // in the wiring. Collapsing the two makes every bot write look like a
     // human one, for ever, with nothing saying so
-    // ([ADR 0165](../docs/adr/0165-a-value-that-reaches-the-bottom.md)).
+    // ([ADR 133](../docs/adr/133-a-value-that-reaches-the-bottom.md)).
     const Caller = struct { agent: ?u64 };
 
     var run = Run.init(testing.allocator);
@@ -745,7 +745,7 @@ test "an erased Scope carries the request id of the Scope it was made from, and 
 test "an erased Scope answers what the Run behind it was given, and NotGiven for the rest" {
     // Item 80: an event written on the far side of a function pointer has
     // to know who is acting, and the value was given (or resolved) on the
-    // near side. It reaches across by type name (ADR 0219).
+    // near side. It reaches across by type name (ADR 144).
     const Actor = struct { agent: []const u8 };
     const Other = struct { n: u8 };
 
@@ -783,7 +783,7 @@ test "an erased Scope answers what the Run behind it was given, and NotGiven for
 test "a callback stored as a function pointer runs under whichever Scope it is handed" {
     // This is the shape the type was built for, written out: one function
     // pointer, two Scopes, and no generic anywhere. Before this it was fifty
-    // lines of vtable per caller (ADR 0177).
+    // lines of vtable per caller (ADR 144).
     const Reaction = *const fn (scope: *AnyScope, note: []const u8) anyerror!Str;
     const react: Reaction = struct {
         fn run(scope: *AnyScope, note: []const u8) anyerror!Str {

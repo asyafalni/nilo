@@ -5,7 +5,7 @@
 //! navigation — a browser opening a URL puts `text/html` at the front of its
 //! list, and a `<script src>` sends `*/*` — and that difference is what
 //! separates answering a deep link from answering a missing asset with a page
-//! (ADR 0109).
+//! (ADR 087).
 //!
 //! Nothing is allocated and nothing is collected. The header is walked once
 //! and what comes back is one of four answers about the one type the caller
@@ -17,7 +17,7 @@
 //! refusal.** A client that says nothing has not asked for HTML and has not
 //! ruled it out, and the two callers here treat those differently. Collapsing
 //! them is what makes `*/*` from a `fetch()` look like a browser opening a
-//! page, which is the bug ADR 0109 is about.
+//! page, which is the bug ADR 087 is about.
 //!
 //! Quality values are read only far enough to tell zero from anything else.
 //! `q=0` is a refusal and is the one part of the grammar with an effect a

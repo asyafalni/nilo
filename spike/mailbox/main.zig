@@ -1,7 +1,7 @@
 //! What does a connection that can be broadcast to cost, when the wakeup is a
 //! mailbox its own fiber drains?
 //!
-//! [ADR 0029](../../docs/adr/0029-a-spawned-fiber-belongs-to-the-server.md)
+//! [ADR 028](../../docs/adr/028-a-spawned-fiber-belongs-to-the-server.md)
 //! killed the only shape that worked at the time with one number: a second
 //! fiber per connection, 8,673 bytes, against a whole-connection budget of
 //! 8,767. It also said which shape was right and could not be built —
@@ -11,7 +11,7 @@
 //! `spike/completion_queue/` settled that it is not blocked: `CompletionQueue`
 //! is public in the pinned v0.17.0, its cancel path holds, and re-arming
 //! across a broadcast is lossless if only the completion is rebuilt. So the
-//! question is back to the one ADR 0029 asked, and it is a number again.
+//! question is back to the one ADR 028 asked, and it is a number again.
 //!
 //! **What is measured is the difference and nothing else.** Both modes accept
 //! the same connections, spawn exactly one fiber each, and park it forever.
@@ -40,7 +40,7 @@ const Mode = enum { baseline, mailbox };
 /// decide something — drop oldest, drop newest, disconnect.
 ///
 /// `-Dslots=N`, because it is the caller's number and not this spike's: it
-/// belongs to whoever is running the server, and ADR 0020 currently refuses
+/// belongs to whoever is running the server, and ADR 019 currently refuses
 /// to have it at all. Sweeping it is also the only way to see the third cost
 /// in the total, which is neither the machinery nor the ring — see the
 /// README.
@@ -77,7 +77,7 @@ fn hold(mode: Mode, stream: zio.net.Stream, gpa: std.mem.Allocator, up: *std.ato
         .baseline => {
             // What an idle connection does today: park in a read until the
             // client says something. `.none` is no timeout, which is the
-            // honest shape — a WebSocket with no deadline is ADR 0022's
+            // honest shape — a WebSocket with no deadline is ADR 021's
             // recorded hole, not this spike's business.
             var buf: [256]u8 = undefined;
             _ = up.fetchAdd(1, .release);

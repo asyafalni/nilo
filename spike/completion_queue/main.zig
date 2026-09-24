@@ -5,7 +5,7 @@
 //! a handler does not hold needs the fiber that already owns a connection to
 //! be woken by *somebody else* while it sits in a read — otherwise every
 //! connection that can be broadcast to needs a second fiber, which is
-//! 8,673 bytes each and the whole of ADR 0018's per-connection budget over
+//! 8,673 bytes each and the whole of ADR 017's per-connection budget over
 //! again.
 //!
 //! zio#668 asked for `waitForIo` to be exported for this. The answer was that

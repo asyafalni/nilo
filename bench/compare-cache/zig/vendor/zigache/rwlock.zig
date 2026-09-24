@@ -4,7 +4,7 @@
 //! `const Mutex = if (thread_safety) std.Thread.RwLock else void;`. Zig 0.16
 //! has neither `std.Thread.RwLock` nor `std.Thread.Mutex` — both moved behind
 //! `std.Io`, which a plain library has no way to get. This is the same wall
-//! `nilo_cache` hit (ADR 0138), and the answer is the same one: spin.
+//! `nilo_cache` hit (ADR 109), and the answer is the same one: spin.
 //!
 //! **This is the whole patch.** Nothing else in the vendored copy is changed,
 //! so what the benchmark measures is zigache's own algorithms. A spin lock is

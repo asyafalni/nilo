@@ -45,7 +45,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var seed: u64 = bulkhead.monotonicNanos();
 
     // `--frames` throws HTTP/2 connections at the gRPC listener instead of
-    // requests at the parser (`fuzz_frames.zig`, ADR 0297).
+    // requests at the parser (`fuzz_frames.zig`, ADR 220).
     var frames = false;
 
     var args: std.process.Args.Iterator = .init(init.args);

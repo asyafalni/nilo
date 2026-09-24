@@ -1,8 +1,8 @@
 # `nilo_fetch` — what the Fitting costs
 
-The four axes of [ADR 0018](../../docs/adr/0018-the-trade-budget-has-three-axes.md),
+The four axes of [ADR 017](../../docs/adr/017-the-trade-budget-has-four-axes.md),
 measured for the outbound HTTP client
-([ADR 0070](../../docs/adr/0070-a-fitting-borrows-the-loop.md)) before it is
+([ADR 061](../../docs/adr/061-a-fitting-borrows-the-loop.md)) before it is
 called finished. `nilo_fetch` is sixty-five lines of policy around
 `std.http.Client`, so every number here is asked twice: once against a program
 with no client in it at all, and once against the same call made through plain
@@ -43,7 +43,7 @@ overhead rather than a round trip.
 
 ## Memory per idle connection
 
-The axis that decided the design, and the one ADR 0063 makes mandatory: a
+The axis that decided the design, and the one ADR 062 makes mandatory: a
 suspended fiber holds its stack at the high-water mark, so **a handler's cost
 is per connection, not per request.**
 
@@ -99,7 +99,7 @@ so `/warm` was added to serve the same 1,008 bytes out of the same arena with no
 client in it. It costs 2,048. The arena is not where the 16 KB went.
 
 What is left is the fiber's stack, at the depth std drives it to, held per
-connection exactly as ADR 0063 says.
+connection exactly as ADR 062 says.
 
 ## Throughput and p99
 
@@ -119,7 +119,7 @@ first showed the machine has a bad mood and the ratios survived it.
 difference between them is the entire question and it is smaller than the drift.
 
 **`nilo_fetch` is within ±1% of a bare `std.http.Client`** — 0.9% and 1.1%
-behind in run A, 1.0% ahead in run B. That is below the 10% ADR 0018 allows a DX
+behind in run A, 1.0% ahead in run B. That is below the 10% ADR 017 allows a DX
 feature to spend and below this harness's own noise, which is the honest way to
 report it: no measurable cost, rather than a specific small one.
 
@@ -145,17 +145,17 @@ Three stripped `ReleaseFast` executables, identical but for the client:
 Zig at all.
 
 A program that never imports `nilo_fetch` pays **zero** — the first row is the
-whole binary, and the module is not in it. That is the same property ADR 0040
+whole binary, and the module is not in it. That is the same property ADR 037
 buys for `pg.zig` with `.lazy = true`, here for free because an unimported
 module is never analysed.
 
-ADR 0018's running total gains 1,688 bytes, and only for programs that call out.
+ADR 017's running total gains 1,688 bytes, and only for programs that call out.
 
 ## Allocations per call
 
 **Two, and they are the response's header block and its body**, into the
 Scope's arena: the block is `dupe`d before the body reads over it
-([ADR 0244](../../docs/adr/0244-a-response-carries-its-headers.md)), and the
+([ADR 187](../../docs/adr/187-a-head-that-outlives-its-body.md)), and the
 body is `allocRemaining`. Held by a test rather than by this file —
 `test "a call on a warm connection allocates twice: the header block, then the body"`
 in `fetch/live.zig`, which counts through a wrapping allocator the way
@@ -165,7 +165,7 @@ change: a call that never reads a header pays one `memcpy` of a few hundred
 bytes it did not before. An `Exchange` still allocates nothing in `begin`.
 `postJson` and `withQuery` each add one more, for the JSON written out and
 the URL assembled, which is the allocation their callers were already making
-by hand ([ADR 0243](../../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+by hand ([ADR 061](../../docs/adr/061-a-fitting-borrows-the-loop.md)).
 
 The gate is a semaphore with nothing allocated behind it, the deadline arms into
 a slot inside the `Bound` on the stack, and the request head is written into the
@@ -190,12 +190,12 @@ non-empty `Str`, and every byte of it unreadable.
 in a diff:
 
 - **`readerDecompressing` was the alternative**, and it costs a
-  `http.Decompress` plus a 32 KiB flate window. By ADR 0063 that is per
+  `http.Decompress` plus a 32 KiB flate window. By ADR 062 that is per
   *connection* on the handler's stack — twice what the whole call already costs
   there, against the 16,495 measured above.
 - **A setting would be the worst of the three.** The branch would be at
   runtime, so flate would link into every binary that dials out whether or not
-  anybody turned it on. That is ADR 0018's complaint about `docs()`, exactly.
+  anybody turned it on. That is ADR 017's complaint about `docs()`, exactly.
 - **Identity costs 48 bytes** — the difference between the +1,640 first
   measured and the +1,688 in the table — and makes `max_body` count the bytes
   a caller receives rather than the bytes on the wire, which is the more useful
@@ -216,7 +216,7 @@ rather than only in a step somebody remembers to run.
 
 Everything above was taken at `81bd9df`. `dcadb46` landed two days later and
 gave a connection's *stack* pages back once it goes quiet
-([ADR 0063](../../docs/adr/0063-a-handlers-stack-is-per-connection.md),
+([ADR 062](../../docs/adr/062-where-a-connection-waits-is-what-it-costs.md),
 `releaseIdleStack` in `http/engine/zio.zig`), which is precisely the lever the
 ranked list below used to open with — and nothing re-ran this file, so the
 number stood for a month describing a server that no longer existed.
@@ -289,7 +289,7 @@ Ranked, with the three that were already tried marked.
 
 ## The transfer buffer was never a resident page
 
-18 September 2026, `b743876` plus the working tree of ADR 0237 and 0238,
+18 September 2026, `b743876` plus the working tree of ADR 056 and 186,
 `bench/fetch_server.zig` in ReleaseFast, `bench/mem.py` to 5,000, before and
 after interleaved twice, load average under 1.6. A different box again from
 the run above (AMD, 16 threads, Linux 7.2.5), so `/health` is 5,186 here
@@ -306,7 +306,7 @@ rather than 4,679 and only the differences are comparable.
 
 The diff under test takes the 4,096-byte `transfer_buffer` out of
 `Client.send` and adds 64 bytes to `@sizeOf(Exchange)` (928 → 992, ADR
-0237's tap reader). **−14 bytes, both pairs.** A 4 KiB stack array that is
+056's tap reader). **−14 bytes, both pairs.** A 4 KiB stack array that is
 declared `undefined` and never written is never faulted in, so it was never
 in `VmRSS` and taking it out cannot move `VmRSS`; and 64 bytes of struct
 that *are* written land inside a page the frame already touches. That is
@@ -316,7 +316,7 @@ fact on file under "the lever is depth".
 
 What the buffer cost was the claim: three documents said it was the body's
 window, and a download manager planned a mebibyte against it
-([ADR 0238](../../docs/adr/0238-the-transfer-buffer-serves-nothing-here.md)).
+([ADR 186](../../docs/adr/186-the-transfer-buffer-serves-nothing-here.md)).
 
 `/call` over `/bare` is +54 here, where the September run had them equal;
 the two are one run each on a box with 1.5 of load, and the difference is

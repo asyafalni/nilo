@@ -1,5 +1,5 @@
 //! An `ORDER BY` chosen at run time, from a closed set declared while
-//! compiling ([ADR 0204](../docs/adr/0204-an-order-chosen-at-run-time-from-a-closed-set.md)).
+//! compiling ([ADR 165](../docs/adr/165-an-order-chosen-at-run-time-from-a-closed-set.md)).
 //!
 //! `.order = .{ .created_at = .desc }` is settled while compiling, and
 //! `Direction`'s own comment says why: a sort chosen at run time is two
@@ -26,7 +26,7 @@
 //! ```
 //!
 //! `?order=due:desc,title` reads straight into the field: the type parses
-//! itself (`nilo_parse`, ADR 0142), so a key that is not one of the three is
+//! itself (`nilo_parse`, ADR 113), so a key that is not one of the three is
 //! the same 400 a bad number gets, and the document says the field is text.
 //!
 //! **What stays true is that no run-time string reaches the statement.** A
@@ -35,7 +35,7 @@
 //! The request decides *which*; it never decides *what*.
 //!
 //! **What is given up is the plan name.** A statement whose text is assembled
-//! per request is not a constant, and ADR 0057's argument for keeping one
+//! per request is not a constant, and ADR 051's argument for keeping one
 //! prepared is that the set of names a program can use is fixed when it is
 //! built — here it is fixed too, but at (2·keys)^tiers, and a cache that size
 //! on every pooled connection is not a cache. So an ordered statement runs
@@ -92,7 +92,7 @@ pub fn Ordering(comptime Row: type, comptime keys: anytype) type {
         /// Row is refused, because the columns were checked against this one.
         pub const nilo_ordering = Row;
 
-        /// What a nilo compile error calls this type (ADR 0122).
+        /// What a nilo compile error calls this type (ADR 074).
         pub const nilo_type_name = "sql.Ordering(" ++ @typeName(Row) ++ ")";
 
         /// What a 400 says the value has to be, in place of the type's name.
@@ -137,7 +137,7 @@ pub fn Ordering(comptime Row: type, comptime keys: anytype) type {
         /// `due:desc,title` — one key per term, `:asc` or `:desc` behind it
         /// or nothing for ascending. A key that is not declared, an empty
         /// term, and more terms than keys are all null, which is the 400 a
-        /// bad number gets (ADR 0142).
+        /// bad number gets (ADR 113).
         pub fn nilo_parse(text: []const u8) ?Self {
             var self: Self = .{};
             var pieces = std.mem.splitScalar(u8, text, ',');
@@ -387,7 +387,7 @@ fn readKey(comptime Row: type, comptime name: []const u8, comptime said: anytype
 /// The column a key names, spelled the way the answer carries it.
 ///
 /// **A shaped Row is ordered by the names in its answer**
-/// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)):
+/// ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)):
 /// an aggregate by its field, and a parent's column by the path to it,
 /// `.{ .customer, .name }`, answered as `"customer.name"`. A flat Row's
 /// columns are the one-element case of the same thing.

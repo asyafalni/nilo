@@ -1,5 +1,5 @@
 //! Responses written in pieces: a report too long to hold in memory, and a
-//! stream of events a browser watches (ADR 0020).
+//! stream of events a browser watches (ADR 019).
 //!
 //! `zig build run-stream`, then:
 //!
@@ -54,7 +54,7 @@ fn tokens(c: *nilo.Ctx, pace: *Pace) !void {
         try events.send(.{ .name = "token", .data = word });
         // Standing in for whatever is actually slow. `nilo.sleep` takes
         // milliseconds and parks this fiber; `std.Thread.sleep` would stop
-        // every other request sharing its thread (ADR 0014).
+        // every other request sharing its thread (ADR 013).
         //
         // Zero under a test, where there is no Engine to park in and no
         // reason to wait — `pace` is a service so the test can say so.

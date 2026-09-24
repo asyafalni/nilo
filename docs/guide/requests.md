@@ -57,7 +57,7 @@ string.
 
 For one-off reads there is `c.query("q")` on a `*Ctx`, which gives a `?Str` and
 converts nothing. See
-[ADR 0012](../adr/0012-the-query-string-is-a-struct-of-your-own.md) for why the
+[ADR 011](../adr/011-the-query-string-is-a-struct-of-your-own.md) for why the
 struct is the default.
 
 ## JSON bodies
@@ -171,7 +171,7 @@ body" means, and it is also what makes the field optional in the generated
 description. Where "leave it" and "clear it" really are the same thing,
 `incoming.due.orNull()` collapses the two.
 
-See [ADR 0026](../adr/0026-a-patch-needs-three-answers-and-an-optional-has-two.md).
+See [ADR 025](../adr/025-a-patch-needs-three-answers-and-an-optional-has-two.md).
 
 ### Reading the body yourself
 
@@ -189,7 +189,7 @@ wrong for a file.
 It takes the arena as the bytes arrive rather than as `Content-Length` promises
 them, so a client that announces a megabyte and then trickles holds a page
 rather than a megabyte
-([ADR 0105](../adr/0105-a-body-is-taken-as-it-arrives.md)). A body that arrives
+([ADR 083](../adr/083-a-body-is-taken-as-it-arrives.md)). A body that arrives
 normally pays for that in nothing: under a page it is the one allocation it
 always was, over a page it is two.
 
@@ -197,7 +197,7 @@ always was, over a page it is two.
 it** — `c.body()`, `c.json`, a struct argument, a `Form(T)` all see the JSON
 and not the stream, the way they see neither framing. The stock OpenTelemetry
 Collector and most agents that push to a server gzip by default, and until
-[ADR 0251](../adr/0251-a-gzipped-body-is-inflated-into-the-buffer-that-holds-it.md)
+[ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)
 that default met a 415. The compressed bytes are bounded by `max_body`; what
 they inflate to is bounded by the same number, checked against the length the
 stream announces before a byte is inflated, so a small body that would inflate
@@ -245,7 +245,7 @@ before it sends anything. nilo answers `100 Continue` at the moment it commits t
 reading, so a request refused before that gets its final status and **never
 receives the body at all**: over the ceiling, no such route, wrong method, or a
 handler that simply never asks for it
-([ADR 0094](../adr/0094-a-header-is-answered-as-asked-or-refused.md)). There is
+([ADR 073](../adr/073-a-header-is-answered-as-asked-or-refused.md)). There is
 nothing to switch on and nothing to write.
 
 | | |
@@ -260,7 +260,7 @@ nothing to switch on and nothing to write.
 A body left half-read is fine — nilo discards the rest so the connection is
 clean for the next request.
 
-See [ADR 0020](../adr/0020-a-request-that-lasts-is-still-one-request.md).
+See [ADR 019](../adr/019-a-request-that-lasts-is-still-one-request.md).
 
 ## Headers, and the rest
 

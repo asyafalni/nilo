@@ -1,6 +1,6 @@
 //! An extension named in a SQLite schema. SQLite loads an extension into a
 //! connection; there is no statement that creates one, so the list is refused
-//! rather than sent (ADR 0253).
+//! rather than sent (ADR 181).
 
 const sql = @import("nilo_sql");
 

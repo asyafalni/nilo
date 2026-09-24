@@ -2,7 +2,7 @@
 //!
 //! A stop hook puts something down, and a copy has nothing anybody else can
 //! see. Zig makes this easy to write by accident: `self: Mailer` compiles and
-//! does nothing (ADR 0151).
+//! does nothing (ADR 121).
 
 const nilo = @import("nilo_http");
 

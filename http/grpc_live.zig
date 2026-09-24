@@ -1,5 +1,5 @@
 //! The tests of a gRPC listener that need a server actually running
-//! ([ADR 0297](../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+//! ([ADR 220](../docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md)).
 //!
 //! `grpc.zig`'s own tests drive a connection through in-memory buffers, and
 //! there every call runs inline: `bulkhead.spawn` answers `error.NoServer`

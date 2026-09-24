@@ -32,7 +32,7 @@ the end of the connection.
 **Nothing is allocated per piece** — one buffer when the stream opens, and that
 is all, however long it runs. A streamed request costs two allocations whether it
 writes 1 piece or 200
-([ADR 0020](../adr/0020-a-request-that-lasts-is-still-one-request.md)).
+([ADR 019](../adr/019-a-request-that-lasts-is-still-one-request.md)).
 
 `finish()` is required: it writes the marker saying where the body ends. Forget
 it and nilo writes one so the connection stays usable, and logs that it had to.
@@ -99,7 +99,7 @@ large download makes when it resumes.
 reading a `Content-Length` stops there and everything after it is read as the
 beginning of the next response. Finishing short cannot be refused — the head
 has already gone — so the connection closes and the log names both numbers
-([ADR 0128](../adr/0128-a-stream-that-knows-its-length-says-so.md)).
+([ADR 101](../adr/101-a-stream-that-knows-its-length-says-so.md)).
 
 ## Ending, on purpose and otherwise
 
@@ -119,7 +119,7 @@ One fiber each, and **it is not the 4,669 bytes an idle connection costs.** A
 stream is a handler that has not returned, so it holds its buffers — an idle
 connection gives those back, a streaming one is using them — and it holds its
 stack at the high-water mark of everything the handler has touched
-([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)). Turning
+([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)). Turning
 `read_buffer` and `write_buffer` down in `listen()` comes straight off it, which
 it does not for an idle connection.
 

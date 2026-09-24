@@ -1,11 +1,11 @@
-//! Seven claims [ADR 0074](../../docs/adr/0074-one-writer-is-not-a-setting-it-is-the-database.md)
+//! Seven claims [ADR 065](../../docs/adr/065-one-writer-is-not-a-setting-it-is-the-database.md)
 //! makes about SQLite and had not run. It says so itself:
 //!
 //! > Both SQLite behaviours above are stated from its documentation and are to
 //! > be confirmed by a twelve-line program before this ADR is cited as
 //! > evidence.
 //!
-//! This is that program. It runs against the library [ADR 0073](../../docs/adr/0073-a-file-has-no-socket-to-wait-on.md)
+//! This is that program. It runs against the library [ADR 064](../../docs/adr/064-a-file-has-no-socket-to-wait-on.md)
 //! chose, so what it reports is the behaviour nilo would actually ship with
 //! rather than SQLite in the abstract — the two can differ, because the flags
 //! a wrapper passes to `sqlite3_open_v2` decide several of these.
@@ -133,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
         check("5. a shared in-memory database after its last connection closes", "gone", seen);
     }
 
-    // 6. The mechanism ADR 0074 routes `db.raw` through: a reader is opened
+    // 6. The mechanism ADR 065 routes `db.raw` through: a reader is opened
     //    read-only, so a raw that writes is refused by SQLite rather than by
     //    us guessing from the text.
     {
@@ -167,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
     //     in-memory database, because SQLite's URI `mode=` parameter takes
     //     precedence over the flags passed to `sqlite3_open_v2`.
     //
-    //     That matters because ADR 0074 leans on read-only readers as the
+    //     That matters because ADR 065 leans on read-only readers as the
     //     backstop under routing `db.raw` by its first keyword. The backstop
     //     exists on a file and does not exist in memory — so it is one more
     //     thing a suite running entirely in memory would never test.
@@ -186,7 +186,7 @@ pub fn main(init: std.process.Init) !void {
         check("6c. a write down a read-only connection to an in-memory database", "no error", name);
     }
 
-    // 7. The per-connection memory ADR 0074 owes a number for. `cache_size`
+    // 7. The per-connection memory ADR 065 owes a number for. `cache_size`
     //    is negative for "this many KiB" and positive for "this many pages".
     {
         const conn = try zqlite.open(":memory:", flags);
@@ -206,7 +206,7 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    // 8. What a pool connection actually holds, which is the number ADR 0074
+    // 8. What a pool connection actually holds, which is the number ADR 065
     //    says it owes and the one it got wrong on paper. `cache_size` is a
     //    **ceiling**: SQLite grows the page cache as pages are touched and
     //    never past that. So an idle reader and a reader that has scanned the

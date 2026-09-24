@@ -21,7 +21,7 @@
 //! before it goes back to waiting. A handler never sees it and never writes a
 //! branch for it.
 //!
-//! **The speaker never writes to anybody else's socket.** ADR 0029 measured
+//! **The speaker never writes to anybody else's socket.** ADR 028 measured
 //! what happens when it does: the broadcast is performed by the speaker's own
 //! fiber, so it reaches the first client that has stopped reading and blocks
 //! there, and everybody else's messages stop because one client stopped. A
@@ -33,13 +33,13 @@
 //! **What a post is made of.** One allocation per `say`, refcounted, freed by
 //! whichever seat drains it last — not one copy per recipient. The alternative
 //! was an inline copy into every seat, which needs no refcount and no
-//! allocator and was rejected for what it does to the number ADR 0018 calls a
+//! allocator and was rejected for what it does to the number ADR 017 calls a
 //! hard invariant: with the bytes inline, memory per idle connection becomes a
 //! function of how big a message you allow, and a budget you can state turns
 //! into a budget you have to multiply. Here a seat costs the same whether the
 //! room is silent or shouting.
 //!
-//! **A post arrives already framed** (ADR 0052). A server frame carries no
+//! **A post arrives already framed** (ADR 046). A server frame carries no
 //! mask and nothing else that differs by recipient, so the WebSocket header
 //! is built here, once, and every connection in the room writes the same
 //! bytes. Delivery is one `writeAll` per post rather than a header built a
@@ -51,7 +51,7 @@
 //! visit ten thousand, per message.
 //!
 //! **A Room is a Service.** `app.provide(&room)` and it arrives by type like
-//! anything else, which is the whole of ADR 0022's argument for why a
+//! anything else, which is the whole of ADR 021's argument for why a
 //! WebSocket is a handler: nothing here is a registration API, a callback, or
 //! a shape of its own.
 
@@ -69,7 +69,7 @@ pub const Options = struct {
     /// sentence naming the number, which is a server that says what is wrong
     /// rather than one that quietly stops delivering.
     ///
-    /// Sizing it generously is cheap in a way it was not before ADR 0052: an
+    /// Sizing it generously is cheap in a way it was not before ADR 046: an
     /// empty seat costs its own bytes and nothing else, because neither `join`
     /// nor `say` walks past the connections that are actually here.
     seats: usize = 1024,
@@ -86,7 +86,7 @@ pub const Options = struct {
 
 /// What happens to a post for a connection whose backlog is full.
 ///
-/// [ADR 0020](../docs/adr/0020-a-request-that-lasts-is-still-one-request.md)
+/// [ADR 019](../docs/adr/019-a-request-that-lasts-is-still-one-request.md)
 /// refused to have this at all — "a queue with a policy — drop oldest, drop
 /// newest, disconnect — is what a pub/sub layer wants, and nilo is not one".
 /// A room is one, so the refusal is amended rather than ignored, and the
@@ -194,7 +194,7 @@ pub const Error = error{
 
 pub const Room = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Room";
 
     gpa: std.mem.Allocator,
@@ -208,7 +208,7 @@ pub const Room = struct {
     /// walk, and `say` visits the connections that are actually in the room
     /// rather than every seat it was sized for. A room of ten thousand seats
     /// holding three used to cost ten thousand iterations a message; it costs
-    /// three, and four bytes a seat to have (ADR 0052).
+    /// three, and four bytes a seat to have (ADR 046).
     roll: []u32,
     backlog: usize,
     full: Full = .drop_oldest,
@@ -222,7 +222,7 @@ pub const Room = struct {
     /// pushed into a seat's ring and a bell is rung; the bytes reach the wire
     /// on the connection's own fiber, outside every lock in this file. A
     /// client that has stopped reading holds nothing here, so one slow reader
-    /// is never on another's path (ADR 0029).
+    /// is never on another's path (ADR 028).
     ///
     /// Releasing the roster before the loop is not the small change it looks
     /// like. `leave` drains a seat under this lock and `takeSeat` does not
@@ -460,7 +460,7 @@ pub const Room = struct {
     /// Room for one post, with its frame header already written in front of
     /// where the message goes. The header is built here — once — because a
     /// server frame carries no mask and nothing else that differs by
-    /// recipient (ADR 0052).
+    /// recipient (ADR 046).
     fn reserve(self: *Room, kind: websocket.Kind, len: usize) Error!*Post {
         var head: [websocket.max_header]u8 = undefined;
         const framing = websocket.headerFor(&head, kind, len);

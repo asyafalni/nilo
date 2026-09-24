@@ -1,8 +1,8 @@
-//! The API description, worked out from the handler signatures (ADR 0017).
+//! The API description, worked out from the handler signatures (ADR 016).
 //!
 //! FastAPI's one big idea, which nilo was already most of the way to
 //! without noticing: you write the function signature, and everything else
-//! is derived from it (ADR 0015). The typed engine has read those
+//! is derived from it (ADR 014). The typed engine has read those
 //! signatures since stage 3 to decide what to pass in. This reads the same
 //! information to say what the endpoint takes and returns.
 //!
@@ -18,14 +18,14 @@
 //! }}
 //! ```
 //!
-//! Two things about the shape of this file follow from ADR 0018. Everything
+//! Two things about the shape of this file follow from ADR 017. Everything
 //! a route contributes is **comptime data**, not a generated function: one
 //! `Operation` value per route, its slices pointing at read-only memory, and
 //! a single writer walking them. A per-route writer would have put a copy of
 //! the JSON-emitting code in the binary for each one. And nothing here is on
 //! the request path — the document is built once when `listen()` resolves
 //! the routes, and served from memory afterwards like any other file
-//! (ADR 0010).
+//! (ADR 009).
 
 const std = @import("std");
 const http1 = @import("http1.zig");
@@ -45,11 +45,11 @@ pub const Schema = union(enum) {
     integer,
     /// An integer with a bound the server holds: `minimum` for an unsigned
     /// Zig integer, both for a `nilo.Within(min, max)`
-    /// ([ADR 0206](../docs/adr/0206-a-whole-number-inside-a-range-is-a-type.md)).
+    /// ([ADR 167](../docs/adr/167-a-whole-number-inside-a-range-is-a-type.md)).
     bounded: Bounds,
     /// Text with a shape the server holds — `minLength`, `maxLength`, a
     /// `format` — read off a `nilo.Text`
-    /// ([ADR 0264](../docs/adr/0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)).
+    /// ([ADR 193](../docs/adr/193-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)).
     sized: TextShape,
     number,
     boolean,
@@ -60,13 +60,12 @@ pub const Schema = union(enum) {
     nullable: *const Schema,
     object: Object,
     /// A file out of a multipart form — `{"type":"string","format":"binary"}`,
-    /// which is how OpenAPI 3.1 says "bytes" (ADR 0031).
+    /// which is how OpenAPI 3.1 says "bytes" (ADR 030).
     binary,
     /// What a type said about itself, because it writes its own JSON and this
-    /// module cannot read that off its fields (ADR 0076).
+    /// module cannot read that off its fields (ADR 016).
     told: Told,
-    /// A `union(enum)`, in whichever encoding the type asked for (ADR 0077,
-    /// ADR 0085).
+    /// A `union(enum)`, in whichever encoding the type asked for (ADR 016).
     one_of: OneOf,
     /// A type that writes its own JSON and did **not** say what it looks like.
     /// Emitted as `{}` with a note — the fields are known to be the wrong
@@ -106,7 +105,7 @@ const text_marker = "nilo_text";
 /// JSON name the shape it writes, not to give anybody a second way to describe
 /// a struct — a type whose fields *are* its JSON needs none of this, and one
 /// that wants `pattern`, `minimum` and `examples` is asking this module to
-/// become a JSON Schema builder, which ADR 0018 prices and refuses.
+/// become a JSON Schema builder, which ADR 017 prices and refuses.
 pub const Told = struct {
     /// `"string"`, `"integer"`, `"number"`, `"boolean"` — a JSON type.
     type: []const u8,
@@ -132,7 +131,7 @@ pub const Object = struct {
 ///
 /// `tag` is null for the one `std.json` writes — an object with a single key,
 /// the arm's name — and is the discriminator's own key when the type said so
-/// with `nilo_json` ([ADR 0085](../docs/adr/0085-a-type-says-how-its-json-is-spelled.md)).
+/// with `nilo_json` ([ADR 016](../docs/adr/016-the-api-description-comes-from-the-signatures.md)).
 /// The two are different documents, not a different rendering of one: the first
 /// nests the arm under its name, the second puts the name beside the arm's own
 /// fields, and a generated client cannot read one from the other.
@@ -156,7 +155,7 @@ pub const Field = struct {
     /// not required — the same rule `Query(T)` and the body parser follow.
     required: bool,
     /// Whether this parameter takes more than one value, which the document
-    /// has to say *how* ([ADR 0164](../docs/adr/0164-a-query-parameter-that-is-a-list.md)).
+    /// has to say *how* ([ADR 132](../docs/adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)).
     /// `?tag=a,b` and `?tag=a&tag=b` are two wire contracts and a client
     /// generated against the wrong one sends a filter the server reads half
     /// of. Written as `style: form, explode: false`, which is the comma.
@@ -180,7 +179,7 @@ pub const Answer = struct {
     content_type: []const u8,
     schema: ?*const Schema,
     /// Whether this endpoint answers 404 when the thing asked for is not
-    /// there — which is exactly the handlers returning `?T` (ADR 0024). The
+    /// there — which is exactly the handlers returning `?T` (ADR 023). The
     /// only failure mode a signature can state, and so the only one this
     /// document is entitled to promise.
     not_found: bool = false,
@@ -193,12 +192,12 @@ pub const Answer = struct {
     /// exactly like one that answers an empty 200.
     written: bool = false,
     /// Whether this endpoint answers with a `Location` and no body — a
-    /// `Redirect(303)` (ADR 0032). The status is already in `status`; what
+    /// `Redirect(303)` (ADR 031). The status is already in `status`; what
     /// this adds is that the header is part of the promise, which is the
     /// half a client generator has to see to follow it.
     redirect: bool = false,
     /// Whether this endpoint answers with the bytes of a file — a
-    /// `FileBody` (ADR 0037). Written as `application/octet-stream` with
+    /// `FileBody` (ADR 009). Written as `application/octet-stream` with
     /// `{"type":"string","format":"binary"}`, which is OpenAPI's way of
     /// saying "bytes".
     ///
@@ -211,7 +210,7 @@ pub const Answer = struct {
     /// that only promises what the signature settles.
     binary: bool = false,
     /// Whether this endpoint answers with an `ETag` and a 304 to a client
-    /// that sends it back — a `Versioned(T)` (ADR 0258). The body described
+    /// that sends it back — a `Versioned(T)` (ADR 189). The body described
     /// is `T`'s; what this adds is the header on the 200 and the 304 beside
     /// it, which is the half a client that caches has to see.
     versioned: bool = false,
@@ -220,7 +219,7 @@ pub const Answer = struct {
 /// How a request body is expected to arrive on the wire. The shape is
 /// described the same way whichever it is; this is the content type it is
 /// filed under, and a form with a file in it can only be the last one
-/// (ADR 0031).
+/// (ADR 030).
 pub const BodyKind = enum {
     json,
     urlencoded,
@@ -243,23 +242,23 @@ pub const Operation = struct {
     params: []const Param,
     query: []const Field,
     /// The request headers the signature asks for
-    /// ([ADR 0163](../docs/adr/0163-a-header-a-handler-can-be-given.md)).
+    /// ([ADR 131](../docs/adr/131-a-header-a-handler-can-be-given.md)).
     /// Empty for every route that reads its headers with `c.header`, which
     /// nilo cannot see and does not guess at.
     headers: []const Field = &.{},
     /// The `Authorization` header the signature asks for, as the security
     /// scheme a generated client signs in with
-    /// ([ADR 0191](../docs/adr/0191-an-authorization-header-a-handler-can-ask-for.md)).
+    /// ([ADR 153](../docs/adr/153-an-authorization-header-a-handler-can-ask-for.md)).
     security: Security = .none,
     /// Whether a middleware `app.guard` declared stands in front of this
     /// route — the cookie scheme, which no signature can say because the
     /// cookie is read by a guard on the group rather than by the handler
-    /// ([ADR 0252](../docs/adr/0252-the-document-takes-a-guards-word-for-the-cookie.md)).
+    /// ([ADR 153](../docs/adr/153-an-authorization-header-a-handler-can-ask-for.md)).
     /// Settled by `writeOpenApi` from the App's middleware, not at
     /// registration, because `without` and `with` can still move it.
     guarded: bool = false,
     /// Whether the route answers once per `Idempotency-Key`, and so can
-    /// answer 409 and 422 on the key alone (ADR 0193).
+    /// answer 409 and 422 on the key alone (ADR 155).
     idempotent: bool = false,
     body: ?*const Schema,
     body_kind: BodyKind = .json,
@@ -271,7 +270,7 @@ pub const Operation = struct {
     can_reject: bool,
     /// The `operationId`, when the route was given one with `app.named(…)`.
     /// Null is the derived name below
-    /// ([ADR 0149](../docs/adr/0149-a-route-can-say-its-own-name.md)).
+    /// ([ADR 119](../docs/adr/119-a-route-can-say-its-own-name.md)).
     name: ?[]const u8 = null,
 };
 
@@ -294,8 +293,8 @@ pub const Security = enum {
 };
 
 /// The name the cookie scheme is written under. One per document, because
-/// a program has one session cookie (ADR 0035), and the guard that reads
-/// it is declared once (ADR 0252).
+/// a program has one session cookie (ADR 033), and the guard that reads
+/// it is declared once (ADR 153).
 pub const cookie_scheme = "cookieAuth";
 
 pub const Info = struct {
@@ -304,10 +303,10 @@ pub const Info = struct {
     description: []const u8 = "",
     /// The cookie a guarded route is behind, from `app.guard`, or null when
     /// no guard was declared. What `components.securitySchemes.cookieAuth`
-    /// names as `name` (ADR 0252).
+    /// names as `name` (ADR 153).
     cookie: ?[]const u8 = null,
     /// The shape of a failure body, from `app.failures`, or null for nilo's
-    /// own (ADR 0270). Written under `components.schemas.Failure` in place
+    /// own (ADR 024). Written under `components.schemas.Failure` in place
     /// of `error_schema`, so the document describes what the wire carries.
     failure: ?*const Schema = null,
 };
@@ -344,7 +343,7 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
         if (depth >= max_depth) return held(.unknown);
         // The same reason `covers` does it: reading the marker is what checks
         // it, so a marker on a shape it cannot describe is refused rather than
-        // quietly ignored (ADR 0085).
+        // quietly ignored (ADR 016).
         if (mark.marked(T)) _ = mark.of(T);
         if (T == Str) return held(.string);
         // A file is bytes, not the three-field struct it is carried in.
@@ -356,25 +355,25 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
             return held(.{ .nullable = schemaWithin(T.nilo_patch, depth + 1) });
         }
 
-        // A whole number inside a range says its range (ADR 0206). Before
+        // A whole number inside a range says its range (ADR 167). Before
         // the writer check below, because it writes itself as the number and
         // the number's bounds are the thing worth telling a client.
         if (withinOf(T)) |bounds| return held(.{ .bounded = bounds });
-        // Text with a shape says its shape, for the same reason (ADR 0264).
+        // Text with a shape says its shape, for the same reason (ADR 193).
         if (textOf(T)) |shape| return held(.{ .sized = shape });
 
         // **A type that writes its own JSON is not described by its fields**
-        // (ADR 0076). `std.json` calls `jsonStringify` and never looks at the
+        // (ADR 016). `std.json` calls `jsonStringify` and never looks at the
         // struct, so reflecting the struct describes something the server does
         // not send: a `Uuid` went out as a 36-character string and was
         // documented as an object with a `bytes` field, which broke every
         // generated client that read one.
         //
-        // The same test ADR 0039 uses to decide what its generated writer may
+        // The same test ADR 036 uses to decide what its generated writer may
         // touch, asked here for the same reason. What a type says about itself
         // wins; a type that says nothing gets `{}` and a note, because being
         // visibly silent beats being confidently wrong.
-        // **A document is its value** (ADR 0202): `sql.Json(Theme)` sends a
+        // **A document is its value** (ADR 163): `sql.Json(Theme)` sends a
         // `Theme` and is described as one, and `Json(std.json.Value)` falls
         // through to whatever the value says of itself — which for that one
         // is nothing, and `untold` below is the honest answer.
@@ -384,14 +383,14 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
             return held(.untold);
         }
         // **A type that parses itself arrives as text, and its fields are
-        // not what arrives** (ADR 0205). One that said what it looks like is
+        // not what arrives** (ADR 166). One that said what it looks like is
         // described as that; `sql.Ordering` is one, and so is a bounded
         // integer, which says its bounds.
         if (convert.parsesItself(T)) {
             if (@hasDecl(T, "nilo_openapi")) return held(.{ .told = toldOf(T) });
         }
         // **And a type that writes its own body is not JSON at all**
-        // (ADR 0195): the bytes under its label are whatever `nilo_write`
+        // (ADR 157): the bytes under its label are whatever `nilo_write`
         // put there, and the only thing this document can say about them
         // is what the type says with `nilo_openapi` — or that it said
         // nothing, which is the same discipline as above.
@@ -404,13 +403,13 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
             .bool => held(.boolean),
             // An unsigned integer refuses `-1` with a 400, so the document
             // may say so: `minimum: 0` is a promise the signature makes
-            // (ADR 0206).
+            // (ADR 167).
             .int => |i| if (i.signedness == .unsigned) held(.{ .bounded = .{ .min = 0 } }) else held(.integer),
             .comptime_int => held(.integer),
             .float, .comptime_float => held(.number),
 
             // The choices are the names that go out, which is not the same as
-            // the field names once `rename_all` is in play (ADR 0085).
+            // the field names once `rename_all` is in play (ADR 016).
             .@"enum" => |e| blk: {
                 if (mark.marked(T)) break :blk held(.{ .choice = mark.wireNames(T) });
                 var names: []const []const u8 = &.{};
@@ -421,7 +420,7 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
             .optional => |o| held(.{ .nullable = schemaWithin(o.child, depth + 1) }),
 
             // A tagged union has a derivable shape and used to get `{}`
-            // (ADR 0077). `std.json` writes it externally tagged — one object
+            // (ADR 016). `std.json` writes it externally tagged — one object
             // with one key — so JSON Schema says it with `oneOf`. An
             // *untagged* union still gets `{}`, which is the honest answer:
             // nothing in the type says which arm is live, so nothing can.
@@ -433,7 +432,7 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
                     .name = on_the_wire,
                     // A variant carrying nothing has no shape under its name,
                     // and only the internally tagged encoding can say so — the
-                    // name is the whole of the object there (ADR 0085).
+                    // name is the whole of the object there (ADR 016).
                     .schema = if (f.type == void) held(.unknown) else schemaWithin(f.type, depth + 1),
                 }};
                 break :blk held(.{ .one_of = .{
@@ -450,9 +449,9 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
                 // The keys are the names that go out, which is not the same as
                 // the field names once `rename_all` is in play — the same
                 // sentence the enum arm above makes, now true of a struct too
-                // ([ADR 0181](../docs/adr/0181-a-field-name-is-a-spelling-too.md)).
+                // ([ADR 148](../docs/adr/148-a-field-name-is-a-spelling-too.md)).
                 // A document that named `full_name` while the server sent
-                // `fullName` is the failure ADR 0076 already recorded once.
+                // `fullName` is the failure ADR 016 already recorded once.
                 const said = mark.of(T);
                 var fields: []const Field = &.{};
                 for (s.fields) |f| {
@@ -532,7 +531,7 @@ fn withinOf(comptime T: type) ?Bounds {
 /// `T.nilo_openapi`, read field by field rather than coerced.
 ///
 /// It is written as `.{ .type = "string", .format = "uuid" }` in a module that
-/// may not import this one — `nilo_id` imports nothing at all (ADR 0042) — so
+/// may not import this one — `nilo_id` imports nothing at all (ADR 038) — so
 /// it arrives as an anonymous struct and there is no shared type to coerce it
 /// to. Reading it here is also where a mistake gets a sentence: a marker with
 /// no `type` is the one way to write this wrong, and it would otherwise be a
@@ -715,7 +714,7 @@ const Slot = struct {
     contested: bool = false,
     /// The other name this slot answers to, when a shape arrived twice
     /// because its `Str` half and its `Text` half are separate Zig types
-    /// (ADR 0077). Empty for every other slot, which is most of them.
+    /// (ADR 016). Empty for every other slot, which is most of them.
     twin: []const u8 = "",
 };
 
@@ -727,7 +726,7 @@ const Slot = struct {
 /// A list that grows rather than an array of sixty-four: a product of six
 /// contexts reached the fixed ceiling, and past it a shape was written out
 /// in place — a true document whose generated client had lost the name
-/// ([ADR 0209](../docs/adr/0209-a-document-names-every-shape-it-has.md)).
+/// ([ADR 170](../docs/adr/170-a-document-names-every-shape-it-has.md)).
 /// The document is written once, before the server listens, so the list is
 /// the one allocation that is free to make here.
 const Components = struct {
@@ -773,7 +772,7 @@ const Components = struct {
                     } else if (self.lifetimeTwinOf(full, schema)) |i| {
                         // The same shape, once with `Str` in it and once with
                         // `Text` — one JSON shape wearing two Zig lifetimes
-                        // (ADR 0077). Its fields were walked when the first
+                        // (ADR 016). Its fields were walked when the first
                         // half was seen.
                         self.slots.items[i].twin = full;
                         return;
@@ -817,11 +816,11 @@ const Components = struct {
     /// **What splits it is a Zig lifetime, and a lifetime has no rendering in
     /// JSON.** `Meta(Str)` is the body half of a shape and `Meta(Text)` is the
     /// row half, which is the split nilo itself asks for
-    /// ([ADR 0004](../docs/adr/0004-request-arena-and-the-str-type.md)); both
+    /// ([ADR 003](../docs/adr/003-request-arena-and-the-str-type.md)); both
     /// used to reach a generated client as `Meta_Str` and `Meta_Text`,
     /// byte-identical and twice.
     ///
-    /// Narrow on purpose (ADR 0077): only a `_Str`/`_Text` pair over the same
+    /// Narrow on purpose (ADR 016): only a `_Str`/`_Text` pair over the same
     /// stem, and only when the two render the same all the way down. Anything
     /// else keeps its own name — `Page_Order` and `Page_User` share field
     /// names and are not the same shape.
@@ -903,7 +902,7 @@ const Components = struct {
     /// only has to tell two *different* types that rendered to one name apart,
     /// so field names are enough. Merging two shapes into one component says
     /// they are interchangeable to a client, which is a claim about every
-    /// field's type as well (ADR 0077).
+    /// field's type as well (ADR 016).
     ///
     /// Terminates because `max_depth` caps a Schema's height — a type holding
     /// one of its own becomes `unknown` at the eighth level.
@@ -1067,7 +1066,7 @@ pub fn write(gpa: std.mem.Allocator, w: *std.Io.Writer, ops: []const Operation, 
 
     // Only the schemes a route actually takes: a document that lists a
     // scheme nothing uses is a document promising a sign-in that goes
-    // nowhere (ADR 0191).
+    // nowhere (ADR 153).
     var wrote_scheme = false;
     for ([_]Security{ .bearer, .basic }) |which| {
         if (!Components.anySecurity(ops, which)) continue;
@@ -1083,7 +1082,7 @@ pub fn write(gpa: std.mem.Allocator, w: *std.Io.Writer, ops: []const Operation, 
         });
     }
     // The cookie: `apiKey` in a cookie is the one spelling OpenAPI has for
-    // a session, and every generator reads it as "send the cookie" (ADR 0252).
+    // a session, and every generator reads it as "send the cookie" (ADR 153).
     if (info.cookie) |cookie| if (Components.anyGuarded(ops)) {
         try w.writeAll(if (wrote_scheme) "," else ",\"securitySchemes\":{");
         wrote_scheme = true;
@@ -1096,7 +1095,7 @@ pub fn write(gpa: std.mem.Allocator, w: *std.Io.Writer, ops: []const Operation, 
     try w.writeAll("}}");
 }
 
-/// The shape of every failure nilo assembles (ADR 0025). Written out here
+/// The shape of every failure nilo assembles (ADR 024). Written out here
 /// rather than derived from a Zig type, because the type it would be derived
 /// from is a fixed buffer and a status code, not a struct anybody returns.
 const error_schema =
@@ -1138,7 +1137,7 @@ fn writeOperation(w: *std.Io.Writer, components: *const Components, op: Operatio
                 if (f.required) "true" else "false",
             });
             // Which of the two spellings a generated client should send
-            // (ADR 0164). Only on a list, because on a scalar the pair means
+            // (ADR 132). Only on a list, because on a scalar the pair means
             // nothing and every generator would carry it about anyway.
             if (f.list) try w.writeAll("\"style\":\"form\",\"explode\":false,");
             try w.writeAll("\"schema\":");
@@ -1146,7 +1145,7 @@ fn writeOperation(w: *std.Io.Writer, components: *const Components, op: Operatio
             try w.writeByte('}');
         }
         // Last, so that adding one does not move the path and query params a
-        // generated client has already been built against (ADR 0163).
+        // generated client has already been built against (ADR 131).
         for (op.headers, 0..) |f, i| {
             if (i > 0 or op.params.len > 0 or op.query.len > 0) try w.writeByte(',');
             try w.writeAll("{\"name\":");
@@ -1170,9 +1169,9 @@ fn writeOperation(w: *std.Io.Writer, components: *const Components, op: Operatio
 
     // Before the responses, and written whether or not the route can be
     // refused for anything else: the 401 is nilo's, sent before the handler
-    // runs, so the document can promise it (ADR 0191). A guard's cookie and
+    // runs, so the document can promise it (ADR 153). A guard's cookie and
     // a signature's header in one requirement object, which OpenAPI reads
-    // as *both*: the guard ran first and the handler still asked (ADR 0252).
+    // as *both*: the guard ran first and the handler still asked (ADR 153).
     if (op.security != .none or op.guarded) {
         try w.writeAll(",\"security\":[{");
         if (op.guarded) try w.print("\"{s}\":[]", .{cookie_scheme});
@@ -1213,7 +1212,7 @@ fn writeOperation(w: *std.Io.Writer, components: *const Components, op: Operatio
 }
 
 /// A failure this endpoint's signature promises, carrying the shape every
-/// failure nilo assembles has (ADR 0025).
+/// failure nilo assembles has (ADR 024).
 fn writeFailure(w: *std.Io.Writer, status: []const u8, description: []const u8) !void {
     try w.print(",\"{s}\":{{\"description\":", .{status});
     try writeString(w, description);
@@ -1281,7 +1280,7 @@ fn writeAnswer(w: *std.Io.Writer, components: *const Components, answer: Answer)
 /// into a method. Built from the verb and the path so that it is stable
 /// across runs and unique wherever the routes are.
 ///
-/// **Unless the route said its own** (ADR 0149). The derived name is a good
+/// **Unless the route said its own** (ADR 119). The derived name is a good
 /// default and a poor key: it is not a word anybody chose, and it changes when
 /// the path moves. A consumer keying an authorisation table off it wants both
 /// of those the other way round, so `app.named("addPartnerCapability")` puts
@@ -1301,7 +1300,7 @@ fn writeOperationId(w: *std.Io.Writer, op: Operation) !void {
 ///
 /// Public because it is written twice — into the document here, and onto
 /// the `Route` at registration so that `Ctx.routeName` answers the same word
-/// the document prints ([ADR 0201](../docs/adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
+/// the document prints ([ADR 162](../docs/adr/162-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
 /// One copy of the derivation is what keeps those two from drifting, which
 /// is the property an authorisation table keyed by the name depends on.
 pub fn writeDerivedName(w: *std.Io.Writer, method: http1.Method, pattern: []const u8) !void {
@@ -1404,7 +1403,7 @@ fn writeSchema(
         // `{}` means "anything", which is true. The description is there
         // because a reader who sees `{}` on one field of an otherwise precise
         // document should be told it is a gap somebody can close rather than a
-        // shape nobody could name (ADR 0076).
+        // shape nobody could name (ADR 016).
         .untold => try w.writeAll(
             "{\"description\":\"This type writes its own body, and has not said what it looks like." ++
                 " Add `pub const nilo_openapi = .{ .type = \\\"string\\\" };` to it to describe the value it sends.\"}",
@@ -1430,10 +1429,10 @@ fn writeSchema(
         // Externally tagged: `{"link":{"url":"…"}}` — one key, whose name is
         // the arm. Written out as the alternatives rather than as `{}`, which
         // is what a union used to get while serialising perfectly well
-        // (ADR 0077). A void arm carries no value and is the bare key.
+        // (ADR 016). A void arm carries no value and is the bare key.
         //
         // Internally tagged: `{"signal":"metrics","threshold":0.9}` — the arm's
-        // own fields, with the discriminator among them (ADR 0085). The arm may
+        // own fields, with the discriminator among them (ADR 016). The arm may
         // already be a named component, and nothing can be merged into a
         // `$ref`, so the two halves are put side by side with `allOf` — which is
         // the pattern OpenAPI has for exactly this. `discriminator` names the
@@ -1631,7 +1630,7 @@ test "text with a shape says its shape, and a check of the caller's own is not c
 
 test "the plain types map to what JSON Schema calls them" {
     // An unsigned integer is refused below zero, and the document says so
-    // (ADR 0206). A signed one is any integer.
+    // (ADR 167). A signed one is any integer.
     try expectSchema(u32, "{\"type\":\"integer\",\"minimum\":0}");
     try expectSchema(i8, "{\"type\":\"integer\"}");
     try expectSchema(f64, "{\"type\":\"number\"}");
@@ -1714,7 +1713,7 @@ test "a union that says its tag is described with the discriminator beside the f
         logs: struct { query: []const u8 },
     };
     // `allOf` rather than a merge, because the arm may already be a named
-    // component and nothing can be merged into a `$ref` (ADR 0085).
+    // component and nothing can be merged into a `$ref` (ADR 016).
     try expectSchema(Condition,
         \\{"oneOf":[{"allOf":[{"type":"object","properties":{"threshold":{"type":"number"}},"required":["threshold"]},{"type":"object","properties":{"signal":{"type":"string","enum":["metrics"]}},"required":["signal"]}]},{"allOf":[{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]},{"type":"object","properties":{"signal":{"type":"string","enum":["logs"]}},"required":["signal"]}]}],"discriminator":{"propertyName":"signal"}}
     );
@@ -1744,7 +1743,7 @@ test "a renamed variant is described by the name that goes out, not the Zig one"
 }
 
 test "a renamed struct is described by the keys it actually sends" {
-    // The half that has to move with the writer or the document lies. ADR 0076
+    // The half that has to move with the writer or the document lies. ADR 016
     // is this failure once already: a `Uuid` went out as 36 characters and was
     // described as an object with a `bytes` field, and every generated client
     // that read one broke.
@@ -1768,7 +1767,7 @@ test "a renamed enum lists the choices it actually sends" {
         rate_per_second,
     };
     // The document promising `avg` while the server sends `AVG` is the exact
-    // failure ADR 0076 was written about, arriving from a new direction.
+    // failure ADR 016 was written about, arriving from a new direction.
     try expectSchema(Agg, "{\"type\":\"string\",\"enum\":[\"AVG\",\"RATE_PER_SECOND\"]}");
 }
 
@@ -1780,13 +1779,13 @@ test "the same arms under two encodings are two shapes, not one component" {
     };
     // A client cannot read one of these from the other, so merging them under
     // one name would be the `Meta_Str`/`Meta_Text` fix applied where it is
-    // wrong (ADR 0077).
+    // wrong (ADR 016).
     try testing.expect(!comptime Components.rendersTheSame(schemaOf(External), schemaOf(Internal)));
 }
 
 test "one shape split only by a lifetime is one component" {
     // What the `Str`-in / `Text`-out rule produces: the same generic twice,
-    // and two Zig types that render identically (ADR 0077).
+    // and two Zig types that render identically (ADR 016).
     const Meta = struct {
         fn of(comptime T: type) type {
             return struct { label: T, note: ?T };
@@ -1817,7 +1816,7 @@ test "a document past sixty-four named shapes still refers to every one of them 
     // Seventy shapes with a name each, on seventy routes. Six contexts of a
     // real product reached the old ceiling of sixty-four, and the shapes past
     // it were written out in place — a true document whose generated client
-    // had lost their names (ADR 0209).
+    // had lost their names (ADR 170).
     const Shape = struct {
         fn of(comptime n: usize) type {
             return struct { id: u32, digits: [n]u8 };
@@ -1910,7 +1909,7 @@ test "a custom writer that says nothing is visibly silent rather than confidentl
     defer testing.allocator.free(json);
 
     // The one thing that must not happen: describing `secret`, which the
-    // writer above never sends. That was the bug (ADR 0076).
+    // writer above never sends. That was the bug (ADR 016).
     try testing.expect(std.mem.indexOf(u8, json, "secret") == null);
     try testing.expect(std.mem.indexOf(u8, json, "writes its own body") != null);
     try testing.expect(std.mem.indexOf(u8, json, "nilo_openapi") != null);
@@ -1932,7 +1931,7 @@ test "a custom writer inside a struct does not describe the struct's fields eith
 
 test "a document is described as its value, and a value that says nothing stays silent" {
     // The shape of `sql.Json(T)`, written out here so this test does not need
-    // the module: exactly a `T` under `.value` (ADR 0202).
+    // the module: exactly a `T` under `.value` (ADR 163).
     const Theme = struct { theme: []const u8 };
     const Settings = struct {
         value: Theme,

@@ -8,11 +8,11 @@
 //! same walk out of ten 2 MiB pages takes ten.
 //!
 //! Asked for in 2 MiB pages it is ten of each, and the measurement is in
-//! ADR 0049: **13.6 ms a hash becomes 11.0** — -19% uncontended, -8% at the
+//! ADR 044: **13.6 ms a hash becomes 11.0** — -19% uncontended, -8% at the
 //! eight the Gate allows at once — for memory that is still handed back at the
 //! end of the call rather than held. That is the whole of what this file does
 //! — `mmap`, one `madvise`, and `munmap` — and it is opt-in because the
-//! allocator is the caller's to name (ADR 0048).
+//! allocator is the caller's to name (ADR 044).
 //!
 //! ```zig
 //! const stored = try c.hashPassword(pw.huge_pages, form.password);

@@ -1,7 +1,7 @@
 //! A `nilo.Verified(…)` in the return type. It is what a handler is given,
 //! and answering with it would send the token back to the client along
 //! with the claims
-//! ([ADR 0260](../docs/adr/0260-verified-claims-are-a-handler-argument.md)).
+//! ([ADR 191](../docs/adr/191-verified-claims-are-a-handler-argument.md)).
 
 const nilo = @import("nilo_http");
 

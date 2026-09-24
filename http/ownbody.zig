@@ -1,4 +1,4 @@
-//! A type that writes its own answer (ADR 0195).
+//! A type that writes its own answer (ADR 157).
 //!
 //! ```zig
 //! const Invoice = struct {
@@ -37,7 +37,7 @@
 //! `comptime` on the type, so a program with no such type links none of it.
 //!
 //! **What it is not.** A serialiser. nilo does not know XML, CSV or HTML and
-//! is not going to (ADR 0195 says why); it knows how to send bytes under a
+//! is not going to (ADR 157 says why); it knows how to send bytes under a
 //! label, and this lets a type say which bytes and which label.
 
 const std = @import("std");

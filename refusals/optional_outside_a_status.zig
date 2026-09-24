@@ -3,7 +3,7 @@
 //! shape reached neither and the `Status` struct itself went out as JSON,
 //! `headers` and all: a crash on the success path. The `?` is a 404 and
 //! belongs on the body: `Status(201, ?T)`
-//! ([ADR 0276](../docs/adr/0276-a-question-mark-goes-inside-the-wrapper.md)).
+//! ([ADR 203](../docs/adr/203-a-question-mark-goes-inside-the-wrapper.md)).
 
 const nilo = @import("nilo_http");
 

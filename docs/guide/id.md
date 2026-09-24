@@ -4,7 +4,7 @@
 made, v4 for one that carries nothing but randomness. It is a tool module:
 nothing here allocates, nothing here does IO, and it imports nothing, so
 `zig test id/id.zig` runs the whole of it
-([ADR 0042](../adr/0042-the-bottom-layer-holds-more-than-one-module.md)).
+([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)).
 
 The `Uuid` here is the same type `nilo_sql` reads a `uuid` column into, so a
 generated key goes straight into an insert, and it says what its JSON looks
@@ -36,10 +36,10 @@ where `Doc.id` is a `sql.Uuid`, which is this type under another name.
 `v7Now` takes a Scope — the `*Ctx`, or a [`nilo.Run`](../reference/core.md#run)
 built with `initIo` — because a key needs randomness and the clock, and both
 are IO a module in the bottom layer has no Bulkhead to reach through
-([ADR 0046](../adr/0046-entropy-belongs-to-the-loop.md)). Inside a request
+([ADR 042](../adr/042-entropy-belongs-to-the-loop.md)). Inside a request
 that is `c.entropy(…)` and `nilo.nowMillis()`, which is the pair every
 `create` was writing out by hand before, `@intCast` included
-([ADR 0176](../adr/0176-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)).
+([ADR 143](../adr/143-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)).
 On a `Run` built by `init` rather than `initIo` it is `error.NoIo`.
 
 | | |
@@ -82,7 +82,7 @@ key: id.Uuid)` against `/documents/:key` is a 400 saying so when the text is
 not one, and the API description says the parameter is a string in `uuid`
 format. In a returned struct it leaves as its text, and in a Row it is
 written and read as the `uuid` column
-([ADR 0078](../adr/0078-a-uuid-is-whatever-the-database-stores.md)).
+([ADR 067](../adr/067-a-value-is-whatever-the-database-stores.md)).
 
 ## What a v7 orders, and what it does not
 
@@ -144,5 +144,5 @@ A handler that takes an `id.Uuid` is an ordinary function, and
 - [The reference](../reference/id.md#nilo_id) — the surface as a list.
 - [Talking to a database](./sql/README.md) — the `uuid` column a `Uuid` is written
   to, and the Row that carries it.
-- [ADR 0176](../adr/0176-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)
+- [ADR 143](../adr/143-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)
   — why `v7Now` and `{f}` exist.

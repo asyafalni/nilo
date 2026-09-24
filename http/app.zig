@@ -49,11 +49,11 @@ const Ctx = ctx_mod.Ctx;
 /// pages and the kernel zeroes every one of them. Measured on a route
 /// answering a megabyte: 257 minor faults a request, and raising this past
 /// the response took the same route from 7,908 req/s to 11,069
-/// ([ADR 0096](../docs/adr/0096-a-response-larger-than-the-arena-keep-is-a-page-fault-per-page.md)).
+/// ([ADR 075](../docs/adr/075-a-response-larger-than-the-arena-keep-is-a-page-fault-per-page.md)).
 /// That is why it is a `listen()` option and not only this constant.
 pub const default_arena_keep = 16 * 1024;
 
-/// The health page (ADR 0192). A `*Ctx` handler rather than a typed one
+/// The health page (ADR 154). A `*Ctx` handler rather than a typed one
 /// because what it reads is the registry itself, which no argument type
 /// names.
 fn healthRoute(c: *Ctx) anyerror!void {
@@ -67,56 +67,56 @@ fn healthRoute(c: *Ctx) anyerror!void {
 
 pub const App = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.App";
 
     gpa: std.mem.Allocator,
     router: router.Router,
     services: service_mod.Registry,
     /// The services handlers asked for, collected as routes are registered
-    /// and checked once in `listen()` (ADR 0006).
+    /// and checked once in `listen()` (ADR 005).
     requirements: std.ArrayList(service_mod.Requirement) = .empty,
     /// Middleware registrations, in the order `use` was called.
     scoped: std.ArrayList(mw.Scoped) = .empty,
     /// Routes that said a middleware does not cover them, from `without`
-    /// (ADR 0080). Empty for almost every App: the shape it exists for is the
+    /// (ADR 008). Empty for almost every App: the shape it exists for is the
     /// sign-up route inside a prefix that requires a session.
     exemptions: std.ArrayList(mw.Exemption) = .empty,
     /// The networks `listen(.{ .trusted_proxies = … })` named, parsed once
-    /// (ADR 0129). Owned by the App; `limits.trusted_proxies` points at it.
+    /// (ADR 102). Owned by the App; `limits.trusted_proxies` points at it.
     trusted_proxies: []const proxies_mod.Cidr = &.{},
-    /// Routes carrying a middleware of their own, from `with` (ADR 0126). The
+    /// Routes carrying a middleware of their own, from `with` (ADR 099). The
     /// other direction of the same question, and empty for almost every App
     /// too: the shape it exists for is the one endpoint inside a group that
     /// needs a guard its neighbours do not.
     attached: std.ArrayList(mw.Attached) = .empty,
     /// The middleware `guard` said reads the session cookie, if one did
-    /// (ADR 0252). Read by `writeOpenApi` and by nothing on the request path.
+    /// (ADR 153). Read by `writeOpenApi` and by nothing on the request path.
     declared_guard: ?mw.Guard = null,
     /// Directories loaded into memory by `static`, searched only when no
-    /// route matched (ADR 0010).
+    /// route matched (ADR 009).
     static_sets: std.ArrayList(static_mod.Set) = .empty,
     /// What each route's signature says about it, collected as routes are
     /// registered and turned into an OpenAPI document by `listen()` if
-    /// `docs()` asked for one (ADR 0017).
+    /// `docs()` asked for one (ADR 016).
     operations: std.ArrayList(openapi.Operation) = .empty,
     /// The `operationId` of every route that did not say its own, worked
     /// out once at registration so that `Ctx.routeName` can hand it to a
-    /// middleware without a request paying to spell it (ADR 0201). One
+    /// middleware without a request paying to spell it (ADR 162). One
     /// allocation per unnamed route at boot, and nothing per request; a
     /// route registered through `named` points at its comptime literal and
     /// takes no slot here.
     derived_names: std.ArrayList([]const u8) = .empty,
     docs_options: ?openapi.Options = null,
     /// The body a failure goes out with, from `failures()`, or null for
-    /// nilo's own `{"error":…,"status":…}` (ADR 0270). Read on the failure
+    /// nilo's own `{"error":…,"status":…}` (ADR 024). Read on the failure
     /// path only, so a request that succeeds never touches it. The schema
     /// beside it is what the document says under `Failure`; set together.
     failure_write: ?failurebody.Write = null,
     failure_schema: ?*const openapi.Schema = null,
     /// Every counter in the process, or null on a server that never called
     /// `metrics()` — which is what makes the whole feature one branch on the
-    /// request path (ADR 0100). Sized when the chains are resolved, because
+    /// request path (ADR 079). Sized when the chains are resolved, because
     /// that is the moment the route count stops moving.
     ///
     /// Held by value rather than allocated so that `metrics()` can hand a
@@ -131,7 +131,7 @@ pub const App = struct {
     /// every App that never asked.
     compress_options: ?compress_mod.Options = null,
     /// The compressors, one per thread, built at `resolveChains` and never
-    /// touched by a request's stack (ADR 0287). Held by value so that a
+    /// touched by a request's stack (ADR 211). Held by value so that a
     /// request can point at it, the way `_session_key` points at the key.
     compressors: ?compress_mod.Pool = null,
     /// How many compressors to build: the thread count `listen()` was given,
@@ -147,7 +147,7 @@ pub const App = struct {
     /// `listen()` beside the routes' chains, and for the same reason: a
     /// static file is a hot path, and building its chain per request is an
     /// allocation on a path that did not ask for one
-    /// ([ADR 0018](../docs/adr/0018-the-trade-budget-has-three-axes.md)).
+    /// ([ADR 017](../docs/adr/017-the-trade-budget-has-four-axes.md)).
     ///
     /// Per file rather than per set, which is what makes it unconditional.
     /// A set has one URL prefix, but a middleware can be scoped *below* it
@@ -181,23 +181,23 @@ pub const App = struct {
     /// for a program that never listens — a test, a script — and `listen()`
     /// sets it on the server's own loop. **`.start` and then `listen()` is
     /// refused** when a service took that `Io`, because it was the wrong
-    /// one (ADR 0220).
+    /// one (ADR 180).
     services_started: StartedBy = .nobody,
     /// Work that needs the services and has to finish before the first
     /// request: a migration, a version guard, a key set fetched once.
     /// Registered with `before`, run by `listen()` on the server's loop
-    /// after the services have started (ADR 0220). Empty for most Apps.
+    /// after the services have started (ADR 180). Empty for most Apps.
     before_serving: std.ArrayList(Background) = .empty,
     /// Whether the list above has run. A second `listen()` on the same App
     /// — a test that restarts one — does not migrate twice.
     before_ran: bool = false,
     /// Whether every service's `nilo_check` has run, once, after the list
-    /// above (ADR 0277). Held apart from `before_ran` for the reason
+    /// above (ADR 180). Held apart from `before_ran` for the reason
     /// `background_started` is: set at a different moment, by either of
     /// `start` and `listen()`.
     checks_ran: bool = false,
     /// Work that is not a request, registered before the server exists and
-    /// started once it does (ADR 0086). Empty for almost every App.
+    /// started once it does (ADR 028). Empty for almost every App.
     background: std.ArrayList(Background) = .empty,
     /// Whether the list above has been started. Separate from
     /// `services_started` on purpose: the two are set at different moments
@@ -221,7 +221,7 @@ pub const App = struct {
     /// `start` takes the App's allocator and the loop's `Io` as well as the
     /// arguments. `spawn` has no use for either — the fiber it starts finds
     /// the loop through the Bulkhead — and `before` builds the boot's `Run`
-    /// out of both, so that work which mints a key there can (ADR 0160).
+    /// out of both, so that work which mints a key there can (ADR 128).
     const Background = struct {
         args: *anyopaque,
         start: *const fn (args: *anyopaque, gpa: std.mem.Allocator, io: std.Io) anyerror!void,
@@ -232,7 +232,7 @@ pub const App = struct {
     ///
     /// Here so that a plugin written as `fn mount(g: anytype) !void` can ask
     /// without caring whether it was handed a group or the App itself, which
-    /// is the shape `guide/routing.md` recommends (ADR 0080).
+    /// is the shape `guide/routing.md` recommends (ADR 008).
     pub const mounted_at = "";
 
     /// What one request is allowed to do. Declared on the Ctx, which is
@@ -274,7 +274,7 @@ pub const App = struct {
 
     /// Everything registered through the returned value sits under
     /// `prefix` — routes, middleware, static files and further groups
-    /// (ADR 0015).
+    /// (ADR 014).
     ///
     /// ```zig
     /// const api = app.group("/api/v1");
@@ -304,7 +304,7 @@ pub const App = struct {
     ///
     /// Order against route registration does not matter — chains are
     /// resolved in `listen()`. Order among `use`/`useOn` calls is the run
-    /// order (ADR 0009).
+    /// order (ADR 008).
     pub fn use(self: *App, middleware: mw.Middleware) !void {
         try self.scoped.append(self.gpa, .{ .prefix = "", .middleware = middleware });
     }
@@ -325,7 +325,7 @@ pub const App = struct {
     /// The shape it exists for is the one every API with accounts has: a prefix
     /// behind a session, and the two routes inside it that cannot be, because
     /// you cannot require a session to create one
-    /// ([ADR 0080](../docs/adr/0080-a-route-can-say-it-is-not-covered.md)).
+    /// ([ADR 008](../docs/adr/008-middleware-is-an-onion-of-ctx-functions.md)).
     ///
     /// ```zig
     /// const v1 = app.group("/v1");
@@ -338,7 +338,7 @@ pub const App = struct {
     ///
     /// **The default stays deny**, so a route added later is guarded by
     /// accident rather than exposed by accident — and the exception is written
-    /// where the route is, so renaming the route moves it (ADR 0080).
+    /// where the route is, so renaming the route moves it (ADR 008).
     pub fn without(self: *App, comptime middleware: mw.Middleware) GroupOf("", &.{middleware}) {
         return .{ .app = self };
     }
@@ -348,7 +348,7 @@ pub const App = struct {
     ///
     /// The case `without` leaves open: a route that wants *more* than its
     /// neighbours, without inventing a prefix that matches only it
-    /// ([ADR 0126](../docs/adr/0126-a-route-can-say-what-covers-it.md)).
+    /// ([ADR 099](../docs/adr/099-a-route-can-say-what-covers-it.md)).
     ///
     /// ```zig
     /// try app.with(requireAdmin).delete("/users/:id", removeUser);
@@ -367,7 +367,7 @@ pub const App = struct {
 
     /// Say that `middleware` refuses a request without the session cookie
     /// named `cookie`, so the API description can say so too
-    /// ([ADR 0252](../docs/adr/0252-the-document-takes-a-guards-word-for-the-cookie.md)).
+    /// ([ADR 153](../docs/adr/153-an-authorization-header-a-handler-can-ask-for.md)).
     ///
     /// ```zig
     /// const api = app.group("/api");
@@ -385,7 +385,7 @@ pub const App = struct {
     ///
     /// Declaring it does not install it: `use` the middleware as before.
     /// One guard per App, because a program has one session cookie
-    /// (ADR 0035); a second call is `error.GuardAlreadyDeclared`.
+    /// (ADR 033); a second call is `error.GuardAlreadyDeclared`.
     pub fn guard(self: *App, middleware: mw.Middleware, cookie: []const u8) error{GuardAlreadyDeclared}!void {
         std.debug.assert(cookie.len > 0);
         if (self.declared_guard != null) return error.GuardAlreadyDeclared;
@@ -394,7 +394,7 @@ pub const App = struct {
 
     /// The App, with the next route registered through what this hands back
     /// carrying `name` as its `operationId`
-    /// ([ADR 0149](../docs/adr/0149-a-route-can-say-its-own-name.md)).
+    /// ([ADR 119](../docs/adr/119-a-route-can-say-its-own-name.md)).
     ///
     /// ```zig
     /// try app.named("addPartnerCapability")
@@ -402,7 +402,7 @@ pub const App = struct {
     /// ```
     ///
     /// **This says what the route is called and nothing about what it does** —
-    /// the document is still described from the signature (ADR 0017). A name
+    /// the document is still described from the signature (ADR 016). A name
     /// derived from the path cannot be a *key*, because it changes when the
     /// path moves.
     ///
@@ -450,7 +450,7 @@ pub const App = struct {
     ///
     /// The directory is read into memory here and now, before anything is
     /// being served — nothing touches the disk on the request path (ADR
-    /// 0010). `dir_path` is relative to the working directory the server
+    /// 009). `dir_path` is relative to the working directory the server
     /// runs in.
     ///
     /// ```zig
@@ -461,7 +461,7 @@ pub const App = struct {
     /// still gets its way.
     ///
     /// A directory that cannot be loaded says why in one line and stops the
-    /// process, for the reason `listen()` and `route()` do (ADR 0002).
+    /// process, for the reason `listen()` and `route()` do (ADR 001).
     /// `tryStatic` is the same call with the error as a value.
     pub fn static(self: *App, url_prefix: []const u8, dir_path: []const u8) !void {
         try self.staticWith(url_prefix, dir_path, .{});
@@ -488,7 +488,7 @@ pub const App = struct {
     /// and nothing is logged**, because the caller has the path and the
     /// decision, and a program that handles a case should not read `error:`
     /// in its own log for it
-    /// ([ADR 0282](../docs/adr/0282-a-try-call-hands-back-the-error-and-says-nothing.md)).
+    /// ([ADR 207](../docs/adr/207-a-try-call-hands-back-the-error-and-says-nothing.md)).
     /// A problem inside a directory that *is* there (a file that could not
     /// be read, a path too long) is still said in one line, since the
     /// error cannot name the file and the line can.
@@ -523,7 +523,7 @@ pub const App = struct {
     }
 
     /// Serve files the binary carries, the way `static` serves a directory
-    /// (ADR 0249).
+    /// (ADR 009).
     ///
     /// ```zig
     /// try app.embedded("/", &.{
@@ -576,7 +576,7 @@ pub const App = struct {
     ///
     /// The same fiber `nilo.spawn` starts, started for you at the one moment
     /// it can be: `nilo.spawn` is "now" and needs a running server, this is
-    /// "when there is one" and is registered beside the routes (ADR 0086).
+    /// "when there is one" and is registered beside the routes (ADR 028).
     ///
     /// ```zig
     /// try app.provide(&exporter);
@@ -598,7 +598,7 @@ pub const App = struct {
     /// ```
     ///
     /// Registered here rather than in a Service's `nilo_start`, which runs in
-    /// a phase that may have no server to own the fiber (ADR 0086).
+    /// a phase that may have no server to own the fiber (ADR 028).
     ///
     /// `func` may not fail: there is no request to answer and nobody to
     /// answer it, so an error has nowhere to go. Log instead. The two things
@@ -632,7 +632,7 @@ pub const App = struct {
     /// started and before the first connection is accepted. The place for
     /// work that needs a pool and has to be done before anybody is served:
     /// a migration, a version guard, a key set fetched once
-    /// ([ADR 0220](../docs/adr/0220-work-that-needs-the-services-runs-on-their-loop.md)).
+    /// ([ADR 180](../docs/adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
     ///
     /// ```zig
     /// fn migrate(run: *nilo.Run, db: *sql.Db) !void {
@@ -651,9 +651,9 @@ pub const App = struct {
     /// comes back out of `listen()` after one line saying so, and the
     /// services are put down on the way. A migration that could not run is
     /// a database this binary must not serve. A fail function called inside
-    /// it keeps its sentence, which that line carries (ADR 0161).
+    /// it keeps its sentence, which that line carries (ADR 129).
     ///
-    /// This is the phase ADR 0079 put *before* `listen()`, as
+    /// This is the phase ADR 180 put *before* `listen()`, as
     /// `app.start(io)` on an `Io` of the caller's, moved inside it. What
     /// changes is which loop the work runs on, and that is the whole
     /// difference: a pool is dialled through the `Io` it is given and a
@@ -781,7 +781,7 @@ pub const App = struct {
     /// letting the error travel back to `main` prints a stack trace through
     /// nilo's own files on top of the answer, and which file inside the
     /// framework noticed the collision is not the user's problem (ADR
-    /// 0002). `tryRoute` is the same call with the error as a value.
+    /// 001). `tryRoute` is the same call with the error as a value.
     pub fn route(
         self: *App,
         method: http1.Method,
@@ -792,7 +792,7 @@ pub const App = struct {
     }
 
     /// `route`, with the `operationId` the route was given by `app.named(…)`.
-    /// Called by the group methods; `route` is this with no name (ADR 0149).
+    /// Called by the group methods; `route` is this with no name (ADR 119).
     pub fn routeNamed(
         self: *App,
         comptime name: ?[]const u8,
@@ -820,7 +820,7 @@ pub const App = struct {
         return self.tryRouteNamed(null, method, pattern, handler);
     }
 
-    /// `tryRoute`, with the `operationId` the route was given (ADR 0149).
+    /// `tryRoute`, with the `operationId` the route was given (ADR 119).
     pub fn tryRouteNamed(
         self: *App,
         comptime name: ?[]const u8,
@@ -848,7 +848,7 @@ pub const App = struct {
         // `app.post` refuses this while compiling; here the verb is a
         // runtime value, so it is said at registration instead — and, like
         // a duplicate, stops the process unless the caller asked for the
-        // error (ADR 0247).
+        // error (ADR 188).
         if (comptime typed.isCached(pattern, handler)) {
             if (!cached_mod.allows(method)) {
                 std.log.err(
@@ -867,7 +867,7 @@ pub const App = struct {
         // prints — given, or derived by the same function the document
         // calls — so a middleware keyed by `operationId` and a contract
         // held against the document cannot disagree about a route
-        // (ADR 0201).
+        // (ADR 162).
         const route_name: []const u8 = name orelse blk: {
             var out: std.Io.Writer.Allocating = .init(self.gpa);
             errdefer out.deinit();
@@ -881,11 +881,11 @@ pub const App = struct {
 
         // Read from the same argument list `wrap` just read, so the
         // description of an endpoint and the code that serves it cannot
-        // drift apart (ADR 0017). Comptime data, so what is appended here is
+        // drift apart (ADR 016). Comptime data, so what is appended here is
         // one struct of slices pointing at read-only memory.
         // A name given twice is the document carrying the same key twice,
         // and whichever consumer read it would see one of the two. Caught
-        // here, where both routes can be named (ADR 0149).
+        // here, where both routes can be named (ADR 119).
         if (name) |given| {
             if (wiring.nameTaken(self, given)) |existing| {
                 std.log.err(
@@ -905,7 +905,7 @@ pub const App = struct {
     }
 
     /// Serve a description of this API, worked out from the handler
-    /// signatures (ADR 0017).
+    /// signatures (ADR 016).
     ///
     /// ```zig
     /// app.docs(.{ .title = "Orders", .version = "2.0.0" });
@@ -914,7 +914,7 @@ pub const App = struct {
     /// The document lands at `/openapi.json` and a page for reading it at
     /// `/docs`. Both are built when `listen()` resolves the routes, so it
     /// does not matter whether this is called before or after them — the
-    /// same order-independence `use` and `get` have (ADR 0009).
+    /// same order-independence `use` and `get` have (ADR 008).
     ///
     /// Routes win over both paths, so registering a `/docs` of your own
     /// still gets its way.
@@ -924,7 +924,7 @@ pub const App = struct {
 
     /// The body every failure goes out with, when nilo's
     /// `{"error":"…","status":404}` is not the one your clients already read
-    /// ([ADR 0270](../docs/adr/0270-a-failure-body-is-a-struct-the-application-names.md)).
+    /// ([ADR 024](../docs/adr/024-every-failure-answers-as-json.md)).
     ///
     /// ```zig
     /// const ApiError = struct {
@@ -956,7 +956,7 @@ pub const App = struct {
 
     /// Serve a page that says whether this process can do its job, by asking
     /// every service that declared `nilo_ready`
-    /// ([ADR 0192](../docs/adr/0192-a-health-route-asks-the-services.md)).
+    /// ([ADR 154](../docs/adr/154-a-health-route-asks-the-services.md)).
     ///
     /// ```zig
     /// try app.health("/healthz");
@@ -970,11 +970,11 @@ pub const App = struct {
     /// where you mount it.
     pub fn health(self: *App, comptime path: []const u8) !void {
         try self.get(path, healthRoute);
-        // The one thing ADR 0150 cannot read off a `*Ctx` handler is what
+        // The one thing ADR 120 cannot read off a `*Ctx` handler is what
         // it answers, and this handler is nilo's own: a JSON page with a
         // `status` in it, 200 when everything is ready. Said here so the
         // document describes the route and the count of routes it cannot
-        // describe is the application's alone (ADR 0281). The 503s are
+        // describe is the application's alone (ADR 120). The 503s are
         // failures, which the document does not promise for any route.
         self.describeLast(.{
             .status = 200,
@@ -984,7 +984,7 @@ pub const App = struct {
     }
 
     /// Give the route registered last an answer nilo already knows, for
-    /// the two handlers nilo wrote itself (ADR 0281). A `*Ctx` handler that
+    /// the two handlers nilo wrote itself (ADR 120). A `*Ctx` handler that
     /// returns nothing is otherwise `written`: undescribed, and counted in
     /// the line `listen()` prints about them.
     fn describeLast(self: *App, answer: openapi.Answer) void {
@@ -992,7 +992,7 @@ pub const App = struct {
     }
 
     /// Count every request, and serve the numbers at `/metrics` in the format
-    /// Prometheus scrapes (ADR 0100).
+    /// Prometheus scrapes (ADR 079).
     ///
     /// ```zig
     /// try app.metrics(.{});
@@ -1008,7 +1008,7 @@ pub const App = struct {
     ///
     /// The page is an **ordinary route** with no authentication of its own:
     /// what protects it is where you mount it and what you `use` there. Called
-    /// before or after the routes, either way (ADR 0009).
+    /// before or after the routes, either way (ADR 008).
     pub fn metrics(self: *App, comptime opts: metrics_mod.Options) !void {
         comptime metrics_mod.check(opts);
         if (self.metrics_table != null) return error.MetricsAlreadyEnabled;
@@ -1021,7 +1021,7 @@ pub const App = struct {
         try self.services.add(&self.metrics_table.?);
         try self.get(opts.path, metrics_mod.readout);
         // nilo wrote the readout, so it can say what the readout answers:
-        // the text format Prometheus scrapes, as a 200 (ADR 0281).
+        // the text format Prometheus scrapes, as a 200 (ADR 120).
         self.describeLast(.{
             .status = 200,
             .content_type = metrics_mod.content_type,
@@ -1030,7 +1030,7 @@ pub const App = struct {
     }
 
     /// Gzip every answer worth gzipping, per request, for a client that
-    /// asked for it (ADR 0287).
+    /// asked for it (ADR 211).
     ///
     /// ```zig
     /// try app.compress(.{});
@@ -1071,7 +1071,7 @@ pub const App = struct {
     /// which means a hash and a lock on the path of a request. Here you own
     /// the counter and increment it yourself — `_ = orders_placed.fetchAdd(1,
     /// .monotonic)` — and nilo only reads it, once per scrape. Nothing about
-    /// this touches a request that is not the scrape (ADR 0100).
+    /// this touches a request that is not the scrape (ADR 079).
     ///
     /// The number has to be a `std.atomic.Value(u64)`, because handlers run
     /// on several threads at once and a plain `u64` counted from all of them
@@ -1095,7 +1095,7 @@ pub const App = struct {
     }
 
     /// Every route this App answers, in the order they were registered
-    /// ([ADR 0127](../docs/adr/0127-a-route-pattern-is-the-name-of-its-url.md)).
+    /// ([ADR 100](../docs/adr/100-a-route-pattern-is-the-name-of-its-url.md)).
     ///
     /// The question it exists for is "did my routes register":
     ///
@@ -1105,7 +1105,7 @@ pub const App = struct {
     ///
     /// A view over the table rather than a copy of it, so this allocates
     /// nothing and costs a request nothing: the table is what the router
-    /// already scans and what metrics already index into (ADR 0100). It stays
+    /// already scans and what metrics already index into (ADR 079). It stays
     /// valid until another route is registered.
     pub fn routes(self: *const App) Routes {
         return .{ ._inner = self.router.routes.items };
@@ -1130,7 +1130,7 @@ pub const App = struct {
     /// A server that cannot start says why in one line and stops the
     /// process there. That is the whole point of those messages: letting
     /// the error travel back to `main` instead would print a stack trace
-    /// through nilo's own files on top of the answer (ADR 0002). Use
+    /// through nilo's own files on top of the answer (ADR 001). Use
     /// `tryListen` to get the error as a value and no message.
     pub fn listen(self: *App, options_: bulkhead.Options) !void {
         self.tryListen(options_) catch |err| {
@@ -1156,13 +1156,13 @@ pub const App = struct {
         try self.checkServices();
         // Before the chains are resolved, because that is when the
         // compressors are sized, and they are sized to the threads the
-        // Engine is about to start (ADR 0287).
+        // Engine is about to start (ADR 211).
         self.compress_slots = bulkhead.threadCount(options_);
         try self.resolveChains();
         wiring.countUndescribed(self);
         // Parsed here rather than per request, and before the port is taken:
         // a rule that is not an address is a deployment mistake, and the
-        // moment somebody is watching for one is startup (ADR 0129).
+        // moment somebody is watching for one is startup (ADR 102).
         wiring.parseTrustedProxies(self, options_.trusted_proxies) catch |err| {
             // Said here rather than inside the parse, so the parse can be
             // tested: a logged error during a test is a failed test whatever
@@ -1190,11 +1190,11 @@ pub const App = struct {
             .request_deadline_ms = options_.request_deadline_ms,
         };
         // Read once per request by the connection loop rather than by a
-        // request, which is why it is a field of its own (ADR 0096).
+        // request, which is why it is a field of its own (ADR 075).
         self.arena_keep = options_.arena_keep;
         // Not on the App, because there is one memory controller per process
         // rather than one per App: two Apps hashing eight each would be
-        // sixteen, which is the number the measurement in ADR 0048 says not
+        // sixteen, which is the number the measurement in ADR 044 says not
         // to run.
         password_mod.setLimit(options_.password_hashes_at_once);
         // Here rather than at the first request that reads a cookie: a secret
@@ -1244,9 +1244,9 @@ pub const App = struct {
     /// try client.get("/users/1");            // and a test can use it
     /// ```
     ///
-    /// **Not before `listen()`.** ADR 0079 had it there, as the phase a
+    /// **Not before `listen()`.** ADR 180 had it there, as the phase a
     /// migration runs in, and that shape is refused now
-    /// ([ADR 0220](../docs/adr/0220-work-that-needs-the-services-runs-on-their-loop.md)):
+    /// ([ADR 180](../docs/adr/180-work-that-needs-the-services-runs-on-their-loop.md)):
     /// a service keeps the `Io` it was started on, `listen()` runs on a loop
     /// of its own, and a pool dialled through one cannot be driven from the
     /// other — a job worker started that way crashes on an `Io` that has
@@ -1257,14 +1257,14 @@ pub const App = struct {
     /// **What this does not start is what `spawn` registered.** There is no
     /// server here — the `Io` is the caller's own, and a fiber owned by a
     /// server that does not exist has nothing to count it and nothing to cut
-    /// it off (ADR 0086).
+    /// it off (ADR 028).
     pub fn start(self: *App, io: std.Io) !void {
         try self.checkServices();
         try self.resolveChains();
         try self.startServices(io, .{}, .start);
         // The same two phases `listen()` runs after the pool is open, on
         // the same `Io`: the work `before` registered, then what each
-        // service checks once that work is done (ADR 0277). A test that
+        // service checks once that work is done (ADR 180). A test that
         // registered `createMissing` with `before` gets its tables here, and
         // a `Db` checks its Rows against them rather than against an empty
         // file.
@@ -1276,7 +1276,7 @@ pub const App = struct {
     /// event loop existed.
     ///
     /// Called by the Engine from inside `listen()`, after the port is taken
-    /// and before anything is accepted (ADR 0040), and by `start` above for a
+    /// and before anything is accepted (ADR 037), and by `start` above for a
     /// caller with an `Io` of their own. Nothing is kept: a service that needs
     /// the loop after startup took a copy of it here, and the App has no use
     /// for one.
@@ -1299,8 +1299,8 @@ pub const App = struct {
 
     /// Everything that has to happen once, inside `listen()`, after the port
     /// is taken and before anything is accepted. The hook the Engine is
-    /// handed (ADR 0040), which is four steps rather than one (ADR 0086,
-    /// ADR 0220, ADR 0277).
+    /// handed (ADR 037), which is four steps rather than one (ADR 028,
+    /// ADR 180).
     ///
     /// The order is the only one available: the work registered by `before`
     /// needs the services, a service's `nilo_check` looks at what that work
@@ -1349,7 +1349,7 @@ pub const App = struct {
 
     /// Run what every service declared as `nilo_check`, once, after the
     /// work `before` registered and before anything is accepted
-    /// ([ADR 0277](../docs/adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+    /// ([ADR 180](../docs/adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
     ///
     /// **This is the phase the schema check moved into.** A `Db` compares
     /// its Rows against their tables, and the tables are what
@@ -1381,7 +1381,7 @@ pub const App = struct {
     /// same service functions a handler does, and a `fail.unprocessable(…)`
     /// in one of them used to reach this line as `Failed` and nothing else,
     /// because outside a request there was no box to write the sentence
-    /// into (ADR 0161). The boot now has one, on this frame, for as long as
+    /// into (ADR 129). The boot now has one, on this frame, for as long as
     /// the work runs. Once, at boot: no request and no connection pays for
     /// it.
     fn runBefore(self: *App, io: std.Io) !void {
@@ -1411,7 +1411,7 @@ pub const App = struct {
     /// boot runs on.** On the Engine's loop, which is `listen()`'s, it is
     /// bound to the task running the boot, and no spawned fiber inherits a
     /// binding. The fallback slot is a threadlocal, and set on an executor
-    /// thread it is read by every spawned fiber that runs there: ADR 0007's
+    /// thread it is read by every spawned fiber that runs there: ADR 006's
     /// leak. Any other `Io` is a caller's own, `app.start(io)` on
     /// `std.Io.Threaded` in a test or a script, with no task to bind to and
     /// no spawned fiber reading the threadlocal, so it is the fallback there,
@@ -1443,7 +1443,7 @@ pub const App = struct {
     }
 
     /// The mirror of `serverStarting`, run on the way out of `listen()`
-    /// (ADR 0151).
+    /// (ADR 121).
     ///
     /// A Service that was handed the Engine's loop in `nilo_start` may have
     /// left work on it — pg.zig's pool refills itself from a task there —
@@ -1487,7 +1487,7 @@ pub const App = struct {
     /// here, on this frame — which is a page deeper than the connection loop
     /// would run it, and does not matter to anything that calls this.
     /// What a listener with `.grpc = true` runs for each connection, in place
-    /// of `serve.handleConnection` (ADR 0297). Reached only by an Engine
+    /// of `serve.handleConnection` (ADR 220). Reached only by an Engine
     /// built with `-Dgrpc`, so a build without it analyses none of `grpc.zig`.
     fn serveGrpc(
         self: *App,
@@ -1500,7 +1500,7 @@ pub const App = struct {
         grpc.serveConnection(self.grpcHost(), in, out, deadlines, waker, peer);
     }
 
-    /// The App as a gRPC connection sees it (ADR 0297). `grpc.zig` is outside
+    /// The App as a gRPC connection sees it (ADR 220). `grpc.zig` is outside
     /// this core and cannot name `App`, so it is handed the few things it
     /// uses instead: the router's answer to one path, and `handleRequest`.
     pub fn grpcHost(self: *App) grpc.Host {
@@ -1558,7 +1558,7 @@ pub const App = struct {
 /// reader the router cannot change underneath.
 pub const Registered = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Registered";
 
     method: http1.Method,
@@ -1568,7 +1568,7 @@ pub const Registered = struct {
     /// The route's `operationId`, given or derived — the word `Ctx.routeName`
     /// answers and the document prints, so a test can hold an authorisation
     /// table against the route table without going through the document
-    /// (ADR 0201).
+    /// (ADR 162).
     name: []const u8,
 
     pub fn format(self: Registered, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -1583,7 +1583,7 @@ pub const Registered = struct {
 /// asks for one.
 pub const Routes = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Routes";
 
     _inner: []const router.Route,
@@ -1607,7 +1607,7 @@ pub const Routes = struct {
 };
 
 /// One prefix and everything registered beneath it — what `app.group()`
-/// hands back (ADR 0015).
+/// hands back (ADR 014).
 ///
 /// The prefix is a compile-time parameter rather than a field, because the
 /// route patterns have to be joined while compiling: `typed.wrap` reads the
@@ -1623,7 +1623,7 @@ pub fn Group(comptime prefix: []const u8) type {
 }
 
 /// A group, and the middlewares the routes registered through it say do not
-/// cover them (ADR 0080).
+/// cover them (ADR 008).
 ///
 /// `excluded` is empty for every group `app.group()` hands back; `without`
 /// is what puts something in it, and what comes back is a different type, so
@@ -1634,7 +1634,7 @@ pub fn GroupOf(comptime prefix: []const u8, comptime excluded: []const mw.Middle
 
 /// The same, plus the middlewares the routes registered through it carry of
 /// their own — what `with` puts there
-/// ([ADR 0126](../docs/adr/0126-a-route-can-say-what-covers-it.md)).
+/// ([ADR 099](../docs/adr/099-a-route-can-say-what-covers-it.md)).
 ///
 /// Three comptime parameters and no fields but the App: which middleware a
 /// route ends up wrapped in is settled while compiling, and the chain itself
@@ -1660,7 +1660,7 @@ pub fn GroupWith(
         /// Published because a plugin written as `fn mount(g: anytype) !void`
         /// otherwise cannot ask, and the prefix is a comptime parameter of the
         /// type rather than a field — so the only way to get at it was parsing
-        /// `@typeName(@TypeOf(g))`, which is not a thing to ship (ADR 0080).
+        /// `@typeName(@TypeOf(g))`, which is not a thing to ship (ADR 008).
         pub const mounted_at = prefix;
 
         /// A group inside this one. `app.group("/api").group("/v1")` and
@@ -1695,7 +1695,7 @@ pub fn GroupWith(
 
         /// This group, with the next route registered through what comes back
         /// carrying `name` as its `operationId` — see `App.named`, which is
-        /// the same call at the top level (ADR 0149).
+        /// the same call at the top level (ADR 119).
         pub fn named(self: Self, comptime name: []const u8) GroupWith(prefix, excluded, attached, name) {
             return .{ .app = self.app };
         }
@@ -1733,7 +1733,7 @@ pub fn GroupWith(
         }
 
         /// A service. Groups do not scope services — a `*Db` is a `*Db` to
-        /// the whole App (ADR 0006) — but a plugin that brings its own has
+        /// the whole App (ADR 005) — but a plugin that brings its own has
         /// to be able to register it without being handed the App as well.
         pub fn provide(self: Self, ptr: anytype) !void {
             return self.app.provide(ptr);
@@ -1859,12 +1859,12 @@ pub fn GroupWith(
 }
 
 /// A route's own `operationId` is a word a client generator turns into a
-/// method name, so it has to be one (ADR 0149). Letters, digits, `_` and
+/// method name, so it has to be one (ADR 119). Letters, digits, `_` and
 /// `-`, starting with a letter or `_`.
 ///
 /// **The hyphen is allowed because the document on the other side of a port
 /// may already have it**
-/// ([ADR 0200](../docs/adr/0200-a-hyphen-is-a-spelling-a-generator-can-carry.md)).
+/// ([ADR 119](../docs/adr/119-a-route-can-say-its-own-name.md)).
 /// OpenAPI permits one, every client generator in use folds `auth-login` to
 /// `authLogin`, and a contract spelled by somebody else's generator is not a
 /// contract this framework gets to respell. A space, a dot or a slash is
@@ -1873,7 +1873,7 @@ fn checkName(comptime name: []const u8) void {
     comptime {
         // **A framework spending a caller's comptime budget is the
         // framework's to account for**
-        // ([ADR 0157](../docs/adr/0157-a-check-pays-for-its-own-branches.md)).
+        // ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)).
         // This loop walks a name a byte at a time, so sixteen `named` routes
         // on one group were enough to finish the default 1,000 backwards
         // branches — and what the caller saw was `evaluation exceeded 1000
@@ -2011,7 +2011,7 @@ test "app.start opens the services once, and a second call is not a second pool"
     try app.provide(&opened);
     try app.get("/thing", readsOpened);
 
-    // A program that never listens: a test, a script (ADR 0079).
+    // A program that never listens: a test, a script (ADR 180).
     try app.start(threaded.io());
     try testing.expectEqual(@as(usize, 1), opened.times);
 
@@ -2067,7 +2067,7 @@ const Witness = struct {
         self.times += 1;
         self.service_was_up = opened.times == 1;
         // The Run is built on the loop the services were started on, so a
-        // key can be minted from it (ADR 0160); `Run.init` would say NoIo.
+        // key can be minted from it (ADR 128); `Run.init` would say NoIo.
         _ = try run.entropy(4);
         self.had_io = true;
     }
@@ -2117,7 +2117,7 @@ test "app.before runs inside the boot, after the services, with a Run on their l
 }
 
 /// A service with something to verify once the boot work is done: what a
-/// `Db` does with its schema (ADR 0277). Records whether the `before` work
+/// `Db` does with its schema (ADR 180). Records whether the `before` work
 /// had already run when the check did, which is the whole point of the
 /// phase.
 const Checked = struct {

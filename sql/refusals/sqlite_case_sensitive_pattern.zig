@@ -4,7 +4,7 @@
 //! `PRAGMA case_sensitive_like` is a property of the connection, so honouring
 //! this would make the answer depend on how the database was opened rather
 //! than on what the query says. The Refusal names `icontains`, which is the
-//! operator that means what this database actually does (ADR 0061).
+//! operator that means what this database actually does (ADR 055).
 
 const sql = @import("nilo_sql");
 

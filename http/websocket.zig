@@ -1,4 +1,4 @@
-//! WebSocket — the connection that stops being HTTP (ADR 0022, ADR 0071).
+//! WebSocket — the connection that stops being HTTP (ADR 021, ADR 062).
 //!
 //! ```zig
 //! fn echo(c: *nilo.Ctx) !void {
@@ -17,9 +17,9 @@
 //! frames, and then gets out of the way. What it does **not** do is let the
 //! handler keep the loop — a handler that loops in place is suspended inside
 //! the request machinery for the life of the socket, and a suspended fiber
-//! holds every byte of its stack (ADR 0063). So the handler hands the loop
+//! holds every byte of its stack (ADR 062). So the handler hands the loop
 //! back and the connection loop runs it, which is `Handover` below and
-//! ADR 0071: 9,290 bytes an idle socket down to 5,183.
+//! ADR 062: 9,290 bytes an idle socket down to 5,183.
 //!
 //! Memory is one buffer per message **in flight**, not one per open socket. It
 //! comes from the executor's free list when a message starts arriving and goes
@@ -28,7 +28,7 @@
 //! `Options.max_message` closes the connection with 1009 rather than growing
 //! anything.
 //!
-//! **No byte of a message is copied twice** (ADR 0052). A frame that is
+//! **No byte of a message is copied twice** (ADR 046). A frame that is
 //! already in the connection's read buffer — which is nearly every frame, and
 //! every frame at all under the size of one read — is unmasked *as* it is
 //! copied into the message buffer, in one pass. A frame too big to have
@@ -71,7 +71,7 @@ pub const Options = struct {
     ///
     /// So the default is same-origin, and what "same" means is the request's
     /// `Origin` naming the authority its `Host` did — **the scheme is not
-    /// compared**, because TLS is terminated in front (ADR 0028) and nilo never
+    /// compared**, because TLS is terminated in front (ADR 027) and nilo never
     /// learns which one the browser used. A request with no `Origin` at all is
     /// allowed: that is not a browser, and the ambient-cookie problem this
     /// exists for is a browser's.
@@ -105,7 +105,7 @@ pub const Options = struct {
     /// another stretch. A client that does not answer the next one has gone,
     /// and gets closed with 1001.
     ///
-    /// That is ADR 0022's recorded answer to the hole ADR 0020 first named —
+    /// That is ADR 021's recorded answer to the hole ADR 019 first named —
     /// "a client that opens a socket and never speaks holds a fiber until TCP
     /// gives up" — written down long before there was a wait that could carry
     /// a limit.
@@ -130,7 +130,7 @@ pub const Options = struct {
 /// The default ceiling on one message, and the size of a buffer on the
 /// executor's free list.
 ///
-/// **ADR 0022 refused to have this option at all**, on the grounds that the
+/// **ADR 021 refused to have this option at all**, on the grounds that the
 /// buffer handed to `receive` was already the limit and one limit is better
 /// than two. That was right about the limits and wrong about where the buffer
 /// should live: a buffer declared in the handler is a local in a frame that
@@ -177,10 +177,10 @@ pub const state_align = 16;
 /// A handler that keeps the loop itself parks 1,608 bytes inside
 /// `App.serveRequest` — the `Ctx`, the parsed request, the route match — and a
 /// suspended fiber holds every one of those bytes for the life of the
-/// connection, which for a chat tab is hours (ADR 0063). So the handler does
+/// connection, which for a chat tab is hours (ADR 062). So the handler does
 /// the handshake and returns; the connection loop takes this back and runs the
 /// loop from its own frame, a page higher up, with the request's machinery
-/// already unwound. See ADR 0071.
+/// already unwound. See ADR 062.
 pub const Handover = struct {
     socket: Socket,
     run: *const fn (*Socket, *const anyopaque) anyerror!void,
@@ -217,7 +217,7 @@ pub fn runner(
 ///
 /// The messages name the argument list the caller wrote, because that is what
 /// they have to change — a loop is an ordinary function and the only thing
-/// nilo asks of it is its first parameter (ADR 0027).
+/// nilo asks of it is its first parameter (ADR 026).
 pub fn checkLoop(comptime loop: anytype, comptime State: type) void {
     const Loop = @TypeOf(loop);
     const info = switch (@typeInfo(Loop)) {
@@ -276,7 +276,7 @@ pub const Kind = enum { text, binary };
 /// another connection, may already be filling.
 ///
 /// Nothing traps that. A `Str` that outlives its request is caught in Debug
-/// and ReleaseSafe (ADR 0004) and this is not, which makes it the one
+/// and ReleaseSafe (ADR 003) and this is not, which makes it the one
 /// borrowed thing here a reader has to take on trust. A handler that wants a
 /// message after the next `receive` copies it somewhere of its own first.
 /// `room.say` and `socket.send` both finish with the bytes before they
@@ -340,7 +340,7 @@ pub const max_header = 10;
 /// Public because a `Room` builds this **once** for a message and every
 /// connection in the room writes the same bytes. A server frame carries no
 /// mask and no per-connection anything, so there is nothing in a header worth
-/// building a thousand times (ADR 0038, ADR 0052).
+/// building a thousand times (ADR 035, ADR 046).
 pub fn headerFor(into: *[max_header]u8, kind: Kind, len: u64) []u8 {
     return writeHeader(into, .of(kind), len);
 }
@@ -368,7 +368,7 @@ fn writeHeader(into: *[max_header]u8, opcode: Opcode, len: u64) []u8 {
 /// An open WebSocket connection.
 pub const Socket = struct {
     /// What a nilo compile error calls this type, which is the name the
-    /// reader's own import line gives it (ADR 0122).
+    /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Socket";
 
     _in: *std.Io.Reader,
@@ -412,7 +412,7 @@ pub const Socket = struct {
 
     /// The request's blocking detector, or null for a Socket a test built by
     /// hand. A stretch of handler time ends at every park, so what is between
-    /// two of them is what the handler did with one message (ADR 0132).
+    /// two of them is what the handler did with one message (ADR 013).
     _watch: ?*watchdog.Watch = null,
 
     /// The next message, or null once the connection is over.
@@ -441,14 +441,14 @@ pub const Socket = struct {
         while (true) {
             // Anything the room posted while this connection was quiet goes
             // out here, written by the fiber that owns the socket — which is
-            // the whole of ADR 0029's finding, in three lines. A handler never
+            // the whole of ADR 028's finding, in three lines. A handler never
             // sees a post and never writes a branch for one.
             try self.deliver();
 
             // A server on its way out ends the conversation itself, rather
             // than leaving every handler to spell out the same `live()` check
             // and every client to find the socket gone without being told
-            // (ADR 0020). What is already queued has gone out above; what is
+            // (ADR 019). What is already queued has gone out above; what is
             // half-collected here is a message the other end never finished.
             if (self.stopping()) {
                 self.closeWith(.going_away) catch {};
@@ -541,7 +541,7 @@ pub const Socket = struct {
             // runs on to flush its TLB: measured, 420K of those in eight
             // seconds of `echo-ws-limited` against 600 for the same shape over
             // HTTP, and on the arena's sixty-four cores the server sat at
-            // thirty-nine of them (ADR 0292).
+            // thirty-nine of them (ADR 216).
             if (filled == 0 and frame.fin and self._in.bufferedLen() >= frame.len) {
                 const data = self._in.buffered()[0..@intCast(frame.len)];
                 unmask(data, frame.mask, 0);
@@ -587,7 +587,7 @@ pub const Socket = struct {
     /// plain return. The alternative — an error — would be one every handler
     /// has to branch on for the one case it cannot prevent: the other end
     /// closing between two of its own sends. That is the same reading
-    /// `receive` gives a client that vanished (ADR 0022).
+    /// `receive` gives a client that vanished (ADR 021).
     pub fn send(self: *Socket, kind: Kind, data: []const u8) Error!void {
         if (self._closed) return;
         return self.sendFrame(.of(kind), data);
@@ -615,7 +615,7 @@ pub const Socket = struct {
     /// The arguments are therefore read twice: pass values, not a window onto
     /// memory another fiber is writing. **If they disagree the connection is
     /// closed rather than desynchronised** — `Framed` below is that check, and
-    /// ADR 0097 is why it is a close and not an assert.
+    /// ADR 076 is why it is a close and not an assert.
     pub fn print(self: *Socket, comptime fmt: []const u8, args: anytype) Error!void {
         if (self._closed) return;
         const promise = try self.beginCounted(counted(struct {
@@ -661,7 +661,7 @@ pub const Socket = struct {
         @memcpy(payload[2..][0..room], reason[0..room]);
         try self.writeFrame(.close, payload[0 .. 2 + room]);
         // Flushed whatever the read buffer holds: this connection is not
-        // going to read again, so there is no later moment (ADR 0274).
+        // going to read again, so there is no later moment (ADR 201).
         self._out.flush() catch return error.WriteFailed;
     }
 
@@ -675,9 +675,9 @@ pub const Socket = struct {
     /// connection is over, and false once a shutdown has started.
     ///
     /// `receive` checks this itself, so a message loop needs no branch for it
-    /// (ADR 0052). What it is still for is a handler doing work of its own
+    /// (ADR 046). What it is still for is a handler doing work of its own
     /// between messages — a long computation, a timer, a queue it drains —
-    /// which nilo cannot see and cannot end on its behalf (ADR 0020).
+    /// which nilo cannot see and cannot end on its behalf (ADR 019).
     pub fn live(self: *const Socket) bool {
         return !self._closed and !self.stopping();
     }
@@ -825,7 +825,7 @@ pub const Socket = struct {
         // conversation, not an error for the handler's loop or a line in
         // the log; measured, the line was one per connection at 70,000
         // connections a second, and the one lock under it was what every
-        // connection queued on to leave (ADR 0275,
+        // connection queued on to leave (ADR 202,
         // [`http.md`](../bench/result/http.md#a-reset-between-frames-is-a-client-that-has-gone)).
         // Everywhere below here a stream that stops is a truncated frame,
         // which is a broken one.
@@ -925,7 +925,7 @@ pub const Socket = struct {
     /// page; what comes back is exactly `_max_message` of it, so the ceiling a
     /// caller was promised is the ceiling a caller gets. A buffer that was
     /// quietly bigger than the option said is precisely the "the option is a
-    /// lie" that ADR 0022 refused to ship.
+    /// lie" that ADR 021 refused to ship.
     fn takeScratch(self: *Socket) error{OutOfMemory}![]align(std.heap.page_size_min) u8 {
         const parked = self.slot();
         const whole = parked.* orelse whole: {
@@ -950,7 +950,7 @@ pub const Socket = struct {
     ///
     /// `App.waitForRequest` does exactly this between two requests, and stops
     /// the moment a handler upgrades: a socket never goes back round that loop
-    /// (ADR 0022). So the twelve kilobytes an idle keep-alive connection hands
+    /// (ADR 021). So the twelve kilobytes an idle keep-alive connection hands
     /// back were held for the whole life of every WebSocket, which is a thing
     /// nobody had measured — `bench/ws_server.zig` and `bench/ws_idle.py` now
     /// do, and the entry is in `bench/result/http.md`.
@@ -965,14 +965,14 @@ pub const Socket = struct {
         // flush when the next frame is already buffered (`settle`), and this
         // is where the skipped flushes are made good: the wait below is on
         // the socket's readiness rather than on a read, so the Engine's own
-        // guarantee, which sits on reads, does not reach it (ADR 0274). A
+        // guarantee, which sits on reads, does not reach it (ADR 201). A
         // peer that cannot be written to is a peer that is gone.
         if (self._out.end != 0) self._out.flush() catch return .closed;
 
         // Silence on a socket is not the handler holding its thread. This is
         // the wait that used to excuse a WebSocket from the detector
         // entirely; bracketed, what is left between two of them is exactly
-        // what the handler did with one message (ADR 0132).
+        // what the handler did with one message (ADR 013).
         const token = watchdog.waiting(self._watch);
         defer watchdog.waited(self._watch, token);
 
@@ -987,7 +987,7 @@ pub const Socket = struct {
             else => |woken| return woken,
         }
         // Quiet. The allocation stays and nothing here allocates, so ADR
-        // 0018's per-request invariant is untouched; the next frame faults the
+        // 017's per-request invariant is untouched; the next frame faults the
         // pages back in as zeroes, which is all a buffer about to be
         // overwritten needs to be.
         // The message buffer goes back to the executor's free list here and
@@ -1039,7 +1039,7 @@ pub const Socket = struct {
     /// What makes skipping safe is that nothing on this connection can wait
     /// for the peer with a message still in memory: `park` flushes before
     /// it waits, and the Engine flushes before any read of the socket
-    /// ([ADR 0274](../docs/adr/0274-a-response-is-flushed-before-the-connection-waits.md)).
+    /// ([ADR 201](../docs/adr/201-a-response-is-flushed-before-the-connection-waits.md)).
     /// What that leaves is a handler that stops calling `receive` while the
     /// peer has sent something it has not read, whose sends then leave when
     /// the write buffer fills; a handler that does not read what it is sent
@@ -1070,7 +1070,7 @@ pub const Socket = struct {
     }
 
     /// Whether the writing pass wrote the bytes the counting pass promised, and
-    /// what to do when it did not (ADR 0097).
+    /// what to do when it did not (ADR 076).
     fn keptTo(self: *Socket, promise: Framed) Error!void {
         if (!promise.broken(self._out)) return;
 
@@ -1104,12 +1104,12 @@ pub const Socket = struct {
 };
 
 /// A frame whose length went out before its bytes did, and what it takes to
-/// check that the two agree ([ADR 0097](../docs/adr/0097-a-frame-that-lies-about-its-length-is-not-sent.md)).
+/// check that the two agree ([ADR 076](../docs/adr/076-a-frame-that-lies-about-its-length-is-not-sent.md)).
 ///
 /// `print` and `json` state a length from a counting pass and then write the
 /// payload in a second pass. If the two disagree, the length on the wire is a
 /// lie and the connection desynchronises for good — the one mistake in this
-/// file that cannot be recovered from, and until ADR 0097 the one place that
+/// file that cannot be recovered from, and until ADR 076 the one place that
 /// checked nothing. `Room.print` has the same two passes and has asserted
 /// between them since the day it was written, because it writes into a buffer
 /// it can measure.
@@ -1215,7 +1215,7 @@ fn fits(reason: []const u8) usize {
 /// every one of them tiles it exactly, and LLVM splits each into whatever
 /// registers the target actually has.
 ///
-/// 128 is where the throughput stopped improving when ADR 0052 measured it:
+/// 128 is where the throughput stopped improving when ADR 046 measured it:
 /// 2.4× a single 32-byte tile on a 16 KiB message, with 256 worth another 6%
 /// and twice the unrolled code. The smaller steps are not an afterthought —
 /// a chat line is forty bytes and would otherwise fall straight past the wide
@@ -1240,7 +1240,7 @@ fn unmask(data: []u8, key: [4]u8, offset: usize) void {
 /// pattern, which is a vector operation rather than a loop.
 ///
 /// **Copying and unmasking are the same pass**, which is the second half of
-/// that finding (ADR 0052): the bytes arrive in the connection's read buffer
+/// that finding (ADR 046): the bytes arrive in the connection's read buffer
 /// and have to reach the handler's, and doing the XOR on the way costs
 /// nothing over the move itself. Reading them and then unmasking them where
 /// they landed is two walks over the same cache lines for one result.
@@ -1360,7 +1360,7 @@ const testing = std.testing;
 ///
 /// The heartbeat is the one behaviour here that a real clock would make a
 /// slow, flaky test of — and `Waker` is a vtable and a pointer, so a test can
-/// supply its own and the waiting costs nothing. ADR 0033: a guard that has
+/// supply its own and the waiting costs nothing. ADR 032: a guard that has
 /// never been seen to fire is not a guard.
 const Quiet = struct {
     /// How long the client stays quiet, counted across every wait the socket
@@ -1525,7 +1525,7 @@ const Peer = struct {
 
     /// A socket with a ceiling of the caller's choosing, for the tests about
     /// what happens at it. The buffer itself comes from the free list either
-    /// way — the size is all a test gets to pick now (ADR 0022's `max_message`,
+    /// way — the size is all a test gets to pick now (ADR 021's `max_message`,
     /// which that ADR refused and `http/scratch.zig` brought back).
     fn socketHolding(self: *Peer, max_message: usize) Socket {
         self.in = .fixed(self.to_server.items);
@@ -1548,7 +1548,7 @@ const Peer = struct {
 /// A fixed reader has the whole conversation in memory before the first call,
 /// so it never once reaches the paths that exist for a frame arriving split
 /// across reads — which is what a network does with every frame over a
-/// kilobyte. Those paths are the slow half of ADR 0052 and were untested
+/// kilobyte. Those paths are the slow half of ADR 046 and were untested
 /// until this existed.
 const Trickle = struct {
     rest: []const u8,
@@ -1799,7 +1799,7 @@ test "the page that opens a socket has to be one this server serves" {
     const none: []const []const u8 = &.{};
 
     // Same authority, whichever scheme the browser thinks it used. nilo sits
-    // behind the TLS terminator (ADR 0028) and never learns which it was.
+    // behind the TLS terminator (ADR 027) and never learns which it was.
     try testing.expect(originAllowed("https://example.dev", "example.dev", none));
     try testing.expect(originAllowed("http://example.dev", "example.dev", none));
     try testing.expect(originAllowed("http://localhost:5173", "localhost:5173", none));
@@ -1861,7 +1861,7 @@ test "a message split across frames is put back together" {
 test "a message that arrived whole is handed over without taking a message buffer" {
     // The short-lived socket's case: ten small messages and gone. Taking a
     // buffer for each connection is what cost every core a TLB flush per
-    // connection on a many-core machine (ADR 0292).
+    // connection on a many-core machine (ADR 216).
     var peer: Peer = .{};
     defer peer.deinit();
     try peer.frame(true, 2, "\x00\x01\x02\x03\x04\x05\x06\x07\x08");
@@ -2170,7 +2170,7 @@ test "a formatted message needs no buffer of the handler's own" {
 }
 
 /// A value that formats differently the second time it is asked — which is
-/// exactly the mistake `Socket.print`'s doc warns about, and until ADR 0097 the
+/// exactly the mistake `Socket.print`'s doc warns about, and until ADR 076 the
 /// one nothing here could tell had happened.
 const Shifting = struct {
     asked: *usize,
@@ -2247,7 +2247,7 @@ test "a shutdown ends the loop, and the client is told why" {
 
     // A deploy starts. The handler's loop ends on its own — no `live()`
     // branch of its own — and the other end gets a close rather than a
-    // socket that stopped answering (ADR 0020).
+    // socket that stopped answering (ADR 019).
     stopping.store(true, .release);
     try testing.expectEqual(@as(?Message, null), try socket.receive());
     try testing.expectEqualStrings("\x88\x02\x03\xe9", peer.sent()); // 1001
@@ -2320,7 +2320,7 @@ test "the header a room builds once is the one a socket would have written" {
 }
 
 /// A writer that counts how many times it put bytes on the wire, and keeps
-/// them. What ADR 0274 changes is how many writes a burst of echoes costs,
+/// them. What ADR 201 changes is how many writes a burst of echoes costs,
 /// which `Peer`'s fixed writer cannot say: its flush is a no-op.
 const Wire = struct {
     buffer: [1024]u8 = undefined,

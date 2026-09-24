@@ -11,7 +11,7 @@ const fail = nilo.fail;
 pub const std_options = nilo.std_options;
 pub const std_options_debug_io = nilo.debug_io;
 
-/// A panic still takes the process down — Zig cannot recover (ADR 0008) —
+/// A panic still takes the process down — Zig cannot recover (ADR 007) —
 /// but this makes it say which request was being served when it happened.
 pub const panic = nilo.panic;
 
@@ -58,7 +58,7 @@ pub fn main() !void {
     try app.provide(&db);
 
     // Middleware order is the order registered; where the routes are
-    // registered relative to this does not matter (ADR 0009).
+    // registered relative to this does not matter (ADR 008).
     //
     // `logger.standard` is deliberately absent: this same binary is the
     // benchmark target, and a log line per request would measure the
@@ -72,7 +72,7 @@ pub fn main() !void {
 }
 
 // A handler is an ordinary function, so it is tested without starting a
-// server and without fake HTTP — which is exactly what ADR 0003 promised.
+// server and without fake HTTP — which is exactly what ADR 002 promised.
 test "getUser" {
     var db = Db{ .max_id = 10 };
     try std.testing.expectEqual(@as(u32, 7), (try getUser(&db, 7)).id);

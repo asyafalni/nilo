@@ -1,4 +1,4 @@
-//! Half of the fourth axis for `nilo_s3` (ADR 0018): the server that stores
+//! Half of the fourth axis for `nilo_s3` (ADR 017): the server that stores
 //! nothing.
 //!
 //! One route, one path param, one body written back. It names no object

@@ -20,7 +20,7 @@
 //! A test that provokes one is a failed step whatever the level says, which
 //! is why a refusal that speaks is tested as a decision with the message
 //! left out — `tlsRefusal` and `keyIsTheCertificates` in `engine/zio.zig`
-//! are the shape ([ADR 0294](../docs/adr/0294-a-key-is-checked-against-its-certificate-at-listen.md)).
+//! are the shape ([ADR 212](../docs/adr/212-tls-is-an-option-a-build-asks-for.md)).
 //!
 //! Worth knowing if this comes back: the build still *succeeds*. A test
 //! process that writes to stderr gets a red `failed command` block that is

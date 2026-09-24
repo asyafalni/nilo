@@ -29,7 +29,7 @@ const tally = try db.raw(Tally, c,
 `raw` still fills your struct, still uses the arena, still follows the `Str`
 rule. The `SELECT` list is counted against the struct's fields while
 compiling, and a column that plainly has a name is held against the field in
-its position ([ADR 0148](../../adr/0148-a-raw-statement-is-counted-while-compiling.md));
+its position ([ADR 051](../../adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md));
 what it gives up is nilo writing the text, and nothing else.
 
 It is still a **Row**, so it still carries a `nilo_table` — `raw` never reads
@@ -43,7 +43,7 @@ second statement or handed over by a service. `nilo_beside` names such
 fields: they are on the Row, in its JSON and in its document, and in no
 statement, so the `SELECT` list is counted against the columns and a read
 leaves them at their default for you to fill
-([ADR 0217](../../adr/0217-a-row-can-carry-a-field-no-column-holds.md)):
+([ADR 178](../../adr/178-a-row-can-carry-a-field-no-column-holds.md)):
 
 <!-- compiles: body -->
 ```zig
@@ -74,7 +74,7 @@ The values are a tuple, one per placeholder, and the placeholders are `$1`,
 appears, and a `$n` written twice is one value. The text is comptime, so the
 count is checked while compiling: a statement naming `$3` and handed two
 values is a Refusal, not a run-time error on one database and a silent NULL
-on the other ([ADR 0278](../../adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+on the other ([ADR 204](../../adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
 
 A parameter is anything a column takes, converted the way a Row's field is
 written: an integer or a float, a `bool`, `[]const u8`, a `nilo.Str` as it
@@ -111,14 +111,14 @@ plan, and the same text on both databases.
 A list written where it is used, `&.{ 1, 2, 3 }`, binds as an array for
 `= ANY($1)`, which is Postgres's shape and not SQLite's; a named struct of
 values is left to the driver, which is zqlite's `:name` binding
-([ADR 0145](../../adr/0145-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
+([ADR 116](../../adr/116-a-raw-parameter-is-converted-the-way-a-rows-is.md)).
 
 ## One column, no Row
 
 A statement that answers one column — a name off the catalogue, an id, a
 count — has no shape worth a struct. Hand `raw` the column's type instead of
 a Row and it reads column one of every row
-([ADR 0234](../../adr/0234-a-scalar-out-of-raw.md)):
+([ADR 125](../../adr/125-a-row-that-owns-no-table.md)):
 
 <!-- compiles: body -->
 ```zig
@@ -147,7 +147,7 @@ invoices` answers one row whatever is in the table, and so does `RETURNING`
 on a keyed write. `rawOne` would hand back a `?Row` for a null that cannot
 happen; `rawExactlyOne` answers the Row, and a statement that answered with
 none is `error.QueryFailed` rather than a zero-filled struct
-([ADR 0280](../../adr/0280-a-statement-that-always-answers-answers-a-row.md)):
+([ADR 206](../../adr/206-a-statement-that-always-answers-answers-a-row.md)):
 
 <!-- compiles: body -->
 ```zig
@@ -179,7 +179,7 @@ tables that way wants the same thing. `rawPage` reads your statement as a
 page: the Row's columns, then the window as one more column on the end,
 which becomes `.total`. The `ORDER BY` and the `LIMIT` are yours, for the
 reason `db.page` requires both
-([ADR 0279](../../adr/0279-a-raw-statement-can-carry-its-total.md)):
+([ADR 205](../../adr/205-a-raw-statement-can-carry-its-total.md)):
 
 <!-- compiles: body -->
 ```zig
@@ -246,7 +246,7 @@ statements to write: a query engine, where the tables, the columns and the
 aggregates come out of a model that is data. What it never needs is a
 run-time *string* in a statement — only names and values — so that is what
 `sql.Composed` lets it write, and nothing else
-([ADR 0283](../../adr/0283-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)):
+([ADR 208](../../adr/208-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)):
 
 <!-- compiles: body -->
 ```zig
@@ -297,7 +297,7 @@ Four things to know when the file is SQLite:
   nilo respells `$n` as `?n` while compiling for every call that takes
   comptime text, which is `raw`, `rawOne`, `rawExactlyOne`, `rawPage`,
   `rawOrdered` and the `Tx` versions
-  ([ADR 0278](../../adr/0278-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+  ([ADR 204](../../adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
   `exec` takes its text at run time and sends it as written: write `?1`
   there, or a bare `?`, or a statement with no parameters, which is what
   DDL is.
@@ -342,7 +342,7 @@ CREATE VIEW all_orders AS
   SELECT id, total, placed_at FROM archived_orders;
 ```
 
-([ADR 0058](../../adr/0058-a-set-operation-over-one-table-is-a-condition.md).)
+([ADR 052](../../adr/052-a-set-operation-over-one-table-is-a-condition.md).)
 
 ## Several statements at once
 
@@ -351,7 +351,7 @@ round trip to Postgres is 24 µs and the query inside it is about 2**, so
 latency is the cost and concurrency is what hides it. A server here serves
 **215,000 requests a second with a real query in every one**, because a
 waiting fiber frees its thread
-([ADR 0059](../../adr/0059-a-round-trip-is-not-the-cost-worth-chasing.md)).
+([ADR 053](../../adr/053-a-round-trip-is-not-the-cost-worth-chasing.md)).
 
 Where several statements really do have to land together, SQL already does it
 in one round trip and `db.raw` reaches it:

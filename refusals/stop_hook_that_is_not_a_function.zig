@@ -2,7 +2,7 @@
 //!
 //! The marker is read by name, so anything called `nilo_stop` is taken to be
 //! the hook. A constant with that name is a service nilo would silently never
-//! stop, which is the failure this whole hook exists to stop (ADR 0151).
+//! stop, which is the failure this whole hook exists to stop (ADR 121).
 
 const nilo = @import("nilo_http");
 

@@ -18,7 +18,7 @@
 //! against short literals and no allocation: the value that goes out is one of
 //! the literals, not a copy of what arrived. A request with no `Origin` is not
 //! cross-origin and gets no such header, which is the same thing the browser
-//! would do with it (ADR 0099).
+//! would do with it (ADR 078).
 //!
 //! What a named list costs that `"*"` does not is **one walk of the request
 //! headers per request**, because finding out a request has no `Origin` means
@@ -28,7 +28,7 @@
 //!
 //! Headers go out before the handler runs, because a response is flushed
 //! the moment it is sent and there is nothing left to add afterwards (ADR
-//! 0009). They go out through `setStaticHeader`: every value here is a
+//! 008). They go out through `setStaticHeader`: every value here is a
 //! compile-time constant, so copying it into the request arena would be
 //! work with nothing to show for it.
 
@@ -64,7 +64,7 @@ pub const Options = struct {
 pub const permissive = with(.{});
 
 /// The origins a deployment answers, filled before `listen()` and read on the
-/// requests that carry an `Origin` (ADR 0110).
+/// requests that carry an `Origin` (ADR 088).
 ///
 /// `with` settles its list while compiling, which is what makes a named origin
 /// cost one `mem.eql` against a literal and no allocation. The cost of that is
@@ -160,7 +160,7 @@ pub const Origins = struct {
 };
 
 /// The CORS middleware, reading its origins from `held` rather than from a
-/// list settled while compiling (ADR 0110).
+/// list settled while compiling (ADR 088).
 ///
 /// Everything else — the preflight, the credentials, the exposed headers, the
 /// max age — is comptime exactly as `with`'s is, because none of it is a fact
@@ -192,7 +192,7 @@ pub fn reading(comptime held: *Origins, comptime options: Options) mw.Middleware
                     // text has to outlive the server: that contract is what
                     // makes this `setStaticHeader` rather than an allocation
                     // on the request path, and it is what keeps the budget at
-                    // one (ADR 0018).
+                    // one (ADR 017).
                     try c.setStaticHeader("Access-Control-Allow-Origin", allowed);
                 } else if (held.list.len == 0) {
                     sayItIsEmpty();

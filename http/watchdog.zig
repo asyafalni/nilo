@@ -1,18 +1,18 @@
-//! Catching a handler that holds its thread (ADR 0034).
+//! Catching a handler that holds its thread (ADR 013).
 //!
 //! Many requests share one OS thread. A handler that waits on the operating
 //! system directly — a database driver, `std.fs`, `std.http.Client` — stops
 //! every other request on that thread for as long as it waits. `nilo.blocking`
-//! is the way not to, and ADR 0014 recorded that **nothing forces it**: the
+//! is the way not to, and ADR 013 recorded that **nothing forces it**: the
 //! wrong version compiles, passes its tests, and only misbehaves under
 //! concurrency, which is the one condition development does not have.
 //!
 //! This is what now notices. It is the same shape as the `Str` staleness trap
-//! (ADR 0004): a rule the type system cannot hold, held instead by something
+//! (ADR 003): a rule the type system cannot hold, held instead by something
 //! that watches at run time and says so in words.
 //!
 //! What it measures is **the longest stretch the fiber ran without parking**
-//! ([ADR 0132](../docs/adr/0132-what-is-watched-is-one-unparked-stretch.md)).
+//! ([ADR 013](../docs/adr/013-handlers-must-not-block-the-thread.md)).
 //! A stretch ends wherever the request waits on something that is not the
 //! handler's own code, and every one of those says so:
 //!
@@ -62,7 +62,7 @@ pub const Watch = struct {
 /// started, counted before the rate limit below throws any away.
 ///
 /// This exists because a detector nobody can watch fail is a detector nobody
-/// can trust (ADR 0033). The log line is for people; this is what a test
+/// can trust (ADR 032). The log line is for people; this is what a test
 /// asserts on, since the suite runs with warnings turned off.
 pub var caught: std.atomic.Value(u64) = .init(0);
 
@@ -193,14 +193,14 @@ fn report(method: []const u8, path: []const u8, ms: u64) void {
         std.log.warn(
             "handler {s} {s} held its thread for {d}ms. Every other request being served " ++
                 "on that thread waited the whole time. Hand the call that waits to " ++
-                "nilo.blocking (ADR 0014).",
+                "nilo.blocking (ADR 013).",
             .{ method, path, ms },
         );
     } else {
         std.log.warn(
             "handler {s} {s} held its thread for {d}ms, and {d} more did in the second " ++
                 "before it. Every other request being served on those threads waited. " ++
-                "Hand the call that waits to nilo.blocking (ADR 0014).",
+                "Hand the call that waits to nilo.blocking (ADR 013).",
             .{ method, path, ms, others },
         );
     }

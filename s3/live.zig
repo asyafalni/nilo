@@ -376,7 +376,7 @@ test "a presigned POST is a form a real server accepts" {
             // directly: Garage answers the form with a 204 and no
             // `content-length`, which std's own reader waits on until the
             // server reaps the socket, and `nilo_fetch` is where that is
-            // closed (ADR 0215). The test found it the moment the form was
+            // closed (ADR 176). The test found it the moment the form was
             // accepted.
             const result = try store.client.send(&scope, .POST, posted.url, body.written(), .{
                 .headers = &.{.{

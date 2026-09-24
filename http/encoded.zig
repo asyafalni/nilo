@@ -1,5 +1,5 @@
 //! A request body under `Content-Encoding: gzip`, decoded into the arena
-//! ([ADR 0251](../docs/adr/0251-a-gzipped-body-is-inflated-into-the-buffer-that-holds-it.md)).
+//! ([ADR 089](../docs/adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)).
 //!
 //! The roadmap held this behind a pool of 64 KB windows shared with response
 //! compression, and the pool turned out to be the wrong half of the answer

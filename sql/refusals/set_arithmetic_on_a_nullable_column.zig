@@ -3,7 +3,7 @@
 //! `SET "views" = "views" + $1` with `views` NULL stores NULL. The statement
 //! runs, reports one row changed, and the counter is gone — the same shape as
 //! `= NULL` in a condition, which is legal SQL, raises nothing and is never
-//! what was meant (ADR 0039).
+//! what was meant (ADR 036).
 
 const sql = @import("nilo_sql");
 

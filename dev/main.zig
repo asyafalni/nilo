@@ -1,5 +1,5 @@
 //! `zig build dev` — the server restarted on every save
-//! ([ADR 0259](../docs/adr/0259-a-restart-on-save-watches-the-binary-not-the-sources.md)).
+//! ([ADR 190](../docs/adr/190-a-restart-on-save-watches-the-binary-not-the-sources.md)).
 //!
 //! ```
 //! nilo-dev [--zig <path>] [--build <step>] [--incremental] [--keep-cache] [-D<option>…] <exe> [-- <server args>]
@@ -53,7 +53,7 @@
 //! The numbers, all five rows of them, are in the ADR.
 //!
 //! **The old server is asked, not killed.** SIGTERM, which nilo answers by
-//! draining what is in flight (ADR 0098); SIGKILL only after `drain_ms`.
+//! draining what is in flight (ADR 077); SIGKILL only after `drain_ms`.
 //! Each child is in a process group of its own, so Ctrl-C reaches this
 //! process alone and the two signals a server gets are this file's — a
 //! second one would be read by nilo as "stop waiting" and skip the drain.

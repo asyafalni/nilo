@@ -80,7 +80,7 @@ Zig 0.16's `std.Io.Mutex.lock` takes an `io: Io`, because parking a caller on a
 futex is something only a runtime can do. **A module with no event loop has no
 `Io` to give it**, so a tool module cannot have a mutex without putting `Io`
 into `get`'s signature — and needing no loop is the entry condition for that
-layer ([ADR 0042](../../docs/adr/0042-the-bottom-layer-holds-more-than-one-module.md)).
+layer ([ADR 038](../../docs/adr/038-a-module-sits-where-the-loop-puts-it.md)).
 
 What is left is `tryLock` and a spin, which forces a rule rather than merely
 allowing one: **the critical section must stay short enough to spin on**, which

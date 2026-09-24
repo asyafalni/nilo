@@ -1,6 +1,6 @@
 //! One level of children is one more statement for every parent at once.
 //! A second level would be a statement per level with nowhere to stop, so it
-//! is a call of its own (ADR 0295).
+//! is a call of its own (ADR 218).
 
 const sql = @import("nilo_sql");
 

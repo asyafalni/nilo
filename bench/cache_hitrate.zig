@@ -5,7 +5,7 @@
 //! matter**: every key is equally likely next, so knowing which entries were
 //! read recently tells you nothing about which will be read again. A cache
 //! measured that way reports `capacity / working set` whatever its policy is,
-//! which is exactly the straight line ADR 0138 recorded and read as good news.
+//! which is exactly the straight line ADR 109 recorded and read as good news.
 //!
 //! Real traffic is Zipfian: a few keys take most of the requests. There the
 //! policy is the whole game, and the gap between what a cache gets and what a

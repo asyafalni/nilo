@@ -3,7 +3,7 @@
 //! They are the two ends of one join — `.on` a column of the inner Row, `.via`
 //! a column of the outer one — and a join has one key on one side. Both at
 //! once is two joins, or one written twice, and either way it is not what the
-//! caller meant (ADR 0214).
+//! caller meant (ADR 175).
 
 const sql = @import("nilo_sql");
 

@@ -7,9 +7,8 @@ each one assumes the ones above it — and jump straight in afterwards.
 
 nilo is a toolkit of eleven modules rather than one library, and which one a page
 belongs to is decided by a single question — does it need the event loop?
-([ADR 0041](../adr/0041-a-module-sits-where-the-loop-puts-it.md),
-[ADR 0042](../adr/0042-the-bottom-layer-holds-more-than-one-module.md),
-[ADR 0070](../adr/0070-a-fitting-borrows-the-loop.md))
+([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md),
+[ADR 061](../adr/061-a-fitting-borrows-the-loop.md))
 
 | Module | What it is | Pages |
 |---|---|---|

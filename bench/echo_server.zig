@@ -2,7 +2,7 @@
 //! one binary: what the record layer costs when both directions are loaded at
 //! once.
 //!
-//! ADR 0288 measured the handshake and what a request costs on a connection
+//! ADR 212 measured the handshake and what a request costs on a connection
 //! kept alive, and left one row open in so many words: "Throughput at
 //! saturation over `https://` was not measured, for want of a load generator
 //! with TLS on the box." This is the server for that row. The shape is the
@@ -17,7 +17,7 @@
 //! the encryption gets measured as the encryption. Here the plain run and the
 //! TLS run are the same bytes of machine code with `ECHO_TLS` unset or set.
 //! The build is still `-Dtls`, so both sides also carry the page per idle
-//! connection that flag costs every listener (ADR 0288), and neither side has
+//! connection that flag costs every listener (ADR 212), and neither side has
 //! an advantage the other lacks.
 //!
 //! ```

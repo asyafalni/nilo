@@ -17,13 +17,13 @@
 //!
 //! 2. **Can it be tested with no engine and no module graph?** The entry
 //!    condition proposed for the fourth layer is `zig test <m>/<m>.zig` under
-//!    `std.Io.Threaded` — the same shape as ADR 0042's, one tier up. Nobody
+//!    `std.Io.Threaded` — the same shape as ADR 038's, one tier up. Nobody
 //!    had checked whether an HTTP client can pass it. Everything here runs
 //!    against a loopback server on `std.Io.Threaded`, no zio anywhere, and the
 //!    dependency list in `build.zig.zon` is empty.
 //!
 //! What is deliberately *not* here: TLS, which is `std.crypto.tls.Client` and
-//! costs this layer nothing to enable, and the deadline, which is ADR 0065 and
+//! costs this layer nothing to enable, and the deadline, which is ADR 056 and
 //! does not exist yet. Where the deadline would be armed is marked. Neither
 //! changes the answer to question 1 — see the README.
 
@@ -93,7 +93,7 @@ pub const Outbound = struct {
         try self.gate.wait(io);
         defer self.gate.post(io);
 
-        // Where ADR 0065 arms the deadline: one `Limits.bind` around
+        // Where ADR 056 arms the deadline: one `Limits.bind` around
         // everything below, released with the permit.
 
         var req = try self.client.request(method, uri, .{});

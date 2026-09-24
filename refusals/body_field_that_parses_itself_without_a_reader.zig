@@ -2,7 +2,7 @@
 //! reader. On the path and in the query string nilo reads it through
 //! `nilo_parse`; in a body `std.json` would read it as its fields, and a
 //! client sending the text would be told the field has to be an object
-//! ([ADR 0205](../docs/adr/0205-a-body-field-that-parses-itself.md)).
+//! ([ADR 166](../docs/adr/166-a-body-field-that-parses-itself.md)).
 
 const nilo = @import("nilo_http");
 

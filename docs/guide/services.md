@@ -27,7 +27,7 @@ from middleware, `c.service(*Db)` is the same lookup.
 The App is a service like any other — `try app.provide(&app)` — which is how an
 admin endpoint gets at `app.shutdown()`.
 
-See [ADR 0006](../adr/0006-services-via-a-runtime-registry.md).
+See [ADR 005](../adr/005-services-via-a-runtime-registry.md).
 
 ## They are shared across threads
 
@@ -52,7 +52,7 @@ fn addUser(store: *Store, incoming: NewUser) !User {
 `lock()` can fail with `error.Canceled` if the request went away while waiting,
 which maps to a 503 already. It still works with no server running, so a handler
 that takes the lock is still testable as a plain function. See
-[ADR 0011](../adr/0011-shared-services-need-a-lock-from-the-bulkhead.md).
+[ADR 010](../adr/010-shared-services-need-a-lock-from-the-bulkhead.md).
 
 ## Holding on to request text
 
@@ -264,7 +264,7 @@ whatever it spent legitimately waiting, and says so:
 ```
 handler GET /users/7 held its thread for 2003ms. Every other request being
 served on that thread waited the whole time. Hand the call that waits to
-nilo.blocking (ADR 0014).
+nilo.blocking (ADR 013).
 ```
 
 The useful part is *when*: on the first request, with nobody else on the server.
@@ -285,11 +285,10 @@ same thing on a request that lasts a millisecond and on a connection that lasts
 a day, so a blocking call inside a WebSocket loop is reported now — and it is
 where the mistake costs the most, since a stalled fiber there holds its executor
 against every other socket that executor is serving
-([ADR 0132](../adr/0132-what-is-watched-is-one-unparked-stretch.md)).
+([ADR 013](../adr/013-handlers-must-not-block-the-thread.md)).
 
 A handler that yields every 30ms is not holding its thread, whatever it adds up
 to over a request, and is not reported.
 
-See [ADR 0014](../adr/0014-handlers-must-not-block-the-thread.md) for the rule
-and [ADR 0034](../adr/0034-the-thing-a-handler-holds-is-watched-at-run-time.md)
-for what watches it.
+See [ADR 013](../adr/013-handlers-must-not-block-the-thread.md) for the rule
+and what watches it.

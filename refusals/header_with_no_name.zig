@@ -1,5 +1,5 @@
 //! A `FromHeader` that names no header, which is a lookup with nothing to look
-//! up ([ADR 0163](../docs/adr/0163-a-header-a-handler-can-be-given.md)).
+//! up ([ADR 131](../docs/adr/131-a-header-a-handler-can-be-given.md)).
 
 const nilo = @import("nilo_http");
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Does the server survive running out of file descriptors?
 
-Until ADR 0265 it did not: `accept` failed with `ProcessFdQuotaExceeded`, the
+Until ADR 194 it did not: `accept` failed with `ProcessFdQuotaExceeded`, the
 accept loop returned on anything but a timeout, and `listen()` ended with a
 clean "nilo stopping" in the log — at about a thousand connections on a
 default `ulimit -n`, well short of `max_connections`. This is the regression
-check, the way `shutdown.py` is ADR 0098's.
+check, the way `shutdown.py` is ADR 077's.
 
     zig build bench-stream-server -Doptimize=ReleaseFast
     python3 bench/fdlimit.py --cmd ./zig-out/bin/nilo-bench-stream-server \\

@@ -2,7 +2,7 @@
 
 A gRPC method is a route. `app.post("/package.Service/Method", handler)` registers it, the handler reads the message with `c.body()` and answers with `c.send`, and a listener that speaks gRPC turns each call into that request and the answer back into what the client expects. Middleware, fail functions, deadlines, counters and the log see a call as the request it became.
 
-It is for the callers you do not choose: a service whose contract is a `.proto` file, an OpenTelemetry Collector exporting OTLP, a Kubernetes plugin, an Envoy filter. Unary calls only, and it has to be built in ([ADR 0297](../adr/0297-grpc-is-served-over-h2c-behind-a-flag.md)).
+It is for the callers you do not choose: a service whose contract is a `.proto` file, an OpenTelemetry Collector exporting OTLP, a Kubernetes plugin, an Envoy filter. Unary calls only, and it has to be built in ([ADR 220](../adr/220-grpc-is-served-over-h2c-behind-a-flag.md)).
 
 ## Turning it on
 

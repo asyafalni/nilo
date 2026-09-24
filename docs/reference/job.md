@@ -7,7 +7,7 @@ One page of [the reference](./README.md): work that runs later, again, or on a s
 Work that runs later, again, or on a schedule: a queue whose rows live in a
 table in the database the program already has, and a worker loop the server
 owns. A **Fitting**, like `nilo_fetch`: it borrows the loop and is handed
-its store ([ADR 0198](../adr/0198-a-queue-is-a-table-in-the-database-you-already-have.md)).
+its store ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 **At least once**: `run` is written to be safe to call twice.
 
 ```zig
@@ -44,10 +44,10 @@ is copied rather than carried. Three declarations are read while compiling:
 |---|---|
 | `pub const nilo_job = "…"` | the name the row carries. Required; at most 64 bytes; unique across the `kinds` |
 | `pub const retry: job.Retry` | required, no default: `.none`, or `.{ .times, .backoff }` with `.{ .fixed_ms }` or `.{ .exponential = .{ .from_ms, .to_ms } }` |
-| `pub fn run(self, scope: *nilo.Run, …) !void` | the work: the job by value, the Run, then any service by pointer, found in `.deps` by type — and `tick: job.Tick` by value, if it wants to know which tick it is ([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)) |
-| `pub const final = error{ … }` | optional: the failures that are **final**. A `run` failing with one is dead on that attempt whatever `retry` says, and the row keeps the error's name; a timeout never is. Refused on a kind whose `retry` is `.none` ([ADR 0218](../adr/0218-a-run-can-say-its-failure-is-final.md)) |
+| `pub fn run(self, scope: *nilo.Run, …) !void` | the work: the job by value, the Run, then any service by pointer, found in `.deps` by type — and `tick: job.Tick` by value, if it wants to know which tick it is ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
+| `pub const final = error{ … }` | optional: the failures that are **final**. A `run` failing with one is dead on that attempt whatever `retry` says, and the row keeps the error's name; a timeout never is. Refused on a kind whose `retry` is `.none` ([ADR 179](../adr/179-a-run-can-say-its-failure-is-final.md)) |
 | `pub const timeout_ms` | optional, over the queue's. Also the lease |
-| `pub const priority: job.Priority` | optional; `.high`, `.normal` (the default) or `.low`. A free worker takes the most urgent **due** row, and among equals the one that has been due longest ([ADR 0290](../adr/0290-a-job-says-how-urgent-it-is.md)). A number here is a Refusal naming the three levels |
+| `pub const priority: job.Priority` | optional; `.high`, `.normal` (the default) or `.low`. A free worker takes the most urgent **due** row, and among equals the one that has been due longest ([ADR 214](../adr/214-a-job-says-how-urgent-it-is.md)). A number here is a Refusal naming the three levels |
 | `pub const schedule`, `overlap`, `missed` | for a job that runs on the clock — below |
 
 A field that is a `*T` is a Refusal naming the field; a `run` that asks for a
@@ -69,7 +69,7 @@ one naming the job.
 |---|---|
 | `.kinds` | a tuple of job types. A job pushed but not listed is a Refusal |
 | `.store` | `job.Table(Db)`, `job.Memory`, or anything carrying the contract in `job/contract.zig` |
-| `.deps` | optional: a struct of pointers a `run` may ask for by type — or `fn (comptime Jobs: type) type` answering one, for a `run` that asks for `*Jobs` to push the next job ([ADR 0245](../adr/0245-a-job-can-push-the-next-one.md)). A function of another shape is a Refusal |
+| `.deps` | optional: a struct of pointers a `run` may ask for by type — or `fn (comptime Jobs: type) type` answering one, for a `run` that asks for `*Jobs` to push the next job ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)). A function of another shape is a Refusal |
 | `.status` | optional: a `cache.Space` of `job.Status` kept per row, for a route to poll |
 
 | | |
@@ -79,17 +79,17 @@ one naming the job.
 | `Jobs.Row` | the store's table, for `createMissing` and `db.checking`; `void` for `job.Memory` |
 | `jobs.push(c, value, opts)` | `!Id`; `!?Id` when `opts` has `.unique`, null when a row already carries the key |
 | `jobs.pushIn(&tx, c, value, opts)` | the same inside a transaction you hold. A Refusal on `job.Memory`, and with `.within`. Wakes nobody — the row is not there until the commit — so call `wake` after it |
-| `jobs.wake()` | wake every idle worker, for a row nilo did not see arrive: another process's, or one `pushIn` put under a transaction that has since committed. A `push` wakes one worker itself ([ADR 0229](../adr/0229-a-push-wakes-a-worker.md)) |
+| `jobs.wake()` | wake every idle worker, for a row nilo did not see arrive: another process's, or one `pushIn` put under a transaction that has since committed. A `push` wakes one worker itself ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
 | `jobs.stats(c)` | `Stats` — `queued`, `running`, `dead` |
 | `jobs.status(id)` | `?job.Status` — `state`, `attempts` and `progress`, from the Space, while it remembers |
-| `jobs.progress(id, n)` | `n` into the Space's `progress` for the row, from inside a `run` with a `job.Tick` and a `*Jobs`. Reset by every change of state except `done`, which keeps it. Nothing without a Space ([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)) |
-| `jobs.cancel(c, id)` | `bool` — a `queued` row deleted before it runs, its `unique` key with it; `false` when the row is running, finished or absent. One statement, so a claim in the same instant wins or loses whole. A Refusal on a store with no `cancel` ([ADR 0257](../adr/0257-a-queued-row-can-be-taken-back.md)) |
+| `jobs.progress(id, n)` | `n` into the Space's `progress` for the row, from inside a `run` with a `job.Tick` and a `*Jobs`. Reset by every change of state except `done`, which keeps it. Nothing without a Space ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
+| `jobs.cancel(c, id)` | `bool` — a `queued` row deleted before it runs, its `unique` key with it; `false` when the row is running, finished or absent. One statement, so a claim in the same instant wins or loses whole. A Refusal on a store with no `cancel` ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
 | `jobs.deadOnes(c)` | `[]Dead` — `id`, `kind`, `attempts`, `err`, newest first |
 | `jobs.retryDead(c, id)` | `bool` — queued again from attempt one |
 | `Jobs.serve(&jobs)` | the worker loop, for `app.spawn`. Stops with the server |
 | `jobs.serveOn(io)` | the same on an `Io` of yours, for a worker process. Returns when cancelled |
 | `jobs.drain(&run)` / `jobs.runOne(&run)` | run what is due on this thread, for a test, against one reading of the clock. A `*Ctx` is refused |
-| `jobs.drainAt(&run, now)` / `jobs.runOneAt(&run, now)` | the same as if it were `now`, microseconds since the epoch: what is due, when a retry is, when the next tick is, all read that number. How a test moves the clock ([ADR 0246](../adr/0246-a-tick-knows-which-one-it-is-and-a-test-says-when.md)) |
+| `jobs.drainAt(&run, now)` / `jobs.runOneAt(&run, now)` | the same as if it were `now`, microseconds since the epoch: what is due, when a retry is, when the next tick is, all read that number. How a test moves the clock ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
 | `jobs.seed(&run)` / `jobs.seedAt(&run, now)` | queue every schedule's next tick, the way `serve` does at start — for a test that drains rather than serves |
 | `jobs.nilo_ready(scope)` | what `app.health` asks: the store, and whether a worker is alive |
 
@@ -106,11 +106,11 @@ one naming the job.
 
 | Field | Default | |
 |---|---|---|
-| `workers` | 4 | rows running at once in this process. A fiber each, its stack held at the high-water mark ([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)) |
-| `poll_ms` | 1,000 | how long an idle worker waits before asking again **when nothing wakes it first**. A `push` from this process wakes a worker, so this is the latency only of a row another process pushed, and the cost of an idle queue: one claim per worker per interval ([ADR 0229](../adr/0229-a-push-wakes-a-worker.md)) |
+| `workers` | 4 | rows running at once in this process. A fiber each, its stack held at the high-water mark ([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)) |
+| `poll_ms` | 1,000 | how long an idle worker waits before asking again **when nothing wakes it first**. A `push` from this process wakes a worker, so this is the latency only of a row another process pushed, and the cost of an idle queue: one claim per worker per interval ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
 | `timeout_ms` | 60,000 | how long one run may take, for a kind naming no `timeout_ms`. Also the lease |
 
-**A schedule** ([ADR 0199](../adr/0199-a-schedule-is-a-type-that-makes-the-caller-choose.md)):
+**A schedule** ([ADR 161](../adr/161-a-schedule-is-a-type-that-makes-the-caller-choose.md)):
 
 | | |
 |---|---|
@@ -128,7 +128,7 @@ of a scheduled job has a default, since nobody pushes one.
 
 | | |
 |---|---|
-| `job.Table(Db)` | the queue as a `nilo_table` Row named `nilo_jobs`, over your `sql.Db` or `sql.Sqlite(…)`. `open(&db)`. Claims with `FOR UPDATE SKIP LOCKED` on Postgres, and without on SQLite, where a claim is a write and `workers` is the number of them. The claim asks only for the kinds this program runs (`kind IN (…)`), so a row another binary pushed under a kind you do not declare is left queued for the binary that does ([ADR 0291](../adr/0291-a-worker-claims-only-what-it-can-run.md)) |
+| `job.Table(Db)` | the queue as a `nilo_table` Row named `nilo_jobs`, over your `sql.Db` or `sql.Sqlite(…)`. `open(&db)`. Claims with `FOR UPDATE SKIP LOCKED` on Postgres, and without on SQLite, where a claim is a write and `workers` is the number of them. The claim asks only for the kinds this program runs (`kind IN (…)`), so a row another binary pushed under a kind you do not declare is left queued for the binary that does ([ADR 215](../adr/215-a-worker-claims-only-what-it-can-run.md)) |
 | `table.sweep(c, before)` | delete `done` rows finished before a moment. Nothing calls it for you |
 | `job.Memory` | the same contract in this process. `open(gpa, .{ .bytes, .max_payload = 4096 })`; a full one is `error.QueueFull`, never a row written over |
 

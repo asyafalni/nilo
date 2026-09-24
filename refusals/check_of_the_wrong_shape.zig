@@ -1,7 +1,7 @@
 //! A `nilo_check` that takes only the value and no rules to write into. It
 //! has nowhere to put what did not hold, so the shape is refused with the one
 //! that works
-//! ([ADR 0264](../docs/adr/0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)).
+//! ([ADR 193](../docs/adr/193-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)).
 
 const nilo = @import("nilo_http");
 

@@ -5,7 +5,7 @@ One page of [the reference](./README.md): an expiring cache in this process.
 ## `nilo_cache`
 
 An expiring cache in this process, and nothing that needs a loop
-([ADR 0138](../adr/0138-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)).
+([ADR 109](../adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)).
 A tool module: it imports nothing, so `zig test cache/cache.zig` runs the whole
 of it and a program that is not a server can take it on its own.
 
@@ -40,8 +40,8 @@ const Carts = cache.Space("cart", Cart, .{ .ttl_s = 300 });
 | `space.putFor(key, value, ttl_s)` | for a life of its own. `0` is "until the ring writes over it" |
 | `space.get(key)` | `?V` for a flat value; `?[]const u8` and a `*Held` for bytes |
 | `space.del(key)` | `bool` — was there anything to forget |
-| `space.incr(key, delta)` | `V` — the new count, for a Space whose `V` is an integer; anything else is a Refusal. The read, the add and the write are under the shard's lock, so two callers count two. A key nobody wrote counts from zero and lives `ttl_s`; one there keeps the expiry it had. Saturating ([ADR 0261](../adr/0261-a-count-is-added-to-under-the-lock-the-copy-is-under.md)) |
-| `space.putIfAbsent(key, value)` | store only if the key is free, and say whether it was — `bool` for a flat value, `!bool` for bytes. One shard lock around the scan and the write, so two callers racing get one `true` between them. What `nilo.Idempotent` claims a key with ([ADR 0193](../adr/0193-a-request-answered-once-is-answered-the-same-way-again.md)) |
+| `space.incr(key, delta)` | `V` — the new count, for a Space whose `V` is an integer; anything else is a Refusal. The read, the add and the write are under the shard's lock, so two callers count two. A key nobody wrote counts from zero and lives `ttl_s`; one there keeps the expiry it had. Saturating ([ADR 109](../adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)) |
+| `space.putIfAbsent(key, value)` | store only if the key is free, and say whether it was — `bool` for a flat value, `!bool` for bytes. One shard lock around the scan and the write, so two callers racing get one `true` between them. What `nilo.Idempotent` claims a key with ([ADR 155](../adr/155-a-request-answered-once-is-answered-the-same-way-again.md)) |
 | `space.getInto(key, buf)` | the bytes read as `get` reads them, into a buffer of your choosing rather than a `Held` — for a caller whose buffer is an arena |
 | `store.stats()` | hits, and the three different ways of missing |
 | `store.bytesHeld()` | every byte it will ever hold, and it never moves |
@@ -68,7 +68,7 @@ fn render(pages: *Pages, path: []const u8) ![]const u8 {
 ```
 
 **`Held` is your stack, and stack is held per connection for the life of it**
-([ADR 0063](../adr/0063-a-handlers-stack-is-per-connection.md)). A handler
+([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)). A handler
 declaring a 4 KiB `Held` has added 4 KiB to every connection that reaches it.
 It is written as an array you declare rather than a buffer the cache hides
 because that is the only way the number is yours to see.
@@ -100,7 +100,7 @@ read moved out of the write cursor's way, which is the policy working.
 
 The counters are exact and the *reading* is not a snapshot: nothing is locked
 while they are summed, because a lookup takes no lock either
-([ADR 0188](../adr/0188-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md)).
+([ADR 152](../adr/152-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md)).
 `evicted` also counts the rare read whose bytes a `put` overwrote mid-copy —
 that read found the key and lost it to the ring, which is what the word means.
 
@@ -111,7 +111,7 @@ does take one, per shard.
 **A new entry has to be asked for twice before it gets the run of the ring.** It
 lands in a tenth of it and is copied into the rest when something reads it
 again, so a flood of keys nobody asks for twice cannot flush what the cache is
-holding (ADR 0187). Two things follow: a cache with room still admits freely,
+holding (ADR 109). Two things follow: a cache with room still admits freely,
 and a cache written to and never read holds its first entries indefinitely
 rather than forgetting the oldest.
 
@@ -131,5 +131,5 @@ the single-threaded rows where go-cache is faster, and why).
 
 **What it will not do is leave this process.** Two instances of your program
 have two caches that do not agree, neither survives a restart, and nothing here
-reaches a network. That is the trade the module is for; ADR 0139 argues it, and
+reaches a network. That is the trade the module is for; ADR 110 argues it, and
 names `nilo_redis` as the other answer nobody has needed yet.

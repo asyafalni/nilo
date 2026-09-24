@@ -1,5 +1,5 @@
 //! A function in a SQLite schema. A SQLite function is a callback registered
-//! on the connection, not a statement, so the list is refused (ADR 0253).
+//! on the connection, not a statement, so the list is refused (ADR 181).
 
 const sql = @import("nilo_sql");
 

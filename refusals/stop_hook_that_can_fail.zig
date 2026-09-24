@@ -3,7 +3,7 @@
 //! It runs from a `defer` on the way out of `listen()`. There is nobody left
 //! to hand a failure to and nothing useful to do with one, so a service that
 //! hits trouble putting something down logs it and carries on — which is what
-//! every `deinit` in this repository already does (ADR 0151).
+//! every `deinit` in this repository already does (ADR 121).
 
 const nilo = @import("nilo_http");
 

@@ -16,7 +16,7 @@
 //! This was private to `fetch/live.zig` for a year, and the guide told a
 //! suite of somebody's own to copy its shape — a loopback
 //! `std.Io.net.Server`, a `serveOne`, the port read back — so every such
-//! suite wrote it again ([ADR 0243](../docs/adr/0243-the-ordinary-call-sends-json-and-a-query.md)).
+//! suite wrote it again ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)).
 //! It is not an HTTP server: just enough of one to drive a client, and
 //! `serveOne` is the whole of what a caller's test needs. The other `serve*`
 //! below are the shapes the module's own tests drive — a keep-alive, a
@@ -26,7 +26,7 @@
 //!
 //! Nothing here touches the Engine. A `Canned` runs on `std.Io.Threaded`,
 //! which is the entry condition for the Fitting layer
-//! ([ADR 0070](../docs/adr/0070-a-fitting-borrows-the-loop.md)), and a
+//! ([ADR 061](../docs/adr/061-a-fitting-borrows-the-loop.md)), and a
 //! program that never names `fetch.testing` links none of it.
 
 const std = @import("std");
@@ -38,7 +38,7 @@ const std = @import("std");
 /// harness held for a day.** `std.Io.async` is allowed to run the function
 /// on the calling thread — `Threaded` does exactly that whenever its pool
 /// counts as many busy tasks as it has spare cores, which on a two-core
-/// machine is one. Until ADR 0230 nothing in the module's tests ever had a
+/// machine is one. Until ADR 056 nothing in the module's tests ever had a
 /// task in flight while a server was being started, so the inline path was
 /// never taken. Now every bounded call runs as a task of its own, and the
 /// worker that ran it wakes the awaiter *before* it takes the pool's lock
@@ -450,7 +450,7 @@ pub const Canned = struct {
     /// for a second request, which is answered with a body. What a peer
     /// reaping an idle keep-alive looks like is `serveThenReap`; this is the
     /// peer *not* reaping it, which is what turned a complete answer into a
-    /// wait for EOF (ADR 0215).
+    /// wait for EOF (ADR 176).
     pub fn serveNoContentThenOne(self: *Canned) !void {
         var stream = try self.server.accept(self.io);
         defer stream.close(self.io);
@@ -530,9 +530,9 @@ pub const Canned = struct {
     }
 
     /// A head that promises `body_len` bytes and sends them one at a time,
-    /// `trickle_ms` apart: the slow server ADR 0230 refused to call a
+    /// `trickle_ms` apart: the slow server ADR 056 refused to call a
     /// failure, and the control for the silence clock: a body that keeps
-    /// moving, however slowly, must never be called a stall (ADR 0237).
+    /// moving, however slowly, must never be called a stall (ADR 056).
     pub fn serveTrickle(self: *Canned, trickle_ms: u32) !void {
         var stream = try self.server.accept(self.io);
         defer stream.close(self.io);

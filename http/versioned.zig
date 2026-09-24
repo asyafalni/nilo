@@ -1,6 +1,6 @@
 //! An answer with a version on it, so a client holding that version gets a
 //! 304 and no body
-//! ([ADR 0258](../docs/adr/0258-a-version-a-handler-names-is-an-etag.md)).
+//! ([ADR 189](../docs/adr/189-a-version-a-handler-names-is-an-etag.md)).
 //!
 //! ```zig
 //! fn listOrders(c: *nilo.Ctx, db: *Db) !nilo.Versioned([]const Order) {
@@ -61,7 +61,7 @@ pub fn Versioned(comptime T: type) type {
 
         /// What the body is, for the compile-time engine and the document.
         pub const nilo_versioned = T;
-        /// What a nilo compile error calls this type (ADR 0122).
+        /// What a nilo compile error calls this type (ADR 074).
         pub const nilo_type_name = "nilo.Versioned(" ++ naming.of(T) ++ ")";
 
         /// The version of the body, as the handler counts it.

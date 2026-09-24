@@ -1,9 +1,9 @@
-//! nilo_id — identifiers, and nothing that needs a loop (ADR 0042).
+//! nilo_id — identifiers, and nothing that needs a loop (ADR 038).
 //!
 //! The first **tool module**: one in the bottom layer that is not the
 //! vocabulary. `nilo_core` is what every layer agrees about; this is a job
 //! that happens to need no event loop, which is the only question that
-//! decides where a module goes (ADR 0041).
+//! decides where a module goes (ADR 038).
 //!
 //! ```zig
 //! const id = @import("nilo_id");
@@ -16,7 +16,7 @@
 //!
 //! A `Uuid` from here is the same type `nilo_sql` reads a `uuid` column into
 //! — the Service imports this module rather than declaring a second Uuid of
-//! its own, which is what ADR 0042 decides. So a generated key goes straight
+//! its own, which is what ADR 038 decides. So a generated key goes straight
 //! into an insert:
 //!
 //! ```zig
@@ -26,9 +26,9 @@
 //! **The randomness and the millisecond are arguments.** Both are IO in Zig
 //! 0.16 and neither is something a module down here can reach: nilo gets
 //! entropy through the Bulkhead so that the syscall parks the fiber instead
-//! of stopping the thread (ADR 0002, ADR 0014), and a module in this layer
+//! of stopping the thread (ADR 001, ADR 013), and a module in this layer
 //! has no Bulkhead. What that costs a handler, and what the seam would look
-//! like, is written down in ADR 0042 rather than guessed at here.
+//! like, is written down in ADR 038 rather than guessed at here.
 //!
 //! **This module imports nothing at all**, and that is checked rather than
 //! promised: `zig build layering` refuses an import here that is not `std`,
@@ -47,7 +47,7 @@ pub const v4 = Uuid.v4;
 pub const v7 = Uuid.v7;
 
 /// The same key, minted from the Scope already in hand
-/// ([ADR 0176](../docs/adr/0176-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)):
+/// ([ADR 143](../docs/adr/143-a-key-that-can-be-printed-and-a-key-that-can-be-made.md)):
 ///
 /// ```zig
 /// const key = try id.v7Now(c);

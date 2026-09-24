@@ -1,5 +1,5 @@
 //! Redirects — a status and a `Location`, returned rather than sent
-//! (ADR 0032).
+//! (ADR 031).
 //!
 //! ```zig
 //! fn shortLink(db: *Db, code: Str) !nilo.Redirect(302) {
@@ -14,7 +14,7 @@
 //!
 //! The status is part of the type, so the generated API description names it
 //! and says the answer carries a `Location` — the same reason `Status(201, T)`
-//! exists next to `Response(T)` (ADR 0024). A redirect whose status is only
+//! exists next to `Response(T)` (ADR 023). A redirect whose status is only
 //! known while the request is running is `c.redirect(status, where)`, which
 //! is what this compiles down to anyway.
 //!
@@ -38,7 +38,7 @@ pub fn Redirect(comptime status: u16) type {
 
         pub const nilo_redirect = status;
         /// What a nilo compile error calls this type, which is the name the
-        /// reader's own import line gives it (ADR 0122).
+        /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = std.fmt.comptimePrint("nilo.Redirect({d})", .{status});
 
         /// Where the client is being sent. A path (`/welcome`) or a whole
@@ -48,7 +48,7 @@ pub fn Redirect(comptime status: u16) type {
         /// What nilo does check is that it is one header value: a `Location`
         /// carrying a newline would end the header early and start a second
         /// one, and that is refused with a 500 rather than written
-        /// ([ADR 0087](../docs/adr/0087-a-header-value-cannot-end-its-own-line.md)).
+        /// ([ADR 029](../docs/adr/029-a-header-is-checked-once-and-two-of-them-repeat.md)).
         /// Worth knowing here in particular, because the shape this type is
         /// for — a short link read out of a database — is the one where the
         /// destination did not come from you.

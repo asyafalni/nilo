@@ -21,7 +21,7 @@ to work, because Zig reserves it for byte slices and a `Str` is a struct.
 **`blank()` is the check in front of a write that takes a name, a title or a
 body**, because required text arrives as `"  "` in the ordinary case rather than
 the rare one — a field somebody tabbed through, a paste that brought its newline
-along ([ADR 0175](../adr/0175-required-text-arrives-as-two-spaces.md)). The set is
+along ([ADR 142](../adr/142-required-text-arrives-as-two-spaces.md)). The set is
 `std.ascii.whitespace`, which includes the `\n` a hand-written `" \t\r\n"` drops
 about half the time; a comment whose entire body is a newline is required text
 that renders as an empty screen.
@@ -59,7 +59,7 @@ const rows = try db.select(User, &run, .{ .where = .{ .age = .{ .gt = 18 } } });
 compiles under both — which is what "pass the `*Ctx`, or a `nilo.Run` if there
 is no request" has always promised, and was false of the most common function in
 any program, the one that mints a key
-([ADR 0160](../adr/0160-a-scope-that-can-mint-a-key.md)):
+([ADR 128](../adr/128-a-scope-that-can-mint-a-key.md)):
 
 ```zig
 fn create(db: *Db, scope: anytype, title: []const u8) !Doc {
@@ -93,7 +93,7 @@ const types: []const Str = &.{ .static("DealValueChanged"), .static("DealWon") }
 argument** — which is the top of the call stack. What needs it is often the
 bottom: an audit row assembled sixty call sites down, where every function in
 between would have to carry a value it has no business knowing about
-([ADR 0165](../adr/0165-a-value-that-reaches-the-bottom.md)).
+([ADR 133](../adr/133-a-value-that-reaches-the-bottom.md)).
 
 Both scopes answer `resolve`, so one function body reaches it either way:
 
@@ -107,7 +107,7 @@ fn record(db: *Db, scope: anytype, what: Event) !void {
 **Where the value comes from is what differs, and that is the point.** Under a
 server, `Actor` carries `nilo_resolve` and is worked out from the request — so
 "is it set?" is answered while compiling, and no middleware has to remember
-anything (ADR 0016). A seed or a CLI has no request to work it out from, so it
+anything (ADR 015). A seed or a CLI has no request to work it out from, so it
 is told once at the top:
 
 ```zig
@@ -137,7 +137,7 @@ it.
 
 Not a type — the two calls `arena()` and `str()` that [`Run`](#run) lists. A `Ctx` has them and a
 `Run` has them, and anything asking for a Scope takes either
-([ADR 0041](../adr/0041-a-module-sits-where-the-loop-puts-it.md)). It is checked
+([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)). It is checked
 while compiling, so passing something else is a Refusal naming the call rather
 than an error from inside the module.
 
@@ -149,7 +149,7 @@ with no server in it can depend on `nilo_core` alone.
 
 A Scope with its type erased, for the one place the shape above cannot reach:
 **the other side of a function pointer**
-([ADR 0177](../adr/0177-a-scope-that-crosses-a-function-pointer.md)). Zig has no
+([ADR 144](../adr/144-a-scope-that-crosses-a-function-pointer.md)). Zig has no
 closures, so a bus, a queue or a job registry stores a callback as a function
 pointer — and a function pointer names one type per argument, so a reaction
 cannot be generic over the Scope it runs under while still running under a
@@ -174,8 +174,8 @@ try reaction(&erased, payload);
 | `erased.str(bytes)` | the same, stamped with the wrapped Scope's lifetime |
 | `erased.entropy(n)` | `![n]u8` |
 | `erased.entropyInto(buf)` | `!void`, and the one the vtable actually carries |
-| `erased.requestId()` | `?Str` — the request's id when it was made from a `*Ctx`, `null` from a `Run` ([ADR 0196](../adr/0196-a-request-id-goes-out-with-the-call.md)) |
-| `erased.resolve(V)` | `!V` — what the Scope behind it **already holds**: given to the `Run`, or resolved for the request before it was erased. `error.NotGiven` otherwise; an erased Scope never runs a resolver. So a type only the far side asks for is resolved in the middleware that proves it — `_ = try c.resolve(V);` before `next.run` — not at the bottom ([ADR 0219](../adr/0219-an-erased-scope-answers-what-was-resolved.md)) |
+| `erased.requestId()` | `?Str` — the request's id when it was made from a `*Ctx`, `null` from a `Run` ([ADR 158](../adr/158-a-request-id-goes-out-with-the-call.md)) |
+| `erased.resolve(V)` | `!V` — what the Scope behind it **already holds**: given to the `Run`, or resolved for the request before it was erased. `error.NotGiven` otherwise; an erased Scope never runs a resolver. So a type only the far side asks for is resolved in the middleware that proves it — `_ = try c.resolve(V);` before `next.run` — not at the bottom ([ADR 144](../adr/144-a-scope-that-crosses-a-function-pointer.md)) |
 
 It passes the Scope check, so `db.select(Row, &erased, …)` works — a reaction can
 query, and can ask who is acting.
@@ -200,7 +200,7 @@ RFC 3986, both directions. The server decodes every path param and query value
 through it and you never call that half; the encoding half is for building a
 URL or signing one, and a Service can reach it because it is in Core rather
 than behind `nilo_http`
-([ADR 0066](../adr/0066-percent-is-needed-by-two-layers.md)).
+([ADR 057](../adr/057-percent-is-needed-by-two-layers.md)).
 
 ```zig
 const percent = @import("nilo_core").percent;
@@ -211,7 +211,7 @@ const key = percent.encodeInto(&buf, "holiday photos/bali.jpg", .path);
 ```
 
 A handler reaches the same thing as **`nilo.percent`** without adding an import
-— which is the other half of what ADR 0066 is about, and what
+— which is the other half of what ADR 057 is about, and what
 `examples/outbound/` uses to put a path param into a URL it is about to fetch.
 
 | Call | |
@@ -249,13 +249,13 @@ stays off for path params, where a `+` is a plain `+`.
 Plain functions rather than calls on a `Ctx` or a `Run`: reading the wall clock
 needs no event loop and nobody owns the time, so there is nothing for a Scope to
 be the holder of
-([ADR 0045](../adr/0045-core-knows-what-time-it-is.md)). They are `nilo_core`'s,
+([ADR 041](../adr/041-core-knows-what-time-it-is.md)). They are `nilo_core`'s,
 so a program with no server in it has them too. 15ns a call.
 
 **Use `monotonicMicros` for a duration, never the other two.** A wall clock
 moves when an operator moves it or when NTP steps it, so two readings a second
 apart can come back in either order. It is the clock `db.watching` times a
-statement with ([ADR 0137](../adr/0137-a-statement-can-be-watched.md)).
+statement with ([ADR 108](../adr/108-a-statement-can-be-watched.md)).
 
 A handler that waits on the operating system without going through one of these
 holds the thread every other request on it is being served by. nilo notices and
@@ -264,12 +264,12 @@ says so, once a second at most:
 ```
 handler GET /users/7 held its thread for 2003ms. Every other request being
 served on that thread waited the whole time. Hand the call that waits to
-nilo.blocking (ADR 0014).
+nilo.blocking (ADR 013).
 ```
 
 A wait inside a service — `db.raw` on its socket, a pool a caller queues on —
 is a park too, and the service says so through `Limits.waiting`/`waited`
-([ADR 0286](../adr/0286-a-services-wait-on-its-own-socket-is-a-park.md)); a
+([ADR 210](../adr/210-a-services-wait-on-its-own-socket-is-a-park.md)); a
 slow query is not a report, a slow loop is.
 
 It fires on the first request, with nobody else waiting, which is the point —
@@ -278,8 +278,7 @@ threshold and `0` turns it off. What is measured is the longest stretch the
 fiber ran **without parking**, so a stream, a body reader and a WebSocket are
 watched on the same terms as anything else — a blocking call inside a WebSocket
 loop is where it costs the most
-([ADR 0034](../adr/0034-the-thing-a-handler-holds-is-watched-at-run-time.md),
-[ADR 0132](../adr/0132-what-is-watched-is-one-unparked-stretch.md)).
+([ADR 013](../adr/013-handlers-must-not-block-the-thread.md)).
 
 `spawn` starts `f` in a fiber the server owns: counted while it runs, cut off
 when the shutdown grace period ends. `error.NoServer` if nothing is listening.
@@ -296,8 +295,8 @@ try nilo.spawn(flushMetrics, .{&exporter});
 `app.spawn` registers the same work before the server and starts it once there
 is one — after the port is taken, after the services and whatever `app.before`
 registered, before the first connection is accepted
-([ADR 0086](../adr/0086-work-that-is-not-a-request-belongs-to-the-server.md),
-[ADR 0220](../adr/0220-work-that-needs-the-services-runs-on-their-loop.md),
+([ADR 028](../adr/028-a-spawned-fiber-belongs-to-the-server.md),
+[ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md),
 [the guide](../guide/background.md)):
 
 ```zig
@@ -310,4 +309,4 @@ The work is a loop around a wait that can say stop: `nilo.sleep` fails with
 
 Sending to a WebSocket somebody else's connection is holding does not need
 this — see [`Room`](./streaming.md#room). It needs no fiber of its own, which is the whole
-of [ADR 0038](../adr/0038-a-broadcast-rings-a-bell-it-does-not-write.md).
+of [ADR 035](../adr/035-a-broadcast-rings-a-bell-it-does-not-write.md).

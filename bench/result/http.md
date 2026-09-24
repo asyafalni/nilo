@@ -69,7 +69,7 @@ split, so **the server is on four physical cores.**
 ## Throughput and latency
 
 The primary metric, as `bench/bench.sh` has stated it since stage 1 and as the
-first row of [ADR 0018](../../docs/adr/0018-the-trade-budget-has-three-axes.md)'s budget
+first row of [ADR 017](../../docs/adr/017-the-trade-budget-has-four-axes.md)'s budget
 puts it: a routed `GET` with a path param returning ~1 KB of JSON, keep-alive,
 no pipelining. The target is `GET /users/:id` in
 [`bench/main.zig`](../main.zig), 982 bytes of body, CORS installed, no logger.
@@ -90,7 +90,7 @@ a measurement against a measurement rather than against a published figure. The
 two servers were run **alternately in the same session**, four pairs, so a
 machine that drifts drifts under both:
 
-| pair | before (`0492be0`) | after (ADR 0071) | after − before |
+| pair | before (`0492be0`) | after (ADR 062) | after − before |
 |---|---|---|---|
 | 1 | 1,443,307 req/s, p99 65µs | 1,469,457 req/s, p99 58µs | +1.8% |
 | 2 | 1,445,694 req/s, p99 62µs | 1,427,047 req/s, p99 70µs | −1.3% |
@@ -169,7 +169,7 @@ box is about 3.2× faster. The router table moved with it — the mixed set went
 from 27/47/56/107/167ns to 13/20/19/38/60ns across 1/5/25/50/100 routes, between
 2.1× and 3.0× — and because both halves shrank together, the conclusion drawn
 from their ratio survives: 10% of 181ns is 18ns, a 25-route mixed set costs 19ns
-to match, and the linear scan still crosses ADR 0001's bar at around 25 to 30
+to match, and the linear scan still crosses ADR 017's bar at around 25 to 30
 routes. Only the absolute numbers were ever machine-bound.
 
 ### The number that reframes the budget
@@ -181,7 +181,7 @@ other ~96% is the kernel: `epoll`, `recv`, `send`, and the TCP/IP path — on
 loopback, where it is at its cheapest.
 
 That is worth stating plainly next to
-[ADR 0001](../../docs/adr/0001-dx-wins-below-the-10-percent-threshold.md), because it
+[ADR 017](../../docs/adr/017-the-trade-budget-has-four-axes.md), because it
 makes the 10% rule more generous than it sounds. Ten percent of nilo's own work
 is 18ns, which is **0.4% of the request**. The DX budget was never the thing
 standing between this framework and a throughput number.
@@ -191,7 +191,7 @@ standing between this framework and a throughput number.
 `serialise the body` is 33% of that 181ns, and one shape was paying about three
 times what the rest do. `covers` is answered for the **whole** value — one field
 the generated writer does not recognise takes the entire struct to `std.json`
-with it — and until [ADR 0085](../../docs/adr/0085-a-type-says-how-its-json-is-spelled.md)
+with it — and until [ADR 016](../../docs/adr/016-the-api-description-comes-from-the-signatures.md)
 it did not recognise a `union(enum)` at all. So a response with one union field
 anywhere in it paid `std.json`'s byte-at-a-time string escaping for every string
 in the response.
@@ -251,7 +251,7 @@ One contact row, 305 bytes: three uuids, four strings, a bool and an integer.
 | | ns, across three runs |
 |---|---|
 | **A** `std.json`, whole value — what nilo sent | 244–254 |
-| **B** generated writer, leaf handed to `std.json` — [ADR 0182](../../docs/adr/0182-a-leaf-that-says-what-it-is-can-be-carried.md) | 161–169 |
+| **B** generated writer, leaf handed to `std.json` — [ADR 148](../../docs/adr/148-a-field-name-is-a-spelling-too.md) | 161–169 |
 | **C** *control:* the same struct with the uuids already text | 102–121 |
 
 **33% off**, and C says where the rest of it is: the gap between B and C is the
@@ -286,21 +286,21 @@ asserts the two paths produce identical bytes before it times either.
 Row C is the floor for this payload and B is 50ns over it, all of it in three
 `std.json` leaf calls. Closing that would mean nilo writing `Uuid`'s 36
 characters itself, which it cannot: the type is `nilo_id`'s and `http/` never
-learns it exists (ADR 0046). A `nilo_json_write` a leaf could declare would do
+learns it exists (ADR 042). A `nilo_json_write` a leaf could declare would do
 it and is not worth 50ns on a 305-byte response — filed here rather than built,
 so the next person starts from the number.
 
 ### What checking every response header costs
 
 Run to settle one question:
-[ADR 0087](../../docs/adr/0087-a-header-value-cannot-end-its-own-line.md)
+[ADR 029](../../docs/adr/029-a-header-is-checked-once-and-two-of-them-repeat.md)
 refuses a response header value that can end its own line, and the open choice
 was whether to do it in every optimize mode or only in `Debug` and
 `ReleaseSafe`. Same harness, same box, commit `a1537a6` as the baseline.
 
 **Measured against a table-driven predicate that did not ship.** This run was
 taken on the branch that refused only the six bytes with a consequence; what
-merged is ADR 0087's `token` and `field-value` rules, which are a per-byte loop
+merged is ADR 029's `token` and `field-value` rules, which are a per-byte loop
 rather than a table lookup. The numbers below are what *having a guard on every
 `setHeader`* costs, and that is the question they were run to answer. What the
 shipped predicate costs on its own has not been measured separately — it is a
@@ -360,7 +360,7 @@ done
 
 ## Correctness under load
 
-Not a speed measurement. [ADR 0007](../../docs/adr/0007-failure-box-bound-to-the-fiber.md)
+Not a speed measurement. [ADR 006](../../docs/adr/006-failure-box-bound-to-the-fiber.md)
 binds a fail function's `Failure` to the fiber rather than the thread, and
 `bench/mixed.lua` is what would catch it if that were wrong: alternating hits on
 a user that exists and one that does not, checking every body against the id it
@@ -377,7 +377,7 @@ Not one message crossed between concurrent requests in 13.7 million of them.
 
 ## Memory per idle connection
 
-The third row of [ADR 0018](../../docs/adr/0018-the-trade-budget-has-three-axes.md)'s
+The third row of [ADR 017](../../docs/adr/017-the-trade-budget-has-four-axes.md)'s
 budget, described there as a hard invariant that every feature has to state a
 cost against — and until now not measured, because `bench.sh` says outright that
 it does not measure it.
@@ -438,7 +438,7 @@ touched once and then held for as long as the client kept the socket open.
 Which is a thing that can be fixed, and now is. Between requests — once a short
 read has come back empty, so a connection under load never reaches it —
 `MADV_DONTNEED` hands both buffers' pages back to the kernel. The allocation
-stays, so nothing here allocates and ADR 0018's per-request invariant is
+stays, so nothing here allocates and ADR 017's per-request invariant is
 untouched; the next request faults the pages in again as zeroes, which is all a
 buffer about to be overwritten needs to be.
 
@@ -460,7 +460,7 @@ connections against 8,769 at 10,000.
 > pages of fiber stack, and one of them was there only because the connection
 > suspended itself four kilobytes deeper than it had to — see *Memory per idle
 > WebSocket* below and
-> [ADR 0071](../../docs/adr/0071-where-a-connection-waits-is-what-it-costs.md).
+> [ADR 062](../../docs/adr/062-where-a-connection-waits-is-what-it-costs.md).
 
 **That is the framework's floor, and the same bug turned out to be alive one
 layer down.** Buffer pages stopped being held; *stack* pages never did. A
@@ -470,7 +470,7 @@ closes, so a handler adds every byte it touches — measured one for one, from
 **17,022 bytes** per idle connection rather than 8,749, and a handler with a
 64 KiB buffer on its stack holds 64 KiB per connection rather than per request.
 `bench/sql_server.zig` has the four routes that separate the causes, and
-[ADR 0063](../../docs/adr/0063-a-handlers-stack-is-per-connection.md) has the tables.
+[ADR 062](../../docs/adr/062-where-a-connection-waits-is-what-it-costs.md) has the tables.
 
 The gate is the whole design. Releasing on every trip round the loop, which was
 the first attempt, took throughput from 1.31M to **626k** — a 52% loss, because
@@ -486,13 +486,13 @@ is the next thing to look at rather than a defect.
 
 ### The seventh inline header costs nothing, and the figure is per binary
 
-[ADR 0089](../../docs/adr/0089-two-layers-can-each-name-a-vary-axis.md) took
+[ADR 029](../../docs/adr/029-a-header-is-checked-once-and-two-of-them-repeat.md) took
 `inline_headers` from six to seven so a gzipped static file behind a named-origin
 CORS could carry both `Vary` axes without spilling to the arena. The 32 bytes sit
 on `serveRequest`'s frame, which is `noinline` and unwound before the connection
 waits, so the reasoning said an idle connection was untouched. **The reasoning was
 all there was**: `bench/mem.py` reads `ss` and `/proc/<pid>/VmRSS`, both Linux,
-and the change was made on Darwin. ADR 0063 is why that was not left alone — a
+and the change was made on Darwin. ADR 062 is why that was not left alone — a
 per-connection claim reasoned from the shape of the code, and repeated in six
 files, was half wrong for two milestones.
 
@@ -512,7 +512,7 @@ two per side, started alternately so a machine that drifts drifts under both.
 last step is 4,798–4,803 against an average of 4,810, so the reading has
 converged and the difference between the two sides is smaller than the noise on
 either. The seventh header costs an idle connection nothing, which is what
-ADR 0089 argued and what nothing had checked.
+ADR 029 argued and what nothing had checked.
 
 **The other half of this run is the one to remember.** 4,810 is not 4,669, and
 the gap is not a regression — it is a different program. The published figure
@@ -526,7 +526,7 @@ afternoon reads inside the band it always has:
 
 136 bytes apart, on two programs whose names are one character different. This is
 the memory axis of the trap the binary-size table already names further down: **a
-row in the ADR 0018 table means `bench/main.zig`, and `run-hello` is a different
+row in the ADR 017 table means `bench/main.zig`, and `run-hello` is a different
 answer to the same question.** The roadmap's own reproduce line said `run-hello`,
 so the next person to settle the `inline_headers` question would have read 4,810,
 compared it against 4,669 and found a regression that is not there. That line now
@@ -559,7 +559,7 @@ Three things changed across this cycle and the columns are in the order they
 landed: the message buffer stopped belonging to the handler
 (`http/scratch.zig`), then the idle wait and the socket loop both moved up to
 the connection loop's frame
-([ADR 0071](../../docs/adr/0071-where-a-connection-waits-is-what-it-costs.md)).
+([ADR 062](../../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)).
 
 | what the connection is | at the start | pooled buffer | loop handed back |
 |---|---|---|---|
@@ -608,7 +608,7 @@ exactly what `http/scratch.zig` was built to make true and is the one row worth
 checking after any change to it.
 
 So the figures to quote are the converged ones: **4,669 bytes per idle
-keep-alive connection** — the number ADR 0018 carries, and every reading from
+keep-alive connection** — the number ADR 017 carries, and every reading from
 500 to 10,000 sockets is inside 4,645–4,674 — and **5,183 bytes per idle
 WebSocket**, whatever it has received.
 
@@ -629,7 +629,7 @@ The rows are there to stop each other being misread:
   same as the others: the buffer goes back when the conversation goes quiet.
 - **The last row is the control that keeps the rest honest.** 64 KiB touched on
   the loop's own stack still costs 64 KiB per connection, one byte for one
-  byte. [ADR 0063](../../docs/adr/0063-a-handlers-stack-is-per-connection.md)'s
+  byte. [ADR 062](../../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)'s
   finding is unchanged by any of this — what changed is how much stack the
   framework leaves under a parked socket, not whether a fiber holds it.
 
@@ -691,7 +691,7 @@ read, and dropped the fiber into a blocking read with no deadline on it.
   first never hears from it again;
 - `Options.idle_ms` only ever pinged a socket that had never spoken. With
   `IDLE_MS=1000` a silent socket is pinged at 1.0s and closed at 2.0s; one that
-  had sent six bytes got nothing in six seconds. The heartbeat ADR 0022 built
+  had sent six bytes got nothing in six seconds. The heartbeat ADR 021 built
   to catch a client that has gone away could not catch one that had ever said
   anything.
 
@@ -747,7 +747,7 @@ WebSocket needs:
   arriving, and goes back when the connection goes quiet.
 - the handler kept the loop, so a parked socket was suspended inside the
   request machinery. gws parks in its own read loop with the HTTP request long
-  gone. ADR 0071 is the same idea: the handler hands the loop back.
+  gone. ADR 062 is the same idea: the handler hands the loop back.
 
 Throughput, same machine, both servers pinned to the same four physical cores
 and driven by the same client — `bench/compare/wsload/`, which uses gws's own
@@ -817,9 +817,9 @@ turns it on is a different comparison in both directions.
 The row of the same axis that had never been taken. `docs/guide/streaming.md`
 quoted **~21 KB a stream** from v1 and told the reader to plan ten thousand of
 them around it; that figure predates
-[ADR 0063](../../docs/adr/0063-a-handlers-stack-is-per-connection.md), which
+[ADR 062](../../docs/adr/062-where-a-connection-waits-is-what-it-costs.md), which
 found a handler holds its stack at its high-water mark, and
-[ADR 0071](../../docs/adr/0071-where-a-connection-waits-is-what-it-costs.md),
+[ADR 062](../../docs/adr/062-where-a-connection-waits-is-what-it-costs.md),
 which took an idle connection to 4,669. The guide dropped the number rather than
 keep quoting one nothing stood behind, which was honest and not useful.
 
@@ -841,7 +841,7 @@ at 4,852 B.
 |---|---|---|
 | `/health` | keep-alive, nothing suspended | **4,674 B** |
 | `/stream` | a held stream, `logger.standard` in front | **21,058 B** |
-| `/stream/quiet` | the same, exempt from the logger (ADR 0080) | **21,057 B** |
+| `/stream/quiet` | the same, exempt from the logger (ADR 008) | **21,057 B** |
 | `/stream/deep` | the same, 32 KiB of handler stack touched first | **53,825 B** |
 
 Marginal met average at every step from 500 up, so all four are converged rather
@@ -852,7 +852,7 @@ right.** 4.5× an idle connection, and the gap is what a suspended handler holds
 that a parked connection loop does not: its own frame, its stack at high water,
 and the response buffer it has not finished with.
 
-**`/stream/deep` is ADR 0063 again, to the byte.** 53,825 − 21,058 = 32,767,
+**`/stream/deep` is ADR 062 again, to the byte.** 53,825 − 21,058 = 32,767,
 which is the 32 KiB the handler touched, charged one for one and never given
 back, because the frame holding it is live for as long as the stream is. The
 arena is cheaper than the stack, on this path as on the others.
@@ -863,7 +863,7 @@ arena is cheaper than the stack, on this path as on the others.
 the handler waits"**, waiting on a number. `logger.with`'s inner `log` declares
 `var buf: [1024]u8` and was a plain `fn`, so it was a candidate for inlining
 into `run`, whose frame is live across `next.run(c)` — which is exactly the
-mistake ADR 0071 §3 found in `handleConnection`, where four unreachable
+mistake ADR 062 §3 found in `handleConnection`, where four unreachable
 `std.log.warn` sites were most of 4,184 bytes.
 
 The number says it was not happening. `/stream` against `/stream/quiet` is
@@ -876,7 +876,7 @@ inlining it. Three interleaved pairs of the full measurement agree: 21,058 /
 21,057, 21,058 / 21,058, 21,057 / 21,057.
 
 **The `noinline` is kept anyway, as a pin rather than a fix.** It costs nothing
-today, provably, and ADR 0071 already put the same keyword on seven functions
+today, provably, and ADR 062 already put the same keyword on seven functions
 for the same reason: what the optimiser chooses is not a guarantee, and a
 kilobyte reappearing on a live frame is not the kind of regression anybody would
 notice.
@@ -885,9 +885,9 @@ notice.
 
 `roadmap.md` carried **"nothing runs the Autobahn suite against the
 WebSocket"**, and by
-[ADR 0033](../../docs/adr/0033-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)'s
+[ADR 032](../../docs/adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)'s
 reading that made every close-code and UTF-8 rule in
-[ADR 0052](../../docs/adr/0052-a-message-is-copied-once-and-framed-once.md) a
+[ADR 046](../../docs/adr/046-a-message-is-copied-once-and-framed-once.md) a
 guard only ever seen to pass: the framing tests were all written from RFC 6455
 by whoever wrote the framing.
 
@@ -962,7 +962,7 @@ of 301, identical to the table above, and this time the script's last line is
 `info: nilo stopped` and no process is left behind.
 
 What it changed:
-[ADR 0098](../../docs/adr/0098-a-completion-the-loop-holds-outlives-the-frame-that-submitted-it.md).
+[ADR 077](../../docs/adr/077-a-completion-the-loop-holds-outlives-the-frame-that-submitted-it.md).
 `Wake` submitted two completions to zio's loop and never gave them back, so the
 loop wrote through `c.group.owner` into a fiber frame that had been handed on.
 The roadmap had it filed as upstream and it was never upstream — the answer was
@@ -1007,7 +1007,7 @@ quoted as a result if nobody writes them down:
   server.
 
 What it changed:
-[ADR 0100](../../docs/adr/0100-the-route-table-is-the-registry.md) — metrics
+[ADR 079](../../docs/adr/079-the-route-table-is-the-registry.md) — metrics
 ship counting plain atomics rather than a sharded table, on the strength of this
 being inside the noise.
 
@@ -1017,11 +1017,11 @@ named: shard per executor, pad to 64 bytes, sum at scrape time.
 
 ## Binary size
 
-The fourth axis of [ADR 0018](../../docs/adr/0018-the-trade-budget-has-three-axes.md),
+The fourth axis of [ADR 017](../../docs/adr/017-the-trade-budget-has-four-axes.md),
 and the one this change spends. Stripped `ReleaseFast`, every example rather
 than the usual two, against `0492be0` **built from a `git archive` of that
 commit into a scratch directory** rather than quoted from the table in
-ADR 0018 — the whole reason that rule exists is that the published figure and
+ADR 017 — the whole reason that rule exists is that the published figure and
 the same binary rebuilt months later are not the same number.
 
 | binary | `0492be0` | `dcadb46` | delta |
@@ -1045,7 +1045,7 @@ handover as well.
 
 `nilo-hello` is +2,512 rather than +1,240 on nearly the same source, which is
 worth noticing before somebody quotes the wrong one: it is `bench/main.zig`,
-not `examples/hello`, and it is a different program. **A row in the ADR 0018
+not `examples/hello`, and it is a different program. **A row in the ADR 017
 table means the example, and the two names are one character apart.**
 
 0.14% of the binary, for 4,096 bytes on every connection the process holds.
@@ -1126,7 +1126,7 @@ std.debug.print("stack: size={d} live={d} release={d}\n", .{
 ```
 
 One connection of each kind against that build says where every byte is. It is
-three lines and it is how ADR 0071 was found, so it is written down here rather
+three lines and it is how ADR 062 was found, so it is written down here rather
 than left in the engine.
 
 `bench/bench.sh` runs the first of those with the repo's defaults and no
@@ -1145,7 +1145,7 @@ throughput number. It is written down anyway, because the change it prices is on
 the request path of every request.
 
 What changed:
-[ADR 0101](../../docs/adr/0101-a-request-nobody-else-would-answer-is-refused.md)
+[ADR 070](../../docs/adr/070-a-request-nobody-else-would-answer-is-refused.md)
 put `'h'` into the parser's first-byte set, so a `Host` line now reaches
 `applyHeaderAt` and costs a four-byte `eqlIgnoreCase` instead of being thrown
 out for nothing, and `parseHead` gained one branch at the end of the head.
@@ -1206,7 +1206,7 @@ The first pair is byte-identical at every step. `Request` gained a `has_host`
 bool and `websocket.Options` gained a slice, and neither was expected to cost
 anything — the bool lands in padding (`@sizeOf(Request)` is 48 both ways) and
 the Options live in the handshake's frame, which unwinds before the connection
-loop takes over (ADR 0071). This is that reasoning checked.
+loop takes over (ADR 062). This is that reasoning checked.
 
 **The absolute figure is this box's, not the framework's.** 8,843 bytes here
 against the 4,669 published above, on two cores rather than eight and with a
@@ -1352,7 +1352,7 @@ each:
 | `example-rest` | 1,043,424 | 1,050,512 | **+7,088 B** |
 
 Two programs agreeing within 112 bytes says the figure is the feature rather
-than whatever generic it woke up, which is the mistake ADR 0018 opens with.
+than whatever generic it woke up, which is the mistake ADR 017 opens with.
 
 **Both rows moved after the first measurement, and the movement is the useful
 part.** The same three binaries first came out at +5,712, +5,584 and +5,760
@@ -1466,11 +1466,11 @@ scheduler, and no lever can be ranked until something says which.
 ## What a field on `Request` costs per connection
 
 Run for
-[ADR 0120](../../docs/adr/0120-a-target-is-read-in-the-form-it-arrived-in.md),
+[ADR 095](../../docs/adr/095-a-target-is-read-in-the-form-it-arrived-in.md),
 which added a 16-byte `authority` slice to `http1.Request` so an absolute-form
 target could be split. `Request` lives in the connection loop's frame and a
 fiber holds its stack at its high-water mark
-([ADR 0063](../../docs/adr/0063-a-handlers-stack-is-per-connection.md)), so the
+([ADR 062](../../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)), so the
 question was whether 16 bytes there is 16 bytes per connection.
 
 `bench/mem.py --port 8787 --path /users/1` against `bench/main.zig`,
@@ -1504,7 +1504,7 @@ connection holds. Same reason, one route over.
 ## What validating a string as UTF-8 costs
 
 Run for
-[ADR 0121](../../docs/adr/0121-a-byte-that-is-not-text-is-not-a-string.md),
+[ADR 096](../../docs/adr/096-a-byte-that-is-not-text-is-not-a-string.md),
 which made `json.zig` ask `std.unicode.utf8ValidateSlice` before writing a
 string so that a byte that is not text comes out as `std.json`'s array of
 numbers rather than as invalid JSON. The question the run had to answer was
@@ -1532,7 +1532,7 @@ onwards to a byte-at-a-time decoder — which is why the same kilobyte costs
 
 **What it decided:** ship it. 10ns against the 126ns that writing the whole
 payload costs is +8%, under
-[ADR 0001](../../docs/adr/0001-dx-wins-below-the-10-percent-threshold.md)'s bar,
+[ADR 017](../../docs/adr/017-the-trade-budget-has-four-axes.md)'s bar,
 and the case it fixes is a response that could not be parsed at all.
 
 **What it changed about how the next one gets run:** best of five was not
@@ -1594,7 +1594,7 @@ cost is flatly linear at **1.2ns an entry**, which is a dependent load, a
 compare and a branch that nothing unrolls. What the number changes is that
 "probably free" was only ever true for small apps: at four services the lookup
 is 1.6% of a request, comfortably under
-[ADR 0001](../../docs/adr/0001-dx-wins-below-the-10-percent-threshold.md)'s 10%
+[ADR 017](../../docs/adr/017-the-trade-budget-has-four-axes.md)'s 10%
 bar, and at thirty-two it is 13.4%, over it. **And it is per service argument,
 not per request** — a handler taking a database and a cache pays twice.
 
@@ -1617,7 +1617,7 @@ either direction.
 
 ## What a `Date` costs, and what leaving `Connection` off gives back
 
-[ADR 0269](../../docs/adr/0269-a-response-says-when-it-was-sent.md) put a
+[ADR 197](../../docs/adr/197-a-response-says-when-it-was-sent.md) put a
 `Date` on every response and took `Connection: keep-alive` off HTTP/1.1
 ones. The wire goes from 1,110 bytes to 1,123 on the benchmark response —
 checked with `nc | wc -c`, not arithmetic — which is what Go, axum, Fiber
@@ -1630,7 +1630,7 @@ no syscalls), 8 GB, kernel 6.8.0-110, Zig 0.16.0, wrk 4.1.0 — with wrk on
 the same two cores as the server. The absolute figures are a fortieth of
 the table at the top and mean nothing outside this section; the *pairs*
 are what the run is for. Before is `ab3c893` from `git archive`, after is
-the same tree with ADR 0269 on it, both `ReleaseFast`, stripped. Each run:
+the same tree with ADR 197 on it, both `ReleaseFast`, stripped. Each run:
 3 s warm-up discarded, then `wrk -t1 -c64 -d10s --latency`, server and
 client restarted between every run, before and after alternating.
 
@@ -1661,7 +1661,7 @@ loop over years and months and both inline; the errno name table
 `__zig_tag_name_os.linux.E` is about 2,000, pulled in by `core.nowMicros`'s
 panic message and paid for the first time here because nothing on the
 request path had read the wall clock before; `sendFinal` grows 342 and the
-head writers by a call each. The row is in ADR 0018's running total.
+head writers by a call each. The row is in ADR 017's running total.
 
 ### Can it be pushed further
 
@@ -1721,7 +1721,7 @@ RMWs a second on one line, and at 50–100 ns each under contention it is
 0.14–0.28 s of CPU a second across sixteen cores, **1–2% of the machine**.
 That is the ceiling on what the lanes can give back, and it is the same
 1.5% [`cache.md`](./cache.md) measured for per-thread lanes on eight
-threads. Inside ADR 0001's 10% either way; a number worth having, not a
+threads. Inside ADR 017's 10% either way; a number worth having, not a
 number worth a second design.
 
 ### Can it be pushed further
@@ -1736,7 +1736,7 @@ share a lane.
 
 ## What a listen backlog of 128 drops
 
-[ADR 0271](../../docs/adr/0271-a-backlog-is-sized-for-the-burst-not-the-load.md)
+[ADR 198](../../docs/adr/198-a-backlog-is-sized-for-the-burst-not-the-load.md)
 raised the listen backlog from zio's default of 128 to 4,096. The question
 was not throughput — a backlog is a queue capacity and costs nothing per
 request — but what a burst of connections does against each number, which
@@ -1817,7 +1817,7 @@ the one place a wakeup is free: the thread was awake anyway. HttpArena's
 `latency-10k` profile asks the other question — 1,024 connections at
 10,000 req/s over sixty-four threads — and reported nilo at 40 µs of CPU
 a request against 18 µs for the same server near saturation on eight CPUs,
-where tokio reads 21 in both. [ADR 0272](../../docs/adr/0272-a-connection-is-served-by-the-thread-it-was-dealt-to.md)
+where tokio reads 21 in both. [ADR 199](../../docs/adr/199-a-connection-is-served-by-the-thread-it-was-dealt-to.md)
 is the decision; this is the run.
 
 **The instrument is `bench/paced.py`**: a fixed offered rate, round-robin
@@ -1874,9 +1874,9 @@ the row was not looking for**: at 2,000 req/s over 1,024 connections a
 request costs 117 µs against 59 at 64 or 256 connections, on the same
 route at the same rate. The difference is that a connection sees a
 request every 512 ms at 1,024 and every 32 ms at 64, and `idle_peek_ms`
-is 200: past it the connection hands its pages back (ADR 0071) — a timer
+is 200: past it the connection hands its pages back (ADR 062) — a timer
 wake, three `madvise` calls, and three minor faults on the next request,
-which on this VM is ~57 µs. That is the trade ADR 0071 made, memory for
+which on this VM is ~57 µs. That is the trade ADR 062 made, memory for
 CPU on a connection that has gone quiet, and it is the right trade for a
 person behind a browser; it is now a number rather than a sentence. Not
 acted on. The arena's `latency-10k` sits at ~100 ms between requests on a
@@ -1906,7 +1906,7 @@ that could be told "stay awake a little" would batch the way one thread
 does. That is Go's spinning-M and it burns CPU to save CPU; the honest
 version is a `poll` with a short timeout only when the *previous* poll
 returned work, which is zio's doze with the condition inverted, and is
-the upstream issue ADR 0272 describes. Below that, the 25 µs floor is
+the upstream issue ADR 199 describes. Below that, the 25 µs floor is
 one `io_uring_enter` to wake and one to submit, and one context switch;
 what is left is the request itself.
 
@@ -1914,13 +1914,13 @@ The `idle_peek_ms` finding has a lever too: `MADV_FREE` instead of
 `DONTNEED` for the two buffers would make the give-back lazy — no fault
 on the next request unless the kernel actually took the page — at the
 cost of `VmRSS` no longer showing the saving, which is the number ADR
-0071 was measured by. A run with `--conns 1024 --rate 2000` before and
+062 was measured by. A run with `--conns 1024 --rate 2000` before and
 after, plus `bench/mem.py` to see what RSS does under pressure, would
 settle whether the 57 µs is worth the honesty of the RSS figure.
 
 ## What one accept fiber caps a server at
 
-[ADR 0273](../../docs/adr/0273-every-executor-accepts.md) is the decision;
+[ADR 200](../../docs/adr/200-every-executor-accepts.md) is the decision;
 this is the run, and the arena reading that led to it.
 
 **The instrument on this box is [gcannon](https://github.com/MDA2AV/gcannon)**
@@ -1953,8 +1953,8 @@ what a connection costs.
 ### The arena's two readings, and what changed between them
 
 HttpArena ran nilo twice on 2026-09-21, first at `da101ff` and then at
-`f1152a7`, which is the same tree plus the `Date` header (ADR 0269), the
-4,096 backlog (ADR 0271) and stealing off (ADR 0272). Sixty-four logical
+`f1152a7`, which is the same tree plus the `Date` header (ADR 197), the
+4,096 backlog (ADR 198) and stealing off (ADR 199). Sixty-four logical
 CPUs for the server (`0-31,64-95` on a Threadripper PRO 3995WX), 5 s runs,
 best of three on throughput.
 
@@ -1972,10 +1972,10 @@ best of three on throughput.
 
 Three things to read off it, one of which was predicted.
 
-**ADR 0272 landed where it said it would, and its other side is now
+**ADR 199 landed where it said it would, and its other side is now
 measured.** The prediction was 25–30 µs on `latency-10k` from 40; the
 reading is 34.5, and 30.6 on `latency-1m`, with the rate held at 0.998 on
-both for the first time (ADR 0271's backlog). Everything saturated paid
+both for the first time (ADR 198's backlog). Everything saturated paid
 for it: at the same throughput the baseline's p50 doubled, pipelined's
 tail went from a quarter of a second to over one, and the async profile's
 timers fire 6 ms late instead of 3. `bench/paced.py` measured a server
@@ -1990,16 +1990,16 @@ connections on two threads is not a burst.
 is about.** 451K and 426K are the same number; the p99 moved from 3 ms to
 100 ms because the backlog moved from 128 to 4,096, and each p99 is that
 backlog divided by ~43K connections a second. One accept fiber at ~23 µs a
-connection is the ceiling, on 18 of 64 cores, and ADR 0273 is the answer.
+connection is the ceiling, on 18 of 64 cores, and ADR 200 is the answer.
 The next arena run is the reading this box cannot take.
 
 **Memory per active connection is ~29.5 KiB, not 4,669 bytes.** 483 MiB
 over 16,384 echoing WebSockets and 924 MiB over 32,000 sleeping fibers
 both divide to it. The 4,669 figure is an idle connection whose pages went
-back (ADR 0071); a connection inside a request or a `sleep` holds its
+back (ADR 062); a connection inside a request or a `sleep` holds its
 fiber's stack to its high-water mark plus both buffers, and that is what
 the arena's memory column reads. It feeds only the board's optional memory
-bonus, and it is ADR 0018's third axis for a connection that is *not* idle,
+bonus, and it is ADR 017's third axis for a connection that is *not* idle,
 which no number here had put beside the idle one.
 
 ### Can it be pushed further
@@ -2015,7 +2015,7 @@ there.
 
 ## What a flush per response costs a client that pipelines
 
-[ADR 0274](../../docs/adr/0274-a-response-is-flushed-before-the-connection-waits.md)
+[ADR 201](../../docs/adr/201-a-response-is-flushed-before-the-connection-waits.md)
 is the decision; this is the run.
 
 Same instrument and same split as the section above: gcannon (`11c802b`,
@@ -2052,7 +2052,7 @@ shape ever has a second request buffered when it answers, so both flush on
 fill on every read that reaches the socket. WebSocket: identical to the
 third digit and to the CPU tick. HTTP: 0.4% down with the sign the same in
 all three pairs, at the same CPU. That is within the spread the section
-above quotes for the same shape (2.62–2.65M) and inside ADR 0018's 10% by
+above quotes for the same shape (2.62–2.65M) and inside ADR 017's 10% by
 a factor of twenty, but it is not nothing, and it is written down as the
 price rather than rounded away.
 
@@ -2081,7 +2081,7 @@ wanted it.
 
 ## A reset between frames is a client that has gone
 
-[ADR 0275](../../docs/adr/0275-a-reset-between-frames-is-a-client-that-has-gone.md)
+[ADR 202](../../docs/adr/202-a-reset-between-frames-is-a-client-that-has-gone.md)
 is the decision; this is the run that found it, made before subscribing
 nilo's arena entry to `echo-ws-limited`.
 
@@ -2103,11 +2103,11 @@ from gcannon's `Reconnects` and `WS upgrades`:
 |---|---|---|---|---|---|
 | `7e084ce`, one acceptor | a file | 878K | 10,014 | 542K | 445K |
 | | `/dev/null` | 1.18M | 323 | 590K | 600K |
-| `0efa4c0`, every executor accepts (ADR 0273) | a file | 454K | 10,025 | 2.6M | 233K |
+| `0efa4c0`, every executor accepts (ADR 200) | a file | 454K | 10,025 | 2.6M | 233K |
 | | `/dev/null` | 708K | 10,021 | 2.4M | 360K |
-| the tree with ADR 0275 | a file | 1.70M | 560 | 851K | 863K |
+| the tree with ADR 202 | a file | 1.70M | 560 | 851K | 863K |
 
-**The warning per connection was the ceiling, and ADR 0273 lowered it.**
+**The warning per connection was the ceiling, and ADR 200 lowered it.**
 A reset between frames came up through `receive` as `ReadFailed` and was
 logged as "the WebSocket loop failed", once per connection; the log takes
 one lock for the whole process and holds it across the format and the
@@ -2122,8 +2122,8 @@ and not the shape, which is what says the lock and not the disk.
 Treating the reset the way a FIN is already treated, `null` from
 `receive` and no line, is the whole fix.
 
-Interleaved pairs, eight seconds, `0efa4c0` → the tree with ADR 0274 and
-0275, stderr to a file:
+Interleaved pairs, eight seconds, `0efa4c0` → the tree with ADR 201 and
+202, stderr to a file:
 
 | shape | before | after |
 |---|---|---|
@@ -2157,13 +2157,13 @@ which is the same order but not the same number. The roadmap carries it.
 The after rows are the same server that echoes 2.75M frames a second on
 persistent connections, so the remaining 1M a second is the connection:
 accept, the upgrade's SHA-1 and base64, a fiber and its two buffers, and
-the teardown. ADR 0273's upstream row, a spawn homed on the accepting
+the teardown. ADR 200's upstream row, a spawn homed on the accepting
 executor, is the next lever on it, and the same for HTTP's short-lived
 shape.
 
 ## What gzipping an answer costs, and what putting the compressor on the stack would have
 
-[ADR 0287](../../docs/adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)
+[ADR 211](../../docs/adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)
 is the decision; these are the three runs under it, all on the Ryzen 7
 9700X (8 cores, 16 threads) under Linux 7.2.5, Zig 0.16.0, against
 `dc19600` where a before is named.
@@ -2179,7 +2179,7 @@ is splatted in place. The same wrapper doing the assignment field by field
 `writeAll` + `finish` are `Compress.huffman.build` at 4,936 bytes and the
 `sort.block` instantiation under it at 4,888. This is the number that
 moved the compressor off the fiber and into a pool: on a fiber a frame is
-held at its high-water mark for the connection's life (ADR 0063), and
+held at its high-water mark for the connection's life (ADR 062), and
 99 KB × 4,096 keep-alive connections is 400 MB.
 
 **What the compressor costs per body: `zig build bench-compress`.** One
@@ -2225,7 +2225,7 @@ page is a static set and static sets gzip at load. The second column is
 the `Accept-Encoding` reader's `std.fmt.parseFloat(f32, q)` replaced by a
 digit scan: **25 KB** on a binary that parses no other float, 3.7 KB on
 the three that already do (`orders`, `rest`, `sqlite`). It had been there
-since static gzip landed. ADR 0018's table carries the row.
+since static gzip landed. ADR 017's table carries the row.
 
 ### Can it be pushed further
 
@@ -2242,7 +2242,7 @@ decision of its own.
 
 ## What TLS carries at saturation, and the build flag that decides it
 
-[ADR 0288](../../docs/adr/0288-tls-is-an-option-a-build-asks-for.md) closed
+[ADR 212](../../docs/adr/212-tls-is-an-option-a-build-asks-for.md) closed
 saying "throughput at saturation over `https://` was not measured, for want
 of a load generator with TLS on the box, and is a roadmap row". This is that
 row. Ryzen 7 9700X (8 cores, 16 threads), Linux 7.2.5, Zig 0.16.0, over
@@ -2365,7 +2365,7 @@ The first was tried, and needed no upstream: nilo pins its own fork. It is [the 
 
 ## What TLS costs a listener, and what it costs one that never asked
 
-[ADR 0288](../../docs/adr/0288-tls-is-an-option-a-build-asks-for.md) is the
+[ADR 212](../../docs/adr/212-tls-is-an-option-a-build-asks-for.md) is the
 decision; these are the runs it quotes, taken on the code as shipped rather
 than on the spike that preceded it (the spike's figures were within 2% on
 memory and read 455 µs per handshake where the shipped code reads 280–295,
@@ -2415,7 +2415,7 @@ costs 14 bytes more than that: its 33,114 bytes of record buffers are
 page-aligned and handed back at idle with the cleartext pair, and `smaps`
 on the spike showed the slab mappings unchanged between the two rows. The
 page is the plain path's park frame crossing a page boundary once the
-handler has a second caller; ADR 0288 has the account and the roadmap has
+handler has a second caller; ADR 212 has the account and the roadmap has
 the measurement that would buy it back.
 
 **CPU per operation**, server `utime + stime` from `/proc/<pid>/stat`
@@ -2440,7 +2440,7 @@ in the library to make the second cheaper. And **the baseline ISA has no AES
 instructions**, so a `-Dtarget=x86_64-linux-gnu` binary with no `-Dcpu`
 encrypts in software and a request costs six times what it costs with them:
 a TLS listener is the one place in this repository where `-Dcpu` decides
-the number, and ADR 0288's guide page says so.
+the number, and ADR 212's guide page says so.
 
 **Not measured, and the roadmap carries each:** throughput and p99 at
 saturation over `https://` (no load generator with TLS on this box), the
@@ -2448,7 +2448,7 @@ plain park's headroom under the page boundary, and kernel TLS.
 
 ## zzz beside nilo, and the one thing its runtime does that zio does not
 
-Run to settle a premise before planning against it: that [zzz](https://github.com/tardy-org/zzz), which ADR 0002 names as the road not taken (its own io_uring runtime, [tardy](https://github.com/tardy-org/tardy)), is faster than nilo's Engine and has something to port. It is not faster on this box, on any shape tried, and what was worth taking from it is one SQE opcode inside zio rather than anything in the Engine.
+Run to settle a premise before planning against it: that [zzz](https://github.com/tardy-org/zzz), which ADR 001 names as the road not taken (its own io_uring runtime, [tardy](https://github.com/tardy-org/tardy)), is faster than nilo's Engine and has something to port. It is not faster on this box, on any shape tried, and what was worth taking from it is one SQE opcode inside zio rather than anything in the Engine.
 
 **The machine** is the Ryzen 7 9700X of the sections above, now on Linux 7.2.5 (Omarchy), governor `performance`, Zig 0.16.0. **The instrument** is gcannon (`11c802b`, native, liburing 2.15), eight threads on CPUs `4-7,12-15`; the server gets `0-3,8-11`, four physical cores and their siblings, eight threads each (zzz's example patched from `.auto` to `.multi = 8`, nilo takes its count from the affinity mask). Every run is 8 s after a 3 s warm-up that is discarded, the pairs are interleaved, and CPU is `utime + stime` from `/proc/<pid>/stat` across the run. nilo is `nilo-hello` at `16dc5dc` on `/health`, `ReleaseFast`, `-Dtarget=x86_64-linux-gnu -Dcpu=native`. zzz is **v0.3.2**, its last release for Zig 0.16 (main has moved to 0.17-dev), its `basic` example (`Hello, world!`), `ReleaseFast`. The two answers are 116 and 101 bytes on the wire.
 
@@ -2458,9 +2458,9 @@ Run to settle a premise before planning against it: that [zzz](https://github.co
 | 512 conns × 10 requests | 1.69 / 1.88 / 1.89M, 3.09–3.32 µs, p99 1.5–2.9 ms, p99.9 10.8–13.4 ms, 34–45 MB | 713 / 720 / 739K, 8.7–9.1 µs, p99 2.2–2.4 ms, p99.9 2.7–3.2 ms, **23.1–24.0 GB** |
 | 256 conns, `-p 16` | 11.53 / 11.73 / 11.99M, 0.61–0.64 µs, p99 357–379 µs, 10 MB | 1.81M × 3, 2.83 µs, p99 3.8–5.2 ms, 291–324 MB |
 
-**Neither server was saturated on the keep-alive row**, which is why CPU a request is the column to read there rather than req/s: sampled per thread over six seconds, nilo's eight threads each ran 4.33–4.38 core-seconds and zzz's 3.84–3.90, so both are balanced and both are waiting on the client part of the time. The first guess about zzz's idle share, that a thread-per-core runtime with no stealing had left some threads with more connections than others, was checked this way and is wrong. What zzz spends more on per request was not taken apart; tardy v0.3.2's loop submits and then waits in separate `io_uring_enter` calls where zio does both in one, sets no `DEFER_TASKRUN`, keeps headers in a hash map that lower-cases and hashes each name byte by byte, and formats its status line and headers through `print`. The pipelined row is zzz answering one request per `send`, which is what nilo did before ADR 0274. The 23 GB is `VmHWM` on a 30 GiB box under connection churn and was not investigated; it is written down so nobody mistakes zzz's README figure for a property of its runtime under this shape.
+**Neither server was saturated on the keep-alive row**, which is why CPU a request is the column to read there rather than req/s: sampled per thread over six seconds, nilo's eight threads each ran 4.33–4.38 core-seconds and zzz's 3.84–3.90, so both are balanced and both are waiting on the client part of the time. The first guess about zzz's idle share, that a thread-per-core runtime with no stealing had left some threads with more connections than others, was checked this way and is wrong. What zzz spends more on per request was not taken apart; tardy v0.3.2's loop submits and then waits in separate `io_uring_enter` calls where zio does both in one, sets no `DEFER_TASKRUN`, keeps headers in a hash map that lower-cases and hashes each name byte by byte, and formats its status line and headers through `print`. The pipelined row is zzz answering one request per `send`, which is what nilo did before ADR 201. The 23 GB is `VmHWM` on a 30 GiB box under connection churn and was not investigated; it is written down so nobody mistakes zzz's README figure for a property of its runtime under this shape.
 
-**One row goes zzz's way**, and it is the tail on the churn shape: p99.9 2.7–3.2 ms against nilo's 10.8–13.4 ms. zzz serves that at 40% of nilo's throughput, so it is not a like-for-like tail, but it is the shape where tardy's model differs most from nilo's: tardy's accept task *becomes* the connection and spawns its replacement acceptor, so the first request is served on the thread whose ring completed the accept, with no handoff on its critical path. nilo's acceptor deals the connection to another executor (ADR 0273), which is the upstream row on a spawn homed on the calling executor.
+**One row goes zzz's way**, and it is the tail on the churn shape: p99.9 2.7–3.2 ms against nilo's 10.8–13.4 ms. zzz serves that at 40% of nilo's throughput, so it is not a like-for-like tail, but it is the shape where tardy's model differs most from nilo's: tardy's accept task *becomes* the connection and spawns its replacement acceptor, so the first request is served on the thread whose ring completed the accept, with no handoff on its critical path. nilo's acceptor deals the connection to another executor (ADR 200), which is the upstream row on a spawn homed on the calling executor.
 
 ### What tardy does that zio does not: a plain `RECV` and `SEND`
 
@@ -2472,14 +2472,14 @@ tardy prepares a socket read as `IORING_OP_RECV` and a write as `IORING_OP_SEND`
 | keep-alive, 64 conns | 2.50 / 2.51 / 2.47 / 2.44 µs | 2.40 / 2.36 / 2.40 / 2.36 µs | 4 of 4 lower, **−4.0%** |
 | 256 conns, `-p 16` | 0.58 / 0.61 / 0.61 / 0.60 µs | 0.55 / 0.59 / 0.55 / 0.62 µs | sign changes in pair 4: **unchanged** |
 
-Eight pairs of eight the same sign on the two keep-alive shapes, and the ranges do not overlap, so **3–4% of CPU a request** is a result rather than noise. The pipelined row is what the mechanism predicts: sixteen answers share one `send`, so a per-syscall saving is diluted sixteen times. Memory, allocations and binary size do not move (the patched `nilo-hello` is 224 bytes larger, all of it inside zio). It is zio's code, not nilo's: nilo cannot reach an SQE from the Engine, and ADR 0002 is the reason it should not. **Not pursued** (2026-09-23); it is written down so the next person starts from the number rather than re-running it.
+Eight pairs of eight the same sign on the two keep-alive shapes, and the ranges do not overlap, so **3–4% of CPU a request** is a result rather than noise. The pipelined row is what the mechanism predicts: sixteen answers share one `send`, so a per-syscall saving is diluted sixteen times. Memory, allocations and binary size do not move (the patched `nilo-hello` is 224 bytes larger, all of it inside zio). It is zio's code, not nilo's: nilo cannot reach an SQE from the Engine, and ADR 001 is the reason it should not. **Not pursued** (2026-09-23); it is written down so the next person starts from the number rather than re-running it.
 
 ### Can it be pushed further
 
 Ranked, and none of it is in zzz's HTTP layer, which has nothing nilo's does not already do more cheaply:
 
 1. **The opcode above, upstream.** Measured, 3–4% on keep-alive, zero cost on every other axis. Not pursued, and no upstream issue was filed.
-2. **An acceptor that becomes its connection**, tardy's shape, inside the Engine and needing nothing upstream: after `accept`, spawn the replacement acceptor (round-robin, as now) and serve the connection in the accepting fiber. It moves the handoff off the first request's critical path rather than removing it, so the thing to measure is the churn row's p50 and tail, not CPU. Two hazards are known before writing it: the acceptors' group is cancelled before the drain, so a connection living in it would be cut off rather than drained (ADR 0273's shutdown order), and the frame under a plain connection's park would grow by the acceptor's, which is under 300 bytes from a page (ADR 0288). `gcannon -r 10`, `bench/mem.py` and `bench/shutdown.py` are the three runs it would need.
+2. **An acceptor that becomes its connection**, tardy's shape, inside the Engine and needing nothing upstream: after `accept`, spawn the replacement acceptor (round-robin, as now) and serve the connection in the accepting fiber. It moves the handoff off the first request's critical path rather than removing it, so the thing to measure is the churn row's p50 and tail, not CPU. Two hazards are known before writing it: the acceptors' group is cancelled before the drain, so a connection living in it would be cut off rather than drained (ADR 200's shutdown order), and the frame under a plain connection's park would grow by the acceptor's, which is under 300 bytes from a page (ADR 212). `gcannon -r 10`, `bench/mem.py` and `bench/shutdown.py` are the three runs it would need.
 3. **`IORING_RECVSEND_POLL_FIRST` on the read that follows a flush**, where a keep-alive client almost never has its next request already sent, which would skip the inline attempt that returns `EAGAIN`. Also zio's, not measured.
 
 Not taken, each with its number above: a pool of per-connection buffers allocated at startup (zzz's "provisions", 787 MB at 512 connections against nilo's 15 MB, which gives pages back when idle), headers in a hash map, and one `send` per pipelined response.
@@ -2494,7 +2494,7 @@ taskset -c 4-7,12-15 gcannon http://127.0.0.1:8787/health -t 8 -d 8 -c 512   # -
 
 ## A short-lived WebSocket and the TLB
 
-[ADR 0292](../../docs/adr/0292-a-message-that-arrived-whole-is-handed-over-where-it-lies.md) is the decision; these are the runs under it.
+[ADR 216](../../docs/adr/216-a-message-that-arrived-whole-is-handed-over-where-it-lies.md) is the decision; these are the runs under it.
 
 **What the arena showed.** `echo-ws-limited` at `baaccf8`: 1.13M frames a second at 512 connections and 945K at 4,096, on 39 of the arena's 64 cores. Every entry above nilo in the column served more at 4,096 than at 512 and used 53 to 60 cores. A server using fewer cores and doing less with more connections is waiting on something rather than working, and this box, at 8 threads, did not show the shape at all.
 
@@ -2530,7 +2530,7 @@ On the arena's column, the next thing is whatever the next run shows. A short-li
 
 ## What a signature on the executor costs the connections already open
 
-[ADR 0293](../../docs/adr/0293-a-handshakes-signature-is-computed-off-the-executor.md) is the decision; these are the runs under it.
+[ADR 217](../../docs/adr/217-a-handshakes-signature-is-computed-off-the-executor.md) is the decision; these are the runs under it.
 
 **What the arena showed.** `8gbit` at `baaccf8`: p50 101 µs, p99 169 µs, mean 267 µs, and p99.9 46 to 68 ms, in five seconds over 512 connections opened once. The mean is a quarter of the score and the field's best is 81.5 µs, so the column's gap was the tail.
 
@@ -2549,7 +2549,7 @@ On the arena's column, the next thing is whatever the next run shows. A short-li
 
 The 5 s and 20 s rows put the same total excess on the requests, about 230 request-seconds, so it is paid once at the start. The P-256 row says most of it is the signature. The cleartext row says some of it is not TLS at all.
 
-**The fix and its pairs**, without and with the signature on the blocking pool, both with ADR 0292, interleaved:
+**The fix and its pairs**, without and with the signature on the blocking pool, both with ADR 216, interleaved:
 
 | run | before | after |
 |---|---|---|
@@ -2569,7 +2569,7 @@ Yes, twice. The p99.9 of 29 to 42 ms that is left is the start of the run: clear
 
 ## What checking a key against its certificate costs the binary
 
-[ADR 0294](../../docs/adr/0294-a-key-is-checked-against-its-certificate-at-listen.md)
+[ADR 212](../../docs/adr/212-tls-is-an-option-a-build-asks-for.md)
 is the decision; this is the run behind its size table. The change is a
 comparison at `listen()` of the leaf certificate's public key against the
 one the private key carries, so the only axis it can spend is binary size:
@@ -2620,7 +2620,7 @@ the first one, the default build at 968,144.
 
 ## What a gRPC client puts on the wire, and what a stream would cost
 
-Taken for [ADR 0297](../../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md), before any of it is built, because the two numbers that decide whether a gRPC connection fits nilo's memory axis are not in any RFC: what a real client does when the server asks it for less, and what zio charges for a fiber per stream. Ryzen 7 9700X (8 cores, 16 threads), Linux 7.2.5, Zig 0.16.0, zio v0.18.0, commit `dce5d93`, loopback. The harness is `spike/grpc/`: `./run.sh` for the clients, `fiber/` for the fiber.
+Taken for [ADR 220](../../docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md), before any of it is built, because the two numbers that decide whether a gRPC connection fits nilo's memory axis are not in any RFC: what a real client does when the server asks it for less, and what zio charges for a fiber per stream. Ryzen 7 9700X (8 cores, 16 threads), Linux 7.2.5, Zig 0.16.0, zio v0.18.0, commit `dce5d93`, loopback. The harness is `spike/grpc/`: `./run.sh` for the clients, `fiber/` for the fiber.
 
 **The clients.** `spike/grpc/probe/` is a gRPC server written at the frame level with `golang.org/x/net/http2` v0.59.0, so it can count what the client chose rather than what a library decoded. It answers every unary call with an empty message after 20 ms. Each client makes 32 calls, 16 at a time, on one channel: grpc-go 1.84.0, grpc-js 1.14.5, grpcio 1.84.0 (C-core 56.0.0), and tonic 0.14.6 on h2 0.4.19. The fifth row is the OpenTelemetry Collector 0.161.0 with its default `otlp` exporter, fed twenty traces, because a client library called by hand is not the same as a client somebody deployed with defaults.
 
@@ -2659,15 +2659,15 @@ At `SETTINGS_MAX_CONCURRENT_STREAMS = 1`, all four libraries queued on the one c
 | 8 KiB | 12,739 | 12,736 |
 | 16 KiB | 20,931 | 20,928 to 20,982 |
 
-**A parked fiber costs 4,547 bytes, and every page of stack it touched after the first costs a page.** Marginal met average in every row, so it is a cost and not a transient. It is ADR 0063's rule seen from the other side: that ADR found a handler's stack is charged one for one to the connection holding it, and this is the same charge on a fiber that holds nothing else. [ADR 0029](../../docs/adr/0029-a-spawned-fiber-belongs-to-the-server.md)'s 8,673 bytes for a second fiber was a fiber draining a queue, on a connection whose idle figure was then 66,959; this one has touched under a page, and the two are not the same question.
+**A parked fiber costs 4,547 bytes, and every page of stack it touched after the first costs a page.** Marginal met average in every row, so it is a cost and not a transient. It is ADR 062's rule seen from the other side: that ADR found a handler's stack is charged one for one to the connection holding it, and this is the same charge on a fiber that holds nothing else. [ADR 028](../../docs/adr/028-a-spawned-fiber-belongs-to-the-server.md)'s 8,673 bytes for a second fiber was a fiber draining a queue, on a connection whose idle figure was then 66,959; this one has touched under a page, and the two are not the same question.
 
-**What it decided:** that a stream in flight on HTTP/2 costs what a request in flight on HTTP/1.1 already costs, a fiber and its stack, so the idle axis does not move with the number of streams a connection has served. What moves is the worst case of one connection, which becomes the cap times that figure: at 100 streams of the database route in [ADR 0063](../../docs/adr/0063-a-handlers-stack-is-per-connection.md), about 1.7 MB. The cap is the number that bounds it, and it has to be a stated default rather than a library's.
+**What it decided:** that a stream in flight on HTTP/2 costs what a request in flight on HTTP/1.1 already costs, a fiber and its stack, so the idle axis does not move with the number of streams a connection has served. What moves is the worst case of one connection, which becomes the cap times that figure: at 100 streams of the database route in [ADR 062](../../docs/adr/062-where-a-connection-waits-is-what-it-costs.md), about 1.7 MB. The cap is the number that bounds it, and it has to be a stated default rather than a library's.
 
 **Can it be pushed further:** the 4,547 is a page and zio's task. Whether the only stream open could run on the connection's own fiber was the open question here, and [the section below](#a-grpc-listener-built) answers it: it could, and it may not.
 
 ## A gRPC listener, built
 
-The listener [ADR 0297](../../docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md) accepted, measured before it was committed: the working tree on top of `dce5d93`, the same machine as the section above. `spike/grpc/server/` is the server (routes for the Collector, an echo, and HttpArena's `GetSum`), `spike/grpc/throughput.sh` the throughput run.
+The listener [ADR 220](../../docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md) accepted, measured before it was committed: the working tree on top of `dce5d93`, the same machine as the section above. `spike/grpc/server/` is the server (routes for the Collector, an echo, and HttpArena's `GetSum`), `spike/grpc/throughput.sh` the throughput run.
 
 ### Against real clients
 
@@ -2685,7 +2685,7 @@ grpc-go 1.84.0, grpc-js 1.14.5, grpcio 1.84.0, tonic 0.14.6 and the Collector 0.
 | gRPC on the spike server, before the optimizations below | 6,029 to 6,044 |
 | gRPC on the spike server, as committed | 5,685 to 5,917 |
 
-**The flag costs a plain connection nothing**, the thing ADR 0288 found `-Dtls` did not manage, and a gRPC connection sits under a page above an HTTP/1.1 one on the same binary: the stream table, the decoder with a table of 0, and the spare streams dropped at the idle release.
+**The flag costs a plain connection nothing**, the thing ADR 212 found `-Dtls` did not manage, and a gRPC connection sits under a page above an HTTP/1.1 one on the same binary: the stream table, the decoder with a table of 0, and the spare streams dropped at the idle release.
 
 ### Binary size, stripped `ReleaseFast`
 
@@ -2734,7 +2734,7 @@ What moved it: a Huffman decoder reading nine bits at a time from a 64-bit accum
 
 ### What it decided
 
-- **The only stream open does not run on the connection's fiber** (ADR 0297's question 5). Inline is 4x the throughput, and a gRPC client puts every call on one connection, so one slow call would hold the rest and the connection's own PINGs behind it. The live test "two calls at once" is what holds that.
+- **The only stream open does not run on the connection's fiber** (ADR 220's question 5). Inline is 4x the throughput, and a gRPC client puts every call on one connection, so one slow call would hold the rest and the connection's own PINGs behind it. The live test "two calls at once" is what holds that.
 - **Spare streams are dropped when the connection waits with no call in flight**, not at the 200 ms idle release. Kept until then, a burst of 10,000 connections opening at once measured 5 MB more heap, which the allocator then held; dropped at the wait, the idle figure fell to below the unpooled one.
 
 ### Can it be pushed further
@@ -2761,5 +2761,5 @@ What moved it: a Huffman decoder reading nine bits at a time from a 64-bit accum
   not the crisis a release-mode number alone makes it look. Both of the numbers
   in that sentence that moved were moved by being measured properly, not by
   being argued with.
-- **The allocations-per-request invariant**, the second row of ADR 0018's
+- **The allocations-per-request invariant**, the second row of ADR 017's
   budget, which is held by a test rather than by this document.

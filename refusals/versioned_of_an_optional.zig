@@ -1,7 +1,7 @@
 //! `Versioned(?T)` would give `null` two meanings — the 404 a `?T` means
 //! everywhere else, and the "you already hold it" a versioned answer says
 //! with a null value — and nilo refuses to pick
-//! ([ADR 0258](../docs/adr/0258-a-version-a-handler-names-is-an-etag.md)).
+//! ([ADR 189](../docs/adr/189-a-version-a-handler-names-is-an-etag.md)).
 
 const nilo = @import("nilo_http");
 

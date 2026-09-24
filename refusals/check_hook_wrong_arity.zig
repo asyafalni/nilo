@@ -1,6 +1,6 @@
 //! A `nilo_check` that takes no `Io`, so it could never make the Scope a
 //! statement against the database needs
-//! ([ADR 0277](../docs/adr/0277-the-schema-check-runs-after-the-boot-work.md)).
+//! ([ADR 180](../docs/adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
 
 const nilo = @import("nilo_http");
 

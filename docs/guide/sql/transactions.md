@@ -51,7 +51,7 @@ connection goes back to the pool carrying nothing.
 has no way to attach one to a statement in the same message — so it has to
 travel down the same connection as the statement it bounds. `db.select` takes
 whichever connection is free and hands it straight back, so there is nothing
-to set one on ([ADR 0047](../../adr/0047-a-deadline-needs-a-connection-you-hold.md)).
+to set one on ([ADR 043](../../adr/043-a-deadline-needs-a-connection-you-hold.md)).
 
 For a floor under *everything*, including the queries that are not in a
 transaction, set it beside the database rather than in your code:

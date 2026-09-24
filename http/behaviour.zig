@@ -85,7 +85,7 @@ const Harness = struct {
     }
 
     /// Whether a failure response says `wanted`, read out of the JSON body
-    /// rather than off the wire (ADR 0025). A test then spells the message
+    /// rather than off the wire (ADR 024). A test then spells the message
     /// the way a person reads it, instead of the way JSON escapes it — and
     /// gets "the body really was JSON" asserted for free.
     fn saysFailure(response: []const u8, wanted: []const u8) !bool {
@@ -360,7 +360,7 @@ test "a query parameter that is a list is read both ways it can arrive" {
     defer h.deinit();
 
     // Comma-joined, which is what nilo writes into the document and what a
-    // client generated from it sends (ADR 0164).
+    // client generated from it sends (ADR 132).
     const commas = h.send(&app, "GET /feed?tag=a,b HTTP/1.1\r\nHost: t\r\n\r\n");
     try testing.expect(std.mem.indexOf(u8, commas.response, "a;b;") != null);
 
@@ -479,7 +479,7 @@ test "a header that is required and absent is a 400 naming it, not a surprise ze
 
 test "a header a handler asks for is a header the document promises" {
     // The whole point of the wrapper: `c.header` reads one and the document
-    // says nothing, so a generated client cannot know to send it (ADR 0163).
+    // says nothing, so a generated client cannot know to send it (ADR 131).
     var app = App.init(testing.allocator);
     defer app.deinit();
     app.docs(.{});
@@ -531,7 +531,7 @@ test "a bearer token a handler asks for is the bytes after the scheme, whatever 
     try testing.expect(std.mem.endsWith(u8, plain.response, "abc.def.ghi"));
 
     // RFC 9110 §11.1: the scheme is case-insensitive. This is the first of
-    // the two mistakes the hand-written version made (ADR 0191).
+    // the two mistakes the hand-written version made (ADR 153).
     const lower = h.send(&app, "GET /whose HTTP/1.1\r\nHost: t\r\nAuthorization: bearer abc.def.ghi\r\n\r\n");
     try testing.expect(std.mem.startsWith(u8, lower.response, "HTTP/1.1 200"));
 
@@ -671,7 +671,7 @@ test "a guard declared on a cookie is a security scheme on every route it is in 
     var app = App.init(testing.allocator);
     defer app.deinit();
     app.docs(.{});
-    // The shape ADR 0252 exists for: a prefix behind a session, two routes
+    // The shape ADR 153 exists for: a prefix behind a session, two routes
     // inside it that cannot be, one outside that wants it anyway — and one
     // that asks for a header on top of the cookie.
     const api = app.group("/api");
@@ -743,7 +743,7 @@ test "a document with no Authorization anywhere lists no security scheme" {
     try testing.expect(std.mem.indexOf(u8, json, "securitySchemes") == null);
 }
 
-// ---- the health route (ADR 0192) ----
+// ---- the health route (ADR 154) ----
 
 const ProbePool = struct {
     up: bool,
@@ -781,9 +781,9 @@ test "the health route is ok while every service is ready, and names the one tha
 }
 
 test "the health and metrics pages are described, and not counted as routes that write their own answer" {
-    // Both are `*Ctx` handlers returning nothing, which ADR 0150 cannot
+    // Both are `*Ctx` handlers returning nothing, which ADR 120 cannot
     // describe from a signature, and both are nilo's own, so it knows what
-    // they answer and says so (ADR 0281). Before this, `app.health` alone
+    // they answer and says so (ADR 120). Before this, `app.health` alone
     // made `listen()` print "1 of N routes hold the Ctx and return nothing",
     // and the reader went looking for a handler of theirs that was not there.
     var pool = ProbePool{ .up = true };
@@ -829,7 +829,7 @@ test "the health route says stopping from the moment the server is told to stop"
     try testing.expect(std.mem.endsWith(u8, stopping.response, "{\"status\":\"stopping\"}"));
 }
 
-// ---- answering once per Idempotency-Key (ADR 0193) ----
+// ---- answering once per Idempotency-Key (ADR 155) ----
 
 /// The shape `Idempotent` asks of a Space, over a map: what `nilo_cache`'s
 /// bytes Space has, written here because `http/` names no cache.
@@ -985,7 +985,7 @@ test "a key without a request, reused on another request, or still in flight is 
     try testing.expectEqual(@as(u32, 1), counter.placed);
 }
 
-// ---- a type that writes its own answer (ADR 0195) ----
+// ---- a type that writes its own answer (ADR 157) ----
 
 const XmlInvoice = struct {
     number: u32,
@@ -1217,7 +1217,7 @@ test "typed handler: service and path param matched by type" {
     try testing.expect(std.mem.indexOf(u8, result.response, "{\"id\":7,\"name\":\"wati\"}") != null);
 }
 
-// The main selling point (ADR 0003): a handler is tested as an ordinary
+// The main selling point (ADR 002): a handler is tested as an ordinary
 // function, without starting a server and without fake HTTP.
 test "a typed handler can be tested as an ordinary function" {
     var db = Db{ .rows = &.{.{ .id = 7, .name = "wati" }} };
@@ -1449,7 +1449,7 @@ test "a PATCH body tells a field left out from one sent as null" {
 
     const cases = [_]struct { body: []const u8, says: []const u8 }{
         // The distinction `?T` cannot make, and the reason Patch exists
-        // (ADR 0026).
+        // (ADR 025).
         .{ .body = "{}", .says = "{\"title\":\"absent\",\"due\":\"absent\"}" },
         .{ .body = "{\"title\":null}", .says = "{\"title\":\"cleared\",\"due\":\"absent\"}" },
         .{ .body = "{\"title\":\"buy milk\"}", .says = "{\"title\":\"buy milk\",\"due\":\"absent\"}" },
@@ -1589,7 +1589,7 @@ test "a body nested past the depth the walk follows says so, rather than nothing
 
     const cases = [_]struct { body: []const u8, says: []const u8 }{
         // Below the ceiling there is nothing left to name, and the old
-        // answer was a bare 400 with no sentence in it at all (ADR 0081).
+        // answer was a bare 400 with no sentence in it at all (ADR 034).
         .{
             .body = opens ++ "{\"value\":\"no\"}" ++ closes,
             .says = "nested deeper than 8 levels",
@@ -1659,7 +1659,7 @@ test "a path nothing is registered under is still a 404" {
     try testing.expect(std.mem.indexOf(u8, result.response, "Allow:") == null);
 }
 
-// ---- the failure body an application names (ADR 0270) ----
+// ---- the failure body an application names (ADR 024) ----
 
 const ApiError = struct {
     code: u16,
@@ -1695,7 +1695,7 @@ test "app.failures gives every failure the application's shape, message and head
     try testing.expect(failed.keep_alive);
 
     // The built-in 405 goes through the same place, so it takes the shape
-    // too — and still carries the `Allow` it has to (ADR 0025).
+    // too — and still carries the `Allow` it has to (ADR 024).
     const wrong_verb = h.send(&app, "DELETE /orders HTTP/1.1\r\nHost: x\r\n\r\n");
     try testing.expect(std.mem.startsWith(u8, wrong_verb.response, "HTTP/1.1 405 Method Not Allowed\r\n"));
     try testing.expect(std.mem.indexOf(u8, wrong_verb.response, "Allow: GET, HEAD, POST\r\n") != null);
@@ -1737,7 +1737,7 @@ test "a shape that outgrows the failure buffer falls back to nilo's own, sentenc
 }
 
 test "a malformed head keeps nilo's own shape whatever app.failures said" {
-    // Answered before there is a request to route, as a constant (ADR 0197),
+    // Answered before there is a request to route, as a constant (ADR 159),
     // and `failurebody.zig` says why that is kept.
     var app = App.init(testing.allocator);
     defer app.deinit();
@@ -1827,7 +1827,7 @@ test "once a stop is asked for, a connection answers what it has and closes" {
 
     const before = h.send(&app, "GET /users HTTP/1.1\r\nHost: x\r\n\r\n");
     try testing.expect(before.keep_alive);
-    // HTTP/1.1 staying open says nothing about it (ADR 0269).
+    // HTTP/1.1 staying open says nothing about it (ADR 197).
     try testing.expect(std.mem.indexOf(u8, before.response, "Connection:") == null);
 
     app.shutdown();
@@ -2044,7 +2044,7 @@ test "a handler returning ?T answers 404 when there is none, and never sends nul
     try testing.expect(std.mem.indexOf(u8, found.response, "{\"id\":7,\"name\":\"wati\"}") != null);
 
     // Not `200 null`, which is what this used to be and what nobody meant
-    // (ADR 0024). The path is in the message, so the log says which one.
+    // (ADR 023). The path is in the message, so the log says which one.
     const missing = h.send(&app, "GET /users/99 HTTP/1.1\r\nHost: t\r\n\r\n");
     try testing.expect(std.mem.startsWith(u8, missing.response, "HTTP/1.1 404 Not Found\r\n"));
     try testing.expect(try Harness.saysFailure(missing.response, "there is no /users/99"));
@@ -2070,7 +2070,7 @@ fn scribbleOverTheStack() u64 {
 
 test "a Response's headers are copied out of the frame that wrote them" {
     // This is the test the old `headers: []const Header` could not pass in a
-    // release build, and passed in Debug for a whole stage (ADR 0019).
+    // release build, and passed in Debug for a whole stage (ADR 018).
     var buffer: [64]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&buffer);
     const headers = try headersBuiltInAFrameThatDies(fixed.allocator(), 42);
@@ -2249,7 +2249,7 @@ test "the document can be written with no server, and is the same bytes the serv
     app.docs(.{ .title = "t", .version = "1" });
 
     // Before anything listens, before any chain is resolved: the operations
-    // are collected at registration, which is the whole claim (ADR 0167).
+    // are collected at registration, which is the whole claim (ADR 135).
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try app.writeOpenApi(&out.writer);
@@ -2414,7 +2414,7 @@ fn injectedHeader(c: *Ctx) anyerror!void {
     // wrote.
     const from_the_database = "/welcome\r\nSet-Cookie: admin=1";
     // `error.Failed` rather than a bare error of its own: each of these is a
-    // 500 carrying a sentence that says which header and why (ADR 0087).
+    // 500 carrying a sentence that says which header and why (ADR 029).
     try testing.expectError(error.Failed, c.redirect(302, from_the_database));
     try testing.expectError(error.Failed, c.setHeader("X-Note", from_the_database));
     try testing.expectError(error.Failed, c.setHeader("X-Note", "a\x00b"));
@@ -2442,7 +2442,7 @@ test "a header value carrying a line break cannot write the rest of the response
 fn reservedHeader(c: *Ctx) anyerror!void {
     // A refusal from `putHeader` is a fail function, so it arrives as
     // `error.Failed` with a sentence attached rather than as a bare error
-    // name the client would see as "internal server error" (ADR 0087).
+    // name the client would see as "internal server error" (ADR 029).
     try testing.expectError(error.Failed, c.setHeader("Content-Length", "999"));
     try testing.expectError(error.Failed, c.setHeader("connection", "close"));
     // Setting the same header twice replaces it rather than sending both.
@@ -2494,7 +2494,7 @@ test "a header value carrying a newline is refused, not written" {
 fn splittingCookieHeader(c: *Ctx) anyerror!void {
     // `Set-Cookie` through `setHeader` rather than `setCookie` — the route a
     // `Response`'s or a `Redirect`'s `.headers` takes, which never reaches
-    // `cookie.check` and so was the one way past it (ADR 0087).
+    // `cookie.check` and so was the one way past it (ADR 029).
     try c.setHeader("Set-Cookie", "session=abc\r\nX-Injected: yes");
     try c.sendText(200, "ok");
 }
@@ -2681,7 +2681,7 @@ test "middleware runs even when no route matched" {
     const result = h.send(&app, "GET /nowhere HTTP/1.1\r\nHost: t\r\n\r\n");
     try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 404 Not Found\r\n"));
     // A logger has to be able to see 404s, and CORS has to answer
-    // preflights for paths with no route (ADR 0009).
+    // preflights for paths with no route (ADR 008).
     try testing.expect(std.mem.indexOf(u8, result.response, "X-Order: outer") != null);
 }
 
@@ -3184,7 +3184,7 @@ test "static files: routes win, a prefix scopes, and middleware still wraps" {
 }
 
 test "an asset that is not there is a 404, and a deep link is still the page" {
-    // What this is about is the stale build hash (ADR 0109): `index.html`
+    // What this is about is the stale build hash (ADR 087): `index.html`
     // referring to a bundle the directory no longer holds used to answer 200
     // with the page, and the browser reported a syntax error on line 1 of
     // something that was never JavaScript.
@@ -3281,7 +3281,7 @@ var test_origins: cors.Origins = .empty;
 test "a CORS origin can arrive at run time instead of being compiled in" {
     // The deployment fact this is for: the same binary in staging and in
     // production, with the front end at a different address in each
-    // (ADR 0110).
+    // (ADR 088).
     var buf: [4][]const u8 = undefined;
     try test_origins.setSplit(&buf, "https://app.example.com, https://staging.example.com");
 
@@ -3314,7 +3314,7 @@ test "a CORS origin can arrive at run time instead of being compiled in" {
     );
     try testing.expect(std.mem.indexOf(u8, other.response, "Access-Control-Allow-Origin") == null);
     // …and it still says the response varies by origin, so a shared cache
-    // cannot hand this one to somebody who was allowed (ADR 0089).
+    // cannot hand this one to somebody who was allowed (ADR 029).
     try testing.expect(std.mem.indexOf(u8, other.response, "Vary: Origin") != null);
 
     // A preflight is answered here and never reaches the route.
@@ -3334,7 +3334,7 @@ test "a CORS origin can arrive at run time instead of being compiled in" {
 test "two layers each naming a Vary axis both survive onto the response" {
     // A gzipped file behind a CORS with a named origin: the middleware says
     // the answer depends on the Origin, the file says it depends on
-    // Accept-Encoding, and both are true of the same response (ADR 0089).
+    // Accept-Encoding, and both are true of the same response (ADR 029).
     // `Vary` used to replace, so whichever ran second was the only one left —
     // and the handler always runs after the middleware, so it was always
     // `Vary: Origin` that went.
@@ -3362,7 +3362,7 @@ test "two layers each naming a Vary axis both survive onto the response" {
 }
 
 test "a gzipped file behind a named-origin CORS still allocates nothing" {
-    // The path the second `Vary` was added to, put against ADR 0018's hard
+    // The path the second `Vary` was added to, put against ADR 017's hard
     // invariant rather than reasoned about. Seven response headers now — CORS
     // two, the file five — and `inline_headers` is six, so this is the test
     // that says whether the extra one spills to the arena.
@@ -3407,7 +3407,7 @@ test "a gzipped file behind a named-origin CORS still allocates nothing" {
     // to something that outlives the request, so there is nothing to copy.
     // The seventh header would have spilled — the exact-duplicate check in
     // `putHeader` is not what saves it, since these seven are all different;
-    // `inline_headers` moving from six to seven is (ADR 0089).
+    // `inline_headers` moving from six to seven is (ADR 029).
     try testing.expectEqual(@as(usize, 0), counting.allocs);
     try testing.expectEqual(@as(usize, 0), counting.resizes);
 }
@@ -3463,7 +3463,7 @@ fn arenaAllocationsAcross(keep: usize, count: usize) !usize {
 }
 
 test "a response bigger than arena_keep makes the connection take fresh pages every request" {
-    // The finding behind the option (ADR 0096). At the default the 64 KiB
+    // The finding behind the option (ADR 075). At the default the 64 KiB
     // body does not fit in what is retained, so the arena gives the block
     // back after every request and asks for it again on the next one. On a
     // megabyte that showed up as 257 minor faults a request.
@@ -3597,7 +3597,7 @@ test "a request is counted against its route, not the path it arrived on" {
     const page = h.send(&app, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").response;
 
     // Two paths, one series — which is the whole reason the counter is the
-    // route's index rather than something keyed by the path (ADR 0100).
+    // route's index rather than something keyed by the path (ADR 079).
     try testing.expect(std.mem.indexOf(
         u8,
         page,
@@ -3610,7 +3610,7 @@ test "a request is counted against its route, not the path it arrived on" {
     try testing.expect(std.mem.indexOf(u8, page, "route=\"/metrics\"") == null);
 }
 
-// ---- refusing a request for load (ADR 0197) ----
+// ---- refusing a request for load (ADR 159) ----
 
 test "a request past max_in_flight is a 503 at once, and one inside it is answered" {
     var app = App.init(testing.allocator);
@@ -3732,9 +3732,9 @@ test "counting a request adds nothing to the allocation budget" {
     send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
 
     // The same one as with metrics off, and it is still the JSON body. This
-    // is the claim ADR 0100 is built on: the table is sized once when the
+    // is the claim ADR 079 is built on: the table is sized once when the
     // routes are resolved, so a counted request touches memory that already
-    // exists (ADR 0018).
+    // exists (ADR 017).
     try testing.expectEqual(@as(usize, 1), counting.allocs);
     try testing.expectEqual(@as(usize, 0), counting.resizes);
 }
@@ -3777,7 +3777,7 @@ test "an allowance adds nothing to the allocation budget" {
     send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
 
     // Still the JSON body and nothing else, which is the whole reason the
-    // table is sized while compiling rather than kept in a map (ADR 0114).
+    // table is sized while compiling rather than kept in a map (ADR 092).
     // The address is not copied, not hashed into anything that allocates, and
     // the slot it lands in existed before `main` ran.
     try testing.expectEqual(@as(usize, 1), counting.allocs);
@@ -3826,7 +3826,7 @@ test "compression switched on adds nothing to a request under its threshold" {
 
     // Still the one, and it is still the JSON body: the compressors were
     // taken when the chains were resolved, and a request that is not
-    // compressed never reaches for them (ADR 0287).
+    // compressed never reaches for them (ADR 211).
     try testing.expectEqual(@as(usize, 1), counting.allocs);
     try testing.expectEqual(@as(usize, 0), counting.resizes);
 }
@@ -3872,7 +3872,7 @@ test "a compressed answer costs one allocation, and it is the compressed body" {
     // the one allocation is the compressed copy, sized to fit on the first
     // try so that it is never grown. A JSON route pays its usual one for
     // the body on top of this, which is the number `app.compress`'s doc
-    // states (ADR 0287).
+    // states (ADR 211).
     try testing.expectEqual(@as(usize, 1), counting.allocs);
     try testing.expectEqual(@as(usize, 0), counting.resizes);
 }
@@ -3933,7 +3933,7 @@ test "metrics cannot be switched on twice" {
 /// this test was named for a *fifth* header and spelled six of them, from back
 /// when four were held inline — so by the time it was read again it had been
 /// asserting nothing about spilling for two changes to that constant
-/// (ADR 0033, and ADR 0089 for the change that made it worth noticing).
+/// (ADR 032, and ADR 029 for the change that made it worth noticing).
 const spilling_headers = ctx_mod.inline_headers + 1;
 
 test "one header more than the Ctx holds inline spills, and all of them go out in order" {
@@ -4148,7 +4148,7 @@ test "two requests on one trickling connection do not borrow each other's head" 
     }
 }
 
-// ---- deadlines (ADR 0023) ----
+// ---- deadlines (ADR 022) ----
 //
 // What is tested here is the policy: which limit the request path asks for,
 // when, how many times, and what it sends when one runs out. What zio does
@@ -4412,7 +4412,7 @@ test "reading a body puts the body's limit on it, not the head's" {
 
     // A deadline rather than a per-read duration, and in the future: five
     // bytes at the test's rate is 500ms of grace and a rounding error
-    // (ADR 0124).
+    // (ADR 022).
     const at = d.clock.lastRead().?.by_ns;
     try testing.expect(at > bulkhead.monotonicNanos());
 }
@@ -4487,7 +4487,7 @@ test "a WebSocket is allowed to sit quiet once the handshake is done" {
     try testing.expectEqual(bulkhead.Limit.none, d.clock.lastRead().?);
 }
 
-// ---- the generated API description (ADR 0017) ----
+// ---- the generated API description (ADR 016) ----
 
 const DocUser = struct { id: u32, name: Str, admin: bool = false };
 const DocNewUser = struct { name: Str, age: ?u32 = null, plan: enum { free, paid } };
@@ -4612,7 +4612,7 @@ test "the document names the statuses and failures the signatures settle" {
     const json = try docsFor(&app);
 
     // `Status(code, T)` puts the code in the type, so the document names it
-    // instead of falling back to `default` (ADR 0024).
+    // instead of falling back to `default` (ADR 023).
     try testing.expect(std.mem.indexOf(u8, json, "\"responses\":{\"201\":") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"responses\":{\"204\":") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"default\":") == null);
@@ -4629,7 +4629,7 @@ test "the document names the statuses and failures the signatures settle" {
     ) != null);
 
     // Every failure the document promises has the one shape all of them
-    // take, described once (ADR 0025).
+    // take, described once (ADR 024).
     try testing.expect(std.mem.indexOf(u8, json, "\"Failure\":{\"type\":\"object\"") != null);
     try testing.expect(std.mem.indexOf(
         u8,
@@ -4875,7 +4875,7 @@ test "a route that says its own name gets it as the operationId" {
     try api.named("createUser").post("/users", docCreateUser);
     // A hyphen, which is how the generator on the other side of a port
     // spelled five of its names; the document carries it as written
-    // (ADR 0200).
+    // (ADR 119).
     try api.named("auth-login").post("/auth/login", docCreateUser);
 
     const json = try docsFor(&app);
@@ -4901,7 +4901,7 @@ test "a route that says its own name gets it as the operationId" {
     );
 }
 
-/// One middleware and one table, which is the shape ADR 0046 of the port
+/// One middleware and one table, which is the shape ADR 042 of the port
 /// that asked for this argued for: a check per handler leaves the
 /// ninety-first endpoint open with no error and no failing test, and a table
 /// consulted from one place does not. Default-deny — a route the table does
@@ -4965,7 +4965,7 @@ test "a middleware can read the name of the route it is in front of" {
     try testing.expectEqual(@as(u16, 403), deleted.status);
     try testing.expect(std.mem.indexOf(u8, deleted.body, "deleteUser is not in the permission table") != null);
 
-    // Nothing matched: null, and the middleware still runs (ADR 0009).
+    // Nothing matched: null, and the middleware still runs (ADR 008).
     const missing = try client.get(&app, "/nothing-here");
     try testing.expectEqual(@as(u16, 404), missing.status);
     try testing.expect(missing.header("X-Needed") == null);
@@ -4977,7 +4977,7 @@ test "a middleware can read the name of the route it is in front of" {
 test "twenty named routes on one group is a program, not a branch budget" {
     // Sixteen was the number that stopped compiling, and the message named a
     // line in this file and whichever route the walk happened to be on
-    // (ADR 0157). Twenty here, so the test fails if the sizing is ever taken
+    // (ADR 126). Twenty here, so the test fails if the sizing is ever taken
     // back out — and long names, because the cost is per byte.
     var db = Db{ .rows = &.{} };
     var app = App.init(testing.allocator);
@@ -5025,7 +5025,7 @@ test "docs can be asked for before or after the routes, and both pages appear" {
     try app.provide(&db);
 
     // After the routes this time — the order-independence `use` and `get`
-    // already have (ADR 0009).
+    // already have (ADR 008).
     try app.get("/users/:id", docGetUser);
     app.docs(.{ .title = "Late", .ui_path = "/reference" });
 
@@ -5126,7 +5126,7 @@ test "rebuilding the document twice does not leak the first one" {
     try testing.expect(app.docs_set != null);
 }
 
-// ---- groups and plugins (ADR 0015) ----
+// ---- groups and plugins (ADR 014) ----
 
 /// A plugin: an ordinary function that registers into whatever group it is
 /// handed. Taking `anytype` rather than a named type is what lets the same
@@ -5282,14 +5282,14 @@ test "a duplicate route inside a group is still refused, naming the joined path"
     // `std.log.err` that Zig's test runner reads as a failure.
     //
     // A prefix is not a namespace — it is text on the front — so the
-    // collision is against the joined pattern and nothing else (ADR 0013).
+    // collision is against the joined pattern and nothing else (ADR 012).
     try testing.expect(app.router.conflicting(.GET, "/api/users/:name") != null);
     try testing.expect(app.router.conflicting(.GET, "/users/:id") == null);
 }
 
-// ---- resolved values (ADR 0016) ----
+// ---- resolved values (ADR 015) ----
 //
-// The gap ADR 0009 wrote down and left open: middleware can refuse a
+// The gap ADR 008 wrote down and left open: middleware can refuse a
 // request but cannot hand the handler the user it just looked up. These
 // tests are that gap closed, end to end through a real request.
 
@@ -5424,7 +5424,7 @@ test "a service only a resolver needs is still caught before serving" {
     defer app.deinit();
     // `*Sessions` appears nowhere in whoAmI's arguments — only inside the
     // resolver behind `SignedIn`. Missing it has to stop `listen()` all the
-    // same (ADR 0006), or the first authenticated request finds out instead.
+    // same (ADR 005), or the first authenticated request finds out instead.
     try app.get("/me", whoAmI);
 
     // Through the predicate rather than `checkServices()`, which logs the
@@ -5436,7 +5436,7 @@ test "a service only a resolver needs is still caught before serving" {
 }
 
 test "a route that resolves nothing still costs what it always did" {
-    // ADR 0018's rule, as a test: a feature nobody used must not show up on
+    // ADR 017's rule, as a test: a feature nobody used must not show up on
     // the request path. `_resolved` starts empty and allocates only when
     // something is put in it, so this is the same budget as before.
     var db = Db{ .rows = &.{.{ .id = 7, .name = "wati" }} };
@@ -5484,12 +5484,12 @@ test "the in-flight request is readable, which is what the panic handler uses" {
     _ = h.send(&app, "GET /known HTTP/1.1\r\nHost: t\r\n\r\n");
 
     // App records these before running the chain, so a panic anywhere
-    // inside it can name the request (ADR 0008).
+    // inside it can name the request (ADR 007).
     try testing.expectEqualStrings("GET", h.in_flight.method);
     try testing.expectEqualStrings("/known", h.in_flight.path);
 }
 
-// ---- responses written in pieces (ADR 0020) ----
+// ---- responses written in pieces (ADR 019) ----
 
 fn streamRows(c: *Ctx) anyerror!void {
     var body = try c.stream(200, "text/csv");
@@ -5638,7 +5638,7 @@ test "a stream allocates once, however many pieces it writes" {
     send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
 
     // One: the stream's own buffer. Two hundred pieces went out through it
-    // and not one of them allocated — which is the promise ADR 0020 makes, and
+    // and not one of them allocated — which is the promise ADR 019 makes, and
     // the reason a stream can run for a week. (It was two; the request head is
     // no longer copied for a request with no body.)
     try testing.expectEqual(@as(usize, 1), counting.allocs);
@@ -5706,7 +5706,7 @@ test "a shutdown asks a stream to wind up rather than cutting it off" {
     const result = h.send(&app, "GET /forever HTTP/1.1\r\nHost: t\r\n\r\n");
 
     // Two events went out and the third was never started: `live()` went
-    // false, the loop ended, and the body was closed properly (ADR 0020).
+    // false, the loop ended, and the body was closed properly (ADR 019).
     const body = result.response[std.mem.indexOf(u8, result.response, "\r\n\r\n").? + 4 ..];
     try testing.expectEqualStrings("c\r\ndata: tick\n\n\r\nc\r\ndata: tick\n\n\r\n0\r\n\r\n", body);
 
@@ -5715,7 +5715,7 @@ test "a shutdown asks a stream to wind up rather than cutting it off" {
     try testing.expect(!result.keep_alive);
 }
 
-// ---- request bodies read in pieces (ADR 0020) ----
+// ---- request bodies read in pieces (ADR 019) ----
 
 /// Counts the body rather than holding it, which is the point: this handler
 /// works the same for eleven bytes and eleven gigabytes.
@@ -5854,7 +5854,7 @@ test "a body read in pieces allocates nothing" {
     try testing.expectEqual(@as(usize, 2), counting.allocs);
 }
 
-// ---- asking for part of a file (ADR 0021) ----
+// ---- asking for part of a file (ADR 020) ----
 
 test "a range asks for part of a file and gets a 206" {
     var files = try TmpFiles.init(testing.allocator, &.{
@@ -5983,7 +5983,7 @@ test "a HEAD with a range gets the head a GET would have, and no body" {
     try testing.expect(std.mem.endsWith(u8, head.response, "\r\n\r\n"));
 }
 
-// ---- WebSocket (ADR 0022) ----
+// ---- WebSocket (ADR 021) ----
 
 fn echoSocket(c: *Ctx) anyerror!void {
     return c.upgrade(echoLoop, {});
@@ -6089,7 +6089,7 @@ test "a WebSocket allocates nothing per message, however many it carries" {
 test "the loop runs after the handler has returned, not inside it" {
     // The whole point of the shape: `serveRequest` is finished with — its
     // `Ctx`, its parsed head and its route match are gone — before a byte of
-    // the conversation is read (ADR 0071).
+    // the conversation is read (ADR 062).
     const Trace = struct {
         var handler_returned: bool = false;
         var loop_saw_it: bool = false;
@@ -6252,7 +6252,7 @@ test "every query parameter can be walked, including a name sent twice" {
     defer h.deinit();
 
     // The case `query(name)` cannot serve at all: names that are data, and a
-    // name sent more than once (ADR 0112).
+    // name sent more than once (ADR 090).
     const answer = h.send(
         &app,
         "GET /q?filter%5Bstatus%5D=open&tag=a&tag=b&empty= HTTP/1.1\r\nHost: t\r\n\r\n",
@@ -6370,7 +6370,7 @@ test "a body under a Content-Encoding nilo cannot decode is refused with a 415 n
 
     // What used to happen: the stream reached the JSON parser and came back
     // as "malformed body", which is true of the bytes and useless to whoever
-    // sent them (ADR 0111). gzip is decoded now (ADR 0251); brotli is not.
+    // sent them (ADR 089). gzip is decoded now; brotli is not.
     const brotli = h.send(
         &app,
         "POST /things HTTP/1.1\r\nHost: t\r\nContent-Encoding: br\r\n" ++
@@ -6437,7 +6437,7 @@ test "a gzipped body is inflated before anything reads it, so a typed handler se
     defer h.deinit();
 
     // A typed body: what the stock OpenTelemetry Collector and most agents
-    // send by default reaches `c.json` as JSON (ADR 0251).
+    // send by default reaches `c.json` as JSON (ADR 089).
     const greeting = try gzippedRequest(
         testing.allocator,
         "POST /greet HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\nContent-Type: application/json\r\n",
@@ -6578,7 +6578,7 @@ test "with two proxies trusted, the client is two entries from the right" {
 test "naming the network reads the client whatever the chain's length turned out to be" {
     // The gap a hop count leaves: grow a hop and the count is silently wrong,
     // because `clientIp()` goes on returning something that looks like an
-    // address (ADR 0129). Described instead, the length stops mattering.
+    // address (ADR 102). Described instead, the length stops mattering.
     var app = App.init(testing.allocator);
     defer app.deinit();
     try app.get("/who", echoClientIp);
@@ -7133,7 +7133,7 @@ test "a cookie split across two Cookie headers is still found" {
 test "reading a cookie allocates nothing" {
     // The claim `Ctx.cookie` makes: the header is walked where it lies, so a
     // request that carries cookies costs the same as one that does not
-    // (ADR 0018's hard invariant, ADR 0030).
+    // (ADR 017's hard invariant, ADR 029).
     var app = App.init(testing.allocator);
     defer app.deinit();
     try app.get("/me", echoCookie);
@@ -7179,7 +7179,7 @@ test "a handler can ask for entropy, and gets different bytes every time" {
     // Driven through a whole request rather than called directly, because
     // what is being checked is that the Bulkhead answers at all outside a
     // running server — a handler is an ordinary function and this suite has
-    // no Engine under it (ADR 0046). Two readings rather than one, because
+    // no Engine under it (ADR 042). Two readings rather than one, because
     // a source that is broken open answers zeroes and a source that is
     // broken shut answers the same bytes twice; neither would fail a test
     // that only looked at the length.
@@ -7392,7 +7392,7 @@ test "an id that would smuggle something is ignored, not repeated" {
 
 fn echoesItsErasedRequestId(c: *Ctx) ![]const u8 {
     // What a reaction behind a function pointer sees, and what `nilo_fetch`
-    // reads by declaration: the same id, through the erasure (ADR 0196).
+    // reads by declaration: the same id, through the erasure (ADR 158).
     var erased = str_mod.AnyScope.of(c);
     const id = erased.requestId() orelse return error.NoRequestId;
     return id.view();
@@ -7417,7 +7417,7 @@ test "an erased Scope made from a request carries the request's id" {
 }
 
 /// The far side of a function pointer: what `TokenHolder` the request
-/// resolved, or `NotGiven` (ADR 0219).
+/// resolved, or `NotGiven` (ADR 144).
 const Reaction = *const fn (scope: *str_mod.AnyScope) anyerror![]const u8;
 fn tokenBehindThePointer(scope: *str_mod.AnyScope) anyerror![]const u8 {
     const holder = scope.resolve(TokenHolder) catch |err| return @errorName(err);
@@ -7783,10 +7783,10 @@ test "the document says which encoding a form takes, and where a redirect sends 
     try testing.expect(std.mem.indexOf(u8, document, "\"requestBody\":{\"required\":true,\"content\":{\"application/json\"") == null);
 }
 
-// ---- a handler that holds its thread (ADR 0034) ----
+// ---- a handler that holds its thread (ADR 013) ----
 //
 // The whole point of these is that the detector is watched failing, in the
-// shape a person would hit it (ADR 0033). They cost real milliseconds of
+// shape a person would hit it (ADR 032). They cost real milliseconds of
 // wall clock, which is the price of measuring something whose unit is time.
 
 /// Hold this thread for `ms`, the way a database driver waiting on a socket
@@ -7881,7 +7881,7 @@ fn streamsProperly(c: *Ctx) anyerror!void {
 }
 
 test "a stream that blocks is caught, where it used to be excused" {
-    // This test asserted the opposite until ADR 0132: a stream, a body reader
+    // This test asserted the opposite until ADR 013: a stream, a body reader
     // and a WebSocket were excused entirely, so a blocking call inside one
     // was never reported — and a WebSocket loop is where it costs the most.
     var app = App.init(testing.allocator);
@@ -7917,7 +7917,7 @@ fn blocksBetweenTwoWaits(c: *Ctx) anyerror!void {
     // Two stretches, each under the limit, with the whole request well over
     // it. The old metric summed elapsed-minus-parked and reported this; one
     // stretch does not, and a handler that yields every 6ms is not holding
-    // its thread (ADR 0132).
+    // its thread (ADR 013).
     for (0..4) |_| {
         bulkhead.blocking(holdFor, .{held_ms / 4});
         holdFor(held_ms / 4);
@@ -8024,7 +8024,7 @@ test "a route can say a group's middleware does not cover it" {
     try v1.get("/whoami", signedIn);
 
     // The whole shape this exists for: you cannot require a session to create
-    // one (ADR 0080). Default-deny — the guard is on the group and the route
+    // one (ADR 008). Default-deny — the guard is on the group and the route
     // says otherwise about itself.
     const open = v1.without(guard);
     try open.post("/sign-up", signUp);
@@ -8082,7 +8082,7 @@ test "a route can carry a middleware its neighbours do not" {
 
     // One endpoint inside a group needs a guard the rest do not. Before `with`
     // this meant a prefix invented to match only it, or a group of one
-    // (ADR 0126).
+    // (ADR 099).
     const v1 = app.group("/v1");
     try v1.get("/users/:id", shown);
     try v1.with(adminOnly).delete("/users/:id", removed);
@@ -8108,7 +8108,7 @@ test "a carried middleware runs inside the group's, whichever was written first"
     defer app.deinit();
 
     // `use` after the route, on purpose: chains are resolved at `listen()`, so
-    // the order these two lines are written in still does not matter (ADR 0009)
+    // the order these two lines are written in still does not matter (ADR 008)
     // — and the carried one is still the inner of the two.
     const v1 = app.group("/v1");
     try v1.with(adminOnly).delete("/users/:id", removed);
@@ -8186,7 +8186,7 @@ test "the route table can be read from outside, and printed" {
     try testing.expectEqual(http1.Method.DELETE, app.routes().at(2).method);
     // And the name each answers to — derived where the route said nothing,
     // given where it did — so a table keyed by it can be held against the
-    // route table (ADR 0201).
+    // route table (ADR 162).
     try testing.expectEqualStrings("getUsersId", app.routes().at(0).name);
     try testing.expectEqualStrings("postUsers", app.routes().at(1).name);
     try testing.expectEqualStrings("removeUser", app.routes().at(2).name);
@@ -8210,7 +8210,7 @@ test "a URL is built from the pattern, with every value encoded" {
     defer client.deinit();
 
     // The slash in the slug is a character somebody typed, so it stays inside
-    // one segment rather than inventing another (ADR 0127).
+    // one segment rather than inventing another (ADR 100).
     const answer = try client.get(&app, "/build");
     try testing.expectEqualStrings("/users/42/posts/a%20b%2Fc", answer.body);
 }
@@ -8234,7 +8234,7 @@ test "the mode nilo reads off std is the one the program was built at" {
     // Here nilo and the program are the same compilation, so what this holds
     // is the *derivation* rather than the warning: `warnIfBuiltDifferently`
     // is only ever right if `std.log.default_level` tracks the optimize mode
-    // of the root (ADR 0084). If a future std stops doing that, the warning
+    // of the root (ADR 069). If a future std stops doing that, the warning
     // starts firing at everybody or at nobody, and this is what notices.
     //
     // The suite runs in Debug and ReleaseSafe, so two of the three arms are
@@ -8278,7 +8278,7 @@ test "the arm the suite never builds in is checked anyway" {
     try testing.expect(wiring.modeFrom(.info, false) != wiring.modeFrom(.info, true));
 }
 
-// ---- a body field that parses itself (ADR 0205), and a bounded integer (ADR 0206) ----
+// ---- a body field that parses itself (ADR 166), and a bounded integer (ADR 167) ----
 
 /// A stand-in for `sql.Uuid`: `http/` may not import `nilo_id`, and the
 /// protocol is read by name so that it need not. Three capital letters.
@@ -8329,7 +8329,7 @@ fn postLine(h: *Harness, app: *App, body: []const u8) []const u8 {
 test "a body field that parses itself is read from the text a response writes it as" {
     // Item 64: `sql.Uuid` in a body was handed to `std.json`, which read it
     // as the `{bytes: …}` struct it is and answered 400 to the 36 characters
-    // the same server writes in every response (ADR 0205).
+    // the same server writes in every response (ADR 166).
     var app = App.init(testing.allocator);
     defer app.deinit();
     try app.post("/lines", addLine);
@@ -8390,7 +8390,7 @@ fn listLines(q: typed.Query(ListQuery)) !struct { limit: u8, offset: u32 } {
     return .{ .limit = q.value.limit.value, .offset = q.value.offset };
 }
 
-// ---- text with a shape, and a struct that checks itself (ADR 0264) ----
+// ---- text with a shape, and a struct that checks itself (ADR 193) ----
 
 const text_mod = @import("text.zig");
 
@@ -8559,7 +8559,7 @@ test "a query string reads a shaped field and runs the struct's check, and the d
 
 test "a query field carries its bounds, and the document says them" {
     // Item 68: `limit` between 1 and 200 was two lines at the top of every
-    // list handler, and the document said nothing about either (ADR 0206).
+    // list handler, and the document said nothing about either (ADR 167).
     var app = App.init(testing.allocator);
     defer app.deinit();
     app.docs(.{});

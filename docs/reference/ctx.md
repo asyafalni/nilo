@@ -11,14 +11,14 @@ One page of [the reference](./README.md): one request in flight: reading it, ans
 | `c.method` | `.GET`, `.POST`, … |
 | `c.path()` | `Str` — the path, without the query string |
 | `c.param(name)` | `?Str`, percent-decoded. `"*"` for a catch-all |
-| `c.routeName()` | `?[]const u8` — the `operationId` of the route that matched, as the API description prints it: what `app.named` gave it, or the derived `getUsersId`. Null when nothing matched — a 404, a 405, a static file. For a middleware holding one authorisation table over every route ([ADR 0201](../adr/0201-a-middleware-can-learn-which-route-it-is-in-front-of.md)) |
+| `c.routeName()` | `?[]const u8` — the `operationId` of the route that matched, as the API description prints it: what `app.named` gave it, or the derived `getUsersId`. Null when nothing matched — a 404, a 405, a static file. For a middleware holding one authorisation table over every route ([ADR 162](../adr/162-a-middleware-can-learn-which-route-it-is-in-front-of.md)) |
 | `c.query(name)` | `?Str`, percent-decoded, `+` as space |
 | `c.queries()` | an iterator over every query parameter, in arrival order — `while (it.next()) \|q\|`, `q.name` and `q.value` are `Str`. A name sent twice appears twice |
 | `c.queryString()` | `Str` — the query as it arrived, still encoded, no `?` on the front. `""` when there was none |
 | `c.host()` | `Str` — the host this request was addressed to. `X-Forwarded-Host` under `trusted_hops`, else the authority of an absolute-form target, else the `Host` header |
 | `c.scheme()` | `Str` — `"https"` or `"http"`, what the **client** used. `X-Forwarded-Proto` under `trusted_hops`, else always `"http"` |
 | `c.header(name)` | `?Str`, name matched case-insensitively. The **first** of that name |
-| `c.clientHas(version)` | `bool` — whether `If-None-Match` names the tag a `nilo.Versioned(T)` with that `u64` goes out under. Asked before building the body, so `.unchanged(version)` skips the query as well as the bytes ([ADR 0258](../adr/0258-a-version-a-handler-names-is-an-etag.md)) |
+| `c.clientHas(version)` | `bool` — whether `If-None-Match` names the tag a `nilo.Versioned(T)` with that `u64` goes out under. Asked before building the body, so `.unchanged(version)` skips the query as well as the bytes ([ADR 189](../adr/189-a-version-a-handler-names-is-an-etag.md)) |
 | `c.authorization(.bearer)` | `!Authorization(.bearer)` — the header as one scheme, or the 401 with the challenge on it. For a resolver; a handler asks in its argument list |
 | `c.verified(V)` | `!Verified(V)` — the bearer token verified through the `jwt.Verifier` `V`, or the 401. For a middleware guarding a prefix; a handler asks in its argument list |
 | `c.headers()` | an iterator over every header, in arrival order — `while (it.next()) \|h\|`, `h.name` and `h.value` are `Str` |
@@ -61,30 +61,30 @@ One page of [the reference](./README.md): one request in flight: reading it, ans
 | `c.setCookie(cookie)` | a `Set-Cookie`. Calling it twice sets two, not one |
 | `c.clearCookie(.{ .name = …, .path = …, .domain = … })` | delete one. Path and domain have to match |
 | `c.redirect(status, location)` | a `Location` and no body |
-| `c.send(status, content_type, bytes)` | gzipped on the way out when `app.compress` is on and the body, the type and the client all qualify ([ADR 0287](../adr/0287-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)); so are the two below |
+| `c.send(status, content_type, bytes)` | gzipped on the way out when `app.compress` is on and the body, the type and the client all qualify ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)); so are the two below |
 | `c.sendText(status, text)` | `text/plain` |
 | `c.sendJson(status, value)` | `application/json` |
 | `c.sendEmpty(status)` | no body and no `Content-Type` — a 204, usually |
 | `c.sendFile(.{ .file = f, .content_type = … })` | an open file. **Closed here**, on every way out |
 | `c.stream(status, content_type)` | `!Stream` |
 | `c.streamWith(status, content_type, .{ .buffer = … })` | the same, buffer of your own. Default 4 KB |
-| `c.streamWith(…, .{ .length = n })` | a stream whose length is already known: `Content-Length` and no chunk framing ([ADR 0128](../adr/0128-a-stream-that-knows-its-length-says-so.md)) |
-| `c.url(pattern, args)` | `!Str` — a URL for a route, every value percent-encoded and every mistake a compile error ([ADR 0127](../adr/0127-a-route-pattern-is-the-name-of-its-url.md)) |
+| `c.streamWith(…, .{ .length = n })` | a stream whose length is already known: `Content-Length` and no chunk framing ([ADR 101](../adr/101-a-stream-that-knows-its-length-says-so.md)) |
+| `c.url(pattern, args)` | `!Str` — a URL for a route, every value percent-encoded and every mistake a compile error ([ADR 100](../adr/100-a-route-pattern-is-the-name-of-its-url.md)) |
 | `c.events()` | `!Events` |
 | `c.upgrade(loop, state)` | `!void` — the connection becomes a WebSocket and `loop` reads it. `{}` when there is no state |
 | `c.upgradeWith(loop, state, .{ .protocol = "chat.v1" })` | the same, naming a subprotocol |
 
 Every response goes out with a `Date`, written by nilo; set one yourself and
-yours is sent instead ([ADR 0269](../adr/0269-a-response-says-when-it-was-sent.md)).
+yours is sent instead ([ADR 197](../adr/197-a-response-says-when-it-was-sent.md)).
 `Content-Type`, `Content-Length`, `Transfer-Encoding` and `Connection` are
 refused by `setHeader`. So is a name that is not a token, and a value holding a
 control byte — a newline in one would start a second header, and two would start
-a second response ([ADR 0087](../adr/0087-a-header-value-cannot-end-its-own-line.md)).
+a second response ([ADR 029](../adr/029-a-header-is-checked-once-and-two-of-them-repeat.md)).
 All three are a 500 naming the header. Set headers before sending. Setting the
 same header twice replaces it — except `Set-Cookie` and `Vary`, which a response
 may carry more than one of. `Set-Cookie` because two cookies cannot be folded
 into one line; `Vary` because two layers each name their own axis, and replacing
-threw one away ([ADR 0089](../adr/0089-two-layers-can-each-name-a-vary-axis.md)).
+threw one away ([ADR 029](../adr/029-a-header-is-checked-once-and-two-of-them-repeat.md)).
 Setting either with a name and value already present adds nothing.
 
 **`host()` and `scheme()` are how a handler writes a URL to its own service** —
@@ -92,7 +92,7 @@ a password-reset link, an OAuth `redirect_uri`, an absolute `Location`. nilo
 does not speak TLS, so with no `trusted_hops` set `scheme()` is always
 `"http"`; behind a proxy set it and the two headers that proxy writes are
 believed, exactly as `X-Forwarded-For` is
-([ADR 0112](../adr/0112-a-request-can-be-read-past-the-parts-a-handler-names.md)).
+([ADR 090](../adr/090-a-request-can-be-read-past-the-parts-a-handler-names.md)).
 A forwarded host that is not host-shaped is dropped rather than used, because
 this ends up in a link somebody clicks.
 
@@ -100,7 +100,7 @@ this ends up in a link somebody clicks.
 does.** `GET http://example.com/users/7` is what a client sends to what it
 believes is a proxy, and RFC 9112 §3.2 gives an origin server no choice: the
 authority on the request line is the host, and a `Host` header beside it is
-ignored ([ADR 0120](../adr/0120-a-target-is-read-in-the-form-it-arrived-in.md)).
+ignored ([ADR 095](../adr/095-a-target-is-read-in-the-form-it-arrived-in.md)).
 The router still matches on the path, so nothing about writing routes changes.
 A trusted `X-Forwarded-Host` outranks both.
 
@@ -108,10 +108,10 @@ A trusted `X-Forwarded-Host` outranks both.
 before anything reads it** — `body`, `json`, a struct argument, a form — bounded
 by `max_body` on both sides of the inflating, and a 400 naming the coding when
 it does not decode
-([ADR 0251](../adr/0251-a-gzipped-body-is-inflated-into-the-buffer-that-holds-it.md)).
+([ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)).
 `bodyStream` does not decode and answers a gzipped body with a 415. **Any other
 coding is a 415** naming the header, before any handler runs
-([ADR 0111](../adr/0111-a-body-under-an-encoding-nilo-cannot-read-is-refused.md)).
+([ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)).
 The header on a request with no body is ignored.
 
 **A stream with a `.length` is held to it.** Writing past the promise is
@@ -172,7 +172,7 @@ is always on.
 `max_age` sets the cookie attribute **and** an expiry sealed inside the cookie,
 where the client cannot reach it — `Max-Age` alone is advice a copied cookie
 does not take. Null seals `nilo.session.default_max_age`, 24 hours
-([ADR 0088](../adr/0088-an-expiry-a-client-can-ignore-is-not-one.md)).
+([ADR 033](../adr/033-a-session-is-sealed-into-the-cookie.md)).
 `nilo.session.openAt(T, cookie, key, when)` opens one against a time you name,
 for a test that wants the boundary without a wall clock.
 
@@ -197,7 +197,7 @@ One file out of a multipart form, as a `Form(T)` field type.
 `saveTo` replaces the file at `name` or leaves it untouched: the bytes go to a
 temporary name beside it and one rename puts them in place, so a request
 serving that same name out of the same `Dir` never reads it half-written
-([ADR 0123](../adr/0123-a-file-is-written-by-the-engine.md)). Handing `u.filename`
+([ADR 097](../adr/097-a-file-is-written-by-the-engine.md)). Handing `u.filename`
 in as the name is `error.NameNotAllowed`, not a path resolved against the
 directory.
 
@@ -220,4 +220,4 @@ All return `error.Failed`. The message goes into a 240-byte slot, no allocation,
 and goes out as `{"error": "…", "status": 404}` — the same shape for every
 failure, whatever the endpoint returns when it works — or as the struct
 `app.failures(T)` named, filled from the same status and message
-([ADR 0270](../adr/0270-a-failure-body-is-a-struct-the-application-names.md)).
+([ADR 024](../adr/024-every-failure-answers-as-json.md)).

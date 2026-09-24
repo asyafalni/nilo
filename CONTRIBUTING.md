@@ -20,6 +20,7 @@ Then read these four, in this order:
 | [`CONTEXT.md`](./CONTEXT.md) | the vocabulary, and the words this project won't use |
 | [`CLAUDE.md`](./CLAUDE.md) | the working brief: layout, the commands, invariants, conventions |
 | [`docs/adr/`](./docs/adr/) | the decisions, each one naming the alternative it beat |
+| [`docs/design/`](./docs/design/) | one page a topic: how its decisions fit, and which ADR decided each rule. Written one topic at a time |
 
 The ADRs are the important one. Before you propose a design change, check whether it already has a file: "why not X?" usually has an answer on record, and if you disagree with it you get to argue with something specific instead of with a vibe.
 
@@ -37,7 +38,7 @@ The rest of the build steps are in [`CLAUDE.md`](./CLAUDE.md#commands), and the 
 
 **The refusals never cache.** The compiler keeps nothing from a compilation that failed, so every one of them is re-analysed on every run. They are the floor of a run rather than its slow part: a run after an edit is longer by whichever single compilation is biggest, because that one cannot be split across cores. [`bench/result/build.md`](./bench/result/build.md) has the numbers and the levers.
 
-**The bottom layer runs without the build system.** `zig test core/core.zig`, and the same for `id/`, `config/`, `pw/`, `cache/` and `jwt/`, work on their own, filters and all. That is the entry condition for the layer, not a nicety: if a change stops one of them working, the layering broke, not the test. A Fitting is one step short because it borrows the loop ([ADR 0070](./docs/adr/0070-a-fitting-borrows-the-loop.md)), and needs `nilo_core` in the graph and nothing else:
+**The bottom layer runs without the build system.** `zig test core/core.zig`, and the same for `id/`, `config/`, `pw/`, `cache/` and `jwt/`, work on their own, filters and all. That is the entry condition for the layer, not a nicety: if a change stops one of them working, the layering broke, not the test. A Fitting is one step short because it borrows the loop ([ADR 061](./docs/adr/061-a-fitting-borrows-the-loop.md)), and needs `nilo_core` in the graph and nothing else:
 
 ```
 zig test --dep nilo_core -Mroot=fetch/fetch.zig -Mnilo_core=core/core.zig
@@ -52,16 +53,16 @@ Four things, the same four whether a person or a model wrote the code. The [pull
 
 ### 1. Which axis it spends, and the number
 
-Performance here is four numbers, not one, and they don't recover the same way ([ADR 0018](./docs/adr/0018-the-trade-budget-has-three-axes.md)):
+Performance here is four numbers, not one, and they don't recover the same way ([ADR 017](./docs/adr/017-the-trade-budget-has-four-axes.md)):
 
 | | |
 |---|---|
 | Throughput and p99 | a nicer API wins if it costs under 10% |
-| Allocations per request | fixed, held by a test in `http/app.zig` |
-| Memory per idle connection | 4,669 bytes is the **floor**, and a handler adds every byte of stack it touches ([ADR 0063](./docs/adr/0063-a-handlers-stack-is-per-connection.md), [ADR 0071](./docs/adr/0071-where-a-connection-waits-is-what-it-costs.md)). Every feature states its own cost |
+| Allocations per request | fixed, held by a test in `http/behaviour.zig` |
+| Memory per idle connection | 4,669 bytes is the **floor**, and a handler adds every byte of stack it touches ([ADR 062](./docs/adr/062-where-a-connection-waits-is-what-it-costs.md)). Every feature states its own cost |
 | Binary size | anything the linker can't drop states its measured cost, as a stripped `ReleaseFast` number |
 
-Say which one your change spends, and by how much, when you *propose* it, not after it lands. If it costs an allocation on a path that didn't ask for one, it doesn't go in, and the honest move is to say so early. A feature that can't be made to fit doesn't ship in a worse shape: response compression is the standing example, known shape, not built, no allocate-per-request version shipped meanwhile.
+Say which one your change spends, and by how much, when you *propose* it, not after it lands. If it costs an allocation on a path that didn't ask for one, it doesn't go in, and the honest move is to say so early. A feature that can't be made to fit doesn't ship in a worse shape: response compression is the standing example: its shape was known long before it shipped, no allocate-per-request version went in meanwhile, and it landed once a compressor borrowed from a pool made it fit ([ADR 211](./docs/adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 
 ### 2. Its refusals
 
@@ -87,7 +88,7 @@ Documentation is part of the change, not a follow-up:
 
 | What you have | Where it goes |
 |---|---|
-| a design decision | a new file in [`docs/adr/`](./docs/adr/), naming the alternative it rejected |
+| a design decision | a new file in [`docs/adr/`](./docs/adr/), naming the alternative it rejected; a change to one edits that ADR in place ([ADR 221](./docs/adr/221-an-adr-is-the-rule-in-force-and-a-topic-page-joins-them.md)) |
 | something you measured, or a guess that turned out wrong | [`docs/history.md`](./docs/history.md) |
 | a benchmark you ran | [`bench/result/`](./bench/result/), one file an area |
 | something now built | delete its entry from [`docs/roadmap.md`](./docs/roadmap.md) |
@@ -95,11 +96,11 @@ Documentation is part of the change, not a follow-up:
 | something a user has to change | [`CHANGELOG.md`](./CHANGELOG.md), under `## Unreleased` |
 | a public API | [`docs/reference/`](./docs/reference/), one page a module, every heading listed once on its `README.md` |
 
-**A snippet you publish is a program, so let the build compile it.** `<!-- compiles -->` above a fenced `zig` block (`<!-- compiles: body -->` for a run of statements) and `zig build snippets` compiles it with [`docs/snippets/types.zig`](./docs/snippets/types.zig) in front. Writing that step found seven mistakes in one five-line example ([ADR 0083](./docs/adr/0083-the-guide-is-the-source-of-its-own-snippets.md)). Unlike the refusals these cache, so marking one more is nearly free.
+**A snippet you publish is a program, so let the build compile it.** `<!-- compiles -->` above a fenced `zig` block (`<!-- compiles: body -->` for a run of statements) and `zig build snippets` compiles it with [`docs/snippets/types.zig`](./docs/snippets/types.zig) in front. Writing that step found seven mistakes in one five-line example ([ADR 068](./docs/adr/068-the-guide-is-the-source-of-its-own-snippets.md)). Unlike the refusals these cache, so marking one more is nearly free.
 
-**The guide is also a website, published when a release is tagged.** `docs/guide/` and nothing else, one copy per minor release, built by Material for MkDocs ([ADR 0296](./docs/adr/0296-the-guide-is-published-once-a-release.md)). A new guide page needs a line in `nav:` in [`mkdocs.yml`](./mkdocs.yml), and CI fails on a page left out of it or on a link to a heading that no longer exists. `pip install -r docs/site/requirements.txt`, then `mkdocs serve` to see it.
+**The guide is also a website, published when a release is tagged.** `docs/guide/` and nothing else, one copy per minor release, built by Material for MkDocs ([ADR 219](./docs/adr/219-the-guide-is-published-once-a-release.md)). A new guide page needs a line in `nav:` in [`mkdocs.yml`](./mkdocs.yml), and CI fails on a page left out of it or on a link to a heading that no longer exists. `pip install -r docs/site/requirements.txt`, then `mkdocs serve` to see it.
 
-**A benchmark that changed a decision gets written down where it can be re-run.** The entry says what was run, on what machine, at what commit, through what transport (the same server measured 197k requests a second across a Docker port and 458k over a unix socket), what the numbers were, and what they changed; and it closes with whether the number can be pushed further, ranked. Build the before rather than quoting it, interleave the runs, pin both sides of a comparison, and quote a margin narrower than its own spread as a range. This is a rule because the repository has already published wrong numbers three times, and all three were found by re-measuring ([ADR 0071](./docs/adr/0071-where-a-connection-waits-is-what-it-costs.md)).
+**A benchmark that changed a decision gets written down where it can be re-run.** The entry says what was run, on what machine, at what commit, through what transport (the same server measured 197k requests a second across a Docker port and 458k over a unix socket), what the numbers were, and what they changed; and it closes with whether the number can be pushed further, ranked. Build the before rather than quoting it, interleave the runs, pin both sides of a comparison, and quote a margin narrower than its own spread as a range. This is a rule because the repository has already published wrong numbers three times, and all three were found by re-measuring ([ADR 062](./docs/adr/062-where-a-connection-waits-is-what-it-costs.md)).
 
 **The roadmap holds nothing finished and nothing decided.** When something ships its entry leaves entirely: no strikethrough, no "done". **`docs/history.md` stays short**: an entry gets in only if it would change what somebody does next time, not to record what shipped.
 
@@ -108,7 +109,7 @@ Documentation is part of the change, not a follow-up:
 - **Use the project's words.** [`CONTEXT.md`](./CONTEXT.md) lists each term and the words it refuses: Ctx not "Context", Str not "string", keep not "dupe", Refusal not "negative test". In code, comments and commit messages.
 - **Doc comments say why, and name the ADR.** The header of every module is its design rationale, including the alternatives measured and dropped.
 - **A `Str` never escapes its request without `.keep()`**, inside the framework as much as in user code.
-- **A module imports downward only, and never sideways.** `zig build layering` enforces it. Which module a file belongs in is one question: does it need the event loop? ([ADR 0041](./docs/adr/0041-a-module-sits-where-the-loop-puts-it.md), [ADR 0042](./docs/adr/0042-the-bottom-layer-holds-more-than-one-module.md))
+- **A module imports downward only, and never sideways.** `zig build layering` enforces it. Which module a file belongs in is one question: does it need the event loop? ([ADR 038](./docs/adr/038-a-module-sits-where-the-loop-puts-it.md))
 
 ## Adding a whole module
 
@@ -116,7 +117,7 @@ A design decision before it's a patch, so it starts with an ADR. Mechanically it
 
 ## Proposing a design change
 
-Open an issue first; design changes are cheap to argue and expensive to build. If it lands it gets an ADR, and an ADR names the decision and the alternative that lost and why. A document that only describes what was built is a description, not a decision. [ADR 0043](./docs/adr/0043-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md) is a good first read: an earlier rule tested under real pressure, where the rule won and the convenient thing lost.
+Open an issue first; design changes are cheap to argue and expensive to build. If it lands it gets an ADR, and an ADR names the decision and the alternative that lost and why. A document that only describes what was built is a description, not a decision. [ADR 039](./docs/adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md) is a good first read: an earlier rule tested under real pressure, where the rule won and the convenient thing lost.
 
 ## Commits and pull requests
 
@@ -134,7 +135,7 @@ One decision per pull request. A branch carrying two is two pull requests, and t
 ## Where to start
 
 - **An [open question](./docs/roadmap.md#open-questions) in the roadmap.** Those want an argument more than a patch, and each entry ends with what would settle it.
-- **A module that dials out.** Mail and Redis are ordinary work now: the outbound seam is designed ([ADR 0070](./docs/adr/0070-a-fitting-borrows-the-loop.md)), `nilo_fetch` is the way out and `s3/` is a worked example on top of it.
+- **A module that dials out.** Mail and Redis are ordinary work now: the outbound seam is designed ([ADR 061](./docs/adr/061-a-fitting-borrows-the-loop.md)), `nilo_fetch` is the way out and `s3/` is a worked example on top of it.
 - **The small end, which is real work here.** A refusal whose wording could be clearer, a guide page that assumes something it shouldn't, an example for the case you hit. Wording is a feature in this repository, so improving a sentence is a change, not a chore.
 
 ## Working with an agent
@@ -145,7 +146,7 @@ One ask: read the diff before you send it. An agent will happily write a paragra
 
 ## What gets turned down
 
-Templates, TLS and gRPC in the default build, and HTTP/2 for ordinary routes. These aren't gaps waiting for a volunteer, they are decisions with reasoning on file; the move is to argue against the ADR, not to open a pull request adding one. (TLS behind `-Dtls` is the one that was argued and moved, and [ADR 0288](./docs/adr/0288-tls-is-an-option-a-build-asks-for.md) is what that took: the numbers on all four axes, and a default build that pays 2,760 bytes. gRPC behind `-Dgrpc` moved the same way, [ADR 0297](./docs/adr/0297-grpc-is-served-over-h2c-behind-a-flag.md).) Also anything that needs an annotation to work, anything that can't say what it costs, and anything that adds an allocation to a request path that didn't ask for one. None of that is meant to sound closed; it's meant to save you from writing a thousand lines that were never going to land.
+Templates, TLS and gRPC in the default build, and HTTP/2 for ordinary routes. These aren't gaps waiting for a volunteer, they are decisions with reasoning on file; the move is to argue against the ADR, not to open a pull request adding one. (TLS behind `-Dtls` is the one that was argued and moved, and [ADR 212](./docs/adr/212-tls-is-an-option-a-build-asks-for.md) is what that took: the numbers on all four axes, and a default build that pays 2,760 bytes. gRPC behind `-Dgrpc` moved the same way, [ADR 220](./docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md).) Also anything that needs an annotation to work, anything that can't say what it costs, and anything that adds an allocation to a request path that didn't ask for one. None of that is meant to sound closed; it's meant to save you from writing a thousand lines that were never going to land.
 
 ## License
 

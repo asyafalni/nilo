@@ -5,7 +5,7 @@ One page of [the reference](./README.md): password hashing.
 ## `nilo_pw`
 
 Password hashing
-([ADR 0048](../adr/0048-a-password-hash-is-gated-because-forgetting-is-silent.md)).
+([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)).
 Argon2id, in the PHC form everybody else writes.
 
 <!-- compiles: body -->
@@ -55,7 +55,7 @@ instead of thirty and turns the form into a query for which addresses are
 registered. Passing null does the work anyway and answers false — **at the Cost
 you give `verifyPasswordWith`**, which is why that method exists: the work done
 for an account that is not there has to be the work done for one that is
-([ADR 0049](../adr/0049-a-hash-asks-for-the-pages-it-walks.md)).
+([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)).
 
 **`gpa` is an argument because 19 MiB is worth seeing.** Not `c.arena()` — the
 request arena is reset per request keeping `arena_keep` bytes, and pushing
@@ -75,12 +75,12 @@ Gate and the same blocking pool, for a CLI resetting an account, a job
 re-hashing at a raised Cost, or a test with neither an App nor a Ctx. With no
 loop at all it runs inline. There is no `nilo.hashPassword` beside it, because
 a hash needs entropy and `c.entropy` is where the wait for it is paid
-([ADR 0241](../adr/0241-a-token-is-not-a-password-and-a-check-needs-no-request.md)).
+([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)).
 
 ## A token that is not a password
 
 A password-reset link, an email verification, an API key
-([ADR 0241](../adr/0241-a-token-is-not-a-password-and-a-check-needs-no-request.md)).
+([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)).
 Thirty-two bytes of entropy, 43 characters to send, a SHA-256 digest to
 store, and a constant-time compare when it comes back.
 

@@ -1,5 +1,5 @@
 //! Text with a shape, as a type
-//! ([ADR 0264](../docs/adr/0264-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)).
+//! ([ADR 193](../docs/adr/193-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)).
 //!
 //! ```zig
 //! const SignUp = struct {
@@ -10,8 +10,8 @@
 //! };
 //! ```
 //!
-//! What `Within(min, max)` is for a number (ADR 0206), this is for text: a
-//! `Str` that parses itself (ADR 0142), so it is read wherever a `Str` is —
+//! What `Within(min, max)` is for a number (ADR 167), this is for text: a
+//! `Str` that parses itself (ADR 113), so it is read wherever a `Str` is —
 //! a path param, a query value, a form field, a JSON body — refused with one
 //! sentence in all four, collected by `Bound` beside every other field, and
 //! described in the document with `minLength`, `maxLength` and `format`,
@@ -73,7 +73,7 @@ pub fn Text(comptime opts: Options) type {
     return struct {
         const Self = @This();
 
-        /// What a nilo compile error calls this type (ADR 0122).
+        /// What a nilo compile error calls this type (ADR 074).
         pub const nilo_type_name = opts.name orelse spelled(opts);
 
         /// What a 400 asks for, in place of the type's name.
@@ -84,7 +84,7 @@ pub fn Text(comptime opts: Options) type {
         pub const nilo_text = .{ .min = opts.min, .max = opts.max, .format = opts.format };
 
         /// Text on the wire, and said so, so that a response carrying one
-        /// is written by nilo's own writer around it (ADR 0182).
+        /// is written by nilo's own writer around it (ADR 148).
         pub const nilo_openapi = .{ .type = "string", .format = opts.format };
 
         value: Str,
@@ -103,7 +103,7 @@ pub fn Text(comptime opts: Options) type {
         }
 
         /// The bytes, refused with the same null a bad number gets
-        /// (ADR 0142). The `Str` built here has no lifetime marker; the
+        /// (ADR 113). The `Str` built here has no lifetime marker; the
         /// engine stamps it with the one on the text it came from.
         pub fn nilo_parse(text: []const u8) ?Self {
             if (fits(text) == null) return null;
@@ -113,7 +113,7 @@ pub fn Text(comptime opts: Options) type {
         /// The tail of the sentence after the label — `has to be text of 10
         /// to 72 characters, not 6` — written by the type because the type
         /// knows which part of the shape the text missed, and because it is
-        /// the type's decision whether the text is quoted (ADR 0264).
+        /// the type's decision whether the text is quoted (ADR 193).
         pub fn nilo_explain(text: []const u8, w: *std.Io.Writer) !void {
             const n = count(text);
             if (opts.min != null and n < opts.min.?) return sayCount(n, w);
@@ -138,7 +138,7 @@ pub fn Text(comptime opts: Options) type {
         }
 
         /// The third arrival, a JSON body: the string, handed to
-        /// `nilo_parse` (ADR 0205).
+        /// `nilo_parse` (ADR 166).
         pub const jsonParse = mark.parseFor(Self);
 
         pub fn jsonStringify(self: Self, jw: anytype) !void {
@@ -170,7 +170,7 @@ fn count(text: []const u8) usize {
 }
 
 /// The declaration a type that parses itself may carry to word its own
-/// refusal, read by `convert.zig` in place of the sentence ADR 0142 wrote.
+/// refusal, read by `convert.zig` in place of the sentence ADR 113 wrote.
 pub const explain_marker = "nilo_explain";
 
 /// The declaration the document reads the shape off, by name.

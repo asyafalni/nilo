@@ -5,9 +5,9 @@ The listen backlog is how many completed handshakes the kernel holds for
 `accept`. Past it a SYN is dropped — not refused — and the client's TCP
 retries it a second later, so what a person sees is a p99 on connection
 setup of one second against an accept loop that was never busy. Until ADR
-0271 nilo left it at zio's 128, and a benchmark opening a thousand sockets at
+198 nilo left it at zio's 128, and a benchmark opening a thousand sockets at
 once found out. This is the regression check, the way `fdlimit.py` is
-ADR 0265's.
+ADR 194's.
 
     zig build -Doptimize=ReleaseFast
     python3 bench/burst.py --cmd ./zig-out/bin/nilo-hello --port 8787 --conns 1000

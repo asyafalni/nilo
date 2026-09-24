@@ -1,5 +1,5 @@
 //! The where walker — a struct of the caller's own turned into a SQL
-//! fragment while compiling, and into a list of values at runtime (ADR 0039).
+//! fragment while compiling, and into a list of values at runtime (ADR 036).
 //!
 //! ```zig
 //! .where = .{ .age = .{ .gt = 18 }, .name = "bob" }
@@ -8,13 +8,13 @@
 //! "age" > $1 AND "name" = $2
 //! ```
 //!
-//! This is ADR 0039's rule at its narrowest: **which column, which operator
+//! This is ADR 036's rule at its narrowest: **which column, which operator
 //! and how many parameters are settled here, while compiling. Only the 18 and
 //! the "bob" are not.** A column that does not exist is a Refusal naming the
 //! near miss; it never becomes a runtime error, because by the time the
 //! program runs the question has already been answered.
 //!
-//! It is the same trick `Query(T)` plays one layer up — ADR 0012's *the query
+//! It is the same trick `Query(T)` plays one layer up — ADR 011's *the query
 //! string is a struct of your own* — applied to the other end of the request.
 //!
 //! Three shapes, and no more:
@@ -29,18 +29,18 @@
 //!
 //! And one condition over several columns — `.across = .{ .columns = .{ .code,
 //! .name }, .icontains = q }` — which is the three shapes again with one
-//! parameter named on every column (ADR 0211).
+//! parameter named on every column (ADR 172).
 //!
 //! A shaped Row adds two more: a parent's name is a way into its columns,
 //! and a grouped Row's condition splits into a `WHERE` and a `HAVING` by what
-//! each name is (`planScoped`, ADR 0295). Everything past that, a join no
+//! each name is (`planScoped`, ADR 218). Everything past that, a join no
 //! reference names, `DISTINCT`, a subquery that is not an `.exists`, is
 //! `db.raw`.
 //!
 //! **A null is written, never held.** `.deleted_at = null` is `IS NULL` and
 //! `.{ .ne = null }` is `IS NOT NULL`, because the compiler can see the null.
 //! An optional that *might* be null is a Refusal — see `assertNotOptional`,
-//! which is ADR 0039's rule at its sharpest.
+//! which is ADR 036's rule at its sharpest.
 //!
 //! **Except once, and the exception proves the rule rather than bending it.**
 //! `.{ .not_distinct_from = maybe }` takes an optional, because
@@ -71,7 +71,7 @@ pub const not_exists_field = "not_exists";
 
 /// The field name that means *one condition, whichever of these columns meets
 /// it* — a search box over the code, the name and the trademark
-/// ([ADR 0211](../docs/adr/0211-one-condition-over-several-columns-is-one-parameter.md)).
+/// ([ADR 172](../docs/adr/172-one-condition-over-several-columns-is-one-parameter.md)).
 /// Reserved the same way `any` is.
 pub const across_field = "across";
 
@@ -88,7 +88,7 @@ const exists_known = [_][]const u8{ "in", "on", "via", "where" };
 
 /// A value a condition only has *sometimes* — the term is in the statement
 /// when there is one, and out of it when there is not
-/// ([ADR 0183](../docs/adr/0183-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
+/// ([ADR 149](../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
 ///
 /// ```zig
 /// .where = .{
@@ -101,7 +101,7 @@ const exists_known = [_][]const u8{ "in", "on", "via", "where" };
 /// word rather than an optional the operators started taking. `.status = null`
 /// is `IS NULL` and means *the rows whose status is nothing*; this means *no
 /// condition on status at all*. Nobody with a search box wants the first, and
-/// ADR 0044 is why the second could not be spelled: an optional reaching `=`
+/// ADR 040 is why the second could not be spelled: an optional reaching `=`
 /// sends `= NULL`, which runs, matches nothing, and says nothing.
 ///
 /// What it compiles to is the guard a hand-written statement uses, with the
@@ -122,7 +122,7 @@ pub fn Given(comptime T: type) type {
         /// is being written for without unwrapping the field.
         pub const nilo_given = T;
 
-        /// What a nilo compile error calls this type (ADR 0122).
+        /// What a nilo compile error calls this type (ADR 074).
         pub const nilo_type_name = "nilo.sql.Given";
 
         value: ?T,
@@ -201,11 +201,11 @@ pub const Param = struct {
     /// one. Set by `distinct_from`, and by `sql.given`: both are spellings
     /// whose SQL does not change when the value turns out to be null, which
     /// is the property that lets an optional reach a placeholder at all
-    /// (`nullSafeSpelling`, ADR 0183).
+    /// (`nullSafeSpelling`, ADR 149).
     nullable: bool = false,
     /// Whether the term this parameter belongs to disappears when the value
     /// is null — `sql.given`
-    /// ([ADR 0183](../docs/adr/0183-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
+    /// ([ADR 149](../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
     ///
     /// Read by `statement.zig`, which refuses one in the condition of an
     /// `UPDATE` or a `DELETE`: what stands between those and the whole table
@@ -245,7 +245,7 @@ pub const Plan = struct {
     /// What each parameter is for, in that same order — see `Param`.
     params: []const Param,
     /// The parents the condition named, by the path a statement over a shaped
-    /// Row joins each one under (ADR 0295). A count joins these and no others,
+    /// Row joins each one under (ADR 218). A count joins these and no others,
     /// because a join nothing reads is work the answer does not need.
     reached: []const []const u8 = &.{},
 
@@ -288,7 +288,7 @@ pub fn planAt(
     };
 }
 
-/// Which half of a grouped Row's condition a walk writes (ADR 0295).
+/// Which half of a grouped Row's condition a walk writes (ADR 218).
 ///
 /// A grouped Row's `.where` is one struct and two clauses: a term on a column
 /// of the table narrows the rows before they are grouped, and a term on an
@@ -304,7 +304,7 @@ pub const Phase = enum {
 };
 
 /// Where a walk over a shaped Row starts
-/// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+/// ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
 pub const Scope = struct {
     /// The Row whose parents and aggregates a name in the condition may be.
     shape: type,
@@ -471,7 +471,7 @@ const State = struct {
     inner: ?type = null,
     /// Set while the walk is inside a `sql.given`: the value lives one field
     /// deeper than the path says, and the parameter binds as an optional
-    /// whatever its column is (ADR 0183).
+    /// whatever its column is (ADR 149).
     ///
     /// **On the State for the same reason the qualifier is**: the path and the
     /// two flags have to move together, and there is one walk.
@@ -481,12 +481,12 @@ const State = struct {
     /// of its own and `oneExists` writes one around the lot.
     in_group: bool = false,
     /// Placeholders being written a second time, for another column of an
-    /// `.across` (ADR 0211). `take` hands them back in order and records
+    /// `.across` (ADR 172). `take` hands them back in order and records
     /// nothing: the value was recorded, once, when the first column took it,
     /// and the statement names the same `$n` on every column.
     replay: []const usize = &.{},
     replayed: usize = 0,
-    /// Set while the walk is over a shaped Row (ADR 0295): the Row whose
+    /// Set while the walk is over a shaped Row (ADR 218): the Row whose
     /// parents and aggregates a name at this level may be, the path its
     /// parent is joined under (empty for the Row itself), and how the Row is
     /// written when an `.exists` below correlates with it.
@@ -542,7 +542,7 @@ const State = struct {
         if (owned.of == null) owned.of = self.inner;
         // The same argument for the other two: a `given` is recognised in one
         // place and every `take` under it carries the flags, so no operator
-        // has to remember to set them (ADR 0183).
+        // has to remember to set them (ADR 149).
         if (self.dropping) {
             owned.droppable = true;
             owned.nullable = true;
@@ -582,7 +582,7 @@ fn walk(
             const path = prefix ++ &[_][]const u8{f.name};
             const term = term: {
                 // A name on a shaped Row may be something other than a column
-                // (ADR 0295), and which clause it belongs to follows from what
+                // (ADR 218), and which clause it belongs to follows from what
                 // it is.
                 if (state.shape) |Shape| switch (row_mod.kindOf(Shape, f.name)) {
                     .aggregate => {
@@ -661,7 +661,7 @@ fn anyOf(
             const sub = walk(D, Row, f.type, path ++ &[_][]const u8{f.name}, state);
             state.nested = was_nested;
             // **`.any` is OR, and that reverses what dropping a term means**
-            // (ADR 0183). Everywhere else a term that is not there widens the
+            // (ADR 149). Everywhere else a term that is not there widens the
             // answer; an alternative that is not there narrows it, because the
             // rows it would have matched are gone. Two opposite meanings for
             // one word is what this refuses.
@@ -688,7 +688,7 @@ fn anyOf(
 
 /// `.customer = .{ .name = … }` on a shaped Row: the conditions on a parent's
 /// columns, written against the alias the statement joins it under
-/// ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+/// ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
 ///
 /// **The same walk one level down**, with the qualifier and the Row it reads
 /// moved together for the reason `.exists` moves them: a qualifier out of step
@@ -746,7 +746,7 @@ fn parentTerm(
 }
 
 /// `.owed = .{ .gt = 0 }` on a grouped Row: a term on the groups, written
-/// against the aggregate the field reports (ADR 0295). The operators and the
+/// against the aggregate the field reports (ADR 218). The operators and the
 /// binding are a column's; what they compare is the call.
 fn groupTerm(
     comptime D: type,
@@ -776,7 +776,7 @@ fn groupTerm(
 /// subquery per entry, ANDed, and `.not_exists` for `NOT EXISTS`.
 ///
 /// **This is the one place the line past *one table* moves, and it moves for a
-/// reason that names itself** ([ADR 0171](../docs/adr/0171-a-row-over-there-is-a-condition.md)).
+/// reason that names itself** ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
 /// An `EXISTS` does not change the column list and does not change the row
 /// count: the answer is still rows of this Row, one per matching row, so
 /// `.limit` still means what the caller thinks it means. A join changes both,
@@ -785,7 +785,7 @@ fn groupTerm(
 ///
 /// **The correlation is read out of a `.references` one of the two Rows
 /// declared** — the child's, pointing at this table, or this Row's own,
-/// pointing at the child's ([ADR 0214](../docs/adr/0214-an-exists-reads-the-reference-from-either-side.md))
+/// pointing at the child's ([ADR 175](../docs/adr/175-an-exists-reads-the-reference-from-either-side.md))
 /// — which is already checked harder than anything else in this repository:
 /// `table.oneReference` makes the target be a Row, the target column be one of
 /// its columns, and the two Zig types be the same. So joining on it costs no
@@ -894,7 +894,7 @@ fn oneExists(
         // Before the join is looked for, because a self-reference is a
         // reference in both directions and would be refused as that instead.
         // The Row outside is written the way the statement wrote it: its
-        // relation, or the alias a parent was joined under (ADR 0295).
+        // relation, or the alias a parent was joined under (ADR 218).
         const outer_rel = if (state.outer.len > 0) state.outer else relationOf(D, Outer);
         const inner_rel = relationOf(D, Inner);
         if (std.mem.eql(u8, outer_rel, inner_rel)) @compileError(
@@ -922,7 +922,7 @@ fn oneExists(
         state.shape = null;
         state.outer = inner_rel;
         // A `given` in here drops the whole subquery rather than one term of
-        // it, so the terms write no guards of their own (ADR 0183).
+        // it, so the terms write no guards of their own (ADR 149).
         state.in_group = true;
         // The **type** of the condition, because that is what a walk reads —
         // the mirror of the line above, and the one place the two are easy to
@@ -941,7 +941,7 @@ fn oneExists(
         state.outer = was_outer;
 
         // **A `given` inside an `.exists` is the whole test, or it is a
-        // Refusal** (ADR 0183). Dropping one term of the subquery would leave
+        // Refusal** (ADR 149). Dropping one term of the subquery would leave
         // it asking whether *any* joined row exists, which excludes every row
         // with none — the opposite of no filter, and it compiles.
         var droppable = 0;
@@ -986,7 +986,7 @@ fn oneExists(
 
 /// `.across = .{ .columns = .{ .code, .name }, .icontains = q }` — one
 /// condition, and the row matches when any of the columns meets it
-/// ([ADR 0211](../docs/adr/0211-one-condition-over-several-columns-is-one-parameter.md)).
+/// ([ADR 172](../docs/adr/172-one-condition-over-several-columns-is-one-parameter.md)).
 /// A tuple of entries is several, ANDed, the way `.exists` takes several.
 fn acrossOf(
     comptime D: type,
@@ -1210,7 +1210,7 @@ fn nameList(comptime columns: []const []const u8) []const u8 {
 /// Which columns of each side the two tables are joined by, one for one.
 ///
 /// **A list rather than a name since a foreign key can span two columns**
-/// (ADR 0222). Joining a composite key on its first column alone is the shape
+/// (ADR 181). Joining a composite key on its first column alone is the shape
 /// of mistake this module exists to refuse: the query runs, reads correctly and
 /// answers a wider question than the schema asked.
 const Link = struct {
@@ -1232,7 +1232,7 @@ const Link = struct {
 /// at each other are the second mistake in a different coat: which direction
 /// the query means is the same question, and `.on` names the inner column
 /// while `.via` names the outer one, so an answer cannot be read as the other
-/// ([ADR 0214](../docs/adr/0214-an-exists-reads-the-reference-from-either-side.md)).
+/// ([ADR 175](../docs/adr/175-an-exists-reads-the-reference-from-either-side.md)).
 fn correlation(
     comptime Outer: type,
     comptime Inner: type,
@@ -1402,7 +1402,7 @@ fn condition(
     comptime state: *State,
 ) []const u8 {
     comptime {
-        // A term on a group names the aggregate rather than a column (ADR 0295).
+        // A term on a group names the aggregate rather than a column (ADR 218).
         const quoted = if (state.spelled.len > 0) state.spelled else state.qualifier ++ D.quote(column);
 
         // `.deleted_at = null` is `IS NULL`. It cannot mean anything else:
@@ -1411,7 +1411,7 @@ fn condition(
         if (@typeInfo(T) == .null) return quoted ++ " IS NULL";
 
         // A term that is only there when the filter carried a value
-        // ([ADR 0183](../docs/adr/0183-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
+        // ([ADR 149](../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
         // Asked before `assertNotOptional`, because a `Given` is a struct
         // holding an optional rather than an optional, and before
         // `operatorsOf`, which would read it as a value being compared whole.
@@ -1502,7 +1502,7 @@ fn spelling(comptime name: []const u8) ?[]const u8 {
 /// would otherwise depend on a value that arrives at run time. Here it does
 /// not: `"col" IS DISTINCT FROM $1` is the same six words whether `$1` turns
 /// out to be null or not, so nothing about the statement is left until run
-/// time and ADR 0039's rule is kept rather than bent.
+/// time and ADR 036's rule is kept rather than bent.
 ///
 /// This is also the operator that closes the branch `assertNotOptional` asks
 /// for. `if (maybe) |v| … else …` is two statements written out because the
@@ -1529,7 +1529,7 @@ fn nullSafeSpelling(comptime name: []const u8) ?[]const u8 {
 /// straight to the writer. That worked while one Dialect existed and stopped
 /// the moment a second one spelled the same test another way, so the
 /// question this answers is now *which operator* and the spelling belongs to
-/// the branch that knows the dialect (ADR 0061).
+/// the branch that knows the dialect (ADR 055).
 const ListOp = enum { in, not_in };
 
 fn listSpelling(comptime name: []const u8) ?ListOp {
@@ -1673,7 +1673,7 @@ fn operator(
 
         // The same as the one in `condition`, one level down: `.name = .{
         // .icontains = sql.given(search) }` is the shape a search box has
-        // (ADR 0183). Placed after `nullSafeSpelling`, whose operators already
+        // (ADR 149). Placed after `nullSafeSpelling`, whose operators already
         // take an optional and mean something else by it.
         if (givenValue(op.T)) |Held| {
             if (nullSafeSpelling(op.name) != null) @compileError(
@@ -1746,7 +1746,7 @@ fn operator(
                 } ++ "(SELECT value FROM json_each(" ++ bound ++ "))",
                 // Expanding the list into one placeholder each would make the
                 // statement depend on a length only known at runtime, which is
-                // the half of ADR 0039's rule this module exists to keep.
+                // the half of ADR 036's rule this module exists to keep.
                 .expanded, .unsupported => dialect_mod.noListForm(D, column),
             };
         }
@@ -1754,13 +1754,13 @@ fn operator(
         // `ILIKE` is Postgres's word for what SQLite's `LIKE` already does, so
         // on a Dialect whose `LIKE` folds the folding spelling drops the `I` —
         // the same swap `dialect.SQLite.pattern` makes for `icontains`
-        // (ADR 0061). The table below predates the second Dialect and wrote
+        // (ADR 055). The table below predates the second Dialect and wrote
         // `ILIKE` on both, which compiled and came back a syntax error.
         //
         // And the case-sensitive pair is the Refusal `contains` already is
         // there: `.like` on SQLite compiled and folded, matching more than
         // it was asked to on one database only, which is the lie the seam
-        // exists not to tell (ADR 0263). The message names `ilike`, which
+        // exists not to tell (ADR 055). The message names `ilike`, which
         // is what that database was doing all along.
         const spelled = if (D.like_folds and std.mem.eql(u8, op.name, "ilike"))
             "LIKE"
@@ -1793,7 +1793,7 @@ fn operator(
     }
 }
 
-/// An optional in a condition is a Refusal, and it is ADR 0039's own rule
+/// An optional in a condition is a Refusal, and it is ADR 036's own rule
 /// rather than a taste: **the shape of a query is settled while compiling.**
 ///
 /// `.handle = null` written as a literal is `IS NULL`, because the compiler
@@ -1957,7 +1957,7 @@ test "the folding spelling is ILIKE and the negation is NOT, on the same express
 }
 
 test "every leaf still has a negation, which is what keeps the algebra closed" {
-    // ADR 0058's argument that `EXCEPT` needs no mechanism rests on this, so
+    // ADR 052's argument that `EXCEPT` needs no mechanism rests on this, so
     // an operator family arriving without its negations would quietly break a
     // decision that is on the record.
     inline for (.{
@@ -2112,7 +2112,7 @@ const WorkItem = struct {
 test "an exists over a foreign key of two columns joins on both of them" {
     // **Joining on the first column alone would run, read correctly and answer
     // a wider question**: every item whose epic id matches, on any board. The
-    // schema said the pair, so the subquery says the pair (ADR 0222).
+    // schema said the pair, so the subquery says the pair (ADR 181).
     try testing.expectEqualStrings(
         "EXISTS (SELECT 1 FROM \"work_items\"" ++
             " WHERE \"work_items\".\"epic_id\" = \"work_epics\".\"id\"" ++
@@ -2193,7 +2193,7 @@ test "not_exists is the same subquery with two words in front" {
 }
 
 test "an exists nests inside any, because it is a condition like any other" {
-    // ADR 0058's closure argument needs this: a leaf that cannot go inside
+    // ADR 052's closure argument needs this: a leaf that cannot go inside
     // `.any` is a leaf the OR half of the algebra cannot reach.
     const written = partnerSql(.{ .any = .{
         .{ .name = @as([]const u8, "acme") },
@@ -2223,7 +2223,7 @@ test "an explicit on wins where the schema declares nothing" {
 test "an exists reads the reference from the outer Row too, so a child can ask about its parent" {
     // Item 75 of the port: `staff WHERE EXISTS (department WHERE name …)`.
     // The key is `staff.department_id`, declared on the *outer* Row, and the
-    // subquery correlates `departments.id = staff.department_id` (ADR 0214).
+    // subquery correlates `departments.id = staff.department_id` (ADR 175).
     try testing.expectEqualStrings(
         "EXISTS (SELECT 1 FROM \"departments\"" ++
             " WHERE \"departments\".\"id\" = \"staff\".\"department_id\"" ++
@@ -2412,7 +2412,7 @@ test "an alternative inside any may itself be several conditions" {
 
 test "an any nests inside an any, which is what closes the boolean algebra" {
     // The reachability argument in
-    // [ADR 0058](../docs/adr/0058-a-set-operation-over-one-table-is-a-condition.md)
+    // [ADR 052](../docs/adr/052-a-set-operation-over-one-table-is-a-condition.md)
     // rests on this: AND is a struct, OR is `.any`, every leaf has a
     // negation, and De Morgan holds in SQL's three-valued logic — so any
     // boolean combination over one table is writable, `EXCEPT` included.
@@ -2490,7 +2490,7 @@ const escaped_one = "replace(replace(replace($1, '\\', '\\\\'), '%', '\\%'), '_'
 test "a filter that may be absent guards its own term" {
     // Item 54: `.age = maybe` was a Refusal, and the advice it gave — branch —
     // is four arms for two optional filters, each repeating the order, the
-    // limit, the offset and the count beside it (ADR 0183).
+    // limit, the offset and the count beside it (ADR 149).
     const p = comptime plan(Pg, User, @TypeOf(.{
         .age = given(@as(?i32, null)),
     }), 1);
@@ -2525,7 +2525,7 @@ test "an operator takes one too, and the fixed terms beside it are untouched" {
 test "one condition over several columns is one parameter, and the guard goes around the bracket" {
     // Item 72: a search box over the code, the name and the trademark was two
     // statements, one with the `.any` and one without, with every other
-    // `sql.given` filter written twice (ADR 0211).
+    // `sql.given` filter written twice (ADR 172).
     const p = comptime plan(Pg, User, @TypeOf(.{
         .age = given(@as(?i32, null)),
         .across = .{ .columns = .{ .email, .role }, .icontains = given(@as(?[]const u8, null)) },
@@ -2562,7 +2562,7 @@ test "one condition over several columns is one parameter, and the guard goes ar
 test "a filter inside an exists drops the subquery rather than a term of it" {
     // Dropping the term would leave the subquery asking whether any joined row
     // exists at all, which excludes every partner with no capabilities — the
-    // opposite of no filter, and it compiles (ADR 0183).
+    // opposite of no filter, and it compiles (ADR 149).
     try testing.expectEqualStrings(
         "(EXISTS (SELECT 1 FROM \"partner_capabilities\"" ++
             " WHERE \"partner_capabilities\".\"partner_id\" = \"partners\".\"id\"" ++

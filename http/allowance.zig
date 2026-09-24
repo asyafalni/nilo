@@ -1,5 +1,5 @@
 //! An Allowance: how many requests one address may make inside a window, and
-//! the fixed table that remembers who has used what (ADR 0114).
+//! the fixed table that remembers who has used what (ADR 092).
 //!
 //! ```zig
 //! try app.useOn("/api", allowance.with(.{ .per_window = 100, .window_s = 60 }));
@@ -9,7 +9,7 @@
 //! other framework keys a map by the client's address, which is a hash and an
 //! allocation on the path of every request it guards — and one allocation per
 //! request is the invariant this project treats as fixed
-//! ([ADR 0018](../docs/adr/0018-the-trade-budget-has-three-axes.md)). So this
+//! ([ADR 017](../docs/adr/017-the-trade-budget-has-four-axes.md)). So this
 //! is a table sized while compiling, living in `.bss`, indexed by a hash of
 //! the address: **no allocation at startup either**, nothing per connection,
 //! and one 64-byte cache line touched per request.
@@ -135,7 +135,7 @@ pub fn with(comptime options: Options) mw.Middleware {
         /// 429.
         ///
         /// `noinline` for the reason `warnSocketFailed` is
-        /// ([ADR 0071](../docs/adr/0071-where-a-connection-waits-is-what-it-costs.md)):
+        /// ([ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)):
         /// inlined, `std.log.warn`'s format machinery would sit on the frame
         /// of every guarded request, and a suspended fiber holds its stack at
         /// its high-water mark for the life of the connection.
@@ -178,7 +178,7 @@ pub const OnNull = enum {
 /// An allowance counted against something the application knows, rather than
 /// against the address the connection came from.
 pub const Keyed = struct {
-    /// What a nilo compile error calls this type (ADR 0122).
+    /// What a nilo compile error calls this type (ADR 074).
     pub const nilo_type_name = "nilo.allowance.Keyed";
 
     /// How many requests one key may make inside `window_s`.
@@ -186,7 +186,7 @@ pub const Keyed = struct {
     /// The whole `u16` is available here, unlike `Options.per_window`, which
     /// stops at 1023: an address's fingerprint shares its 64-bit word with the
     /// counters, and a key's tag is a word of its own
-    /// ([ADR 0131](../docs/adr/0131-a-key-the-application-knows-is-a-word-of-its-own.md)).
+    /// ([ADR 104](../docs/adr/104-a-key-the-application-knows-is-a-word-of-its-own.md)).
     per_window: u16 = 100,
     /// How long the window is, in seconds. Also what `Retry-After` says.
     window_s: u16 = 60,
@@ -263,7 +263,7 @@ pub fn keyed(comptime key: anytype, comptime options: Keyed) mw.Middleware {
             // picks the bucket, the other is the tag. A collision has to match
             // both, which is 2^(bucket bits + 64) rather than the 2^46 a
             // packed fingerprint would give — and 2^46 is grindable offline
-            // for a key an attacker chooses, like a username (ADR 0131).
+            // for a key an attacker chooses, like a username (ADR 104).
             const h = std.hash.Wyhash.hash(hashSeed(), text);
             const at = (h % buckets) * ways;
             const allowed = chargeKeyed(
@@ -336,7 +336,7 @@ fn chargeKeyed(
 ) bool {
     // Whether this key was ever seen to own a way in this bucket. Once it has,
     // running out of tries is a refusal rather than a pass: the contention is
-    // its own (ADR 0114).
+    // its own (ADR 092).
     var ours = false;
 
     var tries: u8 = 0;
@@ -462,7 +462,7 @@ fn fingerprintOf(comptime S: type, h: u64) @FieldType(S, "fp") {
 /// allowance.
 ///
 /// **It fails open where the slot is ambiguous, and closed where it is not**,
-/// and the difference is the whole of ADR 0114's argument applied properly.
+/// and the difference is the whole of ADR 092's argument applied properly.
 /// Losing four compare-and-swaps while *inserting* means somebody else is
 /// competing for the same way, and refusing there would refuse a stranger who
 /// has made no requests. Losing four on a slot whose fingerprint already

@@ -11,7 +11,7 @@
 //! at the point it bites:
 //!
 //! - the session is **sealed into the cookie**, so nothing is kept server-side
-//!   and a session cannot be revoked (ADR 0035);
+//!   and a session cannot be revoked (ADR 033);
 //! - a session may hold no slice, because a browser drops an oversized cookie
 //!   silently — so the name is a `[24]u8`, not a `[]const u8`;
 //! - hashing goes through the `Ctx`, never through `nilo_pw` directly.
@@ -191,7 +191,7 @@ fn signUp(
     // `pw.huge_pages` rather than the request arena: 19 MiB through an arena
     // that is reset per request spends the one budget nilo treats as an
     // invariant, and the huge-page allocator is 11.0 ms a hash against 13.6
-    // (ADR 0049).
+    // (ADR 044).
     // `.view()`, because `hashPassword` takes a `[]const u8`. The worked example
     // in `guide/sessions.md`, `docs/reference.md` and `ctx.zig`'s own doc comment
     // all pass a `Str` straight in and do not compile. Item 11 in `DX.md`.
@@ -200,7 +200,7 @@ fn signUp(
     // A v7 rather than a v4: sortable, so the first six bytes say when the
     // account was made and a listing comes back in order for free. The entropy
     // is an argument because a bottom-layer module has no Bulkhead to reach
-    // through — inside a request that is `c.entropy` (ADR 0046).
+    // through — inside a request that is `c.entropy` (ADR 042).
     // The `@intCast` is not decoration: `nilo.nowMillis()` answers an `i64` and
     // `v7` takes a `u64`. The reference's own one-line example for this module
     // hands one straight to the other and does not compile. Item 11 in `DX.md`.
@@ -244,7 +244,7 @@ fn signIn(
     // with no account has no hash to check, and returning early there answers in
     // a millisecond instead of thirty — which turns this form into a query for
     // which addresses are registered. Passing null does the work anyway and
-    // answers false (ADR 0049).
+    // answers false (ADR 044).
     const ok = try c.verifyPassword(
         pw.huge_pages,
         if (row) |r| r.password.view() else null,

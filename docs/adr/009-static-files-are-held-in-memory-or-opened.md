@@ -1,0 +1,72 @@
+# Static files are held in memory, or opened where holding them does not fit
+
+**Status:** accepted
+**Topic:** [static-files](../design/static-files.md)
+
+## Context
+
+Reading a file with the standard library blocks the OS thread it runs on. Under zio that thread is running many fibers, so a single handler waiting on a disk read stops every other connection sharing it. The project measures itself on p99 as well as throughput, specifically so that stalling the tail does not get to look like a win. A blocking read on the request path would wreck exactly the number that metric exists to protect, under exactly the load it exists to measure.
+
+So the choice was never "disk or memory". It was between adding file IO to the Bulkhead contract, so the Engine does it without blocking, and reading the files before the socket opens, serving from memory. Zig 0.16 later changed the price of the first option: `sendFile` became a slot in the `std.Io.Writer` vtable and zio filled it in, so a directory too big to hold whole no longer has to be refused.
+
+## Decision
+
+**A directory is read once, at `listen()`, into memory owned by the App. A file over `max_file_bytes` is the one exception: it stays in the list with its size, its modification time and the path the walk produced, and a request opens it and sends it from the disk.** `app.static("/", "public")` walks the directory once; lookup is a binary search over URLs sorted at load.
+
+### What holding the bytes buys
+
+- **No syscall, no page cache round trip, no stat**, for anything at or under the threshold. The bytes are already where the response is assembled from.
+- **Path traversal is not possible.** Not defended against: not possible. The set of URLs is fixed before the socket opens, and `GET /../../etc/passwd` is a name looked up in a fixed list, and it is not in the list. There is no normalisation step to get wrong.
+- **ETags are free**, for a held file. Each file's hash is computed once at load, so a conditional request is a string compare.
+
+### What spilling keeps of that
+
+A spilled file carries the relative path the directory walk produced, and the string handed to `openat` never comes from a request, so traversal is still not possible. The memory is still a number, because a spilled file holds no bytes at all: it costs one file descriptor for as long as the response takes, bounded by `max_connections` like everything else in flight. The read that does happen goes through the Engine (four names on the Bulkhead: open a directory, open a file in it, its size, close it), so the fiber parks rather than stopping the thread every other connection on it is served by.
+
+What gives is the ETag: above the threshold a tag is `"<mtime>-<size>"` rather than a hash of the contents, since hashing gigabytes at load means a server that takes a minute to start on a directory of videos, and doing it per request is worse. RFC 9110 requires a weak validator's `If-Range` to be ignored, which would send the whole file to every client resuming a download, exactly what large files are for; mtime and size together are a strong validator in practice and have been nginx's default for twenty years. A spilled file is also never gzipped, for the reason nothing compresses per request ([ADR 017](./017-the-trade-budget-has-four-axes.md)): a file that is not held cannot be compressed once at load. In practice the threshold sorts this out on its own, since a file over 8 MB is a video, an archive or an installer, and all three are compressed already.
+
+`max_file_bytes` is the line, not a ceiling: at or below it nothing has changed, above it the file is not read at all. `reload` (for development) sets it to zero, so every file is served the spilled way, an `open`, a `stat` and a read per request, and edits are visible without a restart; it does not notice a file that did not exist at startup, since the list of names comes from the walk. `max_total_bytes` counts held bytes only, gzipped copies included, because that is what an operator multiplies against a memory budget and a file opened per request is not in it.
+
+### A tree the binary carries
+
+`app.embedded(prefix, files)` serves a list of `.{ .path, .bytes }` through the same Set a directory is, with the bytes borrowed from the binary (`@embedFile`) rather than read. `static.embed` is `load` with the read taken out: the same join onto the prefix, content type, ETag, gzipped copy, sorted list and fallback rule. A request cannot tell the two apart, and no code on the request path was touched to add it.
+
+Three things follow from where the bytes are:
+
+- **The Set does not own embedded bytes.** They are mapped for the life of the process and cannot be given back, so `Set.owns_bytes` is false and `deinit` steps over the file rather than freeing it. Copying instead would double the memory of every embedded tree for nothing.
+- **Nothing can spill, so nothing is over a limit.** `EmbedOptions` drops `max_file_bytes`, `max_total_bytes`, `dotfiles` and `reload`: no threshold because there is no disk to leave a file on, no total because the bytes are mapped whether or not a Set names them, no dotfile rule because every name was written by the caller, no reload because there is nothing to reload from.
+- **Two mistakes a directory cannot make are refused.** Two entries under one URL is `error.StaticDuplicateUrl` naming the URL (a directory holds one file per name; a list can hold two, and the binary search would answer whichever it found first, forever). A fallback naming no entry is `error.StaticDirNotFound`, the same the directory case gives.
+
+`@embedFile` stays in the caller's hands: its path is relative to the file it is written in, so nothing in nilo can name a caller's `dist/`. A build step that walks a directory into a list is an ordinary `build.zig` step the caller owns.
+
+### Choices inside both paths
+
+- **Routes win over files.** An explicit `app.get("/index.html", …)` beats a file of the same name; a file silently shadowing code somebody wrote on purpose would be the surprising direction.
+- **Dotfiles are skipped by default**, so a `.env` or a `.git/` that found its way into a published directory is not something to discover from an access log.
+- **`spa_fallback` is opt-in**, and `spa_fallback_for: .navigations` is the default: a request that asked for HTML gets the fallback page, a request for a missing asset gets a 404 naming it. Answering every path under the prefix (`.any_path`) is kept for a caller that depends on the pre-0.2.0 behaviour.
+- **Static files are terminal handlers, not middleware.** They need state, and a `Middleware` is a bare function pointer with nowhere to keep any. As a handler, the ordinary middleware chain wraps them, so CORS covers an asset served cross-origin and the logger sees it, with no special case anywhere.
+- **A handler can also answer with a file directly**, through `FileBody{ .dir, .name, .content_type }`, for something that is not part of the static tree, an invoice behind an authorisation check. The signature is the whole contract, the way it is for a redirect ([ADR 031](./031-a-redirect-puts-its-status-in-the-type.md)): `?nilo.FileBody` is a 404 the generated document can see. `dir` is a directory opened on purpose and held as a Service, and the name is checked before use, no `..` segment, not absolute, no NUL: the same rule as the tree's, never resolve a path, open a name relative to a descriptor chosen at startup. A symlink inside that directory is followed, because refusing them breaks ordinary deployments. The document describes the body as `application/octet-stream`, since the real content type is filled in at runtime and naming it would be a guess.
+- **A short send closes the connection**, held or spilled: the length went out in the head from the file's size, and bytes arriving short of that would let a client staple the next response onto this one. **A missing file at send time is a 404**, since `FileNotFound` from the disk disagreeing with the list is, from the client's side, indistinguishable from asking for something that never existed. The transfer is the server waiting, not the handler running, wrapped in `watchdog.waiting` exactly as `Ctx.send` is ([ADR 013](./013-handlers-must-not-block-the-thread.md)).
+
+## What was rejected
+
+**Adding file IO to the Bulkhead as the first move.** File IO used to be a different order of obligation, open, stat, read, seek, errors, cancellation, owed by every replacement Engine forever, which is the risk the Bulkhead exists to contain ([ADR 001](./001-zio-as-the-engine-behind-the-bulkhead.md)). Reading everything up front paid nothing on that account and was faster and safer for the common case besides. What reversed only the size ceiling, not this choice, is that the obligation stopped being nilo's to define: `sendFile` is a slot in the `std.Io.Writer` vtable and `std.Io.File.Reader` is a standard type, so the Bulkhead grows four names shaped like `std.Io` rather than a bespoke file-IO contract.
+
+**A weak ETag for a spilled file.** RFC 9110 makes a recipient ignore a weak validator on `If-Range`, which defeats the resume that large files are downloaded for.
+
+**Widening `fromMemory`** (from [ADR 016](./016-the-api-description-comes-from-the-signatures.md)) to take a prefix, options, a fallback and borrowed bytes, instead of adding `embed`. It takes one `Entry` and copies its bytes for a value generated at run time; teaching it six more parameters it does not use for the tree case would have made its one call look like an oversight when used for the API description.
+
+**Serving an embedded tree through `fromMemory` with a copy.** Works, and doubles the memory of every embedded tree: a 5 MB front-end bundle held twice is 5 MB spent on nothing.
+
+**A build step in nilo that walks a directory and emits the embed list.** Not built until two callers have written the same one by hand and it is clear which choices, hidden files, symlinks, a size cap, matter.
+
+## What it costs
+
+| Axis | Cost |
+|---|---|
+| Allocations per request | none; the request path is the one `static` always took |
+| Memory per idle connection | unchanged; nothing here is per connection |
+| Throughput and p99 | a syscall and a park for a spilled file, none for a held one |
+| Binary size | the embedded tree itself, chosen by the caller, plus `embed`, a few hundred lines beside `load` sharing its helpers |
+
+Held-file memory is per file: the URL, the ETag(s) and the gzipped copy if one was worth it, charged against `max_total_bytes`. An embedded tree costs the same minus the bytes themselves, which are already mapped in the binary whether or not a Set names them.

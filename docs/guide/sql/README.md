@@ -22,7 +22,7 @@ const nilo = b.dependency("nilo", .{
 That flag exists because the drivers are 11 MB and most projects want neither.
 Leaving it out and importing `nilo_sql` anyway is a compile error saying this
 in one sentence, rather than a missing module or a mysterious `pg` — see
-[ADR 0075](../../adr/0075-a-lazy-dependency-is-a-request.md), which is also the
+[ADR 066](../../adr/066-a-lazy-dependency-is-a-request.md), which is also the
 account of why `.lazy = true` on its own was not enough.
 
 The idea is the same one the HTTP half runs on, pointed at a database: **the
@@ -193,20 +193,20 @@ Two whole areas come off before the list starts.
 What is left splits three ways.
 
 - **Refused on the record**, each with its ADR: set operations and CTEs
-  ([0058](../../adr/0058-a-set-operation-over-one-table-is-a-condition.md));
+  ([052](../../adr/052-a-set-operation-over-one-table-is-a-condition.md));
   several statements in one round trip
-  ([0059](../../adr/0059-a-round-trip-is-not-the-cost-worth-chasing.md)); automatic
+  ([053](../../adr/053-a-round-trip-is-not-the-cost-worth-chasing.md)); automatic
   read-replica routing and a query cache
-  ([0060](../../adr/0060-a-second-database-is-a-second-type.md)).
+  ([054](../../adr/054-a-second-database-is-a-second-type.md)).
 - **Waiting on a caller**: children two levels deep, and children through a
   key of several columns. A parent, children one level deep and a group are
   declared on the Row and ship
-  ([ADR 0295](../../adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)),
+  ([ADR 218](../../adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)),
   as does `.exists`
-  ([ADR 0171](../../adr/0171-a-row-over-there-is-a-condition.md)). The tooling
+  ([ADR 218](../../adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)). The tooling
   commands still missing are on [the roadmap](../../roadmap.md#next) under
   `nilo_sql`, and they wait on one question rather than on a decision:
-  [ADR 0153](../../adr/0153-a-migration-is-a-diff-against-a-snapshot.md) made that,
+  [ADR 123](../../adr/123-a-migration-is-a-diff-against-a-snapshot.md) made that,
   and the library under them is built.
 - **Nobody has looked**: row-level security, and Postgres extensions.
 
@@ -215,9 +215,9 @@ A GUI over the database is not coming from here.
 ---
 
 The reasoning behind all of it is in
-[ADR 0039](../../adr/0039-the-shape-of-a-query-is-settled-while-compiling.md),
+[ADR 036](../../adr/036-the-shape-of-a-query-is-settled-while-compiling.md),
 and how it was wired to a real driver is in
-[ADR 0040](../../adr/0040-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md).
+[ADR 037](../../adr/037-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md).
 The whole surface on one page is in [the reference](../../reference/sql.md#nilo_sql),
 and what it costs — including the connection string that is the largest
 number in the module — is in [`bench/result/sql.md`](../../../bench/result/sql.md).

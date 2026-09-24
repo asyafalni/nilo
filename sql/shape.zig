@@ -1,6 +1,6 @@
 //! A statement over a shaped Row: a parent joined in, children read after, a
 //! group counted and summed
-//! ([ADR 0295](../docs/adr/0295-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+//! ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
 //!
 //! ```zig
 //! const CustomerName = struct {
@@ -22,7 +22,7 @@
 //! JOIN "customers" AS "customer" ON "customer"."id" = "orders"."customer_id"
 //! ```
 //!
-//! **ADR 0039 drew its line at one table, and ADR 0171 said what the line
+//! **ADR 036 drew its line at one table, and ADR 218 said what the line
 //! protects**: the Row describes the answer, and `.limit` counts Rows. This
 //! file is the three shapes that keep both, and each keeps them for its own
 //! reason.
@@ -40,7 +40,7 @@
 //!
 //! **The call site did not change.** It is `db.select`, `db.page`, `db.find`
 //! with `.where`, `.order` and `.limit`, and there is still no `.join` and no
-//! `.group_by` to write there. A chain of calls is what ADR 0039 refused, and
+//! `.group_by` to write there. A chain of calls is what ADR 036 refused, and
 //! the refusal stands. What moved is what a Row may say about itself.
 //!
 //! **Every column is answered under the path to its field**: `"id"`,
@@ -221,7 +221,7 @@ const Link = struct {
 /// Which reference a parent field follows: out of `Holder`'s table, to the
 /// table of the Row the field holds.
 ///
-/// **The rules are `.exists`'s** ([ADR 0171](../docs/adr/0171-a-row-over-there-is-a-condition.md)),
+/// **The rules are `.exists`'s** ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)),
 /// because it is the same question asked by a field instead of a condition:
 /// one reference is the join, none is a schema that has not said how the two
 /// relate, and two is a schema that said it twice (`owner_staff_id` and

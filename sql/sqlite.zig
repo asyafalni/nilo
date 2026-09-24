@@ -3,9 +3,9 @@
 //! Everything here follows from one sentence: **SQLite is not a server.** It
 //! is a library reading a file in this process, so there is no socket to wait
 //! on, no server to hold the rules, and no second connection that may write.
-//! [ADR 0073](../docs/adr/0073-a-file-has-no-socket-to-wait-on.md) decides how
+//! [ADR 064](../docs/adr/064-a-file-has-no-socket-to-wait-on.md) decides how
 //! a statement reaches a thread and whose C brings SQLite in;
-//! [ADR 0074](../docs/adr/0074-one-writer-is-not-a-setting-it-is-the-database.md)
+//! [ADR 065](../docs/adr/065-one-writer-is-not-a-setting-it-is-the-database.md)
 //! decides the pool, where `raw` goes, durability and the test story.
 //!
 //! Three things are worth knowing before reading the code.
@@ -15,7 +15,7 @@
 //! a compile error naming both answers. It is not a tuning knob: it decides
 //! whether a slow statement stalls an executor thread, and there is no
 //! measurement yet saying which way a given deployment should go
-//! (ADR 0073). What the field buys is that taking that measurement later
+//! (ADR 064). What the field buys is that taking that measurement later
 //! changes a line in a program rather than this file.
 //!
 //! **The pool is one writer and several read-only readers.** SQLite
@@ -42,7 +42,7 @@ const wire = @import("wire.zig");
 /// Only the tests reach for this, and only for `SQLite.introspect` — the
 /// query `columnsOf` is handed at run time. A Wire is not allowed to have an
 /// opinion about a Dialect anywhere else, which is what keeps the seam a seam
-/// (ADR 0061).
+/// (ADR 055).
 const dialect = @import("dialect.zig");
 const types = @import("types.zig");
 
@@ -50,7 +50,7 @@ const types = @import("types.zig");
 ///
 /// Public because it is the one thing about this Wire that comes from
 /// somewhere else: SQLite is a bundled amalgamation rather than a library the
-/// machine happened to have (ADR 0073), so a benchmark or a `/health` route
+/// machine happened to have (ADR 064), so a benchmark or a `/health` route
 /// that prints a version is printing something the build pinned. Reading it
 /// here saves every caller an import of `zqlite`, which is the seam's whole
 /// point.
@@ -63,7 +63,7 @@ pub const Options = struct {
     /// is spelled rather than one: `Wire` refuses a null with a message naming
     /// both answers and what each costs. Leaving the field out of the struct
     /// entirely would refuse it too, in Zig's words rather than nilo's, and an
-    /// error message is a feature here (ADR 0027).
+    /// error message is a feature here (ADR 026).
     threading: ?Threading = null,
 
     /// How long SQLite waits for a lock somebody else holds before giving up.
@@ -77,7 +77,7 @@ pub const Options = struct {
     /// `PRAGMA cache_size`, in KiB, or null for SQLite's own default of 2,000.
     ///
     /// **It is a ceiling rather than an allocation**, which is the correction
-    /// [`spike/sqlite_facts`](../spike/sqlite_facts/) made to ADR 0074: a
+    /// [`spike/sqlite_facts`](../spike/sqlite_facts/) made to ADR 065: a
     /// connection holds 28 KiB opened and grows towards this as pages are
     /// touched. The same spike measured what the ceiling buys, in reads: five
     /// thousand primary-key lookups issue ten of them at 2,000 KiB and ten at
@@ -95,7 +95,7 @@ pub const Options = struct {
     /// `.full` is one word away and is what to write if losing a committed
     /// transaction is not survivable. `OFF` is not offered — it is the
     /// setting where corruption is possible, and no default here should make
-    /// that reachable by accident (ADR 0074).
+    /// that reachable by accident (ADR 065).
     synchronous: Synchronous = .normal,
 };
 
@@ -139,12 +139,12 @@ pub const Threading = union(enum) {
     /// `nilo_http` — `zig build layering` refuses it. `std.Io.concurrent` is
     /// not the way round it: zio implements that slot by starting a *fiber*,
     /// so a blocking call inside one holds an executor thread exactly as it
-    /// would have held the caller's (ADR 0073).
+    /// would have held the caller's (ADR 064).
     hop: type,
 };
 
 /// `Options` with `threading` settled, or a compile error saying why it
-/// cannot be. The whole of ADR 0073 is that this choice is made rather than
+/// cannot be. The whole of ADR 064 is that this choice is made rather than
 /// defaulted, and a default here would be the one place it could be missed.
 const Settled = struct {
     threading: Threading,
@@ -187,14 +187,14 @@ pub fn Wire(comptime opts_in: Options) type {
         /// queueing for the writer *parks* instead of holding its thread —
         /// through zio when there is an Engine, and through `std.Io.Threaded`
         /// in a test. That is true under `.in_fiber` as much as under `.hop`:
-        /// the choice in ADR 0073 is about where a statement *runs*, and this
+        /// the choice in ADR 064 is about where a statement *runs*, and this
         /// is about waiting for a turn to run it.
         io: std.Io,
         /// Index 0 is the writer. Everything after it is a read-only reader.
         conns: []Conn,
         lock: std.Io.Mutex = .init,
         /// **One queue per question, and that is the fix rather than a
-        /// tidying** (ADR 0116). These used to be a single `Condition` that
+        /// tidying** (ADR 065). These used to be a single `Condition` that
         /// `takeWriter` and `takeReader` both waited on while testing
         /// different predicates, woken with `signal`. So a reader coming back
         /// could wake the fiber that wanted the *writer*, which re-tested
@@ -218,7 +218,7 @@ pub fn Wire(comptime opts_in: Options) type {
         ///
         /// **`open` used to read `size` and drop the rest**, so the option a
         /// caller set to bound a queue was silently ignored here while it was
-        /// honoured on Postgres (ADR 0135).
+        /// honoured on Postgres (ADR 107).
         queue_timeout_ms: u32,
         /// What can reach a waiting fiber to stop it. `.off` in a program
         /// with no Engine, where nothing can cancel a fiber and the wait is
@@ -229,7 +229,7 @@ pub fn Wire(comptime opts_in: Options) type {
         ///
         /// The cache is per connection because a `sqlite3_stmt` belongs to the
         /// `sqlite3` it was prepared against — which is the same reason
-        /// [ADR 0057](../docs/adr/0057-a-statement-that-is-a-constant-can-be-prepared-once.md)
+        /// [ADR 051](../docs/adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)
         /// gives for Postgres, arriving here from a different direction.
         const Conn = struct {
             handle: zqlite.Conn,
@@ -337,7 +337,7 @@ pub fn Wire(comptime opts_in: Options) type {
 
             /// **Refused, and the dialect is named.**
             ///
-            /// [ADR 0047](../docs/adr/0047-a-deadline-needs-a-connection-you-hold.md)
+            /// [ADR 043](../docs/adr/043-a-deadline-needs-a-connection-you-hold.md)
             /// put this on the `Tx` because a deadline has to be set on the
             /// connection the statement travels down. On Postgres that is a
             /// message to a server. SQLite has no server: the only mechanism
@@ -348,7 +348,7 @@ pub fn Wire(comptime opts_in: Options) type {
             /// A deadline that sometimes aborts a neighbouring statement is
             /// worse than one that says plainly it is not available here.
             /// `busy_timeout_ms` already covers the case that actually
-            /// happens — waiting on a lock nobody is releasing (ADR 0074).
+            /// happens — waiting on a lock nobody is releasing (ADR 065).
             pub fn deadline(self: *Tx, ms: u32) wire.Error!void {
                 _ = self;
                 _ = ms;
@@ -420,7 +420,7 @@ pub fn Wire(comptime opts_in: Options) type {
         /// `connect_on_init` has no meaning: a file is opened or it is not,
         /// and there is no server to be switched off. It is ignored rather
         /// than refused, so one program can hold both kinds of database
-        /// without writing two option structs (ADR 0060).
+        /// without writing two option structs (ADR 054).
         pub fn open(
             io: std.Io,
             gpa: std.mem.Allocator,
@@ -518,19 +518,19 @@ pub fn Wire(comptime opts_in: Options) type {
         ///
         /// **A cancelled wait answers `TimedOut`**, which is the one place
         /// this Wire has a deadline at all: `tx.deadline` is refused
-        /// (ADR 0074), but a request whose fiber is cancelled while queueing
+        /// (ADR 065), but a request whose fiber is cancelled while queueing
         /// gives its turn up rather than holding it. The name is right for
         /// what the handler has to decide — this statement is not going to
         /// run.
         ///
         /// **The queue is bounded by `timeout_ms`, and the timer is armed
-        /// only by a fiber that is actually going to wait** (ADR 0135). A
+        /// only by a fiber that is actually going to wait** (ADR 107). A
         /// statement that finds the writer free pays nothing at all: arming
         /// is the Engine registering a timer, and doing that per statement
         /// would put the cost on the path that is never in trouble. The
         /// `Bound` costs `core.Limits.slot_size` bytes of this frame either
         /// way, which is stack a handler touches and therefore per
-        /// connection (ADR 0063).
+        /// connection (ADR 062).
         fn takeWriter(self: *Self, holder: []const u8) wire.Error!usize {
             self.lock.lock(self.io) catch return error.TimedOut;
             defer self.lock.unlock(self.io);
@@ -589,7 +589,7 @@ pub fn Wire(comptime opts_in: Options) type {
         /// not have. What held the writer was the previous probe's own
         /// `SELECT 1`, parked in the Engine's thread pool behind the report.
         /// The holder's text tells those three apart without a fiber
-        /// identity, which `std.Io` does not hand a Service (ADR 0135): a
+        /// identity, which `std.Io` does not hand a Service (ADR 107): a
         /// `BEGIN` is a transaction, a long `SELECT` is the work itself, and
         /// a one-line statement held past `timeout_ms` is waiting for a
         /// thread rather than for the database.
@@ -616,7 +616,7 @@ pub fn Wire(comptime opts_in: Options) type {
 
         /// The readers' holders written straight into the log line, so naming
         /// four statements costs no buffer on the frame of a fiber that is
-        /// about to be parked (ADR 0063).
+        /// about to be parked (ADR 062).
         const Holders = struct {
             conns: []const Conn,
 
@@ -657,7 +657,7 @@ pub fn Wire(comptime opts_in: Options) type {
         /// verb. For `db.raw` it is a guess, and the guess is safe because a
         /// reader is open read-only — a `raw` that writes and looks like a
         /// read is refused by SQLite with `ReadOnly` on its first call rather
-        /// than answering from the wrong snapshot (ADR 0074).
+        /// than answering from the wrong snapshot (ADR 065).
         ///
         /// `WITH` goes to the writer. A CTE may write, the keyword does not
         /// say, and being wrong in that direction costs a report the writer's
@@ -791,7 +791,7 @@ pub fn Wire(comptime opts_in: Options) type {
 
         /// What SQLite said about the statement that just failed, left where a
         /// program can read it rather than only in the log
-        /// ([ADR 0146](../docs/adr/0146-a-statement-that-failed-says-what-the-database-said.md)).
+        /// ([ADR 117](../docs/adr/117-a-statement-that-failed-says-what-the-database-said.md)).
         ///
         /// **Three of `Problem`'s fields stay empty here, and that is said
         /// rather than guessed at.** SQLite has no SQLSTATE, no severity word
@@ -830,7 +830,7 @@ pub fn Wire(comptime opts_in: Options) type {
         /// How many columns the row `next` just stopped on has.
         ///
         /// **Only answerable once a row is under it**, which is what decides
-        /// where `fill` asks (ADR 0134): zqlite's `columnCount` is
+        /// where `fill` asks (ADR 106): zqlite's `columnCount` is
         /// `sqlite3_data_count`, and that is `0` on a prepared statement
         /// nobody has stepped, on one that has run off the end, and on one
         /// that answers with no rows at all. `sqlite3_column_count` is the
@@ -858,7 +858,7 @@ pub fn Wire(comptime opts_in: Options) type {
             const Inner = if (optional) @typeInfo(T).optional.child else T;
 
             // **Asked for every column rather than only the optional ones,
-            // and that is the fix** (ADR 0118). The test used to live inside
+            // and that is the fix** (ADR 094). The test used to live inside
             // `if (optional)`, so a NULL arriving in a column the Row says is
             // not optional fell straight through to the reads below — where
             // `stmt.int` answers 0 and `stmt.text` answers the empty string,
@@ -869,7 +869,7 @@ pub fn Wire(comptime opts_in: Options) type {
             //
             // The startup check catches this when the table declares the
             // column nullable. It cannot catch a view, which answers `UNKNOWN`
-            // and is skipped by design (ADR 0056), and it does not run at all
+            // and is skipped by design (ADR 050), and it does not run at all
             // for a `Db` nobody called `checking` on.
             //
             // What it costs is one `sqlite3_column_type` — a couple of loads,
@@ -885,7 +885,7 @@ pub fn Wire(comptime opts_in: Options) type {
                     "nilo_sql: column {d} came back NULL and the Row reads it as {s}, " ++
                         "which cannot hold one. Make the field optional, or make the " ++
                         "column NOT NULL. A view is the case the startup check cannot " ++
-                        "see (ADR 0056).",
+                        "see (ADR 050).",
                     .{ col, @typeName(Inner) },
                 );
                 return error.QueryFailed;
@@ -903,7 +903,7 @@ pub fn Wire(comptime opts_in: Options) type {
             // stores for it and what `sqlite3_strftime` and friends read. The
             // Postgres Wire reads the same column as four bytes, and neither
             // reads it as a number — which is why `WireRead` keeps the type
-            // this far (ADR 0221).
+            // this far (ADR 181).
             if (comptime Inner == types.Date) return types.Date.nilo_parse(stmt.text(col)) orelse
                 error.QueryFailed;
 
@@ -1020,13 +1020,13 @@ pub fn Wire(comptime opts_in: Options) type {
         /// The columns the database says a table has.
         ///
         /// **The schema goes into the text rather than into a parameter**, and
-        /// that is the seam's one loose joint — written down in ADR 0061
+        /// that is the seam's one loose joint — written down in ADR 055
         /// before this file existed. SQLite's `pragma_table_info` is a
         /// table-valued function and a schema qualifies the *function's* name,
         /// where Postgres puts it in a `WHERE` and binds it.
         ///
         /// **Every occurrence, not the first.** `dialect.SQLite.introspect`
-        /// names `pragma_table_info` twice since ADR 0115 — once in the `FROM`
+        /// names `pragma_table_info` twice since ADR 050 — once in the `FROM`
         /// and once in the subquery that counts a table's primary-key columns
         /// — and the rewrite this used to do qualified whichever came first in
         /// the text. That would have asked the attached database for the
@@ -1051,7 +1051,7 @@ pub fn Wire(comptime opts_in: Options) type {
             // view — and it went unqualified for a cycle after the first
             // rewrite, so a Row over a view in an attached database asked
             // `main.sqlite_master`, found nothing, and got exactly the
-            // failure ADR 0056 was written to remove.
+            // failure ADR 050 was written to remove.
             var pragma_buf: [1024]u8 = undefined;
             var master_buf: [1024]u8 = undefined;
             const text = if (schema) |db_name| blk: {
@@ -1102,7 +1102,7 @@ pub fn Wire(comptime opts_in: Options) type {
     };
 }
 
-/// A zqlite error as one of the seven this module admits to (ADR 0039).
+/// A zqlite error as one of the seven this module admits to (ADR 036).
 ///
 /// The parameter tuple with every `wire.Bytes` in it turned into the wrapper
 /// zqlite binds a blob from.
@@ -1165,7 +1165,7 @@ fn translate(conn: zqlite.Conn, err: anyerror) wire.Error {
         // does not change with the request around it.
         error.ConstraintUnique, error.ConstraintPrimaryKey => error.AlreadyExists,
         // The three the extended codes can name, which the Postgres side names
-        // by SQLSTATE (ADR 0184). **Both Wires answer the same word for the
+        // by SQLSTATE (ADR 117). **Both Wires answer the same word for the
         // same failure**, which is the property that lets a handler tested
         // against SQLite branch on what Postgres will send it.
         error.ConstraintForeignKey => error.ForeignKeyViolated,
@@ -1207,7 +1207,7 @@ fn translate(conn: zqlite.Conn, err: anyerror) wire.Error {
         error.CantOpen, error.IoErr, error.NotADB, error.Corrupt => error.Disconnected,
 
         else => {
-            // The text never reaches the client (ADR 0025); it goes here,
+            // The text never reaches the client (ADR 024); it goes here,
             // where whoever reads the log is the person who can fix it.
             std.log.err("nilo_sql: {s} [{s}]", .{ conn.lastError(), @errorName(err) });
             return error.QueryFailed;
@@ -1348,7 +1348,7 @@ test "a NULL reads as null, and an integer too wide for the field is refused not
             try testing.expectEqual(@as(?i64, null), try w.read(&rows, ?i64, 0));
 
             // And the same NULL read into a field that cannot hold one is an
-            // error rather than a zero (ADR 0118). It used to be `0` for the
+            // error rather than a zero (ADR 094). It used to be `0` for the
             // integer and `""` for the text, because the null test only ran
             // for an optional field — the same class of wrong-answer-that-
             // looks-right as the truncation below, arriving from the other
@@ -1358,7 +1358,7 @@ test "a NULL reads as null, and an integer too wide for the field is refused not
             try testing.expectEqual(@as(?[]const u8, null), try w.read(&rows, ?[]const u8, 2));
             // SQLite has one integer type, so a field too narrow for the value
             // is the one class of mismatch its schema check cannot catch
-            // beforehand (ADR 0061). It has to be an error rather than a
+            // beforehand (ADR 055). It has to be an error rather than a
             // truncation, because a truncated id is a wrong answer that looks
             // like a right one.
             try testing.expectError(error.QueryFailed, w.read(&rows, i16, 1));
@@ -1370,7 +1370,7 @@ test "a NULL reads as null, and an integer too wide for the field is refused not
 test "a returning reader wakes the fiber that wanted a reader, not the one that wanted the writer" {
     // **If this test ever hangs, the pool has lost a wakeup** — that is the
     // failure it exists to catch, and the diagnosis is `ps -o etime,cputime`
-    // showing minutes of wall against no CPU. Before ADR 0116 both `take`
+    // showing minutes of wall against no CPU. Before ADR 065 both `take`
     // calls waited on one `Condition` while testing different predicates, so
     // `release` waking one fiber could wake the one that could not proceed.
     //
@@ -1420,7 +1420,7 @@ test "the introspection query reads the rowid alias as not-null, and its near mi
     // `db.checkSchema`, which reports a problem with `std.log.err` and so
     // fails the test runner for every test that provokes one. What is being
     // held here is the query's three answers, which is what the check is
-    // built out of (ADR 0115).
+    // built out of (ADR 050).
     try withIo(struct {
         fn nullableOf(
             w: *TestWire,
@@ -1444,7 +1444,7 @@ test "the introspection query reads the rowid alias as not-null, and its near mi
                 "CREATE TABLE not_integer (id INT PRIMARY KEY, label TEXT)",
                 "CREATE TABLE composite (tenant_id INTEGER, id INTEGER, PRIMARY KEY (tenant_id, id))",
                 // A column with no declared type at all, which SQLite allows.
-                // Here because ADR 0118 made a NULL in a non-optional field an
+                // Here because ADR 094 made a NULL in a non-optional field an
                 // error, and this query reads `upper(i.type)` as a
                 // `[]const u8`: if the pragma answered NULL rather than the
                 // empty string for an untyped column, the schema check would
@@ -1485,7 +1485,7 @@ test "the introspection query reads the rowid alias as not-null, and its near mi
             try testing.expectEqual(@as(?bool, false), try nullableOf(&w, arena, "untyped", "id"));
 
             // And the third answer still arrives: a view says nothing about
-            // nullability and the check skips it (ADR 0056). The rowid branch
+            // nullability and the check skips it (ADR 050). The rowid branch
             // sits behind the view branch so this cannot be turned into a
             // `false` by an `id` that came from an aliased column.
             try testing.expectEqual(@as(?bool, null), try nullableOf(&w, arena, "as_view", "id"));
@@ -1518,7 +1518,7 @@ test "a statement given a plan name is prepared once, and one without a name is 
 
             // One entry, on the one reader that ran it — the cache is per
             // connection because a prepared statement belongs to the
-            // connection it was prepared against (ADR 0057).
+            // connection it was prepared against (ADR 051).
             var kept: usize = 0;
             for (w.conns) |conn| kept += conn.kept.count();
             try testing.expectEqual(@as(usize, 1), kept);
@@ -1555,7 +1555,7 @@ test "a result set nobody finished reading leaves its connection usable" {
             // The connection is back, and the kept statement starts from the
             // top rather than from where the last caller stopped. Without the
             // reset in `Rows.close` this would answer 2 — which is the shape
-            // ADR 0033 asks for: a guard seen to fail.
+            // ADR 032 asks for: a guard seen to fail.
             var again = try w.run(gpa, "SELECT id FROM t", .{}, "nilo_t_all", null);
             defer again.close();
             try testing.expect(try w.next(&again));
@@ -1593,7 +1593,7 @@ test "a unique violation is AlreadyExists and every other constraint is not" {
 
             // A NOT NULL is a constraint too, and it is not a 409: it usually
             // means the code is wrong rather than the client. It has a name of
-            // its own since ADR 0184, so a handler can say which one fired.
+            // its own since ADR 117, so a handler can say which one fired.
             try testing.expectError(error.NotNullViolated, w.exec(
                 gpa,
                 "INSERT INTO t(id, email) VALUES (3, NULL)",
@@ -1692,7 +1692,7 @@ test "a read-only transaction takes a reader, so a report does not stop the writ
 test "a reader refuses a write, which is what makes routing safe to get wrong" {
     // **On a file, and that is the test rather than an accident of it.**
     //
-    // `OpenFlags.ReadOnly` is what ADR 0074 leans on: routing `db.raw` by its
+    // `OpenFlags.ReadOnly` is what ADR 065 leans on: routing `db.raw` by its
     // first keyword is a guess, and a guess that goes the wrong way has to
     // land somewhere it cannot do damage. But SQLite's URI `mode=` parameter
     // takes precedence over the flags handed to `sqlite3_open_v2`, so
@@ -1723,8 +1723,8 @@ test "a reader refuses a write, which is what makes routing safe to get wrong" {
             try testing.expectEqual(@as(usize, 4), w.conns.len);
             _ = try w.exec(gpa, "CREATE TABLE t(id INTEGER PRIMARY KEY)", .{}, null, null);
 
-            // ADR 0074's backstop, seen to fail rather than assumed to work
-            // (ADR 0033).
+            // ADR 065's backstop, seen to fail rather than assumed to work
+            // (ADR 032).
             for (w.conns[1..]) |conn| {
                 try testing.expectError(
                     error.ReadOnly,
@@ -1753,7 +1753,7 @@ test "each constraint a caller branches on arrives under its own name" {
     // Item 55: `23503` used to arrive as `ConstraintViolated` beside a check
     // somebody wrote and a null the code should never have sent, so the one
     // failure in class 23 that is routinely a race could not be told from the
-    // two that mean the program is wrong (ADR 0184).
+    // two that mean the program is wrong (ADR 117).
     try withIo(struct {
         fn run(io: std.Io) !void {
             var w = try openTest(io, "file:named-constraints?mode=memory&cache=shared", 2);
