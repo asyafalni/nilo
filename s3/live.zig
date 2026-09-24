@@ -10,11 +10,12 @@
 //! nothing to somebody who has not started a container. With one:
 //!
 //! ```
-//! docker run -d --name minio -p 9000:9000 \
-//!   -e MINIO_ROOT_USER=niloadmin -e MINIO_ROOT_PASSWORD=nilosecret123 \
-//!   quay.io/minio/minio server /data
+//! docker run -d --name seaweedfs -p 9100:8333 \
+//!   -e AWS_ACCESS_KEY_ID=niloadmin -e AWS_SECRET_ACCESS_KEY=nilosecret123 \
+//!   chrislusf/seaweedfs:4.47 server -dir=/data -s3 -s3.port=8333
+//! python3 bench/s3_setup.py
 //!
-//! S3_ENDPOINT=http://127.0.0.1:9000 S3_ACCESS_KEY=niloadmin \
+//! S3_ENDPOINT=http://127.0.0.1:9100 S3_ACCESS_KEY=niloadmin \
 //!   S3_SECRET_KEY=nilosecret123 zig build test-s3
 //! ```
 //!
