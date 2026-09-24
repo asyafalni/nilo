@@ -169,7 +169,7 @@ compressed ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrow
 |---|---|
 | `nilo.Mutex` | `.init`, then `try lock()`, `unlock()`, `tryLock()`, `lockUncancelable()` |
 | `nilo.blocking(f, args)` | run a blocking call off the event loop |
-| `nilo.Gate` | `.open(n)`, then `try enter()`, `leave()` — a lock that lets `n` through |
+| `nilo.Gate` | `.open(n)`, then `try enter()` or `try enterWithin(ms)`, `leave()` — a lock that lets `n` through, the rest served in the order they came; `enterWithin` gives up with `error.TimedOut` holding nothing ([ADR 222](../adr/222-a-gate-serves-its-waiters-in-the-order-they-came.md)) |
 | `nilo.sleep(ms)` | wait without parking the thread |
 | `nilo.spawn(f, args)` | run something that is not a request, now — `error.NoServer` if nothing is listening |
 | `app.spawn(f, args)` | the same fiber, registered before the server and started once it is up ([the guide](../guide/background.md)) |
