@@ -82,7 +82,7 @@ connection is accepted.
 **Work that has to finish before the first request is `app.before`.** A
 migration, a version guard, a key set fetched once: it needs the services, so
 it runs inside `listen()`, after they have started and before anything
-`app.spawn` registered ([Applying](./sql/migrations.md#applying)):
+`app.spawn` registered ([Applying](./sql/migrations.md#applying-them)):
 
 ```zig
 fn migrate(run: *nilo.Run, db: *sql.Db) !void {

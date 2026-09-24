@@ -75,7 +75,7 @@ Three files carry context this one deliberately does not repeat:
 - **`CONTEXT.md`** — the project's vocabulary, and the words it refuses to use
   (Ctx not "Context", Str not "string", keep not "dupe", Refusal not "negative
   test"). Match it in code, comments, docs and commit messages.
-- **`docs/adr/`** — 295 binding decisions, each naming the alternative it
+- **`docs/adr/`** — 296 binding decisions, each naming the alternative it
   rejected. Check here before proposing a design change; "why not X?" usually
   already has an answer on file. **ADR 0041 decides which module new work goes
   in and ADR 0042 decides what that module may import**, and they are the two
@@ -137,6 +137,8 @@ zig build refusals-s3  # nilo_s3's 10; also run by test-s3
 zig build refusals-job # nilo_job's 18; also run by test-job
 zig build refusals-fetch # nilo_fetch's 15; also run by test-fetch
 zig build snippets     # the documentation's own marked snippets, which must compile
+mkdocs serve           # the guide as the website, live; `mkdocs build` is the strict check CI runs.
+                       #   pip install -r docs/site/requirements.txt first (ADR 0296)
 zig build smoke-tls -Dnetwork   # a real HTTPS endpoint — NOT part of test
 zig build examples     # build all ten examples
 zig build fuzz -- --iterations 1000000 --seed 0x…   # generated requests at the parser
@@ -558,6 +560,11 @@ resolve on a release page. What stays in the file is one line under
 `## Released` pointing at the page, and any README link into the section it took
 becomes a link to that page. The file is then the next release again, and it
 never grows past one.
+
+**Pushing the tag also publishes the guide**: `.github/workflows/docs.yml`
+builds `docs/guide/` into the `X.Y` copy of the site, and moves `latest` only
+when the tag is the newest (ADR 0296). A page added to the guide needs a line
+in `nav:` in `mkdocs.yml`, or the `docs` job in CI fails.
 
 **The roadmap holds nothing that is built, and nothing that is decided.** It
 is what is still open: a plan, not a record. The moment something ships, its

@@ -699,10 +699,10 @@ test "a list is a signed question about the bucket, and the answer is a page wit
                 \\<Name>files</Name><Prefix>photos%2F</Prefix><KeyCount>2</KeyCount><MaxKeys>2</MaxKeys>
                 \\<EncodingType>url</EncodingType><IsTruncated>true</IsTruncated>
                 \\<NextContinuationToken>1dEs3p+aG/e=</NextContinuationToken>
-                \\<Contents><Key>photos%2Fwati%20sari.png</Key><LastModified>2026-09-18T10:11:12.000Z</LastModified>
+                \\<Contents><Key>photos%2Fwati+sari%2B1.png</Key><LastModified>2026-09-18T10:11:12.000Z</LastModified>
                 \\<ETag>&quot;9a0364b9e99bb480dd25e1f0284c8555&quot;</ETag><Size>1024</Size><StorageClass>STANDARD</StorageClass></Contents>
                 \\<Contents><Key>photos%2Ftwo.png</Key><LastModified>2026-09-18T10:11:13.000Z</LastModified>
-                \\<ETag>&quot;abc&quot;</ETag><Size>0</Size></Contents>
+                \\<ETag>&#34;abc&#34;</ETag><Size>0</Size></Contents>
                 \\</ListBucketResult>
                 ,
             };
@@ -730,13 +730,17 @@ test "a list is a signed question about the bucket, and the answer is a page wit
             const first = try files.list(&scope, .{ .prefix = "photos/", .max_keys = 2 });
 
             try testing.expectEqual(@as(usize, 2), first.objects.len);
-            // Decoded: the key out of its percent coding, the ETag out of
-            // its entities and quoted the way `head` hands it back.
-            try testing.expectEqualStrings("photos/wati sari.png", first.objects[0].key.view());
+            // Decoded: the key out of its percent coding, with `+` a space
+            // and `%2B` a plus the way a real server writes them, and the
+            // ETag out of its entities and quoted the way `head` hands it
+            // back.
+            try testing.expectEqualStrings("photos/wati sari+1.png", first.objects[0].key.view());
             try testing.expectEqual(@as(u64, 1024), first.objects[0].size);
             try testing.expectEqualStrings("\"9a0364b9e99bb480dd25e1f0284c8555\"", first.objects[0].etag.view());
             try testing.expectEqualStrings("2026-09-18T10:11:12.000Z", first.objects[0].last_modified.view());
             try testing.expectEqualStrings("photos/two.png", first.objects[1].key.view());
+            // Go's encoder, and so MinIO, writes the quote as `&#34;`.
+            try testing.expectEqualStrings("\"abc\"", first.objects[1].etag.view());
             try testing.expectEqual(@as(u64, 0), first.objects[1].size);
             try testing.expectEqualStrings("1dEs3p+aG/e=", first.next.?.view());
 

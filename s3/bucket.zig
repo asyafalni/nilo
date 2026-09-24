@@ -642,7 +642,10 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             var walk: listing_mod.Objects = .init(xml);
             for (objects) |*object| {
                 const raw = walk.next() orelse unreachable; // counted a moment ago
-                const key = core.percent.decode(c.arena(), raw.key, false) catch return error.OutOfMemory;
+                // `+` is a space here, as in a form: that is how AWS and
+                // MinIO both write one under `encoding-type=url`, and a `+`
+                // in the key itself arrives as `%2B`.
+                const key = core.percent.decode(c.arena(), raw.key, true) catch return error.OutOfMemory;
                 const etag = try c.arena().alloc(u8, listing_mod.unescapedLen(raw.etag));
                 object.* = .{
                     .key = c.str(key),

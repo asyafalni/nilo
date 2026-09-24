@@ -14,12 +14,16 @@
 //!
 //! Two encodings meet in the answer, and both are handled where they arise.
 //! The request asks for `encoding-type=url`, so a key comes back
-//! percent-encoded and is decoded with Core's `percent` — the same coding a
-//! key was written with on the way out, and a well-defined one, unlike the
-//! bare XML text that would otherwise need `&amp;` and friends handled in
-//! every key. An ETag is not covered by that and arrives as
-//! `&quot;…&quot;`, so the five entities XML predefines are unescaped for
-//! it and for the continuation token, and for nothing else.
+//! percent-encoded and is decoded with Core's `percent`, a well-defined
+//! coding, unlike the bare XML text that would otherwise need `&amp;` and
+//! friends handled in every key. It is the form flavour of it, not the one a
+//! key was written with on the way out: AWS and MinIO both send a space as
+//! `+` and a plus as `%2B`, so `+` decodes to a space. The canned server
+//! wrote `%20`, and only a real one said otherwise. An ETag is not covered
+//! by that and arrives as `&quot;…&quot;` from AWS and `&#34;…&#34;` from
+//! MinIO, whose XML is Go's, so the five entities XML predefines and a
+//! numeric reference to an ASCII character are unescaped for it and for the
+//! continuation token, and for nothing else.
 
 const std = @import("std");
 const core = @import("nilo_core");
@@ -182,11 +186,14 @@ pub fn unescapedLen(text: []const u8) usize {
     return n;
 }
 
-/// The five entities XML predefines, and no others: `&quot;`, `&amp;`,
-/// `&lt;`, `&gt;`, `&apos;`. A numeric reference or anything unknown is
-/// left as the bytes it was, which is what `percent.decode` does with a
-/// broken escape and for the same reason — a value that fails to decode is
-/// still a value, and refusing it would refuse the whole page.
+/// The five entities XML predefines, `&quot;`, `&amp;`, `&lt;`, `&gt;` and
+/// `&apos;`, and a numeric reference to an ASCII character, `&#34;` or
+/// `&#x22;`, which is how Go's encoder writes a quote. An ETag and a cursor
+/// are ASCII, so a reference past it is not something either can hold, and
+/// keeping every entity one byte keeps the answer no longer than the text.
+/// Anything else is left as the bytes it was, which is what `percent.decode`
+/// does with a broken escape and for the same reason — a value that fails to
+/// decode is still a value, and refusing it would refuse the whole page.
 pub fn unescapeInto(dst: []u8, text: []const u8) []u8 {
     var n: usize = 0;
     var i: usize = 0;
@@ -219,7 +226,20 @@ fn entityAt(text: []const u8, i: usize) ?Entity {
     inline for (table) |row| {
         if (std.mem.startsWith(u8, rest, row[0])) return .{ .ch = row[1], .len = row[0].len };
     }
-    return null;
+    return numericAt(rest);
+}
+
+/// `&#34;` or `&#x22;`, for a character below 0x80, or null. More than
+/// eight digits is not a reference this could accept, so it is not parsed.
+fn numericAt(rest: []const u8) ?Entity {
+    if (!std.mem.startsWith(u8, rest, "&#")) return null;
+    const hex = rest.len > 2 and (rest[2] == 'x' or rest[2] == 'X');
+    const start: usize = if (hex) 3 else 2;
+    const semi = std.mem.indexOfScalarPos(u8, rest, start, ';') orelse return null;
+    if (semi == start or semi - start > 8) return null;
+    const value = std.fmt.parseInt(u8, rest[start..semi], if (hex) 16 else 10) catch return null;
+    if (value >= 0x80) return null;
+    return .{ .ch = value, .len = semi + 1 };
 }
 
 const testing = std.testing;
@@ -313,13 +333,17 @@ test "a block missing one of the four names is stepped over rather than half-rea
     try testing.expectEqual(@as(usize, 0), Objects.count(""));
 }
 
-test "the five entities become their characters, and anything else stays" {
+test "the five entities and an ASCII reference become their characters, and anything else stays" {
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("\"abc\"", unescapeInto(&buf, "&quot;abc&quot;"));
     try testing.expectEqualStrings("a&b<c>d'e", unescapeInto(&buf, "a&amp;b&lt;c&gt;d&apos;e"));
-    // Unknown, numeric, or a bare ampersand: left as the bytes they were.
-    try testing.expectEqualStrings("&#39;&bogus;&", unescapeInto(&buf, "&#39;&bogus;&"));
+    // What MinIO sends, because Go's encoder writes a quote as `&#34;`.
+    try testing.expectEqualStrings("\"abc\"", unescapeInto(&buf, "&#34;abc&#34;"));
+    try testing.expectEqualStrings("'\"", unescapeInto(&buf, "&#x27;&#X22;"));
+    // Unknown, past ASCII, malformed, or a bare ampersand: left as the bytes they were.
+    try testing.expectEqualStrings("&#233;&bogus;&#;&#x;&#12a;&", unescapeInto(&buf, "&#233;&bogus;&#;&#x;&#12a;&"));
     try testing.expectEqualStrings("", unescapeInto(&buf, ""));
     try testing.expectEqual(@as(usize, 5), unescapedLen("&quot;abc&quot;"));
-    try testing.expectEqual(@as(usize, 13), unescapedLen("&#39;&bogus;&"));
+    try testing.expectEqual(@as(usize, 5), unescapedLen("&#34;abc&#34;"));
+    try testing.expectEqual(@as(usize, 14), unescapedLen("&#233;&bogus;&"));
 }

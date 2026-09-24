@@ -1,0 +1,114 @@
+# The documentation site: docs/guide/ and nothing else, one copy per minor
+# release, published by .github/workflows/docs.yml when a tag is pushed.
+# Links out of the guide are rewritten to GitHub by docs/site/hooks.py.
+
+site_name: nilo
+site_description: A toolkit for Zig 0.16, and an HTTP server
+site_url: https://nevindra.github.io/nilo/
+repo_url: https://github.com/nevindra/nilo
+repo_name: nevindra/nilo
+edit_uri: edit/main/docs/guide/
+
+docs_dir: docs/guide
+site_dir: zig-out/site
+strict: true
+
+# A link to a heading that was renamed fails the build, not only a missing
+# page, and so does a guide page nobody put in the nav below.
+validation:
+  anchors: warn
+  nav:
+    omitted_files: warn
+
+hooks:
+  - docs/site/hooks.py
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - navigation.indexes
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Light mode
+
+extra:
+  version:
+    provider: mike
+    default: latest
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+
+# The order docs/guide/README.md numbers them in.
+nav:
+  - Guide: README.md
+  - Start here:
+      - getting-started.md
+      - handlers.md
+      - routing.md
+  - Handling a request:
+      - requests.md
+      - forms.md
+      - responses.md
+      - cookies.md
+      - sessions.md
+      - streaming.md
+      - websocket.md
+  - Building an application:
+      - middleware.md
+      - services.md
+      - static-files.md
+      - errors.md
+      - config.md
+      - background.md
+      - idempotency.md
+  - The other modules:
+      - Talking to a database:
+          - sql/README.md
+          - sql/tables.md
+          - sql/reading.md
+          - sql/shapes.md
+          - sql/writing.md
+          - sql/transactions.md
+          - sql/raw.md
+          - sql/sqlite.md
+          - sql/migrations.md
+          - sql/running.md
+      - fetch.md
+      - s3.md
+      - jobs.md
+      - cache.md
+      - jwt.md
+      - id.md
+  - Shipping it:
+      - testing.md
+      - openapi.md
+      - metrics.md
+      - deploying.md

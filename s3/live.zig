@@ -44,6 +44,14 @@ const testing = std.testing;
 /// compiling. That is the design being tested rather than a limitation of it.
 const Live = bucket_mod.Bucket(s3_config.bucket, .{ .style = .path, .max_bytes = 4 << 20 });
 
+/// Where every key here lives: a folder per optimize mode, because `zig build
+/// test-s3` runs the Debug and the ReleaseSafe binary **at the same time**
+/// against one server, and a key the two shared was the other binary's to
+/// delete between this one's write and its read. The presigned POST found it
+/// first and took a key of its own; the list, which reads four keys back and
+/// counts them, found it the first time CI ran against a real MinIO.
+const home = "live/" ++ @tagName(@import("builtin").mode) ++ "/";
+
 const Settings = struct {
     endpoint: []const u8,
     access_key: []const u8,
@@ -102,12 +110,12 @@ test "an object put is an object got, byte for byte" {
             defer scope.deinit();
 
             const body = "cinta laut dan langit, and a few bytes more";
-            try live.put(&scope, "live/one.txt", .{
+            try live.put(&scope, home ++ "one.txt", .{
                 .bytes = body,
                 .content_type = "text/plain",
             });
 
-            const got = try live.get(&scope, "live/one.txt");
+            const got = try live.get(&scope, home ++ "one.txt");
             try testing.expectEqualStrings(body, got.bytes.view());
             try testing.expectEqualStrings("text/plain", got.content_type.view());
             try testing.expectEqual(@as(u64, body.len), got.len);
@@ -115,8 +123,8 @@ test "an object put is an object got, byte for byte" {
             // handing it back as `if-none-match` work at all.
             try testing.expect(got.etag.len() > 2);
 
-            try live.delete(&scope, "live/one.txt");
-            try testing.expectError(error.NotFound, live.get(&scope, "live/one.txt"));
+            try live.delete(&scope, home ++ "one.txt");
+            try testing.expectError(error.NotFound, live.get(&scope, home ++ "one.txt"));
         }
     }.run);
 }
@@ -132,7 +140,7 @@ test "a key that needs encoding survives a round trip through a real server" {
 
             // The characters that break a client which encodes twice, or
             // encodes a space as `+`.
-            const key = "live/wati sari$1+2/café & co.txt";
+            const key = home ++ "wati sari$1+2/café & co.txt";
             try live.put(&scope, key, .{ .bytes = "ada", .content_type = "text/plain" });
             defer live.delete(&scope, key) catch {};
 
@@ -151,13 +159,13 @@ test "a range asks for a slice and gets exactly that slice" {
             var scope: core.Run = .init(testing.allocator);
             defer scope.deinit();
 
-            try live.put(&scope, "live/range.txt", .{
+            try live.put(&scope, home ++ "range.txt", .{
                 .bytes = "0123456789abcdef",
                 .content_type = "text/plain",
             });
-            defer live.delete(&scope, "live/range.txt") catch {};
+            defer live.delete(&scope, home ++ "range.txt") catch {};
 
-            const part = try live.getRange(&scope, "live/range.txt", .{ .from = 4, .to = 9 });
+            const part = try live.getRange(&scope, home ++ "range.txt", .{ .from = 4, .to = 9 });
             try testing.expectEqualStrings("456789", part.bytes.view());
         }
     }.run);
@@ -177,17 +185,17 @@ test "an object over the ceiling costs a round trip rather than a download" {
             defer testing.allocator.free(big);
             @memset(big, 'x');
 
-            try live.put(&scope, "live/big.bin", .{
+            try live.put(&scope, home ++ "big.bin", .{
                 .bytes = big,
                 .content_type = "application/octet-stream",
             });
-            defer live.delete(&scope, "live/big.bin") catch {};
+            defer live.delete(&scope, home ++ "big.bin") catch {};
 
-            try testing.expectError(error.TooLarge, live.get(&scope, "live/big.bin"));
+            try testing.expectError(error.TooLarge, live.get(&scope, home ++ "big.bin"));
 
             // And the way through it, which is the whole reason `getRange`
             // exists: without it a large object has no way in at all.
-            const head = try live.getRange(&scope, "live/big.bin", .{ .from = 0, .to = 1023 });
+            const head = try live.getRange(&scope, home ++ "big.bin", .{ .from = 0, .to = 1023 });
             try testing.expectEqual(@as(u64, 1024), head.len);
         }
     }.run);
@@ -204,17 +212,17 @@ test "a streamed put is a get, and a streamed get is the same bytes" {
 
             const body = "streamed in, streamed out, and never held whole";
             var source = std.Io.Reader.fixed(body);
-            try live.putStream(&scope, "live/streamed.txt", .{
+            try live.putStream(&scope, home ++ "streamed.txt", .{
                 .reader = &source,
                 .len = @as(u64, body.len),
                 .content_type = "text/plain",
             });
-            defer live.delete(&scope, "live/streamed.txt") catch {};
+            defer live.delete(&scope, home ++ "streamed.txt") catch {};
 
             var reading: Live.Reading = .idle;
             defer reading.close();
 
-            try live.stream(&scope, "live/streamed.txt", &reading);
+            try live.stream(&scope, home ++ "streamed.txt", &reading);
             try testing.expectEqual(@as(u64, body.len), reading.len);
 
             var out: [128]u8 = undefined;
@@ -234,17 +242,17 @@ test "a head says what an object is without moving it" {
             var scope: core.Run = .init(testing.allocator);
             defer scope.deinit();
 
-            try live.put(&scope, "live/meta.json", .{
+            try live.put(&scope, home ++ "meta.json", .{
                 .bytes = "{\"ada\":true}",
                 .content_type = "application/json",
             });
-            defer live.delete(&scope, "live/meta.json") catch {};
+            defer live.delete(&scope, home ++ "meta.json") catch {};
 
-            const meta = try live.head(&scope, "live/meta.json");
+            const meta = try live.head(&scope, home ++ "meta.json");
             try testing.expectEqual(@as(u64, 12), meta.len);
             try testing.expectEqualStrings("application/json", meta.content_type.view());
 
-            try testing.expectError(error.NotFound, live.head(&scope, "live/nothing-here"));
+            try testing.expectError(error.NotFound, live.head(&scope, home ++ "nothing-here"));
         }
     }.run);
 }
@@ -258,24 +266,24 @@ test "an ETag from a real server is one a conditional get understands" {
             var scope: core.Run = .init(testing.allocator);
             defer scope.deinit();
 
-            try live.put(&scope, "live/cond.txt", .{
+            try live.put(&scope, home ++ "cond.txt", .{
                 .bytes = "unchanged",
                 .content_type = "text/plain",
             });
-            defer live.delete(&scope, "live/cond.txt") catch {};
+            defer live.delete(&scope, home ++ "cond.txt") catch {};
 
-            const first = try live.get(&scope, "live/cond.txt");
+            const first = try live.get(&scope, home ++ "cond.txt");
             const tag = try first.etag.keep(testing.allocator);
             defer testing.allocator.free(tag);
 
-            switch (try live.getIf(&scope, "live/cond.txt", tag)) {
+            switch (try live.getIf(&scope, home ++ "cond.txt", tag)) {
                 .unmodified => {},
                 .object => return error.ExpectedUnmodified,
             }
 
             // And an ETag that is not the object's is a full answer, which is
             // the case a client that always sends 304 would get wrong.
-            switch (try live.getIf(&scope, "live/cond.txt", "\"not-the-etag\"")) {
+            switch (try live.getIf(&scope, home ++ "cond.txt", "\"not-the-etag\"")) {
                 .unmodified => return error.ExpectedTheObject,
                 .object => |o| try testing.expectEqualStrings("unchanged", o.bytes.view()),
             }
@@ -292,13 +300,13 @@ test "a presigned URL works in something that did not sign it" {
             var scope: core.Run = .init(testing.allocator);
             defer scope.deinit();
 
-            try live.put(&scope, "live/presigned.txt", .{
+            try live.put(&scope, home ++ "presigned.txt", .{
                 .bytes = "anybody with the link",
                 .content_type = "text/plain",
             });
-            defer live.delete(&scope, "live/presigned.txt") catch {};
+            defer live.delete(&scope, home ++ "presigned.txt") catch {};
 
-            const link = try live.presign(&scope, "live/presigned.txt", 900);
+            const link = try live.presign(&scope, home ++ "presigned.txt", 900);
 
             // Fetched with a plain client carrying no credentials at all,
             // which is the whole claim a presigned URL makes.
@@ -331,15 +339,7 @@ test "a presigned POST is a form a real server accepts" {
             var scope: core.Run = .init(testing.allocator);
             defer scope.deinit();
 
-            // A key of this test's own, because `zig build test-s3` runs the
-            // Debug and the ReleaseSafe binary **at the same time** against one
-            // server. Every other test here shares a key across the two and
-            // gets away with it; this one does not, because a POST through a
-            // fresh connection is slow enough that the other binary's
-            // `delete` lands between this one's POST and its read. It failed
-            // that way twice out of two under `zig build` and passed both
-            // binaries standalone, which is what said where to look.
-            const key = "live/posted-" ++ @tagName(@import("builtin").mode) ++ ".txt";
+            const key = home ++ "posted.txt";
             defer live.delete(&scope, key) catch {};
 
             const posted = try live.presignPost(&scope, key, .{
@@ -407,14 +407,14 @@ test "a list from a real server pages under a prefix, and the cursor reaches the
 
             // Three under one prefix and one beside it, so the prefix and
             // the page size are both seen to do something.
-            const keys = [_][]const u8{ "live/list/a.txt", "live/list/b c.txt", "live/list/d.txt", "live/other.txt" };
+            const keys = [_][]const u8{ home ++ "list/a.txt", home ++ "list/b c.txt", home ++ "list/d.txt", home ++ "other.txt" };
             for (keys) |key| try live.put(&scope, key, .{ .bytes = "x", .content_type = "text/plain" });
             defer for (keys) |key| live.delete(&scope, key) catch {};
 
-            const first = try live.list(&scope, .{ .prefix = "live/list/", .max_keys = 2 });
+            const first = try live.list(&scope, .{ .prefix = home ++ "list/", .max_keys = 2 });
             try testing.expectEqual(@as(usize, 2), first.objects.len);
-            try testing.expectEqualStrings("live/list/a.txt", first.objects[0].key.view());
-            try testing.expectEqualStrings("live/list/b c.txt", first.objects[1].key.view());
+            try testing.expectEqualStrings(home ++ "list/a.txt", first.objects[0].key.view());
+            try testing.expectEqualStrings(home ++ "list/b c.txt", first.objects[1].key.view());
             try testing.expectEqual(@as(u64, 1), first.objects[0].size);
             // A real server quotes its ETag, and a value from here is one
             // `getIf` understands as it is.
@@ -422,15 +422,15 @@ test "a list from a real server pages under a prefix, and the cursor reaches the
             try testing.expect(first.next != null);
 
             const second = try live.list(&scope, .{
-                .prefix = "live/list/",
+                .prefix = home ++ "list/",
                 .max_keys = 2,
                 .cursor = first.next.?.view(),
             });
             try testing.expectEqual(@as(usize, 1), second.objects.len);
-            try testing.expectEqualStrings("live/list/d.txt", second.objects[0].key.view());
+            try testing.expectEqualStrings(home ++ "list/d.txt", second.objects[0].key.view());
             try testing.expect(second.next == null);
 
-            const conditional = try live.getIf(&scope, "live/list/a.txt", first.objects[0].etag.view());
+            const conditional = try live.getIf(&scope, home ++ "list/a.txt", first.objects[0].etag.view());
             try testing.expect(conditional == .unmodified);
         }
     }.run);

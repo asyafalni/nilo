@@ -258,7 +258,7 @@ is one binary rather than two.
 | `timeout_ms` | the client's | this service's own deadline; a `Call` still overrides it for one call |
 | `stall_ms` | the client's | likewise, for silence |
 | `max_body` | the client's | likewise, for the body |
-| `ready` | null | a path the [health route](./deploying.md#health) GETs on every probe, with a 2xx as ready. Null is started-is-ready, because a balancer asks every second and a call to somebody else's API at that rate is a bill and a rate limit rather than a check |
+| `ready` | null | a path the [health route](./deploying.md#knowing-whether-it-is-ready) GETs on every probe, with a 2xx as ready. Null is started-is-ready, because a balancer asks every second and a call to somebody else's API at that rate is a bill and a rate limit rather than a check |
 
 | Given to `open` | |
 |---|---|
