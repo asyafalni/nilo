@@ -120,7 +120,7 @@ jobs:
   # than 4, zio on kqueue rather than io_uring and epoll, and the branches
   # under `builtin.os.tag` that name Darwin or fall to "anything not Linux".
   # The first of those hid a test that asserted nothing until somebody ran
-  # the suite on a Mac (docs/history.md, "Two tests that could not fail").
+  # the suite on a Mac (docs/history.md, "Tests that could not fail").
   #
   # `test` rather than `test-all`: this job is for what differs by platform,
   # and ReleaseSafe does not; that is covered above. No Postgres or MinIO for

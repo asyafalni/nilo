@@ -163,7 +163,7 @@ box, one request is **181ns of nilo's own work**:
 | write the response | 31ns | 17.2% |
 | arena alloc + reset | 6ns | 3.7% |
 
-[`history.md`](../../docs/history.md#after-010-what-the-router-scan-actually-costs)
+[`history.md`](../../docs/history.md#where-the-cost-turned-out-to-be)
 recorded 585ns for the same harness on the machine it was written on, so this
 box is about 3.2× faster. The router table moved with it — the mixed set went
 from 27/47/56/107/167ns to 13/20/19/38/60ns across 1/5/25/50/100 routes, between

@@ -67,7 +67,7 @@ name — an enum column has none this module can write — and means the same
 thing, `OR` being commutative in three-valued logic. `sql/live.zig` runs each
 shape against Postgres now: text, a number, a pattern, a `timestamptz`, a
 `uuid`, an enum and an `EXISTS`. The lesson is in
-[`history.md`](../history.md#a-design-closed-on-a-comptime-assertion-is-closed-on-paper).
+[`history.md`](../history.md#tests-that-could-not-fail).
 
 ## One statement, and the alternative that was rejected
 

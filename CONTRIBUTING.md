@@ -18,7 +18,7 @@ Then read these four, in this order:
 |---|---|
 | [`README.md`](./README.md) | what this is and what it refuses to be |
 | [`CONTEXT.md`](./CONTEXT.md) | the vocabulary, and the words this project won't use |
-| [`CLAUDE.md`](./CLAUDE.md) | the working brief: layout, every command, invariants, conventions |
+| [`CLAUDE.md`](./CLAUDE.md) | the working brief: layout, the commands, invariants, conventions |
 | [`docs/adr/`](./docs/adr/) | the decisions, each one naming the alternative it beat |
 
 The ADRs are the important one. Before you propose a design change, check whether it already has a file: "why not X?" usually has an answer on record, and if you disagree with it you get to argue with something specific instead of with a vibe.
@@ -33,7 +33,7 @@ zig build examples      # build every example
 zig build fuzz -- --iterations 1000000 --seed 0x…
 ```
 
-The full list, one line each, is in [`CLAUDE.md`](./CLAUDE.md#commands). Three things worth knowing before they surprise you:
+The rest of the build steps are in [`CLAUDE.md`](./CLAUDE.md#commands), and the benchmarks in [`bench/README.md`](./bench/README.md). Three things worth knowing before they surprise you:
 
 **The refusals never cache.** The compiler keeps nothing from a compilation that failed, so every one of them is re-analysed on every run. They are the floor of a run rather than its slow part: a run after an edit is longer by whichever single compilation is biggest, because that one cannot be split across cores. [`bench/result/build.md`](./bench/result/build.md) has the numbers and the levers.
 

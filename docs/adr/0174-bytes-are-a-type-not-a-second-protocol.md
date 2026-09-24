@@ -110,7 +110,7 @@ over, because the Wire passed nilo's wrapper to the driver untouched where
 `postgres.zig` opens the tuple now the way `sqlite.zig` does (`opened`), a
 batch element opens to the slice inside the caller's row (`ArrayElement`),
 and `sql/live.zig` writes one through every statement shape that binds one.
-The account is in [`history.md`](../history.md#a-type-both-wires-name-was-tested-on-one-of-them).
+The account is in [`history.md`](../history.md#tests-that-could-not-fail).
 
 ## Consequences
 
