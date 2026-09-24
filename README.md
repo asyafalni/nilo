@@ -5,8 +5,8 @@
 </p>
 
 <p align="center">
-  <a href="https://www.http-arena.com/frameworks/nilo/"><img alt="HTTP Arena H/1.1: #3 of 100" src="https://img.shields.io/static/v1?label=HTTP%20Arena%20H%2F1.1&message=%233%20of%20100&color=e3b341&labelColor=8a5a12&style=flat-square"></a>
-  <a href="https://www.http-arena.com/frameworks/nilo/"><img alt="HTTP Arena WebSocket: #1 of 29" src="https://img.shields.io/static/v1?label=HTTP%20Arena%20WebSocket&message=%231%20of%2029&color=e3b341&labelColor=8a5a12&style=flat-square"></a>
+  <a href="https://www.http-arena.com/frameworks/nilo/"><img alt="HTTP Arena H/1.1: #2 of 79" src="https://img.shields.io/static/v1?label=HTTP%20Arena%20H%2F1.1&message=%232%20of%2079&color=e3b341&labelColor=8a5a12&style=flat-square"></a>
+  <a href="https://www.http-arena.com/frameworks/nilo/"><img alt="HTTP Arena WebSocket: #1 of 22" src="https://img.shields.io/static/v1?label=HTTP%20Arena%20WebSocket&message=%231%20of%2022&color=e3b341&labelColor=8a5a12&style=flat-square"></a>
 </p>
 
 <p align="center">
@@ -48,7 +48,7 @@ Those three lines are a complete route. From them you get:
 
 ### At a glance
 
-- 🏁 **#3 of 100** on [HttpArena](https://www.http-arena.com/frameworks/nilo/)'s HTTP/1.1 board, and **#1 of 29** on WebSocket.
+- 🏁 **#2 of 79** on [HttpArena](https://www.http-arena.com/frameworks/nilo/)'s HTTP/1.1 board, and **#1 of 22** on WebSocket, among untuned entries.
 - 🪶 **1 allocation** per request. A test fails if it ever becomes 2.
 - 💾 **4,669 bytes** per idle connection.
 - 🧯 **386 mistakes caught while compiling**, each with a sentence that tells you the fix.
@@ -262,7 +262,7 @@ The same things make nilo easy for coding agents: a small API, no ordering to gu
 
 ## 📏 Performance, measured
 
-On [HttpArena](https://www.http-arena.com/frameworks/nilo/), an independent board that runs every entry on the same 64-core machine, nilo is **#3 of 100 frameworks on HTTP/1.1** and **#1 of 29 on WebSocket**.
+On [HttpArena](https://www.http-arena.com/frameworks/nilo/), an independent board that runs every entry on the same 64-core machine, nilo is **#2 of 79 on HTTP/1.1** and **#1 of 22 on WebSocket**, among untuned entries like itself.
 
 | | |
 |---|---|
