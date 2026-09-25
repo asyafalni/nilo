@@ -719,6 +719,30 @@ pub const Options = struct {
     /// Checked at `listen()`: the wrong length stops the server with a
     /// message, rather than every request failing once the traffic arrives.
     session_secret: ?[]const u8 = null,
+
+    /// Secrets a session cookie is still opened under when `session_secret`
+    /// does not open it. Nothing is ever sealed under one (ADR 225).
+    ///
+    /// **This is how the secret changes without signing everybody out.** Put
+    /// the new secret in `session_secret` and the old one here, and every
+    /// cookie out there keeps working until it expires. The expiry inside the
+    /// seal is what bounds the wait: once the longest `max_age` you seal with
+    /// has passed since the switch, no cookie sealed under the old secret can
+    /// open anyway, and it can be dropped from here.
+    ///
+    /// **On several instances, change it in two deploys.** While a deploy
+    /// rolls out, some instances seal under the new secret and the rest do
+    /// not know it yet. So the first deploy adds the new secret here and
+    /// changes nothing else, and the second swaps the two.
+    ///
+    /// **Not for a secret that leaked.** A fallback still opens every cookie
+    /// sealed under it, including the ones somebody forged with it. Drop a
+    /// leaked secret outright, and everybody signs in again.
+    ///
+    /// At most `nilo.session.max_fallbacks` (3), each 32 bytes, none the same
+    /// as `session_secret` or another. Each is one more decryption for a
+    /// cookie the current secret does not open, and nothing for one it does.
+    session_fallback_secrets: []const []const u8 = &.{},
 };
 
 /// How many OS threads `options` means: `threads` when it was set, one per

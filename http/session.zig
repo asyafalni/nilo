@@ -121,11 +121,26 @@ pub const default_max_age: i64 = 24 * 60 * 60;
 /// Where the sealed bytes start once the nonce is out of the way.
 const overhead = Cipher.nonce_length + Cipher.tag_length;
 
+/// How many fallback secrets a session may still be opened under.
+///
+/// **Each one is one more decryption for every cookie the current secret does
+/// not open** (ADR 225): a cookie sealed before the rotation, and a forged or
+/// stale one of the right length. A refused decryption measured 270ns, so
+/// three bound a forged cookie at about 1.1µs. An old secret needs to stay a
+/// fallback for one `max_age` and no longer, so needing a fourth means
+/// rotating faster than a session lasts, and the answer to that is a shorter
+/// `max_age`.
+pub const max_fallbacks = 3;
+
 pub const Error = error{
-    /// The secret is not `key_len` bytes.
+    /// The secret, or one of the fallbacks, is not `key_len` bytes.
     SessionSecretWrongLength,
-    /// A session was asked for and the application never set a secret.
+    /// Fallback secrets were given with no secret to seal under.
     SessionSecretMissing,
+    /// A fallback secret is the current one, or another fallback.
+    SessionSecretRepeated,
+    /// More than `max_fallbacks` fallback secrets.
+    SessionSecretsTooMany,
 };
 
 // ---- what a session may hold ----
@@ -412,6 +427,22 @@ pub fn open(comptime T: type, text: []const u8, key: Key) ?T {
 /// It is also what a test of an application's own can use to stand a session
 /// at any age it likes without moving the machine's clock.
 pub fn openAt(comptime T: type, text: []const u8, key: Key, now: i64) ?T {
+    return openAmong(T, text, key, &.{}, now);
+}
+
+/// `openAt`, trying the fallback secrets after the current one (ADR 225).
+///
+/// **The current secret first, and the fallbacks only when it fails**, so a
+/// cookie sealed since the rotation, which is nearly every cookie, costs what
+/// it cost before there were fallback secrets. There is no key id in the cookie
+/// to pick one by: adding one would change the format, and a format change
+/// signs everybody out, which is the thing rotating is meant not to do.
+///
+/// The cookie is decoded once and each key is one decryption. A cookie that
+/// decrypts is then held to the version, the shape and the expiry exactly as
+/// one under the current secret is: a fallback changes which key opens
+/// a cookie, never how long it lives.
+fn openAmong(comptime T: type, text: []const u8, key: Key, fallbacks: []const Key, now: i64) ?T {
     const sealed_len = std.base64.standard.Decoder.calcSizeForSlice(text) catch return null;
     if (sealed_len != plainSize(T) + overhead) return null;
 
@@ -422,7 +453,15 @@ pub fn openAt(comptime T: type, text: []const u8, key: Key, now: i64) ?T {
     const nonce = raw[0..Cipher.nonce_length];
     const body = raw[Cipher.nonce_length..][0..plain.len];
     const tag = raw[Cipher.nonce_length + plain.len ..][0..Cipher.tag_length];
-    Cipher.decrypt(&plain, body, tag.*, "", nonce.*, key) catch return null;
+    opened: {
+        Cipher.decrypt(&plain, body, tag.*, "", nonce.*, key) catch {
+            for (fallbacks) |fallback| {
+                Cipher.decrypt(&plain, body, tag.*, "", nonce.*, fallback) catch continue;
+                break :opened;
+            }
+            return null;
+        };
+    }
 
     if (plain[0] != format_version) return null;
     if (std.mem.readInt(u32, plain[1..5], .little) != comptime fingerprint(T)) return null;
@@ -458,6 +497,36 @@ pub fn checkSecret(secret: []const u8) Error!Key {
     var key: Key = undefined;
     @memcpy(&key, secret);
     return key;
+}
+
+/// The fallback secrets, checked and copied into `into`, asked at `listen()`
+/// beside `checkSecret` (ADR 225).
+///
+/// Each is refused for the reason the current one would be, and two more
+/// things are refused because they are a rotation that did not happen: a
+/// fallback that is the current secret, and one listed twice. Both would
+/// work, and both would leave somebody believing an old secret had stopped
+/// sealing when it had not, or paying a decryption for nothing.
+///
+/// It takes the current key as optional because fallback secrets with none to
+/// seal under are refused too: they would open cookies nothing can seal any
+/// more, which is a rotation with its first half missing.
+pub fn checkFallbacks(
+    current: ?Key,
+    fallbacks: []const []const u8,
+    into: *[max_fallbacks]Key,
+) Error![]const Key {
+    if (fallbacks.len == 0) return &.{};
+    const key = current orelse return error.SessionSecretMissing;
+    if (fallbacks.len > max_fallbacks) return error.SessionSecretsTooMany;
+    for (fallbacks, 0..) |secret, i| {
+        into[i] = try checkSecret(secret);
+        if (std.mem.eql(u8, &into[i], &key)) return error.SessionSecretRepeated;
+        for (into[0..i]) |earlier| {
+            if (std.mem.eql(u8, &into[i], &earlier)) return error.SessionSecretRepeated;
+        }
+    }
+    return into[0..fallbacks.len];
 }
 
 // ---- the handler-facing type ----
@@ -532,7 +601,10 @@ pub fn Session(comptime T: type) type {
                 .{key_len},
             );
             const text = c.cookie(cookie_name) orelse return .{ .value = null, ._c = c };
-            return .{ .value = open(T, text.view(), key.*), ._c = c };
+            return .{
+                .value = openAmong(T, text.view(), key.*, c._session_fallbacks.*, nowSeconds()),
+                ._c = c,
+            };
         }
 
         /// What the client sent, or null if it sent nothing nilo could read.
@@ -871,6 +943,76 @@ test "two seals of the same value differ, because the nonce does" {
     try testing.expectEqual(@as(u32, 7), open(Signed, second, key_a).?.user);
 }
 
+test "a cookie sealed under a fallback secret still opens, and one under a dropped secret does not" {
+    const key_c: Key = @splat(0x3C);
+    var buf: Sealed(Signed) = undefined;
+    const before = try seal(Signed, .{ .user = 7 }, far_future, key_a, &buf);
+
+    // Rotated from `key_a` to `key_b`, with `key_a` a fallback: the cookie out
+    // there keeps working.
+    try testing.expectEqual(@as(u32, 7), openAmong(Signed, before, key_b, &.{key_a}, 0).?.user);
+    // Behind another fallback too, whatever the order.
+    try testing.expectEqual(@as(u32, 7), openAmong(Signed, before, key_b, &.{ key_c, key_a }, 0).?.user);
+    // And once `key_a` is dropped, it is no session, like any other secret
+    // this server does not hold.
+    try testing.expect(openAmong(Signed, before, key_b, &.{key_c}, 0) == null);
+    try testing.expect(openAmong(Signed, before, key_b, &.{}, 0) == null);
+}
+
+test "a fallback secret opens a cookie until its own expiry and not a second after" {
+    // A fallback changes which key opens a cookie and never how long it lives.
+    // That is what makes one `max_age` the whole wait before a fallback secret
+    // can be dropped: no cookie sealed under it outlives that.
+    const signed_at: i64 = 1_800_000_000;
+    var buf: Sealed(Signed) = undefined;
+    const text = try seal(Signed, .{ .user = 7 }, signed_at + 60, key_a, &buf);
+
+    try testing.expect(openAmong(Signed, text, key_b, &.{key_a}, signed_at + 59) != null);
+    try testing.expect(openAmong(Signed, text, key_b, &.{key_a}, signed_at + 60) == null);
+}
+
+test "a cookie under the current secret opens without any fallback being tried" {
+    // Not observable through the answer, which would be the same either
+    // way, so observed through fallbacks that could not open anything:
+    // the cookie opens under the current key and the list is never reached.
+    var buf: Sealed(Signed) = undefined;
+    const text = try seal(Signed, .{ .user = 7 }, far_future, key_b, &buf);
+    try testing.expectEqual(@as(u32, 7), openAmong(Signed, text, key_b, &.{ key_a, key_a, key_a }, 0).?.user);
+}
+
+test "every byte of a cookie under a fallback secret is still covered by its tag" {
+    var buf: Sealed(Signed) = undefined;
+    const text = try seal(Signed, .{ .user = 7 }, far_future, key_a, &buf);
+    for (0..text.len) |i| {
+        var broken: Sealed(Signed) = undefined;
+        @memcpy(&broken, text);
+        broken[i] = if (broken[i] == 'A') 'B' else 'A';
+        try testing.expect(openAmong(Signed, &broken, key_b, &.{key_a}, 0) == null);
+    }
+}
+
+test "fallback secrets are checked the way the current one is, and a rotation that did not happen is refused" {
+    var into: [max_fallbacks]Key = undefined;
+    const a = "a" ** key_len;
+    const b = "b" ** key_len;
+    const c = "c" ** key_len;
+    const d = "d" ** key_len;
+    const current: Key = ("n" ** key_len).*;
+
+    // No fallbacks is nothing to check, with or without a current key.
+    try testing.expectEqual(@as(usize, 0), (try checkFallbacks(null, &.{}, &into)).len);
+
+    const kept = try checkFallbacks(current, &.{ a, b, c }, &into);
+    try testing.expectEqual(@as(usize, 3), kept.len);
+    try testing.expectEqualStrings(b, &kept[1]);
+
+    try testing.expectError(error.SessionSecretMissing, checkFallbacks(null, &.{a}, &into));
+    try testing.expectError(error.SessionSecretsTooMany, checkFallbacks(current, &.{ a, b, c, d }, &into));
+    try testing.expectError(error.SessionSecretWrongLength, checkFallbacks(current, &.{ a, "short" }, &into));
+    try testing.expectError(error.SessionSecretRepeated, checkFallbacks(current, &.{"n" ** key_len}, &into));
+    try testing.expectError(error.SessionSecretRepeated, checkFallbacks(current, &.{ a, b, a }, &into));
+}
+
 // ---- through a real request ----
 //
 // The tests above are about the bytes. These are about the wiring: that a
@@ -982,6 +1124,39 @@ test "a cookie sealed under another secret is no session rather than an error" {
     ));
     // Not a 500 and not an admin: a 404, exactly as if nothing was sent.
     try testing.expectEqual(@as(u16, 404), answer.status);
+}
+
+test "after a rotation, the old cookie is still signed in and the new one is sealed under the new secret" {
+    // The whole feature, through the App: `key_a` was the secret, `key_b` is
+    // now, and `key_a` is its fallback.
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    app.session_key = key_b;
+    app.session_fallbacks = &.{key_a};
+    try app.post("/sign-in", signInHandler);
+    try app.get("/who", whoHandler);
+
+    var client = try nilo_testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+
+    var buf: Sealed(Signed2) = undefined;
+    const old = try seal(Signed2, .{ .user = 3 }, far_future, key_a, &buf);
+    var request: [4096]u8 = undefined;
+    const answer = try client.send(&app, try std.fmt.bufPrint(
+        &request,
+        "GET /who HTTP/1.1\r\nHost: test\r\nCookie: {s}={s}\r\n\r\n",
+        .{ cookie_name, old },
+    ));
+    try testing.expectEqual(@as(u16, 200), answer.status);
+    var body: [256]u8 = undefined;
+    try testing.expectEqualStrings("{\"user\":3,\"admin\":false}", try answer.text(&body));
+
+    // A fallback secret opens and never seals: what `set` writes now opens
+    // under `key_b` alone and not under `key_a`.
+    const header = (try client.post(&app, "/sign-in", "")).setCookie(cookie_name).?;
+    const value = header[cookie_name.len + 1 .. std.mem.indexOfScalar(u8, header, ';') orelse header.len];
+    try testing.expectEqual(@as(u32, 7), open(Signed2, value, key_b).?.user);
+    try testing.expect(open(Signed2, value, key_a) == null);
 }
 
 test "clearing sends a deletion the browser will act on" {

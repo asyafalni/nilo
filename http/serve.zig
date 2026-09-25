@@ -356,6 +356,7 @@ pub noinline fn serveRequest(
         // A pointer to the App's copy, not the copy: the key is 32 bytes
         // on every Ctx otherwise, for something almost no request reads.
         ._session_key = if (self.session_key) |*k| k else null,
+        ._session_fallbacks = &self.session_fallbacks,
         ._compressors = if (self.compressors) |*p| p else null,
         ._params = &.{},
         ._services = &self.services,

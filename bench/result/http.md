@@ -2804,6 +2804,36 @@ Fiber and actix are not the fast routers they are fast frameworks around: under 
 
 Stripped `ReleaseFast`, `-Dtarget=x86_64-linux-gnu`, `git archive HEAD` (`0ba6fe3`) against the working tree with the tree in it, each built from a scratch directory of the same path length: `examples/hello` 964,960 → 966,576 (**+1,616 B**), `examples/rest` 1,155,464 → 1,156,872 (**+1,408 B**). The same tree carries ADR 224's CSRF middleware, which neither example names and so neither pays for. The row is in ADR 017's running total.
 
+## A fallback session secret
+
+25 September 2026, on the Ryzen 7 9700X above, `0ba6fe3` plus the working tree of ADR 225. The "before" is that working tree with only ADR 225 taken out: `http/session.zig`, `ctx.zig`, `app.zig` and `bulkhead.zig` from `HEAD`, and the one line in `serve.zig`.
+
+**What trying one more key costs.** `XChaCha20Poly1305` on the plaintext of a `Session(struct { user: u32, admin: bool })` (18 bytes), 2,000,000 calls a round, five rounds, `ReleaseFast`, pinned to one core with `taskset -c 2`. The harness is a single file in the session scratchpad and is not kept, because the whole of it is the two loops below.
+
+| | ns a call, five rounds |
+|---|---|
+| decrypt under the right key | 374.1–374.6 |
+| decrypt refused under a wrong key | 270.1–270.6 |
+
+A refusal is cheaper than an open by the work after the tag, and it is not free: the subkey and the Poly1305 key have to be derived before the tag can be checked at all. So each fallback is 270ns on a cookie the current secret does not open, and three bound a forged cookie at four refusals, about 1.1µs. A cookie under the current secret opens on the first try and costs what it did. This is the number that set `max_fallbacks` at three rather than leaving it unbounded.
+
+**Memory per idle connection.** `Ctx` goes from 816 to 824 bytes: a pointer to the App's slice rather than the slice, which measured 832. `bench/mem.py --path /health --steps 1000,5000,10000` against `nilo-hello` built `ReleaseFast` from each tree, before and after interleaved twice:
+
+| | 1,000 | 5,000 | 10,000 |
+|---|---|---|---|
+| before, run 1 | 5,247 | 5,197 | **5,190** |
+| after, run 1 | 5,247 | 5,197 | **5,190** |
+| before, run 2 | 5,247 | 5,197 | **5,190** |
+| after, run 2 | 5,247 | 5,197 | **5,190** |
+
+**The same to the byte.** The only difference is at zero connections, 12 kB higher after on both runs, which is the larger binary mapped in. 5,190 is not the 4,669 in ADR 017 for the reason [`fetch.md`](fetch.md#the-transfer-buffer-was-never-a-resident-page) gives: this box reads `/health` at 5,186 whatever is measured on it, so only the difference is comparable.
+
+**Binary size.** Stripped `ReleaseFast`, each tree from a scratch directory of the same path length: `examples/hello` 966,576 → 967,200 (**+624 B**), `examples/rest` 1,156,872 → 1,157,464 (**+592 B**), `examples/forms`, the one example that seals a session, 1,063,400 → 1,063,928 (+528 B). It is the check in `listen()` and its four one-line messages, which a program that listens links whether it names a fallback or not.
+
+**A misreading on the way, kept because it looks like a result.** The first size comparison put the two trees' binaries in one `ls -l out-before/bin/ out-after/bin/`, and read the change as 624 bytes *smaller*. `ls` sorts its arguments, so `out-after` was printed first. Building each tree again from a second directory reproduced both sizes to the byte, which is what settled it. Name the side on the line that prints the number.
+
+**Can it be pushed further:** not on the path that matters, which is already the cost it was. A key id in the cookie would take a stale cookie from 270ns a fallback to none, and would sign everybody out once to get there (ADR 225).
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

@@ -11,6 +11,7 @@ handler's own struct T   ──►  s.set(value)  ──►  seal  ──►  Se
                                               │
                              [version][fingerprint of T][expires_at][fields]
                              XChaCha20Poly1305, key from the application
+                             (opened under the current key, then each fallback)
 ```
 
 `putHeader` is the one place every response header passes through, cookie or not, so a check written there covers every way of setting one. `Set-Cookie` and `Vary` are the two response headers that repeat instead of replacing, for opposite reasons.
@@ -30,6 +31,7 @@ handler's own struct T   ──►  s.set(value)  ──►  seal  ──►  Se
 11. **The cipher is `XChaCha20Poly1305`, encrypted rather than merely signed**, so a field like a role or a tenant id is not a thing the user can read back. The 192-bit nonce is generated fresh each time because there is nowhere on the server to keep a counter. [ADR 033](../adr/033-a-session-is-sealed-into-the-cookie.md)
 12. **The secret is the application's and has no default**; `listen()` checks its length and refuses to start rather than sealing under zeroes. `Session(T)` with no secret set is a 500 naming the option. [ADR 033](../adr/033-a-session-is-sealed-into-the-cookie.md)
 13. **`Session(T)` is a resolved value, decrypted once per request however many things ask, and reading and writing are separate calls** (`s.value` versus `s.set(...)`), because a mutated copy of a by-value argument would compile cleanly and go nowhere. [ADR 033](../adr/033-a-session-is-sealed-into-the-cookie.md)
+14. **A fallback secret opens a cookie and never seals one**, so the secret changes without signing anybody out. The current secret is tried first, then up to three fallbacks in order; there is no key id in the cookie, because adding one would change the format and sign everybody out once. The sealed expiry bounds the wait: one `max_age` after the switch, nothing sealed under the old secret opens anyway. On several instances a rotation is two deploys, the new secret staged as a fallback first. A leaked secret is dropped, never kept as a fallback. [ADR 225](../adr/225-a-fallback-session-secret-opens-and-never-seals.md)
 
 ## Decisions
 
@@ -37,9 +39,10 @@ handler's own struct T   ──►  s.set(value)  ──►  seal  ──►  Se
 |---|---|
 | [029](../adr/029-a-header-is-checked-once-and-two-of-them-repeat.md) | Cookies as a mechanism: reading, the header choke point, and which headers repeat |
 | [033](../adr/033-a-session-is-sealed-into-the-cookie.md) | A session as policy over that mechanism: sealed, encrypted, expiring, unrevocable |
+| [225](../adr/225-a-fallback-session-secret-opens-and-never-seals.md) | Rotating the secret: fallback secrets open and never seal, three at most, kept for one `max_age` |
 
 Beside this topic: a `Session(T)` is not a `Token`, see [jwt](jwt.md) for the credential nilo verifies rather than issues; the clock the sealed expiry is checked against is [ADR 041](../adr/041-core-knows-what-time-it-is.md), see [id-clock-entropy](id-clock-entropy.md); the entropy the nonce is drawn from is [ADR 042](../adr/042-entropy-belongs-to-the-loop.md), also in [id-clock-entropy](id-clock-entropy.md).
 
 ## Open
 
-- **Key rotation is not settled.** Changing the session secret signs everybody out at once; a second key to decrypt under, how many to keep, and what happens to a cookie sealed under a dropped key are not built, and [ADR 033](../adr/033-a-session-is-sealed-into-the-cookie.md) says a future change should carry its own line in `docs/roadmap.md` rather than assume that ADR still speaks for it.
+Nothing is open.

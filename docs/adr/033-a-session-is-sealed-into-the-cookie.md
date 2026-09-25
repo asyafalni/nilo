@@ -87,6 +87,6 @@ A resolved value is handed to the handler **by value**. A mutated copy would go 
 
 The one behaviour change a user can see, and it is a real one: everybody holding a session was signed out the day the plaintext layout moved, the same thing adding a field to the session struct has always done, and from then on a session cookie that used to work indefinitely stops after a day unless `max_age` says otherwise.
 
-### What this does not settle
+### Rotation
 
-**Rotation.** Changing the secret signs everybody out at once. Doing better means a second key to decrypt with and a decision about how long to keep it, how many keys, where the list comes from, what happens to a cookie sealed under a key that has been dropped. Not built, and not currently carried as its own line in `docs/roadmap.md`; a future change should add one rather than assume this file still speaks for it.
+Changing the secret used to sign everybody out at once. [ADR 225](./225-a-fallback-session-secret-opens-and-never-seals.md) adds fallback secrets, which open a cookie and never seal one, and the expiry above is what bounds how long one has to be kept: one `max_age`.

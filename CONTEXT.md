@@ -92,6 +92,10 @@ _Avoid_: session, token, crumb
 A struct of the caller's own, sealed into one Cookie and held by the client. Encrypted and signed, so the client can tell that it has one and not what is in it. Nothing is kept on the server, which is why it cannot be revoked and why its size has to be settled while compiling. Asked for as `Session(T)`, and a Resolved value like any other.
 _Avoid_: session store, session id, token, JWT, login
 
+**Fallback secret**:
+A secret a Session is opened under and never sealed under, so the secret can change without signing anybody out. Usually the old secret, kept for one `max_age` after the switch, because the expiry inside the seal means nothing sealed under it opens after that; on several instances, first the new one, staged a deploy ahead. Not what a leaked secret becomes: that one is dropped.
+_Avoid_: retired secret, secondary key, key ring
+
 **Redirect**:
 An answer that is a status and a `Location` rather than a body, returned by the handler with its status in the type. `Redirect(303)` is the one a form POST wants, because it turns the follow-up into a GET.
 _Avoid_: forward, 302, location header

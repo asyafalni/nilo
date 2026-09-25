@@ -56,6 +56,57 @@ head -c 32 /dev/urandom | base64
 A handler that asks for a `Session(T)` when no secret was set answers **500**
 with a sentence naming the option. It does not fall back to anything.
 
+## Changing the secret
+
+Put the new secret in `session_secret` and the one it replaces in
+`session_fallback_secrets`:
+
+```zig
+try app.listen(.{
+    .session_secret = new_secret,
+    .session_fallback_secrets = &.{old_secret},
+});
+```
+
+Every session sealed from then on is sealed under the new secret. A cookie
+sealed under the old one still opens, so nobody is signed out by the deploy
+([ADR 225](../adr/225-a-fallback-session-secret-opens-and-never-seals.md)).
+
+**Drop the old secret once one `max_age` has passed.** The expiry is sealed
+inside every cookie, so by then nothing sealed under the old secret can open
+anyway. With no `max_age` that is 24 hours; with `.max_age = 30 * 24 * 60 * 60`
+it is thirty days.
+
+| | why |
+|---|---|
+| At most three fallback secrets | each is one more decryption, about 270 ns, for every cookie the current secret does not open |
+| Each exactly 32 bytes | checked at `listen()`, like the current one |
+| None the same as `session_secret`, and none twice | that is a rotation that did not happen, and `listen()` says so |
+| Fallback secrets need a `session_secret` | otherwise nothing could seal a new session |
+
+A cookie under the current secret costs exactly what it did before. Only a
+cookie the current secret does not open is tried under the fallbacks, in
+the order you listed them.
+
+**On several instances, it is two deploys.** While a deploy rolls out, the
+instances already updated seal under the new secret, and one not yet updated
+cannot open what they wrote. So stage the new secret first:
+
+```zig
+// Deploy 1: every instance learns to open the new secret. Nothing seals under it yet.
+.{ .session_secret = old_secret, .session_fallback_secrets = &.{new_secret} }
+
+// Deploy 2, once the first has reached every instance: swap them.
+.{ .session_secret = new_secret, .session_fallback_secrets = &.{old_secret} }
+```
+
+A single instance can go straight to the second.
+
+**Not after a leak.** A fallback secret still opens every cookie sealed under
+it, including one forged by whoever has the secret. A leaked secret is
+dropped outright, and everybody signs in again. That is the right answer
+after a leak, not the cost of one.
+
 ## What a session may hold
 
 A struct of your own, of a size known while compiling: integers, floats,
@@ -158,9 +209,9 @@ fn me(s: nilo.Session(Signed), db: *Db) !?Profile {
 That is a lookup — but it is the lookup you were doing anyway to answer the
 request, rather than a second one to find the session.
 
-**Changing the secret signs everybody out.** Rotating without doing that needs
-a second key to decrypt with, and that is not built yet
-([roadmap](../roadmap.md)).
+**Changing the secret does not have to sign everybody out**: keep the old
+one as a fallback ([above](#changing-the-secret)). Dropping it outright does, and after a
+leak that is what you want.
 
 ## Changing the shape is safe
 
@@ -375,5 +426,6 @@ rather than listening:
 var app = nilo.App.init(testing.allocator);
 defer app.deinit();
 app.session_key = @splat(0xA5);          // what `.session_secret` becomes
+app.session_fallbacks = &.{@splat(0x5A)};  // and `.session_fallback_secrets`, for a rotation
 try app.post("/sign-in", signIn);
 ```

@@ -180,7 +180,9 @@ Every way a cookie can be unreadable — tampered, truncated, expired, sealed
 under another secret, written by a build with a different shape of `T` — is the
 same answer, `null`. The secret comes from
 `listen(.{ .session_secret = … })` and must be exactly 32 bytes; a handler
-asking for a session with none set answers 500.
+asking for a session with none set answers 500. A cookie the secret does not
+open is tried under each of `session_fallback_secrets`, which open and never
+seal ([ADR 225](../adr/225-a-fallback-session-secret-opens-and-never-seals.md)).
 
 ## `Upload`
 

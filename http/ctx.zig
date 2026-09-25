@@ -35,6 +35,11 @@ const watchdog = @import("watchdog.zig");
 const authorization_mod = @import("authorization.zig");
 const verified_mod = @import("verified.zig");
 const versioned_mod = @import("versioned.zig");
+
+/// What `Ctx._session_fallbacks` points at when there are no fallbacks, which is
+/// every App that never rotated and every Ctx a test builds by hand.
+const no_fallbacks: []const [32]u8 = &.{};
+
 const Str = str_mod.Str;
 
 /// What one request is allowed to do. Filled from `listen()`'s options and
@@ -166,6 +171,14 @@ pub const Ctx = struct {
     /// the way `resolve` below does it. `session.zig` asserts the two agree,
     /// so the duplication cannot drift silently.
     _session_key: ?*const [32]u8 = null,
+    /// Secrets a session cookie is opened under when `_session_key` does not
+    /// open it, and never sealed under, from
+    /// `listen(.{ .session_fallback_secrets = … })` (ADR 225).
+    ///
+    /// A pointer to the App's slice rather than the slice, so it is 8 bytes on
+    /// every Ctx rather than 16, for something only a request whose cookie
+    /// the current secret did not open ever reads.
+    _session_fallbacks: *const []const [32]u8 = &no_fallbacks,
     /// The compressors `app.compress` gave the App, or null when it never
     /// did, which is what every App that did not ask for it gets, and a
     /// test driving a handler by hand. A pointer to the App's, eight bytes

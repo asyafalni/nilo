@@ -177,6 +177,15 @@ pub const App = struct {
     /// with no sessions, and for one a test drives directly — a test that
     /// wants sessions sets this field.
     session_key: ?session_mod.Key = null,
+    /// Secrets a session cookie is opened under when `session_key` does not
+    /// open it, and never sealed under, from
+    /// `listen(.{ .session_fallback_secrets = … })` (ADR 225). A test that wants a rotation sets this field, the way it
+    /// sets `session_key`.
+    session_fallbacks: []const session_mod.Key = &.{},
+    /// Where `listen()` copies the fallback secrets, so that what the caller
+    /// passed does not have to outlive the call. `session_fallbacks` points
+    /// into it.
+    fallback_store: [session_mod.max_fallbacks]session_mod.Key = undefined,
     /// Who ran `nilo_start` over the registry, if anybody. `start` sets it
     /// for a program that never listens — a test, a script — and `listen()`
     /// sets it on the server's own loop. **`.start` and then `listen()` is
@@ -1136,12 +1145,15 @@ pub const App = struct {
         self.tryListen(options_) catch |err| {
             // Every one of these has already said, in one line, what is
             // wrong and what to change. `TrustedProxyNotAnAddress`,
-            // `SessionSecretWrongLength` and `StartedOnAnotherLoop` are
-            // `tryListen`'s own; the rest are the Engine's.
+            // the four `SessionSecret…` errors and `StartedOnAnotherLoop`
+            // are `tryListen`'s own; the rest are the Engine's.
             if (bulkhead.explained(err) or
                 err == error.MissingService or
                 err == error.TrustedProxyNotAnAddress or
                 err == error.SessionSecretWrongLength or
+                err == error.SessionSecretMissing or
+                err == error.SessionSecretRepeated or
+                err == error.SessionSecretsTooMany or
                 err == error.StartedOnAnotherLoop) std.process.exit(1);
             return err;
         };
@@ -1212,6 +1224,7 @@ pub const App = struct {
                 return error.SessionSecretWrongLength;
             };
         }
+        try self.keepFallbacks(options_.session_fallback_secrets);
         try bulkhead.serve(
             self.gpa,
             options_,
@@ -1222,6 +1235,45 @@ pub const App = struct {
             serve.handleConnection,
             serveGrpc,
         );
+    }
+
+    /// Check the fallback session secrets and copy them onto the App, or say in
+    /// one line what is wrong with them (ADR 225). Its own function so that
+    /// `tryListen` reads as the list of what it checks.
+    fn keepFallbacks(self: *App, fallbacks: []const []const u8) !void {
+        self.session_fallbacks = session_mod.checkFallbacks(self.session_key, fallbacks, &self.fallback_store) catch |err| {
+            switch (err) {
+                error.SessionSecretMissing => std.log.err(
+                    "{d} fallback session secrets were given and no session_secret, so they would " ++
+                        "open cookies nothing can seal any more. A rotation keeps the new secret " ++
+                        "in session_secret and the old one in session_fallback_secrets.",
+                    .{fallbacks.len},
+                ),
+                error.SessionSecretsTooMany => std.log.err(
+                    "{d} fallback session secrets were given and at most {d} are kept: each is one " ++
+                        "more decryption for every cookie the current secret does not open. A " ++
+                        "secret needs to stay a fallback for one max_age; drop the oldest.",
+                    .{ fallbacks.len, session_mod.max_fallbacks },
+                ),
+                error.SessionSecretWrongLength => for (fallbacks) |secret| {
+                    if (secret.len == session_mod.key_len) continue;
+                    std.log.err(
+                        "a fallback session secret is {d} bytes and it has to be exactly {d}, " ++
+                            "the length it had when it was the session secret.",
+                        .{ secret.len, session_mod.key_len },
+                    );
+                    break;
+                },
+                error.SessionSecretRepeated => std.log.err(
+                    "a fallback session secret is the same as session_secret or as another " ++
+                        "fallback, so the rotation it stands for did not happen. The new " ++
+                        "secret goes in session_secret and only the old ones in " ++
+                        "session_fallback_secrets.",
+                    .{},
+                ),
+            }
+            return err;
+        };
     }
 
     /// Everything `listen()` does **before it accepts anything**, for a
