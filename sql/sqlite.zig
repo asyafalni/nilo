@@ -128,14 +128,15 @@ pub const Threading = union(enum) {
     /// Hand it to the Engine's thread pool and park the fiber until it comes
     /// back.
     ///
-    /// The payload is the namespace holding `blocking` — `nilo` itself:
+    /// The payload is the namespace holding `blockingReserved`, `nilo`
+    /// itself:
     ///
     /// ```zig
     /// const Wire = sqlite.Wire(.{ .threading = .{ .hop = nilo } });
     /// ```
     ///
     /// It arrives from the caller's program rather than being imported here
-    /// because `blocking` lives in `http/bulkhead.zig` and `sql/` may not name
+    /// because it lives in `http/bulkhead.zig` and `sql/` may not name
     /// `nilo_http` — `zig build layering` refuses it. `std.Io.concurrent` is
     /// not the way round it: zio implements that slot by starting a *fiber*,
     /// so a blocking call inside one holds an executor thread exactly as it
@@ -750,7 +751,11 @@ pub fn Wire(comptime opts_in: Options) type {
         inline fn onThread(comptime f: anytype, args: anytype) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
             return switch (comptime opts.threading) {
                 .in_fiber => @call(.auto, f, args),
-                .hop => |Engine| Engine.blocking(f, args),
+                // Reserved rather than queued: the statement holds its
+                // connection while it waits, and behind a slow call on the
+                // pool's one busy worker it held the writer from everyone
+                // (zio#745).
+                .hop => |Engine| Engine.blockingReserved(f, args),
             };
         }
 
@@ -1222,8 +1227,8 @@ const testing = std.testing;
 ///
 /// `.in_fiber` because there is no Engine here to hop to — these run under
 /// `std.Io.Threaded`, which is std's own. That is not a gap: `.hop` is a call
-/// into `nilo.blocking`, and what is worth testing is the statement rather
-/// than which thread ran it.
+/// into `nilo.blockingReserved`, tested where the Engine is, and what is worth
+/// testing here is the statement rather than which thread ran it.
 const TestWire = Wire(.{ .threading = .in_fiber });
 
 /// Every test gets a real `std.Io`, because the pool's queue is built out of

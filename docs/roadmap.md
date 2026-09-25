@@ -33,10 +33,6 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 ### `nilo_http`
 
-**A blocking call can queue behind a busy pool thread rather than get one of its own.** `engine.blocking` submits through zio's `blockInPlace`, which does not reserve a thread, so a SQLite statement under `.hop` can hold its connection in the queue behind a slow read ([`risks.md`](./risks.md#open)). zio's fix, `blockInPlaceReserved` ([zio#746](https://github.com/lalinsky/zio/pull/746)), is in the zio `build.zig.zon` pins.
-
-**Needs:** `engine.blocking` calling `blockInPlaceReserved`, and the test that would have caught it.
-
 **`nilo.deadline(ms)` never shortens the write limit.** The write limit is armed once per connection before any request, and `giveDeadline` stores `until_ns` without re-arming it, so a route with a two-second deadline sending a large body to a slow reader runs for minutes, where `deadline.zig`'s header and [the deadlines page](./design/deadlines.md) say the clamp covers the write.
 
 **Needs:** the write limit clamped with the read ones, or the claim narrowed in both places.

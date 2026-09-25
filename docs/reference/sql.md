@@ -281,7 +281,7 @@ is no wait for the event loop to park on and the choice cannot be made for you
 
 | | |
 |---|---|
-| `.{ .hop = nilo }` | hand each statement to the Engine's thread pool and park the fiber. Costs a few microseconds per statement; **no statement can stall an executor thread**. The payload is `nilo` itself, passed in because `sql/` may not import `nilo_http` |
+| `.{ .hop = nilo }` | hand each statement to the Engine's thread pool and park the fiber, on a worker of its own (`nilo.blockingReserved`) so a statement holding its connection never queues behind a slow call. Costs a few microseconds per statement; **no statement can stall an executor thread**. The payload is `nilo` itself, passed in because `sql/` may not import `nilo_http` |
 | `.in_fiber` | run it on the fiber that asked. Faster when every statement is a cached lookup; a slow one holds a thread that serves other connections |
 
 Which is the better default is unmeasured and is an open question in

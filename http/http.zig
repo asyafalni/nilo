@@ -221,6 +221,18 @@ pub const spawn = @import("bulkhead.zig").spawn;
 /// function (ADR 002).
 pub const blocking = @import("bulkhead.zig").blocking;
 
+/// `blocking`, with a thread of its own rather than a place in the pool's
+/// queue, for a call made while holding something other requests wait for.
+///
+/// A plain `blocking` call can wait behind a slow one already on the pool.
+/// That is only a slower request, unless the caller is holding a pooled
+/// connection or a lock: then everyone waiting on that waits too. This one
+/// gets an idle worker or starts a new one, past the pool's ceiling if it
+/// has to, so it is for a call whose callers are already bounded, not for
+/// fanning work out. It is what SQLite's `.{ .hop = nilo }` uses for every
+/// statement (ADR 064).
+pub const blockingReserved = @import("bulkhead.zig").blockingReserved;
+
 /// Wait, without stopping the thread. `std.Thread.sleep` would park every
 /// other request sharing it; this parks only this one.
 ///

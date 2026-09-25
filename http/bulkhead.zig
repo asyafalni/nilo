@@ -96,7 +96,9 @@
 //! - `blocking`/`sleep` — the general form of that same problem. A handler
 //!   that calls anything blocking stops every other request sharing its
 //!   thread, and the Engine is the only layer that knows how to wait
-//!   without doing that (ADR 013).
+//!   without doing that (ADR 013). `blockingReserved` is `blocking` that
+//!   never queues behind a job already running, for a caller that holds a
+//!   connection while it waits (ADR 064).
 //! - `Dir`/`File` — open a directory, open a file inside it by name, ask
 //!   what it is, close either, and replace a whole file with bytes
 //!   already in hand. Five calls, and deliberately no sixth: no seek, no
@@ -1698,6 +1700,26 @@ fn msToNanos(ms: u32) u64 {
 /// by another route. It lands on a worker because `engine.blocking` is
 /// `zio.blockInPlace`, which submits the call to the thread pool.
 pub fn blocking(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) ReturnType(func) {
+    return handOff(engine.blocking, func, args);
+}
+
+/// `blocking`, with a thread of its own rather than a place in the pool's
+/// queue: an idle worker, or a new one past the pool's ceiling.
+///
+/// For a caller that holds something others wait for while it blocks. A
+/// SQLite statement under `.hop` holds its connection, and queued behind
+/// one slow call on the only busy worker it held the writer until that
+/// call finished, so every write after it timed out (`docs/risks.md`,
+/// zio#745). It is not for fanning work out: every call that finds no
+/// idle worker starts a thread, which is why SQLite's calls are behind a
+/// Gate sized to its connections (ADR 064).
+pub fn blockingReserved(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) ReturnType(func) {
+    return handOff(engine.blockingReserved, func, args);
+}
+
+/// What `blocking` and `blockingReserved` share: the slot carried to the
+/// worker and the wait counted where the fiber is, as `blocking` explains.
+fn handOff(comptime submit: anytype, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) ReturnType(func) {
     const Args = @TypeOf(args);
     const Carrier = struct {
         fn run(carried: ?*anyopaque, inner: Args) ReturnType(func) {
@@ -1716,7 +1738,7 @@ pub fn blocking(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) ReturnTy
     // two threads writing `waited_ns` is a race for no gain (ADR 013).
     const w = watchdog.waitingAnywhere();
     defer watchdog.waitedAnywhere(w);
-    return engine.blocking(Carrier.run, .{ slot(), args });
+    return submit(Carrier.run, .{ slot(), args });
 }
 
 fn ReturnType(comptime func: anytype) type {

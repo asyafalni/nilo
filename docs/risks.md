@@ -104,6 +104,8 @@ a class rather than an oversight: the way to learn how a block is marked is to
 copy a neighbouring page, and a dead mark used to copy as readily as a live
 one. The instance that surfaced it, `docs/guide/openapi.md`, is on the list.
 
+**A blocking call can queue behind a slow one while holding a connection.** `nilo.blockingReserved`, which every SQLite statement under `.hop` goes through: a worker of its own rather than a place in the pool's queue, with the threads it can start bounded by the Gate in front of the connections ([ADR 064](./adr/064-a-file-has-no-socket-to-wait-on.md#a-statement-under-hop-gets-a-thread-of-its-own)). The test is "a reserved blocking call gets a thread while the pool's only worker is held" in `http/engine/zio.zig`.
+
 ## Cannot be held, and said out loud instead
 
 **A panic in any handler takes the whole process down, and Go people will
@@ -128,10 +130,6 @@ the case that trap cannot watch.
 ## Open
 
 No mechanism holds these yet. Each says what it needs; until that arrives the comment at the site is what there is.
-
-**A blocking call can queue behind a slow one while holding a connection.** `nilo.blocking` is zio's `blockInPlace`, which does not reserve a pool thread, and zio starts a second worker only once twice as many jobs are queued as are running. Under `.hop`, a SQLite statement takes its connection and then hops, so one slow read on a reader leaves the next statement holding the writer in the queue behind it, and everything after that times out on the writer. Reproduced at one slow read of 25 s with the default pool; `.in_fiber` does not have it. The writer's timeout line now names the holder, and a one-line statement named there is how it is recognised ([ADR 107](./adr/107-a-wait-for-a-connection-has-a-bound.md)).
-
-**Needs:** `engine.blocking` calling `blockInPlaceReserved`, which reserves a thread and was tested at 2899 ms of queueing down to 0 ([zio#745](https://github.com/lalinsky/zio/issues/745)); the zio commit `build.zig.zon` pins carries it. Setting the runtime's `min_threads` also holds it, at a thread each kept alive for the life of the process and only up to that many calls at once, which is why it was not taken.
 
 **A fail function in spawned work is safe only because of where a threadlocal gets written.** `bulkhead.slot()` falls back to a threadlocal when a fiber has no slot, which spawned fibers never do. It is null on executor threads only because nothing on a server sets it there: `blocking` sets it on a thread-pool worker, and `serveRequest` sets it only with no Engine underneath. This one went off: `serveRequest` used to set it on every request, on the executor, and leave it set across the request's suspensions, so spawned work and job workers wrote into whichever request last set it. `setFallbackSlot` now refuses in Debug to be called from a fiber that has a slot of its own, which is the shape that broke, and every live test in the Debug run passes through it. What it cannot see is a fiber with no slot, a spawned one, setting it.
 

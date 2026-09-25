@@ -2272,6 +2272,11 @@ pub fn waitWithin(cond: *Condition, mutex: *Mutex, ms: u64) error{ Canceled, Tim
 /// what keeps a handler that uses it testable as an ordinary function.
 pub const blocking = zio.blockInPlace;
 
+/// `blocking` with a worker guaranteed: an idle one, or a new one even past
+/// the pool's `max_threads`, so the call never waits in the queue behind a
+/// job already running (zio#745).
+pub const blockingReserved = zio.blockInPlaceReserved;
+
 /// Wait, without stopping the thread. `error.Canceled` if the request was
 /// cancelled while waiting — the same failure `Mutex.lock` has, and it maps
 /// to a 503 already.
@@ -2881,4 +2886,55 @@ test "a fiber spawned local runs on the thread that spawned it" {
     var handle = try rt.spawn(H.parent, .{&wrong});
     try handle.join();
     try testing.expectEqual(@as(u32, 0), wrong.load(.monotonic));
+}
+
+// zio's pool starts no second worker until twice as many jobs wait as run,
+// so behind one held worker a plain `blocking` call queues. The holder
+// gives up after two seconds: a call that queued fails this test by
+// setting `gave_up` rather than hanging it.
+test "a reserved blocking call gets a thread while the pool's only worker is held" {
+    const rt = try zio.Runtime.init(testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    const Flags = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        released: std.atomic.Value(bool) = .init(false),
+        gave_up: std.atomic.Value(bool) = .init(false),
+    };
+
+    const H = struct {
+        fn hold(f: *Flags) void {
+            f.started.store(true, .release);
+            const until = monotonicNanos() + 2 * std.time.ns_per_s;
+            while (!f.released.load(.acquire)) {
+                if (monotonicNanos() > until) return f.gave_up.store(true, .release);
+                std.Thread.yield() catch {};
+            }
+        }
+
+        fn release(f: *Flags) void {
+            f.released.store(true, .release);
+        }
+
+        fn holder(f: *Flags) void {
+            blocking(hold, .{f});
+        }
+
+        fn caller(f: *Flags) !void {
+            var waited: u32 = 0;
+            while (!f.started.load(.acquire)) : (waited += 1) {
+                if (waited == 2000) return error.HolderNeverStarted;
+                try sleep(1);
+            }
+            blockingReserved(release, .{f});
+        }
+    };
+
+    var flags: Flags = .{};
+    var held = try rt.spawn(H.holder, .{&flags});
+    var called = try rt.spawn(H.caller, .{&flags});
+    try called.join();
+    held.join();
+    try testing.expect(flags.released.load(.acquire));
+    try testing.expect(!flags.gave_up.load(.acquire));
 }

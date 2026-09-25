@@ -102,6 +102,40 @@ question the roadmap has carried since `nilo_pw` shipped — *whether the Gate
 belongs to more than passwords* — with the second caller it was waiting for
 rather than with an opinion.
 
+## A statement under `.hop` gets a thread of its own
+
+Every statement under `.hop` goes through `nilo.blockingReserved`, not
+`nilo.blocking`. zio's pool starts with no workers and adds one only once
+twice as many jobs wait as run, so a plain `blocking` call can queue behind
+one already running. For most callers that is a slower request. For a SQLite
+statement it is a held connection: one slow read on the only busy worker,
+and the next statement queued behind it holding the writer, so every write
+after that timed out on the writer. Reproduced at one slow read of 25 s with
+the default pool, and tested upstream at 2,899 ms of queueing down to 0
+([zio#745](https://github.com/lalinsky/zio/issues/745)).
+
+`blockingReserved` is zio's `blockInPlaceReserved` behind the same hand-off as
+`blocking`: an idle worker if there is one, otherwise a new one, past the
+pool's `max_threads` if it has to. **What bounds the threads is the Gate
+above**, sized to the Wire's connections, so a burst of statements adds at
+most that many workers, and they exit after the pool's idle timeout like any
+other. It costs no allocation and no byte of binary: every example, the
+SQLite one included, is the same size to the byte with it. Measured with three
+slow reads holding every reader and five writes behind them: before, four of
+the writes gave up at the writer's 10 s and the fifth took 31 s; after, all
+five answered in under a millisecond. Under load with nothing slow, reads and
+writes are unchanged in throughput, p99 and CPU a request, for one or two more
+pool threads and about 1 MB of RSS
+([`sql.md` §15](../../bench/result/sql.md#15-a-statement-under-hop-with-a-thread-of-its-own)).
+
+What was rejected:
+
+- **Every `nilo.blocking` call reserved.** The same fix with nothing to bound
+  it: a handler that fans a thousand CPU jobs out would start a thousand
+  threads. The queue is the right answer for a caller that holds nothing.
+- **The runtime's `min_threads`.** Holds it too, at a thread each kept alive
+  for the life of the process, and only up to that many calls at once.
+
 ## Whose C
 
 SQLite is a C library and nilo is Zig, so something has to bring it. Four ways,

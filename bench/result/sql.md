@@ -1235,6 +1235,37 @@ is the socket, and after that it is somebody else's repository.**
 
 **Can it be pushed further:** not by anything worth doing. The difference is where one `catch` sits: the flat loop caught each column's error, `readRow` returns it and the row is caught once.
 
+## 15. A statement under `.hop` with a thread of its own
+
+**Run:** a scratch server on `sql.Sqlite(.{ .threading = .{ .hop = nilo } })`, pool `size = 4` (a writer and three readers) over a file of 1,000 rows, with `/read/:id` (a `find`), `/write` (an `insert`), `/slowlong` (a four-way cross join of the table that starts with `SELECT`, so it runs on a reader, about 30 s under load) and `/health`. Built ReleaseFast for `x86_64-linux-gnu` against `git archive` of `1343509` (before, `nilo.blocking`) and of it plus the change (after, `nilo.blockingReserved`), each with its own cache and a fresh database file per start. Server on CPUs 0–3,8–11, eight threads; gcannon `11c802b` on 4–7,12–15. AMD Ryzen 7 9700X, Linux 7.2.5, 2026-09-25.
+
+**Why:** zio's pool adds a worker only when none is idle and twice as many jobs wait as run, so a statement that has taken its connection can queue for a thread behind slow ones and hold the connection the whole time ([zio#745](https://github.com/lalinsky/zio/issues/745), ADR 107's `/healthz` report).
+
+**The case**, two rounds, the order reversed in the second: three `/slowlong` at once, one on each reader, then 300 ms later five `/write` at once.
+
+| | before | after |
+|---|---|---|
+| the five writes | **four 500s at 10.0 s** (the writer's `timeout_ms`), one 200 at 30.7–30.9 s | **five 200s at 0.40–0.83 ms** |
+| the three slow reads | 31 s, and one at 57.6–58.7 s: it queued behind the other two | 29.1–31.3 s each |
+| threads two seconds in | 11 | 13 |
+
+The first write took the writer and waited for a thread until a slow read finished; the four behind it waited for the writer and gave up.
+
+**The cost when nothing is slow**, three interleaved rounds, 512 keep-alive connections, `-t 8`, five seconds a path:
+
+| | before | after |
+|---|---|---|
+| `/read/1` | 29.4–35.7K req/s, p99 67.5–81.3 ms, 155–192 µs CPU a request | 29.5–35.7K, p99 67.2–81.0 ms, 156–192 µs |
+| `/write` | 16.0–16.1K req/s, p99 172–176 ms, 335–338 µs | 16.0–16.2K, p99 172–175 ms, 328–340 µs |
+| threads after the writes | 15 | 16–17 |
+| RSS after the writes | 21,632–21,780 kB | 22,592–22,632 kB |
+
+`/read/1` reads either about 29.4K or 35.7K on both sides, whichever round, so the spread is the machine's and not the change's. No request failed on either side.
+
+**What it changed:** every statement under `.hop` goes through `nilo.blockingReserved` (ADR 064). Throughput, p99 and CPU a request are unchanged; the price is one or two more pool threads under load and about 1 MB of RSS with them, bounded by the Gate in front of the connections, and gone after the pool's 60 s idle timeout. The binary is the same to the byte.
+
+**Can it be pushed further:** the extra threads are the mechanism, not overhead to trim. What is left is the case the test cannot see: a pool whose Gate is larger than the machine wants threads, which is a pool size nobody should pick.
+
 ## What is still missing
 
 - **A second box.** Everything here shares eight physical cores between nilo,

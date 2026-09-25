@@ -21,6 +21,7 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 - **`room.event(.{ .name, .id, .data })` says one event with a name or an id.** An event stream sends all three; a WebSocket gets `data` as a text message. A line break in `name` or `id` is `error.EventFieldBreaksLine`, new in `nilo.Room.Error` (ADR 227).
 - **`nilo.Rooms` lends a Room to a key the application makes up**, from a pool sized at `init`: every tab a user has open joins `"user:42"`, and `rooms.json("user:42", …)` from anywhere reaches all of them. A key nobody is under costs nothing to say into, the last one out gives the Room back, and when every Room is lent a new key is `error.NoRoomFree`, a 503 in `eventsFrom`. `c.eventsFrom` takes `rooms.named(key)` beside or instead of a Room (ADR 228).
 - **A Room made with `.history` catches a returning event stream up.** It keeps its latest text posts, bounded by count and by `history_bytes` (64 KiB), and `c.eventsFrom` writes the ones after the client's `Last-Event-ID` before anything new. Give every post in such a Room an id with `room.event` (ADR 229).
+- **`nilo.blockingReserved(f, args)` is `nilo.blocking` on a thread of its own**, rather than a place in the pool's queue behind a call already running. For a call made while holding a connection or a lock; every call that finds no idle worker starts one, so it is for callers that are already bounded (ADR 064).
 
 ### Changed
 
@@ -29,6 +30,7 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ### Fixed
 
+- **Under `.{ .hop = nilo }`, one slow SQLite read no longer makes every write time out.** A statement queued on the thread pool behind the slow one while holding its connection, and the next write waited on it. Every statement now gets a worker of its own through `nilo.blockingReserved`, bounded by the Gate already in front of the connections ([zio#745](https://github.com/lalinsky/zio/issues/745), ADR 064).
 - **An error returned from `main` in a Debug build exits with its trace**, where it printed `panic: cast causes pointer to be null` and hung, and a panic keeps its stack trace rather than ending in `aborting due to recursive panic`. Both came from zio v0.18.0 under `std_options_debug_io = nilo.debug_io` ([zio#744](https://github.com/lalinsky/zio/issues/744)).
 - **A container's CPU quota sets the thread count.** With `threads` left at 0 nilo started one executor per core the host has, which a `docker --cpus`, Kubernetes or systemd quota does not hide, and the quota throttled them: on two CPUs of an eight-core machine, a p99.9 of 71 ms. The count is now the quota rounded up plus one, read from the tightest cgroup limit above the process, and startup says so when it is below the cores. At two CPUs that is 22% more throughput and a p99.9 of 10 ms; at four, 4% more and 0.5 ms; with no quota nothing changes. A `threads` past 64, or a machine with more cores than that, is held to 64 where the engine used to assert (ADR 230).
 
