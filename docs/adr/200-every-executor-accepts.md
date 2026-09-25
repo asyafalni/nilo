@@ -149,6 +149,8 @@ thread manages ~5 µs per connection with a loop that accepts until
 of two or three from one fiber against a factor of N from N fibers, and
 the N fibers are forty lines.
 
+**log2 of the threads, at least two, as [dusty](https://github.com/lalinsky/dusty) does.** dusty went from two accept loops to five on 24 threads and took one request per connection from 145K to 239K req/s, and past five lost: 12 and 24 loops gave back 20–40% of it and doubled the median. Swept here on eight threads, server and gcannon on separate physical cores, three interleaved rounds: at one request per connection 3 acceptors read 472–490K against 466–477K for 8, and at ten requests per connection 3 read 1.70–1.72M against 1.81–1.83M, and 1.58M against 1.64–1.68M at 4,096 connections. Keep-alive did not move. log2 loses 4–7% where connections carry ten requests and gains nothing outside the spread where they carry one, so on eight threads it stays one per executor ([`http.md`](../../bench/result/http.md#how-many-acceptors-eight-threads-want)). Whether sixty-four acceptors are past dusty's knee is a reading this box cannot take, and the roadmap carries it.
+
 ## Consequences
 
 - `http/engine/zio.zig`: `Acceptor.run` is the loop, `Accepting` is what

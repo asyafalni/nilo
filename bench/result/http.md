@@ -2928,6 +2928,23 @@ With the quota on a parent slice (`systemctl --user set-property nilotest.slice 
 
 **Can it be pushed further.** The one more is a loopback reading, where part of each request's kernel work is charged to the client's CPU. Behind a real NIC more of it lands on the server's cgroup, and the right count may be the quota itself; a run with the load generator on another machine is what would say.
 
+## How many acceptors eight threads want
+
+[ADR 200](../../docs/adr/200-every-executor-accepts.md) kept one acceptor per executor; this is the run behind its log2 alternative, which [dusty](https://github.com/lalinsky/dusty) measured as the knee on 24 threads.
+
+Same instrument and machine as the section above, no quota, eight threads, **server on CPUs 0–3,8–11 and gcannon on 4–7,12–15**, which splits them by physical core. The acceptor count capped by hand in a scratch tree of `53d0792`; three interleaved rounds of the four counts:
+
+| shape | 8 (one per executor) | 5 | 3 (log2) | 2 |
+|---|---|---|---|---|
+| 512 conns, 1 request each, `/health` | 466–477K, p50 490–530 µs, p99 2.0–4.1 ms | 456–478K | 472–490K, p99 1.7–3.2 ms | 483–487K, **p50 985 µs**, p99 1.5–1.7 ms |
+| 512 conns, 10 requests each | **1.81–1.83M** | 1.78–1.79M | 1.70–1.72M | 1.60–1.62M |
+| 4,096 conns, 10 requests each | **1.64–1.68M**, p99 23.5–33 ms | 1.65–1.66M | 1.58M | 1.49–1.51M |
+| 512 conns, keep-alive, `/users/1` | 2.05–2.06M | 2.06M | 2.06M | 2.05M |
+
+**No knee at eight threads.** Where a connection carries one request, fewer acceptors are inside the spread, two at most 4% ahead and at twice the p50; where it carries ten, log2 loses 4–7% and two loses 8–13%; keep-alive does not move. One per executor stays. An earlier pass of the same sweep with the SMT split of the section above read the same way, inside a wider spread.
+
+**Can it be pushed further.** Not on this box. dusty's loss past five loops was on 24 threads and the arena's box has sixty-four; the roadmap carries the run.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings
