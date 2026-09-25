@@ -2986,6 +2986,27 @@ Taken apart in the first shape: with all five new checks out the harness read 29
 
 **Can it be pushed further.** Probably. The name test is nine or three compares a name where a byte-class table lookup (`pshufb`, NEON `tbl`) is two, and Zig 0.16 has no portable runtime shuffle to write it with. Folding the name test into the block walk measured worse here, but it was measured as one shape among several; a version that tests only blocks holding a name start is untried.
 
+## What placing a gRPC call on its own executor buys
+
+The first cut of [zio#704](https://github.com/lalinsky/zio/issues/704) landed on zio `main` as `spawnInto` ([zio#761](https://github.com/lalinsky/zio/pull/761), `0299e57`, not in a release), with `.local` homing a task on the calling executor. The same zio also removed `RuntimeOptions.enable_task_migration`: the mode is `zio_options.scheduling`, read from the root module, and without a declaration it is `.work_stealing`, where `.local` returns `error.InvalidPlacement`. The run below is the upgrade that keeps nilo pinned without a line in the application: `.scheduling = .pinned` passed to every `b.dependency("zio", …)` in `build.zig`, which a root `zio_options` still overrides.
+
+Three trees from `git archive` of `d7c40bb`, each with its own cache: **A** as committed (zio v0.18.0); **B** zio `0299e57`, pinned through the build default, `enable_task_migration` dropped, every spawn still `.auto`; **C** B with the engine's `spawn` calling `group.spawnInto(.local, …)`, which is what `http/grpc.zig` starts a call through. `spike/grpc/server/` built ReleaseFast against each, and the instrument of [the gRPC throughput section](#throughput): h2load posting a 9-byte `SumRequest` to `GetSum`, `-m 100`, eight threads, 5 s, server on CPUs 0–3,8–11 with `NILO_THREADS=8`, h2load on 4–7,12–15, loopback. Three rounds, the order reversed every other round; CPU and context switches per call from `/proc` across the h2load run. No run errored, and a call to C answered `grpc-status: 0`, so no call went down the `InvalidPlacement` path, which answers 14.
+
+| c | tree | calls/s | CPU per call | context switches per call | mean | max |
+|---|---|---|---|---|---|---|
+| 256 | A | 739–752k | 4.69–4.74 µs | 0.92–0.93 | 27–28 ms | 1.45–1.51 s |
+| 256 | B | 755–756k | 4.53–4.56 µs | 0.80–0.81 | 27–28 ms | 1.55–1.79 s |
+| 256 | C | **2.06–2.08M** | 3.73–3.78 µs | 0.035–0.036 | 12.3–12.5 ms | **51–52 ms** |
+| 1,024 | A | 545–554k | 7.40–8.12 µs | 0.73–0.83 | 116–130 ms | 3.40–3.85 s |
+| 1,024 | B | 555–557k | 7.62–8.37 µs | 0.55–0.64 | 124–138 ms | 3.19–3.59 s |
+| 1,024 | C | **1.61–1.63M** | 4.81–4.87 µs | 0.034–0.036 | 64–65 ms | **149–167 ms** |
+
+**The zio upgrade alone moves nothing**: B is inside 2% of A on throughput at both counts. **`.local` is 2.7x at 256 and 2.9x at 1,024**, context switches fall from nearly one a call to one in thirty, and **the worst call falls from 1.5 s to 52 ms**, which answers item 2 under "Can it be pushed further" in [the listener's section](#a-grpc-listener-built): the unexplained worst call was the hop, not HPACK or the stream table.
+
+**What it decided**: the call fiber goes on `.local` when the pin moves to a zio release that has `spawnInto`, and nilo sets the scheduling mode through `b.dependency` rather than asking every application to declare `zio_options`, pending the maintainer's answer on whether a dependent may rely on that default ([asked in #704](https://github.com/lalinsky/zio/issues/704#issuecomment-5832480560)).
+
+**Can it be pushed further.** Yes. C is 2.07M against 3.12M inline, and 3.75 µs a call against 2.5; the fiber measured 0.23 µs on one executor, so about a microsecond is still unaccounted for and was not run down. The connection an acceptor spawns is the other round-robin hop left, and `.local` there is a separate run: the engine chose round-robin for connections on purpose (`http/engine/zio.zig`, above `Acceptor`).
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings
