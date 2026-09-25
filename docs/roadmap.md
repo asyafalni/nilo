@@ -117,10 +117,6 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 **Needs:** `maximum` taken from the type, and `required` in a response schema meaning "always written".
 
-**A Gate test fails now and then, on a race of its own.** `test "a turn given back while someone waits is theirs, not the next caller's"` leaves the gate and then asserts that `enterWithin(0)` times out, but the waiter it handed the turn to (`Arrivals.take`) enters and leaves at once, and when its thread runs both before the assertion the gate is free again and the test fails. One `zig build test-all` of two failed on it with nothing in `Gate` changed.
-
-**Needs:** the waiter held inside its turn until the assertion has been made, by a flag it waits on before `leave`.
-
 ---
 
 ## Next

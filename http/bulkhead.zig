@@ -1866,8 +1866,16 @@ fn gateWaiting(g: *Gate) usize {
     return g._waiting;
 }
 
-fn untilWaiting(g: *Gate, n: usize) void {
-    while (gateWaiting(g) < n) std.Thread.yield() catch {};
+/// Until the Gate counts `n` waiting, for at most five seconds. Bounded, and
+/// failing when the bound passes, so a line that never forms is a failed test
+/// rather than a suite that waits for the CI job's own limit: a waiter that
+/// gave up before the next one queued once held macOS CI for thirty minutes.
+fn untilWaiting(g: *Gate, n: usize) !void {
+    const until = monotonicNanos() + 5 * std.time.ns_per_s;
+    while (gateWaiting(g) < n) {
+        if (monotonicNanos() > until) return error.LineNeverFormed;
+        std.Thread.yield() catch {};
+    }
 }
 
 const Arrivals = struct {
@@ -1889,25 +1897,63 @@ test "a Gate hands a freed turn to the oldest waiter, in the order they came" {
     var threads: [4]std.Thread = undefined;
     for (&threads, 0..) |*t, i| {
         t.* = try std.Thread.spawn(.{}, Arrivals.take, .{ &a, @as(u8, @intCast(i)) });
-        untilWaiting(&g, i + 1);
+        try untilWaiting(&g, i + 1);
     }
     g.leave();
     for (threads) |t| t.join();
     try testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3 }, a.order[0..4]);
 }
 
+/// A waiter that keeps its turn until the test says, so what the test asks
+/// while it holds the turn has one answer however the threads are scheduled.
+/// Let go of after five seconds at most, saying so, so a test that fails
+/// before it lets go cannot hang the suite.
+const Holder = struct {
+    gate: *Gate,
+    entered: std.atomic.Value(bool) = .init(false),
+    let_go: std.atomic.Value(bool) = .init(false),
+    gave_up: std.atomic.Value(bool) = .init(false),
+
+    fn take(self: *Holder) void {
+        self.gate.enter() catch unreachable;
+        self.entered.store(true, .release);
+        const until = monotonicNanos() + 5 * std.time.ns_per_s;
+        while (!self.let_go.load(.acquire)) {
+            if (monotonicNanos() > until) {
+                self.gave_up.store(true, .release);
+                break;
+            }
+            std.Thread.yield() catch {};
+        }
+        self.gate.leave();
+    }
+};
+
 test "a turn given back while someone waits is theirs, not the next caller's" {
     // The case a first-come lock gets wrong: the fiber that just left asks
     // again at once, and would win every time against one still waking up.
+    // The waiter holds its turn until the question has been asked: one that
+    // woke, took its turn and gave it back before the question made the
+    // answer "free" and the test fail now and then.
     var g: Gate = .open(1);
     try g.enter();
-    var a: Arrivals = .{ .gate = &g };
-    const t = try std.Thread.spawn(.{}, Arrivals.take, .{ &a, 7 });
-    untilWaiting(&g, 1);
+    var h: Holder = .{ .gate = &g };
+    const t = try std.Thread.spawn(.{}, Holder.take, .{&h});
+    untilWaiting(&g, 1) catch |err| {
+        g.leave();
+        t.join();
+        return err;
+    };
     g.leave();
-    try testing.expectError(error.TimedOut, g.enterWithin(0));
+    // Whether or not the waiter has woken yet, the turn is theirs.
+    const took = if (g.enterWithin(0)) |_| true else |_| false;
+    // Taken wrongly, it is given back, or the waiter would wait on it for ever.
+    if (took) g.leave();
+    h.let_go.store(true, .release);
     t.join();
-    try testing.expectEqual(@as(u8, 7), a.order[0]);
+    try testing.expect(!took);
+    try testing.expect(h.entered.load(.acquire));
+    try testing.expect(!h.gave_up.load(.acquire));
     // And once the waiter is done, the turn is free for anyone.
     try g.enterWithin(0);
     g.leave();
@@ -1930,7 +1976,10 @@ test "a wait with a limit gives up empty-handed and leaves the line as it found 
 
 const Patient = struct {
     fn giveUp(g: *Gate, out: *?anyerror) void {
-        g.enterWithin(15) catch |err| {
+        // Long enough that the second waiter is in line behind it before it
+        // gives up, which is the case this is about; 15 ms was not, on a
+        // slow runner.
+        g.enterWithin(300) catch |err| {
             out.* = err;
             return;
         };
@@ -1944,10 +1993,15 @@ test "a waiter that gave up is skipped, and the one behind it is served" {
     try g.enter();
     var gave_up: ?anyerror = null;
     const first = try std.Thread.spawn(.{}, Patient.giveUp, .{ &g, &gave_up });
-    untilWaiting(&g, 1);
+    try untilWaiting(&g, 1);
     var a: Arrivals = .{ .gate = &g };
     const second = try std.Thread.spawn(.{}, Arrivals.take, .{ &a, 2 });
-    untilWaiting(&g, 2);
+    untilWaiting(&g, 2) catch |err| {
+        first.join();
+        g.leave();
+        second.join();
+        return err;
+    };
     first.join();
     try testing.expectEqual(@as(?anyerror, error.TimedOut), gave_up);
     g.leave();
@@ -1982,7 +2036,11 @@ test "a caller that asks again right after leave does not jump the line" {
         try g.enter();
         var a: Arrivals = .{ .gate = &g };
         const t = try std.Thread.spawn(.{}, Arrivals.take, .{ &a, 7 });
-        untilWaiting(&g, 1);
+        untilWaiting(&g, 1) catch |err| {
+            g.leave();
+            t.join();
+            return err;
+        };
         g.leave();
         try g.enter();
         if (a.served.load(.seq_cst) == 0) barged += 1;
