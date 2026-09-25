@@ -147,9 +147,9 @@ const Quiet = struct {
                 w.flush() catch return;
             },
             .trickle => {
-                w.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n") catch return;
+                w.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 24\r\n\r\n") catch return;
                 w.flush() catch return;
-                for (0..8) |_| {
+                for (0..24) |_| {
                     std.Io.sleep(io, .fromMilliseconds(60), .awake) catch return;
                     w.writeByte('x') catch return;
                     w.flush() catch return;
@@ -177,6 +177,22 @@ fn callQuiet(api: *fetch.Client, c: *nilo.Ctx) !nilo.Str {
     };
     _ = res;
     return c.str("answered");
+}
+
+/// The trickle's call: no ceiling on the call and a second on silence.
+///
+/// A second rather than the 200 ms `callPatient` gives a stall, because the
+/// gaps here are the server's `sleep(60)`, and on a loaded CI machine a sleep
+/// is a request, not a promise: on the macOS runner, with every test binary of
+/// `zig build test` running at once, 60 ms sleeps were measured at 67 to
+/// 135 ms and went past 200 often enough to fail this test on every run.
+/// Twenty-four bytes keep the body longer than the bound, which is what the
+/// test proves: a timer armed once at `begin` would still fire before the end.
+fn callTrickle(api: *fetch.Client, c: *nilo.Ctx) !nilo.Str {
+    const res = api.get(c, quiet_url, .{ .timeout_ms = 0, .stall_ms = 1000 }) catch |err| {
+        return c.str(@errorName(err));
+    };
+    return res.body;
 }
 
 /// The same call with no ceiling on the call at all and 200 ms on silence
@@ -283,13 +299,13 @@ test "silence inside a call with no ceiling is a stall, under the Engine's timer
 }
 
 test "a body that trickles under the Engine is re-armed on every byte and never stalls" {
-    const body = try drive(.trickle, "/trickle", callPatient);
+    const body = try drive(.trickle, "/trickle", callTrickle);
     defer std.heap.smp_allocator.free(body);
 
-    // 480 ms of body under a 200 ms silence bound: a timer armed once at
-    // `begin` would have fired at 200 ms, and one re-armed by each chunk
+    // 1.44 s of body under a one-second silence bound: a timer armed once at
+    // `begin` would have fired at one second, and one re-armed by each chunk
     // never does. The whole body coming back is the proof of the re-arm.
-    try testing.expectEqualStrings("xxxxxxxx", body);
+    try testing.expectEqualStrings("x" ** 24, body);
 }
 
 /// One request over a real socket, from a thread that is not the Engine's.
