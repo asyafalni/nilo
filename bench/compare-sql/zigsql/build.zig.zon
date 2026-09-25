@@ -12,8 +12,8 @@
         // same pg.zig — a control on a different version measures the driver's
         // release notes.
         .pg = .{
-            .url = "git+https://github.com/lalinsky/pg.zig#a2c98876a7d8a36b1771679ce912bfead46ee8f6",
-            .hash = "pg-0.0.0-Wp_7gUqUBgDARGCn8B7brldZRA9lmDQGn262ySg2tg3W",
+            .url = "git+https://github.com/nevindra/pg.zig#0a8dab418315048ee545a0096f4ac62cb97e9d30",
+            .hash = "pg-0.0.0-Wp_7gVK8BgC_5-H41JsVCpQqanRobB3SiML9V7A2XJtm",
         },
     },
     .paths = .{

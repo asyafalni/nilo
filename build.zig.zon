@@ -23,9 +23,15 @@
         // and enqueues the download. So the calls sit behind `-Dsql`, which is
         // off for a dependent until they pass `.sql = true`. ADR 066 is where
         // that was found, a year after the sentence above was published.
+        //
+        // `nevindra/pg.zig` is lalinsky's `ec8cf27` plus two of karlseguin's
+        // `master`: startup_parameters reach the server (`2907296`), and a
+        // cached statement stops paying a second round trip (`2c7c6ca`,
+        // `bench/result/sql.md` §16). Move back to lalinsky's once
+        // lalinsky/pg.zig#13 is merged.
         .pg = .{
-            .url = "git+https://github.com/lalinsky/pg.zig#ec8cf27d2667a5e0652ebdb9494185f0d7b11c1b",
-            .hash = "pg-0.0.0-Wp_7gRWzBgDeelADnZ__d0xgRnuGZanv8Dcc5UmEGYTD",
+            .url = "git+https://github.com/nevindra/pg.zig#0a8dab418315048ee545a0096f4ac62cb97e9d30",
+            .hash = "pg-0.0.0-Wp_7gVK8BgC_5-H41JsVCpQqanRobB3SiML9V7A2XJtm",
             .lazy = true,
         },
         // The other driver behind `nilo_sql`, and lazy for the same reason.

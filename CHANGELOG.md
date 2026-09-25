@@ -27,6 +27,7 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 - **A gRPC call runs on its connection's thread** rather than the next one round-robin, which sent nearly every call to another thread and its answer back: 2.7x the unary calls a second at 256 connections, and the worst call at 52 ms rather than 1.5 s (ADR 220).
 - **zio is pinned at `0299e57` on its `main`**, for `spawnInto` and the fix below, and built with its tasks pinned to the thread they start on through zio's own build option (ADR 199). Nothing to change in an application. One that also depends on zio itself passes `.scheduling = .pinned` to its own `b.dependency("zio", …)` as well, or it builds a second, differently configured zio beside nilo's. A stripped binary is 6.9 KB larger (ADR 017).
+- **A cached Postgres statement takes one round trip rather than two.** pg.zig is pinned at `nevindra/pg.zig@0a8dab4`, lalinsky's `ec8cf27` plus two fixes from karlseguin's `master`: a cached statement no longer sends a `Sync` of its own and waits before Bind and Execute, 2.1–3.1 µs off every query over a unix socket and about three times that through a Docker port; and `startup_parameters` now reach the server. Nothing to change in an application. The pin moves back to lalinsky's once lalinsky/pg.zig#13 merges ([`sql.md` §16](bench/result/sql.md#16-the-round-trip-pgzig-wasted-taken-back)).
 
 ### Fixed
 

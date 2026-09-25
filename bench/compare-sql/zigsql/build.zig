@@ -12,7 +12,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize });
+    // `.sql = true` or there is no `nilo_sql` to measure (ADR 066).
+    const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize, .sql = true });
     const pg = b.dependency("pg", .{ .target = target, .optimize = optimize });
 
     const imports: []const std.Build.Module.Import = &.{

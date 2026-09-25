@@ -1175,7 +1175,8 @@ expensive, it is pg.zig taking two where pgx and tokio-postgres take one.**
 path and waits for `ReadyForQuery` before it sends Bind and Execute. Coalescing
 those is a small, local change rather than a protocol rewrite — and it is the
 whole of nilo's single-row deficit against Rust in §8. Still upstream work, but
-of a completely different size from pipelining.
+of a completely different size from pipelining. **Taken since**: upstream
+removed it in `2c7c6ca`, nilo pins it, and §16 has the numbers.
 
 **3. Releasing a fiber's stack, blocked on zio.** §7 says an ordinary database
 route holds 17 kB an idle connection and most of it is stack that will never be
@@ -1265,6 +1266,44 @@ The first write took the writer and waited for a thread until a slow read finish
 **What it changed:** every statement under `.hop` goes through `nilo.blockingReserved` (ADR 064). Throughput, p99 and CPU a request are unchanged; the price is one or two more pool threads under load and about 1 MB of RSS with them, bounded by the Gate in front of the connections, and gone after the pool's 60 s idle timeout. The binary is the same to the byte.
 
 **Can it be pushed further:** the extra threads are the mechanism, not overhead to trim. What is left is the case the test cannot see: a pool whose Gate is larger than the machine wants threads, which is a pool size nobody should pick.
+
+## 16. The round trip pg.zig wasted, taken back
+
+**Run:** `git archive` of `9a031a1` twice. One side on the pin of the time, `lalinsky/pg.zig@ec8cf27`. The other on `ec8cf27` plus karlseguin's `2c7c6ca` ("Remove unnecessary sync when executing a cached prepared statement"), which cherry-picks cleanly. Postgres 18 (`postgres:18`, `--network host`, `synchronous_commit = off`) over its unix socket. AMD Ryzen 7 9700X, Linux 7.2.5, 2026-09-25. `bench-sql` ran four interleaved pairs; `compare-sql/ops.py` ran two runs of three passes for the Zig arms and one for Go and Rust, with every checksum agreeing.
+
+**Why:** §8 found that on a cache hit, pg.zig writes a standalone `Sync` and waits for `ReadyForQuery` before Bind and Execute. That is two round trips where pgx and tokio-postgres take one, and it was the whole of the single-row gap to Rust.
+
+**`bench-sql`**, the prepared arm, best of five, ns a query. The unprepared arm is the control: the change does not touch it, and it did not move (9,741–10,742 before against 9,666–10,587 after on `SELECT 1`).
+
+| | before | after |
+|---|---|---|
+| `SELECT 1` | 7,721–8,012 | 4,904–5,061 |
+| a key lookup | 8,899–9,333 | 6,102–6,700 |
+| `db.find` through the module | 8,977–9,289 | 6,063–6,572 |
+
+**`compare-sql`**, raw drivers only, median ns an operation, the two Zig runs side by side:
+
+| | pg.zig before | pg.zig after | pgx | tokio-postgres |
+|---|---:|---:|---:|---:|
+| `SELECT 1` | 7,614 / 7,608 | 4,914 / 4,684 | 5,092 | **4,669** |
+| 1 row × 4 | 9,242 / 9,310 | 6,545 / 6,500 | 7,254 | **6,005** |
+| 20 rows × 4 | 83,740 / 83,832 | **81,224** / 81,554 | 84,895 | 85,238 |
+| 1000 rows × 4 | 94,376 / 95,482 | **92,094** / 92,646 | 108,998 | 139,916 |
+| 1 row × 20 | 11,008 / 11,014 | 7,916 / **7,846** | 9,462 | 7,842 |
+| 1000 rows × 20 | 396,493 / 383,401 | 387,118 / **383,815** | 396,915 | 507,677 |
+| insert | 10,654 / 10,636 | **8,579** / 8,682 | 10,740 | 9,466 |
+| 100 in one statement | 123,738 / 127,344 | 127,154 / 128,554 | 146,269 | 138,642 |
+| update | 13,054 / 13,264 | 10,096 / **9,954** | 11,344 | 10,326 |
+| delete | 9,940 / 9,810 | **7,910** / 7,962 | 9,856 | 8,586 |
+| transaction | 30,200 / 30,256 | 24,962 / 24,872 | 27,078 | **24,342** |
+
+Every shape that goes through a cached statement lost 2.1 to 3.1 µs, one unix-socket round trip, and both runs agree. The batch did not move beyond its own spread. `nilo_sql` against raw pg.zig is still unmeasurable by §8's rule: `stability.py` finds the sign changing between passes on every shape it flags.
+
+**What it changed:** pg.zig went from 24–63% behind tokio-postgres on a single row to fastest on seven of eleven shapes. It is ahead of pgx on all eleven, and 1–9% behind tokio-postgres on four single-row shapes. nilo pins `nevindra/pg.zig@0a8dab4`, which is `ec8cf27` plus this commit and `2907296` (startup_parameters), until [lalinsky/pg.zig#13](https://github.com/lalinsky/pg.zig/pull/13) is merged. `test-all` passed on that pin against a live Postgres.
+
+**Two harness faults turned up on the way.** `bench/sql.zig` released its one connection twice, so every `bench-sql` since `987764b` ended in SEGV inside `Pool.deinit`, after its numbers had printed. `compare-sql/zigsql` no longer built, because it never passed `.sql = true` (ADR 066). Its pin had also drifted to `a2c9887` while the root's was `ec8cf27`, so its control was on a different driver. All three are fixed.
+
+**Can it be pushed further:** what is left against tokio-postgres is under 10% and is CPU, not packets. The next thing to measure is the pool behind many threads (§12), not the single query.
 
 ## What is still missing
 

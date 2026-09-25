@@ -191,8 +191,11 @@ pub fn main() !void {
     });
     defer pool.deinit();
 
+    // An errdefer, because the success path releases it by hand before
+    // `throughTheModule`: a `defer` here released it twice, and a pool of one
+    // then freed the same connection twice in `Pool.deinit`.
     var conn = try pool.acquire();
-    defer conn.release();
+    errdefer conn.release();
 
     var it = std.mem.splitScalar(u8, setup, ';');
     while (it.next()) |raw| {
