@@ -447,15 +447,19 @@ test "a body that keeps moving never stalls, however slowly" {
         fn run(io: std.Io) !void {
             var canned = try Canned.open(io);
             defer canned.close();
-            canned.body_len = 8;
+            canned.body_len = 24;
 
-            // Eight bytes, 60 ms apart: 480 ms of body under a 200 ms
-            // silence bound. A bound on the call would fire; a bound on
-            // silence must not, because every gap is under it.
+            // Twenty-four bytes, 60 ms apart: 1.44 s of body under a
+            // one-second silence bound. A bound on the call would fire; a
+            // bound on silence must not, because every gap is under it. A
+            // second rather than 200 ms because the gaps are the server's
+            // sleeps, and on the loaded macOS CI runner a 60 ms sleep was
+            // measured at up to 135 ms and went past 200 often enough to fail
+            // this on every run.
             var served = try io.concurrent(Canned.serveTrickle, .{ &canned, @as(u32, 60) });
             defer served.cancel(io) catch {};
 
-            var client = try started(io, .{ .timeout_ms = 0, .stall_ms = 200 });
+            var client = try started(io, .{ .timeout_ms = 0, .stall_ms = 1000 });
             defer client.deinit();
 
             var scope: core.Run = .init(testing.allocator);
@@ -463,7 +467,7 @@ test "a body that keeps moving never stalls, however slowly" {
 
             var buf: [64]u8 = undefined;
             const res = try client.get(&scope, try canned.url(&buf), .{});
-            try testing.expectEqualStrings("xxxxxxxx", res.body.view());
+            try testing.expectEqualStrings("x" ** 24, res.body.view());
         }
     }.run);
 }
