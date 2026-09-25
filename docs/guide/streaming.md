@@ -79,6 +79,37 @@ source.addEventListener("token", (e) => output.append(e.data));
 A browser reconnecting sends `Last-Event-ID`, which is an ordinary request
 header: `c.header("Last-Event-ID")`.
 
+## A feed, where every event is somebody else's
+
+Most event streams have nothing of their own to say: a browser opens one, and every event it will see is something another request said. For that, the handler does not need to stay. Put the streams in a [`Room`](../reference/streaming.md#room), say things into the room, and hand the stream over:
+
+<!-- compiles -->
+```zig
+fn feed(c: *nilo.Ctx, news: *nilo.Room) !void {
+    return c.eventsFrom(news, .{ .retry_ms = 5_000 });
+}
+
+fn publish(news: *nilo.Room, headline: nilo.Str) !void {
+    try news.event(.{ .name = "headline", .data = headline.view() });
+}
+```
+
+`eventsFrom` takes a seat in the room, writes the head and returns. From there the connection waits on the room the way an idle connection waits for its next request, and every `say`, `print`, `json` or `event` into the room goes out as an event, one chunk each. A comment goes out every 30 seconds while nothing is said, so a proxy that closes quiet connections sees this one speak (`.keepalive_ms`, `0` for none). The stream ends when the browser goes away or the server stops.
+
+Pass a tuple for more than one room, `c.eventsFrom(.{ lobby, mine }, .{})`, and a stream hears all of them. A room can hold WebSockets and event streams together, so the chat room a socket speaks into can be the one a read-only page listens to. A binary message said into it reaches the sockets and is counted as missed for the streams, because an event is text.
+
+**A browser that reconnects can be caught up.** It sends `Last-Event-ID`, the id of the last event it read, and a room made with `.history` keeps its latest text posts, including those said while nobody was listening. `eventsFrom` writes the ones after that id before anything new, and nothing is written twice:
+
+```zig
+var news = try nilo.Room.initWith(gpa, .{ .history = 256 });
+```
+
+Give every post in such a room an id, with `room.event(.{ .id = … })`: a post without one does not move the browser's last id, so it would be written again on the next reconnect. An id the room no longer has replays nothing ([ADR 229](../adr/229-a-room-that-keeps-history-catches-a-returning-stream-up.md)).
+
+**One user rather than everybody** is a key in a [`nilo.Rooms`](../reference/streaming.md#rooms) pool: `c.eventsFrom(.{ news, rooms.named(key) }, .{})` with the user's key, and `rooms.json(key, value)` from wherever the notification starts. The [WebSocket guide](./websocket.md#one-user-on-every-tab) has the rest.
+
+When the handler does have something of its own to do between events, the tokens of a model as they arrive, say, that is `c.events()` above, and it costs what [holding one open](#what-it-costs-to-hold-one-open) costs.
+
 ## When you already know how long it is
 
 A handler moving bytes out of something that has already counted them — an S3
@@ -134,6 +165,8 @@ handler that touches 32 KiB before its first wait, and it measures 53,825 —
 because the frame holding it never unwinds. So measure your own handler with
 `python3 bench/mem.py --port … --path … --hold` before planning ten thousand,
 and keep what a streaming handler puts on its stack small.
+
+**A feed handed to a room does not pay any of this.** `c.eventsFrom` returns from the handler before the stream waits, so it costs what an idle connection does, 5,184 bytes against 21,566 for a held stream measured on the same host the same afternoon, and whatever stack the handler touched first is given back ([ADR 227](../adr/227-an-event-stream-fed-by-rooms-waits-where-a-connection-waits.md)). If your events all come from somewhere else, that is the shape to plan ten thousand of.
 
 A client that opens a stream and then stops reading is cut off by
 `write_timeout_ms`, which bounds one write rather than the whole response — so a

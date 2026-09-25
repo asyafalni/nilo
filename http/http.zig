@@ -304,7 +304,9 @@ pub const Headers = @import("typed.zig").Headers;
 /// for a body whose length nobody knows when the head goes out (ADR 019).
 pub const Stream = @import("stream.zig").Stream;
 
-/// A stream of server-sent events, from `c.events()`.
+/// A stream of server-sent events, from `c.events()`. One whose every event
+/// comes from Rooms is `c.eventsFrom(rooms, .{})` instead, which hands the
+/// stream to the connection and costs what an idle socket costs (ADR 227).
 pub const Events = @import("stream.zig").Events;
 
 /// A request body read in pieces, from `c.bodyStream()` — for the ones too
@@ -320,11 +322,19 @@ pub const websocket = @import("websocket.zig");
 
 /// Saying something to sockets a handler does not hold. Provide one as a
 /// service, `join` on the way in, `defer leave` on the way out, and `say`
-/// reaches everybody in it.
+/// reaches everybody in it, event streams from `c.eventsFrom` included.
 pub const Room = @import("room.zig").Room;
 
 /// Everything else Room: `Options`, `Full`, `Ticket`.
 pub const room = @import("room.zig");
+
+/// Rooms by name, lent from a pool sized up front: `rooms.join("user:42",
+/// socket)` on every tab a user has open, and `rooms.json("user:42", …)`
+/// from anywhere to reach all of them (ADR 228).
+pub const Rooms = @import("rooms.zig").Rooms;
+
+/// Everything else Rooms: `Options`, `max_key`, `Error`.
+pub const rooms = @import("rooms.zig");
 
 /// One message on an event stream: `.{ .name = "token", .data = text }`.
 pub const Event = @import("stream.zig").Event;
@@ -932,6 +942,8 @@ test {
     _ = @import("websocket.zig");
     _ = @import("scratch.zig");
     _ = @import("room.zig");
+    _ = @import("rooms.zig");
+    _ = @import("handover.zig");
     _ = @import("testing.zig");
     _ = @import("middleware.zig");
     _ = @import("typed.zig");

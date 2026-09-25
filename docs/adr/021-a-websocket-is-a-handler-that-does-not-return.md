@@ -10,26 +10,32 @@ The temptation is a shape of its own — a registration API, a set of callbacks,
 So it is a handler:
 
 ```zig
-fn chat(c: *nilo.Ctx, room: *Room) !void {
-    var socket = try c.upgrade();
-    var buf: [16 * 1024]u8 = undefined;
-    while (try socket.receive(&buf)) |message| {
+fn chat(c: *nilo.Ctx) !void {
+    return c.upgrade(echoLoop, {});
+}
+
+fn echoLoop(socket: *nilo.Socket) !void {
+    while (try socket.receive()) |message| {
         try socket.send(message.kind, message.data);
     }
 }
 ```
 
+> **The handler hands its loop back rather than running it** ([ADR 062](./062-where-a-connection-waits-is-what-it-costs.md)). It is still a handler: it takes services and resolved values, and middleware runs in front of it. What moved is where the loop runs, from inside the request to the connection's own frame, because that is where an idle socket is cheap to keep.
+
 `app.get("/ws", chat)` registers it, `room` arrives by type like any service, a `CurrentUser` would arrive the same way, and the middleware in front of it runs exactly as it does for anything else. What is different is only that it does not return for a while — which ADR 019 already had to have an answer for.
 
-## The buffer is the limit, and there is only one
+## There is one message ceiling, and it is `Options.max_message`
 
-The first version had an `Options.max_message` alongside the buffer passed to `receive`. It was wrong, and the way it was found is the argument: a test client sent 70 KB, the option said a megabyte was fine, the buffer was 4 KB, and the connection closed with `1009` for no reason visible anywhere in the handler.
+> **`Options.max_message` (16 KiB by default) is the message ceiling, and it is also the size of the buffer a message is collected into.** There is no second number.
 
-> **The buffer handed to `receive` is the message ceiling.** There is no second number.
+A frame whose header announces more than is left under the ceiling is refused with `1009` before a byte of its payload is read, so a client announcing four gigabytes costs four bytes to refuse. Fragments are reassembled into one buffer and the total is checked as they arrive. The buffer is not the connection's: it is taken from the executor's free list when a message starts arriving and given back when the socket goes quiet (`http/scratch.zig`), and a message that arrived whole in the read buffer takes none ([ADR 216](./216-a-message-that-arrived-whole-is-handed-over-where-it-lies.md)).
 
-A frame whose header announces more than the buffer holds is refused before a byte of its payload is read, so a client announcing four gigabytes costs four bytes to refuse. Fragments are reassembled into that same buffer and the total is checked as they arrive. Nothing is allocated — the connection's memory is the handler's `buf`, exactly as ADR 019 requires of a body reader.
+### What was rejected
 
-An option that can quietly contradict the code beside it is worse than no option.
+**An option beside a buffer the handler declared.** The first version had `Options.max_message` alongside the buffer passed to `receive`, and a test client found it: it sent 70 KB, the option said a megabyte was fine, the buffer was 4 KB, and the connection closed with `1009` for no reason visible anywhere in the handler. An option that can quietly contradict the code beside it is worse than no option.
+
+**The handler's buffer as the only ceiling**, which is what replaced it. It had one number, and it cost that number per open socket for as long as the socket stayed open: the buffer was a local in a frame that lives for the whole connection, and a suspended fiber keeps its stack at the high-water mark. A socket that had received one 60 KiB message held 74,809 bytes idle against 13,375 for one that had not (`http/scratch.zig` has the measurement, [ADR 062](./062-where-a-connection-waits-is-what-it-costs.md) the reason). Moving the buffer onto the executor's free list made it one buffer per message in flight rather than one per connection, and a buffer nobody declares needs a size before anybody asks. So the option came back, this time as the only number rather than a second one.
 
 ## The protocol keeps itself alive, invisibly
 
@@ -55,7 +61,7 @@ Every refusal sends a close frame with the right code before returning the error
 | A reserved bit set | `1002` — an extension nobody negotiated |
 | A continuation with nothing to continue | `1002` |
 | Text that is not valid UTF-8 | `1007`, not `1002` — the framing was fine, the payload was not |
-| A message bigger than the buffer | `1009` |
+| A message bigger than `max_message` | `1009` |
 
 > **One row was missing and its absence was worse than pedantry** ([ADR 046](./046-a-message-is-copied-once-and-framed-once.md)). A close frame carrying one byte, a code nobody assigned, or a reason that is not UTF-8 was *echoed* — so a server whose whole discipline here is "say goodbye properly" answered a broken goodbye by putting the same broken bytes back on the wire. It is a `1002` now, like every other framing error, and the reason nilo sends with a close of its own is cut on a character boundary rather than at the 123rd byte.
 

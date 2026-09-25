@@ -54,11 +54,19 @@
 //! anything else, which is the whole of ADR 021's argument for why a
 //! WebSocket is a handler: nothing here is a registration API, a callback, or
 //! a shape of its own.
+//!
+//! **An event stream sits in a room as well** (ADR 227). `c.eventsFrom(room,
+//! .{})` hands the stream to the connection, which drains its seats the way a
+//! Socket's `receive` does, so one room reaches browser tabs on either. A post
+//! is framed for a WebSocket once, here, and written as event-stream lines by
+//! each stream as it goes out, because those lines are the same bytes for
+//! every stream and cost nothing to build a second time next to the syscall.
 
 const std = @import("std");
 
 const bulkhead = @import("bulkhead.zig");
 const json_mod = @import("json.zig");
+const stream_mod = @import("stream.zig");
 const websocket = @import("websocket.zig");
 
 pub const Options = struct {
@@ -82,6 +90,25 @@ pub const Options = struct {
     /// few, which is the whole job — a backlog deep enough to ride out a slow
     /// reader is a backlog deep enough to hide one.
     backlog: usize = 4,
+
+    /// How many of the room's latest text posts it keeps for an event stream
+    /// that comes back. A browser reconnecting sends `Last-Event-ID`, the id
+    /// of the last event it read, and `eventsFrom` writes what this room said
+    /// after that one before anything new (ADR 229). Zero, the default, keeps
+    /// nothing, and a room that keeps nothing costs nothing for having the
+    /// option.
+    ///
+    /// A post is found by the id `event` gave it, so a room that keeps
+    /// posts wants every post to have one: a `say` in between carries no id,
+    /// and a browser that read it still reports the id before it.
+    history: usize = 0,
+
+    /// The most bytes the kept posts may hold between them, each counted
+    /// whole, header and all. The oldest goes first when a new one would pass
+    /// it, and a post bigger than this on its own is not kept. So what a room
+    /// holding history costs is this number, and not a count times the
+    /// biggest message anybody might say.
+    history_bytes: usize = 64 * 1024,
 };
 
 /// What happens to a post for a connection whose backlog is full.
@@ -106,13 +133,19 @@ pub const Full = enum {
 ///
 /// The frame header and the bytes live immediately after the struct in the
 /// same allocation, so a post is one `alloc` and one `free` rather than three
-/// of each — and so a connection delivering it writes one slice.
-const Post = struct {
+/// of each — and so a connection delivering it writes one slice. An event's
+/// name and id, when it has them, follow the message in the same block: a
+/// WebSocket never reads them and an event stream writes them as fields.
+pub const Post = struct {
     refs: std.atomic.Value(u32),
     kind: websocket.Kind,
     /// How many of the bytes behind this struct are the frame header nilo
     /// wrote, rather than what somebody said. Two, four or ten.
     head: u8,
+    /// The `event:` and `id:` an event stream sends with it. Zero for a post
+    /// from `say`, which a stream sends as a plain `message`.
+    name_len: u32 = 0,
+    id_len: u32 = 0,
     /// How many are the message.
     len: usize,
 
@@ -134,9 +167,25 @@ const Post = struct {
         return raw[@sizeOf(Post) + self.head ..][0..self.len];
     }
 
+    /// The event's name and id, behind the message.
+    fn fields(self: *Post) []u8 {
+        const raw: [*]u8 = @ptrCast(self);
+        return raw[@sizeOf(Post) + self.head + self.len ..][0 .. self.name_len + self.id_len];
+    }
+
+    fn name(self: *const Post) []const u8 {
+        const raw: [*]const u8 = @ptrCast(self);
+        return raw[@sizeOf(Post) + self.head + self.len ..][0..self.name_len];
+    }
+
+    fn id(self: *const Post) []const u8 {
+        const raw: [*]const u8 = @ptrCast(self);
+        return raw[@sizeOf(Post) + self.head + self.len + self.name_len ..][0..self.id_len];
+    }
+
     fn block(self: *Post) []align(@alignOf(Post)) u8 {
         const raw: [*]align(@alignOf(Post)) u8 = @ptrCast(self);
-        return raw[0 .. @sizeOf(Post) + self.head + self.len];
+        return raw[0 .. @sizeOf(Post) + self.head + self.len + self.name_len + self.id_len];
     }
 };
 
@@ -155,6 +204,11 @@ const Seat = struct {
     slot: u32 = 0,
     waker: bulkhead.Waker = .off,
     lock: bulkhead.Mutex = .{},
+    /// An event stream sits here, and an event stream is text: a binary post
+    /// is counted in `dropped` rather than queued, because there is no way to
+    /// write it as event-stream lines that a browser reads back as the same
+    /// bytes.
+    text_only: bool = false,
 
     /// A slice of the room's one ring allocation. Empty slots are null.
     ring: []?*Post = &.{},
@@ -175,21 +229,44 @@ const Seat = struct {
     /// store rather than an atomic add: the lock is what makes it exclusive,
     /// and the atomic is only there so the reader is not racing.
     dropped: std.atomic.Value(u64) = .init(0),
+
+    /// The next room the connection in this seat sits in. See `Seating`.
+    next: Seating = .{},
 };
 
 /// Where a connection sits, and proof it is still the one sitting there.
+///
+/// `u32` because `roll` already is: a room has at most that many seats, and
+/// the narrower index is what keeps a `Seating` at sixteen bytes.
 pub const Ticket = struct {
-    index: usize,
+    index: u32,
     era: u32,
+};
+
+/// One room a connection sits in, and through that seat the next one.
+///
+/// A connection holds the first of these and every seat holds the one after
+/// it, so a connection in any number of rooms carries sixteen bytes however
+/// many it joins, and a room pays sixteen bytes a seat for being joinable
+/// alongside others. The cost sits on the seat for ADR 046's reason: a seat
+/// is paid for once, when the room is made, and a connection is the number
+/// ADR 017 holds.
+///
+/// **Only the connection's own fiber touches the chain.** It joins, it
+/// leaves, it drains, and the loop's end gives up what is left; a speaker
+/// touches a seat's ring and its bell and never `next`. So the chain needs
+/// no lock of its own, and a seat's lock is not held while walking it.
+pub const Seating = struct {
+    room: ?*Room = null,
+    ticket: Ticket = .{ .index = 0, .era = 0 },
 };
 
 pub const Error = error{
     /// Every seat is taken. The room's `seats` is the number to raise.
     RoomFull,
-    /// The socket is already sitting in another room. A socket has one seat
-    /// and `receive` drains that one, so a second room would never be heard;
-    /// `leave` the first before joining the next.
-    AlreadySeated,
+    /// An event's name or id has a line break in it, which on an event
+    /// stream would end the field early and start a field nobody sent.
+    EventFieldBreaksLine,
     OutOfMemory,
     /// The connection was cancelled while waiting for a lock — a shutdown
     /// landing mid-broadcast. The handler is on its way out anyway.
@@ -216,6 +293,23 @@ pub const Room = struct {
     roll: []u32,
     backlog: usize,
     full: Full = .drop_oldest,
+
+    /// The latest text posts, oldest at `kept_head`, for an event stream
+    /// coming back with `Last-Event-ID` (ADR 229). Empty unless `history`
+    /// asked for some. Written under the roster's lock, where `handOut`
+    /// already is.
+    kept: []?*Post = &.{},
+    kept_head: usize = 0,
+    kept_count: usize = 0,
+    kept_bytes: usize = 0,
+    kept_limit: usize = 0,
+
+    /// Told when a seat has been given up, so whoever lent this room out can
+    /// take it back once nobody is in it. `Rooms` sets it on the rooms in its
+    /// pool (ADR 228); a room somebody made for themselves has none. A
+    /// pointer rather than a call, so that `stand`, which every program with a
+    /// WebSocket links, does not link the pool.
+    vacated: ?*const fn (*Room) void = null,
 
     /// Guards taking and giving up a seat, and **held for the whole of a
     /// broadcast**: `handOut` takes it, walks the roll's taken half under it,
@@ -256,6 +350,9 @@ pub const Room = struct {
         errdefer gpa.free(store);
         @memset(store, null);
         const roll = try gpa.alloc(u32, options.seats);
+        errdefer gpa.free(roll);
+        const kept = try gpa.alloc(?*Post, options.history);
+        @memset(kept, null);
 
         for (seats, 0..) |*seat, i| {
             seat.* = .{ .ring = store[i * options.backlog ..][0..options.backlog] };
@@ -267,6 +364,8 @@ pub const Room = struct {
             .ring_store = store,
             .roll = roll,
             .backlog = options.backlog,
+            .kept = kept,
+            .kept_limit = options.history_bytes,
         };
     }
 
@@ -275,6 +374,8 @@ pub const Room = struct {
         // ordinary shutdown, so this is a normal path rather than a leak
         // check.
         for (self.seats) |*seat| self.drain(seat);
+        while (self.kept_count > 0) self.forgetOldest();
+        self.gpa.free(self.kept);
         self.gpa.free(self.roll);
         self.gpa.free(self.ring_store);
         self.gpa.free(self.seats);
@@ -295,39 +396,95 @@ pub const Room = struct {
     /// the connection's frame and a seat left behind would ring it after the
     /// frame has gone.
     ///
-    /// Joining the room the socket is already in does nothing. Joining a
-    /// second one is `error.AlreadySeated`: the socket holds one ticket, and
-    /// taking another used to leave the first seat taken for good.
+    /// Joining the room the socket is already in does nothing. Joining
+    /// another as well is a seat in each, drained by the same `receive`: a
+    /// lobby and a channel of its own, or everybody and one user's tabs.
     /// A socket with no Engine behind it — one built over a fixed buffer in a
     /// test — is seated like any other. Its bell rings into nothing, but
-    /// `receive` drains its seat before it reads either way, so the posts
+    /// `receive` drains its seats before it reads either way, so the posts
     /// still arrive and the whole thing is testable without a server. That is
     /// deliberate: a feature only reachable through a real socket is a
     /// feature tested by hand.
     pub fn join(self: *Room, socket: *websocket.Socket) Error!void {
-        if (socket.inRoom()) |seated| {
-            if (seated == self) return;
-            return error.AlreadySeated;
-        }
-        try self.roster.lock();
-        defer self.roster.unlock();
-
-        const ticket = self.takeSeat() orelse return error.RoomFull;
-        self.seats[ticket.index].waker = socket.waker();
-        socket.seatedIn(self, ticket);
+        return self.sit(socket.seating(), socket.waker(), false);
     }
 
     /// Give the seat up. Safe to call twice, and safe to call on a socket
     /// that never joined — which is what makes `defer room.leave(&socket)`
     /// correct on every path out of a handler, including the failed ones.
+    /// The socket's other rooms keep their seats.
     pub fn leave(self: *Room, socket: *websocket.Socket) void {
-        // A ticket is an index into one room's seats. Read against another
-        // room's, it would give up a seat that is not this socket's and leave
-        // the one that is.
-        if (socket.inRoom() != self) return;
-        const ticket = socket.ticket() orelse return;
-        socket.unseat();
+        self.stand(socket.seating());
+    }
 
+    /// `join`, for whatever holds a chain and a bell: a Socket, or an event
+    /// stream handed to its connection. nilo's own; a handler joins a Socket.
+    pub fn sit(self: *Room, first: *Seating, waker: bulkhead.Waker, text_only: bool) Error!void {
+        _ = try self.sitAfter(first, waker, text_only, "", &.{});
+    }
+
+    /// `sit`, and under the same lock the kept posts that followed the one
+    /// whose id is `last_id`, each with a reference the caller writes out and
+    /// then `release`s. Returns how many went into `into`, which has room for
+    /// `keeps()` of them.
+    ///
+    /// **One lock for both is the whole point.** Seated first, a post landing
+    /// between the two would be in the seat and in the copy, and written
+    /// twice; copied first, a post landing between would be in neither.
+    pub fn sitAfter(
+        self: *Room,
+        first: *Seating,
+        waker: bulkhead.Waker,
+        text_only: bool,
+        last_id: []const u8,
+        into: []*Post,
+    ) Error!usize {
+        if (self.find(first.*) != null) return 0;
+
+        try self.roster.lock();
+        defer self.roster.unlock();
+
+        const ticket = self.takeSeat() orelse return error.RoomFull;
+        const seat = &self.seats[ticket.index];
+        seat.waker = waker;
+        seat.text_only = text_only;
+        // In front of the rooms it already sits in. The order is nobody's to
+        // rely on: every seat is drained before the connection waits,
+        // whichever rang.
+        seat.next = first.*;
+        first.* = .{ .room = self, .ticket = ticket };
+        return self.keptAfter(last_id, into);
+    }
+
+    /// How many posts this room keeps for a stream that comes back.
+    pub fn keeps(self: *const Room) usize {
+        return self.kept.len;
+    }
+
+    /// Throw away every kept post. What `Rooms` does before it lends this
+    /// room out under another name, so one user's history is never read by
+    /// the next.
+    pub fn forget(self: *Room) void {
+        self.roster.lockUncancelable();
+        defer self.roster.unlock();
+        while (self.kept_count > 0) self.forgetOldest();
+    }
+
+    /// `leave`, for whatever `sit` seated.
+    pub fn stand(self: *Room, first: *Seating) void {
+        // Found by room rather than read off the front: a ticket is an index
+        // into one room's seats, and read against another room's it would
+        // give up a seat that is not this connection's and leave the one that
+        // is.
+        const ticket = self.unlink(first) orelse return;
+        self.giveUp(ticket);
+        // After the roster's lock is let go, because whoever lent the room
+        // out takes a lock of its own, and a pool's lock taken inside a
+        // room's would order the two differently from every other path.
+        if (self.vacated) |told| told(self);
+    }
+
+    fn giveUp(self: *Room, ticket: Ticket) void {
         // **Neither of these may be the cancellable `lock`.** Both used to be,
         // and both gave up the same way — `catch return` — on the one error
         // they can return, which is `Canceled`: what a fiber gets when the
@@ -425,9 +582,31 @@ pub const Room = struct {
         return self.handOut(post);
     }
 
+    /// One event with a name, an id or both, to everybody. An event stream
+    /// sends `event:` and `id:` with it; a WebSocket gets `data` as a text
+    /// message, because a frame has nowhere to carry the other two.
+    ///
+    /// A line break in `name` or `id` is `error.EventFieldBreaksLine` and
+    /// nothing is said, the rule `Events.send` keeps: on the wire it would end
+    /// the field and begin one nobody sent.
+    pub fn event(self: *Room, e: stream_mod.Event) Error!void {
+        if (std.mem.indexOfAny(u8, e.name, "\r\n") != null) return error.EventFieldBreaksLine;
+        if (std.mem.indexOfAny(u8, e.id, "\r\n") != null) return error.EventFieldBreaksLine;
+        if (self.empty()) return;
+
+        const post = try self.reserveFields(.text, e.data.len, e.name.len, e.id.len);
+        defer self.release(post);
+        @memcpy(post.mutable(), e.data);
+        const fields = post.fields();
+        @memcpy(fields[0..e.name.len], e.name);
+        @memcpy(fields[e.name.len..], e.id);
+
+        return self.handOut(post);
+    }
+
     /// How many posts this connection was too slow to take, since it joined.
     pub fn missed(self: *Room, socket: *websocket.Socket) u64 {
-        const ticket = socket.ticket() orelse return 0;
+        const ticket = self.find(socket.seating().*) orelse return 0;
         const seat = &self.seats[ticket.index];
         if (!seat.taken or seat.era != ticket.era) return 0;
         return seat.dropped.load(.monotonic);
@@ -462,17 +641,57 @@ pub const Room = struct {
         return .{ .kind = post.kind, .data = post.bytes() };
     }
 
+    /// A post as an event stream writes it: its name and id, when `event`
+    /// gave it any, and the message as its data.
+    pub fn eventOf(_: *Room, post: *const Post) stream_mod.Event {
+        return .{ .name = post.name(), .id = post.id(), .data = post.bytes() };
+    }
+
     pub fn release(self: *Room, post: *Post) void {
         if (post.refs.fetchSub(1, .acq_rel) == 1) self.gpa.free(post.block());
     }
 
+    /// The room the connection in this seat sits in after this one, or an
+    /// empty `Seating` at the end of the chain.
+    pub fn after(self: *Room, ticket: Ticket) Seating {
+        return self.seats[ticket.index].next;
+    }
+
     // ---- inside ----
+
+    /// This room's seat in a connection's chain, or null if it has none here.
+    fn find(self: *Room, first: Seating) ?Ticket {
+        var at = first;
+        while (at.room) |in_room| {
+            if (in_room == self) return at.ticket;
+            at = in_room.after(at.ticket);
+        }
+        return null;
+    }
+
+    /// Take this room's seat out of a connection's chain and say which it
+    /// was, or null if it had none here. The connection's own fiber is the
+    /// only caller, which is why nothing here is locked (see `Seating`).
+    fn unlink(self: *Room, first: *Seating) ?Ticket {
+        var holder = first;
+        while (holder.room) |in_room| {
+            const seat = &in_room.seats[holder.ticket.index];
+            if (in_room == self) {
+                const ticket = holder.ticket;
+                holder.* = seat.next;
+                seat.next = .{};
+                return ticket;
+            }
+            holder = &seat.next;
+        }
+        return null;
+    }
 
     /// Nobody here. Worth its own check at the top of everything that says
     /// something: a room is empty most of the time, and a message into one
     /// should cost an atomic load rather than an allocation to throw away.
     fn empty(self: *Room) bool {
-        return self.here.load(.monotonic) == 0;
+        return self.here.load(.monotonic) == 0 and self.kept.len == 0;
     }
 
     /// Room for one post, with its frame header already written in front of
@@ -480,19 +699,30 @@ pub const Room = struct {
     /// server frame carries no mask and nothing else that differs by
     /// recipient (ADR 046).
     fn reserve(self: *Room, kind: websocket.Kind, len: usize) Error!*Post {
+        return self.reserveFields(kind, len, 0, 0);
+    }
+
+    /// `reserve`, with room behind the message for an event's name and id.
+    fn reserveFields(self: *Room, kind: websocket.Kind, len: usize, name_len: usize, id_len: usize) Error!*Post {
         var head: [websocket.max_header]u8 = undefined;
         const framing = websocket.headerFor(&head, kind, len);
+        // A name or id past four gigabytes is not an event anybody sends, and
+        // the allocation it asks for would fail the same way.
+        const names = std.math.cast(u32, name_len) orelse return error.OutOfMemory;
+        const ids = std.math.cast(u32, id_len) orelse return error.OutOfMemory;
 
         const block = try self.gpa.alignedAlloc(
             u8,
             .fromByteUnits(@alignOf(Post)),
-            @sizeOf(Post) + framing.len + len,
+            @sizeOf(Post) + framing.len + len + name_len + id_len,
         );
         const post: *Post = @ptrCast(block.ptr);
         post.* = .{
             .refs = .init(1),
             .kind = kind,
             .head = @intCast(framing.len),
+            .name_len = names,
+            .id_len = ids,
             .len = len,
         };
         @memcpy(block[@sizeOf(Post)..][0..framing.len], framing);
@@ -508,6 +738,58 @@ pub const Room = struct {
         for (self.roll[0..self.here.load(.monotonic)]) |index| {
             self.put(&self.seats[index], post);
         }
+        // Text only, for `put`'s reason: an event stream is the one thing
+        // that reads these back, and it cannot carry a binary post.
+        if (self.kept.len != 0 and post.kind == .text) self.keep(post);
+    }
+
+    /// Hold on to one more post, letting the oldest go past either bound.
+    /// The roster's lock is the caller's.
+    fn keep(self: *Room, post: *Post) void {
+        const size = post.block().len;
+        if (size > self.kept_limit) return;
+
+        _ = post.refs.fetchAdd(1, .acq_rel);
+        if (self.kept_count == self.kept.len) self.forgetOldest();
+        self.kept[(self.kept_head + self.kept_count) % self.kept.len] = post;
+        self.kept_count += 1;
+        self.kept_bytes += size;
+        while (self.kept_bytes > self.kept_limit) self.forgetOldest();
+    }
+
+    fn forgetOldest(self: *Room) void {
+        const old = self.kept[self.kept_head].?;
+        self.kept[self.kept_head] = null;
+        self.kept_head = (self.kept_head + 1) % self.kept.len;
+        self.kept_count -= 1;
+        self.kept_bytes -= old.block().len;
+        self.release(old);
+    }
+
+    /// The kept posts after the newest one whose id is `last_id`, into
+    /// `into`, each with a reference of its own. None when nothing here has
+    /// that id: a stream in several rooms reports the id of whichever spoke
+    /// last, and the others have nothing to go on. The roster's lock is the
+    /// caller's.
+    fn keptAfter(self: *Room, last_id: []const u8, into: []*Post) usize {
+        if (last_id.len == 0 or self.kept_count == 0) return 0;
+
+        var at = self.kept_count;
+        const found = while (at > 0) {
+            at -= 1;
+            const post = self.kept[(self.kept_head + at) % self.kept.len].?;
+            if (std.mem.eql(u8, post.id(), last_id)) break at;
+        } else return 0;
+
+        var n: usize = 0;
+        for (found + 1..self.kept_count) |i| {
+            if (n == into.len) break;
+            const post = self.kept[(self.kept_head + i) % self.kept.len].?;
+            _ = post.refs.fetchAdd(1, .acq_rel);
+            into[n] = post;
+            n += 1;
+        }
+        return n;
     }
 
     /// Push one post into one seat, applying the policy if it is full. The
@@ -516,6 +798,14 @@ pub const Room = struct {
     fn put(self: *Room, seat: *Seat, post: *Post) void {
         seat.lock.lock() catch return;
         defer seat.lock.unlock();
+
+        // Counted as missed rather than queued, and the bell is not rung: an
+        // event stream has no way to carry it, and waking a connection to
+        // write nothing is a wakeup for nothing.
+        if (seat.text_only and post.kind == .binary) {
+            seat.dropped.store(seat.dropped.load(.monotonic) + 1, .monotonic);
+            return;
+        }
 
         if (seat.count == self.backlog) {
             seat.dropped.store(seat.dropped.load(.monotonic) + 1, .monotonic);
@@ -553,6 +843,7 @@ pub const Room = struct {
         seat.era +%= 1;
         seat.slot = @intCast(taken);
         seat.dropped.store(0, .monotonic);
+        seat.next = .{};
         self.here.store(taken + 1, .monotonic);
         return .{ .index = index, .era = seat.era };
     }
@@ -874,35 +1165,105 @@ test "leaving twice, and leaving without joining, are both fine" {
     try testing.expectEqual(@as(usize, 0), room.count());
 }
 
-test "a socket in one room is refused by a second, and leaving the wrong room gives up nothing" {
-    // `global.join; chan.join` with a `defer leave` for each is the natural
-    // way to write two rooms. It used to overwrite the socket's ticket, so
-    // `chan.leave` freed its seat by an index into the wrong room and the
-    // `global` seat stayed taken, ringing a bell in a frame that had gone.
-    var global = try Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 2 });
-    defer global.deinit();
-    var chan = try Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 2 });
-    defer chan.deinit();
+test "a socket in two rooms hears both, from one receive" {
+    // A lobby and a channel of its own: the shape that used to be
+    // `error.AlreadySeated`, because a socket held one ticket and `receive`
+    // drained one seat.
+    var lobby = try Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 2 });
+    defer lobby.deinit();
+    var mine = try Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 2 });
+    defer mine.deinit();
 
     var in = std.Io.Reader.fixed("");
     var bytes: [64]u8 = undefined;
     var out = std.Io.Writer.fixed(&bytes);
     var socket: websocket.Socket = .{ ._in = &in, ._out = &out, ._stopping = null };
 
-    try global.join(&socket);
-    try global.join(&socket);
-    try testing.expectEqual(@as(usize, 1), global.count());
-    try testing.expectError(error.AlreadySeated, chan.join(&socket));
-    try testing.expectEqual(@as(usize, 0), chan.count());
+    try lobby.join(&socket);
+    defer lobby.leave(&socket);
+    try mine.join(&socket);
+    defer mine.leave(&socket);
+    try testing.expectEqual(@as(usize, 1), lobby.count());
+    try testing.expectEqual(@as(usize, 1), mine.count());
 
-    chan.leave(&socket);
-    try testing.expectEqual(@as(usize, 1), global.count());
-    try testing.expectEqual(&global, socket.inRoom().?);
+    try lobby.sayText("all");
+    try mine.sayText("you");
 
-    global.leave(&socket);
-    try testing.expectEqual(@as(usize, 0), global.count());
-    try chan.join(&socket);
-    chan.leave(&socket);
+    // One `receive` drains every seat, and the burst is one flush. Which
+    // room comes out first is not a promise, so this asserts on the bytes
+    // rather than their order.
+    try testing.expect(try socket.receive() == null);
+    const got = out.buffered();
+    try testing.expectEqual(@as(usize, 10), got.len);
+    try testing.expect(std.mem.indexOf(u8, got, "\x81\x03all") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\x81\x03you") != null);
+}
+
+test "joining a room twice takes one seat, and leaving one room keeps the others" {
+    var a = try Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 2 });
+    defer a.deinit();
+    var b = try Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 2 });
+    defer b.deinit();
+    var c = try Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 2 });
+    defer c.deinit();
+
+    var in = std.Io.Reader.fixed("");
+    var bytes: [64]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var socket: websocket.Socket = .{ ._in = &in, ._out = &out, ._stopping = null };
+
+    try a.join(&socket);
+    try b.join(&socket);
+    try c.join(&socket);
+    try b.join(&socket);
+    try testing.expectEqual(@as(usize, 1), b.count());
+
+    // The middle of the chain, which is the case a list gets wrong: the seat
+    // in front of it has to be pointed past it, not at it.
+    b.leave(&socket);
+    try testing.expectEqual(@as(usize, 0), b.count());
+    try testing.expectEqual(@as(usize, 1), a.count());
+    try testing.expectEqual(@as(usize, 1), c.count());
+
+    try b.sayText("gone");
+    try a.sayText("a");
+    try c.sayText("c");
+    try testing.expect(try socket.receive() == null);
+    try testing.expectEqual(@as(usize, 6), out.buffered().len);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "gone") == null);
+
+    // Leaving a room the socket is not in gives up nothing anywhere.
+    b.leave(&socket);
+    try testing.expectEqual(@as(usize, 1), a.count());
+    try testing.expectEqual(@as(usize, 1), c.count());
+
+    socket.leaveRooms();
+    try testing.expectEqual(@as(usize, 0), a.count());
+    try testing.expectEqual(@as(usize, 0), c.count());
+    try testing.expect(socket.seating().room == null);
+}
+
+test "a count of dropped posts is the room's own, however many rooms the socket is in" {
+    var loud = try Room.initWith(testing.allocator, .{ .seats = 1, .backlog = 1 });
+    defer loud.deinit();
+    var quiet = try Room.initWith(testing.allocator, .{ .seats = 1, .backlog = 1 });
+    defer quiet.deinit();
+
+    var in = std.Io.Reader.fixed("");
+    var bytes: [64]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var socket: websocket.Socket = .{ ._in = &in, ._out = &out, ._stopping = null };
+
+    try loud.join(&socket);
+    defer loud.leave(&socket);
+    try quiet.join(&socket);
+    defer quiet.leave(&socket);
+
+    try loud.sayText("1");
+    try loud.sayText("2");
+    try loud.sayText("3");
+    try testing.expectEqual(@as(u64, 2), loud.missed(&socket));
+    try testing.expectEqual(@as(u64, 0), quiet.missed(&socket));
 }
 
 test "a room that is full says so, naming nothing it cannot" {
@@ -1013,4 +1374,56 @@ test "one post read by many seats is freed once, by the last of them" {
         try testing.expectEqualStrings("everybody", room.contentsOf(post).data);
         room.release(post);
     }
+}
+
+test "a room with history keeps its latest text posts, inside both bounds" {
+    // Three posts or 200 bytes, whichever comes first. A post here is its header
+    // struct, a two-byte frame header and the text.
+    var room = try Room.initWith(testing.allocator, .{ .seats = 1, .backlog = 2, .history = 3, .history_bytes = 200 });
+    defer room.deinit();
+
+    // Nobody is here, and it is still kept: a client that is away is the
+    // one it is for.
+    try room.event(.{ .id = "a", .data = "one" });
+    try room.sayBinary("\x00");
+    try room.event(.{ .id = "b", .data = "two" });
+    try room.event(.{ .id = "c", .data = "three" });
+    try room.event(.{ .id = "d", .data = "four" });
+    // Three by count, the binary never kept.
+    try testing.expectEqual(@as(usize, 3), room.kept_count);
+    try testing.expectEqualStrings("b", room.kept[room.kept_head].?.id());
+
+    // A post bigger than the whole byte bound is not kept, and costs nothing
+    // already kept.
+    try room.sayText("x" ** 300);
+    try testing.expectEqual(@as(usize, 3), room.kept_count);
+    try testing.expect(room.kept_bytes <= 200);
+
+    room.forget();
+    try testing.expectEqual(@as(usize, 0), room.kept_count);
+    try testing.expectEqual(@as(usize, 0), room.kept_bytes);
+}
+
+test "sitting down after an id takes what followed it and nothing already queued" {
+    var room = try Room.initWith(testing.allocator, .{ .seats = 1, .backlog = 4, .history = 4 });
+    defer room.deinit();
+    try room.event(.{ .id = "1", .data = "one" });
+    try room.event(.{ .id = "2", .data = "two" });
+    try room.event(.{ .id = "3", .data = "three" });
+
+    var first: Seating = .{};
+    var into: [4]*Post = undefined;
+    const n = try room.sitAfter(&first, .off, true, "1", &into);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("two", room.eventOf(into[0]).data);
+    try testing.expectEqualStrings("three", room.eventOf(into[1]).data);
+    for (into[0..n]) |post| room.release(post);
+
+    // Seated: the seat holds only what is said from now on.
+    try testing.expect(room.take(first.ticket) == null);
+    try room.event(.{ .id = "4", .data = "four" });
+    const next = room.take(first.ticket).?;
+    try testing.expectEqualStrings("4", room.eventOf(next).id);
+    room.release(next);
+    room.stand(&first);
 }

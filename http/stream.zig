@@ -23,9 +23,12 @@
 
 const std = @import("std");
 
+const bulkhead = @import("bulkhead.zig");
 const http1 = @import("http1.zig");
 const json_mod = @import("json.zig");
+const room_mod = @import("room.zig");
 const watchdog = @import("watchdog.zig");
+const websocket = @import("websocket.zig");
 
 /// How much a stream buffers before a piece goes out on its own.
 ///
@@ -359,11 +362,7 @@ pub const Events = struct {
     pub fn send(self: *Events, event: Event) !void {
         try oneLine(event.name);
         try oneLine(event.id);
-        const w = &self.stream.writer;
-        if (event.name.len > 0) try w.print("event: {s}\n", .{event.name});
-        if (event.id.len > 0) try w.print("id: {s}\n", .{event.id});
-        try writeData(w, event.data);
-        try w.writeAll("\n");
+        try writeEvent(&self.stream.writer, event);
         try self.stream.flush();
     }
 
@@ -415,6 +414,193 @@ pub const Events = struct {
         return self.stream.finish();
     }
 };
+
+/// What `c.eventsFrom` takes besides the rooms.
+pub const FromRooms = struct {
+    /// A comment this often while nothing is said, so that a proxy or a load
+    /// balancer that closes a quiet connection sees this one speak. `0` sends
+    /// none. Thirty seconds is under nginx's default read timeout of sixty,
+    /// and the same stretch a WebSocket waits before it pings (ADR 021).
+    keepalive_ms: u32 = 30_000,
+    /// `retry:`, sent once before anything else: how long the browser waits
+    /// before reconnecting. Null sends none and leaves the browser's own,
+    /// about three seconds.
+    retry_ms: ?u32 = null,
+};
+
+/// An event stream whose every event comes from Rooms, handed to its
+/// connection rather than held by its handler (ADR 227).
+///
+/// ```zig
+/// fn feed(c: *nilo.Ctx, lobby: *nilo.Room) !void {
+///     return c.eventsFrom(lobby, .{});
+/// }
+/// ```
+///
+/// **Where a stream waits is what it costs.** `c.events()` keeps the handler
+/// suspended inside the request for as long as the stream is open, and a
+/// suspended fiber holds its stack at its high-water mark: 21,058 bytes a
+/// held stream against 4,669 for an idle connection (ADR 019, ADR 062). A
+/// stream with nothing of its own to say has no reason to keep the handler,
+/// so the handler writes the head, sits the stream in its rooms and returns,
+/// and the connection loop waits on it from its own frame, the way it waits
+/// on a Socket.
+///
+/// **A client that speaks has gone.** After its request an `EventSource`
+/// sends nothing, so anything that makes the socket readable is either a
+/// hang-up or bytes that can never be answered, because this response never
+/// ends. Either way the stream ends. It is the one place nilo learns a client
+/// left without writing to it, and the reason it can be learned here is the
+/// same reason it cannot on an ordinary request: an ordinary response ends,
+/// and a client that half-closed may be waiting for it (`docs/roadmap.md`).
+pub const RoomEvents = struct {
+    _in: *std.Io.Reader,
+    _out: *std.Io.Writer,
+    _stopping: ?*const std.atomic.Value(bool),
+    _waker: bulkhead.Waker,
+    /// The request's blocking detector, or null for one a test built. A
+    /// stretch ends at every wait, so what lies between two is one burst of
+    /// events written (ADR 013).
+    _watch: ?*watchdog.Watch = null,
+    _keepalive_ms: u32,
+    /// False for an HTTP/1.0 client, which gets the events unframed and the
+    /// connection closed at the end, as `Stream` does.
+    _chunked: bool,
+    /// The rooms this stream sits in: the first, and through its seat the
+    /// rest (`room.Seating`).
+    _seated: room_mod.Seating = .{},
+
+    /// How long the connection waits before it gives its buffers and stack
+    /// pages back: the peek a Socket and an idle HTTP connection take for the
+    /// same reason (ADR 062).
+    const idle_peek_ms = 200;
+
+    pub fn seating(self: *RoomEvents) *room_mod.Seating {
+        return &self._seated;
+    }
+
+    /// Give up every seat. What the end of `run` does, because each seat's
+    /// bell lives in a frame about to go (ADR 082).
+    pub fn leaveRooms(self: *RoomEvents) void {
+        while (self._seated.room) |in_room| in_room.stand(&self._seated);
+    }
+
+    /// Wait on the rooms until the client goes, the server stops or a write
+    /// fails, writing each post as it arrives. The connection loop's; a
+    /// handler never calls it.
+    pub fn run(self: *RoomEvents) void {
+        defer self.leaveRooms();
+        while (true) {
+            self.deliver() catch return;
+            // What is queued has gone out above. A server on its way out
+            // ends the stream itself rather than leaving the client to find
+            // the socket gone (ADR 019).
+            if (self.stopping()) break;
+            switch (self.park()) {
+                .posted => {},
+                .timed_out => self.keepAlive() catch return,
+                .readable, .closed => break,
+            }
+        }
+        self.finish();
+    }
+
+    /// Write out everything waiting in every seat, as events. Flushed by
+    /// `park`, so a burst is one syscall.
+    fn deliver(self: *RoomEvents) !void {
+        var at = self._seated;
+        while (at.room) |in_room| {
+            while (in_room.take(at.ticket)) |post| {
+                defer in_room.release(post);
+                try self.writeFramed(in_room.eventOf(post));
+            }
+            at = in_room.after(at.ticket);
+        }
+    }
+
+    /// One event as one chunk. Its length is counted first, with the same
+    /// function that writes it, so the chunk header cannot disagree with the
+    /// bytes behind it (ADR 076).
+    fn writeFramed(self: *RoomEvents, event: Event) !void {
+        if (self._chunked) try http1.writeChunkHeader(self._out, @intCast(websocket.counted(writeEvent, event)));
+        try writeEvent(self._out, event);
+        if (self._chunked) try http1.endChunk(self._out);
+    }
+
+    /// `retry:`, once, before any event. `eventsFrom`'s, from the handler's
+    /// frame, while the head it follows is still in the write buffer.
+    pub fn sendRetry(self: *RoomEvents, millis: u32) !void {
+        var line: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&line, "retry: {d}\n\n", .{millis}) catch unreachable;
+        if (self._chunked) try http1.writeChunkHeader(self._out, text.len);
+        try self._out.writeAll(text);
+        if (self._chunked) try http1.endChunk(self._out);
+    }
+
+    /// What a room kept for a client coming back, written before anything
+    /// new and released as it goes (ADR 229). `eventsFrom`'s, from the
+    /// handler's frame. Every post is released whether or not the writing
+    /// got that far.
+    pub fn replay(self: *RoomEvents, in_room: *room_mod.Room, posts: []*room_mod.Post) !void {
+        var at: usize = 0;
+        defer for (posts[at..]) |post| in_room.release(post);
+        while (at < posts.len) : (at += 1) {
+            try self.writeFramed(in_room.eventOf(posts[at]));
+            in_room.release(posts[at]);
+        }
+    }
+
+    /// A comment with nothing in it: the smallest thing a proxy counts as
+    /// the connection speaking.
+    fn keepAlive(self: *RoomEvents) !void {
+        if (self._chunked) try http1.writeChunkHeader(self._out, 3);
+        try self._out.writeAll(":\n\n");
+        if (self._chunked) try http1.endChunk(self._out);
+    }
+
+    /// The end of the body, for a client still there to read it. A client
+    /// that has gone makes this fail, which is nothing to report.
+    fn finish(self: *RoomEvents) void {
+        if (self._chunked) http1.writeLastChunk(self._out) catch return;
+        self._out.flush() catch {};
+    }
+
+    fn stopping(self: *const RoomEvents) bool {
+        const flag = self._stopping orelse return false;
+        return flag.load(.acquire);
+    }
+
+    /// Flush, then wait for a post, the client, or the keep-alive's stretch.
+    /// Past a short peek the buffers and the stack pages below this frame go
+    /// back, as they do for a quiet Socket: a feed with ten thousand readers
+    /// is ten thousand connections that are almost always quiet.
+    fn park(self: *RoomEvents) bulkhead.Woken {
+        if (self._out.end != 0) self._out.flush() catch return .closed;
+
+        const token = watchdog.waiting(self._watch);
+        defer watchdog.waited(self._watch, token);
+
+        const limit = self._keepalive_ms;
+        if (limit != 0 and limit <= idle_peek_ms) return self._waker.wait(limit);
+        switch (self._waker.wait(idle_peek_ms)) {
+            .timed_out => {},
+            else => |woken| return woken,
+        }
+        bulkhead.releaseIdlePages(self._in, self._out);
+        self._waker.releaseStack();
+        return self._waker.wait(if (limit == 0) 0 else limit - idle_peek_ms);
+    }
+};
+
+/// One event's lines: `event:` and `id:` when it has them, `data:` for each
+/// line of the data, and the blank line that ends it. The caller has checked
+/// `name` and `id` for line breaks.
+fn writeEvent(w: *std.Io.Writer, event: Event) !void {
+    if (event.name.len > 0) try w.print("event: {s}\n", .{event.name});
+    if (event.id.len > 0) try w.print("id: {s}\n", .{event.id});
+    try writeData(w, event.data);
+    try w.writeAll("\n");
+}
 
 /// `data:` for every line of `text`, because a newline inside a value is a
 /// line break on the wire and would end the event early.
@@ -801,4 +987,156 @@ test "live follows the server's stopping flag" {
     try body.writeAll("last");
     try body.finish();
     try testing.expectEqualStrings("4\r\nlast\r\n0\r\n\r\n", wire.written());
+}
+
+// ---- an event stream handed to its connection ----
+
+/// A connection's bell for a test: it answers the waits it is given, in
+/// order, and then says the client has gone. `park` spends a keep-alive
+/// stretch as a short peek and then the rest, so the script is of what each
+/// wait answers rather than of how long anything took.
+const Script = struct {
+    answers: []const bulkhead.Woken,
+    at: usize = 0,
+    /// The limits the waits were given, so a test can check the keep-alive
+    /// travelled.
+    limits: [8]u32 = @splat(0),
+
+    fn waker(self: *Script) bulkhead.Waker {
+        return .{ .vtable = &vtable, .target = self };
+    }
+
+    const vtable: bulkhead.Waker.VTable = .{
+        .wait = struct {
+            fn f(target: ?*anyopaque, limit_ms: u32) bulkhead.Woken {
+                const s: *Script = @ptrCast(@alignCast(target.?));
+                if (s.at < s.limits.len) s.limits[s.at] = limit_ms;
+                defer s.at += 1;
+                return if (s.at < s.answers.len) s.answers[s.at] else .readable;
+            }
+        }.f,
+        .post = struct {
+            fn f(_: ?*anyopaque) void {}
+        }.f,
+        .release_stack = struct {
+            fn f(_: ?*anyopaque) void {}
+        }.f,
+        .half_close = struct {
+            fn f(_: ?*anyopaque) void {}
+        }.f,
+    };
+};
+
+fn roomEvents(in: *std.Io.Reader, out: *std.Io.Writer, waker: bulkhead.Waker, chunked: bool) RoomEvents {
+    return .{
+        ._in = in,
+        ._out = out,
+        ._stopping = null,
+        ._waker = waker,
+        ._keepalive_ms = 30_000,
+        ._chunked = chunked,
+    };
+}
+
+test "an event stream in a room writes each post as one chunk, and ends when the client goes" {
+    var room = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 4 });
+    defer room.deinit();
+
+    var in = std.Io.Reader.fixed("");
+    var bytes: [512]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var events = roomEvents(&in, &out, .off, true);
+    try room.sit(events.seating(), .off, true);
+    try testing.expectEqual(@as(usize, 1), room.count());
+
+    try room.sayText("one line\nand a forged\revent: admin");
+    try room.event(.{ .name = "tick", .id = "7", .data = "{}" });
+
+    // `.off` answers every wait with "go and read", which is a client that
+    // has spoken, so the stream writes what is queued and ends.
+    events.run();
+
+    try testing.expectEqualStrings(
+        "36\r\ndata: one line\ndata: and a forged\ndata: event: admin\n\n\r\n" ++
+            "1c\r\nevent: tick\nid: 7\ndata: {}\n\n\r\n" ++
+            "0\r\n\r\n",
+        out.buffered(),
+    );
+    // Every seat is given up on the way out, because each one's bell lives
+    // in a frame that is about to go (ADR 082).
+    try testing.expectEqual(@as(usize, 0), room.count());
+}
+
+test "a quiet event stream sends a comment every keep-alive, and a post wakes it" {
+    var room = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 4 });
+    defer room.deinit();
+
+    // Peek, then the rest of the stretch: a keep-alive. Then a post.
+    var script: Script = .{ .answers = &.{ .timed_out, .timed_out, .posted } };
+    var in = std.Io.Reader.fixed("");
+    var bytes: [512]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var events = roomEvents(&in, &out, script.waker(), true);
+    try room.sit(events.seating(), .off, true);
+
+    try room.sayText("first");
+    events.run();
+
+    try testing.expectEqualStrings(
+        "d\r\ndata: first\n\n\r\n" ++ "3\r\n:\n\n\r\n" ++ "0\r\n\r\n",
+        out.buffered(),
+    );
+    // The whole keep-alive travelled: a short peek, then what is left of it.
+    try testing.expectEqual(@as(u32, RoomEvents.idle_peek_ms), script.limits[0]);
+    try testing.expectEqual(@as(u32, 30_000 - RoomEvents.idle_peek_ms), script.limits[1]);
+}
+
+test "an event stream in two rooms hears both, and a binary post is counted rather than sent" {
+    var lobby = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 4 });
+    defer lobby.deinit();
+    var mine = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 4 });
+    defer mine.deinit();
+
+    var in = std.Io.Reader.fixed("");
+    var bytes: [512]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    // HTTP/1.0: no chunks, and the end of the stream is the end of the
+    // connection.
+    var events = roomEvents(&in, &out, .off, false);
+    try lobby.sit(events.seating(), .off, true);
+    try mine.sit(events.seating(), .off, true);
+
+    try lobby.sayBinary("\x00\x01");
+    try lobby.sayText("all");
+    try mine.sayText("you");
+    try testing.expectEqual(@as(u64, 1), lobby.seats[lobby.roll[0]].dropped.load(.monotonic));
+
+    events.run();
+    const got = out.buffered();
+    try testing.expectEqual(@as(usize, 22), got.len);
+    try testing.expect(std.mem.indexOf(u8, got, "data: all\n\n") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "data: you\n\n") != null);
+    try testing.expectEqual(@as(usize, 0), lobby.count());
+    try testing.expectEqual(@as(usize, 0), mine.count());
+}
+
+test "an event stream ends itself when the server stops, after what was queued" {
+    var room = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 4 });
+    defer room.deinit();
+
+    var stopping = std.atomic.Value(bool).init(true);
+    var script: Script = .{ .answers = &.{.posted} };
+    var in = std.Io.Reader.fixed("");
+    var bytes: [256]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var events = roomEvents(&in, &out, script.waker(), true);
+    events._stopping = &stopping;
+    try room.sit(events.seating(), .off, true);
+
+    try room.sayText("last");
+    events.run();
+
+    try testing.expectEqualStrings("c\r\ndata: last\n\n\r\n0\r\n\r\n", out.buffered());
+    // It never waited: a stopped server is not something to park on.
+    try testing.expectEqual(@as(usize, 0), script.at);
 }

@@ -12,7 +12,15 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ### Breaking
 
+- **A WebSocket can sit in more than one `Room`**, and `error.AlreadySeated` is gone from `nilo.Room.Error`. Joining a second room used to be refused; it is now a seat in each, drained by the same `receive`, and `leave` gives up one room and keeps the rest. What to change: a `switch` on the error that names `error.AlreadySeated` drops that arm. `Socket.ticket()`, `inRoom()`, `seatedIn()` and `unseat()`, which were public for the Room's use, are replaced by `seating()` and `leaveRooms()`, and `room.Ticket.index` is a `u32` (ADR 035).
 - **The session cookie is `__Host-session` wherever the prefix can hold** (`Secure`, `Path=/`, no `Domain`, the defaults), and that name is read before `session`. A sibling subdomain could plant a `session` cookie of its own under a path of this site, and the victim worked inside the attacker's account. Nobody is signed out: a `session` cookie still opens, and the next `set` moves it. What to change: `app.guard(…, "session")` becomes `app.guard(…, nilo.session.host_cookie_name)`, and a test or a client that reads the cookie by name reads the new one. A session with a `domain`, another `path` or `secure = false` keeps the plain name (ADR 033).
+
+### Added
+
+- **`c.eventsFrom(rooms, .{})` is an event stream fed by Rooms, handed to the connection rather than kept by its handler.** Every post said into the rooms goes out as an event, a comment keeps a quiet connection speaking every 30 seconds, and the stream ends when the client goes or the server stops. It costs 5,184 bytes a connection, an idle connection's figure, where a stream a handler holds costs 21,566. One Room can hold WebSockets and event streams together; a binary post is counted as missed for a stream rather than sent (ADR 227).
+- **`room.event(.{ .name, .id, .data })` says one event with a name or an id.** An event stream sends all three; a WebSocket gets `data` as a text message. A line break in `name` or `id` is `error.EventFieldBreaksLine`, new in `nilo.Room.Error` (ADR 227).
+- **`nilo.Rooms` lends a Room to a key the application makes up**, from a pool sized at `init`: every tab a user has open joins `"user:42"`, and `rooms.json("user:42", …)` from anywhere reaches all of them. A key nobody is under costs nothing to say into, the last one out gives the Room back, and when every Room is lent a new key is `error.NoRoomFree`, a 503 in `eventsFrom`. `c.eventsFrom` takes `rooms.named(key)` beside or instead of a Room (ADR 228).
+- **A Room made with `.history` catches a returning event stream up.** It keeps its latest text posts, bounded by count and by `history_bytes` (64 KiB), and `c.eventsFrom` writes the ones after the client's `Last-Event-ID` before anything new. Give every post in such a Room an id with `room.event` (ADR 229).
 
 ### Fixed
 

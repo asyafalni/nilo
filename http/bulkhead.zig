@@ -687,12 +687,13 @@ pub const Options = struct {
     /// under load, which is the point: the bug is invisible in development
     /// precisely because there is nobody else to be slow for.
     ///
-    /// What is measured is time the handler ran, not time the request took:
-    /// waiting on `nilo.blocking`, `nilo.sleep`, a `nilo.Mutex`, the
-    /// request body or the response write is all subtracted, because in
-    /// every one of those the thread is off serving somebody else. A
-    /// request that takes the connection over — a stream, a body reader, a
-    /// WebSocket — is not watched at all.
+    /// What is measured is the longest stretch the fiber ran without
+    /// parking, not time the request took: a wait on `nilo.blocking`,
+    /// `nilo.sleep`, a `nilo.Mutex`, the request body or the response write
+    /// ends a stretch, because in every one of those the thread is off
+    /// serving somebody else. So a request that takes the connection over is
+    /// watched on the same terms: a stream by its writes, a body reader by
+    /// its reads, a WebSocket by one message at a time.
     ///
     /// A quarter of a second is far longer than any handler that is not
     /// waiting, and long enough that ordinary CPU work does not trip it.

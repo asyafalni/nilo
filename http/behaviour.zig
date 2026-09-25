@@ -31,6 +31,7 @@ const budget = @import("budget.zig");
 const watchdog = @import("watchdog.zig");
 const websocket = @import("websocket.zig");
 const room_mod = @import("room.zig");
+const rooms_mod = @import("rooms.zig");
 const metrics_mod = @import("metrics.zig");
 const nilo_testing = @import("testing.zig");
 const form_mod = @import("form.zig");
@@ -6263,9 +6264,10 @@ const upgrade_request = "GET /ws HTTP/1.1\r\nHost: x\r\n" ++
     "Upgrade: websocket\r\nConnection: Upgrade\r\n" ++
     "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
 
-/// The room `joinAndForgetLoop` sits in. A loop's state is its own; a test
-/// that reads the room after the connection is over needs it out here.
+/// The rooms `joinAndForgetLoop` sits in. A loop's state is its own; a test
+/// that reads the rooms after the connection is over needs them out here.
 var forgetful_room: *room_mod.Room = undefined;
+var forgetful_second: *room_mod.Room = undefined;
 
 fn joinAndForget(c: *Ctx) anyerror!void {
     return c.upgrade(joinAndForgetLoop, {});
@@ -6273,15 +6275,20 @@ fn joinAndForget(c: *Ctx) anyerror!void {
 
 fn joinAndForgetLoop(socket: *websocket.Socket) anyerror!void {
     try forgetful_room.join(socket);
+    try forgetful_second.join(socket);
     while (try socket.receive()) |_| {}
 }
 
-test "a seat a WebSocket loop never gave up is given up when the loop returns" {
-    // The seat's bell is in the connection's frame. Left taken, the next
-    // `say` rings it after that frame has returned (ADR 082).
+test "every seat a WebSocket loop never gave up is given up when the loop returns" {
+    // Each seat's bell is in the connection's frame. Left taken, the next
+    // `say` rings it after that frame has returned (ADR 082), in the second
+    // room as much as the first.
     var room = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 2 });
     defer room.deinit();
+    var second = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 2 });
+    defer second.deinit();
     forgetful_room = &room;
+    forgetful_second = &second;
 
     var app = App.init(testing.allocator);
     defer app.deinit();
@@ -6292,7 +6299,227 @@ test "a seat a WebSocket loop never gave up is given up when the loop returns" {
     const result = h.send(&app, upgrade_request);
     try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 101"));
     try testing.expectEqual(@as(usize, 0), room.count());
+    try testing.expectEqual(@as(usize, 0), second.count());
     try room.sayText("nobody is here");
+    try second.sayText("nor here");
+}
+
+/// The room `feed` sits its event stream in, and says three things into once
+/// the stream is seated: a WebSocket frame has nowhere for the second's name
+/// and id, and an event stream has no way to carry the third.
+var feed_room: *room_mod.Room = undefined;
+
+fn feed(c: *Ctx) anyerror!void {
+    try c.eventsFrom(feed_room, .{ .retry_ms = 5_000 });
+    try feed_room.sayText("hello");
+    try feed_room.event(.{ .name = "tick", .id = "7", .data = "{}" });
+    try feed_room.sayBinary("\x00\x01");
+}
+
+test "an event stream from a room is handed to the connection, and hears what the room says" {
+    var room = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 4 });
+    defer room.deinit();
+    feed_room = &room;
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/feed", feed);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(&app, "GET /feed HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, result.response, "Content-Type: text/event-stream\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, result.response, "X-Accel-Buffering: no\r\n") != null);
+    // The retry first, then each post as its own chunk, and the end of the
+    // body once the client has gone (the harness's Waker answers every wait
+    // with "go and read", which is a client that spoke).
+    try testing.expect(std.mem.endsWith(
+        u8,
+        result.response,
+        "\r\n\r\nd\r\nretry: 5000\n\n\r\n" ++
+            "d\r\ndata: hello\n\n\r\n" ++
+            "1c\r\nevent: tick\nid: 7\ndata: {}\n\n\r\n" ++
+            "0\r\n\r\n",
+    ));
+    // A stream that never ends leaves nothing to keep alive, and every seat
+    // is given up on the way out.
+    try testing.expect(!result.keep_alive);
+    try testing.expectEqual(@as(usize, 0), room.count());
+}
+
+var full_room: *room_mod.Room = undefined;
+
+fn feedFull(c: *Ctx) anyerror!void {
+    return c.eventsFrom(full_room, .{});
+}
+
+test "an event stream into a full room is a 503 the client can read, not a stream that ends at once" {
+    var room = try room_mod.Room.initWith(testing.allocator, .{ .seats = 1, .backlog = 2 });
+    defer room.deinit();
+    full_room = &room;
+
+    var in = std.Io.Reader.fixed("");
+    var bytes: [64]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var sitting: websocket.Socket = .{ ._in = &in, ._out = &out, ._stopping = null };
+    try room.join(&sitting);
+    defer room.leave(&sitting);
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/feed", feedFull);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(&app, "GET /feed HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 503"));
+    try testing.expect(std.mem.indexOf(u8, result.response, "every seat in this room is taken") != null);
+    try testing.expectEqual(@as(usize, 1), room.count());
+}
+
+test "a HEAD for an event stream from a room gets the head and takes no seat" {
+    var room = try room_mod.Room.initWith(testing.allocator, .{ .seats = 1, .backlog = 2 });
+    defer room.deinit();
+    full_room = &room;
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/feed", feedFull);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(&app, "HEAD /feed HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.endsWith(u8, result.response, "\r\n\r\n"));
+    try testing.expect(std.mem.indexOf(u8, result.response, "data:") == null);
+    try testing.expectEqual(@as(usize, 0), room.count());
+}
+
+var kept_room: *room_mod.Room = undefined;
+
+fn feedKept(c: *Ctx) anyerror!void {
+    try c.eventsFrom(kept_room, .{});
+    try kept_room.event(.{ .id = "4", .data = "four" });
+}
+
+/// A room that kept three events while nobody was listening.
+fn keptThree(room: *room_mod.Room) !void {
+    try room.event(.{ .id = "1", .data = "one" });
+    try room.event(.{ .id = "2", .data = "two" });
+    try room.event(.{ .id = "3", .data = "three" });
+}
+
+test "a client coming back with Last-Event-ID gets what the room said after it, then what is new" {
+    var room = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 4, .history = 8 });
+    defer room.deinit();
+    kept_room = &room;
+    try keptThree(&room);
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/feed", feedKept);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(&app, "GET /feed HTTP/1.1\r\nHost: x\r\nLast-Event-ID: 1\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 200 OK\r\n"));
+    // Two and three from the room's history, in the order they were said,
+    // then four, which arrived after the stream sat down. Nothing twice.
+    try testing.expect(std.mem.endsWith(
+        u8,
+        result.response,
+        "\r\n\r\n11\r\nid: 2\ndata: two\n\n\r\n" ++
+            "13\r\nid: 3\ndata: three\n\n\r\n" ++
+            "12\r\nid: 4\ndata: four\n\n\r\n" ++
+            "0\r\n\r\n",
+    ));
+    try testing.expectEqual(@as(usize, 0), room.count());
+}
+
+test "a first connection, or an id the room never kept, replays nothing" {
+    var room = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 4, .history = 8 });
+    defer room.deinit();
+    kept_room = &room;
+    try keptThree(&room);
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/feed", feedKept);
+
+    const only_new = "\r\n\r\n12\r\nid: 4\ndata: four\n\n\r\n0\r\n\r\n";
+    {
+        var h = Harness.init();
+        defer h.deinit();
+        const result = h.send(&app, "GET /feed HTTP/1.1\r\nHost: x\r\n\r\n");
+        try testing.expect(std.mem.endsWith(u8, result.response, only_new));
+    }
+    {
+        // Forgotten, or said by another room: there is no telling which, and
+        // guessing would send somebody events twice.
+        var h = Harness.init();
+        defer h.deinit();
+        const result = h.send(&app, "GET /feed HTTP/1.1\r\nHost: x\r\nLast-Event-ID: 99\r\n\r\n");
+        try testing.expect(std.mem.endsWith(u8, result.response, only_new));
+    }
+}
+
+var named_pool: *rooms_mod.Rooms = undefined;
+
+fn feedMine(c: *Ctx) anyerror!void {
+    try c.eventsFrom(.{ feed_room, named_pool.named("user:1") }, .{});
+    try named_pool.sayText("user:1", "just you");
+    try named_pool.sayText("user:2", "somebody else");
+}
+
+test "an event stream sits under a key beside a Room, and the key goes back when it ends" {
+    var room = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 4 });
+    defer room.deinit();
+    feed_room = &room;
+    var pool = try rooms_mod.Rooms.initWith(testing.allocator, .{ .rooms = 2, .seats = 2 });
+    defer pool.deinit();
+    named_pool = &pool;
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/feed", feedMine);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(&app, "GET /feed HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.endsWith(u8, result.response, "\r\n\r\n10\r\ndata: just you\n\n\r\n0\r\n\r\n"));
+    try testing.expectEqual(@as(usize, 0), room.count());
+    try testing.expectEqual(@as(usize, 0), pool.count("user:1"));
+    try testing.expect(pool.pool.names.get("user:1") == null);
+}
+
+test "an event stream under a key when every Room is lent is a 503 naming the number" {
+    var room = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 4 });
+    defer room.deinit();
+    feed_room = &room;
+    var pool = try rooms_mod.Rooms.initWith(testing.allocator, .{ .rooms = 1, .seats = 2 });
+    defer pool.deinit();
+    named_pool = &pool;
+
+    var in = std.Io.Reader.fixed("");
+    var bytes: [64]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var sitting: websocket.Socket = .{ ._in = &in, ._out = &out, ._stopping = null };
+    try pool.join("user:9", &sitting);
+    defer pool.leave("user:9", &sitting);
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/feed", feedMine);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(&app, "GET /feed HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 503"));
+    try testing.expect(std.mem.indexOf(u8, result.response, "the pool's rooms is the number to raise") != null);
+    // The seat in the Room the stream had already taken is given back.
+    try testing.expectEqual(@as(usize, 0), room.count());
 }
 
 test "a WebSocket handshake is answered with the key every client checks" {

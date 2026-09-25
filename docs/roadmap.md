@@ -289,10 +289,6 @@ The design is known and priced; what is missing is somebody who needs it. Bring 
 
 **Needs:** a deployment probing a gRPC listener, which is a guide section before it is code.
 
-**A WebSocket sits in one `Room` at a time.** A socket holds one ticket and `receive` drains one seat, so joining a second room is `error.AlreadySeated` ([ADR 035](./adr/035-a-broadcast-rings-a-bell-it-does-not-write.md)). A lobby and a channel on one connection is a ticket per room and a drain of each.
-
-**Needs:** a caller with two rooms on one socket, and the per-connection figure for a second ticket.
-
 **A `testing.Conversation` does not share a `testing.Client`'s cookie jar.** A test that signs in over HTTP and then opens a socket copies the cookie across with `setHeader` by hand ([ADR 091](./adr/091-a-websocket-route-can-be-driven-from-a-test.md)).
 
 **Needs:** a second test that has had to copy it.

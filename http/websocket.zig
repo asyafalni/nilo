@@ -424,10 +424,10 @@ pub const Socket = struct {
     /// buffer in a test gets — answers "go and read" to everything, so
     /// `receive` behaves exactly as it did before any of this existed.
     _waker: bulkhead.Waker = .off,
-    /// Where this connection is sitting, once it has joined a Room. Null is
-    /// the ordinary case: a socket that echoes needs none of this.
-    _room: ?*room_mod.Room = null,
-    _ticket: ?room_mod.Ticket = null,
+    /// The first room this connection sits in, and through its seat the
+    /// rest (`room.Seating`). Empty is the ordinary case: a socket that
+    /// echoes needs none of this.
+    _seated: room_mod.Seating = .{},
 
     /// Where this connection's message buffer is parked between messages.
     ///
@@ -726,23 +726,17 @@ pub const Socket = struct {
         return self._waker;
     }
 
-    pub fn ticket(self: *const Socket) ?room_mod.Ticket {
-        return self._ticket;
+    /// The head of the chain of rooms this socket sits in. A Room reads and
+    /// writes it from this socket's own fiber and from nowhere else.
+    pub fn seating(self: *Socket) *room_mod.Seating {
+        return &self._seated;
     }
 
-    /// The room this socket has a seat in, if any.
-    pub fn inRoom(self: *const Socket) ?*room_mod.Room {
-        return self._room;
-    }
-
-    pub fn seatedIn(self: *Socket, in_room: *room_mod.Room, t: room_mod.Ticket) void {
-        self._room = in_room;
-        self._ticket = t;
-    }
-
-    pub fn unseat(self: *Socket) void {
-        self._room = null;
-        self._ticket = null;
+    /// Give up every seat this socket still holds. What the connection loop
+    /// does when the loop returns, because each seat's bell lives in a frame
+    /// that is about to go (ADR 082).
+    pub fn leaveRooms(self: *Socket) void {
+        while (self._seated.room) |in_room| in_room.leave(self);
     }
 
     /// Write out everything waiting for this connection. Called at the top of
@@ -751,17 +745,18 @@ pub const Socket = struct {
     ///
     /// The posts are already framed — the room built the header once, for
     /// everybody — so each one is a single write, and the whole burst is one
-    /// flush. A connection that was away for ten messages costs one syscall
-    /// to catch up, not ten.
+    /// flush, across every room this socket sits in. A connection that was
+    /// away for ten messages costs one syscall to catch up, not ten.
     noinline fn deliver(self: *Socket) Error!void {
-        const in_room = self._room orelse return;
-        const t = self._ticket orelse return;
-
         var any = false;
-        while (in_room.take(t)) |post| {
-            defer in_room.release(post);
-            self._out.writeAll(in_room.framedBytes(post)) catch return error.WriteFailed;
-            any = true;
+        var at = self._seated;
+        while (at.room) |in_room| {
+            while (in_room.take(at.ticket)) |post| {
+                defer in_room.release(post);
+                self._out.writeAll(in_room.framedBytes(post)) catch return error.WriteFailed;
+                any = true;
+            }
+            at = in_room.after(at.ticket);
         }
         if (any) try self.settle();
     }

@@ -193,7 +193,9 @@ it needs no XML parser — a scan for `<Code>…</Code>` is twenty lines. That i
 also the whole reason `LIST` is not in v1: it is the one operation whose success
 path is XML, and a list result is a type AWS wrote rather than one the caller
 did. `COPY` goes with it, and carries its own trap for whoever adds it — S3 can
-answer a copy with **200 and an error in the body**.
+answer a copy with **200 and an error in the body**. `LIST` came back later, as
+one bounded page and no more, when a caller brought the case
+([ADR 058](./058-most-of-an-s3-client-is-not-s3.md)); `COPY` has not.
 
 One thing is worth the five extra lines: `RequestTimeTooSkewed` is the one 403
 that is not the program's fault, and S3's error body carries the server's time.
@@ -219,9 +221,11 @@ run at compile time and are absent from the binary; `Range`, `getIf` and
   `refusals-s3` step. CLAUDE.md's warning applies with more force at five than
   it did at four: adding a row to one table while running another is a check
   that silently never ran.
-- **`LIST`, `COPY` and multipart upload go to the roadmap with their reasons
-  attached**, not as gaps. The reason for all three is the same sentence: they
+- **`COPY` and multipart upload go to the roadmap with their reasons
+  attached**, not as gaps. The reason for both is the same sentence: they
   are where S3 stops being bytes at a key and starts being a document format.
+  `LIST` went with them and has since shipped as one page
+  ([ADR 058](./058-most-of-an-s3-client-is-not-s3.md)).
 - **Arbitrary object metadata is refused on a performance argument**, which
   means the argument can be revisited with a measurement rather than an
   opinion. Whoever wants it should bring the number for a per-request

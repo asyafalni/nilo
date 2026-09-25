@@ -113,7 +113,7 @@ A request body taken in pieces rather than held whole, for the ones too big for 
 _Avoid_: upload stream, multipart, file handle
 
 **Event stream**:
-A Stream carrying server-sent events — one long response a browser reads with `EventSource`. Each event is flushed on its own, and `live` is how the handler learns the server wants to stop.
+A Stream carrying server-sent events — one long response a browser reads with `EventSource`. Each event is flushed on its own, and `live` is how the handler learns the server wants to stop. One whose every event comes from Rooms is handed to the connection instead of held, and ends when the client sends anything or hangs up.
 _Avoid_: SSE channel, subscription, push, socket
 
 **Exchange**:
@@ -211,12 +211,20 @@ An answer that is a file on disk rather than a value, returned by the handler th
 _Avoid_: file response, download, attachment, send file
 
 **Socket**:
-A WebSocket connection, held by an ordinary handler that does not return until it ends. nilo does the handshake, the framing and the housekeeping frames; the loop is the handler's. The buffer it reads into is the message ceiling.
+A WebSocket connection, held by an ordinary handler that does not return until it ends. nilo does the handshake, the framing and the housekeeping frames; the loop is the handler's, and the connection runs it after the handler has returned. `Options.max_message` is the message ceiling.
 _Avoid_: websocket connection, channel, ws, peer
 
 **Room**:
-A Service that reaches Sockets a handler does not hold. Saying something puts one framed message in each seat and rings a bell; the writing is done by the fiber that already owns that connection, so a client that stops reading costs that client alone. A seat is given up by the handler that took it, because Zig has no destructor.
+A Service that reaches Sockets and Event streams a handler does not hold. Saying something puts one post in each seat and rings a bell; the writing is done by the fiber that already owns that connection, so a client that stops reading costs that client alone. A connection can sit in any number of Rooms. A seat is given up by the handler that took it, because Zig has no destructor, and whatever is left is given up when the connection's wait ends.
 _Avoid_: channel, topic, hub, pub/sub, broadcaster
+
+**Rooms**:
+A pool of Rooms made up front and lent to a key the application makes up, `"user:42"`, for as long as somebody is under it. How one user is reached on every tab: each joins the key, and anything that wants them says into it. A key nobody is under has no Room and costs nothing to say into; when every Room is lent, a new key is refused rather than given more memory.
+_Avoid_: channel registry, topics, user channels, hub
+
+**History**:
+The latest text posts a Room keeps, bounded by a count and by bytes, for an Event stream that comes back with `Last-Event-ID`. What followed that id is written before anything new. Found by the id the application gave each post, so a Room that keeps history wants one on every post.
+_Avoid_: replay buffer, backlog (which is a seat's), cache
 
 **Range**:
 A request for part of a file rather than all of it — a video being scrubbed, a download being resumed. One that cannot be understood is ignored and the whole file goes out, because that is a correct answer to every request.

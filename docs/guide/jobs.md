@@ -647,7 +647,9 @@ lets `drainAt` hand a test's number to every one of them
 
 ## What it will not do
 
-Not a priority queue: rows come out in `run_at` order and nothing else. Not
+Not a priority queue with numbers: a kind says `.high`, `.normal` or `.low`,
+and among equals rows come out in `run_at` order
+([ADR 214](../adr/214-a-job-says-how-urgent-it-is.md)). Not
 a workflow engine, not a rate limiter for a kind — `nilo.Gate` inside `run`
 is that — and not exactly once. Not a time zone. Each of those is in
 [`docs/roadmap.md`](../roadmap.md) under `nilo_job`, with what it is waiting

@@ -18,7 +18,7 @@
 //! python3 bench/ws_idle.py
 //! ```
 //!
-//! ## Five routes, because a number needs something standing next to it
+//! ## Seven routes, because a number needs something standing next to it
 //!
 //! - `/health` — HTTP, a constant `[]const u8`, no `Ctx`, no upgrade. The
 //!   floor ADR 062 already published, re-taken on this binary so the
@@ -36,6 +36,10 @@
 //!   live for as long as the loop is.
 //! - `/ws/idle` — nothing is ever sent to it. What the handshake alone costs,
 //!   with no message to touch anything.
+//! - `/ws/room` — `/ws/small` sitting in a `Room`. What a seat costs the
+//!   connection that takes it.
+//! - `/ws/rooms` — the same sitting in two. What a second room costs a
+//!   connection, which should be a seat and nothing on the connection itself.
 //!
 //! `IDLE_MS` sets `Options.idle_ms` and **defaults to 0 here, which is not the
 //! framework's default of 30,000.** A ping every thirty seconds wakes every
@@ -107,6 +111,40 @@ fn wsIdle(c: *nilo.Ctx) !void {
     return c.upgradeWith(echo, {}, .{ .idle_ms = idle_ms });
 }
 
+/// The two rooms `/ws/room` and `/ws/rooms` sit in, sized for the harness's
+/// largest step so neither is ever full. Made before the listener opens, so
+/// what they cost up front is in the baseline and what a connection costs by
+/// taking a seat is in the rows.
+const room_seats = 12_000;
+
+const Rooms = struct { lobby: *nilo.Room, mine: *nilo.Room };
+
+/// The echo loop sitting in one room. Against `/ws/small`, what a seat costs
+/// a connection that takes one.
+fn wsRoom(c: *nilo.Ctx, rooms: *Rooms) !void {
+    return c.upgradeWith(inOne, rooms.lobby, .{ .idle_ms = idle_ms });
+}
+
+fn inOne(socket: *nilo.Socket, lobby: *nilo.Room) !void {
+    try lobby.join(socket);
+    defer lobby.leave(socket);
+    try echo(socket);
+}
+
+/// The same loop sitting in two. Against `/ws/room`, what a second room costs
+/// a connection: a seat in it, and nothing on the connection itself.
+fn wsRooms(c: *nilo.Ctx, rooms: *Rooms) !void {
+    return c.upgradeWith(inTwo, rooms.*, .{ .idle_ms = idle_ms });
+}
+
+fn inTwo(socket: *nilo.Socket, rooms: Rooms) !void {
+    try rooms.lobby.join(socket);
+    defer rooms.lobby.leave(socket);
+    try rooms.mine.join(socket);
+    defer rooms.mine.leave(socket);
+    try echo(socket);
+}
+
 /// `READ_BUFFER` and `WRITE_BUFFER`, which are the control on the whole
 /// exercise: if an idle socket costs what it costs because it is holding the
 /// connection's two buffers, then the number has to move a page for a page
@@ -121,8 +159,15 @@ pub fn main(init: std.process.Init) !void {
         idle_ms = std.fmt.parseInt(u32, text, 10) catch 0;
     }
 
+    var lobby = try nilo.Room.initWith(std.heap.smp_allocator, .{ .seats = room_seats });
+    defer lobby.deinit();
+    var mine = try nilo.Room.initWith(std.heap.smp_allocator, .{ .seats = room_seats });
+    defer mine.deinit();
+    var rooms: Rooms = .{ .lobby = &lobby, .mine = &mine };
+
     var app = nilo.App.init(std.heap.smp_allocator);
     defer app.deinit();
+    try app.provide(&rooms);
 
     // No logger and no CORS, for the reason `bench/main.zig` gives: anything
     // installed here is measured.
@@ -131,6 +176,8 @@ pub fn main(init: std.process.Init) !void {
     try app.get("/ws/big", wsBig);
     try app.get("/ws/deep", wsDeep);
     try app.get("/ws/idle", wsIdle);
+    try app.get("/ws/room", wsRoom);
+    try app.get("/ws/rooms", wsRooms);
 
     try app.listen(.{
         .port = 8789,

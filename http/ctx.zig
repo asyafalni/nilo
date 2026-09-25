@@ -29,6 +29,10 @@ const proxies_mod = @import("proxies.zig");
 const str_mod = @import("nilo_core");
 const patch_mod = @import("patch.zig");
 const websocket = @import("websocket.zig");
+const handover_mod = @import("handover.zig");
+const room_mod = @import("room.zig");
+const rooms_mod = @import("rooms.zig");
+const naming = @import("names.zig");
 const percent = @import("nilo_core").percent;
 const fail = @import("fail.zig");
 const watchdog = @import("watchdog.zig");
@@ -137,13 +141,13 @@ pub const Ctx = struct {
     /// ever uses it; `.off` is the default, and what a test driving App
     /// directly gets, and it answers "go and read" to everything.
     _waker: bulkhead.Waker = .off,
-    /// Where `upgrade` leaves the socket and the loop that is going to run it.
+    /// Where `upgrade` leaves the socket and the loop that is going to run it,
+    /// and where `eventsFrom` leaves its stream.
     ///
     /// Points at a slot in the *connection* loop's frame, which is the whole
     /// point: the loop runs from there, after this request's machinery has
-    /// unwound (ADR 062). Null for a `Ctx` built by hand in a test, and for
-    /// every request that is not a WebSocket, which is all but a few.
-    _handover: ?*?websocket.Handover = null,
+    /// unwound (ADR 062). Null for a `Ctx` built by hand in a test.
+    _handover: ?*handover_mod.Handover = null,
     /// Who the connection came from, as the socket reports it. Empty when
     /// there is no socket — a test driving App directly, a Unix socket.
     _peer: bulkhead.Peer = .{},
@@ -1882,13 +1886,13 @@ pub const Ctx = struct {
             return websocket.runner(loop, State)(&socket, @ptrCast(&carried));
         };
 
-        slot.* = .{
+        slot.* = .{ .socket = .{
             .socket = socket,
             .run = websocket.runner(loop, State),
             .path = self._path,
-        };
+        } };
         if (@sizeOf(State) > 0) {
-            const carried: *State = @ptrCast(@alignCast(&slot.*.?.state));
+            const carried: *State = @ptrCast(@alignCast(&slot.socket.state));
             carried.* = state;
         }
     }
@@ -2016,7 +2020,210 @@ pub const Ctx = struct {
         try self.setStaticHeader("X-Accel-Buffering", "no");
         return .{ .stream = try self.stream(200, stream_mod.Events.content_type) };
     }
+
+    /// An event stream whose every event comes from Rooms, handed to the
+    /// connection rather than held by this handler (ADR 227).
+    ///
+    /// ```zig
+    /// fn feed(c: *nilo.Ctx, lobby: *nilo.Room) !void {
+    ///     return c.eventsFrom(lobby, .{});
+    /// }
+    ///
+    /// fn inbox(c: *nilo.Ctx, lobby: *nilo.Room, mine: *Inbox) !void {
+    ///     return c.eventsFrom(.{ lobby, mine.roomOf(c) }, .{ .retry_ms = 5_000 });
+    /// }
+    /// ```
+    ///
+    /// `rooms` is one `*nilo.Room` or `rooms.named(key)`, or a tuple of them.
+    /// The stream takes a seat in each before the head goes out, so a full
+    /// room, or a pool with no Room left for a key, is a 503 the client can
+    /// read rather than a stream that ends at once.
+    ///
+    /// A browser coming back sends `Last-Event-ID`, and a room that keeps
+    /// history (`Room.Options.history`) writes what it said after that id
+    /// before anything new, taken under the same lock as the seat so nothing
+    /// is written twice or missed in between (ADR 229). After that the
+    /// handler returns and the connection waits: every `say`, `print`, `json`
+    /// and `event` into those rooms goes out as an event, a comment keeps the
+    /// connection speaking every `keepalive_ms`, and the stream ends when the
+    /// client goes or the server stops. A binary post is not an event and is
+    /// counted as missed.
+    ///
+    /// What this does not do is anything of the handler's own between
+    /// events. That is `c.events()`, which keeps the handler and costs what a
+    /// held handler costs (ADR 019).
+    pub fn eventsFrom(self: *Ctx, rooms: anytype, options: stream_mod.FromRooms) !void {
+        comptime checkRooms(@TypeOf(rooms));
+        std.debug.assert(self.answered() == null); // one request, one response
+
+        var held: stream_mod.RoomEvents = .{
+            ._in = self._in,
+            ._out = self._out,
+            ._stopping = self._stopping,
+            ._waker = self._waker,
+            ._watch = self._watch,
+            ._keepalive_ms = options.keepalive_ms,
+            // HTTP/1.0 has no chunks, so the end of the stream is the end of
+            // the connection, which it always is here anyway.
+            ._chunked = self._request.minor_version == 1,
+        };
+
+        // A HEAD is answered with the head a GET would get and nothing else,
+        // so there is nothing to sit in a room for (ADR 019).
+        const head_only = self.method == .HEAD;
+        const last_id: []const u8 = if (self.header("Last-Event-ID")) |id| id.view() else "";
+        // What each room kept for this client, holding a reference apiece
+        // until it is written. A post taken here and never written would be
+        // held for ever, so every way out releases what is left.
+        var replays: [roomsIn(@TypeOf(rooms))]Replay = @splat(.{});
+        defer for (&replays) |*kept| kept.release();
+        if (!head_only) {
+            errdefer held.leaveRooms();
+            if (comptime isRoomLike(@TypeOf(rooms))) {
+                try self.seatEvents(rooms, &held, last_id, &replays[0]);
+            } else inline for (rooms, 0..) |in_room, i| {
+                try self.seatEvents(in_room, &held, last_id, &replays[i]);
+            }
+        }
+        errdefer held.leaveRooms();
+
+        try self.setStaticHeader("Cache-Control", "no-cache");
+        try self.setStaticHeader("X-Accel-Buffering", "no");
+        self.markAnswered(200);
+        self.tookOver();
+        try http1.writeStreamHead(
+            self._out,
+            200,
+            http1.statusPhrase(200),
+            stream_mod.Events.content_type,
+            held._chunked,
+            null,
+            self.connection(),
+            self.extraHeaders(),
+        );
+        if (head_only) return;
+
+        // The stream never ends while the connection could carry another
+        // request, so the connection ends with it.
+        self._force_close = true;
+        if (options.retry_ms) |millis| try held.sendRetry(millis);
+        for (&replays) |*kept| {
+            const posts = kept.posts;
+            kept.posts = &.{};
+            try held.replay(kept.room orelse continue, posts);
+        }
+
+        // No connection loop to hand it to: a `Ctx` built by hand in a test.
+        // The same wait on a deeper stack, which only a test can afford.
+        const slot = self._handover orelse return held.run();
+        slot.* = .{ .events = .{ .stream = held, .run = stream_mod.RoomEvents.run } };
+    }
+
+    /// One seat for `eventsFrom`, in a Room or under a key, with a full room
+    /// said as what it is.
+    fn seatEvents(
+        self: *Ctx,
+        target: anytype,
+        held: *stream_mod.RoomEvents,
+        last_id: []const u8,
+        kept: *Replay,
+    ) !void {
+        if (comptime @TypeOf(target) == *room_mod.Room) {
+            return self.seatIn(target, held, last_id, kept);
+        } else {
+            return self.seatNamed(target, held, last_id, kept);
+        }
+    }
+
+    fn seatNamed(
+        self: *Ctx,
+        target: rooms_mod.Rooms.Named,
+        held: *stream_mod.RoomEvents,
+        last_id: []const u8,
+        kept: *Replay,
+    ) !void {
+        const lent = target.rooms.pin(target.key) catch |err| switch (err) {
+            error.NoRoomFree => return fail.status(
+                503,
+                "every Room in the pool is lent to a key somebody is in; the pool's rooms is the number to raise",
+                .{},
+            ),
+            else => |e| return e,
+        };
+        // Seated before it is let go, so the Room cannot go back to the pool
+        // in between (ADR 228).
+        defer target.rooms.unpin(lent);
+        return self.seatIn(&lent.room, held, last_id, kept);
+    }
+
+    fn seatIn(
+        self: *Ctx,
+        in_room: *room_mod.Room,
+        held: *stream_mod.RoomEvents,
+        last_id: []const u8,
+        kept: *Replay,
+    ) !void {
+        // Asked for only by a client coming back to a room that keeps
+        // something, so a first connection allocates nothing here.
+        const into: []*room_mod.Post = if (last_id.len != 0 and in_room.keeps() != 0)
+            try self._arena.alloc(*room_mod.Post, in_room.keeps())
+        else
+            &.{};
+        const n = in_room.sitAfter(held.seating(), self._waker, true, last_id, into) catch |err| switch (err) {
+            error.RoomFull => return fail.status(
+                503,
+                "every seat in this room is taken; the room's seats is the number to raise",
+                .{},
+            ),
+            else => |e| return e,
+        };
+        kept.* = .{ .room = in_room, .posts = into[0..n] };
+    }
 };
+
+/// The posts one room kept for a client coming back, each holding a
+/// reference until `eventsFrom` writes it (ADR 229).
+const Replay = struct {
+    room: ?*room_mod.Room = null,
+    posts: []*room_mod.Post = &.{},
+
+    fn release(self: *Replay) void {
+        const room = self.room orelse return;
+        for (self.posts) |post| room.release(post);
+        self.posts = &.{};
+    }
+};
+
+fn isRoomLike(comptime T: type) bool {
+    return T == *room_mod.Room or T == rooms_mod.Rooms.Named;
+}
+
+fn roomsIn(comptime T: type) usize {
+    return if (isRoomLike(T)) 1 else @typeInfo(T).@"struct".fields.len;
+}
+
+/// What `eventsFrom` can sit a stream in, checked where the mistake is made
+/// (ADR 026). A stream in no room is one that can only ever send keep-alive
+/// comments, which is a mistake rather than a feed.
+fn checkRooms(comptime T: type) void {
+    const shape = "; it takes a *nilo.Room or rooms.named(key), or a tuple of them like .{ lobby, mine }";
+    if (isRoomLike(T)) return;
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| if (s.is_tuple) {
+            if (s.fields.len == 0) @compileError(
+                "nilo: eventsFrom was given no rooms, so the stream could only ever send keep-alive comments" ++ shape,
+            );
+            for (s.fields) |field| {
+                if (!isRoomLike(field.type)) @compileError(
+                    "nilo: eventsFrom was given a tuple holding " ++ naming.of(field.type) ++ shape,
+                );
+            }
+            return;
+        },
+        else => {},
+    }
+    @compileError("nilo: eventsFrom was given " ++ naming.of(T) ++ shape);
+}
 
 // ---- saying what is wrong with a request body ----
 //

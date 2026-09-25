@@ -145,22 +145,28 @@ the kind of bug that shows up as one user seeing another's messages.
 `defer room.leave(&socket)` is correct on every path out of a handler,
 including the ones that failed before joining.
 
-### A socket sits in one room, and a seat left taken is given up for it
+### A socket sits in any number of rooms, and every seat left taken is given up for it
 
 The era keeps a stale ticket from misdelivering; it does not free the seat.
 A forgotten `leave` left the seat taken with its bell in the connection's
 frame, and the next `say` rang that bell after the frame had returned: the
 use-after-free [ADR 082](./082-a-cleanup-path-is-not-cancellable.md) closed for
 a cancelled `leave`, reached by not calling it at all. So when the loop
-returns, nilo gives up whatever seat the socket still holds.
+returns, nilo gives up every seat the socket still holds.
 
-A socket holds one ticket, and `receive` drains that one seat. Joining a
-second room used to overwrite the ticket, and `leave` on the first room then
-gave up a seat by an index into the wrong one, leaving the real seat taken for
-good. Joining a second room is `error.AlreadySeated`, joining the same room
-again does nothing, and `leave` on a room the socket is not in does nothing.
-A socket in two rooms at once is a ticket per room and a drain of each, which
-waits for a caller who needs it.
+**The chain of rooms lives in the seats, not on the socket.** A socket holds one `Seating`, the first room and its ticket, and each seat holds the next. `join` puts the new seat at the front, `leave` finds its room in the chain and points the link before it past it, and `receive` drains every seat on the way past with one flush for the whole burst. Joining the room a socket is already in does nothing, and `leave` on a room it is not in does nothing, as before.
+
+Nothing but the socket's own fiber reads or writes the chain: it joins, it leaves, it drains, and the connection loop gives up what is left from the same fiber. A speaker touches a seat's ring and its bell and never `next`, so the chain has no lock of its own and no seat's lock is held while walking it.
+
+`Ticket.index` became a `u32`, which the roll already was, so a `Seating` is sixteen bytes. The socket's two fields for one room were thirty-two.
+
+### An event stream sits in a room beside the sockets
+
+A seat is a bell and a ring, and nothing in it is a WebSocket's, so an event stream takes one the same way ([ADR 227](./227-an-event-stream-fed-by-rooms-waits-where-a-connection-waits.md)): `c.eventsFrom(room, .{})` seats the stream, and the connection loop drains its seats as `receive` drains a socket's. What differs is what a post becomes on the way out. A text post is an event's `data`, `room.event` adds the `event:` and `id:` a stream sends and a socket has nowhere to put, and a binary post is counted in `missed` rather than queued, because a stream's seat is marked text-only when it is taken.
+
+### A Room can keep what it said, and can be lent to a key
+
+Two things a Room gained after this ADR, each decided in its own. A Room made with `history` keeps its latest text posts for an event stream that comes back with `Last-Event-ID`, which is the one case where a post outlives every seat that took it ([ADR 229](./229-a-room-that-keeps-history-catches-a-returning-stream-up.md)). And a Room need not be made by the application: `nilo.Rooms` lends Rooms made up front to keys the application invents, one user's tabs under `"user:42"`, and a Room it lends carries a pointer back so the last seat given up returns it ([ADR 228](./228-a-room-for-a-key-is-lent-from-a-pool.md)).
 
 ### A socket with no Engine is seated anyway
 
@@ -192,6 +198,8 @@ row exact.
 plus a seat each, 1,024 seats and a backlog of 4 by default. A post costs one
 allocation for as long as the slowest seat holds it.
 
+**A second room costs a seat in it and nothing on the connection.** Measured when the chain moved into the seats, both sides built the same afternoon and run interleaved: idle WebSockets at 5,691 to 5,695 bytes before and 5,691 to 5,693 after, one room 5,691 to 5,693 before and 5,700 to 5,704 after, and two rooms 5,693, a spread of 13 bytes across all of it. The cost is in the room, up front: +370 kB of baseline for 24,000 seats, the sixteen bytes a seat grew by ([`bench/result/http.md`](../../bench/result/http.md#a-second-room-costs-a-seat-and-nothing-on-the-connection)).
+
 **Throughput and p99: unmoved.** `wrk -t4 -c64`, two 15-second runs each:
 1.110M/1.105M req/s before, 1.108M/1.102M after, with p99 varying more between
 repeats of the same build than between builds. The allocations-per-request test
@@ -200,6 +208,8 @@ this.
 
 ## What was rejected
 
+- **One room per socket, and `error.AlreadySeated` for a second.** What this shipped with. A socket held one ticket and `receive` drained one seat, and joining a second room used to overwrite the ticket, so `leave` on the first gave up a seat by an index into the wrong room and left the real one taken for good. Refusing the second join closed that, and made a lobby plus a room of one user's tabs impossible on one connection, which is the shape every notification feed wants. The chain above replaced it.
+- **A fixed array of tickets on the socket**, four rooms say. The obvious way to hold more than one, and it charges every WebSocket for the rooms it might join: about 72 bytes more on each connection, including the ones that echo and never join anything, in the frame ADR 062 keeps under a page. It also puts a ceiling on rooms that says nothing about the application. The chain charges the seat instead, once, when the room is made.
 - **A second fiber per connection to do the writing.** ADR 028's measurement,
   8,673 bytes against a budget of 8,767. It is the shape that works without any
   of the above, and it doubles the cost of every connection whether or not the

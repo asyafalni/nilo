@@ -144,5 +144,6 @@ back, with a warning, for the binary that does.
 [`bench/result/job.md`](../../bench/result/job.md) is what a claim and a push
 cost on each store.
 
-**What it is not**: a priority queue, a workflow engine, a rate limiter per
+**What it is not**: a priority queue with numbers (a kind has one of three
+levels, `priority`, and a push cannot override it: [ADR 214](../adr/214-a-job-says-how-urgent-it-is.md)), a workflow engine, a rate limiter per
 kind (`nilo.Gate` inside `run` is that), exactly-once, or a time zone.

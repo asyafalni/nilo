@@ -192,6 +192,8 @@ in [the reference](../reference/streaming.md#room). `defer room.leave(socket)` i
 that isn't optional: Zig has no destructor, and a seat nobody gives up is one the
 next connection can't have.
 
+**A socket can sit in more than one room**, and the one `receive` drains all of them: a lobby everybody hears and a room of one user's open tabs, say, each joined and each with its own `defer leave`. A second room costs a seat in that room and nothing on the connection. **And a room can hold event streams beside the sockets**: a read-only page can listen with `EventSource` to the same room a chat speaks into, through [`c.eventsFrom`](./streaming.md#a-feed-where-every-event-is-somebody-elses).
+
 **Size the room for the crowd it might hold.** `join` and `say` both cost what
 the room *holds* rather than what it was sized for, so an extra thousand empty
 seats is a memory decision and nothing else — and a `say` into a room with
@@ -222,6 +224,58 @@ time, which is what kept this off the list for two stages
 
 What else came out of that work is [`nilo.spawn`](../reference/app.md#concurrency),
 for work that is not a request at all.
+
+## One user, on every tab
+
+A room per user is the usual way to reach somebody wherever they are connected, and a room per user is not something to make by hand. `nilo.Rooms` is a pool of rooms made at startup and lent to a key you make up for as long as somebody is under it:
+
+<!-- compiles -->
+```zig
+fn inbox(c: *nilo.Ctx, rooms: *nilo.Rooms, me: *const Me) !void {
+    return c.upgrade(inboxLoop, Where{ .rooms = rooms, .user = me.id });
+}
+
+fn inboxLoop(socket: *nilo.Socket, where: Where) !void {
+    var buf: [32]u8 = undefined;
+    const key = try std.fmt.bufPrint(&buf, "user:{d}", .{where.user});
+    try where.rooms.join(key, socket);
+    defer where.rooms.leave(key, socket);
+
+    while (try socket.receive()) |_| {}
+}
+
+fn notify(rooms: *nilo.Rooms, user: u64) !void {
+    var buf: [32]u8 = undefined;
+    try rooms.json(try std.fmt.bufPrint(&buf, "user:{d}", .{user}), .{ .unread = 1 });
+}
+
+const Me = struct { id: u64 };
+const Where = struct { rooms: *nilo.Rooms, user: u64 };
+```
+
+Every tab the user opens joins the same key, and a `json` into it reaches all of them; into a key nobody is under it does nothing and allocates nothing. The last tab to close gives the room back to the pool. `nilo.Rooms.initWith(gpa, .{ .rooms = …, .seats = … })` is the whole cost, made up front: when every room is lent, a new key is `error.NoRoomFree` rather than more memory ([ADR 228](../adr/228-a-room-for-a-key-is-lent-from-a-pool.md)). The same key works for an event stream, `c.eventsFrom(rooms.named(key), .{})`.
+
+## Saying something on a schedule
+
+A clock, a price feed, a heartbeat of your own: a fiber the server owns, saying into the room every so often. Nothing is added for it, because a room is a service and [background work](./background.md) can hold one:
+
+<!-- compiles -->
+```zig
+fn tick(room: *nilo.Room) void {
+    var n: u64 = 0;
+    while (true) {
+        nilo.sleep(1_000) catch return; // Canceled: the server is going
+        n += 1;
+        room.print("tick {d}", .{n}) catch {};
+    }
+}
+
+fn start(app: *nilo.App, room: *nilo.Room) !void {
+    try app.spawn(tick, .{room});
+}
+```
+
+A room with nobody in it costs the tick nothing but the check.
 
 ## A connection that goes quiet
 

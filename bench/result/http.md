@@ -797,6 +797,22 @@ nilo moving by four bytes. Every reading is in `bench/result/ws-idle.json`, and
 8k, 10k, 20k. The ratio is what survives, and at 1.5× on gws's best row it
 survives with room to spare.
 
+### A second room costs a seat and nothing on the connection
+
+Asked when a socket stopped being limited to one `Room` ([ADR 035](../../docs/adr/035-a-broadcast-rings-a-bell-it-does-not-write.md)): the chain of rooms a socket sits in moved into the seats, sixteen bytes a seat, and the socket's own two fields (32 bytes) became one head (16). The claim was that per idle connection nothing moves and the whole cost is up front, in the seats. Measured 2026-09-25 at `9a4d49f` plus the change, on the machine above now running kernel 7.2.5 (Omarchy) rather than the Ubuntu kernel in the table. Both sides were built the same afternoon from `git archive` into scratch directories, `ReleaseFast -Dtarget=x86_64-linux-gnu`, with the same harness copied into both. The rounds were interleaved before, after, before, after, with `STEPS=500,1000,2000` and `IDLE_MS=0`. Two new routes: `/ws/room` is `/ws/small` joined to one room, and `/ws/rooms` is the same joined to two. Each room has 12,000 seats, made before the listener opens.
+
+| scenario, 2,000 sockets | before, two rounds | after, two rounds |
+|---|---|---|
+| `/ws/idle` | 5,695 / 5,693 B | 5,693 / 5,693 B |
+| `/ws/small` | 5,693 / 5,691 B | 5,693 / 5,691 B |
+| `/ws/room`, one room | 5,691 / 5,693 B | 5,700 / 5,704 B |
+| `/ws/rooms`, two rooms | refused (`AlreadySeated`) | 5,693 / 5,693 B |
+| idle baseline, two 12,000-seat rooms | 11,588 to 11,608 kB | 11,956 to 11,984 kB |
+
+**Per connection: unchanged.** Every row sits inside a 13-byte spread, and `/ws/rooms` is no dearer than `/ws/room`. A seat's pages are written when the room is made, so taking one touches nothing new. The cost shows up in the baseline instead: **+370 kB for 24,000 seats, 15.8 bytes a seat**, which is the sixteen the struct grew by. A room pays 16 KB per thousand seats for being joinable alongside others. Marginal met average at every step on both sides.
+
+**The absolute figure is not the published one.** 5,69x here against 5,183 in the table above, on both builds alike, so it is not this change. The host moved from Ubuntu's 7.0 kernel to 7.2.5 between the two runs, and nothing here has shown that is the cause. The next run of the full table should say which.
+
 ### What is not measured
 
 **A message big enough to be worth pooling, under load.** The throughput
@@ -880,6 +896,46 @@ today, provably, and ADR 062 already put the same keyword on seven functions
 for the same reason: what the optimiser chooses is not a guarantee, and a
 kilobyte reappearing on a live frame is not the kind of regression anybody would
 notice.
+
+### A stream whose events come from Rooms costs what an idle connection does
+
+Asked when `c.eventsFrom` handed an event stream to the connection loop rather than keeping its handler ([ADR 227](../../docs/adr/227-an-event-stream-fed-by-rooms-waits-where-a-connection-waits.md)). The claim was that a stream with nothing of its own to say should cost an idle connection, not the 21 KB above, and that a handler which touched 32 KiB of stack before handing over should not keep it. Measured 2026-09-25 at `9a4d49f` plus the change, on the machine above running kernel 7.2.5 (Omarchy). Both sides were built the same afternoon from `git archive` into scratch directories, `ReleaseFast`, and the rows were interleaved over two rounds, one freshly started server per row, `python3 bench/mem.py --port 8790 --path … --hold`. Two new routes: `/events/room` is `c.eventsFrom(feed_room, .{})`, and `/events/room/deep` is the same after touching 32 KiB of stack first. `feed_room` has 20,000 seats, made before the listener opens, and `KEEPALIVE_MS` is left at its bench default of 0 so no comment wakes the connections during the count.
+
+| route, per connection at 10,000 | before, two rounds | after, two rounds |
+|---|---|---|
+| `/health`, keep-alive, nothing suspended | 5,183 / 5,183 B | 5,182 / 5,182 B |
+| `/stream`, a held stream | 21,566 / 21,567 B | 21,566 / 21,566 B |
+| `/events/room`, a stream in one room | not there | **5,184 / 5,184 B** |
+| `/events/room/deep`, the same after 32 KiB of stack | not there | **5,183 / 5,184 B** |
+| idle baseline | 8,432 to 8,460 kB | 11,312 to 11,380 kB |
+
+**A stream fed by rooms costs an idle connection, to within two bytes**: 5,184 against 21,566 for the stream a handler holds, a quarter of it. **And the stack the handler touched is gone**: `/events/room/deep` reads the same as `/events/room`, where `/stream/deep` above kept all 32,767 bytes. The handler's frame unwound before the connection parked, which is the whole of the design. Marginal met average from 1,000 connections up in every row.
+
+**Nothing moved for a connection that never streams.** `/health` and `/stream` are the same to the byte on both builds, which is the check that the handover slot, now a union of a Socket and an event stream, did not grow the connection loop's frame. The baseline rose 2.9 MB, which is the 20,000 seats of `feed_room`, about 146 bytes a seat, paid by the bench server for having the route.
+
+A third pass, after the stream's `run` was moved behind a pointer for the size axis ([ADR 227](../../docs/adr/227-an-event-stream-fed-by-rooms-waits-where-a-connection-waits.md#what-it-costs)), read 5,182, 5,183 and 5,184 B for the same three routes at 10,000, one round.
+
+**The absolute figures are this host's.** `/health` here is 5,183 against the 4,674 in the table above; both builds agree, so that gap is not this change, and the same unexplained move is under [A second room costs a seat](#a-second-room-costs-a-seat-and-nothing-on-the-connection). Compare within a table, not across them.
+
+**Can it be pushed further?** Not on the connection: it now costs exactly what a connection waiting for its next request does. What is left is the seat, and that is the room's.
+
+### A key costs a connection nothing, and a Room in the pool about 445 bytes
+
+Asked when `nilo.Rooms` began lending Rooms to keys ([ADR 228](../../docs/adr/228-a-room-for-a-key-is-lent-from-a-pool.md)). The claim was that a stream under a key of its own costs what a stream in a Room does, because the pool's Rooms are made before the listener opens. Measured 2026-09-25 at `9a4d49f` plus the change, same machine and kernel as the section above, `ReleaseFast`, two interleaved rounds, one freshly started server per row. `before` is `9a4d49f` itself. The new route is `/events/named`: the stream sits in `feed_room` and under `user:<n>`, a new `n` every connection, in a pool of 20,000 Rooms of one seat.
+
+| route | at 10,000, two rounds | marginal, 5,000 to 10,000 |
+|---|---|---|
+| `before` `/health` | 5,182 / 5,183 B | 5,181 / 5,182 B |
+| `/health` | 5,181 / 5,182 B | 5,183 / 5,184 B |
+| `/events/room`, one Room | 5,184 / 5,183 B | 5,183 / 5,183 B |
+| `/events/named`, a Room and a key | 5,195 / 5,195 B | **5,184 / 5,184 B** |
+| idle baseline | 8,432 / 8,444 kB `before`, 19,956 / 20,124 kB after | |
+
+**Per connection, a key costs nothing**: from 5,000 connections to 10,000 a named stream adds 5,184 bytes each, the figure of a stream in a Room alone. The average at 10,000 is eleven bytes higher because it had not met the marginal yet: the first 500 connections cost about 108 kB more than the same 500 without keys, and the average falls at every step after, 5,415, 5,288, 5,237, 5,205, 5,195. That is paid once, and is the key table's pages written for the first time as keys land across it.
+
+**The pool costs its size, before anybody connects.** The baseline rose 8.6 to 8.7 MB over [the previous run](#a-stream-whose-events-come-from-rooms-costs-what-an-idle-connection-does), which had `feed_room` and no pool: **about 445 bytes a Room of one seat**, its four allocations and its share of the key table included.
+
+**Can it be pushed further?** The per-connection figure cannot, being the floor. The up-front one could: each Room is four allocations of its own, and one block for the whole pool would take the allocator's per-block overhead off every Room. Nobody has asked for a pool large enough for that to matter.
 
 ## The WebSocket against Autobahn
 

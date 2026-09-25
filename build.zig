@@ -2119,6 +2119,14 @@ const refusals = [_]Refusal{
         .says = "field `c` of the state is a *nilo.Ctx, and the request it points at is over by the time the loop runs; take what the loop needs out of the Ctx before upgrade",
     },
     .{
+        .name = "events_from_no_rooms",
+        .says = "eventsFrom was given no rooms, so the stream could only ever send keep-alive comments; it takes a *nilo.Room or rooms.named(key), or a tuple of them like .{ lobby, mine }",
+    },
+    .{
+        .name = "events_from_not_a_room",
+        .says = "eventsFrom was given a tuple holding *events_from_not_a_room.Inbox; it takes a *nilo.Room or rooms.named(key), or a tuple of them like .{ lobby, mine }",
+    },
+    .{
         .name = "ws_state_too_big",
         .says = "a WebSocket loop may carry 128 bytes of state and ws_state_too_big.Seat is 184; put it in the request arena and carry a pointer to it",
     },
@@ -2178,6 +2186,7 @@ const Snippets = struct {
         .{ .path = "docs/reference/cache.md" },
         .{ .path = "docs/reference/jwt.md" },
         .{ .path = "docs/reference/fetch.md" },
+        .{ .path = "docs/reference/streaming.md" },
         .{ .path = "docs/guide/sessions.md" },
         .{ .path = "docs/guide/errors.md" },
         .{ .path = "docs/guide/config.md" },
@@ -2191,6 +2200,8 @@ const Snippets = struct {
         .{ .path = "docs/guide/middleware.md" },
         .{ .path = "docs/guide/responses.md" },
         .{ .path = "docs/guide/grpc.md" },
+        .{ .path = "docs/guide/streaming.md" },
+        .{ .path = "docs/guide/websocket.md" },
         // One page per module in the bottom layers, each against the shared
         // world: its `Carts`, its `client` and `run`, its `Doc`.
         .{ .path = "docs/guide/id.md" },

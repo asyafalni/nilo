@@ -23,6 +23,7 @@ const compress_mod = @import("compress.zig");
 const watchdog = @import("watchdog.zig");
 const scratch = @import("scratch.zig");
 const websocket = @import("websocket.zig");
+const handover_mod = @import("handover.zig");
 const metrics_mod = @import("metrics.zig");
 const failurebody = @import("failurebody.zig");
 
@@ -203,7 +204,7 @@ pub fn waitForRequest(
 /// so that it runs from the caller's frame (ADR 062).
 pub const Served = struct {
     keep_alive: bool,
-    handover: ?websocket.Handover = null,
+    handover: handover_mod.Handover = .none,
     /// Set with `keep_alive` false when the client's bytes may still be on
     /// the socket unread — a head that was refused, a body nobody took. The
     /// connection loop then hangs up with a FIN first rather than a reset,
@@ -230,7 +231,7 @@ pub noinline fn serveRequest(
     waker: bulkhead.Waker,
     peer: bulkhead.Peer,
 ) Served {
-    var handover: ?websocket.Handover = null;
+    var handover: handover_mod.Handover = .none;
     // Started here rather than after the head is read, so that a request
     // whose head never arrived is timed from the same instant as one that
     // was answered. On a server that never called `metrics()` this is a
@@ -509,14 +510,24 @@ pub noinline fn serveRequest(
 /// may walk out without a word, and a buffer nobody hands back is a leak
 /// per connection.
 pub fn runHandover(served: *Served) void {
-    const h = if (served.handover) |*it| it else return;
+    const h = switch (served.handover) {
+        .none => return,
+        .socket => |*it| it,
+        .events => |*events| {
+            // A stream that never ends has no end to keep the connection
+            // alive past (ADR 227).
+            events.run(&events.stream);
+            served.keep_alive = false;
+            return;
+        },
+    };
     h.socket._scratch = &h.scratch;
     defer if (h.scratch) |buf| scratch.give(buf);
     h.run(&h.socket, &h.state) catch |err| warnSocketFailed(h.path, err);
     // A seat the handler did not give up still holds this connection's bell,
     // which lives in a frame that is about to return. The next `say` would
-    // ring it there (ADR 082), so the seat goes now, whatever the loop did.
-    if (h.socket.inRoom()) |seated| seated.leave(&h.socket);
+    // ring it there (ADR 082), so every seat goes now, whatever the loop did.
+    h.socket.leaveRooms();
     // A connection that has been a WebSocket cannot go back to being HTTP.
     served.keep_alive = false;
 }

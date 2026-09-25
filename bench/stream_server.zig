@@ -24,7 +24,7 @@
 //! idle, and a stream that is being held open has no end to drain to, so the
 //! harness could not measure the one thing this measures.
 //!
-//! ## Four routes, because a number needs something standing next to it
+//! ## Seven routes, because a number needs something standing next to it
 //!
 //! - `/health` — HTTP, a constant, no `Ctx`. The 4,669-byte floor re-taken on
 //!   this binary, so the stream rows are compared against a number from the
@@ -39,6 +39,21 @@
 //! - `/stream/deep` — 32 KiB of stack touched before the first wait. ADR 062's
 //!   `/deep/:id` control on this path: the cost the framework cannot give back,
 //!   because the frame holding it is live for as long as the stream is.
+//!
+//! - `/events/room` — an event stream in a `Room`, handed to the connection
+//!   with `c.eventsFrom` (ADR 227). Against `/stream`, what the handler that
+//!   no longer waits was costing.
+//! - `/events/room/deep` — the same with 32 KiB touched first. Against
+//!   `/stream/deep`, whether the handler's stack still stays: it should not,
+//!   because the handler has returned before the connection waits.
+//! - `/events/named` — `/events/room` sitting under a key of its own as well,
+//!   `user:<n>` with a new `n` every connection, lent from a `nilo.Rooms` pool
+//!   (ADR 228). Against `/events/room`, what a key costs a connection, which
+//!   should be nothing: the pool's Rooms are made before the listener opens.
+//!
+//! `KEEPALIVE_MS` sets `eventsFrom`'s keep-alive and **defaults to 0 here, not
+//! the framework's 30,000**, for `bench/ws_server.zig`'s reason: a comment
+//! every thirty seconds wakes every stream in the measurement.
 //!
 //! The logger is installed on purpose, which is the opposite of what
 //! `bench/ws_server.zig` and `bench/main.zig` do. They are measuring the
@@ -84,6 +99,41 @@ fn heldDeep(c: *nilo.Ctx) !void {
     return held(c);
 }
 
+/// Read once in `main`, like `hold_ms`.
+var keepalive_ms: u32 = 0;
+
+/// The room both `/events/room` routes sit in, sized past the largest step
+/// `mem.py` takes so it is never full.
+var feed_room: *nilo.Room = undefined;
+
+/// Nothing held: the head goes out, the stream takes a seat, and the handler
+/// returns. The connection waits from its own frame (ADR 227).
+fn roomFeed(c: *nilo.Ctx) !void {
+    return c.eventsFrom(feed_room, .{ .keepalive_ms = keepalive_ms });
+}
+
+/// The same with 32 KiB touched first, which `/stream/deep` holds for as long
+/// as the stream is open. Here the frame has returned before anything waits.
+fn roomFeedDeep(c: *nilo.Ctx) !void {
+    var pad: [32 * 1024]u8 = undefined;
+    @memset(&pad, 0x5a);
+    std.mem.doNotOptimizeAway(&pad);
+    return roomFeed(c);
+}
+
+/// The pool `/events/named` borrows a Room from, one per connection, sized
+/// like `feed_room`.
+var pool: *nilo.Rooms = undefined;
+var next_user = std.atomic.Value(u64).init(0);
+
+/// A key per connection, the send-to-one-user shape: every stream is alone
+/// under its own, and in the shared room beside it.
+fn namedFeed(c: *nilo.Ctx) !void {
+    var key: [32]u8 = undefined;
+    const mine = try std.fmt.bufPrint(&key, "user:{d}", .{next_user.fetchAdd(1, .monotonic)});
+    return c.eventsFrom(.{ feed_room, pool.named(mine) }, .{ .keepalive_ms = keepalive_ms });
+}
+
 fn millisFrom(init: std.process.Init, name: []const u8, default: u64) u64 {
     const text = init.minimal.environ.getPosix(name) orelse return default;
     return std.fmt.parseInt(u64, text, 10) catch default;
@@ -91,6 +141,14 @@ fn millisFrom(init: std.process.Init, name: []const u8, default: u64) u64 {
 
 pub fn main(init: std.process.Init) !void {
     hold_ms = millisFrom(init, "HOLD_MS", hold_ms);
+    keepalive_ms = @intCast(millisFrom(init, "KEEPALIVE_MS", 0));
+
+    var room = try nilo.Room.initWith(std.heap.smp_allocator, .{ .seats = 20_000 });
+    defer room.deinit();
+    feed_room = &room;
+    var rooms = try nilo.Rooms.initWith(std.heap.smp_allocator, .{ .rooms = 20_000, .seats = 1 });
+    defer rooms.deinit();
+    pool = &rooms;
 
     var app = nilo.App.init(std.heap.smp_allocator);
     defer app.deinit();
@@ -100,6 +158,9 @@ pub fn main(init: std.process.Init) !void {
     try app.get("/health", health);
     try app.get("/stream", held);
     try app.get("/stream/deep", heldDeep);
+    try app.get("/events/room", roomFeed);
+    try app.get("/events/room/deep", roomFeedDeep);
+    try app.get("/events/named", namedFeed);
 
     // The control for the logger itself. **Registration order buys nothing
     // here** — `use` says so in as many words, because chains are resolved in

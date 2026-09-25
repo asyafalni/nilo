@@ -63,6 +63,8 @@ One fiber per connection, and a stream holds its fiber. From v1's measurement:
 
 Most of that is the fiber's own stack; about 4 KB is the read and write buffers, which `Options.read_buffer` and `Options.write_buffer` turn down (17 KB per connection at 2 KB each). This is stated up front because TigerBeetle's rule, quoted approvingly in ADR 014, is that every limit gets a number. Long-lived connections are the first nilo feature where the per-connection figure is the *design* rather than a footnote, and anybody planning to hold 100,000 SSE connections open should be planning around 2 GB before they write the handler.
 
+A stream whose every event comes from Rooms does not pay it: `c.eventsFrom` hands the stream to the connection loop, which waits from its own frame, and it costs what an idle connection does, 5,184 bytes against 21,566 for a held stream on the same host the same afternoon ([ADR 227](./227-an-event-stream-fed-by-rooms-waits-where-a-connection-waits.md)). The number above is what a stream costs whose handler has something of its own to do between events.
+
 ## What the log line means now
 
 The logger writes one line per request, when the handler returns, with how long it took. On a streamed response that line arrives when the stream *ends* and the duration is the stream's lifetime.

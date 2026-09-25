@@ -210,8 +210,11 @@ for any arguments that did not change between them, and an assert says so.
 
 ## Consequences
 
-- `Options.max_message` is still absent and this changes nothing about that.
-  The buffer handed to `receive` is still the one ceiling (ADR 021).
+- This left `Options.max_message` absent, the buffer handed to `receive`
+  being the one ceiling. It exists now: the buffer moved off the handler's
+  frame onto the executor's free list (ADR 062, `http/scratch.zig`), and a
+  buffer nobody declares needs a size before anybody asks. ADR 021 says the
+  rule as it holds.
 - A fragment is now measured against **what is left** of that buffer rather
   than all of it, so a second fragment that cannot fit beside the first is
   refused on its header, before its bytes are read.

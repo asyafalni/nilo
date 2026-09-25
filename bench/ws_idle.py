@@ -65,7 +65,8 @@ TARGETS = {
         # Four WebSocket routes that differ in one thing each, so a number
         # always has something standing next to it.
         paths={"http": "/health", "idle": "/ws/idle", "small": "/ws/small",
-               "big": "/ws/big", "deep": "/ws/deep"},
+               "big": "/ws/big", "deep": "/ws/deep", "room": "/ws/room",
+               "rooms": "/ws/rooms"},
     ),
     "gws": dict(
         label="gws",
@@ -94,6 +95,10 @@ SCENARIOS = [
          label="WebSocket, one 60 KiB echo"),
     dict(key="ws-deep", route="deep", msg=6, skip_for={"gws"},
          label="WebSocket, 64 KiB of stack touched"),
+    dict(key="ws-room", route="room", msg=6, skip_for={"gws"},
+         label="WebSocket in one Room, one 6-byte echo"),
+    dict(key="ws-rooms", route="rooms", msg=6, skip_for={"gws"},
+         label="WebSocket in two Rooms, one 6-byte echo"),
 ]
 
 
