@@ -2069,15 +2069,20 @@ pub fn randomSecure(buffer: []u8) !void {
 /// handler holding one still testable as an ordinary function (ADR 002).
 pub const Mutex = zio.Mutex;
 
-/// A counting lock: N fibers through at once and the rest park.
-///
-/// A Mutex is this with N of 1, and the reason both are here is that the one
-/// caller nilo has wants a number bigger than 1 and much smaller than the
-/// blocking pool — see `http/password.zig` and ADR 044.
-///
-/// Uncontended it takes the Mutex and nothing else, so a test driving an App
-/// with no server running never reaches the fiber-parking half of it.
-pub const Semaphore = zio.Semaphore;
+/// Parked fibers waiting on a `Mutex`, woken oldest first: `signal` pops the
+/// head of a FIFO queue, and a waiter `signal` has claimed never reports a
+/// timeout — it takes the signal instead. Both are what `Gate` builds its
+/// arrival order on (ADR 222).
+pub const Condition = zio.Condition;
+
+/// `cond.wait(mutex)` for at most `ms`, with the mutex held again on every
+/// return. `error.TimedOut` only when no `signal` claimed this waiter first.
+pub fn waitWithin(cond: *Condition, mutex: *Mutex, ms: u64) error{ Canceled, TimedOut }!void {
+    cond.waitTimeout(mutex, .{ .duration = .fromMilliseconds(ms) }) catch |err| switch (err) {
+        error.Timeout => return error.TimedOut,
+        error.Canceled => return error.Canceled,
+    };
+}
 
 /// Run a blocking call on the Engine's thread pool, parking this fiber
 /// until it comes back, so the other fibers sharing this thread keep

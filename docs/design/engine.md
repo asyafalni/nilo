@@ -42,6 +42,7 @@
 12. **A connection is served, start to finish, by the executor it was dealt to.** `enable_task_migration = false` trades zio's steal-on-idle for a lower CPU cost per request below saturation, and it is what lets a handler's threadlocal state read before a wait still be valid after it. [ADR 199](../adr/199-a-connection-is-served-by-the-thread-it-was-dealt-to.md)
 13. **Every executor accepts, on one shared listening socket.** One acceptor fiber per thread replaces the single accept loop that capped every server at the rate one fiber could round-trip through it; the accepted connection is still dealt round-robin exactly as before. [ADR 200](../adr/200-every-executor-accepts.md)
 14. **A server can answer on more than one address, sharing one route table, one connection budget and one thread pool.** `Options.also` lists further listeners, each an address, a port and a certificate; the handler is never told which one carried a request, and `max_connections` counts sockets across all of them. [ADR 213](../adr/213-a-server-answers-on-more-than-one-address.md)
+15. **A `nilo.Gate` serves its waiters in the order they came, and `enterWithin(ms)` bounds the wait.** A turn given back goes to the oldest waiter by name, never onto a count a newcomer could take first; a wait that runs out holds nothing and leaves the line. [ADR 222](../adr/222-a-gate-serves-its-waiters-in-the-order-they-came.md)
 
 ## Decisions
 
@@ -61,6 +62,7 @@
 | [199](../adr/199-a-connection-is-served-by-the-thread-it-was-dealt-to.md) | Task migration is off; a connection stays on the executor it was dealt to |
 | [200](../adr/200-every-executor-accepts.md) | One acceptor fiber per executor, not one accept loop for the server |
 | [213](../adr/213-a-server-answers-on-more-than-one-address.md) | `Options.also`, more than one listener sharing one server |
+| [222](../adr/222-a-gate-serves-its-waiters-in-the-order-they-came.md) | `nilo.Gate` hands a freed turn to the oldest waiter, and `enterWithin` bounds the wait |
 
 Beside this topic: [ADR 017](../adr/017-the-trade-budget-has-four-axes.md) (principles) is the budget every "what it costs" section above is measured against; [ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md) (memory) is the per-idle-connection floor these decisions are careful not to move; [ADR 022](../adr/022-a-deadline-belongs-to-an-operation-not-to-a-request.md) and [ADR 210](../adr/210-a-services-wait-on-its-own-socket-is-a-park.md) (deadlines) cover the timeouts the accept loop and the watchdog sit beside; [ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md) (lifecycle) is why the accept loop's group has to arm before a `ready` hook that might spawn something; [ADR 212](../adr/212-tls-is-an-option-a-build-asks-for.md) and [ADR 027](../adr/027-tls-is-terminated-in-front.md) (tls) are what `also`'s `tls` field and a unix listener's trust both lean on.
 

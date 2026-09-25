@@ -84,6 +84,12 @@
 //!   sharing it — including, possibly, the one holding the lock. Taking one
 //!   can be refused, so the Engine also has to offer a way of taking it that
 //!   cannot be: a cleanup path has nowhere to put a `Canceled`.
+//! - `Condition`/`waitWithin` — park on a `Mutex` until woken, oldest
+//!   waiter first, with or without a limit on how long. `Gate` is built on
+//!   it and on nothing else of the Engine's: its arrival order is the
+//!   queue's order, and a waiter woken just as its limit ran out has to
+//!   come back woken rather than timed out (ADR 222). An Engine that has a
+//!   parking lock has a wait queue under it already.
 //! - `blocking`/`sleep` — the general form of that same problem. A handler
 //!   that calls anything blocking stops every other request sharing its
 //!   thread, and the Engine is the only layer that knows how to wait
@@ -1001,30 +1007,140 @@ pub const Mutex = struct {
 /// the right ceiling for a call that is waiting on a disk and the wrong one
 /// for a call that is eating 19 MiB and a core. Password hashing is the
 /// caller this exists for and the numbers are in ADR 044.
+///
+/// **Turns go in the order the waiters arrived** (ADR 222). A turn given
+/// back while someone is parked is handed to the oldest of them, never put
+/// back where a caller arriving that instant could take it first; a caller
+/// takes a free turn only when nobody is waiting for one. Without that, a
+/// Gate under steady load is not a queue: whoever finishes calls `enter`
+/// again within microseconds, ahead of every fiber still waking up, and the
+/// ones that waited longest wait longest still.
 pub const Gate = struct {
     /// What a nilo compile error calls this type, which is the name the
     /// reader's own import line gives it (ADR 074).
     pub const nilo_type_name = "nilo.Gate";
 
-    _inner: engine.Semaphore,
+    _lock: engine.Mutex = .init,
+    /// Turns nobody holds. Above zero only while nobody is waiting: a turn
+    /// given back while someone waits goes to them, never here.
+    _free: usize,
+    /// The waiters, oldest first. Each node lives on its waiter's stack.
+    _head: ?*Waiter = null,
+    _tail: ?*Waiter = null,
+    _waiting: usize = 0,
+
+    /// One parked caller. `leave` sets `granted` under the Gate's lock and
+    /// wakes this node's own condition, so the turn is the named waiter's
+    /// from that instant — no one arriving later can see it as free, and a
+    /// wake that races a timeout or a cancellation is decided by `granted`,
+    /// not by which of them the condition happened to report.
+    const Waiter = struct {
+        next: ?*Waiter = null,
+        granted: bool = false,
+        wake: engine.Condition = .init,
+    };
 
     /// A Gate that lets `at_once` through. Zero would be a Gate nothing gets
     /// through, so it is read as one.
     pub fn open(at_once: usize) Gate {
-        return .{ ._inner = .{ .permits = @max(1, at_once) } };
+        return .{ ._free = @max(1, at_once) };
     }
 
     /// Wait for a turn. `error.Canceled` if the request went away first,
     /// which is the same answer `Mutex.lock` gives.
     pub fn enter(self: *Gate) error{Canceled}!void {
-        const w = watchdog.waitingAnywhere();
-        defer watchdog.waitedAnywhere(w);
-        return self._inner.wait();
+        return self.wait(null) catch |err| switch (err) {
+            error.Canceled => error.Canceled,
+            error.TimedOut => unreachable, // no limit, nothing to run out
+        };
     }
 
-    /// Give the turn back. Never waits, so there is nothing to forgive.
+    /// Wait for a turn for at most `ms`. `error.TimedOut` if none came, and
+    /// then the caller holds nothing and owes no `leave`: its place in the
+    /// line is gone, and the line behind it moves up. Zero asks only whether
+    /// a turn is free now.
+    ///
+    /// For a caller with something better to do than wait longer — an older
+    /// answer to serve, a refusal that names the limit — which is how a
+    /// bounded queue in front of a scarce resource is built without a poll.
+    pub fn enterWithin(self: *Gate, ms: u64) error{ Canceled, TimedOut }!void {
+        return self.wait(ms);
+    }
+
+    /// Give the turn back: to the oldest waiter, or to the Gate if there is
+    /// none. Never waits, so there is nothing to forgive.
     pub fn leave(self: *Gate) void {
-        self._inner.post();
+        self._lock.lockUncancelable();
+        defer self._lock.unlock();
+        self.handOn();
+    }
+
+    /// A turn nobody holds goes to the head of the line, or back to the
+    /// Gate when the line is empty. The lock is held.
+    fn handOn(self: *Gate) void {
+        const w = self._head orelse {
+            self._free += 1;
+            return;
+        };
+        self._head = w.next;
+        if (self._head == null) self._tail = null;
+        self._waiting -= 1;
+        w.granted = true;
+        w.wake.signal();
+    }
+
+    /// Take `w` out of the line. The lock is held, and `w` is in it.
+    fn unlink(self: *Gate, w: *Waiter) void {
+        var prev: ?*Waiter = null;
+        var at = self._head;
+        while (at) |node| : ({
+            prev = node;
+            at = node.next;
+        }) {
+            if (node != w) continue;
+            if (prev) |p| p.next = node.next else self._head = node.next;
+            if (self._tail == node) self._tail = prev;
+            self._waiting -= 1;
+            return;
+        }
+    }
+
+    fn wait(self: *Gate, limit_ms: ?u64) error{ Canceled, TimedOut }!void {
+        const w = watchdog.waitingAnywhere();
+        defer watchdog.waitedAnywhere(w);
+        try self._lock.lock();
+        defer self._lock.unlock();
+        if (self._head == null and self._free > 0) {
+            self._free -= 1;
+            return;
+        }
+        if (limit_ms) |ms| if (ms == 0) return error.TimedOut;
+
+        var me: Waiter = .{};
+        if (self._tail) |t| t.next = &me else self._head = &me;
+        self._tail = &me;
+        self._waiting += 1;
+
+        const started = engine.monotonicNanos();
+        while (!me.granted) {
+            const parked = if (limit_ms) |ms| blk: {
+                const spent_ms = (engine.monotonicNanos() -| started) / std.time.ns_per_ms;
+                if (spent_ms >= ms) break :blk error.TimedOut;
+                break :blk engine.waitWithin(&me.wake, &self._lock, ms - spent_ms);
+            } else me.wake.wait(&self._lock);
+            parked catch |err| {
+                if (!me.granted) {
+                    self.unlink(&me);
+                    return err;
+                }
+                // `leave` named this waiter as the wait was ending. A limit
+                // that ran out as the turn arrived takes the turn: it came.
+                // A cancellation hands it to whoever is next, or the Gate.
+                if (err == error.TimedOut) return;
+                self.handOn();
+                return err;
+            };
+        }
     }
 };
 
@@ -1692,4 +1808,144 @@ test "the deadlines a test gets by default do nothing, and say nothing timed out
     d.armWrite();
     d.readForever();
     try testing.expect(!d.timedOut());
+}
+
+// ---- Gate (ADR 222) ----
+//
+// Plain threads rather than fibers: the Engine's lock and condition park an
+// OS thread when there is no fiber under them, which is what lets these run
+// without a Runtime and without this file naming the Engine. The order a
+// thread joins the line is made certain by waiting for the Gate to count it
+// before the next one starts.
+
+fn gateWaiting(g: *Gate) usize {
+    g._lock.lockUncancelable();
+    defer g._lock.unlock();
+    return g._waiting;
+}
+
+fn untilWaiting(g: *Gate, n: usize) void {
+    while (gateWaiting(g) < n) std.Thread.yield() catch {};
+}
+
+const Arrivals = struct {
+    gate: *Gate,
+    order: [8]u8 = undefined,
+    served: std.atomic.Value(usize) = .init(0),
+
+    fn take(self: *Arrivals, who: u8) void {
+        self.gate.enter() catch unreachable;
+        self.order[self.served.fetchAdd(1, .seq_cst)] = who;
+        self.gate.leave();
+    }
+};
+
+test "a Gate hands a freed turn to the oldest waiter, in the order they came" {
+    var g: Gate = .open(1);
+    try g.enter();
+    var a: Arrivals = .{ .gate = &g };
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Arrivals.take, .{ &a, @as(u8, @intCast(i)) });
+        untilWaiting(&g, i + 1);
+    }
+    g.leave();
+    for (threads) |t| t.join();
+    try testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3 }, a.order[0..4]);
+}
+
+test "a turn given back while someone waits is theirs, not the next caller's" {
+    // The case a first-come lock gets wrong: the fiber that just left asks
+    // again at once, and would win every time against one still waking up.
+    var g: Gate = .open(1);
+    try g.enter();
+    var a: Arrivals = .{ .gate = &g };
+    const t = try std.Thread.spawn(.{}, Arrivals.take, .{ &a, 7 });
+    untilWaiting(&g, 1);
+    g.leave();
+    try testing.expectError(error.TimedOut, g.enterWithin(0));
+    t.join();
+    try testing.expectEqual(@as(u8, 7), a.order[0]);
+    // And once the waiter is done, the turn is free for anyone.
+    try g.enterWithin(0);
+    g.leave();
+}
+
+test "a wait with a limit gives up empty-handed and leaves the line as it found it" {
+    var g: Gate = .open(1);
+    try g.enter();
+    const started = monotonicNanos();
+    try testing.expectError(error.TimedOut, g.enterWithin(20));
+    const took = monotonicNanos() - started;
+    try testing.expect(took >= 20 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 0), gateWaiting(&g));
+    // Nothing was taken, so one leave frees exactly the one turn there is.
+    g.leave();
+    try g.enterWithin(0);
+    try testing.expectError(error.TimedOut, g.enterWithin(0));
+    g.leave();
+}
+
+const Patient = struct {
+    fn giveUp(g: *Gate, out: *?anyerror) void {
+        g.enterWithin(15) catch |err| {
+            out.* = err;
+            return;
+        };
+        out.* = null;
+        g.leave();
+    }
+};
+
+test "a waiter that gave up is skipped, and the one behind it is served" {
+    var g: Gate = .open(1);
+    try g.enter();
+    var gave_up: ?anyerror = null;
+    const first = try std.Thread.spawn(.{}, Patient.giveUp, .{ &g, &gave_up });
+    untilWaiting(&g, 1);
+    var a: Arrivals = .{ .gate = &g };
+    const second = try std.Thread.spawn(.{}, Arrivals.take, .{ &a, 2 });
+    untilWaiting(&g, 2);
+    first.join();
+    try testing.expectEqual(@as(?anyerror, error.TimedOut), gave_up);
+    g.leave();
+    second.join();
+    try testing.expectEqual(@as(u8, 2), a.order[0]);
+    try testing.expectEqual(@as(usize, 0), gateWaiting(&g));
+    try g.enterWithin(0);
+    g.leave();
+}
+
+test "a Gate of n lets n through before anyone waits" {
+    var g: Gate = .open(3);
+    try g.enterWithin(0);
+    try g.enterWithin(0);
+    try g.enterWithin(0);
+    try testing.expectError(error.TimedOut, g.enterWithin(0));
+    g.leave();
+    try g.enterWithin(0);
+    g.leave();
+    g.leave();
+    g.leave();
+}
+
+test "a caller that asks again right after leave does not jump the line" {
+    // The case `enterWithin(0)` above cannot reach: `enter` from the caller
+    // that just left, before the waiter it handed the turn to has woken.
+    // Found in review, where it barged 45 times in 50 on a Gate that counted
+    // handed turns instead of naming the waiter they were handed to.
+    var barged: usize = 0;
+    for (0..50) |_| {
+        var g: Gate = .open(1);
+        try g.enter();
+        var a: Arrivals = .{ .gate = &g };
+        const t = try std.Thread.spawn(.{}, Arrivals.take, .{ &a, 7 });
+        untilWaiting(&g, 1);
+        g.leave();
+        try g.enter();
+        if (a.served.load(.seq_cst) == 0) barged += 1;
+        g.leave();
+        t.join();
+    }
+    try testing.expectEqual(@as(usize, 0), barged);
 }
