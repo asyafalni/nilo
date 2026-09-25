@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://ziglang.org/"><img alt="Zig 0.16" src="https://img.shields.io/badge/zig-0.16-f7a41d?style=flat-square&logo=zig&logoColor=white"></a>
-  <a href="./CHANGELOG.md"><img alt="version 0.5.0" src="https://img.shields.io/badge/version-0.5.0-3b82f6?style=flat-square"></a>
+  <a href="./CHANGELOG.md"><img alt="version 0.6.0" src="https://img.shields.io/badge/version-0.6.0-3b82f6?style=flat-square"></a>
   <a href="./docs/reference/"><img alt="11 modules" src="https://img.shields.io/badge/modules-11-8957e5?style=flat-square"></a>
   <a href="./refusals/README.md"><img alt="411 refusals" src="https://img.shields.io/badge/mistakes%20refused%20while%20compiling-411-e05d44?style=flat-square"></a>
   <a href="./docs/adr/"><img alt="296 ADRs" src="https://img.shields.io/badge/decisions%20on%20file-296-6b7280?style=flat-square"></a>

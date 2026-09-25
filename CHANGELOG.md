@@ -8,22 +8,18 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 [`docs/roadmap.md`](./docs/roadmap.md), and what was refused or answered is in
 [`docs/decided.md`](./docs/decided.md).
 
-## Unreleased
+## 0.6.0
 
-**0.6.0 is the release that reads what is already here, and what the first
-application built on 0.5.0 sent back.** `http/` was scanned line by line for
-what a stranger on the socket can make it do; what the scan found lands under
-`### Fixed` below as it is fixed, and what it found and cannot hold goes to
-[`docs/risks.md`](./docs/risks.md). The server then took what the benchmark
-arena asked of it: every executor accepts, and a response is flushed before
-the connection waits rather than on every `send`. And a SQLite application
-built against the guide reported eight things the guide showed working on
-the other database or in the other order, which is where the schema check
-moving after the boot work, `$n` respelled for the dialect, `rawPage`,
-`rawExactlyOne` and `examples/sqlite/` come from.
+**0.6.0 is the release where nilo stopped needing a proxy in front of it, and was then read line by line for what a stranger can do without one.** It serves HTTPS itself, answers gRPC, compresses its answers and refuses a cross-site write, each behind an option or a build flag, so a program that asks for none of it is the size it was. Then every file under `http/` was read for what a client on the socket could make it do, and what that found is under Fixed: a JSON body that could take the process down, a content type, cookie or event that could forge a header or an event of its own, a cached page that could reach the wrong user.
 
-Work lands here under `### Breaking`, `### Added`, `### Fixed` and `### Docs`,
-newest first.
+**Needs Zig 0.16**, as 0.5.0 does. Four things in it, in the order you will meet them:
+
+- **Nothing in front, if you want.** `listen(.{ .tls = … })` is HTTPS on a build that asks for it with `-Dtls`; `.also` answers on more than one address; `.grpc = true` serves unary gRPC on the routes you already have; `app.compress` gzips text answers; `nilo.csrf.sameOrigin` refuses a cross-site write with no token; and the session secret changes without signing anybody out.
+- **Faster where it was slow.** Every executor accepts (short connections, 660K to 1.97M requests a second on eight cores), a response is flushed before the connection waits rather than on every `send` (sixteen pipelined requests, 3.05M to 12.3–13.6M), a route is found in a tree (125 ns to 27 ns on a 276-route table), and a server that is not busy spends a third less CPU on each request.
+- **A Row that carries more.** Its parent through a foreign key, its children in one more statement for the whole page, or a sum by group, all read by the `db.select` you already call. Beside it: `$n` spelled for SQLite, `rawPage`, `rawExactlyOne`, statements composed at run time, and a job that says how urgent it is. Most of the SQL half came from the first application built on 0.5.0, a SQLite one, and the eight things it sent back.
+- **What a stranger can do, closed.** A JSON body nested past 64 levels, header and event-stream injection, cookie attributes, `Cached` beside a session, the origin `null`, an unpinned script on `/docs`, four framing holes in the HTTP/1.1 parser, and work in `nilo.spawn` writing into somebody else's request.
+
+**Eleven entries ask something of you**, under Breaking with the fix beside each. The one most programs meet first is an `insert` that leaves out a column nothing fills, which no longer compiles.
 
 ### Breaking
 
