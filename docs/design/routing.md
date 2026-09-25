@@ -1,6 +1,6 @@
 # Routing
 
-**A route's pattern is the whole of its identity: what matches a request, what a URL is built back from, and what a route is called are all read off the same compile-time string, so none of them can drift out of step with another.** How to register and group routes is the guide ([`guide/routing.md`](../guide/routing.md)); every method is the reference ([`reference/app.md#app`](../reference/app.md#app), [`reference/ctx.md`](../reference/ctx.md)). The code is `http/router.zig` (`validatePattern`, `Route`, `add`, `match`, `max_segments`), `http/app.zig` (`routeNamed`, `checkName`, `named`), `http/ctx.zig` (`url`, `routeName`) and `http/url.zig`.
+**A route's pattern is the whole of its identity: what matches a request, what a URL is built back from, and what a route is called are all read off the same compile-time string, so none of them can drift out of step with another.** How to register and group routes is the guide ([`guide/routing.md`](../guide/routing.md)); every method is the reference ([`reference/app.md#app`](../reference/app.md#app), [`reference/ctx.md`](../reference/ctx.md)). The code is `http/router.zig` (`validatePattern`, `Route`, `add`, `matchInto`, `find`, `max_segments`), `http/app.zig` (`routeNamed`, `checkName`, `named`), `http/ctx.zig` (`url`, `routeName`) and `http/url.zig`.
 
 ## How the pieces fit
 
@@ -12,10 +12,11 @@
                                                           or mixed with text,
                                                           `{id}` where `:id` goes
         │
-        ├── app.add(): a specificity score, computed once ── error.DuplicateRoute
-        │               (literal > param > `*`, MSB-first)     if the shape exists
+        ├── app.add(): planted in a tree of segments ─────── error.DuplicateRoute
+        │                                                      if the shape exists
         │
-        ├── match(): highest score wins, not first registered
+        ├── matchInto(): searched literal > param > `*`, backing out of dead
+        │                ends; the first route reached is the most specific
         │
         ├── app.named("…") / checkName: the operationId, or the derived default
         │
@@ -27,7 +28,7 @@
 
 ## The rule in force
 
-1. **The most specific route wins, not the one registered first.** Specificity is two bits per segment, packed most-significant-first, so a literal beats a param beats a `*` and an earlier segment always outranks a later one. [ADR 012](../adr/012-the-most-specific-route-wins-and-duplicates-are-refused.md)
+1. **The most specific route wins, not the one registered first.** A literal beats a param beats a `*`, an earlier segment outranks every later one, and a route ending where the path ends beats a `*` standing for nothing. That ranking is the order a tree of segments is searched in (literal, then param, then `*`, backing out of a dead end), so no score is kept; the tree replaced a linear scan that cost 35% of a request on a real 276-route table and now costs 8%. [ADR 012](../adr/012-the-most-specific-route-wins-and-duplicates-are-refused.md)
 2. **A second route of the same shape is refused at registration**, `error.DuplicateRoute`, naming the pattern already there; param names are not part of the shape, so `/users/:id` and `/users/:name` collide. [ADR 012](../adr/012-the-most-specific-route-wins-and-duplicates-are-refused.md)
 3. **A pattern that cannot work at all is a compile error, not a startup assertion.** `validatePattern` catches no leading slash, an empty pattern, a `:` with no name, a param name used twice, a `*` that is not last or is mixed with other text, before `App` ever runs. [ADR 012](../adr/012-the-most-specific-route-wins-and-duplicates-are-refused.md)
 4. **`{id}` is refused rather than matched as five literal characters.** OpenAPI's brace syntax is what nilo's own document prints and what a porter's existing document already says, so the message names that source rather than only the rule: write `:id`. [ADR 118](../adr/118-a-pattern-written-the-way-the-document-prints-it.md)
@@ -52,4 +53,4 @@ Beside this topic: how the derived `operationId` and the rest of the API descrip
 
 ## Open
 
-- **Whether the router needs a tree instead of the linear scan it has today.** Indexing the first segment moved ADR 017's 10% bar out to about 40 routes, and an application with 203 routes exists; a real structure would have to carry specificity ordering itself rather than as a cost added on top, which is what [ADR 012](../adr/012-the-most-specific-route-wins-and-duplicates-are-refused.md) flagged as unresolved when it landed. On record in [the roadmap](../roadmap.md), with two attempts that lost written up in [`docs/history.md`](../history.md).
+Nothing is open on the record.

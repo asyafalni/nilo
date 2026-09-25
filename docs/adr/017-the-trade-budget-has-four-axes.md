@@ -69,6 +69,7 @@ Measured stripped, `ReleaseFast`, on the examples in this repository.
 | A server answering on more than one address ([ADR 213](./213-a-server-answers-on-more-than-one-address.md)); the `-Dtls` build pays +1,872 B, where a listener's certificate is real | +256 B | +256 B |
 | An RSA key signed through its CRT form, in the pinned tls.zig ([the run](../../bench/result/http.md#what-an-rsa-certificate-costs-a-handshake)); the `-Dtls` build pays +26,768 B and +26,832 B, a second `ff.Modulus` instantiation | +0 | +0 |
 | Unary gRPC over h2c, and over TLS by ALPN, on a listener the build has to ask for ([ADR 220](./220-grpc-is-served-over-h2c-behind-a-flag.md)); the `-Dgrpc` build pays +115,720 B and +52,432 B on top | +8 B | +112 B |
+| A route table searched as a tree rather than scanned ([ADR 012](./012-the-most-specific-route-wins-and-duplicates-are-refused.md)); measured with the CSRF middleware of [ADR 224](./224-a-request-that-changes-something-says-where-it-came-from.md) in the same tree, which neither example names | +1,616 B | +1,408 B |
 
 `nilo_fetch` is +0 on both examples because neither imports it, and that is the whole of the row rather than an accident: a module nothing names is never analysed, so the linker has nothing to drop. Measured on a program that *does* import it, against the same program calling `std.http.Client` itself, it is **+1,688 bytes**; `std.http.Client` and the TLS stack under it are the other 655,600, the price of dialling out in Zig rather than of this module ([`bench/result/fetch.md`](../../bench/result/fetch.md)).
 

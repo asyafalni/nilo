@@ -1,17 +1,19 @@
 //! Router: matches method + path to a handler, with `/users/:id` style
 //! path params.
 //!
-//! Still a linear scan over the routes — which one to use instead gets
-//! decided with numbers, and there are none yet (docs/roadmap.md, "Known
-//! gaps"). What the scan costs, though, does not need numbers to reason
-//! about, and it used to cost too much: every route re-split the request
-//! path from scratch, so fifty routes meant fifty passes over it.
+//! A tree of segments, searched literal first, then param, then `*`, backing
+//! out of a branch that dead-ends. That order is ADR 012's ranking itself: a
+//! literal beats a param beats a `*`, and an earlier segment outranks every
+//! later one, so the first route the search reaches is the most specific one
+//! and there is no score to carry or compare.
 //!
-//! Now the patterns are split once when they are registered and the path
-//! once per request. A route whose segment count differs is rejected on an
-//! integer compare, which is nearly all of them. The scan is still linear
-//! in the number of routes; it is no longer linear in their number times
-//! the length of the path.
+//! It replaced a linear scan over every route, which a real table decided:
+//! 276 routes under one `/api` prefix cost 125ns a match, 35% of a request,
+//! because a prefix every route shares is the one thing a scan's cheap
+//! filters cannot see past (`bench/result/http.md`, "Matching on a real table
+//! of 276 routes under one prefix"). The tree is built at registration; a
+//! match allocates nothing and walks one node per segment, plus whatever it
+//! has to back out of.
 
 const std = @import("std");
 const http1 = @import("http1.zig");
@@ -97,41 +99,14 @@ pub const Route = struct {
     /// `pattern`, split up once at registration. Owned by the Router.
     segments: []const Segment,
 
-    /// All three worked out once at registration, so matching reads fields
-    /// instead of walking the segments again.
-    score: u32 = 0,
     /// Whether the last segment is a `*`, which makes the segment count a
     /// minimum rather than an equality.
     wildcard_tail: bool = false,
-    /// A route of nothing but literals is the most specific thing that can
-    /// match a path of its length, so finding one ends the scan.
-    all_literal: bool = false,
 
-    /// The first segment, boiled down to four bytes — the first level of a
-    /// radix tree, without the tree.
-    ///
-    /// `zig build profile` says where the scan's time goes: at 100 routes
-    /// every route that survives the method and length checks pays a
-    /// `mem.eql` on its first segment, and the gap between the two route
-    /// sets it measures is entirely that call. Comparing a `u32` first
-    /// throws out everything whose first segment is a different word, and
-    /// the `mem.eql` is left to run only where it can succeed.
-    ///
-    /// A collision costs nothing but the `mem.eql` that would have run
-    /// anyway, so the key does not have to be a good hash — only a cheap
-    /// one. What it must not do is exclude a route that could match, which
-    /// is what `first_literal` is for: a route beginning `:id` or `*`
-    /// answers whatever turns up and is never skipped.
-    first_key: u32 = 0,
-    first_literal: bool = false,
-
-    /// How specific this route is, so that `/users/new` wins over
-    /// `/users/:id` no matter which was registered first — the same
-    /// order-independence `use` and `get` already have (ADR 008).
-    ///
-    /// Two bits per segment, most significant first: a literal beats a
-    /// param beats a `*`, and an earlier segment outranks every later one.
-    /// `max_segments` is 16, so the whole ranking fits in a u32.
+    /// How specific a route is, as the scan this router replaced ranked it:
+    /// two bits per segment, most significant first. Only the tests read it
+    /// now, as the oracle the tree is held against on tables where the two
+    /// agree (see `the tree agrees with the scan it replaced`).
     fn specificity(segments: []const Segment) u32 {
         var score: u32 = 0;
         for (segments) |seg| {
@@ -145,14 +120,16 @@ pub const Route = struct {
     }
 
     /// Four bytes standing for a path segment: its length, its first byte,
-    /// its last byte and the one in the middle.
+    /// its last byte and the one in the middle. What a node compares first
+    /// when it looks for the literal child a segment names, so a
+    /// `mem.eql` runs only where it can succeed.
     ///
-    /// Not a hash, and deliberately not — a hash worth the name costs more
-    /// than the `mem.eql` it is trying to avoid at the one route count most
-    /// apps have. This is four loads and three shifts. It has to tell apart
-    /// the segments that actually appear next to each other in a route
-    /// table, and those differ at the end (`/users` and `/uploads`) or in
-    /// length far more often than they differ nowhere at all.
+    /// Not a hash, and deliberately not: a hash worth the name costs more
+    /// than the `mem.eql` it is trying to avoid. This is four loads and
+    /// three shifts. It has to tell apart the segments that actually sit
+    /// side by side under one node, and those differ at the end (`users`
+    /// and `uploads`) or in length far more often than nowhere at all. A
+    /// collision costs the `mem.eql` and nothing else.
     fn firstKey(text: []const u8) u32 {
         if (text.len == 0) return 0;
         const len: u32 = @intCast(@min(text.len, 0xff));
@@ -177,6 +154,49 @@ pub const Route = struct {
 pub const Router = struct {
     gpa: std.mem.Allocator,
     routes: std.ArrayList(Route) = .empty,
+    /// The tree `match` searches; node 0 is the root once a route exists.
+    /// Indices rather than pointers, because a node is appended while its
+    /// parent is being extended.
+    nodes: std.ArrayList(Node) = .empty,
+
+    const none = std.math.maxInt(u32);
+    const methods = @typeInfo(http1.Method).@"enum".fields.len;
+
+    /// One place in the tree: the path matched so far, and where it can go.
+    const Node = struct {
+        /// The children a literal segment leads to. `keys` is `firstKey` of
+        /// each child's text, kept apart from the text so the search reads
+        /// a run of `u32`s before it reads any string.
+        keys: std.ArrayList(u32) = .empty,
+        texts: std.ArrayList([]const u8) = .empty,
+        children: std.ArrayList(u32) = .empty,
+        /// The child any one non-empty segment leads to. One, whatever the
+        /// param is called: `/users/:id` and `/users/:name/posts` share it,
+        /// and the name is read off the route that is found.
+        param: u32 = none,
+        /// The route of each method that ends here.
+        ends: [methods]u32 = @splat(none),
+        /// The route of each method whose `*` stands here, taking whatever
+        /// is left of the path, nothing included.
+        rest: [methods]u32 = @splat(none),
+        /// Every method some route at or below this node answers, so the
+        /// search does not walk a branch for a `POST` that holds only `GET`s.
+        reach: MethodSet = .initEmpty(),
+
+        fn literal(self: *const Node, text: []const u8) ?u32 {
+            const key = Route.firstKey(text);
+            for (self.keys.items, 0..) |k, i| {
+                if (k == key and std.mem.eql(u8, self.texts.items[i], text)) return self.children.items[i];
+            }
+            return null;
+        }
+
+        fn deinit(self: *Node, gpa: std.mem.Allocator) void {
+            self.keys.deinit(gpa);
+            self.texts.deinit(gpa);
+            self.children.deinit(gpa);
+        }
+    };
 
     pub fn init(gpa: std.mem.Allocator) Router {
         return .{ .gpa = gpa };
@@ -185,6 +205,8 @@ pub const Router = struct {
     pub fn deinit(self: *Router) void {
         for (self.routes.items) |r| self.gpa.free(r.segments);
         self.routes.deinit(self.gpa);
+        for (self.nodes.items) |*n| n.deinit(self.gpa);
+        self.nodes.deinit(self.gpa);
     }
 
     /// `pattern` must outlive the Router (normally a literal).
@@ -244,20 +266,65 @@ pub const Router = struct {
         }
         std.debug.assert(captures <= max_params);
 
-        const starts_literal = segments.len > 0 and segments[0].kind == .literal;
-
-        try self.routes.append(self.gpa, .{
+        // Room for the route first, so that once it is in the tree nothing
+        // can fail before it is in the list the tree points into.
+        try self.routes.ensureUnusedCapacity(self.gpa, 1);
+        try self.plant(method, segments, @intCast(self.routes.items.len));
+        self.routes.appendAssumeCapacity(.{
             .method = method,
             .pattern = pattern,
             .handler = handler,
             .name = name,
             .segments = segments,
-            .score = Route.specificity(segments),
             .wildcard_tail = tail_is_wildcard,
-            .all_literal = captures == 0,
-            .first_literal = starts_literal,
-            .first_key = if (starts_literal) Route.firstKey(segments[0].text) else 0,
         });
+    }
+
+    /// Put route `index` into the tree along its segments. A failure part
+    /// way leaves nodes nothing ends at, which the search walks past.
+    fn plant(self: *Router, method: http1.Method, segments: []const Segment, index: u32) !void {
+        const m = @intFromEnum(method);
+        if (self.nodes.items.len == 0) try self.nodes.append(self.gpa, .{});
+        var at: u32 = 0;
+        self.nodes.items[at].reach.insert(method);
+        for (segments) |seg| {
+            switch (seg.kind) {
+                .literal => at = try self.literalChild(at, seg.text),
+                .param => at = try self.paramChild(at),
+                .wildcard => {
+                    // `add` refused a second route of this shape, and a `*`
+                    // is always the last segment.
+                    std.debug.assert(self.nodes.items[at].rest[m] == none);
+                    self.nodes.items[at].rest[m] = index;
+                    return;
+                },
+            }
+            self.nodes.items[at].reach.insert(method);
+        }
+        std.debug.assert(self.nodes.items[at].ends[m] == none);
+        self.nodes.items[at].ends[m] = index;
+    }
+
+    fn literalChild(self: *Router, at: u32, text: []const u8) !u32 {
+        if (self.nodes.items[at].literal(text)) |child| return child;
+        const child: u32 = @intCast(self.nodes.items.len);
+        try self.nodes.append(self.gpa, .{});
+        const node = &self.nodes.items[at];
+        try node.keys.ensureUnusedCapacity(self.gpa, 1);
+        try node.texts.ensureUnusedCapacity(self.gpa, 1);
+        try node.children.ensureUnusedCapacity(self.gpa, 1);
+        node.keys.appendAssumeCapacity(Route.firstKey(text));
+        node.texts.appendAssumeCapacity(text);
+        node.children.appendAssumeCapacity(child);
+        return child;
+    }
+
+    fn paramChild(self: *Router, at: u32) !u32 {
+        if (self.nodes.items[at].param != none) return self.nodes.items[at].param;
+        const child: u32 = @intCast(self.nodes.items.len);
+        try self.nodes.append(self.gpa, .{});
+        self.nodes.items[at].param = child;
+        return child;
     }
 
     /// The pattern already registered that `pattern` would collide with, if
@@ -284,19 +351,35 @@ pub const Router = struct {
         return null;
     }
 
-    pub noinline fn match(self: *const Router, method: http1.Method, path: []const u8) ?Match {
+    /// `matchInto`, returning the match. For a caller with nowhere of its
+    /// own to put one; the request path uses `matchInto`.
+    pub fn match(self: *const Router, method: http1.Method, path: []const u8) ?Match {
+        var result: Match = undefined;
+        return if (self.matchInto(method, path, &result)) result else null;
+    }
+
+    /// Find the route for this request and write it into `out`, which the
+    /// caller owns and the params point out of. False is no route.
+    ///
+    /// Into the caller's memory rather than returned, because a `Match` is
+    /// eight params wide, about 300 bytes, and the request path held it in
+    /// a variable of its own anyway: returning one by value copied it on the
+    /// way out of each call it passed through, on every request, one route
+    /// or three hundred. Measured: 19ns to 13ns on a one-route app, 35ns to
+    /// 27ns across the ERP's 276 (`bench/result/http.md`).
+    pub noinline fn matchInto(self: *const Router, method: http1.Method, path: []const u8, out: *Match) bool {
         var buf: [max_segments][]const u8 = undefined;
         const trimmed = trimSlashes(path);
-        const parts = split(trimmed, &buf) orelse return null;
+        const parts = split(trimmed, &buf) orelse return false;
 
-        if (self.matchExact(method, trimmed, parts)) |m| return m;
+        if (self.matchExact(method, trimmed, parts, out)) return true;
         // A HEAD nobody registered is answered by the GET route: the head of
         // a HEAD response has to be what a GET would have sent anyway, and
         // the body is dropped on the way out (Ctx.send). Making people
         // register both would mean every health check and every link
         // checker gets a 404 from a route that plainly exists.
-        if (method == .HEAD) return self.matchExact(.GET, trimmed, parts);
-        return null;
+        if (method == .HEAD) return self.matchExact(.GET, trimmed, parts, out);
+        return false;
     }
 
     /// The methods that answer this path, whatever the request asked for.
@@ -335,68 +418,92 @@ pub const Router = struct {
         return matches(route, parts);
     }
 
-    /// The best match, not the first one. `/users/new` and `/users/:id` can
-    /// both answer `/users/new`; the literal is what the person who wrote
-    /// them meant, whichever order they happened to be registered in.
-    ///
-    /// Deciding first and capturing afterwards, rather than capturing into
-    /// a running best: a `Match` carries room for eight params and is a few
-    /// hundred bytes, so copying one per candidate cost more than the
-    /// second walk over a handful of short segments does.
+    /// The most specific route for this path, found by walking the tree,
+    /// written into `out` field by field: the params array is left as it
+    /// was past the ones this route fills.
     fn matchExact(
         self: *const Router,
         method: http1.Method,
         trimmed: []const u8,
         parts: []const []const u8,
-    ) ?Match {
-        var result: Match = undefined;
-        var have = false;
-        var best_score: u32 = 0;
+        out: *Match,
+    ) bool {
+        const i = self.find(method, parts) orelse return false;
+        const route = &self.routes.items[i];
+        out.handler = route.handler;
+        out.chain = route.chain;
+        out.index = i;
+        out.n_params = 0;
+        capture(route, trimmed, parts, out);
+        return true;
+    }
 
-        // Worked out once for the path, then compared against every route
-        // that gets far enough to care. Zero when the path has no segments
-        // at all, which no literal-first route can answer anyway — the
-        // length check above has already thrown those out.
-        const want_first = if (parts.len > 0) Route.firstKey(parts[0]) else 0;
+    /// The route the search reaches first, which is the most specific one.
+    ///
+    /// Depth first, and at each segment the three ways on in ADR 012's
+    /// order: the literal child that segment names, then the param child,
+    /// then a `*` standing here. A branch that reaches the end of the path
+    /// with no route for this method is backed out of, and the next way on
+    /// at the level above is tried. So `/files/:name` is found for
+    /// `/files/a` ahead of `/files/*`, and `/:tenant/dashboard` for
+    /// `/acme/dashboard` once `/acme` turns out to lead nowhere.
+    ///
+    /// Iterative, with the way back held in two small arrays rather than on
+    /// the call stack: a match runs on the request's fiber, and by ADR 062
+    /// every byte of stack it touches is held for the life of the
+    /// connection. Eighty-five bytes here, whatever the path.
+    fn find(self: *const Router, method: http1.Method, parts: []const []const u8) ?u32 {
+        const nodes = self.nodes.items;
+        if (nodes.len == 0) return null;
+        const m = @intFromEnum(method);
 
-        for (self.routes.items, 0..) |*route, i| {
-            // Two integer compares throw out nearly every route before any
-            // text is looked at.
-            if (route.method != method) continue;
-            if (route.wildcard_tail) {
-                // The `*` stands in for zero or more segments, so its own
-                // slot is the only one that need not be there.
-                if (parts.len + 1 < route.segments.len) continue;
-            } else if (route.segments.len != parts.len) continue;
+        var at: [max_segments + 1]u32 = undefined;
+        // Which way on this level tries next: 0 the literal, 1 the param,
+        // 2 a `*`, 3 nothing left.
+        var next: [max_segments + 1]u8 = undefined;
+        var d: usize = 0;
+        at[0] = 0;
+        next[0] = 0;
 
-            // A third integer compare, for the route sets the first two
-            // cannot separate: every route the same shape, differing only
-            // in the word they start with. A route beginning with a param
-            // or a `*` answers anything and is never skipped here.
-            if (route.first_literal and route.first_key != want_first) continue;
-
-            // With something already captured, a route that cannot outrank
-            // it is not worth testing — and one that can has to be tested
-            // before it may write, since a half-filled failure would land
-            // on top of the winner. Both are the uncommon path: almost
-            // every request has exactly one route that matches it, and that
-            // one is filled in a single pass, as it always was.
-            if (have) {
-                if (route.score <= best_score) continue;
-                if (!matches(route, parts)) continue;
+        while (true) {
+            const node = &nodes[at[d]];
+            if (d == parts.len) {
+                // The whole path is matched. A route ending here is more
+                // specific than a `*` standing for nothing.
+                if (node.ends[m] != none) return node.ends[m];
+                if (node.rest[m] != none) return node.rest[m];
+            } else {
+                if (next[d] == 0) {
+                    next[d] = 1;
+                    if (node.literal(parts[d])) |child| {
+                        if (nodes[child].reach.contains(method)) {
+                            d += 1;
+                            at[d] = child;
+                            next[d] = 0;
+                            continue;
+                        }
+                    }
+                }
+                if (next[d] == 1) {
+                    next[d] = 2;
+                    // An empty segment fills nothing (`/users//posts`).
+                    if (node.param != none and parts[d].len > 0 and
+                        nodes[node.param].reach.contains(method))
+                    {
+                        d += 1;
+                        at[d] = node.param;
+                        next[d] = 0;
+                        continue;
+                    }
+                }
+                if (next[d] == 2) {
+                    next[d] = 3;
+                    if (node.rest[m] != none) return node.rest[m];
+                }
             }
-
-            result = .{ .handler = route.handler, .chain = route.chain, .index = i };
-            if (!fill(route, trimmed, parts, &result)) continue;
-            have = true;
-            best_score = route.score;
-
-            // Nothing can outrank a route made only of literals, and `add`
-            // has already refused a second one of the same shape — so a
-            // static route still stops the scan where it always did.
-            if (route.all_literal) return result;
+            if (d == 0) return null;
+            d -= 1;
         }
-        return if (have) result else null;
     }
 
     /// The segments that have to line up with a path segment each — every
@@ -425,21 +532,19 @@ pub const Router = struct {
         return true;
     }
 
-    fn fill(
+    /// Write the params of a route the search already found. Nothing is
+    /// compared: `find` only reaches a route whose every segment lined up.
+    fn capture(
         route: *const Route,
         trimmed: []const u8,
         parts: []const []const u8,
         result: *Match,
-    ) bool {
+    ) void {
         const segments = fixedSegments(route);
         for (segments, parts[0..segments.len]) |seg, part| {
-            if (seg.kind == .param) {
-                if (part.len == 0) return false; // an empty segment fills nothing
-                result.params[result.n_params] = .{ .name = seg.text, .value = part };
-                result.n_params += 1;
-            } else if (!std.mem.eql(u8, seg.text, part)) {
-                return false;
-            }
+            if (seg.kind != .param) continue;
+            result.params[result.n_params] = .{ .name = seg.text, .value = part };
+            result.n_params += 1;
         }
 
         if (route.wildcard_tail) {
@@ -451,7 +556,6 @@ pub const Router = struct {
             result.params[result.n_params] = .{ .name = wildcard, .value = rest };
             result.n_params += 1;
         }
-        return true;
     }
 };
 
@@ -928,4 +1032,139 @@ test "a catch-all fills a param slot, so the budget has to count it" {
     try testing.expectEqual(@as(usize, max_params), m.n_params);
     try testing.expectEqualStrings(wildcard, m.params[max_params - 1].name);
     try testing.expectEqualStrings("rest/of/it", m.params[max_params - 1].value);
+}
+
+/// The ranking the scan this router replaced used, with none of its
+/// shortcuts: every route that answers the path is scored, and the highest
+/// wins. Held against the tree on tables with no `*`, where the score and
+/// ADR 012's rule agree (a `*` is where they part; see the test below this
+/// one).
+fn bestByScore(r: *const Router, method: http1.Method, path: []const u8) ?Match {
+    var buf: [max_segments][]const u8 = undefined;
+    const trimmed = trimSlashes(path);
+    const parts = split(trimmed, &buf) orelse return null;
+    var best: ?usize = null;
+    var best_score: u32 = 0;
+    for (r.routes.items, 0..) |*route, i| {
+        if (route.method != method) continue;
+        if (!Router.answers(route, parts)) continue;
+        const score = Route.specificity(route.segments);
+        if (best == null or score > best_score) {
+            best = i;
+            best_score = score;
+        }
+    }
+    const i = best orelse return null;
+    const route = &r.routes.items[i];
+    var result: Match = .{ .handler = route.handler, .chain = route.chain, .index = i };
+    Router.capture(route, trimmed, parts, &result);
+    return result;
+}
+
+test "the tree agrees with the scan it replaced, on a table under one prefix" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    // The shape that decided the tree: everything under `/api`, several
+    // methods per resource, literals beside params at the same depth.
+    const table = [_]struct { http1.Method, []const u8 }{
+        .{ .GET, "/" },                                .{ .GET, "/health" },
+        .{ .GET, "/api/deals" },                       .{ .POST, "/api/deals" },
+        .{ .GET, "/api/deals/:id" },                   .{ .PATCH, "/api/deals/:id" },
+        .{ .DELETE, "/api/deals/:id" },                .{ .GET, "/api/deals/pipeline" },
+        .{ .GET, "/api/deals/:id/lines" },             .{ .POST, "/api/deals/:id/lines" },
+        .{ .POST, "/api/deals/:id/won" },              .{ .GET, "/api/work-items/mine" },
+        .{ .GET, "/api/work-items/:id" },              .{ .POST, "/api/work-items/:id/target-date" },
+        .{ .PATCH, "/api/work-items/:id/target-date" }, .{ .GET, "/api/:tenant/settings" },
+        .{ .PUT, "/api/:tenant/settings" },            .{ .GET, "/api/deals/:id/lines/:line" },
+    };
+    for (table) |route| try r.add(route[0], route[1], testHandler);
+
+    const paths = [_][]const u8{
+        "/",                          "",                             "/health",
+        "/health/",                   "/api",                         "/api/deals",
+        "/api/deals/",                "/api/deals/7",                 "/api/deals/pipeline",
+        "/api/deals/settings",        "/api/deals/7/lines",           "/api/deals/7/lines/3",
+        "/api/deals//lines",          "/api/deals/7/won",             "/api/work-items/mine",
+        "/api/work-items/7",          "/api/work-items/7/target-date", "/api/work-items/settings",
+        "/api/acme/settings",         "/api//settings",               "/api/nope/7",
+        "/api/deals/7/lines/3/more",  "//",                           "/api/deals/pipeline/lines",
+    };
+    for ([_]http1.Method{ .GET, .POST, .PUT, .PATCH, .DELETE, .HEAD, .OPTIONS }) |method| {
+        for (paths) |path| {
+            const now = r.match(method, path);
+            // No HEAD route in the table, so a HEAD is answered by the GET.
+            const want = bestByScore(&r, if (method == .HEAD) .GET else method, path);
+            if (want == null) {
+                try testing.expect(now == null);
+                continue;
+            }
+            try testing.expect(now != null);
+            try testing.expectEqual(want.?.index, now.?.index);
+            try testing.expectEqual(want.?.n_params, now.?.n_params);
+            for (0..want.?.n_params) |i| {
+                try testing.expectEqualStrings(want.?.params[i].name, now.?.params[i].name);
+                try testing.expectEqualStrings(want.?.params[i].value, now.?.params[i].value);
+            }
+        }
+    }
+}
+
+test "a literal branch that leads nowhere is backed out of, and the param tried" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.add(.GET, "/a/b/c", testHandler);
+    try r.add(.GET, "/:x/b/d", otherHandler);
+
+    // `/a` is a literal child, and under it there is no `d`: the search has
+    // to come back up two levels and take the param.
+    const m = r.match(.GET, "/a/b/d") orelse return error.TestExpectedMatch;
+    try testing.expect(m.handler == otherHandler);
+    try testing.expectEqualStrings("a", m.params[0].value);
+    try testing.expect(r.match(.GET, "/a/b/c").?.handler == testHandler);
+}
+
+test "a branch that holds no route for the method is not where the answer comes from" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.add(.GET, "/api/deals/:id", testHandler);
+    try r.add(.POST, "/api/:kind/:id", otherHandler);
+
+    // `/api/deals` holds only a GET, so a POST goes past it to the param.
+    const post = r.match(.POST, "/api/deals/7") orelse return error.TestExpectedMatch;
+    try testing.expect(post.handler == otherHandler);
+    try testing.expectEqualStrings("kind", post.params[0].name);
+    try testing.expectEqualStrings("deals", post.params[0].value);
+    try testing.expect(r.match(.GET, "/api/deals/7").?.handler == testHandler);
+    try testing.expect(r.match(.DELETE, "/api/deals/7") == null);
+}
+
+test "an earlier literal outranks a longer route, which the scan's score got backwards" {
+    // ADR 012's rule is that an earlier segment outranks every later one.
+    // The scan ranked by a number with two bits a segment, so a route with
+    // more segments had more digits and could outrank one that was more
+    // specific where they first differ. Both cases turn on a `*`, the only
+    // way two routes of different lengths can answer one path.
+    for ([_]bool{ false, true }) |star_first| {
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        if (star_first) {
+            try r.add(.GET, "/a/*", testHandler);
+            try r.add(.GET, "/:x/b/c", otherHandler);
+            try r.add(.GET, "/files/*", testHandler);
+            try r.add(.GET, "/files", otherHandler);
+        } else {
+            try r.add(.GET, "/:x/b/c", otherHandler);
+            try r.add(.GET, "/a/*", testHandler);
+            try r.add(.GET, "/files", otherHandler);
+            try r.add(.GET, "/files/*", testHandler);
+        }
+        // `a` is a literal where `/:x/b/c` has a param, so `/a/*` wins; the
+        // scan scored `/:x/b/c` 47 and `/a/*` 13.
+        try testing.expect(r.match(.GET, "/a/b/c").?.handler == testHandler);
+        try testing.expect(r.match(.GET, "/z/b/c").?.handler == otherHandler);
+        // A route ending here beats a `*` standing for nothing, whichever
+        // was registered first. The scan answered by registration order.
+        try testing.expect(r.match(.GET, "/files").?.handler == otherHandler);
+        try testing.expect(r.match(.GET, "/files/x").?.handler == testHandler);
+    }
 }

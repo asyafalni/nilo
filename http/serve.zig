@@ -393,9 +393,10 @@ pub noinline fn serveRequest(
 
     // Held in a variable of this scope on purpose: `c` borrows the
     // params out of it, and they have to outlive the branch below.
-    var matched = self.router.match(c.method, path);
+    var matched: router.Match = undefined;
 
-    if (matched) |*match| {
+    if (self.router.matchInto(c.method, path, &matched)) {
+        const match = &matched;
         // Decoded here rather than before matching: `%2F` is a slash of
         // data, and a router that saw it as a separator would let a
         // request reach a route it does not name.

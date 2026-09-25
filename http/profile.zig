@@ -122,7 +122,9 @@ fn copyHead() void {
 }
 
 fn matchRoute() void {
-    sink += (app.router.match(.GET, "/users/7") orelse unreachable).n_params;
+    var m: router.Match = undefined;
+    if (!app.router.matchInto(.GET, "/users/7", &m)) unreachable;
+    sink += m.n_params;
 }
 
 fn serialiseBody() void {
@@ -145,10 +147,22 @@ fn arenaRound() void {
     _ = arena.reset(.{ .retain_with_limit = arena_keep });
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var gpa_state = std.heap.DebugAllocator(.{}){};
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
+
+    // `zig build profile -- --routes <file>` adds one section: matching on a
+    // route table somebody really has, rather than on the synthetic ones
+    // below. Nothing else takes an argument.
+    var routes_file: ?[]const u8 = null;
+    var args: std.process.Args.Iterator = .init(init.args);
+    _ = args.skip(); // the program's own name
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--routes")) {
+            routes_file = args.next() orelse return error.RoutesNeedsAFile;
+        } else return error.UnknownArgument;
+    }
 
     var db = Db{};
     app = App.init(gpa);
@@ -196,6 +210,7 @@ pub fn main() !void {
 
     try longLived(gpa);
     try routerScale(gpa);
+    if (routes_file) |file| try routeTable(gpa, file, whole / rounds);
     try serviceScale(gpa);
     try grpcCalls();
 
@@ -344,11 +359,18 @@ fn oneScale(gpa: std.mem.Allocator, shape: Shape, n: usize) !u64 {
         .same => .GET,
     };
 
-    for (0..scale_rounds / 4) |_| sink += (r.match(method, wanted) orelse unreachable).n_params;
+    var m: router.Match = undefined;
+    for (0..scale_rounds / 4) |_| {
+        if (!r.matchInto(method, wanted, &m)) unreachable;
+        sink += m.n_params;
+    }
     var best: u64 = std.math.maxInt(u64);
     for (0..reps) |_| {
         const started = clock();
-        for (0..scale_rounds) |_| sink += (r.match(method, wanted) orelse unreachable).n_params;
+        for (0..scale_rounds) |_| {
+            if (!r.matchInto(method, wanted, &m)) unreachable;
+            sink += m.n_params;
+        }
         const took = clock() - started;
         if (took < best) best = took;
     }
@@ -356,6 +378,114 @@ fn oneScale(gpa: std.mem.Allocator, shape: Shape, n: usize) !u64 {
 }
 
 fn nothing(_: *ctx_mod.Ctx) anyerror!void {}
+
+// ---- a route table somebody has ----
+//
+// The two sets above start every route with a different word, so the
+// router's first-segment key throws out almost all of them. An application
+// that mounts everything under one prefix (`/api`) defeats that key entirely:
+// every route has the same first segment, and what is left to separate them
+// is the method and the segment count. So the number that decides whether
+// the router needs a tree is the one for such a table, read from a file.
+//
+// The file is one route a line, `METHOD /pattern`, params as `:name`; `#`
+// starts a comment. Each route is matched against a path of its own shape,
+// with `7` for every param, so the figure is the whole table weighted
+// evenly, not a traffic mix nobody has measured.
+
+const table_rounds = 20_000;
+
+const Operation = struct {
+    method: http1.Method,
+    pattern: []const u8,
+    path: []const u8,
+    ns: u64 = 0,
+};
+
+fn routeTable(gpa: std.mem.Allocator, file: []const u8, request_ns: u64) !void {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const text = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), file, gpa, .limited(4 << 20));
+    defer gpa.free(text);
+
+    var table: std.ArrayList(Operation) = .empty;
+    defer {
+        for (table.items) |op| gpa.free(op.path);
+        table.deinit(gpa);
+    }
+    // After `text` and `table`, so it is torn down first: its routes point
+    // into `text`.
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const entry = std.mem.trim(u8, raw, " \t\r");
+        if (entry.len == 0 or entry[0] == '#') continue;
+        const space = std.mem.indexOfScalar(u8, entry, ' ') orelse return error.RouteLineHasNoPattern;
+        const method = std.meta.stringToEnum(http1.Method, entry[0..space]) orelse return error.RouteLineHasNoMethod;
+        const pattern = std.mem.trim(u8, entry[space + 1 ..], " ");
+        try r.add(method, pattern, nothing);
+        try table.append(gpa, .{ .method = method, .pattern = pattern, .path = try pathFor(gpa, pattern) });
+    }
+    if (table.items.len == 0) return error.RouteFileIsEmpty;
+
+    for (table.items) |*op| {
+        var m: router.Match = undefined;
+        for (0..table_rounds / 4) |_| {
+            if (!r.matchInto(op.method, op.path, &m)) return error.RouteDidNotMatchItsOwnPath;
+            sink += m.n_params;
+        }
+        var best: u64 = std.math.maxInt(u64);
+        for (0..reps) |_| {
+            const started = clock();
+            for (0..table_rounds) |_| {
+                if (!r.matchInto(op.method, op.path, &m)) unreachable;
+                sink += m.n_params;
+            }
+            const took = clock() - started;
+            if (took < best) best = took;
+        }
+        op.ns = best / table_rounds;
+    }
+
+    var total: u64 = 0;
+    var worst: *const Operation = &table.items[0];
+    for (table.items) |*op| {
+        total += op.ns;
+        if (op.ns > worst.ns) worst = op;
+    }
+    const mean = total / table.items.len;
+
+    const sorted = try gpa.alloc(u64, table.items.len);
+    defer gpa.free(sorted);
+    for (sorted, table.items) |*ns, op| ns.* = op.ns;
+    std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+    const median = sorted[sorted.len / 2];
+
+    std.debug.print("\n---- matching on the route table in {s} ----\n\n", .{file});
+    std.debug.print("  {d} routes, each matched against a path of its own shape\n\n", .{table.items.len});
+    std.debug.print("  {s:<8}{d:>6}ns {d:>6.1}% of the {d}ns request above\n", .{ "mean", mean, pct(mean, request_ns), request_ns });
+    std.debug.print("  {s:<8}{d:>6}ns {d:>6.1}%\n", .{ "median", median, pct(median, request_ns) });
+    std.debug.print("  {s:<8}{d:>6}ns {d:>6.1}%  {s} {s}\n", .{ "worst", worst.ns, pct(worst.ns, request_ns), @tagName(worst.method), worst.pattern });
+}
+
+/// A path the pattern matches: `7` for a param, `x` for a trailing `*`.
+fn pathFor(gpa: std.mem.Allocator, pattern: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var parts = std.mem.tokenizeScalar(u8, pattern, '/');
+    while (parts.next()) |part| {
+        try out.append(gpa, '/');
+        if (part[0] == ':') {
+            try out.append(gpa, '7');
+        } else if (std.mem.eql(u8, part, "*")) {
+            try out.append(gpa, 'x');
+        } else try out.appendSlice(gpa, part);
+    }
+    if (out.items.len == 0) try out.append(gpa, '/');
+    return out.toOwnedSlice(gpa);
+}
 
 fn line(label: []const u8, part: u64, whole: u64) void {
     std.debug.print("  {s:<28}{d:>5}ns {d:>6.1}%\n", .{

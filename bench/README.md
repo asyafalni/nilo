@@ -24,6 +24,7 @@ One file an area, each carrying what was run, the machine, the commit, the numbe
 zig build run -Doptimize=ReleaseFast   # the benchmark server (bench/main.zig): GET /users/:id, ~1 KB JSON
 ./bench/bench.sh       # wrk/oha against it, already running; `zig build run` alone is a Debug build
 zig build profile      # where the time inside one request goes, in-process
+zig build profile -- --routes <file>   # and matching on a real route table, `METHOD /pattern` a line
 ```
 
 ## Microbenchmarks

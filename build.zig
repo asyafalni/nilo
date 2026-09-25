@@ -3830,7 +3830,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.step("profile", "Time the pieces of one request").dependOn(&b.addRunArtifact(profile).step);
+    const run_profile = b.addRunArtifact(profile);
+    // `zig build profile -- --routes <file>` times matching on a route table
+    // of the caller's, one `METHOD /pattern` a line.
+    if (b.args) |args| run_profile.addArgs(args);
+    b.step("profile", "Time the pieces of one request").dependOn(&run_profile.step);
 
     // Generated requests thrown at the parser, checking the properties in
     // `src/fuzz.zig`. Separate from `test` because it runs until it is bored

@@ -2744,6 +2744,66 @@ What moved it: a Huffman decoder reading nine bits at a time from a 64-bit accum
 3. **HPACK**, 247 ns of the 973. With a table of 0 every header is Huffman-decoded on every call; the next step is decoding only the fields the translation reads.
 4. **The App's 229 ns** is the HTTP/1.1 parse of text this side just wrote. A request handed over already parsed would skip it, at the price of a second door into `handleRequest`, which is what the translation exists to avoid.
 
+## Matching on a real table of 276 routes under one prefix
+
+The roadmap held "whether the router needs a tree" open on one run: `zig build profile` on the application with 203 paths. That application is the Nodeflux ERP port (`nodeflux-os/backend-zig`), and its contract, `nodeflux-os/openapi.yaml`, lists **203 paths and 276 operations, every one under `/api`**: GET 101, POST 97, DELETE 32, PATCH 29, PUT 17; 2 to 6 segments, 114 of them at 4.
+
+**Run:** `zig build profile -Dtarget=x86_64-linux-gnu -- --routes <file>`, the file being the 276 operations as `METHOD /pattern` with `{id}` written `:id`, extracted from `openapi.yaml`. Each route is matched against a path of its own shape (`7` for a param), best of five, so the figure weights the table evenly rather than by traffic nobody has measured. The same AMD Ryzen 7 9700X as above, now on kernel 7.2.5 (Arch), commit `0ba6fe3` plus the working tree that adds `--routes`. Three runs, back to back, load average under 1.
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| the in-process request, one route | 362ns | 358ns | 360ns |
+| match the route, one route | 19ns | 19ns | 20ns |
+| **mean over the 276 routes** | **126ns (34.8%)** | **124ns (34.6%)** | **125ns (34.7%)** |
+| median | 125ns | 123ns | 124ns |
+| worst, `POST /api/work-items/:id/target-date` | 259ns | 251ns | 251ns |
+
+The in-process request is 360ns here against the 181ns recorded above on an earlier commit; the ratio is what is read, and it is measured in the same run.
+
+**Why the first-segment key does nothing here.** `Route.first_key` compares four bytes of the first segment, which took 44% off the synthetic 100-route set because every route there starts with a different word (`/thingN`). Every route in this table starts with `api`, so the key throws out nothing, and what is left to separate routes before any text is read is the method and the segment count. The biggest bucket those two leave is POST at 4 segments, **65 routes**, which is where the worst route is; the median sitting beside the mean says most of the cost is the walk over all 276 rather than the candidates, and 51 distinct second segments say a tree would reach the right branch in two steps.
+
+**The decision it moved:** ADR 017 lets developer experience spend 10% of nilo's own work, and matching on this table spends 35% on average and 70% at worst. The router needs a structure, which the roadmap made conditional on exactly this number. Put against a request served over a socket (nilo's own work is about 4% of it, "The number that reframes the budget" above), the mean is about 1.4% of the CPU a request costs, so the case is ADR 017's bar rather than a throughput emergency.
+
+### The tree, and two steps after it
+
+Built beside the scan, every row measured by alternating two binaries from one working tree whose only difference is the router, three pairs each, same machine, same afternoon. The comparison binaries for the other routers are in the section below.
+
+| | scan (`0ba6fe3`) | tree | tree + `matchInto` (shipped) |
+|---|---|---|---|
+| the in-process request, one route | 355–362ns | 360–365ns | 345–356ns |
+| match the route, one route | 19–20ns | 19ns | 12–13ns |
+| mixed 1 / 5 / 25 / 50 / 100 | 13–14 / 20–21 / 20 / 33–34 / 42 | 15 / 19 / 19 / 28 / 33–36 | 8–9 / 13–14 / 13 / 21–22 / 27–29 |
+| same 1 / 5 / 25 / 50 / 100 | 23–24 / 25–26 / 36 / 50–51 / 86–96 | 26 / 26–27 / 29–30 / 34–35 / 43–44 | 19 / 19–20 / 22–24 / 27–29 / 37–39 |
+| **mean over the 276 routes** | **124–126ns (34–35%)** | **34–35ns (9.4–9.7%)** | **27–28ns (7.7–8.0%)** |
+| worst | 245–250ns | 61–63ns | 53–55ns |
+
+**The tree** is ADR 012's ranking as a search order: literal, then param, then `*`, backing out of a dead end. It cost a one-route app 1 to 3ns on the synthetic sets and saved 90ns a match on the real table.
+
+**`matchInto`** writes the `Match` into the caller's variable instead of returning it. A `Match` is about 300 bytes, and a temporary breakdown put the capture and its copies at about 13ns of the 35: it was a cost every request paid, which is why the one-route row moved as much as the big table did.
+
+**Tried and dropped: searching the path without splitting it first** (matchit's way). The router got faster on its own, 24–25ns mean and 38–40ns worst, but the whole in-process request got slower by about 10ns in 11 of 12 alternating pairs (step 1 345–360ns, this 355–366ns), and a build with the search marked `noinline` did not bring it back (362–370ns), so it did not read as code layout. Nobody found where the 10ns went; the code is not in the tree, and it is the next thing to try with `perf` on a machine that has it.
+
+**Tried and dropped: comparing eight child keys at once** with a vector at the node holding `/api`'s 51 children: 36–37ns against 35, so the child search was not where the time was.
+
+### Against other routers, on the same table
+
+The 276 operations through three other routers on this machine, each matching every route's own path, `7` for each param. The harnesses are not in this repository: Fiber's is a `_test.go` in a checkout of `gofiber/fiber` at `d0a059d` calling the unexported `app.next` the way its own `Benchmark_Router_Next` does; matchit and actix-router are a Rust binary built `--release` with LTO against checkouts of both.
+
+| router | ns a route | how it matches |
+|---|---|---|
+| matchit (axum's) | 15.4–15.8 | a radix tree over bytes, no split; **path only**, 203 patterns, the method decided after |
+| **nilo, tree + `matchInto`** | **27–28** | a tree of segments; method and path, 276 routes; the split and the capture included |
+| Fiber v3 | 55.9–56.5 | per method, bucketed by the path's first three bytes, then a linear scan with SWAR filters; the path's hash is computed before the loop and not counted |
+| actix-router | 2,800 | a linear scan, a regex a pattern, first match wins; path only |
+
+Fiber and actix are not the fast routers they are fast frameworks around: under one `/api` prefix Fiber's three-byte bucket is one bucket, which is the old scan's problem with better filters, and actix relies on `web::scope` to keep each level small. matchit is the bar, and the gap to it is the split and the capture, not the tree.
+
+**Can it be pushed further:** the 10ns the unsplit search cost the whole request is unexplained, and explaining it is worth up to 3ns a match on this table and 15ns at worst. Below that, matchit's 15ns is a router that does not choose a method.
+
+### What the tree costs the binary
+
+Stripped `ReleaseFast`, `-Dtarget=x86_64-linux-gnu`, `git archive HEAD` (`0ba6fe3`) against the working tree with the tree in it, each built from a scratch directory of the same path length: `examples/hello` 964,960 → 966,576 (**+1,616 B**), `examples/rest` 1,155,464 → 1,156,872 (**+1,408 B**). The same tree carries ADR 224's CSRF middleware, which neither example names and so neither pays for. The row is in ADR 017's running total.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings
