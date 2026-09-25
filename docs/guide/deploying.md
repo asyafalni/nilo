@@ -315,6 +315,8 @@ try app.listen(.{ .trusted_hops = 1 });   // one Caddy, nginx or ALB in front
 
 When both are set, the description wins.
 
+**`c.scheme()` and `c.host()` follow the same rule.** They read `X-Forwarded-Proto` and `X-Forwarded-Host` only from a connection one of your named proxies made, or, with none named, when `trusted_hops` is set; a request that reached the pod directly cannot put its own host into a password-reset link. Behind TLS terminated in front, that is what makes `scheme()` say `"https"`. A listener that terminates TLS itself answers `"https"` from the connection and reads no header ([ADR 102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md)).
+
 Set it to the number of proxies, **not** to the number of entries you have seen
 in a header. Each proxy appends the address it heard from, so the entries are
 counted from the right — the rightmost was written by the proxy nearest this

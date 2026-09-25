@@ -132,8 +132,7 @@ const answer = try client.get(&app, "/me");
 It is off by default so that a suite written before it existed keeps asserting
 what it always asserted
 ([ADR 086](../adr/086-the-test-client-can-do-what-a-client-does.md)).
-`client.cookie("session")` is what the jar is holding, for a test that wants to
-look rather than only send.
+`client.cookie(nilo.session.host_cookie_name)` is what the jar is holding for a `Session(T)`, `__Host-session` with the default options, for a test that wants to look rather than only send.
 
 ### Reading the answer
 

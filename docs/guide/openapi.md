@@ -132,7 +132,7 @@ try api.without(requireSession).post("/sign-in", signIn);   // open, as it is
 Every route `requireSession` is in front of — through `use`, `useOn` or
 `with`, less what `without` took out — is written with a `cookieAuth`
 requirement and a 401, and `components.securitySchemes` gains
-`{"type":"apiKey","in":"cookie","name":"session"}`, which a generated client
+`{"type":"apiKey","in":"cookie","name":"__Host-session"}`, which a generated client
 reads as "send the cookie". Which routes those are is read from the
 middleware wiring when the document is written, not from the declaration,
 so moving a `without` moves the document in the same line. The one thing

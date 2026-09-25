@@ -124,7 +124,7 @@ const SignUp = struct {
 `Form(T)` and a plain struct are the same slot — a form *is* the body — so
 asking for both is a compile error. A `Form(T)` field is a `Str`, a number, a
 `bool`, an enum or an `Upload`, optionally in a `?`; a default is what "not
-sent" means. **A field that is a slice of one of those is a list**, one
+sent" means, and an empty value on an optional or defaulted field whose type has no empty value (`age=` on a `?u32`) is "not sent" too, in a `Query(T)` as well. An empty `?Str` is `""`. **A field that is a slice of one of those is a list**, one
 element per arrival of the name — a checkbox group, a `<select multiple>` —
 in the order sent; nothing sent is the empty list and never a 400, an empty
 value contributes nothing, and a comma is data because a browser never
