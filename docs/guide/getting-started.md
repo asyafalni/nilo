@@ -10,13 +10,13 @@ yet:
 
 ```
 zig init
-zig fetch --save 'git+https://github.com/nevindra/nilo?ref=v0.5.0#c7147f9b4af692c67701b3189afe39757a744cf0'
+zig fetch --save 'git+https://github.com/nevindra/nilo?ref=v0.6.0#221e1b3eaed531efe13de7ab39dedc4091a8775c'
 ```
 
 That writes nilo into your `build.zig.zon`, pinned to the commit the tag
 names. **Keep the `#commit`.** The `?ref=` on its own is not a pin: nilo's
 tags are annotated, Zig 0.16's `zig fetch` does not peel one, and what it
-hands you for `?ref=v0.5.0` alone is the tree of `main` that day — so two
+hands you for `?ref=v0.6.0` alone is the tree of `main` that day — so two
 people installing a week apart get two different libraries, and neither of
 them asked for a version. The commit for each tag is on
 [its release page](https://github.com/nevindra/nilo/releases).

@@ -60,10 +60,10 @@ You need Zig 0.16 and nothing else: no C library, no system package.
 
 ```console
 $ zig init                                                          # only if you have no build.zig.zon yet
-$ zig fetch --save 'git+https://github.com/nevindra/nilo?ref=v0.5.0#c7147f9b4af692c67701b3189afe39757a744cf0'
+$ zig fetch --save 'git+https://github.com/nevindra/nilo?ref=v0.6.0#221e1b3eaed531efe13de7ab39dedc4091a8775c'
 ```
 
-**Keep the `#commit` part.** The tag is annotated, and Zig 0.16's `zig fetch` doesn't peel it, so `?ref=v0.5.0` on its own gives you whatever `main` is that day.
+**Keep the `#commit` part.** The tag is annotated, and Zig 0.16's `zig fetch` doesn't peel it, so `?ref=v0.6.0` on its own gives you whatever `main` is that day.
 
 ```zig
 const std = @import("std");
@@ -123,7 +123,7 @@ Run `zig build run` and it's serving. [Getting started](./docs/guide/getting-sta
 
 The package is `nilo`, and each module is its own import: `nilo_http`, `nilo_sql`, `nilo_s3`, `nilo_fetch`, `nilo_job`, `nilo_cache`, `nilo_jwt`, `nilo_config`, `nilo_pw`, `nilo_id` and `nilo_core`. **There is no module called `nilo`**, so alias the one you use: `const nilo = @import("nilo_http");`.
 
-> **Upgrading from 0.4.0?** [Read this before you deploy](https://github.com/nevindra/nilo/releases/tag/v0.5.0#read-this-before-you-deploy): each change, and how to fix it.
+> **Upgrading from 0.5.0?** [Read this before you deploy](https://github.com/nevindra/nilo/releases/tag/v0.6.0#read-this-before-you-deploy): each change, and how to fix it. From 0.4.0, read [v0.5.0's](https://github.com/nevindra/nilo/releases/tag/v0.5.0#read-this-before-you-deploy) first.
 
 ## ✨ A route is just a function
 
