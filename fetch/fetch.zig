@@ -822,7 +822,13 @@ pub const Exchange = struct {
         // The permit is taken before the deadline is armed, so a caller
         // queueing for one is not also being timed out of the queue by a clock
         // it has not started. It goes back in `end`, after the connection.
-        try client.gate.wait(io);
+        // A queue is a park like a socket is, so the watchdog is told
+        // (ADR 210).
+        {
+            const w = client.limits.waiting();
+            defer client.limits.waited(w);
+            try client.gate.wait(io);
+        }
         self.permit = true;
 
         // One deadline, held by whichever of the two can enforce it. Under an
@@ -1343,7 +1349,21 @@ pub const Exchange = struct {
     fn bounded(self: *Exchange, comptime f: anytype, args: anytype) Returns(f, @TypeOf(args)) {
         // Under an Engine the fiber carries the bound; with none, and with
         // neither clock set, there is nothing to wait for.
-        if (!self.client.limits.engineless()) return @call(.auto, f, args);
+        //
+        // Every step of a call that waits on the socket comes through here
+        // (the head, `take`, `readInto`, `pipe`, each `stream`, the drain in
+        // `end`), so this is where the Engine's watchdog is told the fiber is
+        // parked rather than holding its thread (ADR 210). Per step rather
+        // than once from `begin` to `end`, because a handler moving a body in
+        // pieces does its own work between them, and that work is what the
+        // watchdog is for. The token is a local rather than a field: the
+        // Exchange is on the stack of every handler that dials out, and a
+        // `u64` there is 16 bytes per connection by ADR 062.
+        if (!self.client.limits.engineless()) {
+            const w = self.client.limits.waiting();
+            defer self.client.limits.waited(w);
+            return @call(.auto, f, args);
+        }
         if (self.deadline_us == 0 and self.stall_ms == 0) return @call(.auto, f, args);
         const io = self.client.inner.io;
         const Task = struct {

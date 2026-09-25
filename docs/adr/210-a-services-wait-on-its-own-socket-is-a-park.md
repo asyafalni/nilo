@@ -57,6 +57,8 @@ is the handler's own work *between* rows — converting each one — and that
 work is bounded by the row, not by the handler; a handler that then
 computes for 250 ms on the result it holds is watched again from `close`.
 
+**`nilo_fetch` reports every step of a call rather than one wait per call.** The permit queue in `begin`, and every step that reads or writes the socket: the head, `take`, `readInto`, `pipe`, each `stream`, the drain in `end`. All of these but the queue already run through one function, `Exchange.bounded`, which holds the pair with the token in a local. That is the opposite choice to a statement's, for two reasons that do not hold for rows. A body moved in pieces with `stream` hands each piece to the handler, which does its own work before asking for the next, and that is the work the watchdog is for; one wait from `begin` to `end` would hide all of it for as long as the transfer lasted. And each step is already a socket read, so the pair is two calls beside a syscall rather than beside a row decode. The token is not a field of the `Exchange` because the `Exchange` sits on the stack of every handler that dials out, and a `u64` there is 16 bytes (992 to 1008, measured) held for the life of the inbound connection by ADR 062. `nilo_s3` dials through an `Exchange`, so it reports the same way. A read the caller makes on `ex.reader` directly is not reported, the same way it is outside both of the call's clocks (ADR 056).
+
 The seam is `Limits` because it already is the thing the Engine hands a
 service so that the service can be bounded by the fiber it runs on
 (ADR 056); a park is the other half of that relationship. `sql/` stays
@@ -85,8 +87,8 @@ a thread (one that does not go through `Io`) should still be caught.
 - Two function-pointer calls per statement, on a path that already made a
   round trip, whatever the row count. Nothing on the request path
   allocates for it.
-- `nilo_fetch` does not yet report its waits and still draws the false
-  report on a slow outbound call; it is the next caller of the seam.
+- A slow outbound call through `nilo_fetch` or `nilo_s3` is no longer a warning about the handler either. Two function-pointer calls per socket step, on a step that already made a syscall, and nothing added to the `Exchange`.
 - `sql/live.zig` holds it: a statement is one wait from `run` to `close`
   whatever its row count, and a transaction's three steps each report
   through the `Limits` the wire was opened with.
+- `fetch/live.zig` holds the other half: the permit and the head are reported, each `stream` is a wait of its own, and no wait is open whenever the caller has the fiber back. Run against the code before this change, the test fails.

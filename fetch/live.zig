@@ -79,6 +79,81 @@ test "a body comes back as request-lifetime text" {
     }.run);
 }
 
+/// A `Limits` that counts the waits reported through it, for the test below.
+/// Not `engineless`, so the client takes the Engine's path, which is the one
+/// that reports; under `std.Io.Threaded` that path runs each step on the
+/// calling thread and nothing is ever cancelled, which this test does not need.
+var waits_opened: usize = 0;
+var waits_closed: usize = 0;
+const counting_limits: core.Limits = .{ .vtable = &.{
+    .arm = core.Limits.noop.arm,
+    .release = core.Limits.noop.release,
+    .fired = core.Limits.noop.fired,
+    .waiting = struct {
+        fn f(_: ?*anyopaque) u64 {
+            waits_opened += 1;
+            return 1;
+        }
+    }.f,
+    .waited = struct {
+        fn f(_: ?*anyopaque, token: u64) void {
+            std.debug.assert(token == 1);
+            waits_closed += 1;
+        }
+    }.f,
+} };
+
+test "every wait on the socket is reported, and none is open while the caller has the fiber" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 4096;
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client: fetch.Client = .init(testing.allocator, .{});
+            defer client.deinit();
+            try client.nilo_start(io, counting_limits);
+
+            waits_opened = 0;
+            waits_closed = 0;
+
+            var buf: [64]u8 = undefined;
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            _ = try ex.begin(&client, .{ .method = .GET, .url = try canned.url(&buf) });
+            // The permit and the head are waits; the handler holding the
+            // fiber again means both are closed (ADR 210).
+            try testing.expect(waits_opened >= 2);
+            try testing.expectEqual(waits_opened, waits_closed);
+
+            // A body moved in pieces is a wait per piece, closed before the
+            // piece is handed over, so the handler's own work between them is
+            // watched the way any other work is.
+            var sink: [4096]u8 = undefined;
+            var w = std.Io.Writer.fixed(&sink);
+            var pieces: usize = 0;
+            var moved: usize = 0;
+            while (true) {
+                const before = waits_opened;
+                const n = try ex.stream(&w, .limited(512));
+                try testing.expect(waits_opened > before);
+                try testing.expectEqual(waits_opened, waits_closed);
+                if (n == 0) break;
+                moved += n;
+                pieces += 1;
+            }
+            try testing.expectEqual(@as(usize, 4096), moved);
+            try testing.expect(pieces >= 1);
+
+            ex.end();
+            try testing.expectEqual(waits_opened, waits_closed);
+        }
+    }.run);
+}
+
 test "a body over the ceiling stops at the ceiling" {
     try withIo(struct {
         fn run(io: std.Io) !void {
