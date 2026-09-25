@@ -148,7 +148,8 @@ const header_values = [_][]const u8{
 /// The bytes that break framing, which is where the interesting damage is.
 const delicious = [_]u8{ '\r', '\n', ':', ' ', '\t', ';', ',', '0', 0x00, 0xff, '/', '.' };
 
-fn generate(random: std.Random, buf: []u8) []const u8 {
+/// Public for `fuzz_llhttp.zig`, which hands the same inputs to llhttp.
+pub fn generate(random: std.Random, buf: []u8) []const u8 {
     return switch (random.weightedIndex(u16, &.{ 45, 30, 15, 10 })) {
         // A well-formed request, which is the baseline the rest damages.
         0 => build(random, buf, .{}),

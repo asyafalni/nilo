@@ -56,6 +56,16 @@
             .hash = "tls-0.1.0-ER2e0kvdBgABZ6SYdVWmbLYIb-42yDaDpz9nIzA2OXTB",
             .lazy = true,
         },
+        // Node's HTTP parser, as a second reading of RFC 9112 for
+        // `zig build fuzz-llhttp` (ADR 231), and linked into nothing else.
+        // C, so it waits behind `-Dllhttp` as well as `.lazy`. A release
+        // tarball rather than the repository: the parser in `src/` is
+        // generated, and only the release branch carries it.
+        .llhttp = .{
+            .url = "https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.4.3.tar.gz",
+            .hash = "N-V-__8AANkgBgCZosn_JabRa_Pm-AMJtzCRfMWzALMRadIE",
+            .lazy = true,
+        },
     },
     // One directory per module that ships (ADR 038), and this list is the
     // one place that has to remember they exist — held by a comptime check

@@ -32,6 +32,7 @@ zig build test-all      # the same plus ReleaseSafe and the SQL suite. What CI r
 zig build refusals-sql  # one module's refusal table; refusals, -config, -pw, -cache, -s3, -job, -fetch for the others
 zig build examples      # build every example
 zig build fuzz -- --iterations 1000000 --seed 0x…
+zig build fuzz-llhttp -Dllhttp   # a parser change runs this too (ADR 231)
 ```
 
 The rest of the build steps are in [`CLAUDE.md`](./CLAUDE.md#commands), and the benchmarks in [`bench/README.md`](./bench/README.md). Three things worth knowing before they surprise you:

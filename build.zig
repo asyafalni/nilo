@@ -163,7 +163,7 @@ const http_core = [_][]const u8{
 const http_above_core = [_][]const u8{
     "logger",    "cors",      "csrf",      "allowance", "deadline",
     "maxbody",   "http",      "behaviour", "live",      "profile",
-    "fuzz",      "fuzz_main", "test_root",
+    "fuzz",      "fuzz_main", "fuzz_llhttp", "test_root",
 };
 
 const Layer = struct {
@@ -3891,6 +3891,50 @@ pub fn build(b: *std.Build) void {
     const run_fuzzer = b.addRunArtifact(fuzzer);
     if (b.args) |args| run_fuzzer.addArgs(args);
     b.step("fuzz", "Throw generated requests at the parser, or with --frames connections at the gRPC listener").dependOn(&run_fuzzer.step);
+
+    // The same generated requests, read by nilo and by llhttp, Node's
+    // parser, and every disagreement reported (ADR 231). Behind a flag of
+    // its own and not `.lazy` alone, for the reason on `want_sql`: llhttp
+    // is C, and `lazyDependency` asked for unconditionally would fetch it
+    // for every dependent. Without the flag the step is there and says what
+    // it needs.
+    const fuzz_llhttp = b.step("fuzz-llhttp", "Throw generated requests at nilo's parser and llhttp's, and report where they disagree (-Dllhttp)");
+    if (b.option(bool, "llhttp", "Fetch llhttp, Node's HTTP parser, for `fuzz-llhttp` (ADR 231)") orelse false) {
+        if (b.lazyDependency("llhttp", .{})) |dep| {
+            const header = b.addTranslateC(.{
+                .root_source_file = dep.path("include/llhttp.h"),
+                .target = target,
+                .optimize = .ReleaseSafe,
+            });
+            const llhttp = header.createModule();
+            llhttp.addCSourceFiles(.{
+                .root = dep.path("src"),
+                .files = &.{ "llhttp.c", "api.c", "http.c" },
+                .flags = &.{"-std=c99"},
+            });
+            llhttp.addIncludePath(dep.path("include"));
+            llhttp.link_libc = true;
+
+            const differ = b.addExecutable(.{
+                .name = "nilo-fuzz-llhttp",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("http/fuzz_llhttp.zig"),
+                    .target = target,
+                    .optimize = .ReleaseSafe,
+                    .imports = &.{
+                        .{ .name = "zio", .module = zio.module("zio") },
+                        .{ .name = "nilo_core", .module = coreFor(b, target, .ReleaseSafe) },
+                        .{ .name = "llhttp", .module = llhttp },
+                    },
+                }),
+            });
+            const run_differ = b.addRunArtifact(differ);
+            if (b.args) |args| run_differ.addArgs(args);
+            fuzz_llhttp.dependOn(&run_differ.step);
+        }
+    } else {
+        fuzz_llhttp.dependOn(&b.addFail("fuzz-llhttp needs llhttp, which is fetched only when asked for: zig build fuzz-llhttp -Dllhttp").step);
+    }
 
     // `test` is the loop: Debug, plus the refusals, which are cheap. `test-all`
     // is everything `test` does and the same suite again in ReleaseSafe. Both

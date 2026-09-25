@@ -41,6 +41,7 @@ Every one of these checks lives at the point that first knows the answer rather 
 10. **`Content-Encoding` on a request with no body is left alone.** Refusing it would turn a GET everybody answers into a 415 over a header with no effect, the opposite of what rule 1 is for. [ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)
 11. **`c.bodyStream()` decodes nothing and refuses every coding with its own 415.** A stream hands bytes out as they arrive with nothing to hold the decoder's history against. [ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)
 12. **`read_buffer` defaults to 16 KiB, and it is still the ceiling on a request head as well as the connection's read buffer.** A head that does not fit is a 431; a server that wants the old number passes `.read_buffer = 8 * 1024`. [ADR 196](../adr/196-a-head-is-mostly-cookies-and-sixteen-kilobytes-of-them.md)
+13. **A second parser reads the heads the fuzzer generates, and a difference with it is answered in writing.** `zig build fuzz-llhttp -Dllhttp` hands each head to nilo and to llhttp; nilo accepting what llhttp refuses, or the two framing one head differently, fails the run unless it is listed in `decided` with the RFC section behind it. llhttp is linked into that one program and fetched only by the flag. [ADR 231](../adr/231-a-second-parser-reads-what-the-first-one-reads.md)
 
 ## Decisions
 
@@ -51,6 +52,7 @@ Every one of these checks lives at the point that first knows the answer rather 
 | [089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md) | Which `Content-Encoding` nilo decodes, and how gzip is inflated with no pool |
 | [095](../adr/095-a-target-is-read-in-the-form-it-arrived-in.md) | The four request-target forms, and which one supplies the Host |
 | [196](../adr/196-a-head-is-mostly-cookies-and-sixteen-kilobytes-of-them.md) | The default size of `read_buffer`, and the head ceiling that follows from it |
+| [231](../adr/231-a-second-parser-reads-what-the-first-one-reads.md) | `zig build fuzz-llhttp -Dllhttp`, nilo's parser against llhttp's, and where the differences that are nilo's on purpose are written down |
 
 Beside this topic: TLS is terminated in front rather than by nilo, which is the whole reason a second parser reading the same bytes is a smuggling risk at all, is [ADR 027](../adr/027-tls-is-terminated-in-front.md); the head being parsed in place, which is why the buffer is the ceiling rather than a number configured on its own, is [ADR 085](../adr/085-every-header-without-handing-out-the-head.md); a fiber's stack held at its high-water mark, which is what turns a struct field on `Request` into a per-connection cost, is [ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md); reading a trusted `X-Forwarded-Host` ahead of the authority is [ADR 090](../adr/090-a-request-can-be-read-past-the-parts-a-handler-names.md); the arena bound a compressed body is already held to before it is inflated is [ADR 083](../adr/083-a-body-is-taken-as-it-arrives.md).
 

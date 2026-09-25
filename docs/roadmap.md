@@ -39,11 +39,27 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 **A header field name is never checked to be a token.** `parseHead` finds the colon and compares the five names it acts on, so `Transfer-Encoding\x0b: chunked` or a name with a space inside is a line nilo ignores while a front end that strips the stray byte reads it as the framing, and the two frame the body differently. [The protocol page](./design/http1-protocol.md) says nothing crosses the wire two ways. It is a check on every byte of every name, on the path that parses every request.
 
+llhttp refuses both shapes (`Invalid header token`, `Invalid header field char`) and `zig build fuzz-llhttp -Dllhttp` finds them in 805 of a million generated heads ([ADR 231](./adr/231-a-second-parser-reads-what-the-first-one-reads.md)).
+
 **Needs:** a `tchar` check on each name, and the parser benchmark run before and after it, interleaved, since it spends on the throughput axis.
 
 **Four HTTP/1.1 edges are read differently from the RFC.** `Transfer-Encoding: gzip, chunked` is accepted and the handler reads gzip as its body, where RFC 9110 says 501. An HTTP/1.0 request carrying `Transfer-Encoding` stays open. `Connection: keep-alive, close` is not read as close. A CRLF before the request line is a 400 rather than skipped (RFC 9112 §2.2).
 
+`Connection` is compared whole, so `keep-alive, Upgrade` on HTTP/1.0 closes where llhttp keeps it open, the other side of the same fault; `fuzz-llhttp` reports it as a framing difference (ADR 231).
+
 **Needs:** each one answered as its RFC section says, with a test per section in the parser's file.
+
+**A method is never checked to be a token.** `GET\t /a HTTP/1.1` is method `GET\t`, and a CR before the request line makes the method `\rGET`, where llhttp reads `GET`: the two parsers route one request two ways. RFC 9110 §9.1 makes a method a token; any token is fine (ADR 231 decided that much), and a tab or a CR in one is not. Found by `fuzz-llhttp`, 2,602 of a million heads.
+
+**Needs:** a `tchar` check on the method, in the same benchmarked change as the header names.
+
+**A request-target's bytes are never checked.** A NUL, a control byte, a tab, a bare CR, a byte past 0x7f or a scheme that is not one (`h;tp://x/y`) arrive at the router as the path. llhttp refuses every one of them (`Invalid char in url path`, `Invalid characters in url`, `Unexpected char in url schema` and four more, 401 of a million heads), and RFC 9112 §3.2 allows none: the target is a URI, and a server that routes on bytes a front end would have refused or re-encoded is routing a different request. [ADR 095](./adr/095-a-target-is-read-in-the-form-it-arrived-in.md) reads the forms and not the bytes.
+
+**Needs:** the target checked against the URI grammar's bytes where the request line is split, with the parser benchmark before and after.
+
+**A bare CR or a control byte inside a line is taken as part of it.** `Host: keep-aliv\r, Upgrade`, `X-Forwarded-For:\r 5`, `Connection: 0\x1d` and a line that starts with a CR are all accepted. RFC 9112 §2.2 says a bare CR is refused or made a space before anything reads the line, and RFC 9110 §5.5 keeps control bytes out of a field value; llhttp refuses each (137 of a million heads, ADR 231). A front end that turns the CR into a line ending sees a header nilo does not.
+
+**Needs:** a refusal for CR and CTL in a line, where the line's end is already being found, benchmarked with the two entries above.
 
 **A form body can cost thirty times its size, and a multipart one CPU in proportion to parts times bytes.** `parseQuery` allocates a `Param` per `&` before it reads anything, so a megabyte of `&` to a `Form(T)` route is 33 MB of arena; multipart has `max_parts` against exactly this and urlencoded has nothing. `endOfPartHead` searches for `\n\n` to the end of the body for every part, so 255 parts and a megabyte of padding cost 78 ms of CPU where 1 ms is enough. Reproduced.
 
