@@ -73,6 +73,7 @@ Measured stripped, `ReleaseFast`, on the examples in this repository.
 | Fallback session secrets, checked at `listen()` ([ADR 225](./225-a-fallback-session-secret-opens-and-never-seals.md)) | +624 B | +592 B |
 | A socket in any number of Rooms ([ADR 035](./035-a-broadcast-rings-a-bell-it-does-not-write.md)), and an event stream fed by Rooms handed to the connection ([ADR 227](./227-an-event-stream-fed-by-rooms-waits-where-a-connection-waits.md)); called directly rather than through a pointer, the stream's loop was +6,720 B on both | +656 B | +656 B |
 | Rooms lent to a key from a pool ([ADR 228](./228-a-room-for-a-key-is-lent-from-a-pool.md)), and a Room that keeps history for a stream coming back ([ADR 229](./229-a-room-that-keeps-history-catches-a-returning-stream-up.md)); `chat`, which has a Room, pays +1,056 B | +80 B | +80 B |
+| A thread count read from a container's CPU quota, held to the engine's 64 ([ADR 230](./230-a-cpu-quota-sets-the-thread-count.md)); read once at startup, nothing on the request path | +5,680 B | +5,200 B |
 
 `nilo_fetch` is +0 on both examples because neither imports it, and that is the whole of the row rather than an accident: a module nothing names is never analysed, so the linker has nothing to drop. Measured on a program that *does* import it, against the same program calling `std.http.Client` itself, it is **+1,688 bytes**; `std.http.Client` and the TLS stack under it are the other 655,600, the price of dialling out in Zig rather than of this module ([`bench/result/fetch.md`](../../bench/result/fetch.md)).
 

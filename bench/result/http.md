@@ -2890,6 +2890,44 @@ A refusal is cheaper than an open by the work after the tag, and it is not free:
 
 **Can it be pushed further:** not on the path that matters, which is already the cost it was. A key id in the cookie would take a stale cookie from 270ns a fallback to none, and would sign everybody out once to get there (ADR 225).
 
+## What a CPU quota does to a thread per core
+
+[ADR 230](../../docs/adr/230-a-cpu-quota-sets-the-thread-count.md) is the decision; these are the runs.
+
+**Instrument and shape.** gcannon `11c802b` (liburing 2.15), `-t 8`, five seconds, 512 connections unless said; `nilo-hello` (`bench/main.zig`) in `ReleaseFast` for `x86_64-linux-gnu`, on port 18787; an AMD Ryzen 7 9700X under Linux 7.2.5. The quota is a `systemd-run --user --scope -p CPUQuota=…` around the server. The server is on CPUs 0–7 and gcannon on 8–15, **which are the SMT siblings of 0–7**: every figure in this section shares that, so the comparisons inside it hold and the absolutes are low against a split by physical core. CPU is `utime + stime` of the server across the run. Before is `53d0792`; after is the working tree with ADR 230. Each tree built with its own cache (`docs/history.md`, "Give every tree its own build cache").
+
+**The count, by hand, at one CPU set.** A build of the tree with `threads` from an environment variable, `/users/1`, keep-alive:
+
+| quota | threads | req/s | p50 | p99 | p99.9 | server CPU |
+|---|---|---|---|---|---|---|
+| 1 CPU | 1 | 349–354K | 910 µs | 22 ms | 27 ms | 3.5 s |
+| | **2** | **487–495K** | 740 µs | 26–27 ms | 32–33 ms | 5.1 s |
+| | 3 | 463–470K | 510 µs | 50–51 ms | 56–58 ms | 5.1 s |
+| 2 CPUs | 2 | 694–697K | 740 µs | 836–852 µs | 0.93–0.97 ms | 7.1 s |
+| | **3** | **917–932K** | 510 µs | 620 µs | 9.9 ms | 10.1 s |
+| | 4 | 900–909K | 390 µs | 490 µs | 35 ms | 10.1 s |
+| | 8 | 748–758K | 215 µs | 1.3–2.0 ms | 70–71 ms | 10.2 s |
+| 4 CPUs | 4 | 1.27–1.31M | 390–403 µs | 449–476 µs | 0.53–0.59 ms | 14.7 s |
+| | **5** | **1.56–1.57M** | 325 µs | 376–387 µs | 0.46–0.49 ms | 18.4 s |
+| | 6 | 1.60–1.62M | 285 µs | 423–436 µs | 10–11 ms | 20.2 s |
+| | 8 | 1.48–1.49M | 215 µs | 0.8–1.2 ms | 35–36 ms | 20.0 s |
+
+Two readings. **At the quota, the quota is not spent**: two threads under two CPUs used 7.1 of 10 CPU-seconds, and two threads on two unlimited cores did the same (773–778K, 6.8–6.9 s), so an executor at this load is idle part of its time and a thread past the quota fills it. **Past quota plus one the quota is spent early and the period's remainder shows in the tail**: 35 ms and 70 ms are fractions of the 100 ms CFS period.
+
+**The rule against the old count**, three interleaved pairs, `/users/1`:
+
+| quota | before (a thread per core) | after (quota rounded up, plus one) |
+|---|---|---|
+| 2 CPUs | 749–758K, p99 1.2–1.4 ms, p99.9 71–72 ms | 919–928K, p99 0.62 ms, p99.9 10–11 ms |
+| 4 CPUs | 1.48–1.49M, p99 0.68–0.79 ms, p99.9 36 ms | 1.53–1.56M, p99 0.37–0.38 ms, p99.9 0.45–0.53 ms |
+| none | 2.14–2.15M, p99.9 1.2–1.4 ms | 2.14M, p99.9 1.3–1.6 ms |
+
+With the quota on a parent slice (`systemctl --user set-property nilotest.slice CPUQuota=200%`, the server in a scope under it) the count is 3, which is the case zio's and dusty's readers, which look only at the process's own cgroup, would miss.
+
+**Binary.** `nilo-hello` stripped, 979,112 bytes before and 984,792 after, both built from a clean archive the same afternoon: 5.7 KB, of which about 2.2 KB is the reader and 3.6 KB the one log line (measured apart, on an earlier state of the change). As first written with the quota an `f64` it was 1,008,248, float formatting for the line.
+
+**Can it be pushed further.** The one more is a loopback reading, where part of each request's kernel work is charged to the client's CPU. Behind a real NIC more of it lands on the server's cgroup, and the right count may be the quota itself; a run with the load generator on another machine is what would say.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

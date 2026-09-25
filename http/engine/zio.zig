@@ -1241,14 +1241,147 @@ fn removeSocket(gpa: std.mem.Allocator, path: []const u8) void {
     std.Io.Dir.cwd().deleteFile(threaded.io(), path) catch {};
 }
 
-/// How many OS threads `options` means: `threads` when it was set, one per
-/// core when it was left at 0. Public, and re-exported by the Bulkhead, so
-/// that anything the App sizes to the thread count is sized to the number
-/// this Engine actually starts rather than to a second reading of the same
-/// field (ADR 211).
+/// How many OS threads `options` means: `threads` when it was set, and when
+/// it was left at 0, one per core the process may use, or one more than its
+/// CPU quota where a container sets one. Public, and re-exported by the
+/// Bulkhead, so that anything the App sizes to the thread count is sized to
+/// the number this Engine actually starts rather than to a second reading
+/// of the same field (ADR 211). Never past `max_threads`, whichever way
+/// the count was arrived at.
 pub fn threadCount(options: anytype) u8 {
-    if (options.threads > 0) return options.threads;
-    return @intCast(@min(std.Thread.getCpuCount() catch 1, 255));
+    if (options.threads > 0) return @min(options.threads, max_threads);
+    const cores = std.Thread.getCpuCount() catch 1;
+    return @intCast(@min(autoThreads(cores, cpuQuota()), max_threads));
+}
+
+/// The most executors zio can run: an executor's id is a `u6` on a 64-bit
+/// target and a `u5` on a 32-bit one, which is a bit per executor in its
+/// masks. `ExecutorCount.exact` asserts it and says nothing, so a count
+/// past it is held to it: the startup line says how many ran, and a
+/// refusal in words cost 2.9 KB of every binary (ADR 230).
+const max_threads = @bitSizeOf(usize);
+
+// ---- how many threads a container means ----
+//
+// A container's CPU limit (`docker --cpus`, a Kubernetes CPU limit, systemd
+// `CPUQuota=`) is a quota the kernel enforces per period, and the affinity
+// mask `getCpuCount` reads cannot see it. A server given two CPUs of a
+// 16-core host ran 16 executors, spent its quota in the first part of each
+// 100 ms period and waited out the rest: a p99.9 of 70 ms (ADR 230).
+//
+// Not zio's reading, which is the same files: it floors a quota at two
+// before handing it back, so one CPU and two CPUs arrive as the same
+// number, and they want different counts.
+
+/// The threads for `cores` visible cores under a quota of `quota`
+/// thousandths of a CPU:
+/// the quota rounded up and one more, because an executor is not busy for
+/// the whole of its time, and a thread past the quota fills the gaps rather
+/// than being throttled. Measured at quotas of 1, 2 and 4 CPUs, where it
+/// was the best count on throughput every time, and at 4 on the tail too
+/// (bench/result/http.md). No quota, or one past the cores, is one per core.
+fn autoThreads(cores: usize, quota: ?u64) usize {
+    const q = quota orelse return cores;
+    const within = std.math.divCeil(u64, q, 1000) catch unreachable;
+    return @intCast(@max(1, @min(cores, within + 1)));
+}
+
+/// The CPU quota of this process's cgroup, in thousandths of a CPU (an
+/// integer, because a float would bring its formatting into every binary
+/// for one log line), or null when there is
+/// none (or this is not Linux, or the files cannot be read). The tightest
+/// of the process's own cgroup and every one above it, because a limit is
+/// often set on a parent: a Kubernetes pod's, or a systemd slice's.
+fn cpuQuota() ?u64 {
+    if (builtin.os.tag != .linux) return null;
+
+    var own: [1024]u8 = undefined;
+    if (readSmall("/proc/self/cgroup", &own)) |listing| {
+        if (unifiedPath(listing)) |leaf| {
+            var tightest: ?u64 = null;
+            var at: ?[]const u8 = leaf;
+            while (at) |dir| : (at = parentCgroup(dir)) {
+                // Spelled out rather than formatted: `bufPrint` would be a
+                // format function of its own in every binary, for one path.
+                const root = "/sys/fs/cgroup";
+                const file = "/cpu.max";
+                var path: [root.len + 512 + file.len:0]u8 = undefined;
+                if (dir.len > 512) break;
+                @memcpy(path[0..root.len], root);
+                @memcpy(path[root.len..][0..dir.len], dir);
+                @memcpy(path[root.len + dir.len ..][0..file.len], file);
+                path[root.len + dir.len + file.len] = 0;
+                var content: [64]u8 = undefined;
+                const at_path: [*:0]const u8 = @ptrCast(&path);
+                const limit = parseCpuMax(readSmall(at_path, &content) orelse continue) orelse continue;
+                tightest = if (tightest) |t| @min(t, limit) else limit;
+            }
+            return tightest;
+        }
+    }
+
+    // cgroup v1: the controller's own files, at the path a container mounts.
+    var quota: [32]u8 = undefined;
+    var period: [32]u8 = undefined;
+    return parseCfs(
+        readSmall("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", &quota) orelse return null,
+        readSmall("/sys/fs/cgroup/cpu/cpu.cfs_period_us", &period) orelse return null,
+    );
+}
+
+/// The unified (v2) cgroup this process is in, from `/proc/self/cgroup`'s
+/// `0::<path>` line, or null on a v1-only host.
+fn unifiedPath(listing: []const u8) ?[]const u8 {
+    var lines = std.mem.tokenizeScalar(u8, listing, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "0::")) return std.mem.trimEnd(u8, line["0::".len..], "/");
+    }
+    return null;
+}
+
+/// `/a/b` → `/a` → `` (the root, whose `cpu.max` is `/sys/fs/cgroup/cpu.max`)
+/// → null.
+fn parentCgroup(dir: []const u8) ?[]const u8 {
+    if (dir.len == 0) return null;
+    return dir[0 .. std.mem.lastIndexOfScalar(u8, dir, '/') orelse 0];
+}
+
+/// `cpu.max` is `<quota> <period>` in microseconds, and the quota is the
+/// word `max` when there is none.
+fn parseCpuMax(content: []const u8) ?u64 {
+    var words = std.mem.tokenizeAny(u8, content, " \n");
+    const quota = words.next() orelse return null;
+    if (std.mem.eql(u8, quota, "max")) return null;
+    return ratio(quota, words.next() orelse return null);
+}
+
+/// v1 keeps the two in files of their own, and a quota of -1 is none.
+fn parseCfs(quota: []const u8, period: []const u8) ?u64 {
+    return ratio(std.mem.trim(u8, quota, " \n"), std.mem.trim(u8, period, " \n"));
+}
+
+/// Rounded up, so a quota a hair over a whole CPU still counts as more.
+fn ratio(quota: []const u8, period: []const u8) ?u64 {
+    const q = std.fmt.parseInt(i64, quota, 10) catch return null;
+    const p = std.fmt.parseInt(i64, period, 10) catch return null;
+    if (q <= 0 or p <= 0) return null;
+    const scaled = std.math.mul(u64, @intCast(q), 1000) catch return null;
+    return std.math.divCeil(u64, scaled, @intCast(p)) catch unreachable;
+}
+
+/// A pseudo-file into `buf`, or null for anything that goes wrong: a
+/// missing controller, a path somebody else's namespace hides, a read that
+/// fails. The question is asked before there is a loop to wait on, and any
+/// answer but a quota means "no quota", which is what the count was before.
+fn readSmall(path: [*:0]const u8, buf: []u8) ?[]const u8 {
+    const linux = std.os.linux;
+    const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return null;
+    const fd: i32 = @intCast(opened);
+    defer _ = linux.close(fd);
+    const n = linux.read(fd, buf.ptr, buf.len);
+    if (linux.errno(n) != .SUCCESS or n == 0) return null;
+    return buf[0..n];
 }
 
 /// Run `handler(state, in, out, clocks, wake, peer)` for every accepted
@@ -1527,6 +1660,18 @@ pub fn serve(
             std.log.info("nilo also listening on https://{f}", .{b.server.socket.address})
         else
             std.log.info("nilo also listening on {f}", .{b.server.socket.address});
+    }
+    // Only when the count is not the one a reader would guess from the
+    // machine: a container's quota lowering it is invisible from inside,
+    // and one number with no reason next to it is how sixteen threads on two
+    // CPUs went unnoticed (ADR 230).
+    if (options.threads == 0) {
+        const cores = std.Thread.getCpuCount() catch threads;
+        if (threads < cores) if (cpuQuota()) |quota| std.log.info(
+            "nilo runs {d} thread(s) of the {d} core(s) it can see: its CPU quota is {d}.{d:0>2}, " ++
+                "and a thread past the quota fills the time the others wait",
+            .{ threads, cores, quota / 1000, quota % 1000 / 10 },
+        );
     }
 
     // A buffer that starts on a page boundary and ends on one, so every page
@@ -2563,6 +2708,55 @@ test "the count follows connections closing on other threads" {
     for (threads) |t| t.join();
 
     try testing.expectEqual(@as(u32, 0), capacity.held());
+}
+
+test "threads left at 0 are the cores this process may use, and never more than the engine runs" {
+    const auto = threadCount(.{ .threads = @as(u8, 0) });
+    try testing.expect(auto >= 1);
+    try testing.expect(auto <= max_threads);
+    try testing.expect(auto <= (std.Thread.getCpuCount() catch auto));
+    try testing.expectEqual(@as(u8, 3), threadCount(.{ .threads = @as(u8, 3) }));
+    // Past the engine's limit is held to it, rather than asserted on.
+    try testing.expectEqual(@as(u8, max_threads), threadCount(.{ .threads = @as(u8, 200) }));
+}
+
+test "a CPU quota is one thread more than the quota, and never more than the cores" {
+    try testing.expectEqual(@as(usize, 16), autoThreads(16, null));
+    try testing.expectEqual(@as(usize, 2), autoThreads(16, 1000));
+    try testing.expectEqual(@as(usize, 2), autoThreads(16, 500));
+    try testing.expectEqual(@as(usize, 3), autoThreads(16, 1500));
+    try testing.expectEqual(@as(usize, 3), autoThreads(16, 2000));
+    try testing.expectEqual(@as(usize, 4), autoThreads(16, 2001));
+    try testing.expectEqual(@as(usize, 5), autoThreads(16, 4000));
+    // A quota as large as the machine is no quota.
+    try testing.expectEqual(@as(usize, 4), autoThreads(4, 4000));
+    try testing.expectEqual(@as(usize, 1), autoThreads(1, 2000));
+}
+
+test "cpu.max and the v1 pair read as CPUs, and no limit reads as none" {
+    try testing.expectEqual(@as(?u64, 2000), parseCpuMax("200000 100000\n"));
+    try testing.expectEqual(@as(?u64, 1500), parseCpuMax("150000 100000"));
+    // A third of a CPU rounds up, never down to a quota it is over.
+    try testing.expectEqual(@as(?u64, 334), parseCpuMax("100000 300000"));
+    try testing.expectEqual(@as(?u64, null), parseCpuMax("max 100000\n"));
+    try testing.expectEqual(@as(?u64, null), parseCpuMax(""));
+    try testing.expectEqual(@as(?u64, null), parseCpuMax("200000"));
+    try testing.expectEqual(@as(?u64, null), parseCpuMax("200000 0"));
+    try testing.expectEqual(@as(?u64, 500), parseCfs("50000\n", "100000\n"));
+    try testing.expectEqual(@as(?u64, null), parseCfs("-1\n", "100000\n"));
+}
+
+test "the cgroup is read from its own line and walked up to the root" {
+    try testing.expectEqualStrings("/user.slice/app.scope", unifiedPath("0::/user.slice/app.scope\n").?);
+    // A hybrid host lists v1 controllers before the unified line.
+    try testing.expectEqualStrings("/foo", unifiedPath("3:cpu,cpuacct:/foo\n0::/foo\n").?);
+    // In a container with its own namespace, the cgroup is the root.
+    try testing.expectEqualStrings("", unifiedPath("0::/\n").?);
+    try testing.expectEqual(@as(?[]const u8, null), unifiedPath("3:cpu,cpuacct:/foo\n"));
+
+    try testing.expectEqualStrings("/a", parentCgroup("/a/b").?);
+    try testing.expectEqualStrings("", parentCgroup("/a").?);
+    try testing.expectEqual(@as(?[]const u8, null), parentCgroup(""));
 }
 
 test "a Peer given as text keeps it, and refuses what cannot be an address" {

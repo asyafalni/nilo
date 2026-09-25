@@ -83,7 +83,7 @@ try v1.without(requireOperator).with(rateLimitSignups).post("/sign-up", signUp);
 |---|---|
 | `address` | `"127.0.0.1"` — an address, not a host name. `"unix:/run/nilo.sock"` listens on a path ([ADR 103](../adr/103-a-path-is-an-address-to-listen-on.md)) |
 | `port` | `8787` — not read when `address` names a unix socket |
-| `threads` | `0` (one per core) |
+| `threads` | `0`: one per core, or one more than a container's CPU quota where there is one; at most 64 ([ADR 230](../adr/230-a-cpu-quota-sets-the-thread-count.md)) |
 | `read_buffer` | `16 * 1024` — also the ceiling on a request head. Paid only while a connection is busy; an idle one gives the pages back ([ADR 196](../adr/196-a-head-is-mostly-cookies-and-sixteen-kilobytes-of-them.md)) |
 | `write_buffer` | `4 * 1024` |
 | `arena_keep` | `16 * 1024` — of a connection's request arena, kept between requests |

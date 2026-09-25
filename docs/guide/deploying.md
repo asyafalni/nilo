@@ -41,7 +41,7 @@ error coming back as a value.
 try app.listen(.{
     .address = "0.0.0.0",     // IPv4 or IPv6 — "::" for every interface
     .port = 8080,
-    .threads = 0,             // 0 = one per core
+    .threads = 0,             // 0 = one per core, or the container's CPU quota plus one
     .read_buffer = 16 * 1024, // also the ceiling on a request head (431 past it)
     .write_buffer = 4 * 1024,
     .reuse_address = true,

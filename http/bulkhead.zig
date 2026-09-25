@@ -287,7 +287,10 @@ pub const Options = struct {
     /// what waits to be accepted, that bounds what is held once it has been.
     backlog: u31 = 4096,
 
-    /// How many OS threads run fibers. 0 means one per core.
+    /// How many OS threads run fibers. 0 means one per core, or one more
+    /// than a container's CPU quota where there is one, which the affinity
+    /// mask cannot see; at most 64 either way, and a larger number is held
+    /// to 64 (ADR 230).
     ///
     /// zio's own default is a single executor. That is the right default
     /// for a library that might be embedded in someone else's thread, and
@@ -746,8 +749,8 @@ pub const Options = struct {
     session_fallback_secrets: []const []const u8 = &.{},
 };
 
-/// How many OS threads `options` means: `threads` when it was set, one per
-/// core when it was left at 0. The Engine's own reading of its own field,
+/// How many OS threads `options` means: `threads` when it was set, and at
+/// 0 one per core or a CPU quota plus one (ADR 230). The Engine's own reading of its own field,
 /// so that anything the App sizes to the thread count (the compressors
 /// `app.compress` keeps, one per thread, ADR 211) is sized to the number
 /// the Engine starts.
