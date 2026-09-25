@@ -90,6 +90,9 @@
 //!   queue's order, and a waiter woken just as its limit ran out has to
 //!   come back woken rather than timed out (ADR 222). An Engine that has a
 //!   parking lock has a wait queue under it already.
+//! - `spawn`/`spawnLocal`: start a fiber the running server owns, dealt
+//!   to the next executor or kept on the caller's. An Engine with one
+//!   thread has one answer to both (ADR 028, ADR 220).
 //! - `blocking`/`sleep` — the general form of that same problem. A handler
 //!   that calls anything blocking stops every other request sharing its
 //!   thread, and the Engine is the only layer that knows how to wait
@@ -1183,6 +1186,10 @@ pub fn sleep(ms: u64) error{Canceled}!void {
 /// Somewhere to put work that is not a request, owned by the server that
 /// is running rather than by the fiber that started it (ADR 028).
 pub const spawn = engine.spawn;
+
+/// `spawn`, kept on the calling fiber's thread: for work that answers the
+/// fiber that started it, a gRPC call answering its connection (ADR 220).
+pub const spawnLocal = engine.spawnLocal;
 
 // ---- files (ADR 009) ----
 //

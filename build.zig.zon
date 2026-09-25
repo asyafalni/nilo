@@ -4,9 +4,12 @@
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0xa9fef7e1c22a71e4,
     .dependencies = .{
+        // A commit on zio's `main` rather than a tag: `spawnInto` (zio#761)
+        // and the fixes for zio#744 and zio#745 are in no release yet. Move
+        // to the tag that carries them when there is one.
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=v0.18.0#417757935ef6d0f0a2396d4023a44ca82ac1901c",
-            .hash = "zio-0.18.0-xHbVVELgKQAU2hnwYL9MA0iXUydUZYlBfXxOUUM6v_Uv",
+            .url = "git+https://github.com/lalinsky/zio?ref=main#0299e5771b8c042ca42077af0748771fca27d38e",
+            .hash = "zio-0.18.0-xHbVVPtIKgBBABs3c3jDBGiEAQlZjJysiJg9ot-dIZ2e",
         },
         // The driver behind `nilo_sql`, and lazy on purpose: it brings four
         // transitive dependencies of its own (buffer, metrics, xsync, tls),

@@ -20,15 +20,16 @@
 //!
 //! **One fiber reads and writes the socket; each call runs on a fiber of its
 //! own.** The connection's fiber parses frames, collects a call's message,
-//! and hands the finished call to `bulkhead.spawn`. The call's fiber runs
-//! the route into memory and hands the answer back through a queue and a
+//! and hands the finished call to `bulkhead.spawnLocal`, which keeps it on
+//! the connection's thread. The call's fiber runs the route into memory and
+//! hands the answer back through a queue and a
 //! `Waker.post`, and the connection's fiber writes it, as far as the flow-
 //! control windows allow. So no two fibers ever write the socket, and a
 //! slow route never holds up the frames of another call. A call in flight
 //! costs a fiber, 4,547 bytes and the stack its route touches, which is what
 //! a request in flight on HTTP/1.1 costs already
 //! ([`bench/result/http.md`](../bench/result/http.md#what-a-grpc-client-puts-on-the-wire-and-what-a-stream-would-cost)).
-//! With no server running `spawn` has nowhere to put one, and the call runs
+//! With no server running `spawnLocal` has nowhere to put one, and the call runs
 //! on the connection's own fiber instead, which is how the tests below drive
 //! a whole conversation through buffers in memory.
 //!
@@ -1106,7 +1107,7 @@ const Conn = struct {
         s.state = .running;
         _ = s.shared.running.fetchAdd(1, .acquire);
         s.shared.retain();
-        bulkhead.spawn(runCall, .{ s, true }) catch |err| switch (err) {
+        bulkhead.spawnLocal(runCall, .{ s, true }) catch |err| switch (err) {
             // No server: a test driving the connection through buffers. The
             // call runs here, and is queued exactly as a fiber would queue it.
             error.NoServer => runCall(s, false),

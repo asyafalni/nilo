@@ -54,20 +54,31 @@ sign, so a small real gain rather than noise, from the parks and the
 
 ## Decision
 
-**`enable_task_migration = false` on the Runtime.** A connection is
+**zio is built with `.scheduling = .pinned`.** A connection is
 served, start to finish, by the executor that was dealt it: `spawn`
 already deals new connections round-robin (`getNextExecutor`), so the
 load is spread the same way it was; what stops is a fiber changing threads
 between two waits.
 
+The mode is compile-time in zio, read from the root module's
+`zio_options` and otherwise from zio's own build options. The root module
+is the application's, so nilo sets the build option: `zioFor` in
+`build.zig` is the one place zio is fetched, and it passes `.pinned` to
+every copy. zio's maintainer confirmed that is how the two are meant to
+combine ([zio#704](https://github.com/lalinsky/zio/issues/704)): the build
+option is the default, and a root declaration wins over it.
+
 It is not an `Options` field. ADR 001 says the Engine is not the user's
-business, and a scheduler's stealing policy is the Engine's; a caller who
-wants it back changes one line here and re-runs the two tables above.
+business, and a scheduler's stealing policy is the Engine's. An
+application that wants stealing back declares
+`pub const zio_options: zio.Options = .{ .scheduling = .work_stealing }`
+in its root, which nilo does not document as a knob, because the answer
+is the table above.
 
 **What a caller can now rely on that was not promised before:** a handler
 runs on one OS thread from its first line to its last, across every
 `sleep`, `fetch` and query in it. `threadlocal` state read before a wait is
-the same after it. That was already true of everything nilo keeps per
+the same after it, unless the application's root turned stealing back on. That was already true of everything nilo keeps per
 thread — the `Date` cache, the scratch pool — and is now true of what a
 handler keeps too. It is not a licence to drop `nilo.Mutex` (ADR 010):
 two handlers on two threads still run at the same time.
@@ -106,19 +117,36 @@ sleep for the idle one. Until then, nilo's numbers are nilo's.
 this is trying to save, to shave a wake that a server at 5% load does not
 need shaved.
 
-**Turn migration off at compile time (`zio_options.task_migration`).**
-Removes the atomic on `parent_context_ptr` and the migration bookkeeping
-from every task switch, which is a second saving worth measuring. Not
-taken here because it is a build option that reaches every dependent's
-build graph, and the runtime flag is the whole of the CPU finding.
+**The runtime flag, `enable_task_migration = false` on
+`Runtime.init`.** What this ADR decided first, when zio had both a
+runtime flag and a compile-time option and the flag was the whole of the
+CPU finding. zio removed the flag
+([zio#752](https://github.com/lalinsky/zio/pull/752)): the mode became
+compile-time only, and work stealing when nothing says otherwise, so a
+nilo that kept the old line would not have compiled, and one that only
+dropped it would have stolen. The compile-time mode also removes the
+stealing machinery rather than branching around it. Measured across the
+upgrade that made the move, on eight threads: at 5,000 req/s, 4.7 to
+5.0 µs and one context switch a request against 5.7 to 6.0 µs and three,
+and keep-alive throughput 3 to 4% higher
+([`http.md`](../../bench/result/http.md#what-the-upgrade-costs-everything-else)).
+Those numbers are the whole upgrade, not the mode alone.
+
+**Ask every application to declare `zio_options`.** Where zio's
+documentation points, and where nilo cannot: a library does not own the
+root. It would be a line every application has to write, a breaking
+change for each one, and one a test build cannot write at all, because
+the root of `zig test` is the test runner.
 
 **Expose it on `Options`.** A knob nobody can set from the documentation,
 because the answer is the table and the table says off.
 
 ## Consequences
 
-- `http/engine/zio.zig`: `.enable_task_migration = false` in
-  `Runtime.init`, with the numbers in the comment.
+- `build.zig`: `zioFor` passes `.scheduling = .pinned`, and every copy
+  of zio comes from it. `http/engine/zio.zig` carries the numbers in the
+  comment above `Runtime.init`, and its test "a fiber spawned local runs
+  on the thread that spawned it" fails when a copy of zio work steals.
 - `bench/paced.py` is the instrument, beside `mem.py` and `burst.py`.
 - [`http.md`](../../bench/result/http.md#what-a-request-costs-when-the-server-is-not-busy)
   carries the runs, and a second finding from the same instrument that is

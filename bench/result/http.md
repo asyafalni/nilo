@@ -2795,7 +2795,7 @@ What moved it: a Huffman decoder reading nine bits at a time from a 64-bit accum
 
 ### Can it be pushed further
 
-1. **A spawn on the calling executor.** The gap between 0.8M and 3.1M is almost all the cross-thread hop, and zio has no public call for "here"; the maintainer's proposal for one is [zio#704](https://github.com/lalinsky/zio/issues/704), which is `Placement.here` in the pinned mode nilo already runs. Nothing on nilo's side approaches it.
+1. **A spawn on the calling executor.** The gap between 0.8M and 3.1M is almost all the cross-thread hop, and zio has no public call for "here"; the maintainer's proposal for one is [zio#704](https://github.com/lalinsky/zio/issues/704), which is `Placement.here` in the pinned mode nilo already runs. Nothing on nilo's side approaches it. Taken: [what placing a gRPC call on its own executor buys](#what-placing-a-grpc-call-on-its-own-executor-buys).
 2. **The worst call.** 1.4 s at 256 connections is not explained. A per-call latency histogram, which h2load does not give, is the first thing to take; a client with percentiles (`ghz`) against the same build is the run.
 3. **HPACK**, 247 ns of the 973. With a table of 0 every header is Huffman-decoded on every call; the next step is decoding only the fields the translation reads.
 4. **The App's 229 ns** is the HTTP/1.1 parse of text this side just wrote. A request handed over already parsed would skip it, at the price of a second door into `handleRequest`, which is what the translation exists to avoid.
@@ -3003,7 +3003,24 @@ Three trees from `git archive` of `d7c40bb`, each with its own cache: **A** as c
 
 **The zio upgrade alone moves nothing**: B is inside 2% of A on throughput at both counts. **`.local` is 2.7x at 256 and 2.9x at 1,024**, context switches fall from nearly one a call to one in thirty, and **the worst call falls from 1.5 s to 52 ms**, which answers item 2 under "Can it be pushed further" in [the listener's section](#a-grpc-listener-built): the unexplained worst call was the hop, not HPACK or the stream table.
 
-**What it decided**: the call fiber goes on `.local` when the pin moves to a zio release that has `spawnInto`, and nilo sets the scheduling mode through `b.dependency` rather than asking every application to declare `zio_options`, pending the maintainer's answer on whether a dependent may rely on that default ([asked in #704](https://github.com/lalinsky/zio/issues/704#issuecomment-5832480560)).
+**What it decided**: the call fiber goes on `.local` (`bulkhead.spawnLocal`), and nilo sets the scheduling mode through `b.dependency` rather than asking every application to declare `zio_options`, which the maintainer confirmed is how zio means a dependent to do it ([#704](https://github.com/lalinsky/zio/issues/704)). The pin moved to `0299e57` on zio's `main` rather than waiting for a release, once the run below said the upgrade costs the rest of the server nothing. The committed code, `spawnLocal` with its fallback, measured again against A at c=256, two interleaved rounds: 2.04 to 2.06M calls/s and a worst call of 46 to 52 ms, against 758 to 760k and 1.32 to 1.47 s.
+
+### What the upgrade costs everything else
+
+The same A and B, now from `9630a47`, with `nilo-hello` moved to port 18787 in both trees because another project's server held 8787 (the first pass measured that server, see `docs/history.md`). ReleaseFast for `x86_64-linux-gnu`, stripped; server on CPUs 0–3,8–11 and gcannon `11c802b` on 4–7,12–15, `/users/1`, 512 connections, `-t 8`, five seconds, three interleaved rounds; `bench/paced.py` at `/health`, 64 connections, 6 s, two rounds; `bench/mem.py --path /users/1` to 10,000, two rounds.
+
+| | A, zio v0.18.0 | B, zio `0299e57`, pinned by the build |
+|---|---|---|
+| keep-alive | 2.04–2.06M req/s, p99 459–497 µs | **2.12–2.13M**, p99 475–489 µs |
+| 10 requests a connection (`-r 10`) | 1.56–1.58M | 1.61–1.70M |
+| 5,000 req/s, CPU a request | 5.7–6.0 µs, 3.00 context switches | **4.7–5.0 µs, 1.00** |
+| 1,000 req/s, CPU a request | 6.7–8.3 µs, 3.01 | 6.7–10.0 µs, 1.00 (0.04 s of CPU a window, too coarse to read) |
+| idle connection | 9,279–9,280 B | 9,279 B |
+| stripped binary | `nilo-hello` 988,936, `example-rest` 1,170,520 | **+6,888 to +6,920 B** on every binary built |
+
+`test-all` passes on B against a live Postgres 18 and SeaweedFS the way CI runs them: 758 of 758 steps, 4,761 of 4,764 tests, the three skips being `job/live.zig`'s Postgres tests, which run only in Debug by design. The allocation budget is a test in that gate.
+
+**Nothing moved the wrong way, and the idle server moved the right one.** One context switch a request where A had three is the pinned build showing: a build that stole would have added switches, not removed them (ADR 199). The binary cost is zio's, and the linker cannot drop it; it goes in ADR 017's running total with the pin.
 
 **Can it be pushed further.** Yes. C is 2.07M against 3.12M inline, and 3.75 µs a call against 2.5; the fiber measured 0.23 µs on one executor, so about a microsecond is still unaccounted for and was not run down. The connection an acceptor spawns is the other round-robin hop left, and `.local` there is a separate run: the engine chose round-robin for connections on purpose (`http/engine/zio.zig`, above `Acceptor`).
 

@@ -1416,21 +1416,21 @@ pub fn serve(
     const Options = @TypeOf(options);
     const threads: u8 = threadCount(options);
 
-    // No work stealing between executors. A connection is served by the
-    // thread that was dealt it, start to finish — its socket's completions
-    // land on that thread's ring whatever the scheduler does, so a stolen
-    // fiber only moves the *running* of a request away from where its I/O
-    // is. What stealing costs is paid on every wake: an executor that has
-    // just run a task dozes for 100 µs before it parks, so that its own
-    // loop can hand work back before a thief takes it, and on a server
-    // that is not busy that doze is a second context switch per request —
-    // 100 µs of CPU a request at 500 req/s against 70 without it, 44
-    // against 34 at 8,000, and +3% at saturation, four pairs of four
-    // ([ADR 199](../../docs/adr/199-a-connection-is-served-by-the-thread-it-was-dealt-to.md)).
-    const rt = try zio.Runtime.init(gpa, .{
-        .executors = .exact(threads),
-        .enable_task_migration = false,
-    });
+    // No work stealing between executors, and nothing here says so: the
+    // scheduling mode is a compile-time default `zioFor` in `build.zig`
+    // gives zio (`.pinned`), which an application's root `zio_options` can
+    // still override. A connection is served by the thread that was dealt
+    // it, start to finish: its socket's completions land on that thread's
+    // ring whatever the scheduler does, so a stolen fiber only moves the
+    // *running* of a request away from where its I/O is. What stealing
+    // costs is paid on every wake: an executor that has just run a task
+    // dozes for 100 µs before it parks, so that its own loop can hand work
+    // back before a thief takes it, and on a server that is not busy that
+    // doze is a second context switch per request (100 µs of CPU a
+    // request at 500 req/s against 70 without it, 44 against 34 at 8,000,
+    // and +3% at saturation, four pairs of four;
+    // [ADR 199](../../docs/adr/199-a-connection-is-served-by-the-thread-it-was-dealt-to.md)).
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(threads) });
     defer rt.deinit();
 
     // **Registered second, so it runs second to last** — after the group
@@ -2424,6 +2424,21 @@ pub fn spawn(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !void {
     return group.spawn(func, args);
 }
 
+/// `spawn`, on the executor of the fiber that calls it rather than the next
+/// one round-robin. For work whose answer goes back to the fiber that
+/// started it, where round-robin sends it to another thread and the answer
+/// back again: a gRPC call spawned from its connection is 2.7x the calls a
+/// second this way (ADR 220). Round-robin where tasks work steal, which an
+/// application's own `zio_options` can ask for, because there a task has no
+/// executor to stay on and zio refuses `.local`.
+pub fn spawnLocal(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) !void {
+    const group = background.load(.acquire) orelse return error.NoServer;
+    return group.spawnInto(.local, func, args) catch |err| switch (err) {
+        error.InvalidPlacement => group.spawn(func, args),
+        else => err,
+    };
+}
+
 // ---- the per-request slot (see ADR 006) ----
 //
 // zio runs each connection in its own fiber, and many fibers share one OS
@@ -2838,4 +2853,32 @@ test "two listeners asking for one address is a refusal, and two asking for port
     // a refusal whatever number rides along.
     try testing.expect(sameListener("unix:/run/nilo.sock", 0, true, "unix:/run/nilo.sock", 0));
     try testing.expect(!sameListener("unix:/run/one.sock", 0, true, "unix:/run/two.sock", 0));
+}
+
+// Also the check on `zioFor` in `build.zig`: a zio built without `.pinned`
+// works steal, `spawnLocal` falls back to round-robin there, and the
+// children below land on other threads.
+test "a fiber spawned local runs on the thread that spawned it" {
+    const rt = try zio.Runtime.init(testing.allocator, .{ .executors = .exact(4) });
+    defer rt.deinit();
+
+    const H = struct {
+        fn child(want: std.Thread.Id, wrong: *std.atomic.Value(u32)) void {
+            if (std.Thread.getCurrentId() != want) _ = wrong.fetchAdd(1, .monotonic);
+        }
+
+        fn parent(wrong: *std.atomic.Value(u32)) !void {
+            var group: zio.Group = .init;
+            defer group.cancel();
+            background.store(&group, .release);
+            defer background.store(null, .release);
+            for (0..16) |_| try spawnLocal(child, .{ std.Thread.getCurrentId(), wrong });
+            try group.wait();
+        }
+    };
+
+    var wrong: std.atomic.Value(u32) = .init(0);
+    var handle = try rt.spawn(H.parent, .{&wrong});
+    try handle.join();
+    try testing.expectEqual(@as(u32, 0), wrong.load(.monotonic));
 }

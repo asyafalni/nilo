@@ -2643,6 +2643,25 @@ fn stripMeasured(strip: ?bool, optimize: std.builtin.OptimizeMode) ?bool {
     return if (optimize == .ReleaseFast) true else null;
 }
 
+/// zio for one optimize mode, with its tasks pinned to the executor they
+/// start on (ADR 199).
+///
+/// Every copy of zio in this file comes from here, because the scheduling
+/// mode is a compile-time default and a copy fetched without it would work
+/// steal: nothing fails, the server only spends more CPU a request, and a
+/// gRPC call spawned `.local` falls back to round-robin. The default is
+/// zio's build option rather than a `zio_options` declaration because the
+/// root module is the application's, not nilo's; an application that
+/// declares `zio_options` in its root still gets what it declared, which is
+/// how zio means the two to combine (zio#704).
+fn zioFor(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    mode: std.builtin.OptimizeMode,
+) *std.Build.Dependency {
+    return b.dependency("zio", .{ .target = target, .optimize = mode, .scheduling = .pinned });
+}
+
 /// A copy of Core for one optimize mode (ADR 038).
 ///
 /// A module carries the mode it was created with, so every root that reaches
@@ -2868,7 +2887,7 @@ fn httpFor(
     mode: std.builtin.OptimizeMode,
     core_mod: *std.Build.Module,
 ) *std.Build.Module {
-    const engine = b.dependency("zio", .{ .target = target, .optimize = mode });
+    const engine = zioFor(b, target, mode);
     const module = b.createModule(.{
         .root_source_file = b.path("http/http.zig"),
         .target = target,
@@ -3609,10 +3628,7 @@ pub fn build(b: *std.Build) void {
         "Build nilo_sql and fetch its drivers — on for this repository, off for a dependent until it asks (see ADR 066)",
     ) orelse (b.pkg_hash.len == 0);
 
-    const zio = b.dependency("zio", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const zio = zioFor(b, target, optimize);
 
     // Whether the published module speaks TLS (ADR 212). Off until asked,
     // for everybody: the library it needs is fetched and linked only behind
@@ -4411,7 +4427,7 @@ pub fn build(b: *std.Build) void {
     // It names pg.zig, which is allowed outside the module: `sql/wire.zig`
     // says so, and what is being measured *is* the driver.
     const bench_core = coreFor(b, target, .ReleaseFast);
-    const bench_engine = b.dependency("zio", .{ .target = target, .optimize = .ReleaseFast });
+    const bench_engine = zioFor(b, target, .ReleaseFast);
     const bench_http = b.createModule(.{
         .root_source_file = b.path("http/http.zig"),
         .target = target,
@@ -4807,7 +4823,7 @@ pub fn build(b: *std.Build) void {
     // zio: a module carries the optimize mode it was created with, and this
     // module's tests drive a whole request through `nilo.testing.Client`.
     for (test_modes) |mode| {
-        const engine = b.dependency("zio", .{ .target = target, .optimize = mode });
+        const engine = zioFor(b, target, mode);
 
         // **One Core per mode, shared by both modules below**, and it has to
         // be shared rather than merely identical. Two modules built from the
@@ -4948,7 +4964,7 @@ pub fn build(b: *std.Build) void {
         const step = if (mode == loop_mode) test_step else test_all_step;
         // Each mode needs its own copy of everything, down to zio: a module
         // carries the optimize mode it was created with.
-        const engine = b.dependency("zio", .{ .target = target, .optimize = mode });
+        const engine = zioFor(b, target, mode);
 
         // The library's tests run under a root of their own so there is one
         // place to say what a test build's root actually is: the compiler's
