@@ -1792,8 +1792,38 @@ pub fn serve(
             defer conn_gpa.free(clear_in);
             const clear_out = alignedPages(conn_gpa, sizes.write_buffer) catch return;
             defer conn_gpa.free(clear_out);
-            var tr = conn.reader(clear_in);
             var tw = conn.writer(clear_out);
+
+            // `Link` one layer up: before the cleartext reader asks the
+            // library for a record, what the handler wrote into the cleartext
+            // writer is sealed and sent. `Link` flushes only the record writer
+            // under it, so an answer written while the read buffer still held
+            // bytes (an unread body, the rest of a WebSocket frame) sat in the
+            // cleartext buffer while the connection waited for the client,
+            // which a keep-alive POST measured as the whole idle limit
+            // (ADR 201). tls.zig's reader has only `stream`, so that is the
+            // one wrapped; the defaults it leaves call it.
+            const TlsReader = @TypeOf(conn.reader(clear_in));
+            const ClearLink = struct {
+                reader: TlsReader,
+                writer: *std.Io.Writer,
+                inner: *const std.Io.Reader.VTable,
+
+                const vtable: std.Io.Reader.VTable = .{ .stream = streamSettled };
+
+                fn streamSettled(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+                    const r: *TlsReader = @alignCast(@fieldParentPtr("interface", io_r));
+                    const self: *@This() = @alignCast(@fieldParentPtr("reader", r));
+                    // A failed flush is left for the next write to report,
+                    // as `Link.settle` leaves it.
+                    if (self.writer.end != 0) self.writer.flush() catch {};
+                    return self.inner.stream(io_r, io_w, limit);
+                }
+            };
+            var clear: ClearLink = .{ .reader = conn.reader(clear_in), .writer = &tw.interface, .inner = undefined };
+            clear.inner = clear.reader.interface.vtable;
+            clear.reader.interface.vtable = &ClearLink.vtable;
+            const tr = &clear.reader;
             const raw: Wake.RawLayer = .{
                 .in = &link.reader.interface,
                 .out = &link.writer.interface,

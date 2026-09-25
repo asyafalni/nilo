@@ -186,6 +186,10 @@ pub const Ticket = struct {
 pub const Error = error{
     /// Every seat is taken. The room's `seats` is the number to raise.
     RoomFull,
+    /// The socket is already sitting in another room. A socket has one seat
+    /// and `receive` drains that one, so a second room would never be heard;
+    /// `leave` the first before joining the next.
+    AlreadySeated,
     OutOfMemory,
     /// The connection was cancelled while waiting for a lock — a shutdown
     /// landing mid-broadcast. The handler is on its way out anyway.
@@ -285,9 +289,15 @@ pub const Room = struct {
     /// Take a seat, and tell the socket where it is sitting so `receive` can
     /// drain it.
     ///
-    /// Pair it with `defer room.leave(&socket)`. Zig has no destructor to do
-    /// it for you, and a seat nobody gives up is one the next connection
-    /// cannot have.
+    /// Pair it with `defer room.leave(&socket)`, which gives the seat up the
+    /// moment the handler is done with the room. When the loop returns, nilo
+    /// gives up whatever seat is still taken, because the seat's bell is in
+    /// the connection's frame and a seat left behind would ring it after the
+    /// frame has gone.
+    ///
+    /// Joining the room the socket is already in does nothing. Joining a
+    /// second one is `error.AlreadySeated`: the socket holds one ticket, and
+    /// taking another used to leave the first seat taken for good.
     /// A socket with no Engine behind it — one built over a fixed buffer in a
     /// test — is seated like any other. Its bell rings into nothing, but
     /// `receive` drains its seat before it reads either way, so the posts
@@ -295,6 +305,10 @@ pub const Room = struct {
     /// deliberate: a feature only reachable through a real socket is a
     /// feature tested by hand.
     pub fn join(self: *Room, socket: *websocket.Socket) Error!void {
+        if (socket.inRoom()) |seated| {
+            if (seated == self) return;
+            return error.AlreadySeated;
+        }
         try self.roster.lock();
         defer self.roster.unlock();
 
@@ -307,6 +321,10 @@ pub const Room = struct {
     /// that never joined — which is what makes `defer room.leave(&socket)`
     /// correct on every path out of a handler, including the failed ones.
     pub fn leave(self: *Room, socket: *websocket.Socket) void {
+        // A ticket is an index into one room's seats. Read against another
+        // room's, it would give up a seat that is not this socket's and leave
+        // the one that is.
+        if (socket.inRoom() != self) return;
         const ticket = socket.ticket() orelse return;
         socket.unseat();
 
@@ -854,6 +872,37 @@ test "leaving twice, and leaving without joining, are both fine" {
     room.leave(&socket);
     room.leave(&socket);
     try testing.expectEqual(@as(usize, 0), room.count());
+}
+
+test "a socket in one room is refused by a second, and leaving the wrong room gives up nothing" {
+    // `global.join; chan.join` with a `defer leave` for each is the natural
+    // way to write two rooms. It used to overwrite the socket's ticket, so
+    // `chan.leave` freed its seat by an index into the wrong room and the
+    // `global` seat stayed taken, ringing a bell in a frame that had gone.
+    var global = try Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 2 });
+    defer global.deinit();
+    var chan = try Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 2 });
+    defer chan.deinit();
+
+    var in = std.Io.Reader.fixed("");
+    var bytes: [64]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var socket: websocket.Socket = .{ ._in = &in, ._out = &out, ._stopping = null };
+
+    try global.join(&socket);
+    try global.join(&socket);
+    try testing.expectEqual(@as(usize, 1), global.count());
+    try testing.expectError(error.AlreadySeated, chan.join(&socket));
+    try testing.expectEqual(@as(usize, 0), chan.count());
+
+    chan.leave(&socket);
+    try testing.expectEqual(@as(usize, 1), global.count());
+    try testing.expectEqual(&global, socket.inRoom().?);
+
+    global.leave(&socket);
+    try testing.expectEqual(@as(usize, 0), global.count());
+    try chan.join(&socket);
+    chan.leave(&socket);
 }
 
 test "a room that is full says so, naming nothing it cannot" {

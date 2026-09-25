@@ -1676,6 +1676,10 @@ pub fn blocking(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) ReturnTy
     const Args = @TypeOf(args);
     const Carrier = struct {
         fn run(carried: ?*anyopaque, inner: Args) ReturnType(func) {
+            // Run inline, which zio does when the caller cannot park: the
+            // fiber's own slot is still the one fail functions find, and the
+            // fallback is not needed.
+            if (engine.slot() != null) return @call(.auto, func, inner);
             const previous = setFallbackSlot(carried);
             defer _ = setFallbackSlot(previous);
             return @call(.auto, func, inner);
@@ -1700,18 +1704,32 @@ fn ReturnType(comptime func: anytype) type {
 /// stored here is never read by one.
 ///
 /// A fiber from `spawn` (ADR 028) has no slot, so it *does* read this. It
-/// is safe only because the one place that writes it — `blocking` above —
-/// does so on a thread-pool worker, and spawned fibers run on executor
-/// threads. Anything that starts setting this on an executor thread
-/// reintroduces the cross-request leak ADR 006 exists to prevent.
+/// is safe only because the one place that writes it on a server,
+/// `blocking` above, does so on a thread-pool worker, and spawned fibers
+/// run on executor threads. Anything that starts setting this on an
+/// executor thread reintroduces the cross-request leak ADR 006 exists to
+/// prevent, and `serveRequest` once did.
 threadlocal var fallback_slot: ?*anyopaque = null;
 
 /// Install the fallback slot, returning the previous one so it can be
 /// restored.
+///
+/// **Refused in Debug from a fiber that has a slot of its own.** That fiber
+/// is on an executor, and a value left here across one of its suspensions
+/// is read by whichever spawned fiber runs next on the thread. What this
+/// cannot see is a spawned fiber, which has no slot, setting it; nothing on
+/// the server does.
 pub fn setFallbackSlot(p: ?*anyopaque) ?*anyopaque {
+    if (builtin.mode == .Debug and p != null) std.debug.assert(engine.slot() == null);
     const previous = fallback_slot;
     fallback_slot = p;
     return previous;
+}
+
+/// The slot bound to the running fiber, and never the fallback: null in a
+/// test calling App directly, and in a fiber from `spawn`.
+pub fn fiberSlot() ?*anyopaque {
+    return engine.slot();
 }
 
 /// The slot of the request currently running, or null if there is none.

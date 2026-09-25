@@ -44,6 +44,9 @@ const Serving = struct {
     app: *nilo.App,
     path: []const u8,
     write_timeout_ms: u32 = 30_000,
+    body_timeout_ms: u32 = 30_000,
+    body_grace_ms: u32 = 10_000,
+    body_min_rate: u32 = 8 * 1024,
     bound: std.atomic.Value(bool) = .init(true),
 
     fn run(self: *Serving) void {
@@ -54,6 +57,9 @@ const Serving = struct {
             .threads = 2,
             .stop_on_signal = false,
             .write_timeout_ms = self.write_timeout_ms,
+            .body_timeout_ms = self.body_timeout_ms,
+            .body_grace_ms = self.body_grace_ms,
+            .body_min_rate = self.body_min_rate,
             .also = &.{.{ .address = beside, .grpc = true }},
         }) catch {
             self.bound.store(false, .release);
@@ -381,4 +387,150 @@ test "a client that holds its window at zero is let go of once the write limit p
     // Not before the limit, which is what says the close was the limit's.
     try testing.expect(took.toMilliseconds() >= 250);
     try testing.expect(took.toMilliseconds() < 3000);
+}
+
+test "a zero window is let go of on time however often the client sends a frame" {
+    // The same attack, with a frame every 100 ms. Each one used to start the
+    // write limit again, so the answer and its place in the cap were held for
+    // as long as the client kept typing.
+    hush();
+    const gpa = std.heap.smp_allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var where = try SocketDir.init(gpa, "grpc-trickle.sock");
+    defer where.deinit(gpa);
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.post("/test.Echo/Say", echo);
+
+    var serving: Serving = .{ .app = &app, .path = where.path, .write_timeout_ms = 300 };
+    const thread = try std.Thread.spawn(.{}, Serving.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    try serving.waitUntilUp(io);
+
+    var stream = try connect(io, where.path);
+    defer stream.close(io);
+    var out_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    var in_buf: [32 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+
+    try writer.interface.writeAll(h2.preface);
+    try h2.writeSettings(&writer.interface, &.{.{ .initial_window_size, 0 }});
+    try writeCall(&writer.interface, 1, "/test.Echo/Say", "an answer with nowhere to go");
+    try writer.interface.flush();
+
+    const started = std.Io.Clock.awake.now(io);
+    // Twenty frames of a type nobody knows, 100 ms apart: two seconds of a
+    // client that is plainly still there. A write that fails is the server
+    // having gone, which is the point.
+    for (0..20) |_| {
+        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+        h2.writeHeader(&writer.interface, 0, @enumFromInt(0x20), 0, 0) catch break;
+        writer.interface.flush() catch break;
+    }
+    while (true) {
+        const head = h2.Header.parse(reader.interface.takeArray(h2.header_len) catch break);
+        _ = reader.interface.take(head.len) catch break;
+    }
+    const took = started.durationTo(std.Io.Clock.awake.now(io));
+    try testing.expect(took.toMilliseconds() < 1500);
+}
+
+test "a call whose message never finishes arriving is cancelled, and the connection goes on" {
+    // HEADERS with no END_STREAM, then only PINGs: a client that is there
+    // and never sends what it owes. The call gets the bound a chunked body
+    // does, grace plus the most it may be at the slowest rate, and then an
+    // RST_STREAM; the connection answers the next call as usual.
+    hush();
+    const gpa = std.heap.smp_allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var where = try SocketDir.init(gpa, "grpc-owed.sock");
+    defer where.deinit(gpa);
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.post("/test.Echo/Say", echo);
+
+    // 300 ms of grace, and a rate so high the megabyte adds nothing: the
+    // call has 300 ms to finish arriving. The PINGs keep `body_timeout_ms`
+    // from being the limit that fires.
+    var serving: Serving = .{
+        .app = &app,
+        .path = where.path,
+        .body_grace_ms = 300,
+        .body_min_rate = 1 << 30,
+    };
+    const thread = try std.Thread.spawn(.{}, Serving.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    try serving.waitUntilUp(io);
+
+    var stream = try connect(io, where.path);
+    defer stream.close(io);
+    var out_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    var in_buf: [32 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+
+    try writer.interface.writeAll(h2.preface);
+    try h2.writeSettings(&writer.interface, &.{});
+    var block_buf: [256]u8 = undefined;
+    var block: std.Io.Writer = .fixed(&block_buf);
+    try hpack.writeInt(&block, 0x80, 7, 3); // :method POST
+    try hpack.writeInt(&block, 0x80, 7, 6); // :scheme http
+    try hpack.writeLiteral(&block, ":path", "/test.Echo/Say");
+    try hpack.writeLiteral(&block, ":authority", "localhost");
+    try hpack.writeLiteral(&block, "content-type", "application/grpc");
+    try h2.writeHeaderBlock(&writer.interface, 1, block.buffered(), false, h2.default_max_frame);
+    try writer.interface.flush();
+
+    for (0..10) |_| {
+        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+        try h2.writeHeader(&writer.interface, 8, .ping, 0, 0);
+        try writer.interface.writeAll("12345678");
+        try writer.interface.flush();
+    }
+
+    var cancelled: ?h2.ErrorCode = null;
+    while (cancelled == null) {
+        const head = h2.Header.parse(try reader.interface.takeArray(h2.header_len));
+        const payload = try reader.interface.take(head.len);
+        if (head.type == .goaway) return error.SentAway;
+        if (head.type == .rst_stream and head.stream == 1)
+            cancelled = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
+    }
+    try testing.expectEqual(h2.ErrorCode.cancel, cancelled.?);
+
+    // The connection is still good for the next call.
+    try writeCall(&writer.interface, 3, "/test.Echo/Say", "and this one");
+    try writer.interface.flush();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var decoder = hpack.Decoder.init(arena.allocator());
+    defer decoder.deinit();
+    var status: ?[]const u8 = null;
+    while (true) {
+        const head = h2.Header.parse(try reader.interface.takeArray(h2.header_len));
+        const payload = try reader.interface.take(head.len);
+        if (head.type != .headers or head.stream != 3) continue;
+        var fields: std.ArrayList(hpack.Field) = .empty;
+        _ = try decoder.decode(payload, arena.allocator(), &fields, 1 << 16);
+        for (fields.items) |f| if (std.mem.eql(u8, f.name, "grpc-status")) {
+            status = try arena.allocator().dupe(u8, f.value);
+        };
+        if (head.has(h2.Flags.end_stream)) break;
+    }
+    try testing.expectEqualStrings("0", status.?);
 }

@@ -125,6 +125,30 @@ pub fn Cached(comptime Pages: type, comptime options: Options) type {
     };
 }
 
+/// The headers that say who is calling. Refused as a key here, and as a
+/// `FromHeader` argument beside a `Cached` in `typed.rolesOf`.
+pub const credentials = [_][]const u8{ "Cookie", "Authorization", "Proxy-Authorization" };
+
+/// Whether an argument of the handler says who the caller is, which a route
+/// whose answer is served to the next caller must not read. An
+/// `Authorization`, a `Verified`, a credential `FromHeader`, and a resolved
+/// type that declares `pub const nilo_reads_caller = true;`, as
+/// `Session(T)` does. A `*Ctx` can read anything and is not refused.
+pub fn readsTheCaller(comptime P: type, comptime is_authorization: bool, comptime is_verified: bool) bool {
+    comptime {
+        if (is_authorization or is_verified) return true;
+        switch (@typeInfo(P)) {
+            .@"struct", .@"union", .@"enum", .@"opaque" => {},
+            else => return false,
+        }
+        if (@hasDecl(P, "nilo_reads_caller")) return P.nilo_reads_caller;
+        if (@hasDecl(P, "nilo_header")) {
+            for (credentials) |secret| if (std.ascii.eqlIgnoreCase(P.nilo_header.name, secret)) return true;
+        }
+        return false;
+    }
+}
+
 /// Everything the type and its options have to get right, said at the
 /// route the way `Idempotent`'s Space check is.
 pub fn check(comptime P: type, comptime route: []const u8) void {
@@ -143,7 +167,7 @@ pub fn check(comptime P: type, comptime route: []const u8) void {
                     "nilo: " ++ who ++ " keys its answers on a header and names none.\n" ++
                         "  `.by = .{ .header = \"Accept-Language\" }` is the shape; `.path_and_query` if the answer does not vary by one.",
                 );
-                for ([_][]const u8{ "Cookie", "Authorization", "Proxy-Authorization" }) |secret| {
+                for (credentials) |secret| {
                     if (std.ascii.eqlIgnoreCase(name, secret)) @compileError(
                         "nilo: " ++ who ++ " keys its answers on the `" ++ name ++ "` header, and a credential is not a key.\n" ++
                             "  Every caller would get an entry of their own with the secret in it, which is a session store " ++

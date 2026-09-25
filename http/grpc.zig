@@ -38,8 +38,10 @@
 //! reset, CVE-2023-44487) gains a client nothing; one that keeps opening past
 //! the cap is sent away. A header block is bounded however many CONTINUATION
 //! frames it arrives in, and so is the header list it decodes to. A message
-//! is bounded by `max_body`, compressed or not. PINGs and SETTINGS without a
-//! call between them are counted, and a flood is sent away. A client that
+//! is bounded by `max_body`, compressed or not, and the messages still
+//! arriving by one `max_body` between them, past which a call waits on a
+//! window the client is held to (`Conn.budget`). Frames that move no call
+//! forward are counted, and a flood is sent away. A client that
 //! stops reading while an answer waits on its window is cut off at the write
 //! deadline.
 
@@ -239,8 +241,20 @@ const Stream = struct {
     body_over_limit: bool = false,
     /// When the client stops waiting, from `grpc-timeout`, or 0.
     until_ns: u64 = 0,
+    /// When the client has to have finished sending this call, or 0 for no
+    /// bound. `body_grace_ms + (max_body + 5) / body_min_rate` from the
+    /// HEADERS frame: the rule a chunked HTTP/1.1 body is held to, sized from
+    /// the most it may be because nothing says how much is coming (ADR 022).
+    collect_until_ns: u64 = 0,
     /// Bytes read since this stream's window was last topped up.
     unacked: u32 = 0,
+    /// Bytes of the message counted in the connection's `collected`, given
+    /// back when the call starts or is let go of.
+    held: usize = 0,
+    /// Its window is owed a top-up the connection's budget held back.
+    starved: bool = false,
+    /// What the client may still send on it before this side says more.
+    recv_window: i64 = h2.default_window,
     /// What may be sent on this stream before the client says more.
     send_window: i64,
     /// The client reset it. Its route still runs to the end, because nothing
@@ -327,6 +341,13 @@ const Conn = struct {
     send_window: i64 = h2.default_window,
     /// Bytes of DATA read since the connection's window was last topped up.
     unacked: u32 = 0,
+    /// Bytes of messages read and not yet handed to a route, across every
+    /// call still arriving, and how many of those calls are owed a window.
+    collected: usize = 0,
+    starved: u32 = 0,
+    /// What the client may still send on the connection before this side
+    /// says more. A window is only a bound if it is held to.
+    recv_window: i64 = h2.default_window,
 
     goaway_sent: bool = false,
     peer_goaway: bool = false,
@@ -336,6 +357,10 @@ const Conn = struct {
     control_run: u32 = 0,
     /// When the oldest answer started waiting on a window, or 0.
     blocked_since: u64 = 0,
+    /// When the last frame arrived. A call still being sent with nothing
+    /// arriving for `body_ms` is a client that stopped, as a body read that
+    /// times out is on HTTP/1.1.
+    last_read_ns: u64 = 0,
     /// Streams whose calls are over, kept for the next ones: at most
     /// `max_streams` of them, and none once the connection waits with no call
     /// in flight, so they cost a busy connection what its calls already held
@@ -403,6 +428,7 @@ const Conn = struct {
 
         while (true) {
             c.writeReady() catch break;
+            c.grantWaiting() catch break;
             if (c.goaway_sent or c.peer_goaway) {
                 if (c.streams.items.len == 0) break;
             }
@@ -441,14 +467,17 @@ const Conn = struct {
 
     fn wait(c: *Conn) Waited {
         if (c.streams.items.len != 0) {
-            // Something is in flight: wait as long as it takes, for the
-            // client or for an answer, unless an answer is stuck on a
-            // window, which gets the write deadline and no longer.
-            const limit: u32 = if (c.blocked_since != 0) c.writeLimitMs() else 0;
+            // Something is in flight. A route that is running is waited for
+            // as long as it takes: its own deadline is what bounds it. What
+            // the client owes is not: an answer stuck on a window gets the
+            // write limit, counted from when it first stuck rather than from
+            // the last frame, and a call still being sent gets its own bound
+            // and `body_ms` between frames.
+            const limit = c.inFlightLimitMs() orelse return .stop;
             return switch (c.waker.wait(limit)) {
                 .readable => .readable,
                 .posted => .posted,
-                .timed_out => if (c.blocked_since != 0) .stop else .again,
+                .timed_out => c.overdue(),
                 .closed => blk: {
                     c.peer_gone = true;
                     break :blk .stop;
@@ -493,6 +522,77 @@ const Conn = struct {
 
     fn writeLimitMs(c: *const Conn) u32 {
         return if (c.deadlines.write_ms == 0) 30_000 else c.deadlines.write_ms;
+    }
+
+    /// How long a wait with calls in flight may last: 0 for as long as it
+    /// takes, which is only when nothing is owed by the client. Null when a
+    /// bound has already passed.
+    fn inFlightLimitMs(c: *const Conn) ?u32 {
+        const now = bulkhead.monotonicNanos();
+        var soonest: u64 = std.math.maxInt(u64);
+        if (c.blocked_since != 0) {
+            const until = c.blocked_since +| @as(u64, c.writeLimitMs()) * std.time.ns_per_ms;
+            if (until <= now) return null;
+            soonest = until;
+        }
+        var collecting = false;
+        for (c.streams.items) |s| {
+            if (s.state != .headers and s.state != .body) continue;
+            collecting = true;
+            if (s.collect_until_ns != 0) soonest = @min(soonest, s.collect_until_ns);
+        }
+        if (collecting and c.deadlines.body_ms != 0) {
+            soonest = @min(soonest, c.last_read_ns +| @as(u64, c.deadlines.body_ms) * std.time.ns_per_ms);
+        }
+        if (soonest == std.math.maxInt(u64)) return 0;
+        // Rounded up, and never 0, which would mean no limit at all: a bound
+        // already past gets a wait of 1 ms and `overdue` then acts on it.
+        const left = soonest -| now;
+        return @intCast(@max(1, @min(std.math.maxInt(u32), (left + std.time.ns_per_ms - 1) / std.time.ns_per_ms)));
+    }
+
+    /// A bound on a wait with calls in flight has passed: say which, and do
+    /// what it asks.
+    fn overdue(c: *Conn) Waited {
+        const now = bulkhead.monotonicNanos();
+        if (c.blocked_since != 0 and now -| c.blocked_since >= @as(u64, c.writeLimitMs()) * std.time.ns_per_ms) return .stop;
+        var collecting = false;
+        var i: usize = 0;
+        while (i < c.streams.items.len) {
+            const s = c.streams.items[i];
+            if (s.state != .headers and s.state != .body) {
+                i += 1;
+                continue;
+            }
+            if (s.collect_until_ns != 0 and now >= s.collect_until_ns) {
+                // Too slow sending one call: that call is cancelled and its
+                // buffered message freed, and the connection goes on. Not
+                // while its header block is unfinished, which would leave the
+                // table out of step: that is the connection's, below.
+                if (c.continuing != s) {
+                    h2.writeRstStream(c.out, s.id, .cancel) catch return .stop;
+                    c.forget(s);
+                    continue;
+                }
+            }
+            collecting = true;
+            i += 1;
+        }
+        if (collecting and c.deadlines.body_ms != 0 and now -| c.last_read_ns >= @as(u64, c.deadlines.body_ms) * std.time.ns_per_ms) {
+            // Nothing at all from a client that still owes a call.
+            c.goaway(.no_error) catch {};
+            return .stop;
+        }
+        return .again;
+    }
+
+    /// The bound on sending one call, from now.
+    fn collectUntil(c: *const Conn) u64 {
+        const rate = c.deadlines.body_min_rate;
+        if (rate == 0) return 0;
+        const most: u64 = @as(u64, c.app.max_body) + 5;
+        const ms = @as(u64, c.deadlines.body_grace_ms) + most * std.time.ms_per_s / rate;
+        return bulkhead.monotonicNanos() +| ms * std.time.ns_per_ms;
     }
 
     /// Wait for the calls still running, then write what they answered if
@@ -547,6 +647,7 @@ const Conn = struct {
     fn readFrame(c: *Conn) ReadError!void {
         c.deadlines.armBody();
         const head = h2.Header.parse(c.in.takeArray(h2.header_len) catch return error.Gone);
+        c.last_read_ns = bulkhead.monotonicNanos();
         if (head.len > h2.default_max_frame) return error.FrameSize;
 
         if (c.continuing) |s| {
@@ -558,6 +659,7 @@ const Conn = struct {
             .headers => try c.onHeaders(head),
             .continuation => {
                 const s = c.continuing orelse return error.Protocol;
+                if (head.len == 0 and !head.has(h2.Flags.end_headers)) try c.control();
                 try c.appendBlockBytes(s, head.len);
                 if (head.has(h2.Flags.end_headers)) try c.headersDone(s);
             },
@@ -577,12 +679,19 @@ const Conn = struct {
                 if (head.len != 4) return error.FrameSize;
                 try c.discard(4);
                 if (head.stream > c.last_stream) return error.Protocol;
-                if (c.find(head.stream)) |s| c.onReset(s);
+                if (c.find(head.stream)) |s| {
+                    // A call reset before it ever ran cost a header block
+                    // decoded and a stream made, and bought nothing: HEADERS
+                    // then RST_STREAM, over and over, is a flood like PING.
+                    if (s.state == .headers or s.state == .body) try c.control();
+                    c.onReset(s);
+                }
             },
             .priority => {
                 if (head.stream == 0) return error.Protocol;
                 if (head.len != 5) return error.FrameSize;
                 try c.discard(5);
+                try c.control();
             },
             .goaway => {
                 if (head.stream != 0) return error.Protocol;
@@ -592,12 +701,20 @@ const Conn = struct {
             },
             // A client may not push (§8.4).
             .push_promise => return error.Protocol,
-            // Unknown frame types are ignored (§5.5).
-            _ => try c.discard(head.len),
+            // Unknown frame types are ignored (§5.5), and counted: each one
+            // is a frame read for nothing.
+            _ => {
+                try c.discard(head.len);
+                try c.control();
+            },
         }
     }
 
-    /// A PING or a SETTINGS with no call since the last one.
+    /// A frame that moved no call forward, with no call since the last one:
+    /// PING, SETTINGS, PRIORITY, an unknown type, an empty DATA or
+    /// CONTINUATION, a WINDOW_UPDATE nothing was waiting for, a call reset
+    /// before it ran. Only a call reaching `dispatch` starts the count again,
+    /// so opening a stream in between does not.
     fn control(c: *Conn) ReadError!void {
         c.control_run += 1;
         if (c.control_run > max_control_run) return error.Calm;
@@ -639,9 +756,9 @@ const Conn = struct {
         }
         if (head.stream <= c.last_stream) return error.Protocol;
         c.last_stream = head.stream;
-        c.control_run = 0;
 
         const s = c.newStream(head.stream) catch return error.Internal;
+        s.collect_until_ns = c.collectUntil();
         c.streams.append(c.gpa, s) catch {
             s.destroy();
             return error.Internal;
@@ -679,6 +796,16 @@ const Conn = struct {
             return c.dispatch(s);
         }
 
+        // After this side's GOAWAY: decoded above, because the table has to
+        // stay in step, and refused, because the GOAWAY told the client this
+        // stream was never processed and a client may send it again on a new
+        // connection. Running it here too would run a call twice (§6.8).
+        if (c.goaway_sent) {
+            const id = s.id;
+            c.forget(s);
+            h2.writeRstStream(c.out, id, .refused_stream) catch return error.Gone;
+            return;
+        }
         // Past the cap: refused, which a client reads as "try again", and
         // counted, because a client that keeps doing it is not waiting.
         if (c.streams.items.len > max_streams) {
@@ -696,7 +823,11 @@ const Conn = struct {
     fn onData(c: *Conn, head: h2.Header) ReadError!void {
         if (head.stream == 0) return error.Protocol;
         var len: usize = head.len;
-        // The whole frame counts against the window, padding included (§6.9).
+        // The whole frame counts against the window, padding included (§6.9),
+        // and a client that sends past a window it was given is not sending
+        // HTTP/2 (§6.9.1): the budget below is only a bound if this is held.
+        c.recv_window -= head.len;
+        if (c.recv_window < 0) return error.FlowControl;
         try c.consumed(head.len);
         const pad = try c.padding(head, &len);
         const s = c.find(head.stream) orelse {
@@ -714,6 +845,9 @@ const Conn = struct {
             if (s.state == .headers) return error.Protocol;
             return;
         }
+        if (head.len == 0 and !head.has(h2.Flags.end_stream)) try c.control();
+        s.recv_window -= head.len;
+        if (s.recv_window < 0) return error.FlowControl;
         if (s.body_over_limit or s.body.items.len + len > c.app.max_body + 5) {
             // Past `max_body`: read and dropped, so the connection stays in
             // step, and answered when the client says it is done.
@@ -722,6 +856,8 @@ const Conn = struct {
         } else {
             const dest = s.body.addManyAsSlice(s.arena.allocator(), len) catch return error.Internal;
             c.in.readSliceAll(dest) catch return error.Gone;
+            s.held += len;
+            c.collected += len;
         }
         try c.discard(pad);
         if (head.has(h2.Flags.end_stream)) {
@@ -729,9 +865,61 @@ const Conn = struct {
         } else {
             s.unacked += head.len;
             if (s.unacked >= h2.default_window / 2) {
-                h2.writeWindowUpdate(c.out, s.id, @intCast(s.unacked)) catch return error.Gone;
-                s.unacked = 0;
+                if (c.mayGrow(s)) {
+                    h2.writeWindowUpdate(c.out, s.id, @intCast(s.unacked)) catch return error.Gone;
+                    s.recv_window += s.unacked;
+                    s.unacked = 0;
+                } else if (!s.starved) {
+                    s.starved = true;
+                    c.starved += 1;
+                }
             }
+        }
+    }
+
+    /// What one connection may hold of messages not yet handed to a route:
+    /// one message at `max_body`, which is what an HTTP/1.1 connection holds.
+    /// Past it a call's window is not topped up, so the client waits on it
+    /// rather than this side reading, and all a call can hold beyond the
+    /// budget is the window it was opened with.
+    fn budget(c: *const Conn) usize {
+        return @max(c.app.max_body + 5, h2.default_window);
+    }
+
+    /// Whether this call's window may be topped up now: while the connection
+    /// is under its budget, and always for the oldest call still arriving,
+    /// so that one call can always finish and give its bytes back. Without
+    /// that, calls that each took their first window between them could
+    /// fill the budget with none of them able to end.
+    fn mayGrow(c: *const Conn, s: *const Stream) bool {
+        if (c.collected < c.budget() or s.body_over_limit) return true;
+        for (c.streams.items) |x| if (x.state == .body) return x == s;
+        return false;
+    }
+
+    /// Top up the windows the budget held back, oldest call first, once
+    /// bytes have been given back.
+    fn grantWaiting(c: *Conn) ReadError!void {
+        if (c.starved == 0) return;
+        for (c.streams.items) |s| {
+            if (!s.starved) continue;
+            if (!c.mayGrow(s)) break;
+            h2.writeWindowUpdate(c.out, s.id, @intCast(s.unacked)) catch return error.Gone;
+            s.recv_window += s.unacked;
+            s.unacked = 0;
+            s.starved = false;
+            c.starved -= 1;
+        }
+    }
+
+    /// A call's message is no longer being collected: it has started, or it
+    /// has been let go of. Its bytes leave the budget.
+    fn letGo(c: *Conn, s: *Stream) void {
+        c.collected -= s.held;
+        s.held = 0;
+        if (s.starved) {
+            s.starved = false;
+            c.starved -= 1;
         }
     }
 
@@ -740,6 +928,7 @@ const Conn = struct {
         c.unacked += @intCast(n);
         if (c.unacked >= h2.default_window / 2) {
             h2.writeWindowUpdate(c.out, 0, @intCast(c.unacked)) catch return error.Gone;
+            c.recv_window += c.unacked;
             c.unacked = 0;
         }
     }
@@ -783,6 +972,10 @@ const Conn = struct {
         if (head.len != 4) return error.FrameSize;
         const bytes = try c.take(4);
         const increment = std.mem.readInt(u32, bytes[0..4], .big) & 0x7fff_ffff;
+        // A client reading an answer sends these as it goes, so one while an
+        // answer is being written is progress. One with nothing on the way
+        // is not.
+        if (!c.writing()) try c.control();
         if (head.stream == 0) {
             if (increment == 0) return error.Protocol;
             c.send_window += increment;
@@ -790,6 +983,9 @@ const Conn = struct {
             return;
         }
         const s = c.find(head.stream) orelse return;
+        // Already reset and still running: its answer is going nowhere, and
+        // an RST for every update would be the client making this side write.
+        if (s.reset) return;
         if (increment == 0) {
             h2.writeRstStream(c.out, s.id, .protocol_error) catch return error.Gone;
             c.onReset(s);
@@ -814,6 +1010,11 @@ const Conn = struct {
         }
     }
 
+    fn writing(c: *const Conn) bool {
+        for (c.streams.items) |s| if (s.state == .writing) return true;
+        return false;
+    }
+
     fn find(c: *const Conn, id: u31) ?*Stream {
         for (c.streams.items) |s| if (s.id == id) return s;
         return null;
@@ -828,6 +1029,7 @@ const Conn = struct {
 
     /// Take a stream out of the connection's hands for good.
     fn forget(c: *Conn, s: *Stream) void {
+        c.letGo(s);
         c.remove(s);
         if (c.spares >= max_streams or c.goaway_sent) return s.destroy();
         s.recycle();
@@ -841,6 +1043,10 @@ const Conn = struct {
     /// The client has sent everything. Check the call, take its message out
     /// of its framing, and run it.
     fn dispatch(c: *Conn, s: *Stream) ReadError!void {
+        // A call, answered or run: what ends a run of frames that moved
+        // nothing forward.
+        c.control_run = 0;
+        c.letGo(s);
         const a = s.arena.allocator();
         if (s.headers_over_limit) return c.answerNow(s, 8, "the call's metadata is larger than this server reads");
         if (s.body_over_limit) return c.answerNow(s, 8, "the message is larger than this server's max_body");
@@ -877,9 +1083,20 @@ const Conn = struct {
             return c.answerNow(s, 13, "a unary call carries exactly one message");
         var message: []const u8 = body[5..];
         if (compressed == 1) {
+            // A message marked compressed with no encoding named is the
+            // client's mistake, INTERNAL; an encoding named that this server
+            // does not read is UNIMPLEMENTED, with the ones it does
+            // (gRPC's compression document).
             const encoding = s.field("grpc-encoding") orelse "identity";
-            if (!std.mem.eql(u8, encoding, "gzip"))
-                return c.answerNow(s, 12, "the message is compressed with an encoding this server does not read");
+            if (std.mem.eql(u8, encoding, "identity"))
+                return c.answerNow(s, 13, "the message is marked compressed and grpc-encoding names no compression");
+            if (!std.mem.eql(u8, encoding, "gzip")) {
+                s.head_block = trailersOnlyWith(a, 12, .{ .ours = "the message is compressed with an encoding this server does not read" }, &.{
+                    .{ .name = "grpc-accept-encoding", .value = "identity,gzip" },
+                }) catch return error.Internal;
+                s.trailers_only = true;
+                return c.ready(s);
+            }
             message = encoded.inflate(a, message, c.app.max_body) catch |err| switch (err) {
                 error.BodyTooLarge => return c.answerNow(s, 8, "the message is larger than this server's max_body"),
                 else => return c.answerNow(s, 13, "the message's gzip could not be read"),
@@ -913,7 +1130,7 @@ const Conn = struct {
     /// Answer without running anything: one HEADERS frame carrying the
     /// status, which is what gRPC calls Trailers-Only.
     fn answerNow(c: *Conn, s: *Stream, code: u8, message: []const u8) ReadError!void {
-        s.head_block = trailersOnly(s.arena.allocator(), code, message) catch return error.Internal;
+        s.head_block = trailersOnly(s.arena.allocator(), code, .{ .ours = message }) catch return error.Internal;
         s.trailers_only = true;
         return c.ready(s);
     }
@@ -1008,7 +1225,7 @@ fn runCall(s: *Stream, on_engine: bool) void {
     };
 
     answer(s, &in_flight) catch {
-        s.head_block = trailersOnly(s.arena.allocator(), 13, "the server could not build its answer") catch "";
+        s.head_block = trailersOnly(s.arena.allocator(), 13, .{ .ours = "the server could not build its answer" }) catch "";
         s.trailers_only = true;
     };
 }
@@ -1064,6 +1281,10 @@ fn asRequest(a: std.mem.Allocator, s: *const Stream) ![]const u8 {
         if (f.name.len == 0 or f.name[0] == ':') continue;
         if (hopByHop(f.name)) continue;
         if (std.mem.eql(u8, f.name, "content-length")) continue;
+        // The whole message is already here, so there is nothing to wait
+        // for leave to send; carried, it has `Ctx` write a 100 head in front
+        // of the answer, which `parseResponse` would read as the answer.
+        if (std.mem.eql(u8, f.name, "expect")) continue;
         try out.writeAll(f.name);
         try out.writeAll(": ");
         try out.writeAll(f.value);
@@ -1111,13 +1332,13 @@ fn fromResponse(a: std.mem.Allocator, s: *Stream, raw: []const u8) !void {
         // cut short both read as DEADLINE_EXCEEDED rather than UNAVAILABLE.
         const late = s.until_ns != 0 and bulkhead.monotonicNanos() >= s.until_ns;
         const code = response.grpc_status orelse if (late) 4 else codeForStatus(response.status);
-        const message = response.grpc_message orelse try failureMessage(a, response);
+        const message: Message = if (response.grpc_message) |sent| .{ .routes = sent } else .{ .ours = try failureMessage(a, response) };
         s.head_block = try trailersOnly(a, code, message);
         s.trailers_only = true;
         return;
     }
     if (response.grpc_status) |code| if (code != 0) {
-        s.head_block = try trailersOnly(a, code, response.grpc_message orelse "");
+        s.head_block = try trailersOnly(a, code, .{ .routes = response.grpc_message orelse "" });
         s.trailers_only = true;
         return;
     };
@@ -1262,29 +1483,52 @@ pub fn codeForStatus(status: u16) u8 {
     };
 }
 
+/// What goes out as `grpc-message`, and whose words it is. nilo's own text
+/// is plain and is encoded whole; a route that set the header itself set
+/// what goes on the wire, already encoded, and only what could not be sent
+/// as it is gets encoded.
+const Message = union(enum) {
+    ours: []const u8,
+    routes: []const u8,
+};
+
 /// One HEADERS block carrying a whole failed call: the status, the content
 /// type, `grpc-status` and `grpc-message`.
-fn trailersOnly(a: std.mem.Allocator, code: u8, message: []const u8) ![]const u8 {
+fn trailersOnly(a: std.mem.Allocator, code: u8, message: Message) ![]const u8 {
+    return trailersOnlyWith(a, code, message, &.{});
+}
+
+fn trailersOnlyWith(a: std.mem.Allocator, code: u8, message: Message, extra: []const hpack.Field) ![]const u8 {
     var code_text: [3]u8 = undefined;
     const code_str = std.fmt.bufPrint(&code_text, "{d}", .{code}) catch unreachable;
     var fields: std.ArrayList(hpack.Field) = .empty;
     try fields.append(a, .{ .name = ":status", .value = "200" });
     try fields.append(a, .{ .name = "content-type", .value = "application/grpc" });
     try fields.append(a, .{ .name = "grpc-status", .value = try a.dupe(u8, code_str) });
-    if (message.len != 0) try fields.append(a, .{ .name = "grpc-message", .value = try percentEncoded(a, message) });
+    const text, const encoded_already = switch (message) {
+        .ours => |t| .{ t, false },
+        .routes => |t| .{ t, true },
+    };
+    if (text.len != 0) try fields.append(a, .{ .name = "grpc-message", .value = try percentEncoded(a, text, encoded_already) });
+    try fields.appendSlice(a, extra);
     return encodeBlock(a, fields.items);
 }
 
 /// `grpc-message` is percent-encoded: everything outside printable ASCII,
-/// and `%` itself (gRPC over HTTP/2, "Responses").
-fn percentEncoded(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+/// and `%` itself (gRPC over HTTP/2, "Responses"). With `encoded_already`, a
+/// `%` that starts a well-formed escape is kept as the escape it is, so a
+/// route's `caf%C3%A9` reaches the client as `café` and not as the text
+/// `caf%C3%A9`.
+fn percentEncoded(a: std.mem.Allocator, text: []const u8, encoded_already: bool) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    for (text) |ch| {
-        if (ch < 0x20 or ch > 0x7e or ch == '%') {
+    for (text, 0..) |ch, i| {
+        const escape = encoded_already and ch == '%' and i + 2 < text.len and
+            std.ascii.isHex(text[i + 1]) and std.ascii.isHex(text[i + 2]);
+        if (!escape and (ch < 0x20 or ch > 0x7e or ch == '%')) {
             try out.print(a, "%{X:0>2}", .{ch});
         } else try out.append(a, ch);
     }
-    return out.items;
+    return out.toOwnedSlice(a);
 }
 
 fn encodeBlock(a: std.mem.Allocator, fields: []const hpack.Field) ![]const u8 {
@@ -1471,6 +1715,13 @@ fn missingRoute(_: *Ctx) anyerror!void {
     return fail.notFound("no such order", .{});
 }
 
+/// A route saying its own status, with a message it encoded itself.
+fn refusingRoute(c: *Ctx) anyerror!void {
+    try c.setHeader("grpc-status", "9");
+    try c.setHeader("grpc-message", "caf%C3%A9 is 50%25 off");
+    try c.send(200, "application/grpc", "");
+}
+
 fn metadataRoute(c: *Ctx) anyerror!void {
     const who = if (c.header("x-caller")) |v| v.view() else "nobody";
     try c.setHeader("x-seen", who);
@@ -1490,6 +1741,7 @@ fn testApp() !App {
     try app.post("/test.Orders/Get", missingRoute);
     try app.post("/test.Meta/Who", metadataRoute);
     try app.post("/test.Clock/Check", clockRoute);
+    try app.post("/test.Status/Refuse", refusingRoute);
     try app.resolveChains();
     return app;
 }
@@ -1617,7 +1869,138 @@ test "a compressed message in an encoding this server does not read is UNIMPLEME
 
     var got = try converse(&app, &client);
     defer got.deinit();
-    try testing.expectEqualStrings("12", Answer.value(try got.trailers(1), "grpc-status").?);
+    const trailers = try got.trailers(1);
+    try testing.expectEqualStrings("12", Answer.value(trailers, "grpc-status").?);
+    // And says which it does read, so the client can send again in one.
+    try testing.expectEqualStrings("identity,gzip", Answer.value(trailers, "grpc-accept-encoding").?);
+}
+
+/// `n` bytes of one message's DATA on `stream`, in frames of 16,000, the
+/// first starting with the length prefix of a message `total` bytes long.
+fn sendPart(client: *TestClient, stream: u31, n: usize, total: ?u32, end: bool) !void {
+    var left = n;
+    var first = total != null;
+    while (left > 0) {
+        const len = @min(left, 16_000);
+        left -= len;
+        try h2.writeHeader(client.w(), len, .data, if (end and left == 0) h2.Flags.end_stream else 0, stream);
+        var written: usize = 0;
+        if (first) {
+            try client.w().writeByte(0);
+            var prefix: [4]u8 = undefined;
+            std.mem.writeInt(u32, &prefix, total.?, .big);
+            try client.w().writeAll(&prefix);
+            written = 5;
+            first = false;
+        }
+        try client.w().splatByteAll('m', len - written);
+    }
+}
+
+fn windowUpdateAt(got: *const Answer, stream: u31) ?usize {
+    for (got.frames.items, 0..) |f, i| if (f.head.type == .window_update and f.head.stream == stream) return i;
+    return null;
+}
+
+test "calls still arriving hold one max_body between them, and the rest wait on their windows" {
+    var app = try testApp();
+    defer app.deinit();
+    app.limits.max_body = 200_000;
+    var client = try TestClient.init();
+    defer client.deinit();
+
+    // Four calls of 64,000 bytes each, inside the window every call opens
+    // with. The fourth takes the connection past its budget, so its window
+    // is not topped up: the client would have to wait on it.
+    for ([_]u31{ 1, 3, 5, 7 }) |id| {
+        try client.headersFor(id, "/test.Echo/Say", &.{}, false);
+        try sendPart(&client, id, 64_000, 79_995, false);
+    }
+    // The first call ends, runs, and gives its bytes back.
+    try sendPart(&client, 1, 16_000, null, true);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expect(windowUpdateAt(&got, 1) != null);
+    try testing.expect(windowUpdateAt(&got, 3) != null);
+    try testing.expect(windowUpdateAt(&got, 5) != null);
+    // Stream 7 is topped up, but only once stream 1 was answered.
+    const answered = for (got.frames.items, 0..) |f, i| {
+        if (f.head.type == .headers and f.head.stream == 1) break i;
+    } else return error.NotAnswered;
+    const seven = windowUpdateAt(&got, 7) orelse return error.NeverToppedUp;
+    try testing.expect(seven > answered);
+}
+
+test "a client that sends past the window it was given is sent away" {
+    var app = try testApp();
+    defer app.deinit();
+    app.limits.max_body = 200_000;
+    var client = try TestClient.init();
+    defer client.deinit();
+    for ([_]u31{ 1, 3, 5, 7 }) |id| {
+        try client.headersFor(id, "/test.Echo/Say", &.{}, false);
+        try sendPart(&client, id, 64_000, 150_000, false);
+    }
+    // Stream 7's window was held back, and 16,000 more is past the 65,535
+    // it opened with. A budget is only a bound if the window is held to.
+    try sendPart(&client, 7, 16_000, null, false);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqual(h2.ErrorCode.flow_control_error, got.goaway().?);
+}
+
+test "a message marked compressed with no grpc-encoding is INTERNAL" {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    try client.headersFor(1, "/test.Echo/Say", &.{}, false);
+    try client.message(1, "whatever", true);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqualStrings("13", Answer.value(try got.trailers(1), "grpc-status").?);
+}
+
+test "a call carrying expect: 100-continue is answered by its route, not by the 100" {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    try client.headersFor(1, "/test.Echo/Say", &.{.{ .name = "expect", .value = "100-continue" }}, false);
+    try client.message(1, "still here", false);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqualStrings("0", Answer.value(try got.trailers(1), "grpc-status").?);
+    try testing.expectEqualStrings("still here", try got.message(1));
+}
+
+test "a grpc-message the route encoded itself goes out as it wrote it" {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    try client.call(1, "/test.Status/Refuse", "");
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    const trailers = try got.trailers(1);
+    try testing.expectEqualStrings("9", Answer.value(trailers, "grpc-status").?);
+    try testing.expectEqualStrings("caf%C3%A9 is 50%25 off", Answer.value(trailers, "grpc-message").?);
+}
+
+test "nilo's own grpc-message is encoded whole, a percent sign included" {
+    const a = testing.allocator;
+    const out = try percentEncoded(a, "50% off, caf\xc3\xa9", false);
+    defer a.free(out);
+    try testing.expectEqualStrings("50%25 off, caf%C3%A9", out);
+    // A route's own escapes are kept; a stray percent in it is still encoded.
+    const kept = try percentEncoded(a, "%C3%A9 and 5%", true);
+    defer a.free(kept);
+    try testing.expectEqualStrings("%C3%A9 and 5%25", kept);
 }
 
 test "a message larger than max_body is RESOURCE_EXHAUSTED, and the route never sees it" {
@@ -1775,6 +2158,82 @@ test "a flood of PINGs with no call between them is sent away" {
     var got = try converse(&app, &client);
     defer got.deinit();
     try testing.expectEqual(h2.ErrorCode.enhance_your_calm, got.goaway().?);
+}
+
+test "a stream opened and reset before it runs counts toward the flood, however many streams it takes" {
+    // HEADERS then RST_STREAM costs a decoded block and a stream, and used
+    // to reset the count PING and SETTINGS are held to, so the pair walked
+    // round it for ever.
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    var id: u31 = 1;
+    for (0..max_control_run + 1) |_| {
+        try client.headersFor(id, "/test.Echo/Say", &.{}, false);
+        try h2.writeRstStream(client.w(), id, .cancel);
+        id += 2;
+    }
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqual(h2.ErrorCode.enhance_your_calm, got.goaway().?);
+}
+
+test "a flood of frames of a type nobody knows is sent away" {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    for (0..max_control_run + 1) |_| try h2.writeHeader(client.w(), 0, @enumFromInt(0x20), 0, 0);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqual(h2.ErrorCode.enhance_your_calm, got.goaway().?);
+}
+
+/// The App a route asks to stop, from inside a call, which is the moment a
+/// SIGTERM lands on a busy connection.
+var stopping_app: *App = undefined;
+var calls_after_stop: u32 = 0;
+
+fn stopRoute(c: *Ctx) anyerror!void {
+    stopping_app.stop.request();
+    try c.send(200, "application/grpc", "");
+}
+
+fn countedRoute(c: *Ctx) anyerror!void {
+    calls_after_stop += 1;
+    try c.send(200, "application/grpc", "");
+}
+
+test "a stream opened after the server's GOAWAY is refused, and the ones before it are answered" {
+    // The GOAWAY tells the client a later stream was never processed, and a
+    // client may send it again on a new connection. Running it here as well
+    // would run the call twice.
+    var app = try testApp();
+    defer app.deinit();
+    try app.post("/test.Stop/Now", stopRoute);
+    try app.post("/test.Counted/Once", countedRoute);
+    try app.resolveChains();
+    stopping_app = &app;
+    calls_after_stop = 0;
+
+    var client = try TestClient.init();
+    defer client.deinit();
+    // Stream 1 is still being sent when the stop lands, so the connection
+    // stays open for it and reads what comes after.
+    try client.headersFor(1, "/test.Echo/Say", &.{}, false);
+    try client.call(3, "/test.Stop/Now", "");
+    try client.call(5, "/test.Counted/Once", "");
+    try client.message(1, "still owed", false);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqual(h2.ErrorCode.refused_stream, got.rst(5).?);
+    try testing.expectEqual(@as(u32, 0), calls_after_stop);
+    try testing.expectEqualStrings("0", Answer.value(try got.trailers(1), "grpc-status").?);
+    try testing.expectEqualStrings("still owed", try got.message(1));
 }
 
 test "a client that is not speaking HTTP/2 is told so in HTTP/1.1, and the connection closed" {

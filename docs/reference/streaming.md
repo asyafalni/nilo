@@ -41,6 +41,8 @@ the 404 a file that was never there gets.
 | `e.live()` | false once the server is stopping |
 | `e.close()` | |
 
+Text that runs over lines is split where the browser would split it, at LF, CRLF **and a lone CR**, so `data` and `comment` go out as one field per line and a value cannot start an event of its own. `name` and `id` are one line by definition: a CR or LF in either, or in `json`'s name, is `error.EventFieldBreaksLine`, and nothing is written.
+
 ## `Body`
 
 | | |
@@ -144,8 +146,10 @@ connections, and nothing handles an incoming broadcast. `receive` writes those
 out on the way past, from the fiber that owns the socket — which is why one
 client that stops reading costs that client and nobody else.
 
-`defer room.leave(&socket)` is not optional. Zig has no destructor, and a seat
-nobody gives up is one the next connection cannot have.
+`defer room.leave(&socket)` gives the seat up as soon as the handler is done
+with the room. When the loop returns, nilo gives up any seat still taken, so a
+forgotten `leave` costs the seat until then and nothing after. A socket sits in
+one room at a time: joining a second is `error.AlreadySeated`.
 
 Sizing a room generously is a memory decision and nothing else: `join` and
 `say` both cost what the room *holds*, not what it was sized for, and a `say`

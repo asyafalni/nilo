@@ -19,7 +19,7 @@ So the Failure is bound to the **fiber**, through `zio.TaskLocal`: the value sti
 
 Because only `http/engine/` may name zio (ADR 001), this joins the Bulkhead contract as one pointer bound to the unit of work currently running — `bindSlot`/`unbindSlot`/`slot`. An Engine built on ordinary threads rather than fibers satisfies the same contract with a `threadlocal`.
 
-Outside the Engine there are no fibers at all — unit tests call `App` directly with in-memory buffers. For that the Bulkhead keeps a threadlocal fallback, used only when the fiber slot is empty. On a real server the fiber slot always exists and always wins, so the fallback is never read.
+Outside the Engine there are no fibers at all — unit tests call `App` directly with in-memory buffers. For that the Bulkhead keeps a threadlocal fallback, set only where no fiber slot is bound and used only when the fiber slot is empty. On a real server a connection's fiber slot always exists and always wins; the fallback is read only by a fiber that has no slot, one from `spawn`, which is why nothing on a server may leave it set on an executor thread ([ADR 028](./028-a-spawned-fiber-belongs-to-the-server.md)).
 
 One small departure from ADR 004: the message is not stored in the request arena but in a fixed buffer inside the Failure. The failure path must not have a failure path of its own — running out of memory while trying to report an error is the last place anyone wants to think about. The consequence is that messages are capped at 240 bytes and longer ones are truncated.
 

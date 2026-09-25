@@ -47,7 +47,7 @@ Everything but the list stays comptime.
 | | |
 |---|---|
 | `nilo.cors.Origins` | where the list lives. `.empty` to start; a `var` that outlives the App |
-| `o.set(&.{ … })` | take a list you assembled. `error.OriginNotLowercase`, `.OriginEmpty`, `.OriginIsWildcard` |
+| `o.set(&.{ … })` | take a list you assembled. `error.OriginNotLowercase`, `.OriginEmpty`, `.OriginIsWildcard`, `.OriginNotAnOrigin` (`null`, a path, no scheme) |
 | `o.setSplit(&buf, text)` | split `"https://a.com,https://b.com"` into `buf`, which is yours. `error.TooManyOrigins` past its length |
 | `nilo.cors.reading(&o, .{ … })` | the middleware. `.origins` in the options is a compile error — the list is `o`'s |
 
@@ -124,12 +124,16 @@ matched and answered. That is `max_connections`.
 for everything the application knows: ten accounts behind one office NAT share
 an allowance they should not, and one account on ten machines gets ten.
 
+<!-- compiles -->
 ```zig
-fn account(c: *nilo.Ctx) ?nilo.Str {
-    const who = c.session(Account) orelse return null;
-    return who.id;
+fn account(c: *nilo.Ctx) ?[]const u8 {
+    const session = c.resolve(nilo.Session(Signed)) catch return null;
+    const who = session.get() orelse return null;
+    return std.fmt.allocPrint(c.arena(), "{d}", .{who.user}) catch null;
 }
+```
 
+```zig
 try app.useOn("/api", nilo.allowance.keyed(account, .{
     .per_window = 1000,
     .on_null = .reject,

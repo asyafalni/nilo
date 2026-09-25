@@ -30,6 +30,7 @@ const openapi = @import("openapi.zig");
 const budget = @import("budget.zig");
 const watchdog = @import("watchdog.zig");
 const websocket = @import("websocket.zig");
+const room_mod = @import("room.zig");
 const metrics_mod = @import("metrics.zig");
 const nilo_testing = @import("testing.zig");
 const form_mod = @import("form.zig");
@@ -1585,6 +1586,53 @@ fn takeDeep(incoming: Deep0) !struct { value: u32 } {
     return .{ .value = incoming.down.down.down.down.down.down.down.down.down.value };
 }
 
+/// A comment tree: the shape of body `std.json` reads by recursing once per
+/// level, with nothing but the stack to stop it.
+const TreeNode = struct { name: []const u8 = "", c: []const TreeNode = &.{} };
+
+fn takeTree(tree: TreeNode) !struct { children: usize } {
+    return .{ .children = tree.c.len };
+}
+
+test "a body whose type holds itself is refused past the nesting it may have, before it is parsed" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/tree", takeTree);
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    const levels = ctx_mod.max_json_nesting / 2;
+    const cases = [_]struct { body: []const u8, status: []const u8 }{
+        // Two levels a node, one past the limit: refused, where twenty
+        // thousand of these used to take the process down.
+        .{ .body = "{\"c\":[" ** (levels + 1) ++ "{}" ++ "]}" ** (levels + 1), .status = "400" },
+        // At the limit, and read.
+        .{ .body = "{\"c\":[" ** (levels - 1) ++ "{}" ++ "]}" ** (levels - 1), .status = "200" },
+        // Brackets inside a string are text, not nesting.
+        .{ .body = "{\"name\":\"" ++ "[{" ** 100 ++ "\\\"\",\"c\":[]}", .status = "200" },
+    };
+
+    for (cases) |case| {
+        var request_buf: [2048]u8 = undefined;
+        const request = try std.fmt.bufPrint(
+            &request_buf,
+            "POST /tree HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n{s}",
+            .{ case.body.len, case.body },
+        );
+        const response = h.send(&app, request).response;
+        testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 ") and
+            std.mem.startsWith(u8, response["HTTP/1.1 ".len..], case.status)) catch |err| {
+            std.debug.print("body {s}\n  got: {s}\n", .{ case.body, response });
+            return err;
+        };
+        if (case.status[0] == '4') try testing.expect(try Harness.saysFailure(
+            response,
+            "the body nests deeper than 64 levels, which is as deep as this endpoint reads",
+        ));
+    }
+}
+
 test "a body nested past the depth the walk follows says so, rather than nothing" {
     var app = App.init(testing.allocator);
     defer app.deinit();
@@ -2518,6 +2566,34 @@ test "a Set-Cookie set as a plain header is checked like every other one" {
     const result = h.send(&app, "GET /c HTTP/1.1\r\nHost: t\r\n\r\n");
     try testing.expect(std.mem.indexOf(u8, result.response, "X-Injected") == null);
     try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 500 "));
+}
+
+/// A MIME type handed on from somewhere the handler does not control: an
+/// upload's declared type, an upstream's answer.
+fn splittingContentType(c: *Ctx) anyerror!void {
+    try c.send(200, "text/plain\r\nX-Injected: yes", "ok");
+}
+
+fn splittingStreamType(c: *Ctx) anyerror!void {
+    var body = try c.stream(200, "text/plain\r\nX-Injected: yes");
+    try body.finish();
+}
+
+test "a content type carrying a newline is refused like any other header value" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/sent", splittingContentType);
+    try app.get("/streamed", splittingStreamType);
+
+    for ([_][]const u8{ "/sent", "/streamed" }) |path| {
+        var h = Harness.init();
+        defer h.deinit();
+        var req: [64]u8 = undefined;
+        const result = h.send(&app, try std.fmt.bufPrint(&req, "GET {s} HTTP/1.1\r\nHost: t\r\n\r\n", .{path}));
+        try testing.expect(std.mem.indexOf(u8, result.response, "X-Injected") == null);
+        try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 500 "));
+        try testing.expect(try Harness.saysFailure(result.response, "carriage return or a newline"));
+    }
 }
 
 fn brokenHeaderName(c: *Ctx) anyerror!void {
@@ -5196,6 +5272,11 @@ test "docs can be asked for before or after the routes, and both pages appear" {
     const page = h.send(&app, "GET /reference HTTP/1.1\r\nHost: t\r\n\r\n");
     try testing.expect(std.mem.indexOf(u8, page.response, "Content-Type: text/html") != null);
     try testing.expect(std.mem.indexOf(u8, page.response, "data-url=\"/openapi.json\"") != null);
+    // The script it loads runs in this origin beside the session cookie, so
+    // it is one version and one file, held by its hash.
+    try testing.expect(std.mem.indexOf(u8, page.response, "@scalar/api-reference@") != null);
+    try testing.expect(std.mem.indexOf(u8, page.response, " integrity=\"sha384-") != null);
+    try testing.expect(std.mem.indexOf(u8, page.response, " crossorigin=\"anonymous\"") != null);
 }
 
 test "no docs asked for, no documents served" {
@@ -6151,6 +6232,38 @@ fn echoLoop(socket: *websocket.Socket) anyerror!void {
 const upgrade_request = "GET /ws HTTP/1.1\r\nHost: x\r\n" ++
     "Upgrade: websocket\r\nConnection: Upgrade\r\n" ++
     "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+
+/// The room `joinAndForgetLoop` sits in. A loop's state is its own; a test
+/// that reads the room after the connection is over needs it out here.
+var forgetful_room: *room_mod.Room = undefined;
+
+fn joinAndForget(c: *Ctx) anyerror!void {
+    return c.upgrade(joinAndForgetLoop, {});
+}
+
+fn joinAndForgetLoop(socket: *websocket.Socket) anyerror!void {
+    try forgetful_room.join(socket);
+    while (try socket.receive()) |_| {}
+}
+
+test "a seat a WebSocket loop never gave up is given up when the loop returns" {
+    // The seat's bell is in the connection's frame. Left taken, the next
+    // `say` rings it after that frame has returned (ADR 082).
+    var room = try room_mod.Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 2 });
+    defer room.deinit();
+    forgetful_room = &room;
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/ws", joinAndForget);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(&app, upgrade_request);
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 101"));
+    try testing.expectEqual(@as(usize, 0), room.count());
+    try room.sayText("nobody is here");
+}
 
 test "a WebSocket handshake is answered with the key every client checks" {
     var app = App.init(testing.allocator);
@@ -7118,6 +7231,61 @@ test "a range is served from the plain file even when gzip was offered" {
     try testing.expect(std.mem.startsWith(u8, answer.response, "HTTP/1.1 206"));
     try testing.expect(std.mem.indexOf(u8, answer.response, "Content-Encoding") == null);
     try testing.expect(std.mem.endsWith(u8, answer.response, test_css[0..5]));
+}
+
+test "response compression leaves a static range as the plain bytes it names" {
+    // Static files answer through `Ctx.send`, the same door compression sits
+    // in. A 206 gzipped there carries a Content-Range counted in plain bytes
+    // over a body that is not them.
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.compress(.{ .min_bytes = 1 });
+    try app.static_sets.append(testing.allocator, try static_mod.fromMemory(testing.allocator, &.{.{
+        .url = "/app.css",
+        .bytes = test_css,
+        .content_type = "text/css",
+    }}));
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    const answer = h.send(
+        &app,
+        "GET /app.css HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nRange: bytes=0-1999\r\n\r\n",
+    );
+    try testing.expect(std.mem.startsWith(u8, answer.response, "HTTP/1.1 206"));
+    try testing.expect(std.mem.indexOf(u8, answer.response, "Content-Encoding") == null);
+    try testing.expect(std.mem.endsWith(u8, answer.response, test_css[0..2000]));
+}
+
+test "response compression does not gzip a static file that has no gzipped copy" {
+    // Too short for a copy at load, long enough for `min_bytes`. Gzipped per
+    // request it would go out under the plain file's strong ETag, and a
+    // cache holding it could hand gzip to a client that cannot read it.
+    const text = "plain text that was not worth a gzipped copy at load. " ** 10;
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.compress(.{ .min_bytes = 16 });
+    try app.static_sets.append(testing.allocator, try static_mod.fromMemory(testing.allocator, &.{.{
+        .url = "/notes.txt",
+        .bytes = text,
+        .content_type = "text/plain",
+    }}));
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    var plain_buf: [128]u8 = undefined;
+    const plain = h.send(&app, "GET /notes.txt HTTP/1.1\r\nHost: t\r\n\r\n");
+    const plain_etag = try dupeHeader(&plain_buf, plain.response, "ETag");
+
+    var offered_buf: [128]u8 = undefined;
+    const offered = h.send(&app, "GET /notes.txt HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, offered.response, "Content-Encoding") == null);
+    try testing.expect(std.mem.endsWith(u8, offered.response, text));
+    try testing.expectEqualStrings(plain_etag, try dupeHeader(&offered_buf, offered.response, "ETag"));
 }
 
 test "a file too small to be worth gzipping has one representation and no Vary" {

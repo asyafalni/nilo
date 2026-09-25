@@ -1428,7 +1428,7 @@ const refusals = [_]Refusal{
         .name = "idempotent_handler_returns_a_file",
         .says = "the handler for route \"/receipts\" takes an `Idempotent(…)` and returns a nilo.FileBody, which is not an answer nilo can keep.",
     },
-    // The eight ways to ask for an answer served again that nilo cannot
+    // The nine ways to ask for an answer served again that nilo cannot
     // serve (ADR 188).
     .{
         .name = "cached_not_a_bytes_space",
@@ -1445,6 +1445,10 @@ const refusals = [_]Refusal{
     .{
         .name = "cached_by_a_credential",
         .says = "the `Cached(cached_by_a_credential.Pages, …)` on route \"/pages\" keys its answers on the `Cookie` header, and a credential is not a key.",
+    },
+    .{
+        .name = "cached_beside_the_caller",
+        .says = "the handler for route \"/me\" takes a `Cached(…)` (argument 1) and a nilo.Session(cached_beside_the_caller.Signed) (argument 2), which says who the caller is.",
     },
     .{
         .name = "cached_on_a_post",
@@ -1551,6 +1555,14 @@ const refusals = [_]Refusal{
     .{
         .name = "cors_origin_with_a_capital_letter",
         .says = "the cors origin \"https://Example.com\" has a capital letter in it, and a browser sends its origin lowercased.",
+    },
+    .{
+        .name = "cors_origin_null",
+        .says = "cors was told to trust the origin \"null\", which is what a sandboxed frame or a `file:` page sends, and any site can make one.",
+    },
+    .{
+        .name = "cors_origin_with_a_path",
+        .says = "the cors origin \"https://example.com/\" is not an origin, so no request would ever match it.",
     },
     .{
         .name = "cors_reading_with_origins_named_too",

@@ -31,7 +31,7 @@ A guard that only ever passed and a guard that cannot fail look identical from o
 ## The rule in force
 
 1. **A new comptime check ships with a file in `refusals/` and a row in its module's table**, and `zig build test` compiles the file and asserts the message's first line, minus the `nilo: ` prefix the step itself supplies, so a check that stops inside `std` cannot be recorded as passing. [ADR 026](../adr/026-the-rule-about-error-messages-is-held-by-a-build-step.md)
-2. **Refusals never cache.** The compiler keeps nothing from a failed compilation, so all 170 files under `refusals/` are re-analysed on every `zig build test`. [ADR 026](../adr/026-the-rule-about-error-messages-is-held-by-a-build-step.md)
+2. **Refusals never cache.** The compiler keeps nothing from a failed compilation, so every file under `refusals/` is re-analysed on every `zig build test`. [ADR 026](../adr/026-the-rule-about-error-messages-is-held-by-a-build-step.md)
 3. **A guard ships with the observation of it failing**: a test reverted against the old behaviour first choice, a counter-test proving it stays quiet on correct code second, a recorded measurement only where neither is possible. [ADR 032](../adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
 4. **A number saying a cost went away on its own gets more scrutiny than one saying work made something faster.** A good result nobody worked for has nobody to check it against. [ADR 032](../adr/032-a-guard-is-not-a-guard-until-it-has-been-seen-to-fail.md)
 5. **`std`'s own `std.log.default_level` says which optimize mode the root was built at**, read as `wiring.program_mode`, `null` standing for the `ReleaseFast`/`ReleaseSmall` pair rather than guessing between them; the comparison is comptime and compiles away on a matching build. [ADR 069](../adr/069-a-library-can-tell-what-mode-the-program-was-built-in.md)
@@ -64,6 +64,5 @@ Beside this topic: the second `Content-Length` and second `Host` that make a han
 
 ## Open
 
-- **A WebSocket route cannot be driven by the test client.** `Client` has no way to hand the App a reader that answers frames; ADR 086 calls it a design of its own rather than a fourth method, and it is not currently a line in [the roadmap](../roadmap.md).
 - **The location half of ADR 014's message rule is untested for everything but route registration.** Nothing asserts that a reader's own line stays first in the reference trace elsewhere, because the build system has no way to assert on one, as recorded in ADR 026's consequences.
 

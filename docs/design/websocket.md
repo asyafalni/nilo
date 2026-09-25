@@ -60,7 +60,7 @@ Beside this topic: a handler that ignores the server's stopping flag holds the d
 
 ## Open
 
-- **The Autobahn suite (`wstest`) does not run against nilo yet.** The close-code and UTF-8 rules were written from RFC 6455 directly rather than from a failing report; wiring it up is on [the roadmap](../roadmap.md) as a known gap.
+- **The Autobahn suite (`wstest`) runs by hand, not on `zig build test`.** `bench/autobahn/run.sh` drives it, and the last run passed 294 cases and failed none ([history](../history.md)); nothing re-runs it when the frame reader changes.
 - **`permessage-deflate` is not implemented.** Negotiating it needs a compressor per connection, which is memory nilo has not budgeted, per [ADR 021](../adr/021-a-websocket-is-a-handler-that-does-not-return.md).
 - **`Room.leave`'s narrow cancellation window has no test.** Reproducing it needs a broadcast in flight and a cancellation landing between two instructions, which the suite has no way to drive today, per [ADR 082](../adr/082-a-cleanup-path-is-not-cancellable.md).
 - **A short-lived socket that sends large messages still pays an `mmap` a connection.** [ADR 216](../adr/216-a-message-that-arrived-whole-is-handed-over-where-it-lies.md) narrowed the free-list cost to that shape and says nothing has asked about it since.

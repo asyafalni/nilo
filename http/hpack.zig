@@ -388,11 +388,14 @@ pub const Decoder = struct {
             self.evictTo(0);
             return;
         }
-        self.evictTo(self.capacity - weight);
+        // Copied before anything is evicted: a literal whose name is indexed
+        // points into this table, and the entry it points at may be one of
+        // the ones about to go (§4.4 allows exactly that reference).
         const bytes = try self.gpa.alloc(u8, f.name.len + f.value.len);
         errdefer self.gpa.free(bytes);
         @memcpy(bytes[0..f.name.len], f.name);
         @memcpy(bytes[f.name.len..], f.value);
+        self.evictTo(self.capacity - weight);
         try self.entries.append(self.gpa, .{ .bytes = bytes, .name_len = @intCast(f.name.len) });
         self.size += weight;
     }
@@ -448,32 +451,43 @@ pub const Decoder = struct {
             if (first and self.owed_update) return error.Compression;
             first = false;
 
+            // A field that points into the client's table is counted before
+            // anything is copied, and copied only if it is kept. Copying first
+            // was a bomb: one byte on the wire names an entry of up to the
+            // table's size, so a block of references to one 4 KB entry cost
+            // four thousand times its length in arena before the limit was
+            // looked at.
             var field: Field = undefined;
+            var in_table = false;
+            var incremental = false;
             if (b & 0x80 != 0) {
                 const found = try self.lookup(try readInt(block, &pos, 7));
-                field = if (found.static) found.field else .{
-                    .name = try arena.dupe(u8, found.field.name),
-                    .value = try arena.dupe(u8, found.field.value),
-                };
+                field = found.field;
+                in_table = !found.static;
             } else {
                 // With incremental indexing the index has six bits; without
                 // it, and never-indexed, four (§6.2).
-                const incremental = b & 0xc0 == 0x40;
+                incremental = b & 0xc0 == 0x40;
                 const index = if (incremental) try readInt(block, &pos, 6) else try readInt(block, &pos, 4);
                 const name = if (index == 0) try readString(block, &pos, arena) else name: {
                     const found = try self.lookup(index);
-                    break :name if (found.static) found.field.name else try arena.dupe(u8, found.field.name);
+                    in_table = !found.static;
+                    break :name found.field.name;
                 };
-                const value = try readString(block, &pos, arena);
-                field = .{ .name = name, .value = value };
-                if (incremental) try self.insert(field);
+                field = .{ .name = name, .value = try readString(block, &pos, arena) };
             }
+
             listed += field.name.len + field.value.len + entry_overhead;
-            if (listed > max_list) {
-                result.over_limit = true;
-                continue;
-            }
-            try out.append(arena, field);
+            const kept = listed <= max_list;
+            if (!kept) result.over_limit = true;
+            // Before the insert below, which may evict the entry these bytes
+            // are in. What goes into the table is copied by `insert` itself.
+            if (kept and in_table) field = .{
+                .name = try arena.dupe(u8, field.name),
+                .value = if (b & 0x80 != 0) try arena.dupe(u8, field.value) else field.value,
+            };
+            if (incremental) try self.insert(field);
+            if (kept) try out.append(arena, field);
         }
         if (first and self.owed_update) return error.Compression;
         return result;
@@ -765,6 +779,68 @@ test "headers past the list limit are dropped and said so, and the table still m
     try testing.expect(got.over_limit);
     try testing.expect(out.items.len < 4);
     try testing.expectEqual(@as(u32, 57), d.size);
+}
+
+/// One 4,000-byte entry inserted into the client's table, then `refs` copies
+/// of a reference to it, each a byte or three on the wire.
+fn tableBomb(gpa: std.mem.Allocator, reference: []const u8, refs: usize) ![]u8 {
+    var block: std.ArrayList(u8) = .empty;
+    errdefer block.deinit(gpa);
+    // Literal with incremental indexing, new name `x`, a 4,000-byte value:
+    // 4,000 is 127 in the 7-bit prefix and 3,873 after it.
+    try block.appendSlice(gpa, &.{ 0x40, 0x01, 'x', 0x7f, 0xa1, 0x1e });
+    try block.appendNTimes(gpa, 'v', 4000);
+    for (0..refs) |_| try block.appendSlice(gpa, reference);
+    return block.toOwnedSlice(gpa);
+}
+
+test "a block of references to one large entry costs the list limit, not the references" {
+    // Indexed field 62 (`0xbe`), and a literal never indexed whose name is
+    // index 62 with an empty value (`0x0f 0x2f 0x00`): both used to copy the
+    // entry into the arena before the limit was counted, 277 MB from 60 KB.
+    for ([_][]const u8{ &.{0xbe}, &.{ 0x0f, 0x2f, 0x00 } }) |reference| {
+        var d = Decoder.init(testing.allocator);
+        defer d.deinit();
+        const block = try tableBomb(testing.allocator, reference, 20_000);
+        defer testing.allocator.free(block);
+
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var out: std.ArrayList(Field) = .empty;
+        const max_list = 16 * 1024;
+        const got = try d.decode(block, arena_state.allocator(), &out, max_list);
+
+        try testing.expect(got.over_limit);
+        // What is left is the kept fields and the list growing to hold them:
+        // 22 KB and 83 KB, where copying before counting took 80 MB.
+        try testing.expect(arena_state.queryCapacity() < 256 * 1024);
+    }
+}
+
+test "a literal named by the entry its own insert evicts keeps that name" {
+    // `abc: 1` goes in, then a literal indexed by name 62 (that entry) whose
+    // value is large enough that inserting it evicts the entry its name is
+    // in. The name has to be copied before the eviction, kept or not.
+    for ([_]usize{ 1024 * 1024, 0 }) |max_list| {
+        var d = Decoder.init(testing.allocator);
+        defer d.deinit();
+        var block: std.ArrayList(u8) = .empty;
+        defer block.deinit(testing.allocator);
+        try block.appendSlice(testing.allocator, &.{ 0x40, 0x03, 'a', 'b', 'c', 0x01, '1' });
+        // Incremental, name index 62 (`0x7e`), value of 4,030 bytes: 127 in
+        // the prefix and 3,903 after it.
+        try block.appendSlice(testing.allocator, &.{ 0x7e, 0x7f, 0xbf, 0x1e });
+        try block.appendNTimes(testing.allocator, 'z', 4030);
+
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var out: std.ArrayList(Field) = .empty;
+        _ = try d.decode(block.items, arena_state.allocator(), &out, max_list);
+
+        try testing.expectEqual(@as(usize, 1), d.entries.items.len);
+        try testing.expectEqualStrings("abc", d.entries.items[0].field().name);
+        if (max_list != 0) try testing.expectEqualStrings("abc", out.items[1].name);
+    }
 }
 
 test "what the encoder writes, this decoder reads, and it inserts nothing" {

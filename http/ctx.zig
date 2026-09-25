@@ -1216,6 +1216,7 @@ pub const Ctx = struct {
     /// other Str (ADR 003).
     pub fn json(self: *Ctx, comptime T: type) !T {
         const b = (try self.body()).view();
+        try refuseTooDeep(T, b);
         var value = std.json.parseFromSliceLeaky(T, self._arena, b, .{}) catch |err|
             return describeBadBody(T, self._arena, b, err);
         str_mod.stamp(&value, self._lifetime);
@@ -1284,6 +1285,7 @@ pub const Ctx = struct {
         outcomes: *[@typeInfo(T).@"struct".fields.len]convert.Outcome,
     ) !T {
         const b = (try self.body()).view();
+        try refuseTooDeep(T, b);
         if (std.json.parseFromSliceLeaky(T, self._arena, b, .{})) |parsed| {
             var value = parsed;
             str_mod.stamp(&value, self._lifetime);
@@ -1407,6 +1409,23 @@ pub const Ctx = struct {
         return self._extra_inline[0..self._extra_n];
     }
 
+    /// The content type is written into the head beside the headers
+    /// `putHeader` checks, and never passes through it, since it is chosen
+    /// through `send`, `streamWith` or a file body rather than set. It gets
+    /// the same value check, before the response is marked answered so the
+    /// refusal can still go out: a MIME type stored from an upload or passed
+    /// on from upstream is request data like any other header value.
+    pub fn contentTypeOk(self: *const Ctx, content_type: []const u8) !void {
+        _ = self;
+        if (!http1.headerValueOk(content_type)) return fail.internal(
+            "the content type holds a character a header value cannot: a control byte, most " ++
+                "often a carriage return or a newline, which would end the header early and " ++
+                "start one nobody wrote. It is refused rather than escaped; strip it where the " ++
+                "type came from.",
+            .{},
+        );
+    }
+
     /// Every response header goes through here — `setHeader`,
     /// `setStaticHeader`, `setCookie`, a `Response`'s or a `Redirect`'s
     /// `.headers`, and the built-in middleware. **One choke point on purpose**,
@@ -1515,6 +1534,13 @@ pub const Ctx = struct {
                     "than escaped — encode the value (base64, or percent) before setting it.",
                 .{c.name},
             ),
+            error.CookieAttributeInvalid => fail.internal(
+                "the path, domain or expiry of the cookie \"{s}\" holds a semicolon or a " ++
+                    "control byte, which would end that attribute and start one nobody wrote. " ++
+                    "Refused rather than escaped: a path built from the request's own is the " ++
+                    "usual way it gets there.",
+                .{c.name},
+            ),
             error.CookieNeedsSecure => fail.internal(
                 "the cookie \"{s}\" asks for SameSite=None without Secure, and browsers drop " ++
                     "that combination outright",
@@ -1571,6 +1597,7 @@ pub const Ctx = struct {
 
     pub fn send(self: *Ctx, status: u16, content_type: []const u8, response_body: []const u8) !void {
         std.debug.assert(self.answered() == null); // one request, one response
+        try self.contentTypeOk(content_type);
         self.markAnswered(status);
 
         // Gzipped, when the App asked for that and this body and this client
@@ -1629,6 +1656,11 @@ pub const Ctx = struct {
     /// next client whatever it asked for (ADR 029). `Content-Encoding` only
     /// when it was.
     fn squeezed(self: *Ctx, pool: *const compress_mod.Pool, status: u16, content_type: []const u8, response_body: []const u8) !?[]const u8 {
+        // A static file chose its representation already: the copy gzipped
+        // at load, or the plain one because no copy was worth holding, or a
+        // range, which is an offset into the plain bytes. Its ETag names
+        // that choice, so gzipping here would put one tag on two bodies.
+        if (self._static_file != null) return null;
         if (!pool.eligible(status, content_type, response_body.len)) return null;
         // A handler that gzipped its own body (a cached copy, a file it
         // read compressed) has said so, and it is not compressed twice.
@@ -1736,6 +1768,7 @@ pub const Ctx = struct {
         options: stream_mod.Options,
     ) !stream_mod.Stream {
         std.debug.assert(self.answered() == null); // one request, one response
+        try self.contentTypeOk(content_type);
 
         // A length already says where the body stops, so there is nothing for
         // chunked framing to add and a head must not carry both. Otherwise
@@ -1972,6 +2005,83 @@ pub const Ctx = struct {
 /// would otherwise be followed for ever. Nothing below it is described, so a
 /// mistake down there is still a plain 400.
 const max_body_depth = 8;
+
+/// How deeply a JSON body may nest when the type it is read into holds
+/// itself. `std.json` reads such a type by recursing once per level on the
+/// fiber's stack, with no bound of its own: `{"c":[` twenty thousand times,
+/// 160 KB, took the process down on an 8 MB stack. A comment tree or a menu
+/// 32 deep is two levels a node, so 64 is past anything a page shows, and
+/// the stack it can touch is a few kilobytes rather than all of it.
+pub const max_json_nesting = 64;
+
+/// Refuse a body nested past `max_json_nesting`, before it is parsed, when
+/// `T` can nest without a bound. A type that cannot is bounded by its own
+/// declaration, pays nothing, and is not scanned.
+fn refuseTooDeep(comptime T: type, body: []const u8) !void {
+    if (comptime !nestsWithoutBound(T)) return;
+    if (!nestedDeeperThan(body, max_json_nesting)) return;
+    return fail.badRequest(
+        "the body nests deeper than {d} levels, which is as deep as this endpoint reads",
+        .{max_json_nesting},
+    );
+}
+
+/// Whether some type reachable from `T` reaches itself again, through a
+/// field, a slice, a pointer, an optional, an array or a union's payload:
+/// the shape `std.json` recurses into once per level of the input.
+fn nestsWithoutBound(comptime T: type) bool {
+    @setEvalBranchQuota(100_000);
+    return comptime onCycle(T, &.{});
+}
+
+fn onCycle(comptime T: type, comptime path: []const type) bool {
+    for (path) |seen| if (seen == T) return true;
+    const deeper = path ++ [_]type{T};
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| for (s.fields) |f| {
+            if (onCycle(f.type, deeper)) return true;
+        },
+        .@"union" => |u| for (u.fields) |f| {
+            if (onCycle(f.type, deeper)) return true;
+        },
+        .optional => |o| return onCycle(o.child, deeper),
+        .pointer => |p| return onCycle(p.child, deeper),
+        .array => |a| return onCycle(a.child, deeper),
+        else => {},
+    }
+    return false;
+}
+
+/// Whether `body` opens more than `limit` arrays and objects inside one
+/// another. Brackets inside a string are text, so strings and their escapes
+/// are stepped over. Malformed JSON is the parser's to refuse; this only has
+/// to be right about the depth of JSON that is well formed.
+fn nestedDeeperThan(body: []const u8, limit: usize) bool {
+    var depth: usize = 0;
+    var in_string = false;
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        const b = body[i];
+        if (in_string) {
+            switch (b) {
+                '\\' => i += 1,
+                '"' => in_string = false,
+                else => {},
+            }
+            continue;
+        }
+        switch (b) {
+            '"' => in_string = true,
+            '[', '{' => {
+                depth += 1;
+                if (depth > limit) return true;
+            },
+            ']', '}' => depth -|= 1,
+            else => {},
+        }
+    }
+    return false;
+}
 
 /// Turn a failed body parse into a 400 that names what is wrong with it,
 /// falling back to `err` when nothing here can do better.

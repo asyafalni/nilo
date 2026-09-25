@@ -322,10 +322,11 @@ pub const Event = struct {
     pub const nilo_type_name = "nilo.Event";
 
     /// The `event:` name a listener can subscribe to by itself. Empty is the
-    /// default, which a browser delivers as `message`.
+    /// default, which a browser delivers as `message`. One line: a CR or LF
+    /// in it is `error.EventFieldBreaksLine`, and nothing is written.
     name: []const u8 = "",
     /// The `id:`, which the browser sends back as `Last-Event-ID` when it
-    /// reconnects. Empty leaves it off.
+    /// reconnects. Empty leaves it off. One line, as `name`.
     id: []const u8 = "",
     data: []const u8,
 };
@@ -356,6 +357,8 @@ pub const Events = struct {
 
     /// Send one event.
     pub fn send(self: *Events, event: Event) !void {
+        try oneLine(event.name);
+        try oneLine(event.id);
         const w = &self.stream.writer;
         if (event.name.len > 0) try w.print("event: {s}\n", .{event.name});
         if (event.id.len > 0) try w.print("id: {s}\n", .{event.id});
@@ -373,6 +376,7 @@ pub const Events = struct {
     /// An event whose data is `value` as JSON, serialised straight into the
     /// response. JSON escapes its own newlines, so this is always one line.
     pub fn json(self: *Events, name: []const u8, value: anytype) !void {
+        try oneLine(name);
         const w = &self.stream.writer;
         if (name.len > 0) try w.print("event: {s}\n", .{name});
         try w.writeAll("data: ");
@@ -384,8 +388,14 @@ pub const Events = struct {
     /// A line the client ignores. What it is for is proxies and load
     /// balancers, which close a connection that has said nothing for a
     /// while; a comment every thirty seconds is the usual answer.
+    ///
+    /// Text that runs over lines is one comment line per line, for
+    /// `writeData`'s reason: a line that does not start with `:` is a field.
     pub fn comment(self: *Events, text: []const u8) !void {
-        try self.stream.print(": {s}\n\n", .{text});
+        const w = &self.stream.writer;
+        var lines: Lines = .{ .text = text };
+        while (lines.next()) |line| try w.print(": {s}\n", .{line});
+        try w.writeAll("\n");
         try self.stream.flush();
     }
 
@@ -408,17 +418,41 @@ pub const Events = struct {
 
 /// `data:` for every line of `text`, because a newline inside a value is a
 /// line break on the wire and would end the event early.
-///
-/// A CR is dropped rather than passed through: the client strips CRLF, and a
-/// lone CR left in the middle of a value is a difference between what was
-/// sent and what arrives.
 fn writeData(w: *std.Io.Writer, text: []const u8) !void {
     if (text.len == 0) return w.writeAll("data:\n");
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        const trimmed = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
-        try w.print("data: {s}\n", .{trimmed});
+    var lines: Lines = .{ .text = text };
+    while (lines.next()) |line| try w.print("data: {s}\n", .{line});
+}
+
+/// The lines of `text` as an event stream's reader finds them. The grammar
+/// ends a line at CRLF, at LF **and at a lone CR**, so splitting on LF alone
+/// leaves `a\rdata: forged\revent: admin` as one line here and three at the
+/// browser, the last of them naming an event nobody sent.
+const Lines = struct {
+    text: []const u8,
+    at: usize = 0,
+    done: bool = false,
+
+    fn next(self: *Lines) ?[]const u8 {
+        if (self.done) return null;
+        const start = self.at;
+        while (self.at < self.text.len) : (self.at += 1) {
+            const ch = self.text[self.at];
+            if (ch != '\n' and ch != '\r') continue;
+            const line = self.text[start..self.at];
+            self.at += 1;
+            if (ch == '\r' and self.at < self.text.len and self.text[self.at] == '\n') self.at += 1;
+            return line;
+        }
+        self.done = true;
+        return self.text[start..];
     }
+};
+
+/// A field that is one line by definition, `event:` and `id:`, has nothing
+/// to split into: a line break in it is refused before a byte is written.
+fn oneLine(field: []const u8) error{EventFieldBreaksLine}!void {
+    if (std.mem.indexOfAny(u8, field, "\r\n") != null) return error.EventFieldBreaksLine;
 }
 
 // ---- tests ----
@@ -607,6 +641,37 @@ test "a data value spanning lines becomes one data field per line" {
     try events.close();
 
     try testing.expectEqualStrings("data: one\ndata: two\ndata: three\n\n", wire.written());
+}
+
+test "a lone CR ends a data line as the browser reads it, so it cannot forge an event" {
+    var wire: Wire = .{};
+    wire.init();
+    var events = Events{ .stream = wire.stream(false, false) };
+
+    // Split on LF alone this went out as one `data:` line, and the browser
+    // read a second event named `admin`.
+    try events.data("a\r\rdata: forged\revent: admin");
+    try events.comment("one\rtwo");
+    try events.close();
+
+    try testing.expectEqualStrings(
+        "data: a\ndata: \ndata: data: forged\ndata: event: admin\n\n" ++
+            ": one\n: two\n\n",
+        wire.written(),
+    );
+}
+
+test "a name or id with a line break in it is refused before anything is written" {
+    var wire: Wire = .{};
+    wire.init();
+    var events = Events{ .stream = wire.stream(false, false) };
+
+    try testing.expectError(error.EventFieldBreaksLine, events.send(.{ .name = "a\nevent: admin", .data = "x" }));
+    try testing.expectError(error.EventFieldBreaksLine, events.send(.{ .id = "7\rdata: forged", .data = "x" }));
+    try testing.expectError(error.EventFieldBreaksLine, events.json("a\r\nb", .{}));
+    try events.close();
+
+    try testing.expectEqualStrings("", wire.written());
 }
 
 test "an empty data value is still a well-formed event" {

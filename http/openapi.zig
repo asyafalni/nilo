@@ -1566,6 +1566,18 @@ fn writeEscaped(w: *std.Io.Writer, text: []const u8) !void {
 /// A server with no outbound network — which is most production ones — still
 /// serves the document itself perfectly well; it is only this page that
 /// needs the CDN, and `ui_path = ""` turns it off.
+///
+/// **The script is pinned to one version and its hash.** The page is served
+/// from the application's own origin, so what it loads runs with the
+/// session cookie beside it: an unpinned URL let whatever the package
+/// published next run there. With `integrity` the browser refuses any file
+/// but this one, and a new version is a change here with its own hash, the
+/// sha384 of the file (`openssl dgst -sha384 -binary | openssl base64 -A`),
+/// which jsdelivr's `?structure=flat` listing confirms by its sha256.
+pub const reader_script =
+    \\<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.72.0/dist/browser/standalone.js" integrity="sha384-OPr81V05YKGVtMFR7bgn6teWINJ+Qb5LIgvuAi2xv2C/5Y1/PcjZ0DrvpMdP39ix" crossorigin="anonymous"></script>
+;
+
 pub fn writeReaderPage(w: *std.Io.Writer, title: []const u8, spec_path: []const u8) !void {
     try w.writeAll(
         \\<!doctype html>
@@ -1582,7 +1594,11 @@ pub fn writeReaderPage(w: *std.Io.Writer, title: []const u8, spec_path: []const 
     try writeEscaped(w, spec_path);
     try w.writeAll(
         \\"></script>
-        \\<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+        \\
+    );
+    try w.writeAll(reader_script);
+    try w.writeAll(
+        \\
         \\</body></html>
         \\
     );

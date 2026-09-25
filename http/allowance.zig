@@ -152,8 +152,8 @@ pub fn with(comptime options: Options) mw.Middleware {
                 "an allowance refused {s}, which is the address the connection came from, " ++
                     "and the request carried an X-Forwarded-For. If a proxy stands in front " ++
                     "of this server then every request looks like it came from the proxy and " ++
-                    "the whole table is one slot: set `.trusted_hops` on listen() to the " ++
-                    "number of proxies you run.",
+                    "the whole table is one slot: name the proxies in `.trusted_proxies` on " ++
+                    "listen(), or set `.trusted_hops` to the number of them.",
                 .{peer.address()},
             );
         }
@@ -211,8 +211,9 @@ pub const Keyed = struct {
 ///
 /// ```zig
 /// fn account(c: *nilo.Ctx) ?[]const u8 {
-///     const who = c.session(Account) orelse return null;
-///     return who.id.view();
+///     const session = c.resolve(nilo.Session(Signed)) catch return null;
+///     const who = session.get() orelse return null;
+///     return std.fmt.allocPrint(c.arena(), "{d}", .{who.user}) catch null;
 /// }
 ///
 /// try app.useOn("/api", nilo.allowance.keyed(account, .{

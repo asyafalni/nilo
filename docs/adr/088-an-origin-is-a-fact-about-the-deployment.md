@@ -73,11 +73,20 @@ the request path of every app that named an origin, which is the one axis
 
 ## What is refused, and where
 
-`with` refuses four things while compiling: no origins at all, `*` beside a
-name, `*` with credentials, and a capital letter. A list that arrives at run
+`with` refuses these while compiling: no origins at all, `*` beside a
+name, `*` with credentials, a capital letter, `null`, and anything that is not
+an origin (no scheme, or a path, a trailing slash included). A list that arrives at run
 time cannot be refused any earlier than the call that takes it, so `set` and
 `setSplit` return errors for the same mistakes — at startup, where a program
-can print them beside its other settings.
+can print them beside its other settings. `null` and a path are
+`error.OriginNotAnOrigin`.
+
+`null` is refused because it is not one page: it is what a sandboxed frame or a
+`file:` page sends, and any site can make one, so a list holding it trusts
+every site, for CORS with credentials and for `csrf.reading`, which reads the
+same list. `csrf.with` refused it while compiling from the start; the run-time
+list and `cors.with` did not, until a review found `WEB_ORIGINS` with `null`
+in it passing both.
 
 `"*"` is refused outright rather than handled. A runtime list names the
 deployments this server answers; answering anybody is `cors.permissive`, which

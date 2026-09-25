@@ -44,10 +44,10 @@ pub const Contents = struct {
     /// measured against. Null asks the file.
     ///
     /// Both callers exist. A handler answering with a file has nothing to
-    /// say here and wants the `stat` done for it. The static tree does have
-    /// something to say — it recorded the size when it walked the directory,
-    /// and its ETag is made of that number, so re-statting could hand a
-    /// client a length and a tag that describe two different files.
+    /// say here and wants the `stat` done for it. The static tree has
+    /// something to say: it stats the descriptor it just opened and builds
+    /// its ETag from that same look, so passing the size on keeps the length
+    /// and the tag describing one file (ADR 098).
     size: ?u64 = null,
 
     content_type: []const u8,
@@ -147,6 +147,7 @@ fn writeBody(c: *Ctx, contents: Contents, status: u16, from: u64, len: u64) !voi
     // the reader reads positionally, so its position is a number it hands to
     // `pread` rather than state in the kernel.
     try reader.seekTo(from);
+    try c.contentTypeOk(contents.content_type);
 
     c.markAnswered(status);
 
@@ -284,8 +285,8 @@ fn fileHandler(c: *Ctx) anyerror!void {
     });
 }
 
-/// The same, with the size given rather than asked for — what the static
-/// tree does with the number it recorded at load.
+/// The same, with the size given rather than asked for, which is what the
+/// static tree does with the number its own `stat` read.
 fn knownSizeHandler(c: *Ctx) anyerror!void {
     const files = open_files.?;
     const file = try files.dir.openFile(OneFile.name);

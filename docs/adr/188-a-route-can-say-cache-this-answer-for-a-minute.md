@@ -75,6 +75,18 @@ The Space is a service the route needs, so `listen()` names it when it is
 missing rather than the first request finding out — the requirement is
 read off the argument the way a `*Db` is.
 
+**A handler that reads who the caller is may not be cached.** The key is the
+request line and a kept answer goes to whoever asks next, so an answer made
+from the first caller's session is every later caller's answer, with its
+`Set-Cookie` replayed. Keying on `Cookie` or `Authorization` was refused from
+the start; taking the caller as an argument was not, until a review found it.
+A `Cached(…)` beside a `Session(T)`, an `Authorization`, a `Verified(…)`, or a
+`FromHeader` of `Cookie`, `Authorization` or `Proxy-Authorization` is a
+Refusal, and a resolved type of the caller's own that stands for the caller
+says so with `pub const nilo_reads_caller = true;` and is refused the same
+way. A `*Ctx` can read anything and is not checked; that is the gap the rule
+leaves, and the reference says so.
+
 ## What it costs
 
 Put against [ADR 017](./017-the-trade-budget-has-four-axes.md)'s four
@@ -157,10 +169,10 @@ The TTL there is a fake Space's clock, moved by hand, because `nilo_cache`'s
 is the kernel's monotonic clock and `http/` may not import the module to
 reach `opened_s` anyway. The cache's own suite holds the real expiry.
 
-Eight Refusals: not a bytes Space, `ttl_s` of 0, a header key naming no
+Nine Refusals: not a bytes Space, `ttl_s` of 0, a header key naming no
 header, a header key naming a credential, a `Cached` on a POST, a handler
 that returns nothing, a handler that asks twice, a handler that asks for
-both `Idempotent` and `Cached`.
+both `Idempotent` and `Cached`, and a handler that also takes the caller.
 
 ## Consequences
 

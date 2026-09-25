@@ -1452,6 +1452,21 @@ fn rolesOf(
                 "read under its path and query. A route is one of the two.",
         );
 
+        // A kept answer goes to whoever asks next, and the key is the
+        // request line, so an answer made from who the first caller was is
+        // served to every caller after them, with any cookie it set.
+        if (cached_at) |at| for (params, 0..) |p, i| {
+            if (!cached_mod.readsTheCaller(p.type.?, roles[i] == .authorization, roles[i] == .verified)) continue;
+            @compileError(
+                "nilo: the handler for route \"" ++ pattern ++ "\" takes a `Cached(…)` (argument " ++
+                    num(at + 1) ++ ") and a " ++ naming.of(p.type.?) ++ " (argument " ++ num(i + 1) ++
+                    "), which says who the caller is.\n" ++
+                    "  A kept answer is served to whoever asks next, so the first caller's answer would " ++
+                    "go to every caller after them. Answer per caller without the cache, or keep what is " ++
+                    "the same for everybody in a route of its own.",
+            );
+        };
+
         if (body_at != null and form_at != null) @compileError(
             "nilo: the handler for route \"" ++ pattern ++ "\" asks for both a request body " ++
                 "(argument " ++ num(body_at.? + 1) ++ ", a " ++ naming.of(params[body_at.?].type.?) ++

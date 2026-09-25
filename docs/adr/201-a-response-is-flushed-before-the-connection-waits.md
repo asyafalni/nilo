@@ -157,6 +157,14 @@ save nilo the `@fieldParentPtr`.
   flushes before it waits, and `close` flushes always.
 - `http/engine/zio.zig`: `Link` joins a connection's reader and writer and
   carries the swapped vtable. The Bulkhead's contract gains the line.
+- **On a TLS connection the guarantee needs a second link**, and for a
+  while it had one layer only. The handler writes to the cleartext writer,
+  above the record layer `Link` wraps, so an answer written while the read
+  buffer held bytes sat in the cleartext buffer while the connection
+  waited: a keep-alive POST answered without its body read arrived at the
+  idle limit, 75 s. The TLS path now swaps the cleartext reader's vtable
+  the same way, so reading for a record first seals and sends what the
+  handler wrote. `tls_live.zig` has the test, which failed before.
 - Tests: `http1.zig` counts writes across a pipelined pair;
   `websocket.zig` counts them across sixteen buffered echoes, a lone one,
   and a close with a frame unread; `live.zig` sends two requests in one

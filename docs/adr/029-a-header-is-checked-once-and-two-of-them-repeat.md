@@ -31,6 +31,8 @@ Building that mechanism surfaced a rule bigger than cookies. `Ctx.setHeader` had
 
 `obs-text`, everything from `0x80`, is allowed: deprecated, and also what a UTF-8 filename in a `Content-Disposition` is made of, and it cannot terminate a line, which is the only thing being defended.
 
+The content type is the one header value that never passes through `putHeader`, because it is chosen through `send`, `streamWith` or a file body rather than set, and until a review found `c.send(200, "text/plain\r\nX-Injected: 1", …)` sending the injected header it had no check at all. `Ctx.contentTypeOk` is the value check above, applied where each of the three takes its type and before the response is marked answered, so the refusal can still go out.
+
 All three refusals are `fail.internal`, matching `setCookie`: a malformed header is a mistake in the server, not in the request, so the 500 names the header and which rule it broke rather than reaching the client as a bare "internal server error". **The value is never quoted back**, since it is the half most likely to have come from a request, and echoing it would hand the sender a way to read what the check caught.
 
 ### Two headers repeat, for opposite reasons
@@ -45,7 +47,7 @@ All three refusals are `fail.internal`, matching `setCookie`: a malformed header
 
 ### A cookie value cannot carry its own delimiter
 
-`.value = "abc; Path=/admin"` does not produce a broken cookie, it produces a cookie **with a path nobody wrote**, because `;` is the attribute separator and the grammar has no escaping to defend with. There is nothing to encode it as, so it is refused: `cookie.check` runs before anything is allocated, and a value carrying a character RFC 6265's `cookie-octet` does not allow is a 500 naming the character. `SameSite=None` without `Secure` is refused on the same footing, since every current browser drops that combination and the symptom is a cookie that silently never arrives.
+`.value = "abc; Path=/admin"` does not produce a broken cookie, it produces a cookie **with a path nobody wrote**, because `;` is the attribute separator and the grammar has no escaping to defend with. There is nothing to encode it as, so it is refused: `cookie.check` runs before anything is allocated, and a value carrying a character RFC 6265's `cookie-octet` does not allow is a 500 naming the character. The path, the domain and the expiry get the same refusal, against RFC 6265's `av-octet` (a printable character that is not `;`): a path built from the request's own turns `/x;Domain=example.com` into a cookie every subdomain is sent, and only the name and the value were checked until a review found it. `SameSite=None` without `Secure` is refused on the same footing, since every current browser drops that combination and the symptom is a cookie that silently never arrives.
 
 ### Consequences
 

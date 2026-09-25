@@ -236,6 +236,45 @@ test "a TLS connection kept alive answers again after idling past the peek, on t
     try testing.expect(std.mem.endsWith(u8, second, "hello over tls\n"));
 }
 
+test "an answer to a request whose body nobody read goes out at once over TLS" {
+    // The head and a small body arrive in one record, and the handler
+    // answers without reading the body. `settle` skips the flush while the
+    // read buffer holds bytes, trusting the Engine to flush before its next
+    // read (ADR 201); on TLS the answer sits in the cleartext writer above
+    // the one the Engine flushes, so it waited for the idle limit.
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.post("/", hello);
+
+    var serving: ServingTls = .{ .app = &app, .idle_timeout_ms = 3_000 };
+    const thread = try std.Thread.spawn(.{}, ServingTls.run, .{&serving});
+    const port = try waitForPort(gpa, &serving);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const stream = try connect(io, port);
+    var client: Client = undefined;
+    try client.handshake(io, stream);
+
+    const started = std.Io.Clock.awake.now(io);
+    const answer = try client.ask(gpa, "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello");
+    defer gpa.free(answer);
+    const took = started.durationTo(std.Io.Clock.awake.now(io));
+    stream.close(io);
+
+    app.shutdown();
+    thread.join();
+
+    try testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 200 "));
+    // Well under the idle limit, which is when it used to arrive.
+    try testing.expect(took.toMilliseconds() < 1_000);
+}
+
 test "a client that connects to a TLS port and says nothing is dropped when the header limit runs out" {
     hush();
     const gpa = std.heap.smp_allocator;

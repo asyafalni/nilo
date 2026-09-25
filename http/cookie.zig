@@ -111,6 +111,9 @@ pub const Error = error{
     CookieValueInvalid,
     /// `SameSite=None` without `Secure`, which every current browser drops.
     CookieNeedsSecure,
+    /// A `;` or a control byte in the path, the domain or the expiry, which
+    /// would end the attribute and start one nobody wrote.
+    CookieAttributeInvalid,
 };
 
 /// The value of the cookie called `name` in a `Cookie` header, or null.
@@ -186,7 +189,21 @@ pub fn check(c: Cookie) Error!void {
     for (c.value) |ch| {
         if (!isValueByte(ch)) return error.CookieValueInvalid;
     }
+    // The attributes are as much a place for a `;` as the value: a path
+    // built from the request's own path turns `/x;Domain=example.com` into a
+    // cookie every subdomain is sent.
+    for ([_][]const u8{ c.path, c.domain, c.expires }) |attribute| {
+        for (attribute) |ch| {
+            if (!isAttributeByte(ch)) return error.CookieAttributeInvalid;
+        }
+    }
     if (c.same_site == .none and !c.secure) return error.CookieNeedsSecure;
+}
+
+/// RFC 6265's `av-octet`: any printable US-ASCII character but the `;` that
+/// ends the attribute.
+fn isAttributeByte(ch: u8) bool {
+    return ch >= 0x20 and ch < 0x7f and ch != ';';
 }
 
 /// RFC 9110's `token`: what a header field name, and so a cookie name, may
@@ -415,6 +432,18 @@ test "a value that would smuggle a second attribute is refused" {
     try testing.expectError(error.CookieValueInvalid, check(.{ .name = "a", .value = "a\"b" }));
     try testing.expectError(error.CookieValueInvalid, check(.{ .name = "a", .value = "a\\b" }));
     try testing.expectError(error.CookieValueInvalid, check(.{ .name = "a", .value = "a\r\nX: y" }));
+}
+
+test "an attribute that would smuggle a second one is refused" {
+    try testing.expectError(error.CookieAttributeInvalid, check(.{
+        .name = "session",
+        .value = "v",
+        .path = "/x;Domain=example.com",
+    }));
+    try testing.expectError(error.CookieAttributeInvalid, check(.{ .name = "a", .value = "v", .domain = "a.test; Secure" }));
+    try testing.expectError(error.CookieAttributeInvalid, check(.{ .name = "a", .value = "v", .expires = "Thu\r\nX: y" }));
+    // A path holds what a path holds, spaces and all.
+    try check(.{ .name = "a", .value = "v", .path = "/my files/a,b=c", .domain = "a.test", .expires = "Thu, 01 Jan 1970 00:00:00 GMT" });
 }
 
 test "a name has to be a name" {

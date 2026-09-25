@@ -145,6 +145,23 @@ the kind of bug that shows up as one user seeing another's messages.
 `defer room.leave(&socket)` is correct on every path out of a handler,
 including the ones that failed before joining.
 
+### A socket sits in one room, and a seat left taken is given up for it
+
+The era keeps a stale ticket from misdelivering; it does not free the seat.
+A forgotten `leave` left the seat taken with its bell in the connection's
+frame, and the next `say` rang that bell after the frame had returned: the
+use-after-free [ADR 082](./082-a-cleanup-path-is-not-cancellable.md) closed for
+a cancelled `leave`, reached by not calling it at all. So when the loop
+returns, nilo gives up whatever seat the socket still holds.
+
+A socket holds one ticket, and `receive` drains that one seat. Joining a
+second room used to overwrite the ticket, and `leave` on the first room then
+gave up a seat by an index into the wrong one, leaving the real seat taken for
+good. Joining a second room is `error.AlreadySeated`, joining the same room
+again does nothing, and `leave` on a room the socket is not in does nothing.
+A socket in two rooms at once is a ticket per room and a drain of each, which
+waits for a caller who needs it.
+
 ### A socket with no Engine is seated anyway
 
 A `Socket` over a fixed buffer — what a test has — has nothing that can ring

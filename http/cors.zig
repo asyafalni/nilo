@@ -109,9 +109,14 @@ pub const Origins = struct {
         /// `"*"`. A runtime list names the deployments this server answers;
         /// answering anybody is `cors.permissive`, and it needs no list.
         OriginIsWildcard,
+        /// Not a scheme, a host and a port with nothing after them. Most
+        /// often `null`, which is what a sandboxed frame or a `file:` page
+        /// sends: any site can make one, so trusting it trusts every site,
+        /// for `csrf.reading` as much as for CORS.
+        OriginNotAnOrigin,
     };
 
-    /// Take a list the caller assembled. The same four things `with` refuses
+    /// Take a list the caller assembled. The same things `csrf.with` refuses
     /// while compiling, refused here as errors, because a list that arrives
     /// at run time cannot be refused any earlier.
     pub fn set(self: *Origins, list: []const []const u8) SetError!void {
@@ -148,6 +153,12 @@ pub const Origins = struct {
         if (std.mem.eql(u8, origin, "*")) return error.OriginIsWildcard;
         for (origin) |byte| {
             if (byte >= 'A' and byte <= 'Z') return error.OriginNotLowercase;
+        }
+        // `csrf.with`'s rule, which it applies while compiling: a browser
+        // sends a scheme, `://`, a host and maybe a port, and never a path.
+        const scheme_end = std.mem.indexOf(u8, origin, "://") orelse return error.OriginNotAnOrigin;
+        if (std.mem.indexOfScalar(u8, origin[scheme_end + "://".len ..], '/') != null) {
+            return error.OriginNotAnOrigin;
         }
     }
 
@@ -319,7 +330,7 @@ pub fn with(comptime options: Options) mw.Middleware {
 
 /// Everything that can be wrong with a list of origins, said while compiling.
 ///
-/// All four are mistakes whose symptom is a browser refusing a request with a
+/// Most are mistakes whose symptom is a browser refusing a request with a
 /// message about CORS and no mention of the cause — which is an afternoon
 /// each, and none of them needs a running server to find.
 fn check(comptime options: Options) void {
@@ -364,6 +375,25 @@ fn check(comptime options: Options) void {
                         lowered(origin) ++ "\".",
                 );
             }
+
+            if (std.mem.eql(u8, origin, "null")) @compileError(
+                "nilo: cors was told to trust the origin \"null\", which is what a sandboxed " ++
+                    "frame or a `file:` page sends, and any site can make one.\n  Trusting it " ++
+                    "trusts every site. Name the pages you serve.",
+            );
+
+            // `csrf.with`'s rule: a browser sends a scheme, `://`, a host and
+            // maybe a port, and never a path.
+            const scheme_end = std.mem.indexOf(u8, origin, "://");
+            const has_path = if (scheme_end) |at|
+                std.mem.indexOfScalar(u8, origin[at + "://".len ..], '/') != null
+            else
+                false;
+            if (scheme_end == null or has_path) @compileError(
+                "nilo: the cors origin \"" ++ origin ++ "\" is not an origin, so no request " ++
+                    "would ever match it.\n  A browser sends a scheme, a host and a port with " ++
+                    "nothing after them: \"https://example.com\", no path and no trailing slash.",
+            );
         }
     }
 }
@@ -398,7 +428,7 @@ test "a runtime list is taken, and matched exactly" {
     try testing.expect(origins.matches("https://app.example.co") == null);
 }
 
-test "the three things a runtime origin cannot be, refused where they arrive" {
+test "the four things a runtime origin cannot be, refused where they arrive" {
     var origins: Origins = .empty;
 
     // The same mistakes `with` refuses while compiling. A list that arrives at
@@ -408,6 +438,11 @@ test "the three things a runtime origin cannot be, refused where they arrive" {
     try testing.expectError(error.OriginNotLowercase, origins.set(&.{"https://App.example.com"}));
     try testing.expectError(error.OriginEmpty, origins.set(&.{""}));
     try testing.expectError(error.OriginIsWildcard, origins.set(&.{"*"}));
+    // `null` is what any site's sandboxed frame sends, so it is refused here
+    // as `csrf.with` refuses it while compiling.
+    try testing.expectError(error.OriginNotAnOrigin, origins.set(&.{ "https://app.example.com", "null" }));
+    try testing.expectError(error.OriginNotAnOrigin, origins.set(&.{"https://app.example.com/"}));
+    try testing.expectError(error.OriginNotAnOrigin, origins.set(&.{"app.example.com"}));
 
     // And a refused list is not half-taken.
     try testing.expectEqual(@as(usize, 0), origins.list.len);

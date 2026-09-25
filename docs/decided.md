@@ -70,6 +70,12 @@ Every row has a design that is known and nobody who needs it, or a decision that
 |---|---|---|
 | `std.crypto.pwhash.argon2` does its 16-word permutation one word at a time; as four `@Vector(4, u64)` lanes the same hash is **11.19 ms instead of 13.78**, and 8.98 out of `pw.huge_pages`, byte-identical | upstream's to take; nilo will not carry a copy of somebody else's crypto to get it ([ADR 044](./adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)) | somebody sending `std` the patch |
 
+### `nilo_cache`
+
+| Claim | The answer today | What reopens it |
+|---|---|---|
+| There is no `getOrPut`, so two threads can compute the same value at once | a `getOrPut` that computes would hold the lock across the caller's work, which [ADR 109](./adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md) forbids. The claim half is `Space.putIfAbsent`; the waiting half needs an `Io`, which this module has none of, so it lives in `nilo_http` as `nilo.Cached` and `nilo.Idempotent` ([ADR 188](./adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)) | a caller of `cache.Space` outside `nilo_http` with a stampede, who then waits on the claim in their own layer |
+
 ### `nilo_jwt`
 
 | Claim | The answer today | What reopens it |

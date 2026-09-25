@@ -324,6 +324,14 @@ and `app.route(.POST, …)` refuses it at registration with `error.CachedWrite`.
 A handler that returns nothing, a file or a redirect has no answer nilo can
 keep, and is a Refusal; so is one that takes an `Idempotent(…)` too.
 
+**A handler that reads who the caller is may not be cached**, because the
+first caller's answer would be served to every caller after them: a
+`Cached(…)` beside a `Session(T)`, an `Authorization`, a `Verified(…)` or a
+`FromHeader` of `Cookie` or `Authorization` is a Refusal. A resolved type of
+your own that stands for the caller says so with
+`pub const nilo_reads_caller = true;` and is refused the same way. A `*Ctx`
+can read anything and is not checked.
+
 Costs what `Idempotent` costs, on the route that asks and nowhere else — one
 more arena allocation to join the path and the query when there is one.
 Nothing on the stack.

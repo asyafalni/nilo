@@ -276,7 +276,7 @@ pub const Kind = enum { text, binary };
 /// another connection, may already be filling.
 ///
 /// Nothing traps that. A `Str` that outlives its request is caught in Debug
-/// and ReleaseSafe (ADR 003) and this is not, which makes it the one
+/// (ADR 003) and this is not, which makes it the one
 /// borrowed thing here a reader has to take on trust. A handler that wants a
 /// message after the next `receive` copies it somewhere of its own first.
 /// `room.say` and `socket.send` both finish with the bytes before they
@@ -690,6 +690,11 @@ pub const Socket = struct {
 
     pub fn ticket(self: *const Socket) ?room_mod.Ticket {
         return self._ticket;
+    }
+
+    /// The room this socket has a seat in, if any.
+    pub fn inRoom(self: *const Socket) ?*room_mod.Room {
+        return self._room;
     }
 
     pub fn seatedIn(self: *Socket, in_room: *room_mod.Room, t: room_mod.Ticket) void {

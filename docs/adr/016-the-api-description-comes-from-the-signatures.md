@@ -87,6 +87,8 @@ What it does claim, it claims because the type said so: `:id` on a handler takin
 
 The document is self-contained; the page that renders it is one `<script>` from jsdelivr. Bundling a viewer would put a few hundred kilobytes of somebody else's JavaScript in this repository. This is stated plainly because a server with no outbound network is normal in production and somebody will hit it: the document itself never needs the network, and `ui_path = ""` turns the page off.
 
+**The script is one version, held by its hash.** The page is served from the application's own origin, so what it loads runs beside the session cookie and can make requests that carry it. The tag names `@scalar/api-reference@1.72.0/dist/browser/standalone.js` with an `integrity` hash and `crossorigin="anonymous"`, so the browser runs that file and no other. Until a review read it, the tag named the package with no version and no hash, and whatever the package published next would have run in every nilo application's origin. Moving to a newer viewer is a change to `openapi.reader_script`, with the sha384 of the file (jsdelivr's `?structure=flat` listing confirms it by its sha256).
+
 ## What was rejected
 
 **A writer function per route, generated code beside the handler.** A copy of the JSON-emitting code in the binary for every route, when route count is the one thing that grows in an app.

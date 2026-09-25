@@ -572,6 +572,10 @@ pub fn Session(comptime T: type) type {
 
         pub const nilo_resolve = read;
 
+        /// Who the caller is, so a `Cached` route may not take it: its
+        /// answer would be served to the next caller (`cached.readsTheCaller`).
+        pub const nilo_reads_caller = true;
+
         /// What a nilo compile error calls this type, which is the name the
         /// reader's own import line gives it (ADR 074).
         pub const nilo_type_name = "nilo.Session(" ++ naming.of(T) ++ ")";

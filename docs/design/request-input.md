@@ -39,6 +39,7 @@ A header and an authentication scheme sit beside this rather than inside it: `Fr
 12. **A body is committed only once the client has actually delivered a page of it**, not from the `Content-Length` a stranger typed: `readSizedBody` takes 4 KiB first and grows from there. [ADR 083](../adr/083-a-body-is-taken-as-it-arrives.md)
 13. **A route can say how much body it takes.** `app.with(nilo.maxBody(n))` sets a ceiling narrower or wider than `listen()`'s default for one route, checked before a byte is read; `c.bodyStream()` answers a different question and keeps its own `max_bytes`. [ADR 156](../adr/156-a-route-can-say-how-much-body-it-takes.md)
 14. **Required text is checked for more than emptiness.** `Str.blank()` says whether there is nothing but whitespace and `Str.trimmed()` borrows the middle, both against `std.ascii.whitespace` rather than a charset written out again at every call site. [ADR 142](../adr/142-required-text-arrives-as-two-spaces.md)
+15. **A body whose type holds itself is read 64 levels deep and no deeper.** `std.json` recurses once per level with only the fiber's stack to stop it, so for a type that can reach itself (a comment tree, a menu) the body is scanned for nesting before the parse, and past 64 levels it is a 400; a type that cannot nest for ever is decided while compiling and not scanned. [ADR 226](../adr/226-a-body-that-can-nest-for-ever-is-read-sixty-four-deep.md)
 
 ## Decisions
 
@@ -62,6 +63,7 @@ A header and an authentication scheme sit beside this rather than inside it: `Fr
 | [156](../adr/156-a-route-can-say-how-much-body-it-takes.md) | A route sets its own body-size ceiling with `nilo.maxBody(n)`, over `listen()`'s default |
 | [167](../adr/167-a-whole-number-inside-a-range-is-a-type.md) | `Within(min, max)`: a whole number inside a range is a type |
 | [193](../adr/193-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md) | `Text`/`Email`/`Url` are shaped text, and `nilo_check` puts a whole-struct rule on the struct |
+| [226](../adr/226-a-body-that-can-nest-for-ever-is-read-sixty-four-deep.md) | A body whose type holds itself is refused past 64 levels of nesting, before it is parsed |
 
 Beside this topic: why a header's name and value are `Str` rather than `[]const u8` is [ADR 003](../adr/003-request-arena-and-the-str-type.md) (the request head is usually borrowed, not copied); the JSON half of a type reading itself is [ADR 166](../adr/166-a-body-field-that-parses-itself.md); what the cookie behind `app.guard` is sealed into is [ADR 033](../adr/033-a-session-is-sealed-into-the-cookie.md).
 

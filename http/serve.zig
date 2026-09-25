@@ -234,11 +234,17 @@ pub noinline fn serveRequest(
     var record = metrics_mod.Record.begin(if (self.metrics_table) |*t| t else null);
     const failure = &in_flight.failure;
     in_flight.startRequest("", "");
-    // On a real server the fiber slot is already installed and wins;
-    // this is what keeps fail functions working when App is called
-    // straight from a test, with no Engine underneath.
-    const prev_slot = bulkhead.setFallbackSlot(in_flight);
-    defer _ = bulkhead.setFallbackSlot(prev_slot);
+    // What keeps fail functions working when App is called straight from a
+    // test, with no Engine underneath. Only then: on a real server the
+    // fiber's own slot is bound and is what they reach, and the fallback is
+    // a threadlocal. Set here, it stayed set on the executor thread through
+    // every suspension of this request, where a spawned fiber, which has no
+    // slot, read it and wrote into this request (ADR 006).
+    const standalone = bulkhead.fiberSlot() == null;
+    const prev_slot = if (standalone) bulkhead.setFallbackSlot(in_flight) else null;
+    defer if (standalone) {
+        _ = bulkhead.setFallbackSlot(prev_slot);
+    };
 
     const raw_head = http1.readHead(in, deadlines) catch |err| {
         switch (err) {
@@ -503,6 +509,10 @@ pub fn runHandover(served: *Served) void {
     h.socket._scratch = &h.scratch;
     defer if (h.scratch) |buf| scratch.give(buf);
     h.run(&h.socket, &h.state) catch |err| warnSocketFailed(h.path, err);
+    // A seat the handler did not give up still holds this connection's bell,
+    // which lives in a frame that is about to return. The next `say` would
+    // ring it there (ADR 082), so the seat goes now, whatever the loop did.
+    if (h.socket.inRoom()) |seated| seated.leave(&h.socket);
     // A connection that has been a WebSocket cannot go back to being HTTP.
     served.keep_alive = false;
 }

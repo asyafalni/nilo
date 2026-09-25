@@ -15,9 +15,10 @@ cared what the key was
 missing is the key.
 
 ```zig
-fn account(c: *nilo.Ctx) ?nilo.Str {
-    const who = c.session(Account) orelse return null;
-    return who.id;
+fn account(c: *nilo.Ctx) ?[]const u8 {
+    const session = c.resolve(nilo.Session(Signed)) catch return null;
+    const who = session.get() orelse return null;
+    return std.fmt.allocPrint(c.arena(), "{d}", .{who.user}) catch null;
 }
 
 try app.useOn("/api", nilo.allowance.keyed(account, .{
