@@ -36,6 +36,7 @@ const form_mod = @import("form.zig");
 const bound_mod = @import("bound.zig");
 const redirect_mod = @import("redirect.zig");
 const cors = @import("cors.zig");
+const csrf = @import("csrf.zig");
 const allowance = @import("allowance.zig");
 const patch_mod = @import("patch.zig");
 
@@ -2882,6 +2883,150 @@ test "\"*\" still answers anyone, and says nothing about Vary" {
     );
     try testing.expect(std.mem.indexOf(u8, answer.response, "Access-Control-Allow-Origin: *") != null);
     try testing.expect(std.mem.indexOf(u8, answer.response, "Vary: Origin") == null);
+}
+
+test "csrf refuses a POST from another site before the handler runs, naming the origin" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.use(csrf.sameOrigin);
+    try app.post("/x", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const answer = h.send(
+        &app,
+        "POST /x HTTP/1.1\r\nHost: example.dev\r\nSec-Fetch-Site: cross-site\r\n" ++
+            "Origin: https://evil.example\r\nContent-Length: 0\r\n\r\n",
+    );
+    try testing.expect(std.mem.startsWith(u8, answer.response, "HTTP/1.1 403"));
+    try testing.expect(std.mem.indexOf(u8, answer.response, "handler") == null);
+    try testing.expect(try Harness.saysFailure(answer.response, "\"https://evil.example\""));
+    try testing.expect(try Harness.saysFailure(answer.response, "csrf .origins"));
+}
+
+test "csrf lets through this server's own page, a link from anywhere, and curl" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.use(csrf.sameOrigin);
+    try app.post("/x", plainOk);
+    try app.get("/x", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const cases = [_][]const u8{
+        // A browser saying so.
+        "POST /x HTTP/1.1\r\nHost: example.dev\r\nSec-Fetch-Site: same-origin\r\n" ++
+            "Origin: https://example.dev\r\nContent-Length: 0\r\n\r\n",
+        // A browser too old for Sec-Fetch-Site, whose Origin names the Host.
+        "POST /x HTTP/1.1\r\nHost: example.dev\r\nOrigin: https://example.dev\r\n" ++
+            "Content-Length: 0\r\n\r\n",
+        // A link from another site: a GET changes nothing and is not asked.
+        "GET /x HTTP/1.1\r\nHost: example.dev\r\nSec-Fetch-Site: cross-site\r\n\r\n",
+        // Not a browser, so there is no cookie of somebody else's on it.
+        "POST /x HTTP/1.1\r\nHost: example.dev\r\nContent-Length: 0\r\n\r\n",
+    };
+    for (cases) |request| {
+        const answer = h.send(&app, request);
+        try testing.expect(std.mem.startsWith(u8, answer.response, "HTTP/1.1 200"));
+        try testing.expect(std.mem.endsWith(u8, answer.response, "handler"));
+    }
+}
+
+test "csrf takes a named front end, from a list or from the Origins CORS reads" {
+    const Held = struct {
+        var origins: cors.Origins = .empty;
+    };
+    try Held.origins.set(&.{"https://app.example.com"});
+
+    const from_front_end =
+        "POST /x HTTP/1.1\r\nHost: api.example.com\r\nSec-Fetch-Site: same-site\r\n" ++
+        "Origin: https://app.example.com\r\nContent-Length: 0\r\n\r\n";
+    const from_elsewhere =
+        "POST /x HTTP/1.1\r\nHost: api.example.com\r\nSec-Fetch-Site: same-site\r\n" ++
+        "Origin: https://uploads.example.com\r\nContent-Length: 0\r\n\r\n";
+
+    inline for (.{
+        csrf.with(.{ .origins = &.{"https://app.example.com"} }),
+        csrf.reading(&Held.origins),
+    }) |middleware| {
+        var app = App.init(testing.allocator);
+        defer app.deinit();
+        try app.use(middleware);
+        try app.post("/x", plainOk);
+
+        var h = Harness.init();
+        defer h.deinit();
+        try h.ready(&app);
+
+        try testing.expect(std.mem.startsWith(u8, h.send(&app, from_front_end).response, "HTTP/1.1 200"));
+        // Another subdomain of the same site: what SameSite=Lax would have
+        // sent the cookie with.
+        try testing.expect(std.mem.startsWith(u8, h.send(&app, from_elsewhere).response, "HTTP/1.1 403"));
+    }
+}
+
+test "a route that takes posts from anywhere says so with without" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.use(csrf.sameOrigin);
+    try app.post("/x", plainOk);
+    try app.without(csrf.sameOrigin).post("/hook", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const cross = "HTTP/1.1\r\nHost: example.dev\r\nSec-Fetch-Site: cross-site\r\n" ++
+        "Origin: https://partner.example\r\nContent-Length: 0\r\n\r\n";
+    try testing.expect(std.mem.startsWith(u8, h.send(&app, "POST /hook " ++ cross).response, "HTTP/1.1 200"));
+    try testing.expect(std.mem.startsWith(u8, h.send(&app, "POST /x " ++ cross).response, "HTTP/1.1 403"));
+}
+
+/// How many times the arena is asked for memory by one warm POST, with the
+/// CSRF middleware installed or not. The request is a modern browser's from
+/// the server's own page, which is what almost every guarded request is.
+fn postAllocations(comptime guarded: bool) !usize {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    if (guarded) try app.use(csrf.sameOrigin);
+    try app.post("/x", plainOk);
+    try app.resolveChains();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var counting = budget.Counting{ .child = arena.allocator() };
+    var lifetime = str_mod.Lifetime{};
+    var in_flight = fail.InFlight{};
+    var buf: [4096]u8 = undefined;
+    const request = "POST /x HTTP/1.1\r\nHost: example.dev\r\nSec-Fetch-Site: same-origin\r\n" ++
+        "Origin: https://example.dev\r\nContent-Length: 0\r\n\r\n";
+
+    const send = struct {
+        fn once(a: *App, gpa: std.mem.Allocator, l: *str_mod.Lifetime, f: *fail.InFlight, b: []u8) void {
+            var in = std.Io.Reader.fixed(request);
+            var out = std.Io.Writer.fixed(b);
+            _ = a.handleRequest(gpa, l, f, &in, &out, .off, .off, .{});
+            l.end();
+        }
+    }.once;
+
+    for (0..3) |_| {
+        send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
+        _ = arena.reset(.{ .retain_with_limit = app_mod.default_arena_keep });
+    }
+    counting.reset();
+    send(&app, counting.allocator(), &lifetime, &in_flight, &buf);
+    return counting.allocs;
+}
+
+test "csrf adds no allocation to the request it lets through" {
+    // Three header reads into the request head, and a compare. ADR 224's
+    // number for the allocations axis is this test.
+    try testing.expectEqual(try postAllocations(false), try postAllocations(true));
 }
 
 // ---- stage 5: percent-decoding, chunked bodies, static files ----

@@ -32,6 +32,10 @@ A gap that is the rule. Each was looked at, priced, and kept as it is, and the e
 
 **Reopened by:** nothing on its own. The two calls are for the small structured messages a WebSocket carries, and the alternatives — a wrapper writer on every byte, or a third pass over the arguments — both cost more than the shape they would guard.
 
+**`csrf` covers neither a `GET` that changes something nor a browser from before 2020.** A cross-site `GET` is a link, and refusing one refuses every link into the site, so a route that changes something on a `GET` is the route's bug. A request with neither `Sec-Fetch-Site` nor `Origin` passes, because that is every non-browser client and none of them carries somebody else's cookie; the browser that sends neither has left the market ([ADR 224](./adr/224-a-request-that-changes-something-says-where-it-came-from.md)).
+
+**Reopened by:** a browser still in use that sends a cross-site `POST` with neither header.
+
 **The API description names one failure, and endpoints have several.** `!?T` puts a 404 in the document because the signature settles it ([ADR 023](./adr/023-a-failure-mode-belongs-in-the-return-type.md)). A `fail.conflict` on a duplicate email is a line in a function body and stays invisible. That is the rule rather than a gap, since the document promises what the signature settles, but it is the rule that costs the most. Widening it means a second place to write a failure down, which is an annotation wearing another name and is the one thing this framework does not ask for.
 
 **Reopened by:** a shape that states a failure *in the type*. Wanting one does not.

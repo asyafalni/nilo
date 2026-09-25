@@ -177,6 +177,28 @@ refused**: answering anybody is `cors.permissive`, which needs no list at all.
 And a list you never filled refuses every cross-origin request, so nilo says so
 in the log once, the first time it happens.
 
+## When a request changes something
+
+<!-- compiles: body -->
+```zig
+try app.use(nilo.csrf.sameOrigin);
+```
+
+A `POST`, `PUT`, `PATCH` or `DELETE` that a browser says came from a page this server does not serve is a 403, and your handler never runs. A `GET` is never asked, because a link from another site is a `GET`; a route that changes something on a `GET` is the thing to fix, and no CSRF check can.
+
+There is no token to put in your forms. The browser writes `Sec-Fetch-Site` and `Origin` on the request and a page cannot forge either, so nilo reads those ([ADR 224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md)). `curl`, a webhook and another server send neither and go through: none of them is carrying somebody else's cookie.
+
+**Why you would want it with `SameSite=Lax` already on your cookie:** Lax lets through a page on another subdomain of your site, a user's upload on `files.example.com` for instance, and does nothing once a cookie needs `SameSite=None`. This refuses both.
+
+A front end served from another origin is named, the same way CORS names it:
+
+<!-- compiles: body -->
+```zig
+try app.use(nilo.csrf.with(.{ .origins = &.{"https://app.example.com"} }));
+```
+
+When that address comes from the environment, `nilo.csrf.reading(&origins)` takes the same `nilo.cors.Origins` your `cors.reading` does, so one variable filled before `listen()` answers both. A route that really does take posts from anywhere leaves it with `app.without(nilo.csrf.sameOrigin).post(…)`.
+
 ## When one client asks too often
 
 <!-- compiles: body -->

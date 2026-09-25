@@ -156,14 +156,14 @@ const http_core = [_][]const u8{
 
 /// Files that sit **above** the core rather than below it, and so may name it.
 ///
-/// The four middleware modules and the roots. A middleware is handed a `Ctx`
+/// The middleware modules and the roots. A middleware is handed a `Ctx`
 /// and a `Next`, so naming `ctx.zig` and `middleware.zig` is downward for it;
 /// nothing in the core names any of them back, which is why they are not in
 /// the component.
 const http_above_core = [_][]const u8{
-    "logger",    "cors",      "allowance", "deadline", "maxbody",
-    "http",      "behaviour", "live",      "profile",  "fuzz",
-    "fuzz_main", "test_root",
+    "logger",    "cors",      "csrf",      "allowance", "deadline",
+    "maxbody",   "http",      "behaviour", "live",      "profile",
+    "fuzz",      "fuzz_main", "test_root",
 };
 
 const Layer = struct {
@@ -1555,6 +1555,18 @@ const refusals = [_]Refusal{
     .{
         .name = "cors_reading_with_origins_named_too",
         .says = "cors.reading takes its origins from the Origins you hand it, so the `.origins` field has nothing to do.",
+    },
+    .{
+        .name = "csrf_empty_origin",
+        .says = "csrf was given an empty origin, which matches nothing.",
+    },
+    .{
+        .name = "csrf_origin_with_a_path",
+        .says = "the csrf origin \"https://app.example.com/\" is not an origin, so no request would ever match it.",
+    },
+    .{
+        .name = "csrf_trusting_any_origin",
+        .says = "csrf was told to trust \"*\", which is every page on the web, and that is the same as not installing it.",
     },
     .{
         .name = "deadline_of_no_time",

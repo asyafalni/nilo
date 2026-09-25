@@ -642,6 +642,9 @@ pub const monotonicNanos = @import("bulkhead.zig").monotonicNanos;
 /// Built-in middleware.
 pub const logger = @import("logger.zig");
 pub const cors = @import("cors.zig");
+/// A request that changes something, taken only from a page this server
+/// serves ([ADR 224](../docs/adr/224-a-request-that-changes-something-says-where-it-came-from.md)).
+pub const csrf = @import("csrf.zig");
 pub const metrics = @import("metrics.zig");
 
 /// Gzip every answer worth gzipping, per request, for a client that asked:
@@ -940,6 +943,7 @@ test {
     _ = @import("ctx.zig");
     _ = @import("logger.zig");
     _ = @import("cors.zig");
+    _ = @import("csrf.zig");
     _ = @import("metrics.zig");
     _ = @import("compress.zig");
     _ = @import("allowance.zig");

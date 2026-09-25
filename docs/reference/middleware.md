@@ -16,6 +16,10 @@ nilo.cors.with(.{ .origins = &.{…}, .methods = …, .headers = …,
 
 nilo.cors.reading(&origins, .{ … })                     // the list read at run time
 
+nilo.csrf.sameOrigin                                    // 403 a cross-site POST, PUT, PATCH, DELETE
+nilo.csrf.with(.{ .origins = &.{…} })                   // …unless it came from one of these
+nilo.csrf.reading(&origins)                             // the list, from a cors.Origins
+
 nilo.allowance.with(.{ .per_window = 100, .window_s = 60,   // 429 past this
                         .slots = 16 * 1024,                  // addresses remembered
                         .ipv6_prefix = 64, .name = "" })
@@ -52,6 +56,25 @@ and a `.env`'s text both do — which is what lets the matched origin go out
 without being copied, so a cross-origin request still allocates nothing. `"*"`
 is refused: that is `cors.permissive`. A list nobody filled refuses every
 cross-origin request and says so in the log once.
+
+### `nilo.csrf`
+
+**A request that changes something, taken only from a page this server serves.** `GET`, `HEAD` and `OPTIONS` pass unread. Anything else is asked, in order ([ADR 224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md)):
+
+| the request carries | answer |
+|---|---|
+| `Sec-Fetch-Site: same-origin` or `none` | through |
+| any other `Sec-Fetch-Site`, `same-site` included | through if `Origin` is named, else 403 |
+| `Origin` and no `Sec-Fetch-Site` | through if named, or if it names the `Host` header's authority (scheme aside), else 403 |
+| neither | through: not a browser |
+
+| | |
+|---|---|
+| `nilo.csrf.sameOrigin` | names nobody: only this server's own pages |
+| `nilo.csrf.with(.{ .origins })` | the pages on other origins that may. Scheme, host and port, nothing after; compared case-insensitively. `"*"`, `""` and an entry with a path or no `://` are compile errors |
+| `nilo.csrf.reading(&o)` | the same, with `o` a `nilo.cors.Origins`, so one list can feed `cors.reading` and this |
+
+The 403 names the origin and `csrf .origins`. No allocation on any path, and nothing per connection. A route leaves it with `without(nilo.csrf.sameOrigin)`, which is the shape for a callback another site posts to from a browser; a server-to-server webhook sends neither header and needs nothing.
 
 ### `nilo.allowance`
 

@@ -270,10 +270,6 @@ A question nobody has answered. Not a backlog item, and not blocked: what a read
 
 **What would settle it:** an application that got one of them wrong, or an argument that a CSP belongs with the handlers that decide what a page loads rather than with the deployment.
 
-**Whether a request carries a CSRF token nilo knows about.** A session cookie defaults to `SameSite=Lax`, which is what stops a cross-site form POST from carrying it, and that covers the case almost everybody has. What it does not cover is a `SameSite=None` cookie, a `GET` that changes something, and a browser old enough not to enforce Lax. Every framework that has this ends up with a token in the session, a hidden field in the form and a comparison in a middleware, and all three would fit here.
-
-**What would settle it:** somebody who has to turn `SameSite` off.
-
 **Multipart, streamed.** `Form(T)` reads a multipart body whole, bounded by `max_body` ([ADR 030](./adr/030-a-form-is-the-body-read-by-another-rule.md)), which is right for a form with a photo in it and wrong for a 2 GB video. The streaming version wants a parser that resumes across reads and an `Upload` that is a reader rather than bytes; it inherits nothing from `sendfile`, because sending is a descriptor handed to the kernel and receiving is a parser holding its place.
 
 **What would settle it:** somebody designing it. Until then the answer is `c.bodyStream()`, which holds nothing and makes the framing the handler's problem.

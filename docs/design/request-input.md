@@ -68,4 +68,3 @@ Beside this topic: why a header's name and value are `Str` rather than `[]const 
 ## Open
 
 - **Multipart is read whole, never streamed.** `Form(T)` bounds an upload by `max_body`, right for a photo and wrong for a 2 GB video; a streaming version needs a parser that resumes across reads and an `Upload` that is a reader rather than bytes. On record in [the roadmap](../roadmap.md#known-waiting-for-a-caller), tied to [ADR 030](../adr/030-a-form-is-the-body-read-by-another-rule.md).
-- **Whether a request carries a CSRF token nilo knows about.** A session cookie's `SameSite=Lax` covers the ordinary cross-site POST; a `SameSite=None` cookie, a state-changing `GET`, and a browser old enough not to enforce Lax are not. On record in [the roadmap](../roadmap.md#open-questions) under `nilo_http`.

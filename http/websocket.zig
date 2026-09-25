@@ -1315,8 +1315,9 @@ pub fn originAllowed(origin: []const u8, host: []const u8, allowed: []const []co
 
 /// Whether an origin names the authority a `Host` named, scheme aside.
 /// `https://example.com` and `example.com` are the same place; so are
-/// `http://localhost:5173` and `localhost:5173`.
-fn sameAuthority(origin: []const u8, host: []const u8) bool {
+/// `http://localhost:5173` and `localhost:5173`. `csrf.zig` asks the same
+/// question of a request that carries no `Sec-Fetch-Site` (ADR 224).
+pub fn sameAuthority(origin: []const u8, host: []const u8) bool {
     if (host.len == 0) return false;
     const scheme_end = std.mem.indexOf(u8, origin, "://") orelse return false;
     return std.ascii.eqlIgnoreCase(origin[scheme_end + "://".len ..], host);

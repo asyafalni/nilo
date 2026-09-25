@@ -85,6 +85,8 @@ line rather than a forgotten one:
 | `http_only` | `true` | kept away from JavaScript |
 | `same_site` | `.lax` | `.strict`, `.lax`, `.none`, `.unset` |
 
+`SameSite=Lax` is what stops a form on another site from posting with the cookie. It does not stop a page on another subdomain of your own site, and `.none` turns it off; [`nilo.csrf.sameOrigin`](./middleware.md#when-a-request-changes-something) covers both.
+
 `Secure` on a development server is fine: browsers have treated
 `http://localhost` as a secure context since 2020.
 

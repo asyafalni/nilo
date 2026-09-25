@@ -1,6 +1,6 @@
 # CORS and the proxy in front
 
-**Two headers a browser and a proxy each read on the server's behalf get exactly the answer their protocol defines: `Access-Control-Allow-Origin` echoes the one origin that matched rather than being formatted from a list, and `X-Forwarded-For` is trusted by naming which machine sent it rather than by counting how many there were.** How to use each is the guide ([`guide/middleware.md#the-ones-that-come-with-it`](../guide/middleware.md#the-ones-that-come-with-it), [`guide/deploying.md#who-the-client-is`](../guide/deploying.md#who-the-client-is)); every option is the reference ([`reference/middleware.md`](../reference/middleware.md), [`reference/app.md#listen-options`](../reference/app.md#listen-options)). The code is `http/cors.zig` (`Options`, `Origins`, `with`, `reading`, `permissive`) and `http/proxies.zig` (`Cidr`, `Forwarded`, `holds`).
+**Two headers a browser and a proxy each read on the server's behalf get exactly the answer their protocol defines: `Access-Control-Allow-Origin` echoes the one origin that matched rather than being formatted from a list, and `X-Forwarded-For` is trusted by naming which machine sent it rather than by counting how many there were. The headers the browser writes about where a request came from, `Sec-Fetch-Site` and `Origin`, are what CSRF is checked against, with no token.** How to use each is the guide ([`guide/middleware.md#the-ones-that-come-with-it`](../guide/middleware.md#the-ones-that-come-with-it), [`guide/deploying.md#who-the-client-is`](../guide/deploying.md#who-the-client-is)); every option is the reference ([`reference/middleware.md`](../reference/middleware.md), [`reference/app.md#listen-options`](../reference/app.md#listen-options)). The code is `http/cors.zig` (`Options`, `Origins`, `with`, `reading`, `permissive`), `http/csrf.zig` (`Options`, `with`, `reading`, `sameOrigin`) and `http/proxies.zig` (`Cidr`, `Forwarded`, `holds`).
 
 ## How the pieces fit
 
@@ -11,6 +11,13 @@ Both halves answer the same question from opposite ends of a request: which of s
     request's Origin ──► compared against origins (comptime list or reading())
                             match  → that origin echoed back, Vary: Origin
                             no match → ordinary response, no header at all
+
+  CSRF: whether a request that changes something may run
+    GET, HEAD, OPTIONS ──► through, nothing read
+    Sec-Fetch-Site ──► same-origin, none → through
+                       anything else     → through only if Origin is named
+    no Sec-Fetch-Site, Origin ──► named, or names the Host → through
+    neither header ──► through (not a browser)
 
   Proxy trust: which address is the client
     X-Forwarded-For, walked right to left ──► trusted_proxies (CIDRs, "private", "loopback")
@@ -33,6 +40,11 @@ Both halves answer the same question from opposite ends of a request: which of s
 11. **The walk goes from the right, dropping every entry that names a trusted address; the first one that does not is the client, and everything left of it is unverified.** If every entry is trusted, the connection's own address is the honest answer, because there is no client behind them. [ADR 102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md)
 12. **Every `X-Forwarded-For` field is read as one list, in wire order**, because a proxy is allowed to add a field of its own rather than append to the one the client sent, and reading only the first field lets a forged entry through a proxy that behaves honestly. [ADR 102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md)
 13. **A `trusted_proxies` entry that is not an address stops the server at `listen()`, naming it**, before the port is taken, rather than answering with the wrong client address for the life of the deployment. [ADR 102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md)
+14. **CSRF is checked against what the browser says about where a request came from, not against a token.** `Sec-Fetch-Site` and `Origin` are written by the browser and cannot be set by a page, so the check keeps no state, draws no entropy, and puts nothing in the session or the form, which a sealed session and a server with no templates could not have carried. [ADR 224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md)
+15. **Only `POST`, `PUT`, `PATCH`, `DELETE` and methods nilo does not name are checked.** A cross-site `GET` is a link, and a `GET` that changes something is the route's bug, which no CSRF check covers. [ADR 224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md)
+16. **`Sec-Fetch-Site: same-site` is refused unless its `Origin` is named**, because it is exactly what `SameSite=Lax` lets through: a page on a sibling subdomain posting with the session cookie. When the browser has said `cross-site`, an `Origin` matching the `Host` does not overrule it. [ADR 224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md)
+17. **A request with neither header passes**, because it is not from a browser and carries nobody else's cookie; the `Host` compare, scheme aside, is only the fallback for a browser that sends `Origin` and no `Sec-Fetch-Site`. [ADR 224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md)
+18. **CSRF is opt-in, and its trusted list is the CORS one when it is read at run time**: `csrf.reading(&origins)` takes the same `cors.Origins`. `"*"`, an empty entry and an entry with a path are refused while compiling in `csrf.with`. [ADR 224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md)
 
 ## Decisions
 
@@ -41,6 +53,7 @@ Both halves answer the same question from opposite ends of a request: which of s
 | [078](../adr/078-one-allow-origin-header-means-the-list-is-matched-not-formatted.md) | `origins` as a matched list rather than a formatted string, and where the refusal for a mismatch lands |
 | [088](../adr/088-an-origin-is-a-fact-about-the-deployment.md) | `cors.reading`, a runtime list for the one fact that differs by deployment |
 | [102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md) | `trusted_proxies`, trust by address rather than by hop count |
+| [224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md) | `csrf`, a request that changes something checked against `Sec-Fetch-Site` and `Origin`, and why not a token |
 
 Beside this topic: the header caching rule that makes sending `Vary: Origin` on a miss necessary is [ADR 029](../adr/029-a-header-is-checked-once-and-two-of-them-repeat.md); a bare function pointer being what a `Middleware` is, which is why `cors.reading` needs a caller-owned variable rather than a Service, is decided in [ADR 008](../adr/008-middleware-is-an-onion-of-ctx-functions.md); a repeated `Host` or a smuggled request being refused by the same reasoning `trusted_proxies` uses for a forged hop is [ADR 070](../adr/070-a-request-nobody-else-would-answer-is-refused.md).
 
