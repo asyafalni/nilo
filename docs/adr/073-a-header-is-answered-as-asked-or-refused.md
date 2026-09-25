@@ -88,6 +88,10 @@ list, and treats an empty ETag as matching nothing — which retires
 `serveHeldFile`. `etagMatches` keeps all three behaviours for `If-None-Match`,
 where all three are correct, and its doc now says it is not for `If-Range`.
 
+### `Connection`
+
+**`Connection` is a list, and `close` anywhere in it closes** (RFC 9110 §7.6.1, RFC 9112 §9.6). It was compared as one value, so `keep-alive, close` was read as neither and kept an HTTP/1.1 connection open, and `keep-alive, Upgrade` closed an HTTP/1.0 one; [ADR 231](./231-a-second-parser-reads-what-the-first-one-reads.md)'s run against llhttp found the second. The two values nearly every request sends are still matched whole before anything is split. `keep-alive` on HTTP/1.1 changes nothing, so a `close` on an earlier line stays closed. On HTTP/1.0 a `close` line *before* a `keep-alive` line reads as open: remembering it is a ninth byte in a `Request` whose eight fill its padding, for an order no client sends ([`decided.md`](../decided.md)).
+
 ### `filename*`
 
 A part carrying `filename*` and no `filename` is a 400 naming the part. nilo

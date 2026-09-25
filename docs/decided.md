@@ -40,6 +40,14 @@ A gap that is the rule. Each was looked at, priced, and kept as it is, and the e
 
 **Reopened by:** a shape that states a failure *in the type*. Wanting one does not.
 
+**A byte past 0x7f in a request target is routed as sent.** RFC 3986 has no such byte in a URI and llhttp refuses one; nginx and Go route it, `curl` sends a UTF-8 path that way, and it cannot end a line or split a field. A front end that percent-encodes it sends `%XX`, which a path param decodes to the same bytes. `fuzz-llhttp` counts it under `decided` rather than failing ([ADR 231](./adr/231-a-second-parser-reads-what-the-first-one-reads.md)).
+
+**Reopened by:** a front end that reads such a target as a different path from the one nilo routes.
+
+**On HTTP/1.0, a `Connection: close` line before a `Connection: keep-alive` line reads as open.** `close` anywhere in one line wins, and on HTTP/1.1 a `close` stays closed whatever follows; remembering it across lines on HTTP/1.0 is a ninth byte in a `Request` whose eight fill its padding ([ADR 073](./adr/073-a-header-is-answered-as-asked-or-refused.md)).
+
+**Reopened by:** a client that sends the two on separate lines, or a ninth field that `Request` needs anyway.
+
 ### `nilo_sql`
 
 **A Row left out of the `checking` list is not checked, and nothing says so.** A `Db` with no list at all warns now ([ADR 192](./adr/192-a-db-with-no-schema-check-says-so-or-is-told.md)); a list with one Row missing from it is still silent for that Row, because Zig cannot enumerate the Rows a program declares and there is nothing to compare the list against. One `sql.Schema` handed to `checking`, the migrations tool and `createMissing` is the answer ([ADR 181](./adr/181-the-marker-has-two-kinds-of-word.md)): a Row the tool does not know about has no table either, which is found the first time a migration is generated.

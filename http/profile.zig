@@ -110,9 +110,49 @@ fn readHeadOnly() void {
     sink += (http1.readHead(&in, .off) catch unreachable).len;
 }
 
+/// The head as a parser really meets it: bytes the compiler cannot see.
+/// Handed `request` itself, a constant, LLVM folds part of the parse over
+/// the known bytes, and a simpler parser folds more of itself away than a
+/// stricter one does, so a before-and-after on the constant measured the
+/// folding (ADR 231).
+fn unseen(comptime head: []const u8) []const u8 {
+    const S = struct {
+        var bytes: [head.len]u8 = head[0..head.len].*;
+    };
+    var out: []const u8 = &S.bytes;
+    std.mem.doNotOptimizeAway(&out);
+    return out;
+}
+
 fn parseHeadOnly() void {
     var r = http1.Request{};
-    http1.parseHead(request, &r) catch unreachable;
+    http1.parseHead(unseen(request), &r) catch unreachable;
+    sink += r.target.len;
+}
+
+/// What a browser sends on a navigation: fifteen lines, most of them long,
+/// where `request` is wrk's five. Every check the parser makes per byte or
+/// per name is paid in proportion to this one, so a change to the parser is
+/// measured on both (ADR 231).
+const browser_head = "GET /dashboard/settings?tab=profile HTTP/1.1\r\n" ++
+    "Host: app.example.com\r\n" ++
+    "Connection: keep-alive\r\n" ++
+    "sec-ch-ua: \"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"\r\n" ++
+    "sec-ch-ua-mobile: ?0\r\n" ++
+    "sec-ch-ua-platform: \"Linux\"\r\n" ++
+    "Upgrade-Insecure-Requests: 1\r\n" ++
+    "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n" ++
+    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\n" ++
+    "Sec-Fetch-Site: same-origin\r\n" ++
+    "Sec-Fetch-Mode: navigate\r\n" ++
+    "Sec-Fetch-Dest: document\r\n" ++
+    "Accept-Encoding: gzip, deflate, br, zstd\r\n" ++
+    "Accept-Language: en-US,en;q=0.9\r\n" ++
+    "Cookie: session=4f8a2c9e1b7d3a6f0e5c8b2d9a4f7e1c; theme=dark\r\n\r\n";
+
+fn parseBrowserHead() void {
+    var r = http1.Request{};
+    http1.parseHead(unseen(browser_head), &r) catch unreachable;
     sink += r.target.len;
 }
 
@@ -191,6 +231,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     );
     line("read the head", bestOf(readHeadOnly), whole);
     line("parse the head", bestOf(parseHeadOnly), whole);
+    std.debug.print("  {s:<28}{d:>5}ns   {d} bytes, where the one above is {d}\n", .{ "parse a browser's head", bestOf(parseBrowserHead) / rounds, browser_head.len, request.len });
     line("copy the head to the arena", bestOf(copyHead), whole);
     line("match the route", bestOf(matchRoute), whole);
     line("serialise the body", bestOf(serialiseBody), whole);

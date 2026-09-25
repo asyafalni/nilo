@@ -50,32 +50,121 @@ pub const Finding = struct {
     /// differently. Static text either way, so findings can be counted by
     /// it.
     detail: []const u8,
+    /// Why this one is nilo's on purpose, when it is (`decided`).
+    why: ?[]const u8 = null,
 };
 
 /// Differences that were looked at and are nilo's on purpose. Matched on
-/// the kind and a piece of the detail; each says why, so that the day the
+/// the kind, a piece of the detail, and the input itself: llhttp's reason
+/// names where it stopped, not what was there, so "Invalid char in url path"
+/// is a high byte nilo takes on purpose or a control byte it must refuse,
+/// and only `when` can tell them apart. Each says why, so that the day the
 /// reason stops holding somebody can tell.
-const Decided = struct { kind: Kind, detail: []const u8, why: []const u8 };
+const Decided = struct {
+    kind: Kind,
+    detail: []const u8,
+    when: *const fn (head: []const u8) bool,
+    why: []const u8,
+};
 const decided = [_]Decided{
     .{
         .kind = .nilo_accepts_what_llhttp_refuses,
         .detail = "Invalid method",
+        .when = methodIsToken,
         .why = "RFC 9110 §9.1: a method is any token, and one nobody routed is a 405 or a 404. " ++
-            "llhttp knows a fixed list. A method that is not a token is a finding of its own.",
+            "llhttp knows a fixed list.",
+    },
+    .{
+        .kind = .nilo_accepts_what_llhttp_refuses,
+        .detail = "Expected space after method",
+        .when = methodIsToken,
+        .why = "The same list, met part way: llhttp matched `PUT` and stopped at the `.` of `PUT.`, " ++
+            "which is a token.",
     },
     .{
         .kind = .nilo_accepts_what_llhttp_refuses,
         .detail = "Duplicate Content-Length",
+        .when = always,
         .why = "RFC 9110 §8.6 lets a recipient take a repeat of the same length as the one length; " ++
             "two different ones are refused (http1.zig, `has_content_length`).",
     },
+    .{
+        .kind = .nilo_accepts_what_llhttp_refuses,
+        .detail = "url",
+        .when = targetHasHighByte,
+        .why = "A byte past 0x7f cannot end a line or split a field, and nginx and Go route it as " ++
+            "sent. A front end that encodes it sends `%XX`, which a path param decodes to the same bytes.",
+    },
+    .{
+        .kind = .nilo_accepts_what_llhttp_refuses,
+        .detail = "Unexpected char in url schema",
+        .when = otherScheme,
+        .why = "RFC 3986 §3.1 lets a scheme hold digits, `+`, `-` and `.`, and an absolute-URI need not " ++
+            "go on with `//`; llhttp reads letters and `://`. A scheme nilo does not serve is routed as sent " ++
+            "and finds no route.",
+    },
+    .{
+        .kind = .frames_differently,
+        .detail = "keep-alive",
+        .when = saysCloseAndKeepAlive,
+        .why = "RFC 9112 §9.6: `close` means the connection closes, whatever else is listed. " ++
+            "llhttp keeps an HTTP/1.0 connection open when `keep-alive` is there too.",
+    },
 };
 
-fn decidedWhy(f: Finding) ?[]const u8 {
+fn decidedWhy(f: Finding, head: []const u8) ?[]const u8 {
     for (decided) |d| {
-        if (d.kind == f.kind and std.mem.indexOf(u8, f.detail, d.detail) != null) return d.why;
+        if (d.kind == f.kind and std.mem.indexOf(u8, f.detail, d.detail) != null and d.when(head)) return d.why;
     }
     return null;
+}
+
+fn always(_: []const u8) bool {
+    return true;
+}
+
+/// The method and the target, split off the request line on its first two spaces.
+fn requestLine(head: []const u8) struct { method: []const u8, target: []const u8 } {
+    const line = head[0 .. std.mem.indexOfScalar(u8, head, '\n') orelse head.len];
+    const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return .{ .method = line, .target = "" };
+    const sp2 = std.mem.indexOfScalarPos(u8, line, sp1 + 1, ' ') orelse line.len;
+    return .{ .method = line[0..sp1], .target = line[sp1 + 1 .. sp2] };
+}
+
+fn methodIsToken(head: []const u8) bool {
+    return http1.headerNameOk(requestLine(head).method);
+}
+
+fn targetHasHighByte(head: []const u8) bool {
+    for (requestLine(head).target) |b| if (b >= 0x80) return true;
+    return false;
+}
+
+fn otherScheme(head: []const u8) bool {
+    const target = requestLine(head).target;
+    const colon = std.mem.indexOfScalar(u8, target, ':') orelse return false;
+    const scheme = target[0..colon];
+    if (scheme.len == 0 or !std.ascii.isAlphabetic(scheme[0])) return false;
+    for (scheme) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '+' and ch != '-' and ch != '.') return false;
+    }
+    return !std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https");
+}
+
+fn saysCloseAndKeepAlive(head: []const u8) bool {
+    var close = false;
+    var keep = false;
+    var it = http1.HeaderIterator.from(head);
+    while (it.next()) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "connection")) continue;
+        var options = std.mem.splitScalar(u8, h.value, ',');
+        while (options.next()) |raw| {
+            const option = std.mem.trim(u8, raw, " \t");
+            if (std.ascii.eqlIgnoreCase(option, "close")) close = true;
+            if (std.ascii.eqlIgnoreCase(option, "keep-alive")) keep = true;
+        }
+    }
+    return close and keep;
 }
 
 // ---- llhttp's reading of one head ----
@@ -268,10 +357,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     for (0..iterations) |_| {
         const input = generator.generate(prng.random(), &buf);
-        if (http1.findEndOfHead(input, 0) != null) compared += 1;
-        const f = compare(input) orelse continue;
+        const end = http1.findEndOfHead(input, 0) orelse continue;
+        compared += 1;
+        var f = compare(input) orelse continue;
+        f.why = decidedWhy(f, input[0..end]);
         const slot = for (tallies[0..kinds]) |*t| {
-            if (t.finding.kind == f.kind and std.mem.eql(u8, t.finding.detail, f.detail)) break t;
+            if (t.finding.kind == f.kind and std.mem.eql(u8, t.finding.detail, f.detail) and
+                (t.finding.why == null) == (f.why == null)) break t;
         } else blk: {
             if (kinds == tallies.len) continue;
             tallies[kinds] = .{ .finding = f };
@@ -285,7 +377,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var failing: usize = 0;
     for (tallies[0..kinds]) |*t| {
-        const why = decidedWhy(t.finding);
+        const why = t.finding.why;
         const fails = t.finding.kind.fails() and why == null;
         if (fails) failing += 1;
         std.debug.print("\n{s} {t}: {s} ({d} inputs)\n", .{

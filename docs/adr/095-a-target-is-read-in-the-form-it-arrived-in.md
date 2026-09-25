@@ -25,6 +25,7 @@ origin-form path the router matches.**
 | absolute | `http://example.com/users/7` | split: authority kept, path routed |
 | asterisk | `*` (server-wide `OPTIONS`) | passed through |
 | authority | `example.com:443` (`CONNECT`) | passed through |
+| none of them | `h;tp://x/y`, `?a=1`, `http:/x` | refused, a 400 |
 
 The last two are passed through rather than special-cased because neither names
 a route here. nilo is not a proxy, so a `CONNECT` has nothing to tunnel to, and
@@ -33,6 +34,8 @@ the router as they arrived and get the 404 or 405 they got before. Refusing
 them outright was the alternative and it fails the rule
 [ADR 070](./070-a-request-nobody-else-would-answer-is-refused.md) states:
 refuse what nobody else would answer, and these are answered by somebody.
+
+**A target in none of the four is a 400** (RFC 9112 §3.2). Not origin-form, not `*`, not a scheme and a colon (the absolute-form of a scheme nilo does not serve, which still passes through), and not `host:port`: `h;tp://x/y` was routed as a path while llhttp refused it ([ADR 231](./231-a-second-parser-reads-what-the-first-one-reads.md)), and a target no form has is one no front end forwards as nilo read it.
 
 ## The authority *is* the Host, and that is not a preference
 
@@ -52,7 +55,7 @@ two things follow, and both are behaviour changes rather than additions:
 A `Host` beside an absolute-form target is still read and a second one is still
 a 400. What changed is only which line is allowed to answer the rule.
 
-## Two shapes inside absolute-form are refused
+## Four shapes inside absolute-form are refused
 
 **Userinfo.** `http://real.example.com@evil.example.net/` names
 `evil.example.net`, and every human reading it in a log sees the first name.
@@ -66,16 +69,25 @@ moves them onto a copy of the head by their offset into it — so serving this
 would mean either an allocation on the request path or dropping the query
 silently. Both are worse than refusing a shape nothing sends.
 
+**An authority a host cannot be spelled as.** It becomes the Host, so it is held to RFC 3986 §3.2: an IP-literal in brackets or a reg-name, and a port of digits. `http://|/y` named a host llhttp refused and nilo would have handed to `c.host()` (ADR 231).
+
+**`http:` or `https:` with no `//`.** `http:/x` has no host, and RFC 9110 §4.2.1 says a recipient must reject an `http` URI with an empty one.
+
 `http://example.com` with no path at all *is* served, as `/`. The slash handed
 back is the second one of the target's own `//`, which keeps every slice inside
 the head. A static `"/"` would not survive `App.rebase`, and finding that out
 before shipping it is the only reason this paragraph is short.
 
+## What was rejected
+
+**Routing a target in no form as a path**, which is what nilo did until ADR 231's run: `h;tp://x/y` and `?a=1` reached the router and found a 404. Harmless to nilo, and the reason it changed is the other parser: llhttp refuses every one of them, and a front end that refuses or rewrites what nilo routes is two readings of one request.
+
 ## What it costs
 
 **One byte compare on the request path.** `target[0] == '/'` is true for every
 request a browser sends, and the scheme match is behind it — an origin-form
-target never reaches `startsWithIgnoreCase`.
+target never reaches `startsWithIgnoreCase`. The form and authority checks
+added by ADR 231 sit behind the same compare.
 
 **16 bytes on the `Request` struct**, which is the one axis this spends: the
 struct sits in the connection loop's frame, and a fiber holds its stack at its

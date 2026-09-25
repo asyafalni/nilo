@@ -2945,6 +2945,47 @@ Same instrument and machine as the section above, no quota, eight threads, **ser
 
 **Can it be pushed further.** Not on this box. dusty's loss past five loops was on 24 threads and the arena's box has sixty-four; the roadmap carries the run.
 
+## What reading every byte of the head costs
+
+[ADR 070](../../docs/adr/070-a-request-nobody-else-would-answer-is-refused.md) and [ADR 095](../../docs/adr/095-a-target-is-read-in-the-form-it-arrived-in.md) have the rules and [ADR 231](../../docs/adr/231-a-second-parser-reads-what-the-first-one-reads.md) the run against llhttp that found them: a control byte or a bare CR anywhere in the head, a method or header name that is not a token, and a target in none of the four forms are refused, where before only five headers were read. Unlike the first group in ADR 070, this looks at every byte and every name.
+
+Before is `a629d1d`; after is it plus the parser change, each tree from `git archive` with its own cache, checksums compared. 9700X, Linux 7.2.5, `-Dtarget=x86_64-linux-gnu` (baseline x86-64), ReleaseFast.
+
+**End to end**, the axis ADR 017 budgets: `nilo-hello` on CPUs 0–3,8–11, gcannon `11c802b` on 4–7,12–15, 512 keep-alive connections, eight threads, `/users/1`, five seconds, three interleaved pairs. The request is sent as a raw file: wrk's 125-byte head, and a Chrome navigation's 659-byte one with fourteen headers.
+
+| head | before | after | p99 | p99.9 |
+|---|---|---|---|---|
+| wrk, 125 bytes | 2.04–2.05M req/s | 2.00–2.01M, −1.5 to −2.4% | 477–492 → 453–477 µs | 0.85–0.94 → 0.71–0.73 ms |
+| browser, 659 bytes | 1.96–1.98M | 1.88–1.89M, −3.6 to −4.5% | 485–495 → 416–470 µs | 0.84–0.92 → 0.66–1.11 ms |
+
+**Memory per idle connection**, `bench/mem.py --path /users/1` out to 10,000: 9,288 bytes before, 9,289 after. **Binary**, stripped: `hello` 976,864 → 981,040, `rest` 1,166,376 → 1,170,520, `nilo-hello` 984,792 → 988,936.
+
+**`zig build profile`**, pinned to CPU 2, interleaved, with the head handed over as bytes the compiler cannot see (`unseen` in `profile.zig`; it made no difference here, and a constant is the wrong thing to hand a parser):
+
+| row | before | after |
+|---|---|---|
+| parse the head (wrk's, 121 bytes) | 32–34ns | 54–55ns |
+| parse a browser's head (682 bytes) | 78–79ns | 154–156ns |
+| the whole in-process request | 356–370ns | 423–427ns |
+
+The whole request grew by more than the parse did: 361 → 409–410ns with `parseHead` kept out of line on both sides, where the parse row alone is +22ns. Not run down. The likeliest reading is branch prediction: the new branches are per name and per block, a loop timing only the parser lets the predictor learn them, and a request between two parses does not. The end-to-end run is the one that includes that, and it is what the decision rests on.
+
+**The shapes tried**, timed in a harness of `parseHead` alone that counts parse errors (`catch unreachable` let LLVM delete every refusal, see `docs/history.md`), baseline x86-64, wrk's head / the browser's:
+
+| shape | after |
+|---|---|
+| before, for reference | 29–30 / 63–64ns |
+| the block shifted a lane for "CR then LF", the full `tchar` class per name, a flag per line | 55.7 / 170ns |
+| the same with the stray bytes from the loop's own LF mask, three compares a block | 51.8 / 149ns |
+| the same with a name tested for letters, digits and `-` first | 50.6 / 158ns |
+| both, which is what shipped | 46.6 / 138.7ns |
+| a name class computed per block and tested per line by bit arithmetic | 52.6 / 164.8ns |
+| the first stray byte kept as a position, one compare a line | the same or worse than a flag in all four pairings, by up to 4.6ns on wrk's head and 25ns on the browser's |
+
+Taken apart in the first shape: with all five new checks out the harness read 29.4 / 63.0ns, the same as before, so the `Connection` list and the target forms cost nothing on these heads; the name check was 11 / 34ns and the stray bytes 8 / 48ns.
+
+**Can it be pushed further.** Probably. The name test is nine or three compares a name where a byte-class table lookup (`pshufb`, NEON `tbl`) is two, and Zig 0.16 has no portable runtime shuffle to write it with. Folding the name test into the block walk measured worse here, but it was measured as one shape among several; a version that tests only blocks holding a name start is untried.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

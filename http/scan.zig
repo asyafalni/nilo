@@ -54,6 +54,78 @@ pub fn positionsOf(buf: []const u8, at: usize, byte: u8) u32 {
     return bits;
 }
 
+/// The positions of the control bytes in `buf[at..]`, as `positionsOf` gives
+/// them: everything below 0x20, and DEL. Tab, CR and LF are in it, because
+/// which of those a line may hold depends on where they are, and the request
+/// head's walk already has the masks to tell (ADR 231).
+pub fn controlsOf(buf: []const u8, at: usize) u32 {
+    return classOf(buf, at, controlBlock, isControl);
+}
+
+fn controlBlock(block: Block) u32 {
+    const low: u32 = @bitCast(block < @as(Block, @splat(0x20)));
+    const del: u32 = @bitCast(block == @as(Block, @splat(0x7F)));
+    return low | del;
+}
+
+fn isControl(ch: u8) bool {
+    return ch < 0x20 or ch == 0x7F;
+}
+
+/// The positions of the bytes in `buf[at..]` that are not a letter, a digit
+/// or `-`, which is what nearly every header name is spelled with.
+///
+/// A header name is a `token` (RFC 9110 §5.6.2), and testing a block for the
+/// whole of `tchar` is nine compares where this is three. So a name is
+/// tested with this, and only a byte it flags is looked up in `isTokenByte`:
+/// an `X_Custom`'s underscore, or a byte that is not a token at all. On a
+/// browser's head that was 158ns against 170ns for the nine (ADR 231).
+pub fn unusualNameBytesOf(buf: []const u8, at: usize) u32 {
+    return classOf(buf, at, unusualBlock, isUnusual);
+}
+
+fn unusualBlock(block: Block) u32 {
+    const folded = block | @as(Block, @splat(0x20)); // an upper-case letter as its lower-case one
+    const letter: u32 = @bitCast(folded -% @as(Block, @splat('a')) <= @as(Block, @splat('z' - 'a')));
+    const digit: u32 = @bitCast(block -% @as(Block, @splat('0')) <= @as(Block, @splat(9)));
+    const dash: u32 = @bitCast(block == @as(Block, @splat('-')));
+    return ~(letter | digit | dash);
+}
+
+fn isUnusual(ch: u8) bool {
+    return !(std.ascii.isAlphanumeric(ch) or ch == '-');
+}
+
+/// `tchar`, as RFC 9110 §5.6.2 lists it.
+pub fn isTokenByte(ch: u8) bool {
+    return switch (ch) {
+        'a'...'z', 'A'...'Z', '0'...'9' => true,
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
+/// `positionsOf` for a class of bytes rather than one: the same three ways of
+/// loading a block, with the class tested by `inBlock` on a whole one and by
+/// `isOne` on a buffer too short to have one.
+fn classOf(
+    buf: []const u8,
+    at: usize,
+    comptime inBlock: fn (Block) u32,
+    comptime isOne: fn (u8) bool,
+) u32 {
+    if (at + lanes <= buf.len) return inBlock(buf[at..][0..lanes].*);
+    if (buf.len >= lanes) {
+        const from = buf.len - lanes;
+        return inBlock(buf[from..][0..lanes].*) >> @intCast(at - from);
+    }
+    var bits: u32 = 0;
+    for (buf[at..], 0..) |ch, k| {
+        if (isOne(ch)) bits |= @as(u32, 1) << @intCast(k);
+    }
+    return bits;
+}
+
 /// How many times `byte` occurs in `buf`.
 pub fn countOf(buf: []const u8, byte: u8) usize {
     var n: usize = 0;
@@ -148,4 +220,40 @@ test "positionsOf reads the same bytes as a plain loop, on mixed content" {
             bits = 0;
         }
     }
+}
+
+test "a class of bytes is found at every offset the way a plain loop finds it" {
+    // Every length either side of a block boundary, so all three loads are
+    // taken, over bytes chosen to sit on each side of every range edge.
+    const edges = [_]u8{ 0x00, 0x09, 0x0A, 0x0D, 0x1F, 0x20, 0x21, '"', '#', '\'', '(', ')', '*', ',', '-', '.', '/', '0', '9', ':', '@', 'A', 'Z', '[', ']', '^', '_', '`', 'a', 'z', '{', '|', '}', '~', 0x7F, 0x80, 0xC1, 0xDA, 0xFF };
+    var buf: [80]u8 = undefined;
+    for (1..buf.len) |len| {
+        for (buf[0..len], 0..) |*ch, k| ch.* = edges[(k * 7 + len) % edges.len];
+        const text = buf[0..len];
+        var i: usize = 0;
+        while (i < text.len) : (i += lanes) {
+            var want_controls: u32 = 0;
+            var want_unusual: u32 = 0;
+            for (text[i..@min(i + lanes, text.len)], 0..) |ch, k| {
+                if (isControl(ch)) want_controls |= @as(u32, 1) << @intCast(k);
+                if (isUnusual(ch)) want_unusual |= @as(u32, 1) << @intCast(k);
+            }
+            try testing.expectEqual(want_controls, controlsOf(text, i));
+            try testing.expectEqual(want_unusual, unusualNameBytesOf(text, i));
+        }
+    }
+}
+
+test "every byte a name is tested for first is a token byte, and the rest are looked up" {
+    // `unusualNameBytesOf` may flag a token byte (`_`), since `isTokenByte`
+    // decides it after; it must never pass one that is not a token.
+    var tokens: usize = 0;
+    for (0..256) |b| {
+        const ch: u8 = @intCast(b);
+        const block: Block = @splat(ch);
+        if (unusualBlock(block) == 0) try testing.expect(isTokenByte(ch));
+        if (isTokenByte(ch)) tokens += 1;
+    }
+    // 62 letters and digits and 15 symbols.
+    try testing.expectEqual(@as(usize, 77), tokens);
 }

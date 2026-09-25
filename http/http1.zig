@@ -539,12 +539,22 @@ pub fn findEndOfHead(buf: []const u8, from: usize) ?usize {
 /// is what names the header. Walking them instead cost 36ns on a small head
 /// and 70ns on a browser's, because a header *value* is full of colons and
 /// none of them is interesting.
+///
+/// **A byte no line may carry is found the same way** (ADR 231): a control
+/// byte, and a CR that does not end its line (RFC 9112 §2.2, RFC 9110 §5.5).
+/// A front end that turns a bare CR into a line ending, or drops a NUL,
+/// reads a header nilo does not, so these are refused rather than carried.
+/// Tab is the one control a header value may hold; the request line may hold
+/// none, so there it is refused too.
 pub fn parseHead(head: []const u8, r: *Request) ParseError!void {
     var line_start: usize = 0;
     // Where this line's first colon is. 0 stands for "none yet" — a line
     // cannot begin with one, so the position is free to be the sentinel.
     var colon: usize = 0;
     var first_line = true;
+    // Whether the line still open holds a byte no line may. Carried across
+    // blocks for the same reason `colon` is.
+    var line_bad = false;
 
     var i: usize = 0;
     while (i < head.len) : (i += lanes) {
@@ -554,6 +564,13 @@ pub fn parseHead(head: []const u8, r: *Request) ParseError!void {
         // own, so what is left over at the end of the block belongs to the
         // line still open — which is how a header spanning two blocks works.
         var unclaimed = blockAt(head, i, ':');
+        // Stray bytes, claimed line by line the way the colons are. Tabs are
+        // among them and kept apart, because only the request line refuses
+        // one; they are looked for only in a block that has something stray,
+        // which in a head a browser sent none has.
+        const stray = strayBytes(head, i, newlines);
+        var tabs: u32 = if (stray != 0) blockAt(head, i, '\t') & stray else 0;
+        var bad = stray & ~tabs;
 
         while (newlines != 0) : (newlines &= newlines - 1) {
             const bit = @ctz(newlines);
@@ -563,15 +580,20 @@ pub fn parseHead(head: []const u8, r: *Request) ParseError!void {
             const mine = unclaimed & below;
             unclaimed &= ~below;
             if (colon == 0 and mine != 0) colon = i + @ctz(mine);
+            if ((bad | if (first_line) tabs else 0) & below != 0) line_bad = true;
+            bad &= ~below;
+            tabs &= ~below;
 
             var end = nl_at;
             if (end > line_start and head[end - 1] == '\r') end -= 1;
 
             if (first_line) {
+                if (line_bad) return error.BadRequestLine;
                 try parseRequestLine(head[line_start..end], r);
                 first_line = false;
             } else {
                 if (end == line_start) return finish(r); // the blank line ends the head
+                if (line_bad) return error.BadHeader;
                 // A line that starts with whitespace is obs-fold, the
                 // continuation of the header above it. RFC 9112 §5.2 lets a
                 // server refuse it, and one that reads the continuation as
@@ -590,6 +612,12 @@ pub fn parseHead(head: []const u8, r: *Request) ParseError!void {
                 // `Name: value` while nilo drops it is a framing disagreement,
                 // so it is a 400 rather than a line that is quietly ignored.
                 if (head[colon - 1] == ' ' or head[colon - 1] == '\t') return error.BadHeader;
+                // A name is a token (RFC 9110 §5.1). `Transfer-Encoding\x0b` or
+                // `Con,nection` is a line nilo would ignore while a front end
+                // that strips or splits the stray byte reads it as framing.
+                // Every name, not only the five read below, because which name
+                // a front end makes of it is the question.
+                if (!tokenAt(head, line_start, colon)) return error.BadHeader;
                 // Five headers matter and between them they start with four
                 // letters, so one compare throws out Accept, User-Agent and the
                 // rest before their name is even measured. `e` is here for
@@ -604,8 +632,10 @@ pub fn parseHead(head: []const u8, r: *Request) ParseError!void {
 
             line_start = nl_at + 1;
             colon = 0;
+            line_bad = false;
         }
         if (colon == 0 and unclaimed != 0) colon = i + @ctz(unclaimed);
+        if ((bad | if (first_line) tabs else 0) != 0) line_bad = true;
     }
 
     // A head with no blank line in it — which `readHead` never produces, but
@@ -613,12 +643,61 @@ pub fn parseHead(head: []const u8, r: *Request) ParseError!void {
     if (line_start < head.len or first_line) {
         const line = trimCR(head[@min(line_start, head.len)..]);
         if (first_line) {
+            if (line_bad) return error.BadRequestLine;
             try parseRequestLine(line, r);
         } else if (line.len > 0) {
+            if (line_bad) return error.BadHeader;
             try applyHeader(line, r);
         }
     }
     return finish(r);
+}
+
+/// The control bytes in the block at `i` that no line may carry where they
+/// are: every one but LF, and but a CR with an LF after it. Tab is in it;
+/// the caller tells tabs apart. A CR on the last byte of `head` is let
+/// through, since `trimCR` takes it off the line, and only a fragment ends
+/// that way.
+///
+/// "Followed by an LF" is the block's own LF mask shifted down a bit, with
+/// the byte past the block read for the top one, rather than a second
+/// compare: three compares a block for the whole check (ADR 231).
+fn strayBytes(head: []const u8, i: usize, newlines: u32) u32 {
+    const controls = scan.controlsOf(head, i) & ~newlines;
+    var ended = newlines >> 1;
+    if (i + lanes < head.len) {
+        if (head[i + lanes] == '\n') ended |= 1 << (lanes - 1);
+    } else {
+        ended |= @as(u32, 1) << @intCast(head.len - 1 - i);
+    }
+    return controls & ~(blockAt(head, i, '\r') & ended);
+}
+
+/// Whether `buf[from..to]` is a token, a block at a time. Loads past `to`
+/// and masks what it does not own, so a name shorter than a block is one
+/// load and one class test against the rest of its line, and only a byte
+/// that is not a letter, digit or `-` is looked up in the grammar.
+///
+/// `inline` because it is called for every header line, where a call saves
+/// registers and loads the class's constants for a check shorter than that.
+/// A buffer shorter than a block, which is a request line like
+/// `GET / HTTP/1.1`, is checked over the name alone rather than through the
+/// scan's byte loop over all of it.
+inline fn tokenAt(buf: []const u8, from: usize, to: usize) bool {
+    if (from >= to) return false;
+    if (buf.len < lanes) {
+        for (buf[from..to]) |ch| if (!scan.isTokenByte(ch)) return false;
+        return true;
+    }
+    var at = from;
+    while (at < to) : (at += lanes) {
+        var bits = scan.unusualNameBytesOf(buf, at);
+        if (to - at < lanes) bits &= scan.below(@intCast(to - at));
+        while (bits != 0) : (bits &= bits - 1) {
+            if (!scan.isTokenByte(buf[at + @ctz(bits)])) return false;
+        }
+    }
+    return true;
 }
 
 /// What has to be true of a head as a whole rather than of any one line in it,
@@ -665,6 +744,11 @@ pub fn parseRequestLine(line: []const u8, r: *Request) ParseError!void {
         return error.UnsupportedVersion;
     }
 
+    // A method is a token (RFC 9110 §9.1). Any token, since one nobody routed
+    // is a 404 or a 405, but not `GET\t` or `G,ET`: a front end that trims or
+    // splits it routes a method nilo does not.
+    if (!tokenAt(line, 0, sp1)) return error.BadRequestLine;
+
     r.method = method;
     r.target = target;
     // Origin-form is the whole of what a browser sends, and it is already a
@@ -674,8 +758,73 @@ pub fn parseRequestLine(line: []const u8, r: *Request) ParseError!void {
         if (try absoluteForm(target)) |split| {
             r.authority = split.authority;
             r.target = split.target;
-        }
+        } else if (!otherForm(target)) return error.BadRequestLine;
     }
+}
+
+/// Whether a target that is neither origin-form nor an `http` absolute-form
+/// is one of the two other forms RFC 9112 §3.2 has: `*`, or a scheme and a
+/// colon (the absolute-form of a scheme nilo does not serve, and the
+/// authority-form `host:port` when the host is spelled like one), or an
+/// authority-form a scheme cannot spell, `[::1]:443` or `10.0.0.1:443`.
+///
+/// Anything else is none of the four, and a 400 (ADR 095). `h;tp://x/y` was
+/// routed as a path while llhttp refused it (ADR 231); no form has it, so
+/// no front end forwards the same thing nilo read.
+fn otherForm(target: []const u8) bool {
+    if (std.mem.eql(u8, target, "*")) return true;
+    const colon = std.mem.indexOfScalar(u8, target, ':') orelse return false;
+    const scheme = target[0..colon];
+    // `http:` or `https:` with no `//` after it has no host, and RFC 9110
+    // §4.2.1 says a recipient must reject that: `absoluteForm` took every
+    // one that had one.
+    if (std.ascii.eqlIgnoreCase(scheme, "http") or std.ascii.eqlIgnoreCase(scheme, "https")) return false;
+    if (isScheme(scheme)) return true;
+    return authorityOk(target, true);
+}
+
+/// `host [ ":" port ]` as RFC 3986 §3.2 spells it, with the host not empty
+/// (RFC 9110 §4.2.1): an IP-literal in brackets, or a reg-name, which an
+/// IPv4 address is also spelled as. `port_required` is authority-form's
+/// `uri-host ":" port` (RFC 9112 §3.2.3).
+fn authorityOk(authority: []const u8, port_required: bool) bool {
+    var host = authority;
+    // The port is after the last colon, unless that colon is inside an
+    // IP-literal's brackets.
+    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |last| {
+        if ((std.mem.lastIndexOfScalar(u8, authority, ']') orelse 0) < last) {
+            for (authority[last + 1 ..]) |ch| if (!std.ascii.isDigit(ch)) return false;
+            host = authority[0..last];
+        } else if (port_required) return false;
+    } else if (port_required) return false;
+    if (host.len == 0) return false;
+    if (host[0] == '[') {
+        if (host.len < 3 or host[host.len - 1] != ']') return false;
+        for (host[1 .. host.len - 1]) |ch| if (!regNameByte(ch) and ch != ':') return false;
+        return true;
+    }
+    for (host) |ch| if (!regNameByte(ch)) return false;
+    return true;
+}
+
+/// unreserved, sub-delims and the `%` of pct-encoded: RFC 3986 §3.2.2's
+/// reg-name.
+fn regNameByte(ch: u8) bool {
+    return switch (ch) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-', '.', '_', '~' => true,
+        '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', '%' => true,
+        else => false,
+    };
+}
+
+/// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, RFC 3986 §3.1.
+fn isScheme(text: []const u8) bool {
+    if (text.len == 0 or !std.ascii.isAlphabetic(text[0])) return false;
+    for (text[1..]) |ch| switch (ch) {
+        'a'...'z', 'A'...'Z', '0'...'9', '+', '-', '.' => {},
+        else => return false,
+    };
+    return true;
 }
 
 /// The authority and the path out of an absolute-form target, or null for a
@@ -718,6 +867,9 @@ fn absoluteForm(target: []const u8) ParseError!?struct { authority: []const u8, 
     const authority = rest[0..end];
     if (authority.len == 0) return error.BadRequestLine;
     if (std.mem.indexOfScalar(u8, authority, '@') != null) return error.BadRequestLine;
+    // It becomes the Host, so it is held to what a host can be spelled with:
+    // `http://|/y` named a host no front end reads the same way (ADR 231).
+    if (!authorityOk(authority, false)) return error.BadRequestLine;
 
     if (end == rest.len) {
         // `http://example.com`, which is a request for `/`. The slash handed
@@ -751,6 +903,7 @@ pub fn applyHeader(line: []const u8, r: *Request) ParseError!void {
     // No whitespace between the field name and the colon, the same refusal
     // `parseHead` makes on the fast path (RFC 9112 §5.1).
     if (line[colon - 1] == ' ' or line[colon - 1] == '\t') return error.BadHeader;
+    if (!headerNameOk(line[0..colon])) return error.BadHeader;
     return applyHeaderAt(line, 0, colon, line.len, r);
 }
 
@@ -789,17 +942,14 @@ fn applyHeaderAt(buf: []const u8, from: usize, colon: usize, end: usize, r: *Req
         "connection".len => {
             if (!std.ascii.eqlIgnoreCase(name, "connection")) return;
             const value = headerValue(buf, colon, end);
+            // The two values nearly every request sends, answered before the
+            // list is split.
+            if (std.ascii.eqlIgnoreCase(value, "keep-alive")) return keepAlive(r);
             if (std.ascii.eqlIgnoreCase(value, "close")) {
                 r.keep_alive = false;
-            } else if (std.ascii.eqlIgnoreCase(value, "keep-alive")) {
-                r.keep_alive = true;
-            } else if (std.ascii.indexOfIgnoreCase(value, "upgrade") != null) {
-                // Only reached by a value that is neither of the two ordinary
-                // ones, so the substring search is not on the common path. A
-                // handshake sends `Upgrade` or `keep-alive, Upgrade`; both land
-                // here, and neither changes what keep-alive already was.
-                r.upgrade = true;
+                return;
             }
+            connectionList(value, r);
         },
         "content-length".len => {
             if (!std.ascii.eqlIgnoreCase(name, "content-length")) return;
@@ -851,6 +1001,37 @@ fn applyHeaderAt(buf: []const u8, from: usize, colon: usize, end: usize, r: *Req
         },
         else => {},
     }
+}
+
+/// A `Connection` value that is a list (RFC 9110 §7.6.1), where `close`
+/// anywhere wins (RFC 9112 §9.6): `keep-alive, close` used to be read as
+/// neither and kept an HTTP/1.1 connection open, and `keep-alive, Upgrade`
+/// closed an HTTP/1.0 one llhttp keeps. Out of line so that the arm the two
+/// common values take stays the size it was.
+noinline fn connectionList(value: []const u8, r: *Request) void {
+    var close = false;
+    var keep = false;
+    var options = std.mem.splitScalar(u8, value, ',');
+    while (options.next()) |raw| {
+        const option = std.mem.trim(u8, raw, " \t");
+        if (std.ascii.eqlIgnoreCase(option, "close")) close = true;
+        if (std.ascii.eqlIgnoreCase(option, "keep-alive")) keep = true;
+    }
+    if (close) r.keep_alive = false else if (keep) keepAlive(r);
+    // A handshake sends `Upgrade` or `keep-alive, Upgrade`. Searched for
+    // rather than matched as an option, because `upgrade` is looser on
+    // purpose (see the field).
+    if (std.ascii.indexOfIgnoreCase(value, "upgrade") != null) r.upgrade = true;
+}
+
+/// `keep-alive` asks for what HTTP/1.1 already does, so there it changes
+/// nothing, and a `close` on an earlier line stays closed. On HTTP/1.0 it is
+/// what opens the connection. A `close` line *before* a `keep-alive` one on
+/// HTTP/1.0 is the one order this reads as open: remembering it would be a
+/// ninth byte in a `Request` whose eight fill its padding, for a request no
+/// client sends.
+fn keepAlive(r: *Request) void {
+    if (r.minor_version == 0) r.keep_alive = true;
 }
 
 fn headerValue(buf: []const u8, colon: usize, end: usize) []const u8 {
@@ -1525,6 +1706,123 @@ test "a broken request line" {
 test "a header with no colon" {
     var r = Request{};
     try testing.expectError(error.BadHeader, applyHeader("Host no-colon", &r));
+}
+
+test "a control byte, or a CR that does not end its line, is refused in any line" {
+    // Each of these is what llhttp refused and nilo read (ADR 231). A front
+    // end that turns the CR into a line end, or drops the NUL, reads another
+    // request.
+    const request_line = [_][]const u8{
+        "GET /a\x00b HTTP/1.1\r\nHost: h\r\n\r\n",
+        "GET /a\tb HTTP/1.1\r\nHost: h\r\n\r\n",
+        "GET\t /a HTTP/1.1\r\nHost: h\r\n\r\n",
+        "\rGET /a HTTP/1.1\r\nHost: h\r\n\r\n",
+        "GET /x?a=\r HTTP/1.1\r\nHost: h\r\n\r\n",
+        "GET /a\x7f HTTP/1.1\r\nHost: h\r\n\r\n",
+    };
+    for (request_line) |head| {
+        var r = Request{};
+        try testing.expectError(error.BadRequestLine, parseHead(head, &r));
+    }
+    const header_line = [_][]const u8{
+        "GET / HTTP/1.1\r\nHost: keep-aliv\r, Upgrade\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: h\r\nX-Forwarded-For:\r 5\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: h\r\nConnection: 0\x1d\r\n\r\n",
+        "GET / HTTP/1.1\n\rX: y\nHost: h\n\n",
+        "GET / HTTP/1.1\r\nHost: h\r\nX: a\x00b\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: h\r\nX: y\r\r\n\r\n",
+    };
+    for (header_line) |head| {
+        var r = Request{};
+        try testing.expectError(error.BadHeader, parseHead(head, &r));
+    }
+    // What a value may hold: a tab, and bytes past 0x7f.
+    var r = Request{};
+    try parseHead("GET / HTTP/1.1\r\nHost: h\r\nX: a\tb \xc3\xa9\r\n\r\n", &r);
+}
+
+test "a stray byte is found at every offset, and a CR that ends its line never is" {
+    // The CR and LF that end the value fall on every position against the
+    // 32-byte blocks, including the CR in one block and its LF in the next,
+    // which is where the block's own LFs cannot say what follows it.
+    var buf: [160]u8 = undefined;
+    const front = "GET / HTTP/1.1\r\nHost: h\r\nX: ";
+    const back = "\r\n\r\n";
+    for (0..80) |n| {
+        const head = buf[0 .. front.len + n + back.len];
+        @memcpy(head[0..front.len], front);
+        @memset(head[front.len..][0..n], 'a');
+        @memcpy(head[front.len + n ..], back);
+        var ok = Request{};
+        try parseHead(head, &ok);
+
+        for (0..n) |at| {
+            head[front.len + at] = 0x01;
+            var r = Request{};
+            try testing.expectError(error.BadHeader, parseHead(head, &r));
+            head[front.len + at] = '\r';
+            try testing.expectError(error.BadHeader, parseHead(head, &r));
+            head[front.len + at] = 'a';
+        }
+    }
+}
+
+test "a method and a header name are tokens, and anything else in one is a 400" {
+    var r = Request{};
+    try testing.expectError(error.BadRequestLine, parseHead("G,ET / HTTP/1.1\r\nHost: h\r\n\r\n", &r));
+    try testing.expectError(error.BadRequestLine, parseHead("GE\"T / HTTP/1.1\r\nHost: h\r\n\r\n", &r));
+    const names = [_][]const u8{
+        "GET / HTTP/1.1\r\nHost: h\r\nCon,nection: close\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: h\r\nConnection localhost:8787\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: h\r\nX{: y\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: h\r\n" ++ "X-A-Name-Longer-Than-One-Block-Of-Bytes(: y\r\n\r\n",
+    };
+    for (names) |head| {
+        var bad = Request{};
+        try testing.expectError(error.BadHeader, parseHead(head, &bad));
+    }
+    // Any token: a method nobody routed, and a name nilo does not read.
+    var ok = Request{};
+    try parseHead("M-SEARCH * HTTP/1.1\r\nHost: h\r\nContent_Length: 5\r\nX-A-Name-Longer-Than-One-Block-Of-Bytes!: y\r\n\r\n", &ok);
+    try testing.expectEqualStrings("M-SEARCH", ok.method);
+    try testing.expect(!ok.has_content_length);
+}
+
+test "a target in none of the four forms is a 400, and each form is read" {
+    const refused = [_][]const u8{ "h;tp://x/y", "?a=1", "a/b://c", ":80", "[::1:443", "http:/.x/y", "HTTPS:x", "http://|/y", "http://x:8o/", "http://:80/", "http://[]/" };
+    for (refused) |target| {
+        var r = Request{};
+        var line: [64]u8 = undefined;
+        const text = std.fmt.bufPrint(&line, "GET {s} HTTP/1.0", .{target}) catch unreachable;
+        try testing.expectError(error.BadRequestLine, parseRequestLine(text, &r));
+    }
+    const read = [_][]const u8{ "*", "example.com:443", "[::1]:443", "10.0.0.1:8080", "ftp://x/y", "urn:isbn:1", "my_host:80", "ht:tp://x/y" };
+    for (read) |target| {
+        var r = Request{};
+        var line: [64]u8 = undefined;
+        const text = std.fmt.bufPrint(&line, "GET {s} HTTP/1.0", .{target}) catch unreachable;
+        try parseRequestLine(text, &r);
+        try testing.expectEqualStrings(target, r.target);
+    }
+}
+
+test "Connection is a list, and close anywhere in it closes" {
+    const Case = struct { head: []const u8, keep_alive: bool, upgrade: bool = false };
+    const cases = [_]Case{
+        .{ .head = "GET / HTTP/1.1\r\nHost: h\r\nConnection: keep-alive, close\r\n\r\n", .keep_alive = false },
+        .{ .head = "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\nConnection: keep-alive\r\n\r\n", .keep_alive = false },
+        .{ .head = "GET / HTTP/1.0\r\nConnection: keep-alive, Upgrade\r\n\r\n", .keep_alive = true, .upgrade = true },
+        .{ .head = "GET / HTTP/1.0\r\nConnection: Upgrade,  Keep-Alive \r\n\r\n", .keep_alive = true, .upgrade = true },
+        .{ .head = "GET / HTTP/1.0\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n", .keep_alive = false },
+        .{ .head = "GET / HTTP/1.0\r\nConnection: keep-alive, close\r\n\r\n", .keep_alive = false },
+        .{ .head = "GET / HTTP/1.1\r\nHost: h\r\nConnection: TE, keep-alive\r\n\r\n", .keep_alive = true },
+    };
+    for (cases) |case| {
+        var r = Request{};
+        try parseHead(case.head, &r);
+        try testing.expectEqual(case.keep_alive, r.keep_alive);
+        try testing.expectEqual(case.upgrade, r.upgrade);
+    }
 }
 
 // The head is walked 32 bytes at a time, and the colons inside a block are

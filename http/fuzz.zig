@@ -138,7 +138,21 @@ fn refFinish(r: *const http1.Request) http1.ParseError!void {
     if (r.minor_version == 1 and !r.has_host and r.authority.len == 0) return error.BadHeader;
 }
 
+/// A byte no line may carry where it is: any control but tab, and in the
+/// request line tab as well. `line` has had its one CR taken off already, so
+/// a CR left in it is one that did not end it. Checked a byte at a time over
+/// the line, where `http1` finds them in blocks as it finds the newlines.
+fn refStray(line: []const u8, tab_allowed: bool) bool {
+    for (line) |c| {
+        if (c == '\t') {
+            if (!tab_allowed) return true;
+        } else if (c < 0x20 or c == 0x7F) return true;
+    }
+    return false;
+}
+
 fn refParseRequestLine(line: []const u8, r: *http1.Request) http1.ParseError!void {
+    if (refStray(line, false)) return error.BadRequestLine;
     // Two spaces, and the second one is what the version starts after.
     // Counting them says that in a different way from looking for the
     // second one, which is the point of a reference implementation — and
@@ -160,6 +174,9 @@ fn refParseRequestLine(line: []const u8, r: *http1.Request) http1.ParseError!voi
         r.minor_version = 0;
         r.keep_alive = false;
     } else return error.UnsupportedVersion;
+    // A method is a token, checked with the grammar's own switch where
+    // `http1` compares a block against its runs.
+    if (!http1.headerNameOk(method)) return error.BadRequestLine;
     r.method = method;
     r.target = target;
     try refSplitTarget(r);
@@ -175,9 +192,9 @@ fn refSplitTarget(r: *http1.Request) http1.ParseError!void {
     const target = r.target;
     if (target[0] == '/') return;
 
-    const sep = std.mem.indexOf(u8, target, "://") orelse return;
+    const sep = std.mem.indexOf(u8, target, "://") orelse return refOtherForm(target);
     const scheme = target[0..sep];
-    if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https")) return;
+    if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https")) return refOtherForm(target);
 
     const rest = target[sep + 3 ..];
     var cut: usize = rest.len;
@@ -191,6 +208,7 @@ fn refSplitTarget(r: *http1.Request) http1.ParseError!void {
     const authority = rest[0..cut];
     if (authority.len == 0) return error.BadRequestLine;
     if (std.mem.indexOfScalar(u8, authority, '@') != null) return error.BadRequestLine;
+    try refAuthority(authority, false);
 
     r.authority = authority;
     if (cut == rest.len) {
@@ -201,7 +219,62 @@ fn refSplitTarget(r: *http1.Request) http1.ParseError!void {
     r.target = rest[cut..];
 }
 
+/// The two forms a target that is not origin-form and not an `http`
+/// absolute-form may still be (RFC 9112 §3.2): `*`, a scheme and a colon, or
+/// `host:port`. Written as the grammar's alternatives one after another,
+/// where `http1.otherForm` shares its search for the colon between them.
+fn refOtherForm(target: []const u8) http1.ParseError!void {
+    if (std.mem.eql(u8, target, "*")) return;
+    if (std.mem.indexOfScalar(u8, target, ':')) |colon| {
+        const scheme = target[0..colon];
+        // An `http` URI with no `//` has no host (RFC 9110 §4.2.1).
+        for ([_][]const u8{ "http", "https" }) |named| {
+            if (std.ascii.eqlIgnoreCase(scheme, named)) return error.BadRequestLine;
+        }
+        var ok = scheme.len > 0 and std.ascii.isAlphabetic(scheme[0]);
+        for (scheme) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') ok = false;
+        }
+        if (ok) return;
+    }
+    try refAuthority(target, true);
+}
+
+/// A host and maybe a port, taken apart from the front: a bracketed
+/// IP-literal first when there is one, where `http1.authorityOk` finds the
+/// port from the back.
+fn refAuthority(text: []const u8, port_required: bool) http1.ParseError!void {
+    const reg_name = "-._~!$&'()*+,;=%";
+    var rest: []const u8 = undefined;
+    if (text.len > 0 and text[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, text, ']') orelse return error.BadRequestLine;
+        const inside = text[1..close];
+        if (inside.len == 0) return error.BadRequestLine;
+        for (inside) |c| {
+            if (std.ascii.isAlphanumeric(c) or c == ':') continue;
+            if (std.mem.indexOfScalar(u8, reg_name, c) == null) return error.BadRequestLine;
+        }
+        rest = text[close + 1 ..];
+    } else {
+        const colon = std.mem.indexOfScalar(u8, text, ':') orelse text.len;
+        const host = text[0..colon];
+        if (host.len == 0) return error.BadRequestLine;
+        for (host) |c| {
+            if (std.ascii.isAlphanumeric(c)) continue;
+            if (std.mem.indexOfScalar(u8, reg_name, c) == null) return error.BadRequestLine;
+        }
+        rest = text[colon..];
+    }
+    if (rest.len == 0) {
+        if (port_required) return error.BadRequestLine;
+        return;
+    }
+    if (rest[0] != ':') return error.BadRequestLine;
+    for (rest[1..]) |c| if (!std.ascii.isDigit(c)) return error.BadRequestLine;
+}
+
 fn refApplyHeader(line: []const u8, r: *http1.Request) http1.ParseError!void {
+    if (refStray(line, true)) return error.BadHeader;
     // obs-fold (RFC 9112 §5.2), refused in `http1` in the same commit.
     if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) return error.BadHeader;
     const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadHeader;
@@ -213,19 +286,30 @@ fn refApplyHeader(line: []const u8, r: *http1.Request) http1.ParseError!void {
     // CI derived from a commit that never touched the parser.
     if (line[colon - 1] == ' ' or line[colon - 1] == '\t') return error.BadHeader;
     const name = line[0..colon];
+    if (!http1.headerNameOk(name)) return error.BadHeader;
     const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
 
     if (std.ascii.eqlIgnoreCase(name, "host")) {
         if (r.has_host) return error.BadHeader;
         r.has_host = true;
     } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
-        if (std.ascii.eqlIgnoreCase(value, "close")) {
-            r.keep_alive = false;
-        } else if (std.ascii.eqlIgnoreCase(value, "keep-alive")) {
-            r.keep_alive = true;
-        } else if (std.ascii.indexOfIgnoreCase(value, "upgrade") != null) {
-            r.upgrade = true;
+        // A list, split every time, where `http1` answers the two common
+        // whole values before splitting. `close` anywhere wins; `keep-alive`
+        // opens only what HTTP/1.0 had closed.
+        var close = false;
+        var keep = false;
+        var options = std.mem.splitScalar(u8, value, ',');
+        while (options.next()) |raw| {
+            const option = std.mem.trim(u8, raw, " \t");
+            if (std.ascii.eqlIgnoreCase(option, "close")) close = true;
+            if (std.ascii.eqlIgnoreCase(option, "keep-alive")) keep = true;
         }
+        if (close) {
+            r.keep_alive = false;
+        } else if (keep and r.minor_version == 0) {
+            r.keep_alive = true;
+        }
+        if (std.ascii.indexOfIgnoreCase(value, "upgrade") != null) r.upgrade = true;
     } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
         if (r.chunked) return error.BadHeader;
         if (value.len == 0) return error.BadHeader;
@@ -509,6 +593,29 @@ const corpus = [_][]const u8{
     seed("GET /\x00 HTTP/1.1\r\nHost: h\r\n\r\n"),
     seed("\xff\xfe\xfd\xfc\r\n\r\n"),
     seed("GET / HTTP/1.1\r\nHost: h\r\nX: \xc3\x28\r\n\r\n"),
+
+    // What llhttp refused and nilo accepted, or framed another way, on its
+    // first million inputs (ADR 231): the first input of each kind.
+    seed("GET\x09 /a/b/c HTTP/1.0\nX-Forwarded-For: 18446744073709551615\n\n5\nhello\n0\n\n"),
+    seed("OPTIONS http://x/y HTTP/1.1\nContent_Length: chunked\nX-Forwarded-For: \x09gzip\nCon,nection: +7\n\n5\nhello\n0\n\n"),
+    seed("PUT ///////\x0f//////////////////////////////// HTTP/1.0\n\n5\nhello\n0\n\n"),
+    seed("POST /%2e%2e/ HTTP/1.0\nContent_Length: keep-\x00alive, Upgrade\nContent_Length: chunked\nContent_Length: +7\n\nffffffffffffffff\nhello\n0\n\n"),
+    seed("HEAD http://x/y HTTP/1.0\r\nX-Forwarded-For:\r 5, 6\r\n\r\n 5\r\nhello\r\n0\r\n\r\n"),
+    seed("POST / HTTP/1.0\r\nConnection: keep-alive, Upgrade\r\n\r\nx\r\nhello\r\n0\r\n\r\n"),
+    seed("OPTIONS \x00x?a=1&b=2 HTTP/1.0\n\n"),
+    seed("DELETE /x?a=1&b\xff=2 HTTP/1.0\r\n\r\n-1\r\nhello\r\n0\r\n\r\n"),
+    seed("PUT / HTTP/1.0\nConnection localhost:8787\n\nhello"),
+    seed("PATCH /a/b/c HTTP/1.1\r\nUpgrade: chunked\r\nUpgrade: 5, 6\r\nHost: keep-aliv\r, Upgrade\r\nUpgrade: localhost:8787\r\n\r\n\r\nhello\r\n0\r\n\r\n"),
+    seed("OPTIONS /x?a=1&b=\r HTTP/1.0\r\nContent_Length: 18446744073709551615\r\n\r\nx\r\nhello\r\n0\r\n\r\n"),
+    seed("GET ////////////////////////////////////\x09//// HTTP/1.0\n\n5\nhello\n0\n\n"),
+    seed("PATCH /a/b/c HTTP/1.1\n\rX-Forwarded-For:  \nCookie: 5, 6\nHost: \x09gzip\nCookie: -1\n\nhello"),
+    seed("HEAD http://\x00x/y HTTP/1.0\r\n\r\n"),
+    seed("POST h;tp://x/y HTTP/1.0\n\nhello"),
+    seed("\rGET /a/b/c HTTP/1.1\r\nAccept-Encoding: keep-alive, Upgrade\r\nHost: 18446744073709551615\r\n\r\nhello"),
+
+    seed("GET http:/.x/y HTTP/1.0\n\n"),
+    seed("PATCH http://|/y HTTP/1.1\r\n\r\nhello"),
+    seed("HEAD ht:tp://x/y HTTP/1.0\r\nContent-Length: 007\r\nHost: \r\n\r\n"),
 
     // Chunk sizes, which arrive as attacker-chosen hex.
     seed("0\r\n\r\n"),
