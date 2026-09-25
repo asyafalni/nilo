@@ -15,8 +15,8 @@ One page of [the reference](./README.md): one request in flight: reading it, ans
 | `c.query(name)` | `?Str`, percent-decoded, `+` as space |
 | `c.queries()` | an iterator over every query parameter, in arrival order — `while (it.next()) \|q\|`, `q.name` and `q.value` are `Str`. A name sent twice appears twice |
 | `c.queryString()` | `Str` — the query as it arrived, still encoded, no `?` on the front. `""` when there was none |
-| `c.host()` | `Str` — the host this request was addressed to. `X-Forwarded-Host` under `trusted_hops`, else the authority of an absolute-form target, else the `Host` header |
-| `c.scheme()` | `Str` — `"https"` or `"http"`, what the **client** used. `X-Forwarded-Proto` under `trusted_hops`, else always `"http"` |
+| `c.host()` | `Str` — the host this request was addressed to. `X-Forwarded-Host` from a trusted proxy, else the authority of an absolute-form target, else the `Host` header |
+| `c.scheme()` | `Str` — `"https"` or `"http"`, what the **client** used. `"https"` on a listener with its own TLS, else `X-Forwarded-Proto` from a trusted proxy, else `"http"` |
 | `c.header(name)` | `?Str`, name matched case-insensitively. The **first** of that name |
 | `c.clientHas(version)` | `bool` — whether `If-None-Match` names the tag a `nilo.Versioned(T)` with that `u64` goes out under. Asked before building the body, so `.unchanged(version)` skips the query as well as the bytes ([ADR 189](../adr/189-a-version-a-handler-names-is-an-etag.md)) |
 | `c.authorization(.bearer)` | `!Authorization(.bearer)` — the header as one scheme, or the 401 with the challenge on it. For a resolver; a handler asks in its argument list |
@@ -88,11 +88,7 @@ threw one away ([ADR 029](../adr/029-a-header-is-checked-once-and-two-of-them-re
 Setting either with a name and value already present adds nothing.
 
 **`host()` and `scheme()` are how a handler writes a URL to its own service** —
-a password-reset link, an OAuth `redirect_uri`, an absolute `Location`. nilo
-does not speak TLS, so with no `trusted_hops` set `scheme()` is always
-`"http"`; behind a proxy set it and the two headers that proxy writes are
-believed, exactly as `X-Forwarded-For` is
-([ADR 090](../adr/090-a-request-can-be-read-past-the-parts-a-handler-names.md)).
+a password-reset link, an OAuth `redirect_uri`, an absolute `Location`. On a listener with its own TLS `scheme()` is `"https"` from the connection. Behind a proxy, name it with `.trusted_proxies` (or count it with `.trusted_hops`) and the two headers it writes are believed on a connection it made, exactly as `X-Forwarded-For` is; with neither, `scheme()` is `"http"` ([ADR 090](../adr/090-a-request-can-be-read-past-the-parts-a-handler-names.md), [ADR 102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md)).
 A forwarded host that is not host-shaped is dropped rather than used, because
 this ends up in a link somebody clicks.
 
@@ -168,6 +164,8 @@ those. Not slices. See [Sessions](../guide/sessions.md).
 `setWith` options: `path` (`"/"`), `domain` (`""`), `max_age` (`null` — a
 session cookie), `secure` (`true`), `same_site` (`.lax`). No `http_only`: it
 is always on.
+
+The cookie is `__Host-session` (`nilo.session.host_cookie_name`) when it is `Secure`, at `/` and has no `domain`, which the defaults are, and `session` (`nilo.session.cookie_name`) otherwise, because a browser drops a `__Host-` cookie with any of those changed. Both names are read, the prefixed one first, so a session written under the plain name still opens; the next `set` writes the prefixed one and deletes the plain one, and `clear` deletes both.
 
 `max_age` sets the cookie attribute **and** an expiry sealed inside the cookie,
 where the client cannot reach it — `Max-Age` alone is advice a copied cookie

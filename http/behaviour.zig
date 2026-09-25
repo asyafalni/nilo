@@ -4692,9 +4692,38 @@ test "a body read that failed because the connection broke is not a 408" {
     try testing.expect(!std.mem.startsWith(u8, sent.response, "HTTP/1.1 408"));
 }
 
-test "a WebSocket is allowed to sit quiet once the handshake is done" {
+test "a body the handler never read is thrown away against a rate floor, not read by read" {
+    // Per read, a POST to a route that ignores its body, dribbled at a byte
+    // every 29 seconds, held its fiber with no end. The rest of the body gets
+    // `body()`'s deadline instead: a point in time, sized from the bytes.
+    var d = Deadline.init();
+    defer d.deinit();
+    try d.app.post("/ignore", struct {
+        fn run(c: *Ctx) anyerror!void {
+            try c.sendText(200, "not reading that");
+        }
+    }.run);
+    try d.app.resolveChains();
+
+    const sized = d.stall("POST /ignore HTTP/1.1\r\nHost: example.dev\r\nContent-Length: 5\r\n\r\nhello", 1024);
+    try testing.expect(sized.keep_alive);
+    try testing.expect(d.clock.lastRead().? == .by_ns);
+
+    d.clock = .{};
+    const chunked = d.stall("POST /ignore HTTP/1.1\r\nHost: example.dev\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n0\r\n\r\n", 1024);
+    try testing.expect(chunked.keep_alive);
+    try testing.expect(d.clock.lastRead().? == .by_ns);
+}
+
+test "a WebSocket is allowed to sit quiet between frames, and not inside one" {
     // A chat tab with nobody typing is working correctly, and the limit that
-    // protects the HTTP side would close it. Writes keep theirs.
+    // protects the HTTP side would close it. Silence between frames is the
+    // Socket's park, which reads nothing, so the read limit only ever lands
+    // on a frame already begun: a client that stopped half way through one
+    // was never pinged and held its fiber for ever. Each such read gets what
+    // a quiet client gets between frames, the ping's stretch and one more.
+    // Writes keep theirs.
     var d = Deadline.init();
     defer d.deinit();
     try d.app.get("/ws", struct {
@@ -4713,7 +4742,8 @@ test "a WebSocket is allowed to sit quiet once the handshake is done" {
     );
 
     try testing.expect(std.mem.startsWith(u8, sent.response, "HTTP/1.1 101"));
-    try testing.expectEqual(bulkhead.Limit.none, d.clock.lastRead().?);
+    const idle_ms = (websocket.Options{}).idle_ms;
+    try testing.expectEqual(bulkhead.Limit{ .within_ms = 2 * idle_ms }, d.clock.lastRead().?);
 }
 
 // ---- the generated API description (ADR 016) ----
@@ -6625,6 +6655,47 @@ test "with a proxy trusted, the scheme and host are the ones it forwarded" {
     try testing.expect(std.mem.endsWith(u8, plain.response, "http://api.example.com"));
 }
 
+test "with the proxies named, the scheme and host are read only from a connection one of them made" {
+    // The deploying guide's shape: `.trusted_proxies`, no hop count. Both
+    // accessors used to read `trusted_hops` alone, so this deployment saw
+    // `http` behind TLS for ever, and `trusted_hops = 1` to fix it believed
+    // `X-Forwarded-Host` from a request straight to the pod (ADR 090).
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/where", echoBaseUrl);
+    try app.resolveChains();
+    try wiring.parseTrustedProxies(&app, &.{"10.0.0.0/8"});
+    app.limits.trusted_proxies = app.trusted_proxies;
+
+    var h = Harness.init();
+    defer h.deinit();
+    const forwarded = "GET /where HTTP/1.1\r\nHost: 10.0.0.4:8080\r\n" ++
+        "X-Forwarded-Proto: https\r\nX-Forwarded-Host: api.example.com\r\n\r\n";
+
+    h.peer = try bulkhead.Peer.from("10.0.0.1");
+    const through = h.send(&app, forwarded);
+    try testing.expect(std.mem.endsWith(u8, through.response, "https://api.example.com"));
+
+    // The same headers from an address nobody named are the sender's own.
+    h.peer = try bulkhead.Peer.from("198.51.100.7");
+    const around = h.send(&app, forwarded);
+    try testing.expect(std.mem.endsWith(u8, around.response, "http://10.0.0.4:8080"));
+}
+
+test "on a listener with its own TLS the scheme is https, whatever a header says" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/where", echoBaseUrl);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+    h.peer = try bulkhead.Peer.from("198.51.100.7");
+    h.peer.tls = true;
+    const answer = h.send(&app, "GET /where HTTP/1.1\r\nHost: api.example.com\r\nX-Forwarded-Proto: http\r\n\r\n");
+    try testing.expect(std.mem.endsWith(u8, answer.response, "https://api.example.com"));
+}
+
 // ---- a body under an encoding nilo cannot read ----
 
 test "a body under a Content-Encoding nilo cannot decode is refused with a 415 naming the header" {
@@ -6970,13 +7041,20 @@ test "a proxy that adds a field of its own is read the same as one that appends"
     );
     try testing.expect(std.mem.endsWith(u8, counted.response, "203.0.113.9"));
 
-    // More fields than any chain of proxies writes is a head stuffed by the
-    // client, and none of it is read.
+    // A client that stuffs the head with fields of its own, private
+    // addresses to pass as a proxy, and HAProxy adding the real one as a
+    // field after them. The last eight are read, from the right, so the
+    // client is found; answering with the socket's address, as past eight
+    // once did, answered with the proxy's, `10.0.0.7`, and an allow-list of
+    // private addresses let the client in.
+    app.limits.trusted_hops = 0;
+    app.limits.trusted_proxies = app.trusted_proxies;
     const stuffed = h.send(
         &app,
-        "GET /who HTTP/1.1\r\nHost: t\r\n" ++ ("X-Forwarded-For: 1.2.3.4\r\n" ** 9) ++ "\r\n",
+        "GET /who HTTP/1.1\r\nHost: t\r\n" ++ ("X-Forwarded-For: 10.0.0.9\r\n" ** 8) ++
+            "X-Forwarded-For: 203.0.113.9\r\n\r\n",
     );
-    try testing.expect(std.mem.endsWith(u8, stuffed.response, "10.0.0.7"));
+    try testing.expect(std.mem.endsWith(u8, stuffed.response, "203.0.113.9"));
 }
 
 test "a header with fewer entries than there are hops falls back to the socket" {
@@ -7644,6 +7722,74 @@ test "a form that does not fit is a 400 naming the field, like a query param" {
         "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
     try testing.expect(std.mem.startsWith(u8, wrong_type.response, "HTTP/1.1 400"));
     try testing.expect(try Harness.saysFailure(wrong_type.response, "this endpoint takes a form"));
+}
+
+const Filters = struct {
+    age: ?u32 = null,
+    page: u32 = 1,
+    sort: ?Sort = null,
+    note: ?Str = null,
+};
+
+fn filtersAnswer(arena: std.mem.Allocator, f: Filters) ![]const u8 {
+    const age: i64 = if (f.age) |a| a else -1;
+    const note = if (f.note) |n| n.view() else "(none)";
+    const sort = if (f.sort) |s| @tagName(s) else "(none)";
+    return std.fmt.allocPrint(arena, "age={d} page={d} sort={s} note=[{s}]", .{ age, f.page, sort, note });
+}
+
+fn filtersFromForm(arena: std.mem.Allocator, in: form_mod.Form(Filters)) ![]const u8 {
+    return filtersAnswer(arena, in.value);
+}
+
+fn filtersFromBoundForm(arena: std.mem.Allocator, b: bound_mod.Bound(form_mod.Form(Filters))) ![]const u8 {
+    return filtersAnswer(arena, b.value() orelse return b.fail());
+}
+
+fn filtersFromQuery(arena: std.mem.Allocator, q: typed.Query(Filters)) ![]const u8 {
+    return filtersAnswer(arena, q.value);
+}
+
+fn filtersFromBoundQuery(arena: std.mem.Allocator, b: bound_mod.Bound(typed.Query(Filters))) ![]const u8 {
+    return filtersAnswer(arena, b.value() orelse return b.fail());
+}
+
+test "a box left blank is a field not given, where blank is not a value of its type" {
+    // A browser sends an empty text box as `age=`, not as nothing. That was a
+    // 400 saying an optional age has to be a whole number, on the first form
+    // anybody submitted without filling in every box.
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/form", filtersFromForm);
+    try app.post("/bound-form", filtersFromBoundForm);
+    try app.get("/query", filtersFromQuery);
+    try app.get("/bound-query", filtersFromBoundQuery);
+
+    var client = try nilo_testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+
+    const blank = "age=&page=&sort=&note=";
+    // An empty `?Str` keeps its empty text: blank is a value of text.
+    const expected = "age=-1 page=1 sort=(none) note=[]";
+    for ([_][]const u8{ "/form", "/bound-form" }) |path| {
+        const answer = try client.postWith(&app, path, "application/x-www-form-urlencoded", blank);
+        try testing.expectEqual(@as(u16, 200), answer.status);
+        try testing.expectEqualStrings(expected, answer.body);
+    }
+    for ([_][]const u8{ "/query?" ++ blank, "/bound-query?" ++ blank }) |path| {
+        const answer = try client.get(&app, path);
+        try testing.expectEqual(@as(u16, 200), answer.status);
+        try testing.expectEqualStrings(expected, answer.body);
+    }
+
+    // A value that is there and wrong is still wrong.
+    const wrong = try client.get(&app, "/query?age=soon");
+    try testing.expectEqual(@as(u16, 400), wrong.status);
+
+    // And a field that has to be given has to be given something.
+    try app.post("/register", register);
+    const required = try client.postWith(&app, "/register", "application/x-www-form-urlencoded", "email=a%40b.c&age=");
+    try testing.expectEqual(@as(u16, 422), required.status);
 }
 
 // ---- request ids ----

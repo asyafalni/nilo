@@ -213,6 +213,8 @@ request, rather than a second one to find the session.
 one as a fallback ([above](#changing-the-secret)). Dropping it outright does, and after a
 leak that is what you want.
 
+**The cookie is `__Host-session`, so another subdomain cannot plant one.** A browser keeps a cookie with that prefix only from this host, over HTTPS, at `/`. A plain `session` could be set by any page on a sibling subdomain with `Domain=example.com; Path=/account`, and the browser would send that one first under `/account`, so the person would be working inside somebody else's account without knowing. A `setWith` that names a `domain`, another `path` or `secure = false` writes the plain name, because a browser drops the prefixed one with any of those, and gives up that protection. A session written by 0.6.0 or earlier, under the plain name, still opens, and the next `set` moves it.
+
 ## Changing the shape is safe
 
 Add a field to your session struct, deploy, and the cookies already out there

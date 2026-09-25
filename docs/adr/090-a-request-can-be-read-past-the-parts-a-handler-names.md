@@ -43,14 +43,7 @@ whatever `Host` the proxy chose to pass on. A handler therefore could not write
 a URL to its own service: a password-reset link, an OAuth `redirect_uri`, a
 webhook callback, an absolute `Location`.
 
-**`c.scheme()` and `c.host()` read `X-Forwarded-Proto` and `X-Forwarded-Host`
-when `listen(.{ .trusted_hops = … })` is not zero, and ignore them otherwise.**
-That is exactly the rule `clientIp()` already applies to `X-Forwarded-For`, and
-it is the same argument: a header a client can write is a header a client can
-write. With the default of zero, `scheme()` is always `"http"` — which is the
-truth about the connection rather than a guess — and `host()` is the `Host`
-header, which HTTP/1.1 requires exactly one of
-([ADR 070](./070-a-request-nobody-else-would-answer-is-refused.md)).
+**`c.scheme()` and `c.host()` read `X-Forwarded-Proto` and `X-Forwarded-Host` only from a trusted proxy, and ignore them otherwise:** from a connection one of `listen(.{ .trusted_proxies = … })` made, or, with none named, when `.trusted_hops` is not zero ([ADR 102](./102-a-proxy-is-trusted-by-which-one-it-is.md)). That is exactly the rule `clientIp()` applies to `X-Forwarded-For`, and it is the same argument: a header a client can write is a header a client can write. With no proxy trusted, `scheme()` is what the connection is, `"https"` on a listener with its own TLS ([ADR 212](./212-tls-is-an-option-a-build-asks-for.md)) and `"http"` otherwise, which is the truth about the connection rather than a guess, and `host()` is the `Host` header, which HTTP/1.1 requires exactly one of ([ADR 070](./070-a-request-nobody-else-would-answer-is-refused.md)). The two once read `trusted_hops` alone, so an app that named its proxies got `"http"` behind TLS, and one that set a hop count to fix it believed a forwarded host from anybody; ADR 102 has the account.
 
 Two things are deliberately narrow.
 

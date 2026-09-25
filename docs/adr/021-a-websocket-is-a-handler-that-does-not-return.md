@@ -76,6 +76,8 @@ It is recorded here rather than half-built, because a broadcast that works in a 
 Also not here: `permessage-deflate` (negotiated in the handshake, and a compressor per connection is memory nilo has not budgeted), and any deadline at all — a client that opens a socket and never speaks holds a fiber until TCP gives up. That last one is the same hole ADR 019 recorded, and WebSocket makes it cheaper to exploit.
 
 > **The hole is closed, by the answer this ADR already named.** `Options.idle_ms`, 30 seconds by default: silence sends a ping, and silence after an unanswered ping closes with 1001. Still not a deadline, for the reason given above — a quiet WebSocket is a working one, so the framework asks rather than assumes. What made it buildable was [ADR 035](./035-a-broadcast-rings-a-bell-it-does-not-write.md), which gave the connection a wait that can carry a limit; before that there was no way to time a WebSocket read without also breaking the quiet-is-fine promise. Set it to `0` for the old behaviour.
+>
+> **Quiet between frames, not inside one.** The silence is waited on by the Socket's park, which asks the socket for readiness and reads nothing, and a ping goes out only with nothing buffered. So a client that stopped half way through a frame was never pinged and held its fiber for ever. Every read is of a frame already begun, so each read carries a limit of twice `idle_ms`, what a silent client gets between frames before it is closed: the ping's stretch and the one after it. `0` still waits forever. `test "a WebSocket is allowed to sit quiet between frames, and not inside one"` holds it.
 
 ## Consequences
 

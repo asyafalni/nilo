@@ -1612,6 +1612,20 @@ pub const Deadlines = struct {
         self.set(.read, .none);
     }
 
+    /// Every read from here on shares one limit, `ms` from now: a bound on
+    /// the whole of a wait rather than on each read in it. What a per-read
+    /// limit cannot give: a peer sending a byte a second is inside any
+    /// per-read limit of more than a second for as long as it likes.
+    pub fn armAllReads(self: Deadlines, ms: u32) void {
+        self.set(.read, .{ .by_ns = monotonicNanos() + msToNanos(ms) });
+    }
+
+    /// Each read from here on has `ms`, for a connection that may be slow
+    /// in total but may not stop: a WebSocket part way through a frame.
+    pub fn armEachRead(self: Deadlines, ms: u32) void {
+        self.set(.read, .{ .within_ms = ms });
+    }
+
     /// A deliberately short read limit, used to find out whether a connection
     /// is about to be idle rather than to enforce anything.
     ///

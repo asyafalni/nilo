@@ -269,11 +269,20 @@ pub fn discardChunkedBody(in: *std.Io.Reader, limit: u64) !void {
     try skipTrailers(in);
 }
 
-/// The size line of a chunk. Anything after a `;` is a chunk extension —
+/// The size line of a chunk. Anything after a `;` is a chunk extension:
 /// nobody sends them, but the size in front of one is still a valid size.
+///
+/// **The line ends at CRLF and nowhere else, and an extension holds no
+/// control byte.** Reading a bare LF as the end of the line let `2;\nxx\r\n`
+/// end at the LF here while a front end that reads the LF as a byte of the
+/// extension ends it at the CRLF, so the two frame the body at different
+/// places: the TERM.EXT desync, a smuggled request's way in.
 pub fn readChunkSize(in: *std.Io.Reader) !u64 {
-    const line = takeLine(in) catch return error.BadChunk;
+    const line = takeChunkLine(in) catch return error.BadChunk;
     const end = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+    for (line[end..]) |c| {
+        if ((c < 0x20 and c != '\t') or c == 0x7f) return error.BadChunk;
+    }
     return hexOnly(line[0..end]) orelse error.BadChunk;
 }
 
@@ -301,25 +310,38 @@ fn hexOnly(text: []const u8) ?u64 {
 /// stream and the sizes have drifted apart, and everything read after that
 /// point would be someone else's bytes.
 pub fn endOfChunk(in: *std.Io.Reader) !void {
-    const line = takeLine(in) catch return error.BadChunk;
+    const line = takeChunkLine(in) catch return error.BadChunk;
     if (line.len != 0) return error.BadChunk;
 }
 
+/// How much trailer section a chunked body may carry. A line is bounded by
+/// the read buffer and the number of lines was not, so a client could send
+/// trailers for as long as it kept the connection. Nobody sends more than a
+/// checksum or two, and nilo reads none of them.
+pub const max_trailer_bytes = 8 * 1024;
+
 pub fn skipTrailers(in: *std.Io.Reader) !void {
+    var seen: usize = 0;
     while (true) {
         // A client that closes straight after the last chunk has still
         // sent a complete body; there is nothing to gain by failing here.
-        const line = takeLine(in) catch |err| switch (err) {
+        const line = takeChunkLine(in) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
         };
         if (line.len == 0) return;
+        seen += line.len + 2;
+        if (seen > max_trailer_bytes) return error.BadChunk;
     }
 }
 
-fn takeLine(in: *std.Io.Reader) ![]const u8 {
+/// A line of chunked framing: everything before a CRLF. A bare LF is
+/// `error.BadChunk`, for `readChunkSize`'s reason; the head is the one
+/// place a bare LF is still read as a line end (RFC 9112 §2.2).
+fn takeChunkLine(in: *std.Io.Reader) ![]const u8 {
     const raw = try in.takeDelimiterInclusive('\n');
-    return trimCR(raw[0 .. raw.len - 1]);
+    if (raw.len < 2 or raw[raw.len - 2] != '\r') return error.BadChunk;
+    return raw[0 .. raw.len - 2];
 }
 
 pub const Header = struct {
@@ -550,6 +572,12 @@ pub fn parseHead(head: []const u8, r: *Request) ParseError!void {
                 first_line = false;
             } else {
                 if (end == line_start) return finish(r); // the blank line ends the head
+                // A line that starts with whitespace is obs-fold, the
+                // continuation of the header above it. RFC 9112 §5.2 lets a
+                // server refuse it, and one that reads the continuation as
+                // a header of its own while a front end folds it frames the
+                // request differently, so it is a 400.
+                if (head[line_start] == ' ' or head[line_start] == '\t') return error.BadHeader;
                 // No colon (0 is the sentinel), a colon where the name
                 // should be, or one past the end of the line. A field name
                 // is one or more characters (RFC 9110 §5.1), so `: value`
@@ -714,6 +742,8 @@ fn absoluteForm(target: []const u8) ParseError!?struct { authority: []const u8, 
 /// of `Accept`, `Cookie` and `User-Agent` costs one integer compare each
 /// rather than three case-insensitive string compares and a trim.
 pub fn applyHeader(line: []const u8, r: *Request) ParseError!void {
+    // obs-fold, refused as `parseHead` refuses it (RFC 9112 §5.2).
+    if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) return error.BadHeader;
     const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadHeader;
     // A line that begins with its colon has no name — malformed, same as
     // one with no colon.
@@ -1311,6 +1341,60 @@ test "chunk extensions and trailers are stepped over" {
     defer arena.deinit();
     try testing.expectEqualStrings("zfas", try readChunkedBody(&in, arena.allocator(), 1024));
     try testing.expectEqualStrings("NEXT", try in.take(4));
+}
+
+test "a chunk line ends at CRLF and nowhere else, so an extension cannot move where it ends" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const refused = [_][]const u8{
+        // TERM.EXT: the LF ends the line here, and a front end that reads it
+        // as a byte of the extension ends it at the CRLF two bytes on.
+        "2;\nxx\r\n0\r\n\r\n",
+        // A bare LF after the size, after the data, and after the last chunk.
+        "3\nabc\r\n0\r\n\r\n",
+        "3\r\nabc\n0\r\n\r\n",
+        "3\r\nabc\r\n0\n\r\n",
+        // A control byte inside an extension, a lone CR the likeliest.
+        "3;a\rb\r\nabc\r\n0\r\n\r\n",
+        "3;a\x00\r\nabc\r\n0\r\n\r\n",
+    };
+    for (refused) |body| {
+        var in = std.Io.Reader.fixed(body);
+        try testing.expectError(error.BadChunk, readChunkedBody(&in, arena.allocator(), 1024));
+    }
+    // An extension of ordinary bytes, a tab and a quoted value, is still read.
+    var fine = std.Io.Reader.fixed("3;name=\"a b\";\tx\r\nabc\r\n0\r\n\r\n");
+    try testing.expectEqualStrings("abc", try readChunkedBody(&fine, arena.allocator(), 1024));
+}
+
+test "a trailer section has an end, however slowly its lines arrive" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Each line fits the read buffer and the number of lines did not count:
+    // a client could send trailers for as long as it held the connection.
+    const line = "X-Pad: 0123456789\r\n";
+    const lines = max_trailer_bytes / line.len + 1;
+    var wire: std.ArrayList(u8) = .empty;
+    try wire.appendSlice(arena.allocator(), "3\r\nabc\r\n0\r\n");
+    for (0..lines) |_| try wire.appendSlice(arena.allocator(), line);
+    try wire.appendSlice(arena.allocator(), "\r\n");
+    var endless = std.Io.Reader.fixed(wire.items);
+    try testing.expectError(error.BadChunk, readChunkedBody(&endless, arena.allocator(), 1024));
+
+    // A checksum or two is what a trailer is for, and it still passes.
+    var few = std.Io.Reader.fixed("3\r\nabc\r\n0\r\nDigest: sha-256=x\r\n\r\n");
+    try testing.expectEqualStrings("abc", try readChunkedBody(&few, arena.allocator(), 1024));
+}
+
+test "a header line that starts with whitespace is folded, and refused" {
+    // obs-fold (RFC 9112 §5.2): ` folded: 2` is the header above it carried
+    // on, to a front end that folds, and a header of its own to one that
+    // does not. The first line after the request line gets the same answer.
+    var folded = std.Io.Reader.fixed("GET / HTTP/1.1\r\nHost: t\r\nX-A: 1\r\n folded: 2\r\n\r\n");
+    try testing.expectError(error.BadHeader, readRequest(&folded));
+    var first = std.Io.Reader.fixed("GET / HTTP/1.1\r\n\tHost: t\r\n\r\n");
+    try testing.expectError(error.BadHeader, readRequest(&first));
 }
 
 test "a chunked body nobody read is discarded so the connection survives" {

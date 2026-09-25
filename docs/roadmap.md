@@ -33,29 +33,13 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 ### `nilo_http`
 
-**More than eight `X-Forwarded-For` fields makes `clientIp` answer with the proxy's address.** Past `proxies.max_forwarded_fields` the socket's address is returned, and behind a proxy that address is the proxy's. HAProxy adds a field of its own rather than appending, so a client that sends eight is read as the ninth, `10.0.0.7`: an allow-list of private addresses lets it in, and the allowance charges the proxy's slot. The fallback is deliberate in [ADR 102](./adr/102-a-proxy-is-trusted-by-which-one-it-is.md); this consequence is not on record.
-
-**Needs:** the last eight fields kept rather than the socket's address used, which the right-to-left walk already makes safe.
-
-**`host()` and `scheme()` read `trusted_hops` and never `trusted_proxies`.** An app set up the way the deploying guide says gets `scheme() == "http"` behind TLS for ever, and setting `trusted_hops = 1` to fix it trusts `X-Forwarded-Host` from any peer, a request straight to the pod included: the password-reset poisoning [ADR 090](./adr/090-a-request-can-be-read-past-the-parts-a-handler-names.md) exists to prevent. `scheme()` also answers `"http"` on nilo's own TLS listener, because its comment still says nilo does not speak TLS.
-
-**Needs:** both accessors checking the peer against `trusted_proxies` as `clientIp` does, and `scheme()` asking the listener.
-
-**The session cookie cannot carry the `__Host-` prefix, and the first cookie of that name wins.** The cookie's name is fixed at `session` and `Options` has no field for it. A page on a sibling subdomain that sets `session=<its own valid session>; Domain=example.com; Path=/account` is sent first by the browser under `/account`, so the victim works inside the attacker's account; CSRF does not help, because the victim's requests are same-origin.
-
-**Needs:** `__Host-session` on an HTTPS deployment, or a name option whose default is the prefixed one.
-
-**A wait on a stranger is bounded per read in three places that claim a whole bound.** The linger after a refused request ([ADR 195](./adr/195-a-refused-request-is-hung-up-on-with-a-fin.md), "bounded at one second") arms a per-read limit, so a byte every 900 ms holds the connection until the 64 KiB cap, about 18 hours. The drain of a body the handler did not read has no rate floor and does not count trailer lines, so a POST to a 404 dribbled at a byte every 29 s is held with no bound; [ADR 022](./adr/022-a-deadline-belongs-to-an-operation-not-to-a-request.md)'s 138-second figure holds only for `body()`. A WebSocket client that stops mid-frame is never pinged, because the idle ping runs only with nothing buffered, where [risks.md](./risks.md) says `idle_ms` catches it.
-
-**Needs:** an absolute bound on the linger, the body's rate floor and a trailer limit on the drain, a deadline on a partial frame, and one trickle test for each.
-
 **`nilo.deadline(ms)` never shortens the write limit.** The write limit is armed once per connection before any request, and `giveDeadline` stores `until_ns` without re-arming it, so a route with a two-second deadline sending a large body to a slow reader runs for minutes, where `deadline.zig`'s header and [the deadlines page](./design/deadlines.md) say the clamp covers the write.
 
 **Needs:** the write limit clamped with the read ones, or the claim narrowed in both places.
 
-**Chunked framing accepts a bare LF and any chunk extension.** `takeLine` ends a line at `\n` alone and `readChunkSize` ignores whatever follows `;`, so `2;\nxx\r\n` frames one way here and another at a front end that reads an LF inside an extension as extension bytes, which is the TERM.EXT desync. A folded header line with a colon in it is accepted silently, and a field name is never checked to be a token. [The protocol page](./design/http1-protocol.md) says nothing crosses the wire two ways.
+**A header field name is never checked to be a token.** `parseHead` finds the colon and compares the five names it acts on, so `Transfer-Encoding\x0b: chunked` or a name with a space inside is a line nilo ignores while a front end that strips the stray byte reads it as the framing, and the two frame the body differently. [The protocol page](./design/http1-protocol.md) says nothing crosses the wire two ways. It is a check on every byte of every name, on the path that parses every request.
 
-**Needs:** CRLF required in chunk lines, control bytes refused in an extension, and obs-fold refused (RFC 9112 §5.2).
+**Needs:** a `tchar` check on each name, and the parser benchmark run before and after it, interleaved, since it spends on the throughput axis.
 
 **Four HTTP/1.1 edges are read differently from the RFC.** `Transfer-Encoding: gzip, chunked` is accepted and the handler reads gzip as its body, where RFC 9110 says 501. An HTTP/1.0 request carrying `Transfer-Encoding` stays open. `Connection: keep-alive, close` is not read as close. A CRLF before the request line is a 400 rather than skipped (RFC 9112 §2.2).
 
@@ -84,14 +68,6 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 **The WebSocket subprotocol is echoed rather than negotiated.** `Options.protocol` is written back whether or not the client offered it, and a browser fails a connection whose answer names a protocol it did not offer (RFC 6455 §4.1), so `new WebSocket(url)` against such a route fails and a client offering two protocols cannot be met. `Sec-WebSocket-Key` is not checked to be sixteen bytes of base64, and a malformed close frame still reports `closedCleanly()`.
 
 **Needs:** the offer read and matched against a list in `Options`.
-
-**Nothing refuses `c.upgrade(loop, c)`.** `checkLoop` checks the arity, size and alignment of the loop's state, and a `*Ctx` in it points into a frame that has returned by the time the loop runs, so the loop reads the next request's memory. [The WebSocket guide](./guide/websocket.md) says the loop cannot reach the Ctx; the type system lets it.
-
-**Needs:** a refusal for a `*Ctx` anywhere in the loop's arguments, with its row in the table.
-
-**An optional number or choice left blank in a form is a 400.** A browser sends an empty text box as `age=`, and `Form(T)` converts `""` rather than taking the null or the default, so `age: ?u32 = null` answers "has to be a whole number"; `Query(T)` does the same for a GET form. A list already reads an empty value as nothing sent ([ADR 132](./adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)).
-
-**Needs:** an empty value read as absent for a scalar that is optional or has a default.
 
 **A request can bind infinity, and a body still reaches the Zig literal grammar.** `spelledAsNumber("1e999")` passes and `parseFloat` returns `inf`, which [ADR 084](./adr/084-a-number-in-a-request-is-not-a-zig-literal.md) refuses by name, and echoed back it writes `{"p":inf}`, which is not JSON. In a body, std.json converts a string token with `parseInt` and `parseFloat`, so `"1_0"` is 10, `"+7"` is 7 and `"nan"` is NaN, where ADR 084 says a body already refuses them. A `u128` field posted as `2e38` panics inside std in ReleaseSafe.
 

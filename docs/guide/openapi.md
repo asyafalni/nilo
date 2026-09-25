@@ -123,7 +123,7 @@ document describes every route behind it as open. Saying so is one line:
 ```zig
 const api = app.group("/api");
 try api.use(requireSession);
-try app.guard(requireSession, nilo.session.cookie_name);
+try app.guard(requireSession, nilo.session.host_cookie_name);
 
 try api.get("/me", me);                            // cookieAuth, and a 401
 try api.without(requireSession).post("/sign-in", signIn);   // open, as it is

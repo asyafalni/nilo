@@ -576,17 +576,19 @@ pub const Ctx = struct {
     ///
     /// The `Host` header, which an HTTP/1.1 request has exactly one of or it
     /// is a 400 ([ADR 070](../docs/adr/070-a-request-nobody-else-would-answer-is-refused.md)) —
-    /// **unless `listen(.{ .trusted_hops = … })` says a proxy stands in
-    /// front**, in which case an `X-Forwarded-Host` it wrote is the answer.
-    /// With the default of zero that header is ignored, because a forged one
-    /// ends up inside the password-reset link somebody clicks.
+    /// **unless `listen()` says a proxy stands in front and this request came
+    /// through it**, in which case an `X-Forwarded-Host` it wrote is the
+    /// answer: with `.trusted_proxies`, only on a connection from an address
+    /// it names, as `clientIp` reads `X-Forwarded-For`; with `.trusted_hops`
+    /// alone, on any. With neither that header is ignored, because a forged
+    /// one ends up inside the password-reset link somebody clicks.
     ///
     /// A target that arrived in absolute form — `GET http://example.com/x` —
     /// is answered from the target instead (RFC 9112 §3.2,
     /// [ADR 095](../docs/adr/095-a-target-is-read-in-the-form-it-arrived-in.md)).
     /// A trusted proxy still outranks it.
     pub fn host(self: *const Ctx) Str {
-        if (self._limits.trusted_hops > 0) {
+        if (self.cameThroughProxy()) {
             if (self.header("X-Forwarded-Host")) |sent| {
                 // A proxy chain writes a list, and the first entry is the one
                 // the client asked for. A value that is not a host — a
@@ -601,25 +603,36 @@ pub const Ctx = struct {
         return self.header("Host") orelse Str.static("");
     }
 
-    /// `"https"` or `"http"` — what the **client** used, which behind a proxy
+    /// `"https"` or `"http"`: what the **client** used, which behind a proxy
     /// is not what nilo saw.
     ///
-    /// nilo does not speak TLS
-    /// ([ADR 027](../docs/adr/027-tls-is-terminated-in-front.md)), so every
-    /// request it reads arrived in plaintext and there is nothing to observe.
-    /// The proxy in front knows, and says so in `X-Forwarded-Proto` — read
-    /// only when `trusted_hops` is not zero, for the reason `host()` gives.
-    ///
-    /// With no proxy configured this is always `"http"`, and that is the
-    /// truth about the connection rather than a guess.
+    /// On a listener with its own `.tls` it is `"https"`, from the connection
+    /// ([ADR 212](../docs/adr/212-tls-is-an-option-a-build-asks-for.md)).
+    /// Behind a proxy that terminates TLS, the proxy knows, and says so in
+    /// `X-Forwarded-Proto`, read only from a proxy `listen()` was told about,
+    /// for the reason `host()` gives. Otherwise `"http"`, which is the truth
+    /// about the connection rather than a guess.
     pub fn scheme(self: *const Ctx) Str {
-        if (self._limits.trusted_hops > 0) {
+        if (self._peer.tls) return Str.static("https");
+        if (self.cameThroughProxy()) {
             if (self.header("X-Forwarded-Proto")) |sent| {
                 const first = std.mem.trim(u8, upTo(sent.view(), ','), " \t");
                 if (std.ascii.eqlIgnoreCase(first, "https")) return Str.static("https");
             }
         }
         return Str.static("http");
+    }
+
+    /// Whether the forwarding headers on this request may be believed: it
+    /// came from an address `.trusted_proxies` names (or over a unix socket,
+    /// ADR 103), or, with no list, `.trusted_hops` says a proxy stands in
+    /// front. The rule `clientIp` applies to `X-Forwarded-For`, so `host()`
+    /// and `scheme()` cannot be told something `clientIp` would refuse
+    /// (ADR 102).
+    fn cameThroughProxy(self: *const Ctx) bool {
+        const named_proxies = self._limits.trusted_proxies;
+        if (named_proxies.len > 0) return self._peer.local or proxies_mod.holds(named_proxies, self._peer.address());
+        return self._limits.trusted_hops > 0;
     }
 
     /// This request's id — the one thing that ties a log line, a response,
@@ -983,9 +996,12 @@ pub const Ctx = struct {
     /// **Every `X-Forwarded-For` field is read, as one list in wire order.** A
     /// proxy may add a field of its own rather than append to the one the
     /// client sent — HAProxy does — and reading only the first field handed
-    /// that client its own forgery back. More than
-    /// `proxies.max_forwarded_fields` of them is a head nobody honest sends,
-    /// and is answered with the socket's address.
+    /// that client its own forgery back. Past `proxies.max_forwarded_fields`
+    /// of them the last ones are read and the first let go: the walk is from
+    /// the right, so what is let go is the far end, the part a client wrote.
+    /// Answering with the socket's address instead, as this once did, answered
+    /// with the proxy's, and a client that sent eight fields was read as the
+    /// proxy by every allow-list of private addresses.
     pub fn clientIp(self: *const Ctx) Str {
         const hops = self._limits.trusted_hops;
         const named_proxies = self._limits.trusted_proxies;
@@ -993,16 +1009,20 @@ pub const Ctx = struct {
             return Str.fromRequest(self._peer.address(), self._lifetime);
         }
 
-        // Every field of that name, in wire order, as slices into the head.
-        // Collected here rather than walked in place because the walk goes
-        // right to left and a header iterator only goes forward; eight
-        // slices on the stack is cheaper than a second pass per entry.
+        // The last fields of that name, in wire order, as slices into the
+        // head. Collected here rather than walked in place because the walk
+        // goes right to left and a header iterator only goes forward; eight
+        // slices on the stack is cheaper than a second pass per entry. Past
+        // eight, the oldest is shifted out.
         var fields: [proxies_mod.max_forwarded_fields][]const u8 = undefined;
         var n: usize = 0;
         var it = http1.HeaderIterator.from(self._head);
         while (it.next()) |h| {
             if (!std.ascii.eqlIgnoreCase(h.name, "X-Forwarded-For")) continue;
-            if (n == fields.len) return Str.fromRequest(self._peer.address(), self._lifetime);
+            if (n == fields.len) {
+                std.mem.copyForwards([]const u8, fields[0 .. n - 1], fields[1..n]);
+                n -= 1;
+            }
             fields[n] = h.value;
             n += 1;
         }
@@ -1904,7 +1924,7 @@ pub const Ctx = struct {
         // whole account.
         if (self.header("Origin")) |origin| {
             // The `Host` header itself, deliberately, and not `host()`: that
-            // one reads `X-Forwarded-Host` under `trusted_hops`, and what
+            // one reads `X-Forwarded-Host` from a trusted proxy, and what
             // this compares has to be the authority the request really named
             // (ADR 080).
             const authority = if (self.header("Host")) |h| h.view() else "";
@@ -1946,7 +1966,19 @@ pub const Ctx = struct {
         // frame to send and a reply to wait for, rather than a deadline
         // (ADR 022). Writes keep their limit: they are how the server finds
         // out the client stopped listening.
-        self._deadlines.readForever();
+        //
+        // **Quiet between frames, not inside one.** Silence between frames is
+        // waited on by the Socket's park, which asks for readiness and reads
+        // nothing, so every read is of a frame already begun. A client that
+        // stopped half way through one was never pinged, because a ping goes
+        // out only with nothing buffered, and it held the fiber for ever. Each
+        // read gets what a silent client gets between frames before it is
+        // closed: a ping's stretch and the one after it.
+        if (options.idle_ms == 0) {
+            self._deadlines.readForever();
+        } else {
+            self._deadlines.armEachRead(options.idle_ms *| 2);
+        }
 
         return .{
             ._in = self._in,

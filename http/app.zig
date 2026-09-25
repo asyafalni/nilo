@@ -381,7 +381,7 @@ pub const App = struct {
     /// ```zig
     /// const api = app.group("/api");
     /// try api.use(requireSession);
-    /// try app.guard(requireSession, nilo.session.cookie_name);
+    /// try app.guard(requireSession, nilo.session.host_cookie_name);
     /// ```
     ///
     /// Every route the middleware is in front of — through `use`, `useOn`

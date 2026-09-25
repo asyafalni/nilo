@@ -2007,7 +2007,12 @@ fn queryValue(comptime T: type, c: *const Ctx) !T {
                 .optional => |o| o.child,
                 else => f.type,
             };
-            @field(out, f.name) = try convert(Inner, .query, s, label);
+            // A GET form sends a blank box as `age=`, as a POST one does.
+            if ((comptime form_mod.mayBeAbsent(f)) and convert_mod.emptyIsAbsent(Inner, .query, s)) {
+                @field(out, f.name) = comptime form_mod.absentValue(f);
+            } else {
+                @field(out, f.name) = try convert(Inner, .query, s, label);
+            }
         } else if (f.defaultValue()) |default| {
             @field(out, f.name) = default;
         } else if (@typeInfo(f.type) == .optional) {
@@ -2058,7 +2063,9 @@ fn queryValueCollecting(
         } else if (c.query(f.name)) |s| {
             outcomes[i].given = s;
             var converted: Inner = undefined;
-            if (convert_mod.tryConvert(Inner, .query, s, &converted)) |reason| {
+            if ((comptime form_mod.mayBeAbsent(f)) and convert_mod.emptyIsAbsent(Inner, .query, s)) {
+                @field(out, f.name) = comptime form_mod.absentValue(f);
+            } else if (convert_mod.tryConvert(Inner, .query, s, &converted)) |reason| {
                 outcomes[i].reason = reason;
                 if (f.defaultValue()) |default| @field(out, f.name) = default;
             } else {

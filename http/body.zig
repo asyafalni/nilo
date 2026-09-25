@@ -89,6 +89,16 @@ pub const Progress = struct {
     pub fn finished(self: Progress) bool {
         return self.state == .done;
     }
+
+    /// The most body there can still be to read: what a sized one has left,
+    /// and what a chunked one may still send before `max_bytes`.
+    pub fn mostLeft(self: Progress) u64 {
+        return switch (self.state) {
+            .sized => |left| left,
+            .chunk, .between => self.max_bytes -| self.seen,
+            .done, .broken => 0,
+        };
+    }
 };
 
 /// A request body, arriving in pieces.

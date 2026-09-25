@@ -10,7 +10,18 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ## Unreleased
 
-Nothing yet. Work lands here under `### Breaking`, `### Added`, `### Fixed` and `### Docs`, newest first.
+### Breaking
+
+- **The session cookie is `__Host-session` wherever the prefix can hold** (`Secure`, `Path=/`, no `Domain`, the defaults), and that name is read before `session`. A sibling subdomain could plant a `session` cookie of its own under a path of this site, and the victim worked inside the attacker's account. Nobody is signed out: a `session` cookie still opens, and the next `set` moves it. What to change: `app.guard(…, "session")` becomes `app.guard(…, nilo.session.host_cookie_name)`, and a test or a client that reads the cookie by name reads the new one. A session with a `domain`, another `path` or `secure = false` keeps the plain name (ADR 033).
+
+### Fixed
+
+- **`host()` and `scheme()` believe `X-Forwarded-Host` and `X-Forwarded-Proto` only from a trusted proxy**, by the rule `clientIp()` uses: named in `trusted_proxies`, or counted by `trusted_hops` when none is named. They read `trusted_hops` alone, so an app that named its proxies got `scheme() == "http"` behind TLS, and one that set a hop count to fix that believed a forwarded host from any peer, the reset-link poisoning ADR 090 is there to stop. `scheme()` is `"https"` on a listener with its own TLS (ADR 102).
+- **More than eight `X-Forwarded-For` fields no longer makes `clientIp()` answer with the proxy's address.** The last eight fields are read, which are the proxies' end of the list; a client that stuffed the head was read as the proxy, inside an allow-list of private addresses (ADR 102).
+- **A chunk line ends at CRLF and nowhere else, a chunk extension may not carry a control byte, and a folded header line is a 400.** Each let nilo and a front end frame one request two ways, the TERM.EXT desync among them (ADR 070).
+- **Three waits on a client that claimed a whole bound now have one.** The linger after a refused request is one second in all, not one second per read, which let a byte every 900 ms hold a fiber for eighteen hours (ADR 195). The body a handler never read is thrown away under `body()`'s rate floor, not a per-read limit, and a trailer section stops at 8 KiB (ADR 022). A WebSocket client that stops half way through a frame is closed after twice `idle_ms`, where it was never pinged and held its fiber for ever (ADR 021).
+- **A box left blank on an optional or defaulted field is the field not given.** A browser sends an empty box as `age=`, and `Form(T)`, `Query(T)` and both `Bound` forms answered a 400 saying an optional age has to be a whole number. An empty `?Str` is still `""`, and a required field left blank is still refused (ADR 132).
+- **`c.upgrade(loop, c)` is refused while compiling**, and so is a `*Ctx` anywhere in the loop's state. The Ctx is gone by the time the loop runs, so the loop read the next request's memory (ADR 062).
 
 ## Released
 

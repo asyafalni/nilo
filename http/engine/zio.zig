@@ -38,6 +38,9 @@ pub const Peer = struct {
     /// named-network rules are trying to establish about a proxy over
     /// loopback, and can establish here without a rule at all (ADR 103).
     local: bool = false,
+    /// This connection's TLS is terminated here, by the listener's own
+    /// certificate, so the client used `https` whatever any header says.
+    tls: bool = false,
 
     /// `ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255` — the longest an IP
     /// address gets in text.
@@ -1749,6 +1752,7 @@ pub fn serve(
             var peer: Peer = .{
                 .port = portOf(stream.socket.address),
                 .local = false,
+                .tls = true,
             };
             peer._len = writePeer(&peer._text, stream.socket.address);
 

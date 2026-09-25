@@ -2111,6 +2111,14 @@ const refusals = [_]Refusal{
         .says = "upgrade was given state of type u32, and the loop's second argument is nilo.Str",
     },
     .{
+        .name = "ws_state_is_ctx",
+        .says = "the state is a *nilo.Ctx, and the request it points at is over by the time the loop runs; take what the loop needs out of the Ctx before upgrade",
+    },
+    .{
+        .name = "ws_state_holds_ctx",
+        .says = "field `c` of the state is a *nilo.Ctx, and the request it points at is over by the time the loop runs; take what the loop needs out of the Ctx before upgrade",
+    },
+    .{
         .name = "ws_state_too_big",
         .says = "a WebSocket loop may carry 128 bytes of state and ws_state_too_big.Seat is 184; put it in the request arena and carry a pointer to it",
     },

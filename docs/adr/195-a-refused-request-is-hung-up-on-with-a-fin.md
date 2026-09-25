@@ -38,8 +38,7 @@ throw away what arrives until the peer hangs up, then close.** `shutdown(SHUT_WR
 sends the FIN, which tells the peer there is nothing more to wait for; a
 peer that has read the answer closes within a round trip, and the read then
 returns end-of-stream. Two bounds keep a peer that does neither from holding
-the fiber: `linger_limit` (64 KiB) of discarded input, and `linger_ms`
-(one second) on the wait, after which the close goes ahead, reset and all.
+the fiber: `linger_limit` (64 KiB) of discarded input, and `linger_ms` (one second) on the whole wait, after which the close goes ahead, reset and all. **The second is for all of the wait, not for each read in it**: it was armed per read at first, and a peer sending a byte every 900 ms stayed inside it until the 64 KiB, about eighteen hours. `Deadlines.armAllReads` is the one bound across every read, and `test "the linger after a refused request is bounded as a whole, not read by read"` in `serve.zig` holds it.
 
 **Which closes those are is a field on `Served`**, `linger`, set at the
 returns where unread input is possible: `HeadTooLong`; a head that did not

@@ -52,7 +52,7 @@ When the browser has said `cross-site`, an `Origin` that matches the `Host` is n
 - **A double-submit cookie**: as above, and a subdomain that can write a cookie defeats it.
 - **On by default.** ADR 080 made the WebSocket check the default because nothing else refused a cross-site handshake. Here `SameSite=Lax` already refuses the common case, and a default would break every application whose API takes posts from a front end on another origin, which is the ordinary shape of one. An application can reach for it in one line.
 - **Checking `GET`.** A cross-site `GET` is a link, and refusing it refuses every link into the site. A `GET` that changes something is not covered by this or by any CSRF check: the route is the bug.
-- **Reading `X-Forwarded-Host` through `trusted_hops`.** The same reason as ADR 080: what is compared has to be the authority the request named.
+- **Reading `X-Forwarded-Host` from a trusted proxy.** The same reason as ADR 080: what is compared has to be the authority the request named.
 
 ## What it costs
 

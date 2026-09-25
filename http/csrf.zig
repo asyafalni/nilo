@@ -101,7 +101,7 @@ fn refuseCrossSite(c: *Ctx, trusted: []const []const u8) !void {
     const site = if (c.header("Sec-Fetch-Site")) |s| s.view() else null;
     const origin = if (c.header("Origin")) |o| o.view() else null;
     // The `Host` header itself, deliberately, and not `host()`: that one reads
-    // `X-Forwarded-Host` under `trusted_hops`, and what this compares has to be
+    // `X-Forwarded-Host` from a trusted proxy, and what this compares has to be
     // the authority the request really named (ADR 080).
     const host = if (c.header("Host")) |h| h.view() else "";
 

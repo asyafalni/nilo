@@ -202,6 +202,8 @@ fn refSplitTarget(r: *http1.Request) http1.ParseError!void {
 }
 
 fn refApplyHeader(line: []const u8, r: *http1.Request) http1.ParseError!void {
+    // obs-fold (RFC 9112 §5.2), refused in `http1` in the same commit.
+    if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) return error.BadHeader;
     const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadHeader;
     if (colon == 0) return error.BadHeader;
     // No whitespace between the field name and the colon (RFC 9112 §5.1),

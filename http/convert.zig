@@ -379,6 +379,26 @@ pub fn sayWhy(
 /// `label` is how it is named back to the client — `:id` for a path param,
 /// `?page` for a query one, `"email"` for a form field — so the same message
 /// serves all three.
+/// Whether an empty value stands for nothing sent, for a field that may be
+/// absent (optional, or with a default): `""` is not a value of its type.
+///
+/// A browser sends an empty text box as `age=`, never as nothing, so an
+/// optional number or choice left blank arrived as text that will not
+/// convert and was a 400 saying it has to be a whole number. Text that `""`
+/// is a value of keeps it, so an empty `?Str` is still `""`: whether a blank
+/// box means nothing or the empty string is the field's to say, and only for
+/// a type with no empty value is the answer plain. A list already reads an
+/// empty value as nothing sent (ADR 132).
+pub fn emptyIsAbsent(comptime P: type, comptime slot: Slot, s: Str) bool {
+    if (s.view().len != 0) return false;
+    if (P == Str) {
+        return false;
+    } else {
+        var probe: P = undefined;
+        return tryConvert(P, slot, s, &probe) != null;
+    }
+}
+
 pub fn convert(comptime P: type, comptime slot: Slot, s: Str, comptime label: []const u8) !P {
     // Text is text. Answered before anything below, because nothing below
     // has a sentence to write about a `Str` and asking it for one is a

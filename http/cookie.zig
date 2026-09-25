@@ -300,8 +300,11 @@ pub fn deletion(clearing: Clearing) Cookie {
         .expires = "Thu, 01 Jan 1970 00:00:00 GMT",
         // A deletion has to match the flags loosely enough to land whatever
         // the original was set with; the browser keys on name, path and
-        // domain and nothing else.
-        .secure = false,
+        // domain and nothing else. Except that a `__Host-` or `__Secure-`
+        // name is refused without `Secure`, the deletion included, so there
+        // it goes out.
+        .secure = std.mem.startsWith(u8, clearing.name, "__Host-") or
+            std.mem.startsWith(u8, clearing.name, "__Secure-"),
         .http_only = false,
         .same_site = .unset,
     };

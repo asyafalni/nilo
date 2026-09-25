@@ -182,11 +182,11 @@ pub fn holds(rules: []const Cidr, address: []const u8) bool {
     return false;
 }
 
-/// The most `X-Forwarded-For` fields one head may carry before nilo stops
-/// reading any of them. Each proxy adds at most one, so eight is more chain
-/// than any deployment has; more than that is a client stuffing the head,
-/// and a header nilo cannot hold whole is answered with the socket's address
-/// rather than with whichever part of it fitted.
+/// How many `X-Forwarded-For` fields `clientIp` reads: the last ones. Each
+/// proxy adds at most one, so eight is more chain than any deployment has,
+/// and more than that is a client stuffing the head. The walk is from the
+/// right, so letting the first fields go lets go of what the client wrote
+/// and keeps what the proxies did.
 pub const max_forwarded_fields = 8;
 
 /// The entries of every `X-Forwarded-For` field in a head, handed out from

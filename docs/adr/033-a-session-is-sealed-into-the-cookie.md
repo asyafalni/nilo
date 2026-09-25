@@ -60,7 +60,15 @@ fn signIn(s: nilo.Session(Signed)) !nilo.Redirect(303) {
 
 A resolved value is handed to the handler **by value**. A mutated copy would go nowhere, compile cleanly, and look exactly like it had worked; `set` is a line in a diff instead, next to the `c.setCookie` it turns into.
 
+### The cookie is `__Host-session` wherever the prefix can hold
+
+A session cookie with `Secure`, `Path=/` and no `Domain`, which are the defaults, is named `__Host-session`, and it is read before a cookie named `session`. A browser only accepts a `__Host-` cookie from this host, over HTTPS, for the whole site, so a page on a sibling subdomain cannot plant one. It could plant `session`: `session=<its own valid session>; Domain=example.com; Path=/account` is sent first under `/account`, so the victim works inside the attacker's account, and CSRF does not help, because the victim's requests are same-origin. A cookie with a `Domain`, another path or `Secure` turned off cannot carry the prefix, so it keeps the plain name and the risk that comes with it.
+
+A session written under the plain name before the prefix still opens, and the next `set` writes the prefixed one and clears the plain one, so nobody is signed out by the rename. `clear` deletes both, the prefixed deletion carrying `Secure`, because a browser refuses a `__Host-` cookie without it, deletions included. `nilo.session.host_cookie_name` and `nilo.session.cookie_name` are the two names, for `app.guard` and for a test.
+
 ## What was rejected
+
+**A name option whose default is the prefixed one.** Every other shape of session cookie is a choice a caller makes by setting `domain`, `path` or `secure`, and the name follows from those; a separate name would be a fourth knob that has to agree with the three.
 
 **Trusting `Max-Age` and doing nothing.** What there was before. It works right up until somebody has a copy of the cookie, which is the only case an expiry is for.
 

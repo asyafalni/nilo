@@ -119,12 +119,16 @@ const linger_ms: u32 = 1000;
 /// until it hangs up, or `linger_ms` passes, or `linger_limit` bytes of a
 /// peer that keeps sending ([ADR 195](../docs/adr/195-a-refused-request-is-hung-up-on-with-a-fin.md)).
 ///
+/// **`linger_ms` is for the whole of it, not for each read.** Armed per read,
+/// a peer sending a byte every 900 ms stayed inside it until the 64 KiB,
+/// about eighteen hours of a fiber for a request already refused.
+///
 /// Only on the paths that set `Served.linger`, which is where unread input
 /// is possible; an ordinary `Connection: close` has nothing queued and closes
 /// as it always did, with no syscall and no wait.
 fn hangUp(in: *std.Io.Reader, deadlines: bulkhead.Deadlines, waker: bulkhead.Waker) void {
     waker.halfClose();
-    deadlines.armPeek(linger_ms);
+    deadlines.armAllReads(linger_ms);
     _ = in.discardShort(linger_limit) catch {};
 }
 
@@ -682,16 +686,22 @@ fn drain(c: *Ctx, in: *std.Io.Reader, r: *const http1.Request) bool {
     // a `while (try incoming.read(…))` that breaks early is an ordinary
     // thing to write. What is left of it goes here, so the next request on
     // this connection starts where it should (ADR 019).
+    //
+    // **The rest gets `body()`'s rate floor, not a per-read limit.** Per read,
+    // a POST to a 404 dribbled at a byte every 29 seconds held its fiber with
+    // no end, for a body nobody was going to read. Sized from what is left at
+    // most, as `readSizedBody` sizes it (ADR 022).
     if (c._incoming) |*progress| {
         if (progress.finished()) return true;
-        c._deadlines.armBody();
+        c._deadlines.armBodyRun(progress.mostLeft());
         var rest = body_mod.Body.init(in, progress);
         rest.discardRest() catch return false;
         return true;
     }
     if (http1.readsMore(r)) {
-        c._deadlines.armBody();
-        http1.discardBody(in, r, c._limits.max_body) catch return false;
+        const max_body = c._limits.max_body;
+        c._deadlines.armBodyRun(if (r.chunked) max_body else @min(r.content_length, max_body));
+        http1.discardBody(in, r, max_body) catch return false;
     }
     return true;
 }
@@ -1165,6 +1175,33 @@ test "a connection is lingered on only where the client's bytes may still be unr
     const gone = serveOnce(&app, "");
     try testing.expect(!gone.keep_alive);
     try testing.expect(!gone.linger);
+}
+
+test "the linger after a refused request is bounded as a whole, not read by read" {
+    // Per read, a peer sending a byte every 900 ms held the connection until
+    // the 64 KiB cap, about eighteen hours (ADR 195).
+    const Caught = struct {
+        limit: bulkhead.Limit = .none,
+        fn take(target: ?*anyopaque, _: bulkhead.Side, l: bulkhead.Limit) void {
+            const self: *@This() = @ptrCast(@alignCast(target.?));
+            self.limit = l;
+        }
+        fn never(_: ?*anyopaque) bool {
+            return false;
+        }
+    };
+    var caught: Caught = .{};
+    const deadlines: bulkhead.Deadlines = .{ .target = &caught, .vtable = &.{ .limit = Caught.take, .timedOut = Caught.never } };
+
+    var in = std.Io.Reader.fixed("left over");
+    const before = bulkhead.monotonicNanos();
+    hangUp(&in, deadlines, .off);
+    const after = bulkhead.monotonicNanos();
+
+    try testing.expect(caught.limit == .by_ns);
+    const at = caught.limit.by_ns;
+    try testing.expect(at >= before + @as(u64, linger_ms) * std.time.ns_per_ms);
+    try testing.expect(at <= after + @as(u64, linger_ms) * std.time.ns_per_ms);
 }
 
 test "a head that does not fit is answered 431 and lingered on" {

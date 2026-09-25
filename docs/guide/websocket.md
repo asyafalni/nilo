@@ -31,7 +31,7 @@ browser that wandered onto the URL gets told rather than hung up on.
 Because a suspended fiber holds its stack, and where a socket waits is what it
 costs while it waits. A handler that looped in place would be parked *inside*
 the request — holding the `Ctx`, the parsed head and the route match, none of
-which the loop can reach — for as long as the tab is open. Returning first lets
+which the loop can reach — for as long as the tab is open. The compiler holds that: a `*nilo.Ctx` passed as the state, or inside it, is refused, so take what the loop needs out of the Ctx before `upgrade`. Returning first lets
 all of that unwind: an idle socket costs **5,183 bytes** instead of 9,290
 ([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)).
 

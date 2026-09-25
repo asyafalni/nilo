@@ -80,13 +80,15 @@ set, the description wins: an operator who described their network meant that,
 and the count left over from before is the thing the description exists to stop
 mattering.
 
+**`host()` and `scheme()` ask the same question.** `X-Forwarded-Host` and `X-Forwarded-Proto` are read only from a connection a named proxy made, or, with no names, when `trusted_hops` is not zero, which is the rule `clientIp()` applies to `X-Forwarded-For`. A header one accessor refuses cannot be the answer of another. On a listener that terminates TLS itself ([ADR 212](./212-tls-is-an-option-a-build-asks-for.md)), `scheme()` is `"https"` from the connection, and no header is read.
+
 ## What it costs
 
 **Startup**: one parse per rule, into an allocation the App owns. `"private"`
 is nine networks.
 
 **Per request: nothing, unless a handler asks.** `Ctx` reads this only inside
-`clientIp()`, and only when the request carries the header. Then it is a
+`clientIp()`, `host()` and `scheme()`, and walks a header only when the request carries it. Then it is a
 16-byte prefix compare per entry per rule — a handful of integer compares for a
 list that is one to three long
 ([ADR 017](017-the-trade-budget-has-four-axes.md)). Nothing is allocated;
@@ -132,10 +134,11 @@ than by a deployment.
 
 Every field of that name is read now, as one list, and both walks — the
 rules and the count — go through `proxies.Forwarded`, which hands out entries
-from the last field's right end to the first field's left. Up to eight
-fields; more is a head nobody honest sends, and is answered with the socket's
-address. Still no allocation: eight slices on the stack, on the path only a
-`clientIp()` call walks. `test "a proxy that adds a field of its own is read
+from the last field's right end to the first field's left. The last eight fields are read; a head with more loses its first ones, which are the client's end of the list. Still no allocation: eight slices on the stack, on the path only a `clientIp()` call walks.
+
+**More than eight fields was answered with the socket's address, which behind a proxy is the proxy's.** A client that sent eight fields of its own was read as the proxy that added the ninth, `10.0.0.7`: an allow-list of private addresses let it in, and an allowance charged the proxy's slot. Only the last eight are read now, and those are the proxies' end of the list. `test "a proxy that adds a field of its own is read the same as one that appends"` holds the stuffed head too.
+
+**`host()` and `scheme()` read `trusted_hops` and never `trusted_proxies`.** An app set up the way the deploying guide says got `scheme() == "http"` behind TLS for ever, and setting `trusted_hops = 1` to fix it trusted `X-Forwarded-Host` from any peer, a request straight to the pod included: the reset-link poisoning [ADR 090](./090-a-request-can-be-read-past-the-parts-a-handler-names.md) exists to prevent. `scheme()` also said `"http"` on nilo's own TLS listener, from a comment that still said nilo does not speak TLS. `test "with the proxies named, the scheme and host are read only from a connection one of them made"` and `test "on a listener with its own TLS the scheme is https, whatever a header says"` hold both. `test "a proxy that adds a field of its own is read
 the same as one that appends"` in `behaviour.zig` holds it, with HAProxy's
 order.
 

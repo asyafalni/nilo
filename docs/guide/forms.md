@@ -87,6 +87,8 @@ browser never joins a group with commas, so unlike a
 read, and `tags=a%2Cb` is one tag. A list of `Upload` is refused while
 compiling — a file is a part, not a value, and a field takes one.
 
+**A box left blank on a field that may be absent is the field not given.** A browser sends an empty box as `age=`, so an optional or defaulted number, bool or choice reads it as its default, or null, rather than as a 400. Text keeps the empty string: an empty `?Str` is `""`, and `blank()` is how to ask whether anything was typed. A required field left blank is still refused.
+
 A value that will not convert — `notify=nonsense` — is the 400 the single
 field would have got, naming the field. Behind a
 [`Bound(Form(T))`](#when-one-field-is-wrong-and-the-rest-are-fine) the first

@@ -49,12 +49,7 @@ The one that does bound a whole request, `request_deadline_ms`, is off unless
 set, and a stream or a WebSocket lets it go
 ([ADR 105](./adr/105-a-route-can-say-how-long-it-has.md)).
 
-**A WebSocket has no read limit, so a client that vanishes without a FIN holds
-a fiber.** Caught by the write limit as soon as the server sends anything, and
-a connection nobody writes to is caught by `.idle_ms`, 30 seconds by default,
-`0` waiting forever. It is a ping rather than a deadline, because a quiet
-WebSocket is a working one
-([ADR 021](./adr/021-a-websocket-is-a-handler-that-does-not-return.md)).
+**A WebSocket has no read limit between frames, so a client that vanishes without a FIN holds a fiber.** Caught by the write limit as soon as the server sends anything, and a connection nobody writes to is caught by `.idle_ms`, 30 seconds by default, `0` waiting forever. It is a ping rather than a deadline, because a quiet WebSocket is a working one; inside a frame, where no ping can reach, each read has twice `idle_ms` ([ADR 021](./adr/021-a-websocket-is-a-handler-that-does-not-return.md)).
 
 **The request head is the one thing a stranger writes directly, and every test
 of it was an input somebody thought of.** `http/fuzz.zig` states properties

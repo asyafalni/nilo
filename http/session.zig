@@ -83,7 +83,23 @@ comptime {
 /// The name of the cookie. One per application: a second `Session(T)` of a
 /// different `T` would write over the first, and the shape check below is
 /// what turns that from a silent misread into an ignored cookie.
+///
+/// **`__Host-session` whenever the cookie's attributes allow it**, which the
+/// defaults do: `Secure`, `Path=/` and no `Domain`. A browser keeps a
+/// `__Host-` cookie only from this host over HTTPS, so a page on a sibling
+/// subdomain cannot plant one; a plain `session` it could, with
+/// `Domain=example.com; Path=/account`, and the browser sent that one first
+/// under `/account`, so the victim worked inside the attacker's account.
+/// `cookie_name` is what a session with a `domain`, another `path` or
+/// `secure = false` is written as, and what 0.6.0 and earlier wrote.
+pub const host_cookie_name = "__Host-session";
 pub const cookie_name = "session";
+
+/// The name a session with these attributes is written under.
+pub fn nameFor(secure: bool, path: []const u8, domain: []const u8) []const u8 {
+    if (secure and domain.len == 0 and std.mem.eql(u8, path, "/")) return host_cookie_name;
+    return cookie_name;
+}
 
 /// What a browser will actually keep. RFC 6265 asks for at least 4096 bytes
 /// per cookie *including the name and the attributes*, and browsers hold
@@ -604,7 +620,12 @@ pub fn Session(comptime T: type) type {
                     "`.session_secret = my_secret` — {d} bytes, the same on every instance.",
                 .{key_len},
             );
-            const text = c.cookie(cookie_name) orelse return .{ .value = null, ._c = c };
+            // The prefixed name first, so a planted `session` never wins over
+            // one this host set. The plain name is still read, so a session
+            // written before the prefix, or under a `domain`, opens: nobody is
+            // signed out by the upgrade.
+            const text = c.cookie(host_cookie_name) orelse c.cookie(cookie_name) orelse
+                return .{ .value = null, ._c = c };
             return .{
                 .value = openAmong(T, text.view(), key.*, c._session_fallbacks.*, nowSeconds()),
                 ._c = c,
@@ -642,8 +663,9 @@ pub fn Session(comptime T: type) type {
             const lives_for = options.max_age orelse default_max_age;
             var buf: Sealed(T) = undefined;
             const text = try seal(T, value, nowSeconds() + lives_for, key.*, &buf);
+            const name = nameFor(options.secure, options.path, options.domain);
             try c.setCookie(.{
-                .name = cookie_name,
+                .name = name,
                 .value = text,
                 .path = options.path,
                 .domain = options.domain,
@@ -652,6 +674,13 @@ pub fn Session(comptime T: type) type {
                 .http_only = true,
                 .same_site = options.same_site,
             });
+            // A session moving to the prefixed name leaves the plain one it
+            // came in under behind, and a stale copy is one more cookie to
+            // open on every request until it expires. Only when one came in,
+            // so a session that has always been prefixed sends one header.
+            if (name.ptr == host_cookie_name.ptr and c.cookie(cookie_name) != null) {
+                try c.clearCookie(.{ .name = cookie_name });
+            }
         }
 
         /// Sign out. The cookie is deleted rather than emptied, because an
@@ -666,6 +695,11 @@ pub fn Session(comptime T: type) type {
                     "deletion on.",
                 .{},
             );
+            // Both names: signing out has to reach a session written before
+            // the prefix as well as one written after it.
+            if (options.domain.len == 0 and std.mem.eql(u8, options.path, "/")) {
+                try c.clearCookie(.{ .name = host_cookie_name });
+            }
             try c.clearCookie(.{
                 .name = cookie_name,
                 .path = options.path,
@@ -1063,7 +1097,7 @@ test "a handler sets a session and it leaves as a Set-Cookie" {
     const answer = try client.post(&app, "/sign-in", "");
     try testing.expectEqual(@as(u16, 200), answer.status);
 
-    const header = answer.setCookie(cookie_name).?;
+    const header = answer.setCookie(host_cookie_name).?;
     // The safe attributes, without the handler having asked for them.
     try testing.expect(std.mem.indexOf(u8, header, "HttpOnly") != null);
     try testing.expect(std.mem.indexOf(u8, header, "Secure") != null);
@@ -1081,7 +1115,7 @@ test "the cookie a browser sends back arrives as the value that was put in it" {
 
     // Take the cookie off the first response the way a browser would: the
     // pair, and none of the attributes.
-    const header = (try client.post(&app, "/sign-in", "")).setCookie(cookie_name).?;
+    const header = (try client.post(&app, "/sign-in", "")).setCookie(host_cookie_name).?;
     const pair = header[0 .. std.mem.indexOfScalar(u8, header, ';') orelse header.len];
 
     var request: [4096]u8 = undefined;
@@ -1157,8 +1191,8 @@ test "after a rotation, the old cookie is still signed in and the new one is sea
 
     // A fallback secret opens and never seals: what `set` writes now opens
     // under `key_b` alone and not under `key_a`.
-    const header = (try client.post(&app, "/sign-in", "")).setCookie(cookie_name).?;
-    const value = header[cookie_name.len + 1 .. std.mem.indexOfScalar(u8, header, ';') orelse header.len];
+    const header = (try client.post(&app, "/sign-in", "")).setCookie(host_cookie_name).?;
+    const value = header[host_cookie_name.len + 1 .. std.mem.indexOfScalar(u8, header, ';') orelse header.len];
     try testing.expectEqual(@as(u32, 7), open(Signed2, value, key_b).?.user);
     try testing.expect(open(Signed2, value, key_a) == null);
 }
@@ -1171,8 +1205,70 @@ test "clearing sends a deletion the browser will act on" {
     var client = try nilo_testing.Client.init(testing.allocator, .{});
     defer client.deinit();
 
-    const header = (try client.post(&app, "/sign-out", "")).setCookie(cookie_name).?;
-    try testing.expect(std.mem.indexOf(u8, header, "Max-Age=0") != null);
+    const answer = try client.post(&app, "/sign-out", "");
+    // Both names, so a session written before the prefix is signed out too;
+    // the prefixed one carries `Secure`, without which a browser ignores it.
+    const plain = answer.setCookie(cookie_name).?;
+    try testing.expect(std.mem.indexOf(u8, plain, "Max-Age=0") != null);
+    const prefixed = answer.setCookie(host_cookie_name).?;
+    try testing.expect(std.mem.indexOf(u8, prefixed, "Max-Age=0") != null);
+    try testing.expect(std.mem.indexOf(u8, prefixed, "Secure") != null);
+}
+
+test "a session planted under the plain name by a sibling subdomain does not win over this host's" {
+    // A page on another subdomain sets `session=<its own valid session>`
+    // with `Domain=example.com; Path=/account`, and the browser sends it
+    // first there. This host's own is `__Host-session`, which no other host
+    // can set, and it is the one read.
+    var app = appWithSession(testing.allocator);
+    defer app.deinit();
+    try app.get("/who", whoHandler);
+
+    var client = try nilo_testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+
+    var planted_buf: Sealed(Signed2) = undefined;
+    const planted = try seal(Signed2, .{ .user = 666 }, far_future, key_a, &planted_buf);
+    var own_buf: Sealed(Signed2) = undefined;
+    const own = try seal(Signed2, .{ .user = 7 }, far_future, key_a, &own_buf);
+
+    var request: [4096]u8 = undefined;
+    const answer = try client.send(&app, try std.fmt.bufPrint(
+        &request,
+        "GET /who HTTP/1.1\r\nHost: test\r\nCookie: {s}={s}; {s}={s}\r\n\r\n",
+        .{ cookie_name, planted, host_cookie_name, own },
+    ));
+    var body: [256]u8 = undefined;
+    try testing.expectEqualStrings("{\"user\":7,\"admin\":false}", try answer.text(&body));
+}
+
+test "a session written before the prefix still opens, and the next set moves it" {
+    var app = appWithSession(testing.allocator);
+    defer app.deinit();
+    try app.post("/sign-in", signInHandler);
+
+    var client = try nilo_testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+
+    var buf: Sealed(Signed2) = undefined;
+    const old = try seal(Signed2, .{ .user = 3 }, far_future, key_a, &buf);
+    var request: [4096]u8 = undefined;
+    const answer = try client.send(&app, try std.fmt.bufPrint(
+        &request,
+        "POST /sign-in HTTP/1.1\r\nHost: test\r\nCookie: {s}={s}\r\nContent-Length: 0\r\n\r\n",
+        .{ cookie_name, old },
+    ));
+    try testing.expect(answer.setCookie(host_cookie_name) != null);
+    try testing.expect(std.mem.indexOf(u8, answer.setCookie(cookie_name).?, "Max-Age=0") != null);
+}
+
+test "a session with a domain, another path or no Secure keeps the plain name" {
+    // `__Host-` is refused by a browser on any of the three, so the prefix
+    // is only used where it will be kept.
+    try testing.expectEqualStrings(host_cookie_name, nameFor(true, "/", ""));
+    try testing.expectEqualStrings(cookie_name, nameFor(true, "/", "example.com"));
+    try testing.expectEqualStrings(cookie_name, nameFor(true, "/app", ""));
+    try testing.expectEqualStrings(cookie_name, nameFor(false, "/", ""));
 }
 
 test "asking for a session with no secret set fails with a message, not a wrong answer" {

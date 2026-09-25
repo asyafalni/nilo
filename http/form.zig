@@ -294,6 +294,17 @@ pub fn parse(arena: std.mem.Allocator, kind: Kind, body: []const u8) !Fields {
     };
 }
 
+/// Whether a field may be left out: it is optional, or it has a default.
+pub fn mayBeAbsent(comptime f: std.builtin.Type.StructField) bool {
+    return f.defaultValue() != null or @typeInfo(f.type) == .optional;
+}
+
+/// What a field left out is: its default, or null.
+pub fn absentValue(comptime f: std.builtin.Type.StructField) f.type {
+    if (f.defaultValue()) |default| return default;
+    return null;
+}
+
 /// Fill `T` from an already-parsed form.
 fn fill(comptime T: type, arena: std.mem.Allocator, fields: Fields, lifetime: *const str_mod.Lifetime) !T {
     var out: T = undefined;
@@ -323,7 +334,12 @@ fn fill(comptime T: type, arena: std.mem.Allocator, fields: Fields, lifetime: *c
                 return fail.badRequest("the form is missing the file " ++ label, .{});
             }
         } else if (fields.find(f.name)) |raw| {
-            @field(out, f.name) = try convert.convert(Inner, .form, Str.fromRequest(raw, lifetime), label);
+            const arrived = Str.fromRequest(raw, lifetime);
+            if ((comptime mayBeAbsent(f)) and convert.emptyIsAbsent(Inner, .form, arrived)) {
+                @field(out, f.name) = comptime absentValue(f);
+            } else {
+                @field(out, f.name) = try convert.convert(Inner, .form, arrived, label);
+            }
         } else if (f.defaultValue()) |default| {
             @field(out, f.name) = default;
         } else if (@typeInfo(f.type) == .optional) {
@@ -385,7 +401,9 @@ fn fillCollecting(
             outcomes[i].given = arrived;
 
             var converted: Inner = undefined;
-            if (convert.tryConvert(Inner, .form, arrived, &converted)) |reason| {
+            if ((comptime mayBeAbsent(f)) and convert.emptyIsAbsent(Inner, .form, arrived)) {
+                @field(out, f.name) = comptime absentValue(f);
+            } else if (convert.tryConvert(Inner, .form, arrived, &converted)) |reason| {
                 outcomes[i].reason = reason;
                 if (f.defaultValue()) |default| @field(out, f.name) = default;
             } else {

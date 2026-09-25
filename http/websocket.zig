@@ -247,6 +247,15 @@ pub fn checkLoop(comptime loop: anytype, comptime State: type) void {
             ", and the loop's second argument is " ++
             naming.of(info.params[1].type orelse anyopaque));
     }
+    // The loop runs after the handler has returned, so a `*Ctx` carried into
+    // it points into a frame that is gone and at a request that is over: the
+    // loop reads the next request's memory. Only through values, not behind
+    // a pointer of the caller's, which is where the walk would have to guess
+    // at whose memory it is reading.
+    if (comptime ctxIn(State, "the state")) |where| {
+        @compileError("nilo: " ++ where ++ " is a *nilo.Ctx, and the request it points at is over " ++
+            "by the time the loop runs; take what the loop needs out of the Ctx before upgrade");
+    }
     if (@sizeOf(State) > state_max) {
         @compileError("nilo: a WebSocket loop may carry " ++ num(state_max) ++
             " bytes of state and " ++ naming.of(State) ++ " is " ++ num(@sizeOf(State)) ++
@@ -255,6 +264,35 @@ pub fn checkLoop(comptime loop: anytype, comptime State: type) void {
     if (@alignOf(State) > state_align) {
         @compileError("nilo: a WebSocket loop's state is aligned to " ++ num(state_align) ++
             " bytes and " ++ naming.of(State) ++ " needs " ++ num(@alignOf(State)));
+    }
+}
+
+/// Where in `T` a pointer to the request's `Ctx` sits, walking fields,
+/// optionals and arrays, or null if nowhere. Named by `nilo_type_name` rather
+/// than by type, because `ctx.zig` imports this file.
+fn ctxIn(comptime T: type, comptime where: []const u8) ?[]const u8 {
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            const C = p.child;
+            if (@typeInfo(C) == .@"struct" and @hasDecl(C, naming.marker) and
+                std.mem.eql(u8, @field(C, naming.marker), "nilo.Ctx")) return where;
+            return null;
+        },
+        .optional => |o| return ctxIn(o.child, where),
+        .array => |a| return ctxIn(a.child, where ++ "'s items"),
+        .@"struct" => |s| {
+            for (s.fields) |f| {
+                if (ctxIn(f.type, if (s.is_tuple) where ++ "'s item " ++ f.name else "field `" ++ f.name ++ "` of " ++ where)) |found| return found;
+            }
+            return null;
+        },
+        .@"union" => |u| {
+            for (u.fields) |f| {
+                if (ctxIn(f.type, "field `" ++ f.name ++ "` of " ++ where)) |found| return found;
+            }
+            return null;
+        },
+        else => return null,
     }
 }
 
