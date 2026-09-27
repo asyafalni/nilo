@@ -301,6 +301,14 @@ pub const Postgres = struct {
     /// What the first key's number is. `WITH ORDINALITY` counts from one.
     pub const ordinal_base = 1;
 
+    /// What `db.explain` writes in front of a read, and how many columns a
+    /// line of the answer has, the plan's own text last. `ANALYZE` runs the
+    /// statement and reports what it did rather than what the planner
+    /// guessed, which is the question a slow page asks; `BUFFERS` says how
+    /// much of it came off the disk.
+    pub const explain = "EXPLAIN (ANALYZE, BUFFERS) ";
+    pub const explain_width = 1;
+
     /// Where NULLs sit in an ordered result, or `null` for a database that
     /// cannot be told. Written the same way `lock` is, and for the same
     /// reason: a Dialect that has no spelling for this refuses rather than
@@ -549,6 +557,29 @@ pub const Postgres = struct {
     /// What a `.default` of `.now` writes.
     pub const now_default = "now()";
 
+    /// What `.now` writes into a column read as text, `sql.AsText("timestamptz")`
+    /// (ADR 181). The column is still a `timestamptz` here, so it is the same
+    /// clock.
+    pub const now_text = "now()";
+
+    /// The clock moved by a number written out, `.{ .today = -90 }` or
+    /// `.{ .now = .{ .days = -90 } }` (item 105). A day moves by whole days,
+    /// which a `date` does with `-`; a moment by an `interval`. The number is
+    /// in the text, so nothing is bound and the statement is still a constant.
+    pub fn shiftedClock(comptime clock: Clock, comptime by: i64, comptime unit: ClockUnit) []const u8 {
+        comptime {
+            const base = if (clock == .day) "CURRENT_DATE" else now_default;
+            if (by == 0) return base;
+            const sign = if (by < 0) " - " else " + ";
+            const n = std.fmt.comptimePrint("{d}", .{@abs(by)});
+            return switch (clock) {
+                .day => "(" ++ base ++ sign ++ n ++ ")",
+                .moment, .moment_text => "(" ++ base ++ sign ++ "interval '" ++ n ++ " " ++
+                    @tagName(unit) ++ "')",
+            };
+        }
+    }
+
     /// Whether this database can drop a table constraint and add another in
     /// its place. Postgres can, in one `ALTER TABLE`, which is what makes a
     /// changed word on an enum column a diff rather than a rebuild.
@@ -562,7 +593,7 @@ pub const Postgres = struct {
     /// does without an extension, so this is a functional index on `lower(…)`.
     /// **That has a consequence worth knowing before it surprises somebody**: a
     /// plain `WHERE "email" = $1` will not use this index. A lookup that wants
-    /// it writes `lower("email") = lower($1)`, which today is `db.raw`. The
+    /// it writes `lower("email") = lower($1)`, which is `.ieq`. The
     /// alternative is the `citext` extension, which is a `CREATE EXTENSION` this
     /// module has no word for and would not run on a managed database that has
     /// not allowed it.
@@ -819,6 +850,49 @@ pub const Postgres = struct {
         };
     }
 
+    /// The column types a raw statement's column may arrive as for a field
+    /// of `T` to be read out of it, for the check `db.raw` makes the first
+    /// time it runs
+    /// ([ADR 233](../docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
+    ///
+    /// **`accepts` with the numbers made exact.** That list is about a table
+    /// a Row both reads and writes, and lets an `i32` stand over an `int8`
+    /// column; the read is pg.zig's, which decodes an `i32` out of `int4`
+    /// and nothing else. So the `int8` a `count(*)` answers and the
+    /// `numeric` a `sum(int8)` answers are both a statement that fails on
+    /// its first row, and this is where that is said before the row.
+    ///
+    /// A text column is `text` here because a raw statement asks for it as
+    /// `::text`, which `rawcheck.assertCasts` holds it to (ADR 124). A
+    /// column the database sends as a string it names otherwise (a domain
+    /// over `text`, `citext`, an enum) is judged by `wire.Described.textual`
+    /// rather than by this list.
+    pub fn reads(comptime T: type) Accepts {
+        return comptime readsInner(T);
+    }
+
+    fn readsInner(comptime T: type) Accepts {
+        const Inner = switch (@typeInfo(T)) {
+            .optional => |o| o.child,
+            else => T,
+        };
+        if (!types.isBytes(Inner) and types.asText(Inner) != null) return text_accepts;
+        return switch (@typeInfo(Inner)) {
+            .int => |i| if (i.signedness == .unsigned) null else switch (i.bits) {
+                16 => &.{"int2"},
+                32 => &.{"int4"},
+                64 => &.{"int8"},
+                else => null,
+            },
+            .float => |f| switch (f.bits) {
+                32 => &.{"float4"},
+                64 => &.{"float8"},
+                else => null,
+            },
+            else => accepts(T),
+        };
+    }
+
     fn intAccepts(comptime info: std.builtin.Type.Int) Accepts {
         // Postgres has no unsigned integers, so an unsigned Zig type reads
         // out of the next width up — the one that can hold all of it.
@@ -945,6 +1019,12 @@ pub const SQLite = struct {
 
     /// `json_each` counts from zero.
     pub const ordinal_base = 0;
+
+    /// `EXPLAIN QUERY PLAN`, which plans and does not run: SQLite has no
+    /// `ANALYZE` form that reports timings. Four columns a line, the step's
+    /// text last.
+    pub const explain = "EXPLAIN QUERY PLAN ";
+    pub const explain_width = 4;
 
     /// The same two words, and **that is the finding rather than the
     /// coincidence.** SQLite has taken `NULLS FIRST`/`NULLS LAST` since 3.30
@@ -1130,6 +1210,35 @@ pub const SQLite = struct {
     pub const now_default =
         "(CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) * 1000)";
 
+    /// What `.now` writes into a column read as text, `sql.AsText("timestamptz")`
+    /// (ADR 181). `now_default` is a number of microseconds, which a text
+    /// column would hand back as digits; this is RFC 3339 in UTC to the
+    /// millisecond, which two of sort as text in the order they happened.
+    pub const now_text = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+
+    /// The clock moved by a number written out (item 105). SQLite's date
+    /// functions take the offset as a modifier after `'now'`, so each of the
+    /// three spellings of the clock takes it in the same place: `date` for a
+    /// day, `julianday` under `now_default`'s arithmetic for a `Timestamp`,
+    /// and `strftime` for a moment read as text.
+    pub fn shiftedClock(comptime clock: Clock, comptime by: i64, comptime unit: ClockUnit) []const u8 {
+        comptime {
+            if (by == 0) return switch (clock) {
+                .day => "CURRENT_DATE",
+                .moment => now_default,
+                .moment_text => now_text,
+            };
+            const modifier = "'" ++ (if (by < 0) "-" else "+") ++
+                std.fmt.comptimePrint("{d}", .{@abs(by)}) ++ " " ++ @tagName(unit) ++ "'";
+            return switch (clock) {
+                .day => "date('now', " ++ modifier ++ ")",
+                .moment => "(CAST((julianday('now', " ++ modifier ++
+                    ") - 2440587.5) * 86400000 AS INTEGER) * 1000)",
+                .moment_text => "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', " ++ modifier ++ ")",
+            };
+        }
+    }
+
     /// **The clause that is a different shape rather than a different word.**
     ///
     /// `INTEGER PRIMARY KEY` is an alias for the rowid here, so the type and
@@ -1232,6 +1341,60 @@ pub const SQLite = struct {
         return comptime acceptsSqlite(T);
     }
 
+    /// What `db.raw`'s first-run check holds a column against (ADR 233),
+    /// in **affinities**, which is what the SQLite Wire's `describe` reports:
+    /// the one of five a declared type falls into, rather than the free text
+    /// somebody declared.
+    ///
+    /// **Looser than `accepts`, because SQLite converts on the way out.**
+    /// zqlite reads an integer out of any column and text out of any column,
+    /// so very little here fails; what is caught is the read that answers
+    /// wrong without failing. A `Str` over an `INTEGER` column hands back the
+    /// digits, a number over a `TEXT` column hands back zero, and a
+    /// `Timestamp` over `TEXT` is the column ADR 067 is about.
+    pub fn reads(comptime T: type) Accepts {
+        return comptime readsSqlite(T);
+    }
+
+    fn readsSqlite(comptime T: type) Accepts {
+        const Inner = switch (@typeInfo(T)) {
+            .optional => |o| o.child,
+            else => T,
+        };
+        if (types.isBytes(Inner)) return &.{ "BLOB", "TEXT" };
+        if (Inner == types.Timestamp) return &.{ "INTEGER", "NUMERIC" };
+        if (Inner == core.Str or types.asText(Inner) != null or types.declaredColumn(Inner) != null)
+            return &.{ "TEXT", "NUMERIC", "BLOB" };
+        if (types.listElement(Inner) != null) return null;
+        return switch (@typeInfo(Inner)) {
+            .bool, .int => &.{ "INTEGER", "NUMERIC" },
+            .float => &.{ "REAL", "INTEGER", "NUMERIC" },
+            .@"enum" => &.{ "TEXT", "NUMERIC", "BLOB" },
+            .pointer => |ptr| if (ptr.size == .slice and ptr.child == u8)
+                &.{ "TEXT", "NUMERIC", "BLOB" }
+            else
+                null,
+            else => null,
+        };
+    }
+
+    /// The affinity SQLite gives a declared type, by its own rule
+    /// (<https://sqlite.org/datatype3.html#determination_of_column_affinity>),
+    /// or null for no declared type, which is every expression.
+    pub fn affinityOf(declared: []const u8) ?[]const u8 {
+        if (declared.len == 0) return null;
+        const has = struct {
+            fn has(text: []const u8, part: []const u8) bool {
+                return std.ascii.indexOfIgnoreCase(text, part) != null;
+            }
+        }.has;
+        if (has(declared, "INT")) return "INTEGER";
+        if (has(declared, "CHAR") or has(declared, "CLOB") or has(declared, "TEXT")) return "TEXT";
+        if (has(declared, "BLOB")) return "BLOB";
+        if (has(declared, "REAL") or has(declared, "FLOA") or has(declared, "DOUB")) return "REAL";
+        return "NUMERIC";
+    }
+
     fn acceptsSqlite(comptime T: type) Accepts {
         const Inner = switch (@typeInfo(T)) {
             .optional => |o| o.child,
@@ -1297,6 +1460,15 @@ pub const SQLite = struct {
     }
 };
 
+/// Which clock a column is compared with (`where.clockWord`): a moment the
+/// column stores as a `Timestamp`, a moment it reads as text, or a day. The
+/// three are spelled differently on SQLite and the same on Postgres.
+pub const Clock = enum { moment, moment_text, day };
+
+/// What `.now` may be moved by: `.{ .now = .{ .days = -90 } }`. No months or
+/// years, because the two databases do not agree on the thirty-first.
+pub const ClockUnit = enum { days, hours, minutes, seconds };
+
 /// Everything a Dialect owes, checked where it is handed over rather than at
 /// the first call that happens to need a missing piece. The same reason
 /// `service.zig` checks the registry at `listen()`.
@@ -1319,6 +1491,7 @@ pub fn assertDialect(comptime D: type) void {
             "limit",
             "offset",
             "accepts",
+            "reads",
             "introspect",
             "readAs",
             "bindAs",
@@ -1338,6 +1511,8 @@ pub fn assertDialect(comptime D: type) void {
             "like_folds",
             "enum_values",
             "now_default",
+            "now_text",
+            "shiftedClock",
             "can_alter_constraint",
             "text_accepts",
             "trigger_drop_names_table",
@@ -1345,6 +1520,8 @@ pub fn assertDialect(comptime D: type) void {
             "readAggregate",
             "ordinalList",
             "ordinal_base",
+            "explain",
+            "explain_width",
         };
         for (owed) |decl| {
             if (!@hasDecl(D, decl)) @compileError(
@@ -1764,4 +1941,27 @@ test "the key clause is where the two databases disagree structurally" {
         "\"public\" TEXT NOT NULL PRIMARY KEY",
         SQLite.keyColumn("\"public\"", "TEXT", false),
     );
+}
+
+test "SQLite's affinity is its own substring rule, and no declared type is none" {
+    try testing.expectEqualStrings("INTEGER", SQLite.affinityOf("bigint").?);
+    try testing.expectEqualStrings("TEXT", SQLite.affinityOf("VARCHAR(255)").?);
+    try testing.expectEqualStrings("TEXT", SQLite.affinityOf("nvarchar").?);
+    try testing.expectEqualStrings("BLOB", SQLite.affinityOf("blob").?);
+    try testing.expectEqualStrings("REAL", SQLite.affinityOf("DOUBLE PRECISION").?);
+    try testing.expectEqualStrings("NUMERIC", SQLite.affinityOf("DATETIME").?);
+    // "POINT" has "INT" in it, which is SQLite's rule and not a typo here.
+    try testing.expectEqualStrings("INTEGER", SQLite.affinityOf("POINT").?);
+    try testing.expectEqual(@as(?[]const u8, null), SQLite.affinityOf(""));
+}
+
+test "a raw read on Postgres takes a number of exactly its width" {
+    try testing.expectEqualSlices([]const u8, &.{"int4"}, Postgres.reads(i32).?);
+    try testing.expectEqualSlices([]const u8, &.{"int8"}, Postgres.reads(?i64).?);
+    try testing.expectEqualSlices([]const u8, &.{"float8"}, Postgres.reads(f64).?);
+    // Where `accepts` is the table's list, wider on both sides.
+    try testing.expect(Postgres.accepts(i32).?.len > 1);
+    // A text column arrives as text, because a raw statement casts it.
+    try testing.expectEqualStrings("text", Postgres.reads(types.Decimal).?[0]);
+    try testing.expectEqualStrings("timestamptz", Postgres.reads(types.Timestamp).?[0]);
 }

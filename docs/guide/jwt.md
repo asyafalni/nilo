@@ -1,17 +1,12 @@
 # Checking somebody else's token
 
-`nilo_jwt` verifies a JWT that an identity provider signed — a Google ID
-token, an Auth0 or Clerk access token, a Keycloak or Cognito bearer, a
-Supabase session — and reads the claims into a struct of your own. RS256
-and ES256, which between them are what those issuers sign with. It is a
-tool module: no event loop, no allocator of its own, and it imports
-nothing, so `zig test jwt/jwt.zig` runs the whole of it
-([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
+**`nilo_jwt` verifies a JWT that an identity provider signed, with RS256 or ES256, and reads its claims into a struct of your own.**
 
-**It is for a token somebody else issued.** A sign-in your own server keeps
-is a [`Session(T)`](./sessions.md), sealed into a cookie, and needs no token
-at all. The word *token* here only ever means a credential that arrived from
-outside ([`CONTEXT.md`](../../CONTEXT.md#tokens)).
+**Reference:** [`nilo_jwt`](../reference/jwt.md#nilo_jwt), [`jwt.Keyring`](../reference/jwt.md#jwtkeyring), [`jwt.Verifier`](../reference/jwt.md#jwtverifierclaims-client), [`Verified(V)`](../reference/handlers.md#verifiedv) · **Design:** [JWT verification](../design/jwt.md)
+
+`nilo_jwt` verifies tokens such as a Google ID token, an Auth0 or Clerk access token, a Keycloak or Cognito bearer token, or a Supabase session. It supports RS256 and ES256, which between them are what those issuers sign with. It is a tool module: no event loop, no allocator of its own, and it imports nothing, so `zig test jwt/jwt.zig` runs all of it ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
+
+**It is for a token somebody else issued.** A sign-in that your own server keeps track of is a [`Session(T)`](./sessions.md), sealed into a cookie, and needs no token at all. In nilo, the word *token* only ever means a credential that arrived from outside ([`CONTEXT.md`](../../CONTEXT.md#tokens)).
 
 ```zig
 const jwt = @import("nilo_jwt");
@@ -23,7 +18,7 @@ and one line in `build.zig`, beside the `nilo_http` one:
 .{ .name = "nilo_jwt", .module = nilo.module("nilo_jwt") },
 ```
 
-## The whole of it
+## A complete example
 
 <!-- compiles -->
 ```zig
@@ -45,112 +40,66 @@ fn whoIsThis(gpa: std.mem.Allocator, keys: *const jwt.Keys, token: []const u8) !
 }
 ```
 
-`verify` does everything, in the order that is safe, and answers the claims
-or one of the errors [below](#what-it-answers-instead). Three things decide
-the shape of the call:
+**`verify` does every check, in a safe order, and returns the claims or one of the [errors below](#errors).** Three things shape the call:
 
-- **`Claims` is yours.** One field per thing the application wants out of the
-  token; fields the token carries and the struct does not name are ignored.
-  The registered claims — `iss`, `aud`, `exp`, `nbf` — are checked whether or
-  not the struct mentions them, so a `Claims` with only `sub` in it is still
-  a full check.
-- **Strings in the answer point into `gpa`.** Hand it `c.arena()` inside a
-  request and there is nothing to free; hand it a real allocator and the
-  strings are yours to free.
-- **The clock is an argument.** A module with no loop has no clock, and a
-  test that cannot choose the time cannot test an expiry. Inside a request,
-  `nilo.nowMillis()` is the one to pass.
+- **`Claims` is yours.** Add one field per thing the application wants from the token; fields the token carries that the struct does not name are ignored. The registered claims (`iss`, `aud`, `exp`, `nbf`) are checked whether or not the struct mentions them, so a `Claims` with only `sub` in it still gets a full check.
+- **Strings in the result point into `gpa`.** Pass `c.arena()` inside a request and there is nothing to free. Pass a real allocator and the strings are yours to free.
+- **The clock is an argument.** A module with no loop has no clock, and a test that cannot choose the time cannot test an expiry. Inside a request, pass `nilo.nowMillis()`.
 
 ## Options
 
 | Field | Default | |
 |---|---|---|
-| `keys` | — | `*const jwt.Keys`, the issuer's — [below](#where-the-keys-come-from) |
-| `issuer` | `null` | refuse a token whose `iss` is not exactly this. Null skips the check, which is right only when the key set itself is the proof of who signed |
-| `audience` | `null` | refuse a token whose `aud` does not carry this — your client id. Null skips it, and a token minted for another application then passes |
-| `now_s` | — | seconds since the epoch, for `exp` and `nbf` |
-| `leeway_s` | `0` | how far the two clocks may disagree, both ways. Sixty is the usual number when the issuer is somebody else's machine |
+| `keys` | none | `*const jwt.Keys`, the issuer's: [below](#getting-the-issuers-keys) |
+| `issuer` | `null` | reject a token whose `iss` is not exactly this. Null skips the check, which is right only when the key set itself proves who signed |
+| `audience` | `null` | reject a token whose `aud` does not include this (your client id). Null skips it, and then a token minted for another application passes |
+| `now_s` | none | seconds since the epoch, for `exp` and `nbf` |
+| `leeway_s` | `0` | how far the two clocks may disagree, in both directions. Sixty is the usual value when the issuer is somebody else's machine |
 
-Name the `issuer` and the `audience`. Both are optional because there are
-deployments where the key set already settles them, and both are wrong to
-leave off in the ordinary one: a Google ID token minted for *somebody else's*
-application is signed by the same keys as one minted for yours, and `aud` is
-the only thing that tells them apart.
+**Set both `issuer` and `audience`.** Both are optional because in some deployments the key set already settles them, but leaving them off is wrong in the ordinary case. A Google ID token minted for *somebody else's* application is signed by the same keys as one minted for yours, and `aud` is the only thing that tells them apart.
 
-## What is not an option
+## Security checks that are always on
 
-Each of these is a way to write a verifier that passes every test and leaves
-the endpoint open, which is the whole reason the module exists rather than a
-paragraph pointing at `std.crypto`:
+**Each of these is a mistake that would give you a verifier that passes every test and leaves the endpoint open**, and preventing them is the reason this module exists rather than a paragraph pointing at `std.crypto`:
 
-- **The algorithm is the key's, never the token's `alg`.** A JWKS key that
-  says `RSA` is checked as RS256 and one that says `EC` on `P-256` as ES256,
-  and nothing in the header can change which. The header's `alg` is only
-  compared: a header saying `none`, or `HS256` with the RSA modulus you
-  published used as the HMAC secret, is refused before a key is looked up,
-  and a header saying `ES256` over a key that is RSA — or `RS256` over one
-  that is EC — is `error.WrongAlgorithm` before any arithmetic runs. A key
-  set holding both kinds, which is what an issuer mid-migration publishes,
-  cannot be talked into checking one with the other
-  ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
-- **Nothing in the payload is read until the signature has passed.** An `exp`
-  off an unverified token is a number somebody chose.
-- **`exp` is required.** A credential with no end is not one, so a token
-  without it is `error.NoExpiry` however well it is signed.
+- **The algorithm comes from the key, never from the token's `alg`.** A JWKS key that says `RSA` is checked as RS256, and one that says `EC` on `P-256` as ES256; nothing in the token header can change that. The header's `alg` is only compared. A header saying `none`, or `HS256` with your published RSA modulus used as the HMAC secret, is rejected before any key is looked up. A header saying `ES256` over an RSA key, or `RS256` over an EC key, returns `error.WrongAlgorithm` before any arithmetic runs. So a key set holding both kinds, which is what an issuer publishes in the middle of a migration, cannot be tricked into checking one kind with the other ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
+- **Nothing in the payload is read until the signature has passed.** An `exp` from an unverified token is a number somebody chose.
+- **`exp` is required.** A credential with no end is not a credential, so a token without `exp` returns `error.NoExpiry` however well it is signed.
 
-## What it answers instead
+## Errors
 
 | Error | When | What to answer |
 |---|---|---|
 | `error.NotAToken` | not three base64url segments, or the header is not JSON | 401 |
-| `error.WrongAlgorithm` | the header says anything but `RS256` or `ES256`, `none` included — or says one over a key of the other kind | 401 |
-| `error.NoSuchKey` | the `kid` is not in the set, or none was named and the set has more than one key | the issuer may have rotated — [refresh](#when-the-issuer-rotates), then 401 |
+| `error.WrongAlgorithm` | the header says anything but `RS256` or `ES256` (`none` included), or names one over a key of the other kind | 401 |
+| `error.NoSuchKey` | the `kid` is not in the set, or no `kid` was named and the set has more than one key | the issuer may have rotated: [refresh](#key-rotation), then 401 |
 | `error.BadSignature` | the key is right and the signature is not | 401 |
-| `error.NoExpiry`, `error.Expired`, `error.NotYetValid` | `exp` missing, `exp` passed, `nbf` not arrived | 401 |
-| `error.WrongIssuer`, `error.WrongAudience` | `iss` or `aud` is not what you named | 401 |
-| `error.ClaimsNotReadable` | the signature passed and the payload does not fit your struct | 401 — or a 500 if the struct is the thing that is wrong |
-| `error.KeySizeNotSupported` | a modulus that is not 2048, 3072 or 4096 bits | 500, and a caller on the [roadmap](../roadmap.md#known-waiting-for-a-caller) |
+| `error.NoExpiry`, `error.Expired`, `error.NotYetValid` | `exp` missing, `exp` passed, `nbf` not reached | 401 |
+| `error.WrongIssuer`, `error.WrongAudience` | `iss` or `aud` is not what you set | 401 |
+| `error.ClaimsNotReadable` | the signature passed and the payload does not fit your struct | 401, or a 500 if your struct is what is wrong |
+| `error.KeySizeNotSupported` | a modulus that is not 2048, 3072 or 4096 bits | 500, and an entry on the [roadmap](../roadmap.md#known-waiting-for-a-caller) waiting for someone who needs it |
 | `error.CurveNotSupported` | an EC key whose `crv` is not `P-256` | the same 500, and the same roadmap entry |
-| `error.SignatureWrongLength` | a signature that is not the size of its key — for ES256, sixty-four bytes of `r \|\| s` | 401. If it is *your* test token, the signer wrote DER — [below](#es256-and-the-shape-of-the-signature) |
-| `error.KeyNotUsable` | the set carried a key the arithmetic cannot use: an even exponent, a coordinate that is not on the curve | 500 — the document is wrong, and no token will pass |
+| `error.SignatureWrongLength` | a signature that is not the size of its key (for ES256, sixty-four bytes of `r \|\| s`) | 401. If it is *your* test token, the signer wrote DER: [below](#es256-signatures) |
+| `error.KeyNotUsable` | the set carried a key the arithmetic cannot use: an even exponent, a point that is not on the curve | 500. The key document is wrong, and no token will pass |
 
-Every one of them is a 401 to the client, and the *reason* belongs in your
-log rather than in the response: telling a caller which check failed is
-telling them what to fix on the next attempt. The one worth a different
-answer is `NoSuchKey`, because it is what a key rotation looks like from here.
+**Every one of these is a 401 to the client, and the reason belongs in your log, not in the response.** Telling a caller which check failed tells them what to fix on the next attempt. The one worth a different answer is `NoSuchKey`, because that is what a key rotation looks like from here.
 
-## Where the keys come from
+## Getting the issuer's keys
 
-**The client that fetches the key set is yours** — deliberately, because it
-is an HTTPS GET that [`nilo_fetch`](./fetch.md) already sends, and this module
-imports nothing. A `Keyring` takes that client, fetches at startup, and fetches
-again on an unknown `kid` at most once an interval; whether a miss should
-refuse instead is `verify` rather than `verifyOrRefresh`, and yours to pick
-([decided](../decided.md#answered-and-kept-to-one-line-each)). What the module
-does with the document is read it:
+**You supply the HTTP client that fetches the key set.** This is deliberate: it is an HTTPS GET that [`nilo_fetch`](./fetch.md) already sends, and this module imports nothing. A `Keyring` takes that client, fetches the keys at startup, and fetches again on an unknown `kid`, at most once per interval. If you would rather a miss be rejected than trigger a fetch, call `verify` instead of `verifyOrRefresh`; the choice is yours ([decided](../decided.md#answered-and-kept-to-one-line-each)). What the module does with the key document is parse it:
 
 | | |
 |---|---|
-| `jwt.parseKeys(gpa, bytes)` | `!Keys` — a JWKS document read into the keys it can verify with: `RSA` as `n` and `e`, `EC` as `crv`, `x` and `y`. Keys of another type — an Ed25519, a key marked `"use":"enc"` — are skipped, not refused |
+| `jwt.parseKeys(gpa, bytes)` | `!Keys`: a JWKS document read into the keys it can verify with, `RSA` as `n` and `e`, `EC` as `crv`, `x` and `y`. Keys of another type (Ed25519, a key marked `"use":"enc"`) are skipped, not rejected |
 | `keys.find(kid)` | `?Key`. A set with exactly one key answers for a token that named no `kid` |
 | `key.material` | `.rsa` or `.ec`, and the key's own `algorithm()` is `RS256` or `ES256` accordingly |
-| `keys.deinit()` | frees the lot |
-| `jwt.key_sizes` | the modulus lengths with a branch: 256, 384 and 512 bytes |
-| `jwt.curves` | the curves with a branch: `P-256` |
+| `keys.deinit()` | frees everything |
+| `jwt.key_sizes` | the supported modulus lengths: 256, 384 and 512 bytes |
+| `jwt.curves` | the supported curves: `P-256` |
 
-`parseKeys` answers `error.NotAKeySet` for bytes that are not a JSON object
-with a `keys` array, and `error.KeyNotUsable` for a key that said RSA and then
-carried no `n` and `e`, or said EC and carried no `crv`, `x` or `y`. An EC
-key on a curve other than `P-256` is *kept*, so that a token naming it is
-`error.CurveNotSupported` rather than a `NoSuchKey` that sends you looking
-for a rotation.
+`parseKeys` returns `error.NotAKeySet` for bytes that are not a JSON object with a `keys` array, and `error.KeyNotUsable` for a key that says RSA but has no `n` and `e`, or says EC but has no `crv`, `x` or `y`. An EC key on a curve other than `P-256` is *kept*, so that a token naming it returns `error.CurveNotSupported` rather than a `NoSuchKey` that sends you looking for a rotation.
 
-The document's address is published by the issuer — Google's is
-`https://www.googleapis.com/oauth2/v3/certs`, and for anything OIDC it is the
-`jwks_uri` in `/.well-known/openid-configuration`. **The ordinary shape is a
-`Keyring`**: the issuer's URL, issuer and audience written once, the
-document fetched at startup, and the set swapped safely when the issuer
-rotates ([below](#when-the-issuer-rotates)).
+The issuer publishes the document's address. Google's is `https://www.googleapis.com/oauth2/v3/certs`, and for any OIDC issuer it is the `jwks_uri` in `/.well-known/openid-configuration`. **The usual setup is a `Keyring`**: the key URL, issuer and audience written once, the document fetched at startup, and the key set swapped safely when the issuer rotates ([below](#key-rotation)).
 
 <!-- compiles -->
 ```zig
@@ -174,41 +123,19 @@ try app.provide(&google);
 try app.before(fetchKeys, .{ &google, &api });
 ```
 
-`run` there is a [`nilo.Run`](../reference/core.md#run) — the Scope for work that
-is not a request, which a startup path is. Since `nilo_fetch` is finished by
-`listen()` like any other service, the fetch goes in `app.before`, which runs
-inside `listen()` once the client is up and before the first request, exactly
-as a database migration does ([A query with no
-server](./sql/reading.md#a-query-with-no-server),
-[ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
-The ring asks the client for one call — `get(scope, url, .{})` — and holds
-the module to importing nothing: the client is an argument, the way a
-[`job.Table`](./jobs.md) takes your Db.
+`run` there is a [`nilo.Run`](../reference/core.md#run), the Scope for work that is not a request, such as startup. `nilo_fetch` is finished by `listen()` like any other service, so the fetch goes in `app.before`, which runs inside `listen()` once the client is ready and before the first request, the same way a database migration does ([A query with no server](./sql/reading.md#queries-outside-a-request), [ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)). The ring needs only one call from the client, `get(scope, url, .{})`, which keeps the module free of imports: the client is an argument, the same way a [`job.Table`](./jobs.md) takes your Db.
 
-A program that wants the bytes and nothing else still has `parseKeys`:
-`jwt.parseKeys(gpa, res.body.view())` off a `client.get`, held as a
-`*const Keys` for a set that never rotates.
+A program that only wants to parse the bytes can still use `parseKeys`: `jwt.parseKeys(gpa, res.body.view())` on the result of a `client.get`, held as a `*const Keys` for a key set that never rotates.
 
-## ES256 and the shape of the signature
+## ES256 signatures
 
-Supabase, Apple and a growing number of issuers sign with ES256 — ECDSA over
-P-256 with SHA-256 — and their JWKS carries `{"kty":"EC","crv":"P-256","x":…,"y":…}`
-rather than `n` and `e`. Nothing in the call above changes: the key's type is
-what picks the arithmetic, and the same `verify` reads both.
+**ES256 keys need nothing different in the call: the key's type picks the arithmetic, and the same `verify` handles both.** Supabase, Apple and a growing number of issuers sign with ES256 (ECDSA over P-256 with SHA-256), and their JWKS carries `{"kty":"EC","crv":"P-256","x":…,"y":…}` instead of `n` and `e`.
 
-One thing is worth knowing if you ever *make* an ES256 token for a test. A
-JWS signature is the two integers `r` and `s` back to back, thirty-two bytes
-each, sixty-four in all (RFC 7518 §3.4). Every tool outside JOSE — `openssl
-dgst`, a certificate, a `.sig` file — writes the DER `SEQUENCE { INTEGER r,
-INTEGER s }` instead, seventy bytes or so with a variable length. A token
-whose last segment is DER arrives here as `error.SignatureWrongLength`, by
-name, rather than as a `BadSignature` you spend an afternoon on. The
-module's own vector is RFC 7515's, which sidesteps the question.
+One thing matters if you ever *create* an ES256 token for a test. A JWS signature is the two integers `r` and `s` back to back, thirty-two bytes each, sixty-four in total (RFC 7518 §3.4). Every tool outside JOSE (`openssl dgst`, a certificate, a `.sig` file) writes the DER `SEQUENCE { INTEGER r, INTEGER s }` instead, around seventy bytes with a variable length. A token whose last segment is DER is rejected here as `error.SignatureWrongLength`, by name, rather than as a `BadSignature` you spend an afternoon on. The module's own test vector is the one from RFC 7515, which avoids the problem.
 
-## The signed-in user
+## The signed-in user as a handler argument
 
-With the keys held, the claims behind a bearer token are one argument
-([ADR 191](../adr/191-verified-claims-are-a-handler-argument.md)):
+**Once the keys are loaded, the claims behind a bearer token are one handler argument** ([ADR 191](../adr/191-verified-claims-are-a-handler-argument.md)):
 
 <!-- compiles -->
 ```zig
@@ -226,33 +153,18 @@ var verifier = Google.init(&google, &api);
 try app.provide(&verifier);
 ```
 
-`jwt.Verifier(Claims, Client)` is the ring, the client its refresh needs
-and the claims type, held as one service — which is what lets an argument
-name one type and reach all three. Before `me` runs, nilo reads the
-`Authorization` header, insists on `Bearer`, verifies the token through
-the ring with the issuer, the audience and the clock, fetches the keys
-once if a `kid` went missing, and hands over the claims parsed into the
-request arena. Anything short of that is a 401 with `WWW-Authenticate:
-Bearer` on it and the reason in the body — `Expired`, `WrongAudience` —
-and the one thing that is not a 401 is the issuer being unreachable when
-a refresh was needed, which is a 503 because the token was never judged.
-`listen()` refuses to start if the verifier was not provided, the way it
-does for a `*Db`; the OpenAPI document carries the bearer scheme and the
-401.
+[`jwt.Verifier(Claims, Client)`](../reference/jwt.md#jwtverifierclaims-client) bundles the ring, the client its refresh needs, and the claims type into one service, which is what lets an argument name one type and reach all three. Before `me` runs, nilo:
 
-The refusal after reading — the account is closed, the role is wrong —
-is `nilo.Verified(Google).refuse("that account is closed", .{})`, the
-same 401 with the same header. `user.token` is the token as the client
-sent it, for a handler that passes it on to another service. A middleware
-guarding a prefix reads the same thing with `c.verified(Google)`, and a
-handler under it that asks again verifies again — the signature check
-twice, which the next section is the way round.
+1. reads the `Authorization` header and requires the `Bearer` scheme;
+2. verifies the token through the ring, with the issuer, the audience and the clock;
+3. fetches the keys once if the `kid` was missing;
+4. hands over the claims, parsed into the request arena.
 
-**When the handler wants more than the claims** — the database row behind
-`sub`, a struct of your own — the token check is a
-[resolved value](./middleware.md#resolved-values): the type says how it is
-worked out, a handler asks for it by writing it in its argument list, and it
-is worked out once per request however many things ask.
+Anything that fails is a 401 with `WWW-Authenticate: Bearer` and the reason in the body (`Expired`, `WrongAudience`). The one exception is when the issuer cannot be reached while a refresh was needed: that is a 503, because the token was never judged. `listen()` refuses to start if the verifier was not provided, the same as for a `*Db`. The OpenAPI document includes the bearer scheme and the 401.
+
+To reject a user after the token passes (the account is closed, the role is wrong), return `nilo.Verified(Google).refuse("that account is closed", .{})`, which is the same 401 with the same header. `user.token` is the token exactly as the client sent it, for a handler that forwards it to another service. A middleware guarding a prefix reads the same thing with `c.verified(Google)`, but a handler under it that asks again verifies again, so the signature is checked twice. A resolved value, below, avoids that.
+
+**When the handler needs more than the claims** (the database row behind `sub`, a struct of your own), make the token check a [resolved value](./middleware.md#resolved-values). The type says how the value is worked out, a handler asks for it by writing it in its argument list, and it is worked out once per request however many things ask for it.
 
 <!-- compiles -->
 ```zig
@@ -286,118 +198,54 @@ fn profile(user: CurrentUser) !CurrentUser {
 }
 ```
 
-`c.authorization(.bearer)` is the `Authorization` header read as one scheme
-([the reference](../reference/handlers.md#authorizationscheme)): the scheme matched
-case-insensitively, the blanks trimmed, and absent or another scheme answered
-with a 401 that carries `WWW-Authenticate: Bearer` — the header every 401 has
-to carry and the one a hand-written `startsWith(value, "Bearer ")` forgets.
-`Authorization(.bearer).refuse` is `fail.unauthorized` with the same header
-on it, for the refusal that comes after reading. A handler that wants the
-token itself rather than the user asks for `nilo.Authorization(.bearer)` in
-its argument list and gets a security scheme in the OpenAPI document as well.
+`c.authorization(.bearer)` reads the `Authorization` header as one scheme ([the reference](../reference/handlers.md#authorizationscheme)). The scheme is matched case-insensitively and whitespace is trimmed. A missing header or a different scheme gets a 401 that carries `WWW-Authenticate: Bearer`, the header every 401 must carry and the one a hand-written `startsWith(value, "Bearer ")` forgets. `Authorization(.bearer).refuse` is `fail.unauthorized` with that same header, for a rejection after reading. A handler that wants the raw token rather than the user asks for `nilo.Authorization(.bearer)` in its argument list, and also gets a security scheme in the OpenAPI document.
 
-`profile` is still an ordinary function — `profile(.{ .id = "7", .email = "…" })`
-in a test, with no token anywhere. Guarding a whole prefix is the same `c.resolve`
-the middleware page shows: `try app.useOn("/api", requireUser)` with
-`_ = try c.resolve(CurrentUser)` inside it, and the handler behind it gets the
-same lookup rather than a second one.
+`profile` is still an ordinary function: in a test, call `profile(.{ .id = "7", .email = "…" })` with no token anywhere. To guard a whole prefix, use the same `c.resolve` the middleware page shows: `try app.useOn("/api", requireUser)` with `_ = try c.resolve(CurrentUser)` inside it. The handler behind it then reuses that result instead of verifying a second time.
 
-`c.arena()` is the right allocator there. The claims live exactly as long as
-the request, and nothing is freed. A resolver that takes a `*Google` and
-calls `google.verify(c.arena(), auth.value.view(), now_s, c)` is the same
-five lines with the client already inside.
+`c.arena()` is the right allocator there. The claims live exactly as long as the request, and nothing needs freeing. A resolver that takes a `*Google` and calls `google.verify(c.arena(), auth.value.view(), now_s, c)` is the same five lines with the client already included.
 
-## When the issuer rotates
+## Key rotation
 
-An issuer publishes a new key, signs with it, and keeps the old one in the
-document for a while. From here that arrives as `error.NoSuchKey` on a token
-that is otherwise fine. This guide used to say the answer was three lines —
-fetch again, hold a `*const Keys`, swap under a mutex — and each of the
-three was wrong in a way no test finds: no refetch is every sign-in failing
-until a restart, an unbounded refetch is one GET to the issuer per forged
-`kid`, and swapping a set another thread is reading is a use-after-free the
-Debug build has no trap for. The last one is concurrency rather than policy,
-and it is why the ring is in the module
-([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
+**When an issuer rotates keys, a valid token arrives signed with a key you do not have yet, and `verify` returns `error.NoSuchKey`.** An issuer publishes a new key, signs with it, and keeps the old one in the document for a while. This guide used to say the fix was three lines: fetch again, hold a `*const Keys`, swap under a mutex. Each of the three was wrong in a way no test catches:
 
-**`verifyOrRefresh` is `verify`, and on `NoSuchKey` one fetch at most per
-`refresh_interval_s`**, then `verify` again. Whichever request sees the miss
-first takes the slot; the others inside that minute are `NoSuchKey` as they
-were, which under a real rotation is a handful of 401s in the second the
-first new-key token arrives, and under a flood of forged tokens is the bound
-doing its job. A [ticker](./background.md) calling `refresh` on a schedule
-sits beside it, and a refresh that ran — scheduled or not — is the last
-one, so a miss straight after it does not fetch again.
+- no refetch means every sign-in fails until a restart;
+- an unbounded refetch means one GET to the issuer per forged `kid`;
+- swapping a set that another thread is reading is a use-after-free that the Debug build has no trap for.
+
+The last one is a concurrency problem, not a policy choice, and it is why the ring lives in the module ([ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md)).
+
+**`verifyOrRefresh` is `verify`, plus at most one fetch per `refresh_interval_s` on `NoSuchKey`**, then `verify` again. The first request that sees the miss does the fetch. Other requests within that interval still get `NoSuchKey`. During a real rotation that means a handful of 401s in the second the first new-key token arrives; under a flood of forged tokens it is the limit doing its job. A [ticker](./background.md) can also call `refresh` on a schedule. Any refresh that ran, scheduled or not, counts as the last one, so a miss straight after it does not fetch again.
 
 | | |
 |---|---|
-| `ring.load(bytes)` | a document read and made current; the old set is freed once the verifies reading it are done, and a document that does not parse leaves it in place |
-| `ring.refresh(scope, client, now_s)` | `client.get(scope, url, .{})` and `load`; `error.KeysNotAvailable` for anything but a 2xx, with the old set still held |
-| `ring.verify(Claims, gpa, token, now_s)` | `jwt.verify` against the set held now, with the ring's issuer, audience and leeway; never fetches |
-| `ring.verifyOrRefresh(Claims, gpa, token, now_s, scope, client)` | the above, and one bounded refresh on a missing `kid` |
+| `ring.load(bytes)` | parses a document and makes it current. The old set is freed once the verifies reading it are done, and a document that does not parse leaves the old set in place |
+| `ring.refresh(scope, client, now_s)` | `client.get(scope, url, .{})` then `load`. Returns `error.KeysNotAvailable` for anything but a 2xx, with the old set still held |
+| `ring.verify(Claims, gpa, token, now_s)` | `jwt.verify` against the current set, with the ring's issuer, audience and leeway. Never fetches |
+| `ring.verifyOrRefresh(Claims, gpa, token, now_s, scope, client)` | the above, plus one bounded refresh on a missing `kid` |
 
-**The swap is safe because a verify pins the set it reads.** A verify
-counts itself on the set, reads, and counts itself off; a swap publishes
-the new set and then waits for the old set's count to reach zero before
-freeing it. Readers never wait. The one wait is the writer's, and it is a
-spin bounded by the length of one verify, once per rotation — a
-`std.Io.Mutex` needs an `Io` a tool module does not have, which is the
-same reason the [cache](./cache.md) spins. `nilo_cache` answers the same
-lifetime question with a copy and a generation
-([ADR 152](../adr/152-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md));
-a key set is not flat, so here it is a pin.
+**The swap is safe because each verify pins the set it reads.** A verify increments a count on the set, reads, and decrements it. A swap publishes the new set, then waits for the old set's count to reach zero before freeing it. Readers never wait. Only the writer waits, with a spin that lasts at most one verify, once per rotation. It spins because a `std.Io.Mutex` needs an `Io`, which a tool module does not have; the [cache](./cache.md) spins for the same reason. `nilo_cache` solves the same lifetime problem with a copy and a generation number ([ADR 152](../adr/152-a-lookup-asks-the-cursor-afterwards-instead-of-taking-a-lock.md)). A key set is not flat data, so here it is a pin.
 
-When a `kid` miss should mean *refuse* rather than *fetch* is still yours:
-call `verify` and decide. The interval is a bound on the fetch, not a
-policy about it.
+Whether a `kid` miss should *reject* rather than *fetch* is still your decision: call `verify` and decide. The interval limits how often a fetch can happen; it is not a policy about whether to fetch.
 
 ## Testing
 
-`now_s` is an argument, so an expiry is tested by choosing the time rather
-than by waiting. A token signed with a key you hold — `openssl genrsa` or
-`openssl ecparam -name prime256v1 -genkey`, the public half as a JWKS
-document, a token signed by any JOSE library — and a `verify` at the second
-before its `exp`, the second of it, and the second after is the whole of a
-test, and it runs under `zig test` with no server.
+**`now_s` is an argument, so you test an expiry by choosing the time instead of waiting.** Create a key you hold (`openssl genrsa` or `openssl ecparam -name prime256v1 -genkey`), publish its public half as a JWKS document, and sign a token with any JOSE library. Then call `verify` at the second before its `exp`, at `exp`, and the second after. That is a complete test, and it runs under `zig test` with no server.
 
-The module's own suite does exactly that against two fixed vectors
-(`jwt/vector.zig`) — an RSA one signed elsewhere, and RFC 7515's own ES256
-example — which is the file to copy the shape from.
+The module's own suite does exactly that against two fixed vectors in `jwt/vector.zig` (an RSA token signed elsewhere, and RFC 7515's own ES256 example). Copy the shape from that file.
 
 ## What it costs
 
-**Nothing per request that is not yours.** The module allocates only what
-the claims need, from the allocator you passed, and holds nothing between
-calls.
+**Nothing per request beyond what you ask for.** The module allocates only what the claims need, from the allocator you passed, and holds nothing between calls.
 
-**And the number for one verification is not on file.** An RSA verify at
-2048 bits is a modular exponentiation and it is not small; an ES256 verify
-is two scalar multiplications on P-256 and is usually the cheaper of the two,
-but neither has been measured here. Whether a hot endpoint should cache the
-answer or just do it is a question the roadmap is waiting on a measurement
-for. Until then, the safe reading is that a resolved
-value is already the cheapest shape — once per request, not once per
-handler — and a session cookie set after the first verified request is the
-usual way to stop paying it at all.
+**The cost of one verification has not been measured.** An RSA verify at 2048 bits is a modular exponentiation, which is not cheap. An ES256 verify is two scalar multiplications on P-256 and is usually the cheaper of the two, but neither has been measured here. Whether a busy endpoint should cache the result or simply verify each time is a question the roadmap is waiting on a measurement for. Until then, a resolved value is already the cheapest setup (once per request, not once per handler), and setting a session cookie after the first verified request is the usual way to stop paying the cost at all.
 
 ## What it will not do
 
-HS256, any curve but P-256, encrypted tokens (JWE), signing, discovery, PKCE
-and the nonce. Signing is absent because a server issuing its own sessions has
-[`Session(T)`](./sessions.md) and needs no token; HS256 is absent because a
-module verifying both a shared secret and a public key has to defend against
-the confusion attack that a module verifying one cannot commit
-([roadmap](../roadmap.md#known-waiting-for-a-caller)). The rest is
-the sign-in flow — redirecting to the provider, exchanging a code — which is
-yours.
+**Not supported: HS256, any curve but P-256, encrypted tokens (JWE), signing, discovery, PKCE and the nonce.** Signing is missing because a server that issues its own sessions has [`Session(T)`](./sessions.md) and needs no token. HS256 is missing because a module that verifies both a shared secret and a public key has to defend against an algorithm-confusion attack that a module verifying only one cannot fall for ([roadmap](../roadmap.md#known-waiting-for-a-caller)). The rest is the sign-in flow (redirecting to the provider, exchanging a code), which is yours.
 
 ## See also
 
-- [The reference](../reference/jwt.md#nilo_jwt) — the surface as a list.
-- [Sessions](./sessions.md) — what a signed-in user becomes after the first
-  verified request.
-- [Calling somebody else's API](./fetch.md) — the fetch that gets the key set.
-- [ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md) —
-  why verifying is here and fetching is not.
-- [ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md) — why the key
-  picks the algorithm, and what ES256 costs.
+- [The reference](../reference/jwt.md#nilo_jwt): the full list of calls.
+- [Sessions](./sessions.md): what a signed-in user becomes after the first verified request.
+- [Calling somebody else's API](./fetch.md): the fetch that gets the key set.
+- [ADR 111](../adr/111-nilo-verifies-a-token-and-does-not-fetch-one.md): why verifying is in this module and fetching is not, why the key picks the algorithm, and what ES256 costs.

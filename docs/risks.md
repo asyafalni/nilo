@@ -131,6 +131,10 @@ the case that trap cannot watch.
 
 No mechanism holds these yet. Each says what it needs; until that arrives the comment at the site is what there is.
 
+**`checkSchema` lets a Row read a number the driver will not decode.** `Dialect.accepts` lets an `i32` field stand over an `int8` column and an `f64` over a `float4`, so a table passes the startup check and the first typed read of that column fails at the row: pg.zig decodes an `i32` out of `int4` and nothing else. The list was written for a table a Row both reads and writes, and a Row that only writes an `i32` into an `int8` is correct under it, which is why it was not made exact when raw statements got the exact list, `Dialect.reads` ([ADR 233](./adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
+
+**Needs:** the check to know which Rows are read, or to hold every field to `reads` and every write to `accepts`, with a sentence for the case where they differ; and a word on what it does to a server that starts today.
+
 **A fail function in spawned work is safe only because of where a threadlocal gets written.** `bulkhead.slot()` falls back to a threadlocal when a fiber has no slot, which spawned fibers never do. It is null on executor threads only because nothing on a server sets it there: `blocking` sets it on a thread-pool worker, and `serveRequest` sets it only with no Engine underneath. This one went off: `serveRequest` used to set it on every request, on the executor, and leave it set across the request's suspensions, so spawned work and job workers wrote into whichever request last set it. `setFallbackSlot` now refuses in Debug to be called from a fiber that has a slot of its own, which is the shape that broke, and every live test in the Debug run passes through it. What it cannot see is a fiber with no slot, a spawned one, setting it.
 
 **Needs:** a way to ask zio whether the running thread is an executor, which it has (`getCurrentTaskOrNull`) and does not export; with it the Debug check covers every fiber rather than the ones with a slot.

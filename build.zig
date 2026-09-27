@@ -340,10 +340,6 @@ const sql_refusals = [_]Refusal{
         .says = "the condition on a delete on given_on_a_delete.Partner holds a `sql.given`.",
     },
     .{
-        .name = "given_on_a_list",
-        .says = "the condition on `id` (as `in`) was given a `sql.given`.",
-    },
-    .{
         .name = "given_on_a_value_that_is_always_there",
         .says = "`sql.given` was handed a []const u8, which is not an optional.",
     },
@@ -444,6 +440,32 @@ const sql_refusals = [_]Refusal{
     .{
         .name = "raw_page_without_a_total",
         .says = "the statement handed to `db.rawPage` selects 2 columns, and raw_page_without_a_total.Line has 2 fields and wants one more.",
+    },
+    // A page past its last row is asked again with its offset at 0, so the
+    // offset has to be a value of its own (ADR 205).
+    .{
+        .name = "raw_page_offset_not_a_placeholder",
+        .says = "the statement handed to `db.rawPage` has an `OFFSET` that is not one placeholder.",
+    },
+    .{
+        .name = "raw_page_offset_written_out",
+        .says = "the statement handed to `db.rawPage` writes `OFFSET 40`.",
+    },
+    .{
+        .name = "raw_page_offset_shared",
+        .says = "the statement handed to `db.rawPage` uses its offset, $1, somewhere besides `OFFSET`.",
+    },
+    .{
+        .name = "raw_page_limit_with_a_comma",
+        .says = "the statement handed to `db.rawPage` writes `LIMIT a, b`.",
+    },
+    .{
+        .name = "raw_page_values_named",
+        .says = "`db.rawPage` was given its values in a struct with named fields.",
+    },
+    .{
+        .name = "raw_page_offset_not_a_number",
+        .says = "a page's `LIMIT` or `OFFSET` was given a []const u8.",
     },
     // The two shapes a `::text` cannot be hiding in, and the only two this
     // refuses (ADR 138). Both name the *column* type rather than the Zig one:
@@ -555,6 +577,85 @@ const sql_refusals = [_]Refusal{
         .name = "order_on_unknown_column",
         .says = "order_on_unknown_column.User has no column `creted_at`, asked for in `.order`.",
     },
+    // `nilo_children`: a count is an i64, and an entry takes what one
+    // statement for every parent can honour (ADR 218).
+    .{
+        .name = "children_count_read_as_a_usize",
+        .says = "children_count_read_as_a_usize.RabCard reads `.line_count`, a count, as usize.",
+    },
+    // `nilo_through`: a column of another table read flat (item 83).
+    .{
+        .name = "through_read_as_never_null",
+        .says = "through_read_as_never_null.DealLine reads `.approver_name` through a reference as []const u8," ++
+            " and the column is []const u8 behind a reference that may be null.",
+    },
+    .{
+        .name = "through_a_column_with_no_reference",
+        .says = "through_a_column_with_no_reference.DealLine's `.owner_name` goes through `owner_id`, and" ++
+            " through_a_column_with_no_reference.Deal declares no `.references` of that one column to a Row.",
+    },
+    // What a row the path does not reach reads (item 109).
+    .{
+        .name = "through_join_left",
+        .says = "through_join_left.ItemLine's nilo_through `.kind_tracks` says `.join = .left`.",
+    },
+    .{
+        .name = "through_inner_where_nothing_is_missing",
+        .says = "through_inner_where_nothing_is_missing.ItemLine's nilo_through `.owner_name` says" ++
+            " `.join = .inner`, and no reference on its path may be null.",
+    },
+    .{
+        .name = "through_otherwise_read_as_optional",
+        .says = "through_otherwise_read_as_optional.ItemLine reads `.kind_tracks` through a reference as" ++
+            " ?bool, and its `.otherwise` stands in for every null.",
+    },
+    .{
+        .name = "through_otherwise_where_nothing_is_missing",
+        .says = "through_otherwise_where_nothing_is_missing.ItemLine's nilo_through `.owner_name` says" ++
+            " `.otherwise`, and the column is []const u8, so it is never null.",
+    },
+    .{
+        .name = "through_inner_under_a_missing_parent",
+        .says = "through_inner_under_a_missing_parent.TaskLine reads `.item.kind_tracks` with `.join = .inner`," ++
+            " inside a parent that may be missing.",
+    },
+    .{
+        .name = "children_max_read_as_not_optional",
+        .says = "children_max_read_as_not_optional.EpicCard reads `.latest_target`, the max of `target_date` over the rows pointing back, as types.Date.",
+    },
+    .{
+        .name = "children_max_naming_only_a_column",
+        .says = "children_max_naming_only_a_column.EpicCard's nilo_children `.latest_target` gives `.max` a @EnumLiteral().",
+    },
+    .{
+        .name = "children_entry_with_a_limit",
+        .says = "children_entry_with_a_limit.RabCard's nilo_children gives `.lines` a `.limit`, which it does not take.",
+    },
+    // An aggregate's `.where`: it narrows a computation, it makes the answer
+    // nullable, and it takes only what a literal can say (ADR 218).
+    .{
+        .name = "aggregate_filter_with_nothing_to_compute",
+        .says = "aggregate_filter_with_nothing_to_compute.ByCustomer's nilo_aggregate gives `.foreign` a `.where` and nothing to compute.",
+    },
+    .{
+        .name = "aggregate_filter_read_as_never_null",
+        .says = "aggregate_filter_read_as_never_null.ByCustomer reads `.idr` as i64, and it reads only the rows its `.where` matches, and sum over a group where none does is null.",
+    },
+    .{
+        .name = "aggregate_filter_word_of_another_enum",
+        .says = "aggregate_filter_word_of_another_enum.Tally's `.open` `.where` gives" ++
+            " aggregate_filter_word_of_another_enum.State.category a" ++
+            " aggregate_filter_word_of_another_enum.Stage, and the column holds one of" ++
+            " aggregate_filter_word_of_another_enum.Category's words.",
+    },
+    .{
+        .name = "aggregate_filter_with_a_pattern",
+        .says = "aggregate_filter_with_a_pattern.ByCustomer's `.rupiah` `.where` tests `currency` with `.starts_with`, which is not one it writes.",
+    },
+    .{
+        .name = "order_on_a_grouped_row_by_a_column_it_does_not_carry",
+        .says = "`.order` on order_on_a_grouped_row_by_a_column_it_does_not_carry.ByCustomer names `year`, a column of its table that the Row does not carry, and the Row is grouped.",
+    },
     // An `ORDER BY` chosen per request from a closed set (ADR 165). The
     // keys are checked where they are declared, and an ordering carries the
     // Row it was checked against.
@@ -569,6 +670,10 @@ const sql_refusals = [_]Refusal{
     .{
         .name = "ordering_expression_on_a_typed_select",
         .says = "`db.select` on ordering_expression_on_a_typed_select.Ticket was given an ordering whose key `title` is an expression, and a statement nilo writes orders by columns.",
+    },
+    .{
+        .name = "raw_page_ordered_without_a_total",
+        .says = "the statement handed to `db.rawPageOrdered` selects 2 columns, and raw_page_ordered_without_a_total.Card has 2 fields and wants one more.",
     },
     .{
         .name = "raw_ordered_without_a_hole",
@@ -835,14 +940,29 @@ const sql_refusals = [_]Refusal{
     },
     .{
         .name = "table_default_word_written_as_text",
-        .says = "`.default` gives table_default_word_written_as_text.Task.priority a" ++
-            " *const [6:0]u8, and the column holds one of" ++
+        .says = "`.default` gives table_default_word_written_as_text.Task.priority" ++
+            " text, and the column holds one of" ++
             " table_default_word_written_as_text.Priority's words.",
     },
     .{
         .name = "insert_leaves_out_a_column",
         .says = "an insert into insert_leaves_out_a_column.User leaves out `age`, `created_at`," ++
             " and nothing fills them in.",
+    },
+    .{
+        .name = "insert_leaves_out_an_unread_column",
+        .says = "an insert into insert_leaves_out_an_unread_column.Deal leaves out `created_at`," ++
+            " and nothing fills it in.",
+    },
+    // `.unread`: a column of the table the Row that names it does not read
+    // (item 102).
+    .{
+        .name = "unread_names_a_column_it_reads",
+        .says = "unread_names_a_column_it_reads.Deal's `.unread` names `created_at`, which unread_names_a_column_it_reads.Deal reads.",
+    },
+    .{
+        .name = "unread_key",
+        .says = "unread_key.Deal's key is `code`, which its `.unread` declares.",
     },
     .{
         .name = "insert_many_leaves_out_a_column",
@@ -927,6 +1047,30 @@ const sql_refusals = [_]Refusal{
         .says = "`.age = .{ .contains = … }` on pattern_on_a_number_column.User," ++
             " whose `age` is i32.",
     },
+    // The database's clock as a word: each goes in the column type it is a
+    // value of (ADR 181).
+    .{
+        .name = "today_on_a_timestamp",
+        .says = "`.set = .{ .seen_at = .today }` on today_on_a_timestamp.Card, whose `seen_at` is types.Timestamp.",
+    },
+    .{
+        .name = "today_on_a_timestamp_read_as_text",
+        .says = "`.set = .{ .seen_at = .today }` on today_on_a_timestamp_read_as_text.Card, whose `seen_at` is a `timestamptz` column read as text.",
+    },
+    // Moved by an offset: `.now` takes a unit both databases count alike.
+    .{
+        .name = "now_moved_by_a_bare_number",
+        .says = "`.seen_at = .{ .gt = .{ .now = … } }` moves `.now` by a comptime_int.",
+    },
+    .{
+        .name = "now_moved_by_months",
+        .says = "`.seen_at = .{ .gt = .{ .now = … } }` moves `.now` by `.months`, which is not a unit it takes.",
+    },
+    .{
+        .name = "ieq_on_a_number_column",
+        .says = "`.age = .{ .ieq = … }` on ieq_on_a_number_column.User," ++
+            " whose `age` is i32.",
+    },
     .{
         .name = "pattern_given_something_that_is_not_text",
         .says = "`.email = .{ .contains = … }` was given a i32.",
@@ -946,6 +1090,17 @@ const sql_refusals = [_]Refusal{
         .name = "exists_without_a_reference",
         .says = "`.exists` names exists_without_a_reference.Capability, which declares" ++
             " no `.references` to exists_without_a_reference.Partner's table `partners`.",
+    },
+    // With no `.where`, an `.exists` asks whether any row points back, and
+    // only when the key is the inner Row's (item 107).
+    .{
+        .name = "exists_without_a_where_over_its_own_key",
+        .says = "an entry of `.not_exists` over exists_without_a_where_over_its_own_key.Department says no" ++
+            " `.where`, and the key is exists_without_a_where_over_its_own_key.Staff's own `department_id`.",
+    },
+    .{
+        .name = "exists_with_an_empty_where",
+        .says = "an entry of `.exists` over exists_with_an_empty_where.Capability has an empty `.where`.",
     },
     .{
         .name = "exists_with_two_references",
@@ -1105,8 +1260,7 @@ const sql_refusals = [_]Refusal{
     },
     .{
         .name = "shape_raw",
-        .says = "`db.raw` into shape_raw.OrderCard, which carries a parent, children or an" ++
-            " aggregate.",
+        .says = "`db.raw` into shape_raw.OrderCard, which reads `customer` as a parent.",
     },
     .{
         .name = "shape_order_through_a_column",
@@ -3470,6 +3624,362 @@ const AdrCheck = struct {
     }
 };
 
+/// The step that holds the documentation to one shape, so a reader, a person
+/// or an agent, finds any topic the same way (ADR 236).
+///
+/// Every page of `docs/guide/`, `docs/design/` and `docs/reference/`, and the
+/// map at `docs/README.md`, opens with five lines: a title, one bold sentence
+/// saying what the page is, and a line linking the same topic in the other two
+/// layers. Its prose is one paragraph a line, so a phrase is never split for
+/// grep, and carries no em dash. Every relative link on it resolves, every
+/// anchor any Markdown file in the repository names on it exists, the map
+/// links every page, and the reference's list of every heading is exactly the
+/// one the pages produce. `docs-index` rewrites that list; `docs-check`, on
+/// `test`, refuses it when it is out of step.
+///
+/// Anchors are GitHub's, lowercase with punctuation dropped, because the
+/// reference and the design pages are read on GitHub (ADR 219). A scan rather
+/// than a parse, like `AdrCheck`: the shapes it reads are the ones these pages
+/// are written in.
+const DocsCheck = struct {
+    const map = "docs/README.md";
+    const index = "docs/reference/README.md";
+    const index_heading = "## Every heading";
+    const index_note = "Every heading of every page, in page order. Find a name here, then read it on its page. `zig build docs-index` writes this list from the pages, and `zig build docs-check` refuses it when it is out of step.";
+    const folders = [_][]const u8{ "docs/guide", "docs/design", "docs/reference" };
+    const heads = [_][]const u8{ "**Guide:**", "**Reference:**", "**Design:**" };
+
+    fn step(b: *std.Build, comptime write: bool) *std.Build.Step {
+        const self = b.allocator.create(DocsCheck) catch @panic("OOM");
+        self.* = .{ .write = write, ._step = .init(.{
+            .id = .custom,
+            .name = if (write) "docs-index" else "docs-check",
+            .owner = b,
+            .makeFn = make,
+        }) };
+        const named = if (write)
+            b.step("docs-index", "Rewrite the reference's list of every heading from the pages")
+        else
+            b.step("docs-check", "Check each doc page's head, prose and links, the map, and the reference's list of headings");
+        named.dependOn(&self._step);
+        return named;
+    }
+
+    _step: std.Build.Step,
+    write: bool,
+
+    const Page = struct { path: []const u8, text: []const u8 };
+
+    fn make(s: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
+        const self: *DocsCheck = @fieldParentPtr("_step", s);
+        const b = s.owner;
+        const io = b.graph.io;
+        const gpa = b.allocator;
+        const root = b.build_root.handle;
+
+        var pages: std.ArrayList(Page) = .empty;
+        try pages.append(gpa, .{ .path = map, .text = try root.readFileAlloc(io, map, gpa, .limited(1 << 20)) });
+        for (folders) |folder| {
+            var dir = root.openDir(io, folder, .{ .iterate = true }) catch |err|
+                return s.fail("nilo: cannot read `{s}/`: {s}", .{ folder, @errorName(err) });
+            defer dir.close(io);
+            var walker = try dir.walk(gpa);
+            defer walker.deinit();
+            while (try walker.next(io)) |entry| {
+                if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".md")) continue;
+                try pages.append(gpa, .{
+                    .path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ folder, entry.path }),
+                    .text = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(4 << 20)),
+                });
+            }
+        }
+
+        const current = pageAt(pages.items, index).?.text;
+        const wanted = try indexed(gpa, pages.items, current);
+        if (self.write) {
+            if (!std.mem.eql(u8, wanted, current)) try root.writeFile(io, .{ .sub_path = index, .data = wanted });
+            return;
+        }
+
+        var refused: usize = 0;
+        for (pages.items) |page| {
+            refused += try head(s, page);
+            refused += try prose(s, page);
+            refused += try links(s, page.path, page.text, pages.items, true);
+        }
+        refused += try mapped(s, pages.items);
+        if (!std.mem.eql(u8, wanted, current)) {
+            refused += 1;
+            try s.addError("nilo: {s}'s list of every heading is out of step with the pages; `zig build docs-index` rewrites it.", .{index});
+        }
+
+        // An anchor named from anywhere else: an ADR, the changelog, the roadmap.
+        var repo = try root.openDir(io, ".", .{ .iterate = true });
+        defer repo.close(io);
+        var walker = try repo.walkSelectively(gpa);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind == .directory) {
+                if (entry.basename[0] != '.' and !AdrCheck.listed(entry.basename)) try walker.enter(io, entry);
+                continue;
+            }
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".md")) continue;
+            if (pageAt(pages.items, entry.path) != null) continue;
+            const text = entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(8 << 20)) catch continue;
+            refused += try links(s, try gpa.dupe(u8, entry.path), text, pages.items, false);
+        }
+
+        if (refused > 0) return error.MakeFailed;
+    }
+
+    fn pageAt(pages: []const Page, path: []const u8) ?Page {
+        for (pages) |page| if (std.mem.eql(u8, page.path, path)) return page;
+        return null;
+    }
+
+    /// Lines 1 to 5: `# Title`, a blank, `**One sentence.**`, a blank, and the
+    /// line that links the other layers.
+    fn head(s: *std.Build.Step, page: Page) !usize {
+        var lines = std.mem.splitScalar(u8, page.text, '\n');
+        var first: [5][]const u8 = @splat("");
+        for (&first) |*line| line.* = lines.next() orelse "";
+        const claim = std.mem.trimEnd(u8, first[2], " ");
+        const says: ?[]const u8 = if (!std.mem.startsWith(u8, first[0], "# "))
+            "line 1 is not a `# ` title"
+        else if (first[1].len != 0 or first[3].len != 0)
+            "lines 2 and 4 are not blank"
+        else if (claim.len < 5 or !std.mem.startsWith(u8, claim, "**") or !std.mem.endsWith(u8, claim, "**"))
+            "line 3 is not one bold sentence saying what the page is"
+        else for (heads) |layer| {
+            if (std.mem.startsWith(u8, first[4], layer)) break null;
+        } else "line 5 does not start with `**Guide:**`, `**Reference:**` or `**Design:**`, linking the same topic in the other layers";
+        if (says) |why| {
+            try s.addError("nilo: {s}: {s}. See how `docs/README.md` opens.", .{ page.path, why });
+            return 1;
+        }
+        return 0;
+    }
+
+    /// Outside a code fence and outside inline code: no em dash, and no
+    /// paragraph carried onto a second line.
+    fn prose(s: *std.Build.Step, page: Page) !usize {
+        var refused: usize = 0;
+        var fenced = false;
+        var lines = std.mem.splitScalar(u8, page.text, '\n');
+        var n: usize = 0;
+        while (lines.next()) |line| {
+            n += 1;
+            if (fence(line)) {
+                fenced = !fenced;
+                continue;
+            }
+            if (fenced) continue;
+            if (dashed(line)) {
+                refused += 1;
+                try s.addError("nilo: {s}:{d} has an em dash in prose; use a comma, a colon, a full stop or parentheses.", .{ page.path, n });
+            }
+            const next = lines.peek() orelse "";
+            if (paragraph(line) and continues(next) and !std.mem.endsWith(u8, line, "  ") and !std.mem.endsWith(u8, line, ":")) {
+                refused += 1;
+                try s.addError("nilo: {s}:{d} carries a paragraph onto the next line; a paragraph is one line.", .{ page.path, n });
+            }
+        }
+        return refused;
+    }
+
+    fn fence(line: []const u8) bool {
+        const t = std.mem.trimStart(u8, line, " ");
+        return std.mem.startsWith(u8, t, "```") or std.mem.startsWith(u8, t, "~~~");
+    }
+
+    fn dashed(line: []const u8) bool {
+        var code = false;
+        var i: usize = 0;
+        while (i < line.len) : (i += 1) {
+            if (line[i] == '`') code = !code;
+            if (!code and std.mem.startsWith(u8, line[i..], "\u{2014}")) return true;
+        }
+        return false;
+    }
+
+    fn numbered(t: []const u8) bool {
+        var i: usize = 0;
+        while (i < t.len and std.ascii.isDigit(t[i])) i += 1;
+        return i > 0 and i < t.len and t[i] == '.';
+    }
+
+    /// A line of running text: not a heading, table, quote, list item, HTML
+    /// comment or a line that opens in bold.
+    fn paragraph(line: []const u8) bool {
+        const t = std.mem.trimStart(u8, line, " ");
+        return t.len > 0 and std.mem.indexOfScalar(u8, "#|>*-<", t[0]) == null and !numbered(t);
+    }
+
+    /// The line after a paragraph line, read as the same paragraph going on.
+    fn continues(line: []const u8) bool {
+        const t = std.mem.trimStart(u8, line, " ");
+        if (t.len == 0 or std.mem.indexOfScalar(u8, "#|>-<`~", t[0]) != null or numbered(t)) return false;
+        if (std.mem.startsWith(u8, t, "**")) {
+            if (std.mem.indexOf(u8, t, ":**")) |colon| {
+                for (t[2..colon]) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return true;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Every `](target)` whose target is in the repository: the file exists
+    /// (checked on the pages only), and an anchor into a page is a heading on it.
+    fn links(s: *std.Build.Step, path: []const u8, text: []const u8, pages: []const Page, files: bool) !usize {
+        const b = s.owner;
+        const gpa = b.allocator;
+        var refused: usize = 0;
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, text, at, "](")) |open| {
+            at = open + 2;
+            const close = std.mem.indexOfAnyPos(u8, text, at, ") \n") orelse break;
+            if (text[close] != ')') continue;
+            const target = text[at..close];
+            if (target.len == 0 or std.mem.indexOf(u8, target, "://") != null or std.mem.startsWith(u8, target, "mailto:")) continue;
+            const hash = std.mem.indexOfScalar(u8, target, '#');
+            const file = target[0 .. hash orelse target.len];
+            const resolved = if (file.len == 0) path else try std.fs.path.resolvePosix(gpa, &.{ std.fs.path.dirnamePosix(path) orelse ".", file });
+            if (std.mem.startsWith(u8, resolved, "..")) continue;
+            const line = std.mem.count(u8, text[0..open], "\n") + 1;
+            if (files and file.len > 0) {
+                if (b.build_root.handle.access(b.graph.io, resolved, .{})) |_| {} else |_| {
+                    refused += 1;
+                    try s.addError("nilo: {s}:{d} links to {s}, which does not exist.", .{ path, line, file });
+                    continue;
+                }
+            }
+            const anchor = if (hash) |h| target[h + 1 ..] else continue;
+            const page = pageAt(pages, resolved) orelse continue;
+            if (!try hasAnchor(gpa, page.text, anchor)) {
+                refused += 1;
+                try s.addError("nilo: {s}:{d} links to {s}#{s}, and no heading there has that anchor.", .{ path, line, resolved, anchor });
+            }
+        }
+        return refused;
+    }
+
+    /// GitHub's anchor for a heading: lowercase, spaces to `-`, and everything
+    /// but letters, digits, `-` and `_` dropped. A byte past ASCII is dropped
+    /// too, which is right for the `…` and `→` these headings use.
+    fn slug(gpa: std.mem.Allocator, heading: []const u8) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        for (std.mem.trim(u8, heading, " ")) |c| {
+            if (c == ' ') {
+                try out.append(gpa, '-');
+            } else if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') {
+                try out.append(gpa, std.ascii.toLower(c));
+            }
+        }
+        return out.items;
+    }
+
+    const Heading = struct { depth: usize, text: []const u8, anchor: []const u8 };
+
+    /// Every heading outside a code fence, with its anchor; a repeated one
+    /// gets `-1`, `-2` on the end, the way GitHub numbers them.
+    fn headings(gpa: std.mem.Allocator, text: []const u8) ![]Heading {
+        var out: std.ArrayList(Heading) = .empty;
+        var seen: std.StringHashMapUnmanaged(usize) = .empty;
+        var fenced = false;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (fence(line)) {
+                fenced = !fenced;
+                continue;
+            }
+            if (fenced) continue;
+            var depth: usize = 0;
+            while (depth < line.len and line[depth] == '#') depth += 1;
+            if (depth == 0 or depth > 6 or depth >= line.len or line[depth] != ' ') continue;
+            const words = std.mem.trim(u8, line[depth + 1 ..], " ");
+            const base = try slug(gpa, words);
+            const count = try seen.getOrPut(gpa, base);
+            const n = if (count.found_existing) count.value_ptr.* else 0;
+            count.value_ptr.* = n + 1;
+            try out.append(gpa, .{
+                .depth = depth,
+                .text = words,
+                .anchor = if (n == 0) base else try std.fmt.allocPrint(gpa, "{s}-{d}", .{ base, n }),
+            });
+        }
+        return out.items;
+    }
+
+    fn hasAnchor(gpa: std.mem.Allocator, text: []const u8, anchor: []const u8) !bool {
+        for (try headings(gpa, text)) |h| if (std.mem.eql(u8, h.anchor, anchor)) return true;
+        return false;
+    }
+
+    /// The map links every page of the three folders.
+    fn mapped(s: *std.Build.Step, pages: []const Page) !usize {
+        const gpa = s.owner.allocator;
+        const text = pageAt(pages, map).?.text;
+        var linked: std.StringHashMapUnmanaged(void) = .empty;
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, text, at, "](")) |open| {
+            at = open + 2;
+            const close = std.mem.indexOfScalarPos(u8, text, at, ')') orelse break;
+            const target = text[at..close];
+            const file = target[0 .. std.mem.indexOfScalar(u8, target, '#') orelse target.len];
+            if (file.len == 0) continue;
+            try linked.put(gpa, try std.fs.path.resolvePosix(gpa, &.{ "docs", file }), {});
+        }
+        var refused: usize = 0;
+        for (pages) |page| {
+            if (std.mem.eql(u8, page.path, map) or linked.contains(page.path)) continue;
+            refused += 1;
+            try s.addError("nilo: {s} does not link {s}; every page of the guide, the reference and the design pages has a row or a link there.", .{ map, page.path });
+        }
+        return refused;
+    }
+
+    /// The reference's README with its list of every heading as the pages
+    /// produce it: pages in the order the list has them, a page it does not
+    /// list yet on the end, and each page's headings from `##` down to `####`.
+    fn indexed(gpa: std.mem.Allocator, pages: []const Page, current: []const u8) ![]u8 {
+        const cut = std.mem.indexOf(u8, current, index_heading) orelse current.len;
+        var order: std.ArrayList([]const u8) = .empty;
+        var at = cut;
+        while (std.mem.indexOfPos(u8, current, at, "\n**[")) |found| {
+            at = found + 4;
+            const open = std.mem.indexOfPos(u8, current, at, "](./") orelse break;
+            const close = std.mem.indexOfScalarPos(u8, current, open, ')') orelse break;
+            const path = try std.fmt.allocPrint(gpa, "docs/reference/{s}", .{current[open + 4 .. close]});
+            if (pageAt(pages, path) != null) try order.append(gpa, path);
+        }
+        for (pages) |page| {
+            if (!std.mem.startsWith(u8, page.path, "docs/reference/") or std.mem.eql(u8, page.path, index)) continue;
+            for (order.items) |listed| {
+                if (std.mem.eql(u8, listed, page.path)) break;
+            } else try order.append(gpa, page.path);
+        }
+
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(gpa, current[0..cut]);
+        try out.print(gpa, "{s}\n\n{s}\n", .{ index_heading, index_note });
+        for (order.items) |path| {
+            const text = pageAt(pages, path).?.text;
+            var lines = std.mem.splitScalar(u8, text, '\n');
+            const title = std.mem.trimStart(u8, lines.next() orelse "", "# ");
+            _ = lines.next();
+            const claim = std.mem.trim(u8, lines.next() orelse "", "* ");
+            const name = path["docs/reference/".len..];
+            try out.print(gpa, "\n**[{s}](./{s})**: {s}\n\n", .{ title, name, claim });
+            for (try headings(gpa, text)) |h| {
+                if (h.depth < 2 or h.depth > 4) continue;
+                for (0..h.depth - 2) |_| try out.appendSlice(gpa, "  ");
+                try out.print(gpa, "- [{s}](./{s}#{s})\n", .{ h.text, name, h.anchor });
+            }
+        }
+        return out.items;
+    }
+};
+
 /// What somebody else's project downloads when it names this one.
 ///
 /// `build.zig.zon` has claimed since ADR 037 that "a project that serves HTTP
@@ -4381,6 +4891,12 @@ pub fn build(b: *std.Build) void {
 
     // Every ADR cited is one that exists, and none by its old number (ADR 221).
     test_step.dependOn(AdrCheck.step(b));
+
+    // Every doc page opens the same way, reads as one paragraph a line, and
+    // links only what exists; the map and the reference's heading list keep
+    // up with the pages (ADR 236).
+    test_step.dependOn(DocsCheck.step(b, false));
+    _ = DocsCheck.step(b, true);
 
     // The SQL module keeps its own step, and `test` does not depend on it
     // (ADR 036). Not for speed: it has a tier that cannot run without a

@@ -8,15 +8,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **A module gets built because the job is common, not because it is interesting**, and it gets in only if it is expressible as a type the caller already wrote, checked while compiling, with its cost written down (ADR 017). The README's three words, helpful, quick, cheerful, are the order the trades are made in.
 
-Three files carry context this one does not repeat:
+Four places carry context this one does not repeat:
 
 - **`CONTEXT.md`**: the vocabulary and the words the project refuses (Ctx not "Context", Str not "string", keep not "dupe", Refusal not "negative test"). Match it in code, comments, docs and commit messages.
 - **`docs/adr/`**: the binding decisions, each naming the alternative it rejected, and each the rule in force: a change to a decision edits its ADR in place, and a new number is for a new decision (ADR 221). Every ADR names its topic; a topic with a page in `docs/design/` is where to start reading it. Check here before proposing a design change; "why not X?" usually has an answer on file. The ADRs were renumbered once to three digits, so a four-digit number is an old one: `docs/adr/renumbered.md` translates it, and `zig build adr-check` refuses it anywhere else. **ADR 038 decides which module new work goes in and what that module may import**; read it before adding a file anywhere but `http/`, and ADR 039 and 063 before adding a module.
 - **`docs/reference/`**: the whole public API, one page a module.
+- **`docs/README.md`**: the map, one row per topic with its guide, reference and design page. Every doc page's line 3 says what it is and line 5 links its other two layers, so `head -5` over a folder is its table of contents (ADR 236).
 
 ## Who works here
 
-The repository is written to be worked on by somebody who did not write it, a person or a model. **Nothing load-bearing may live only in the author's head, only in a commit body, or only in this session.** A decision goes in an ADR, a lesson in `docs/history.md`, a rule in a build step. **Prefer making a rule enforceable over writing it down here**: a paragraph nobody runs is the thing that rots. `zig build layering`, `adr-check` and the refusal steps are the ones to lean on.
+The repository is written to be worked on by somebody who did not write it, a person or a model. **Nothing load-bearing may live only in the author's head, only in a commit body, or only in this session.** A decision goes in an ADR, a lesson in `docs/history.md`, a rule in a build step. **Prefer making a rule enforceable over writing it down here**: a paragraph nobody runs is the thing that rots. `zig build layering`, `adr-check`, `docs-check` and the refusal steps are the ones to lean on.
 
 `CONTRIBUTING.md` is the outward-facing half: the four things a change carries (which axis it spends and the number, its refusals, its tests in both optimize modes, its documentation). Propose work in that shape. A change to those rules, the commands or the layout changes there and here together.
 
@@ -56,7 +57,7 @@ It is the flag, not `.lazy = true`, that keeps a dependency out: `b.lazyDependen
 
 ```
 zig build test         # the loop: the suite in Debug, the refusals, every module's gate but
-                       #   test-sql, plus layering, adr-check and snippets
+                       #   test-sql, plus layering, adr-check, docs-check and snippets
 zig build test-all     # the above, the suite in ReleaseSafe, test-sql and refusals-sql.
                        #   What CI runs, and the whole gate
 zig build test-{core,id,config,pw,cache,jwt,fetch,job,s3,dev}   # one module, both modes,
@@ -65,6 +66,8 @@ zig build test-fetch-engine  # an outbound deadline firing against a real port; 
 zig build test-sql     # nilo_sql, with test-job-sql and refusals-sql; Postgres if DATABASE_URL reaches one
 zig build layering     # no module imports upward or sideways
 zig build adr-check    # ADR files, their Topic lines, and every ADR cited exists; on test
+zig build docs-check   # every doc page's head, prose, links and anchors, the map, the reference's heading list; on test
+zig build docs-index   # rewrite the reference's list of every heading after renaming or adding one
 zig build refusals     # the framework's table only; refusals-{sql,config,pw,cache,s3,job,fetch} for the others
 zig build snippets     # the documentation's marked snippets, which must compile
 zig build examples     # build every example; run-{hello,rest,orders,forms,spa,stream,chat,scheduled,outbound,sqlite}
@@ -156,7 +159,8 @@ The habits, each of which caught something here (the cases are under *Measuring*
 | a question answered, a gap kept as the rule, a feature refused with its reason | `docs/decided.md` |
 | a risk with no mechanism under it yet | `docs/risks.md`, under `## Open` |
 | a benchmark run | `bench/result/` |
-| a new guide page | `docs/guide/`, plus a line in `nav:` in `mkdocs.yml` or CI's `docs` job fails |
+| a new guide page | `docs/guide/`, with the five-line head and a row in `docs/README.md` (`docs-check` refuses either missing), plus a line in `nav:` in `mkdocs.yml` or CI's `docs` job fails |
+| a new reference or design page, or a renamed heading on one | the five-line head, a link in `docs/README.md`, and `zig build docs-index` for the reference's heading list |
 
 **The roadmap holds nothing built and nothing decided.** When something ships its entry leaves entirely, no strikethrough; what was learned moves to `docs/history.md`. Every entry opens with its whole claim in bold and closes with a `Needs:` or `What would settle it:` line, which is what makes a blocker that has quietly stopped being one findable. **`docs/history.md` stays short**: a lesson, not an account of what shipped, and a lesson learned again extends its entry rather than adding one.
 

@@ -1,54 +1,40 @@
-# Running it
+# Running a database: checks, logging and errors
 
-What happens between `init` and the first query, and what a query answers
-when it cannot answer a Row: the check at startup, the stack a handler
-holds, a second database, the prepared statements you did not ask for, the
-log line that shows them, and the nine errors.
+**What happens between `init` and the first query, and what a query returns when it cannot return a Row: the startup check, stack memory, a second database, prepared statements, statement logging, and the ten errors.**
 
-## When a Row and its table disagree
+**Reference:** [`Db`](../../reference/sql.md#db), [errors](../../reference/sql.md#errors) · **Design:** [The SQL runtime](../../design/sql-runtime.md)
+
+## Checking Rows against tables at startup
 
 <!-- compiles: body -->
 ```zig
 db.checking(.{ .tables = &.{ User, Order } });
 ```
 
-Each Row is compared against the table it names, once, while the server
-starts. A column that is missing, or is `text` where the struct says `i32`,
-stops startup with a line naming it — instead of becoming a 500 at three in
-the morning on whichever request reached it first.
+**Each Row is compared against the table it names, once, while the server starts.** A column that is missing, or is `text` where the struct says `i32`, stops startup with a line naming it, instead of becoming a 500 at three in the morning on whichever request reaches it first.
 
-A table that is not there at all is **one** line rather than one per column,
-because the mistake is one mistake:
+A table that does not exist at all is reported in **one** line rather than one per column, because it is one mistake:
 
 ```
 nilo_sql: nilo: User reads table "users", and the database has no table by
 that name
 ```
 
-which is usually a migration that has not run.
+This usually means a migration has not run.
 
-Set `.schema_mismatch_is_fatal = false` to log and carry on.
+Set `.schema_mismatch_is_fatal = false` to log the mismatch and carry on.
 
-**A `Db` that never had `checking` called on it says so at startup**, at
-`warn`, once: the Rows will be checked by the first request that reads
-them, which is later than anybody wanted. It is one line and it is not a
-failure — a program with a `Db` and no Rows is a perfectly good program.
-Say `.unchecked = true` in the options when that is what was meant, and
-the line goes away
-([ADR 192](../../adr/192-a-db-with-no-schema-check-says-so-or-is-told.md)):
+**A `Db` that never had `checking` called on it logs one `warn` line at startup** saying so: its Rows will only be checked by the first request that reads them, which is later than anybody wants. It is one line and not a failure, because a program with a `Db` and no Rows is a perfectly good program. If that is what you meant, set `.unchecked = true` in the options and the line goes away ([ADR 192](../../adr/192-a-db-with-no-schema-check-says-so-or-is-told.md)):
 
 ```zig
 var scratch = sql.Db.init(gpa, url, .{ .unchecked = true });
 ```
 
-The two used to look the same, and the second was the one that reached
-production: a Row disagreeing with its table on a `Db` nobody had thought
-about checking.
+The two cases used to look the same, and the unchecked one was what reached production: a Row that disagreed with its table, on a `Db` nobody had thought to check.
 
-## The arena is cheaper than the stack
+## Scratch memory: use the arena, not the stack
 
-Worth knowing before you write a handler that needs a scratch buffer, because
-it is the opposite of the usual Zig advice:
+**A buffer on the stack is held for as long as the connection stays open; the same buffer in the arena is freed after the request.** This is the opposite of the usual Zig advice, so it is worth knowing before you write a handler that needs a scratch buffer:
 
 ```zig
 fn report(db: *sql.Db, c: *nilo.Ctx) ![]const u8 {
@@ -56,23 +42,13 @@ fn report(db: *sql.Db, c: *nilo.Ctx) ![]const u8 {
     const buf = try c.arena().alloc(u8, 64 * 1024);   // ✓ per request
 ```
 
-A connection waiting for its next request is a **suspended fiber**, and a
-suspended fiber holds its stack at the deepest point it ever reached. So a
-64 KiB stack buffer is 64 KiB held for as long as that connection stays open —
-measured one byte per byte, from 8 KiB to 128 KiB
-([ADR 062](../../adr/062-where-a-connection-waits-is-what-it-costs.md)). The arena is
-reset after every request.
+A connection waiting for its next request is a **suspended fiber**, and a suspended fiber keeps its stack at the deepest point it ever reached. So a 64 KiB stack buffer is 64 KiB held for as long as that connection stays open. This was measured byte for byte, from 8 KiB to 128 KiB ([ADR 062](../../adr/062-where-a-connection-waits-is-what-it-costs.md)). The arena is reset after every request.
 
-It applies to the database path too, and that is where the number came from: a
-route that reads one row and answers JSON holds **17,022 bytes** per idle
-connection against **8,749** for one that returns a constant. Most of the
-difference is how deep the driver's protocol code goes, and none of it is
-something the query did.
+It applies to the database path too, which is where the number came from: a route that reads one row and returns JSON holds **17,022 bytes** per idle connection, against **8,749** for a route that returns a constant. Most of the difference is how deep the driver's protocol code goes, and none of it comes from the query itself.
 
 ## A second database
 
-The Service registry is keyed by type, so `*sql.Db` is *the* database and a
-second one had nowhere to live. `sql.Named` gives it a type of its own:
+**`sql.Named` gives a second database its own type, so it can be a second service.** The service registry is keyed by type, so `*sql.Db` is *the* database, and a second one had nowhere to go:
 
 <!-- compiles -->
 ```zig
@@ -87,69 +63,41 @@ fn buy(db: *sql.Db, c: *nilo.Ctx) !Order {               // must not be
 }
 ```
 
-Two names are two types and two types are two services, so both are
-`app.provide`d and both are checked at `listen()` like any other. **Which
-pool a statement takes is in the argument list**, which is where you can see
-it without leaving the line.
+Two names are two types, and two types are two services, so both are registered with `app.provide` and both are checked at `listen()` like any other. **Which pool a statement uses is visible in the argument list**, without leaving the line.
 
-Nothing routes anything, and that is deliberate. A reader that sent writes to
-the primary and reads to a replica would need health checking, lag awareness
-and read-after-write safety — three background tasks this module does not
-have, and the last one fails *silently*
-([ADR 054](../../adr/054-a-second-database-is-a-second-type.md)). Writing
-`*Replica` in a signature is you saying "stale is fine here", once, on
-purpose.
+Nothing routes queries automatically, on purpose. A router that sent writes to the primary and reads to a replica would need health checks, replication lag awareness and read-after-write safety: three background tasks this module does not have, and the last one fails *silently* ([ADR 054](../../adr/054-a-second-database-is-a-second-type.md)). Writing `*Replica` in a signature is you saying "stale is fine here", once, on purpose.
 
-It is not only for replicas: a reporting warehouse, a second tenant, a
-database somebody else owns. `sql.Named("")` is a compile error, because the
-name is the whole mechanism.
+It is not only for replicas: a reporting warehouse, a second tenant, or a database somebody else owns all work the same way. `sql.Named("")` is a compile error, because the name is what makes the type distinct.
 
-There is no query cache and there will not be one. The speed case is the
-strong half — a round trip is 24 µs and the query inside it is 2 — but
-invalidation cannot be right from here, because this module sees only the
-writes that go through it. Hold the value in a Service of your own, where the
-rule for when it goes stale is a rule you know.
+There is no query cache and there will not be one. The speed argument is real (a round trip is 24 µs and the query inside it is 2), but cache invalidation cannot be correct from here, because this module only sees the writes that go through it. Keep the value in a Service of your own, where you know the rule for when it goes stale.
 
-## Statements are prepared, and you did nothing to ask for it
+## Prepared statements
 
-Every statement this module sends is settled while compiling, so there is a
-fixed set of them and each one is kept prepared on the connection it went
-down. The second time a connection sends it, Postgres skips Parse and
-Describe.
+**Every statement is prepared automatically, and you do not have to ask for it.** Every statement this module sends is fixed while compiling, so there is a fixed set of them, and each one is kept prepared on the connection it was sent on. The second time a connection sends it, Postgres skips Parse and Describe.
 
-It is worth about **12 µs a query** — 30% of a key lookup, 14% of a page with
-a sort and a range
-([ADR 051](../../adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)).
-A fixed saving, so the cheap queries a service runs most of are the ones it
-helps most. Nothing in your code changes.
+It saves about **12 µs a query**: 30% of a lookup by key, 14% of a page with a sort and a range ([ADR 051](../../adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)). The saving is fixed per query, so it helps most with the cheap queries a service runs most often. Nothing in your code changes.
 
-`db.raw` is in it too. Its text is comptime, so its name is derived the same
-way ([ADR 051](../../adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)).
+`db.raw` statements are prepared too. Their text is comptime, so their name is derived the same way ([ADR 051](../../adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)).
 
-**Turn it off behind pgbouncer in transaction mode.**
+**Turn it off behind pgbouncer in transaction mode:**
 
 <!-- compiles: body -->
 ```zig
 var db = sql.Db.init(gpa, url, .{ .prepared = false });
 ```
 
-A transaction-mode pooler hands out a different server connection per
-transaction, so a statement prepared on one is missing on the next. The
-failure is loud — Postgres says the prepared statement does not exist — which
-is why the default is the fast one rather than the safe one.
+A transaction-mode pooler hands out a different server connection for each transaction, so a statement prepared on one connection is missing on the next. The failure is loud (Postgres says the prepared statement does not exist), which is why the default is the fast setting rather than the safe one.
 
-## Seeing the statements a request sent
+## Logging statements (`db.watching`)
 
-One line per request tells you a page is slow. What was slow *in* it is the
-statements, and `db.watching` is how they are shown:
+**`db.watching` shows you each statement a request sent, with its duration.** One log line per request tells you a page is slow; the statements tell you what was slow *in* it:
 
 <!-- compiles: body -->
 ```zig
 db.watching(sql.logging);       // one debug line per statement
 ```
 
-Set it before `listen()`. `sql.logging` writes the duration, the row count and
-the text at debug level; anything narrower is a function of your own:
+Set it before `listen()`. `sql.logging` writes the duration, the row count and the text at debug level. For anything more selective, write your own function:
 
 <!-- compiles -->
 ```zig
@@ -159,15 +107,19 @@ fn slowOnes(sent: sql.Sent) void {
 }
 ```
 
-`db.watching(slowOnes)`, and nothing else changes. A `sql.Sent` carries the
-statement, the name it is kept prepared under, how long the database took, how
-many rows moved, and whether it failed. **Not the
-values it bound** — those are the interesting half and they are also somebody's
-password, so putting them in a log is a decision rather than a default
-([ADR 108](../../adr/108-a-statement-can-be-watched.md)).
+Pass it as `db.watching(slowOnes)`; nothing else changes. A `sql.Sent` carries:
 
-A statement that failed carries one thing more: `sent.problem`, which is what
-the database said about refusing it.
+- the statement text, and the name it is kept prepared under;
+- how long the database took, how many rows were affected, and whether it failed;
+- `route`: the name of the route whose request sent it (the `operationId` that `c.routeName()` returns), or null for a statement sent under a `Run`. That is how you tell that a slow `SELECT` belongs to `listDeals` and not to the facet count next to it that sends the same text.
+
+A `db.raw` statement has a name too, so a watcher can count heavy raw reads by name rather than by text. The statements without a name are `db.exec`, a statement whose `ORDER BY` the request chose, and anything on a `Db` with `prepared = false`.
+
+**The bound values are not included.** They are the interesting half, but they are also somebody's password, so putting them in a log is your decision, not a default ([ADR 108](../../adr/108-a-statement-can-be-watched.md)).
+
+### What the database said about a failure
+
+**A failed statement also carries `sent.problem`: what the database said when it rejected it.**
 
 <!-- compiles -->
 ```zig
@@ -179,38 +131,56 @@ fn whyItFailed(sent: sql.Sent) void {
 }
 ```
 
-`message` always says something. When the driver refused the statement before
-it left the process — a value it will not bind — there is no server message, so
-the Zig error's own name goes there instead. `code` is the SQLSTATE, `23505`
-for a duplicate key; `severity`, `detail`, `hint` and `constraint` are the rest
-of what Postgres knew. Fields a database does not answer are empty rather than
-null, because SQLite has no SQLSTATE and does not invent one
-([ADR 117](../../adr/117-a-statement-that-failed-says-what-the-database-said.md)).
+`message` always has something. When the driver rejected the statement before it left the process (a value it will not bind), there is no server message, so the Zig error's name goes there instead. `code` is the SQLSTATE, such as `23505` for a duplicate key; `severity`, `detail`, `hint` and `constraint` are the rest of what Postgres reported. Fields a database does not provide are empty rather than null, because SQLite has no SQLSTATE and nilo does not invent one ([ADR 117](../../adr/117-a-statement-that-failed-says-what-the-database-said.md)).
 
-It lives in the request's arena, so keeping one past the request means copying
-it. **`detail` is usually the values that collided**, which is worth knowing
-before you log it. None of it ever reaches the client.
+It lives in the request's arena, so keeping it past the request means copying it. **`detail` usually contains the values that collided**, which is worth knowing before you log it. None of it is ever sent to the client.
 
-A `Db` nobody is watching pays one null test per statement, and a watched one
-pays two clock reads at 15ns each.
+A `Db` nobody is watching pays one null check per statement, and a watched one pays two clock reads at 15 ns each.
 
-## Views, and the one thing a check cannot know
+### Query plans (`db.explain`)
 
-A Row can name a **view** or a **materialized view** instead of a table, and
-everything works the same way — reading it, checking it, `db.raw` past it.
+**`db.explain` takes the same arguments as `db.select` and returns the plan of the statement that read would send, with the same values bound** ([ADR 232](../../adr/232-a-read-can-show-its-plan.md)):
 
-One half of the check is skipped there, and it has to be: Postgres does not
-track `NOT NULL` through a view, so every column of one reads as nullable
-whatever its source column was. Checking that would flag every non-optional
-field of a Row over a view, so the column's **type** is compared and its
-nullability is left alone
-([ADR 050](../../adr/050-a-view-or-a-rowid-alias-is-not-a-nullable-column.md)).
+<!-- compiles -->
+```zig
+fn planOfTheList(db: *sql.Db, c: *nilo.Ctx) ![]const u8 {
+    return db.explain(User, c, .{ .where = .{ .age = .{ .gt = 18 } }, .limit = 20 });
+}
+```
 
-## Columns the database fills in
+On Postgres it is `EXPLAIN (ANALYZE, BUFFERS)`, which **runs the read** and reports what it did. On SQLite it is `EXPLAIN QUERY PLAN`, which only plans it. Use it from a test or a development endpoint. Against seeded data, a test can check the plan, so an index that goes missing fails the test suite instead of a page in production:
 
-An identity key, a sequence default and a generated column all work with
-nothing said about them, because an insert names a **subset** of the Row's
-columns and `RETURNING` is not optional:
+```zig
+const plan = try db.explain(DealCard, &run, .{ .where = .{ .stage = .won }, .order = .{ .id = .desc }, .limit = 20 });
+try std.testing.expect(std.mem.indexOf(u8, plan, "Seq Scan on deals") == null);
+```
+
+The plan covers the statement that reads the rows. A Row's children are read by a second statement, which is not included.
+
+For a statement you wrote yourself, use `db.rawExplain` with the text and values `db.raw` would take, or `db.rawExplainOrdered` for one with the `{order}` placeholder:
+
+<!-- compiles -->
+```zig
+fn planOfTheInvoices(db: *sql.Db, c: *nilo.Ctx) ![]const u8 {
+    return db.rawExplain(c,
+        "SELECT i.id, u.name FROM invoices i JOIN users u ON u.id = i.user_id WHERE i.total > $1",
+        .{@as(i64, 100)});
+}
+```
+
+It runs inside a transaction that is rolled back, because `ANALYZE` executes what it plans: the plan of an `UPDATE` leaves no row changed.
+
+**On a test database with only a few rows, assert on the shape of the plan, not on which index it chose.** The planner prices a plan by the number of rows it expects, and over ten rows a sequential scan and a nested loop are the cheapest choice whatever indexes exist. An assertion of "no `Seq Scan`" then fails on a correct schema. What holds at any size is what the statement's shape decides: a `SubPlan` is there, a `Join` is not. An assertion about an index needs enough seeded rows for the index to win, and `ANALYZE` on the table after seeding.
+
+## Views
+
+**A Row can name a view or a materialized view instead of a table, and everything works the same way:** reading it, checking it, and `db.raw` against it.
+
+One half of the startup check is skipped for views, and it has to be. Postgres does not track `NOT NULL` through a view, so every column of a view reads as nullable, whatever its source column was. Checking nullability would flag every non-optional field of a Row over a view, so only the column's **type** is compared ([ADR 050](../../adr/050-a-view-or-a-rowid-alias-is-not-a-nullable-column.md)).
+
+## Generated columns and identity keys
+
+**An identity key, a sequence default and a generated column all work with no extra setup**, because an insert names only **some** of the Row's columns and always uses `RETURNING`:
 
 <!-- compiles: body -->
 ```zig
@@ -226,43 +196,28 @@ const made = try db.insert(Auto, c, .{ .label = "alpha" });
 // made.id is the database's, made.slug is "alpha-x"
 ```
 
-A batch is the same: the arrays hold only the columns that were written. Note
-that a generated column carries no `NOT NULL` unless one was written, so the
-Row reads it as an optional.
+A batch works the same way: the arrays hold only the columns that were written. Note that a generated column has no `NOT NULL` unless you wrote one, so the Row reads it as an optional.
 
-A Row can say more about its table than its columns — a default, a unique, an
-index and its predicate, a foreign key — and that is the subject of
-[Making the tables](./migrations.md). What is past those words, a check
-constraint you wrote yourself or a trigger, is written where you write the rest
-of your DDL. The half that reaches a handler is already done either way: a
-unique violation is `error.AlreadyExists` and a 409.
-
+A Row can declare more about its table than its columns: a default, a unique, an index and its condition, a foreign key. That is the subject of [Making the tables](./migrations.md). Anything beyond those, such as a check constraint you wrote yourself or a trigger, goes wherever you write the rest of your DDL. The part a handler sees works either way: a unique violation is `error.AlreadyExists` and a 409.
 
 ## Errors
 
-The module raises ten, and they read:
+**The module returns ten errors, and three of them have a default HTTP answer:**
 
 | | |
 |---|---|
-| `error.AlreadyExists` | a unique violation — **409** by default |
-| `error.ForeignKeyViolated` | a row this statement names is not there, or a row it removes is still named by another. No default |
-| `error.NotNullViolated` | a `NOT NULL` column was sent a null — 500 |
-| `error.CheckViolated` | a `CHECK` said no |
-| `error.ConstraintViolated` | whatever is left — an exclusion constraint, a `RESTRICT` |
+| `error.AlreadyExists` | a unique violation. **409** by default |
+| `error.ForeignKeyViolated` | a row this statement refers to is not there, or a row it removes is still referred to by another. No default |
+| `error.NotNullViolated` | a `NOT NULL` column was sent a null. 500 |
+| `error.CheckViolated` | a `CHECK` constraint failed |
+| `error.ConstraintViolated` | any other constraint: an exclusion constraint, a `RESTRICT` |
 | `error.Locked` | a `.lock = .update_nowait` found a row somebody else holds. No default |
-| `error.Disconnected` | the database went away, or was never there — **503** by default |
-| `error.RolledBack` | the database rolled the transaction back — a serialization failure, a deadlock. Run it again ([Transactions](./transactions.md#when-the-database-rolls-it-back-for-you)) — **503** by default |
+| `error.Disconnected` | the database went away, or was never there. **503** by default |
+| `error.RolledBack` | the database rolled the transaction back (a serialization failure, a deadlock). Run it again ([Transactions](./transactions.md#retrying-a-rolled-back-transaction)). **503** by default |
 | `error.TimedOut` | a statement ran past the `tx.deadline` you set |
 | `error.QueryFailed` | anything else. The server's text is logged, never sent |
 
-Three have a default answer, and each one means the same thing whatever the
-request was. A duplicate is a conflict. A database that is not there, or
-that rolled the work back, is a 503, and the client may send the request
-again. The rest have no default, on purpose. A check that failed is a 422
-for one endpoint and a 500 for another, and the module does not know which
-request it is inside. So it hands you an error you can read and lets you
-decide. A default is only a default, too. Catch the error before it leaves
-the handler and the answer is yours:
+Each of the three defaults means the same thing whatever the request was. A duplicate is a conflict. A database that is not there, or that rolled the work back, is a 503, and the client may send the request again. The rest have no default, on purpose: a failed check is a 422 for one endpoint and a 500 for another, and the module does not know which request it is running in. So it gives you an error you can read and lets you decide. A default is only a default: catch the error before it leaves the handler and the answer is yours:
 
 <!-- compiles: body -->
 ```zig
@@ -272,10 +227,7 @@ const made = db.insert(User, c, .{ .email = email, .name = name }) catch |err| s
 };
 ```
 
-**`ForeignKeyViolated` has no default for the same reason, and it is the one
-worth knowing about.** It is the only constraint failure that is routinely a
-race rather than a bug: a delete guarded by a count is right up until somebody
-adds a child row between the two statements.
+**`ForeignKeyViolated` is the one worth knowing about.** It has no default for the same reason, and it is the only constraint failure that is usually a race rather than a bug: a delete that first checks a count is correct until somebody adds a child row between the two statements.
 
 <!-- compiles: body -->
 ```zig
@@ -289,10 +241,9 @@ _ = db.delete(User, c, .{ .where = .{ .id = id } }) catch |err| switch (err) {
 };
 ```
 
-**And when the name is not enough, `sql.problem(c)` is what the database
-actually said** ([ADR 117](../../adr/117-a-statement-that-failed-says-what-the-database-said.md)).
-A table with two unique indexes on it raises one error for both; the
-`constraint` field is what says which:
+### Which constraint failed (`sql.problem`, `sql.violated`)
+
+**When the error name is not enough, `sql.problem(c)` returns what the database actually said** ([ADR 117](../../adr/117-a-statement-that-failed-says-what-the-database-said.md)). A table with two unique indexes raises the same error for both, and the `constraint` field tells you which one:
 
 ```zig
 const said = sql.problem(c) orelse return err;
@@ -301,8 +252,7 @@ if (std.mem.eql(u8, said.constraint, "users_email_key")) {
 }
 ```
 
-For a unique the marker declares, `sql.violated` asks the same thing by the
-columns and checks them while compiling:
+For a unique declared on the Row, `sql.violated` asks the same question by column names, and checks them while compiling:
 
 <!-- compiles: body -->
 ```zig
@@ -315,11 +265,6 @@ _ = db.insert(User, c, .{ .email = email, .name = name, .age = 30 }) catch |err|
 };
 ```
 
-`users_email_key` in a string is a name nothing checks, and SQLite does not
-use it: it reports `users.email`. `sql.violated` accepts either, and a column
-list that is neither the key nor a `.unique` does not compile.
+`users_email_key` in a string is a name nothing checks, and SQLite does not use it (it reports `users.email`). `sql.violated` accepts either, and a column list that is neither the key nor a `.unique` does not compile.
 
-It answers for the last statement **this fiber** ran, and null when it worked.
-Read it in the `catch`: it lives as long as the request does, and the next
-statement replaces it. `db.watching` is the other end of the same information
-and is for logging every statement rather than branching on one.
+It answers for the last statement **this fiber** ran, and returns null when that statement worked. Read it inside the `catch`: it lives as long as the request, and the next statement replaces it. `db.watching` gives you the same information from the other end, for logging every statement rather than acting on one.

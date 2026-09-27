@@ -1,10 +1,14 @@
 # Design, one page a topic
 
-**Each page here is one topic's rule as it holds today: how its pieces fit, each rule in force with the ADR that decided it, and what is still open.** Start here to understand a part of nilo; follow a page's links into [`docs/adr/`](../adr/) for why each rule won and what it beat. Every ADR's `**Topic:**` line links back to its page, and `zig build adr-check` refuses a page that leaves out an ADR of its topic ([ADR 221](../adr/221-an-adr-is-the-rule-in-force-and-a-topic-page-joins-them.md)).
+**Each page here explains why one part of nilo works the way it does: how its pieces fit, the rules that hold today with the ADR behind each, and what is still open.**
 
-## The whole
+**Guide:** [The nilo guide](../guide/README.md) · **Reference:** [The reference](../reference/README.md)
 
-- [nilo's design principles](principles.md): the four axes every change is put against.
+Start here to understand a part of nilo. Each page links into [`docs/adr/`](../adr/), where every rule has its full reasoning and the alternatives it beat. Every ADR's `**Topic:**` line links back to its page, and `zig build adr-check` fails if a page leaves out an ADR of its topic ([ADR 221](../adr/221-an-adr-is-the-rule-in-force-and-a-topic-page-joins-them.md)).
+
+## Foundations
+
+- [nilo's design principles](principles.md): the four axes every change is measured against.
 - [Layering](layering.md): which module a file goes in, and what that module may import.
 - [Memory per request and per connection](memory.md): the arena, `Str`, and where a fiber waits.
 - [Documentation tooling](docs-tooling.md): snippets that compile, the site, and these pages.
@@ -12,7 +16,7 @@
 
 ## Serving a request
 
-- [The engine](engine.md): the Bulkhead, zio behind it, accepting and dealing connections.
+- [The engine](engine.md): the Bulkhead, zio behind it, accepting and handing out connections.
 - [The HTTP/1.1 wire protocol](http1-protocol.md)
 - [TLS](tls.md)
 - [Lifecycle](lifecycle.md): boot, services, the loop, shutdown.
@@ -49,9 +53,9 @@
 - [SQL column types](sql-types.md)
 - [Migrations](sql-migrations.md)
 
-## Topics that are one ADR
+## Topics with a single ADR
 
-A topic with one decision has no page; the ADR is the page.
+A topic with only one decision has no page; the ADR is the page.
 
 - config: [ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)
 - pw: [ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)

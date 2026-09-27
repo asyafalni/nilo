@@ -4114,6 +4114,212 @@ test "a search over several columns is one statement on Postgres, with the box e
     try testing.expectEqualStrings("ada@example.dev", found.rows[0].email);
 }
 
+test "ieq finds an address whatever its case, and reads an underscore as itself" {
+    // Item 84: `lower("email") = lower($1)` is the lookup a unique that
+    // ignores case is an index for; `.ilike` would have read the `_` in an
+    // address as any one character.
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const found = (try stack.db.one(Person, &run, .{
+        .where = .{ .email = .{ .ieq = @as([]const u8, "ADA@Example.DEV") } },
+    })).?;
+    try testing.expectEqual(@as(i64, 1), found.id);
+    try testing.expectEqual(@as(usize, 0), try stack.db.count(Person, &run, .{
+        .where = .{ .email = .{ .ieq = @as([]const u8, "ad_@example.dev") } },
+    }));
+    try testing.expectEqual(@as(usize, 2), try stack.db.count(Person, &run, .{
+        .where = .{ .email = .{ .not_ieq = @as([]const u8, "Ada@Example.Dev") } },
+    }));
+}
+
+test "a list that may be absent drops its term on Postgres, and an empty one does not" {
+    // Item 81: the multi-select on a filter bar. Postgres types `$1` from
+    // `= ANY($1)` before the guard reads it, which is the order ADR 149
+    // settled for one value, and the same has to hold for an array.
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const given = where_mod.given;
+    const Ids = struct {
+        fn count(db: *db_mod.Db, scope: *nilo.Run, in: ?[]const i64, not_in: ?[]const i64) !usize {
+            return db.count(Person, scope, .{ .where = .{
+                .id = .{ .in = given(in), .not_in = given(not_in) },
+            } });
+        }
+    };
+    const one_three = [_]i64{ 1, 3 };
+    const one = [_]i64{1};
+    try testing.expectEqual(@as(usize, 3), try Ids.count(&stack.db, &run, null, null));
+    try testing.expectEqual(@as(usize, 2), try Ids.count(&stack.db, &run, &one_three, null));
+    try testing.expectEqual(@as(usize, 0), try Ids.count(&stack.db, &run, &.{}, null));
+    try testing.expectEqual(@as(usize, 2), try Ids.count(&stack.db, &run, null, &one));
+    try testing.expectEqual(@as(usize, 3), try Ids.count(&stack.db, &run, null, &.{}));
+    try testing.expectEqual(@as(usize, 1), try Ids.count(&stack.db, &run, &one_three, &one));
+
+    // Text and a uuid, the two element types that bind as something other
+    // than themselves.
+    const emails = [_][]const u8{ "ada@example.dev", "grace@example.dev" };
+    try testing.expectEqual(@as(usize, 2), try stack.db.count(Filtered, &run, .{
+        .where = .{ .email = .{ .in = given(@as(?[]const []const u8, &emails)) } },
+    }));
+    const tokens = [_]types.Uuid{try types.Uuid.parse("550e8400-e29b-41d4-a716-446655440001")};
+    try testing.expectEqual(@as(usize, 1), try stack.db.count(Filtered, &run, .{
+        .where = .{ .token = .{ .in = given(@as(?[]const types.Uuid, &tokens)) } },
+    }));
+    try testing.expectEqual(@as(usize, 3), try stack.db.count(Filtered, &run, .{
+        .where = .{ .token = .{ .in = given(@as(?[]const types.Uuid, null)) } },
+    }));
+}
+
+test "today is the database's date, written and compared without a parameter" {
+    // Item 91: the start-date stamp, whose `WHERE` compares the column to
+    // the same day the `SET` writes.
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // Grace's is NULL and Kid's is in 2015, so only Grace is stamped.
+    const stamped = try stack.db.update(Birthday, &run, .{
+        .set = .{ .born = .today },
+        .where = .{
+            .id = .{ .in = @as([]const i64, &.{ 2, 3 }) },
+            .any = .{ .{ .born = null }, .{ .born = .{ .gt = .today } } },
+        },
+    });
+    try testing.expectEqual(@as(usize, 1), stamped);
+    try testing.expectEqual(@as(usize, 1), try stack.db.count(Birthday, &run, .{ .where = .{ .born = .today } }));
+    try testing.expectEqual(@as(usize, 2), try stack.db.count(Birthday, &run, .{ .where = .{ .born = .{ .lt = .today } } }));
+
+    // And `.now` compares the way it is written.
+    try testing.expectEqual(@as(usize, 3), try stack.db.count(Profile, &run, .{ .where = .{ .seen_at = .{ .lt = .now } } }));
+
+    // Item 105: the clock moved by an offset, in a statement's `.where` and
+    // in an aggregate's, which is where "closed in the last 90 days" is
+    // counted. Grace's day is today and the other two are years back.
+    try testing.expectEqual(@as(usize, 1), try stack.db.count(Birthday, &run, .{ .where = .{ .born = .{ .gte = .{ .today = -90 } } } }));
+    try testing.expectEqual(@as(usize, 2), try stack.db.count(Birthday, &run, .{ .where = .{ .born = .{ .lt = .{ .today = -90 } } } }));
+    try testing.expectEqual(@as(usize, 0), try stack.db.count(Birthday, &run, .{ .where = .{ .born = .{ .today = 1 } } }));
+    try testing.expectEqual(@as(usize, 3), try stack.db.count(Profile, &run, .{ .where = .{ .seen_at = .{ .lt = .{ .now = .{ .days = 1 } } } } }));
+    try testing.expectEqual(@as(usize, 0), try stack.db.count(Profile, &run, .{ .where = .{ .seen_at = .{ .gt = .{ .now = .{ .seconds = 60 } } } } }));
+    const Recent = struct {
+        pub const nilo_table = Birthday;
+        pub const nilo_aggregate = .{
+            .recent = .{ .count = .id, .where = .{ .born = .{ .gte = .{ .today = -90 } } } },
+            .stamped = .{ .count = .id, .where = .{ .born = .today } },
+        };
+        recent: i64,
+        stamped: i64,
+    };
+    const recent = try stack.db.exactlyOne(Recent, &run, .{});
+    try testing.expectEqual(@as(i64, 1), recent.recent);
+    try testing.expectEqual(@as(i64, 1), recent.stamped);
+
+    // Item 99: the same two words on columns read as text, which is how a
+    // date crosses an API as `yyyy-MM-dd`. The database writes the value
+    // either way.
+    const Stamped = struct {
+        pub const nilo_table = .{ .name = table, .key = .id };
+        id: i64,
+        born: ?types.AsText("date"),
+        seen_at: types.AsText("timestamptz"),
+    };
+    try testing.expectEqual(@as(usize, 1), try stack.db.count(Stamped, &run, .{ .where = .{ .born = .today } }));
+    try testing.expectEqual(@as(usize, 1), try stack.db.update(Stamped, &run, .{
+        .set = .{ .born = .today, .seen_at = .now },
+        .where = .{ .id = @as(i64, 1), .born = .{ .lt = .today } },
+    }));
+    try testing.expectEqual(@as(usize, 2), try stack.db.count(Stamped, &run, .{ .where = .{ .born = .today, .seen_at = .{ .lte = .now } } }));
+}
+
+test "a paged raw statement takes the request's order and still carries its total" {
+    // Item 82: `/work`, `/commitments` and `/deals` were `rawOrdered` and a
+    // second statement for the count with the `WHERE` pasted in again.
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const Paged = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        email: []const u8,
+    };
+    const Sort = @import("ordering.zig").Ordering(Paged, .{ .id = .id, .age = "p.age" });
+    const text = "SELECT p.id, p.email, count(*) OVER () FROM " ++ table ++
+        " p WHERE p.age > $1 {order} LIMIT $2";
+
+    const oldest = try stack.db.rawPageOrdered(Paged, &run, text, .{ @as(i32, 10), @as(i64, 2) }, Sort.by(&.{.{ .key = .age, .direction = .desc }}));
+    try testing.expectEqual(@as(i64, 3), oldest.total);
+    try testing.expectEqual(@as(usize, 2), oldest.rows.len);
+    try testing.expectEqualStrings("grace@example.dev", oldest.rows[0].email);
+    try testing.expectEqualStrings("ada@example.dev", oldest.rows[1].email);
+
+    // Item 97: past the last row the window has no row to ride on, and the
+    // same statement asked again from row one says the total. The port's
+    // shape, a cast on each bound.
+    const skipping = "SELECT p.id, p.email, count(*) OVER () FROM " ++ table ++
+        " p WHERE p.age > $1 {order} LIMIT $2::int OFFSET $3::int";
+    const past = try stack.db.rawPageOrdered(Paged, &run, skipping, .{ @as(i32, 10), @as(i32, 2), @as(i32, 200) }, Sort.by(&.{.{ .key = .id }}));
+    try testing.expectEqual(@as(usize, 0), past.rows.len);
+    try testing.expectEqual(@as(i64, 3), past.total);
+    const typed_past = try stack.db.page(Person, &run, .{ .order = .{ .id = .asc }, .limit = 2, .offset = @as(i64, 200) });
+    try testing.expectEqual(@as(usize, 0), typed_past.rows.len);
+    try testing.expectEqual(@as(i64, 3), typed_past.total);
+
+    // Item 98: the plan of the same statement, sorted as a request sorted it.
+    const plan = try stack.db.rawExplainOrdered(&run, skipping, .{ @as(i32, 10), @as(i32, 2), @as(i32, 0) }, Sort.by(&.{.{ .key = .age }}));
+    try testing.expect(std.mem.indexOf(u8, plan, "WindowAgg") != null);
+    try testing.expect(std.mem.indexOf(u8, plan, "Execution Time:") != null);
+
+    // A write's plan is asked inside a transaction that is rolled back, so
+    // `ANALYZE` running it keeps nothing.
+    const write_plan = try stack.db.rawExplain(&run, "UPDATE " ++ table ++ " SET age = age + $1", .{@as(i32, 100)});
+    try testing.expect(std.mem.indexOf(u8, write_plan, "Update on") != null);
+    try testing.expectEqual(@as(usize, 0), try stack.db.count(Person, &run, .{ .where = .{ .age = .{ .gt = @as(i32, 100) } } }));
+}
+
+test "a narrower Row sorts by a column of its table it does not carry" {
+    // Item 86: the tiebreak the response has no reason to show.
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const Email = struct {
+        pub const nilo_table = Person;
+        id: i64,
+        email: []const u8,
+    };
+    const by_age = try stack.db.select(Email, &run, .{ .order = .{ .age = .desc } });
+    try testing.expectEqual(@as(usize, 3), by_age.len);
+    try testing.expectEqual(@as(i64, 2), by_age[0].id);
+    try testing.expectEqual(@as(i64, 1), by_age[1].id);
+    try testing.expectEqual(@as(i64, 3), by_age[2].id);
+
+    // Item 96: and narrowed by one, bound as the table's `int4`.
+    const grown = try stack.db.select(Email, &run, .{ .where = .{ .age = .{ .gte = @as(i32, 18) } }, .order = .{ .id = .asc } });
+    try testing.expectEqual(@as(usize, 2), grown.len);
+    try testing.expectEqualStrings("grace@example.dev", grown[1].email);
+    const found = (try stack.db.one(Email, &run, .{ .where = .{ .handle = "kid" } })).?;
+    try testing.expectEqual(@as(i64, 3), found.id);
+}
+
 test "an exists from the child's side reads the parent's key off the child's own reference" {
     // Item 75: `staff WHERE EXISTS (departments WHERE …)`, where the key is on
     // the outer Row. Here the session points at the person, and the query is
@@ -4157,6 +4363,96 @@ test "an exists from the child's side reads the parent's key off the child's own
     try testing.expectEqual(@as(usize, 1), try stack.db.count(Session, &run, .{ .where = .{
         .exists = .{.{ .in = Person, .where = .{ .email = .{ .icontains = given(@as(?[]const u8, "ada")) } } }},
     } }));
+}
+
+test "a raw statement is held against its Row the first time it runs" {
+    // Item 94: `rawcheck` counts and names the columns while compiling, and
+    // the rest was left to the first row. The port's feed page went down on a
+    // `LEFT JOIN LATERAL` read into a field that was not optional (ADR 233).
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const Pair = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        other: i64,
+    };
+    const MaybePair = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        other: ?i64,
+    };
+
+    // A LEFT JOIN that finds a row every time, so reading it would work: the
+    // statement is refused by the check and by nothing else, before a row is
+    // read. Into an optional, the same statement fits and runs.
+    const always = "SELECT p.id, q.id AS other FROM " ++ table ++ " p LEFT JOIN " ++ table ++
+        " q ON q.id = p.id ORDER BY p.id";
+    try testing.expectError(error.QueryFailed, stack.db.raw(Pair, &run, always, .{}));
+    try testing.expectEqual(@as(usize, 3), (try stack.db.raw(MaybePair, &run, always, .{})).len);
+
+    // What the Wire says about each shape, read directly.
+    const w = &stack.db.wire.?;
+    const arena = run.arena();
+    const people = " FROM " ++ table ++ " p LEFT JOIN " ++ session_table ++ " s ON s.person_id = p.id";
+
+    const left = (try w.describe(arena, "SELECT p.id, s.id, coalesce(s.id, 0)" ++ people, true)).?;
+    try testing.expectEqual(false, left[0].outer_null);
+    try testing.expectEqual(true, left[1].outer_null);
+    // An expression is not judged, and `coalesce` is one.
+    try testing.expectEqual(false, left[2].outer_null);
+    try testing.expectEqualStrings("int8", left[1].udt.?);
+
+    // A condition that throws the NULLs away, which the planner reads as an
+    // inner join.
+    const kept = (try w.describe(arena, "SELECT p.id, s.id" ++ people ++ " WHERE s.id > $1", true)).?;
+    try testing.expectEqual(false, kept[1].outer_null);
+    // `($1 IS NULL OR …)` does not throw them away, which is why the plan is
+    // the generic one: one made for a value might have dropped the join.
+    const guarded = (try w.describe(arena, "SELECT p.id, s.id" ++ people ++
+        " WHERE ($1::bigint IS NULL OR s.id = $1)", true)).?;
+    try testing.expectEqual(true, guarded[1].outer_null);
+
+    // The port's shape.
+    const lateral = (try w.describe(arena, "SELECT p.id, t.id FROM " ++ table ++
+        " p LEFT JOIN LATERAL (SELECT s.id FROM " ++ session_table ++
+        " s WHERE s.person_id = p.id ORDER BY s.id DESC LIMIT 1) t ON true", true)).?;
+    try testing.expectEqual(false, lateral[0].outer_null);
+    try testing.expectEqual(true, lateral[1].outer_null);
+
+    // A branch of a UNION ALL, whose column the first branch names.
+    const branch = (try w.describe(arena, "SELECT p.id, p.id FROM " ++ table ++
+        " p UNION ALL SELECT p.id, s.id" ++ people, true)).?;
+    try testing.expectEqual(false, branch[0].outer_null);
+    try testing.expectEqual(true, branch[1].outer_null);
+
+    // And types: `count(*)` is `int8`, which pg.zig will not decode into an
+    // `i32` though `checkSchema` lets an `i32` stand over an `int8` column;
+    // an enum arrives as its label, which a text field reads whatever the
+    // type is called.
+    const typed = (try w.describe(arena, "SELECT count(*), count(*)::int4, 'admin'::" ++ role_type ++
+        " FROM " ++ table, false)).?;
+    try testing.expectEqualStrings("int8", typed[0].udt.?);
+    try testing.expectEqualStrings("int4", typed[1].udt.?);
+    try testing.expectEqualStrings(role_type, typed[2].udt.?);
+    try testing.expect(typed[2].textual);
+    try testing.expectError(error.QueryFailed, stack.db.rawExactlyOne(i32, &run, "SELECT count(*) FROM " ++ table, .{}));
+    try testing.expectEqual(@as(i32, 3), try stack.db.rawExactlyOne(i32, &run, "SELECT count(*)::int4 FROM " ++ table, .{}));
+    const Named = struct {
+        pub const nilo_table = .projection;
+        role: []const u8,
+    };
+    _ = try stack.db.raw(Named, &run, "SELECT 'admin'::" ++ role_type ++ " AS role", .{});
+
+    // Every describe above prepared the same name on one of the pool's
+    // connections, so one left behind would have refused the next; and the
+    // connection this lands on holds none.
+    const left_over = try stack.db.rawExactlyOne(i64, &run, "SELECT count(*) FROM pg_prepared_statements WHERE name = 'nilo_describe'", .{});
+    try testing.expectEqual(@as(i64, 0), left_over);
 }
 
 /// A person carrying the ids of their sessions — which no column holds, and
@@ -4642,6 +4938,56 @@ test "a statement composed at run time fills a Row by position and runs unnamed"
     try testing.expectError(error.ParamCountMismatch, stack.db.composed(i64, &run, s, .{}));
 }
 
+/// A Row that is the response and leaves its timestamp out, declaring it
+/// unread (item 102).
+const UnreadDeal = struct {
+    pub const nilo_table = .{
+        .name = "nilo_unread_deals",
+        .default = .{ .created_at = .now },
+        .unread = .{ .created_at = types.Timestamp },
+    };
+    id: i64,
+    title: []const u8,
+};
+
+test "a column the Row does not read is written, ordered, narrowed and checked on a real Postgres" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    _ = try stack.db.exec(&run, "DROP TABLE IF EXISTS nilo_unread_deals", .{});
+    _ = try stack.db.exec(&run, "CREATE TABLE nilo_unread_deals (id bigserial PRIMARY KEY, " ++
+        "title text NOT NULL, created_at timestamptz NOT NULL DEFAULT now())", .{});
+
+    // Two written with a moment of their own, in 2001 and 2000, and one left
+    // to the default.
+    _ = try stack.db.insert(UnreadDeal, &run, .{ .title = "old", .created_at = types.Timestamp{ .micros = 978_307_200_000_000 } });
+    _ = try stack.db.insert(UnreadDeal, &run, .{ .title = "older", .created_at = types.Timestamp{ .micros = 946_684_800_000_000 } });
+    _ = try stack.db.insert(UnreadDeal, &run, .{ .title = "new" });
+
+    const ordered = try stack.db.select(UnreadDeal, &run, .{ .order = .{ .created_at = .asc } });
+    try testing.expectEqual(@as(usize, 3), ordered.len);
+    try testing.expectEqualStrings("older", ordered[0].title);
+    try testing.expectEqualStrings("new", ordered[2].title);
+    try testing.expectEqual(@as(usize, 1), try stack.db.count(UnreadDeal, &run, .{
+        .where = .{ .created_at = .{ .gt = .{ .now = .{ .days = -90 } } } },
+    }));
+
+    // The boot check holds the unread column like a read one, and says so
+    // when the table has lost it.
+    const arena = run.arena();
+    var problems: std.ArrayList(schema.Problem) = .empty;
+    const columns = try stack.live.wire.columnsOf(arena, dialect.Postgres.introspect, null, "nilo_unread_deals");
+    try testing.expectEqual(@as(usize, 0), try schema.compare(dialect.Postgres, UnreadDeal, columns, &problems, arena));
+    _ = try stack.db.exec(&run, "ALTER TABLE nilo_unread_deals DROP COLUMN created_at", .{});
+    const without = try stack.live.wire.columnsOf(arena, dialect.Postgres.introspect, null, "nilo_unread_deals");
+    try testing.expectEqual(@as(usize, 1), try schema.compare(dialect.Postgres, UnreadDeal, without, &problems, arena));
+    try testing.expectEqualStrings("created_at", problems.items[0].column);
+    _ = try stack.db.exec(&run, "DROP TABLE nilo_unread_deals", .{});
+}
+
 // -- shaped Rows ---------------------------------------------------------
 //
 // What SQLite cannot say about ADR 218: that `sum` over a `bigint` comes
@@ -4694,6 +5040,14 @@ const ShapeOrderCard = struct {
     lines: []const ShapeSku,
 };
 
+/// An order read for its customer alone, which leaves the order's key out
+/// (item 103).
+const ShapeOrderOwner = struct {
+    pub const nilo_table = ShapeOrder;
+    pub const nilo_via = .{ .customer = .customer_id };
+    customer: ShapeCustomerName,
+};
+
 const ShapeByCustomer = struct {
     pub const nilo_table = ShapeOrder;
     pub const nilo_via = .{ .customer = .customer_id };
@@ -4710,6 +5064,116 @@ const ShapeByCustomer = struct {
     mean: f64,
     heaviest: f32,
     weighed: f64,
+};
+
+const ShapeLineTally = struct {
+    pub const nilo_table = ShapeLine;
+    pub const nilo_aggregate = .{
+        .acme = .{ .count = .id, .where = .{ .order_id = .{ .customer_id = .{ .name = "Acme" } } } },
+        .referred = .{ .count = .id, .where = .{ .order_id = .{ .referrer_id = .{ .name = "Borealis" } } } },
+    };
+    acme: i64,
+    referred: i64,
+};
+
+const ShapeCounted = struct {
+    pub const nilo_table = ShapeOrder;
+    pub const nilo_via = .{ .customer = .customer_id };
+    pub const nilo_children = .{
+        .line_count = .{ .count = ShapeLine },
+        .lines = .{ .order = .{ .sku = .desc }, .where = .{ .sku = .{ .in = .{ "a", "b" } } } },
+    };
+    id: types.Uuid,
+    customer: ShapeCustomerName,
+    line_count: i64,
+    lines: []const ShapeSku,
+};
+
+const ShapeFiltered = struct {
+    pub const nilo_table = ShapeOrder;
+    pub const nilo_via = .{ .customer = .customer_id };
+    pub const nilo_aggregate = .{
+        .large = .{ .sum = .total, .where = .{ .total = .{ .gte = 100 } } },
+        .referred = .{ .count = .id, .where = .{ .referrer_id = .{ .ne = null } } },
+        .light = .{ .max = .weight, .where = .{ .weight = .{ .lt = 2.0 } } },
+    };
+    customer: ShapeCustomerName,
+    large: ?i64,
+    referred: i64,
+    light: ?f32,
+};
+
+const ShapeOrderTotal = struct {
+    pub const nilo_table = ShapeOrder;
+    total: i64,
+};
+
+/// A customer with figures over its orders, some narrowed through the
+/// order's other reference to a customer (item 100).
+const ShapeCustomerPulse = struct {
+    pub const nilo_table = ShapeCustomer;
+    pub const nilo_via = .{
+        .orders = .customer_id,
+        .referred = .customer_id,
+        .biggest_referred = .customer_id,
+        .lightest = .customer_id,
+        .referred_orders = .customer_id,
+    };
+    pub const nilo_children = .{
+        .orders = .{ .count = ShapeOrder },
+        .referred = .{ .count = ShapeOrder, .where = .{ .referrer_id = .{ .name = "Borealis" } } },
+        .biggest_referred = .{ .max = .{ ShapeOrder, .total }, .where = .{ .referrer_id = .{ .name = "Borealis" } } },
+        .lightest = .{ .min = .{ ShapeOrder, .weight } },
+        .referred_orders = .{ .where = .{ .referrer_id = .{ .name = .{ .ne = "Nobody" } } } },
+    };
+    id: i64,
+    name: []const u8,
+    orders: i64,
+    referred: i64,
+    biggest_referred: ?i64,
+    lightest: ?f32,
+    referred_orders: []const ShapeOrderTotal,
+};
+
+/// An order read flat, the way a response whose contract is flat has it
+/// (item 83).
+const ShapeOrderFlat = struct {
+    pub const nilo_table = ShapeOrder;
+    pub const nilo_through = .{
+        .customer_name = .{ .customer_id, .name },
+        .referrer_name = .{ .referrer_id, .name },
+    };
+    id: types.Uuid,
+    total: i64,
+    customer_name: []const u8,
+    referrer_name: ?[]const u8,
+};
+
+const ShapeLineFlat = struct {
+    pub const nilo_table = ShapeLine;
+    pub const nilo_through = .{ .customer_name = .{ .order_id, .customer_id, .name } };
+    sku: []const u8,
+    customer_name: []const u8,
+};
+
+/// A row whose referrer is missing, read as a word of its own or left out
+/// (item 109).
+const ShapeOrderLabelled = struct {
+    pub const nilo_table = ShapeOrder;
+    pub const nilo_through = .{
+        .referrer_label = .{ .path = .{ .referrer_id, .name }, .otherwise = "direct" },
+    };
+    total: i64,
+    referrer_label: []const u8,
+};
+
+const ShapeOrderReferred = struct {
+    pub const nilo_table = ShapeOrder;
+    pub const nilo_through = .{
+        .referrer_name = .{ .path = .{ .referrer_id, .name }, .join = .inner },
+    };
+    total: i64,
+    referrer_name: []const u8,
 };
 
 const shape_setup = [_][]const u8{
@@ -4754,6 +5218,12 @@ test "a parent, its children and a sum come back from a real Postgres" {
     try testing.expectEqualStrings("Acme", cards[2].referrer.?.name);
     try testing.expectEqualStrings("c", cards[2].lines[0].sku);
 
+    // Item 103: a Row carrying only a parent is found by the key it leaves
+    // out, the way `one` finds it with the key in `.where`.
+    const owner = (try stack.db.find(ShapeOrderOwner, &run, cards[2].id)).?;
+    try testing.expectEqualStrings("Borealis", owner.customer.name);
+    try testing.expect((try stack.db.find(ShapeOrderOwner, &run, types.Uuid.nil)) == null);
+
     // A condition through a parent, in a transaction so the two statements
     // are one snapshot.
     var tx = try stack.db.begin(&run, .{});
@@ -4778,6 +5248,141 @@ test "a parent, its children and a sum come back from a real Postgres" {
     try testing.expectEqual(@as(f32, 2.5), groups.rows[0].heaviest);
     try testing.expectEqual(@as(f64, 4), groups.rows[0].weighed);
     try testing.expectEqual(@as(i64, 40), groups.rows[1].revenue);
+
+    // An aggregate's `.where`: the cast applies to the filtered call, and a
+    // group none of whose rows matches is null rather than missing.
+    const filtered = try stack.db.select(ShapeFiltered, &run, .{ .order = .{ .customer = .{ .name = .asc } } });
+    try testing.expectEqual(@as(usize, 2), filtered.len);
+    try testing.expectEqual(@as(?i64, 350), filtered[0].large);
+    try testing.expectEqual(@as(i64, 1), filtered[0].referred);
+    try testing.expectEqual(@as(?f32, 1.5), filtered[0].light);
+    try testing.expect(filtered[1].large == null);
+    try testing.expectEqual(@as(i64, 1), filtered[1].referred);
+    try testing.expectEqual(@as(?f32, 0.5), filtered[1].light);
+    const having = try stack.db.select(ShapeFiltered, &run, .{ .where = .{ .large = .{ .gt = @as(i64, 0) } } });
+    try testing.expectEqual(@as(usize, 1), having.len);
+    // A filtered sum is optional, and on Postgres `.desc` puts its nulls
+    // first: a leaderboard ranks with `NULLS LAST`.
+    const ranked = try stack.db.select(ShapeFiltered, &run, .{ .order = .{ .large = .desc_nulls_last } });
+    try testing.expectEqual(@as(?i64, 350), ranked[0].large);
+    try testing.expect(ranked[1].large == null);
+
+    // Children in an order of their own and narrowed, and a count of them
+    // read in the same statement as the rows it belongs to.
+    const counted = try stack.db.select(ShapeCounted, &run, .{
+        .where = .{ .line_count = .{ .gt = @as(i64, 0) } },
+        .order = .{ .line_count = .desc },
+    });
+    try testing.expectEqual(@as(usize, 2), counted.len);
+    try testing.expectEqual(@as(i64, 2), counted[0].line_count);
+    try testing.expectEqual(@as(usize, 2), counted[0].lines.len);
+    try testing.expectEqualStrings("b", counted[0].lines[0].sku);
+    try testing.expectEqualStrings("a", counted[0].lines[1].sku);
+    try testing.expectEqual(@as(i64, 1), counted[1].line_count);
+    try testing.expectEqual(@as(usize, 0), counted[1].lines.len);
+
+    // Item 100: a count, a max and a min over the rows pointing back, the
+    // first two narrowed through the order's nullable reference to its
+    // referrer, and a children list narrowed the same way. Acme's orders are
+    // 100 (referred by Borealis) and 250; Borealis's is 40, referred by Acme.
+    const pulse = try stack.db.select(ShapeCustomerPulse, &run, .{ .order = .{ .name = .asc } });
+    try testing.expectEqual(@as(usize, 2), pulse.len);
+    try testing.expectEqual(@as(i64, 2), pulse[0].orders);
+    try testing.expectEqual(@as(i64, 1), pulse[0].referred);
+    try testing.expectEqual(@as(?i64, 100), pulse[0].biggest_referred);
+    try testing.expectEqual(@as(?f32, 1.5), pulse[0].lightest);
+    try testing.expectEqual(@as(usize, 1), pulse[0].referred_orders.len);
+    try testing.expectEqual(@as(i64, 100), pulse[0].referred_orders[0].total);
+    try testing.expectEqual(@as(i64, 1), pulse[1].orders);
+    try testing.expectEqual(@as(i64, 0), pulse[1].referred);
+    try testing.expect(pulse[1].biggest_referred == null);
+    try testing.expectEqual(@as(?f32, 0.5), pulse[1].lightest);
+    try testing.expectEqual(@as(i64, 40), pulse[1].referred_orders[0].total);
+    const with_referred = try stack.db.select(ShapeCustomerPulse, &run, .{
+        .where = .{ .biggest_referred = .{ .gt = @as(i64, 0) } },
+    });
+    try testing.expectEqual(@as(usize, 1), with_referred.len);
+    try testing.expectEqualStrings("Acme", with_referred[0].name);
+
+    // Item 83: the same parents read flat, ordered and narrowed by, and two
+    // references away from a line.
+    const flat = try stack.db.select(ShapeOrderFlat, &run, .{ .order = .{ .total = .desc } });
+    try testing.expectEqual(@as(usize, 3), flat.len);
+    try testing.expectEqualStrings("Acme", flat[0].customer_name);
+    try testing.expect(flat[0].referrer_name == null);
+    try testing.expectEqualStrings("Borealis", flat[1].referrer_name.?);
+    try testing.expectEqualStrings("Borealis", flat[2].customer_name);
+    const by_referrer = try stack.db.select(ShapeOrderFlat, &run, .{
+        .where = .{ .referrer_name = @as([]const u8, "Acme") },
+    });
+    try testing.expectEqual(@as(usize, 1), by_referrer.len);
+    try testing.expectEqual(@as(i64, 40), by_referrer[0].total);
+    try testing.expectEqual(@as(usize, 2), try stack.db.count(ShapeOrderFlat, &run, .{
+        .where = .{ .customer_name = @as([]const u8, "Acme") },
+    }));
+    const flat_lines = try stack.db.select(ShapeLineFlat, &run, .{ .order = .{ .customer_name = .desc, .sku = .asc } });
+    try testing.expectEqual(@as(usize, 3), flat_lines.len);
+    try testing.expectEqualStrings("Borealis", flat_lines[0].customer_name);
+    try testing.expectEqualStrings("a", flat_lines[1].sku);
+    try testing.expectEqualStrings("Acme", flat_lines[2].customer_name);
+
+    // Item 108: the same Row filled by a statement written by hand, one
+    // field per column, held against it on its first run like any raw Row.
+    const raw_flat = try stack.db.raw(ShapeOrderFlat, &run,
+        \\SELECT o.id, o.total, c.name AS customer_name, r.name AS referrer_name
+        \\FROM nilo_shape_orders o
+        \\JOIN nilo_shape_customers c ON c.id = o.customer_id
+        \\LEFT JOIN nilo_shape_customers r ON r.id = o.referrer_id
+        \\ORDER BY o.total DESC
+    , .{});
+    try testing.expectEqual(@as(usize, 3), raw_flat.len);
+    try testing.expect(raw_flat[0].referrer_name == null);
+    try testing.expectEqualStrings("Borealis", raw_flat[1].referrer_name.?);
+
+    // Item 109: the order with no referrer reads the word the Row gave, in
+    // the answer and in a condition alike, or is not read at all, and a
+    // count agrees with the list.
+    const labelled = try stack.db.select(ShapeOrderLabelled, &run, .{ .order = .{ .total = .desc } });
+    try testing.expectEqual(@as(usize, 3), labelled.len);
+    try testing.expectEqualStrings("direct", labelled[0].referrer_label);
+    try testing.expectEqualStrings("Borealis", labelled[1].referrer_label);
+    const direct = try stack.db.select(ShapeOrderLabelled, &run, .{
+        .where = .{ .referrer_label = @as([]const u8, "direct") },
+    });
+    try testing.expectEqual(@as(usize, 1), direct.len);
+    try testing.expectEqual(@as(i64, 250), direct[0].total);
+    const referred_only = try stack.db.page(ShapeOrderReferred, &run, .{ .order = .{ .total = .desc }, .limit = 10 });
+    try testing.expectEqual(@as(i64, 2), referred_only.total);
+    try testing.expectEqual(@as(i64, 100), referred_only.rows[0].total);
+    try testing.expectEqualStrings("Acme", referred_only.rows[1].referrer_name);
+    try testing.expectEqual(@as(usize, 2), try stack.db.count(ShapeOrderReferred, &run, .{}));
+
+    // Item 107: the orders no line points at, an `.exists` with nothing to
+    // ask of the line but that it is there.
+    const bare = try stack.db.select(ShapeOrderTotal, &run, .{
+        .where = .{ .not_exists = .{.{ .in = ShapeLine }} },
+    });
+    try testing.expectEqual(@as(usize, 1), bare.len);
+    try testing.expectEqual(@as(i64, 250), bare[0].total);
+    try testing.expectEqual(@as(usize, 2), try stack.db.count(ShapeOrderTotal, &run, .{
+        .where = .{ .exists = .{.{ .in = ShapeLine }} },
+    }));
+
+    // An aggregate's `.where` through two references, one of them nullable.
+    const tally = try stack.db.exactlyOne(ShapeLineTally, &run, .{});
+    // Order 1 is Acme's and holds two lines; order 2, Acme's too, holds none.
+    try testing.expectEqual(@as(i64, 2), tally.acme);
+    try testing.expectEqual(@as(i64, 2), tally.referred);
+
+    // The plan of a shaped read, run with its values bound: what a slow page
+    // is asked first.
+    const plan = try stack.db.explain(ShapeOrderCard, &run, .{
+        .where = .{ .total = .{ .gt = @as(i64, 50) } },
+        .order = .{ .total = .desc },
+    });
+    try testing.expect(std.mem.indexOf(u8, plan, "nilo_shape_orders") != null);
+    try testing.expect(std.mem.indexOf(u8, plan, "Execution Time:") != null);
+    try testing.expect(std.mem.indexOf(u8, plan, "\n") != null);
 
     for (shape_setup[0..3]) |text| _ = try stack.db.exec(&run, text, .{});
 }

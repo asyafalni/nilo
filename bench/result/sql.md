@@ -1305,6 +1305,26 @@ Every shape that goes through a cached statement lost 2.1 to 3.1 µs, one unix-s
 
 **Can it be pushed further:** what is left against tokio-postgres is under 10% and is CPU, not packets. The next thing to measure is the pool behind many threads (§12), not the single query.
 
+## 17. What holding a raw statement against its Row costs the binary
+
+**Run:** `git archive` of `20478da` against the working tree of [ADR 233](../../docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md), both built with `zig build size-sql -Doptimize=ReleaseFast -Dsql -j1`, stripped. Three programs added to both trees for the run and not kept: `pg_raw` and `sqlite_raw`, `pg_only.zig` and `sqlite_only.zig` with the route's `db.find` replaced by one `db.raw` of a `LEFT JOIN`, and `pg_raw2`, `pg_raw` with a second route and a second raw statement. Intel Xeon Platinum 8255C, 2 vCPU, Linux 6.8, Zig 0.16.0, 2026-09-26.
+
+**Why:** the check is reachable from every raw call and runs behind a runtime flag, so the linker keeps all of it; ADR 017 asks for the number.
+
+| | before | after | Δ |
+|---|---:|---:|---:|
+| `pg_only` (no raw statement) | 1,916,144 | 1,916,144 | +0 |
+| `sqlite_only` (no raw statement) | 2,327,560 | 2,327,560 | +0 |
+| `pg_raw`, first version (`std.json.Value`) | 1,917,536 | 2,006,032 | +88,496 |
+| `pg_raw`, a reader of its own | 1,917,536 | 1,952,720 | +35,184 |
+| `pg_raw`, the once-only half out of the generic call | 1,917,536 | 1,948,400 | **+30,864** |
+| `sqlite_raw` | 2,326,712 | 2,337,528 | **+10,816** |
+| `pg_raw2` − `pg_raw`, what a second statement costs | 7,296 | 7,664 | +368 |
+
+**What it changed:** `std.json` went. Reading four string keys off a plan does not need a hash map per object or a float parser, and the unstripped symbol table put the new code at about 20 KB by name (the plan reader 13 KB, `outerNulls` 2.7 KB, `typeNames` 1.9 KB), the rest inlined into the call. Moving the half that runs once into a `noinline`, non-generic function is what keeps a second statement at +368.
+
+**Can it be pushed further:** yes, by a few KB. The plan reader builds a tree and walks it; a reader that answered the question in one pass over the text would drop the tree and the two lists. Not done, because what is left is paid once per program and not per statement.
+
 ## What is still missing
 
 - **A second box.** Everything here shares eight physical cores between nilo,

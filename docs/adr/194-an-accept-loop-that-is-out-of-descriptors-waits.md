@@ -86,7 +86,7 @@ sustained shortage, a fixed long one is latency under a brief one.
 - `http/engine/zio.zig`: `accept_backoff_min_ms`, `accept_backoff_max_ms`,
   the three-arm `switch` in the accept loop, `warnIfDescriptorsShort` before
   it.
-- [Deploying](../guide/deploying.md#when-a-bound-is-hit) gains a row for the
+- [Deploying](../guide/deploying.md#what-happens-at-each-limit) gains a row for the
   descriptor limit, between `max_connections` and `max_in_flight`.
 - `docs/reference/app.md`: `max_connections` names the warning.
 - Not held by a test in the suite: driving `accept` into `EMFILE` needs a

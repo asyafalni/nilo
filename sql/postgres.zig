@@ -46,6 +46,8 @@ const pg = @import("pg");
 
 const types = @import("types.zig");
 const wire = @import("wire.zig");
+/// The plan reader `describe` hands `EXPLAIN`'s answer to (ADR 233).
+const plan_reader = @import("plan.zig");
 const core = @import("nilo_core");
 
 /// A pool of connections, behind the contract in `wire.zig`.
@@ -1006,6 +1008,55 @@ pub const Wire = struct {
         return found.toOwnedSlice(arena) catch return error.QueryFailed;
     }
 
+    /// What `sql` would answer, column by column, without running it: the
+    /// type of each column, and with `nulls` whether an outer join makes it
+    /// NULL on some row (ADR 233). Asked once per raw statement per process.
+    ///
+    /// **The types come from the description a prepare answers with**, which
+    /// is what pg.zig reads before every statement it binds, so they are the
+    /// OIDs the rows would carry; one more round trip turns them into the
+    /// names `Dialect.accepts` speaks. The OIDs go into that query's text
+    /// rather than a parameter, because they are numbers the server just
+    /// sent and binding an `oid[]` is a decoder pg.zig does not have.
+    ///
+    /// **The NULLs come from the plan**, and the plan needs values for the
+    /// parameters it has none of. So the statement is prepared under a name
+    /// and explained with every parameter NULL, with `plan_cache_mode` set so
+    /// the plan is the generic one, which is the plan that holds for every
+    /// value and so the one that cannot have used a NULL to drop a join.
+    /// `SET LOCAL` needs a transaction, which is rolled back: nothing ran, so
+    /// nothing is lost. A `PREPARE` outlives a rollback, so the name is
+    /// dropped after it. Five round trips, planning only, once.
+    pub fn describe(
+        self: *Wire,
+        arena: std.mem.Allocator,
+        sql: []const u8,
+        nulls: bool,
+    ) wire.Error!?[]const wire.Described {
+        const w = self.limits.waiting();
+        defer self.limits.waited(w);
+        var conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+        defer giveBack(self.io, conn);
+
+        var oids: []const i32 = &.{};
+        var params: u16 = 0;
+        {
+            var stmt = conn.prepareOpts(sql, .{ .allocator = arena }) catch |err|
+                return translate(self.io, conn, err);
+            defer stmt.deinit();
+            oids = arena.dupe(i32, stmt.result_state.oids[0..stmt.column_count]) catch
+                return error.QueryFailed;
+            params = stmt.param_count;
+        }
+
+        const out = arena.alloc(wire.Described, oids.len) catch return error.QueryFailed;
+        for (out) |*column| column.* = .{ .udt = null };
+        if (oids.len == 0) return out;
+        try typeNames(self.io, conn, arena, oids, out);
+        if (nulls) try outerNulls(self.io, conn, arena, sql, params, out);
+        return out;
+    }
+
     /// The values an enum type has, for the same comparison. The query is
     /// `dialect.Postgres.enum_values`; an empty answer is a type that is not
     /// there, and `checkSchema` says so.
@@ -1097,6 +1148,97 @@ fn opened(values: anytype) Opened(@TypeOf(values)) {
 /// while the field is about the statement that just ran: the pool clears it
 /// on `release`, and a transaction clears it itself in `Tx.fresh`, which is
 /// where the reasoning is written down.
+/// Each OID's type name, into `out` by position. An OID the catalog does not
+/// answer for leaves its column unjudged.
+///
+/// **A domain is named by the type under it**, because that is what the
+/// driver decodes: a domain over `int4` sends an `int4`. And a type in the
+/// string category, or an enum, is marked textual, because pg.zig asks for
+/// every type it has no decoder for in binary and a string's binary form is
+/// its text.
+fn typeNames(
+    io: std.Io,
+    conn: *pg.Conn,
+    arena: std.mem.Allocator,
+    oids: []const i32,
+    out: []wire.Described,
+) wire.Error!void {
+    var text: std.ArrayList(u8) = .empty;
+    text.appendSlice(arena,
+        \\SELECT t.oid::int8, b.typname::text, b.typcategory IN ('S', 'E')
+        \\FROM pg_catalog.pg_type t
+        \\JOIN pg_catalog.pg_type b
+        \\  ON b.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype ELSE t.oid END
+        \\WHERE t.oid IN (
+    ) catch return error.QueryFailed;
+    for (oids, 0..) |oid, i| {
+        // An OID is unsigned and pg.zig reads it into an `i32`.
+        text.print(arena, "{s}{d}", .{ if (i == 0) "" else ", ", @as(u32, @bitCast(oid)) }) catch
+            return error.QueryFailed;
+    }
+    text.append(arena, ')') catch return error.QueryFailed;
+
+    const result = conn.queryOpts(text.items, .{}, .{ .allocator = arena }) catch |err|
+        return translate(io, conn, err);
+    defer result.deinit();
+    while (result.next() catch |err| return translate(io, conn, err)) |row| {
+        const oid = row.get(i64, 0) catch return error.QueryFailed;
+        const name = arena.dupe(u8, row.get([]const u8, 1) catch return error.QueryFailed) catch
+            return error.QueryFailed;
+        const textual = row.get(bool, 2) catch return error.QueryFailed;
+        for (oids, out) |asked, *column| {
+            if (@as(u32, @bitCast(asked)) == oid) column.* = .{ .udt = name, .textual = textual };
+        }
+    }
+}
+
+/// Mark in `out` the columns the generic plan of `sql` shows coming from the
+/// side of an outer join that may find nothing (`plan.zig`).
+fn outerNulls(
+    io: std.Io,
+    conn: *pg.Conn,
+    arena: std.mem.Allocator,
+    sql: []const u8,
+    params: u16,
+    out: []wire.Described,
+) wire.Error!void {
+    conn.begin() catch |err| return translate(io, conn, err);
+    var prepared = false;
+    defer {
+        conn.rollback() catch {};
+        if (prepared) _ = conn.execOpts("DEALLOCATE nilo_describe", .{}, .{}) catch {};
+    }
+    _ = conn.execOpts("SET LOCAL plan_cache_mode = force_generic_plan", .{}, .{}) catch |err|
+        return translate(io, conn, err);
+
+    const prepare = std.fmt.allocPrint(arena, "PREPARE nilo_describe AS {s}", .{sql}) catch
+        return error.QueryFailed;
+    _ = conn.execOpts(prepare, .{}, .{}) catch |err| return translate(io, conn, err);
+    prepared = true;
+
+    var explain: std.ArrayList(u8) = .empty;
+    explain.appendSlice(arena, "EXPLAIN (VERBOSE, FORMAT JSON) EXECUTE nilo_describe") catch
+        return error.QueryFailed;
+    for (0..params) |i| {
+        explain.appendSlice(arena, if (i == 0) "(NULL" else ", NULL") catch return error.QueryFailed;
+    }
+    if (params > 0) explain.append(arena, ')') catch return error.QueryFailed;
+
+    var json: std.ArrayList(u8) = .empty;
+    {
+        const result = conn.queryOpts(explain.items, .{}, .{ .allocator = arena }) catch |err|
+            return translate(io, conn, err);
+        defer result.deinit();
+        while (result.next() catch |err| return translate(io, conn, err)) |row| {
+            const piece = row.get([]const u8, 0) catch return error.QueryFailed;
+            json.appendSlice(arena, piece) catch return error.QueryFailed;
+        }
+    }
+
+    const found = plan_reader.outerNullable(arena, json.items, out.len) catch return error.QueryFailed;
+    for (out, found) |*column, is_null| column.outer_null = is_null;
+}
+
 /// Give a connection back to the pool with cancellation held off (ADR 223).
 ///
 /// Returning a connection is cleanup, and pg.zig's `release` may dial a

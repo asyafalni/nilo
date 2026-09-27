@@ -184,5 +184,5 @@ the one thing nobody runs beside its dev loop.
   "Reloading the server without a restart" and gains the upstream gap.
 - [`bench/result/build.md`](../../bench/result/build.md) carries the table
   and the machine.
-- `bench/devloop.py`: a save the build never reads must leave the server up, and a save it reads must restart it; the guide's [What a save has to touch](../guide/getting-started.md#what-a-save-has-to-touch) is the same line for a reader.
+- `bench/devloop.py`: a save the build never reads must leave the server up, and a save it reads must restart it; the guide's [What a save has to touch](../guide/getting-started.md#what-triggers-a-restart) is the same line for a reader.
 - The first build before the watch: `bench/devloop.py` makes `--inside` stale with the loop stopped and fails on a restart after the first start. Before, the server started and then restarted into the new binary; after, it started once and stayed up for the six seconds watched. A failed first build deletes the binary at the path the loop was given, which is a build output the loop owns while it runs.

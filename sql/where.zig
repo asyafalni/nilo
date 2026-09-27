@@ -59,6 +59,7 @@ const core = @import("nilo_core");
 const row_mod = @import("row.zig");
 const table_mod = @import("table.zig");
 const dialect_mod = @import("dialect.zig");
+const types = @import("types.zig");
 
 /// The field name that means OR. A Row with a column of this name is refused,
 /// because one word cannot mean both.
@@ -357,12 +358,56 @@ pub fn planScoped(
 /// column qualified by the relation the statement reads. The same text in
 /// the `SELECT` list and the `HAVING`, which is what lets a condition on
 /// `.owed` mean the number the row reports.
+///
+/// An entry with a `.where` takes it as `FILTER (WHERE …)`, with the values
+/// written in (`table.literalCondition`): the condition is part of `Shape`'s
+/// declaration, so it is the same for every statement and there is nothing
+/// to bind. Both databases take the clause, SQLite since 3.30.
 pub fn aggregateCall(
     comptime D: type,
+    comptime Shape: type,
     comptime relation: []const u8,
     comptime aggregate: row_mod.Aggregate,
 ) []const u8 {
-    return comptime aggregate.kind.call(if (aggregate.column) |c| relation ++ "." ++ D.quote(c) else null);
+    return comptime blk: {
+        const call = aggregate.kind.call(if (aggregate.column) |c| relation ++ "." ++ D.quote(c) else null);
+        if (!aggregate.filtered) break :blk call;
+        break :blk call ++ " FILTER (WHERE " ++ aggregateFilter(D, Shape, relation, aggregate).sql ++ ")";
+    };
+}
+
+/// An aggregate's `.where`, and the tables it reaches through a reference
+/// (`table.literalReaching`), which the statement joins once each.
+fn aggregateFilter(
+    comptime D: type,
+    comptime Shape: type,
+    comptime relation: []const u8,
+    comptime aggregate: row_mod.Aggregate,
+) table_mod.Reached {
+    return comptime blk: {
+        const where = @field(@field(Shape, row_mod.aggregate_marker), aggregate.field).where;
+        const what = @typeName(Shape) ++ "'s `." ++ aggregate.field ++ "` `.where`";
+        break :blk table_mod.literalReaching(D, row_mod.ownerOf(Shape), relation, table_mod.reach_prefix, what, where);
+    };
+}
+
+/// Every table the aggregates' `.where`s reach, once each and in the order
+/// they were first reached: the joins a grouped statement adds so the
+/// `FILTER`s can read them (ADR 218).
+pub fn aggregateHops(comptime D: type, comptime Shape: type, comptime relation: []const u8) []const table_mod.Hop {
+    return comptime blk: {
+        var out: []const table_mod.Hop = &.{};
+        for (row_mod.aggregatesOf(Shape)) |aggregate| {
+            if (!aggregate.filtered) continue;
+            for (aggregateFilter(D, Shape, relation, aggregate).hops) |hop| {
+                const seen = for (out) |h| {
+                    if (std.mem.eql(u8, h.alias, hop.alias)) break true;
+                } else false;
+                if (!seen) out = out ++ &[_]table_mod.Hop{hop};
+            }
+        }
+        break :blk out;
+    };
 }
 
 /// How many parameters the fragment carries. The same number as
@@ -498,6 +543,9 @@ fn entryFiltersNothing(ops: anytype) bool {
 }
 
 fn opFiltersNothing(comptime name: []const u8, value: anytype) bool {
+    // A term that may drop never reaches an `UPDATE` or a `DELETE`: the
+    // statement refuses it while compiling (`assertNothingDroppable`).
+    if (comptime givenValue(@TypeOf(value)) != null) return false;
     if (comptime listSpelling(name)) |op| {
         // An empty `in` matches no row, which narrows as far as it goes.
         if (op == .in) return false;
@@ -686,6 +734,14 @@ fn walk(
                         if (state.phase == .groups) continue;
                         break :term parentTerm(D, Shape, f.name, f.type, path, state);
                     },
+                    .over_children => {
+                        if (state.phase == .groups) continue;
+                        break :term overChildrenTerm(D, Shape, f.name, f.type, path, state);
+                    },
+                    .through => {
+                        if (state.phase == .groups) continue;
+                        break :term throughTerm(D, Shape, f.name, f.type, path, state);
+                    },
                     .children => row_mod.noSuchColumn(Shape, f.name, "a condition"),
                     .column, .beside => {},
                 };
@@ -694,10 +750,40 @@ fn walk(
                 if (std.mem.eql(u8, f.name, exists_field)) break :term existsOf(D, Row, f.type, path, state, false);
                 if (std.mem.eql(u8, f.name, not_exists_field)) break :term existsOf(D, Row, f.type, path, state, true);
                 if (std.mem.eql(u8, f.name, across_field)) break :term acrossOf(D, Row, f.type, path, state);
-                if (!row_mod.hasColumn(Row, f.name)) {
+                // A narrower Row may be narrowed by a column of its table it
+                // does not carry, as it may be ordered by one: the statement
+                // reads the table, and the condition is about the table's
+                // rows. The column's name and type are the owner's, and so is
+                // the type its value is bound as. A field the Row carries
+                // beside its columns keeps its own refusal: the name means
+                // that field to whoever reads the Row.
+                const Column = if (row_mod.hasColumn(Row, f.name))
+                    Row
+                else if (row_mod.fieldTypeOf(Row, f.name) == null and row_mod.tableHasColumn(Row, f.name))
+                    row_mod.ownerOf(Row)
+                else
                     row_mod.noSuchColumn(Row, f.name, "a condition");
+                // `.due_date = .today`: the database's clock, compared with
+                // `=`, and nothing bound. Read here rather than in `condition`,
+                // which is handed the type and not the struct the word sits in.
+                if (f.type == @TypeOf(.enum_literal)) {
+                    if (clockWord(D, Column, f.name, fieldValue(W, f.name), "`." ++ f.name ++ " = ." ++
+                        @tagName(fieldValue(W, f.name)) ++ "`")) |clock|
+                    {
+                        break :term state.qualifier ++ D.quote(f.name) ++ " = " ++ clock;
+                    }
                 }
-                break :term condition(D, Row, f.name, f.type, path, state);
+                if (isShiftShape(f.type)) {
+                    const shift = clockShifted(D, Column, f.name, f.type, fieldValue(W, f.name), "`." ++
+                        f.name ++ " = .{ ." ++ @typeInfo(f.type).@"struct".fields[0].name ++ " = … }`").?;
+                    break :term state.qualifier ++ D.quote(f.name) ++ " = " ++ shift;
+                }
+                if (Column == Row) break :term condition(D, Row, f.name, f.type, path, state);
+                const held = state.inner;
+                state.inner = Column;
+                const widened = condition(D, Column, f.name, f.type, path, state);
+                state.inner = held;
+                break :term widened;
             };
             if (term.len == 0) continue;
             out = out ++ (if (out.len == 0) "" else " AND ") ++ term;
@@ -848,7 +934,58 @@ fn groupTerm(
         const was_inner = state.inner;
         // The qualifier here is the grouped relation's, because a term on the
         // groups is only ever written at the top of the walk.
-        state.spelled = aggregateCall(D, state.outer, aggregate);
+        state.spelled = aggregateCall(D, Shape, state.outer, aggregate);
+        state.inner = Shape;
+        const term = condition(D, Shape, name, T, path, state);
+        state.spelled = was_spelled;
+        state.inner = was_inner;
+        return term;
+    }
+}
+
+/// `.customer_name = "Acme"` on a Row that reads the name through a
+/// reference (item 83): the joined column in place of the field, the way
+/// `parentTerm` writes a parent's, and the joins it needs reached so a count
+/// adds them.
+fn throughTerm(
+    comptime D: type,
+    comptime Shape: type,
+    comptime name: []const u8,
+    comptime T: type,
+    comptime path: Path,
+    comptime state: *State,
+) []const u8 {
+    comptime {
+        const reached = @import("shape.zig").throughOf(D, Shape, name, state.outer, state.alias, false);
+        state.reach(reached.alias);
+        const was_spelled = state.spelled;
+        const was_inner = state.inner;
+        state.spelled = reached.read;
+        state.inner = Shape;
+        const term = condition(D, Shape, name, T, path, state);
+        state.spelled = was_spelled;
+        state.inner = was_inner;
+        return term;
+    }
+}
+
+/// `.line_count = .{ .gt = 0 }` on a Row that counts its children, or reads
+/// a `.max` or `.min` over them: the subquery in place of the column
+/// (ADR 218), the way `groupTerm` puts an aggregate's call there. Correlated
+/// with `state.outer`, which is the relation at the top of the walk and a
+/// parent's alias inside one.
+fn overChildrenTerm(
+    comptime D: type,
+    comptime Shape: type,
+    comptime name: []const u8,
+    comptime T: type,
+    comptime path: Path,
+    comptime state: *State,
+) []const u8 {
+    comptime {
+        const was_spelled = state.spelled;
+        const was_inner = state.inner;
+        state.spelled = @import("shape.zig").overChildrenCall(D, Shape, name, state.outer);
         state.inner = Shape;
         const term = condition(D, Shape, name, T, path, state);
         state.spelled = was_spelled;
@@ -959,13 +1096,6 @@ fn oneExists(
             "nilo: an entry of `." ++ word ++ "` does not say `.in`.\n" ++
                 "  That is the Row the matching row would be over.\n" ++ shape,
         );
-        if (!@hasField(T, "where")) @compileError(
-            "nilo: an entry of `." ++ word ++ "` does not say `.where`.\n" ++
-                "  Without one it asks whether the other table has any row joined to " ++
-                "this one at all, which the join column already answers — and answers " ++
-                "without a subquery.\n" ++ shape,
-        );
-
         const Child = @FieldType(T, "in");
         if (Child != type) @compileError(
             "nilo: `." ++ word ++ "`'s `.in` is a " ++ @typeName(Child) ++ ".\n" ++
@@ -992,6 +1122,24 @@ fn oneExists(
         );
 
         const link = correlation(Outer, Inner, T, word);
+        var joined: []const u8 = "";
+        for (link.inner, link.outer) |mine, theirs| {
+            joined = joined ++ (if (joined.len == 0) "" else " AND ") ++
+                inner_rel ++ "." ++ D.quote(mine) ++ " = " ++
+                outer_rel ++ "." ++ D.quote(theirs);
+        }
+        const opening = (if (negate) "NOT EXISTS (SELECT 1 FROM " else "EXISTS (SELECT 1 FROM ") ++
+            inner_rel ++ " WHERE " ++ joined;
+
+        // **With no `.where` it asks whether any row over there points at
+        // this one** (item 107): "the Org Units no Deal points at". That has
+        // no other spelling when the key is the inner Row's. When it is this
+        // Row's own, the key column already says it, and the subquery would
+        // be the long way round.
+        if (!@hasField(T, "where")) {
+            if (!link.points_back) keyOnThisSide(Outer, Inner, link, negate, word, "says no `.where`");
+            return opening ++ ")";
+        }
 
         // The walk inside the subquery names the other table and the other
         // Row. Saved and put back, so a second entry beside this one is walked
@@ -1045,21 +1193,19 @@ fn oneExists(
                 "there.",
         );
 
-        if (inside.len == 0) @compileError(
-            "nilo: an entry of `." ++ word ++ "` has an empty `.where`.\n" ++
-                "  An empty condition matches every row of " ++ @typeName(Inner) ++ ", so " ++
-                "the test asks only whether one is joined to this row — which the join " ++
-                "column answers without a subquery.",
-        );
-
-        var joined: []const u8 = "";
-        for (link.inner, link.outer) |mine, theirs| {
-            joined = joined ++ (if (joined.len == 0) "" else " AND ") ++
-                inner_rel ++ "." ++ D.quote(mine) ++ " = " ++
-                outer_rel ++ "." ++ D.quote(theirs);
+        // One spelling for "any row pointing back": the entry without a
+        // `.where`, so an empty one is refused either way.
+        if (inside.len == 0) {
+            if (!link.points_back) keyOnThisSide(Outer, Inner, link, negate, word, "has an empty `.where`");
+            @compileError(
+                "nilo: an entry of `." ++ word ++ "` over " ++ @typeName(Inner) ++ " has an empty `.where`.\n" ++
+                    "  An empty condition matches every row, so the test asks whether any row of " ++
+                    @typeName(Inner) ++ " points at this one. That is the entry without a `.where`: " ++
+                    "leave it out.",
+            );
         }
-        const test_sql = (if (negate) "NOT EXISTS (SELECT 1 FROM " else "EXISTS (SELECT 1 FROM ") ++
-            inner_rel ++ " WHERE " ++ joined ++ " AND " ++ inside ++ ")";
+
+        const test_sql = opening ++ " AND " ++ inside ++ ")";
         if (droppable == 0) return test_sql;
         // The guard the terms inside did not write, around the whole test.
         // Nested inside another `.exists` it belongs to that one instead, and
@@ -1067,6 +1213,31 @@ fn oneExists(
         // reason `guarded` gives.
         if (was_group) return test_sql;
         return guarded(D, test_sql, guard);
+    }
+}
+
+/// An `.exists` that asks only whether the row a key of this Row points at
+/// is there: the key column answers it without a subquery, and a foreign key
+/// is what makes the two the same answer.
+fn keyOnThisSide(
+    comptime Outer: type,
+    comptime Inner: type,
+    comptime link: Link,
+    comptime negate: bool,
+    comptime word: []const u8,
+    comptime said: []const u8,
+) noreturn {
+    comptime {
+        const instead = if (link.outer.len == 1)
+            "`." ++ link.outer[0] ++ (if (negate) " = null`" else " = .{ .ne = null }`")
+        else
+            "a condition on those columns";
+        @compileError(
+            "nilo: an entry of `." ++ word ++ "` over " ++ @typeName(Inner) ++ " " ++ said ++
+                ", and the key is " ++ @typeName(Outer) ++ "'s own " ++ nameList(link.outer) ++ ".\n" ++
+                "  Without a condition it asks only whether the row that key points at is " ++
+                "there, and " ++ instead ++ " asks that without a subquery.",
+        );
     }
 }
 
@@ -1175,7 +1346,8 @@ fn oneAcross(
         for (info.fields) |f| {
             if (std.mem.eql(u8, f.name, across_columns)) continue;
             if (spelling(f.name) == null and patternSpelling(f.name) == null and
-                listSpelling(f.name) == null and nullSafeSpelling(f.name) == null)
+                listSpelling(f.name) == null and nullSafeSpelling(f.name) == null and
+                foldedSpelling(f.name) == null)
             {
                 @compileError(
                     "nilo: an entry of `.across` sets `." ++ f.name ++ "`, which is not an operator.\n" ++
@@ -1302,6 +1474,10 @@ fn nameList(comptime columns: []const []const u8) []const u8 {
 const Link = struct {
     inner: []const []const u8,
     outer: []const []const u8,
+    /// Whether the key is the inner Row's, pointing back at the outer one.
+    /// Only then does an `.exists` with no `.where` ask something the outer
+    /// row cannot answer by itself (item 107).
+    points_back: bool,
 };
 
 /// The join, taken from a `.references` on either Row — the child's, pointing
@@ -1335,7 +1511,7 @@ fn correlation(
             if (!std.mem.eql(u8, ref.table, outer_q.table)) continue;
             if (!table_mod.sameSchema(ref.schema, outer_q.schema)) continue;
             named = named ++ (if (found.len == 0) "" else ", ") ++ nameList(ref.columns);
-            found = found ++ &[_]Link{.{ .inner = ref.columns, .outer = ref.targets }};
+            found = found ++ &[_]Link{.{ .inner = ref.columns, .outer = ref.targets, .points_back = true }};
         }
         // The parent direction: a column of Outer that points at Inner.
         var back: []const Link = &.{};
@@ -1344,7 +1520,7 @@ fn correlation(
             if (!std.mem.eql(u8, ref.table, inner_q.table)) continue;
             if (!table_mod.sameSchema(ref.schema, inner_q.schema)) continue;
             back_named = back_named ++ (if (back.len == 0) "" else ", ") ++ nameList(ref.columns);
-            back = back ++ &[_]Link{.{ .inner = ref.targets, .outer = ref.columns }};
+            back = back ++ &[_]Link{.{ .inner = ref.targets, .outer = ref.columns, .points_back = false }};
         }
 
         if (@hasField(T, "on") and @hasField(T, "via")) @compileError(
@@ -1384,7 +1560,7 @@ fn correlation(
                     "  Declare the foreign key: `.references = .{ ." ++ wanted ++ " = .{ " ++
                     @typeName(Outer) ++ ", .<column> } }`.",
             );
-            return .{ .inner = &.{wanted}, .outer = &.{outer_keys[0]} };
+            return .{ .inner = &.{wanted}, .outer = &.{outer_keys[0]}, .points_back = true };
         }
 
         if (@hasField(T, "via")) {
@@ -1412,7 +1588,7 @@ fn correlation(
                     "  Declare the foreign key: `.references = .{ ." ++ wanted ++ " = .{ " ++
                     @typeName(Inner) ++ ", .<column> } }`.",
             );
-            return .{ .inner = &.{inner_keys[0]}, .outer = &.{wanted} };
+            return .{ .inner = &.{inner_keys[0]}, .outer = &.{wanted}, .points_back = false };
         }
 
         if (found.len == 0 and back.len == 0) @compileError(
@@ -1479,6 +1655,157 @@ fn fieldValue(comptime T: type, comptime field: []const u8) blk: {
     }
 }
 
+/// **The database's clock, as a word**: `.now` on a `sql.Timestamp` column and
+/// `.today` on a `sql.Date` one, the expression the database evaluates in
+/// place of a value. Null when the word is neither, and on a column whose type
+/// is an enum, where `.now` is that enum's value as it always was.
+///
+/// **A column read as text takes the word its column type does**:
+/// `sql.AsText("date")` takes `.today` and `sql.AsText("timestamptz")` takes
+/// `.now`, because the database writes the value either way and the Zig type
+/// only decides how it comes back. On SQLite, where `.now` is otherwise a
+/// number of microseconds, a text column gets `D.now_text`.
+///
+/// Read by a `.set` (`statement.zig`) and by a condition, so the start-date
+/// stamp is one statement: `.set = .{ .start_date = .today }` where
+/// `.start_date = .{ .gt = .today }`. `.now` is `D.now_default`, the
+/// expression a `.default` of `.now` puts in the schema. `.today` is
+/// `CURRENT_DATE`, which both databases spell the same: a `date` on Postgres,
+/// in the session's time zone, and the ten characters a `Date` is stored as on
+/// SQLite, in UTC.
+///
+/// `said` is how the caller wrote it, for the message that refuses the word on
+/// a column it does not fit.
+pub fn clockWord(
+    comptime D: type,
+    comptime Row: type,
+    comptime column: []const u8,
+    comptime word: @TypeOf(.enum_literal),
+    comptime said: []const u8,
+) ?[]const u8 {
+    comptime {
+        return switch (clockOf(Row, column, word, said) orelse return null) {
+            .moment => D.now_default,
+            .moment_text => D.now_text,
+            .day => "CURRENT_DATE",
+        };
+    }
+}
+
+/// Which clock `word` is on `column`: a moment the column stores as a
+/// `Timestamp`, one it stores as text, or a day. Null when the word is not a
+/// clock word, or the column is an enum whose value it is. The refusal for a
+/// word on a column it does not fit is here, so a shifted clock
+/// (`clockShifted`) is refused in the same words.
+fn clockOf(
+    comptime Row: type,
+    comptime column: []const u8,
+    comptime word: @TypeOf(.enum_literal),
+    comptime said: []const u8,
+) ?dialect_mod.Clock {
+    comptime {
+        const name = @tagName(word);
+        const now = std.mem.eql(u8, name, "now");
+        const today = std.mem.eql(u8, name, "today");
+        if (!now and !today) return null;
+        const F = row_mod.ColumnType(Row, column);
+        const C = switch (@typeInfo(F)) {
+            .optional => |o| o.child,
+            else => F,
+        };
+        if (@typeInfo(C) == .@"enum") return null;
+        if (now and C == types.Timestamp) return .moment;
+        if (today and C == types.Date) return .day;
+        const text = if (C != types.Timestamp and C != types.Date) types.asText(C) else null;
+        const moment = if (text) |t| isMomentColumn(t) else false;
+        const day = if (text) |t| std.ascii.eqlIgnoreCase(t, "date") else false;
+        if (now and moment) return .moment_text;
+        if (today and day) return .day;
+        @compileError(
+            "nilo: " ++ said ++ " on " ++ @typeName(Row) ++ ", whose `" ++ column ++ "` is " ++
+                (if (text) |t| "a `" ++ t ++ "` column read as text" else @typeName(F)) ++ ".\n" ++
+                (if (now)
+                    "  `.now` is the moment the statement runs, so it goes in a `sql.Timestamp` " ++
+                        "or a `sql.AsText(\"timestamptz\")`." ++
+                        (if (C == types.Date or day) " A date takes `.today`." else "")
+                else
+                    "  `.today` is the day the statement runs, so it goes in a `sql.Date` " ++
+                        "or a `sql.AsText(\"date\")`." ++
+                        (if (C == types.Timestamp or moment) " A timestamp takes `.now`." else "")),
+        );
+    }
+}
+
+/// `.{ .today = -90 }` and `.{ .now = .{ .days = -90 } }`: the database's
+/// clock moved by a number written out, for "in the last ninety days"
+/// (item 105). The offset is in the text, spelled by the Dialect, and nothing
+/// is bound, so the boundary is the database's day in the database's time
+/// zone, which is the reason `.today` exists. Null when `V` is not one of
+/// the two shapes.
+///
+/// `.today` moves by days and takes the number itself; `.now` takes one of
+/// `.days`, `.hours`, `.minutes` or `.seconds`, because a bare number of a
+/// moment would leave the unit to be guessed.
+pub fn clockShifted(
+    comptime D: type,
+    comptime Row: type,
+    comptime column: []const u8,
+    comptime V: type,
+    comptime written: V,
+    comptime said: []const u8,
+) ?[]const u8 {
+    comptime {
+        const info = switch (@typeInfo(V)) {
+            .@"struct" => |st| st,
+            else => return null,
+        };
+        if (info.is_tuple or info.fields.len != 1) return null;
+        const name = info.fields[0].name;
+        const today = std.mem.eql(u8, name, "today");
+        if (!today and !std.mem.eql(u8, name, "now")) return null;
+        const word = if (today) .today else .now;
+        const clock = clockOf(Row, column, word, said).?;
+        const by = @field(written, name);
+        if (today) {
+            if (@typeInfo(@TypeOf(by)) != .comptime_int and @typeInfo(@TypeOf(by)) != .int) @compileError(
+                "nilo: " ++ said ++ " moves `.today` by a " ++ @typeName(@TypeOf(by)) ++ ".\n" ++
+                    "  `.today` moves by whole days, written as a number: `.{ .today = -90 }`.",
+            );
+            return D.shiftedClock(clock, by, .days);
+        }
+        const unit_info = switch (@typeInfo(@TypeOf(by))) {
+            .@"struct" => |st| st,
+            else => @compileError(
+                "nilo: " ++ said ++ " moves `.now` by a " ++ @typeName(@TypeOf(by)) ++ ".\n" ++
+                    "  A moment moves by a unit that says what it is: " ++
+                    "`.{ .now = .{ .days = -90 } }`, or `.hours`, `.minutes`, `.seconds`.",
+            ),
+        };
+        if (unit_info.fields.len != 1) @compileError(
+            "nilo: " ++ said ++ " moves `.now` by " ++
+                std.fmt.comptimePrint("{d}", .{unit_info.fields.len}) ++ " units.\n" ++
+                "  Name one: `.{ .now = .{ .days = -90 } }`, or `.hours`, `.minutes`, `.seconds`.",
+        );
+        const unit_name = unit_info.fields[0].name;
+        const unit = std.meta.stringToEnum(dialect_mod.ClockUnit, unit_name) orelse @compileError(
+            "nilo: " ++ said ++ " moves `.now` by `." ++ unit_name ++ "`, which is not a unit it takes.\n" ++
+                "  They are `.days`, `.hours`, `.minutes` and `.seconds`.",
+        );
+        return D.shiftedClock(clock, @field(by, unit_name), unit);
+    }
+}
+
+/// Whether a column type named in text is a moment: `.now` is one whatever the
+/// spelling Postgres accepts for it.
+fn isMomentColumn(comptime t: []const u8) bool {
+    comptime {
+        for ([_][]const u8{ "timestamptz", "timestamp", "timestamp with time zone", "timestamp without time zone" }) |name| {
+            if (std.ascii.eqlIgnoreCase(t, name)) return true;
+        }
+        return false;
+    }
+}
+
 fn condition(
     comptime D: type,
     comptime Row: type,
@@ -1521,7 +1848,8 @@ fn condition(
             var out: []const u8 = "";
             for (ops, 0..) |op, i| {
                 if (i > 0) out = out ++ " AND ";
-                out = out ++ operator(D, Row, column, quoted, op, path, state);
+                out = out ++ (clockTerm(D, Row, column, quoted, T, op) orelse
+                    operator(D, Row, column, quoted, op, path, state));
             }
             return out;
         }
@@ -1531,6 +1859,48 @@ fn condition(
             row_mod.ColumnType(Row, column),
             false,
         );
+    }
+}
+
+/// `.{ .gt = .today }`: a comparison against the database's clock
+/// (`clockWord`), or null for every operator and value that is not one. Only
+/// the six comparisons take it; a list, a pattern and a null-safe comparison
+/// have no clock to be compared with.
+fn clockTerm(
+    comptime D: type,
+    comptime Row: type,
+    comptime column: []const u8,
+    comptime quoted: []const u8,
+    comptime T: type,
+    comptime op: Operator,
+) ?[]const u8 {
+    comptime {
+        const spelled = spelling(op.name) orelse return null;
+        if (std.mem.indexOf(u8, spelled, "LIKE") != null) return null;
+        if (op.T != @TypeOf(.enum_literal)) {
+            if (!isShiftShape(op.T)) return null;
+            const shift = clockShifted(D, Row, column, op.T, fieldValue(T, op.name), "`." ++ column ++
+                " = .{ ." ++ op.name ++ " = .{ ." ++ @typeInfo(op.T).@"struct".fields[0].name ++ " = … } }`").?;
+            return quoted ++ " " ++ spelled ++ " " ++ shift;
+        }
+        const word = fieldValue(T, op.name);
+        const clock = clockWord(D, Row, column, word, "`." ++ column ++ " = .{ ." ++ op.name ++
+            " = ." ++ @tagName(word) ++ " }`") orelse return null;
+        return quoted ++ " " ++ spelled ++ " " ++ clock;
+    }
+}
+
+/// Whether `V` is written as a clock moved by an offset, `.{ .today = … }` or
+/// `.{ .now = … }`: one field of that name and nothing else.
+pub fn isShiftShape(comptime V: type) bool {
+    comptime {
+        const info = switch (@typeInfo(V)) {
+            .@"struct" => |st| st,
+            else => return false,
+        };
+        if (info.is_tuple or info.fields.len != 1) return false;
+        const name = info.fields[0].name;
+        return std.mem.eql(u8, name, "today") or std.mem.eql(u8, name, "now");
     }
 }
 
@@ -1577,6 +1947,7 @@ fn operatorsOf(comptime T: type) ?[]const Operator {
             if (listSpelling(f.name) != null) continue;
             if (nullSafeSpelling(f.name) != null) continue;
             if (patternSpelling(f.name) != null) continue;
+            if (foldedSpelling(f.name) != null) continue;
             return null;
         }
         var out: [info.fields.len]Operator = undefined;
@@ -1703,6 +2074,27 @@ fn patternSpelling(comptime name: []const u8) ?PatternOp {
     }
 }
 
+/// **Equality that ignores case**: `.ieq`, and `.not_ieq` so the leaf keeps
+/// its negation ([ADR 052](../docs/adr/052-a-set-operation-over-one-table-is-a-condition.md)).
+/// The answer is whether the operator negates.
+///
+/// **It is written as the lookup a `.unique` that ignores case serves**, which
+/// is the reason it exists rather than `.ilike`: that unique is an index on
+/// `lower(…)` on Postgres and a `COLLATE NOCASE` one on SQLite
+/// (`dialect.foldedColumn`), and a plain `=` uses neither. So both sides go
+/// through the same `foldedColumn` the index was built with, and the planner
+/// sees the expression it indexed. `.ilike` would fold case too and read an
+/// `_` in an email address as a wildcard; `.icontains` escapes it and matches
+/// a substring. The upsert Refusal on a folded unique sends people here
+/// ([ADR 151](../docs/adr/151-a-key-is-named-once.md)).
+fn foldedSpelling(comptime name: []const u8) ?bool {
+    comptime {
+        if (std.mem.eql(u8, name, "ieq")) return false;
+        if (std.mem.eql(u8, name, "not_ieq")) return true;
+        return null;
+    }
+}
+
 /// A pattern operator compares text against text, and both halves are checked.
 ///
 /// The column, because `"age" LIKE …` is a comparison Postgres will make by
@@ -1720,15 +2112,15 @@ fn assertTextPattern(
         if (!isText(F)) @compileError(
             "nilo: `." ++ column ++ " = .{ ." ++ op ++ " = … }` on " ++ @typeName(Row) ++
                 ", whose `" ++ column ++ "` is " ++ @typeName(F) ++ ".\n" ++
-                "  A pattern matches text. On a column holding something else the " ++
+                "  `." ++ op ++ "` compares text. On a column holding something else the " ++
                 "database casts it to text first, which compares the digits it happens " ++
                 "to print rather than the value.",
         );
         if (!isText(Value) and Value != @TypeOf(.enum_literal)) @compileError(
             "nilo: `." ++ column ++ " = .{ ." ++ op ++ " = … }` was given a " ++
                 @typeName(Value) ++ ".\n" ++
-                "  The pattern is built out of the text handed in, so what goes here is " ++
-                "text — a `Str` from the request, or a `[]const u8`.",
+                "  It is compared as text, so what goes here is text — a `Str` from the " ++
+                "request, or a `[]const u8`.",
         );
     }
 }
@@ -1792,15 +2184,10 @@ fn operator(
                     "for `sql.given` to drop.\n" ++
                     "  Write `." ++ column ++ " = .{ ." ++ op.name ++ " = maybe }`.",
             );
-            if (listSpelling(op.name)) |list_op| @compileError(
-                "nilo: the condition on `" ++ column ++ "` (as `" ++ op.name ++
-                    "`) was given a `sql.given`.\n" ++
-                    "  `" ++ op.name ++ "` takes a list, and a list that may be absent is " ++
-                    "the empty list — which `" ++ op.name ++ "` already reads as " ++
-                    (if (list_op == .in) "*no row matches*" else "*every row matches*") ++
-                    ".\n" ++
-                    "  Pass an empty slice, or branch.",
-            );
+            // A list is no exception (ADR 149). A filter bar's multi-select
+            // asks two questions: absent is *no filter*, and a list is *these*.
+            // An empty list keeps meaning what `.in` says it means, and null
+            // drops the term the way it does for one value.
             const n = state.next;
             const was = state.dropping;
             state.dropping = true;
@@ -1830,6 +2217,18 @@ fn operator(
             );
             return D.pattern(quoted, bound, pat.shape, pat.fold, pat.negate) orelse
                 dialect_mod.noPatternForm(D, column, op.name, pat.folding);
+        }
+
+        // Both sides folded the way the index over the column was, so the
+        // lookup a `.unique` that ignores case exists for can use it.
+        if (foldedSpelling(op.name)) |negate| {
+            assertTextPattern(Row, column, op.name, op.T);
+            const bound = D.bindAs(
+                D.placeholder(state.take(path, .{ .column = column })),
+                row_mod.ColumnType(Row, column),
+                false,
+            );
+            return D.foldedColumn(quoted) ++ (if (negate) " <> " else " = ") ++ D.foldedColumn(bound);
         }
 
         if (listSpelling(op.name)) |list_op| {
@@ -2120,6 +2519,32 @@ test "ilike on sqlite is spelled LIKE, and not_ilike NOT LIKE, for the same reas
     try testing.expectEqualStrings("\"email\" ILIKE $1", sqlOf(.{ .email = .{ .ilike = "%@B.com" } }));
 }
 
+test "ieq folds both sides the way a unique that ignores case was built, on both databases" {
+    // `lower(…)` is the expression the Postgres index is over, so a lookup
+    // written this way is one the index serves; `= $1` would not be.
+    try testing.expectEqualStrings(
+        "lower(\"email\") = lower($1)",
+        sqlOf(.{ .email = .{ .ieq = @as([]const u8, "Ana@Example.com") } }),
+    );
+    try testing.expectEqualStrings(
+        "lower(\"email\") <> lower($1)",
+        sqlOf(.{ .email = .{ .not_ieq = @as([]const u8, "Ana@Example.com") } }),
+    );
+    const Lite = dialect_mod.SQLite;
+    try testing.expectEqualStrings(
+        "\"email\" COLLATE NOCASE = ?1 COLLATE NOCASE",
+        comptime plan(Lite, User, @TypeOf(.{ .email = .{ .ieq = @as([]const u8, "a") } }), 1).sql,
+    );
+    // It takes a `sql.given` the way a pattern does: the lookup box that may
+    // be empty.
+    try testing.expectEqualStrings(
+        "(lower(\"email\") = lower($1) OR $1 IS NULL)",
+        sqlOf(.{ .email = .{ .ieq = given(@as(?[]const u8, null)) } }),
+    );
+    // An underscore is a character here, not the wildcard `.ilike` would read.
+    try testing.expect(!filtersNothing(.{ .email = .{ .ieq = @as([]const u8, "") } }));
+}
+
 // -- a row over there ----------------------------------------------------
 
 const Partner = struct {
@@ -2299,6 +2724,23 @@ test "not_exists is the same subquery with two words in front" {
         } }),
         "NOT EXISTS (SELECT 1 FROM \"partner_capabilities\"",
     ));
+}
+
+test "an exists with no where asks whether any row points back, and is the one spelling of it" {
+    // Item 107: "the Partners no capability row points at". The key is the
+    // inner Row's, so nothing on the outer row says it.
+    try testing.expectEqualStrings(
+        "NOT EXISTS (SELECT 1 FROM \"partner_capabilities\"" ++
+            " WHERE \"partner_capabilities\".\"partner_id\" = \"partners\".\"id\")",
+        partnerSql(.{ .not_exists = .{.{ .in = Capability }} }),
+    );
+    // Beside a condition of its own, and numbered with it.
+    const p = comptime plan(Pg, Partner, @TypeOf(.{
+        .exists = .{.{ .in = Capability }},
+        .name = @as([]const u8, "acme"),
+    }), 1);
+    try testing.expectEqual(@as(usize, 1), p.params.len);
+    try testing.expect(std.mem.endsWith(u8, p.sql, "\"partners\".\"id\") AND \"name\" = $1"));
 }
 
 test "an exists nests inside any, because it is a condition like any other" {
@@ -2629,6 +3071,31 @@ test "an operator takes one too, and the fixed terms beside it are untouched" {
     try testing.expect(p.params[0].droppable);
     try testing.expect(!p.params[1].droppable);
     try testing.expectEqualStrings("value", p.paths[0][p.paths[0].len - 1]);
+}
+
+test "a list that may be absent drops its term, and an empty one still means what in means" {
+    // Item 81: a multi-select on a filter bar is absent (*no filter*) or a
+    // list (*these*), and the refusal that stood here read the first as the
+    // empty list, which `.in` answers with no rows (ADR 149).
+    const p = comptime plan(Pg, User, @TypeOf(.{
+        .id = .{ .in = given(@as(?[]const i64, null)) },
+        .age = .{ .not_in = given(@as(?[]const i32, null)) },
+    }), 1);
+    try testing.expectEqualStrings(
+        "(\"id\" = ANY($1) OR $1 IS NULL) AND (\"age\" <> ALL($2) OR $2 IS NULL)",
+        p.sql,
+    );
+    try testing.expect(p.params[0].list and p.params[0].droppable and p.params[0].nullable);
+    try testing.expectEqualStrings("value", p.paths[0][p.paths[0].len - 1]);
+
+    // SQLite reads the list out of one JSON parameter, and `json_each(NULL)`
+    // is no rows, which the guard beside it never has to ask about.
+    try testing.expectEqualStrings(
+        "(\"id\" IN (SELECT value FROM json_each(?1)) OR ?1 IS NULL)",
+        comptime plan(dialect_mod.SQLite, User, @TypeOf(.{
+            .id = .{ .in = given(@as(?[]const i64, null)) },
+        }), 1).sql,
+    );
 }
 
 test "one condition over several columns is one parameter, and the guard goes around the bracket" {

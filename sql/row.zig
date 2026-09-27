@@ -248,6 +248,13 @@ pub const Kind = enum {
     /// Named in `nilo_aggregate`: a count, a sum, a minimum over the rows of
     /// the group.
     aggregate,
+    /// Named in `nilo_children` with a `.count`, a `.max` or a `.min`: a
+    /// figure over the rows of another table that point at this one, read in
+    /// the same statement by a subquery.
+    over_children,
+    /// Named in `nilo_through`: a column of another table, reached through
+    /// a reference and read flat into a field of this Row (item 83).
+    through,
 };
 
 /// The declaration that makes a Row grouped
@@ -257,6 +264,47 @@ pub const Kind = enum {
 /// pub const nilo_aggregate = .{ .objects = .count, .owed = .{ .sum = .principal } };
 /// ```
 pub const aggregate_marker = "nilo_aggregate";
+
+/// The declaration that says what a Row reads of the rows pointing back at
+/// it, past the list itself: an order and a condition for a children field,
+/// or a count in place of one
+/// ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+///
+/// ```zig
+/// pub const nilo_children = .{
+///     .lines = .{ .order = .{ .position = .asc }, .where = .{ .state = .{ .ne = .void } } },
+///     .line_count = .{ .count = Line },
+/// };
+/// ```
+pub const children_marker = "nilo_children";
+
+/// The declaration that reads a column of another table into a field of its
+/// own, through the reference that reaches it (item 83):
+///
+/// ```zig
+/// pub const nilo_through = .{
+///     .customer_name = .{ .customer_id, .name },
+///     .customer_kind = .{ .org_unit_id, .customer_id, .kind },
+/// };
+/// ```
+///
+/// Every name but the last is a column with a `.references` of that one
+/// column, followed from the table before it; the last is a column of the
+/// table reached. **What it adds over a parent is the spelling and nothing
+/// else**: a parent is a nested object in a response, and a response whose
+/// contract is flat (`customerName`, not `customer: { name }`) had to copy
+/// it into a second struct by hand. The join, the condition and the order go
+/// the way a parent's do.
+///
+/// A row the path does not reach reads null, unless the entry says otherwise
+/// (item 109): `.otherwise` is what it reads instead, and `.join = .inner`
+/// leaves the row out.
+///
+/// ```zig
+/// .tracks_range = .{ .path = .{ .kind_id, .tracks_range }, .otherwise = false },
+/// .deal_name = .{ .path = .{ .deal_id, .name }, .join = .inner },
+/// ```
+pub const through_marker = "nilo_through";
 
 /// The declaration that says which reference a parent or children field
 /// follows, when the schema declares more than one between the two tables.
@@ -275,6 +323,11 @@ pub const Aggregate = struct {
     field: []const u8,
     kind: dialect_mod.Aggregate,
     column: ?[]const u8,
+    /// Whether the entry carries a `.where`, which only narrows the rows this
+    /// one aggregate reads: `sum(…) FILTER (WHERE …)`. The condition itself
+    /// is read off the declaration by `where.aggregateCall`, which has the
+    /// table to check it against and this file does not.
+    filtered: bool = false,
 };
 
 /// What `name` is on `Row`. A name that is not a field answers `.column`, so
@@ -294,6 +347,8 @@ pub fn kindWith(comptime Row: type, comptime name: []const u8, comptime T: type)
         // Row written before ADR 218, answers from the type alone.
         if (@hasDecl(Row, beside_marker) and isBeside(Row, name)) break :blk .beside;
         if (@hasDecl(Row, aggregate_marker) and aggregateNamed(Row, name)) break :blk .aggregate;
+        if (@hasDecl(Row, children_marker) and overChildrenNamed(Row, name)) break :blk .over_children;
+        if (@hasDecl(Row, through_marker) and throughNamed(Row, name)) break :blk .through;
         if (parentRowOf(T) != null) break :blk .parent;
         if (childRowOf(T) != null) break :blk .children;
         break :blk .column;
@@ -309,6 +364,185 @@ fn aggregateNamed(comptime Row: type, comptime name: []const u8) bool {
         .@"struct" => |s| !s.is_tuple and @hasField(D, name),
         else => false,
     };
+}
+
+/// Whether `nilo_children` has an entry for `name` that computes over the
+/// rows pointing back: a struct with a `.count`, a `.max` or a `.min` in it.
+/// Asked of the types alone, the way `aggregateNamed` is; `shape.zig` says
+/// what is wrong with an entry of any other shape.
+fn overChildrenNamed(comptime Row: type, comptime name: []const u8) bool {
+    const D = @TypeOf(@field(Row, children_marker));
+    switch (@typeInfo(D)) {
+        .@"struct" => |s| if (s.is_tuple or !@hasField(D, name)) return false,
+        else => return false,
+    }
+    const E = @FieldType(D, name);
+    return switch (@typeInfo(E)) {
+        .@"struct" => |s| !s.is_tuple and
+            (@hasField(E, "count") or @hasField(E, "max") or @hasField(E, "min")),
+        else => false,
+    };
+}
+
+/// Whether `nilo_through` has an entry for `name`, asked of the types alone.
+fn throughNamed(comptime Row: type, comptime name: []const u8) bool {
+    const D = @TypeOf(@field(Row, through_marker));
+    return switch (@typeInfo(D)) {
+        .@"struct" => |s| !s.is_tuple and @hasField(D, name),
+        else => false,
+    };
+}
+
+/// One `nilo_through` entry, read (items 83 and 109).
+pub const ThroughEntry = struct {
+    /// The reference columns to follow, then the column read at the end.
+    path: []const []const u8,
+    /// `.join = .inner`: every hop is an inner join, so a row the path does
+    /// not reach is not read at all.
+    inner: bool,
+    /// Whether the entry says `.otherwise`, what a row the path does not
+    /// reach, or whose column is null, reads as. The value is read off the
+    /// declaration by `shape.zig`, which has the column to write it for.
+    otherwise: bool,
+};
+
+/// The words a `nilo_through` entry takes past its path.
+const through_words = [_][]const u8{ "path", "join", "otherwise" };
+
+/// A `nilo_through` entry: the path alone, `.{ .customer_id, .name }`, or
+/// the path with what a row it does not reach reads as,
+/// `.{ .path = .{ .kind_id, .tracks_range }, .otherwise = false }` or
+/// `.{ .path = .{ .deal_id, .name }, .join = .inner }`.
+pub fn throughEntry(comptime Row: type, comptime name: []const u8) ThroughEntry {
+    comptime {
+        const entry = @field(@field(Row, through_marker), name);
+        const E = @TypeOf(entry);
+        const head = "nilo: " ++ @typeName(Row) ++ "'s " ++ through_marker ++ " `." ++ name ++ "`";
+        const shape = "  It is the reference columns to follow and the column to read at the end: `." ++
+            name ++ " = .{ .customer_id, .name }`, or `.{ .org_unit_id, .customer_id, .kind }` " ++
+            "through two. Written as `.{ .path = .{ … }, .otherwise = <value> }` it also says " ++
+            "what a row the path does not reach reads as, and `.join = .inner` in place of " ++
+            "`.otherwise` leaves that row out.";
+        const info = switch (@typeInfo(E)) {
+            .@"struct" => |st| st,
+            else => @compileError(head ++ " is a " ++ @typeName(E) ++ ".\n" ++ shape),
+        };
+        if (info.is_tuple) return .{ .path = pathOf(head, shape, entry), .inner = false, .otherwise = false };
+
+        for (info.fields) |f| {
+            for (through_words) |w| {
+                if (std.mem.eql(u8, f.name, w)) break;
+            } else @compileError(
+                head ++ " says `." ++ f.name ++ "`, which it does not take.\n" ++
+                    "  It takes `.path`, and `.otherwise` or `.join = .inner`.",
+            );
+        }
+        if (!@hasField(E, "path")) @compileError(head ++ " says no `.path`.\n" ++ shape);
+        const P = @TypeOf(entry.path);
+        const path_ok = switch (@typeInfo(P)) {
+            .@"struct" => |st| st.is_tuple,
+            else => false,
+        };
+        if (!path_ok) @compileError(head ++ "'s `.path` is a " ++ @typeName(P) ++ ".\n" ++ shape);
+        var inner = false;
+        if (@hasField(E, "join")) {
+            if (@TypeOf(entry.join) != @TypeOf(.enum_literal) or
+                !std.mem.eql(u8, @tagName(entry.join), "inner")) @compileError(
+                head ++ " says `.join = " ++ (if (@TypeOf(entry.join) == @TypeOf(.enum_literal))
+                    "." ++ @tagName(entry.join)
+                else
+                    "<" ++ @typeName(@TypeOf(entry.join)) ++ ">") ++ "`.\n" ++
+                    "  The one it takes is `.inner`, which leaves out a row the path does not " ++
+                    "reach. Without it the join is outer wherever a reference may be null.",
+            );
+            inner = true;
+        }
+        return .{ .path = pathOf(head, shape, entry.path), .inner = inner, .otherwise = @hasField(E, "otherwise") };
+    }
+}
+
+fn pathOf(comptime head: []const u8, comptime shape: []const u8, comptime path: anytype) []const []const u8 {
+    comptime {
+        if (@typeInfo(@TypeOf(path)).@"struct".fields.len < 2) @compileError(
+            head ++ " names one column, and reaches no other table.\n" ++ shape,
+        );
+        var out: []const []const u8 = &.{};
+        for (path) |step| {
+            if (@TypeOf(step) != @TypeOf(.enum_literal)) @compileError(
+                head ++ " holds a " ++ @typeName(@TypeOf(step)) ++ ".\n" ++ shape,
+            );
+            out = out ++ &[_][]const u8{@tagName(step)};
+        }
+        return out;
+    }
+}
+
+/// The names a `nilo_through` entry walks: the reference columns, then the
+/// column read at the end.
+pub fn throughPath(comptime Row: type, comptime name: []const u8) []const []const u8 {
+    return comptime throughEntry(Row, name).path;
+}
+
+/// What a `nilo_children` entry computes over the rows pointing back.
+pub const OverChildren = struct {
+    /// The Row whose table points back at this one.
+    Child: type,
+    /// `count`, `max` or `min`.
+    word: []const u8,
+    /// The column of `Child`'s table a `.max` or `.min` reads; null for a
+    /// count, which counts rows.
+    column: ?[]const u8,
+};
+
+/// The entry a figure over the rows pointing back is read from:
+/// `.{ .count = Line }`, `.{ .max = .{ Line, .shipped_on } }`, or `.min`
+/// the same way. One of the three words; a `.max` or `.min` names the Row
+/// and its column together, as a `.references` names a table and its key.
+pub fn overChildrenOf(comptime Row: type, comptime name: []const u8) OverChildren {
+    comptime {
+        const entry = @field(@field(Row, children_marker), name);
+        const E = @TypeOf(entry);
+        const head = "nilo: " ++ @typeName(Row) ++ "'s " ++ children_marker ++ " `." ++ name ++ "`";
+        var said: usize = 0;
+        for ([_][]const u8{ "count", "max", "min" }) |w| {
+            if (@hasField(E, w)) said += 1;
+        }
+        if (said > 1) @compileError(
+            head ++ " says more than one of `.count`, `.max` and `.min`.\n" ++
+                "  One field is one figure. Give each its own field and entry.",
+        );
+        if (@hasField(E, "count")) {
+            const counted = entry.count;
+            if (@TypeOf(counted) != type or !isRow(counted)) @compileError(
+                head ++ " counts over a " ++ @typeName(@TypeOf(counted)) ++ ".\n" ++
+                    "  A count names the Row whose table points back at this one: `." ++ name ++
+                    " = .{ .count = Line }`.",
+            );
+            return .{ .Child = counted, .word = "count", .column = null };
+        }
+        const word = if (@hasField(E, "max")) "max" else "min";
+        const pair = @field(entry, word);
+        const P = @TypeOf(pair);
+        const shape = "  A `." ++ word ++ "` names the Row whose table points back and the column it " ++
+            "reads, the way a `.references` names a table and its key: `." ++ name ++ " = .{ ." ++
+            word ++ " = .{ Line, .shipped_on } }`.";
+        const ok = switch (@typeInfo(P)) {
+            .@"struct" => |st| st.is_tuple and st.fields.len == 2,
+            else => false,
+        };
+        if (!ok) @compileError(head ++ " gives `." ++ word ++ "` a " ++ @typeName(P) ++ ".\n" ++ shape);
+        const Child = pair[0];
+        if (@TypeOf(Child) != type or !isRow(Child)) @compileError(
+            head ++ " reads its `." ++ word ++ "` over a " ++ @typeName(@TypeOf(Child)) ++ ".\n" ++ shape,
+        );
+        if (@TypeOf(pair[1]) != @TypeOf(.enum_literal)) @compileError(
+            head ++ " names its `." ++ word ++ "` column with a " ++ @typeName(@TypeOf(pair[1])) ++ ".\n" ++ shape,
+        );
+        const column = @tagName(pair[1]);
+        const Owner = ownerOf(Child);
+        if (!hasColumn(Owner, column)) noSuchColumn(Owner, column, "`." ++ name ++ "`'s `." ++ word ++ "`");
+        return .{ .Child = Child, .word = word, .column = column };
+    }
 }
 
 /// Whether `name` is one of the Row's columns rather than anything else a
@@ -377,7 +611,7 @@ pub fn isShaped(comptime Row: type) bool {
         if (@hasDecl(Row, aggregate_marker)) break :blk true;
         for (@typeInfo(Row).@"struct".fields) |f| {
             switch (kindWith(Row, f.name, f.type)) {
-                .parent, .children => break :blk true,
+                .parent, .children, .over_children, .through => break :blk true,
                 else => {},
             }
         }
@@ -396,7 +630,8 @@ pub fn isGrouped(comptime Row: type) bool {
 pub fn isTally(comptime Row: type) bool {
     return comptime isGrouped(Row) and
         fieldsOfKind(Row, .column).len == 0 and
-        fieldsOfKind(Row, .parent).len == 0;
+        fieldsOfKind(Row, .parent).len == 0 and
+        fieldsOfKind(Row, .through).len == 0;
 }
 
 /// The entries of `nilo_aggregate`, in the order they were written. Empty for
@@ -462,7 +697,8 @@ fn aggregateSpec(comptime Row: type, comptime field: []const u8, comptime said: 
         const S = @TypeOf(said);
         const words = "`.count`, `.{ .count = .<column> }`, `.{ .count_distinct = .<column> }`, " ++
             "`.{ .sum = .<column> }`, `.{ .min = .<column> }`, `.{ .max = .<column> }` or " ++
-            "`.{ .avg = .<column> }`";
+            "`.{ .avg = .<column> }`, each but the first with a `.where` beside it if it " ++
+            "reads only some of the rows";
         if (S == @TypeOf(.enum_literal)) {
             if (said == .count) return .{ .field = field, .kind = .count, .column = null };
             @compileError(
@@ -479,11 +715,21 @@ fn aggregateSpec(comptime Row: type, comptime field: []const u8, comptime said: 
                     "` a " ++ @typeName(S) ++ ".\n  It is " ++ words ++ ".",
             ),
         };
-        if (info.is_tuple or info.fields.len != 1) @compileError(
+        // A `.where` beside the computation narrows what it reads, and is the
+        // one other name an entry may carry.
+        const filtered = !info.is_tuple and @hasField(S, "where");
+        if (filtered and info.fields.len == 1) @compileError(
+            "nilo: " ++ @typeName(Row) ++ "'s " ++ aggregate_marker ++ " gives `." ++ field ++
+                "` a `.where` and nothing to compute.\n" ++
+                "  The condition narrows a computation: `.{ .sum = .principal, .where = .{ .currency = \"IDR\" } }`. " ++
+                "Rows that match are counted by naming a column that is never null: " ++
+                "`.{ .count = .id, .where = … }`.",
+        );
+        if (info.is_tuple or info.fields.len != @as(usize, if (filtered) 2 else 1)) @compileError(
             "nilo: " ++ @typeName(Row) ++ "'s " ++ aggregate_marker ++ " gives `." ++ field ++
                 "` more than one computation.\n  One field holds one answer: " ++ words ++ ".",
         );
-        const word = info.fields[0].name;
+        const word = if (std.mem.eql(u8, info.fields[0].name, "where")) info.fields[1].name else info.fields[0].name;
         const kind = std.meta.stringToEnum(dialect_mod.Aggregate, word) orelse @compileError(
             "nilo: " ++ @typeName(Row) ++ "'s " ++ aggregate_marker ++ " asks `." ++ field ++
                 "` for `." ++ word ++ "`, which is not one it computes.\n  It is " ++ words ++
@@ -495,7 +741,7 @@ fn aggregateSpec(comptime Row: type, comptime field: []const u8, comptime said: 
                 "`'s `." ++ word ++ "` a " ++ @typeName(@TypeOf(column)) ++ ".\n" ++
                 "  It names a column of the table, written as one: `.{ ." ++ word ++ " = .principal }`.",
         );
-        return .{ .field = field, .kind = kind, .column = @tagName(column) };
+        return .{ .field = field, .kind = kind, .column = @tagName(column), .filtered = filtered };
     }
 }
 
@@ -640,9 +886,11 @@ pub fn keysOf(comptime Row: type) []const []const u8 {
                     "  Write `.key = .<column>` alongside `.name`, or " ++
                     "`.key = .{ .<column>, .<column> }` when it takes two.",
             );
+            if (unreadType(Row, "id") != null) unreadKey(Row, "id");
             break :blk &[_][]const u8{"id"};
         };
         for (named) |column| {
+            if (unreadType(Row, column) != null) unreadKey(Row, column);
             if (isBeside(Row, column)) @compileError(
                 "nilo: " ++ @typeName(Row) ++ "'s key names `" ++ column ++ "`, which it " ++
                     "carries beside its columns.\n" ++
@@ -658,6 +906,16 @@ pub fn keysOf(comptime Row: type) []const []const u8 {
         }
         break :blk named;
     };
+}
+
+/// A key has to be read: `db.find` hands back the row it found, and
+/// `insert`'s `RETURNING` and a children field hand rows out by it.
+fn unreadKey(comptime Row: type, comptime column: []const u8) noreturn {
+    @compileError(
+        "nilo: " ++ @typeName(Row) ++ "'s key is `" ++ column ++ "`, which its `.unread` declares.\n" ++
+            "  A key is what a row is found and handed out by, so the Row that names the " ++
+            "table reads it. Make it a field.",
+    );
 }
 
 /// The one column that identifies a row, for the callers that can only mean
@@ -787,7 +1045,7 @@ pub fn Borrowed(comptime Row: type) type {
                 // before this type is ever built. Kept so the refusal is the
                 // one the caller meets rather than one about this struct.
                 .children => f.type,
-                .column, .aggregate => borrowedType(f.type),
+                .column, .aggregate, .over_children, .through => borrowedType(f.type),
             };
         }
         const frozen_names = names;
@@ -815,21 +1073,108 @@ fn borrowedType(comptime T: type) type {
     }
 }
 
-/// Whether `Row` reads a column by that name. The one question the where
+/// Whether `Row` has a column by that name: one it reads, or, on the Row that
+/// names its table, one its `.unread` declares. The one question the where
 /// walker asks, and the one that turns a typo into a Refusal.
 pub fn hasColumn(comptime Row: type, comptime column: []const u8) bool {
     return comptime blk: {
-        if (fieldTypeOf(Row, column) == null) break :blk false;
+        if (fieldTypeOf(Row, column) == null) break :blk unreadType(Row, column) != null;
         break :blk isColumnField(Row, column);
     };
 }
 
-/// The type `Row` reads a column into.
+/// A column the table has and the Row that names it does not read: its name
+/// and the Zig type it would be read into.
+pub const Unread = struct { name: [:0]const u8, T: type };
+
+/// **The columns the Row that names its table declares and does not read**
+/// (item 102):
+///
+/// ```zig
+/// pub const nilo_table = .{
+///     .name = "deals",
+///     .default = .{ .created_at = .now },
+///     .unread = .{ .created_at = sql.Timestamp, .updated_at = sql.Timestamp },
+/// };
+/// ```
+///
+/// A Row that names its table is also, as often as not, the response, and a
+/// field is a key of the JSON it writes. So a column the response has no
+/// reason to show had nowhere to be said except a second, wider Row, and a
+/// narrower Row could not order or narrow by it. An unread column is a column
+/// of the table to everything that asks `hasColumn` and `ColumnType`: the
+/// schema and the migration diff, `db.checking`, a `.default`, an index, a
+/// `.where`, an `.order` and a `.set` on this Row or any Row that borrows it,
+/// and a narrower Row that reads it. It is in no `SELECT` list of this Row, and
+/// an insert of this Row cannot write it, so one that is not optional needs a
+/// `.default` or `.filled`.
+pub fn unreadOf(comptime Row: type) []const Unread {
+    comptime {
+        if (!hasUnread(Row)) return &.{};
+        const written = @field(Row, marker).unread;
+        const W = @TypeOf(written);
+        const head = "nilo: " ++ @typeName(Row) ++ "'s `.unread`";
+        const shape = "  It names the columns the table has and this Row does not read, each " ++
+            "with the type it would be read as: `.unread = .{ .created_at = sql.Timestamp }`.";
+        const info = switch (@typeInfo(W)) {
+            .@"struct" => |st| if (st.is_tuple) @compileError(head ++ " is a tuple.\n" ++ shape) else st,
+            else => @compileError(head ++ " is a " ++ @typeName(W) ++ ".\n" ++ shape),
+        };
+        var out: []const Unread = &.{};
+        for (info.fields) |f| {
+            if (f.type != type) @compileError(
+                head ++ " gives `." ++ f.name ++ "` a " ++ @typeName(f.type) ++ ".\n" ++ shape,
+            );
+            if (fieldTypeOf(Row, f.name) != null) @compileError(
+                head ++ " names `" ++ f.name ++ "`, which " ++ @typeName(Row) ++ " reads.\n" ++
+                    "  A column is read or unread. Take it out of one of them.",
+            );
+            out = out ++ &[_]Unread{.{ .name = f.name, .T = @field(written, f.name) }};
+        }
+        return out;
+    }
+}
+
+/// The type `.unread` declares for `column`, or null when it does not.
+pub fn unreadType(comptime Row: type, comptime column: []const u8) ?type {
+    comptime {
+        if (!hasUnread(Row)) return null;
+        for (unreadOf(Row)) |u| {
+            if (std.mem.eql(u8, u.name, column)) return u.T;
+        }
+        return null;
+    }
+}
+
+/// Whether `Row` names its table and says `.unread`: asked of the marker's
+/// type, so a Row that borrows a table or is a projection answers no.
+fn hasUnread(comptime Row: type) bool {
+    comptime {
+        if (!@hasDecl(Row, marker)) return false;
+        const M = @TypeOf(@field(Row, marker));
+        return @typeInfo(M) == .@"struct" and @hasField(M, "unread");
+    }
+}
+
+/// Whether the table `Row` reads has a column by that name, whether or not
+/// `Row` carries it: the owner's columns, for a narrower Row. What `.order`
+/// asks, because a tiebreak the response does not show is still a column the
+/// statement can sort by. A projection owns no table and answers only for
+/// itself.
+pub fn tableHasColumn(comptime Row: type, comptime column: []const u8) bool {
+    return comptime blk: {
+        const Owner = ownerOf(Row);
+        break :blk hasColumn(Owner, column);
+    };
+}
+
+/// The type `Row` reads a column into, or the one its `.unread` declares.
 pub fn ColumnType(comptime Row: type, comptime column: []const u8) type {
     comptime {
         for (@typeInfo(Row).@"struct".fields) |f| {
             if (std.mem.eql(u8, f.name, column)) return f.type;
         }
+        if (unreadType(Row, column)) |T| return T;
         @compileError("nilo: " ++ @typeName(Row) ++ " has no column `" ++ column ++ "`.");
     }
 }
@@ -893,6 +1238,18 @@ pub fn noSuchColumn(
                     "  It is computed over each group, so it can be sorted by and filtered on from " ++
                     "`.order` and `.where`, and from nowhere that reads one row at a time.",
             ),
+            .over_children => @compileError(
+                "nilo: `" ++ wrong ++ "` on " ++ @typeName(Row) ++ " is computed over the rows pointing " ++
+                    "back, asked for in " ++ what ++ ".\n" ++
+                    "  It is computed by a subquery, so it can be sorted by and filtered on from " ++
+                    "`.order` and `.where` of a read, and from nowhere else.",
+            ),
+            .through => @compileError(
+                "nilo: `" ++ wrong ++ "` on " ++ @typeName(Row) ++ " is a column of another table, read " ++
+                    "through a reference, asked for in " ++ what ++ ".\n" ++
+                    "  It can be sorted by and filtered on from `.order` and `.where` of a read. It is " ++
+                    "written through the table that holds it.",
+            ),
             .column, .beside => {},
         };
         const head = "nilo: " ++ @typeName(Row) ++ " has no column `" ++ wrong ++
@@ -940,7 +1297,7 @@ const Spec = struct {
 const allowed = [_][]const u8{
     "name",    "key",        "unique", "index",
     "default", "references", "was",    "managed",
-    "check",   "trigger",    "filled",
+    "check",   "trigger",    "filled", "unread",
 };
 
 /// The table spec `Row` resolves to, following `nilo_table = OtherRow` until
@@ -997,6 +1354,7 @@ pub fn ownerOf(comptime Row: type) type {
                 continue;
             }
             assertDescribesItsTable(current);
+            _ = unreadOf(current);
             return current;
         }
         @compileError(
@@ -1046,7 +1404,7 @@ fn readSpec(comptime Row: type, comptime decl: anytype) Spec {
                     "`, which is not part of it.\n" ++
                     "  It takes `.name`, and `.key` when the identity column is not " ++
                     "`id`. The words a migration reads are `.unique`, `.index`, " ++
-                    "`.default`, `.references`, `.was`, `.check` and `.trigger`; " ++
+                    "`.default`, `.references`, `.was`, `.check`, `.trigger` and `.unread`; " ++
                     "everything else about the table is SQL in a step, which nilo " ++
                     "will not touch.",
             );
@@ -1128,7 +1486,7 @@ fn assertDescribesItsTable(comptime Row: type) void {
                     what ++ ".\n" ++ narrower,
             );
         }
-        for ([_][]const u8{ aggregate_marker, via_marker }) |decl| {
+        for ([_][]const u8{ aggregate_marker, via_marker, children_marker, through_marker }) |decl| {
             if (@hasDecl(Row, decl)) @compileError(
                 "nilo: " ++ @typeName(Row) ++ " names its table and says `" ++ decl ++ "`.\n" ++ narrower,
             );

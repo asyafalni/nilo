@@ -11,9 +11,11 @@ one view, one hypertable and 113 rows of reference data. A Zig port
 (`backend-zig/`) has been serving the same API on nilo for some time, with every
 context Row declared `.managed = false` (ADR 130) and checked at boot.
 
-Two rounds so far. The first, against **v0.4.0** at `eb545fa`, filed ten
+Three rounds so far. The first, against **v0.4.0** at `eb545fa`, filed ten
 findings; nilo answered nine of them in ADRs 180, 181 and 123. The second re-did
-the whole port on `636d7b6` and found three more. This file is what is still
+the whole port on `636d7b6` and found three more. The third read every raw
+statement of the port against the query surface of v0.6.0 at `de37265` and
+filed items 81–94, which have [a section of their own](#the-query-surface-items-8194). This file is what is still
 open, with the settled items kept to a paragraph each at the end so a number
 cited from an ADR or a commit still resolves. The files are under
 `nodeflux-os/backend-zig/src/schema/` and `nodeflux-os/backend-zig/migrations/`,
@@ -65,6 +67,69 @@ same reason — nilo has to write something in the middle:
   hash is chained onto the one before it. One case writes nothing and says so:
   `--baseline` rewriting a version 1 whose `before` or `after` hold hand-written
   steps, since those are Zig nothing has compiled yet.
+
+---
+
+## The query surface, items 81–94
+
+Filed in `nodeflux-os/docs/nilo-feedback.md` from reading all 171 raw call
+sites of the port against ADR 218, `rawPage` and `rawExactlyOne`. The numbers
+are that file's, so an item cited from either side resolves. Answered on the
+branch `sql-improvements`.
+
+| # | Finding | Status |
+|---|---|---|
+| 81 | `sql.given` on `.in`: an absent list filter is not an empty one | Done, [ADR 149](./adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md). Null drops the term, a present empty list is still the list. |
+| 82 | `rawPage` takes no `{order}` hole | Done, [ADR 205](./adr/205-a-raw-statement-can-carry-its-total.md), as `db.rawPageOrdered`. |
+| 83 | A parent cannot be spelled flat on the wire | Done, [ADR 235](./adr/235-a-column-of-another-table-may-be-read-flat.md): `nilo_through = .{ .deal_name = .{ .deal_id, .name } }`, a field that is a column of another table. The path is reference columns rather than a parent field, and the JSON is flat because the Row is; the HTTP module is not involved. |
+| 84 | `.ieq` is named in a refusal and is not an operator | Done, [ADR 181](./adr/181-the-marker-has-two-kinds-of-word.md) and [ADR 052](./adr/052-a-set-operation-over-one-table-is-a-condition.md): `.ieq` and `.not_ieq`, the expression an `.ignoring_case` unique indexes. |
+| 85 | An aggregate cannot carry a filter | Done, [ADR 218](./adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md): a `.where` on the entry is `FILTER (WHERE …)`, and follows a `.references` into the row it points at, joined once. |
+| 86 | A narrower Row cannot be ordered by a column it does not carry | Done, [ADR 218](./adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md). Refused on a grouped Row, by name. |
+| 87 | Children: an order, a condition, and a count | Done, [ADR 218](./adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md), as `nilo_children`: `.order` and `.where` on a list, and `.{ .count = C }` read by a correlated subquery. |
+| 88 | A `numeric` that is not money, read as `f64` | Answered in the documentation, the answer the item said was enough: a `Quantity` column type in [the tables guide](./guide/sql/tables.md#a-numeric-that-is-not-money), and a line in [decided](./decided.md). |
+| 89 | An aggregate over a product of two columns | Not an ask. Stays `db.raw`, written down in ADR 218's *What is still refused*. |
+| 90 | No `INNER JOIN` over a nullable reference | Not an ask. `?P` with `.{ .ne = null }` in the condition stands. |
+| 91 | The date, not only the instant, and a column on the right of a condition | `.today` done, [ADR 181](./adr/181-the-marker-has-two-kinds-of-word.md), in `.set` and in a condition. A column on the right, the larger ask, is not taken up. |
+| 92 | Docs: `.exists` through a column no reference covers | Done: the reference and the guide say `.via` names such a column. |
+| 93 | A slow query, from the route down to the plan | Done: `sql.Sent.route` ([ADR 108](./adr/108-a-statement-can-be-watched.md)) and `db.explain` ([ADR 232](./adr/232-a-read-can-show-its-plan.md)); a raw statement already had a plan name, and only the doc said otherwise. Open: a stable name for a statement whose `ORDER BY` a `sql.Ordering` chose, and counts per statement on the metrics page. |
+| 94 | Where the bugs are now: the statements nilo tells us to write raw | **Done.** The first time a raw statement runs, each column's type and whether an outer join can leave it NULL are asked of the database and held against the Row: a failed statement in a test binary, a warning in a server. Types are held to what pg.zig will decode, so `count(*)` into an `i32` is caught; the NULLs are read off the generic plan, so the feed's `LEFT JOIN LATERAL` into a field that is not optional is caught, and a `WHERE` that throws the NULLs away is not. Not inside a transaction ([ADR 233](adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)). |
+
+## The second round, items 95–99
+
+Filed after the port built against the branch above.
+
+| # | Finding | Status |
+|---|---|---|
+| 95 | A `*_nulls_*` order through a narrower Row did not compile | Fixed: an order term through a parent, on an aggregate, or on a children field says where the nulls go. |
+| 96 | `.order` may name a column a narrower Row does not carry, and `.where` may not | Done, [ADR 218](./adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md): a condition names one too, bound as the table's column type. |
+| 97 | A page past the last row says the total is zero | Fixed, [ADR 150](./adr/150-a-page-knows-what-it-left-out.md) and [ADR 205](./adr/205-a-raw-statement-can-carry-its-total.md). A typed page sends one `db.count`; a raw page asks the same statement again from row one, which needs its `OFFSET` to be one placeholder. |
+| 98 | `db.explain` covers typed reads only | Done, [ADR 232](./adr/232-a-read-can-show-its-plan.md): `db.rawExplain` and `db.rawExplainOrdered`, rolled back. The ADR says only structural assertions survive a tiny database. |
+| 99 | `.today` needs `sql.Date`, and every date here is `sql.AsText("date")` | Done, [ADR 181](./adr/181-the-marker-has-two-kinds-of-word.md): `.today` on `AsText("date")`, `.now` on `AsText("timestamptz")`. |
+
+## The third round, items 100–106
+
+Filed against `20478da`.
+
+| # | Finding | Status |
+|---|---|---|
+| 100 | A child count cannot filter through a reference, and children have no `max` | Done, [ADR 218](./adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md): every `nilo_children` entry's `.where` follows a reference, joined inside a figure's subquery or into a list's statement, and `.{ .max = .{ C, .col } }` and `.min` sit beside `.count`, into a `?` of the column's type. The Row is named with the column because a column alone does not say which table it is on. |
+| 101 | An aggregate's `.where` two references away | Already worked; the reference now says the way nests, and an outer join anywhere on it makes the rest outer. |
+| 102 | An uncarried column has to be declared on the table's Row, and that Row is the response | Done, [ADR 234](./adr/234-a-table-row-may-declare-a-column-it-does-not-read.md): `.unread = .{ .created_at = sql.Timestamp }` in the marker, the second of the two shapes asked for. The first, a column only the live table knows, was refused: its type would be known only at run time. |
+| 103 | `find` wants the key carried, `one` with the key in `.where` does not | Done: `db.find` on a Row that leaves the key out reads it with the key in `.where`, bound as the table's column type. |
+| 104 | An aggregate's `.where` refuses a typed slice, and the message blames a string | Fixed: a value of the column's own enum is the word, so `&finished` is taken; another enum's value is refused with a message about how the words are written. |
+| 105 | A date relative to the database's clock | Done, [ADR 181](./adr/181-the-marker-has-two-kinds-of-word.md): `.{ .today = -90 }` and `.{ .now = .{ .days = -90 } }` in a condition, an aggregate's `.where` and a `nilo_children` entry's. |
+| 106 | `insertOrUpdate` writes every column it was handed, the key included | Already so: the update half never writes the key or the conflict target, and a test says it. The reference now says it too. |
+
+## The fourth round, items 107–110
+
+Filed against `bf70c93`.
+
+| # | Finding | Status |
+|---|---|---|
+| 107 | `.not_exists` with no `.where` is refused, and the reason holds in one direction only | Done, [ADR 218](./adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md): with the key on the inner Row the entry needs no `.where`. With the key on this Row it is still refused, and the message names the column that says it. `.where = .{}` stays refused, as the same entry spelled twice. |
+| 108 | `db.raw` cannot read into a Row with `nilo_through` | Done: a raw statement refuses only a parent or children, and fills a through field, an aggregate or a count by position like any column. |
+| 109 | A through read cannot say what a missing row reads as | Done, [ADR 235](./adr/235-a-column-of-another-table-may-be-read-flat.md): `.{ .path = .{ … }, .otherwise = false }` is a `COALESCE` everywhere the field is named, and `.join = .inner` leaves the row out, the count included. `.required` as a last word of the path was not taken, because a column may be called that. |
+| 110 | A `numeric` read as a JSON number | Already answered by item 88: a `Quantity` column type in [the tables guide](./guide/sql/tables.md#a-numeric-that-is-not-money), one per column type. No new API. |
 
 ---
 
@@ -376,7 +441,7 @@ reimbursement tables have no Row outside the schema module at all), but it
 changes the JSON those Rows serialise to, which is the contract the Go API
 still serves. So `src/schema/` stays for now, 3,444 lines, and its header
 says why. The migration path is one context at a time, which is what the
-by-name `.references` was for. This is ours to do, not nilo's.
+by-name `.references` was for. This is ours to do, not nilo's. Since [ADR 234](./adr/234-a-table-row-may-declare-a-column-it-does-not-read.md) those 8 can declare the two columns in `.unread`, which keeps them in the table and out of the JSON.
 
 ---
 

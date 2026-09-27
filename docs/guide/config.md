@@ -1,9 +1,12 @@
 # Settings
 
-`nilo_config` reads a struct of your own out of the environment, before
-anything opens. It is a module of its own: no event loop, no allocator, and it
-opens no file
-([ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)).
+**`nilo_config` reads your own settings struct out of the environment before anything opens, and names every bad setting at once.**
+
+**Reference:** [`nilo_config`](../reference/config.md#nilo_config), [a `.env`](../reference/config.md#a-env) · **Design:** [Layering](../design/layering.md) (config is one of its single-ADR topics)
+
+`nilo_config` is a module of its own: no event loop, no allocator, and it opens no file ([ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)).
+
+## Declaring the settings
 
 <!-- compiles -->
 ```zig
@@ -17,12 +20,9 @@ const Settings = struct {
 };
 ```
 
-The field name upper-cased is the variable: `database_url` is read from
-`DATABASE_URL`. A field is text, a number, a `bool`, an enum, or any of those
-wrapped in `?` — anything else is a compile error naming the field.
+The variable name is the field name in upper case: `database_url` is read from `DATABASE_URL`. A field can be text, a number, a `bool`, an enum, or any of those wrapped in `?`. Anything else is a compile error naming the field.
 
-**Every bad setting is named at once**, which is the whole point of reading them
-into a struct rather than one at a time:
+**Every bad setting is reported at once.** That is the reason to read them into a struct rather than one at a time:
 
 ```
 3 settings could not be read from the environment:
@@ -31,12 +31,9 @@ into a struct rather than one at a time:
   LOG_LEVEL has to be one of debug, info, warn, not "verbose"
 ```
 
-## The whole of a real `main`
+## A complete `main`
 
-Two things here need an `std.Io`, and the loop that will supply one does not
-exist yet — `listen()` is further down the same function. **The `Io` you need is
-already an argument to `main`.** That is `std.process.Init`, it is Zig's rather
-than nilo's, and it is what makes both of these three lines instead of thirty:
+**Reading settings needs an `std.Io`, and `main` already receives one through `std.process.Init`.** Two things here need an `Io`, and the event loop that would supply one does not exist yet: `listen()` comes further down the same function. `std.process.Init` is Zig's, not nilo's, and it turns both of these into three lines instead of thirty:
 
 <!-- compiles -->
 ```zig
@@ -83,44 +80,28 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-Four things in there are worth saying out loud, because each was rediscovered
-the hard way by an application written against this page before it existed:
+Four things in it are worth spelling out, because an application written before this page existed had to discover each one the hard way:
 
-- **`main` takes `std.process.Init`.** That is where `io` comes from, and where
-  `environ` comes from. Standing up a `std.Io.Threaded` of your own for the
-  length of one 98-byte read works and is nine lines you do not need.
-- **The text has to outlive the settings.** A `[]const u8` field points into it,
-  exactly as it points into the environment block. Free it after the server
-  stops, or never.
-- **`report` takes a `*std.Io.Writer`**, and stderr's is
-  `std.Io.File.stderr().writer(io, &buf)` — the `.interface` field is the
-  writer, and it has to be flushed. A fixed buffer works too
-  (`std.Io.Writer.fixed(&buf)` and `std.debug.print`) but it puts a ceiling on a
-  report whose length is however many settings are wrong.
-- **`file.report` is a separate call from `read.report`.** They answer different
-  questions: one is lines in the file that are not settings at all, the other is
-  settings that would not convert. A clean file writes nothing.
+- **`main` takes `std.process.Init`.** That is where `io` and `environ` come from. Setting up a `std.Io.Threaded` of your own for one 98-byte read works, and is nine lines you do not need.
+- **The text has to outlive the settings.** A `[]const u8` field points into it, just as it points into the environment block. Free it after the server stops, or never.
+- **`report` takes a `*std.Io.Writer`.** For stderr that is `std.Io.File.stderr().writer(io, &buf)`: the `.interface` field is the writer, and it has to be flushed. A fixed buffer works too (`std.Io.Writer.fixed(&buf)` and `std.debug.print`), but it limits the length of a report that grows with the number of wrong settings.
+- **`file.report` is a separate call from `read.report`.** They report different things: the first, lines in the file that are not settings at all; the second, settings that could not be converted. A clean file writes nothing.
 
-## What a `.env` may hold
+## `.env` file syntax
 
-`Dotenv` takes text rather than a path, which is what keeps the module free of
-IO ([ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)).
+**`Dotenv` reads a simple, strict subset of the `.env` format, and takes text rather than a path.** Taking text is what keeps the module free of IO ([ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)).
 
-It reads `NAME=value`, blank lines, `#` comments on their own line, `'` and `"`
-quoting, an optional `export ` prefix, and CRLF. It **refuses** escapes,
-multi-line values, `${OTHER}` interpolation, and a comment after a value — so
-`PASSWORD=abc#123` arrives intact, and `PORT=8080 # the port` says
+It reads `NAME=value`, blank lines, `#` comments on their own line, `'` and `"` quoting, an optional `export ` prefix, and CRLF. It **rejects** escapes, multi-line values, `${OTHER}` interpolation, and a comment after a value. So `PASSWORD=abc#123` arrives intact, and `PORT=8080 # the port` reports
 
 ```
 PORT has to be a whole number, not "8080 # the port"
 ```
 
-rather than guessing which half you meant. **A report never quotes a value**,
-because a `.env` is where a password lives.
+rather than guessing which half you meant. **A report never quotes a value that came from the `.env`**, because a `.env` is where passwords live.
 
-## Where the settings then live
+## Using the settings in handlers
 
-A Config is an ordinary struct, so it is an ordinary service:
+**A settings struct is an ordinary struct, so it is an ordinary service:**
 
 ```zig
 try app.provide(&settings);
@@ -130,9 +111,4 @@ fn verbosity(cfg: *const Settings) []const u8 {
 }
 ```
 
-`*const Settings` in a handler's arguments is the whole wiring. (A route
-that says whether the server is *ready* is not this — it is
-[`app.health`](./deploying.md#knowing-whether-it-is-ready), which asks the
-services rather than the settings.) See
-[Services](./services.md) for what else that slot takes, and
-[the reference](../reference/config.md#nilo_config) for the rest of the API.
+`*const Settings` in a handler's arguments is all the wiring there is. (A route that says whether the server is *ready* is a different thing: that is [`app.health`](./deploying.md#health-checks), which asks the services rather than the settings.) See [Services](./services.md) for what else a handler argument like this can take, and [the reference](../reference/config.md#nilo_config) for the rest of the API.

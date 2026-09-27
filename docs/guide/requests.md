@@ -1,11 +1,12 @@
 # Requests
 
-Everything a request carries, and the argument that asks for it.
+**Everything a request carries (path, query, body, headers), and the handler argument that reads each one.**
+
+**Reference:** [handler arguments](../reference/handlers.md#handler-arguments), [reading a request from `Ctx`](../reference/ctx.md#reading), [`Body`](../reference/streaming.md#body) · **Design:** [Request input](../design/request-input.md)
 
 ## Path params
 
-A `:name` in the pattern arrives as the argument in the same position. The type
-is the conversion:
+**A `:name` in the pattern arrives as the argument in the same position, and the argument's type decides the conversion:**
 
 ```zig
 try app.get("/users/:id", getUser);
@@ -15,18 +16,13 @@ try app.get("/posts/:year/:slug", getPost);
 fn getPost(year: u16, slug: nilo.Str) !Post { … }
 ```
 
-`u32`, `i64`, `f64`, `bool`, an enum, or a `Str` for the text as it arrived. A
-value that doesn't convert is a 400 saying which param and what was expected —
-your handler doesn't run. Values are percent-decoded before conversion.
+The type can be `u32`, `i64`, `f64`, `bool`, an enum, or a `Str` for the text as it arrived. A value that doesn't convert is a 400 saying which param and what was expected, and your handler doesn't run. Values are percent-decoded before conversion.
 
-A `*` as the last segment matches the whole rest of the path and arrives under
-the name `*`, which is not a legal Zig identifier — so that one is read from a
-`*Ctx`: `c.param("*")`.
+A `*` as the last segment matches the whole rest of the path and arrives under the name `*`. That is not a legal Zig identifier, so you read it from a `*Ctx`: [`c.param("*")`](../reference/ctx.md#reading).
 
 ## Query params
 
-A path param is positional; a query param is named and may be missing. So it
-arrives as a struct, one field per param:
+**Query params arrive as a struct, one field per param**, because unlike a path param a query param is named and may be missing:
 
 ```zig
 const Search = struct {
@@ -41,8 +37,7 @@ fn search(db: *Db, params: Query(Search)) ![]const Item {
 }
 ```
 
-The types are checked before your handler runs, so the answers to a client that
-gets it wrong are already written:
+The types are checked before your handler runs, so the answers to a client that gets it wrong are already written:
 
 ```
 ?q is required
@@ -50,20 +45,13 @@ gets it wrong are already written:
 ?sort is not one of the known choices (newest, oldest): "sideways"
 ```
 
-Values arrive percent-decoded, with `+` counting as a space the way an HTML form
-sends one. `Query(Search)` is an ordinary struct, so a test builds one directly —
-`listUsers(&db, .{ .value = .{ .page = 2 } })` — and never touches a query
-string.
+Values arrive percent-decoded, with `+` counting as a space the way an HTML form sends one. `Query(Search)` is an ordinary struct, so a test builds one directly (`listUsers(&db, .{ .value = .{ .page = 2 } })`) and never touches a query string.
 
-For one-off reads there is `c.query("q")` on a `*Ctx`, which gives a `?Str` and
-converts nothing. See
-[ADR 011](../adr/011-the-query-string-is-a-struct-of-your-own.md) for why the
-struct is the default.
+For one-off reads, [`c.query("q")`](../reference/ctx.md#reading) on a `*Ctx` gives a `?Str` and converts nothing. [ADR 011](../adr/011-the-query-string-is-a-struct-of-your-own.md) explains why the struct is the default.
 
 ## JSON bodies
 
-Any struct argument that isn't a `Query(T)`, a service or a resolved value is the
-request body, parsed from JSON:
+**Any struct argument that isn't a `Query(T)`, a service or a resolved value is the request body, parsed from JSON:**
 
 ```zig
 const NewUser = struct { name: Str, age: u32, plan: Plan = .free };
@@ -73,8 +61,7 @@ fn createUser(db: *Db, incoming: NewUser) !User {
 }
 ```
 
-A body that does not fit gets the same treatment a query param does — the field
-named, and what was wrong with it:
+A body that does not fit gets the same treatment as a query param: a 400 that names the field and what was wrong with it.
 
 ```
 the request body has a field "titl" this endpoint does not know. It takes: title, done (optional)
@@ -86,12 +73,9 @@ the request body is not valid JSON — it stops making sense at line 1, column 1
 the request body is empty. This endpoint expects a JSON object with: title, done (optional)
 ```
 
-A field with a default is what "absent" is allowed to mean, exactly as in a query
-struct. Working out which of these to say costs a second parse, which is paid
-only by a request that was already going to be refused.
+A field with a default may be absent, exactly as in a query struct. Working out which message to send costs a second parse, and only a request that was already going to be refused pays it.
 
-Nested objects and lists are named by where the trouble is, not by the field at
-the top that contains it:
+Nested objects and lists are named by where the problem is, not by the top-level field that contains it:
 
 ```
 the request body is missing "address.city" (text)
@@ -99,9 +83,7 @@ the request body has a field "address.zip" this endpoint does not know. It takes
 "lines[1].qty" has to be a whole number, not text
 ```
 
-That goes eight levels down — the same depth the API description and the
-staleness trap follow. Below that there is no field name left to quote, so the
-400 says which wall it hit instead of saying nothing:
+That goes eight levels down, the same depth the API description and the staleness check follow. Below that there is no field name left to quote, so the 400 says which limit it hit instead of saying nothing:
 
 ```
 the request body is valid JSON and does not fit this endpoint, but it is nested
@@ -109,16 +91,13 @@ deeper than 8 levels — which is as far as nilo follows a body — so it cannot
 which part is wrong. The mistake is somewhere below that.
 ```
 
-That sentence means the shape is too deep to name, not that the depth itself is
-refused: a body that *fits* is parsed however deep it goes.
+That message means the shape is too deep to name, not that the depth is refused: a body that *fits* is parsed however deep it goes.
 
-A `Str` field lives in the request arena, so — like every `Str` — it stops being
-valid when the request ends. `keep` it if the value goes into a service.
+A `Str` field lives in the request arena, so like every `Str` it stops being valid when the request ends. `keep` it if the value goes into a service.
 
-### Every bad field at once, rather than the first
+### Reporting every bad field at once
 
-The 400 above names one field, because the parse stops at the first thing it
-cannot do. `Bound(T)` collects them all and hands them to the handler:
+**`Bound(T)` collects every bad field and hands them to the handler**, where the plain 400 above names only one, because the parse stops at the first thing it cannot do:
 
 ```zig
 fn placeOrder(b: nilo.Bound(NewOrder)) !nilo.Status(201, Order) {
@@ -127,26 +106,13 @@ fn placeOrder(b: nilo.Bound(NewOrder)) !nilo.Status(201, Order) {
 }
 ```
 
-`b.fail()` is a 422 naming each one; `b.failures()` is there when the answer
-wants a shape of its own. `b.must("total", order.total > 0, "has to be more
-than nothing")` puts a rule of your own into the same answer, so an endpoint
-does not end up refusing in two shapes.
-`Bound(Query(T))` does the same for the query string,
-and the full account — including the three cases that stay a plain 400 — is
-under [Forms](./forms.md#when-one-field-is-wrong-and-the-rest-are-fine), where
-it matters most.
+`b.fail()` is a 422 naming each one, and `b.failures()` is there when the answer needs a shape of its own. `b.must("total", order.total > 0, "has to be more than nothing")` adds a rule of your own to the same answer, so an endpoint does not end up rejecting requests in two different shapes. `Bound(Query(T))` does the same for the query string. The full explanation, including the three cases that stay a plain 400, is under [Forms](./forms.md#collecting-every-field-error-bound), where it matters most. The type is [`Bound(W)`](../reference/handlers.md#boundw) in the reference.
 
-One difference worth knowing here: in JSON a quoted value **is** text, so
-`{"quantity":"12"}` fails as `"quantity" has to be a whole number, not text`
-rather than as a number that would not parse. A form has only text to work
-with; a body says what kind each value is.
+One difference to know: in JSON a quoted value **is** text, so `{"quantity":"12"}` fails as `"quantity" has to be a whole number, not text`, not as a number that would not parse. A form has only text to work with; a JSON body says what kind each value is.
 
 ### PATCH: telling "not sent" from "sent as null"
 
-`?T` has two states and a PATCH needs three. With `due: ?Str = null`, the bodies
-`{}` and `{"due":null}` arrive identical — so "leave the due date alone" and
-"empty the due date out" cannot be told apart, and one of them has to be given
-up. `Patch(T)` is the field type that keeps all three:
+**`Patch(T)` tells apart a field that was not sent, one sent as null, and one sent with a value.** `?T` has two states and a PATCH needs three. With `due: ?Str = null`, the bodies `{}` and `{"due":null}` arrive identical, so "leave the due date alone" and "clear the due date" cannot be told apart. `Patch(T)` keeps all three:
 
 ```zig
 const EditTodo = struct {
@@ -166,10 +132,7 @@ fn editTodo(store: *Store, id: u32, incoming: EditTodo) !?Todo {
 }
 ```
 
-The `= .absent` default is not optional: it is what "the field was not in the
-body" means, and it is also what makes the field optional in the generated
-description. Where "leave it" and "clear it" really are the same thing,
-`incoming.due.orNull()` collapses the two.
+The `= .absent` default is required: it is what "the field was not in the body" means, and it also makes the field optional in the generated description. Where "leave it" and "clear it" really are the same, `incoming.due.orNull()` merges the two.
 
 See [ADR 025](../adr/025-a-patch-needs-three-answers-and-an-optional-has-two.md).
 
@@ -183,35 +146,17 @@ From a `*Ctx`:
 | `c.json(T)` | the body parsed into `T`, the same as a struct argument |
 | `c.bodyStream()` | the body in pieces, below |
 
-`c.body()` reads whole and is refused past **1 MB**. That is right for JSON and
-wrong for a file.
+**`c.body()` reads the whole body and refuses anything past 1 MB.** That is right for JSON and wrong for a file.
 
-It takes the arena as the bytes arrive rather than as `Content-Length` promises
-them, so a client that announces a megabyte and then trickles holds a page
-rather than a megabyte
-([ADR 083](../adr/083-a-body-is-taken-as-it-arrives.md)). A body that arrives
-normally pays for that in nothing: under a page it is the one allocation it
-always was, over a page it is two.
+It takes arena memory as the bytes arrive, not as `Content-Length` promises them, so a client that announces a megabyte and then trickles holds a page, not a megabyte ([ADR 083](../adr/083-a-body-is-taken-as-it-arrives.md)). A body that arrives normally pays nothing for this: under a page it is still one allocation, over a page it is two.
 
-**A body sent as `Content-Encoding: gzip` is inflated before anything reads
-it** — `c.body()`, `c.json`, a struct argument, a `Form(T)` all see the JSON
-and not the stream, the way they see neither framing. The stock OpenTelemetry
-Collector and most agents that push to a server gzip by default, and until
-[ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md)
-that default met a 415. The compressed bytes are bounded by `max_body`; what
-they inflate to is bounded by the same number, checked against the length the
-stream announces before a byte is inflated, so a small body that would inflate
-to a large one is a 413 and not a megabyte. A stream that does not decode is a
-400 naming the coding. Every other coding — `br`, `deflate`, `zstd`, two
-stacked — is still a 415 naming the header. What it costs a gzipped request is
-one more arena allocation, of the inflated size exactly; a request that is not
-gzipped pays nothing.
+**A body sent as `Content-Encoding: gzip` is decompressed before anything reads it.** `c.body()`, `c.json`, a struct argument and a `Form(T)` all see the JSON, not the compressed stream, just as they never see the framing. The stock OpenTelemetry Collector and most agents that push to a server gzip by default, and until [ADR 089](../adr/089-a-body-under-an-encoding-other-than-gzip-is-refused.md) that default got a 415.
 
-`c.bodyStream()` is the exception: a stream hands bytes out as they arrive and
-holds nothing, so there is nowhere to inflate into, and a gzipped body on a
-streaming route is a 415 that says so.
+The limits: the compressed bytes are bounded by `max_body`, and so is what they decompress to. That is checked against the length the stream announces before a byte is decompressed, so a small body that would expand into a large one is a 413, not a megabyte. A stream that does not decode is a 400 naming the coding. Every other coding (`br`, `deflate`, `zstd`, two stacked) is still a 415 naming the header. A gzipped request costs one more arena allocation, of exactly the decompressed size; a request that is not gzipped pays nothing.
 
-## Bodies too big to hold
+`c.bodyStream()` is the exception: a stream hands bytes out as they arrive and holds nothing, so there is nowhere to decompress into, and a gzipped body on a streaming route is a 415 that says so.
+
+## Streaming a large body
 
 ```zig
 fn upload(c: *nilo.Ctx, store: *Store) !Receipt {
@@ -225,28 +170,13 @@ fn upload(c: *nilo.Ctx, store: *Store) !Receipt {
 }
 ```
 
-The 64 KB above is the only memory involved — **this allocates nothing at all**,
-not even the one buffer a response stream takes, because a body reader has
-somewhere to put bytes already. `Content-Length` and chunked look the same from
-here, exactly as they do to `c.body()`: a handler asks for the body, not for the
-way it arrived.
+**A body read in pieces allocates nothing at all.** The 64 KB above is the only memory involved. It does not even take the one buffer a response stream takes, because a body reader already has somewhere to put bytes. `Content-Length` and chunked bodies look the same from here, exactly as they do to `c.body()`: a handler asks for the body, not for how it arrived. The reader is [`Body`](../reference/streaming.md#body) in the reference.
 
-Measured on the streaming example: 5 × (a 3 MB upload plus a 50,000-row streamed
-report) moved the server's RSS by **72 KB**.
+Measured on the streaming example: 5 × (a 3 MB upload plus a 50,000-row streamed report) moved the server's RSS by **72 KB**.
 
-`max_bytes` has a default of 64 MB and there has to be a number, because a
-chunked body announces no size and "however much they send" is a client's
-decision about your memory. A `Content-Length` past the ceiling is refused before
-a byte is read.
+`max_bytes` defaults to 64 MB and must be a number, because a chunked body announces no size, and "however much they send" would let a client decide how much of your memory to use. A `Content-Length` past the limit is refused before a byte is read.
 
-**A client that asks first is told first.** Something sending
-`Expect: 100-continue` — curl does, past 1 KB of body — waits for the server
-before it sends anything. nilo answers `100 Continue` at the moment it commits to
-reading, so a request refused before that gets its final status and **never
-receives the body at all**: over the ceiling, no such route, wrong method, or a
-handler that simply never asks for it
-([ADR 073](../adr/073-a-header-is-answered-as-asked-or-refused.md)). There is
-nothing to switch on and nothing to write.
+**A client that asks first is answered first.** A client sending `Expect: 100-continue` (curl does, for bodies over 1 KB) waits for the server before it sends the body. nilo answers `100 Continue` only when it commits to reading, so a request refused before that gets its final status and **never sends the body at all**: over the limit, no such route, wrong method, or a handler that never asks for the body ([ADR 073](../adr/073-a-header-is-answered-as-asked-or-refused.md)). There is nothing to turn on and nothing to write.
 
 | | |
 |---|---|
@@ -257,12 +187,11 @@ nothing to switch on and nothing to write.
 | `incoming.size()` | what the request announced, or `null` if it was chunked |
 | `incoming.reader` | a plain `std.Io.Reader`, for handing to the standard library |
 
-A body left half-read is fine — nilo discards the rest so the connection is
-clean for the next request.
+A body left half-read is fine: nilo discards the rest so the connection is clean for the next request.
 
 See [ADR 019](../adr/019-a-request-that-lasts-is-still-one-request.md).
 
-## Headers, and the rest
+## Headers, method and path
 
 ```zig
 c.method            // .GET, .POST, …
@@ -272,9 +201,7 @@ c.param("id")       // a path param, percent-decoded
 c.query("q")        // a query param, percent-decoded
 ```
 
-`c.header` answers with the **first** header of that name. For the rest of
-them — or for a middleware that does not know the names in advance — walk the
-lot:
+**[`c.header`](../reference/ctx.md#reading) returns the first header of that name.** To read the others, or in a middleware that does not know the names in advance, walk them all:
 
 ```zig
 var it = c.headers();
@@ -284,9 +211,6 @@ while (it.next()) |h| {
 }
 ```
 
-Nothing is allocated either way: both read the head where it lies.
+Neither allocates: both read the head where it already is.
 
-The whole request head has to fit in the connection's `read_buffer` (16 KB by
-default, which covers a browser behind a single sign-on); one that doesn't is
-answered with a 431. Turn it up in `listen()` if you serve clients with cookies
-bigger than that.
+The whole request head has to fit in the connection's `read_buffer` (16 KB by default, which is enough for a browser behind a single sign-on). A head that doesn't fit is answered with a 431. Raise it in `listen()` if your clients send cookies bigger than that.

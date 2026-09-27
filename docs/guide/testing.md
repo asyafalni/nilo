@@ -1,10 +1,12 @@
 # Testing
 
-## Handlers are ordinary functions
+**A handler is tested by calling it; a handler that writes its own answer is tested through a test client with no server and no socket.**
 
-The whole point of the signature rules is this: a handler takes only what it
-needs, so a test hands it those things and calls it. No server, no socket, no
-fake HTTP request.
+**Reference:** [`nilo.testing.Client`](../reference/testing.md#testingclient), [`Wired`](../reference/testing.md#testingwired) · **Design:** [Testing](../design/testing.md)
+
+## Testing a handler by calling it
+
+**A handler takes only what it needs, so a test builds those things and calls it.** No server, no socket, no fake HTTP request. That is the point of the signature rules.
 
 ```zig
 /// The service the handler asks for. In the program it reads a table; in a
@@ -29,19 +31,11 @@ test "getUser" {
 }
 ```
 
-nilo ships no fake database. A pointer argument is a service, and a service
-is a type you wrote, so a test builds one. When the handler takes the real
-`*sql.Db`, the test gets a real database; see
-[A handler with a table behind it](#a-handler-with-a-table-behind-it).
+nilo ships no fake database. A pointer argument is a service, and a service is a type you wrote, so a test builds one. When the handler takes the real `*sql.Db`, the test uses a real database; see [Testing against a real database](#testing-against-a-real-database).
 
-Every fail function returns `error.Failed`, so that is what a refusal asserts on.
-A handler returning `?T` says the same thing by answering null, so there the
-assertion is `try expect(try getUser(&users, 99) == null)` and no error is
-involved at all.
-To check *which* refusal, look at the message the failure box holds — or drive the
-request through the test client below, where the status is on the answer.
+Every `fail` function returns `error.Failed`, so that is what a test for a refusal checks. A handler returning `?T` refuses by returning null, so there the check is `try expect(try getUser(&users, 99) == null)` and no error is involved. To check *which* refusal, look at the message the failure holds, or send the request through the test client below, where the status is on the response.
 
-The rest follows the same shape:
+Everything else works the same way:
 
 ```zig
 // a query struct is an ordinary struct
@@ -57,24 +51,15 @@ const created = try createUser(&db, .{ .name = .static("wati"), .age = 30 });
 const signed_up = try signUp(.ok(.{ .email = .static("wati@example.com"), .age = 31 }));
 ```
 
-`Bound(W)` is the one argument a test cannot spell as a plain struct — it has
-private fields, because a half-filled struct is exactly what it exists to
-withhold. `.ok(value)` is the binding where every field bound. To test the
-*other* branch, drive the request through the test client below: what a handler
-does with a failure is a 422 on the wire, and that is the thing worth asserting
-on.
+`Bound(W)` is the one argument a test cannot write as a plain struct. It has private fields, because a half-filled struct is exactly what it exists to hold back. `.ok(value)` is the binding where every field bound. To test the *other* branch, send the request through the test client below: what a handler does with a failure is a 422 on the wire, and that is what is worth checking.
 
-`nilo.blocking` and `nilo.Mutex` both work with no server under them, so a
-handler that uses either is still callable from a test.
+`nilo.blocking` and `nilo.Mutex` both work with no server running, so a handler that uses either can still be called from a test.
 
-`Str.static("wati")` is how a test makes one: text that already outlives any
-request, so nothing can go stale.
+`Str.static("wati")` is how a test makes a `Str`: text that already outlives any request, so nothing can go stale.
 
-## Handlers that write their answer
+## The test client
 
-A handler that returns a value is tested by calling it. One that *writes* its
-answer — a stream, an event stream, anything sending from a `*Ctx` — needs
-somewhere to write to. So there is a client for that:
+**A handler that writes its own answer is tested through [`nilo.testing.Client`](../reference/testing.md#testingclient).** A handler that returns a value is tested by calling it. One that *writes* its answer (a stream, an event stream, anything sending from a `*Ctx`) needs somewhere to write to:
 
 ```zig
 var app = nilo.App.init(testing.allocator);
@@ -92,9 +77,7 @@ var buf: [4096]u8 = undefined;
 try testing.expectEqualStrings("id,name\n1,wati\n", try answer.text(&buf));
 ```
 
-It runs one request through the App with no server and no socket. Everything the
-request path does happens: middleware, routing, the arena, the response written
-to a buffer instead of a connection.
+It runs one request through the App with no server and no socket. Everything on the request path still happens: middleware, routing, the arena, and the response, written to a buffer instead of a connection.
 
 ### Sending a request
 
@@ -106,7 +89,7 @@ to a buffer instead of a connection.
 | `client.sendRequest(&app, .{ … })` | any of the above plus headers, every field defaulted |
 | `client.send(&app, raw)` | the whole request written out, for a version the others don't cover |
 
-`sendRequest` is the one to reach for when a route reads a header:
+**Use `sendRequest` when a route reads a header:**
 
 ```zig
 const answer = try client.sendRequest(&app, .{
@@ -116,23 +99,13 @@ const answer = try client.sendRequest(&app, .{
 try testing.expectEqual(@as(u16, 206), answer.status);
 ```
 
-`client.setHeader("Authorization", "Bearer t")` sets one for every request from
-then on, which is what a suite behind a bearer token wants.
+`client.setHeader("Authorization", "Bearer t")` sets a header for every request from then on, which is what a suite behind a bearer token needs.
 
-`send` is left for what nothing else can express — an HTTP/1.0 request, a
-deliberately malformed one. **There, write the `Host` yourself**: every other
-entry point puts one in for you, and an HTTP/1.1 request without one is a 400
-before it reaches a route
-([ADR 070](../adr/070-a-request-nobody-else-would-answer-is-refused.md)).
-`send` also applies neither `setHeader` nor the jar — the bytes are yours,
-exactly as given.
+`send` is for what nothing else can express: an HTTP/1.0 request, or a deliberately malformed one. **With `send`, write the `Host` yourself.** Every other method adds one for you, and an HTTP/1.1 request without one is a 400 before it reaches a route ([ADR 070](../adr/070-a-request-nobody-else-would-answer-is-refused.md)). `send` also applies neither `setHeader` nor the cookie jar: the bytes are sent exactly as given.
 
-### Signing in, and staying signed in
+### Keeping cookies between requests
 
-`Client.init(gpa, .{ .cookies = true })` keeps what the answers set and sends it
-back, the way a browser does. Without it a sign-in followed by a request *as*
-that user means copying the `Set-Cookie` out of one answer into the next request
-by hand.
+**`Client.init(gpa, .{ .cookies = true })` keeps the cookies responses set and sends them back**, the way a browser does. Without it, signing in and then making a request *as* that user means copying the `Set-Cookie` from one response into the next request by hand.
 
 ```zig
 var client = try nilo.testing.Client.init(testing.allocator, .{ .cookies = true });
@@ -145,18 +118,15 @@ _ = try client.postWith(&app, "/sign-in", "application/x-www-form-urlencoded",
 const answer = try client.get(&app, "/me");
 ```
 
-It is off by default so that a suite written before it existed keeps asserting
-what it always asserted
-([ADR 086](../adr/086-the-test-client-can-do-what-a-client-does.md)).
-`client.cookie(nilo.session.host_cookie_name)` is what the jar is holding for a `Session(T)`, `__Host-session` with the default options, for a test that wants to look rather than only send.
+It is off by default so that suites written before it existed keep testing what they always tested ([ADR 086](../adr/086-the-test-client-can-do-what-a-client-does.md)). `client.cookie(nilo.session.host_cookie_name)` returns what the jar holds for a `Session(T)` (`__Host-session` with the default options), for a test that wants to look at it rather than only send it.
 
-### Reading the answer
+### Reading the response
 
 | | |
 |---|---|
 | `answer.status` | |
 | `answer.header("content-type")` | case-insensitive, `null` if absent |
-| `answer.body` | the bytes after the head — still chunk-framed if it was a stream |
+| `answer.body` | the bytes after the head, still chunk-framed if it was a stream |
 | `answer.text(&buf)` | the body as a client sees it, framing undone |
 | `answer.bytes(arena)` | the same, into memory the arena owns |
 | `answer.json(T, arena)` | the body read back as a value |
@@ -165,28 +135,20 @@ what it always asserted
 | `answer.chunked` | whether it arrived in chunks |
 | `answer.keep_alive` | whether the connection could have carried another request |
 
-**`answer.json` is there because nilo already decided how the value was
-written** — walking a `std.json.Value` to pull one field out of a create was four
-lines at every call site
-([ADR 147](../adr/147-a-response-is-read-back-the-way-it-was-written.md)):
+**`answer.json` reads the body back into a type**, because nilo already decided how the value was written. Walking a `std.json.Value` to pull one field out of a create response took four lines at every call site ([ADR 147](../adr/147-a-response-is-read-back-the-way-it-was-written.md)):
 
 ```zig
 const made = try answer.json(struct { id: []const u8 }, arena);
 try testing.expectEqual(@as(usize, 36), made.id.len);
 ```
 
-It undoes chunk framing first and copies everything into the arena, so what comes
-back survives the next request on the same client. Fields it was not asked about
-are ignored — you are asking a question about part of the response, not asserting
-its whole shape. When the shape *is* what you are asserting, ask for
-`std.json.Value`.
+It removes chunk framing first and copies everything into the arena, so what it returns survives the next request on the same client. Fields you did not ask for are ignored: you are asking about part of the response, not checking its whole shape. When the shape *is* what you are checking, ask for `std.json.Value`.
 
-A client may be reused for as many requests as you like; each one gets a fresh
-arena, exactly as a real connection does between requests.
+A client can be reused for as many requests as you like. Each one gets a fresh arena, exactly as a real connection does between requests.
 
-### An App and a Client together
+### `Wired`: an App and a Client together
 
-Most test files build the same pair. `Wired` is that pair:
+**[`Wired`](../reference/testing.md#testingwired) is the App and Client pair most test files build:**
 
 ```zig
 var wired = try nilo.testing.Wired.init(testing.allocator, .{});
@@ -199,33 +161,21 @@ const answer = try wired.post("/partners", "{\"name\":\"Wati\"}");
 try testing.expectEqual(@as(u16, 201), answer.status);
 ```
 
-`wired.app` is a plain `App`, so routes, services, groups and `docs()` are
-registered exactly as they are anywhere else — nothing here is a second API, and
-no database is assumed. Every `Client` call is on it without the `&app`:
-`wired.get`, `.post`, `.postWith`, `.request`, `.sendRequest`, `.send`,
-`.setHeader`, `.cookie`.
+`wired.app` is a plain `App`, so routes, services, groups and `docs()` are registered exactly as anywhere else. It is not a second API, and no database is assumed. Every `Client` method is on it without the `&app`: `wired.get`, `.post`, `.postWith`, `.request`, `.sendRequest`, `.send`, `.setHeader`, `.cookie`.
 
-`Client` is still there and is still the answer when one test needs two of them
-against one App — two addresses, two cookie jars.
+`Client` is still there for a test that needs two clients against one App: two addresses, two cookie jars.
 
-`Client.init(gpa, .{ .response_bytes = 1 << 20 })` for a stream that produces a
-lot — an answer that doesn't fit is truncated rather than failing.
+Use `Client.init(gpa, .{ .response_bytes = 1 << 20 })` for a stream that produces a lot. A response that doesn't fit is cut short instead of failing.
 
 None of this is on the request path, and none of it exists in a running server.
 
-### Two things `listen()` does that the client does not
+### Checking and starting services in a test
 
-**It checks the services.** `listen()` refuses to open the socket when a route
-needs a service nobody registered, and names the type and the routes. A test
-driving the App itself gets a 500 on those routes instead — with the type in the
-log, since
-[ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md), rather than in
-silence. `try app.checkServices();` after the `provide` calls is the whole gate,
-and it is worth one line in a test that registers a lot of routes.
+**`listen()` does two things the test client does not: it checks the services and it starts them.**
 
-**It starts the services.** A `*Db` provided to an App has no pool until
-`nilo_start` runs, and until then every query answers `error.Disconnected`. So a
-test with a database needs the phase:
+**Checking.** `listen()` refuses to open the socket when a route needs a service nobody registered, and names the type and the routes. A test driving the App directly gets a 500 on those routes instead, with the type in the log since [ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md), not silently. `try app.checkServices();` after the `provide` calls is the whole check, and it is worth one line in a test that registers a lot of routes.
+
+**Starting.** A `*Db` provided to an App has no pool until `nilo_start` runs, and until then every query returns `error.Disconnected`. So a test with a database needs this step:
 
 ```zig
 var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -235,21 +185,13 @@ try app.provide(&db);
 try app.start(threaded.io());     // services checked, pools open, schema checked
 ```
 
-`app.start` also runs `db.checking`, which is worth having in a test for its own
-sake: a Row that disagrees with its table passes an entire suite otherwise.
+`app.start` also runs `db.checking`, which is worth having in a test on its own: otherwise a Row that disagrees with its table passes the whole suite.
 
-It is for a program that never listens, which a test is. In a program that
-does, the same work goes in `app.before` and `listen()` runs it on its own
-loop; `app.start` followed by `listen()` is refused
-([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
+`app.start` is for a program that never listens, which a test is. In a program that does listen, the same work goes in `app.before` and `listen()` runs it on its own loop. `app.start` followed by `listen()` is refused ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)).
 
-## A handler with a table behind it
+## Testing against a real database
 
-A handler that takes `db: *Db` is tested against a database, because what it
-would be tested for, the statement, is the part a fake leaves out. On SQLite
-that costs nothing to set up: the database lives in memory, one per test, and
-the App boots it the way `listen()` would. This is the shape
-[`examples/sqlite/`](../../examples/sqlite/main.zig) tests itself with:
+**A handler that takes `db: *Db` is tested against a real database**, because the SQL statement is what it would be tested for, and that is exactly what a fake leaves out. On SQLite this costs nothing to set up: the database lives in memory, one per test, and the App starts it the way `listen()` would. [`examples/sqlite/`](../../examples/sqlite/main.zig) tests itself this way:
 
 ```zig
 const Stack = struct {
@@ -287,16 +229,9 @@ const Stack = struct {
 };
 ```
 
-Heap-allocated because the App holds a pointer to the Db and the client hands
-out a `Ctx` pointing at the App, so none of the three may move. A bare
-`:memory:` is refused when the pool opens it: a pool of them is several empty
-databases, with writes going to one and reads finding nothing
-([SQLite](./sql/sqlite.md#two-things-about-the-filename)).
+It is heap-allocated because the App holds a pointer to the Db and the client hands out a `Ctx` pointing at the App, so none of the three may move. A bare `:memory:` is refused when the pool opens it: a pool of them is several separate empty databases, with writes going to one and reads finding nothing ([SQLite](./sql/sqlite.md#the-database-filename)).
 
-A program on Postgres tests against Postgres. `sql/live.zig` is the pattern
-this repository uses: the URL comes from `DATABASE_URL` through `build.zig`,
-every test skips when there is none, so the loop never needs a server up, and
-CI sets it so the coverage is not optional there.
+A program on Postgres tests against Postgres. `sql/live.zig` shows how this repository does it: the URL comes from `DATABASE_URL` through `build.zig`, and every test skips when there is none, so the everyday loop never needs a server running, while CI sets it so the coverage is not optional there.
 
 ## Running the suite
 
@@ -305,22 +240,10 @@ zig build test        # Debug, plus the refusals and every module's gate — the
 zig build test-all    # the same in ReleaseSafe as well — the gate, and what CI runs
 ```
 
-What each costs is measured rather than remembered:
-[`bench/result/build.md`](../../bench/result/build.md) has the numbers, and the
-levers when they move.
+What each costs is measured, not remembered: [`bench/result/build.md`](../../bench/result/build.md) has the numbers, and what to change when they move.
 
-nilo's own suite runs **in both `Debug` and `ReleaseSafe`**, and `-Doptimize=`
-cannot change that. That is not decoration: the bug that made
-[ADR 018](../adr/018-a-response-owns-its-headers.md) necessary passed 175
-tests in `Debug` and segfaulted in release, because a stack temporary still holds
-the right bytes until something reuses the stack. A suite that only runs in one
-mode can't see that class of bug at all.
+**nilo's own suite runs in both `Debug` and `ReleaseSafe`**, and `-Doptimize=` cannot change that. This matters: the bug that led to [ADR 018](../adr/018-a-response-owns-its-headers.md) passed 175 tests in `Debug` and segfaulted in release, because a stack temporary still holds the right bytes until something reuses the stack. A suite that runs in only one mode cannot see that kind of bug at all.
 
-The two modes are split across two steps only so the fast one can be run without
-thinking about it. `test-all` is what CI runs on every push, so nothing reaches
-`main` having been checked in one mode — which is the part that matters, and the
-part that is easy to lose by making it a flag somebody has to remember.
+The two modes are split into two steps only so the fast one can be run without thinking about it. `test-all` is what CI runs on every push, so nothing reaches `main` having been checked in only one mode. That is the part that matters, and it is easy to lose if it becomes a flag somebody has to remember.
 
-Worth doing the same in your own `build.zig` if you hold anything across a
-handler's return: the split costs nothing and the second mode is the only thing
-that sees a dangling pointer before your users do.
+Do the same in your own `build.zig` if you hold anything past a handler's return: the split costs nothing, and the second mode is the only thing that catches a dangling pointer before your users do.

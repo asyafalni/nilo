@@ -1226,6 +1226,41 @@ pub fn Wire(comptime opts_in: Options) type {
             return found.toOwnedSlice(arena) catch return error.QueryFailed;
         }
 
+        /// What `sql` would answer, without stepping it: the affinity of
+        /// each column's declared type, which is what SQLite converts a
+        /// value by and so what `dialect.SQLite.reads` is written in
+        /// (ADR 233).
+        ///
+        /// **Only a column read straight out of a table has one.** SQLite's
+        /// types belong to values, not to expressions, so `count(*)`, a
+        /// `CAST` and anything computed come back unjudged. And `nulls` asks
+        /// for nothing here: SQLite has no plan that names a join's far side.
+        /// What this catches is a `Str` field over an `INTEGER` column, which
+        /// zqlite would otherwise read as the digits.
+        pub fn describe(
+            self: *Self,
+            arena: std.mem.Allocator,
+            sql: []const u8,
+            nulls: bool,
+        ) wire.Error!?[]const wire.Described {
+            _ = nulls;
+            const at = if (wantsWriter(sql)) try self.takeWriter(sql) else try self.takeReader(sql);
+            defer self.release(at);
+            const conn = self.conns[at].handle;
+            const stmt = conn.prepare(sql) catch |err| return translate(conn, err);
+            defer stmt.deinit();
+
+            const count: usize = @intCast(zqlite.c.sqlite3_column_count(stmt.stmt));
+            const out = arena.alloc(wire.Described, count) catch return error.QueryFailed;
+            for (out, 0..) |*column, i| {
+                column.* = .{ .udt = null };
+                const declared = zqlite.c.sqlite3_column_decltype(stmt.stmt, @intCast(i)) orelse continue;
+                const affinity = dialect.SQLite.affinityOf(std.mem.span(declared)) orelse continue;
+                column.* = .{ .udt = affinity, .textual = std.mem.eql(u8, affinity, "TEXT") };
+            }
+            return out;
+        }
+
         /// Never called: `dialect.SQLite.enum_values` is null, because SQLite
         /// has no enum type to hold a Zig enum against. Here so the Wire
         /// contract is one list rather than one with an exception in it.

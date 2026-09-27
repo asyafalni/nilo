@@ -64,6 +64,7 @@
 const std = @import("std");
 const core = @import("nilo_core");
 const row_mod = @import("row.zig");
+const where_mod = @import("where.zig");
 const types_mod = @import("types.zig");
 
 /// The longest identifier Postgres keeps, in bytes.
@@ -520,7 +521,11 @@ fn columnsOf(
     comptime {
         assertDefaultsAreColumns(Row, decl);
         _ = filledOf(Row, decl);
-        const fields = @typeInfo(Row).@"struct".fields;
+        // The Row's fields and then its unread columns (item 102), which are
+        // columns of the table like any other and are only left out of what
+        // this Row reads.
+        const unread = row_mod.unreadOf(Row);
+        const fields = @typeInfo(Row).@"struct".fields ++ unreadFields(unread);
         var out: [fields.len]Column = undefined;
         var n: usize = 0;
         for (fields) |f| {
@@ -577,6 +582,24 @@ fn columnsOf(
         }
         const frozen = out[0..n].*;
         return &frozen;
+    }
+}
+
+/// The unread columns as struct fields, so `columnsOf` and `requiredOf` walk
+/// them with the Row's own: a name and a type is all either reads.
+fn unreadFields(comptime unread: []const row_mod.Unread) []const std.builtin.Type.StructField {
+    comptime {
+        var out: []const std.builtin.Type.StructField = &.{};
+        for (unread) |u| {
+            out = out ++ &[_]std.builtin.Type.StructField{.{
+                .name = u.name,
+                .type = u.T,
+                .default_value_ptr = null,
+                .is_comptime = false,
+                .alignment = null,
+            }};
+        }
+        return out;
     }
 }
 
@@ -646,7 +669,7 @@ pub fn requiredOf(comptime Row: type) []const []const u8 {
         const has_default = @hasField(@TypeOf(decl), "default");
 
         var out: []const []const u8 = &.{};
-        for (@typeInfo(owner).@"struct".fields) |f| {
+        for (@typeInfo(owner).@"struct".fields ++ unreadFields(row_mod.unreadOf(owner))) |f| {
             if (row_mod.isBeside(owner, f.name)) continue;
             if (@typeInfo(f.type) == .optional) continue;
             if (has_default and @hasField(@TypeOf(decl.default), f.name)) continue;
@@ -768,12 +791,13 @@ fn defaultOf(
 
 /// One value of the caller's, as SQL text the database reads straight.
 ///
-/// **The two places in this module where a value becomes SQL rather than a
-/// parameter**, and both are parts of the schema rather than of a statement: a
-/// column's `DEFAULT` and a partial index's `WHERE`. There is nothing to bind
-/// against in either, which is also why the value has to be one the compiler
-/// can see.
-fn literalText(
+/// **The four places in this module where a value becomes SQL rather than a
+/// parameter**: a column's `DEFAULT`, a partial index's `WHERE`, an
+/// aggregate's `FILTER`, and a through field's `.otherwise`. The first two
+/// are parts of the schema and the other two parts of a Row's declaration, so
+/// there is nothing to bind against in any of them, which is also why the
+/// value has to be one the compiler can see.
+pub fn literalText(
     comptime Row: type,
     comptime what: []const u8,
     comptime column: []const u8,
@@ -789,17 +813,29 @@ fn literalText(
         // column is: `.draft`, not `"draft"`.
         const words = enumValues(T);
         if (words.len > 0) {
-            if (@typeInfo(W) != .enum_literal) @compileError(
-                "nilo: " ++ what ++ " gives " ++ mine ++ " a " ++ @typeName(W) ++ ", and " ++
+            // A value of the column's own enum is the same word written
+            // another way, and it is as comptime as a literal: an array of
+            // them declared once, `&finished`, is what a program that already
+            // names the set somewhere reaches for (item 104).
+            const tag = if (@typeInfo(W) == .enum_literal or W == Inner)
+                @tagName(written)
+            else if (isTextLiteral(W)) @compileError(
+                "nilo: " ++ what ++ " gives " ++ mine ++ " text, and " ++
                     "the column holds one of " ++ @typeName(Inner) ++ "'s words.\n" ++
                     "  They are written the way a column is: " ++ namedList(words) ++
                     " — so `." ++ words[0] ++ "` rather than `\"" ++ words[0] ++ "\"`.",
+            ) else @compileError(
+                "nilo: " ++ what ++ " gives " ++ mine ++ " a " ++ @typeName(W) ++ ", and " ++
+                    "the column holds one of " ++ @typeName(Inner) ++ "'s words.\n" ++
+                    "  Write the word as an enum literal, `." ++ words[0] ++ "`, or a list of them " ++
+                    "as a tuple, `.{ ." ++ words[0] ++ " }`; a value of " ++ @typeName(Inner) ++
+                    " itself is taken too. They are " ++ namedList(words) ++ ".",
             );
             for (words) |w| {
-                if (std.mem.eql(u8, w, @tagName(written))) return quoteLiteral(w);
+                if (std.mem.eql(u8, w, tag)) return quoteLiteral(w);
             }
             @compileError(
-                "nilo: " ++ what ++ " gives " ++ mine ++ " `." ++ @tagName(written) ++
+                "nilo: " ++ what ++ " gives " ++ mine ++ " `." ++ tag ++
                     "`, which is not one of " ++ @typeName(Inner) ++ "'s words.\n" ++
                     "  They are " ++ namedList(words) ++ ".",
             );
@@ -838,7 +874,7 @@ fn literalText(
         @compileError(
             "nilo: " ++ what ++ " gives " ++ mine ++ " a value, and the column is " ++
                 @typeName(T) ++ ".\n" ++
-                "  What nilo writes into a schema is text, a whole number, a fraction, a " ++
+                "  What nilo writes into the SQL is text, a whole number, a fraction, a " ++
                 "bool, one of a Zig enum's words, or a list of those. Anything else the " ++
                 "database has to work out, so it is a step.",
         );
@@ -983,8 +1019,8 @@ fn wrongLiteral(
     @compileError(
         "nilo: " ++ what ++ " gives " ++ mine ++ " a " ++ @typeName(W) ++ ", and the " ++
             "column is " ++ @typeName(T) ++ ".\n" ++
-            "  A value written into the schema is of the column's own type, because " ++
-            "nothing converts it on the way: the database reads the text as it stands.",
+            "  A value written into the SQL rather than bound is of the column's own type, " ++
+            "because nothing converts it on the way: the database reads the text as it stands.",
     );
 }
 
@@ -1485,6 +1521,274 @@ fn whereTerm(
         }
         return quoted ++ " = " ++ literalText(Row, "`.index`'s `.where`", column, written);
     }
+}
+
+/// One table a literal condition reached through a reference, joined into
+/// the statement under `alias`: `text` is the whole ` JOIN … ON …`.
+pub const Hop = struct {
+    alias: []const u8,
+    text: []const u8,
+};
+
+/// What `literalReaching` answers: the condition, and the joins it needs.
+pub const Reached = struct {
+    sql: []const u8,
+    hops: []const Hop,
+};
+
+/// The alias every table an aggregate's `.where` reaches is joined under
+/// starts with this, followed by the path of reference columns:
+/// `"#f.org_unit_id.customer_id"`. `#` begins no field name, so no parent's
+/// alias can meet one. Inside a subquery over the rows pointing back the
+/// path starts with that subquery's own alias instead (`shape.countCall`).
+pub const reach_prefix = "#f";
+
+/// A condition over one table's columns written as SQL with its values in
+/// it, for the places a statement has a condition and nowhere to bind it: an
+/// aggregate's `.where`, which becomes `FILTER (WHERE …)`, and a
+/// `nilo_children` entry's
+/// ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+///
+/// **The where walker's words, narrowed to what a literal can say.** A value
+/// is `=`, `null` is `IS NULL`, and an operator struct takes `.eq`, `.ne`,
+/// `.gt`, `.gte`, `.lt`, `.lte`, `.in` and `.not_in`, ANDed across fields and
+/// within one; `.now` and `.today`, moved or not, are the database's clock.
+/// No `.any`, no pattern and no `.exists`: a filter that needs one is the
+/// statement's own `.where`, or `db.raw`. The values are the compiler's, so
+/// `literalText` checks each against its column the way it checks a default,
+/// and a quote in one is doubled rather than trusted.
+///
+/// A column with a `.references` may also be a way into the row it points
+/// at: `.state_id = .{ .category = .{ .not_in = … } }`.
+///
+/// **The table reached is joined, once, under an alias its path names**, and
+/// the condition reads its columns there. A reference points at one row or
+/// none, so the join changes neither how many rows there are nor what any
+/// other aggregate reads: that is ADR 218's argument for a parent, and it
+/// holds here for the same reason. A `JOIN` when the reference cannot be
+/// null and a `LEFT JOIN` when it can, or when anything above it is, the way
+/// a parent's join is chosen. A join and not an `EXISTS`, because the
+/// statements this replaces read a whole table into a dashboard's totals,
+/// and one join is one pass where a subquery in a `FILTER` is a lookup per
+/// row per aggregate. The same holds inside the subquery a `nilo_children`
+/// count is and in the statement a children list is, which is why their
+/// `.where` takes the same way (item 100). `relation` is the relation the
+/// condition reads, quoted, and `prefix` what the aliases of the tables it
+/// reaches start with.
+pub fn literalReaching(
+    comptime D: type,
+    comptime Row: type,
+    comptime relation: []const u8,
+    comptime prefix: []const u8,
+    comptime what: []const u8,
+    comptime where: anytype,
+) Reached {
+    comptime {
+        var hops: []const Hop = &.{};
+        const sql = literalWalk(D, Row, relation ++ ".", what, where, .{ .path = prefix, .left = false }, &hops);
+        return .{ .sql = sql, .hops = hops };
+    }
+}
+
+/// Where a literal walk may go through a reference: the alias path so far,
+/// and whether a join above this one was already outer.
+const Reach = struct {
+    path: []const u8,
+    left: bool,
+};
+
+/// `.now`, `.today` and the two moved by an offset, in a literal condition:
+/// the database's clock, which a statement reads as it runs (item 105). The
+/// words `where.clockWord` reads in a statement's own `.where`, with the same
+/// refusal on a column they do not fit. Null for every other value, and for
+/// `.now` on an enum column, where it is that enum's word.
+fn clockLiteral(
+    comptime D: type,
+    comptime Row: type,
+    comptime what: []const u8,
+    comptime column: []const u8,
+    comptime written: anytype,
+) ?[]const u8 {
+    comptime {
+        const W = @TypeOf(written);
+        const said = what ++ "'s `." ++ column ++ "`";
+        if (W == @TypeOf(.enum_literal)) return where_mod.clockWord(D, Row, column, written, said);
+        if (!where_mod.isShiftShape(W)) return null;
+        // A way through a reference into a row with a column called `now` or
+        // `today` is that, and not the clock.
+        if (pointedFrom(Row, column)) |pointed| {
+            if (row_mod.hasColumn(pointed.row, @typeInfo(W).@"struct".fields[0].name)) return null;
+        }
+        return where_mod.clockShifted(D, Row, column, W, written, said);
+    }
+}
+
+fn literalWalk(
+    comptime D: type,
+    comptime Row: type,
+    comptime qualifier: []const u8,
+    comptime what: []const u8,
+    comptime where: anytype,
+    comptime reach: Reach,
+    comptime hops: *[]const Hop,
+) []const u8 {
+    comptime {
+        const W = @TypeOf(where);
+        if (!isNamedForm(W)) @compileError(
+            "nilo: " ++ what ++ " is a " ++ @typeName(W) ++ ".\n" ++
+                "  It is keyed by the column it tests, the way a condition is: " ++
+                "`.where = .{ .currency = \"IDR\" }`.",
+        );
+        const fields = @typeInfo(W).@"struct".fields;
+        if (fields.len == 0) @compileError(
+            "nilo: " ++ what ++ " is empty.\n" ++
+                "  An aggregate over every row of the group is the ordinary kind: leave `.where` out.",
+        );
+        var out: []const u8 = "";
+        for (fields, 0..) |f, i| {
+            if (!row_mod.hasColumn(Row, f.name)) row_mod.noSuchColumn(Row, f.name, what);
+            const term = literalTerm(D, Row, qualifier, what, f.name, @field(where, f.name), reach, hops);
+            out = out ++ (if (i == 0) "" else " AND ") ++ term;
+        }
+        return out;
+    }
+}
+
+fn literalTerm(
+    comptime D: type,
+    comptime Row: type,
+    comptime qualifier: []const u8,
+    comptime what: []const u8,
+    comptime column: []const u8,
+    comptime written: anytype,
+    comptime reach: Reach,
+    comptime hops: *[]const Hop,
+) []const u8 {
+    comptime {
+        const quoted = qualifier ++ D.quote(column);
+        const W = @TypeOf(written);
+        if (W == @TypeOf(null)) return quoted ++ " IS NULL";
+        if (clockLiteral(D, Row, what, column, written)) |clock| return quoted ++ " = " ++ clock;
+        if (!isNamedForm(W)) return quoted ++ " = " ++ literalText(Row, what, column, written);
+
+        const words = "`.eq`, `.ne`, `.gt`, `.gte`, `.lt`, `.lte`, `.in` and `.not_in`";
+        const fields = @typeInfo(W).@"struct".fields;
+        if (fields.len == 0) @compileError(
+            "nilo: " ++ what ++ " tests `" ++ column ++ "` with no operator.\n  They are " ++ words ++ ".",
+        );
+
+        // A struct of columns rather than of operators: a way through the
+        // reference this column is, into the row it points at.
+        var operators: usize = 0;
+        for (fields) |f| {
+            if (listWord(f.name) != null or comparisonWord(f.name) != null) operators += 1;
+        }
+        if (operators == 0) {
+            if (pointedFrom(Row, column)) |pointed| {
+                const path = reach.path ++ "." ++ column;
+                const alias = D.quote(path);
+                const left = reach.left or @typeInfo(row_mod.ColumnType(Row, column)) == .optional;
+                var seen = false;
+                for (hops.*) |h| {
+                    if (std.mem.eql(u8, h.alias, path)) seen = true;
+                }
+                if (!seen) {
+                    const q = row_mod.qualifiedOf(pointed.row);
+                    hops.* = hops.* ++ &[_]Hop{.{
+                        .alias = path,
+                        .text = (if (left) " LEFT JOIN " else " JOIN ") ++ D.qualify(q.schema, q.table) ++
+                            " AS " ++ alias ++ " ON " ++ alias ++ "." ++ D.quote(pointed.target) ++
+                            " = " ++ quoted,
+                    }};
+                }
+                return literalWalk(D, pointed.row, alias ++ ".", what, written, .{ .path = path, .left = left }, hops);
+            }
+        }
+
+        var out: []const u8 = "";
+        for (fields, 0..) |f, i| {
+            const value = @field(written, f.name);
+            const term = if (listWord(f.name)) |negate| blk: {
+                if (!isListLiteral(@TypeOf(value))) @compileError(
+                    "nilo: " ++ what ++ " gives `" ++ column ++ "`'s `." ++ f.name ++ "` a " ++
+                        @typeName(@TypeOf(value)) ++ ".\n" ++
+                        "  It takes a list written out: `.{ ." ++ f.name ++ " = &.{ .done, .cancelled } }`.",
+                );
+                var list: []const u8 = "";
+                for (value, 0..) |element, n| {
+                    list = list ++ (if (n == 0) "" else ", ") ++ literalText(Row, what, column, element);
+                }
+                if (list.len == 0) @compileError(
+                    "nilo: " ++ what ++ " gives `" ++ column ++ "`'s `." ++ f.name ++ "` an empty list.\n" ++
+                        "  `IN ()` is not SQL, and a condition nothing can meet is one to take out.",
+                );
+                break :blk quoted ++ (if (negate) " NOT IN (" else " IN (") ++ list ++ ")";
+            } else if (comparisonWord(f.name)) |op| blk: {
+                if (@TypeOf(value) == @TypeOf(null)) {
+                    if (std.mem.eql(u8, op, "=")) break :blk quoted ++ " IS NULL";
+                    if (std.mem.eql(u8, op, "<>")) break :blk quoted ++ " IS NOT NULL";
+                    @compileError(
+                        "nilo: " ++ what ++ " asks whether `" ++ column ++ "` is `." ++ f.name ++
+                            "` null.\n  Nothing is greater or less than null: `null` is IS NULL " ++
+                            "and `.{ .ne = null }` is IS NOT NULL.",
+                    );
+                }
+                break :blk quoted ++ " " ++ op ++ " " ++
+                    (clockLiteral(D, Row, what, column, value) orelse literalText(Row, what, column, value));
+            } else @compileError(
+                "nilo: " ++ what ++ " tests `" ++ column ++ "` with `." ++ f.name ++
+                    "`, which is not one it writes.\n  They are " ++ words ++
+                    (if (operators == 0)
+                        ". A column with a `.references` of one column is also a way into the " ++
+                            "row it points at: `." ++ column ++ " = .{ .<its column> = … }`"
+                    else
+                        "") ++
+                    ". A pattern, an `.any` or an `.exists` belongs in the statement's own " ++
+                    "`.where`, or in `db.raw`.",
+            );
+            out = out ++ (if (i == 0) "" else " AND ") ++ term;
+        }
+        return out;
+    }
+}
+
+/// The Row a column of `Row`'s table points at through a `.references` of
+/// that one column, and the column it points at there. Null for a column
+/// that points nowhere, for one inside a key of several columns, and for a
+/// reference that named its table as text: there is no Row there to check a
+/// column against.
+pub fn pointedFrom(comptime Row: type, comptime column: []const u8) ?struct { row: type, target: []const u8 } {
+    comptime {
+        const owner = row_mod.ownerOf(Row);
+        const decl = @field(owner, row_mod.marker);
+        if (!isNamedForm(@TypeOf(decl)) or !@hasField(@TypeOf(decl), "references")) return null;
+        const refs = decl.references;
+        if (!@hasField(@TypeOf(refs), column)) return null;
+        const entry = @field(refs, column);
+        if (isNamedForm(@TypeOf(entry))) return null;
+        const target = targetOf(owner, column, entry[0], entry[1]);
+        const Pointed = target.row orelse return null;
+        if (target.columns.len != 1) return null;
+        return .{ .row = Pointed, .target = target.columns[0] };
+    }
+}
+
+/// `.in` and `.not_in`, and whether the one found negates.
+fn listWord(comptime name: []const u8) ?bool {
+    if (std.mem.eql(u8, name, "in")) return false;
+    if (std.mem.eql(u8, name, "not_in")) return true;
+    return null;
+}
+
+fn comparisonWord(comptime name: []const u8) ?[]const u8 {
+    const table = .{
+        .{ "eq", "=" }, .{ "ne", "<>" }, .{ "gt", ">" },
+        .{ "gte", ">=" }, .{ "lt", "<" }, .{ "lte", "<=" },
+    };
+    inline for (table) |pair| {
+        if (std.mem.eql(u8, name, pair[0])) return pair[1];
+    }
+    return null;
 }
 
 /// What an entry of `.references` may say beside its columns.

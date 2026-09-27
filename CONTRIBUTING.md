@@ -27,7 +27,7 @@ The ADRs are the important one. Before you propose a design change, check whethe
 ## The commands
 
 ```
-zig build test          # the loop: the suite in Debug, the refusals, every module gate, layering, snippets
+zig build test          # the loop: the suite in Debug, the refusals, every module gate, layering, snippets, adr-check, docs-check
 zig build test-all      # the same plus ReleaseSafe and the SQL suite. What CI runs, and the whole gate
 zig build refusals-sql  # one module's refusal table; refusals, -config, -pw, -cache, -s3, -job, -fetch for the others
 zig build examples      # build every example
@@ -95,7 +95,11 @@ Documentation is part of the change, not a follow-up:
 | something now built | delete its entry from [`docs/roadmap.md`](./docs/roadmap.md) |
 | a question answered, or a feature refused with its reason | [`docs/decided.md`](./docs/decided.md), and out of the roadmap |
 | something a user has to change | [`CHANGELOG.md`](./CHANGELOG.md), under `## Unreleased` |
-| a public API | [`docs/reference/`](./docs/reference/), one page a module, every heading listed once on its `README.md` |
+| a public API | [`docs/reference/`](./docs/reference/), one page a module; `zig build docs-index` rewrites the list of every heading on its `README.md` |
+| how to use something | [`docs/guide/`](./docs/guide/), one page a task |
+| how a topic's decisions fit together | its page in [`docs/design/`](./docs/design/), linked from each ADR's `**Topic:**` line |
+
+**Every page of the guide, the reference and the design pages opens the same way, and a build step holds it.** Line 1 is the title, line 3 one bold sentence saying what the page is, and line 5 links the same topic in the other two layers (`**Reference:** … · **Design:** …`, or `none`). A heading names what its section covers in the words a reader would search for (a task in the guide, a symbol in the reference), and what it concludes is the section's bold first sentence. Prose is one paragraph a line with no em dash. A new page also gets a row or link in the map, [`docs/README.md`](./docs/README.md). `zig build docs-check`, on `test`, refuses a page that breaks any of this, and every anchor that points at nothing ([ADR 236](./docs/adr/236-a-doc-page-says-what-it-is-and-where-its-other-layers-are.md)).
 
 **A snippet you publish is a program, so let the build compile it.** `<!-- compiles -->` above a fenced `zig` block (`<!-- compiles: body -->` for a run of statements) and `zig build snippets` compiles it with [`docs/snippets/types.zig`](./docs/snippets/types.zig) in front. Writing that step found seven mistakes in one five-line example ([ADR 068](./docs/adr/068-the-guide-is-the-source-of-its-own-snippets.md)). Unlike the refusals these cache, so marking one more is nearly free.
 

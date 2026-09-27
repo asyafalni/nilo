@@ -49,7 +49,7 @@ that motivated the change is unaffected.
 
 A `fetch()` that sends `*/*` to an extensionless path is indistinguishable from
 a deep link at this layer, and gets the page. That is unchanged behaviour, said
-out loud in [the guide](../guide/static-files.md#the-fallback-and-what-it-is-for)
+out loud in [the guide](../guide/static-files.md#the-spa-fallback)
 rather than left to be discovered. Sending `Accept: application/json` — which
 most clients do — is what separates them, and is worth doing for reasons that
 have nothing to do with this.

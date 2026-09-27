@@ -1,8 +1,12 @@
 # Routing
 
-**A route's pattern is the whole of its identity: what matches a request, what a URL is built back from, and what a route is called are all read off the same compile-time string, so none of them can drift out of step with another.** How to register and group routes is the guide ([`guide/routing.md`](../guide/routing.md)); every method is the reference ([`reference/app.md#app`](../reference/app.md#app), [`reference/ctx.md`](../reference/ctx.md)). The code is `http/router.zig` (`validatePattern`, `Route`, `add`, `matchInto`, `find`, `max_segments`), `http/app.zig` (`routeNamed`, `checkName`, `named`), `http/ctx.zig` (`url`, `routeName`) and `http/url.zig`.
+**A route's pattern is the whole of its identity: what matches a request, what a URL is built back from, and what a route is called are all read off the same compile-time string, so none of them can drift out of step with another.**
 
-## How the pieces fit
+**Guide:** [Routing](../guide/routing.md) · **Reference:** [`App`](../reference/app.md#app), [`c.url`](../reference/ctx.md#answering)
+
+The code is `http/router.zig` (`validatePattern`, `Route`, `add`, `matchInto`, `find`, `max_segments`), `http/app.zig` (`routeNamed`, `checkName`, `named`), `http/ctx.zig` (`url`, `routeName`) and `http/url.zig`.
+
+## Overview
 
 ```
   "/api/partners/:id"  ── validatePattern (comptime) ──► six refusals:
@@ -26,7 +30,7 @@
 
 `app.routes()` is a read-only view onto the same table `match` scans and `app.metrics` indexes into: method, joined pattern and name, nothing more.
 
-## The rule in force
+## Rules
 
 1. **The most specific route wins, not the one registered first.** A literal beats a param beats a `*`, an earlier segment outranks every later one, and a route ending where the path ends beats a `*` standing for nothing. That ranking is the order a tree of segments is searched in (literal, then param, then `*`, backing out of a dead end), so no score is kept; the tree replaced a linear scan that cost 35% of a request on a real 276-route table and now costs 8%. [ADR 012](../adr/012-the-most-specific-route-wins-and-duplicates-are-refused.md)
 2. **A second route of the same shape is refused at registration**, `error.DuplicateRoute`, naming the pattern already there; param names are not part of the shape, so `/users/:id` and `/users/:name` collide. [ADR 012](../adr/012-the-most-specific-route-wins-and-duplicates-are-refused.md)
@@ -51,6 +55,6 @@
 
 Beside this topic: how the derived `operationId` and the rest of the API description are read off a handler's signature is [ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md); how a middleware learns which route it is in front of, through the same name, is [ADR 162](../adr/162-a-middleware-can-learn-which-route-it-is-in-front-of.md); why an error message is held to the wording a build step checks is [ADR 026](../adr/026-the-rule-about-error-messages-is-held-by-a-build-step.md).
 
-## Open
+## Open questions
 
 Nothing is open on the record.

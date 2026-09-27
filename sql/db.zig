@@ -160,8 +160,13 @@ pub const Sent = struct {
     /// `db.raw` and `db.exec`.
     sql: []const u8,
     /// The name it is kept prepared under, or null for a statement that is
-    /// not kept — which is `db.raw`, `db.exec`, and every statement on a `Db`
-    /// with `prepared = false` (ADR 051).
+    /// not kept (ADR 051). A `db.raw` statement is kept and named like any
+    /// other, since its text became comptime, so the name is what a watcher
+    /// counts and groups by. Null is `db.exec`, whose text arrives at run time;
+    /// a statement whose `ORDER BY` a `sql.Ordering` chose, typed or raw,
+    /// whose text differs per request; a `Composed` statement; and every
+    /// statement on a `Db` with
+    /// `prepared = false`.
     plan: ?[]const u8,
     /// How long the database took, from the call going out to the rows being
     /// in hand. Taken from the monotonic clock, so an operator moving the
@@ -194,6 +199,14 @@ pub const Sent = struct {
     /// the request has to copy it — the same rule a `Str` follows. And it
     /// still never reaches the client (ADR 024).
     problem: ?wire_mod.Problem = null,
+    /// The `operationId` of the route whose request sent it, the name
+    /// `c.routeName()` answers, or null for a statement sent under a `Run`
+    /// and for a request no route matched. What joins a slow statement to
+    /// the screen that paid for it: one list, its count and seven facets are
+    /// often the same text, and this says which request each came from. A
+    /// comptime literal or a name the App owns for its life, so a watcher
+    /// may keep it.
+    route: ?[]const u8 = null,
 };
 
 /// What `db.watching` takes. A plain function pointer rather than an
@@ -652,6 +665,95 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             return comptime statement.planName(sql);
         }
 
+        /// Hold a raw statement against the Row it fills, **the first time it
+        /// runs in this process**
+        /// ([ADR 233](../docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
+        ///
+        /// `rawcheck` counts and names the columns while compiling, and that is
+        /// all a comptime pass can do: the types are the database's, and so is
+        /// whether a column can be NULL. The port's feed page went down on the
+        /// second: a `LEFT JOIN LATERAL` whose column was read into a field
+        /// that was not optional, which worked on every row until the day a
+        /// subject was deleted. So the Wire is asked what the statement would
+        /// answer, without running it, and the answer is held against the Row.
+        ///
+        /// **Once per statement per process**, on a flag of its own: every
+        /// call after the first costs one atomic load. The first costs what
+        /// `describe` costs, planning only. **A misfit fails the statement in a
+        /// test binary and is a warning in a server**: a suite is where the
+        /// mistake is cheap to fix, and a server whose check found a column
+        /// that *may* be NULL still has every row that is not.
+        ///
+        /// `key` is the statement as written, `text` what is sent; they differ
+        /// by the `{order}` an `Ordering` fills, which changes nothing a column
+        /// is. Not asked inside a transaction: `describe` takes a connection of
+        /// its own, and a transaction already holding the writer on SQLite, or
+        /// every connection of a small pool, would wait on itself.
+        fn vetRaw(
+            self: *Self,
+            comptime Row: type,
+            comptime key: []const u8,
+            comptime call: []const u8,
+            comptime scalar: bool,
+            comptime total: bool,
+            c: anytype,
+            text: []const u8,
+        ) !void {
+            // One flag per statement, Row and call. **The declarations below
+            // are what make it one**: Zig gives a struct declared in a
+            // generic function one type for every instantiation that
+            // captures the same values, so a struct naming none of them is
+            // one flag for the whole program, and the first raw statement to
+            // run was the only one ever held against its Row.
+            const First = struct {
+                const statement_key = key;
+                const Filled = Row;
+                const called = call;
+                const Db = Self;
+                var taken: std.atomic.Value(bool) = .init(false);
+            };
+            if (First.taken.load(.acquire)) return;
+            const w = if (self.wire) |*w| w else return;
+            if (First.taken.swap(true, .acq_rel)) return;
+            return vetFirst(w, c.arena(), comptime schema.readingsOf(D, Row, scalar, total), call, @typeName(Row), text);
+        }
+
+        /// The half of `vetRaw` that runs once, and **the half that is not
+        /// generic**: a flag and a call are what each raw statement in a
+        /// program adds, and this is linked once. `noinline` keeps it that way,
+        /// since inlined it was a copy per call site.
+        noinline fn vetFirst(
+            w: *W,
+            arena: std.mem.Allocator,
+            readings: []const schema.Reading,
+            call: []const u8,
+            row_name: []const u8,
+            text: []const u8,
+        ) !void {
+            var nulls = false;
+            for (readings) |r| nulls = nulls or !r.optional;
+            const described = w.describe(arena, text, nulls) catch |err| {
+                std.log.warn(
+                    "nilo_sql: `{s}` into {s} could not be held against what the statement " ++
+                        "answers ({s}), so it runs unchecked: {s}",
+                    .{ call, row_name, @errorName(err), text },
+                );
+                return;
+            } orelse return;
+
+            var misfits: std.ArrayList(schema.Misfit) = .empty;
+            try schema.fit(readings, described, &misfits, arena);
+            if (misfits.items.len == 0) return;
+
+            var said: std.Io.Writer.Allocating = .init(arena);
+            for (misfits.items) |m| try m.write(&said.writer);
+            std.log.warn(
+                "nilo_sql: `{s}` into {s} does not fit what the statement answers:\n{s}  The statement: {s}",
+                .{ call, row_name, said.written(), text },
+            );
+            if (builtin.is_test) return error.QueryFailed;
+        }
+
         /// A raw statement's text as this Dialect spells its placeholders,
         /// with the `$n` in it held against the values handed over
         /// ([ADR 204](../docs/adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
@@ -781,7 +883,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// nobody could get a word out of (ADR 117).
         fn told(
             self: *const Self,
-            arena: std.mem.Allocator,
+            c: anytype,
             started: ?i64,
             sql: []const u8,
             plan: ?[]const u8,
@@ -793,11 +895,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // watcher's half: a `Db` with no watcher and a `Db` with timing off
             // both still owe the caller an answer about the statement it just
             // ran (ADR 117).
-            remember(arena, problem);
+            remember(c.arena(), problem);
             const f = self.watch orelse return;
             const at = started orelse return;
             const took = core.monotonicMicros() - at;
             f(.{
+                .route = core.routeNameOf(c),
                 .sql = sql,
                 .plan = plan,
                 // A monotonic clock does not go backwards, so this cannot be
@@ -827,15 +930,15 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             var problem: ?wire_mod.Problem = null;
             const changed = if (tx) |t|
                 t.exec(arena, sql, values, plan, &problem) catch |err| {
-                    self.told(arena, started, sql, plan, null, true, problem);
+                    self.told(c, started, sql, plan, null, true, problem);
                     return err;
                 }
             else
                 w.exec(arena, sql, values, plan, &problem) catch |err| {
-                    self.told(arena, started, sql, plan, null, true, problem);
+                    self.told(c, started, sql, plan, null, true, problem);
                     return err;
                 };
-            self.told(arena, started, sql, plan, changed, false, null);
+            self.told(c, started, sql, plan, changed, false, null);
             return changed;
         }
 
@@ -1114,6 +1217,97 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             return fill(Row, stmt.reserve, self, null, c, try textOf(stmt, options, c), self.planOf(stmt), try valuesOf(stmt, Row, options, c));
         }
 
+        /// The plan of the statement `db.select(Row, c, options)` sends, with
+        /// the same values bound, one line of it per line of text.
+        ///
+        /// ```zig
+        /// const plan = try db.explain(DealCard, c, .{ .where = .{ .stage = .won }, .order = .{ .id = .desc }, .limit = 20 });
+        /// try testing.expect(std.mem.indexOf(u8, plan, "Seq Scan on deals") == null);
+        /// ```
+        ///
+        /// **For a test and for a developer, and it says so by what it does.**
+        /// On Postgres it is `EXPLAIN (ANALYZE, BUFFERS)`, which runs the read
+        /// and reports what it did; on SQLite `EXPLAIN QUERY PLAN`, which plans
+        /// it. The point is the statement nilo wrote: a shaped or typed read's
+        /// text exists only while it runs and its values are kept from the
+        /// watcher on purpose, so without this the plan of a slow `db.page`
+        /// meant rebuilding the text and guessing the values. A Row's children
+        /// are a second statement and are not in it. Sent unprepared, and
+        /// told to the watcher like any other statement.
+        pub fn explain(self: *Self, comptime Row: type, c: anytype, options: anytype) ![]const u8 {
+            comptime core.checkScope(@TypeOf(c), "db.explain");
+            comptime assertUnlocked(Row, @TypeOf(options), "db.explain", "The plan of a locking read is the plan " ++
+                "of the same read without the lock: take `.lock` out.");
+            const stmt = comptime statement.select(D, Row, @TypeOf(options));
+            const text = try std.mem.concat(c.arena(), u8, &.{ D.explain, try textOf(stmt, options, c) });
+            return explained(self, null, c, text, try valuesOf(stmt, Row, options, c));
+        }
+
+        /// `db.explain` for a statement this module did not write: the plan of
+        /// `db.raw(…, sql, values)`, with the same values bound
+        /// ([ADR 232](../docs/adr/232-a-read-can-show-its-plan.md)).
+        ///
+        /// ```zig
+        /// const plan = try db.rawExplain(c,
+        ///     \\SELECT d.id, count(*) OVER () FROM deals d
+        ///     \\WHERE d.stage = $1 ORDER BY d.id LIMIT $2 OFFSET $3
+        /// , .{ "won", @as(i64, 20), @as(i64, 0) });
+        /// ```
+        ///
+        /// The statements worth explaining are mostly these: the lists with a
+        /// join no Row names, a `LATERAL`, the facets. **It runs inside a
+        /// transaction that is always rolled back**, because on Postgres
+        /// `ANALYZE` executes what it plans and a raw statement may be an
+        /// `UPDATE`: asking how a write is done never keeps the write. A
+        /// sequence it advanced stays advanced, since Postgres keeps that
+        /// outside every transaction.
+        pub fn rawExplain(self: *Self, c: anytype, comptime sql: []const u8, values: anytype) ![]const u8 {
+            comptime core.checkScope(@TypeOf(c), "db.rawExplain");
+            const text = comptime D.explain ++ rawText(sql, @TypeOf(values), "db.rawExplain");
+            var tx = try self.begin(c, .{});
+            defer tx.deinit();
+            return explained(self, &tx.inner, c, text, try rawValuesOf(values, c));
+        }
+
+        /// `db.rawExplain` for a statement with the `{order}` hole
+        /// `db.rawOrdered` and `db.rawPageOrdered` take, filled with `order`
+        /// (ADR 165, ADR 232): the plan of the list a request sorted.
+        pub fn rawExplainOrdered(
+            self: *Self,
+            c: anytype,
+            comptime sql: []const u8,
+            values: anytype,
+            order: anytype,
+        ) ![]const u8 {
+            comptime core.checkScope(@TypeOf(c), "db.rawExplainOrdered");
+            const parts = comptime ordering.split(rawText(sql, @TypeOf(values), "db.rawExplainOrdered"), "`db.rawExplainOrdered`");
+            const text = try spliced(D.explain ++ parts.head, order, parts.tail, c);
+            var tx = try self.begin(c, .{});
+            defer tx.deinit();
+            return explained(self, &tx.inner, c, text, try rawValuesOf(values, c));
+        }
+
+        /// The plan a Dialect's `explain` prefix answers with, one line of it
+        /// per line of text, in the Scope's arena. Sent unprepared, since it
+        /// is asked once, and through `filling`, so a watcher is told.
+        fn explained(self: *Self, tx: ?*W.Tx, c: anytype, text: []const u8, values: anytype) ![]const u8 {
+            const arena = c.arena();
+            const lines = try filling(PlanLine(D.explain_width), null, self, tx, c, text, null, values, null);
+            var size: usize = 0;
+            for (lines) |line| size += line.text.len + 1;
+            const out = try arena.alloc(u8, size -| 1);
+            var at: usize = 0;
+            for (lines, 0..) |line, i| {
+                if (i > 0) {
+                    out[at] = '\n';
+                    at += 1;
+                }
+                @memcpy(out[at..][0..line.text.len], line.text);
+                at += line.text.len;
+            }
+            return out;
+        }
+
         /// The first row matching `options`, or null.
         ///
         /// `?Row` is already a 404 in the typed layer (ADR 023), so a
@@ -1159,6 +1353,9 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// key, and a tuple are all Refusals.
         pub fn find(self: *Self, comptime Row: type, c: anytype, key: anytype) !?Row {
             comptime core.checkScope(@TypeOf(c), "db.find");
+            // A narrower Row that does not carry its table's key is found the
+            // way `one` finds it with the key in `.where` (item 103).
+            if (comptime !statement.carriesKey(Row)) return self.one(Row, c, statement.keyWhere(Row, key));
             const stmt = comptime statement.find(D, Row, @TypeOf(key));
             const found = try fill(Row, stmt.reserve, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, key, c));
             return if (found.len == 0) null else found[0];
@@ -1227,6 +1424,8 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 try valuesOf(stmt, Row, options, c),
                 &total,
             );
+            // Past the last row the window has no row to ride on (ADR 150).
+            if (rows.len == 0 and skippedRows(options)) total = try countBehind(self, Row, null, c, options);
             return .{ .rows = rows, .total = total };
         }
 
@@ -1303,7 +1502,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 self.planOf(stmt),
                 &problem,
             ) catch |err| {
-                self.told(arena, started, text, self.planOf(stmt), null, true, problem);
+                self.told(c, started, text, self.planOf(stmt), null, true, problem);
                 return err;
             };
             // **What a watcher is told here is the statement opening**, with
@@ -1311,7 +1510,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // nothing in this call sees the last one. A stream that is slow to
             // *open* is the half worth reporting, and it is the half this can
             // report honestly (ADR 108).
-            self.told(arena, started, text, self.planOf(stmt), null, false, null);
+            self.told(c, started, text, self.planOf(stmt), null, false, null);
             // Counted only once the statement is away, so a `stream` that
             // never opened is not a `stream` that was never closed.
             if (traps_enabled) self.hold(&self.open_streams, .Add);
@@ -1333,11 +1532,13 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// and a disagreement is a compile error naming both. The statement is
         /// kept prepared like every other one.
         ///
-        /// **What is still given up is the *type* check**, which is the whole
-        /// of what this call costs now. A comptime pass has no schema, so
-        /// `SELECT id, email` into `struct { id: i64, email: Str }` is checked
-        /// for shape and not for whether `email` is really `text`. That half
-        /// belongs to `db.checking`, which asks the database.
+        /// **The types, and the NULLs an outer join makes, are asked of the
+        /// database the first time the statement runs** (`vetRaw`,
+        /// [ADR 233](../docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
+        /// A comptime pass has no schema, so `SELECT id, email` into
+        /// `struct { id: i64, email: Str }` is checked here for shape, and
+        /// whether `email` is really `text` is found out on the first call: a
+        /// failed statement in a test binary, a warning in a server.
         ///
         /// A `*` in the list, and a statement with no `SELECT` and no
         /// `RETURNING`, are counted as "not counted" rather than guessed at —
@@ -1356,9 +1557,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // ([ADR 125](../docs/adr/125-a-row-that-owns-no-table.md)).
             if (comptime scalarColumn(Row)) {
                 comptime rawcheck.assertOne(Row, sql, "db.raw");
+                try self.vetRaw(Row, text, "db.raw", true, false, c, text);
                 return fillScalar(Row, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c));
             }
             comptime rawcheck.assertList(D, Row, sql, "db.raw");
+            try self.vetRaw(Row, text, "db.raw", false, false, c, text);
             // No ceiling: this module did not write the statement and so has
             // nothing to say about how many rows it can answer with.
             //
@@ -1409,6 +1612,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             comptime ordering.assertFor(@TypeOf(order), Row, "`db.rawOrdered`", false);
             const parts = comptime ordering.split(rawText(sql, @TypeOf(values), "db.rawOrdered"), "`db.rawOrdered`");
             const text = try spliced(parts.head, order, parts.tail, c);
+            try self.vetRaw(Row, sql, "db.rawOrdered", false, false, c, text);
             return fill(Row, null, self, null, c, text, null, try rawValuesOf(values, c));
         }
 
@@ -1446,10 +1650,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             const text = comptime rawText(sql, @TypeOf(values), "db.rawOne");
             if (comptime scalarColumn(Row)) {
                 comptime rawcheck.assertOne(Row, sql, "db.rawOne");
+                try self.vetRaw(Row, text, "db.rawOne", true, false, c, text);
                 const found = try fillScalar(Row, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c));
                 return if (found.len == 0) null else found[0];
             }
             comptime rawcheck.assertList(D, Row, sql, "db.rawOne");
+            try self.vetRaw(Row, text, "db.rawOne", false, false, c, text);
             const found = try fill(Row, null, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c));
             return if (found.len == 0) null else found[0];
         }
@@ -1486,10 +1692,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             const text = comptime rawText(sql, @TypeOf(values), "db.rawExactlyOne");
             if (comptime scalarColumn(Row)) {
                 comptime rawcheck.assertOne(Row, sql, "db.rawExactlyOne");
+                try self.vetRaw(Row, text, "db.rawExactlyOne", true, false, c, text);
                 const found = try fillScalar(Row, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c));
                 return if (found.len == 0) error.QueryFailed else found[0];
             }
             comptime rawcheck.assertList(D, Row, sql, "db.rawExactlyOne");
+            try self.vetRaw(Row, text, "db.rawExactlyOne", false, false, c, text);
             const found = try fill(Row, null, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c));
             return if (found.len == 0) error.QueryFailed else found[0];
         }
@@ -1531,9 +1739,60 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         ) !Page(Row) {
             comptime core.checkScope(@TypeOf(c), "db.rawPage");
             comptime rawcheck.assertPaged(D, Row, sql, "db.rawPage");
+            const paged = comptime rawcheck.paging(sql, @TypeOf(values), "db.rawPage");
             const text = comptime rawText(sql, @TypeOf(values), "db.rawPage");
+            try self.vetRaw(Row, text, "db.rawPage", false, true, c, text);
+            const bound = try rawValuesOf(values, c);
             var total: i64 = 0;
-            const rows = try filling(Row, null, self, null, c, text, self.rawPlanOf(text), try rawValuesOf(values, c), &total);
+            const rows = try filling(Row, null, self, null, c, text, self.rawPlanOf(text), bound, &total);
+            if (comptime paged.asksAgain()) {
+                if (rows.len == 0 and rawSkipped(paged, bound)) {
+                    total = try rawTotalBehind(Row, paged, self, null, c, text, self.rawPlanOf(text), bound);
+                }
+            }
+            return .{ .rows = rows, .total = total };
+        }
+
+        /// `db.rawPage` with its `ORDER BY` chosen per request: the `{order}`
+        /// hole `db.rawOrdered` takes, in a statement whose list ends in
+        /// `count(*) OVER ()`
+        /// ([ADR 205](../docs/adr/205-a-raw-statement-can-carry-its-total.md)).
+        ///
+        /// ```zig
+        /// const found = try db.rawPageOrdered(Card, c,
+        ///     \SELECT c.id, c.title, count(*) OVER () FROM commitments c
+        ///     \WHERE ($1::text IS NULL OR c.state = $1) {order} LIMIT $2 OFFSET $3
+        /// , .{ state, limit, offset }, q.value.order);
+        /// ```
+        ///
+        /// **A list screen whose order is the request's is the one that most
+        /// needs its total**, and without this it was `rawOrdered` for the rows
+        /// and a second statement for the count with the `WHERE` pasted in
+        /// again: the two could disagree, which is what `rawPage` was written
+        /// to end. Both checks apply unchanged: the list is the Row's fields and
+        /// one more, and the hole is there exactly once. It runs unnamed for
+        /// the reason `rawOrdered` does.
+        pub fn rawPageOrdered(
+            self: *Self,
+            comptime Row: type,
+            c: anytype,
+            comptime sql: []const u8,
+            values: anytype,
+            order: anytype,
+        ) !Page(Row) {
+            comptime core.checkScope(@TypeOf(c), "db.rawPageOrdered");
+            comptime rawcheck.assertPaged(D, Row, sql, "db.rawPageOrdered");
+            const paged = comptime rawcheck.paging(sql, @TypeOf(values), "db.rawPageOrdered");
+            comptime ordering.assertFor(@TypeOf(order), Row, "`db.rawPageOrdered`", false);
+            const parts = comptime ordering.split(rawText(sql, @TypeOf(values), "db.rawPageOrdered"), "`db.rawPageOrdered`");
+            const text = try spliced(parts.head, order, parts.tail, c);
+            try self.vetRaw(Row, sql, "db.rawPageOrdered", false, true, c, text);
+            const bound = try rawValuesOf(values, c);
+            var total: i64 = 0;
+            const rows = try filling(Row, null, self, null, c, text, null, bound, &total);
+            if (comptime paged.asksAgain()) {
+                if (rows.len == 0 and rawSkipped(paged, bound)) total = try rawTotalBehind(Row, paged, self, null, c, text, null, bound);
+            }
             return .{ .rows = rows, .total = total };
         }
 
@@ -2167,6 +2426,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
             pub fn find(self: *Tx, comptime Row: type, c: anytype, key: anytype) !?Row {
                 comptime core.checkScope(@TypeOf(c), "tx.find");
+                if (comptime !statement.carriesKey(Row)) return self.one(Row, c, statement.keyWhere(Row, key));
                 const stmt = comptime statement.find(D, Row, @TypeOf(key));
                 const found = try fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, key, c));
                 return if (found.len == 0) null else found[0];
@@ -2257,6 +2517,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                     try valuesOf(stmt, Row, options, c),
                     &total,
                 );
+                if (rows.len == 0 and skippedRows(options)) total = try countBehind(self.db, Row, &self.inner, c, options);
                 return .{ .rows = rows, .total = total };
             }
 
@@ -2461,9 +2722,41 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             ) !Page(Row) {
                 comptime core.checkScope(@TypeOf(c), "tx.rawPage");
                 comptime rawcheck.assertPaged(D, Row, sql, "tx.rawPage");
+                const paged = comptime rawcheck.paging(sql, @TypeOf(values), "tx.rawPage");
                 const text = comptime rawText(sql, @TypeOf(values), "tx.rawPage");
+                const bound = try rawValuesOf(values, c);
                 var total: i64 = 0;
-                const rows = try filling(Row, null, self.db, &self.inner, c, text, self.db.rawPlanOf(text), try rawValuesOf(values, c), &total);
+                const rows = try filling(Row, null, self.db, &self.inner, c, text, self.db.rawPlanOf(text), bound, &total);
+                if (comptime paged.asksAgain()) {
+                    if (rows.len == 0 and rawSkipped(paged, bound)) {
+                        total = try rawTotalBehind(Row, paged, self.db, &self.inner, c, text, self.db.rawPlanOf(text), bound);
+                    }
+                }
+                return .{ .rows = rows, .total = total };
+            }
+
+            /// `db.rawPageOrdered` inside the transaction: the caller's paged
+            /// statement with its `ORDER BY` chosen per request (ADR 205).
+            pub fn rawPageOrdered(
+                self: *Tx,
+                comptime Row: type,
+                c: anytype,
+                comptime sql: []const u8,
+                values: anytype,
+                order: anytype,
+            ) !Page(Row) {
+                comptime core.checkScope(@TypeOf(c), "tx.rawPageOrdered");
+                comptime rawcheck.assertPaged(D, Row, sql, "tx.rawPageOrdered");
+                const paged = comptime rawcheck.paging(sql, @TypeOf(values), "tx.rawPageOrdered");
+                comptime ordering.assertFor(@TypeOf(order), Row, "`tx.rawPageOrdered`", false);
+                const parts = comptime ordering.split(rawText(sql, @TypeOf(values), "tx.rawPageOrdered"), "`tx.rawPageOrdered`");
+                const text = try spliced(parts.head, order, parts.tail, c);
+                const bound = try rawValuesOf(values, c);
+                var total: i64 = 0;
+                const rows = try filling(Row, null, self.db, &self.inner, c, text, null, bound, &total);
+                if (comptime paged.asksAgain()) {
+                    if (rows.len == 0 and rawSkipped(paged, bound)) total = try rawTotalBehind(Row, paged, self.db, &self.inner, c, text, null, bound);
+                }
                 return .{ .rows = rows, .total = total };
             }
 
@@ -2563,7 +2856,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             inline for (@typeInfo(Row).@"struct".fields) |f| {
                 const F = @FieldType(B, f.name);
                 switch (comptime row_mod.kindWith(Row, f.name, f.type)) {
-                    .column, .aggregate => {
+                    .column, .aggregate, .over_children, .through => {
                         @field(out, f.name) = try borrowColumn(w, rows, F, col);
                         col += 1;
                     },
@@ -2746,12 +3039,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
             var rows = if (tx) |t|
                 t.run(arena, sql, values, plan, &problem) catch |err| {
-                    db.told(arena, started, sql, plan, null, true, problem);
+                    db.told(c, started, sql, plan, null, true, problem);
                     return err;
                 }
             else
                 w.run(arena, sql, values, plan, &problem) catch |err| {
-                    db.told(arena, started, sql, plan, null, true, problem);
+                    db.told(c, started, sql, plan, null, true, problem);
                     return err;
                 };
             // Whatever happens below, the connection goes back usable —
@@ -2765,12 +3058,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // **once per statement** rather than once per row, and asked at
             // the first moment both drivers can answer it (ADR 106).
             const any = w.next(&rows) catch |err| {
-                db.told(arena, started, sql, plan, null, true, stepProblem(w, &rows, err, arena));
+                db.told(c, started, sql, plan, null, true, stepProblem(w, &rows, err, arena));
                 return err;
             };
             if (any) {
                 wideEnough(Row, if (total == null) 0 else 1, w, &rows) catch |err| {
-                    db.told(arena, started, sql, plan, null, true, null);
+                    db.told(c, started, sql, plan, null, true, null);
                     return err;
                 };
                 // Read once rather than per row: `count(*) OVER ()` is the
@@ -2783,24 +3076,24 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                         comptime shape.width(Row),
                         c,
                     ) catch |err| {
-                        db.told(arena, started, sql, plan, null, true, null);
+                        db.told(c, started, sql, plan, null, true, null);
                         return err;
                     };
                 }
                 while (true) {
                     const filled = readRow(Row, 0, w, &rows, c) catch |err| {
-                        db.told(arena, started, sql, plan, null, true, null);
+                        db.told(c, started, sql, plan, null, true, null);
                         return err;
                     };
                     try out.append(arena, filled);
                     const more = w.next(&rows) catch |err| {
-                        db.told(arena, started, sql, plan, null, true, stepProblem(w, &rows, err, arena));
+                        db.told(c, started, sql, plan, null, true, stepProblem(w, &rows, err, arena));
                         return err;
                     };
                     if (!more) break;
                 }
             }
-            db.told(arena, started, sql, plan, out.items.len, false, null);
+            db.told(c, started, sql, plan, out.items.len, false, null);
             return out.toOwnedSlice(arena);
         }
 
@@ -2872,12 +3165,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
             var rows = if (tx) |t|
                 t.run(arena, sql, values, plan, &problem) catch |err| {
-                    db.told(arena, started, sql, plan, null, true, problem);
+                    db.told(c, started, sql, plan, null, true, problem);
                     return err;
                 }
             else
                 w.run(arena, sql, values, plan, &problem) catch |err| {
-                    db.told(arena, started, sql, plan, null, true, problem);
+                    db.told(c, started, sql, plan, null, true, problem);
                     return err;
                 };
             defer w.drain(&rows);
@@ -2888,19 +3181,19 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 // answered rows, so this is the one width a scalar can be
                 // short of, and it is checked for the reason `wideEnough` is.
                 if (w.width(&rows) < 1) {
-                    db.told(arena, started, sql, plan, null, true, null);
+                    db.told(c, started, sql, plan, null, true, null);
                     return error.QueryFailed;
                 }
                 while (true) {
                     const value = readColumn(w, &rows, T, 0, c) catch |err| {
-                        db.told(arena, started, sql, plan, null, true, null);
+                        db.told(c, started, sql, plan, null, true, null);
                         return err;
                     };
                     try out.append(arena, value);
                     if (!try w.next(&rows)) break;
                 }
             }
-            db.told(arena, started, sql, plan, out.items.len, false, null);
+            db.told(c, started, sql, plan, out.items.len, false, null);
             return out.toOwnedSlice(arena);
         }
 
@@ -2926,12 +3219,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
             var rows = if (tx) |t|
                 t.run(arena, sql, values, plan, &problem) catch |err| {
-                    db.told(arena, started, sql, plan, null, true, problem);
+                    db.told(c, started, sql, plan, null, true, problem);
                     return err;
                 }
             else
                 w.run(arena, sql, values, plan, &problem) catch |err| {
-                    db.told(arena, started, sql, plan, null, true, problem);
+                    db.told(c, started, sql, plan, null, true, problem);
                     return err;
                 };
             defer w.drain(&rows);
@@ -2940,18 +3233,144 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // driver and Postgres disagree about what was sent, which is not
             // something to paper over with a zero.
             if (!try w.next(&rows)) {
-                db.told(arena, started, sql, plan, null, true, null);
+                db.told(c, started, sql, plan, null, true, null);
                 return error.QueryFailed;
             }
             const answer = w.read(&rows, T, 0) catch |err| {
-                db.told(arena, started, sql, plan, null, true, null);
+                db.told(c, started, sql, plan, null, true, null);
                 return err;
             };
             // One row, which is what an aggregate is — the count in it is the
             // answer rather than the number of rows, and a watcher reading
             // `rows` gets what a `SELECT` would have given it.
-            db.told(arena, started, sql, plan, 1, false, null);
+            db.told(c, started, sql, plan, 1, false, null);
             return answer;
+        }
+
+        /// Whether a typed page that came back empty could still have rows
+        /// behind it: it skipped some, or it asked for none. Anything else
+        /// empty matched nothing, and zero is already the total.
+        fn skippedRows(options: anytype) bool {
+            if (comptime @hasField(@TypeOf(options), "offset")) {
+                if (options.offset != 0) return true;
+            }
+            return options.limit == 0;
+        }
+
+        /// The total behind a typed page that came back empty past its last
+        /// row: `db.count` with the page's own `.where`
+        /// ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md)).
+        ///
+        /// A second statement, and the one place a page sends one. There are
+        /// no rows on the page for the number to disagree with, and a count
+        /// is cheaper than asking the page again: no sort, no columns.
+        fn countBehind(db: *Self, comptime Row: type, tx: ?*W.Tx, c: anytype, options: anytype) !i64 {
+            if (comptime @hasField(@TypeOf(options), "where")) {
+                return counted(db, Row, tx, c, .{ .where = options.where });
+            }
+            return counted(db, Row, tx, c, .{});
+        }
+
+        fn counted(db: *Self, comptime Row: type, tx: ?*W.Tx, c: anytype, options: anytype) !i64 {
+            const stmt = comptime statement.count(D, Row, @TypeOf(options));
+            return only(i64, db, tx, c, stmt.sql, db.planOf(stmt), try valuesOf(stmt, Row, options, c));
+        }
+
+        /// Whether a raw page that came back empty could still have rows
+        /// behind it, read off the values `rawcheck.paging` found: a
+        /// non-zero offset, or a limit of zero.
+        fn rawSkipped(comptime paged: rawcheck.Paging, values: anytype) bool {
+            if (comptime paged.offset) |at| {
+                if (!isZero(values[at], true)) return true;
+            }
+            if (comptime paged.limit) |at| {
+                if (isZero(values[at], false)) return true;
+            }
+            return false;
+        }
+
+        /// `null_is` is what a null bound means: `OFFSET NULL` is no offset
+        /// on Postgres, which is zero, and `LIMIT NULL` is no limit, which is
+        /// not.
+        fn isZero(value: anytype, comptime null_is: bool) bool {
+            return switch (@typeInfo(@TypeOf(value))) {
+                .int, .comptime_int => value == 0,
+                .optional => if (value) |v| v == 0 else null_is,
+                else => @compileError(
+                    "nilo: a page's `LIMIT` or `OFFSET` was given a " ++ @typeName(@TypeOf(value)) ++
+                        ".\n  It counts rows, so it is a whole number.",
+                ),
+            };
+        }
+
+        /// The values of a raw page asked again from its first row: the
+        /// offset at 0 and, where it is a placeholder of its own, the limit
+        /// at 1. Copied into a tuple of run-time fields, since a value the
+        /// caller wrote out is a comptime field and cannot be set.
+        fn fromTheTop(comptime paged: rawcheck.Paging, values: anytype) Unfrozen(@TypeOf(values)) {
+            var out: Unfrozen(@TypeOf(values)) = undefined;
+            inline for (0..@typeInfo(@TypeOf(values)).@"struct".fields.len) |i| {
+                if (comptime paged.offset == i) {
+                    out[i] = 0;
+                } else if (comptime paged.limit == i) {
+                    out[i] = 1;
+                } else {
+                    out[i] = values[i];
+                }
+            }
+            return out;
+        }
+
+        /// The total behind a raw page that came back empty: the same
+        /// statement, asked from its first row, read for its window and
+        /// nothing else (ADR 205). The same text, so the same prepared plan.
+        fn rawTotalBehind(
+            comptime Row: type,
+            comptime paged: rawcheck.Paging,
+            db: *Self,
+            tx: ?*W.Tx,
+            c: anytype,
+            sql: []const u8,
+            plan: ?[]const u8,
+            values: anytype,
+        ) !i64 {
+            const arena = c.arena();
+            const w = try db.wireOf();
+            const started = db.timing();
+            var problem: ?wire_mod.Problem = null;
+            const again = fromTheTop(paged, values);
+
+            var rows = if (tx) |t|
+                t.run(arena, sql, again, plan, &problem) catch |err| {
+                    db.told(c, started, sql, plan, null, true, problem);
+                    return err;
+                }
+            else
+                w.run(arena, sql, again, plan, &problem) catch |err| {
+                    db.told(c, started, sql, plan, null, true, problem);
+                    return err;
+                };
+            defer w.drain(&rows);
+
+            const any = w.next(&rows) catch |err| {
+                db.told(c, started, sql, plan, null, true, stepProblem(w, &rows, err, arena));
+                return err;
+            };
+            // Nothing from the top either: the statement matches nothing.
+            if (!any) {
+                db.told(c, started, sql, plan, 0, false, null);
+                return 0;
+            }
+            wideEnough(Row, 1, w, &rows) catch |err| {
+                db.told(c, started, sql, plan, null, true, null);
+                return err;
+            };
+            const total = readColumn(w, &rows, i64, comptime shape.width(Row), c) catch |err| {
+                db.told(c, started, sql, plan, null, true, null);
+                return err;
+            };
+            db.told(c, started, sql, plan, 1, false, null);
+            return total;
         }
 
         /// One row of the answer, from column `at` on, in the order the Row
@@ -2967,7 +3386,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             comptime var col = at;
             inline for (@typeInfo(Row).@"struct".fields) |f| {
                 switch (comptime row_mod.kindWith(Row, f.name, f.type)) {
-                    .column, .aggregate => {
+                    .column, .aggregate, .over_children, .through => {
                         @field(filled, f.name) = try readColumn(w, rows, f.type, col, c);
                         col += 1;
                     },
@@ -3039,12 +3458,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             var problem: ?wire_mod.Problem = null;
             var rows = if (tx) |t|
                 t.run(arena, stmt.sql, values, plan, &problem) catch |err| {
-                    db.told(arena, started, stmt.sql, plan, null, true, problem);
+                    db.told(c, started, stmt.sql, plan, null, true, problem);
                     return err;
                 }
             else
                 w.run(arena, stmt.sql, values, plan, &problem) catch |err| {
-                    db.told(arena, started, stmt.sql, plan, null, true, problem);
+                    db.told(c, started, stmt.sql, plan, null, true, problem);
                     return err;
                 };
             defer w.drain(&rows);
@@ -3053,7 +3472,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             var last: usize = 0;
             while (try w.next(&rows)) {
                 const read = readChild(Child, numbered, w, &rows, c) catch |err| {
-                    db.told(arena, started, stmt.sql, plan, null, true, null);
+                    db.told(c, started, stmt.sql, plan, null, true, null);
                     return err;
                 };
                 // The number is the parent's position, counted from where the
@@ -3061,14 +3480,14 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 // statement is not the one this was written against.
                 const at = read.number - D.ordinal_base;
                 if (at < last or at >= parents.len) {
-                    db.told(arena, started, stmt.sql, plan, null, true, null);
+                    db.told(c, started, stmt.sql, plan, null, true, null);
                     return error.QueryFailed;
                 }
                 last = @intCast(at);
                 try found.append(arena, read.child);
                 ends[last] = found.items.len;
             }
-            db.told(arena, started, stmt.sql, plan, found.items.len, false, null);
+            db.told(c, started, stmt.sql, plan, found.items.len, false, null);
 
             var from: usize = 0;
             for (parents, ends) |*parent, end| {
@@ -3318,9 +3737,20 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             var out: Values(D, Row, @TypeOf(options), stmt) = undefined;
             inline for (stmt.paths, 0..) |path, i| {
                 const param = comptime stmt.params[i];
-                // The one parameter that is not one value: a list the Dialect
-                // wants as JSON text rather than as an array (ADR 067).
-                if (comptime param.list and D.list_form == .json_each) {
+                // A list under a `sql.given`: null is the term dropping and
+                // binds as null, and a list present, empty or not, is the
+                // list (ADR 149).
+                if (comptime param.list and param.nullable) {
+                    const held = where_mod.valueAt(options, path);
+                    const List = comptime @typeInfo(@TypeOf(out[i])).optional.child;
+                    out[i] = if (held) |list| (if (comptime D.list_form == .json_each)
+                        try jsonList(comptime WireWrite(D, where_mod.ParamType(Row, param)), list, c)
+                    else
+                        try forWire(List, list, c)) else null;
+                } else if (comptime param.list and D.list_form == .json_each) {
+                    // The one parameter that is not one value: a list the
+                    // Dialect wants as JSON text rather than as an array
+                    // (ADR 067).
                     const Item = comptime WireWrite(D, where_mod.ParamType(Row, param));
                     const value = where_mod.valueAt(options, path);
                     out[i] = try jsonList(Item, value, c);
@@ -3421,6 +3851,18 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 /// value that may be null is one `?`, not two.
 fn Maybe(comptime T: type) type {
     return comptime if (@typeInfo(T) == .optional) T else ?T;
+}
+
+/// A tuple of the same types with no comptime fields, so each can be set.
+/// What a raw page past its last row is asked again with (ADR 205).
+fn Unfrozen(comptime V: type) type {
+    comptime {
+        const given = @typeInfo(V).@"struct".fields;
+        var fields: [given.len]type = undefined;
+        for (given, 0..) |f, i| fields[i] = f.type;
+        const frozen = fields;
+        return std.meta.Tuple(&frozen);
+    }
 }
 
 /// The parameter tuple for a batch: one field per column, each a slice of
@@ -3592,11 +4034,14 @@ fn Values(
             // SQLite does: `json_each(?1)` takes one text parameter holding
             // the whole array, so the parameter is bytes rather than a list
             // (ADR 067). `jsonList` is what fills it.
+            const List = if (D.list_form == .json_each)
+                []const u8
+            else
+                []const ArrayElement(D, where_mod.ParamType(Row, param));
+            // A list under a `sql.given` may be null, which is the term
+            // dropping (ADR 149).
             fields[i] = if (param.list)
-                (if (D.list_form == .json_each)
-                    []const u8
-                else
-                    []const ArrayElement(D, where_mod.ParamType(Row, param)))
+                (if (param.nullable) ?List else List)
             else if (param.nullable) Maybe(F) else F;
         }
         const frozen = fields;
@@ -3901,7 +4346,7 @@ fn assertReadable(comptime Row: type) void {
                     assertReadable(row_mod.childRowOf(f.type).?);
                     continue;
                 },
-                .column, .aggregate => {},
+                .column, .aggregate, .over_children, .through => {},
             }
             const Column = switch (@typeInfo(f.type)) {
                 .optional => |o| o.child,
@@ -3994,7 +4439,7 @@ fn assertStreamable(comptime Row: type) void {
                         "and a stream never has them in hand. Stream a Row without the list, " ++
                         "or read a page of them with `db.select`.",
                 ),
-                .column, .aggregate => {},
+                .column, .aggregate, .over_children, .through => {},
             }
             const Inner = switch (@typeInfo(f.type)) {
                 .optional => |o| o.child,
@@ -4033,6 +4478,25 @@ fn assertStreamable(comptime Row: type) void {
 /// exactly the kind of mistake a compiler can hold.
 ///
 /// The same call inside a `Tx` is the intended one, and the message says so.
+/// One line of what `db.explain` reads back: the plan's text, after
+/// whatever the Dialect answers in front of it (`explain_width`).
+fn PlanLine(comptime width: usize) type {
+    return switch (width) {
+        1 => struct {
+            pub const nilo_table = .projection;
+            text: []const u8,
+        },
+        4 => struct {
+            pub const nilo_table = .projection;
+            id: i64,
+            parent: i64,
+            notused: i64,
+            text: []const u8,
+        },
+        else => @compileError("nilo: a Dialect's `explain_width` is 1 or 4."),
+    };
+}
+
 fn assertUnlocked(
     comptime Row: type,
     comptime O: type,
@@ -5718,6 +6182,117 @@ test "a statement this module did not write is prepared too, because its text is
     try testing.expectEqualStrings(statement.planName("SELECT * FROM people WHERE id = $1"), plan);
 }
 
+test "a raw column the database answers as another type fails the statement in a test, and is asked about once" {
+    const Tally = struct {
+        pub const nilo_table = .projection;
+        state: []const u8,
+        n: i32,
+    };
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer db.deinit();
+    db.wire = .{ .answers = 1, .described = &.{
+        .{ .udt = "text", .textual = true },
+        .{ .udt = "int8" },
+    } };
+
+    var run = nilo.Run.init(testing.allocator);
+    defer run.deinit();
+
+    // `count(*)` is `int8`, and pg.zig reads an `i32` out of `int4` only
+    // (ADR 233). A test binary is where that is cheap to hear, so it fails.
+    const text = "SELECT state, count(*) AS n FROM deals GROUP BY state";
+    try testing.expectError(error.QueryFailed, db.raw(Tally, &run, text, .{}));
+    try testing.expectEqual(@as(usize, 1), db.wire.?.described_calls);
+
+    // Once per statement per process: the second call is not asked about.
+    _ = try db.raw(Tally, &run, text, .{});
+    try testing.expectEqual(@as(usize, 1), db.wire.?.described_calls);
+
+    // And per statement rather than per program: another one is asked about
+    // in its turn. The flag was one for the whole program while it named
+    // nothing it was for, and only the first raw statement ever ran checked.
+    db.wire.?.described = &.{ .{ .udt = "text", .textual = true }, .{ .udt = "int4" } };
+    _ = try db.raw(Tally, &run, "SELECT kind AS state, count(*)::int4 AS n FROM deals GROUP BY kind", .{});
+    try testing.expectEqual(@as(usize, 2), db.wire.?.described_calls);
+}
+
+test "a raw column an outer join may leave NULL fails a field that is not optional, and fits one that is" {
+    const Card = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        title: []const u8,
+    };
+    const MaybeCard = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        title: ?[]const u8,
+    };
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer db.deinit();
+    db.wire = .{ .answers = 1, .described = &.{
+        .{ .udt = "int8" },
+        .{ .udt = "text", .textual = true, .outer_null = true },
+    } };
+
+    var run = nilo.Run.init(testing.allocator);
+    defer run.deinit();
+
+    const text = "SELECT e.id, i.title FROM events e LEFT JOIN items i ON i.id = e.item_id";
+    try testing.expectError(error.QueryFailed, db.raw(Card, &run, text, .{}));
+    _ = try db.raw(MaybeCard, &run, text, .{});
+    // Through every door a raw statement comes in by, each asked once.
+    try testing.expectError(error.QueryFailed, db.rawOne(Card, &run, text, .{}));
+    try testing.expectError(error.QueryFailed, db.rawExactlyOne(Card, &run, text, .{}));
+}
+
+test "a raw statement inside a transaction is not asked about" {
+    const Card = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        title: []const u8,
+    };
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer db.deinit();
+    db.wire = .{ .answers = 1, .described = &.{
+        .{ .udt = "int8" },
+        .{ .udt = "text", .textual = true, .outer_null = true },
+    } };
+
+    var run = nilo.Run.init(testing.allocator);
+    defer run.deinit();
+
+    // `describe` takes a connection of its own, and a transaction holding
+    // the writer on SQLite would wait on itself (ADR 233).
+    var tx = try db.begin(&run, .{});
+    defer tx.rollback();
+    _ = try tx.raw(Card, &run, "SELECT e.id, i.title FROM events e LEFT JOIN items i ON i.id = e.id", .{});
+    try testing.expectEqual(@as(usize, 0), db.wire.?.described_calls);
+}
+
+test "find takes a key the Row does not carry, the way one does with the key in .where" {
+    const Email = struct {
+        pub const nilo_table = Person;
+        email: nilo.Str,
+    };
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer db.deinit();
+    db.wire = .{ .answers = 1 };
+
+    var run = nilo.Run.init(testing.allocator);
+    defer run.deinit();
+
+    // Item 103: `find` refused this while `one(.where = .{ .id = 7 })`
+    // compiled and answered the same row.
+    const found = try db.find(Email, &run, 7);
+    try testing.expect(found != null);
+    // Copied, because the Fake writes every statement into one buffer.
+    const by_one = try run.arena().dupe(u8, db.wire.?.last_sql);
+    try testing.expect(std.mem.indexOf(u8, by_one, "\"id\" = $1") != null);
+    try testing.expect(std.mem.indexOf(u8, by_one, "LIMIT 1") != null);
+    _ = try db.one(Email, &run, .{ .where = .{ .id = @as(i64, 7) } });
+    try testing.expectEqualStrings(by_one, db.wire.?.last_sql);
+}
+
 test "a Db told to keep no plans keeps none for a raw statement either" {
     var db = FakeDb.init(testing.allocator, "postgres://test/test", .{ .prepared = false });
     defer db.deinit();
@@ -5748,6 +6323,7 @@ var watched: struct {
     failed: bool = false,
     micros: u64 = 0,
     problem: ?wire_mod.Problem = null,
+    route: ?[]const u8 = null,
 } = .{};
 
 fn recordSent(sent: Sent) void {
@@ -5758,6 +6334,7 @@ fn recordSent(sent: Sent) void {
     watched.failed = sent.failed;
     watched.micros = sent.micros;
     watched.problem = sent.problem;
+    watched.route = sent.route;
 }
 
 test "a watcher is told the statement, the plan and how many rows it moved" {
@@ -5783,6 +6360,41 @@ test "a watcher is told the statement, the plan and how many rows it moved" {
     try testing.expect(watched.plan != null);
     try testing.expectEqual(@as(?usize, 2), watched.rows);
     try testing.expect(!watched.failed);
+}
+
+test "a watcher is told which route's request sent the statement, and a Run sends none" {
+    // Item 93: the metrics page knows `/api/deals` and the watcher knows a
+    // `SELECT`; the route's name on the statement is what joins the two.
+    watched = .{};
+
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer db.deinit();
+    db.wire = .{ .answers = 1 };
+    db.watching(recordSent);
+
+    var run = nilo.Run.init(testing.allocator);
+    defer run.deinit();
+    _ = try db.select(Person, &run, .{});
+    try testing.expect(watched.route == null);
+
+    // The shape `Ctx` has: a Scope with a `routeName`.
+    const Routed = struct {
+        run: *nilo.Run,
+        pub fn arena(self: *@This()) std.mem.Allocator {
+            return self.run.arena();
+        }
+        pub fn str(self: *@This(), bytes: []const u8) core.Str {
+            return self.run.str(bytes);
+        }
+        pub fn routeName(self: *const @This()) ?[]const u8 {
+            _ = self;
+            return "listPeople";
+        }
+    };
+    var routed: Routed = .{ .run = &run };
+    _ = try db.select(Person, &routed, .{});
+    try testing.expectEqual(@as(usize, 2), watched.count);
+    try testing.expectEqualStrings("listPeople", watched.route.?);
 }
 
 test "a statement that failed is reported as failed, with no row count to give" {
@@ -6969,13 +7581,194 @@ test "rawPage reads the total off the window the caller put on the end" {
     try testing.expectEqual(@as(usize, 0), none.rows.len);
     try testing.expectEqual(@as(i64, 0), none.total);
 
+    // Past the last row the window has no row to ride on, so the same
+    // statement is asked again from row one and its window read (ADR 205).
+    var offset: i64 = 30;
+    _ = &offset;
+    const past = try db.rawPage(PageLine, &run, statement_text, .{ @as(i64, 1), @as(i64, 3), offset });
+    try testing.expectEqual(@as(usize, 0), past.rows.len);
+    try testing.expectEqual(@as(i64, 6), past.total);
+    const past_none = try db.rawPage(PageLine, &run, statement_text, .{ @as(i64, 99), @as(i64, 3), offset });
+    try testing.expectEqual(@as(i64, 0), past_none.total);
+    // A limit of zero is a page of no rows that still knows the total.
+    const counted_only = try db.rawPage(PageLine, &run, statement_text, .{ @as(i64, 1), @as(i64, 0), @as(i64, 0) });
+    try testing.expectEqual(@as(usize, 0), counted_only.rows.len);
+    try testing.expectEqual(@as(i64, 6), counted_only.total);
+    // A statement with no `OFFSET` skips nothing, so it needs nothing found,
+    // and SQLite's `:name` binding still reads a page.
+    const named = try db.rawPage(PageLine, &run, "SELECT id, email, count(*) OVER () FROM accounts WHERE id > :low ORDER BY id LIMIT 2", .{ .low = @as(i64, 5) });
+    try testing.expectEqual(@as(usize, 2), named.rows.len);
+    try testing.expectEqual(@as(i64, 2), named.total);
+
     // And inside a transaction.
     var tx = try db.begin(&run, .{});
     errdefer tx.rollback();
     const in_tx = try tx.rawPage(PageLine, &run, statement_text, .{ @as(i64, 0), @as(i64, 2), @as(i64, 0) });
     try testing.expectEqual(@as(usize, 2), in_tx.rows.len);
     try testing.expectEqual(@as(i64, 7), in_tx.total);
+    const in_tx_past = try tx.rawPage(PageLine, &run, statement_text, .{ @as(i64, 0), @as(i64, 2), @as(i64, 50) });
+    try testing.expectEqual(@as(i64, 7), in_tx_past.total);
     try tx.commit();
+}
+
+test "rawPageOrdered takes the request's order through its hole and still reads the total" {
+    // The three flagship lists of the port that asked for it were
+    // `rawOrdered` for the rows and a second statement for the count, the
+    // `WHERE` pasted into both (ADR 205).
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:raw-page-ordered?mode=memory&cache=shared",
+        .{ .size = 2, .unchecked = true },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, accounts_ddl, .{});
+    for (0..7) |i| {
+        var mail: [16]u8 = undefined;
+        _ = try db.insert(SqliteAccount, &run, .{
+            .public = types.Uuid.nil,
+            .email = try std.fmt.bufPrint(&mail, "n{d}@example.dev", .{i}),
+        });
+    }
+
+    const PageLine = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        email: nilo.Str,
+    };
+    const Sort = ordering.Ordering(PageLine, .{ .id = .id, .mail = "email" });
+    const statement_text =
+        "SELECT id, email, count(*) OVER () FROM accounts WHERE id > $1 {order} LIMIT $2 OFFSET $3";
+
+    const newest = try db.rawPageOrdered(PageLine, &run, statement_text, .{ @as(i64, 1), @as(i64, 3), @as(i64, 0) }, Sort.by(&.{.{ .key = .id, .direction = .desc }}));
+    try testing.expectEqual(@as(usize, 3), newest.rows.len);
+    try testing.expectEqual(@as(i64, 6), newest.total);
+    try testing.expectEqualStrings("n6@example.dev", newest.rows[0].email.view());
+
+    // The other way round is the same total, because the order moved and
+    // the `WHERE` did not.
+    const oldest = try db.rawPageOrdered(PageLine, &run, statement_text, .{ @as(i64, 1), @as(i64, 3), @as(i64, 0) }, Sort.by(&.{.{ .key = .mail }}));
+    try testing.expectEqual(@as(i64, 6), oldest.total);
+    try testing.expectEqualStrings("n1@example.dev", oldest.rows[0].email.view());
+
+    // Past the last row, the total from the same statement asked again.
+    const past = try db.rawPageOrdered(PageLine, &run, statement_text, .{ @as(i64, 1), @as(i64, 3), @as(i64, 12) }, Sort.by(&.{.{ .key = .mail }}));
+    try testing.expectEqual(@as(usize, 0), past.rows.len);
+    try testing.expectEqual(@as(i64, 6), past.total);
+
+    var tx = try db.begin(&run, .{});
+    errdefer tx.rollback();
+    const in_tx = try tx.rawPageOrdered(PageLine, &run, statement_text, .{ @as(i64, 0), @as(i64, 2), @as(i64, 0) }, Sort.by(&.{.{ .key = .id, .direction = .desc }}));
+    try testing.expectEqual(@as(usize, 2), in_tx.rows.len);
+    try testing.expectEqual(@as(i64, 7), in_tx.total);
+    try testing.expectEqualStrings("n6@example.dev", in_tx.rows[0].email.view());
+    const in_tx_past = try tx.rawPageOrdered(PageLine, &run, statement_text, .{ @as(i64, 0), @as(i64, 2), @as(i64, 8) }, Sort.by(&.{.{ .key = .id }}));
+    try testing.expectEqual(@as(i64, 7), in_tx_past.total);
+    try tx.commit();
+}
+
+test "on SQLite, a list that may be absent drops its term, and today is the database's date" {
+    // Items 81 and 91 on the second database: the list is one JSON text
+    // parameter, and `json_each(NULL)` is no rows beside a guard that says the
+    // term is not there; `CURRENT_DATE` is the ten characters a `Date` is.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:given-list-today?mode=memory&cache=shared",
+        .{ .size = 2, .unchecked = true },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, accounts_ddl, .{});
+    for (0..4) |i| {
+        var mail: [16]u8 = undefined;
+        _ = try db.insert(SqliteAccount, &run, .{
+            .public = types.Uuid.nil,
+            .email = try std.fmt.bufPrint(&mail, "n{d}@example.dev", .{i}),
+        });
+    }
+
+    const given = where_mod.given;
+    const some = [_]i64{ 1, 3 };
+    try testing.expectEqual(@as(usize, 4), try db.count(SqliteAccount, &run, .{
+        .where = .{ .id = .{ .in = given(@as(?[]const i64, null)) } },
+    }));
+    try testing.expectEqual(@as(usize, 2), try db.count(SqliteAccount, &run, .{
+        .where = .{ .id = .{ .in = given(@as(?[]const i64, &some)) } },
+    }));
+    try testing.expectEqual(@as(usize, 0), try db.count(SqliteAccount, &run, .{
+        .where = .{ .id = .{ .in = given(@as(?[]const i64, &.{})) } },
+    }));
+    try testing.expectEqual(@as(usize, 2), try db.count(SqliteAccount, &run, .{
+        .where = .{ .id = .{ .not_in = given(@as(?[]const i64, &some)) } },
+    }));
+
+    // `.ieq` is `COLLATE NOCASE` on both sides here.
+    try testing.expectEqual(@as(usize, 1), try db.count(SqliteAccount, &run, .{
+        .where = .{ .email = .{ .ieq = @as([]const u8, "N2@EXAMPLE.dev") } },
+    }));
+
+    _ = try db.exec(&run, "CREATE TABLE days (id INTEGER PRIMARY KEY NOT NULL, day TEXT)", .{});
+    const Day = struct {
+        pub const nilo_table = .{ .name = "days", .key = .id };
+        id: i64,
+        day: ?types.Date,
+    };
+    _ = try db.insert(Day, &run, .{ .id = @as(i64, 1), .day = @as(?types.Date, null) });
+    _ = try db.insert(Day, &run, .{ .id = @as(i64, 2), .day = @as(?types.Date, types.Date.nilo_parse("2015-03-01").?) });
+    try testing.expectEqual(@as(usize, 1), try db.update(Day, &run, .{
+        .set = .{ .day = .today },
+        .where = .{ .day = null },
+    }));
+    try testing.expectEqual(@as(usize, 1), try db.count(Day, &run, .{ .where = .{ .day = .today } }));
+    try testing.expectEqual(@as(usize, 1), try db.count(Day, &run, .{ .where = .{ .day = .{ .lt = .today } } }));
+    // Read back as a day, which is what says `CURRENT_DATE` wrote the ten
+    // characters `Date` parses rather than something else.
+    const stamped = (try db.find(Day, &run, @as(i64, 1))).?;
+    try testing.expect(stamped.day.?.days > 20_000);
+
+    // Item 99: the same words on columns read as text. The date is the ten
+    // characters `CURRENT_DATE` writes, and the moment is RFC 3339 text
+    // rather than the microseconds a `Timestamp` column holds.
+    _ = try db.exec(&run, "CREATE TABLE marks (id INTEGER PRIMARY KEY NOT NULL, day TEXT, at TEXT)", .{});
+    const Mark = struct {
+        pub const nilo_table = .{ .name = "marks", .key = .id };
+        id: i64,
+        day: ?types.AsText("date"),
+        at: ?types.AsText("timestamptz"),
+    };
+    _ = try db.insert(Mark, &run, .{ .id = @as(i64, 1), .day = @as(?types.AsText("date"), null), .at = @as(?types.AsText("timestamptz"), null) });
+    try testing.expectEqual(@as(usize, 1), try db.update(Mark, &run, .{
+        .set = .{ .day = .today, .at = .now },
+        .where = .{ .id = @as(i64, 1) },
+    }));
+    const mark = (try db.find(Mark, &run, @as(i64, 1))).?;
+    try testing.expectEqual(@as(usize, 10), mark.day.?.text.len);
+    try testing.expect(types.Date.nilo_parse(mark.day.?.text) != null);
+    try testing.expectEqual(@as(usize, 24), mark.at.?.text.len);
+    try testing.expectEqual(@as(u8, 'T'), mark.at.?.text[10]);
+    try testing.expectEqual(@as(u8, 'Z'), mark.at.?.text[23]);
+    try testing.expectEqual(@as(usize, 1), try db.count(Mark, &run, .{ .where = .{ .day = .today, .at = .{ .lte = .now } } }));
+
+    // Item 105: moved by an offset. The date is `date('now', …)`, which
+    // compares as the same ten characters, and the moment is RFC 3339 text
+    // moved the same way.
+    try testing.expectEqual(@as(usize, 1), try db.count(Day, &run, .{ .where = .{ .day = .{ .gte = .{ .today = -90 } } } }));
+    try testing.expectEqual(@as(usize, 1), try db.count(Day, &run, .{ .where = .{ .day = .{ .lt = .{ .today = -90 } } } }));
+    try testing.expectEqual(@as(usize, 0), try db.count(Day, &run, .{ .where = .{ .day = .{ .today = -1 } } }));
+    try testing.expectEqual(@as(usize, 1), try db.count(Mark, &run, .{ .where = .{ .day = .{ .today = 0 }, .at = .{ .gt = .{ .now = .{ .minutes = -5 } } } } }));
+    try testing.expectEqual(@as(usize, 0), try db.count(Mark, &run, .{ .where = .{ .at = .{ .gt = .{ .now = .{ .minutes = 5 } } } } }));
 }
 
 test "rawExactlyOne answers the row an aggregate always has, and refuses a statement with none" {
@@ -7235,6 +8028,45 @@ test "a page carries the total the condition matched, in one statement" {
     });
     try testing.expectEqual(@as(usize, 0), none.rows.len);
     try testing.expectEqual(@as(i64, 0), none.total);
+
+    // Past the last row the window has no row to ride on, and the total is
+    // what a count with the same `.where` says (ADR 150): a list of 7 asked
+    // for rows 10 onward is an empty page of 7, not "nothing matches".
+    const past = try db.page(SqliteAccount, &run, .{
+        .order = .{ .id = .asc },
+        .limit = 3,
+        .offset = @as(i64, 10),
+    });
+    try testing.expectEqual(@as(usize, 0), past.rows.len);
+    try testing.expectEqual(@as(i64, 7), past.total);
+
+    const past_narrowed = try db.page(SqliteAccount, &run, .{
+        .where = .{ .email = "n2@example.dev" },
+        .order = .{ .id = .asc },
+        .limit = 3,
+        .offset = 3,
+    });
+    try testing.expectEqual(@as(usize, 0), past_narrowed.rows.len);
+    try testing.expectEqual(@as(i64, 1), past_narrowed.total);
+
+    // Nothing matching past the end is still zero, and a page of no rows
+    // still says how many there were.
+    const past_none = try db.page(SqliteAccount, &run, .{
+        .where = .{ .email = "nobody@example.dev" },
+        .order = .{ .id = .asc },
+        .limit = 3,
+        .offset = @as(i64, 3),
+    });
+    try testing.expectEqual(@as(i64, 0), past_none.total);
+    const counted_only = try db.page(SqliteAccount, &run, .{ .order = .{ .id = .asc }, .limit = @as(i64, 0) });
+    try testing.expectEqual(@as(usize, 0), counted_only.rows.len);
+    try testing.expectEqual(@as(i64, 7), counted_only.total);
+
+    var tx = try db.begin(&run, .{});
+    errdefer tx.rollback();
+    const in_tx = try tx.page(SqliteAccount, &run, .{ .order = .{ .id = .asc }, .limit = 3, .offset = @as(i64, 9) });
+    try testing.expectEqual(@as(i64, 7), in_tx.total);
+    try tx.commit();
 }
 
 const AccountSort = ordering.Ordering(SqliteAccount, .{
@@ -7659,6 +8491,10 @@ test "a grouped Row is one row per group, narrowed before and after the grouping
     const page = try db.page(ShopByCustomer, &run, .{ .order = .{ .orders = .desc, .customer = .{ .name = .asc } }, .limit = 1 });
     try testing.expectEqual(@as(i64, 3), page.total);
     try testing.expectEqualStrings("Acme", page.rows[0].customer.name);
+    // Past the last group, the total is still the groups.
+    const past = try db.page(ShopByCustomer, &run, .{ .order = .{ .orders = .desc }, .limit = 1, .offset = @as(i64, 5) });
+    try testing.expectEqual(@as(usize, 0), past.rows.len);
+    try testing.expectEqual(@as(i64, 3), past.total);
     try testing.expectEqual(@as(usize, 1), try db.count(ShopByCustomer, &run, .{ .where = .{ .revenue = .{ .gt = @as(i64, 150) }, .year = @as(i32, 2026) } }));
 
     // An order chosen per request, by an aggregate or through a parent.
@@ -7667,6 +8503,149 @@ test "a grouped Row is one row per group, narrowed before and after the grouping
     try testing.expectEqualStrings("Cobalt", by_name[0].customer.name);
     const by_revenue = try db.select(ShopByCustomer, &run, .{ .order = Sort.by(&.{.{ .key = .revenue }}) });
     try testing.expectEqualStrings("Borealis", by_revenue[0].customer.name);
+}
+
+const ShopOrderCounted = struct {
+    pub const nilo_table = ShopOrder;
+    pub const nilo_children = .{
+        .line_count = .{ .count = ShopLine },
+        .big = .{ .count = ShopLine, .where = .{ .qty = .{ .gte = 2 } } },
+        .lines = .{ .order = .{ .qty = .asc }, .where = .{ .sku = .{ .ne = "b" } } },
+    };
+    id: i64,
+    line_count: i64,
+    big: i64,
+    lines: []const ShopLineBrief,
+};
+
+const ShopLineTally = struct {
+    pub const nilo_table = ShopLine;
+    pub const nilo_aggregate = .{
+        .west_qty = .{ .sum = .qty, .where = .{ .order_id = .{ .customer_id = .{ .region = "west" } } } },
+        .unapproved = .{ .count = .id, .where = .{ .order_id = .{ .approver_id = null } } },
+        .by_budi = .{ .count = .id, .where = .{ .order_id = .{ .approver_id = .{ .full_name = "Budi" } } } },
+    };
+    west_qty: ?i64,
+    unapproved: i64,
+    by_budi: i64,
+};
+
+test "on SQLite, an aggregate's .where reaches through two references and one that may be null" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = try shopDb(&threaded, "shape-reach", &run);
+    defer db.deinit();
+
+    const all = try db.exactlyOne(ShopLineTally, &run, .{});
+    // Acme is west, and orders 10 and 11 are Acme's: lines of 1, 2 and 5.
+    try testing.expectEqual(@as(?i64, 8), all.west_qty);
+    // Order 12 has no approver: its one line.
+    try testing.expectEqual(@as(i64, 1), all.unapproved);
+    // Budi approved orders 10 and 13, and only 10 has lines: two.
+    try testing.expectEqual(@as(i64, 2), all.by_budi);
+
+    // The statement's own condition still narrows the rows every aggregate reads.
+    const some = try db.exactlyOne(ShopLineTally, &run, .{ .where = .{ .sku = "b" } });
+    try testing.expectEqual(@as(?i64, 5), some.west_qty);
+    try testing.expectEqual(@as(i64, 0), some.by_budi);
+}
+
+test "on SQLite, children come back in the order asked, narrowed, and counted without being read" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = try shopDb(&threaded, "shape-counted", &run);
+    defer db.deinit();
+
+    const orders = try db.select(ShopOrderCounted, &run, .{
+        .where = .{ .line_count = .{ .gt = @as(i64, 0) } },
+        .order = .{ .line_count = .desc, .id = .asc },
+    });
+    try testing.expectEqual(@as(usize, 3), orders.len);
+    try testing.expectEqual(@as(i64, 10), orders[0].id);
+    try testing.expectEqual(@as(i64, 2), orders[0].line_count);
+    try testing.expectEqual(@as(i64, 1), orders[0].big);
+    // By quantity rather than by key: c (1) before a (2).
+    try testing.expectEqual(@as(usize, 2), orders[0].lines.len);
+    try testing.expectEqualStrings("c", orders[0].lines[0].sku);
+    try testing.expectEqualStrings("a", orders[0].lines[1].sku);
+    // Order 11's one line is b, which the entry's `.where` leaves out; the
+    // count has no `.where` and still sees it.
+    try testing.expectEqual(@as(i64, 11), orders[1].id);
+    try testing.expectEqual(@as(i64, 1), orders[1].line_count);
+    try testing.expectEqual(@as(usize, 0), orders[1].lines.len);
+    try testing.expectEqual(@as(i64, 0), orders[2].big);
+
+    // A count on a page: the rows the page shows, and the total of all.
+    const page = try db.page(ShopOrderCounted, &run, .{ .order = .{ .id = .desc }, .limit = 2 });
+    try testing.expectEqual(@as(i64, 5), page.total);
+    try testing.expectEqual(@as(i64, 0), page.rows[0].line_count);
+}
+
+const ShopFiltered = struct {
+    pub const nilo_table = ShopOrder;
+    pub const nilo_aggregate = .{
+        .this_year = .{ .sum = .total, .where = .{ .year = 2026 } },
+        .discounted = .{ .count = .id, .where = .{ .discount = .{ .ne = null } } },
+        .big = .{ .count = .id, .where = .{ .total = .{ .gte = 100 }, .owner_id = .{ .in = .{1} } } },
+    };
+    customer: ShopCustomerName,
+    this_year: ?i64,
+    discounted: i64,
+    big: i64,
+};
+
+test "on SQLite, an aggregate's .where narrows the rows it reads and not the group" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = try shopDb(&threaded, "shape-filter", &run);
+    defer db.deinit();
+
+    const groups = try db.select(ShopFiltered, &run, .{ .order = .{ .customer = .{ .name = .asc } } });
+    try testing.expectEqual(@as(usize, 3), groups.len);
+    try testing.expectEqualStrings("Acme", groups[0].customer.name);
+    try testing.expectEqual(@as(?i64, 350), groups[0].this_year);
+    try testing.expectEqual(@as(i64, 1), groups[0].discounted);
+    try testing.expectEqual(@as(i64, 1), groups[0].big);
+    try testing.expectEqual(@as(?i64, 100), groups[1].this_year);
+    try testing.expectEqual(@as(i64, 0), groups[1].big);
+    // Cobalt's one order is from 2025: the group is there, its filtered sum
+    // is null and its filtered count is zero.
+    try testing.expectEqualStrings("Cobalt", groups[2].customer.name);
+    try testing.expect(groups[2].this_year == null);
+    try testing.expectEqual(@as(i64, 0), groups[2].discounted);
+    try testing.expectEqual(@as(i64, 1), groups[2].big);
+
+    // A condition on the field is on the filtered number.
+    const current = try db.select(ShopFiltered, &run, .{
+        .where = .{ .this_year = .{ .gt = @as(i64, 0) } },
+        .order = .{ .this_year = .desc },
+    });
+    try testing.expectEqual(@as(usize, 2), current.len);
+    try testing.expectEqualStrings("Acme", current[0].customer.name);
+}
+
+test "on SQLite, explain answers the plan of the read a select would send" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = try shopDb(&threaded, "shape-explain", &run);
+    defer db.deinit();
+
+    // By key: a search, not a scan.
+    const by_key = try db.explain(ShopOrderCard, &run, .{ .where = .{ .id = @as(i64, 11) } });
+    try testing.expect(std.mem.indexOf(u8, by_key, "SEARCH") != null);
+    try testing.expect(std.mem.indexOf(u8, by_key, "SCAN shop_orders") == null);
+    // By a column nothing indexes: the whole table, which is what a test
+    // asserting on this is there to notice.
+    const by_total = try db.explain(ShopOrderCard, &run, .{ .where = .{ .total = @as(i64, 100) } });
+    try testing.expect(std.mem.indexOf(u8, by_total, "SCAN shop_orders") != null);
 }
 
 test "a Row grouped by nothing is exactly one row, with a null sum over no rows" {

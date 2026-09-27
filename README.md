@@ -293,7 +293,7 @@ Against eight other servers returning the same JSON, nilo is 1st on throughput, 
 ## 🚫 What it won't do
 
 - **Templates.** If your app is mostly HTML, [jetzig](https://www.jetzig.dev/) is built for it.
-- **HTTP/2 for your routes.** Put a proxy in front if you need it. TLS 1.3 is built in behind `.tls = true`, or a proxy can terminate it ([deploying guide](./docs/guide/deploying.md#tls-and-the-proxy-in-front)). gRPC is served, unary calls on a listener of its own, behind `.grpc = true` ([gRPC guide](./docs/guide/grpc.md)).
+- **HTTP/2 for your routes.** Put a proxy in front if you need it. TLS 1.3 is built in behind `.tls = true`, or a proxy can terminate it ([deploying guide](./docs/guide/deploying.md#tls-and-a-reverse-proxy)). gRPC is served, unary calls on a listener of its own, behind `.grpc = true` ([gRPC guide](./docs/guide/grpc.md)).
 - **Revoking a session.** Sessions are sealed into the cookie, so there's no session table to delete from.
 
 Each of these was decided on purpose; [`docs/decided.md`](./docs/decided.md) says why.
@@ -317,7 +317,7 @@ $ zig build run-sqlite     # two Rows on one SQLite file: tables at boot, parent
 
 Start with **`rest`**. Swap `run-` for `dev-` to restart the server every time you save.
 
-If the link fails on `.sframe` in `crt1.o`, add `-Dtarget=x86_64-linux-gnu` ([why](./docs/guide/getting-started.md#if-the-link-fails-on-sframe)).
+If the link fails on `.sframe` in `crt1.o`, add `-Dtarget=x86_64-linux-gnu` ([why](./docs/guide/getting-started.md#fixing-the-sframe-link-error)).
 
 ## 📚 Documentation
 

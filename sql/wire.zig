@@ -115,6 +115,14 @@
 //!   what a transaction is. A Wire whose `run` takes a fresh connection each
 //!   time has nowhere to put one.
 //!
+//! - `describe(arena, sql, nulls)` — what a statement would answer, column
+//!   by column, **without running it**: the type each column arrives as, and,
+//!   when `nulls` asks, whether an outer join makes it NULL on some row. For
+//!   `db.raw`'s check the first time a statement runs
+//!   ([ADR 233](../docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
+//!   Null is "this Wire cannot say", which the Fake answers, and it is not
+//!   a failure: the statement runs unchecked, as it did before.
+//!
 //! ## The rule all three of those are instances of
 //!
 //! > **Whatever the handler did, the connection goes back usable.**
@@ -449,6 +457,26 @@ pub const Column = struct {
     nullable: ?bool,
 };
 
+/// One column of a statement as `describe` found it, before it ran
+/// ([ADR 233](../docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
+pub const Described = struct {
+    /// The type the column arrives as, in the spelling `Dialect.accepts`
+    /// answers in (`int8`, `text`; `TEXT` on SQLite), or **null when the
+    /// database does not say**: SQLite names the declared type of a column
+    /// read straight out of a table and nothing for an expression.
+    udt: ?[]const u8,
+    /// Whether the column arrives as a string whatever `udt` calls it: a
+    /// domain over `text`, `citext`, an enum's label on Postgres; `TEXT`
+    /// affinity on SQLite. A text field reads any of them, and a list of
+    /// every string type a database can have is not something to keep.
+    textual: bool = false,
+    /// Whether the column is NULL on some row because the side of an outer
+    /// join it comes from may find nothing. **True only when that is
+    /// certain**: false is "cannot say" as much as "no", because a column
+    /// wrongly called NULL fails a statement that works.
+    outer_null: bool = false,
+};
+
 /// Whether a type carries what this module asks of a Wire. Checked where the
 /// Wire is handed over rather than at the first call that needs a missing
 /// piece — the same reason `service.zig` checks the registry at `listen()`.
@@ -458,7 +486,7 @@ pub fn assertWire(comptime W: type) void {
             "open",     "close",     "run",      "exec",
             "next",     "read",      "drain",    "begin",
             "Tx",       "columnsOf", "readList", "width",
-            "labelsOf",
+            "labelsOf", "describe",
         };
         for (owed) |decl| {
             if (!@hasDecl(W, decl)) @compileError(
@@ -479,6 +507,12 @@ const testing = std.testing;
 /// it — and it is what the schema tests compare against.
 pub const Fake = struct {
     columns: []const Column = &.{},
+    /// What `describe` answers for any statement, so the first-run check of
+    /// `db.raw` can be driven without a database (ADR 233).
+    described: ?[]const Described = null,
+    /// How many times `describe` was asked, which is how a test sees that the
+    /// check ran once and not per call.
+    described_calls: usize = 0,
     /// What `labelsOf` answers for any enum type, the way `columns` answers
     /// for any table.
     labels: []const []const u8 = &.{},
@@ -752,6 +786,21 @@ pub const Fake = struct {
         _ = query;
         _ = type_name;
         return self.labels;
+    }
+
+    /// What `described` holds, for any statement. Null unless a test set it,
+    /// which is a Wire that cannot say and a statement that runs unchecked.
+    pub fn describe(
+        self: *Fake,
+        arena: std.mem.Allocator,
+        sql: []const u8,
+        nulls: bool,
+    ) Error!?[]const Described {
+        _ = arena;
+        _ = sql;
+        _ = nulls;
+        self.described_calls += 1;
+        return self.described;
     }
 };
 

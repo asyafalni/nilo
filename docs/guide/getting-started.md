@@ -1,33 +1,25 @@
 # Getting started
 
-nilo needs **Zig 0.16**. Nothing else — no C library, no system package.
+**Add nilo to a Zig 0.16 project, write a first server, and restart it on every save.**
+
+**Reference:** [`App`](../reference/app.md#app), [`listen` options](../reference/app.md#listen-options), [root wiring](../reference/README.md#declarations-in-the-root-file) · **Design:** [nilo's design principles](../design/principles.md)
+
+nilo needs **Zig 0.16**. Nothing else: no C library, no system package.
 
 ## Add it to your project
 
-Starting from an empty directory, `zig init` first — `zig fetch --save` writes
-into `build.zig.zon` and fails with `no build.zig file found` if there isn't one
-yet:
+**Run `zig init` first, then `zig fetch --save` with the pinned commit.** `zig fetch --save` writes into `build.zig.zon` and fails with `no build.zig file found` if there isn't one yet:
 
 ```
 zig init
 zig fetch --save 'git+https://github.com/nevindra/nilo?ref=v0.6.0#221e1b3eaed531efe13de7ab39dedc4091a8775c'
 ```
 
-That writes nilo into your `build.zig.zon`, pinned to the commit the tag
-names. **Keep the `#commit`.** The `?ref=` on its own is not a pin: nilo's
-tags are annotated, Zig 0.16's `zig fetch` does not peel one, and what it
-hands you for `?ref=v0.6.0` alone is the tree of `main` that day — so two
-people installing a week apart get two different libraries, and neither of
-them asked for a version. The commit for each tag is on
-[its release page](https://github.com/nevindra/nilo/releases).
+That writes nilo into your `build.zig.zon`, pinned to the commit the tag points at. **Keep the `#commit`.** The `?ref=` on its own is not a pin: nilo's tags are annotated, Zig 0.16's `zig fetch` does not resolve an annotated tag, and what it gives you for `?ref=v0.6.0` alone is whatever `main` was that day. Two people installing a week apart would get two different versions, and neither asked for one. The commit for each tag is on [its release page](https://github.com/nevindra/nilo/releases).
 
-What `zig init` leaves behind is a library-and-executable scaffold built around
-`src/root.zig`, and it is not what you want. **Replace the generated
-`build.zig` with the one below rather than pasting into it, and delete
-`src/root.zig`** — that template is Zig's and nothing here can change it. Keep
-`build.zig.zon`, which is where `zig fetch` just wrote nilo.
+`zig init` leaves a library-and-executable scaffold built around `src/root.zig`, which is not what you want. **Replace the generated `build.zig` with the one below instead of pasting into it, and delete `src/root.zig`.** That template comes from Zig, and nilo can't change it. Keep `build.zig.zon`, which is where `zig fetch` just wrote nilo.
 
-Then hand the module to whatever imports it, in `build.zig`:
+Then pass the module to whatever imports it, in `build.zig`:
 
 ```zig
 const std = @import("std");
@@ -56,50 +48,33 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-That is the whole file — `zig build run` after it, and `src/main.zig` next.
-[Restarting on every save](#restarting-on-every-save), below, is four more
-lines once the server exists.
+That is the whole file. Next come `zig build run` and `src/main.zig`. [Restarting on every save](#restarting-on-every-save), below, adds four more lines once the server exists.
 
-### If the link fails on `.sframe`
+### Fixing the `.sframe` link error
 
-On a Linux host whose glibc was built by GCC 16 (Arch and Fedora from
-mid-2026, and their derivatives), a native Debug build can stop at the link
-with
+**On a Linux host whose glibc was built by GCC 16** (Arch and Fedora from mid-2026, and their derivatives), a native Debug build can stop at the link with:
 
 ```
 error: fatal linker error: unhandled relocation type R_X86_64_PC64 at offset 0x1c
     note: in /usr/lib/…/crt1.o:.sframe
 ```
 
-That is Zig 0.16's self-hosted linker meeting a section the system's
-`crt1.o` did not have before, and nothing about nilo. Two ways round it,
-both verified:
+This is Zig 0.16's self-hosted linker meeting a section the system's `crt1.o` did not have before, and has nothing to do with nilo. There are two fixes, both verified:
 
-- **`-Dtarget=x86_64-linux-gnu`** on the `zig build` line. Zig then links
-  against the glibc it ships rather than the host's, the self-hosted linker
-  stays, and a Debug build is as fast as it was. The binary still runs on
-  the host.
-- **`.use_llvm = true`** on the `addExecutable`, or a `-Dllvm` option that
-  sets it, the way nilo's own `zig build examples -Dllvm` does. LLVM's
-  linker path handles the section; a Debug build is slower for it.
+- **`-Dtarget=x86_64-linux-gnu`** on the `zig build` line. Zig then links against the glibc it ships instead of the host's, the self-hosted linker is still used, and a Debug build is as fast as before. The binary still runs on the host.
+- **`.use_llvm = true`** on the `addExecutable`, or a `-Dllvm` option that sets it, the way nilo's own `zig build examples -Dllvm` does. LLVM's linker handles the section, but a Debug build is slower.
 
-The first is the one to reach for while developing; the second is what a
-release build does anyway.
+Use the first while developing. The second is what a release build does anyway.
 
-The package is `nilo`; the module is `nilo_http`. **The bare name is the
-project's, not any one module's** — `nilo_sql`, `nilo_id` and `nilo_core` sit
-beside the server, and you add a line here for each one you import and nothing
-for the ones you do not
-([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)). In your
-own code the alias goes back:
+### Package and module names
+
+**The package is `nilo`; the module is `nilo_http`.** The bare name belongs to the project, not to any one module: `nilo_sql`, `nilo_id` and `nilo_core` sit beside the server, and you add an import line for each one you use and nothing for the ones you don't ([ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md)). In your own code, alias it back:
 
 ```zig
 const nilo = @import("nilo_http");
 ```
 
-Pass the same `.optimize` through to the dependency. Building nilo in `Debug`
-under a `ReleaseFast` program is legal and slow, and nilo says so at startup
-rather than leaving you to find it:
+Pass the same `.optimize` through to the dependency. Building nilo in `Debug` under a `ReleaseFast` program works but is slow, and nilo says so at startup instead of leaving you to find out:
 
 ```
 nilo was built in Debug and this program in ReleaseSafe, which is legal and
@@ -108,14 +83,9 @@ slow. Pass the mode through: b.dependency("nilo", .{ .target = target,
 gets missed.
 ```
 
-**The test step is the one that usually gets missed**, which is why the same
-warning comes out of `nilo.testing.Client` and not only out of `listen()`: a
-suite that loops over both optimize modes fetches the dependency in the same
-place, and a ReleaseSafe suite running against a Debug nilo is checking a
-configuration nobody deploys
-([ADR 069](../adr/069-a-library-can-tell-what-mode-the-program-was-built-in.md)).
+**The test step is the one people usually miss**, which is why `nilo.testing.Client` prints the same warning, not only `listen()`. A suite that runs in both optimize modes fetches the dependency in the same place, and a ReleaseSafe suite running against a Debug nilo is testing a setup nobody deploys ([ADR 069](../adr/069-a-library-can-tell-what-mode-the-program-was-built-in.md)).
 
-## A server that answers
+## A first server
 
 ```zig
 const std = @import("std");
@@ -153,20 +123,11 @@ $ curl localhost:8787/greet/wati
 wati
 ```
 
-`hello` takes nothing and returns text. `greet` takes a `nilo.Str`, which is
-the first `:param` in the pattern — text that belongs to the request and is only
-valid while it runs. Neither function knows what HTTP is, which is the point:
-both are callable from a test.
+**Handlers are plain functions that don't know about HTTP, so a test can call them.** `hello` takes nothing and returns text. `greet` takes a `nilo.Str`, which is the first `:param` in the pattern: text that belongs to the request and is only valid while it runs.
 
 ## Restarting on every save
 
-A Zig binary cannot swap its own code, so there is no hot reload; what there
-is instead is a server started again every time the build writes a new one.
-`nilo-dev` ships with the package and does that — it runs one
-`zig build --watch`, and restarts your server whenever the binary it
-produces changes
-([ADR 190](../adr/190-a-restart-on-save-watches-the-binary-not-the-sources.md)).
-Four lines under the `run` step:
+**`nilo-dev` rebuilds and restarts your server every time you save.** A Zig binary cannot swap its own code, so there is no hot reload. Instead, `nilo-dev` (shipped with the package) runs one `zig build --watch` and restarts your server whenever the binary it produces changes ([ADR 190](../adr/190-a-restart-on-save-watches-the-binary-not-the-sources.md)). Add four lines under the `run` step:
 
 ```zig
 const dev = b.addRunArtifact(nilo.artifact("nilo-dev"));
@@ -185,40 +146,27 @@ info: nilo listening on 127.0.0.1:8787 across 8 thread(s)
 nilo-dev: zig-out/bin/my-app changed; restarted (pid 41107, the old one drained in 100 ms)
 ```
 
-### What a save has to touch
+### What triggers a restart
 
-**The loop watches the build, not the repository.** `zig build --watch` reacts to the files the compiler read to make the binary, which is every `.zig` file the server imports, nilo's own among them, and anything it `@embedFile`s; `nilo-dev` then restarts the server when that binary changes, and looks at nothing else. Nothing else in the checkout moves it. In a repository that holds a front end beside the server, a save under `web/` neither rebuilds nor restarts anything: the front end has its own dev server, and this loop is the back end's. Measured on `examples/spa`, whose `public/` is served from disk: a save to `public/app.js` left the loop untouched for the fifteen seconds it was watched, and a save to `main.zig` had the new server listening one to two seconds later ([`build.md`](../../bench/result/build.md#what-a-save-has-to-touch)). Three edges of that line:
+**The loop watches the build, not the repository.** `zig build --watch` reacts to the files the compiler read to make the binary: every `.zig` file the server imports (nilo's own included) and anything it `@embedFile`s. `nilo-dev` then restarts the server when that binary changes, and looks at nothing else. In a repository with a front end next to the server, a save under `web/` neither rebuilds nor restarts anything: the front end has its own dev server, and this loop is for the back end. Measured on `examples/spa`, whose `public/` is served from disk: a save to `public/app.js` left the loop untouched for the fifteen seconds it was watched, and a save to `main.zig` had the new server listening one to two seconds later ([`build.md`](../../bench/result/build.md#what-a-save-has-to-touch)).
 
-- **A file served from disk is not watched, and does not need to be.** With `staticWith(.{ .reload = true })` the edit is served on the next request ([static files](./static-files.md#while-you-are-working-on-it)); without `.reload`, or for a name that did not exist at startup, the server needs a restart and the loop will not give it one. A file that reaches the binary through `@embedFile` is the other way round: it is watched, because saving it changes the binary.
-- **A `.zig` file nothing imports yet is not watched either.** The build reads what the root reaches; write the `@import` first and the next save is seen.
-- **`build.zig` is not watched.** A change there is Ctrl-C and `zig build dev` again.
+Three edge cases:
 
-A build step that reads the front end, an `installDirectory` of its assets say, runs on a save there and copies what changed; the server is not restarted, because the binary did not change. `python3 bench/devloop.py` is the check that all of this stays true, and it runs against any dev step given a file the build reads and one it does not.
+- **A file served from disk is not watched, and does not need to be.** With `staticWith(.{ .reload = true })` the edit is served on the next request ([static files](./static-files.md#reloading-files-during-development)). Without `.reload`, or for a name that did not exist at startup, the server needs a restart and the loop will not do it. A file that reaches the binary through `@embedFile` is the opposite: it is watched, because saving it changes the binary.
+- **A `.zig` file nothing imports yet is not watched either.** The build reads only what the root file reaches, so write the `@import` first and the next save is seen.
+- **`build.zig` is not watched.** After a change there, press Ctrl-C and run `zig build dev` again.
 
-**The first server is the one your sources describe.** Before it watches anything, `nilo-dev` runs the build once to the end, so a binary left in `zig-out` by an earlier session, from sources you have since changed, is never started: it could seed a database with a schema you just removed. If that first build fails, the old binary is deleted and nothing starts until a save compiles ([ADR 190](../adr/190-a-restart-on-save-watches-the-binary-not-the-sources.md)).
+A build step that reads the front end (an `installDirectory` of its assets, say) runs on a save there and copies what changed. The server is not restarted, because the binary did not change. `python3 bench/devloop.py` checks that all of this stays true, and it runs against any dev step given one file the build reads and one it does not.
 
-**A build that fails changes nothing.** The errors print, the old server keeps
-serving, and the next save that compiles is the one that restarts it. The old
-server is asked with SIGTERM and gets five seconds to finish what it was
-answering before it is killed. Ctrl-C stops all of it. The fourth line is what
-lets anything after `--` reach `nilo-dev` at all: `-D` options go on to the
-`zig build` it keeps running (`-Dtarget=x86_64-linux-gnu` on the host the
-[link section](#if-the-link-fails-on-sframe) is about), a second `--` and
-what follows go to your server, and `--build <step>` names a build step other
-than `install`.
+**The first server always matches your current sources.** Before it watches anything, `nilo-dev` runs the build once to the end, so a binary left in `zig-out` by an earlier session, from sources you have changed since, is never started. It could otherwise seed a database with a schema you just removed. If that first build fails, the old binary is deleted and nothing starts until a save compiles ([ADR 190](../adr/190-a-restart-on-save-watches-the-binary-not-the-sources.md)).
 
-**Every save writes a whole new binary into `.zig-cache`, and Zig never
-deletes the old one** — 27 MB a save for the smallest example, the size of
-your program for yours. So after each restart `nilo-dev` deletes the cache
-directories holding earlier builds of the binary it serves, and nothing else:
-four saves in a row left the cache 0.0 MB larger. Undo is safe — a build back
-to a version it deleted is rebuilt, not looked up. `--keep-cache` leaves them.
+**A build that fails changes nothing.** The errors print, the old server keeps serving, and the next save that compiles restarts it. The old server gets SIGTERM and five seconds to finish what it was answering before it is killed. Ctrl-C stops everything.
 
-`--incremental` is the other route to a flat cache: the compiler stays
-resident and patches what it already made, so a rebuild is milliseconds where
-the cores allow. On 0.16.0 its output only runs under the LLVM backend when
-libc is linked, which every nilo server does through zio, so the flag goes
-with one more line in `build.zig` and costs an LLVM emit per save:
+The fourth line is what passes anything after `--` to `nilo-dev`: `-D` options go to the `zig build` it keeps running (for example `-Dtarget=x86_64-linux-gnu` on a host with the [link error](#fixing-the-sframe-link-error)), a second `--` and what follows go to your server, and `--build <step>` picks a build step other than `install`.
+
+**Every save writes a whole new binary into `.zig-cache`, and Zig never deletes the old one**: 27 MB a save for the smallest example, the size of your program for yours. So after each restart, `nilo-dev` deletes the cache directories holding earlier builds of the binary it serves, and nothing else. Four saves in a row left the cache 0.0 MB larger. Undo is safe: going back to a version it deleted rebuilds it. `--keep-cache` keeps them.
+
+`--incremental` is the other way to keep the cache flat: the compiler stays running and patches what it already built, so a rebuild takes milliseconds when there are cores free. On 0.16.0 its output only runs under the LLVM backend when libc is linked, which every nilo server does through zio. So the flag needs one more line in `build.zig`, and costs an LLVM build step per save:
 
 ```zig
 exe.use_llvm = true; // or behind a -D option, for the dev loop only
@@ -228,26 +176,17 @@ exe.use_llvm = true; // or behind a -D option, for the dev loop only
 $ zig build dev -- --incremental
 ```
 
-The numbers behind both paragraphs — 0.12 s for an incremental binary that
-did not run, 27 MB a save for one that did — are in
-[`bench/result/build.md`](../../bench/result/build.md#what-a-restart-on-save-costs-per-save).
-Files served by `staticWith(.{ .reload = true })` need none of this: they are
-read from disk per request already
-([static files](./static-files.md)).
+The numbers behind both paragraphs (0.12 s for an incremental binary that did not run, 27 MB a save for one that did) are in [`bench/result/build.md`](../../bench/result/build.md#what-a-restart-on-save-costs-per-save). Files served by `staticWith(.{ .reload = true })` need none of this, because they are already read from disk per request ([static files](./static-files.md)).
 
-## The two lines at the top
+## Logging setup: `std_options` and `debug_io`
 
-They are easy to write the wrong way round, and each fixes a different symptom.
-`listen()` says so at startup if either is missing, so you don't have to
-remember which.
+**Two lines at the top of `main.zig` fix two different logging problems.** They are easy to confuse, and `listen()` warns at startup if either is missing, so you don't have to remember which is which.
 
 ```zig
 pub const std_options = nilo.std_options;
 ```
 
-Turns the Engine's debug chatter down to warnings. Without it a debug build opens
-with `debug(zio): Spawning worker thread 1` and buries your own logs. To keep
-settings of your own, start from this one:
+This turns the Engine's debug output down to warnings. Without it, a debug build starts with `debug(zio): Spawning worker thread 1` and your own logs get buried. To keep settings of your own, start from this one:
 
 ```zig
 pub const std_options: std.Options = .{
@@ -260,10 +199,7 @@ pub const std_options: std.Options = .{
 pub const std_options_debug_io = nilo.debug_io;
 ```
 
-Keeps `std.log` from blocking the event loop. Writing to stderr is a syscall, and
-many requests share one OS thread — so without this every log line stops every
-request on that thread. The symptom is a server that is merely slow, which is why
-`listen()` warns rather than letting you find it under load.
+This stops `std.log` from blocking the event loop. Writing to stderr is a syscall, and many requests share one OS thread, so without this every log line stops every request on that thread. The symptom is a server that is just slow, which is why `listen()` warns instead of letting you find it under load.
 
 There is an optional third line, worth having in production:
 
@@ -271,22 +207,16 @@ There is an optional third line, worth having in production:
 pub const panic = nilo.panic;
 ```
 
-It makes a crash say which request caused it — `panic: integer overflow (while
-handling GET /boom/50)`. See [Deploying](./deploying.md#panics).
+It makes a crash say which request caused it: `panic: integer overflow (while handling GET /boom/50)`. See [Deploying](./deploying.md#panics).
 
 ## The allocator
 
-`App.init` takes one, and it is used for the App's own furniture: the route
-table, the static files, the service registry. Requests do **not** allocate from
-it — each gets an arena of its own that is thrown away when it ends.
+**The allocator passed to `App.init` is only for the App's own data**: the route table, the static files, the service registry. Requests do **not** allocate from it. Each gets its own arena, thrown away when the request ends.
 
-`std.heap.smp_allocator` is the one to use for a server: it is built for
-allocation from several threads at once. Use `std.testing.allocator` in tests,
-which also checks for leaks.
+Use `std.heap.smp_allocator` for a server: it is built for allocating from several threads at once. Use `std.testing.allocator` in tests, which also checks for leaks.
 
 ## Where to go next
 
-- [Handlers](./handlers.md) — the rule that decides what each argument means.
-- [Routing](./routing.md) — patterns, precedence, and grouping.
-- The ten examples in [`examples/`](../../examples/), each runnable with
-  `zig build run-<name>`.
+- [Handlers](./handlers.md): the rule that decides what each argument means.
+- [Routing](./routing.md): patterns, priority, and groups.
+- The ten examples in [`examples/`](../../examples/), each runnable with `zig build run-<name>`.

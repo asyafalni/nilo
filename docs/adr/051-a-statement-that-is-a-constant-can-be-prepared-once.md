@@ -73,7 +73,7 @@ and field 2 of partner.Person is `age`.
   … AS "age".
 ```
 
-Types are not checked here: a comptime pass has no schema, so `SELECT id, email` into `struct { id: i64, email: Str }` is checked for shape and not for whether `email` is really `text`. That half belongs to `db.checking`, which asks the database.
+Types are not checked here: a comptime pass has no schema, so `SELECT id, email` into `struct { id: i64, email: Str }` is checked for shape and not for whether `email` is really `text`. That half is asked of the database the first time the statement runs, along with whether an outer join can make a column NULL ([ADR 233](./233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)); `db.checking`, which this sentence used to name, holds tables and was never given a statement.
 
 **The break is deliberate and total.** A program that built SQL text at run time cannot call `db.raw` any more, and there is no second call with the old signature kept around: that would have left the unchecked path exactly where it was, under a name suggesting it is merely the one to reach for less often. What a caller who assembled text at run time does instead is assemble it at comptime, a `switch` over an enum of the orderings the application actually supports, a shape that also stops the injection nobody meant to allow.
 

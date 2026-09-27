@@ -1,75 +1,89 @@
 # The App
 
-One page of [the reference](./README.md): the App and its groups, what `listen()` takes, the loop, and the options behind `static` and the OpenAPI document.
+**The App is the server: where services, middleware and routes are registered, and what `listen()` takes to run it.**
+
+**Guide:** [Getting started](../guide/getting-started.md), [Routing](../guide/routing.md), [Services](../guide/services.md), [Deploying](../guide/deploying.md) · **Design:** [Lifecycle](../design/lifecycle.md), [Routing](../design/routing.md), [The engine](../design/engine.md)
+
+This page covers the App and its groups, the options `listen()` takes, the concurrency tools, and the options for `static` and the OpenAPI document.
 
 ## `App`
 
+### Services and startup
+
 | | |
 |---|---|
-| `App.init(gpa)` | a new App. The allocator is for the App's furniture, not for requests |
+| `App.init(gpa)` | a new App. The allocator is for the App's own structures, not for requests |
 | `app.deinit()` | |
-| `app.provide(&thing)` | register a service, looked up later by its pointer type. A service may declare `pub fn nilo_start(self: *T, io: std.Io) !void` to finish building itself once there is an event loop ([ADR 037](../adr/037-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md)) and `pub fn nilo_stop(self: *T) void` to put it down again before the loop goes ([ADR 121](../adr/121-a-service-is-stopped-before-the-loop-is.md)). **A service that put work on the loop needs the second one**, or the loop cannot be torn down. A third, `pub fn nilo_ready(self: *T, scope: *nilo_core.AnyScope) ?[]const u8`, is what `app.health` asks ([ADR 154](../adr/154-a-health-route-asks-the-services.md)). A fourth, `pub fn nilo_check(self: *T, io: std.Io) !void`, runs once after the work `before` registered and before the first request, for a service with something to verify once the boot work is done: a `Db` checks its Rows against their tables there, after the `createMissing` that made them ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)) |
+| `app.provide(&thing)` | registers a service, looked up later by its pointer type. A service may declare up to four hooks. `pub fn nilo_start(self: *T, io: std.Io) !void` finishes building it once there is an event loop ([ADR 037](../adr/037-a-service-that-needs-the-loop-is-finished-when-the-loop-exists.md)). `pub fn nilo_stop(self: *T) void` shuts it down before the loop goes ([ADR 121](../adr/121-a-service-is-stopped-before-the-loop-is.md)); **a service that put work on the loop needs this one**, or the loop cannot be torn down. `pub fn nilo_ready(self: *T, scope: *nilo_core.AnyScope) ?[]const u8` is what `app.health` asks ([ADR 154](../adr/154-a-health-route-asks-the-services.md)). `pub fn nilo_check(self: *T, io: std.Io) !void` runs once after the work `before` registered and before the first request, for a service that has something to verify once boot work is done: a `Db` checks its Rows against their tables there, after the `createMissing` that made them ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)) |
 | `app.spawn(f, args)` | work that is not a request, started once the server is up ([ADR 028](../adr/028-a-spawned-fiber-belongs-to-the-server.md)) |
-| `app.before(f, args)` | work that needs the services and has to finish before the first request — a migration, a version guard, a key set fetched once. `f` is `fn (run: *nilo.Run, …) !void`, run once inside `listen()` after the services have started and before what `spawn` registered, on the server's loop; if it fails the server does not start ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)). A fail function called inside it is not lost: the line that stops the boot carries its status and sentence, and which piece of the work it was ([ADR 129](../adr/129-a-refusal-outside-a-request-is-still-a-refusal.md)) |
-| `app.use(mw)` | middleware, everywhere |
-| `app.useOn(prefix, mw)` | middleware, under a path prefix |
-| `app.without(mw)` | the same App with `mw` off for the routes registered through what comes back — how a sign-up route sits inside a guarded prefix ([ADR 008](../adr/008-middleware-is-an-onion-of-ctx-functions.md)) |
-| `app.with(mw)` | the other direction: the same App with `mw` **on** for the routes registered through what comes back, so one endpoint can be guarded where its neighbours are not ([ADR 099](../adr/099-a-route-can-say-what-covers-it.md)) |
-| `app.guard(mw, cookie)` | say that `mw` refuses a request without the session cookie named `cookie`, so every route it is in front of is written in the API description with a `cookieAuth` requirement and a 401 — which routes is read from `use`/`useOn`/`with`/`without` when the document is written; only the cookie's name is taken on your word. One per App; a second is `error.GuardAlreadyDeclared`. Declaring it does not install it ([ADR 153](../adr/153-an-authorization-header-a-handler-can-ask-for.md)) |
-| `app.named("listPartners")` | the same App with the next route registered through what comes back carrying that as its `operationId`, instead of the one derived from the method and the path ([ADR 119](../adr/119-a-route-can-say-its-own-name.md)). Letters, digits, `_` and `-`, starting with a letter or `_` — `auth-login` is a name a generator can carry ([ADR 119](../adr/119-a-route-can-say-its-own-name.md)) |
-| `app.group(prefix)` | a group — see below |
+| `app.before(f, args)` | work that needs the services and has to finish before the first request: a migration, a version check, a key set fetched once. `f` is `fn (run: *nilo.Run, …) !void`, run once inside `listen()`, after the services have started and before what `spawn` registered, on the server's loop. If it fails, the server does not start ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)). A fail function called inside it is not lost: the log line that stops the boot includes its status and message, and which piece of work it was ([ADR 129](../adr/129-a-refusal-outside-a-request-is-still-a-refusal.md)) |
+| `app.checkServices()` | `error.MissingService` if a route needs a service nobody provided |
+
+### Middleware
+
+| | |
+|---|---|
+| `app.use(mw)` | middleware on every route |
+| `app.useOn(prefix, mw)` | middleware under a path prefix |
+| `app.without(mw)` | the same App with `mw` turned off for the routes registered through the value it returns. This is how a sign-up route sits inside a guarded prefix ([ADR 008](../adr/008-middleware-is-an-onion-of-ctx-functions.md)) |
+| `app.with(mw)` | the opposite: the same App with `mw` turned **on** for the routes registered through the value it returns, so one endpoint can be guarded while its neighbours are not ([ADR 099](../adr/099-a-route-can-say-what-covers-it.md)) |
+| `app.guard(mw, cookie)` | declares that `mw` rejects a request without the session cookie named `cookie`, so every route it covers is described in the API document with a `cookieAuth` requirement and a 401. Which routes it covers is read from `use`/`useOn`/`with`/`without` when the document is written; only the cookie's name is taken on trust. One per App; a second is `error.GuardAlreadyDeclared`. Declaring it does not install it ([ADR 153](../adr/153-an-authorization-header-a-handler-can-ask-for.md)) |
+
+### Routes
+
+| | |
+|---|---|
 | `app.get / post / put / delete / patch / head / options (pattern, handler)` | a route |
-| `app.route(method, pattern, handler)` | any other method |
-| `app.static(url_prefix, dir_path)` | a directory, read into memory at startup |
-| `app.staticWith(url_prefix, dir_path, options)` | the same, with [options](#static-options) |
-| `app.embedded(url_prefix, files)` | files the binary carries — a list of `.{ .path, .bytes }` with `@embedFile` on each — served as a directory is ([Static files](../guide/static-files.md#files-the-binary-carries), [ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)) |
-| `app.embeddedWith(url_prefix, files, options)` | the same, with the [options that are not about a disk](#static-options) |
-| `app.docs(options)` | serve an [OpenAPI document](../guide/openapi.md). Returns nothing: no `try` |
-| `app.failures(T)` | the body every failure goes out with, when nilo's `{"error":…,"status":…}` is not the one your clients read. `T` is a struct whose fields are the JSON, with `pub fn nilo_failure(status: u16, message: []const u8) T` filling it from the status and the fail function's sentence; the document's `Failure` schema comes from the same fields. Once per App; a second is `error.FailureShapeAlreadySet`. The answers written before there is a request to route — 400, 408, 415, 431, a shed 503 — keep nilo's own ([Errors](../guide/errors.md#what-the-client-is-told), [ADR 024](../adr/024-every-failure-answers-as-json.md)) |
-| `app.health(path)` | a page that says whether this process can do its job — `200 {"status":"ok"}`, or `503` naming the services that are not ready and why, or `503 {"status":"stopping"}` once the server was told to stop. Asks every service that declared `pub fn nilo_ready(self: *T, scope: *nilo_core.AnyScope) ?[]const u8` — null is ready, a sentence is why not ([Deploying](../guide/deploying.md#knowing-whether-it-is-ready), [ADR 154](../adr/154-a-health-route-asks-the-services.md)). Described in the document as a `200` of `{"status":…}`, and not counted among the routes that write their own answer ([ADR 120](../adr/120-a-ctx-handler-that-returns-nothing-may-have-written-it.md)) |
-| `app.metrics(options)` | count every request and serve the numbers at `/metrics`, Prometheus format ([Metrics](../guide/metrics.md), [ADR 079](../adr/079-the-route-table-is-the-registry.md)) |
-| `app.expose(name, kind, &atomic)` | publish a `std.atomic.Value(u64)` of your own on that page. `kind` is `.counter` or `.gauge` |
-| `app.compress(options)` | gzip every answer that is text, at least `min_bytes` long and going to a client whose `Accept-Encoding` takes it, per request, on a compressor borrowed from a pool of one per thread; `Content-Encoding: gzip`, `Vary: Accept-Encoding`, the compressed length. A client that did not ask gets the body as it is. Not streams, not event streams, not static files. Once per App; a second is `error.CompressionAlreadyEnabled` ([Responses](../guide/responses.md#compression), [ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)) |
-| `app.listen(options)` | run until stopped. Stops the process on a startup error |
-| `app.start(io)` | everything `listen()` does before it accepts anything (services checked, chains resolved, pools opened, the work `before` registered run, every `nilo_check` run after it) for a program that never listens: a test through `testing.Client`, a script, a worker on `jobs.serveOn(io)` ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)). **Not before `listen()`**: a service keeps the `Io` it was started on, so `start(io)` followed by `listen()` is refused when any service took one; the phase between the pool and the server is `app.before` ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)). What it does *not* start is `spawn`, which needs a server |
-| `app.shutdown()` | stop, from any thread or from inside a handler |
-| `app.boundPort()` | `?u16` — the port the server is listening on, from any thread. Null before `listen()` has bound, and for a unix socket. `.port = 0` asks the kernel for a free one and this is its answer |
-| `app.tryListen / tryRoute / tryStatic / tryStaticWith` | the same calls, error returned rather than reported. `tryStatic` on a directory that is not there is `error.StaticDirNotFound` and no log line; a problem inside a directory that is there is still said in one line, since the error cannot name the file ([ADR 207](../adr/207-a-try-call-hands-back-the-error-and-says-nothing.md)) |
-| `app.checkServices()` | `error.MissingService` if a route needs one nobody provided |
-| `app.routes()` | every route, in registration order — a view rather than a copy. `.len()`, `.at(i)` and `{f}` ([ADR 100](../adr/100-a-route-pattern-is-the-name-of-its-url.md)). `.at(i)` is `.method`, `.pattern` and `.name` — the `operationId`, given or derived, so a table keyed by it can be held against the route table ([ADR 162](../adr/162-a-middleware-can-learn-which-route-it-is-in-front-of.md)) |
+| `app.route(method, pattern, handler)` | a route for any other method |
+| `app.named("listPartners")` | the same App, where the next route registered through the value it returns gets that `operationId` instead of the one derived from the method and path ([ADR 119](../adr/119-a-route-can-say-its-own-name.md)). Letters, digits, `_` and `-`, starting with a letter or `_`, so `auth-login` works as a name a code generator can use ([ADR 119](../adr/119-a-route-can-say-its-own-name.md)) |
+| `app.group(prefix)` | a group: see [`Group`](#group) below |
+| `app.routes()` | every route, in registration order, as a view, not a copy. `.len()`, `.at(i)` and `{f}` ([ADR 100](../adr/100-a-route-pattern-is-the-name-of-its-url.md)). `.at(i)` has `.method`, `.pattern` and `.name` (the `operationId`, given or derived), so a table keyed by name can be checked against the route table ([ADR 162](../adr/162-a-middleware-can-learn-which-route-it-is-in-front-of.md)) |
 
 `pattern` and `handler` are `comptime`. Registration order never matters.
 
-**Which of these fail.** Every call in the table returns an error union and
-takes a `try`, except these, which return a value or nothing: `App.init`,
-`app.deinit`, `app.group`, `app.without`, `app.with`, `app.named`,
-`app.docs`, `app.routes`, `app.boundPort` and `app.shutdown`. Three fail in
-one named way, `app.guard` with `error.GuardAlreadyDeclared`,
-`app.failures` with `error.FailureShapeAlreadySet` and `app.compress` with
-`error.CompressionAlreadyEnabled`. `app.listen`,
-`app.route` and the `static` calls stop the process on the errors they can
-explain in one line, and their `try*` twins hand the same errors back
-instead ([ADR 207](../adr/207-a-try-call-hands-back-the-error-and-says-nothing.md)).
+### Static files
+
+| | |
+|---|---|
+| `app.static(url_prefix, dir_path)` | a directory, read into memory at startup |
+| `app.staticWith(url_prefix, dir_path, options)` | the same, with [options](#static-options) |
+| `app.embedded(url_prefix, files)` | files the binary carries, as a list of `.{ .path, .bytes }` with `@embedFile` on each, served the same way a directory is ([Static files](../guide/static-files.md#embedded-files), [ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)) |
+| `app.embeddedWith(url_prefix, files, options)` | the same, with the [options that are not about a disk](#static-options) |
+
+### Documents, health, metrics and compression
+
+| | |
+|---|---|
+| `app.docs(options)` | serves an [OpenAPI document](../guide/openapi.md). Returns nothing, so no `try` |
+| `app.failures(T)` | the body every failure is sent with, when nilo's `{"error":…,"status":…}` is not what your clients read. `T` is a struct whose fields are the JSON, with `pub fn nilo_failure(status: u16, message: []const u8) T` filling it from the status and the fail function's message; the document's `Failure` schema comes from the same fields. Once per App; a second is `error.FailureShapeAlreadySet`. Responses written before there is a request to route (400, 408, 415, 431, a shed 503) keep nilo's own shape ([Errors](../guide/errors.md#the-error-response-body), [ADR 024](../adr/024-every-failure-answers-as-json.md)) |
+| `app.health(path)` | a page that says whether this process can do its job: `200 {"status":"ok"}`, or `503` naming the services that are not ready and why, or `503 {"status":"stopping"}` once the server has been told to stop. It asks every service that declared `pub fn nilo_ready(self: *T, scope: *nilo_core.AnyScope) ?[]const u8`, where null means ready and a sentence says why not ([Deploying](../guide/deploying.md#health-checks), [ADR 154](../adr/154-a-health-route-asks-the-services.md)). Described in the document as a `200` of `{"status":…}`, and not counted among the routes that write their own answer ([ADR 120](../adr/120-a-ctx-handler-that-returns-nothing-may-have-written-it.md)) |
+| `app.metrics(options)` | counts every request and serves the numbers at `/metrics`, in Prometheus format ([Metrics](../guide/metrics.md), [ADR 079](../adr/079-the-route-table-is-the-registry.md)) |
+| `app.expose(name, kind, &atomic)` | publishes a `std.atomic.Value(u64)` of your own on that page. `kind` is `.counter` or `.gauge` |
+| `app.compress(options)` | gzips every text response that is at least `min_bytes` long and going to a client whose `Accept-Encoding` accepts it, per request, using a compressor borrowed from a pool of one per thread. Sets `Content-Encoding: gzip`, `Vary: Accept-Encoding` and the compressed length. A client that did not ask gets the body unchanged. Does not apply to streams, event streams or static files. Once per App; a second is `error.CompressionAlreadyEnabled` ([Responses](../guide/responses.md#compression), [ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)) |
+
+### Running
+
+| | |
+|---|---|
+| `app.listen(options)` | runs until stopped. Stops the process on a startup error |
+| `app.start(io)` | everything `listen()` does before it accepts anything (services checked, middleware chains resolved, pools opened, the work `before` registered run, every `nilo_check` run after it), for a program that never listens: a test using `testing.Client`, a script, a worker on `jobs.serveOn(io)` ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)). **Not before `listen()`**: a service keeps the `Io` it was started on, so `start(io)` followed by `listen()` is refused when any service took one. For work between the pool and the server, use `app.before` ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)). It does *not* start `spawn` work, which needs a server |
+| `app.shutdown()` | stops the server, from any thread or from inside a handler |
+| `app.boundPort()` | `?u16`: the port the server is listening on, from any thread. Null before `listen()` has bound, and for a unix socket. `.port = 0` asks the kernel for a free port, and this returns it |
+| `app.tryListen / tryRoute / tryStatic / tryStaticWith` | the same calls, returning the error instead of reporting it. `tryStatic` on a directory that does not exist returns `error.StaticDirNotFound` with no log line; a problem inside a directory that does exist is still logged in one line, since the error cannot name the file ([ADR 207](../adr/207-a-try-call-hands-back-the-error-and-says-nothing.md)) |
+
+### Which calls fail
+
+**Every call above returns an error union and needs a `try`, except these**, which return a value or nothing: `App.init`, `app.deinit`, `app.group`, `app.without`, `app.with`, `app.named`, `app.docs`, `app.routes`, `app.boundPort` and `app.shutdown`. Three fail in one named way: `app.guard` with `error.GuardAlreadyDeclared`, `app.failures` with `error.FailureShapeAlreadySet`, and `app.compress` with `error.CompressionAlreadyEnabled`. `app.listen`, `app.route` and the `static` calls stop the process on the errors they can explain in one line, and their `try*` versions return the same errors instead ([ADR 207](../adr/207-a-try-call-hands-back-the-error-and-says-nothing.md)).
 
 ### `Group`
 
-`app.group("/api")` returns one. It has `group`, `use`, `useOn`, `without`,
-`provide`, `get`, `post`, `put`, `delete`, `patch`, `head`, `options`, `route`,
-`tryRoute`, `static`, `staticWith`, `tryStatic`, `tryStaticWith` — the same as an
-App, minus `listen`, `docs` and `shutdown`. The prefix is compile-time text and
-must be literal; the type is `nilo.Group("/api")`.
+**`app.group("/api")` returns a group.** It has `group`, `use`, `useOn`, `without`, `provide`, `get`, `post`, `put`, `delete`, `patch`, `head`, `options`, `route`, `tryRoute`, `static`, `staticWith`, `tryStatic` and `tryStaticWith`: the same as an App, minus `listen`, `docs` and `shutdown`. The prefix is compile-time text and must be a literal; the type is `nilo.Group("/api")`.
 
-`@TypeOf(g).mounted_at` is where it is mounted — `"/api"`, and `""` for an App,
-so a plugin taking `anytype` can ask either.
+`@TypeOf(g).mounted_at` is where it is mounted: `"/api"`, or `""` for an App, so a plugin taking `anytype` can ask either.
 
-`g.without(mw)` is the same group with `mw` off for the routes registered
-through it, which is how the two routes that create a session sit inside a
-prefix that requires one. Its type is `nilo.GroupOf("/api", &.{mw})`.
+`g.without(mw)` is the same group with `mw` off for the routes registered through it. This is how the two routes that create a session sit inside a prefix that requires one. Its type is `nilo.GroupOf("/api", &.{mw})`.
 
-`g.with(mw)` is the other direction, for a route that wants *more* than its
-neighbours. A carried middleware runs innermost, and both `with` and `without`
-match on the joined pattern **and the method**, so a `DELETE` guard does not
-cover the `GET` beside it. They compose:
+`g.with(mw)` is the opposite, for a route that needs *more* than its neighbours. A middleware added this way runs innermost. Both `with` and `without` match on the joined pattern **and the method**, so a guard on `DELETE` does not cover the `GET` next to it. They can be combined:
 
 ```zig
 const v1 = app.group("/v1");
@@ -81,55 +95,41 @@ try v1.without(requireOperator).with(rateLimitSignups).post("/sign-up", signUp);
 
 | | Default |
 |---|---|
-| `address` | `"127.0.0.1"` — an address, not a host name. `"unix:/run/nilo.sock"` listens on a path ([ADR 103](../adr/103-a-path-is-an-address-to-listen-on.md)) |
-| `port` | `8787` — not read when `address` names a unix socket |
+| `address` | `"127.0.0.1"`: an address, not a host name. `"unix:/run/nilo.sock"` listens on a path ([ADR 103](../adr/103-a-path-is-an-address-to-listen-on.md)) |
+| `port` | `8787`. Not read when `address` names a unix socket |
 | `threads` | `0`: one per core, or one more than a container's CPU quota where there is one; at most 64 ([ADR 230](../adr/230-a-cpu-quota-sets-the-thread-count.md)) |
-| `read_buffer` | `16 * 1024` — also the ceiling on a request head. Paid only while a connection is busy; an idle one gives the pages back ([ADR 196](../adr/196-a-head-is-mostly-cookies-and-sixteen-kilobytes-of-them.md)) |
+| `read_buffer` | `16 * 1024`. Also the limit on a request head. Paid only while a connection is busy; an idle one gives the pages back ([ADR 196](../adr/196-a-head-is-mostly-cookies-and-sixteen-kilobytes-of-them.md)) |
 | `write_buffer` | `4 * 1024` |
-| `arena_keep` | `16 * 1024` — of a connection's request arena, kept between requests |
-| `reuse_address` | `true` — on a unix socket, removes a socket file left behind by a process that is gone |
-| `backlog` | `4096` — completed handshakes the kernel holds for `accept`; past it a SYN is dropped and the client retries a second later. `somaxconn`'s default, and the kernel caps it there ([ADR 198](../adr/198-a-backlog-is-sized-for-the-burst-not-the-load.md)) |
-| `stop_on_signal` | `true` — Ctrl-C and SIGTERM |
+| `arena_keep` | `16 * 1024`: how much of a connection's request arena is kept between requests |
+| `reuse_address` | `true`. On a unix socket, removes a socket file left behind by a process that has exited |
+| `backlog` | `4096`: completed handshakes the kernel holds for `accept`. Past it a SYN is dropped and the client retries a second later. This is `somaxconn`'s default, and the kernel caps it there ([ADR 198](../adr/198-a-backlog-is-sized-for-the-burst-not-the-load.md)) |
+| `stop_on_signal` | `true`: Ctrl-C and SIGTERM stop the server |
 | `shutdown_grace_ms` | `10_000` |
-| `header_timeout_ms` | `10_000` — the whole head, from its first byte |
-| `idle_timeout_ms` | `75_000` — a connection between requests |
-| `body_timeout_ms` | `30_000` — any one read of a body |
-| `body_min_rate` | `8 * 1024` — bytes a second a buffered body has to keep up. `0` = off |
-| `body_grace_ms` | `10_000` — before the rate is asked for |
-| `write_timeout_ms` | `30_000` — any one write to the client |
-| `request_deadline_ms` | `0` — a deadline every request starts with, what [`nilo.deadline(ms)`](./middleware.md#nilodeadline) gives one route. A route that takes the connection over lets go of it; a route's own is kept. `0` = none ([ADR 105](../adr/105-a-route-can-say-how-long-it-has.md)) |
-| `max_connections` | `10_000` — held at once, 4,669 bytes each when idle. `0` = no limit. `listen()` warns when the process's descriptor limit (`ulimit -n`) is below it, and the accept loop waits out a shortage rather than stopping ([ADR 194](../adr/194-an-accept-loop-that-is-out-of-descriptors-waits.md)) |
-| `max_in_flight` | `0` — the most requests answered at once; past it a request is a `503` with `Retry-After: 1` at once rather than a place in a queue. `0` = no limit ([ADR 159](../adr/159-a-server-past-its-limit-says-so-at-once.md)) |
-| `max_body` | `1024 * 1024` — the most `c.body()` reads into the arena. One route can say its own with [`nilo.maxBody(bytes)`](./middleware.md#nilomaxbody) |
-| `trusted_hops` | `0` — how many proxies stand in front, for `c.clientIp()`, `c.host()` and `c.scheme()` |
-| `trusted_proxies` | `&.{}` — **which** ones: CIDRs, bare addresses, `"private"`, `"loopback"`. Their headers are read only on a connection one of them made. Wins over `trusted_hops` ([ADR 102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md)) |
-| `session_secret` | `null` — 32 bytes, for `Session(T)`. The same on every instance |
-| `session_fallback_secrets` | `&.{}` — secrets a session cookie is still opened under when `session_secret` does not open it; nothing is sealed under any. The old secret after a rotation, kept for the longest `max_age` you seal with and then dropped, or the next one, staged a deploy ahead on several instances. At most three, each 32 bytes and none the same as `session_secret`. Drop a leaked one at once ([ADR 225](../adr/225-a-fallback-session-secret-opens-and-never-seals.md), [guide](../guide/sessions.md#changing-the-secret)) |
-| `tls` | `null` — `.{ .cert = "…pem", .key = "…pem" }` serves HTTPS, TLS 1.3, on a build that passed `.tls = true` to the dependency (`-Dtls` here); any other build refuses it at `listen()`. The two files are read before the port is taken, and a key that is not the certificate's own is refused there rather than left to fail every handshake ([ADR 212](../adr/212-tls-is-an-option-a-build-asks-for.md)). 560 KB of binary and a page per idle connection in that build, about 300 µs of CPU per handshake with an ECDSA certificate and 2.6 ms with an RSA-2048 one, and no audit behind it; a proxy in front stays the recommendation ([ADR 212](../adr/212-tls-is-an-option-a-build-asks-for.md), [deploying](../guide/deploying.md#tls-without-a-proxy)) |
-| `also` | `&.{}` — more addresses to answer on, each `.{ .address, .port, .tls, .grpc }` and nothing else. One server, one route table, one thread pool; the handler is not told which listener a request arrived on, and `max_connections` counts sockets across all of them. A cleartext port beside a TLS one is what it is for, and so is a gRPC port beside an HTTP one. 82 KB of resident memory per extra listener on sixteen threads, and nothing per connection or per request ([ADR 213](../adr/213-a-server-answers-on-more-than-one-address.md)) |
-| `grpc` | `false` — the listener speaks gRPC rather than HTTP/1.1: HTTP/2 with prior knowledge (h2c), or with `tls` set as well, HTTP/2 chosen by ALPN (`h2` and nothing else). Each unary call is answered by the `app.post` route at its path, `c.body()` being the message and `c.send(200, "application/grpc", …)` the answer; a failed route's status becomes the `grpc-status` it means, and `grpc-timeout` is the request's deadline. Needs `.grpc = true` on the dependency (`-Dgrpc` here); any other build refuses it at `listen()`. Set it on an `also` entry for a gRPC port beside an HTTP one, or here for a server that speaks nothing else. Under a page per idle gRPC connection more than an HTTP/1.1 one, 116 KB of binary in that build, a fiber per call in flight, at most 100 calls a connection ([ADR 220](../adr/220-grpc-is-served-over-h2c-behind-a-flag.md), [guide](../guide/grpc.md)) |
-| `block_warning_ms` | `250` — say so when a handler holds its thread. `0` = off |
-| `password_hashes_at_once` | `8` — password hashes run at once through `c.hashPassword` and `c.verifyPassword`; past it a sign-in waits its turn rather than failing. Bounds concurrency, not the queue ([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)) |
+| `header_timeout_ms` | `10_000`: the whole head, from its first byte |
+| `idle_timeout_ms` | `75_000`: a connection between requests |
+| `body_timeout_ms` | `30_000`: any one read of a body |
+| `body_min_rate` | `8 * 1024`: bytes per second a buffered body has to keep up. `0` turns it off |
+| `body_grace_ms` | `10_000`: time before the minimum rate is enforced |
+| `write_timeout_ms` | `30_000`: any one write to the client |
+| `request_deadline_ms` | `0`: a deadline every request starts with, the same thing [`nilo.deadline(ms)`](./middleware.md#nilodeadline) gives one route. A route that takes over the connection drops it; a route's own deadline is kept. `0` means none ([ADR 105](../adr/105-a-route-can-say-how-long-it-has.md)) |
+| `max_connections` | `10_000` held at once, 4,669 bytes each when idle. `0` means no limit. `listen()` warns when the process's file descriptor limit (`ulimit -n`) is below it, and the accept loop waits out a shortage instead of stopping ([ADR 194](../adr/194-an-accept-loop-that-is-out-of-descriptors-waits.md)) |
+| `max_in_flight` | `0`: the most requests answered at once. Past it, a request immediately gets a `503` with `Retry-After: 1` instead of waiting in a queue. `0` means no limit ([ADR 159](../adr/159-a-server-past-its-limit-says-so-at-once.md)) |
+| `max_body` | `1024 * 1024`: the most `c.body()` reads into the arena. One route can set its own with [`nilo.maxBody(bytes)`](./middleware.md#nilomaxbody) |
+| `trusted_hops` | `0`: how many proxies are in front, for `c.clientIp()`, `c.host()` and `c.scheme()` |
+| `trusted_proxies` | `&.{}`: **which** proxies, as CIDRs, bare addresses, `"private"` or `"loopback"`. Their headers are read only on connections one of them made. Takes priority over `trusted_hops` ([ADR 102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md)) |
+| `session_secret` | `null`: 32 bytes, for `Session(T)`. Must be the same on every instance |
+| `session_fallback_secrets` | `&.{}`: secrets a session cookie is still opened with when `session_secret` does not open it; nothing is sealed with them. Use it for the old secret after a rotation (kept for the longest `max_age` you seal with, then removed), or for the next secret, staged one deploy ahead across several instances. At most three, each 32 bytes and none equal to `session_secret`. Remove a leaked one immediately ([ADR 225](../adr/225-a-fallback-session-secret-opens-and-never-seals.md), [guide](../guide/sessions.md#rotating-the-secret)) |
+| `tls` | `null`. `.{ .cert = "…pem", .key = "…pem" }` serves HTTPS (TLS 1.3) on a build that passed `.tls = true` to the dependency (`-Dtls` in this repository); any other build refuses it at `listen()`. Both files are read before the port is taken, and a key that does not belong to the certificate is refused there, instead of failing every handshake later ([ADR 212](../adr/212-tls-is-an-option-a-build-asks-for.md)). In that build it costs 560 KB of binary and a page per idle connection, about 300 µs of CPU per handshake with an ECDSA certificate and 2.6 ms with an RSA-2048 one, and it has not been audited; a proxy in front is still the recommendation ([ADR 212](../adr/212-tls-is-an-option-a-build-asks-for.md), [deploying](../guide/deploying.md#tls-without-a-proxy)) |
+| `also` | `&.{}`: more addresses to answer on, each `.{ .address, .port, .tls, .grpc }` and nothing else. One server, one route table, one thread pool; the handler is not told which listener a request came in on, and `max_connections` counts sockets across all of them. It is meant for a cleartext port next to a TLS one, or a gRPC port next to an HTTP one. Costs 82 KB of resident memory per extra listener on sixteen threads, and nothing per connection or per request ([ADR 213](../adr/213-a-server-answers-on-more-than-one-address.md)) |
+| `grpc` | `false`. When true, the listener speaks gRPC instead of HTTP/1.1: HTTP/2 with prior knowledge (h2c), or, with `tls` set as well, HTTP/2 chosen by ALPN (`h2` only). Each unary call is answered by the `app.post` route at its path, with `c.body()` as the message and `c.send(200, "application/grpc", …)` as the answer; a failed route's status becomes the matching `grpc-status`, and `grpc-timeout` becomes the request's deadline. Needs `.grpc = true` on the dependency (`-Dgrpc` in this repository); any other build refuses it at `listen()`. Set it on an `also` entry for a gRPC port next to an HTTP one, or here for a server that speaks only gRPC. Costs under a page more per idle gRPC connection than an HTTP/1.1 one, 116 KB of binary in that build, a fiber per call in flight, and at most 100 calls per connection ([ADR 220](../adr/220-grpc-is-served-over-h2c-behind-a-flag.md), [guide](../guide/grpc.md)) |
+| `block_warning_ms` | `250`: logs a warning when a handler holds its thread this long. `0` turns it off |
+| `password_hashes_at_once` | `8`: password hashes run at once through `c.hashPassword` and `c.verifyPassword`. Past it, a sign-in waits its turn instead of failing. Limits concurrency, not the queue ([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)) |
 
-**`arena_keep` is the one in that table with a cliff under it.** A response
-larger than it does not fit in what the arena retains, so the block goes back to
-the operating system after every request and the next one faults it in a page at
-a time — 257 minor faults for a megabyte, with the kernel zeroing each page. A
-server that assembles large responses in `c.arena()` should set this just past
-the largest of them, and no higher: the memory is held **per connection**, so a
-megabyte here across ten thousand connections is ten gigabytes
-([ADR 075](../adr/075-a-response-larger-than-the-arena-keep-is-a-page-fault-per-page.md)).
-Leaving it alone is right for a server whose responses fit in 16 KiB.
+**`arena_keep` is the option in this table with a cliff.** A response larger than it does not fit in what the arena keeps, so the block goes back to the operating system after every request, and the next request faults it back in one page at a time: 257 minor faults for a megabyte, with the kernel zeroing each page. A server that builds large responses in `c.arena()` should set this just above the largest of them, and no higher, because the memory is held **per connection**: a megabyte here across ten thousand connections is ten gigabytes ([ADR 075](../adr/075-a-response-larger-than-the-arena-keep-is-a-page-fault-per-page.md)). The default is right for a server whose responses fit in 16 KiB.
 
-Each of the four deadlines bounds one wait for the network, not a request, so a
-long upload or an hour-long stream is not hurried by any of them. `0` turns one
-off. See [Deploying](../guide/deploying.md#deadlines) — and what each bound in
-this table does once it is reached, the status and the log line, is one table
-under [When a bound is hit](../guide/deploying.md#when-a-bound-is-hit).
+**Each of the four timeouts bounds one wait for the network, not a whole request**, so a long upload or an hour-long stream is not cut short by any of them. `0` turns one off. See [Deploying](../guide/deploying.md#deadlines). What happens when each limit in this table is reached (the status and the log line) is one table under [When a bound is hit](../guide/deploying.md#what-happens-at-each-limit).
 
-Past `max_connections` a connection is accepted and closed at once — no request
-read, no status sent
-([why](../guide/deploying.md#how-many-connections-at-once)).
+Past `max_connections`, a connection is accepted and closed immediately, with no request read and no status sent ([why](../guide/deploying.md#how-many-connections-at-once)).
 
 ### `metrics` options
 
@@ -137,18 +137,12 @@ read, no status sent
 
 | | Default |
 |---|---|
-| `path` | `"/metrics"` — an ordinary route, so middleware in front of it applies |
-| `buckets` | `100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 1_000_000` — latency boundaries in microseconds, climbing. Reported as seconds |
+| `path` | `"/metrics"`: an ordinary route, so middleware in front of it applies |
+| `buckets` | `100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 1_000_000`: latency boundaries in microseconds, in increasing order. Reported in seconds |
 
-What goes on the page: `nilo_requests_total{method,route,status}` by status
-class, `nilo_request_duration_seconds` as a histogram, `nilo_responses_total`
-by exact code for the whole process, `nilo_requests_in_flight`, and anything
-`app.expose` was given.
+**What the page shows:** `nilo_requests_total{method,route,status}` by status class, `nilo_request_duration_seconds` as a histogram, `nilo_responses_total` by exact code for the whole process, `nilo_requests_in_flight`, and anything given to `app.expose`.
 
-Counted per **route**, not per path — `/users/1` and `/users/2` are both
-`/users/:id`. Five slots are not routes: `<unmatched>`, `<method not allowed>`, `<shed>`,
-`<static file>` and `<unparsed>`. A route that has answered nothing has no
-series at all. See [Metrics](../guide/metrics.md).
+Requests are counted per **route**, not per path: `/users/1` and `/users/2` both count as `/users/:id`. Five slots are not routes: `<unmatched>`, `<method not allowed>`, `<shed>`, `<static file>` and `<unparsed>`. A route that has answered nothing has no series at all. See [Metrics](../guide/metrics.md).
 
 ### `compress` options
 
@@ -156,36 +150,27 @@ series at all. See [Metrics](../guide/metrics.md).
 
 | | Default |
 |---|---|
-| `min_bytes` | `1024`: bodies shorter than this go out as they are |
+| `min_bytes` | `1024`: bodies shorter than this are sent uncompressed |
 | `level` | `.default`, zlib's level 6. `.fastest` is level 1, `.best` is level 9 |
 
-What it costs: one compressor per thread, `~288 KB` each, taken when the
-chains are resolved; one arena allocation on a request that is compressed;
-tens of microseconds of gzip per body (`zig build bench-compress` has the
-table). Nothing per connection, and nothing on a request that is not
-compressed ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
+**What it costs:** one compressor per thread, about 288 KB each, created when the middleware chains are resolved; one arena allocation for each compressed response; and tens of microseconds of gzip per body (`zig build bench-compress` has the table). Nothing per connection, and nothing on a response that is not compressed ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 
 ## Concurrency
 
 | | |
 |---|---|
 | `nilo.Mutex` | `.init`, then `try lock()`, `unlock()`, `tryLock()`, `lockUncancelable()` |
-| `nilo.blocking(f, args)` | run a blocking call off the event loop |
-| `nilo.blockingReserved(f, args)` | the same, on a thread of its own rather than behind a call already on the pool, for a caller holding a connection or a lock; every call that finds no idle worker starts one, so its callers have to be bounded already ([ADR 064](../adr/064-a-file-has-no-socket-to-wait-on.md#a-statement-under-hop-gets-a-thread-of-its-own)) |
-| `nilo.Gate` | `.open(n)`, then `try enter()` or `try enterWithin(ms)`, `leave()` — a lock that lets `n` through, the rest served in the order they came; `enterWithin` gives up with `error.TimedOut` holding nothing ([ADR 222](../adr/222-a-gate-serves-its-waiters-in-the-order-they-came.md)) |
-| `nilo.sleep(ms)` | wait without parking the thread |
-| `nilo.spawn(f, args)` | run something that is not a request, now — `error.NoServer` if nothing is listening |
-| `app.spawn(f, args)` | the same fiber, registered before the server and started once it is up ([the guide](../guide/background.md)) |
-| `nilo.randomSecure(&buf)` | fill a buffer you already hold, off the event loop |
-| `nilo.verifyPassword(gpa, stored, text)` | `c.verifyPassword` with no request in hand — the same Gate and pool, inline with no loop ([`nilo_pw`](./pw.md)) |
-| `nilo.monotonicNanos()` | a clock reading, for durations |
+| `nilo.blocking(f, args)` | runs a blocking call off the event loop |
+| `nilo.blockingReserved(f, args)` | the same, on a thread of its own instead of queued behind calls already on the pool, for a caller holding a connection or a lock. Every call that finds no idle worker starts one, so its callers must already be bounded ([ADR 064](../adr/064-a-file-has-no-socket-to-wait-on.md#a-statement-under-hop-gets-a-thread-of-its-own)) |
+| `nilo.Gate` | `.open(n)`, then `try enter()` or `try enterWithin(ms)`, and `leave()`: a lock that lets `n` callers through and serves the rest in arrival order. `enterWithin` gives up with `error.TimedOut`, holding nothing ([ADR 222](../adr/222-a-gate-serves-its-waiters-in-the-order-they-came.md)) |
+| `nilo.sleep(ms)` | waits without blocking the thread |
+| `nilo.spawn(f, args)` | runs something that is not a request, now. `error.NoServer` if nothing is listening |
+| `app.spawn(f, args)` | the same fiber, registered before the server starts and started once it is up ([the guide](../guide/background.md)) |
+| `nilo.randomSecure(&buf)` | fills a buffer you already hold, off the event loop |
+| `nilo.verifyPassword(gpa, stored, text)` | `c.verifyPassword` with no request in hand: the same Gate and pool, or inline with no loop ([`nilo_pw`](./pw.md)) |
+| `nilo.monotonicNanos()` | a clock reading, for measuring durations |
 
-`lock()` and `sleep()` fail with `error.Canceled` if the request went away, which
-maps to a 503. `lockUncancelable()` cannot fail and cannot be interrupted, which
-is for a cleanup path — one that has nowhere to put a failure, and would leave
-something unreleased if it gave up
-([ADR 082](../adr/082-a-cleanup-path-is-not-cancellable.md)). Only for a short
-section that does not itself wait; `lock()` is still the one to reach for.
+**`lock()` and `sleep()` fail with `error.Canceled` if the request went away**, which becomes a 503. `lockUncancelable()` cannot fail and cannot be interrupted. It is for a cleanup path: one that has nowhere to report a failure, and would leave something unreleased if it gave up ([ADR 082](../adr/082-a-cleanup-path-is-not-cancellable.md)). Use it only for a short section that does not itself wait; `lock()` is still the default choice.
 
 ## Static options
 
@@ -196,42 +181,21 @@ section that does not itself wait; `lock()` is still the one to reach for.
 | `index` | `"index.html"` |
 | `cache_control` | `"public, max-age=3600"` |
 | `spa_fallback` | `""` (off) |
-| `spa_fallback_for` | `.navigations` — or `.any_path`, which is what shipped before 0.2.0 |
+| `spa_fallback_for` | `.navigations`, or `.any_path`, which was the behaviour before 0.2.0 |
 | `max_file_bytes` | `8 * 1024 * 1024` |
 | `max_total_bytes` | `64 * 1024 * 1024` |
 | `dotfiles` | `false` |
-| `reload` | `false` — hold nothing, open every file per request |
+| `reload` | `false`. When true, holds nothing and opens every file per request |
 
-`spa_fallback_for` decides which requests the fallback answers: `.navigations`
-is a request naming `text/html`, or one that named nothing and has no file
-extension in its last path segment, and everything else under the prefix is a
-404 naming the path. See
-[Static files](../guide/static-files.md#the-fallback-and-what-it-is-for).
+**`spa_fallback_for` decides which requests the fallback answers.** `.navigations` means a request that asks for `text/html`, or one that asks for nothing and has no file extension in its last path segment; every other request under the prefix gets a 404 naming the path. See [Static files](../guide/static-files.md#the-spa-fallback).
 
-`max_file_bytes` is a threshold, not a ceiling: a file over it is listed but not
-read, and each request opens it and sends it from the disk — no gzipped copy, an
-ETag made of the modification time and the size, and one file descriptor for as
-long as the response takes. `max_total_bytes` counts held bytes only. See
-[Static files](../guide/static-files.md#files-too-big-to-hold).
+**`max_file_bytes` is a threshold, not a limit.** A file over it is listed but not read into memory, and each request opens it and sends it from disk: no gzipped copy, an ETag made from the modification time and size, and one file descriptor for as long as the response takes. `max_total_bytes` counts only the bytes held in memory. See [Static files](../guide/static-files.md#large-files-served-from-disk).
 
-Both the length and the ETag of a spilled file come from one look at the
-descriptor whose bytes are about to go out, so editing a file under a running
-server cannot serve a stale length under a stale tag
-([ADR 098](../adr/098-a-file-is-described-by-the-descriptor-being-sent.md)).
+Both the length and the ETag of a file served from disk come from one look at the descriptor whose bytes are about to be sent, so editing a file under a running server cannot serve a stale length under a stale tag ([ADR 098](../adr/098-a-file-is-described-by-the-descriptor-being-sent.md)).
 
-`app.embeddedWith(prefix, files, …)` takes `index`, `cache_control`,
-`spa_fallback`, `spa_fallback_for`, `compress` and `compress_min_bytes`, with the
-defaults above, and none of the rest: nothing in the binary can spill, nothing is
-over a total, every name was written by the caller, and there is no disk to
-reload from. A path listed twice and a fallback that names no entry are refused
-at startup
-([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)).
+`app.embeddedWith(prefix, files, …)` takes `index`, `cache_control`, `spa_fallback`, `spa_fallback_for`, `compress` and `compress_min_bytes`, with the defaults above, and none of the others: nothing in the binary is served from disk, there is no total to exceed, every name was written by the caller, and there is no disk to reload from. A path listed twice, and a fallback that names no entry, are refused at startup ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)).
 
-**`reload = true` is `max_file_bytes = 0` with a name**: nothing is held, every
-file is opened per request, and editing one works without a restart. For
-development — it gives up the in-memory copy and the gzipped one — and a file
-that did not exist at startup still needs a restart, because the list of names
-comes from the walk.
+**`reload = true` is the same as `max_file_bytes = 0`**: nothing is held, every file is opened per request, and edits show up without a restart. It is for development, since it gives up the in-memory and gzipped copies. A file that did not exist at startup still needs a restart, because the list of names comes from the directory walk at startup.
 
 ## OpenAPI options
 
@@ -243,27 +207,19 @@ comes from the walk.
 | `version` | `"1.0.0"` |
 | `description` | `""` |
 | `path` | `"/openapi.json"` |
-| `ui_path` | `"/docs"` — empty for none |
+| `ui_path` | `"/docs"`. Empty for none |
 
-A type with a `jsonStringify` is described by what it says, not by its fields —
-`std.json` calls the function and never reads them, so reflecting them would
-describe something the server does not send
-([ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md)):
+**A type with a `jsonStringify` is described by a marker, not by its fields**, because `std.json` calls the function and never reads the fields, so describing them would describe something the server does not send ([ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md)):
 
 ```zig
 pub const nilo_openapi = .{ .type = "string", .format = "uuid" };
 ```
 
-`type` is required — `"string"`, `"integer"`, `"number"`, `"boolean"` — and
-`format` is an optional hint. nilo's own types carry it already (`Uuid`,
-`Timestamp`, `Decimal`, `Interval`, `Inet`). One with a custom writer and no
-marker gets `{}` and a description saying so.
+`type` is required (`"string"`, `"integer"`, `"number"` or `"boolean"`), and `format` is an optional hint. nilo's own types already carry it (`Uuid`, `Timestamp`, `Decimal`, `Interval`, `Inet`). A type with a custom writer and no marker is described as `{}` with a description saying so.
 
 ### The document without a server
 
-`app.writeOpenApi(w)` writes the same bytes `/openapi.json` serves, to any
-writer, with **no port, no database and no network**
-([ADR 135](../adr/135-the-document-is-a-build-artefact.md)):
+**`app.writeOpenApi(w)` writes the same bytes `/openapi.json` serves**, to any writer, with **no port, no database and no network** ([ADR 135](../adr/135-the-document-is-a-build-artefact.md)):
 
 <!-- compiles -->
 ```zig
@@ -284,30 +240,12 @@ pub fn writeTheDocument(gpa: std.mem.Allocator) ![]u8 {
 }
 ```
 
-Call it after the routes are registered and before `listen`. The operations are
-collected as each route is registered, so nothing has to have started.
+Call it after the routes are registered and before `listen`. The operations are collected as each route is registered, so nothing has to be started.
 
-**`app.provide` does not have to be called**, which is what makes the build
-step's binary genuinely clean. `provide` is for the request path; writing the
-document needs only the operations, so a program that does nothing but write it
-links no database driver and needs no stand-in `*Db` to get registration past
-the type checker.
+**You do not have to call `app.provide`**, which keeps the build step's binary free of everything else. `provide` is for handling requests; writing the document needs only the operations, so a program that only writes it links no database driver and needs no placeholder `*Db` to get route registration past the type checker.
 
-**Register the routes in one place both callers use.** A `routes.zig` that
-`main.zig` and the document step each call is the same argument as `buildDocs`
-going through this method rather than beside it: two route lists is how a
-checked-in contract starts describing a server that no longer exists, and the
-one somebody forgets to add to the second list disappears with no error and no
-failing test.
+**Register the routes in one place that both programs use.** A `routes.zig` that `main.zig` and the document step both call follows the same reasoning as `buildDocs` going through this method instead of a separate path: two route lists is how a checked-in contract starts describing a server that no longer exists, and a route somebody forgets to add to the second list disappears with no error and no failing test.
 
-**This is what makes the document a build artefact rather than a thing you
-curl.** A checked-in `openapi.json` is how a typed frontend client is generated
-and how a breaking change shows up in review; producing it by booting a server
-means `listen`, which means `db.checking`, which means a migrated database — so
-a file describing a set of types ends up needing Postgres. `zig build openapi >
-openapi.json` needs none of it.
+**This makes the document a build artefact, not something you fetch with curl.** A checked-in `openapi.json` is how a typed frontend client is generated and how a breaking change shows up in review. Producing it by booting a server means `listen`, which means `db.checking`, which means a migrated database, so a file describing some types would end up needing Postgres. `zig build openapi > openapi.json` needs none of that.
 
-The title and version come from `app.docs(.{ … })` if it was called, and are
-`"API"` / `"1.0.0"` if it was not, so a program that serves no document can
-still write one. The served copy goes through this same call, which is what
-stops a checked-in file and a running server describing two different APIs.
+The title and version come from `app.docs(.{ … })` if it was called, and default to `"API"` / `"1.0.0"` if not, so a program that serves no document can still write one. The served copy goes through this same call, which is what stops a checked-in file and a running server from describing two different APIs.

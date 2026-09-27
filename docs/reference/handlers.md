@@ -1,6 +1,8 @@
 # Handlers
 
-One page of [the reference](./README.md): what a handler's arguments mean, what it may return, and how JSON is shaped.
+**What a handler's arguments mean, what it may return, and how its JSON is shaped.**
+
+**Guide:** [Handlers](../guide/handlers.md), [Requests](../guide/requests.md), [Forms](../guide/forms.md), [Responses](../guide/responses.md) · **Design:** [Typed handlers](../design/typed-handlers.md), [Request input](../design/request-input.md), [Responses](../design/responses.md), [JSON](../design/json.md)
 
 ## Handler arguments
 
@@ -8,29 +10,26 @@ One page of [the reference](./README.md): what a handler's arguments mean, what 
 |---|---|
 | `*Ctx` | the request itself |
 | `*Db`, `*const Config` | a service, by type |
-| `u32`, `f64`, `Str`, `bool`, an enum | a path param, positionally |
-| a type with `nilo_parse` | a path param too — `sql.Uuid` is one |
+| `u32`, `f64`, `Str`, `bool`, an enum | a path param, by position |
+| a type with `nilo_parse` | also a path param; `sql.Uuid` is one |
 | `Within(1, 200)` | a whole number inside a range; `.value` is the number |
 | `Query(T)` | the query string as a struct |
 | `FromHeader("X-Staff-Id", T)` | one request header, converted like a path param |
-| `Authorization(.bearer)`, `Authorization(.{ .basic = "realm" })` | the `Authorization` header as one scheme — absent or another scheme is a 401 with the challenge on it |
-| `Idempotent(Replays, .{ .by = fn })` | the `Idempotency-Key` header, and with it the route answering once per key: a retry gets the kept answer back and the handler does not run |
-| `Cached(Pages, .{ .ttl_s = 60 })` | the answer kept for a minute under the path and query: the next request gets it back and the handler does not run. GET and HEAD only |
-| `Form(T)` | the body as an HTML form — urlencoded or multipart |
-| `Bound(W)` | any of the three above, with its failures instead of a 400 |
-| `Session(T)` | the session, out of its cookie |
+| `Authorization(.bearer)`, `Authorization(.{ .basic = "realm" })` | the `Authorization` header as one scheme. Missing, or another scheme, is a 401 with the challenge header |
+| `Idempotent(Replays, .{ .by = fn })` | the `Idempotency-Key` header, which makes the route answer once per key: a retry gets the stored answer back and the handler does not run |
+| `Cached(Pages, .{ .ttl_s = 60 })` | the answer stored for a minute under the path and query: the next request gets it back and the handler does not run. GET and HEAD only |
+| `Form(T)` | the body as an HTML form, urlencoded or multipart |
+| `Bound(W)` | any of the three above, with its failures handed to you instead of a 400 |
+| `Session(T)` | the session, read from its cookie |
 | `std.mem.Allocator` | the request arena |
 | a type with `nilo_resolve` | a resolved value |
 | any other struct | the body, parsed from JSON |
 
-A body field may be `Patch(T)`, which tells "not sent" from "sent as null":
-`.absent`, `.cleared`, `.value`. Give it `= .absent` as its default;
-`.orNull()` collapses the two empty cases.
+**A body field may be `Patch(T)`, which tells "not sent" apart from "sent as null"**: `.absent`, `.cleared`, `.value`. Give it `= .absent` as its default; `.orNull()` merges the two empty cases.
 
-**A path param may also be a type that parses itself.** Give a type
-`pub fn nilo_parse(text: []const u8) ?Self` and nilo calls it with the segment,
-answering 400 when it returns null — so a malformed uuid is refused at the
-router instead of in every handler. `sql.Uuid` already carries it:
+### Types that parse themselves
+
+**A path param may be a type that parses itself.** Give a type `pub fn nilo_parse(text: []const u8) ?Self`, and nilo calls it with the path segment and answers 400 when it returns null, so a malformed uuid is rejected at the router instead of in every handler. `sql.Uuid` already has it:
 
 <!-- compiles -->
 ```zig
@@ -39,43 +38,21 @@ fn showDoc(db: *Db, c: *nilo.Ctx, doc_id: sql.Uuid) !?Doc {
 }
 ```
 
-on `/docs/:doc_id` is the whole of it. What the document says about the param comes
-from the type as well: a `Uuid` publishes `{"type":"string","format":"uuid"}`
-through its `nilo_openapi`, so a generated client gets the format rather than a
-bare string. The declaration is looked for by name and never imported, which is
-what lets a module in the bottom layer offer it
-([ADR 113](../adr/113-a-path-param-can-parse-itself.md)).
+on `/docs/:doc_id` is all it takes. What the document says about the param also comes from the type: a `Uuid` publishes `{"type":"string","format":"uuid"}` through its `nilo_openapi`, so a generated client gets the format instead of a bare string. The declaration is looked up by name and never imported, which is what lets a module in the bottom layer provide it ([ADR 113](../adr/113-a-path-param-can-parse-itself.md)).
 
-**A `Query(T)` or `Form(T)` field takes one too**, and for the same reason: one
-arrival has one answer, so `/deals/:id` and `?actor=<uuid>` cannot read the same
-type two different ways
-([ADR 113](../adr/113-a-path-param-can-parse-itself.md)). So a field is a `Str`, a
-number, a `bool`, an enum, **or a type with `nilo_parse`** — `sql.Uuid` and
-`sql.Timestamp` both are — optionally in a `?`, and a `Form(T)` field may also
-be an `Upload`.
+**A `Query(T)` or `Form(T)` field can be one too**, for the same reason: a value arriving one way has one meaning, so `/deals/:id` and `?actor=<uuid>` cannot read the same type in two different ways ([ADR 113](../adr/113-a-path-param-can-parse-itself.md)). So a field is a `Str`, a number, a `bool`, an enum, **or a type with `nilo_parse`** (`sql.Uuid` and `sql.Timestamp` both are), optionally wrapped in `?`, and a `Form(T)` field may also be an `Upload`.
 
-**A body field takes one as well** — the third arrival
-([ADR 166](../adr/166-a-body-field-that-parses-itself.md)). `std.json` reads a
-body, and it picks the reader by looking for `jsonParse` on the type; `sql.Uuid`
-and `sql.Timestamp` carry one, and a `[]const sql.Uuid` reads a list of them. A
-type of your own that parses itself writes one line beside `nilo_parse`:
+**A body field can be one as well** ([ADR 166](../adr/166-a-body-field-that-parses-itself.md)). `std.json` reads the body, and it picks the parser by looking for `jsonParse` on the type; `sql.Uuid` and `sql.Timestamp` have one, and a `[]const sql.Uuid` reads a list of them. A type of your own that parses itself adds one line next to `nilo_parse`:
 
 ```zig
 pub const jsonParse = nilo.jsonParseFor(@This());
 ```
 
-A body holding a type that parses itself and has no reader is a compile error
-naming the route. The 400 for text the type refused quotes it back, the way a
-query value's does — `"sku" has to be a Sku, not "abc"` — and a type that can
-say more than its name says it with `pub const nilo_expects = "a ticket number
-like T-1234"`, which every slot then asks for in those words.
+A body containing a type that parses itself but has no `jsonParse` is a compile error naming the route. The 400 for text the type rejected quotes it back, the same way a query value's does (`"sku" has to be a Sku, not "abc"`), and a type can describe itself better than its name with `pub const nilo_expects = "a ticket number like T-1234"`, which every error message then uses.
 
-**`Within(min, max)` is a whole number inside a range**
-([ADR 167](../adr/167-a-whole-number-inside-a-range-is-a-type.md)): a type that
-parses itself, so it is read wherever a `u8` is, refused outside the range with
-`?limit has to be a whole number from 1 to 200, not "500"`, and described in
-the document with `minimum` and `maximum`. The number is `.value`; the default
-goes through `.of`, which checks it against the range while compiling:
+### `Within(min, max)`
+
+**`Within(min, max)` is a whole number inside a range** ([ADR 167](../adr/167-a-whole-number-inside-a-range-is-a-type.md)). It is a type that parses itself, so it can be used anywhere a `u8` can. A value outside the range is rejected with `?limit has to be a whole number from 1 to 200, not "500"`, and the document describes it with `minimum` and `maximum`. The number is `.value`; a default goes through `.of`, which checks it against the range while compiling:
 
 <!-- compiles -->
 ```zig
@@ -85,28 +62,13 @@ const ListQuery = struct {
 };
 ```
 
-**`Text(.{ .min, .max, .check, .said })` is text with a shape**, and
-**`Email`** and **`Url`** are presets of it
-([ADR 193](../adr/193-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)):
-a `Str` that parses itself, read wherever a `Str` is, refused with one
-sentence in every slot, and described with `minLength`, `maxLength` and
-`format`. `min` and `max` count code points; `check` is a
-`fn ([]const u8) bool` of your own and wants `said`, its sentence in `must`'s
-shape, beside it. A `Text` never quotes the text back — `"password" has to be
-text of 10 to 72 characters, not 7` — and the presets do. The `Str` is
-`.value`, with `view`, `len`, `eql` and `blank` forwarded; `.of("…")` is the
-default, checked against the shape while compiling. Bounds the wrong way
-round, a `Text` with no bound and no check, a check with no `said`, and a
-default outside the shape are each a compile error.
+### `Text`, `Email` and `Url`
 
-**`nilo_check` is a rule about the struct, on the struct** (the same ADR):
-`pub fn nilo_check(self: T, r: *nilo.Rules(T)) void`, run once every field has
-bound — in a form, a query string, a JSON body, and under `Bound` — with
-`r.must(field, holds, sentence)` in the shape `Bound.must` has. On a plain
-slot a rule that did not hold is a 422 naming every one that did not; under
-`Bound` the sentences join the other failures. It is not run over a value
-with a field that did not bind, takes nothing but the value, and is a compile
-error if its shape is not that one.
+**`Text(.{ .min, .max, .check, .said })` is text with a shape, and `Email` and `Url` are presets of it** ([ADR 193](../adr/193-text-with-a-shape-is-a-type-and-a-rule-about-the-struct-is-a-function-on-it.md)). It is a `Str` that parses itself, usable wherever a `Str` is, rejected with one sentence wherever it appears, and described with `minLength`, `maxLength` and `format`. `min` and `max` count code points. `check` is a `fn ([]const u8) bool` of your own and needs `said` next to it: its error sentence, in the same form as `must`'s. A `Text` never quotes the text back (`"password" has to be text of 10 to 72 characters, not 7`), but the presets do. The `Str` is `.value`, with `view`, `len`, `eql` and `blank` forwarded; `.of("…")` is a default, checked against the shape while compiling. Each of these is a compile error: bounds in the wrong order, a `Text` with no bound and no check, a check with no `said`, and a default outside the shape.
+
+### `nilo_check`
+
+**`nilo_check` is a rule about the whole struct, declared on the struct** (same ADR): `pub fn nilo_check(self: T, r: *nilo.Rules(T)) void`. It runs once every field has bound, in a form, a query string, a JSON body, and under `Bound`, with `r.must(field, holds, sentence)` in the same form as `Bound.must`. On a plain argument, any rule that did not hold makes a 422 naming every failed rule; under `Bound`, the sentences join the other failures. It does not run on a value with a field that failed to bind, it takes only the value, and a different signature is a compile error.
 
 <!-- compiles -->
 ```zig
@@ -121,23 +83,15 @@ const SignUp = struct {
 };
 ```
 
-`Form(T)` and a plain struct are the same slot — a form *is* the body — so
-asking for both is a compile error. A `Form(T)` field is a `Str`, a number, a
-`bool`, an enum or an `Upload`, optionally in a `?`; a default is what "not
-sent" means, and an empty value on an optional or defaulted field whose type has no empty value (`age=` on a `?u32`) is "not sent" too, in a `Query(T)` as well. An empty `?Str` is `""`. **A field that is a slice of one of those is a list**, one
-element per arrival of the name — a checkbox group, a `<select multiple>` —
-in the order sent; nothing sent is the empty list and never a 400, an empty
-value contributes nothing, and a comma is data because a browser never
-joins a group with one, so there is no second spelling as there is for a
-query. A list of `Upload` is a Refusal. Under `Bound(Form(T))` the first
-value that will not convert is the one reported and the rest are still read
-([ADR 132](../adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)).
-See [Forms](../guide/forms.md#a-checkbox-group-is-a-list).
+### `Form(T)`
+
+**`Form(T)` and a plain struct fill the same argument slot** (a form *is* the body), so asking for both is a compile error. A `Form(T)` field is a `Str`, a number, a `bool`, an enum or an `Upload`, optionally in a `?`. A default is what "not sent" means. An empty value on an optional or defaulted field whose type has no empty value (`age=` on a `?u32`) also counts as "not sent", in a `Query(T)` too. An empty `?Str` is `""`.
+
+**A field that is a slice of one of those types is a list**, with one element per occurrence of the name (a checkbox group, a `<select multiple>`), in the order sent. Nothing sent is an empty list and never a 400, an empty value adds nothing, and a comma is part of the data, because a browser never joins a group with commas, so there is no second spelling like there is for a query. A list of `Upload` is a Refusal. Under `Bound(Form(T))`, the first value that fails to convert is the one reported, and the rest are still read ([ADR 132](../adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)). See [Forms](../guide/forms.md#checkbox-groups-and-multiple-selects).
 
 ### `FromHeader(name, T)`
 
-One request header, as an argument the signature declares
-([ADR 131](../adr/131-a-header-a-handler-can-be-given.md)):
+**One request header, as an argument the signature declares** ([ADR 131](../adr/131-a-header-a-handler-can-be-given.md)):
 
 <!-- compiles -->
 ```zig
@@ -151,23 +105,15 @@ fn addComment(
 }
 ```
 
-`.value` is the header, converted the way a path param is: a `?T` is null when
-the header is not sent, anything else is a 400 saying which header is required,
-and text that will not convert is the same 400 in the same words. Two of them
-on one handler is ordinary — unlike `Query(T)`, which is one struct.
+`.value` is the header, converted the same way a path param is. A `?T` is null when the header is not sent; any other type makes a missing header a 400 saying which header is required, and text that does not convert is the same 400 in the same words. Two of them on one handler is normal, unlike `Query(T)`, which is one struct.
 
-`c.header("X-Staff-Id")` still reads it and is not going anywhere. What the
-wrapper adds is the generated document: a header parameter, so a client built
-from the OpenAPI knows the endpoint needs one. The name is checked while
-compiling — empty, or anything that is not a header token, is a Refusal.
+`c.header("X-Staff-Id")` still reads the header and is not going away. What the wrapper adds is the generated document: a header parameter, so a client generated from the OpenAPI knows the endpoint needs one. The name is checked while compiling: an empty name, or anything that is not a valid header token, is a Refusal.
 
-**`FromHeader` and not `Header`**: `nilo.Header` is the response side, and has
-been since 0.2.0.
+**It is `FromHeader`, not `Header`**, because `nilo.Header` is the response side, and has been since 0.2.0.
 
 ### `Authorization(scheme)`
 
-The `Authorization` header, read as the one scheme the endpoint takes
-([ADR 153](../adr/153-an-authorization-header-a-handler-can-ask-for.md)):
+**The `Authorization` header, read as the one scheme the endpoint accepts** ([ADR 153](../adr/153-an-authorization-header-a-handler-can-ask-for.md)):
 
 <!-- compiles -->
 ```zig
@@ -186,29 +132,19 @@ fn admin(auth: nilo.Authorization(.{ .basic = "admin" })) !nilo.Status(204, void
 
 | | |
 |---|---|
-| `.bearer` | `.value` is the token as sent — the bytes after the scheme, blanks trimmed, nothing decoded |
-| `.{ .basic = "realm" }` | `.user` and `.password`, base64 opened and split at the **first** colon. The realm is required (RFC 7617) and is what the browser's prompt shows |
-| `T.challenge` | the `WWW-Authenticate` value — `Bearer`, or `Basic realm="…"` |
-| `T.refuse(fmt, args)` | `fail.unauthorized` with `T.challenge` on it — for the refusal *after* reading, when the token did not verify or the password did not match |
-| `c.authorization(scheme)` | the same read from a resolver or a middleware, which have no argument list |
+| `.bearer` | `.value` is the token as sent: the bytes after the scheme, whitespace trimmed, nothing decoded |
+| `.{ .basic = "realm" }` | `.user` and `.password`, base64-decoded and split at the **first** colon. The realm is required (RFC 7617) and is what the browser's login prompt shows |
+| `T.challenge` | the `WWW-Authenticate` value: `Bearer`, or `Basic realm="…"` |
+| `T.refuse(fmt, args)` | `fail.unauthorized` with `T.challenge` attached, for rejecting *after* reading, when the token did not verify or the password did not match |
+| `c.authorization(scheme)` | the same, read from a resolver or a middleware, which have no argument list |
 
-The scheme is matched case-insensitively (RFC 9110 §11.1), and **every 401
-carries `WWW-Authenticate`** (§15.5.2) — the two things the hand-written six
-lines got wrong in both places this repository had them. Absent, another
-scheme, an empty token, Basic that is not base64 or has no colon: each is a
-401 saying which, before the handler runs. In the document, a `security`
-entry and a 401 rather than a parameter, so a generated client signs in.
+**The scheme is matched case-insensitively (RFC 9110 §11.1), and every 401 carries `WWW-Authenticate` (§15.5.2).** Those are the two things the hand-written six-line versions got wrong in both places this repository had them. A missing header, another scheme, an empty token, or Basic that is not base64 or has no colon: each is a 401 saying which, before the handler runs. In the document it is a `security` entry and a 401, not a parameter, so a generated client knows to sign in.
 
-Bearer allocates nothing; Basic decodes into the request arena, once. There is
-no chain that also looks in the query string or a cookie, on purpose: a token
-in a query string is a token in every access log on the way here.
+Bearer allocates nothing; Basic decodes into the request arena, once. There is deliberately no fallback that also looks in the query string or a cookie: a token in a query string ends up in every access log along the way.
 
 ### `Verified(V)`
 
-The same header, verified: the claims behind a bearer token, read through
-the `jwt.Verifier` the argument names, or a 401 with the challenge before
-the handler runs
-([ADR 191](../adr/191-verified-claims-are-a-handler-argument.md)):
+**The same header, verified: the claims behind a bearer token**, read through the `jwt.Verifier` the argument names, or a 401 with the challenge before the handler runs ([ADR 191](../adr/191-verified-claims-are-a-handler-argument.md)):
 
 <!-- compiles -->
 ```zig
@@ -223,25 +159,18 @@ fn me(user: nilo.Verified(Google), db: *sql.Db, c: *nilo.Ctx) !User {
 
 | | |
 |---|---|
-| `V` | a `jwt.Verifier(Claims, Client)` — the ring, the client its refresh needs and the claims type, held as one service ([`jwt.Verifier`](./jwt.md#jwtverifierclaims-client)). Provided like any other; `listen()` refuses to start without it |
-| `.claims` | the payload as `Claims`, strings in the request arena |
+| `V` | a `jwt.Verifier(Claims, Client)`: the key ring, the client its refresh needs, and the claims type, held as one service ([`jwt.Verifier`](./jwt.md#jwtverifierclaims-client)). Provided like any other service; `listen()` refuses to start without it |
+| `.claims` | the payload as `Claims`, with strings in the request arena |
 | `.token` | the token as sent, for a handler that passes it on |
 | `T.challenge` | `Bearer` |
-| `T.refuse(fmt, args)` | `fail.unauthorized` with the challenge on it — for the refusal *after* verifying |
-| `c.verified(V)` | the same read from a middleware guarding a prefix; a handler under it that asks again verifies again |
+| `T.refuse(fmt, args)` | `fail.unauthorized` with the challenge attached, for rejecting *after* verifying |
+| `c.verified(V)` | the same, read from a middleware guarding a prefix; a handler under it that asks again verifies again |
 
-Absent, another scheme, or a token the ring refuses — expired, wrong
-audience, unknown `kid` after one bounded fetch, bad signature — is a 401
-with `WWW-Authenticate: Bearer` and the reason in the body. The issuer's
-keys unreachable when a refresh was needed is a 503, since the token was
-never judged. In the document, the bearer scheme and a 401. Costs what
-`Authorization(.bearer)` plus one `verify` cost: the claims are the one
-allocation, into the arena, and the signature check is the work.
+A missing header, another scheme, or a token the ring rejects (expired, wrong audience, unknown `kid` after one bounded fetch, bad signature) is a 401 with `WWW-Authenticate: Bearer` and the reason in the body. If the issuer's keys cannot be reached when a refresh is needed, the answer is a 503, since the token was never judged. In the document it is the bearer scheme and a 401. It costs what `Authorization(.bearer)` plus one `verify` cost: the claims are the one allocation, into the arena, and the signature check is the work.
 
 ### `Idempotent(Replays, options)`
 
-The `Idempotency-Key` header, as the argument that makes a route answer once
-per key ([ADR 155](../adr/155-a-request-answered-once-is-answered-the-same-way-again.md)):
+**The `Idempotency-Key` header, as the argument that makes a route answer once per key** ([ADR 155](../adr/155-a-request-answered-once-is-answered-the-same-way-again.md)):
 
 <!-- compiles -->
 ```zig
@@ -260,35 +189,21 @@ fn placeOrder(key: nilo.Idempotent(Replays, .{ .by = account }), body: NewOrder)
 }
 ```
 
-The first request with a key runs the handler and **keeps what it returned** —
-status, the `Response(T)` headers of its own, the body. Every later request
-with that key gets the kept answer back, byte for byte, with
-`Idempotent-Replayed: true` on it, and the handler does not run. What the
-handler *failed* with is not kept, so a retry after a `fail.…` or an error
-runs it again.
+The first request with a key runs the handler and **stores what it returned**: the status, the `Response(T)` headers, and the body. Every later request with that key gets the stored answer back, byte for byte, with `Idempotent-Replayed: true`, and the handler does not run. A failure is not stored, so a retry after a `fail.…` or an error runs the handler again.
 
 | | |
 |---|---|
-| `Replays` | where answers are kept: a `cache.Space` holding `[]const u8`, `app.provide`d. Any type with `getInto`, `putIfAbsent`, `put`, `del`, `max_bytes` and `Held` will do, which is what a table over Redis would carry |
-| `.by` | whose key it is — a function of one `*Ctx` answering `?Str`. Two callers choosing the same key must never see each other's answer, so leave it null only on an endpoint with one caller. Null from the function is a 403 |
+| `Replays` | where answers are stored: a `cache.Space` holding `[]const u8`, registered with `app.provide`. Any type with `getInto`, `putIfAbsent`, `put`, `del`, `max_bytes` and `Held` works, which is what a Redis-backed table would provide |
+| `.by` | whose key it is: a function of one `*Ctx` returning `?Str`. Two callers who pick the same key must never see each other's answer, so leave it null only on an endpoint with a single caller. Null from the function is a 403 |
 | `.key` | the header as sent |
 
-Before the handler runs, and each with the header named: **400** with no
-`Idempotency-Key` or one over 255 bytes; **409** when the same key is still
-being answered; **422** when the key is reused on a different request — the
-method, path, query and body are fingerprinted. In the document, a required
-header parameter and the two extra answers. A handler that returns nothing, a
-file or a redirect has no answer nilo can keep, and is a Refusal.
+**Checked before the handler runs, each answer naming the header:** **400** with no `Idempotency-Key` or one over 255 bytes; **409** when the same key is still being answered; **422** when the key is reused on a different request (the method, path, query and body are fingerprinted). In the document: a required header parameter and the two extra responses. A handler that returns nothing, a file or a redirect has no answer nilo can store, and is a Refusal.
 
-On the route that asks, and nowhere else: one arena allocation of the
-Space's `max_bytes` to read a kept answer into, one to encode the answer being
-kept, and the JSON buffer the answer was taking anyway. Nothing on the stack.
+**What it costs, only on the route that uses it:** one arena allocation of the Space's `max_bytes` to read a stored answer into, one to encode the answer being stored, and the JSON buffer the answer was using anyway. Nothing on the stack.
 
 ### `Cached(Pages, options)`
 
-A kept answer served again for a time, as the argument that makes a GET say
-so in its signature
-([ADR 188](../adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)):
+**A stored answer served again for a while, as an argument that makes a GET declare it in its signature** ([ADR 188](../adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)):
 
 <!-- compiles -->
 ```zig
@@ -302,44 +217,24 @@ fn frontPage(page: nilo.Cached(Pages, .{ .ttl_s = 60 })) !Front {
 }
 ```
 
-The first request runs the handler and **keeps what it returned** — status,
-the `Response(T)` headers of its own, the body — under the path and the
-query. Every request for the same inside `ttl_s` gets the kept answer back,
-byte for byte, with `Cache-Status: nilo; hit` on it, and the handler does not
-run; a fresh answer carries `Cache-Status: nilo; fwd=miss`. What the handler
-*failed* with is not kept, so the next request runs it again.
+The first request runs the handler and **stores what it returned** (status, the `Response(T)` headers, the body) under the path and query. Every request for the same path and query within `ttl_s` gets the stored answer back, byte for byte, with `Cache-Status: nilo; hit`, and the handler does not run; a fresh answer carries `Cache-Status: nilo; fwd=miss`. A failure is not stored, so the next request runs the handler again.
 
 | | |
 |---|---|
-| `Pages` | where answers are kept: a `cache.Space` holding `[]const u8`, `app.provide`d. Any type with `getInto`, `putIfAbsent`, `putFor`, `del`, `max_bytes` and `Held` will do. A service the route needs, so `listen()` names it when it is missing |
-| `.ttl_s` | how long a kept answer is served, in seconds. No default, and 0 is a Refusal |
-| `.by` | what the key is made of: `.path_and_query` (the default), `.path`, or `.{ .header = "Accept-Language" }` for the path, the query and one header's value. The query is taken as it arrived — `?a=1&b=2` and `?b=2&a=1` are two entries. `Cookie` and `Authorization` are refused as keys |
-| `.key` | what the answer was kept under, as `Str` |
+| `Pages` | where answers are stored: a `cache.Space` holding `[]const u8`, registered with `app.provide`. Any type with `getInto`, `putIfAbsent`, `putFor`, `del`, `max_bytes` and `Held` works. It is a service the route needs, so `listen()` names it when it is missing |
+| `.ttl_s` | how long a stored answer is served, in seconds. No default, and 0 is a Refusal |
+| `.by` | what the key is made of: `.path_and_query` (the default), `.path`, or `.{ .header = "Accept-Language" }` for the path, the query and one header's value. The query is used as it arrived, so `?a=1&b=2` and `?b=2&a=1` are two entries. `Cookie` and `Authorization` are refused as keys |
+| `.key` | what the answer was stored under, as a `Str` |
 
-**A request that finds the answer still being made waits for it** rather than
-being told 409: it reads again every 10 ms, for at most 2 s or half of what
-`nilo.deadline(ms)` left the route, and past that runs the handler itself.
-**GET and HEAD only** — `app.post(…)` and the rest refuse it while compiling,
-and `app.route(.POST, …)` refuses it at registration with `error.CachedWrite`.
-A handler that returns nothing, a file or a redirect has no answer nilo can
-keep, and is a Refusal; so is one that takes an `Idempotent(…)` too.
+**A request that finds the answer still being built waits for it**, instead of getting a 409: it checks again every 10 ms, for at most 2 s or half of what `nilo.deadline(ms)` left the route, and after that runs the handler itself. **GET and HEAD only**: `app.post(…)` and the others refuse it while compiling, and `app.route(.POST, …)` refuses it at registration with `error.CachedWrite`. A handler that returns nothing, a file or a redirect has no answer nilo can store, and is a Refusal, and so is one that also takes an `Idempotent(…)`.
 
-**A handler that reads who the caller is may not be cached**, because the
-first caller's answer would be served to every caller after them: a
-`Cached(…)` beside a `Session(T)`, an `Authorization`, a `Verified(…)` or a
-`FromHeader` of `Cookie` or `Authorization` is a Refusal. A resolved type of
-your own that stands for the caller says so with
-`pub const nilo_reads_caller = true;` and is refused the same way. A `*Ctx`
-can read anything and is not checked.
+**A handler that reads who the caller is cannot be cached**, because the first caller's answer would be served to every caller after them. A `Cached(…)` next to a `Session(T)`, an `Authorization`, a `Verified(…)` or a `FromHeader` of `Cookie` or `Authorization` is a Refusal. A resolved type of your own that represents the caller declares it with `pub const nilo_reads_caller = true;` and is refused the same way. A `*Ctx` can read anything and is not checked.
 
-Costs what `Idempotent` costs, on the route that asks and nowhere else — one
-more arena allocation to join the path and the query when there is one.
-Nothing on the stack.
+It costs what `Idempotent` costs, only on the route that uses it, plus one arena allocation to join the path and the query when there is a query. Nothing on the stack.
 
 ### A query field that is a list
 
-A `Query(T)` field may be a slice, and every arrival of that name is one
-element ([ADR 132](../adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)):
+**A `Query(T)` field may be a slice, and every occurrence of that name is one element** ([ADR 132](../adr/132-a-query-parameter-or-a-form-field-that-is-a-list.md)):
 
 <!-- compiles -->
 ```zig
@@ -353,57 +248,31 @@ fn search(q: nilo.Query(Filter)) !usize {
 }
 ```
 
-**Both spellings are read**: `?tag=a&tag=b&tag=c` and `?tag=a,b,c` are the same
-three elements, in the order they arrived, allocated from the request arena.
-`?tag=a,b` is what nilo writes into the document — `"style":"form"`,
-`"explode":false` — and `?tag=a&tag=b` is what half the clients in the world
-send anyway; a server that takes the first and drops the rest answers with fewer
-rows, which looks exactly like a filter that worked.
+**Both spellings are read**: `?tag=a&tag=b&tag=c` and `?tag=a,b,c` give the same three elements, in the order they arrived, allocated from the request arena. `?tag=a,b` is what nilo writes into the document (`"style":"form"`, `"explode":false`), and `?tag=a&tag=b` is what half the clients in the world send anyway. A server that takes the first and drops the rest returns fewer rows, which looks exactly like a filter that worked.
 
-An empty value contributes nothing, so `?tag=` is an empty list rather than a
-list holding one empty string — which is also why a list field wants `= &.{}`
-rather than being required, and why it is never `required` in the document.
-That is the cost of the separator: a value with a comma in it cannot be sent.
+An empty value adds nothing, so `?tag=` is an empty list, not a list with one empty string. That is also why a list field should default to `= &.{}` instead of being required, and why it is never `required` in the document. The cost of the comma separator is that a value containing a comma cannot be sent.
 
-**"Not sent" and "sent empty" cannot be told apart**, and `?[]const Str` is not
-the way out: it compiles, and it answers null for both. What an optional list
-changes is only what *nothing* is spelled as — null instead of `&.{}` — not
-which nothing it was. Every filter written against a list has so far meant the
-same thing by either, which is why there is no second spelling for it.
+**"Not sent" and "sent empty" cannot be told apart**, and `?[]const Str` does not solve it: it compiles, and returns null for both. An optional list only changes how *nothing* is represented (null instead of `&.{}`), not which kind of nothing it was. Every filter written against a list so far has meant the same thing by either, which is why there is no second way to express it.
 
-The element converts exactly like a scalar field would, so `[]const Kind` for an
-enum refuses `?kind=nope` with the same sentence a single `kind` gets, and under
-`Bound(Query(T))` it is the **first** bad value that is reported. A list of
-something a query value cannot become at all is a Refusal.
+Each element converts exactly like a single field would, so `[]const Kind` for an enum rejects `?kind=nope` with the same sentence a single `kind` gets, and under `Bound(Query(T))` the **first** bad value is the one reported. A list of something a query value cannot become at all is a Refusal.
 
 ### `Bound(W)`
 
-`Bound(Form(T))`, `Bound(Query(T))`, `Bound(T)` for a JSON body. Occupies the
-same slot as what it wraps.
+**`Bound(Form(T))`, `Bound(Query(T))`, or `Bound(T)` for a JSON body**, in the same argument slot as what it wraps. It hands the handler the binding failures instead of answering 400.
 
 | | |
 |---|---|
-| `b.value()` | `?T` — the binding, or null if **any** field failed |
+| `b.value()` | `?T`: the bound value, or null if **any** field failed |
 | `b.fail()` | a 422 naming every field that did not bind |
-| `b.failed()`, `b.failedCount()` | whether, and how many |
+| `b.failed()`, `b.failedCount()` | whether any failed, and how many |
 | `b.failures()` | an iterator of `Failure` |
-| `b.given("name")` | `Str` — the text that arrived, bound or not. Name checked while compiling |
-| `b.must("name", holds, "wants …")` | a rule of your own, added to the same answer → `Checked` |
-| `Bound(W).ok(value)` | a binding where everything bound, for a test calling the handler directly |
+| `b.given("name")` | `Str`: the text that arrived, bound or not. The name is checked while compiling |
+| `b.must("name", holds, "wants …")` | adds a rule of your own to the same answer, and returns a `Checked` |
+| `Bound(W).ok(value)` | a binding where everything bound, for a test that calls the handler directly |
 
-A `Failure` carries `field`, `reason`, `given`, `kind`, `expected`, `said`, and
-`say(w)` — nilo's own sentence for it. `reason` is one of `.missing`,
-`.not_a_number`, `.not_true_or_false`, `.not_a_choice`, `.wrong_kind`, or
-**null when the failure is a rule of yours**; that is the whole list, and it is
-not a validator. Nothing is allocated per failed field. See
-[Forms](../guide/forms.md#when-one-field-is-wrong-and-the-rest-are-fine)
-and [ADR 034](../adr/034-a-binding-hands-its-failures-to-the-handler.md).
+A `Failure` has `field`, `reason`, `given`, `kind`, `expected`, `said`, and `say(w)`, which writes nilo's own sentence for it. `reason` is one of `.missing`, `.not_a_number`, `.not_true_or_false`, `.not_a_choice`, `.wrong_kind`, or **null when the failure comes from one of your rules**. That is the whole list: it is not a validation library. Nothing is allocated per failed field. See [Forms](../guide/forms.md#collecting-every-field-error-bound) and [ADR 034](../adr/034-a-binding-hands-its-failures-to-the-handler.md).
 
-`must` returns a `Checked`, which has the same `value`, `failed`,
-`failedCount`, `given`, `failures` and `fail`, and one more `must` to chain.
-`holds` is the rule holding, not failing. A handler that checks no rules never
-builds one and pays nothing
-([ADR 034](../adr/034-a-binding-hands-its-failures-to-the-handler.md)).
+`must` returns a `Checked`, which has the same `value`, `failed`, `failedCount`, `given`, `failures` and `fail`, and another `must` for chaining. `holds` is true when the rule holds, not when it fails. A handler that checks no rules never builds a `Checked` and pays nothing ([ADR 034](../adr/034-a-binding-hands-its-failures-to-the-handler.md)).
 
 ## Handler returns
 
@@ -413,13 +282,13 @@ builds one and pays nothing
 | `Str`, `[]const u8` | 200, `text/plain` |
 | anything else | 200, that value as JSON |
 | `?T` | 200 with the value, **404** when null |
-| `Status(code, T)` | that status — and the API description names it |
-| `Response(T)` | a status chosen at runtime; the description says `default` |
+| `Status(code, T)` | that status, and the API description names it |
+| `Response(T)` | a status chosen at run time; the description says `default` |
 | `Redirect(code)` | that status and a `Location`, no body |
 | `FileBody` | a file on disk, opened and sent without being held in memory |
-| `Bytes` | bytes already in hand, under a content type chosen per request — somebody else's download passed on ([ADR 173](../adr/173-bytes-handed-on-are-an-answer.md)) |
-| `Versioned(T)` | `T` under a weak `ETag` made from a `u64` the handler names; **304** with no body when `If-None-Match` carries it ([ADR 189](../adr/189-a-version-a-handler-names-is-an-etag.md)) |
-| a type with `nilo_content_type` and `nilo_write` | 200, the bytes `nilo_write` wrote, under that content type — [below](#a-type-that-writes-its-own-answer) |
+| `Bytes` | bytes already in hand, under a content type chosen per request, for example somebody else's download passed on ([ADR 173](../adr/173-bytes-handed-on-are-an-answer.md)) |
+| `Versioned(T)` | `T` with a weak `ETag` made from a `u64` the handler provides; **304** with no body when `If-None-Match` matches it ([ADR 189](../adr/189-a-version-a-handler-names-is-an-etag.md)) |
+| a type with `nilo_content_type` and `nilo_write` | 200, the bytes `nilo_write` wrote, under that content type: see [below](#a-type-that-writes-its-own-answer) |
 
 ```zig
 Status(201, User){ .headers = .of(&.{…}), .value = user }
@@ -432,65 +301,35 @@ Bytes{ .body = got.body, .content_type = got.content_type } // `?Bytes` likewise
 Versioned([]Order){ .version = revision, .value = orders }  // `W/"…"`; `.unchanged(revision)` when `c.clientHas(revision)`
 ```
 
-**A handler that also takes a `*Ctx` and returns `void` is the one case the
-document cannot describe.** It sends 200 with an empty body if the handler
-wrote nothing, and whatever the handler wrote if it did, and nilo has no way to
-tell which from the signature — so the description says it does not know, and
-`listen()` says how many routes are in that state. A handler that means "200,
-empty" says so by returning `Status(200, void)` and is described like anything
-else ([ADR 120](../adr/120-a-ctx-handler-that-returns-nothing-may-have-written-it.md)).
+`Headers` holds up to 8 headers by value; a ninth is a compile error.
 
-**A `?` goes inside a wrapper, never around it.** `Status(201, ?T)` and
-`Response(?T)` are the value or a 404; `?Status(201, T)`, `?Response(T)`,
-`?Redirect(code)` and `?Versioned(T)` are each a compile error naming the
-shape to write, since the `?` is about the body and those have none for it
-to be about ([ADR 203](../adr/203-a-question-mark-goes-inside-the-wrapper.md)).
-The [guide](../guide/handlers.md#where-the--goes) has the two tables.
+### A `*Ctx` handler that returns `void`
 
-`Redirect` takes 301, 302, 303, 307 or 308; anything else is a compile error.
-303 is the one a form POST wants.
+**This is the one case the document cannot describe.** It sends 200 with an empty body if the handler wrote nothing, and whatever the handler wrote if it did, and nilo cannot tell which from the signature. So the description says it does not know, and `listen()` reports how many routes are in that state. A handler that means "200, empty" says so by returning `Status(200, void)`, and is described like anything else ([ADR 120](../adr/120-a-ctx-handler-that-returns-nothing-may-have-written-it.md)).
 
-`FileBody` fields: `dir` (a [`Dir`](./streaming.md#dir)), `name`, `content_type`
-(`"application/octet-stream"`), `cache_control` (`""`) and `headers` — a
-`Content-Disposition` goes in the last of those, and there is no `download_as`.
-The name is checked before it is opened: a `..` segment, an absolute path, a NUL
-— and on Windows a backslash or a drive letter — answer the same 404 a missing
-file does. `Range`, `If-Range`, `If-None-Match` and `HEAD` work as they do for a
-static file; the API description says the body is `application/octet-stream`
-with `format: binary` whatever the content type is at run time. See
-[Responses](../guide/responses.md#files).
+### A `?` inside a wrapper
 
-`Bytes` fields: `body`, `content_type` (`"application/octet-stream"`) and
-`headers`, the same way. Nothing is copied: the body is the handler's — the
-request arena, or a response it still holds — and goes out as it is. The
-document says `format: binary` for the reason it does for a `FileBody`: the
-label is decided while the request runs, and a document that guessed
-`application/zip` would be wrong the first time upstream sent something else.
-It is the answer for a proxy that downloads from one service and hands the
-bytes to the browser with *their* `Content-Type` and a `Content-Disposition`,
-where a `*Ctx` handler calling `c.send` was undescribed.
+**A `?` goes inside a wrapper, never around it.** `Status(201, ?T)` and `Response(?T)` mean the value or a 404. `?Status(201, T)`, `?Response(T)`, `?Redirect(code)` and `?Versioned(T)` are each a compile error naming the form to write instead, since the `?` is about the body, and those have no body for it to be about ([ADR 203](../adr/203-a-question-mark-goes-inside-the-wrapper.md)). The [guide](../guide/handlers.md#combining--with-status-and-response) has the two tables.
 
-`Versioned(T)` fields: `version` (a `u64`), `headers` and `value` (`?T` —
-null is `.unchanged(version)`, the answer for a client `c.clientHas(version)`
-said already holds it; `.unchangedWith(version, headers)` when the 304 should
-carry the `Cache-Control` the 200 does). The tag is `W/"<hex>"`, weak because a version says
-the representation is the same and nothing about the bytes; `headers` go out
-on the 200 and the 304 both. `.unchanged` to a client that did not send the
-version is a 500 naming the route. `Versioned(?T)`, `Versioned(void)`, a
-`Versioned` inside a `Status` or a `Response`, and one under a `Cached` or an
-`Idempotent` are each a compile error saying what to write instead; a thing
-that is not there is `fail.notFound`. The document puts the `ETag` on the 200
-and a `304` beside it. See
-[Responses](../guide/responses.md#a-body-the-client-already-holds).
+### `Redirect(code)`
 
-`Headers` holds up to 8 by value; a ninth is a compile error.
+`Redirect` takes 301, 302, 303, 307 or 308; anything else is a compile error. 303 is the one to use after a form POST.
+
+### `FileBody`
+
+**Fields:** `dir` (a [`Dir`](./streaming.md#dir)), `name`, `content_type` (`"application/octet-stream"`), `cache_control` (`""`) and `headers`. A `Content-Disposition` goes in `headers`; there is no `download_as`. The name is checked before the file is opened: a `..` segment, an absolute path, a NUL byte, and on Windows a backslash or a drive letter, all get the same 404 a missing file does. `Range`, `If-Range`, `If-None-Match` and `HEAD` work as they do for a static file. The API description says the body is `application/octet-stream` with `format: binary`, whatever the content type is at run time. See [Responses](../guide/responses.md#files).
+
+### `Bytes`
+
+**Fields:** `body`, `content_type` (`"application/octet-stream"`) and `headers`, as for `FileBody`. Nothing is copied: the body belongs to the handler (the request arena, or a response it still holds) and is sent as it is. The document says `format: binary` for the same reason as `FileBody`: the content type is decided while the request runs, and a document that guessed `application/zip` would be wrong the first time the upstream sent something else. It is the answer for a proxy that downloads from one service and passes the bytes to the browser with *their* `Content-Type` and a `Content-Disposition`, which a `*Ctx` handler calling `c.send` could not describe.
+
+### `Versioned(T)`
+
+**Fields:** `version` (a `u64`), `headers`, and `value` (`?T`; null is `.unchanged(version)`, the answer for a client that `c.clientHas(version)` said already has it; use `.unchangedWith(version, headers)` when the 304 should carry the same `Cache-Control` as the 200). The tag is `W/"<hex>"`: weak, because a version says the representation is the same, not that the bytes are. `headers` are sent on both the 200 and the 304. `.unchanged` sent to a client that did not send the version is a 500 naming the route. `Versioned(?T)`, `Versioned(void)`, a `Versioned` inside a `Status` or a `Response`, and one under a `Cached` or an `Idempotent` are each a compile error saying what to write instead; for something that does not exist, use `fail.notFound`. The document puts the `ETag` on the 200 and adds a `304`. See [Responses](../guide/responses.md#etags-and-304-not-modified).
 
 ### A type that writes its own answer
 
-XML for a consumer that will not change, CSV for a spreadsheet, HTML from a
-template of your own: a type carrying two declarations goes out as whatever it
-writes, under the label it names
-([ADR 157](../adr/157-a-type-can-write-its-own-answer.md)).
+**A type with two declarations is sent as whatever it writes, under the content type it names**: XML for a consumer that will not change, CSV for a spreadsheet, HTML from your own template ([ADR 157](../adr/157-a-type-can-write-its-own-answer.md)).
 
 <!-- compiles -->
 ```zig
@@ -512,25 +351,13 @@ fn showInvoice(number: u32) ?Invoice {
 }
 ```
 
-Every wrapper works the way it does for JSON: `?Invoice` is a 404 when null,
-`Status(201, Invoice)` is a 201, `Response(Invoice)` carries headers, and an
-`Idempotent` route keeps the answer with its label. The body is written into
-the request arena the way a JSON one is — one allocation, the same one — and
-nothing is linked by a program with no such type.
+Every wrapper works the way it does for JSON: `?Invoice` is a 404 when null, `Status(201, Invoice)` is a 201, `Response(Invoice)` carries headers, and an `Idempotent` route stores the answer with its content type. The body is written into the request arena the same way a JSON body is (one allocation, the same one), and a program with no such type links none of it.
 
-**Both declarations or neither.** One without the other is a compile error, and
-so is an empty content type, one with a control character in it, or a
-`nilo_write` with any other signature. The document names the content type and
-describes the body with `nilo_openapi` when the type carries one — `{}` and a
-note otherwise, the way a type that writes its own JSON is described. nilo
-knows nothing about XML, CSV or HTML and does not parse any of them on the way
-in; a body arriving in one of those is `c.body()`.
+**Both declarations or neither.** One without the other is a compile error, and so is an empty content type, one containing a control character, or a `nilo_write` with any other signature. The document names the content type and describes the body with `nilo_openapi` if the type has one, or with `{}` and a note otherwise, the same as for a type that writes its own JSON. nilo knows nothing about XML, CSV or HTML and does not parse them on the way in; to read a body in one of those formats, use `c.body()`.
 
 ## JSON shapes
 
-A struct is its fields and an enum is its tag name. A type that wants something
-else says so with `nilo_json`, which is plain data and is read while compiling
-([ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md)).
+**A struct is written as its fields, and an enum as its tag name.** A type that wants something else declares it with `nilo_json`, which is plain data read while compiling ([ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md)).
 
 <!-- compiles -->
 ```zig
@@ -548,23 +375,15 @@ const Condition = union(enum) {
 
 | | |
 |---|---|
-| `.tag` | the discriminator's key. A `union(enum)` only: the variant's name goes under it, and the variant's own fields go beside it in the same object |
-| `.rename_all` | how a name is spelled on the wire — an enum's tag, a union's variant, or **a struct's field names** |
-| `.rename` | the names spelled one at a time — `.{ .amount_minor = "amountMinor" }` — which win over `.rename_all` ([ADR 168](../adr/168-one-field-can-be-spelled-on-its-own.md)) |
+| `.tag` | the discriminator's key. For a `union(enum)` only: the variant's name goes under it, and the variant's own fields go beside it in the same object |
+| `.rename_all` | how names are spelled on the wire: an enum's tags, a union's variants, or **a struct's field names** |
+| `.rename` | names spelled one at a time, such as `.{ .amount_minor = "amountMinor" }`, which take priority over `.rename_all` ([ADR 168](../adr/168-one-field-can-be-spelled-on-its-own.md)) |
 
-`.rename_all` takes `.lowercase`, `.UPPERCASE`, `.camelCase`, `.PascalCase`,
-`.SCREAMING_SNAKE_CASE` and `.@"kebab-case"`. The first two join the words
-(`not_found` → `notfound`); `.SCREAMING_SNAKE_CASE` keeps the underscore. There
-is no `.snake_case` — that is what a Zig field name already is, and asking for
-it is a compile error rather than a no-op. Two names that land on one is also a
-compile error, in every shape: it would put the same key in an object twice.
+`.rename_all` takes `.lowercase`, `.UPPERCASE`, `.camelCase`, `.PascalCase`, `.SCREAMING_SNAKE_CASE` and `.@"kebab-case"`. The first two join the words (`not_found` becomes `notfound`); `.SCREAMING_SNAKE_CASE` keeps the underscore. There is no `.snake_case`, because that is what a Zig field name already is, and asking for it is a compile error instead of a silent no-op. Two names that end up the same are also a compile error, in every case, because the object would have the same key twice.
 
 ### A struct that renames its fields
 
-A Row is snake_case because Postgres is and a wire is camelCase because the
-browser is. Saying so once beats a mapping function written out field by field,
-which is what a DTO layer is and which nothing holds against the Row it came from
-([ADR 148](../adr/148-a-field-name-is-a-spelling-too.md)):
+**Declare the wire spelling once on the struct.** A Row is snake_case because Postgres is, and the wire is camelCase because the browser is. Declaring it once is better than a mapping function written out field by field, which is what a DTO layer is, and which nothing checks against the Row it came from ([ADR 148](../adr/148-a-field-name-is-a-spelling-too.md)):
 
 <!-- compiles -->
 ```zig
@@ -577,12 +396,11 @@ const Contact = struct {
 };
 ```
 
-The API description says the same keys, so a generated client reads what the
-server sends. It costs nothing per request: the name is a comptime string either
-way, written as part of the same call the punctuation is in.
+The API description uses the same keys, so a generated client reads what the server sends. It costs nothing per request: the name is a comptime string either way, written in the same call as the punctuation around it.
 
-**One field that no case reaches is spelled on its own**, beside the case, and
-the entry wins ([ADR 168](../adr/168-one-field-can-be-spelled-on-its-own.md)):
+#### Renaming one field
+
+**A field no case rule can reach is spelled on its own**, next to the case rule, and the entry takes priority ([ADR 168](../adr/168-one-field-can-be-spelled-on-its-own.md)):
 
 <!-- compiles -->
 ```zig
@@ -598,31 +416,17 @@ const Summary = struct {
 };
 ```
 
-An entry naming a field the struct does not have, one that spells a field as it
-is already written, and one that lands on another field's key are each a
-compile error.
+An entry naming a field the struct does not have, one that spells a field the way it is already written, and one that lands on another field's key are each a compile error.
 
-**It is a spelling for what goes *out*, and using one for what comes in is a
-Refusal.** `std.json` chooses the parser for a body and reads it into the field
-names as they are written, so such a type would document `fullName` and answer
-400 to a client that sent it. A struct with `rename_all` used as a request body,
-a form or a query string is a compile error naming the route. Give what comes in
-a struct of its own, spelled the way the wire spells it.
+#### Renamed types are for output only
 
-A renamed struct nilo's own writer cannot reach is refused as well. One shape it
-does not recognise — a tuple, an array of bytes, an untagged union, a type that
-writes its own JSON and says nothing about it, anything past eight deep — sends
-the whole value to `std.json`, which does not read the marker.
+**A renamed spelling is for what goes *out*, and using the type for input is a Refusal.** `std.json` chooses the parser for a body and reads it into the field names as written, so such a type would document `fullName` and answer 400 to a client that sent it. A struct with `rename_all` used as a request body, a form or a query string is a compile error naming the route. Give the input its own struct, spelled the way the wire spells it.
 
-**A type that writes its own JSON *and says what it looks like* is a leaf rather
-than one of those**, and that is the difference between a marker that can be used
-here and one that cannot
-([ADR 148](../adr/148-a-field-name-is-a-spelling-too.md)). A
-`nilo_openapi` may only name `"string"`, `"integer"`, `"number"` or `"boolean"`,
-so a type carrying one has promised its JSON is a single scalar — which is the
-promise the writer needs to keep writing the object around it. `sql.Uuid`,
-`sql.Timestamp`, `sql.AsText` and `id.Uuid` are all leaves, so a Row-shaped
-response holding any of them can rename its fields:
+A renamed struct that nilo's own writer cannot handle is also refused. A shape it does not recognise (a tuple, an array of bytes, an untagged union, a type that writes its own JSON without describing it, anything more than eight levels deep) sends the whole value to `std.json`, which does not read the marker.
+
+#### Leaf types
+
+**A type that writes its own JSON *and describes what it looks like* is treated as a leaf**, and that is what decides whether it can appear in a renamed struct ([ADR 148](../adr/148-a-field-name-is-a-spelling-too.md)). A `nilo_openapi` may only name `"string"`, `"integer"`, `"number"` or `"boolean"`, so a type that has one has promised its JSON is a single scalar, which is the promise the writer needs to keep writing the object around it. `sql.Uuid`, `sql.Timestamp`, `sql.AsText` and `id.Uuid` are all leaves, so a Row-shaped response containing any of them can rename its fields:
 
 ```zig
 const Contact = struct {
@@ -634,40 +438,22 @@ const Contact = struct {
 };
 ```
 
-It is also worth 33% of such a response whether or not anything is renamed:
-`covers` is answered for the *whole* value, so one leaf used to send every string
-beside it to `std.json` as well — 250ns → 165ns on a 305-byte row with three
-uuids in it ([`bench/result/http.md`](../../bench/result/http.md)). Your own type
-gets the same by writing the same two declarations.
+It also makes such a response 33% faster whether or not anything is renamed: `covers` is decided for the *whole* value, so one leaf used to send every string next to it to `std.json` as well. That was 250 ns and is now 165 ns, on a 305-byte row with three uuids ([`bench/result/http.md`](../../bench/result/http.md)). Your own type gets the same by adding the same two declarations.
 
-**The marker is per type, not inherited.** A struct renames its own fields; a
-union renames its *variants* and leaves a payload struct's fields to that
-struct's own marker; a nested struct that says nothing keeps its own spelling.
+#### The marker is not inherited
 
-`nilo.jsonParseFor(@This())` is the reader, and it is a second line because
-`std.json` picks the parser for a type and nothing can add a declaration to a
-type you wrote. Only needed if the type arrives in a request; sending needs
-nothing. On a type with `nilo_parse` it is the reader that hands the string to
-that ([ADR 166](../adr/166-a-body-field-that-parses-itself.md)). Adding it to a
-type with neither a `nilo_json` nor a `nilo_parse` is a compile error, and so is
-adding it to a struct that only renames — there is nothing for the reader to do
-differently.
+**The marker is per type.** A struct renames its own fields; a union renames its *variants* and leaves a payload struct's fields to that struct's own marker; a nested struct without a marker keeps its own spelling.
 
-Without a marker a `union(enum)` is externally tagged — `{"metrics":{…}}`, what
-`std.json` writes — and it is written by nilo's own writer either way. An
-*untagged* union has nothing saying which arm is live and is left to `std.json`
-whole. A variant carrying no payload is legal under `.tag` and is the
-discriminator on its own; under the default encoding it is not covered.
+### `nilo.jsonParseFor`
 
-The generated API description follows whichever encoding the type asked for:
-`oneOf` of one-key objects for the default, and `oneOf` with `discriminator`
-plus a per-arm `allOf` for a tagged one. See
-[Responses](../guide/responses.md#json-shapes-of-your-own).
+**`nilo.jsonParseFor(@This())` is the parser, and it is a separate line** because `std.json` picks the parser from the type, and nothing can add a declaration to a type you wrote. You only need it if the type arrives in a request; sending needs nothing. On a type with `nilo_parse`, it is the parser that passes the string to `nilo_parse` ([ADR 166](../adr/166-a-body-field-that-parses-itself.md)). Adding it to a type with neither a `nilo_json` nor a `nilo_parse` is a compile error, and so is adding it to a struct that only renames, because there is nothing for the parser to do differently.
 
-**A `[]const u8` or a `Str` that is not valid UTF-8 goes out as an array of
-byte values** — `{"name":[255]}` — because JSON has no way to carry a byte that
-is not text. That is what `std.json` does with the same value, and this writer's
-whole contract is to write what `std.json` writes
-([ADR 096](../adr/096-a-byte-that-is-not-text-is-not-a-string.md)). The
-description still calls the field a string, since the type is text and only the
-value is not.
+### Unions
+
+**Without a marker, a `union(enum)` is externally tagged**: `{"metrics":{…}}`, which is what `std.json` writes. It is written by nilo's own writer either way. An *untagged* union has nothing saying which variant is active, and is left entirely to `std.json`. A variant with no payload is allowed under `.tag` and is just the discriminator; under the default encoding it is not supported.
+
+The generated API description follows whichever encoding the type chose: `oneOf` of one-key objects for the default, and `oneOf` with a `discriminator` plus a per-variant `allOf` for a tagged one. See [Responses](../guide/responses.md#json-field-names-and-union-tags).
+
+### Text that is not UTF-8
+
+**A `[]const u8` or a `Str` that is not valid UTF-8 is sent as an array of byte values**, such as `{"name":[255]}`, because JSON has no way to carry a byte that is not text. That is what `std.json` does with the same value, and this writer's whole contract is to write what `std.json` writes ([ADR 096](../adr/096-a-byte-that-is-not-text-is-not-a-string.md)). The description still calls the field a string, since the type is text and only the value is not.

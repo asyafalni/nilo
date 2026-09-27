@@ -1,5 +1,9 @@
 # Sessions
 
+**`Session(T)` seals a struct of yours into one encrypted, signed cookie, so nothing about a session is kept on the server.**
+
+**Reference:** [`Session(T)`](../reference/ctx.md#sessiont), [`session_secret` and the other `listen` options](../reference/app.md#listen-options), [password calls on `Ctx`](../reference/ctx.md#reading), [`nilo_pw`](../reference/pw.md) · **Design:** [Cookies and sessions](../design/cookies-sessions.md)
+
 ```zig
 const Signed = struct { user: u32, admin: bool = false };
 
@@ -21,45 +25,37 @@ fn signOut(s: nilo.Session(Signed)) !nilo.Redirect(303) {
 }
 ```
 
-**Nothing is kept on the server.** The whole session is serialised, encrypted
-and signed, and handed to the browser as one cookie. There is no table, no
-expiry sweep, no lock, and nothing added to what an idle connection costs —
-which is the reason to prefer it, not a detail of how it is written
-([ADR 033](../adr/033-a-session-is-sealed-into-the-cookie.md)).
+**Nothing is kept on the server.** The whole session is serialised, encrypted and signed, and handed to the browser as one cookie. There is no table, no expiry sweep, no lock, and nothing added to what an idle connection costs. That is the reason to choose it, not an implementation detail ([ADR 033](../adr/033-a-session-is-sealed-into-the-cookie.md)).
 
-A request that does not ask for a session runs the code it ran before.
+A request that does not ask for a session runs exactly the code it ran before.
 
-## The secret
+## Setting the session secret
 
 ```zig
 try app.listen(.{ .session_secret = secret });   // exactly 32 bytes
 ```
 
-Where it comes from is yours — an environment variable, a mounted file, a
-secrets manager. nilo has **no default**, because a default key is a key
-everybody who has read this repository already has.
+**nilo has no default secret; you supply one.** It can come from an environment variable, a mounted file or a secrets manager. There is no default because a default key is a key everybody who has read this repository already has.
 
-Three things have to be true of it, and getting any of them wrong is quiet:
+Three things must be true of it, and getting any of them wrong fails silently:
 
 | | why |
 |---|---|
 | Exactly 32 bytes | checked at `listen()`, which stops with a message |
-| The same on every instance | otherwise a request lands on the machine that cannot read its own cookies |
+| The same on every instance | otherwise a request lands on a machine that cannot read its own cookies |
 | The same after a restart | otherwise a deploy signs everybody out |
 
-Generating one, once, and keeping it wherever your other secrets live:
+Generate one once, and keep it wherever your other secrets live:
 
 ```
 head -c 32 /dev/urandom | base64
 ```
 
-A handler that asks for a `Session(T)` when no secret was set answers **500**
-with a sentence naming the option. It does not fall back to anything.
+A handler that asks for a `Session(T)` when no secret was set answers **500** with a sentence naming the option. It does not fall back to anything.
 
-## Changing the secret
+## Rotating the secret
 
-Put the new secret in `session_secret` and the one it replaces in
-`session_fallback_secrets`:
+**Put the new secret in `session_secret` and the old one in `session_fallback_secrets`:**
 
 ```zig
 try app.listen(.{
@@ -68,14 +64,9 @@ try app.listen(.{
 });
 ```
 
-Every session sealed from then on is sealed under the new secret. A cookie
-sealed under the old one still opens, so nobody is signed out by the deploy
-([ADR 225](../adr/225-a-fallback-session-secret-opens-and-never-seals.md)).
+Every session sealed from then on uses the new secret. A cookie sealed under the old one still opens, so nobody is signed out by the deploy ([ADR 225](../adr/225-a-fallback-session-secret-opens-and-never-seals.md)).
 
-**Drop the old secret once one `max_age` has passed.** The expiry is sealed
-inside every cookie, so by then nothing sealed under the old secret can open
-anyway. With no `max_age` that is 24 hours; with `.max_age = 30 * 24 * 60 * 60`
-it is thirty days.
+**Remove the old secret once one `max_age` has passed.** The expiry is sealed inside every cookie, so by then nothing sealed under the old secret can open anyway. With no `max_age` that is 24 hours; with `.max_age = 30 * 24 * 60 * 60` it is thirty days.
 
 | | why |
 |---|---|
@@ -84,13 +75,9 @@ it is thirty days.
 | None the same as `session_secret`, and none twice | that is a rotation that did not happen, and `listen()` says so |
 | Fallback secrets need a `session_secret` | otherwise nothing could seal a new session |
 
-A cookie under the current secret costs exactly what it did before. Only a
-cookie the current secret does not open is tried under the fallbacks, in
-the order you listed them.
+A cookie under the current secret costs exactly what it did before. Only a cookie the current secret does not open is tried under the fallbacks, in the order you listed them.
 
-**On several instances, it is two deploys.** While a deploy rolls out, the
-instances already updated seal under the new secret, and one not yet updated
-cannot open what they wrote. So stage the new secret first:
+**With several instances, it takes two deploys.** While a deploy rolls out, the instances already updated seal under the new secret, and an instance not yet updated cannot open what they wrote. So stage the new secret first:
 
 ```zig
 // Deploy 1: every instance learns to open the new secret. Nothing seals under it yet.
@@ -100,17 +87,13 @@ cannot open what they wrote. So stage the new secret first:
 .{ .session_secret = new_secret, .session_fallback_secrets = &.{old_secret} }
 ```
 
-A single instance can go straight to the second.
+A single instance can go straight to the second step.
 
-**Not after a leak.** A fallback secret still opens every cookie sealed under
-it, including one forged by whoever has the secret. A leaked secret is
-dropped outright, and everybody signs in again. That is the right answer
-after a leak, not the cost of one.
+**Do not use a fallback after a leak.** A fallback secret still opens every cookie sealed under it, including one forged by whoever has the secret. Drop a leaked secret outright, and everybody signs in again. After a leak that is the correct result, not a side effect.
 
-## What a session may hold
+## What a session can store
 
-A struct of your own, of a size known while compiling: integers, floats,
-bools, enums, `[N]u8` arrays, optionals of those, and structs of those.
+**A struct of your own whose size is known at compile time:** integers, floats, bools, enums, `[N]u8` arrays, optionals of those, and structs of those.
 
 ```zig
 const Signed = struct {
@@ -120,31 +103,20 @@ const Signed = struct {
 };
 ```
 
-**Not a slice.** `name: []const u8` is a compile error, and the reason is not
-that it would be hard: a browser drops an oversized cookie *silently*, so the
-size has to be checkable, and a size that depends on the data is a size nobody
-checked. The ceiling is about 4 KB and a `Session(T)` past it stops the build
-with the number.
+**Not a slice.** `name: []const u8` is a compile error, and not because it would be hard to support: a browser drops an oversized cookie *silently*, so the size has to be checkable, and a size that depends on the data cannot be checked in advance. The limit is about 4 KB, and a `Session(T)` over it stops the build with the number.
 
-For text, give it a bound — `name: [32]u8` — or, better, keep an id in the
-session and look the rest up. **The session goes up the wire on every request**,
-static files included, so a small one is not a style preference.
+For text, give it a fixed size (`name: [32]u8`), or better, keep an id in the session and look the rest up. **The session is sent with every request**, static files included, so keeping it small matters.
 
-## Reading is not writing
+## Changing a session value
 
 ```zig
 try s.set(.{ .user = id });     // ✅
 s.value.user = id;              // ❌ compiles, and does nothing
 ```
 
-A session is a [resolved value](./middleware.md#resolved-values), handed to
-the handler by value. A mutated copy goes nowhere and looks exactly like it
-worked, so writing is a call: `set` turns into one `Set-Cookie` on this
-response.
+**To change a session, call `set`; assigning to a field does nothing.** A session is a [resolved value](./middleware.md#resolved-values), handed to the handler by value. A changed copy goes nowhere and looks exactly like it worked, so writing is a call: `set` becomes one `Set-Cookie` on this response.
 
-Being a resolved value is also what makes it cheap: the cookie is decrypted
-**once per request** however many things ask for it, so a middleware guarding
-`/admin` and the handler behind it do not both pay.
+Being a resolved value also makes it cheap: the cookie is decrypted **once per request** however many things ask for it, so a middleware guarding `/admin` and the handler behind it do not both pay.
 
 ```zig
 fn requireAdmin(c: *nilo.Ctx, next: nilo.Next) !void {
@@ -155,43 +127,25 @@ fn requireAdmin(c: *nilo.Ctx, next: nilo.Next) !void {
 }
 ```
 
-## Staying signed in
+## Session lifetime (`max_age`)
 
-The cookie is a session cookie by default — gone when the browser closes,
-which is what a sign-in usually wants. To outlive that, say for how long:
+**By default the cookie is a browser-session cookie, gone when the browser closes**, which is what a sign-in usually wants. To keep it longer, say for how long:
 
 ```zig
 try s.setWith(.{ .user = id }, .{ .max_age = 30 * 24 * 60 * 60 });   // 30 days
 ```
 
-**That one number sets two things**, and the second is the one that counts.
-`Max-Age` is an instruction to the browser, and a browser obeys it; a copy of
-the cookie — out of a proxy log, a `curl -v` pasted into a ticket, a backup —
-obeys nothing. So the same thirty days is sealed *inside* the cookie, where the
-client cannot reach it, and after thirty days it stops opening for anybody
-([ADR 033](../adr/033-a-session-is-sealed-into-the-cookie.md)).
+**That one number sets two things**, and the second is the one that matters. `Max-Age` is an instruction to the browser, and a browser follows it. A copy of the cookie (from a proxy log, a `curl -v` pasted into a ticket, a backup) follows nothing. So the same thirty days is also sealed *inside* the cookie, where the client cannot change it, and after thirty days it stops opening for anybody ([ADR 033](../adr/033-a-session-is-sealed-into-the-cookie.md)).
 
-A session cookie has a ceiling too, for exactly that reason: leaving `max_age`
-unset asks the browser to forget the cookie at the end of the window, and seals
-`nilo.session.default_max_age` — **24 hours** — for the copy that does not. Null
-does not mean forever and never safely could.
+A browser-session cookie has a limit too, for the same reason: leaving `max_age` unset asks the browser to forget the cookie when it closes, and seals `nilo.session.default_max_age`, **24 hours**, for any copy that does not. Null does not mean forever, and could never safely mean that.
 
-`setWith` also takes `path`, `domain`, `secure` and `same_site`. It does not
-take `http_only`: a session a script can read is a session an injected script
-can send somewhere.
+[`setWith`](../reference/ctx.md#sessiont) also takes `path`, `domain`, `secure` and `same_site`. It does not take `http_only`: a session a script can read is a session an injected script can send somewhere.
 
-Testing what happens at the boundary needs no clock and no waiting.
-`nilo.session.openAt(T, cookie, key, when)` opens a cookie against a time you
-name, which is how nilo's own tests reach the second before an expiry, the
-second of it, and the second after.
+Testing the expiry boundary needs no clock and no waiting. `nilo.session.openAt(T, cookie, key, when)` opens a cookie as of a time you choose, which is how nilo's own tests check the second before an expiry, the second of it, and the second after.
 
-## What it cannot do
+## Revoking a session early
 
-**A session cannot be revoked early.** A sealed cookie is valid until the
-expiry sealed into it, and nothing can cut that short, because there is no row
-to go and mark. `s.clear()` deletes the cookie in *this* browser; a cookie
-somebody copied goes on opening until its expiry — which is the reason the
-expiry exists, and the reason it is not optional.
+**A session cannot be revoked early.** A sealed cookie is valid until the expiry sealed into it, and nothing can cut that short, because there is no row to mark. `s.clear()` deletes the cookie in *this* browser; a cookie somebody copied keeps opening until its expiry. That is why the expiry exists, and why it is not optional.
 
 If you need revocation, put a number in the session and check it:
 
@@ -206,35 +160,25 @@ fn me(s: nilo.Session(Signed), db: *Db) !?Profile {
 }
 ```
 
-That is a lookup — but it is the lookup you were doing anyway to answer the
-request, rather than a second one to find the session.
+That is a database lookup, but it is the lookup you were already doing to answer the request, not a second one just to find the session.
 
-**Changing the secret does not have to sign everybody out**: keep the old
-one as a fallback ([above](#changing-the-secret)). Dropping it outright does, and after a
-leak that is what you want.
+**Changing the secret does not have to sign everybody out**: keep the old one as a fallback ([above](#rotating-the-secret)). Dropping it outright does, and after a leak that is what you want.
 
-**The cookie is `__Host-session`, so another subdomain cannot plant one.** A browser keeps a cookie with that prefix only from this host, over HTTPS, at `/`. A plain `session` could be set by any page on a sibling subdomain with `Domain=example.com; Path=/account`, and the browser would send that one first under `/account`, so the person would be working inside somebody else's account without knowing. A `setWith` that names a `domain`, another `path` or `secure = false` writes the plain name, because a browser drops the prefixed one with any of those, and gives up that protection. A session written by 0.6.0 or earlier, under the plain name, still opens, and the next `set` moves it.
+### The `__Host-` cookie name
 
-## Changing the shape is safe
+**The cookie is called `__Host-session`, so another subdomain cannot plant one.** A browser only accepts a cookie with that prefix from this host, over HTTPS, at `/`. A plain `session` cookie could be set by any page on a sibling subdomain with `Domain=example.com; Path=/account`, and the browser would send that one first under `/account`, so the person would be working inside somebody else's account without knowing. A `setWith` that names a `domain`, another `path` or `secure = false` writes the plain name, because a browser drops the prefixed one with any of those, and so gives up that protection. A session written by 0.6.0 or earlier, under the plain name, still opens, and the next `set` moves it to the new name.
 
-Add a field to your session struct, deploy, and the cookies already out there
-are **ignored** rather than misread — the people holding them sign in again.
+## Changing the session struct
 
-That is not luck. The sealed bytes carry a fingerprint of the struct's shape,
-so a cookie written by another build does not open. Without it, the bytes that
-were a `bool` would become the low byte of a `u32` and somebody would be
-signed in as the wrong user — the same for two fields of the same type
-swapping places, which no size check would catch.
+**Adding a field to your session struct is safe: cookies already issued are ignored, not misread**, and the people holding them sign in again.
 
-## A session is not authentication
+This is by design. The sealed bytes carry a fingerprint of the struct's layout, so a cookie written by a different build does not open. Without it, the bytes that were a `bool` would become the low byte of a `u32` and somebody would be signed in as the wrong user. The same would happen if two fields of the same type swapped places, which no size check would catch.
 
-It is where a user's id lives once something else has established it. What
-talks to the identity provider, what a role means, how many sign-in attempts an
-address gets — all yours. nilo provides the mechanism and no policy, the same
-line it draws around [middleware and resolved values](./middleware.md).
+## Sign-in and password checking
 
-**Checking the password is the one half nilo does provide**, because getting it
-wrong is quiet:
+**A session is not authentication: it only holds a user's id once something else has confirmed who they are.** Talking to an identity provider, deciding what a role means, limiting sign-in attempts per address: all of that is yours. nilo provides the mechanism and no policy, the same line it draws around [middleware and resolved values](./middleware.md).
+
+**Checking the password is the one part nilo does provide**, because getting it wrong fails silently:
 
 <!-- compiles -->
 ```zig
@@ -258,23 +202,11 @@ fn signIn(
 }
 ```
 
-Three things about that call are the whole reason it exists
-([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)):
+Three things about [`c.verifyPassword`](../reference/ctx.md#reading) are the whole reason it exists ([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)):
 
-- **The stored hash is optional, and `null` means there is no such account.**
-  It does the work anyway and answers false. Returning early when the address
-  is unknown answers in a millisecond instead of thirty, which turns the form
-  into a query for which addresses are registered. If you hash at a Cost of
-  your own, say so here too — `c.verifyPasswordWith(cost, …)` — because that
-  Cost is what the no-account path is measured out at.
-- **It is a `Ctx` method rather than a call to `nilo_pw`.** One hash is 13 ms
-  and 19 MiB — under `block_warning_ms`, so calling the module directly holds
-  the thread on every sign-in and nothing in the log says so. The method parks
-  the fiber and holds one of `password_hashes_at_once` permits.
-- **The allocator is `pw.huge_pages` rather than `db.gpa`.** The 19 MiB arrives
-  in ten pages instead of 4,864, which is 11.0 ms a hash against 13.6 and
-  nothing held between them. Any allocator works; this is the one that is
-  fastest, and on anything that is not Linux it *is* `page_allocator`.
+- **The stored hash is optional, and `null` means there is no such account.** The call still does the full work and answers false. Returning early for an unknown address answers in a millisecond instead of thirty, which lets anyone use the form to find out which addresses are registered. If you hash at a Cost of your own, pass it here too (`c.verifyPasswordWith(cost, …)`), because that Cost sets how long the no-account path takes.
+- **It is a `Ctx` method, not a direct call to `nilo_pw`.** One hash takes 13 ms and 19 MiB, which is under `block_warning_ms`, so calling the module directly would block the thread on every sign-in with nothing in the log. The method parks the fiber and holds one of `password_hashes_at_once` permits.
+- **The allocator is `pw.huge_pages`, not `db.gpa`.** The 19 MiB arrives in ten pages instead of 4,864, which is 11.0 ms a hash against 13.6, with nothing held between hashes. Any allocator works; this is the fastest, and on anything other than Linux it *is* `page_allocator`.
 
 Signing somebody up is the other direction:
 
@@ -284,8 +216,7 @@ const stored = try c.hashPassword(pw.huge_pages, form.password.view());
 _ = try db.insert(Account, c, .{ .email = form.email, .password = stored.text() });
 ```
 
-And when a sign-in succeeds is the one moment the plaintext is in hand, so it
-is the only place a row written at an older Cost can be written forward:
+A successful sign-in is the only moment the plaintext password is available, so it is the only place a hash written at an older Cost can be upgraded:
 
 <!-- compiles: body -->
 ```zig
@@ -299,14 +230,9 @@ if (try pw.needsRehash(row.?.password.view(), .default)) {
 }
 ```
 
-### Checking one with no request in hand
+### Checking a password outside a request
 
-A CLI that resets an account, a job that re-hashes every row at a raised
-Cost, a test that wants neither an App nor a `Ctx`: none of them has a
-request, and none of them needs one, because the salt is in the stored
-string. `nilo.verifyPassword` is the method without the `Ctx` — the same
-Gate and the same blocking pool, run inline when there is no loop at all
-([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)):
+**`nilo.verifyPassword` is the same check without a `Ctx`.** A CLI that resets an account, a job that re-hashes every row at a higher Cost, a test that wants neither an App nor a `Ctx`: none of them has a request, and none needs one, because the salt is in the stored string. It uses the same Gate and the same blocking pool, and runs inline when there is no event loop at all ([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)):
 
 <!-- compiles -->
 ```zig
@@ -315,19 +241,11 @@ fn checkFromTheCommandLine(gpa: std.mem.Allocator, stored: []const u8, typed: []
 }
 ```
 
-There is no `nilo.hashPassword` beside it. Making a hash needs entropy, and
-`c.entropy` is where the wait for it is paid; outside a request,
-`std.Io.randomSecure` into a `[pw.salt_len]u8` and `pw.hash` is the whole of
-it.
+There is no matching `nilo.hashPassword`. Making a hash needs entropy, and `c.entropy` is where the wait for it happens. Outside a request, fill a `[pw.salt_len]u8` with `std.Io.randomSecure` and call `pw.hash`; that is all it takes.
 
-## A token that is not a password
+## Password reset tokens and API keys
 
-A password-reset link, an email verification, an API key. Every application
-has all three, and the recipe is small enough that everybody writes it and
-wrong in enough places that most get one of them: the token stored as it was
-sent, so that a copy of the table is a set of working links; `std.mem.eql` on
-the compare; a UUID used as the token. `pw.Token` is the recipe written once
-([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)).
+**[`pw.Token`](../reference/pw.md) is a random token for a reset link, an email verification or an API key, stored as a digest.** Every application needs all three, and the recipe is small enough that everybody writes it, yet easy enough to get wrong that most get one part wrong: storing the token as it was sent (so a copy of the table is a set of working links), comparing with `std.mem.eql`, or using a UUID as the token. `pw.Token` is the recipe written once ([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)).
 
 <!-- compiles -->
 ```zig
@@ -387,39 +305,16 @@ fn sendResetMail(c: *nilo.Ctx, to: Str, text: []const u8) !void {
 }
 ```
 
-Four things about it:
+Four things to know:
 
-- **Send the text, store the digest, keep nothing else.** `token.text()` is
-  43 characters of base64url — safe in a URL, a header and a mail — and
-  `token.digest()` is SHA-256 over the bytes. A row holding the digest is
-  useless to whoever reads the table, which is the point of it.
-- **Every wrong token gets one answer.** `parse` gives null for the wrong
-  length, a character outside base64url or a padded spelling, and the lookup
-  gives null for a token nobody issued. Both end in the same 401, because
-  which way a token was wrong is not something to tell whoever presented it.
-  Finding the row by its digest leaks no timing worth having: whoever sends a
-  token cannot choose the bytes of its SHA-256. Where the row is found some
-  other way, `pw.Token.matches(stored, presented)` is the constant-time
-  compare, and a stored value that is not 32 bytes is `false`, so a table
-  that kept the text by mistake signs nobody in rather than everybody.
-- **No argon2.** A token has 256 bits of entropy and needs no stretching;
-  a reset endpoint that took 13 ms to say no would be one that can be
-  walked. This is why it is `pw.Token` and not a Cost.
-- **Expiry and single use are yours.** `expires_at` is a column in your
-  table, and single use is `deleteReturningOne`: the row is found by its
-  digest and removed by the same statement, so a link clicked twice at once
-  works once. Reading it with `db.one` and deleting it after leaves a gap
-  where both requests read it. The digest needs `.unique` in the marker,
-  which is what lets `deleteReturningOne` promise one row. A failure after
-  the delete, such as the password update, spends the link, and the user asks
-  for another. That is the safe way round. An API key is the same calls with
-  no expiry and no delete: `pw.Token.parse(header).?.digest()` is what to
-  look the row up by.
+- **Send the text, store the digest, keep nothing else.** `token.text()` is 43 characters of base64url, safe in a URL, a header and an email, and `token.digest()` is SHA-256 over the bytes. A row holding the digest is useless to whoever reads the table, which is the point.
+- **Every wrong token gets the same answer.** `parse` returns null for the wrong length, a character outside base64url or a padded spelling, and the lookup returns null for a token nobody issued. Both end in the same 401, because how a token was wrong is not something to tell whoever presented it. Looking the row up by its digest leaks no useful timing: whoever sends a token cannot choose the bytes of its SHA-256. Where the row is found some other way, `pw.Token.matches(stored, presented)` is the constant-time compare, and a stored value that is not 32 bytes gives `false`, so a table that kept the text by mistake signs nobody in rather than everybody.
+- **No argon2.** A token has 256 bits of entropy and needs no stretching; a reset endpoint that took 13 ms to say no would be one that can be brute-forced. That is why this is `pw.Token` and not a Cost.
+- **Expiry and single use are yours to implement.** `expires_at` is a column in your table, and single use is `deleteReturningOne`: the row is found by its digest and removed in the same statement, so a link clicked twice at once works only once. Reading it with `db.one` and deleting it afterwards leaves a gap where both requests read it. The digest needs `.unique` in the marker, which is what lets `deleteReturningOne` promise one row. A failure after the delete, such as the password update, uses up the link, and the user asks for another; that is the safe way round. An API key is the same calls with no expiry and no delete: look the row up by `pw.Token.parse(header).?.digest()`.
 
 ## Testing
 
-A handler taking a session is an ordinary function, and the session is an
-ordinary value:
+**A handler that takes a session is an ordinary function, and the session is an ordinary value:**
 
 ```zig
 test "me answers with the signed-in profile, and 404s without one" {
@@ -430,12 +325,9 @@ test "me answers with the signed-in profile, and 404s without one" {
 }
 ```
 
-`set` and `clear` are the exception: outside a request there is no response to
-put a cookie on, so they fail rather than quietly doing nothing.
+`set` and `clear` are the exception: outside a request there is no response to put a cookie on, so they fail instead of silently doing nothing.
 
-For the round trip — that the cookie really is set and really comes back —
-drive the App with the [test client](./testing.md), setting the key directly
-rather than listening:
+To test the round trip (that the cookie really is set and really comes back), drive the App with the [test client](./testing.md), setting the key directly instead of calling `listen`:
 
 ```zig
 var app = nilo.App.init(testing.allocator);

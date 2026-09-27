@@ -1,5 +1,7 @@
-//! `.in` takes a list, and a list that may be absent is the empty list —
-//! which `.in` already reads as *no row matches*. There is no term to drop.
+//! An `.exists` with `.where = .{}`.
+//!
+//! An empty condition matches every row, so it is the entry with no `.where`,
+//! and one question gets one spelling (item 107).
 
 const sql = @import("nilo_sql");
 
@@ -13,17 +15,14 @@ const Partner = struct {
 const Capability = struct {
     pub const nilo_table = .{
         .name = "partner_capabilities",
-        .key = .{ .partner_id, .capability },
+        .key = .id,
         .references = .{ .partner_id = .{ Partner, .id } },
     };
 
+    id: i64,
     partner_id: i64,
-    capability: []const u8,
 };
 
 export fn refusal() void {
-    const found = sql.selectFor(Partner, @TypeOf(.{
-        .where = .{ .id = .{ .in = sql.given(@as(?[]const i64, null)) } },
-    }));
-    _ = found;
+    _ = sql.selectFor(Partner, @TypeOf(.{ .where = .{ .exists = .{.{ .in = Capability, .where = .{} }} } }));
 }

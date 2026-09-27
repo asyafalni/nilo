@@ -35,7 +35,10 @@ on its new page.
 
 `README.md` is what stays on one page: the modules table, the root wiring,
 and **every heading listed once**, each a link. That is the search the
-single page used to be. A name is found there and read on its page.
+single page used to be. A name is found there and read on its page. The list
+is written by `zig build docs-index` from the pages' `##` to `####` headings,
+and `zig build docs-check` refuses it when it differs, because a list kept by
+hand had lost four headings within a month ([ADR 236](./236-a-doc-page-says-what-it-is-and-where-its-other-layers-are.md)).
 
 Three things moved with it:
 
@@ -55,6 +58,8 @@ Three things moved with it:
   links between sections became links between pages the same way.
 
 ## What was rejected
+
+**A list of every heading kept by hand.** It was the first form, and by 2026-09-26 it had lost `nilo.csrf`, `Rooms` and two streaming headings, with nothing to say so; it is generated now ([ADR 236](./236-a-doc-page-says-what-it-is-and-where-its-other-layers-are.md)).
 
 **One page a `##` section**, thirty-five of them. It was built first, and it
 answers "where is `Cookie`" perfectly and nothing else: `stream.md` was

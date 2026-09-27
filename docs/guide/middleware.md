@@ -1,9 +1,10 @@
 # Middleware and resolved values
 
-Two ways to put something between the request and the handler. They are not
-interchangeable: **middleware enforces, a resolved value provides.**
+**There are two ways to put something between the request and the handler, and they are not interchangeable: middleware enforces a rule, a resolved value provides a value.**
 
-## Middleware
+**Reference:** [`app.use`, `app.useOn`](../reference/app.md#app), [`with`, `without`](../reference/app.md#group), [built-in middleware](../reference/middleware.md#built-in-middleware) · **Design:** [Middleware](../design/middleware.md), [CORS and the proxy](../design/cors-proxy.md), [Rate limiting](../design/rate-limiting.md)
+
+## How middleware works
 
 ```zig
 fn timing(c: *nilo.Ctx, next: nilo.Next) !void {
@@ -19,9 +20,7 @@ try app.use(timing);
 try app.useOn("/api", requireToken);
 ```
 
-An onion: everything before `next.run(c)` happens on the way in, everything after
-on the way out. Not calling `next` at all ends the chain, which is all a
-rejecting auth middleware has to do:
+**Middleware is an onion: everything before `next.run(c)` happens on the way in, everything after it on the way out.** Not calling `next` at all ends the chain, which is all an auth middleware has to do to reject a request:
 
 ```zig
 fn requireToken(c: *nilo.Ctx, next: nilo.Next) !void {
@@ -32,31 +31,19 @@ fn requireToken(c: *nilo.Ctx, next: nilo.Next) !void {
 }
 ```
 
-Returning an error goes down exactly the same path a failing handler does.
+Returning an error takes exactly the same path as a failing handler.
 
-**To learn the status after `next.run(c)`**, read it the way the logger does:
-`c.answered()` is the status once something has been written, and when
-`next.run` returned an error before anything was, `fail.resolveStatus(failure,
-err)` with `fail.current()` — or `fail.statusFor(err)` when there is no
-failure set — is the status App is about to send. Asking `fail` rather than
-mapping the error again is what keeps what you record and what was sent from
-drifting apart.
+**To learn the status after `next.run(c)`, read it the way the logger does.** `c.answered()` is the status once something has been written. When `next.run` returned an error before anything was written, the status the App is about to send is `fail.resolveStatus(failure, err)` with `fail.current()`, or `fail.statusFor(err)` when there is no failure set. Asking `fail` instead of mapping the error yourself keeps what you record in step with what was actually sent.
 
-Registration order between `use` and `get` doesn't matter — chains are resolved
-when `listen()` is called, so middleware registered after a route still applies
-to it. Middleware also runs when nothing matched, so your logger sees 404s and
-CORS can answer a preflight for a path that has no route.
+The order of `use` and `get` calls does not matter. Chains are resolved when `listen()` is called, so middleware registered after a route still applies to it. Middleware also runs when no route matched, so your logger sees 404s and CORS can answer a preflight for a path that has no route.
 
-`useOn(prefix, mw)` scopes by the front of the request path.
-`group("/api").use(mw)` is the same thing said better — see
-[Routing](./routing.md#groups).
+`useOn(prefix, mw)` limits a middleware to paths that start with the prefix. `group("/api").use(mw)` does the same thing more clearly; see [Routing](./routing.md#groups).
 
 See [ADR 008](../adr/008-middleware-is-an-onion-of-ctx-functions.md).
 
-### The two routes that can't be guarded
+### Excluding routes from a middleware (`without`)
 
-Every API with accounts has the same shape: a prefix behind a session, and two
-routes inside it that can't be — **you can't require a session to create one.**
+**Every API with accounts has a prefix behind a session and two routes inside it that cannot require one: you cannot require a session to create one.**
 
 ```zig
 const v1 = app.group("/v1");
@@ -67,36 +54,23 @@ try open.post("/sign-up", signUp);    // …except these two
 try open.post("/sign-in", signIn);
 ```
 
-`without(mw)` hands back the same group with that one middleware off for the
-routes registered through it. Everything else in the chain still runs — your
-logger still logs the sign-up, CORS still answers its preflight.
+[`without(mw)`](../reference/app.md#group) returns the same group with that one middleware turned off for the routes registered through it. Everything else in the chain still runs: your logger still logs the sign-up, and CORS still answers its preflight.
 
-**The default stays deny**, which is the point: a route added to `/v1` next month
-is guarded because nobody did anything, rather than open because nobody
-remembered. And the exception is written where the route is, so renaming
-`/sign-up` moves it — where the alternative, a list of paths compared against
-`c.path()` inside the middleware, would go on guarding a route that no longer
-exists while the real one went open, with nothing failing to compile
-([ADR 008](../adr/008-middleware-is-an-onion-of-ctx-functions.md)).
+**The default stays deny**, and that is the point. A route added to `/v1` next month is guarded without anyone doing anything, instead of open because somebody forgot. The exception is also written where the route is, so renaming `/sign-up` moves it. The alternative, a list of paths compared against `c.path()` inside the middleware, would keep guarding a route that no longer exists while the real one was left open, and nothing would fail to compile ([ADR 008](../adr/008-middleware-is-an-onion-of-ctx-functions.md)).
 
-Registering the open routes before the `use` call does **not** work and it looks
-like it should: chains are resolved in `listen()`, so mount order carries no
-meaning at all (ADR 008).
+Registering the open routes before the `use` call does **not** work, even though it looks like it should: chains are resolved in `listen()`, so the order you register things in has no meaning at all (ADR 008).
 
-### And the one route that wants more
+### Adding a middleware to one route (`with`)
 
-The other direction, for an endpoint that wants a guard its neighbours do not:
+**`with` does the opposite of `without`: it adds a guard to one endpoint that its neighbours do not have.**
 
 ```zig
 try app.with(adminOnly).delete("/users/:id", removeUser);
 ```
 
-`with` hands back a group exactly as `without` does, so there is no second way
-to register a route and nothing new to learn. A carried middleware runs
-**innermost** — the group's session check has to have run by the time the
-route's own check of what that session may do runs.
+`with` returns a group exactly as `without` does, so there is no second way to register a route and nothing new to learn. A middleware added this way runs **innermost**, because the group's session check has to run before the route's own check of what that session is allowed to do.
 
-The two compose, because they are the same vocabulary:
+The two combine:
 
 ```zig
 const v1 = app.group("/v1");
@@ -104,33 +78,20 @@ try v1.use(requireOperator);
 try v1.without(requireOperator).with(rateLimitSignups).post("/sign-up", signUp);
 ```
 
-Both match on the joined pattern **and the method**, so renaming the route moves
-its middleware with it, `/v1/orders` does not cover `/v1/orders/:id`, and a
-guard on `DELETE /users/:id` does not cover the `GET` beside it. That last part
-is the difference between this and `useOn`, where the prefix is a string
-somebody has to keep in step
-([ADR 099](../adr/099-a-route-can-say-what-covers-it.md)).
+Both match on the full pattern **and the method**. So renaming the route moves its middleware with it, `/v1/orders` does not cover `/v1/orders/:id`, and a guard on `DELETE /users/:id` does not cover the `GET` beside it. That is the difference from `useOn`, where the prefix is a string somebody has to keep in step with the routes ([ADR 099](../adr/099-a-route-can-say-what-covers-it.md)).
 
-## The ones that come with it
+## Built-in logger and CORS
 
 ```zig
 try app.use(nilo.logger.standard);
 try app.use(nilo.cors.permissive);
 ```
 
-`logger.with(.{ .level = .debug, .slow_micros = 250_000 })` logs ordinary
-requests at a level of your choosing and anything slower than `slow_micros` at
-`.warn`, so slow requests stand out without a second tool.
+`logger.with(.{ .level = .debug, .slow_micros = 250_000 })` logs ordinary requests at a level you choose and anything slower than `slow_micros` at `.warn`, so slow requests stand out without a second tool.
 
-`cors.with(.{ .origins = &.{"https://app.example.com"}, .credentials = true })`
-— also `methods`, `headers`, `expose`, `max_age`. `permissive` is
-`origins: &.{"*"}` with no credentials, which is reasonable for a public API
-and wrong for one behind a cookie.
+`cors.with(.{ .origins = &.{"https://app.example.com"}, .credentials = true })` also accepts `methods`, `headers`, `expose` and `max_age`. `permissive` is `origins: &.{"*"}` with no credentials, which is reasonable for a public API and wrong for one behind a cookie.
 
-**Name as many origins as you serve.** A production front end and a staging one
-is the ordinary case, and `Access-Control-Allow-Origin` carries one value, so
-nilo compares the request's `Origin` against your list and sends back the one
-that matched:
+**List every origin you serve.** A production front end plus a staging one is the ordinary case, and `Access-Control-Allow-Origin` can carry only one value, so nilo compares the request's `Origin` against your list and sends back the one that matched:
 
 ```zig
 try app.use(nilo.cors.with(.{
@@ -139,19 +100,11 @@ try app.use(nilo.cors.with(.{
 }));
 ```
 
-The compare is unrolled while compiling, so it is one `mem.eql` per entry
-against a literal and nothing is allocated. An origin you did not name gets an
-ordinary response with no `Access-Control-Allow-Origin` on it, and the browser
-is what refuses it. Write them lowercase — a browser does, and nilo refuses a
-capital letter at build time rather than letting it silently never match.
+The comparison is unrolled while compiling, so it is one `mem.eql` per entry against a literal, and nothing is allocated. An origin you did not list gets an ordinary response with no `Access-Control-Allow-Origin`, and the browser is what blocks it. Write origins in lowercase, as browsers do: nilo rejects a capital letter at build time rather than letting it silently never match.
 
-### When the origins come from the environment
+### CORS origins from the environment
 
-The address of your front end is a fact about *where this was deployed*, not
-about the program, so staging and production naming different ones is the
-ordinary case rather than an awkward one. `cors.reading` is the same middleware
-with its list read from somewhere you fill before `listen()`
-([ADR 088](../adr/088-an-origin-is-a-fact-about-the-deployment.md)):
+**When the front-end address differs between deployments, read the origin list at startup with `cors.reading`.** The address of your front end is a fact about *where this was deployed*, not about the program, so staging and production naming different origins is normal. `cors.reading` is the same middleware with its list read from something you fill before `listen()` ([ADR 088](../adr/088-an-origin-is-a-fact-about-the-deployment.md)):
 
 ```zig
 var origins: nilo.cors.Origins = .empty;      // outlives the App
@@ -166,53 +119,46 @@ pub fn main() !void {
 }
 ```
 
-Everything else stays where it was: the methods, the headers, `credentials` and
-`max_age` are all still compile-time, because none of them changes between one
-deployment of the same service and another.
+Everything else stays compile-time: the methods, the headers, `credentials` and `max_age`, because none of them changes between deployments of the same service.
 
-Three things worth knowing. **The text is borrowed**, so whatever you split has
-to outlive the server — the environment block and a `.env`'s text both do, and
-that is what keeps a cross-origin response at zero allocations. **`"*"` is
-refused**: answering anybody is `cors.permissive`, which needs no list at all.
-And a list you never filled refuses every cross-origin request, so nilo says so
-in the log once, the first time it happens.
+Three things to know:
 
-## When a request changes something
+- **The text is borrowed**, so whatever you split has to outlive the server. The environment block and a `.env` file's text both do, and that is what keeps a cross-origin response at zero allocations.
+- **`"*"` is rejected.** To allow anybody, use `cors.permissive`, which needs no list.
+- A list you never filled rejects every cross-origin request, so nilo says so in the log once, the first time it happens.
+
+## CSRF protection
 
 <!-- compiles: body -->
 ```zig
 try app.use(nilo.csrf.sameOrigin);
 ```
 
-A `POST`, `PUT`, `PATCH` or `DELETE` that a browser says came from a page this server does not serve is a 403, and your handler never runs. A `GET` is never asked, because a link from another site is a `GET`; a route that changes something on a `GET` is the thing to fix, and no CSRF check can.
+**A `POST`, `PUT`, `PATCH` or `DELETE` that the browser says came from a page this server does not serve gets a 403, and your handler never runs.** A `GET` is never checked, because a link from another site is a `GET`. A route that changes something on a `GET` is the thing to fix, and no CSRF check can fix it. See [`nilo.csrf`](../reference/middleware.md#nilocsrf).
 
-There is no token to put in your forms. The browser writes `Sec-Fetch-Site` and `Origin` on the request and a page cannot forge either, so nilo reads those ([ADR 224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md)). `curl`, a webhook and another server send neither and go through: none of them is carrying somebody else's cookie.
+There is no token to put in your forms. The browser writes `Sec-Fetch-Site` and `Origin` on the request, and a page cannot forge either, so nilo reads those ([ADR 224](../adr/224-a-request-that-changes-something-says-where-it-came-from.md)). `curl`, a webhook and another server send neither and are let through: none of them is carrying somebody else's cookie.
 
-**Why you would want it with `SameSite=Lax` already on your cookie:** Lax lets through a page on another subdomain of your site, a user's upload on `files.example.com` for instance, and does nothing once a cookie needs `SameSite=None`. This refuses both.
+**Why you would want this even with `SameSite=Lax` on your cookie:** Lax lets through a page on another subdomain of your site (a user's upload on `files.example.com`, for instance), and does nothing once a cookie needs `SameSite=None`. This check blocks both.
 
-A front end served from another origin is named, the same way CORS names it:
+A front end served from another origin is listed, the same way CORS lists it:
 
 <!-- compiles: body -->
 ```zig
 try app.use(nilo.csrf.with(.{ .origins = &.{"https://app.example.com"} }));
 ```
 
-When that address comes from the environment, `nilo.csrf.reading(&origins)` takes the same `nilo.cors.Origins` your `cors.reading` does, so one variable filled before `listen()` answers both. A route that really does take posts from anywhere leaves it with `app.without(nilo.csrf.sameOrigin).post(…)`.
+When that address comes from the environment, `nilo.csrf.reading(&origins)` takes the same `nilo.cors.Origins` your `cors.reading` does, so one variable filled before `listen()` serves both. A route that really does accept posts from anywhere opts out with `app.without(nilo.csrf.sameOrigin).post(…)`.
 
-## When one client asks too often
+## Rate limiting
 
 <!-- compiles: body -->
 ```zig
 try app.useOn("/api", nilo.allowance.with(.{ .per_window = 100, .window_s = 60 }));
 ```
 
-A hundred requests a minute from one address; the hundred-and-first is a 429
-with a `Retry-After`, and your handler never runs. Put it on a group rather than
-the whole App and the routes outside that prefix are not counted at all — a
-health check a load balancer hits every second is the usual reason.
+**This allows a hundred requests a minute from one address; the hundred-and-first gets a 429 with a `Retry-After`, and your handler never runs.** Put it on a group rather than the whole App and routes outside that prefix are not counted at all. A health check that a load balancer hits every second is the usual reason. See [`nilo.allowance`](../reference/middleware.md#niloallowance).
 
-The sign-in form is the case worth naming separately, because the number is
-different by two orders of magnitude:
+The sign-in form deserves its own limit, because the right number differs by two orders of magnitude:
 
 <!-- compiles: body -->
 ```zig
@@ -224,46 +170,25 @@ try app.useOn("/sign-in", nilo.allowance.with(.{
 }));
 ```
 
-**`.name` is what keeps two allowances separate.** Two `with()` calls carrying
-the same options are the same table, which is usually what you want — the same
-allowance applied in two places — and is wrong the moment the two are meant to
-be counted apart. Different numbers already make them different; give one a name
-when the numbers happen to match.
+**`.name` keeps two allowances separate.** Two `with()` calls with the same options share one table. That is usually what you want (the same allowance applied in two places), and wrong as soon as the two are meant to be counted separately. Different numbers already make them different tables; give one a name when the numbers happen to match.
 
-### Behind a proxy, say which machines are in front
+### Rate limiting behind a proxy
 
-This counts against `c.clientIp()`, which is the socket's address unless you
-have told nilo what stands in front:
+**Tell nilo which machines are in front of it, or every request is counted against the proxy's address.** The allowance counts against `c.clientIp()`, which is the socket's address unless you have said what stands in front:
 
 ```zig
 try app.listen(.{ .trusted_proxies = &.{"private"} });
 ```
 
-An entry is a CIDR, a bare address, or one of two names — `"private"` for the
-RFC 1918 ranges plus the loopback and their v6 equivalents, `"loopback"` for the
-loopback alone. `trusted_hops = 1` still works and is the older shape; the
-description wins when both are set, because a count goes wrong the day somebody
-puts a CDN in front and nothing says so
-([ADR 102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md)).
+An entry is a CIDR, a bare address, or one of two names: `"private"` for the RFC 1918 ranges plus loopback and their IPv6 equivalents, and `"loopback"` for loopback alone. `trusted_hops = 1` still works and is the older setting. When both are set, `trusted_proxies` wins, because a hop count goes wrong the day somebody puts a CDN in front and nothing says so ([ADR 102](../adr/102-a-proxy-is-trusted-by-which-one-it-is.md)).
 
-Leave it at zero behind a proxy and every request looks like it came from the
-proxy — one address, one slot, and the first busy second locks out everybody.
-nilo cannot see your deployment, but it can see a refusal whose request carried
-an `X-Forwarded-For` and was counted against the connection's own address, and
-it says so in the log the first time that happens.
+Leave it unset behind a proxy and every request looks like it came from the proxy: one address, one slot, and the first busy second locks out everybody. nilo cannot see your deployment, but it can see a rejected request that carried an `X-Forwarded-For` and was counted against the connection's own address, and it logs that the first time it happens.
 
-### What it costs, and what it is not
+### Rate limiting: cost and limits
 
-Nothing per request: the table is sized while compiling and lives in the
-binary's `.bss`, 131,072 bytes at the default `.slots = 16 * 1024`. Nothing is
-allocated at startup either, and a program that never calls `with` links none of
-it. `.slots` is the number of addresses remembered at once, at eight bytes each,
-and it is a power of two.
+**It costs nothing per request.** The table is sized while compiling and lives in the binary's `.bss`: 131,072 bytes at the default `.slots = 16 * 1024`. Nothing is allocated at startup either, and a program that never calls `with` links none of it. `.slots` is the number of addresses remembered at once, at eight bytes each, and must be a power of two.
 
-**`allowance.keyed` counts against something you know instead** — the account
-that signed in, the API key, the tenant. Ten accounts behind one office NAT
-share an address-keyed allowance they should not, and one account on ten
-machines gets ten:
+**`allowance.keyed` counts against something your application knows instead of the address**: the signed-in account, the API key, the tenant. Ten accounts behind one office NAT would otherwise share one address-keyed allowance, and one account on ten machines would get ten:
 
 ```zig
 try app.useOn("/api", nilo.allowance.keyed(account, .{
@@ -272,30 +197,15 @@ try app.useOn("/api", nilo.allowance.keyed(account, .{
 }));
 ```
 
-`account` is any `fn (*nilo.Ctx) ?nilo.Str`, and its bytes are not kept — what
-goes in the table is a tag computed from them. `.on_null` has no default and
-that is deliberate: on a sign-in route a silent "not counted" leaves every
-*failed* sign-in uncounted, which is the attack the route exists to stop
-([ADR 104](../adr/104-a-key-the-application-knows-is-a-word-of-its-own.md)).
+`account` is any `fn (*nilo.Ctx) ?nilo.Str`, and its bytes are not kept: the table stores a tag computed from them. `.on_null` has no default, on purpose. On a sign-in route, silently not counting a request with no key would leave every *failed* sign-in uncounted, which is exactly the attack the limit exists to stop ([ADR 104](../adr/104-a-key-the-application-knows-is-a-word-of-its-own.md)).
 
-Two things it does on purpose, both the same trade
-([ADR 092](../adr/092-an-allowance-is-a-table-sized-while-compiling.md)). A
-table with no room left **forgets whichever of its addresses has been quiet longest**
-rather than making two addresses share one allowance, and a slot two requests
-reach at the same instant **lets them both through**. Being loose for one window
-is a smaller wrong than refusing somebody who has made no requests at all.
+Two behaviours are deliberate, and both make the same trade ([ADR 092](../adr/092-an-allowance-is-a-table-sized-while-compiling.md)). When the table is full, it **forgets the address that has been quiet longest** rather than making two addresses share one allowance. And when two requests reach the same slot at the same instant, it **lets both through**. Being loose for one window is a smaller mistake than rejecting somebody who has made no requests at all.
 
-And it is not a defence against a flood. A refused request is still read,
-parsed, matched and answered — cheaply, but not for free. Somebody opening ten
-thousand sockets is stopped by `max_connections` on `listen`, which counts per
-process rather than per address.
+**It is not a defence against a flood.** A rejected request is still read, parsed, matched and answered: cheaply, but not for free. Somebody opening ten thousand sockets is stopped by `max_connections` on `listen`, which counts per process rather than per address.
 
 ## Resolved values
 
-Some things a handler needs are neither a service nor request data: they are
-worked out *from* the request. Authentication is the whole genre. So the type
-says how it is worked out, and a handler asks for it by writing it in its
-argument list:
+**Some things a handler needs are neither a service nor request data: they are worked out from the request.** Authentication is the typical case. The type says how the value is worked out, and a handler asks for it by writing it in its argument list:
 
 ```zig
 const CurrentUser = struct {
@@ -317,20 +227,13 @@ fn me(user: CurrentUser) !Profile {
 }
 ```
 
-No registration step, nothing added to `main`. A resolver that fails goes down
-the same path a failing handler does, so `fail.unauthorized` is how it refuses.
-And `me` is still an ordinary function: `me(.{ .id = 7, .name = … })` in a test.
+There is no registration step and nothing to add to `main`. A resolver that fails takes the same path as a failing handler, so it rejects with `fail.unauthorized`. And `me` is still an ordinary function: call `me(.{ .id = 7, .name = … })` in a test.
 
-A resolver takes a `*Ctx`, a service, a `std.mem.Allocator`, and **other resolved
-values** — that last one being how `Admin` gets built out of `CurrentUser`
-instead of out of a second copy of the auth code. It can't take a path param or
-the body: a resolver belongs to the request, not to a route, and the same
-`CurrentUser` serves `/me` and `/orders/:id`. Ask for a `*Ctx` if you need one.
+A resolver can take a `*Ctx`, a service, a `std.mem.Allocator`, and **other resolved values**. That last one is how `Admin` is built from `CurrentUser` instead of from a second copy of the auth code. It cannot take a path param or the body: a resolver belongs to the request, not to a route, and the same `CurrentUser` serves `/me` and `/orders/:id`. Ask for a `*Ctx` if you need one.
 
-It's worked out **once per request**, which matters as soon as you also want to
-guard a whole prefix.
+It is worked out **once per request**, which matters as soon as you also want to guard a whole prefix.
 
-## Which one to reach for
+## Middleware or resolved value?
 
 ```zig
 fn requireAdmin(c: *nilo.Ctx, next: nilo.Next) !void {
@@ -343,22 +246,13 @@ try app.useOn("/admin", requireAdmin);
 fn stats(user: CurrentUser) !Stats { … }   // the same user, not a second lookup
 ```
 
-Only routes that name a resolved value get it, so it's the wrong tool for
-securing a prefix — a handler that forgets the argument simply isn't
-authenticated. `useOn` is what makes a rule apply whether the handler cooperates
-or not, and `c.resolve` is how the two meet: the middleware's lookup and the
-handler's argument are the same one lookup.
+**Use middleware to secure a prefix, and a resolved value to hand the user to a handler.** Only routes that name a resolved value get it, so it is the wrong tool for securing a prefix: a handler that forgets the argument is simply not authenticated. `useOn` makes a rule apply whether or not the handler cooperates. `c.resolve` is where the two meet: the middleware's lookup and the handler's argument are the same single lookup.
 
 See [ADR 015](../adr/015-resolved-values-are-declared-by-their-type.md).
 
-## One table over every route
+## A permission table for every route
 
-A check per handler leaves the ninety-first endpoint open with no error and no
-failing test. A table consulted from one place does not — as long as that place
-can tell which route it is in front of. `c.routeName()` is the route's
-`operationId`, the same word the API description prints, so a middleware can
-key a default-deny table by it and a test can hold the table against the
-document in both directions:
+**Check permissions in one table, from one middleware, instead of in every handler.** A check per handler leaves the ninety-first endpoint open with no error and no failing test. A table consulted from one place does not, as long as that place can tell which route it is in front of. `c.routeName()` is the route's `operationId`, the same name the API description prints, so a middleware can key a default-deny table by it, and a test can check the table against the document in both directions:
 
 ```zig
 const required = std.StaticStringMap(Capability).initComptime(.{
@@ -380,19 +274,10 @@ fn authorize(c: *nilo.Ctx, next: nilo.Next) !void {
 try app.useOn("/api", authorize);
 ```
 
-A route registered without `named` still has a name — the derived one, so
-`getApiPartners` is what the table sees and what the document says. `app.routes()`
-publishes the same name per entry, for the test that checks every key is a
-route and every route is a key without going through the document
-([ADR 162](../adr/162-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
+A route registered without `named` still has a name: the derived one, so `getApiPartners` is what the table sees and what the document says. `app.routes()` lists the same name for each route, for a test that checks every key is a route and every route is a key without going through the document ([ADR 162](../adr/162-a-middleware-can-learn-which-route-it-is-in-front-of.md)).
 
 ## Writing your own middleware
 
-The signature is `fn (c: *nilo.Ctx, next: nilo.Next) !void`. There is no
-registration type and no builder — `app.use` takes the function.
+**The signature is `fn (c: *nilo.Ctx, next: nilo.Next) !void`.** There is no registration type and no builder: `app.use` takes the function.
 
-Middleware is at the `Ctx` layer on purpose: it has no argument list to inject
-into, and giving it one would mean a second dependency system that runs for every
-request whether or not anybody wanted it. What it can do instead is set headers,
-read the request, refuse, and hand something to the handler through
-`c.cacheResolved` — which is what `c.resolve` uses.
+Middleware works at the `Ctx` layer on purpose. It has no argument list to inject into, and giving it one would mean a second dependency system that runs for every request whether or not anybody wanted it. What it can do instead is set headers, read the request, reject it, and hand something to the handler through `c.cacheResolved`, which is what `c.resolve` uses.

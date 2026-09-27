@@ -1,5 +1,9 @@
 # Static files
 
+**`app.static` reads a directory into memory when the server starts, so files are served without touching the disk and path traversal is impossible.**
+
+**Reference:** [`app.static`, `app.embedded`](../reference/app.md#app), [static options](../reference/app.md#static-options) · **Design:** [Static files](../design/static-files.md)
+
 ```zig
 try app.static("/", "public");
 
@@ -9,64 +13,44 @@ try app.staticWith("/assets", "dist", .{
 });
 ```
 
-The directory is read into memory when the server starts, so nothing touches the
-disk while requests are being served
-([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)). Each file gets an
-ETag at load, so a repeat visit is a 304 with no body. Path traversal isn't
-possible, because there is no path to resolve — just a name looked up in a fixed
-list.
+The directory is read into memory when the server starts, so nothing touches the disk while requests are being served ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)). Each file gets an ETag when it is loaded, so a repeat visit is a 304 with no body. Path traversal isn't possible, because there is no path to resolve, only a name looked up in a fixed list.
 
-A file over `max_file_bytes` is the one exception, and it is a spill rather than
-a refusal: it stays in the list with its size and the path the walk produced,
-and a request opens it and sends it from the disk
-([below](#files-too-big-to-hold)). Both of the properties above survive that.
+The one exception is a file over `max_file_bytes`. It is not refused: it stays in the list with its size and the path the directory walk found, and a request opens it and sends it from the disk ([below](#large-files-served-from-disk)). Both properties above still hold.
 
-The path is relative to the working directory the server runs in, and a directory
-that can't be opened stops `listen()` with that sentence in the error.
+The path is relative to the working directory the server runs in. A directory that can't be opened stops `listen()` with that reason in the error.
 
 ## Options
+
+**Every option has a default, listed here and [in the reference](../reference/app.md#static-options).**
 
 | | |
 |---|---|
 | `index` | served for a path ending in `/`. Default `"index.html"`; empty turns it off |
 | `cache_control` | sent on every file. Default `"public, max-age=3600"` |
 | `spa_fallback` | served for a path under the prefix that names no file and could be a browser opening a page. Empty (the default) turns it off |
-| `spa_fallback_for` | which requests that covers. `.navigations` (the default) or `.any_path`, which is what shipped before 0.2.0 ([below](#the-fallback-and-what-it-is-for)) |
-| `max_file_bytes` | the line between a file held in memory and one opened per request. Default 8 MB |
-| `max_total_bytes` | the ceiling on what one tree may hold in memory, gzipped copies included. Default 64 MB |
+| `spa_fallback_for` | which requests that covers. `.navigations` (the default) or `.any_path`, which is how it worked before 0.2.0 ([below](#the-spa-fallback)) |
+| `max_file_bytes` | the size above which a file is opened per request instead of held in memory. Default 8 MB |
+| `max_total_bytes` | the most one tree may hold in memory, gzipped copies included. Default 64 MB |
 | `dotfiles` | whether to load names starting with `.`. Off by default |
 | `compress` | gzip every file worth gzipping, once, at load. On by default |
 | `compress_min_bytes` | files smaller than this are served as they are. Default 1 KB |
 
-Dotfiles are off because a `.env` or a `.git` that found its way into the
-directory being published on the first request is a bad way to learn it was
-there.
+Dotfiles are off because finding out on the first request that a `.env` or a `.git` ended up in the published directory is a bad way to learn it was there.
 
-### The fallback, and what it is for
+### The SPA fallback
 
-`spa_fallback` is what makes a browser reload on `/users/42` reach your
-client-side router instead of a 404. **It answers a request that could be
-somebody opening a page, and nothing else**
-([ADR 087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)):
+**`spa_fallback` answers only a request that could be somebody opening a page**, so a browser reload on `/users/42` reaches your client-side router instead of a 404 ([ADR 087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)):
 
 | The request | The answer |
 |---|---|
-| `GET /users/42`, `Accept: text/html,…` — a reload, a deep link | the page |
-| `GET /users/42` with no `Accept`, or `*/*` — `curl`, a crawler | the page |
-| `GET /app.abc123.js`, `Accept: */*` — a `<script src>` | **404**, naming the path |
-| `GET /api/orders`, `Accept: application/json` — a `fetch` | **404** |
+| `GET /users/42`, `Accept: text/html,…`: a reload, a deep link | the page |
+| `GET /users/42` with no `Accept`, or `*/*`: `curl`, a crawler | the page |
+| `GET /app.abc123.js`, `Accept: */*`: a `<script src>` | **404**, naming the path |
+| `GET /api/orders`, `Accept: application/json`: a `fetch` | **404** |
 
-The middle row is the one that changed in 0.2.0. A build whose hash has moved
-on refers to a bundle the directory no longer holds, and answering that with
-`index.html` is a 200 the browser reports as a syntax error on line 1 of
-something that is not JavaScript — with the name of the missing file nowhere in
-it. The same shape turns a `fetch` into a JSON parse error.
+The script row changed in 0.2.0. A page from an older build refers to a bundle the directory no longer holds. Answering that with `index.html` is a 200 that the browser reports as a syntax error on line 1 of something that is not JavaScript, with the name of the missing file nowhere in it. The same thing turns a `fetch` into a JSON parse error.
 
-Two things are worth knowing about the rule. **A `fetch()` that sends `*/*` to
-a path with no extension still gets the page**, because at this layer it is
-indistinguishable from a deep link; sending `Accept: application/json` is what
-separates them. And a directory that really does want the old behaviour says
-so:
+Two things to know about the rule. **A `fetch()` that sends `*/*` to a path with no extension still gets the page**, because at this layer it looks exactly like a deep link; sending `Accept: application/json` is what tells them apart. And a directory that really wants the old behaviour can ask for it:
 
 ```zig
 try app.staticWith("/", "public", .{
@@ -75,64 +59,34 @@ try app.staticWith("/", "public", .{
 });
 ```
 
-`max_total_bytes` is a real ceiling — the held part of the tree is going into
-RAM — and it is better to hit it at startup than at 3am. `max_file_bytes` is not
-a ceiling but a line: a file over it is served from the disk rather than
-refused, and holds nothing to be counted against the total
-([below](#files-too-big-to-hold)).
+`max_total_bytes` is a real limit, because the held part of the tree goes into RAM, and it is better to hit it at startup than at 3am. `max_file_bytes` is not a limit: a file over it is served from the disk instead of refused, and holds nothing that counts against the total ([below](#large-files-served-from-disk)).
 
 ## Compression
 
-Every file worth compressing is gzipped **once, while the App is being built**,
-and a client that says `Accept-Encoding: gzip` gets the copy that was already
-made. Nothing is compressed per request, so serving a compressed asset costs a
-slice and a header — measured at zero allocations, held by a test.
+**Every file worth compressing is gzipped once, while the App is being built**, and a client that sends `Accept-Encoding: gzip` gets the copy already made. Nothing is compressed per request, so serving a compressed asset costs a slice and a header, measured at zero allocations and held by a test.
 
-That holds with middleware in front of it, which is worth saying because it did
-not always: the chain an asset runs through is worked out at `listen()`, per
-file, the same as a route's. A logger, a CORS, or anything scoped to a prefix
-above or below the asset adds nothing to the request.
+That stays true with middleware in front of it, which did not always hold: the middleware chain for an asset is worked out at `listen()`, per file, the same as a route's. A logger, CORS, or anything scoped to a prefix above or below the asset adds nothing to the request.
 
-That timing is the whole design, not an optimisation on top of it. A gzip
-compressor needs a 64 KB window: one per connection would take an idle
-connection from 4,669 bytes to roughly fifteen times that, and one per request would
-put an allocation on the path where the budget is one
-([ADR 017](../adr/017-the-trade-budget-has-four-axes.md)). A file that never
-changes escapes both, because it can be compressed before the socket is open.
+This timing is the design, not an optimisation added later. A gzip compressor needs a 64 KB window. One per connection would take an idle connection from 4,669 bytes to roughly fifteen times that, and one per request would add an allocation to the request path, whose budget is one ([ADR 017](../adr/017-the-trade-budget-has-four-axes.md)). A file that never changes avoids both, because it can be compressed before the socket is open.
 
-What it costs instead is memory that stays: the compressed copy sits beside the
-original for the life of the process, and is charged against `max_total_bytes`
-like everything else. The startup line says how much it came to:
+What it costs instead is memory held for the life of the process: the compressed copy sits beside the original and counts against `max_total_bytes` like everything else. The startup line says how much it came to:
 
 ```
 nilo: loaded 34 static file(s) (2411903 bytes held, 383204 of them gzipped
        copies) from "dist" onto "/assets"
 ```
 
-A file is skipped when it is under `compress_min_bytes`, when its type is already
-compressed — a PNG, a woff2, an MP4 — when gzip did not actually make it
-smaller, or when it is over `max_file_bytes` and so was never read to be
-compressed at all. **A handler's own answer is a different feature**: files
-are gzipped once here, and `app.compress(.{})` gzips an endpoint's JSON per
-request on a compressor borrowed from a pool ([Responses](./responses.md#compression)).
-Off, an endpoint returning JSON goes out as it is.
+A file is skipped when it is under `compress_min_bytes`, when its type is already compressed (a PNG, a woff2, an MP4), when gzip did not make it smaller, or when it is over `max_file_bytes` and so was never read. **Compressing a handler's own answer is a different feature**: files are gzipped once here, while `app.compress(.{})` gzips an endpoint's JSON per request with a compressor borrowed from a pool ([Responses](./responses.md#compression)). Without it, an endpoint returning JSON goes out uncompressed.
 
-Three details that are easy to get wrong, and are not:
+Three details that are easy to get wrong, and that nilo gets right:
 
-- **`Vary: Accept-Encoding`** goes out whenever a file has two representations,
-  including on the response carrying the plain one. Without it a shared cache
-  stores whichever answer it saw first and hands it to everyone after.
-- **The two representations have different ETags.** An ETag names a
-  representation, not a file, so handing both the same one would let a cache
-  answer a client that can't read gzip with the gzipped copy — the tag matched,
-  after all.
-- **`gzip;q=0` means no.** It contains the word `gzip` and means the opposite,
-  which is how a client that can't decompress says so.
+- **`Vary: Accept-Encoding`** goes out whenever a file has two versions, including on the response carrying the plain one. Without it a shared cache stores whichever answer it saw first and hands it to everyone after.
+- **The two versions have different ETags.** An ETag names a representation, not a file. If both had the same one, a cache could answer a client that can't read gzip with the gzipped copy, because the tag matched.
+- **`gzip;q=0` means no.** It contains the word `gzip` and means the opposite: it is how a client that can't decompress says so.
 
 ## Range requests
 
-A video being scrubbed and a download being resumed both ask for a range, and
-both get one:
+**A request for a byte range gets that range**, which is what a video being scrubbed and a download being resumed both ask for:
 
 ```
 $ curl -i -r 0-20 localhost:8787/video.mp4
@@ -142,76 +96,33 @@ Accept-Ranges: bytes
 Content-Range: bytes 0-20/739
 ```
 
-`bytes=3-7`, `bytes=20-` and `bytes=-30` all work, and `Accept-Ranges: bytes`
-goes out on every file response so a client knows it may ask.
+`bytes=3-7`, `bytes=20-` and `bytes=-30` all work, and `Accept-Ranges: bytes` goes out on every file response so a client knows it may ask.
 
-The rule for everything else is that **a `Range` that can't be understood is
-ignored and the whole file goes out**
-([ADR 020](../adr/020-a-range-is-a-slice-and-two-headers.md)). That is a
-correct answer to every request, so `bytes=abc-def` or `bytes=99-10` gets a 200
-rather than an error. The one case worth refusing is a range starting past the
-end of the file: that's a client with the wrong idea about the size, and a `416`
-with `Content-Range: bytes */739` is the only way to say so.
+For everything else, **a `Range` that can't be understood is ignored and the whole file goes out** ([ADR 020](../adr/020-a-range-is-a-slice-and-two-headers.md)). That is a correct answer to every request, so `bytes=abc-def` or `bytes=99-10` gets a 200, not an error. The one case that is refused is a range starting past the end of the file: the client has the wrong idea about the size, and a `416` with `Content-Range: bytes */739` is the only way to say so.
 
-`If-Range` is honoured against the ETag, which is the one that matters for
-correctness: resuming a download of a file that has since changed would staple
-two halves of two different files together, so a stale ETag gets the whole file
-instead.
+`If-Range` is checked against the ETag, which is what matters for correctness: resuming a download of a file that has changed since would join two halves of two different files, so a stale ETag gets the whole file instead.
 
-The comparison is **strong**, which is stricter than the one `If-None-Match`
-gets: a tag wrapped in `W/` and a bare `*` both get the whole file rather than a
-range. A weak validator promises the representation is equivalent, not that it is
-the same bytes, and the same bytes is exactly what a client stapling this onto a
-prefix it already holds needs
-([ADR 073](../adr/073-a-header-is-answered-as-asked-or-refused.md)).
+The comparison is **strong**, which is stricter than the one `If-None-Match` uses: a tag wrapped in `W/` and a bare `*` both get the whole file, not a range. A weak validator promises the content is equivalent, not that it is the same bytes, and the same bytes is exactly what a client needs when it appends this range to a part it already has ([ADR 073](../adr/073-a-header-is-answered-as-asked-or-refused.md)).
 
-A request that asks for a range gets the **uncompressed** file, whatever it said
-about `Accept-Encoding`. A range is an offset into a representation, and the
-gzipped copy has different offsets — so answering one from the other would hand
-back the wrong bytes without saying so.
+A request for a range gets the **uncompressed** file, whatever it said in `Accept-Encoding`. A range is an offset into one version of the file, and the gzipped copy has different offsets, so answering one from the other would return the wrong bytes without saying so.
 
-A request for several ranges at once is legal and wants a `multipart/byteranges`
-body nilo doesn't assemble — so it gets the whole file too. Nothing sends them.
+A request for several ranges at once is legal, but needs a `multipart/byteranges` body that nilo doesn't build, so it gets the whole file too. Nothing sends them in practice.
 
-## Files too big to hold
+## Large files served from disk
 
-A file over `max_file_bytes` is left where it is. It keeps its place in the list
-with its size, its modification time and the path the directory walk produced,
-and the request that asks for it opens the file and sends it from the disk
-([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)). A
-directory with a video in it serves rather than failing to load.
+**A file over `max_file_bytes` stays on disk and is opened by the request that asks for it.** It keeps its place in the list with its size, its modification time and the path the directory walk found ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)). So a directory with a video in it still loads and serves.
 
-Below the line nothing has changed: read at load, hashed, gzipped if it is worth
-it, answered from a slice. Three things change above it.
+Below the limit nothing changes: the file is read at load, hashed, gzipped if worth it, and answered from memory. Above it, three things change:
 
-- **There is no gzipped copy, and there never will be.** Compression happens
-  once, while the App is being built, and a file that is never read has no
-  "once" to be compressed in. A file that size is a video, an archive or an
-  installer, and all three are compressed already.
-- **The ETag is the modification time and the size**, `"<mtime>-<size>"` in hex,
-  rather than a hash of the contents. It is strong, and it is what nginx has
-  served by default for twenty years. Hashing would mean reading the whole file
-  at startup, and the weak tag that is the other alternative would make
-  `If-Range` unusable for exactly the large downloads that get resumed. Both
-  numbers come from one look at the descriptor whose bytes are about to go out,
-  so a file that changed on disk cannot be sent with a length and a tag that
-  describe different versions of it
-  ([ADR 098](../adr/098-a-file-is-described-by-the-descriptor-being-sent.md)).
-- **One file descriptor is held for as long as the response takes.** One per
-  request in flight, which `max_connections` already bounds — the number an
-  operator was already multiplying.
+- **There is no gzipped copy.** Compression happens once, while the App is being built, and a file that is never read then cannot be compressed then. A file that size is usually a video, an archive or an installer, and all three are compressed already.
+- **The ETag is the modification time and the size**, `"<mtime>-<size>"` in hex, instead of a hash of the contents. It is strong, and it is what nginx has sent by default for twenty years. Hashing would mean reading the whole file at startup, and a weak tag would make `If-Range` unusable for exactly the large downloads that get resumed. Both numbers come from one look at the file descriptor whose bytes are about to be sent, so a file that changed on disk cannot go out with a length and a tag from different versions of it ([ADR 098](../adr/098-a-file-is-described-by-the-descriptor-being-sent.md)).
+- **One file descriptor is held while the response is sent**: one per request in flight, which `max_connections` already bounds.
 
-Two things do not change, and they are the pair that holding everything in
-memory bought. Path traversal is still not possible: the name handed to the
-kernel is the one the walk wrote down before the socket opened, never one a
-request carried. And the memory is still a number — a file over the line holds
-no bytes at all, so `max_total_bytes` counts what is held and nothing else.
+Two things do not change, and they are the two benefits of holding everything in memory. Path traversal is still impossible: the name handed to the kernel is the one the directory walk recorded before the socket opened, never one from a request. And memory is still bounded: a file over the limit holds no bytes at all, so `max_total_bytes` counts only what is held.
 
-Ranges, `If-Range`, `If-None-Match` and `HEAD` are answered exactly as they are
-for a file in memory, by the same code rather than by a second copy of it.
+Ranges, `If-Range`, `If-None-Match` and `HEAD` are answered exactly as for a file in memory, by the same code.
 
-The startup line counts the spilled files separately from the bytes, because
-they are not in that number:
+The startup line counts the files served from disk separately, because their bytes are not in the total:
 
 ```
 nilo: loaded 12 static file(s) (48211 bytes held, 9022 of them gzipped copies)
@@ -219,10 +130,9 @@ nilo: loaded 12 static file(s) (48211 bytes held, 9022 of them gzipped copies)
        request rather than held
 ```
 
-A handler can answer with a file the same way — see
-[Responses](./responses.md#files).
+A handler can answer with a file the same way; see [Responses](./responses.md#files).
 
-## Files the binary carries
+## Embedded files
 
 ```zig
 try app.embeddedWith("/", &.{
@@ -232,75 +142,33 @@ try app.embeddedWith("/", &.{
 }, .{ .spa_fallback = "index.html" });
 ```
 
-A product that is one binary has no `dist/` on the machine it runs on. `embedded`
-is `static` with the read taken out
-([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)):
-the bytes come from `@embedFile` rather than from a disk, and everything after
-that is the same code — the sorted list, an ETag per file, a gzipped copy made
-once for the files worth it, the fallback, and nothing per request. What a
-request sees is indistinguishable from a directory that was read at startup.
+**`app.embedded` serves files compiled into the binary**, for a product that ships as one binary with no `dist/` on the machine it runs on. It is `static` without the disk read ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)): the bytes come from `@embedFile`, and everything after that is the same code (the sorted list, an ETag per file, a gzipped copy made once for the files worth it, the fallback, and nothing per request). A request cannot tell it apart from a directory read at startup.
 
-`@embedFile` is yours to write, because its path is relative to the file it is
-written in and nilo cannot name your `dist/`. The list is the whole of it; a
-build step that walks a directory into one is an ordinary `build.zig` step, and
-is yours until two projects have written the same one.
+You write the `@embedFile` calls, because the path is relative to the file it is written in and nilo cannot know where your `dist/` is. The list is all it needs. A build step that turns a directory into such a list is an ordinary `build.zig` step, and stays yours until two projects have written the same one.
 
-The options are `static`'s less every one that is about a disk: `index`,
-`cache_control`, `spa_fallback`, `spa_fallback_for`, `compress` and
-`compress_min_bytes`, with the same defaults. There is no `max_file_bytes`,
-because nothing here can spill; no `max_total_bytes`, because the bytes are
-mapped whether or not a Set names them and counting them would be counting
-memory that is not spent twice; no `dotfiles`, because every name was written
-by you; and no `reload`, because there is no disk.
+The options are `static`'s minus every one that is about a disk: `index`, `cache_control`, `spa_fallback`, `spa_fallback_for`, `compress` and `compress_min_bytes`, with the same defaults. There is no `max_file_bytes`, because nothing here can be served from disk; no `max_total_bytes`, because the bytes are part of the binary whether or not they are served, so counting them would count memory that is not spent twice; no `dotfiles`, because you wrote every name; and no `reload`, because there is no disk.
 
-Two mistakes a directory cannot make are refused at startup, in one line: a path
-listed twice — a list can do what a directory cannot, and the second entry would
-be unreachable forever — and a `spa_fallback` that names no entry. There is no
-`tryEmbedded`: the list that failed was fixed when the program was compiled, so
-there is nothing for a program to do about it at run time but stop.
+Two mistakes a directory cannot make are refused at startup, in one line: a path listed twice (the second entry could never be reached) and a `spa_fallback` that names no entry. There is no `tryEmbedded`: the list was fixed when the program was compiled, so there is nothing the program can do about it at run time but stop.
 
-What it costs is what a held file costs, less the bytes: the URL, two ETags and
-the gzipped copy are allocated once at startup, and the file itself is the
-binary's. The log line says both numbers.
+It costs what a held file costs, minus the bytes: the URL, two ETags and the gzipped copy are allocated once at startup, and the file itself is part of the binary. The log line gives both numbers.
 
-## While you are working on it
+## Reloading files during development
 
-`staticWith(.{ .reload = true })` holds nothing: every file is left on disk and
-opened per request, so editing one under a running server works.
+**`staticWith(.{ .reload = true })` holds nothing in memory**: every file stays on disk and is opened per request, so you can edit files under a running server.
 
-It is `max_file_bytes = 0` with a name — every file takes the path above, and
-there is no fiber watching anything and no swap of a set under live readers.
-What you give up is what holding buys: the in-memory copy, the gzipped one, and
-one open and one stat per request. It says so in the log once at startup, so a
-release binary that was built with it on is not silent about it.
+It is `max_file_bytes = 0` under another name: every file takes the from-disk path above. No fiber watches anything, and nothing is swapped under live readers. You give up what holding the files buys: the in-memory copy, the gzipped copy, and one open and one stat per request. It says so in the log once at startup, so a release binary built with it on does not hide it.
 
-**A file that did not exist at startup still needs a restart.** The list of
-names comes from the directory walk, and resolving a request-carried string
-into a filename is the traversal the design refuses.
+**A file that did not exist at startup still needs a restart.** The list of names comes from the directory walk, and turning a string from a request into a filename is exactly the path traversal the design rules out.
 
-**A bundler that renames its output is the case that bites.** Vite, esbuild
-and the rest write `app-3f9a1c.js` and a fresh `index.html` pointing at it on
-every build, so with `.reload` on, the edited `index.html` is served and the
-script it names is a 404, because that name was not there when the server
-started. Two ways out, and neither is a rescan on a miss, which would let a
-request-carried string decide when the disk is walked
-([decided](../decided.md#nilo_http-1)):
+**A bundler that renames its output is where this goes wrong.** Vite, esbuild and the rest write `app-3f9a1c.js` and a fresh `index.html` pointing at it on every build. With `.reload` on, the edited `index.html` is served and the script it names is a 404, because that name did not exist when the server started. There are two ways around it. Neither is rescanning the directory on a miss, which would let a string from a request decide when the disk is walked ([decided](../decided.md#nilo_http-1)):
 
-- **While developing, serve the frontend from the bundler's own dev server**
-  and proxy `/api` to nilo. Every bundler has the proxy option, hot reload
-  comes with it, and nilo never sees a hashed name until the build is real.
-- **Or restart nilo yourself after each bundle.** `zig build dev` will not do it: it restarts on the binary changing and watches nothing else ([Getting started](./getting-started.md#what-a-save-has-to-touch)), and a bundle landing in `public/` leaves the binary alone.
+- **While developing, serve the frontend from the bundler's own dev server** and proxy `/api` to nilo. Every bundler has the proxy option, hot reload comes with it, and nilo never sees a hashed name until the build is real.
+- **Or restart nilo yourself after each bundle.** `zig build dev` will not do it: it restarts when the binary changes and watches nothing else ([Getting started](./getting-started.md#what-triggers-a-restart)), and a bundle landing in `public/` leaves the binary alone.
 
-A production build is written once and the server starts after it, so the
-names are all there and nothing above applies.
+A production build is written once and the server starts after it, so all the names are there and none of this applies.
 
 ## The limits
 
-The set of *names* is fixed at startup. Without `.reload`, so are the bytes:
-changing a file means restarting the process, which is what a deploy does
-anyway. An embedded tree is the same, one step further: changing a file means
-rebuilding the binary.
+**The set of file names is fixed at startup.** Without `.reload`, so are the bytes: changing a file means restarting the process, which a deploy does anyway. An embedded tree goes one step further: changing a file means rebuilding the binary.
 
-Static files are not middleware: the set holds state, so it is a terminal handler
-that the middleware chain wraps like any other. Your logger sees them, and CORS
-applies to them.
+Static files are not middleware. The file set holds state, so it is a final handler that the middleware chain wraps like any other route. Your logger sees static requests, and CORS applies to them.

@@ -34,6 +34,8 @@ const std = @import("std");
 const row_mod = @import("row.zig");
 const table_mod = @import("table.zig");
 const wire_mod = @import("wire.zig");
+const rawcheck = @import("rawcheck.zig");
+const types_mod = @import("types.zig");
 
 pub const Mismatch = enum {
     /// There is no table of that name at all, so none of the columns below
@@ -157,8 +159,22 @@ pub fn expectationsOf(comptime D: type, comptime Row: type) []const Expectation 
             };
             n += 1;
         }
+        // The columns its `.unread` declares are the table's too, and a
+        // boot check that skipped them would let one be dropped under a
+        // `.where` that names it (item 102).
         const frozen = out[0..n].*;
-        break :blk &frozen;
+        var all: []const Expectation = &frozen;
+        for (row_mod.unreadOf(Row)) |u| {
+            const accepts: []const []const u8 = D.accepts(u.T) orelse
+                (if (builds and table_mod.enumValues(u.T).len > 0) D.text_accepts else &.{});
+            all = all ++ &[_]Expectation{.{
+                .column = u.name,
+                .accepts = accepts,
+                .expected = list(accepts),
+                .optional = @typeInfo(u.T) == .optional,
+            }};
+        }
+        break :blk all;
     };
 }
 
@@ -334,6 +350,132 @@ fn findColumn(actual: []const wire_mod.Column, name: []const u8) ?wire_mod.Colum
         if (std.mem.eql(u8, c.name, name)) return c;
     }
     return null;
+}
+
+// -- a raw statement against its Row --------------------------------------
+//
+// The same comparison for a statement this module did not write, made the
+// first time it runs rather than at startup, because a raw statement's
+// columns are the statement's and not a table's: nothing can be asked about
+// them until there is a statement to ask about
+// ([ADR 233](../docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
+
+/// One column a raw statement fills, as the first-run check holds it.
+pub const Reading = struct {
+    /// The field the column fills, or the type's name for a scalar read.
+    field: []const u8,
+    /// The column types it reads out of, from `Dialect.reads`. Empty is a
+    /// field the Dialect will not judge.
+    reads: []const []const u8,
+    expected: []const u8,
+    /// Whether the field reads text, so that a column the database sends as
+    /// a string fits it whatever its type is called (`wire.Described.textual`).
+    text: bool,
+    optional: bool,
+};
+
+/// What `Row` expects of the columns of a raw statement, in order. `scalar`
+/// is a read into one value rather than a Row (ADR 125), and `total` is the
+/// `count(*) OVER ()` a `rawPage` reads after the Row's last field (ADR 205).
+pub fn readingsOf(
+    comptime D: type,
+    comptime Row: type,
+    comptime scalar: bool,
+    comptime total: bool,
+) []const Reading {
+    return comptime blk: {
+        var out: []const Reading = &.{};
+        if (scalar) {
+            out = out ++ [_]Reading{reading(D, @typeName(Row), Row)};
+        } else {
+            for (rawcheck.columnFields(Row)) |f| out = out ++ [_]Reading{reading(D, f.name, f.type)};
+        }
+        if (total) out = out ++ [_]Reading{reading(D, "the total", i64)};
+        break :blk out;
+    };
+}
+
+fn reading(comptime D: type, comptime field: []const u8, comptime F: type) Reading {
+    const reads: []const []const u8 = D.reads(F) orelse &.{};
+    var text = types_mod.jsonPayload(switch (@typeInfo(F)) {
+        .optional => |o| o.child,
+        else => F,
+    }) != null;
+    for (reads) |name| {
+        if (std.mem.eql(u8, name, D.text_accepts[0])) text = true;
+    }
+    return .{
+        .field = field,
+        .reads = reads,
+        .expected = list(reads),
+        .text = text,
+        .optional = @typeInfo(F) == .optional,
+    };
+}
+
+/// What `fit` found wrong with one column.
+pub const Misfit = struct {
+    /// Counted from one, as the `SELECT` list is read.
+    column: usize,
+    field: []const u8,
+    kind: enum { wrong_type, outer_null },
+    expected: []const u8,
+    found: []const u8,
+
+    pub fn write(self: Misfit, w: *std.Io.Writer) !void {
+        switch (self.kind) {
+            .wrong_type => try w.print(
+                "  column {d} fills `{s}`, which reads {s}, and the statement answers {s} there. " ++
+                    "Cast the column in the statement, or change the field's type.\n",
+                .{ self.column, self.field, self.expected, self.found },
+            ),
+            .outer_null => try w.print(
+                "  column {d} fills `{s}`, which is not optional, and comes from the side of an " ++
+                    "outer join that may find nothing, where it is NULL. Make the field optional, " ++
+                    "or `coalesce` the column.\n",
+                .{ self.column, self.field },
+            ),
+        }
+    }
+};
+
+/// Hold what `describe` said against the readings, appending what does not
+/// fit. A column the database did not describe, and one past the end of
+/// either list, is not judged: the width is `fill`'s check (ADR 106).
+pub fn fit(
+    readings: []const Reading,
+    described: []const wire_mod.Described,
+    out: *std.ArrayList(Misfit),
+    gpa: std.mem.Allocator,
+) !void {
+    const n = @min(readings.len, described.len);
+    for (readings[0..n], described[0..n], 1..) |want, got, at| {
+        if (got.udt) |udt| {
+            if (!fits(want, udt, got.textual)) try out.append(gpa, .{
+                .column = at,
+                .field = want.field,
+                .kind = .wrong_type,
+                .expected = want.expected,
+                .found = udt,
+            });
+        }
+        if (got.outer_null and !want.optional) try out.append(gpa, .{
+            .column = at,
+            .field = want.field,
+            .kind = .outer_null,
+            .expected = want.expected,
+            .found = got.udt orelse "",
+        });
+    }
+}
+
+fn fits(want: Reading, udt: []const u8, textual: bool) bool {
+    if (want.reads.len == 0) return true;
+    if (want.text and textual) return true;
+    for (want.reads) |name| {
+        if (std.mem.eql(u8, name, udt)) return true;
+    }
+    return false;
 }
 
 fn list(comptime names: []const []const u8) []const u8 {
@@ -591,4 +733,60 @@ test "only an enum that named its type is held against the database" {
     try testing.expectEqualStrings("named", cols[0].column);
     try testing.expectEqualStrings("maybe", cols[1].column);
     try testing.expectEqualStrings("t", cols[1].type_name);
+}
+
+test "a raw column is held to the read the driver makes, not to the table's looser list" {
+    const Line = struct {
+        pub const nilo_table = .projection;
+        id: i32,
+        title: []const u8,
+        doc: types.Json(struct { a: i64 }),
+        note: ?[]const u8,
+    };
+    const readings = comptime readingsOf(Pg, Line, false, true);
+    try testing.expectEqual(@as(usize, 5), readings.len);
+    try testing.expectEqualStrings("the total", readings[4].field);
+
+    var out: std.ArrayList(Misfit) = .empty;
+    defer out.deinit(testing.allocator);
+    try fit(readings, &.{
+        // `count(*)`, which `accepts` lets an `i32` column stand over.
+        .{ .udt = "int8" },
+        // An enum's label, which a text field reads whatever its name is.
+        .{ .udt = "deal_state", .textual = true },
+        // A document cast to text, which `Json` parses the same.
+        .{ .udt = "text", .textual = true },
+        // A NULL the join may leave, into an optional.
+        .{ .udt = "text", .textual = true, .outer_null = true },
+        .{ .udt = "int8" },
+    }, &out, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(@as(usize, 1), out.items[0].column);
+    try testing.expectEqualStrings("int4", out.items[0].expected);
+    try testing.expectEqualStrings("int8", out.items[0].found);
+}
+
+test "a raw column nobody described, or past the Row's end, is not judged" {
+    const One = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+    };
+    var out: std.ArrayList(Misfit) = .empty;
+    defer out.deinit(testing.allocator);
+    try fit(comptime readingsOf(Pg, One, false, false), &.{
+        .{ .udt = null, .outer_null = false },
+        .{ .udt = "uuid", .outer_null = true },
+    }, &out, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+
+    // A scalar read is one column named after its type.
+    const scalar = comptime readingsOf(Pg, i64, true, false);
+    try testing.expectEqualStrings("i64", scalar[0].field);
+    try fit(scalar, &.{.{ .udt = "numeric" }}, &out, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+
+    var said: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer said.deinit();
+    try out.items[0].write(&said.writer);
+    try testing.expect(std.mem.indexOf(u8, said.written(), "reads int8, and the statement answers numeric") != null);
 }

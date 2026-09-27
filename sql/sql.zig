@@ -585,6 +585,9 @@ test {
     _ = schema;
     _ = types;
     _ = postgres;
+    // What `postgres.zig` reads a plan with, and it is tested on plans a
+    // server answered rather than through one (ADR 233).
+    _ = @import("plan.zig");
     _ = sqlite;
     _ = db;
     _ = ddl;

@@ -458,6 +458,53 @@ pub fn find(comptime D: type, comptime Row: type, comptime K: type) Statement {
     };
 }
 
+/// Whether `Row` reads every column of its table's key. False only for a
+/// narrower Row that leaves the key out, which `db.find` then reads through
+/// `one` with the key in `.where`, the way a condition on a column the Row
+/// does not carry already works (ADR 218, item 103).
+///
+/// **Found through `one` rather than refused**, because `one(.where = .{ .id
+/// = id })` answered the same row and compiled: a Row carrying only a parent,
+/// `struct { work_item: Board }`, is the ordinary shape of a page about one
+/// row, and `find` was the stricter of two ways to say the same thing.
+pub fn carriesKey(comptime Row: type) bool {
+    return comptime blk: {
+        const Owner = row_mod.ownerOf(Row);
+        if (Owner == Row) break :blk true;
+        for (row_mod.keysOf(Owner)) |key| {
+            if (!row_mod.hasColumn(Row, key)) break :blk false;
+        }
+        break :blk true;
+    };
+}
+
+/// The options `one` takes for a key handed to `find`: `.{ .where = .{ .id =
+/// key } }` for a key of one column, and the caller's own struct as the
+/// `.where` for a key of several, held to the same rules `find` holds it to.
+pub fn KeyWhere(comptime Row: type, comptime K: type) type {
+    comptime {
+        const Owner = row_mod.ownerOf(Row);
+        const keys = row_mod.keysOf(Owner);
+        if (keys.len > 1) {
+            assertCompositeKey(Owner, keys, K);
+            return struct { where: K };
+        }
+        assertKeyValue(Owner, keys[0], K);
+        const names = [_][]const u8{keys[0]};
+        // A literal `7` has no run-time type to hold, so it takes the key's.
+        const kinds = [_]type{if (K == comptime_int or K == comptime_float) row_mod.ColumnType(Owner, keys[0]) else K};
+        return struct { where: @Struct(.auto, null, &names, &kinds, &@splat(.{})) };
+    }
+}
+
+pub fn keyWhere(comptime Row: type, key: anytype) KeyWhere(Row, @TypeOf(key)) {
+    const keys = comptime row_mod.keysOf(row_mod.ownerOf(Row));
+    if (comptime keys.len > 1) return .{ .where = key };
+    var out: KeyWhere(Row, @TypeOf(key)) = undefined;
+    @field(out.where, keys[0]) = key;
+    return out;
+}
+
 /// The same statement for a Row identified by several columns, where the
 /// caller hands over a struct naming each of them.
 ///
@@ -1451,9 +1498,10 @@ fn setOperator(
     }
 }
 
-/// Whether a `.set` field is `.now`: the column takes the moment the
-/// statement runs, written by the database as `D.now_default`, the same
-/// expression `.default = .{ .x = .now }` puts in the schema.
+/// The expression a `.set` field of `.now` or `.today` writes: the moment the
+/// statement runs, or the day, written by the database (`where.clockWord`).
+/// `.now` is `D.now_default`, the same expression `.default = .{ .x = .now }`
+/// puts in the schema, and `.today` is `CURRENT_DATE`.
 ///
 /// **The database's clock rather than the server's**, because a row stamped
 /// by two servers whose clocks disagree sorts in an order neither wrote. On
@@ -1463,24 +1511,12 @@ fn setOperator(
 ///
 /// A column whose own type is an enum with a `now` in it is that enum's
 /// value, which is what `.now` meant there before this word existed.
-fn setsNow(comptime Row: type, comptime f: std.builtin.Type.StructField) bool {
+fn setsClock(comptime D: type, comptime Row: type, comptime f: std.builtin.Type.StructField) ?[]const u8 {
     comptime {
-        if (f.type != @TypeOf(.enum_literal)) return false;
-        const ptr = f.default_value_ptr orelse return false;
+        if (f.type != @TypeOf(.enum_literal)) return null;
+        const ptr = f.default_value_ptr orelse return null;
         const word = @as(*const f.type, @ptrCast(@alignCast(ptr))).*;
-        if (!std.mem.eql(u8, @tagName(word), "now")) return false;
-        const F = row_mod.ColumnType(Row, f.name);
-        const C = switch (@typeInfo(F)) {
-            .optional => |o| o.child,
-            else => F,
-        };
-        if (C == types_mod.Timestamp) return true;
-        if (@typeInfo(C) == .@"enum") return false;
-        @compileError(
-            "nilo: `.set = .{ ." ++ f.name ++ " = .now }` on " ++ @typeName(Row) ++
-                ", whose `" ++ f.name ++ "` is " ++ @typeName(F) ++ ".\n" ++
-                "  `.now` is the moment the statement runs, so it goes in a `sql.Timestamp`.",
-        );
+        return where_mod.clockWord(D, Row, f.name, word, "`.set = .{ ." ++ f.name ++ " = ." ++ @tagName(word) ++ " }`");
     }
 }
 
@@ -1693,8 +1729,8 @@ fn updating(
             );
             // The moment the statement runs, written by the database: no
             // parameter, so nothing to bind and no clock read on this side.
-            if (setsNow(Row, f)) {
-                sql = sql ++ quoted ++ " = " ++ D.now_default;
+            if (setsClock(D, Row, f)) |clock| {
+                sql = sql ++ quoted ++ " = " ++ clock;
                 continue;
             }
             // Arithmetic on the column's own value, or a new value for it.
@@ -1810,7 +1846,9 @@ fn orderBy(comptime D: type, comptime Row: type, comptime T: type) []const u8 {
 
         var out: []const u8 = " ORDER BY ";
         for (info.fields, 0..) |f, i| {
-            if (!row_mod.hasColumn(Row, f.name)) {
+            // A narrower Row may order by a column of its table it does not
+            // carry: a tiebreak the response has no reason to show.
+            if (!row_mod.hasColumn(Row, f.name) and !row_mod.tableHasColumn(Row, f.name)) {
                 row_mod.noSuchColumn(Row, f.name, "`.order`");
             }
             if (f.type != Direction and f.type != @TypeOf(.enum_literal)) @compileError(
@@ -2067,6 +2105,93 @@ test "several order terms keep the order they were written in" {
         sqlOf(.{ .order = .{ .created_at = .desc, .id = .asc } }),
         "ORDER BY \"created_at\" DESC, \"id\" ASC",
     ));
+}
+
+/// A table whose Row is also the response and leaves its timestamps out of
+/// it, declaring them unread (item 102).
+const Deal = struct {
+    pub const nilo_table = .{
+        .name = "deals",
+        .default = .{ .created_at = .now, .updated_at = .now },
+        .index = .{.{ .columns = .{.created_at} }},
+        .unread = .{ .created_at = types_mod.Timestamp, .updated_at = types_mod.Timestamp },
+    };
+    id: i64,
+    title: []const u8,
+};
+
+const DealTitle = struct {
+    pub const nilo_table = Deal;
+    title: []const u8,
+};
+
+test "an unread column is ordered, narrowed and stamped by, and never read" {
+    // Item 102: `sales.deal.succeeding` orders by `created_at`, which the
+    // Deal response leaves out on purpose.
+    const pg = comptime select(Pg, Deal, @TypeOf(.{
+        .where = .{ .created_at = .{ .gt = .{ .now = .{ .days = -90 } } } },
+        .order = .{ .created_at = .asc },
+    }));
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"title\" FROM \"deals\" WHERE \"created_at\" > (now() - interval '90 days') " ++
+            "ORDER BY \"created_at\" ASC",
+        pg.sql,
+    );
+    // Through a Row that borrows the table, and bound as the declared type.
+    const narrow = comptime select(Pg, DealTitle, @TypeOf(.{
+        .where = .{ .updated_at = .{ .lt = types_mod.Timestamp{ .micros = 0 } } },
+        .order = .{ .created_at = .desc },
+    }));
+    try testing.expectEqualStrings(
+        "SELECT \"title\" FROM \"deals\" WHERE \"updated_at\" < $1 ORDER BY \"created_at\" DESC",
+        narrow.sql,
+    );
+    try testing.expect(narrow.params[0].of.? == Deal);
+    try testing.expect(row_mod.ColumnType(Deal, "updated_at") == types_mod.Timestamp);
+    // And written by a `.set`, which is how `updated_at` is stamped.
+    try testing.expectEqualStrings(
+        "UPDATE \"deals\" SET \"title\" = $1, \"updated_at\" = now() WHERE \"id\" = $2",
+        (comptime update(Pg, Deal, @TypeOf(.{ .set = .{ .title = "x", .updated_at = .now }, .where = .{ .id = @as(i64, 1) } }))).sql,
+    );
+    // The table has them, with the defaults the insert relies on.
+    const desc = comptime table_mod.descOf(Pg, Deal);
+    try testing.expectEqual(@as(usize, 4), desc.columns.len);
+    try testing.expectEqualStrings("now()", desc.column("created_at").?.default.?);
+    try testing.expectEqual(@as(usize, 1), desc.indexes.len);
+    const required = comptime table_mod.requiredOf(Deal);
+    try testing.expectEqual(@as(usize, 1), required.len);
+    try testing.expectEqualStrings("title", required[0]);
+}
+
+test "a narrower Row orders by a column of its table it does not carry" {
+    // Item 86: a checklist ordered by `position` with `created_at` as the
+    // tiebreak, where the response carries neither the timestamp nor any
+    // reason to.
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"email\" FROM \"users\" ORDER BY \"age\" ASC, \"created_at\" ASC",
+        comptime select(Pg, UserCard, @TypeOf(.{ .order = .{ .age = .asc, .created_at = .asc } })).sql,
+    );
+}
+
+test "a narrower Row is narrowed by a column of its table it does not carry" {
+    // Item 96, the other half of item 86: staff creation finds a person by
+    // email through a Row that has no reason to carry it. The value binds as
+    // the table's column, since the Row has no field to take a type from.
+    const stmt = comptime select(Pg, UserCard, @TypeOf(.{
+        .where = .{ .age = .{ .gte = @as(i32, 18) }, .any = .{ .{ .created_at = @as(i64, 0) }, .{ .id = @as(i64, 7) } } },
+    }));
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"email\" FROM \"users\" WHERE \"age\" >= $1 AND (\"created_at\" = $2 OR \"id\" = $3)",
+        stmt.sql,
+    );
+    try testing.expect(stmt.params[0].of.? == User);
+    try testing.expect(stmt.params[1].of.? == User);
+    try testing.expectEqual(@as(?type, null), stmt.params[2].of);
+    // The same for the statements that only take a condition.
+    try testing.expectEqualStrings(
+        "SELECT count(*) FROM \"users\" WHERE \"age\" = $1",
+        (comptime count(Pg, UserCard, @TypeOf(.{ .where = .{ .age = @as(i32, 30) } }))).sql,
+    );
 }
 
 test "an order term can say where NULLs go, which is the half neither database agrees on" {
@@ -2737,6 +2862,128 @@ test "a set of .now is the database's clock, and binds nothing" {
         "UPDATE \"rab_lines\" SET \"kind\" = ?1, \"updated_at\" = " ++ Lite.now_default ++
             " WHERE \"id\" = ?2",
         comptime update(Lite, RabLine, @TypeOf(o)).sql,
+    );
+}
+
+test "a set of .today is the database's date, and a condition may compare with it" {
+    // Item 91: a card moved to *in progress* gets today as its start date,
+    // unless one on or before today is already there — one statement, and
+    // nothing bound for either clock.
+    const Card = struct {
+        pub const nilo_table = .{ .name = "work_items", .key = .id };
+        id: i64,
+        start_date: ?types_mod.Date,
+        seen_at: types_mod.Timestamp,
+    };
+    const o = .{
+        .set = .{ .start_date = .today },
+        .where = .{
+            .id = @as(i64, 7),
+            .any = .{ .{ .start_date = null }, .{ .start_date = .{ .gt = .today } } },
+        },
+    };
+    const pg = comptime update(Pg, Card, @TypeOf(o));
+    try testing.expectEqualStrings(
+        "UPDATE \"work_items\" SET \"start_date\" = CURRENT_DATE WHERE \"id\" = $1 AND " ++
+            "(\"start_date\" IS NULL OR \"start_date\" > CURRENT_DATE)",
+        pg.sql,
+    );
+    try testing.expectEqual(@as(usize, 1), pg.paramCount());
+
+    // `.now` compares the same way, as the expression `.set` writes.
+    const stale = comptime update(Lite, Card, @TypeOf(.{
+        .set = .{ .seen_at = .now },
+        .where = .{ .seen_at = .{ .lt = .now }, .start_date = .today },
+    }));
+    try testing.expectEqualStrings(
+        "UPDATE \"work_items\" SET \"seen_at\" = " ++ Lite.now_default ++ " WHERE \"seen_at\" < " ++
+            Lite.now_default ++ " AND \"start_date\" = CURRENT_DATE",
+        stale.sql,
+    );
+    try testing.expectEqual(@as(usize, 0), stale.paramCount());
+}
+
+test "a column read as text takes the clock its column type names" {
+    // Item 99: dates that cross an API as `yyyy-MM-dd` are
+    // `sql.AsText("date")`, and the database writes the value either way.
+    const Card = struct {
+        pub const nilo_table = .{ .name = "work_items", .key = .id };
+        id: i64,
+        start_date: ?types_mod.AsText("date"),
+        seen_at: types_mod.AsText("timestamptz"),
+    };
+    const o = .{
+        .set = .{ .start_date = .today, .seen_at = .now },
+        .where = .{ .id = @as(i64, 7), .start_date = .{ .lt = .today }, .seen_at = .{ .lte = .now } },
+    };
+    try testing.expectEqualStrings(
+        "UPDATE \"work_items\" SET \"start_date\" = CURRENT_DATE, \"seen_at\" = now() WHERE \"id\" = $1 AND " ++
+            "\"start_date\" < CURRENT_DATE AND \"seen_at\" <= now()",
+        (comptime update(Pg, Card, @TypeOf(o))).sql,
+    );
+    // On SQLite `.now` in a text column is text, not the microseconds a
+    // `Timestamp` column holds.
+    try testing.expectEqualStrings(
+        "UPDATE \"work_items\" SET \"start_date\" = CURRENT_DATE, \"seen_at\" = " ++ Lite.now_text ++
+            " WHERE \"id\" = ?1 AND \"start_date\" < CURRENT_DATE AND \"seen_at\" <= " ++ Lite.now_text,
+        (comptime update(Lite, Card, @TypeOf(o))).sql,
+    );
+}
+
+test "a clock moved by an offset is written into the statement, and binds nothing" {
+    // Item 105: "closed in the last 90 days" is a day boundary in the
+    // database's zone, and "acted in the last 90 days" a moment.
+    const Card = struct {
+        pub const nilo_table = .{ .name = "work_items", .key = .id };
+        id: i64,
+        start_date: ?types_mod.Date,
+        seen_at: types_mod.Timestamp,
+    };
+    const o = .{
+        .set = .{ .seen_at = .now },
+        .where = .{
+            .id = @as(i64, 7),
+            .start_date = .{ .gte = .{ .today = -90 }, .lt = .{ .today = 0 } },
+            .seen_at = .{ .gt = .{ .now = .{ .days = -90 } } },
+        },
+    };
+    const pg = comptime update(Pg, Card, @TypeOf(o));
+    try testing.expectEqualStrings(
+        "UPDATE \"work_items\" SET \"seen_at\" = now() WHERE \"id\" = $1 AND " ++
+            "\"start_date\" >= (CURRENT_DATE - 90) AND \"start_date\" < CURRENT_DATE AND " ++
+            "\"seen_at\" > (now() - interval '90 days')",
+        pg.sql,
+    );
+    try testing.expectEqual(@as(usize, 1), pg.paramCount());
+    try testing.expectEqualStrings(
+        "UPDATE \"work_items\" SET \"seen_at\" = " ++ Lite.now_default ++ " WHERE \"id\" = ?1 AND " ++
+            "\"start_date\" >= date('now', '-90 days') AND \"start_date\" < CURRENT_DATE AND " ++
+            "\"seen_at\" > (CAST((julianday('now', '-90 days') - 2440587.5) * 86400000 AS INTEGER) * 1000)",
+        (comptime update(Lite, Card, @TypeOf(o))).sql,
+    );
+
+    // Forward as well as back, as a plain value, and on columns read as
+    // text, where SQLite's moment is RFC 3339.
+    const Text = struct {
+        pub const nilo_table = .{ .name = "work_items", .key = .id };
+        id: i64,
+        start_date: ?types_mod.AsText("date"),
+        seen_at: types_mod.AsText("timestamptz"),
+    };
+    const t = .{
+        .set = .{ .start_date = .today },
+        .where = .{ .start_date = .{ .today = 1 }, .seen_at = .{ .lte = .{ .now = .{ .minutes = 30 } } } },
+    };
+    try testing.expectEqualStrings(
+        "UPDATE \"work_items\" SET \"start_date\" = CURRENT_DATE WHERE " ++
+            "\"start_date\" = (CURRENT_DATE + 1) AND \"seen_at\" <= (now() + interval '30 minutes')",
+        (comptime update(Pg, Text, @TypeOf(t))).sql,
+    );
+    try testing.expectEqualStrings(
+        "UPDATE \"work_items\" SET \"start_date\" = CURRENT_DATE WHERE " ++
+            "\"start_date\" = date('now', '+1 days') AND " ++
+            "\"seen_at\" <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 minutes')",
+        (comptime update(Lite, Text, @TypeOf(t))).sql,
     );
 }
 

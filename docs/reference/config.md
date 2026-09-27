@@ -1,12 +1,12 @@
 # nilo_config
 
-One page of [the reference](./README.md): settings out of the environment.
+**`nilo_config` reads settings from the environment into a struct of your own, and names every bad setting at once before the server starts.**
+
+**Guide:** [Settings](../guide/config.md) · **Design:** [Layering](../design/layering.md) (config is one of its single-ADR topics)
 
 ## `nilo_config`
 
-Settings, read into a struct of your own before the socket opens
-([ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)).
-Nothing here allocates and nothing here does IO.
+Settings are read into a struct of your own before the socket opens ([ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)). Nothing here allocates and nothing here does IO.
 
 ```zig
 const config = @import("nilo_config");
@@ -32,45 +32,44 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-The field name upper-cased is the variable: `database_url` is read from
-`DATABASE_URL`. A field is text, a number, a `bool`, an enum, or any of those
-wrapped in `?`; anything else is a Refusal.
+The variable name is the field name in upper case: `database_url` is read from `DATABASE_URL`. A field may be text, a number, a `bool`, an enum, or any of those wrapped in `?`. Any other type is a Refusal.
+
+### `config.fromEnv` and `config.from`
 
 | | |
 |---|---|
-| `config.fromEnv(T, environ)` | `Read(T)` out of the process environment |
-| `config.from(T, source)` | out of anything with `get(name) ?[]const u8` |
+| `config.fromEnv(T, environ)` | `Read(T)` from the process environment |
+| `config.from(T, source)` | from anything with `get(name) ?[]const u8` |
 | `config.fromWith(T, .{ .prefix = "NILO_" }, source)` | the same, with a prefix on every name |
 
+### `Read(T)`
+
 | | |
 |---|---|
-| `r.value()` | `?T` — the Config, or null when any setting failed |
+| `r.value()` | `?T`: the settings, or null when any setting failed |
 | `r.report(w)` | every failure, one per line, into a `*std.Io.Writer`. Writes nothing when there are none |
 | `r.failed()`, `r.failedCount()` | |
-| `r.failures()` | an iterator of `Failure`, in the order the struct declares them |
-| `r.given("port")` | the text that arrived, converted or not. Field name checked while compiling |
-| `r.nameOf("port")` | `"PORT"`, prefix and all |
+| `r.failures()` | an iterator of `Failure`, in the order the struct declares the fields |
+| `r.given("port")` | the text that arrived, whether it converted or not. The field name is checked while compiling |
+| `r.nameOf("port")` | `"PORT"`, prefix included |
 
-A `Failure` is `.field`, `.name`, `.reason`, `.given`, `.expected`, and
-`.say(w)` writes nilo's own sentence for it. `Reason` is `missing`,
-`not_a_number`, `not_true_or_false`, `not_a_choice` — four, and it stays four:
-whether the port is one this machine may bind is your question.
+### `Failure`
+
+A `Failure` has `.field`, `.name`, `.reason`, `.given` and `.expected`, and `.say(w)` writes nilo's own sentence for it. `Reason` is one of `missing`, `not_a_number`, `not_true_or_false` and `not_a_choice`. There are four and there will stay four: whether a port is one this machine may bind is your application's question.
+
+### Sources
 
 | Source | |
 |---|---|
-| `config.Env{ .environ = … }` | the environment block, read where it lies. Allocates nothing. POSIX only |
-| `config.Map{ .map = init.environ_map }` | the portable half, and what Windows uses |
-| `config.Fixed{ .pairs = &.{ .{ "PORT", "9000" } } }` | pairs of your own — the seam for a file you parsed yourself |
-| `config.Dotenv{ .text = … }` | a `.env`'s **text**. You open the file; this reads it |
-| `config.layered(.{ a, b })` | several sources in the order they win — the first with the name answers |
+| `config.Env{ .environ = … }` | the environment block, read in place. Allocates nothing. POSIX only |
+| `config.Map{ .map = init.environ_map }` | the portable version, and what Windows uses |
+| `config.Fixed{ .pairs = &.{ .{ "PORT", "9000" } } }` | pairs of your own, for example from a file you parsed yourself |
+| `config.Dotenv{ .text = … }` | a `.env` file's **text**. You open the file; this reads it |
+| `config.layered(.{ a, b })` | several sources in priority order: the first one that has the name wins |
 
 ### A `.env`
 
-`Dotenv` takes text, not a path
-([ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)), so the module
-still opens no file and still allocates nothing. **The text has to outlive the
-Config** — a `[]const u8` field points into it, exactly as it points into the
-environment block.
+**`Dotenv` takes text, not a path** ([ADR 039](../adr/039-a-setting-is-a-field-and-every-bad-one-is-named-at-once.md)), so the module still opens no file and still allocates nothing. **The text has to outlive the settings**, because a `[]const u8` field points into it, exactly as it points into the environment block.
 
 ```zig
 const text = std.Io.Dir.cwd().readFileAlloc(io, ".env", gpa, .limited(64 * 1024)) catch "";
@@ -84,30 +83,17 @@ const read = config.from(Settings, config.layered(.{
 try file.report(w);   // writes nothing when the file is clean
 ```
 
-`io` and `environ` both come from `main`'s own argument, and `w` is
-`std.Io.File.stderr().writer(io, &buf)`'s `.interface`. The whole of a real
-`main` — the one this is a fragment of — is on
-[the settings page](../guide/config.md#the-whole-of-a-real-main).
+`io` and `environ` both come from `main`'s own argument, and `w` is the `.interface` of `std.Io.File.stderr().writer(io, &buf)`. The complete `main` this fragment comes from is on [the settings page](../guide/config.md#a-complete-main).
 
 | | |
 |---|---|
-| `f.get("PORT")` | `?[]const u8` — the first line setting that name |
-| `f.failed()`, `f.failedCount()` | lines that meant to be settings and are not |
+| `f.get("PORT")` | `?[]const u8`: the first line that sets that name |
+| `f.failed()`, `f.failedCount()` | lines that were meant to be settings and are not valid |
 | `f.failures()` | an iterator of `BadLine` |
 | `f.report(w)` | every bad line, one per line. Writes nothing when there are none |
 
-A `BadLine` is `.number`, `.why`, `.name`, and `.say(w)`. `Wrong` is
-`no_equals`, `empty_name`, `bad_name`, `unbalanced_quote` — all about the shape
-of the line; whether the value converts is `Reason`'s question. **A report never
-quotes a value**, because a `.env` is where a password lives.
+A `BadLine` has `.number`, `.why`, `.name` and `.say(w)`. `Wrong` is one of `no_equals`, `empty_name`, `bad_name` and `unbalanced_quote`, all about the shape of the line; whether the value converts is `Reason`'s job. **A report never quotes a value**, because a `.env` is where passwords live.
 
-Reads `NAME=value`, blank lines, `#` comments on their own line, `'` and `"`
-quoting, an optional `export ` prefix, and CRLF. **Refuses** escapes, multi-line
-values, `${OTHER}` interpolation, and comments after a value — so
-`PASSWORD=abc#123` is intact, and `PORT=8080 # the port` says
-`PORT has to be a whole number, not "8080 # the port"` rather than guessing.
+**What it reads:** `NAME=value`, blank lines, `#` comments on their own line, `'` and `"` quoting, an optional `export ` prefix, and CRLF. **What it refuses:** escapes, multi-line values, `${OTHER}` interpolation, and comments after a value. So `PASSWORD=abc#123` stays intact, and `PORT=8080 # the port` fails with `PORT has to be a whole number, not "8080 # the port"` instead of guessing.
 
-**It opens no files.** `std.zon.parse` is in the standard library;
-[sam701/zig-toml](https://github.com/sam701/zig-toml) is the one to reach for
-if the file has to be TOML. Either way the pairs come back as a `Fixed` and
-this module never had to carry the dependency.
+**It opens no files.** For other formats, `std.zon.parse` is in the standard library, and [sam701/zig-toml](https://github.com/sam701/zig-toml) is the one to use if the file has to be TOML. Either way, the pairs come back as a `Fixed`, and this module never has to carry the dependency.

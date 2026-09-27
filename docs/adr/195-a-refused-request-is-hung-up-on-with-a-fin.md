@@ -102,7 +102,7 @@ cannot be read is a refusal that costs a support question.
 - `http/serve.zig`: `Served.linger`, `hangUp`, `linger_limit`, `linger_ms`,
   and the returns that set it; two tests at the bottom hold which paths do.
 - `http/websocket.zig`: the test vtable gains the slot.
-- [Deploying](../guide/deploying.md#when-a-bound-is-hit): the 431 and 413
+- [Deploying](../guide/deploying.md#what-happens-at-each-limit): the 431 and 413
   rows say the send side is shut first.
 - Not held end-to-end on Linux, which hands buffered data to `recv` before
   it reports the reset; what the suite holds is that `linger` is set on the
