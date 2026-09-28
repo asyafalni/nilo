@@ -5250,6 +5250,104 @@ fn listPeople(db: *FakeDb, c: *nilo.Ctx) ![]Person {
     return db.select(Person, c, .{ .where = .{ .age = .{ .gt = 18 } } });
 }
 
+test "every column of a Row is read from its own position, a parent's and a missing parent's included" {
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{ .unchecked = true });
+    defer db.deinit();
+
+    // `ShopOrderCard` is seven columns: its own two, the customer's two, the
+    // owner's one, then the approver's presence and its one. Each answers
+    // something only it could, so a position read twice or skipped reads a
+    // value of the wrong kind and fails, or the wrong value and is seen.
+    const present = [_]wire_mod.Fake.Cell{
+        .{ .int = 10 },    .{ .int = 250 }, .{ .text = "Acme" }, .null,
+        .{ .text = "Wati" }, .{ .boolean = true }, .{ .text = "Budi" },
+    };
+    db.wire = .{ .answers = 1, .cells = &present };
+    const card = (try db.select(ShopOrderCard, &run, .{}))[0];
+    try testing.expectEqual(@as(i64, 10), card.id);
+    try testing.expectEqual(@as(i64, 250), card.total);
+    try testing.expectEqualStrings("Acme", card.customer.name);
+    try testing.expect(card.customer.region == null);
+    try testing.expectEqualStrings("Wati", card.owner.full_name);
+    try testing.expectEqualStrings("Budi", card.approver.?.full_name);
+
+    // The same row streamed, which reads it through `borrowRow` rather
+    // than `readRow`: the two walk the columns separately.
+    {
+        db.wire = .{ .answers = 1, .cells = &present };
+        var rows = try db.stream(ShopOrderCard, &run, .{});
+        defer rows.close();
+        const streamed = (try rows.next()).?;
+        try testing.expectEqual(@as(i64, 250), streamed.total);
+        try testing.expectEqualStrings("Acme", streamed.customer.name);
+        try testing.expectEqualStrings("Wati", streamed.owner.full_name);
+        try testing.expectEqualStrings("Budi", streamed.approver.?.full_name);
+    }
+
+    // An approver that is not there: its presence column says so, and the
+    // column after it is never read as a name.
+    const absent = [_]wire_mod.Fake.Cell{
+        .{ .int = 12 },    .{ .int = 40 },           .{ .text = "Borealis" }, .{ .text = "north" },
+        .{ .text = "Wati" }, .{ .boolean = false }, .null,
+    };
+    db.wire = .{ .answers = 1, .cells = &absent };
+    const alone = (try db.select(ShopOrderCard, &run, .{}))[0];
+    try testing.expect(alone.approver == null);
+    try testing.expectEqualStrings("north", alone.customer.region.?);
+    {
+        db.wire = .{ .answers = 1, .cells = &absent };
+        var rows = try db.stream(ShopOrderCard, &run, .{});
+        defer rows.close();
+        try testing.expect((try rows.next()).?.approver == null);
+    }
+}
+
+test "a row that fails partway through a result fails the read, and the result is given back once" {
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{ .unchecked = true });
+    defer db.deinit();
+
+    db.wire = .{ .answers = 3, .fails_at_row = 1 };
+    try testing.expectError(error.QueryFailed, db.select(Person, &run, .{}));
+    try testing.expectEqual(@as(usize, 1), db.wire.?.drains);
+
+    db.wire = .{ .answers = 3, .fails_at_row = 1 };
+    var rows = try db.stream(Person, &run, .{});
+    _ = (try rows.next()).?;
+    try testing.expectError(error.QueryFailed, rows.next());
+    rows.close();
+    try testing.expectEqual(@as(usize, 1), db.wire.?.drains);
+
+    // A NULL where the field cannot hold one is the same failure, not a
+    // zero: `age` is an `i32`.
+    db.wire = .{ .answers = 1, .cells = &.{ .{ .int = 1 }, .{ .text = "a@b.c" }, .null, .null } };
+    try testing.expectError(error.QueryFailed, db.select(Person, &run, .{}));
+}
+
+test "a raw statement that could not be described runs, and is described again on its next run" {
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{ .unchecked = true });
+    defer db.deinit();
+
+    // A statement of its own: the flag that says it was held against its
+    // Row is one per statement, Row and call, for the life of the program.
+    const text = "SELECT id, email, nickname, age FROM people WHERE age > 64";
+    db.wire = .{ .describe_fails = true };
+    _ = try db.raw(Person, &run, text, .{});
+    _ = try db.raw(Person, &run, text, .{});
+    try testing.expectEqual(@as(usize, 2), db.wire.?.described_calls);
+
+    // Once it is answered, it is not asked again.
+    db.wire.?.describe_fails = false;
+    _ = try db.raw(Person, &run, text, .{});
+    _ = try db.raw(Person, &run, text, .{});
+    try testing.expectEqual(@as(usize, 3), db.wire.?.described_calls);
+}
+
 test "a Db with no checking list has forgotten the check unless it said so" {
     var forgot = FakeDb.init(testing.allocator, "postgres://test/test", .{});
     defer forgot.deinit();

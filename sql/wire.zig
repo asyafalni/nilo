@@ -570,10 +570,38 @@ pub const Fake = struct {
     /// lets the path from a Wire's `problem` out-parameter to `Sent.problem`
     /// be tested with nothing installed (ADR 117).
     refuses: ?Problem = null,
+    /// What each column answers, by position, on every row. Past its end,
+    /// or left empty, a column answers the one value per type `read` falls
+    /// back to. **Per column rather than per type** so a column read from
+    /// the wrong position reads the wrong value: a Row of two integers read
+    /// with its columns swapped passed through a Fake that answered 0 for
+    /// both.
+    cells: []const Cell = &.{},
+    /// The row `next` fails on rather than answering, counted from zero, or
+    /// null for none. How a statement that fails after it started answering
+    /// is driven without a database: a row that does not decode, or a
+    /// connection lost halfway.
+    fails_at_row: ?usize = null,
+    /// Whether `describe` fails rather than answering `described`: the
+    /// first run of a raw statement that could not be held against its Row,
+    /// which is asked again on its next run (ADR 233).
+    describe_fails: bool = false,
+
+    /// One column's answer. A NULL read into a field that cannot hold one
+    /// fails the read, as it does on both real Wires.
+    pub const Cell = union(enum) {
+        null,
+        int: i64,
+        float: f64,
+        text: []const u8,
+        boolean: bool,
+    };
 
     pub const Rows = struct {
         left: usize = 0,
         drained: bool = false,
+        /// Rows handed out so far, which `fails_at_row` is counted against.
+        at: usize = 0,
     };
 
     pub fn open(io: std.Io, gpa: std.mem.Allocator, url: []const u8, opts: OpenOpts) !Fake {
@@ -614,9 +642,10 @@ pub const Fake = struct {
     }
 
     pub fn next(self: *Fake, rows: *Rows) Error!bool {
-        _ = self;
         if (rows.left == 0) return false;
+        if (self.fails_at_row == rows.at) return error.QueryFailed;
         rows.left -= 1;
+        rows.at += 1;
         return true;
     }
 
@@ -635,7 +664,7 @@ pub const Fake = struct {
     /// though there is nothing here that would dangle without it.
     pub fn read(self: *Fake, rows: *const Rows, comptime T: type, col: usize) Error!T {
         _ = rows;
-        _ = col;
+        if (col < self.cells.len) return cellAs(T, self.cells[col]);
         if (T == []const u8 or T == ?[]const u8) return self.text;
         // The two types a Wire decodes itself rather than handing to its
         // driver, so a Fake has to name them too or a Row carrying one cannot
@@ -646,6 +675,31 @@ pub const Fake = struct {
             .int, .float => 0,
             .bool => false,
             .optional => null,
+            else => error.QueryFailed,
+        };
+    }
+
+    /// A cell as the type the caller asked for, refused where a real Wire
+    /// would refuse it: a NULL into a field that cannot be null, a number
+    /// past the field's width, a value of another kind.
+    fn cellAs(comptime T: type, cell: Cell) Error!T {
+        if (@typeInfo(T) == .optional) {
+            return if (cell == .null) null else try cellAs(@typeInfo(T).optional.child, cell);
+        }
+        if (T == []const u8) return if (cell == .text) cell.text else error.QueryFailed;
+        if (T == Bytes) return if (cell == .text) .{ .bytes = cell.text } else error.QueryFailed;
+        if (comptime types_mod.isDate(T)) {
+            const days = if (cell == .int) cell.int else return error.QueryFailed;
+            return .{ .days = std.math.cast(i32, days) orelse return error.QueryFailed };
+        }
+        return switch (@typeInfo(T)) {
+            .int => if (cell == .int) std.math.cast(T, cell.int) orelse error.QueryFailed else error.QueryFailed,
+            .float => switch (cell) {
+                .float => |f| @floatCast(f),
+                .int => |i| @floatFromInt(i),
+                else => error.QueryFailed,
+            },
+            .bool => if (cell == .boolean) cell.boolean else error.QueryFailed,
             else => error.QueryFailed,
         };
     }
@@ -804,6 +858,7 @@ pub const Fake = struct {
         _ = sql;
         _ = nulls;
         self.described_calls += 1;
+        if (self.describe_fails) return error.QueryFailed;
         return self.described;
     }
 };

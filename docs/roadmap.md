@@ -95,10 +95,6 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 #### P1: wrong and loud, a migration that fails, a measured multiple, or a gap in the gate
 
-**The Fake cannot fail and cannot tell columns apart.** `wire.Fake.read` ignores `col` and answers 0 or `"fake"`, and its `describe` and `next` never fail, so a column read from the wrong index, or `vetFirst`'s path for a statement it could not describe, cannot be caught through it. `db.stream` has no test of a Row with an optional parent, and a mutation dropping its column step survived.
-
-**Needs:** a Fake that answers per column and fails on request.
-
 **A mutation run left fourteen of forty-four changes alive, and seven more aimed at suspected gaps all survived.** No test parses 29 February in 1900 or 2000, or refuses a second of 60 or the 31st of April; the width guard of [ADR 106](./adr/106-a-select-list-shorter-than-the-row-is-refused.md) is never tried one column short; Postgres's foreign-key and deadlock codes and SQLite's busy, locked and interrupt are never produced; an optional parent over a required grandparent is never read; and `SchemaBehind`, the advisory locks around `apply`, `generate`'s write order, the `narrowing` guard on `tx.update` and its kin, a count inside a transaction that has written, and the length guard on a Postgres `Date` could each be removed without a test failing. The other thirty were killed, many by the live tests, so the suite is not written to pass: its holes are boundaries, hard-to-produce errors and the paths the Fake cannot reach.
 
 **Needs:** a test for each survivor.
