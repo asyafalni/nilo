@@ -95,10 +95,6 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 #### P1: wrong and loud, a migration that fails, a measured multiple, or a gap in the gate
 
-**A pooled connection that died while idle fails the next request.** `pool.acquire` hands back what it holds without asking (`postgres.zig:430`), so after a database restart, a failover or a NAT dropping an idle socket, every dead connection costs one request a 5xx. Reproduced through `severed.zig`'s proxy.
-
-**Needs:** a failed first write on a freshly acquired connection, with nothing yet sent in a transaction, answered by one reconnect and a resend, or a check on acquire after a connection has idled.
-
 **A page's total costs a scan of every match, which ADR 150 says it does not.** `count(*) OVER ()` is read once but computed over the whole match before the limit applies: over a million rows with an index on the order, a page took 124 ms against 0.024 ms without the window. The guide's keyset condition, an `.any` of `<` and `= … AND <`, filters rather than seeks and costs what `OFFSET` does: 17.8 ms against 0.013 ms for a row comparison at a million rows ([sql.md §18](../bench/result/sql.md#18-the-count-a-page-reads-keyset-paging-and-a-stream-let-go-early)).
 
 **Needs:** [ADR 150](./adr/150-a-page-knows-what-it-left-out.md)'s cost corrected with the fix, a page with no total and a row comparison (both under Next), and the guide's keyset example rewritten on the second.

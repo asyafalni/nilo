@@ -83,6 +83,7 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 ### Fixed
 
 - **A Postgres number column reads into a field of another width**, range-checked: an `i32` over `int8`, a `u8` over `int2`, an `f64` over `float4`. The schema check accepted each and every read answered `QueryFailed`, and a `u16` or an `i8` did not compile inside pg.zig. A value past the field is `error.QueryFailed` naming the column. `db.raw`'s first-run check takes a column as wide as the field or narrower (ADR 233).
+- **A Postgres connection the server closed or reset while it sat in the pool is replaced before it is used**, where it failed the next statement sent down it: after a restart or a failover, every idle connection cost one request a 5xx. One `poll` per acquire; a statement is never sent twice (ADR 237).
 - **`tx.deadline(0)` times the next statement out**, where it sent `statement_timeout = 0`, which Postgres reads as no limit. A number past `maxInt(i32)` is sent as `maxInt(i32)` rather than aborting the transaction with Postgres's range error (ADR 043).
 - **`.in` and `.not_in` over a `sql.Timestamp`, `sql.Date`, `sql.Decimal` or `sql.Bytes` column compile on Postgres and match on SQLite.** Each element is bound the way one value of the column is; a date or decimal list is cast through `text[]`. On SQLite a list of bytes compiled and matched nothing.
 - **`.offset` with no `.limit` runs on SQLite**, written `LIMIT -1 OFFSET …`, where it was a syntax error there and a working statement on Postgres.

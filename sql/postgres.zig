@@ -42,6 +42,7 @@
 //! why this seam is not called a Bulkhead.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const pg = @import("pg");
 
 const types = @import("types.zig");
@@ -430,10 +431,38 @@ pub const Wire = struct {
         );
         const w = self.limits.waiting();
         defer self.limits.waited(w);
-        var conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+        var conn = try self.take();
         errdefer giveBack(self.io, conn);
         _ = conn.exec(comptime beginText(opts), .{}) catch |err| return translate(self.io, conn, err);
         return .{ .wire = self, .conn = conn };
+    }
+
+    /// A connection from the pool, **asked whether it is still there before
+    /// anything is sent down it**. The pool hands back what it holds without
+    /// asking, so after a restart, a failover or a NAT dropping an idle
+    /// socket, every connection that had been idle cost one request a 5xx.
+    ///
+    /// **A check before rather than a resend after**, and the difference is
+    /// whether a statement can run twice. A failure on the first read after
+    /// the write cannot say whether the server got the statement: a FIN that
+    /// arrived before it, and a crash after the server committed it, look the
+    /// same from here, and an `INSERT` sent again is two rows. A socket that
+    /// already said it was closing is known dead before anything went out.
+    ///
+    /// A dead one is given back in a state the pool does not take back, so
+    /// pg.zig destroys it and dials its replacement, and the next is asked.
+    /// Bounded by the pool's size: past that every connection has been looked
+    /// at, and what is left is the pool's own answer.
+    fn take(self: *Wire) wire.Error!*pg.Conn {
+        var looked: usize = 0;
+        while (true) {
+            const conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+            if (looked > self.pool._conns.len or !hungUp(conn)) return conn;
+            looked += 1;
+            std.log.info("nilo_sql: an idle connection had been closed by the server; replaced before use", .{});
+            conn._state = .fail;
+            giveBack(self.io, conn);
+        }
     }
 
     /// `BEGIN`, with whatever the caller asked for spelled onto the end of
@@ -775,7 +804,7 @@ pub const Wire = struct {
         // two calls and a clock per row (ADR 210).
         const w = self.limits.waiting();
         errdefer self.limits.waited(w);
-        var conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+        var conn = try self.take();
         errdefer giveBack(self.io, conn);
 
         const opts: pg.Conn.QueryOpts = .{ .allocator = arena, .cache_name = plan };
@@ -1129,7 +1158,7 @@ pub const Wire = struct {
     ) wire.Error!usize {
         const w = self.limits.waiting();
         defer self.limits.waited(w);
-        var conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+        var conn = try self.take();
         defer giveBack(self.io, conn);
         const opts: pg.Conn.QueryOpts = .{ .allocator = arena, .cache_name = plan };
         const count = conn.execOpts(sql, opened(values), opts) catch |err| retry: {
@@ -1204,7 +1233,7 @@ pub const Wire = struct {
     ) wire.Error!?[]const wire.Described {
         const w = self.limits.waiting();
         defer self.limits.waited(w);
-        var conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+        var conn = try self.take();
         defer giveBack(self.io, conn);
 
         var oids: []const i32 = &.{};
@@ -1420,6 +1449,26 @@ fn giveBack(io: std.Io, conn: *pg.Conn) void {
     const was = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(was);
     conn.release();
+}
+
+/// Whether an idle connection's socket has something to say, which on a
+/// connection nobody has sent anything down means it is gone: a FIN from a
+/// server that restarted or failed over, the `57P01` it sends first, or a
+/// reset from a NAT that forgot it. One `poll` with no wait, a few hundred
+/// nanoseconds against a round trip of tens of microseconds.
+///
+/// A socket that died silently, dropped with nothing sent back, still reads
+/// as quiet here; its first statement fails as it did before, and the pool
+/// replaces it on the way back.
+fn hungUp(conn: *pg.Conn) bool {
+    if (comptime builtin.os.tag == .windows) return false;
+    var fds = [1]std.posix.pollfd{.{
+        .fd = conn._stream.state.stream.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = std.posix.poll(&fds, 0) catch return false;
+    return ready > 0 and fds[0].revents != 0;
 }
 
 /// A connection that could not be had. A cancellation while waiting for

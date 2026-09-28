@@ -283,6 +283,18 @@ const Proxy = struct {
         link.closed = true;
     }
 
+    /// Close connection `index` the way a server that restarts does: a FIN
+    /// rather than a reset, with the client idle and nothing in flight.
+    fn hangUp(self: *Proxy, index: usize) void {
+        const link = &self.links[index];
+        if (link.closed) return;
+        link.up.cancel(self.io);
+        link.down.cancel(self.io);
+        link.client.close(self.io);
+        link.upstream.close(self.io);
+        link.closed = true;
+    }
+
     /// Stop the accept loop, then every pump, then close what is left. The
     /// loop first, so that no link appears while the rest are being closed.
     fn close(self: *Proxy, serving: *std.Io.Future(void)) void {
@@ -458,4 +470,36 @@ test "a commit on an aborted transaction whose socket has since died reaches the
         @as(usize, 1),
         try h.db.exec(&h.run, "UPDATE \"" ++ table ++ "\" SET \"label\" = 'after' WHERE \"id\" = 1", .{}),
     );
+}
+
+/// Both ways an idle connection is told it is gone, then the statement that
+/// used to meet it first. The pool hands back what it holds without asking,
+/// so every connection idle through a restart cost one request a 5xx.
+fn idleThenAsked(h: *Harness, comptime reset: bool) !void {
+    const dirty_before = try sql.postgres.dirtyConnections();
+    if (reset) h.proxy.cut(0) else h.proxy.hangUp(0);
+    // The close has to have reached the pool's socket; on loopback it has
+    // long before this, and the wait is what keeps a slow machine honest.
+    try std.Io.sleep(h.threaded.io(), .fromMilliseconds(50), .awake);
+
+    // Replaced before anything was sent down it, so the statement runs once,
+    // on the replacement, and answers.
+    try testing.expectEqual(
+        @as(usize, 1),
+        try h.db.exec(&h.run, "UPDATE \"" ++ table ++ "\" SET \"label\" = 'after' WHERE \"id\" = 1", .{}),
+    );
+    try testing.expectEqual(dirty_before + 1, try sql.postgres.dirtyConnections());
+    try h.proxy.linked(2);
+}
+
+test "a connection reset while idle is replaced before the next statement is sent" {
+    const h = (try Harness.open()) orelse return error.SkipZigTest;
+    defer h.close();
+    try idleThenAsked(h, true);
+}
+
+test "a connection the server closed while idle is replaced before the next statement is sent" {
+    const h = (try Harness.open()) orelse return error.SkipZigTest;
+    defer h.close();
+    try idleThenAsked(h, false);
 }
