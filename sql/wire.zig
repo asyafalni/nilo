@@ -92,8 +92,10 @@
 //!   `opts` is comptime, which is what lets the whole `BEGIN` be one constant
 //!   and lets a Wire that cannot express an isolation level refuse it while
 //!   compiling rather than at the first request.
-//! - `Tx.commit` / `Tx.rollback` — and `rollback` has to be reachable from a
-//!   `defer`, because that is how it will be called.
+//! - `Tx.commit(arena, problem)` / `Tx.rollback` — and `rollback` has to be
+//!   reachable from a `defer`, because that is how it will be called.
+//!   `commit` takes the slot `run` does, because a deferred constraint is
+//!   checked at the COMMIT and nowhere else.
 //! - `Tx.savepoint(arena, op, id)` — mark a point inside this transaction,
 //!   undo back to one, or drop one. Postgres calls the three `SAVEPOINT`,
 //!   `ROLLBACK TO SAVEPOINT` and `RELEASE SAVEPOINT`, and **a nested
@@ -746,7 +748,9 @@ pub const Fake = struct {
             }
         }
 
-        pub fn commit(self: *Tx) Error!void {
+        pub fn commit(self: *Tx, arena: std.mem.Allocator, problem: ?*?Problem) Error!void {
+            _ = arena;
+            _ = problem;
             self.wire.committed += 1;
         }
 

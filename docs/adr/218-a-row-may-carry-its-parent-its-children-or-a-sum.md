@@ -90,6 +90,8 @@ A field of a narrower Row whose type is another Row, or an optional of one, is t
 
 **This keeps both properties too.** A reference points at one row or none, so the join cannot change how many rows there are, and the columns it adds belong to the field that asked for them. The Row still describes the answer; it describes it as a tree.
 
+**A required parent's inner join can still leave a row out**, when the row it points at is not there: a table with no foreign key, or one deferred inside a transaction. So `db.count`, `db.exists` and the count behind an empty page join every required parent, whatever their condition names, and count the rows the list would read. That is a join over the parent's key per counted row, paid by a count over a Row that carries one; the alternative was a total that disagreed with its own page, a page at offset 1 reporting 1 over a list that was empty. A parent that may be missing is a `LEFT JOIN`, drops nothing, and is joined only when a condition reaches it.
+
 ### Children are a slice field, read by a second statement
 
 A field `[]const C`, where `C` is a Row whose table points back at this one, is the rows that point here. **They are never joined.** Once the parents are read, one more statement reads the children of every parent at once:

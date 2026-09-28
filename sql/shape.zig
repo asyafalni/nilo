@@ -85,9 +85,9 @@ const Join = struct {
     /// The text after `JOIN`, the `ON` clause included.
     text: []const u8,
     /// Whether the join leaves out a row of the table the statement reads:
-    /// inner over a reference that may be null (item 109). A count joins it
-    /// whatever its condition names, or it would count rows the list leaves
-    /// out.
+    /// inner over a reference that may be null (item 109), or a required
+    /// parent, whose row may be missing. A count joins it whatever its
+    /// condition names, or it would count rows the list leaves out.
     narrows: bool = false,
 };
 
@@ -204,6 +204,13 @@ fn visit(
                         .alias = name,
                         .text = (if (left) " LEFT JOIN " else " JOIN ") ++
                             statement.relation(D, Parent) ++ " AS " ++ alias ++ " ON " ++ on,
+                        // An inner join leaves out a row whose parent is not
+                        // there, which a table without the foreign key, or
+                        // one deferred inside a transaction, can hold. So a
+                        // count joins it too, or it counts rows the list
+                        // drops: a page at offset 1 read a total of 1 over a
+                        // list that was empty.
+                        .narrows = !left,
                     }};
                     // A parent that may be missing answers one more column:
                     // whether the key it was joined on matched. Its own
@@ -1083,7 +1090,7 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
         }
         if (@hasField(O, "offset")) {
             const bound = statement.boundary(D, O, "offset", next);
-            sql = sql ++ D.offset(bound.text);
+            sql = sql ++ D.offset(bound.text, @hasField(O, "limit") or answers == .first);
             if (bound.path) |path| {
                 paths = paths ++ &[_]where_mod.Path{path};
                 params = params ++ &[_]where_mod.Param{.{}};
@@ -2069,12 +2076,24 @@ test "a count of a grouped Row counts the groups" {
     );
 }
 
-test "a count of a Row with parents joins only the parents its condition names" {
+test "a count of a Row with parents joins the required ones and those its condition names" {
+    // `customer` and `owner` are inner joins, which leave out an order whose
+    // row there is missing, so the count joins them to agree with the list.
+    // `approver` may be missing and drops nothing, so it is joined only when
+    // a condition reaches it.
     const none = comptime tally(Pg, OrderCard, @TypeOf(.{ .where = .{ .total = @as(i64, 1) } }), false);
-    try testing.expectEqualStrings("SELECT count(*) FROM \"orders\" WHERE \"orders\".\"total\" = $1", none.sql);
+    try testing.expectEqualStrings(
+        "SELECT count(*) FROM \"orders\" JOIN \"customers\" AS \"customer\" ON \"customer\".\"id\" = " ++
+            "\"orders\".\"customer_id\" JOIN \"staff\" AS \"owner\" ON \"owner\".\"id\" = " ++
+            "\"orders\".\"owner_id\" WHERE \"orders\".\"total\" = $1",
+        none.sql,
+    );
+    const approved = comptime tally(Pg, OrderCard, @TypeOf(.{ .where = .{ .approver = .{ .full_name = @as([]const u8, "x") } } }), false);
+    try testing.expect(std.mem.indexOf(u8, approved.sql, "LEFT JOIN \"staff\" AS \"approver\"") != null);
     const one = comptime tally(Pg, OrderCard, @TypeOf(.{ .where = .{ .owner = .{ .full_name = @as([]const u8, "x") } } }), true);
     try testing.expectEqualStrings(
-        "SELECT EXISTS(SELECT 1 FROM \"orders\" JOIN \"staff\" AS \"owner\" ON \"owner\".\"id\" = " ++
+        "SELECT EXISTS(SELECT 1 FROM \"orders\" JOIN \"customers\" AS \"customer\" ON \"customer\".\"id\" = " ++
+            "\"orders\".\"customer_id\" JOIN \"staff\" AS \"owner\" ON \"owner\".\"id\" = " ++
             "\"orders\".\"owner_id\" WHERE \"owner\".\"full_name\" = $1)",
         one.sql,
     );

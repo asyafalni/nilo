@@ -347,7 +347,7 @@ fn rowsOf(
 
         if (@hasField(O, "offset")) {
             const bound = boundary(D, O, "offset", next);
-            sql = sql ++ D.offset(bound.text);
+            sql = sql ++ D.offset(bound.text, @hasField(O, "limit") or answers == .first);
             if (bound.path) |path| {
                 paths = paths ++ &[_]where_mod.Path{path};
                 params = params ++ &[_]where_mod.Param{.{}};
@@ -2163,6 +2163,19 @@ test "offset is numbered after limit" {
     try testing.expectEqual(@as(usize, 2), s.paramCount());
 }
 
+test "an offset with no limit is a syntax error SQLite is not handed" {
+    const off: u32 = 20;
+    // SQLite takes `OFFSET` only after a `LIMIT`; `-1` is its no limit.
+    const lite = comptime select(Lite, User, @TypeOf(.{ .order = .{ .id = .asc }, .offset = off }));
+    try testing.expect(std.mem.endsWith(u8, lite.sql, "ORDER BY \"id\" ASC LIMIT -1 OFFSET ?1"));
+    try testing.expectEqual(@as(usize, 1), lite.paramCount());
+    // Postgres takes it alone, and a limit given is not written twice.
+    const pg = comptime select(Pg, User, @TypeOf(.{ .order = .{ .id = .asc }, .offset = off }));
+    try testing.expect(std.mem.endsWith(u8, pg.sql, "ORDER BY \"id\" ASC OFFSET $1"));
+    const both = comptime select(Lite, User, @TypeOf(.{ .order = .{ .id = .asc }, .limit = off, .offset = off }));
+    try testing.expect(std.mem.endsWith(u8, both.sql, " LIMIT ?1 OFFSET ?2"));
+}
+
 test "several order terms keep the order they were written in" {
     try testing.expect(std.mem.endsWith(
         u8,
@@ -2744,7 +2757,7 @@ test "a numeric is cast where it is inserted, and where it is set" {
 test "a numeric in a list is cast as an array, so the statement stays a constant" {
     try testing.expectEqualStrings(
         "SELECT \"id\", \"total\"::text, \"refunded\"::text FROM \"invoices\"" ++
-            " WHERE \"total\" = ANY($1::numeric[])",
+            " WHERE \"total\" = ANY($1::text[]::numeric[])",
         comptime select(Pg, Invoice, @TypeOf(.{
             .where = .{ .total = .{ .in = &[_]types_mod.Decimal{} } },
         })).sql,

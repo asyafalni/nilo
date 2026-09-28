@@ -96,7 +96,7 @@ UPDATE "drafts" SET "title" = COALESCE($1, "title"), "words" = COALESCE($2, "wor
 
 It is one statement whichever fields arrived, so it is prepared once. A `sql.given` on a column that may be NULL does not compile: there, `null` in the body could mean *clear it*, and `COALESCE` would keep the old value and still answer 200. Set that column with a plain value, where null writes NULL.
 
-`.now` is the database's clock, the same expression `.default = .now` writes, and it binds nothing. On Postgres it is the moment the transaction began, so every row one `Tx` stamps gets the same time. It works on a `sql.Timestamp` column and is rejected anywhere else.
+`.now` is the database's clock, the same expression `.default = .now` writes, and it binds nothing. On Postgres it is the moment the transaction began, so every row one `Tx` stamps gets the same time. On SQLite it is the moment each statement runs: every row one `UPDATE` stamps gets the same time, and two statements in one `Tx` get two. Where two writes have to agree, take `sql.Timestamp.now()` once and pass it to both. It works on a `sql.Timestamp` column and is rejected anywhere else.
 
 ## Inserting and updating many rows
 

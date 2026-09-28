@@ -65,6 +65,14 @@ the same values, so a struct that named none was one flag for the whole
 program, and the first raw statement to run was the only one ever checked. The
 Fake-backed test that asks two statements in a row is what caught it.
 
+**The flag stays set only once `describe` has answered.** It used to be taken
+before the question was asked, so a first run that met a table a migration had
+not made yet, or a pool with nothing in it, spent the one check and left the
+statement unchecked for the life of the process. A `describe` that fails puts
+the flag back, and the next run asks again; that costs a round trip only while
+the statement beside it is failing too. The warning that it could not be asked
+is said once per statement, however often it is asked again.
+
 ### The types: what the driver will read, not what the table accepts
 
 On Postgres the types are the OIDs the statement's description answers with,

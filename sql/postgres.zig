@@ -322,7 +322,10 @@ pub const Wire = struct {
         /// cannot collide with one a `tx.raw` put down by hand.
         const name_prefix = "nilo_sp_";
 
-        pub fn commit(self: *Tx) wire.Error!void {
+        /// `problem` is where a COMMIT the server refused leaves its words: a
+        /// deferred constraint is checked here and nowhere else, so this is
+        /// the only place `sql.violated` can learn which key it was.
+        pub fn commit(self: *Tx, arena: std.mem.Allocator, problem: ?*?wire.Problem) wire.Error!void {
             if (self.done) return;
             self.fresh();
             // **An aborted transaction is rolled back and the commit fails.**
@@ -351,7 +354,7 @@ pub const Wire = struct {
             if (std.Io.checkCancel(self.wire.io)) |_| {} else |_| self.wire.io.recancel();
             const was = self.wire.io.swapCancelProtection(.blocked);
             defer _ = self.wire.io.swapCancelProtection(was);
-            _ = self.conn.exec("COMMIT", .{}) catch |err| return translate(self.wire.io, self.conn, err);
+            _ = self.conn.exec("COMMIT", .{}) catch |err| return reported(self.wire.io, self.conn, err, arena, problem);
         }
 
         /// Cannot fail, because it is called from a `defer` on the way out
@@ -361,7 +364,7 @@ pub const Wire = struct {
         /// which is what `release` does with one that is not idle.
         pub fn rollback(self: *Tx) void {
             const err = self.undo() orelse return;
-            std.log.err(
+            std.log.warn(
                 "nilo_sql: a transaction could not be rolled back ({s}). The connection " ++
                     "is being dropped rather than returned to the pool.",
                 .{@errorName(err)},

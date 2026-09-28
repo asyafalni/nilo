@@ -775,12 +775,12 @@ test "a binary built for a version the database has not reached refuses to serve
     var fx = try Fixture.init(gpa, "expect");
     defer fx.deinit(gpa);
 
-    // `standing` rather than `expect` for the failing direction. The sentence
-    // `expect` logs is the feature, and a test that provokes it would have the
-    // suite count a deliberate `std.log.err` as a failure.
     const behind = try migrate.standing(&fx.db, &fx.run, 9);
     try testing.expectEqual(@as(i64, 0), behind.at);
     try testing.expectEqual(migrate.Standing.Verdict.behind, behind.verdict());
+    // The refusal itself, which logs at `warn` so a test can reach it: the
+    // error is what stops the process, and the line only explains it.
+    try testing.expectError(migrate.Error.SchemaBehind, migrate.expect(&fx.db, &fx.run, 9));
 
     var d9: [64]u8 = undefined;
     const nine, const nine_hash = lone(9, "nine", &.{

@@ -2283,7 +2283,8 @@ fn operator(
                 .json_each => quoted ++ switch (list_op) {
                     .in => " IN ",
                     .not_in => " NOT IN ",
-                } ++ "(SELECT value FROM json_each(" ++ bound ++ "))",
+                } ++ "(SELECT " ++ D.eachValue(row_mod.ColumnType(Row, column)) ++
+                    " FROM json_each(" ++ bound ++ "))",
                 // Expanding the list into one placeholder each would make the
                 // statement depend on a length only known at runtime, which is
                 // the half of ADR 036's rule this module exists to keep.

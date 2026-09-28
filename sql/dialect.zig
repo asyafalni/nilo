@@ -244,7 +244,10 @@ pub const Postgres = struct {
         return " LIMIT " ++ placeholder_text;
     }
 
-    pub fn offset(comptime placeholder_text: []const u8) []const u8 {
+    /// `limited` is whether a `LIMIT` came before it, which Postgres does not
+    /// need to know: it takes an `OFFSET` alone.
+    pub fn offset(comptime placeholder_text: []const u8, comptime limited: bool) []const u8 {
+        _ = limited;
         return " OFFSET " ++ placeholder_text;
     }
 
@@ -448,10 +451,15 @@ pub const Postgres = struct {
             // infers `text` for the parameter and refuses the insert
             // (ADR 181). The read half needs no cast at all, which is the
             // whole difference from `sql.AsText("date")`.
+            //
+            // **A list of them is cast twice**, `::text[]::date[]`, for the
+            // reason `arrayOf` gives: what is on the wire is text, and cast
+            // straight to `date[]` pg.zig picks its encoder off that OID, has
+            // none for it, and writes the elements as `bytea`.
             if (types.isDate(T)) break :blk placeholder_text ++
-                "::date" ++ if (list) "[]" else "";
+                if (list) "::text[]::date[]" else "::date";
             const named = types.asText(T) orelse break :blk placeholder_text;
-            break :blk placeholder_text ++ "::" ++ named ++ if (list) "[]" else "";
+            break :blk placeholder_text ++ if (list) "::text[]::" ++ named ++ "[]" else "::" ++ named;
         };
     }
 
@@ -1007,11 +1015,11 @@ pub const SQLite = struct {
     }
 
     /// SQLite refuses `OFFSET` without a `LIMIT` in front of it, where
-    /// Postgres allows either alone. Nothing here can see the other clause,
-    /// so this writes what it is asked for and a caller who offsets without
-    /// limiting gets SQLite's own syntax error — which names the statement.
-    pub fn offset(comptime placeholder_text: []const u8) []const u8 {
-        return " OFFSET " ++ placeholder_text;
+    /// Postgres takes either alone, so an unlimited one gets `LIMIT -1`,
+    /// which SQLite reads as no limit. Without it `.offset` alone was a
+    /// syntax error here and a working statement on Postgres.
+    pub fn offset(comptime placeholder_text: []const u8, comptime limited: bool) []const u8 {
+        return (if (limited) "" else " LIMIT -1") ++ " OFFSET " ++ placeholder_text;
     }
 
     /// No cast beyond the one `readAs` makes for text: SQLite answers `count`
@@ -1114,6 +1122,14 @@ pub const SQLite = struct {
         _ = T;
         _ = list;
         return placeholder_text;
+    }
+
+    /// What an `.in` selects out of `json_each` for a column of `T`: the value
+    /// itself, or for a blob the bytes its hex spells. JSON has no bytes, so
+    /// `jsonList` writes each one as hex and this turns it back; without it a
+    /// blob was compared with text and matched nothing.
+    pub fn eachValue(comptime T: type) []const u8 {
+        return if (types.isBytes(T)) "unhex(value)" else "value";
     }
 
     /// None, so `insertMany` is a Refusal here. SQLite has no `unnest` and
@@ -1227,6 +1243,14 @@ pub const SQLite = struct {
     /// — 1.8e12, well inside what one holds exactly — and multiplies after the
     /// cast. A row that wants the other three digits passes `Timestamp.now()`
     /// rather than leaving the column out.
+    ///
+    /// **It is the moment the statement runs, where Postgres's `now()` is
+    /// the moment the transaction began.** SQLite holds `'now'` still for
+    /// one `sqlite3_step`, so the rows one statement writes agree, and two
+    /// statements in one transaction do not. Binding one moment per
+    /// transaction would make `.now` a parameter, which a column's
+    /// `DEFAULT` cannot be; the guide says so and names `Timestamp.now()`
+    /// for the writes that have to agree.
     pub const now_default =
         "(CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) * 1000)";
 
@@ -1767,9 +1791,10 @@ test "a numeric is bound as digits and cast back, so nothing goes through a floa
         "$1::numeric",
         Postgres.bindAs(Postgres.placeholder(1), types.Decimal, false),
     );
-    // `.in` puts the whole list in one parameter, so the cast names an array.
+    // `.in` puts the whole list in one parameter, so the cast names an array,
+    // through `text[]` because the digits are what travel.
     try testing.expectEqualStrings(
-        "$2::numeric[]",
+        "$2::text[]::numeric[]",
         Postgres.bindAs(Postgres.placeholder(2), types.Decimal, true),
     );
     try testing.expectEqualStrings("$1", Postgres.bindAs(Postgres.placeholder(1), i64, false));
@@ -1791,7 +1816,7 @@ test "a date is read as the column and written as text, which is the driver's sh
         Postgres.bindAs(Postgres.placeholder(1), types.Date, false),
     );
     try testing.expectEqualStrings(
-        "$2::date[]",
+        "$2::text[]::date[]",
         Postgres.bindAs(Postgres.placeholder(2), types.Date, true),
     );
     try testing.expectEqualStrings("text[]::date[]", Postgres.arrayOf(types.Date).?);

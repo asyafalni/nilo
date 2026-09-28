@@ -1798,9 +1798,7 @@ pub fn headVersion(db: anytype, scope: anytype) !i64 {
 /// Where the database is against the version this binary was built for.
 ///
 /// A value rather than a log line, so that a program which wants to decide for
-/// itself can, and so that a test can provoke the failing case without the
-/// suite counting a logged error as a failure. `expect` is this plus the
-/// sentence and the refusal.
+/// itself can. `expect` is this plus the sentence and the refusal.
 pub const Standing = struct {
     /// The highest version the ledger records.
     at: i64,
@@ -1842,7 +1840,11 @@ pub fn expect(db: anytype, scope: anytype, want: i64) !void {
             .{ where.at, where.want },
         ),
         .behind => {
-            std.log.err(
+            // `warn` rather than `err`, though this stops the process: the
+            // refusal is the error handed back, which `main` returns and the
+            // runtime prints. The line is the explanation, and at `err` it
+            // made the one branch that matters untestable (ADR 145).
+            std.log.warn(
                 "nilo_sql: this binary was built for schema version {d}, and the database " ++
                     "is at {d}. {d} migration(s) have not been applied. Run them before " ++
                     "serving: a request that reads a column the database does not have is " ++

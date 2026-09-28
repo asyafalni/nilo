@@ -103,34 +103,6 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 **Needs:** a failed first write on a freshly acquired connection, with nothing yet sent in a transaction, answered by one reconnect and a resend, or a check on acquire after a connection has idled.
 
-**A count and its rows disagree when a required parent row is missing.** A Row whose parent is required drops a child whose parent does not exist, while `count` and a page's total still count it, because `tally` walks only the joins marked `narrows` (`shape.zig:1395`): a page at offset 1 reports a total of 1 over a list that is empty.
-
-**Needs:** a required parent join counted as narrowing.
-
-**`sql.problem` answers for the wrong statement, and three failures are never told.** A statement refused before it is sent (`narrowing`, `wireOf`, `valuesOf`, `vetRaw`) leaves the previous statement's problem in place; a failed step on a one-column read (`fillScalar`, `only`, `Streamed.next`) reaches neither `sql.problem` nor the watcher; a commit a deferred constraint refuses returns `ForeignKeyViolated` with nothing recorded, so `sql.violated` cannot name the key.
-
-**Needs:** every public call clearing the problem first, and every error path through `told`.
-
-**`tx.deadline(0)` is no deadline at all.** It sends `SET LOCAL statement_timeout = 0`, which Postgres reads as off (`postgres.zig:274`); a `pg_sleep(1)` under it finishes after a second.
-
-**Needs:** 0 refused or raised to 1, and a value past `maxInt(i32)` refused before Postgres aborts the transaction over it.
-
-**One failed `describe` switches the raw check off for the life of the process.** `vetRaw` marks a statement taken before `describe` has answered (`db.zig:715`), so a statement whose first run meets a table a migration has not made yet is never held against its Row again.
-
-**Needs:** the flag set once `describe` has answered.
-
-**A failed rollback logs at `err` on the request path.** `postgres.zig:364`, `sqlite.zig:478` and `491`, and `db.zig:2369` all do, where `err` here means the server is refusing to start and fails any test that reaches it. It is also why `migrate.expect`'s `SchemaBehind` branch has no test.
-
-**Needs:** `warn`, and a value a test can reach.
-
-**A list condition over a Timestamp, Date, Decimal or Bytes column does not compile on Postgres.** `forWire` has list branches for `Uuid` and `Str` only and hands the rest on as they are (`db.zig:4708`), so `.in` and `.not_in` over those columns fail with Zig's own type error. On SQLite, `.in` over `Bytes` compiles and matches nothing, because each element goes into the JSON list as `{"bytes":…}`. The `$n::numeric[]` and `$n::date[]` casts the dialect tests assert are never sent.
-
-**Needs:** each element mapped through `forWire`, and `Bytes` hex-encoded for `json_each`.
-
-**SQLite refuses an `.offset` with no `.limit`, and reads `.now` once per statement.** `OFFSET` alone is a syntax error there and not on Postgres (`statement.zig:341`), and `julianday('now')` stamps two writes in one transaction with two moments where Postgres's `now()` gives one.
-
-**Needs:** `LIMIT -1` before a lone `OFFSET`, and `.now` bound once per transaction on SQLite or documented as per statement.
-
 **A page's total costs a scan of every match, which ADR 150 says it does not.** `count(*) OVER ()` is read once but computed over the whole match before the limit applies: over a million rows with an index on the order, a page took 124 ms against 0.024 ms without the window. The guide's keyset condition, an `.any` of `<` and `= … AND <`, filters rather than seeks and costs what `OFFSET` does: 17.8 ms against 0.013 ms for a row comparison at a million rows ([sql.md §18](../bench/result/sql.md#18-the-count-a-page-reads-keyset-paging-and-a-stream-let-go-early)).
 
 **Needs:** [ADR 150](./adr/150-a-page-knows-what-it-left-out.md)'s cost corrected with the fix, a page with no total and a row comparison (both under Next), and the guide's keyset example rewritten on the second.

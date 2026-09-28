@@ -253,6 +253,21 @@ fn remember(arena: std.mem.Allocator, problem: ?wire_mod.Problem) void {
     recent.arena = if (problem == null) null else arena;
 }
 
+/// The first line of every call that sends a statement: the Scope checked
+/// while compiling, and the last statement's problem put away.
+///
+/// **Cleared on the way in rather than only when a statement is told**,
+/// because several calls fail before anything is sent: a condition that
+/// narrows nothing, a negative `.limit`, a pool that was never opened, a raw
+/// statement its check refused. Each of those used to leave the problem of
+/// whatever this fiber ran before in place, so `sql.problem` answered for
+/// the wrong statement, and `sql.violated` could name a unique the call never
+/// touched. Two stores to a thread-local.
+inline fn opening(c: anytype, comptime call: []const u8) void {
+    comptime core.checkScope(@TypeOf(c), call);
+    remember(c.arena(), null);
+}
+
 /// What the database said about the last statement **this fiber** ran, or null
 /// when it worked (ADR 117).
 ///
@@ -702,7 +717,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         ///
         /// **Once per statement per process**, on a flag of its own: every
         /// call after the first costs one atomic load. The first costs what
-        /// `describe` costs, planning only. **A misfit fails the statement in a
+        /// `describe` costs, planning only. **The flag stays set only once
+        /// `describe` has answered**: a first run that meets a table a
+        /// migration has not made yet, or a pool with nothing in it, used to
+        /// spend the one check and leave the statement unchecked for the life
+        /// of the process. Asked again on the next run instead, which costs a
+        /// round trip only while the statement itself cannot run either. **A misfit fails the statement in a
         /// test binary and is a warning in a server**: a suite is where the
         /// mistake is cheap to fix, and a server whose check found a column
         /// that *may* be NULL still has every row that is not.
@@ -734,11 +754,26 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 const called = call;
                 const Db = Self;
                 var taken: std.atomic.Value(bool) = .init(false);
+                var warned: std.atomic.Value(bool) = .init(false);
             };
             if (First.taken.load(.acquire)) return;
             const w = if (self.wire) |*w| w else return;
             if (First.taken.swap(true, .acq_rel)) return;
-            return vetFirst(w, c.arena(), comptime schema.readingsOf(D, Row, scalar, total), call, @typeName(Row), text);
+            const answered = vetFirst(
+                w,
+                c.arena(),
+                comptime schema.readingsOf(D, Row, scalar, total),
+                call,
+                @typeName(Row),
+                text,
+                &First.warned,
+            ) catch |err| {
+                // A misfit is an answer: the flag stays set, and what the
+                // statement does is the caller's to hear.
+                if (err != error.QueryFailed) First.taken.store(false, .release);
+                return err;
+            };
+            if (!answered) First.taken.store(false, .release);
         }
 
         /// The half of `vetRaw` that runs once, and **the half that is not
@@ -752,21 +787,24 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             call: []const u8,
             row_name: []const u8,
             text: []const u8,
-        ) !void {
+            warned: *std.atomic.Value(bool),
+        ) !bool {
             var nulls = false;
             for (readings) |r| nulls = nulls or !r.optional;
             const described = w.describe(arena, text, nulls) catch |err| {
-                std.log.warn(
+                // Said once, however often it is asked again: the statement
+                // failing beside it says the rest.
+                if (!warned.swap(true, .acq_rel)) std.log.warn(
                     "nilo_sql: `{s}` into {s} could not be held against what the statement " ++
-                        "answers ({s}), so it runs unchecked: {s}",
+                        "answers ({s}); it is asked again on its next run: {s}",
                     .{ call, row_name, @errorName(err), text },
                 );
-                return;
-            } orelse return;
+                return false;
+            } orelse return true;
 
             var misfits: std.ArrayList(schema.Misfit) = .empty;
             try schema.fit(readings, described, &misfits, arena);
-            if (misfits.items.len == 0) return;
+            if (misfits.items.len == 0) return true;
 
             var said: std.Io.Writer.Allocating = .init(arena);
             for (misfits.items) |m| try m.write(&said.writer);
@@ -775,6 +813,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 .{ call, row_name, said.written(), text },
             );
             if (builtin.is_test) return error.QueryFailed;
+            return true;
         }
 
         /// A raw statement's text as this Dialect spells its placeholders,
@@ -914,16 +953,32 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             failed: bool,
             problem: ?wire_mod.Problem,
         ) void {
+            self.toldFor(c.arena(), core.routeNameOf(c), started, sql, plan, rows, failed, problem);
+        }
+
+        /// `told` for a caller holding no Scope, only its arena and route: a
+        /// stream's rows are pulled after the call that opened it returned.
+        fn toldFor(
+            self: *const Self,
+            arena: std.mem.Allocator,
+            route: ?[]const u8,
+            started: ?i64,
+            sql: []const u8,
+            plan: ?[]const u8,
+            rows: ?usize,
+            failed: bool,
+            problem: ?wire_mod.Problem,
+        ) void {
             // Before either early return below, because this is not the
             // watcher's half: a `Db` with no watcher and a `Db` with timing off
             // both still owe the caller an answer about the statement it just
             // ran (ADR 117).
-            remember(c.arena(), problem);
+            remember(arena, problem);
             const f = self.watch orelse return;
             const at = started orelse return;
             const took = core.monotonicMicros() - at;
             f(.{
-                .route = core.routeNameOf(c),
+                .route = route,
                 .sql = sql,
                 .plan = plan,
                 // A monotonic clock does not go backwards, so this cannot be
@@ -1233,7 +1288,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// The statement itself was settled while compiling: `options` only
         /// carries the values (ADR 036).
         pub fn select(self: *Self, comptime Row: type, c: anytype, options: anytype) ![]Row {
-            comptime core.checkScope(@TypeOf(c), "db.select");
+            opening(c, "db.select");
             comptime assertUnlocked(Row, @TypeOf(options), "db.select", "Begin one and ask there: `var tx = try db.begin(c, .{}); defer tx.deinit();` " ++
                 "and then `tx.select(…)`.");
             const stmt = comptime statement.select(D, Row, @TypeOf(options));
@@ -1258,7 +1313,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// are a second statement and are not in it. Sent unprepared, and
         /// told to the watcher like any other statement.
         pub fn explain(self: *Self, comptime Row: type, c: anytype, options: anytype) ![]const u8 {
-            comptime core.checkScope(@TypeOf(c), "db.explain");
+            opening(c, "db.explain");
             comptime assertUnlocked(Row, @TypeOf(options), "db.explain", "The plan of a locking read is the plan " ++
                 "of the same read without the lock: take `.lock` out.");
             const stmt = comptime statement.select(D, Row, @TypeOf(options));
@@ -1285,7 +1340,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// sequence it advanced stays advanced, since Postgres keeps that
         /// outside every transaction.
         pub fn rawExplain(self: *Self, c: anytype, comptime sql: []const u8, values: anytype) ![]const u8 {
-            comptime core.checkScope(@TypeOf(c), "db.rawExplain");
+            opening(c, "db.rawExplain");
             const text = comptime D.explain ++ rawText(sql, @TypeOf(values), "db.rawExplain");
             var tx = try self.begin(c, .{});
             defer tx.deinit();
@@ -1302,7 +1357,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             values: anytype,
             order: anytype,
         ) ![]const u8 {
-            comptime core.checkScope(@TypeOf(c), "db.rawExplainOrdered");
+            opening(c, "db.rawExplainOrdered");
             const parts = comptime ordering.split(rawText(sql, @TypeOf(values), "db.rawExplainOrdered"), "`db.rawExplainOrdered`");
             const text = try spliced(D.explain ++ parts.head, order, parts.tail, c);
             var tx = try self.begin(c, .{});
@@ -1340,7 +1395,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// column that is not unique costs one row rather than every match.
         /// A `.limit` written alongside it is a Refusal.
         pub fn one(self: *Self, comptime Row: type, c: anytype, options: anytype) !?Row {
-            comptime core.checkScope(@TypeOf(c), "db.one");
+            opening(c, "db.one");
             comptime assertUnlocked(Row, @TypeOf(options), "db.one", "Begin one and ask there: `var tx = try db.begin(c, .{}); defer tx.deinit();` " ++
                 "and then `tx.one(…)`.");
             const stmt = comptime statement.one(D, Row, @TypeOf(options));
@@ -1375,7 +1430,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// report nothing. A column left out, a column that is not part of the
         /// key, and a tuple are all Refusals.
         pub fn find(self: *Self, comptime Row: type, c: anytype, key: anytype) !?Row {
-            comptime core.checkScope(@TypeOf(c), "db.find");
+            opening(c, "db.find");
             // A narrower Row that does not carry its table's key is found the
             // way `one` finds it with the key in `.where` (item 103).
             if (comptime !statement.carriesKey(Row)) return self.one(Row, c, statement.keyWhere(Row, key));
@@ -1391,7 +1446,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// compiled by the same walker `select` uses, so the count cannot
         /// drift from the query it is counting. No `.where` counts the table.
         pub fn count(self: *Self, comptime Row: type, c: anytype, options: anytype) !usize {
-            comptime core.checkScope(@TypeOf(c), "db.count");
+            opening(c, "db.count");
             const stmt = comptime statement.count(D, Row, @TypeOf(options));
             const n = try only(i64, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
             // `count(*)` is a `bigint` and never negative. A negative one
@@ -1433,7 +1488,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// too — `FOR UPDATE` and a window function cannot be in one
         /// statement.
         pub fn page(self: *Self, comptime Row: type, c: anytype, options: anytype) !Page(Row) {
-            comptime core.checkScope(@TypeOf(c), "db.page");
+            opening(c, "db.page");
             const stmt = comptime statement.page(D, Row, @TypeOf(options));
             var total: i64 = 0;
             const rows = try filling(
@@ -1458,7 +1513,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// first match instead of counting every one of them to answer a
         /// question the first settles.
         pub fn exists(self: *Self, comptime Row: type, c: anytype, options: anytype) !bool {
-            comptime core.checkScope(@TypeOf(c), "db.exists");
+            opening(c, "db.exists");
             const stmt = comptime statement.exists(D, Row, @TypeOf(options));
             return only(bool, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
         }
@@ -1483,7 +1538,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// null. `db.one` would say null for a case that cannot happen, and
         /// `db.select` would hand back a list that always holds one.
         pub fn exactlyOne(self: *Self, comptime Row: type, c: anytype, options: anytype) !Row {
-            comptime core.checkScope(@TypeOf(c), "db.exactlyOne");
+            opening(c, "db.exactlyOne");
             const stmt = comptime shape.exactlyOne(D, Row, @TypeOf(options));
             const found = try fill(Row, stmt.reserve, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
             return if (found.len == 0) error.QueryFailed else found[0];
@@ -1507,7 +1562,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             c: anytype,
             options: anytype,
         ) !Streamed(Row) {
-            comptime core.checkScope(@TypeOf(c), "db.stream");
+            opening(c, "db.stream");
             comptime assertUnlocked(Row, @TypeOf(options), "db.stream", "There is no `tx.stream` to move this to, either: a result set held open " ++
                 "keeps its connection busy, so nothing else in the transaction could " ++
                 "run until it closed. Lock the rows with `tx.select` and work through " ++
@@ -1537,7 +1592,16 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // Counted only once the statement is away, so a `stream` that
             // never opened is not a `stream` that was never closed.
             if (traps_enabled) self.hold(&self.open_streams, .Add);
-            return .{ .db = self, .w = w, .rows = rows };
+            return .{
+                .db = self,
+                .w = w,
+                .rows = rows,
+                .arena = arena,
+                .route = core.routeNameOf(c),
+                .text = text,
+                .plan = self.planOf(stmt),
+                .started = started,
+            };
         }
 
         /// A statement this module will not write, filling `Row` from the
@@ -1574,7 +1638,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             comptime sql: []const u8,
             values: anytype,
         ) ![]Row {
-            comptime core.checkScope(@TypeOf(c), "db.raw");
+            opening(c, "db.raw");
             const text = comptime rawText(sql, @TypeOf(values), "db.raw");
             // One column and no Row: `db.raw([]const u8, …)`, `db.raw(i64, …)`
             // ([ADR 125](../docs/adr/125-a-row-that-owns-no-table.md)).
@@ -1630,7 +1694,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             values: anytype,
             order: anytype,
         ) ![]Row {
-            comptime core.checkScope(@TypeOf(c), "db.rawOrdered");
+            opening(c, "db.rawOrdered");
             comptime rawcheck.assertList(D, Row, sql, "db.rawOrdered");
             comptime ordering.assertFor(@TypeOf(order), Row, "`db.rawOrdered`", false);
             const parts = comptime ordering.split(rawText(sql, @TypeOf(values), "db.rawOrdered"), "`db.rawOrdered`");
@@ -1669,7 +1733,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             comptime sql: []const u8,
             values: anytype,
         ) !?Row {
-            comptime core.checkScope(@TypeOf(c), "db.rawOne");
+            opening(c, "db.rawOne");
             const text = comptime rawText(sql, @TypeOf(values), "db.rawOne");
             if (comptime scalarColumn(Row)) {
                 comptime rawcheck.assertOne(Row, sql, "db.rawOne");
@@ -1711,7 +1775,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             comptime sql: []const u8,
             values: anytype,
         ) !Row {
-            comptime core.checkScope(@TypeOf(c), "db.rawExactlyOne");
+            opening(c, "db.rawExactlyOne");
             const text = comptime rawText(sql, @TypeOf(values), "db.rawExactlyOne");
             if (comptime scalarColumn(Row)) {
                 comptime rawcheck.assertOne(Row, sql, "db.rawExactlyOne");
@@ -1760,7 +1824,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             comptime sql: []const u8,
             values: anytype,
         ) !Page(Row) {
-            comptime core.checkScope(@TypeOf(c), "db.rawPage");
+            opening(c, "db.rawPage");
             comptime rawcheck.assertPaged(D, Row, sql, "db.rawPage");
             const paged = comptime rawcheck.paging(sql, @TypeOf(values), "db.rawPage");
             const text = comptime rawText(sql, @TypeOf(values), "db.rawPage");
@@ -1803,7 +1867,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             values: anytype,
             order: anytype,
         ) !Page(Row) {
-            comptime core.checkScope(@TypeOf(c), "db.rawPageOrdered");
+            opening(c, "db.rawPageOrdered");
             comptime rawcheck.assertPaged(D, Row, sql, "db.rawPageOrdered");
             const paged = comptime rawcheck.paging(sql, @TypeOf(values), "db.rawPageOrdered");
             comptime ordering.assertFor(@TypeOf(order), Row, "`db.rawPageOrdered`", false);
@@ -1866,7 +1930,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             stmt: composed_mod.Composed,
             values: anytype,
         ) ![]Row {
-            comptime core.checkScope(@TypeOf(c), "db.composed");
+            opening(c, "db.composed");
             comptime rawcheck.assertFlat(Row, "db.composed");
             try checkComposed(stmt, @TypeOf(values));
             if (comptime scalarColumn(Row)) {
@@ -1927,7 +1991,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// it gives up is the same one `raw` gives up. What it keeps is the
         /// pool, the Scope and the seven errors.
         pub fn exec(self: *Self, c: anytype, sql: []const u8, values: anytype) !usize {
-            comptime core.checkScope(@TypeOf(c), "db.exec");
+            opening(c, "db.exec");
             return self.execTold(null, c, sql, null, try rawValuesOf(values, c));
         }
 
@@ -1940,7 +2004,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// database fills in are exactly the ones a caller has nothing to
         /// say about. A name that is not a column is a Refusal.
         pub fn insert(self: *Self, comptime Row: type, c: anytype, values: anytype) !Row {
-            comptime core.checkScope(@TypeOf(c), "db.insert");
+            opening(c, "db.insert");
             const stmt = comptime statement.insert(D, Row, @TypeOf(values));
             // `RETURNING` on a successful insert answers with exactly one
             // row, so the list is sized for one and never grows.
@@ -1973,7 +2037,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// sends the statement with empty arrays and answers with no rows,
         /// which is the same thing the database would have said.
         pub fn insertMany(self: *Self, comptime Row: type, c: anytype, rows: anytype) ![]Row {
-            comptime core.checkScope(@TypeOf(c), "db.insertMany");
+            opening(c, "db.insertMany");
             const V = comptime batchElement(Row, @TypeOf(rows));
             const stmt = comptime statement.insertMany(D, Row, V);
             const items: []const V = rows;
@@ -2009,7 +2073,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// this being a join; `db.update` in a loop is the answer where either
         /// matters.
         pub fn updateMany(self: *Self, comptime Row: type, c: anytype, rows: anytype) ![]Row {
-            comptime core.checkScope(@TypeOf(c), "db.updateMany");
+            opening(c, "db.updateMany");
             const V = comptime batchElement(Row, @TypeOf(rows));
             const stmt = comptime statement.updateMany(D, Row, V);
             const items: []const V = rows;
@@ -2065,7 +2129,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             values: anytype,
             comptime on: anytype,
         ) !?Row {
-            comptime core.checkScope(@TypeOf(c), "db.insertOrIgnore");
+            opening(c, "db.insertOrIgnore");
             const stmt = comptime statement.insertOrIgnore(D, Row, @TypeOf(values), on);
             const back = try fill(Row, stmt.reserve, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, values, c));
             return if (back.len == 0) null else back[0];
@@ -2097,7 +2161,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             values: anytype,
             comptime on: anytype,
         ) !Row {
-            comptime core.checkScope(@TypeOf(c), "db.insertOrUpdate");
+            opening(c, "db.insertOrUpdate");
             const stmt = comptime statement.insertOrUpdate(D, Row, @TypeOf(values), on);
             const back = try fill(Row, stmt.reserve, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, values, c));
             // `DO UPDATE` always touches a row, so an empty answer here means
@@ -2113,7 +2177,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// nothing, and one with no `.where` rewrites the table. Each is a
         /// Refusal rather than a statement nobody meant to send.
         pub fn update(self: *Self, comptime Row: type, c: anytype, options: anytype) !usize {
-            comptime core.checkScope(@TypeOf(c), "db.update");
+            opening(c, "db.update");
             try narrowing(Row, "db.update", options);
             const stmt = comptime statement.update(D, Row, @TypeOf(options));
             return self.execTold(null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
@@ -2132,7 +2196,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// rows a condition matches. `changed[0]` after a length check is the
         /// single-row shape.
         pub fn updateReturning(self: *Self, comptime Row: type, c: anytype, options: anytype) ![]Row {
-            comptime core.checkScope(@TypeOf(c), "db.updateReturning");
+            opening(c, "db.updateReturning");
             try narrowing(Row, "db.updateReturning", options);
             const stmt = comptime statement.updateReturning(D, Row, @TypeOf(options));
             return fill(Row, stmt.reserve, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
@@ -2164,7 +2228,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// where there were many. `updateReturning` is the call for a
         /// condition that means several.
         pub fn updateReturningOne(self: *Self, comptime Row: type, c: anytype, options: anytype) !?Row {
-            comptime core.checkScope(@TypeOf(c), "db.updateReturningOne");
+            opening(c, "db.updateReturningOne");
             try narrowing(Row, "db.updateReturningOne", options);
             const stmt = comptime statement.updateReturningOne(D, Row, @TypeOf(options));
             const changed = try fill(Row, stmt.reserve, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
@@ -2173,7 +2237,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         /// Delete every row matching `options`, and say how many there were.
         pub fn delete(self: *Self, comptime Row: type, c: anytype, options: anytype) !usize {
-            comptime core.checkScope(@TypeOf(c), "db.delete");
+            opening(c, "db.delete");
             try narrowing(Row, "db.delete", options);
             const stmt = comptime statement.delete(D, Row, @TypeOf(options));
             return self.execTold(null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
@@ -2186,7 +2250,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// change a row between the `SELECT` and the `DELETE`, and what comes
         /// back then never existed.
         pub fn deleteReturning(self: *Self, comptime Row: type, c: anytype, options: anytype) ![]Row {
-            comptime core.checkScope(@TypeOf(c), "db.deleteReturning");
+            opening(c, "db.deleteReturning");
             try narrowing(Row, "db.deleteReturning", options);
             const stmt = comptime statement.deleteReturning(D, Row, @TypeOf(options));
             return fill(Row, stmt.reserve, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
@@ -2204,7 +2268,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// What taking a one-time token is: the check and the removal are one
         /// statement, so two requests with the same token cannot both get it.
         pub fn deleteReturningOne(self: *Self, comptime Row: type, c: anytype, options: anytype) !?Row {
-            comptime core.checkScope(@TypeOf(c), "db.deleteReturningOne");
+            opening(c, "db.deleteReturningOne");
             try narrowing(Row, "db.deleteReturningOne", options);
             const stmt = comptime statement.deleteReturningOne(D, Row, @TypeOf(options));
             const gone = try fill(Row, stmt.reserve, self, null, c, stmt.sql, self.planOf(stmt), try valuesOf(stmt, Row, options, c));
@@ -2236,11 +2300,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// capture passed by hand, and `Stream`, `Socket` and `Body` are all
         /// *hold the thing, `defer` the cleanup* (ADR 036).
         pub fn begin(self: *Self, c: anytype, comptime opts: wire_mod.Begin) !Tx {
-            comptime core.checkScope(@TypeOf(c), "db.begin");
+            opening(c, "db.begin");
             const w = try self.wireOf();
             const inner = try w.begin(c.arena(), opts);
             if (traps_enabled) self.hold(&self.open_transactions, .Add);
-            return .{ .db = self, .w = w, .inner = inner };
+            return .{ .db = self, .w = w, .inner = inner, .scope = c.arena() };
         }
 
         /// One transaction. Every call on it is the `Db` call of the same
@@ -2249,6 +2313,9 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             db: *Self,
             w: *W,
             inner: W.Tx,
+            /// The arena of the Scope that began it, where a refused COMMIT
+            /// leaves the database's words for `sql.problem`.
+            scope: std.mem.Allocator,
             finished: bool = false,
             /// The number the next savepoint gets. Counted up and never
             /// reused, so a savepoint taken inside a loop is a fresh mark
@@ -2278,9 +2345,18 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 self.end();
             }
 
+            /// Keep the work. A deferred constraint is checked here, so a
+            /// commit refused for one leaves its problem where the statement
+            /// it refused would have: `sql.problem` and `sql.violated` answer
+            /// for the COMMIT.
             pub fn commit(self: *Tx) !void {
                 if (self.finished) return error.QueryFailed;
-                try self.inner.commit();
+                var problem: ?wire_mod.Problem = null;
+                self.inner.commit(self.scope, &problem) catch |err| {
+                    remember(self.scope, problem);
+                    return err;
+                };
+                remember(self.scope, null);
                 self.end();
             }
 
@@ -2306,9 +2382,16 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             /// however it ends, so the connection goes back to the pool
             /// carrying nothing — the rule the whole of `wire.zig` is built
             /// on.
+            ///
+            /// **The number is kept inside what Postgres reads as a limit.**
+            /// `statement_timeout = 0` means no limit at all, so a budget
+            /// computed down to 0 would lift the deadline it meant to spend;
+            /// it is sent as 1, and the next statement times out. A number
+            /// past `maxInt(i32)` is refused by Postgres and aborts the
+            /// transaction, so it is sent as `maxInt(i32)`, which is 24 days.
             pub fn deadline(self: *Tx, ms: u32) !void {
                 if (self.finished) return error.QueryFailed;
-                return self.inner.deadline(ms);
+                return self.inner.deadline(std.math.clamp(ms, 1, std.math.maxInt(i32)));
             }
 
             /// Roll back now rather than on the way out, for a handler that
@@ -2399,7 +2482,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                     if (!self.live()) return;
                     self.end();
                     self.tx.inner.savepoint(self.tx.arenaOf(), .undo, self.id) catch |err| {
-                        std.log.err(
+                        std.log.warn(
                             "nilo_sql: a savepoint could not be rolled back to ({s}). The " ++
                                 "transaction around it is the one that will fail next.",
                             .{@errorName(err)},
@@ -2448,20 +2531,20 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }
 
             pub fn select(self: *Tx, comptime Row: type, c: anytype, options: anytype) ![]Row {
-                comptime core.checkScope(@TypeOf(c), "tx.select");
+                opening(c, "tx.select");
                 const stmt = comptime statement.select(D, Row, @TypeOf(options));
                 return fill(Row, stmt.reserve, self.db, &self.inner, c, try textOf(stmt, options, c), self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
             }
 
             pub fn one(self: *Tx, comptime Row: type, c: anytype, options: anytype) !?Row {
-                comptime core.checkScope(@TypeOf(c), "tx.one");
+                opening(c, "tx.one");
                 const stmt = comptime statement.one(D, Row, @TypeOf(options));
                 const found = try fill(Row, stmt.reserve, self.db, &self.inner, c, try textOf(stmt, options, c), self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
                 return if (found.len == 0) null else found[0];
             }
 
             pub fn find(self: *Tx, comptime Row: type, c: anytype, key: anytype) !?Row {
-                comptime core.checkScope(@TypeOf(c), "tx.find");
+                opening(c, "tx.find");
                 if (comptime !statement.carriesKey(Row)) return self.one(Row, c, statement.keyWhere(Row, key));
                 const stmt = comptime statement.find(D, Row, @TypeOf(key));
                 const found = try fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, key, c));
@@ -2469,7 +2552,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }
 
             pub fn count(self: *Tx, comptime Row: type, c: anytype, options: anytype) !usize {
-                comptime core.checkScope(@TypeOf(c), "tx.count");
+                opening(c, "tx.count");
                 const stmt = comptime statement.count(D, Row, @TypeOf(options));
                 const n = try only(i64, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
                 if (n < 0) return error.QueryFailed;
@@ -2477,20 +2560,20 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }
 
             pub fn exists(self: *Tx, comptime Row: type, c: anytype, options: anytype) !bool {
-                comptime core.checkScope(@TypeOf(c), "tx.exists");
+                opening(c, "tx.exists");
                 const stmt = comptime statement.exists(D, Row, @TypeOf(options));
                 return only(bool, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
             }
 
             pub fn exactlyOne(self: *Tx, comptime Row: type, c: anytype, options: anytype) !Row {
-                comptime core.checkScope(@TypeOf(c), "tx.exactlyOne");
+                opening(c, "tx.exactlyOne");
                 const stmt = comptime shape.exactlyOne(D, Row, @TypeOf(options));
                 const found = try fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
                 return if (found.len == 0) error.QueryFailed else found[0];
             }
 
             pub fn insert(self: *Tx, comptime Row: type, c: anytype, values: anytype) !Row {
-                comptime core.checkScope(@TypeOf(c), "tx.insert");
+                opening(c, "tx.insert");
                 const stmt = comptime statement.insert(D, Row, @TypeOf(values));
                 // `RETURNING` on a successful insert answers with exactly one
                 // row, so the list is sized for one and never grows.
@@ -2500,7 +2583,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }
 
             pub fn insertMany(self: *Tx, comptime Row: type, c: anytype, rows: anytype) ![]Row {
-                comptime core.checkScope(@TypeOf(c), "tx.insertMany");
+                opening(c, "tx.insertMany");
                 const V = comptime batchElement(Row, @TypeOf(rows));
                 const stmt = comptime statement.insertMany(D, Row, V);
                 const items: []const V = rows;
@@ -2517,7 +2600,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }
 
             pub fn updateMany(self: *Tx, comptime Row: type, c: anytype, rows: anytype) ![]Row {
-                comptime core.checkScope(@TypeOf(c), "tx.updateMany");
+                opening(c, "tx.updateMany");
                 const V = comptime batchElement(Row, @TypeOf(rows));
                 const stmt = comptime statement.updateMany(D, Row, V);
                 const items: []const V = rows;
@@ -2539,7 +2622,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             /// way to make a count and a page agree, and it costs a
             /// transaction where this costs a clause.
             pub fn page(self: *Tx, comptime Row: type, c: anytype, options: anytype) !Page(Row) {
-                comptime core.checkScope(@TypeOf(c), "tx.page");
+                opening(c, "tx.page");
                 const stmt = comptime statement.page(D, Row, @TypeOf(options));
                 var total: i64 = 0;
                 const rows = try filling(
@@ -2564,7 +2647,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 values: anytype,
                 comptime on: anytype,
             ) !?Row {
-                comptime core.checkScope(@TypeOf(c), "tx.insertOrIgnore");
+                opening(c, "tx.insertOrIgnore");
                 const stmt = comptime statement.insertOrIgnore(D, Row, @TypeOf(values), on);
                 const back = try fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, values, c));
                 return if (back.len == 0) null else back[0];
@@ -2577,7 +2660,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 values: anytype,
                 comptime on: anytype,
             ) !Row {
-                comptime core.checkScope(@TypeOf(c), "tx.insertOrUpdate");
+                opening(c, "tx.insertOrUpdate");
                 const stmt = comptime statement.insertOrUpdate(D, Row, @TypeOf(values), on);
                 const back = try fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, values, c));
                 if (back.len == 0) return error.QueryFailed;
@@ -2585,14 +2668,14 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }
 
             pub fn update(self: *Tx, comptime Row: type, c: anytype, options: anytype) !usize {
-                comptime core.checkScope(@TypeOf(c), "tx.update");
+                opening(c, "tx.update");
                 try narrowing(Row, "tx.update", options);
                 const stmt = comptime statement.update(D, Row, @TypeOf(options));
                 return self.db.execTold(&self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
             }
 
             pub fn updateReturning(self: *Tx, comptime Row: type, c: anytype, options: anytype) ![]Row {
-                comptime core.checkScope(@TypeOf(c), "tx.updateReturning");
+                opening(c, "tx.updateReturning");
                 try narrowing(Row, "tx.updateReturning", options);
                 const stmt = comptime statement.updateReturning(D, Row, @TypeOf(options));
                 return fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
@@ -2600,7 +2683,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
             /// `db.updateReturningOne` inside the transaction (ADR 146).
             pub fn updateReturningOne(self: *Tx, comptime Row: type, c: anytype, options: anytype) !?Row {
-                comptime core.checkScope(@TypeOf(c), "tx.updateReturningOne");
+                opening(c, "tx.updateReturningOne");
                 try narrowing(Row, "tx.updateReturningOne", options);
                 const stmt = comptime statement.updateReturningOne(D, Row, @TypeOf(options));
                 const changed = try fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
@@ -2608,21 +2691,21 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             }
 
             pub fn delete(self: *Tx, comptime Row: type, c: anytype, options: anytype) !usize {
-                comptime core.checkScope(@TypeOf(c), "tx.delete");
+                opening(c, "tx.delete");
                 try narrowing(Row, "tx.delete", options);
                 const stmt = comptime statement.delete(D, Row, @TypeOf(options));
                 return self.db.execTold(&self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
             }
 
             pub fn deleteReturning(self: *Tx, comptime Row: type, c: anytype, options: anytype) ![]Row {
-                comptime core.checkScope(@TypeOf(c), "tx.deleteReturning");
+                opening(c, "tx.deleteReturning");
                 try narrowing(Row, "tx.deleteReturning", options);
                 const stmt = comptime statement.deleteReturning(D, Row, @TypeOf(options));
                 return fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
             }
 
             pub fn deleteReturningOne(self: *Tx, comptime Row: type, c: anytype, options: anytype) !?Row {
-                comptime core.checkScope(@TypeOf(c), "tx.deleteReturningOne");
+                opening(c, "tx.deleteReturningOne");
                 try narrowing(Row, "tx.deleteReturningOne", options);
                 const stmt = comptime statement.deleteReturningOne(D, Row, @TypeOf(options));
                 const gone = try fill(Row, stmt.reserve, self.db, &self.inner, c, stmt.sql, self.db.planOf(stmt), try valuesOf(stmt, Row, options, c));
@@ -2641,7 +2724,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 comptime sql: []const u8,
                 values: anytype,
             ) ![]Row {
-                comptime core.checkScope(@TypeOf(c), "tx.raw");
+                opening(c, "tx.raw");
                 const text = comptime rawText(sql, @TypeOf(values), "tx.raw");
                 if (comptime scalarColumn(Row)) {
                     comptime rawcheck.assertOne(Row, sql, "tx.raw");
@@ -2664,7 +2747,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 stmt: composed_mod.Composed,
                 values: anytype,
             ) ![]Row {
-                comptime core.checkScope(@TypeOf(c), "tx.composed");
+                opening(c, "tx.composed");
                 comptime rawcheck.assertFlat(Row, "tx.composed");
                 try checkComposed(stmt, @TypeOf(values));
                 if (comptime scalarColumn(Row)) {
@@ -2695,7 +2778,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 values: anytype,
                 order: anytype,
             ) ![]Row {
-                comptime core.checkScope(@TypeOf(c), "tx.rawOrdered");
+                opening(c, "tx.rawOrdered");
                 comptime rawcheck.assertList(D, Row, sql, "tx.rawOrdered");
                 comptime ordering.assertFor(@TypeOf(order), Row, "`tx.rawOrdered`", false);
                 const parts = comptime ordering.split(rawText(sql, @TypeOf(values), "tx.rawOrdered"), "`tx.rawOrdered`");
@@ -2712,7 +2795,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 comptime sql: []const u8,
                 values: anytype,
             ) !?Row {
-                comptime core.checkScope(@TypeOf(c), "tx.rawOne");
+                opening(c, "tx.rawOne");
                 const text = comptime rawText(sql, @TypeOf(values), "tx.rawOne");
                 if (comptime scalarColumn(Row)) {
                     comptime rawcheck.assertOne(Row, sql, "tx.rawOne");
@@ -2734,7 +2817,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 comptime sql: []const u8,
                 values: anytype,
             ) !Row {
-                comptime core.checkScope(@TypeOf(c), "tx.rawExactlyOne");
+                opening(c, "tx.rawExactlyOne");
                 const text = comptime rawText(sql, @TypeOf(values), "tx.rawExactlyOne");
                 if (comptime scalarColumn(Row)) {
                     comptime rawcheck.assertOne(Row, sql, "tx.rawExactlyOne");
@@ -2756,7 +2839,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 comptime sql: []const u8,
                 values: anytype,
             ) !Page(Row) {
-                comptime core.checkScope(@TypeOf(c), "tx.rawPage");
+                opening(c, "tx.rawPage");
                 comptime rawcheck.assertPaged(D, Row, sql, "tx.rawPage");
                 const paged = comptime rawcheck.paging(sql, @TypeOf(values), "tx.rawPage");
                 const text = comptime rawText(sql, @TypeOf(values), "tx.rawPage");
@@ -2781,7 +2864,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 values: anytype,
                 order: anytype,
             ) !Page(Row) {
-                comptime core.checkScope(@TypeOf(c), "tx.rawPageOrdered");
+                opening(c, "tx.rawPageOrdered");
                 comptime rawcheck.assertPaged(D, Row, sql, "tx.rawPageOrdered");
                 const paged = comptime rawcheck.paging(sql, @TypeOf(values), "tx.rawPageOrdered");
                 comptime ordering.assertFor(@TypeOf(order), Row, "`tx.rawPageOrdered`", false);
@@ -2799,7 +2882,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             /// `db.exec` inside the transaction: a statement that answers with
             /// nothing, and the rows it changed (ADR 067).
             pub fn exec(self: *Tx, c: anytype, sql: []const u8, values: anytype) !usize {
-                comptime core.checkScope(@TypeOf(c), "tx.exec");
+                opening(c, "tx.exec");
                 return self.db.execTold(&self.inner, c, sql, null, try rawValuesOf(values, c));
             }
         };
@@ -2862,14 +2945,36 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 /// instead is one byte on the stack of a handler that streams,
                 /// and nothing at all to one that does not.
                 closed: bool = false,
+                /// What a row that fails to arrive is told with, since the
+                /// call that opened the stream has returned: `sql.problem`
+                /// reads the arena, and the watcher the rest. A step is where
+                /// Postgres reports an error raised mid-result, such as a
+                /// division by zero on the ten-thousandth row, and it used to
+                /// reach neither.
+                arena: std.mem.Allocator,
+                route: ?[]const u8,
+                text: []const u8,
+                plan: ?[]const u8,
+                started: ?i64,
 
                 const Rows = @This();
 
                 /// The next row, or null at the end. **Everything read out
                 /// of the row before this returns is invalid afterwards.**
                 pub fn next(self: *Rows) !?row_mod.Borrowed(Row) {
-                    if (!try self.w.next(&self.rows)) return null;
-                    return try borrowRow(Row, 0, self.w, &self.rows);
+                    const more = self.w.next(&self.rows) catch |err| {
+                        self.failed(stepProblem(self.w, &self.rows, err, self.arena));
+                        return err;
+                    };
+                    if (!more) return null;
+                    return borrowRow(Row, 0, self.w, &self.rows) catch |err| {
+                        self.failed(null);
+                        return err;
+                    };
+                }
+
+                fn failed(self: *const Rows, problem: ?wire_mod.Problem) void {
+                    self.db.toldFor(self.arena, self.route, self.started, self.text, self.plan, null, true, problem);
                 }
 
                 /// Give the connection back. Wanted on every path out,
@@ -3212,7 +3317,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             defer w.drain(&rows);
 
             var out: std.ArrayList(T) = .empty;
-            if (try w.next(&rows)) {
+            const any = w.next(&rows) catch |err| {
+                db.told(c, started, sql, plan, null, true, stepProblem(w, &rows, err, arena));
+                return err;
+            };
+            if (any) {
                 // A statement that answered no columns at all cannot have
                 // answered rows, so this is the one width a scalar can be
                 // short of, and it is checked for the reason `wideEnough` is.
@@ -3226,7 +3335,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                         return err;
                     };
                     try out.append(arena, value);
-                    if (!try w.next(&rows)) break;
+                    const more = w.next(&rows) catch |err| {
+                        db.told(c, started, sql, plan, null, true, stepProblem(w, &rows, err, arena));
+                        return err;
+                    };
+                    if (!more) break;
                 }
             }
             db.told(c, started, sql, plan, out.items.len, false, null);
@@ -3268,7 +3381,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // An aggregate answers with exactly one row. None would mean the
             // driver and Postgres disagree about what was sent, which is not
             // something to paper over with a zero.
-            if (!try w.next(&rows)) {
+            const any = w.next(&rows) catch |err| {
+                db.told(c, started, sql, plan, null, true, stepProblem(w, &rows, err, arena));
+                return err;
+            };
+            if (!any) {
                 db.told(c, started, sql, plan, null, true, null);
                 return error.QueryFailed;
             }
@@ -4708,7 +4825,19 @@ fn forWire(comptime To: type, value: anytype, c: anytype) !To {
         // at the call site. `docs/reference.md` had said `[]const Str` works
         // for two releases.
         if (comptime Item == core.Str or Item == ?core.Str) return strList(To, value, c);
+        // Every other element that is not itself what travels: a `Timestamp`
+        // is its `i64`, a `Date` its ten characters, a `Decimal` its digits,
+        // a `Bytes` the slice inside. Before this an `.in` over any of them
+        // fell through to `return value;` and stopped as Zig's own type error
+        // naming this function, so the list casts the Dialect writes were
+        // never sent.
+        if (comptime listMoves(To, @TypeOf(value))) return mappedList(To, value, c);
     }
+    // A `Bytes` inside a list, where the Wire is handed the slice it holds —
+    // the scalar keeps the wrapper, because only `sqlite.zig` may unwrap it
+    // into zqlite's `Blob`.
+    if (V == types.Bytes and To == []const u8) return value.bytes;
+    if (V == ?types.Bytes and To == ?[]const u8) return if (value) |b| b.bytes else null;
     // A text column writes itself. The arena is here for one that has to
     // build its text rather than hold it; the ones this module ships hold it
     // and never touch the allocator, which is why nothing extra is allocated
@@ -4856,6 +4985,34 @@ fn strList(comptime To: type, value: anytype, c: anytype) !To {
     return out;
 }
 
+/// Whether a list given for `To` has to be rebuilt element by element: true
+/// when what the caller wrote is not already a slice of what binds.
+fn listMoves(comptime To: type, comptime V: type) bool {
+    comptime {
+        const Slice = if (@typeInfo(To) == .optional) @typeInfo(To).optional.child else To;
+        if (@typeInfo(Slice) != .pointer or @typeInfo(Slice).pointer.size != .slice) return false;
+        const Element = @typeInfo(Slice).pointer.child;
+        const Given = givenElement(V) orelse return false;
+        return Given != Element;
+    }
+}
+
+/// A list whose elements each go through `forWire`, for the element types
+/// neither `uuidList` nor `strList` covers. One allocation for the list, and
+/// one per element only where an element builds its text (a `Date`, a
+/// `Decimal`); a `Timestamp` and a `Bytes` are copied or borrowed as they are.
+fn mappedList(comptime To: type, value: anytype, c: anytype) !To {
+    const given = if (comptime @typeInfo(@TypeOf(value)) == .optional)
+        (value orelse return null)
+    else
+        value;
+    const Slice = comptime if (@typeInfo(To) == .optional) @typeInfo(To).optional.child else To;
+    const Element = comptime @typeInfo(Slice).pointer.child;
+    const out = c.arena().alloc(Element, given.len) catch return error.QueryFailed;
+    for (given, out) |item, *slot| slot.* = try forWire(Element, item, c);
+    return out;
+}
+
 /// The list behind an `.in` or a `.not_in`, as the JSON array text
 /// `json_each` reads (`dialect.ListForm.json_each`).
 ///
@@ -4870,10 +5027,38 @@ fn strList(comptime To: type, value: anytype, c: anytype) !To {
 /// of tags is written as what its column holds rather than as whatever Zig
 /// struct the caller had. `F` is the element's *wire* type, which is what
 /// makes that true — `Values` works it out from the Dialect.
+///
+/// **A `Bytes` element is written as its hex**, and the statement reads it
+/// back with `unhex(value)` (`dialect.SQLite.eachValue`). JSON has no bytes,
+/// and handed the wrapper `std.json` wrote `{"bytes":…}`, which compared
+/// equal to nothing: an `.in` over a blob compiled and matched no row.
 fn jsonList(comptime F: type, values: anytype, c: anytype) ![]const u8 {
+    if (comptime F == types.Bytes or F == ?types.Bytes) {
+        const Hex = if (F == types.Bytes) []const u8 else ?[]const u8;
+        const converted = c.arena().alloc(Hex, values.len) catch return error.QueryFailed;
+        // Read as optional whichever the caller wrote: a list for a nullable
+        // column may hold plain values, and a null only ever reaches the
+        // nullable half.
+        for (values, converted) |item, *slot| {
+            const held: ?types.Bytes = item;
+            slot.* = if (held) |b| try hexOf(b.bytes, c) else if (comptime Hex == ?[]const u8) null else unreachable;
+        }
+        return std.json.Stringify.valueAlloc(c.arena(), converted, .{}) catch error.QueryFailed;
+    }
     const converted = c.arena().alloc(F, values.len) catch return error.QueryFailed;
     for (values, converted) |item, *slot| slot.* = try forWire(F, item, c);
     return std.json.Stringify.valueAlloc(c.arena(), converted, .{}) catch error.QueryFailed;
+}
+
+/// Bytes as lowercase hex, in the Scope's arena.
+fn hexOf(bytes: []const u8, c: anytype) ![]const u8 {
+    const out = c.arena().alloc(u8, bytes.len * 2) catch return error.QueryFailed;
+    const digits = "0123456789abcdef";
+    for (bytes, 0..) |b, i| {
+        out[2 * i] = digits[b >> 4];
+        out[2 * i + 1] = digits[b & 0x0f];
+    }
+    return out;
 }
 
 /// A connection URL with the password taken out, for the one log line that
@@ -6030,6 +6215,26 @@ test "a deadline on a finished transaction is refused rather than sent nowhere" 
     // transaction or on nothing at all, and both are worse than an error.
     try testing.expectError(error.QueryFailed, tx.deadline(2_000));
     try testing.expectEqual(@as(?u32, null), db.wire.?.deadline_ms);
+}
+
+test "a deadline of 0 is the shortest one, and one past what Postgres reads is its longest" {
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer db.deinit();
+    db.wire = .{ .answers = 1 };
+
+    var run = nilo.Run.init(testing.allocator);
+    defer run.deinit();
+
+    var tx = try db.begin(&run, .{});
+    defer tx.deinit();
+
+    // `statement_timeout = 0` is Postgres for "no limit", so a budget spent
+    // down to nothing must not lift the deadline it was spending.
+    try tx.deadline(0);
+    try testing.expectEqual(@as(?u32, 1), db.wire.?.deadline_ms);
+    // Past `maxInt(i32)` Postgres refuses the `SET` and aborts the transaction.
+    try tx.deadline(std.math.maxInt(u32));
+    try testing.expectEqual(@as(?u32, std.math.maxInt(i32)), db.wire.?.deadline_ms);
 }
 
 /// A Row with the one column type nothing checks at startup.
@@ -7272,6 +7477,91 @@ test "an `in` on SQLite is the JSON array json_each reads, and it matches" {
     try testing.expectEqual(@as(usize, 0), none.len);
 }
 
+const Stamp = struct {
+    pub const nilo_table = .{ .name = "stamps", .key = .id };
+
+    id: i64,
+    digest: types.Bytes,
+    day: types.Date,
+    at: types.Timestamp,
+    price: types.Decimal,
+};
+
+test "an `in` over bytes, a date, a moment or digits matches on SQLite" {
+    // A blob went into the JSON as `{"bytes":…}` and matched nothing; it is
+    // written as hex now and read back with `unhex(value)`.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:in-list-types?mode=memory&cache=shared",
+        .{ .size = 2, .unchecked = true },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run,
+        \\CREATE TABLE stamps (id INTEGER PRIMARY KEY, digest BLOB NOT NULL,
+        \\  day TEXT NOT NULL, at INTEGER NOT NULL, price TEXT NOT NULL)
+    , .{});
+
+    const one = [_]u8{ 0x00, 0xff, 0x22 };
+    const two = [_]u8{ 0x5b, 0x5d };
+    _ = try db.insert(Stamp, &run, .{
+        .id = @as(i64, 1),
+        .digest = types.Bytes.of(&one),
+        .day = types.Date.nilo_parse("2026-02-28").?,
+        .at = types.Timestamp.fromSeconds(1_000),
+        .price = types.Decimal{ .text = "1.50" },
+    });
+    _ = try db.insert(Stamp, &run, .{
+        .id = @as(i64, 2),
+        .digest = types.Bytes.of(&two),
+        .day = types.Date.nilo_parse("1999-12-31").?,
+        .at = types.Timestamp.fromSeconds(2_000),
+        .price = types.Decimal{ .text = "7" },
+    });
+
+    const by_digest = try db.select(Stamp, &run, .{
+        .where = .{ .digest = .{ .in = &[_]types.Bytes{ types.Bytes.of(&two), types.Bytes.of("zz") } } },
+    });
+    try testing.expectEqual(@as(usize, 1), by_digest.len);
+    try testing.expectEqual(@as(i64, 2), by_digest[0].id);
+
+    const not_digest = try db.select(Stamp, &run, .{
+        .where = .{ .digest = .{ .not_in = &[_]types.Bytes{types.Bytes.of(&two)} } },
+    });
+    try testing.expectEqual(@as(usize, 1), not_digest.len);
+    try testing.expectEqual(@as(i64, 1), not_digest[0].id);
+
+    const by_day = try db.select(Stamp, &run, .{
+        .where = .{ .day = .{ .in = &[_]types.Date{types.Date.nilo_parse("2026-02-28").?} } },
+    });
+    try testing.expectEqual(@as(usize, 1), by_day.len);
+    try testing.expectEqual(@as(i64, 1), by_day[0].id);
+
+    const by_at = try db.select(Stamp, &run, .{
+        .where = .{ .at = .{ .in = &[_]types.Timestamp{types.Timestamp.fromSeconds(2_000)} } },
+    });
+    try testing.expectEqual(@as(usize, 1), by_at.len);
+    try testing.expectEqual(@as(i64, 2), by_at[0].id);
+
+    const by_price = try db.select(Stamp, &run, .{
+        .where = .{ .price = .{ .in = &[_]types.Decimal{.{ .text = "1.50" }} } },
+    });
+    try testing.expectEqual(@as(usize, 1), by_price.len);
+    try testing.expectEqual(@as(i64, 1), by_price[0].id);
+
+    // An offset with no limit, which SQLite takes only as `LIMIT -1 OFFSET`.
+    const skip: u32 = 1;
+    const rest = try db.select(Stamp, &run, .{ .order = .{ .id = .asc }, .offset = skip });
+    try testing.expectEqual(@as(usize, 1), rest.len);
+    try testing.expectEqual(@as(i64, 2), rest[0].id);
+}
+
 test "an INTEGER PRIMARY KEY is the rowid, so a correct table no longer stops the server" {
     // The spelling every SQLite tutorial, every migration tool and SQLite's
     // own documentation writes. SQLite reports `notnull = 0` for it because
@@ -8041,6 +8331,43 @@ test "a statement that worked leaves no problem behind it" {
     try testing.expectEqual(@as(?wire_mod.Problem, null), lastProblem(&run));
 }
 
+test "a call refused before it is sent leaves no earlier statement's problem behind" {
+    // `sql.problem` answered for whatever this fiber ran last, so a delete
+    // refused for narrowing nothing, right after a duplicate insert, read as
+    // the duplicate and `sql.violated` named a unique the delete never met.
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer db.deinit();
+
+    var run = nilo.Run.init(testing.allocator);
+    defer run.deinit();
+
+    db.wire = .{ .refuses = .{ .message = "boom", .code = "23505", .constraint = "people_pkey" } };
+    _ = db.select(Person, &run, .{}) catch {};
+    try testing.expect(lastProblem(&run) != null);
+
+    // An empty `.not_in` narrows nothing, refused in `narrowing`.
+    const none: []const i64 = &.{};
+    try testing.expectError(error.QueryFailed, db.delete(Person, &run, .{
+        .where = .{ .id = .{ .not_in = none } },
+    }));
+    try testing.expectEqual(@as(?wire_mod.Problem, null), lastProblem(&run));
+
+    _ = db.select(Person, &run, .{}) catch {};
+    try testing.expect(lastProblem(&run) != null);
+    // A negative count, refused in `valuesOf`.
+    const back: i64 = -1;
+    try testing.expectError(error.QueryFailed, db.select(Person, &run, .{ .order = .{ .id = .asc }, .limit = back }));
+    try testing.expectEqual(@as(?wire_mod.Problem, null), lastProblem(&run));
+
+    _ = db.select(Person, &run, .{}) catch {};
+    // No pool at all, refused in `wireOf`.
+    const held = db.wire;
+    db.wire = null;
+    defer db.wire = held;
+    try testing.expectError(error.Disconnected, db.count(Person, &run, .{}));
+    try testing.expectEqual(@as(?wire_mod.Problem, null), lastProblem(&run));
+}
+
 test "a problem left by somebody else's request is not this one's to read" {
     // Two Scopes are two arenas, which is what makes a fiber that moved
     // between the failure and the `catch` answer null rather than a plausible
@@ -8570,6 +8897,35 @@ test "a parent is read into its field, and a missing one is null rather than a r
     try testing.expectEqualStrings("Acme", found.customer.name);
     try testing.expectEqualStrings("Wati", found.approver.?.full_name);
     try testing.expect(try db.find(ShopOrderCard, &run, @as(i64, 99)) == null);
+}
+
+test "a count agrees with the list when a required parent's row is missing" {
+    // No foreign key here, so an order can point at a customer that is not
+    // there. The list's inner join leaves it out, and the count used to count
+    // it: a page past it reported a total over a list that was empty.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = try shopDb(&threaded, "shape-orphan", &run);
+    defer db.deinit();
+
+    _ = try db.exec(&run, "INSERT INTO shop_orders VALUES (15, 404, 1, NULL, 7, NULL, 2027)", .{});
+    const listed = try db.select(ShopOrderCard, &run, .{ .where = .{ .year = @as(i32, 2027) } });
+    try testing.expectEqual(@as(usize, 0), listed.len);
+    try testing.expectEqual(@as(usize, 0), try db.count(ShopOrderCard, &run, .{ .where = .{ .year = @as(i32, 2027) } }));
+    try testing.expect(!try db.exists(ShopOrderCard, &run, .{ .where = .{ .year = @as(i32, 2027) } }));
+    // The page whose window has no row to ride on asks the count, and it
+    // agrees with the rows too.
+    const skip: u32 = 1;
+    const paged = try db.page(ShopOrderCard, &run, .{
+        .where = .{ .year = @as(i32, 2027) },
+        .order = .{ .id = .asc },
+        .limit = @as(u32, 10),
+        .offset = skip,
+    });
+    try testing.expectEqual(@as(usize, 0), paged.rows.len);
+    try testing.expectEqual(@as(i64, 0), paged.total);
 }
 
 test "children reach the parent they belong to, in the parents' order and their own key order" {

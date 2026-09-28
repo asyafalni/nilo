@@ -427,7 +427,9 @@ pub fn Wire(comptime opts_in: Options) type {
 
             const name_prefix = "nilo_sp_";
 
-            pub fn commit(self: *Tx) wire.Error!void {
+            /// `problem` is where a refused COMMIT leaves SQLite's words:
+            /// a deferred foreign key is checked here and nowhere else.
+            pub fn commit(self: *Tx, arena: std.mem.Allocator, problem: ?*?wire.Problem) wire.Error!void {
                 if (self.done) return;
                 // Rolled back rather than committed: Postgres would have kept
                 // none of it, and a handler tested here has to hear what it
@@ -450,11 +452,13 @@ pub fn Wire(comptime opts_in: Options) type {
                     };
                     if (broken) {
                         std.log.warn("{s}", .{wire.rebuild_broke_reference});
+                        if (problem) |slot| slot.* = .{ .message = wire.rebuild_broke_reference };
                         self.wire.command(self.at, "ROLLBACK") catch {};
                         return error.ForeignKeyViolated;
                     }
                 }
                 self.wire.command(self.at, "COMMIT") catch |err| {
+                    self.wire.said(self.at, err, arena, problem);
                     // **A COMMIT SQLite refused leaves the transaction open**
                     // — a deferred foreign key that is still broken, a
                     // `BUSY` on the WAL — and the writer was about to go back
@@ -475,7 +479,7 @@ pub fn Wire(comptime opts_in: Options) type {
                 defer self.wire.release(self.at);
                 defer self.restore();
                 self.wire.command(self.at, "ROLLBACK") catch |err| {
-                    std.log.err(
+                    std.log.warn(
                         "nilo_sql: a transaction could not be rolled back ({s}).",
                         .{@errorName(err)},
                     );
@@ -488,7 +492,7 @@ pub fn Wire(comptime opts_in: Options) type {
             fn restore(self: *Tx) void {
                 if (!self.rebuilding) return;
                 self.wire.command(self.at, "PRAGMA foreign_keys = ON") catch |err| {
-                    std.log.err(
+                    std.log.warn(
                         "nilo_sql: foreign keys could not be turned back on after a rebuild ({s}); " ++
                             "the writer goes on without them until the process restarts.",
                         .{@errorName(err)},
@@ -1977,7 +1981,7 @@ test "a transaction commits, rolls back, and gives its connection back either wa
                 var tx = try w.begin(gpa, .{});
                 errdefer tx.rollback();
                 _ = try tx.exec(gpa, "INSERT INTO t(id) VALUES (1)", .{}, null, null);
-                try tx.commit();
+                try tx.commit(gpa, null);
             }
             {
                 var tx = try w.begin(gpa, .{});
@@ -1989,7 +1993,7 @@ test "a transaction commits, rolls back, and gives its connection back either wa
             // hang — which is what a leaked connection would look like, and
             // there is only one writer to leak.
             var tx = try w.begin(gpa, .{});
-            try tx.commit();
+            try tx.commit(gpa, null);
 
             var rows = try w.run(gpa, "SELECT count(*) FROM t", .{}, null, null);
             defer rows.close();
@@ -2015,7 +2019,7 @@ test "a savepoint undoes part of a transaction without ending it" {
             _ = try tx.exec(gpa, "INSERT INTO t(id) VALUES (2)", .{}, null, null);
             try tx.savepoint(gpa, .undo, 1);
             _ = try tx.exec(gpa, "INSERT INTO t(id) VALUES (3)", .{}, null, null);
-            try tx.commit();
+            try tx.commit(gpa, null);
 
             var rows = try w.run(gpa, "SELECT id FROM t ORDER BY id", .{}, null, null);
             defer rows.close();
