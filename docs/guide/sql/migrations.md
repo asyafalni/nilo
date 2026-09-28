@@ -507,6 +507,8 @@ migrations/0007_work_items_get_a_priority.sql
 It holds the same steps in the same order, each with its `why` as a comment above it, wrapped in `BEGIN`/`COMMIT`, with the ledger table created if missing and the ledger row at the end:
 
 ```sql
+\set ON_ERROR_STOP on
+
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS "nilo_migrations" ( … );
@@ -520,7 +522,9 @@ VALUES (7, 'work_items_get_a_priority', '9f3c…', now(), 0);
 COMMIT;
 ```
 
-That last row is what makes it useful. `psql -f`, a CI job with no Zig toolchain, dbmate, or somebody on a jump host can bring a database up to date, and `db.expecting(manifest.head)` still accepts it and `db verify` still checks it against the hash. Without the row, the database would be at 7 while the ledger says 6, and the next start would refuse to serve.
+That last row is what makes it useful. `psql -f`, a CI job with no Zig toolchain, or somebody on a jump host can bring a database up to date, and `db.expecting(manifest.head)` still accepts it and `db verify` still checks it against the hash. Without the row, the database would be at 7 while the ledger says 6, and the next start would refuse to serve.
+
+**The first line stops the shell at the first failed step**, `\set ON_ERROR_STOP on` for `psql` and `.bail on` for `sqlite3`. Without it `sqlite3` carries on past the failure and the `COMMIT` keeps the steps that ran together with the ledger row, and `psql` rolls back but exits 0, so a deploy script reads a failed version as applied. That line makes the file a script for the database's own shell: a driver that sends it as SQL refuses the first line.
 
 **It is an output only.** nilo reads the `.zig` file and never this one, and a version somebody else wrote in SQL is not picked up: migrations are written in Zig, for the reasons [ADR 123](../../adr/123-a-migration-is-a-diff-against-a-snapshot.md) gives. `db check` fails when a twin no longer matches its version file, so it cannot go stale on a branch nobody rebuilt, and any `db generate` rewrites it ([ADR 123](../../adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 

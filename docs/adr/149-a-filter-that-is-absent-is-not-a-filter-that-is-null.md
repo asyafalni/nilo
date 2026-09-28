@@ -163,8 +163,11 @@ of those must not depend on a value that may not arrive. Two operators reach
 the same place by a value that does arrive. `.not_in` with an empty list is
 `"id" <> ALL('{}')`, true of every row, so "delete everything except these"
 empties the table the day the list is empty. A pattern built from empty text,
-`.contains = ""`, is `LIKE '%%'`, true of every row with the column. Neither
-can be seen while compiling.
+`.contains = ""`, is `LIKE '%%'`, true of every row with the column, and so is
+a raw `.like` or `.ilike` pattern of nothing but `%`, which those two bind
+unescaped: a search box's `%` handed to `.ilike` as the condition of a delete
+empties the table. An empty raw pattern is not the same case, since it matches
+`''` alone. None of them can be seen while compiling.
 
 So `update`, `delete` and their returning forms ask `where.filtersNothing`
 before they send anything, and a condition that narrows nothing with the

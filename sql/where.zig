@@ -488,7 +488,8 @@ pub fn comptimeOnly(comptime T: type) bool {
 /// of every row, and a delete written to keep a list of rows empties the table
 /// the day the list arrives empty. A pattern built from empty text is the
 /// other way there: `.contains = ""` is `LIKE '%%'`, and matches every row
-/// that has the column at all.
+/// that has the column at all, and so does `.ilike = "%"`, which a search box
+/// hands over as it is.
 ///
 /// Read structurally, the way the walk writes the SQL: the terms of a
 /// struct are ANDed, so it narrows nothing only when none of them does; the
@@ -556,7 +557,38 @@ fn opFiltersNothing(comptime name: []const u8, value: anytype) bool {
         if (pattern.negate) return false;
         return textLen(value) == 0;
     }
+    // `.like` and `.ilike` bind the caller's pattern as it is, so a search
+    // box's `%` reaches the statement unescaped and `LIKE '%'` is true of every
+    // row that has the column. An empty pattern is not the same case: it
+    // matches `''` and nothing else.
+    if (comptime std.mem.eql(u8, name, "like") or std.mem.eql(u8, name, "ilike"))
+        return onlyWildcards(value);
     return false;
+}
+
+/// Whether a pattern is one or more `%` and nothing else.
+fn onlyWildcards(value: anytype) bool {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .optional => return if (value) |v| onlyWildcards(v) else false,
+        .array => return onlyWildcards(@as([]const u8, &value)),
+        else => {},
+    }
+    const bytes: []const u8 = if (T == core.Str)
+        value.view()
+    else if (comptime isText(T) or isStringLiteral(T))
+        value
+    else
+        return false;
+    return bytes.len > 0 and std.mem.indexOfNone(u8, bytes, "%") == null;
+}
+
+fn isStringLiteral(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| p.size == .one and @typeInfo(p.child) == .array and
+            @typeInfo(p.child).array.child == u8,
+        else => false,
+    };
 }
 
 fn textLen(value: anytype) usize {
@@ -3180,7 +3212,19 @@ test "a condition narrows nothing only when every term it ANDs narrows nothing" 
     try testing.expect(filtersNothing(.{ .name = .{ .icontains = blank } }));
     try testing.expect(filtersNothing(.{ .name = .{ .starts_with = core.Str.static(blank) } }));
 
+    // A raw pattern that is only wildcards, which is what a search box's `%`
+    // handed to `.ilike` is: `LIKE '%'` matches every row with the column.
+    const percent: []const u8 = "%";
+    try testing.expect(filtersNothing(.{ .email = .{ .ilike = percent } }));
+    try testing.expect(filtersNothing(.{ .email = .{ .like = core.Str.static("%%%") } }));
+    try testing.expect(filtersNothing(.{ .email = .{ .like = "%" } }));
+    try testing.expect(filtersNothing(.{ .across = .{ .columns = .{ .code, .name }, .ilike = percent } }));
+
     // And the terms that narrow whatever they are handed.
+    try testing.expect(!filtersNothing(.{ .email = .{ .ilike = blank } }));
+    try testing.expect(!filtersNothing(.{ .email = .{ .like = @as([]const u8, "%@b.com") } }));
+    try testing.expect(!filtersNothing(.{ .email = .{ .like = @as([]const u8, "_%") } }));
+    try testing.expect(!filtersNothing(.{ .email = .{ .not_like = percent } }));
     try testing.expect(!filtersNothing(.{ .id = .{ .not_in = some } }));
     try testing.expect(!filtersNothing(.{ .id = .{ .in = none } }));
     try testing.expect(!filtersNothing(.{ .name = .{ .not_icontains = blank } }));

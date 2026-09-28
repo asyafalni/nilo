@@ -69,6 +69,12 @@ The same text in both Dialects. Window functions are SQL:2003 and SQLite has had
 them since 3.25, so this is not a Postgres-only call and `dialect.zig` gains
 nothing.
 
+## A page ends in the key
+
+**An order a `LIMIT` or an `OFFSET` cuts ends in the table's key**, ascending, where the caller's order does not name it already: `.order = .{ .created_at = .desc }` on a page is `ORDER BY "created_at" DESC, "id" ASC`. Rows the order ties come back in whatever order the plan reaches them, and Postgres may reach them differently at each `OFFSET`: a thousand rows over ten values, paged by 25, showed 179 rows twice and 179 never, while the total said a thousand. With the key last every row has one place, and pages add up to the list. `db.page`, `db.one` and a `db.select` or `db.stream` with a `.limit` or an `.offset` all take it, on a plain Row and a shaped one, which names the key through its table because a parent's columns share the statement. Children have done the same since ADR 218. A statement nothing cuts is left as written, since every row is in it whatever the order among ties, and a grouped Row has no key to add. An order chosen at run time by an `sql.Ordering` does not take it yet.
+
+It costs what the index on the order column no longer covers. Postgres answers with an incremental sort over the tie group the page lands in, so the price is that group's size: on a million rows, `ORDER BY status` over ten values went from 0.07 ms to between 6.6 and 14.4 ms, and a date with a thousand rows a value from 1.2 ms to 2.4 ([sql.md §19](../../bench/result/sql.md#19-the-key-a-cut-order-ends-in)). An index ending in the key, `(status, id)`, takes it back to 0.09 ms. The key goes on anyway, because the statement without it answers a wrong list, and a wrong list is not a speed.
+
 ## Three Refusals
 
 - **No `.limit`.** With no ceiling this is the whole table, and the window
@@ -115,6 +121,8 @@ is a total a caller has to second-guess on every page.
 and every other page pays for it: the condition is evaluated twice and the
 plan is a different shape from the one `db.select` gets, to cover a request
 the frontend rarely sends.
+
+**A tiebreak the caller writes, as the guide asked.** Every test ordered by the key, so the rule was invisible where it was checked and broken where it was not: a list screen ordered by a status or a date.
 
 ## Consequences
 

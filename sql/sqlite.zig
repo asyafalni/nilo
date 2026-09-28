@@ -773,6 +773,10 @@ pub fn Wire(comptime opts_in: Options) type {
             values: anytype,
         ) wire.Error!struct { zqlite.Stmt, bool } {
             const conn = &self.conns[at];
+            // Before any `bind`, because zqlite binds an integer with
+            // `@intCast` into `i64`: a `u64` past it from a request panics in
+            // Debug and ReleaseSafe and is undefined in ReleaseFast.
+            try intsFit(values);
             // Once, at the top, rather than at the four `bind` calls below —
             // a conversion applied at three of four sites is a bug that only
             // shows up on the fourth path (`blobbed`).
@@ -1312,6 +1316,43 @@ fn Blobbed(comptime V: type) type {
         const frozen = out;
         return std.meta.Tuple(&frozen);
     }
+}
+
+/// Every integer in `values` checked into `i64`, which is all SQLite stores.
+///
+/// zqlite binds an integer with `@intCast`, so a `u64` of 2^63 or more, an
+/// `?offset=9223372036854775808` read into a `usize`, is a panic in Debug and
+/// ReleaseSafe and undefined behaviour in ReleaseFast: a request could take
+/// the server down. pg.zig answers `IntWontFit` for the same value, and this
+/// answers the same way. Unrolled while compiling, so a statement holding no
+/// integer wider than `i64` costs nothing here.
+fn intsFit(values: anytype) wire.Error!void {
+    inline for (@typeInfo(@TypeOf(values)).@"struct".fields) |f| {
+        if (comptime wideInt(f.type)) |I| {
+            const held: ?I = @field(values, f.name);
+            if (held) |n| if (std.math.cast(i64, n) == null) {
+                std.log.warn(
+                    "nilo_sql: {d} was refused before it was bound: SQLite stores an " ++
+                        "integer as a signed 64-bit number, and this one does not fit.",
+                    .{n},
+                );
+                return error.QueryFailed;
+            };
+        }
+    }
+}
+
+/// The integer type behind `T`, optional or not, when it holds a value `i64`
+/// cannot: a `u64`, a `usize`, an `i128`. Null for everything else.
+fn wideInt(comptime T: type) ?type {
+    const I = switch (@typeInfo(T)) {
+        .int => T,
+        .optional => |o| if (@typeInfo(o.child) == .int) o.child else return null,
+        else => return null,
+    };
+    if (std.math.minInt(I) >= std.math.minInt(i64) and std.math.maxInt(I) <= std.math.maxInt(i64))
+        return null;
+    return I;
 }
 
 fn blobbed(values: anytype) Blobbed(@TypeOf(values)) {

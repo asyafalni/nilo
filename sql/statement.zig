@@ -20,7 +20,7 @@
 //! .{ .where = .{ .age = .{ .gt = 18 } }, .order = .{ .created_at = .desc }, .limit = 10 }
 //! ```
 //! ```sql
-//! SELECT "id", "email", "age" FROM "users" WHERE "age" > $1 ORDER BY "created_at" DESC LIMIT 10
+//! SELECT "id", "email", "age" FROM "users" WHERE "age" > $1 ORDER BY "created_at" DESC, "id" ASC LIMIT 10
 //! ```
 //!
 //! At runtime what is sent is that constant and one value. Drizzle, whose
@@ -316,7 +316,9 @@ fn rowsOf(
                 head = sql;
                 sql = "";
             } else {
-                sql = sql ++ orderBy(D, Row, Order);
+                const cut = @hasField(O, "limit") or @hasField(O, "offset") or answers != .many;
+                const written = orderBy(D, Row, Order);
+                sql = sql ++ if (cut) cutOrder(written, tiebreak(D, Row, Order, "")) else written;
             }
         }
 
@@ -1832,6 +1834,41 @@ fn lockedBy(comptime D: type, comptime Row: type, comptime O: type) []const u8 {
     }
 }
 
+/// The table's key, ascending, after an order that does not name all of it:
+/// the terms alone, with no comma in front. Empty for a grouped Row, whose
+/// rows are groups and have no key, and for a Row whose table has none.
+///
+/// **Written only where a `LIMIT` or an `OFFSET` cuts the answer.** Rows the
+/// order ties come back in whatever order the plan reaches them, and that can
+/// differ between two `OFFSET`s of the same statement: a thousand rows over
+/// ten values, paged by 25, showed 179 rows twice and 179 never. With the key
+/// last every row has one place. An answer nothing cuts has every row whatever
+/// order they arrive in, so its text is left as the caller wrote it. Children
+/// have ended in their key for the same reason since ADR 218. `prefix` is what
+/// a column is named through: nothing on a plain Row, the table on a shaped
+/// one, where a parent's columns share the statement.
+pub fn tiebreak(comptime D: type, comptime Row: type, comptime Order: type, comptime prefix: []const u8) []const u8 {
+    comptime {
+        if (@hasDecl(Row, row_mod.aggregate_marker)) return "";
+        var out: []const u8 = "";
+        for (row_mod.keysIfAnyOf(Row)) |key| {
+            if (@hasField(Order, key)) continue;
+            if (out.len > 0) out = out ++ ", ";
+            out = out ++ prefix ++ D.quote(key) ++ " ASC";
+        }
+        return out;
+    }
+}
+
+/// `ORDER BY` with `tiebreak` after it, for a statement the caller cut.
+pub fn cutOrder(comptime written: []const u8, comptime ties: []const u8) []const u8 {
+    comptime {
+        if (ties.len == 0) return written;
+        if (written.len == 0) return " ORDER BY " ++ ties;
+        return written ++ ", " ++ ties;
+    }
+}
+
 fn orderBy(comptime D: type, comptime Row: type, comptime T: type) []const u8 {
     comptime {
         const info = switch (@typeInfo(T)) {
@@ -2021,7 +2058,7 @@ test "a narrower Row selects only what it reads, from the table it borrows" {
 test "the whole statement is one constant, condition and order and limit" {
     try testing.expectEqualStrings(
         "SELECT \"id\", \"email\", \"age\", \"created_at\" FROM \"users\"" ++
-            " WHERE \"age\" > $1 ORDER BY \"created_at\" DESC LIMIT 10",
+            " WHERE \"age\" > $1 ORDER BY \"created_at\" DESC, \"id\" ASC LIMIT 10",
         sqlOf(.{
             .where = .{ .age = .{ .gt = 18 } },
             .order = .{ .created_at = .desc },
@@ -2394,7 +2431,7 @@ test "a select can ask whether a row exists in another table, and stay one state
             " AND EXISTS (SELECT 1 FROM \"partner_capabilities\"" ++
             " WHERE \"partner_capabilities\".\"partner_id\" = \"partners\".\"id\"" ++
             " AND \"partner_capabilities\".\"capability\" = $2)" ++
-            " ORDER BY \"name\" ASC LIMIT 20",
+            " ORDER BY \"name\" ASC, \"id\" ASC LIMIT 20",
         s.sql,
     );
     try testing.expectEqual(@as(usize, 2), s.paramCount());

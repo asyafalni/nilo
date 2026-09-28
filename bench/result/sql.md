@@ -1325,6 +1325,47 @@ Every shape that goes through a cached statement lost 2.1 to 3.1 µs, one unix-s
 
 **Can it be pushed further:** yes, by a few KB. The plan reader builds a tree and walks it; a reader that answered the question in one pass over the text would drop the tree and the two lists. Not done, because what is left is paid once per program and not per statement.
 
+## 18. The count a page reads, keyset paging, and a stream let go early
+
+**Run:** `462d84d`, while auditing `nilo_sql` for defects. Postgres 18.6 (`sql/docker-compose.yml`, the TimescaleDB image) over its Docker port on loopback, defaults throughout. AMD Ryzen 7 9700X, Linux 7.2.5, Zig 0.16.0, 2026-09-27. The plans and timings are `EXPLAIN (ANALYZE, BUFFERS)` from `psql` over tables built for the run and not kept; the stream figure is a probe test through `db.stream`, in Debug and ReleaseSafe.
+
+**Why:** [ADR 150](../../docs/adr/150-a-page-knows-what-it-left-out.md) says a page's total is counted during the same scan, and the guide's keyset section offers an `.any` of `<` and `= … AND <` as the way past a deep `OFFSET`. Neither had a plan read under it.
+
+| What | Table | Reading |
+|---|---|---|
+| `db.page`'s statement, `count(*) OVER ()`, index on the order column | 1,000,000 rows | 124 ms |
+| the same page without the window | 1,000,000 rows | 0.024 ms |
+| `db.page` with a condition narrowing the match | 1,000,000 rows | 42 ms |
+| `OFFSET 900000` | 1,000,000 rows | 62 ms |
+| the guide's keyset condition, index on `(created_at, id)`, cursor half way | 200,000 rows | 7.9 ms, `Rows Removed by Filter: 100001` |
+| the guide's keyset condition, generic plan | 1,000,000 rows | 17.8 ms |
+| a row comparison, `(created_at, id) < ($1, $2)` | 1,000,000 rows | 0.013 ms, 4 buffers, `Index Cond: ROW(created_at, id) < ROW($1, $2)` |
+| a stream given back after 1 of 2,000,000 rows of 200 bytes | `generate_series` | 295 ms Debug, 327 ms ReleaseSafe |
+
+`starts_with` and `istarts_with` were read the same way: SQLite plans `SCAN` over a table with a `NOCASE` index on the column, because the pattern is built inside the statement by `replace(…) || '%'` and SQLite's LIKE optimisation wants a constant; Postgres uses a `text_pattern_ops` index on a custom plan and scans 200,000 rows once the statement goes generic.
+
+**What it changed:** four entries under `nilo_sql` in the [roadmap](../../docs/roadmap.md). The window is read once, as ADR 150 says, but computed over every row that matches before the limit applies, so a page costs its whole match. The guide's keyset condition filters rather than seeks, and costs what the `OFFSET` it replaces does. A stream let go early reads the rest of its result off the socket while holding the connection.
+
+**Can it be pushed further:** each is a shape rather than a tuning. A page with no total, a row comparison the index can seek on, and a stream that cancels or reads in batches are the three; the pattern bound whole from Zig costs an allocation a condition, which wants its own number against ADR 017 before it is taken.
+
+## 19. The key a cut order ends in
+
+**Run:** `462d84d` plus the working tree of the change that appends the key, 2026-09-28. Postgres 18.6 (`nilo-test-pg`, `postgres:18`) over its Docker port on loopback, defaults throughout. AMD Ryzen 7 9700X, Linux 7.2.5. `EXPLAIN (ANALYZE, FORMAT JSON, TIMING OFF)` from `psql`, the four statements interleaved for seven rounds, then the fifth for seven after its index was made. The table is 1,000,000 rows, `status` holding 10 values (100,000 rows each) and `created_at` 1,000 (1,000 rows each), with an index on each column alone.
+
+**Why:** a page whose order ties repeats rows and skips others, because Postgres may order the ties differently at each `OFFSET`. The fix is the table's key after any cut order that does not name it ([ADR 150](../../docs/adr/150-a-page-knows-what-it-left-out.md#a-page-ends-in-the-key)), and that is a sort key the index on the order column does not cover.
+
+| `LIMIT 25 OFFSET 500` ordered by | Index | Execution, seven runs |
+|---|---|---|
+| `status` | `(status)` | 0.068 to 0.091 ms |
+| `status, id` | `(status)` | 6.6 to 14.4 ms, an incremental sort over the whole first group |
+| `created_at DESC` | `(created_at)` | 1.1 to 1.3 ms |
+| `created_at DESC, id` | `(created_at)` | 2.2 to 9.7 ms, 2.4 typical |
+| `status, id` | `(status, id)` | 0.085 to 0.13 ms, one run at 3.0 |
+
+**What it changed:** the key goes on anyway, because the statement without it answers a wrong list and the cost is the size of the tie group the page lands in: a hundredfold on an order by a ten-value column with 100,000 rows each, about double on a date with 1,000 rows each. The guide and the reference say that an index serving a paged order should end in the key, which puts it back where it was.
+
+**Can it be pushed further:** by the caller, with the index above. Leaving the key off an order that is unique already is the other half, and nilo cannot see that today: `.unique` columns may be NULL, so only the key counts.
+
 ## What is still missing
 
 - **A second box.** Everything here shares eight physical cores between nilo,

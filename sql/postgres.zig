@@ -885,7 +885,18 @@ pub const Wire = struct {
         try arrayFits(Item, raw.data);
 
         const it = row.iterator(Item, col) catch return error.QueryFailed;
-        return it.alloc(arena) catch return error.QueryFailed;
+        const list = it.alloc(arena) catch return error.QueryFailed;
+        // pg.zig copies an element out of its read buffer only when the
+        // element is exactly `[]const u8`, so an optional one points into a
+        // buffer the next statement overwrites. `db.zig` takes what this
+        // answers as the arena's (`keptList`) and wraps it in a `Str`; a
+        // `[]const ?Str` column read "ZZZZZZ" four statements later.
+        if (comptime Item == ?[]const u8) {
+            for (list) |*item| if (item.*) |text| {
+                item.* = arena.dupe(u8, text) catch return error.QueryFailed;
+            };
+        }
+        return list;
     }
 
     /// The two array shapes pg.zig asserts on rather than refuses, checked

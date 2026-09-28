@@ -1057,7 +1057,12 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
                 head = sql;
                 sql = "";
             } else {
-                sql = sql ++ orderBy(D, Row, Sort);
+                const cut = @hasField(O, "limit") or @hasField(O, "offset") or answers != .many;
+                const written = orderBy(D, Row, Sort);
+                sql = sql ++ if (cut)
+                    statement.cutOrder(written, statement.tiebreak(D, Row, Sort, layout.relation ++ "."))
+                else
+                    written;
             }
         }
         if (@hasField(O, "limit")) {
@@ -2117,7 +2122,7 @@ test "a count of children is a subquery per row, sortable and a condition like a
         "SELECT \"orders\".\"id\" AS \"id\", " ++ lines ++ " AS \"line_count\", " ++
             "(SELECT count(*) FROM \"lines\" AS \"#c\" WHERE \"#c\".\"order_id\" = \"orders\".\"id\" AND \"#c\".\"qty\" >= 10) AS \"big_lines\", " ++
             "count(*) OVER () AS \"#total\" FROM \"orders\" WHERE " ++ lines ++ " > $1 " ++
-            "ORDER BY \"big_lines\" DESC LIMIT 20",
+            "ORDER BY \"big_lines\" DESC, \"orders\".\"id\" ASC LIMIT 20",
         found.sql,
     );
     // A count of a Row that is not the top one correlates with its alias.

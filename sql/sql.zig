@@ -629,7 +629,7 @@ test "the whole statement is a constant, which is the claim this module makes" {
 
     try testing.expectEqualStrings(
         "SELECT \"id\", \"email\", \"age\", \"created_at\" FROM \"users\"" ++
-            " WHERE \"age\" > $1 ORDER BY \"created_at\" DESC LIMIT 10",
+            " WHERE \"age\" > $1 ORDER BY \"created_at\" DESC, \"id\" ASC LIMIT 10",
         found.sql,
     );
 

@@ -1278,14 +1278,17 @@ test "a twin brings a database to head on its own, ledger row and all" {
     );
 }
 
-/// The leading `--` lines of one chunk, dropped. A comment is part of the file
-/// and not part of the statement, and only this test ever separates them.
+/// The leading `--` lines of one chunk, dropped, and the shell's own
+/// `script_stop_on_error` line with them. A comment is part of the file and not
+/// part of the statement, a `\set` is for `psql` and not for the database, and
+/// only this test ever separates them.
 fn stripComments(chunk: []const u8) []const u8 {
     var rest = chunk;
     while (true) {
         const start = std.mem.indexOfNone(u8, rest, " \n") orelse return "";
         rest = rest[start..];
-        if (!std.mem.startsWith(u8, rest, "--")) return rest;
+        if (!std.mem.startsWith(u8, rest, "--") and
+            !std.mem.startsWith(u8, rest, Db.Dialect.script_stop_on_error)) return rest;
         const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return "";
         rest = rest[nl + 1 ..];
     }

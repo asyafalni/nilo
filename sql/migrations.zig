@@ -551,6 +551,12 @@ fn writeManifestAndSnapshot(
 /// that fails halfway leaves nothing; and the ledger row, so a database brought
 /// to head by hand satisfies `db.expecting(manifest.head)` on the next boot
 /// rather than refusing to serve.
+///
+/// `BEGIN`/`COMMIT` alone does not keep the second promise, because both
+/// shells carry on past a failed statement: `sqlite3` then commits the steps
+/// that ran with the ledger row, and `psql` rolls back and exits 0. So the
+/// file opens with the dialect's `script_stop_on_error`, which makes it a
+/// script for `psql` or `sqlite3` rather than text any driver can send.
 pub fn renderSql(
     gpa: std.mem.Allocator,
     comptime D: type,
@@ -573,9 +579,15 @@ pub fn renderSql(
         \\--
         \\-- It carries its own ledger row, so a database brought to head this way
         \\-- is a database `db.expecting(manifest.head)` will serve.
+        \\--
+        \\-- It is a script for the database's own shell, and its first line stops
+        \\-- that shell at the first failed step, so a version runs whole or not at
+        \\-- all and the shell's exit status says which.
+        \\
+        \\{s}
         \\
         \\
-    , .{source});
+    , .{ source, D.script_stop_on_error });
     // What `migrate.apply` does through `wire.Begin.rebuilding`: with foreign
     // keys on, the DROP in a table rebuild deletes the old table's rows first
     // and every `ON DELETE CASCADE` pointing at it fires.
@@ -1199,6 +1211,25 @@ test "a SQLite twin runs its version with foreign keys off and checks them befor
     try testing.expect(std.mem.indexOf(u8, pg, "PRAGMA") == null);
 }
 
+test "a SQLite twin stops at its first failed step, so the COMMIT cannot keep half a version" {
+    // A failed statement does not abort a SQLite transaction, and `sqlite3`
+    // carries on past it: without `.bail on` the closing COMMIT keeps the steps
+    // that ran and the ledger row saying the whole version did.
+    const gpa = testing.allocator;
+    const text = try renderSql(gpa, Lite, .{
+        .number = 2,
+        .name = "x",
+        .steps = &.{.{ .kind = .data, .why = "x", .sql = "DROP TABLE \"old\"" }},
+    }, "x", "abc", "0002_x.zig");
+    defer gpa.free(text);
+
+    // Before anything the shell would run, the pragma included.
+    const bail = std.mem.indexOf(u8, text, "\n.bail on\n").?;
+    try testing.expect(bail < std.mem.indexOf(u8, text, "PRAGMA foreign_keys = OFF;").?);
+    try testing.expect(bail < std.mem.indexOf(u8, text, "BEGIN;").?);
+    try testing.expect(std.mem.indexOf(u8, text, "ON_ERROR_STOP") == null);
+}
+
 test "a version name that is not safe as a path and an identifier is refused" {
     const gpa = testing.allocator;
     var box = try Sandbox.init(gpa);
@@ -1723,6 +1754,11 @@ test "the twin is the version's statements, the ledger table and the ledger row"
     // Wrapped, so a version that fails halfway leaves nothing behind.
     try testing.expect(std.mem.indexOf(u8, text, "\nBEGIN;\n") != null);
     try testing.expect(std.mem.endsWith(u8, text, "COMMIT;\n"));
+
+    // And `psql` told to stop at a failed step before the `BEGIN`, or it rolls
+    // the version back and exits 0.
+    const stop = std.mem.indexOf(u8, text, "\n\\set ON_ERROR_STOP on\n").?;
+    try testing.expect(stop < std.mem.indexOf(u8, text, "\nBEGIN;\n").?);
 
     // The ledger, made if it is not there, or a fresh database cannot take
     // version 1 at all.

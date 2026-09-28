@@ -39,7 +39,7 @@ error: nilo: an update on User with no condition.
        so where somebody reading the code can see it.
 ```
 
-A condition can also turn out to be empty because of what the request sent. Say a delete keeps a list of rows: `.where = .{ .id = .{ .not_in = keep } }`. On the day `keep` arrives empty, that is `"id" <> ALL('{}')`, which is true for every row. An empty search box does the same through `.contains = ""`. The compiler cannot see values, so **an `update` or a `delete` whose condition would match every row with the values it was given is rejected before it is sent**, as `error.QueryFailed` with a log line naming the call. An empty list next to a term that does narrow the rows, such as `.{ .tenant_id = t, .id = .{ .not_in = keep } }`, is an ordinary condition and goes through.
+A condition can also turn out to be empty because of what the request sent. Say a delete keeps a list of rows: `.where = .{ .id = .{ .not_in = keep } }`. On the day `keep` arrives empty, that is `"id" <> ALL('{}')`, which is true for every row. An empty search box does the same through `.contains = ""`, and a box holding `%` does it through `.ilike`, which uses the text as the pattern unchanged. The compiler cannot see values, so **an `update` or a `delete` whose condition would match every row with the values it was given is rejected before it is sent**, as `error.QueryFailed` with a log line naming the call. An empty list next to a term that does narrow the rows, such as `.{ .tenant_id = t, .id = .{ .not_in = keep } }`, is an ordinary condition and goes through.
 
 ### Updating a count in place
 

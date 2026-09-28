@@ -3687,7 +3687,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// catches the statement written with nothing in `.where`; this
         /// catches the one written with a condition that the request emptied
         /// — a `.not_in` list that arrived empty, a pattern built from empty
-        /// text — which reaches every row just the same. Nothing is sent:
+        /// text, a `.like` of only `%` — which reaches every row just the same. Nothing is sent:
         /// the answer is `error.QueryFailed` and a line naming the call.
         ///
         /// Free on the path that did not ask for it: a condition with no list
@@ -3698,8 +3698,8 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             std.log.warn(
                 "nilo_sql: `" ++ call ++ "` on {s} was refused before it was sent: with the " ++
                     "values it was given, its `.where` narrows nothing, so it would have reached " ++
-                    "every row of the table. An empty `.not_in` list and a pattern built from " ++
-                    "empty text are the ways there. If every row is meant, `db.raw` says so " ++
+                    "every row of the table. An empty `.not_in` list, a pattern built from empty " ++
+                    "text and a `.like` of only `%` are the ways there. If every row is meant, `db.raw` says so " ++
                     "where somebody reading the code can see it.",
                 .{@typeName(Row)},
             );
@@ -3737,6 +3737,24 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             var out: Values(D, Row, @TypeOf(options), stmt) = undefined;
             inline for (stmt.paths, 0..) |path, i| {
                 const param = comptime stmt.params[i];
+                // A `.limit` or an `.offset` a request handed over. SQLite
+                // reads `LIMIT -1` as no limit at all, so `?limit=-1` passed a
+                // handler's `@min(q.limit, 100)` and answered with the whole
+                // table, where Postgres refused it. Refused on both, so the two
+                // answer alike.
+                if (comptime param.isCount()) {
+                    const rows = where_mod.valueAt(options, path);
+                    if (comptime @typeInfo(@TypeOf(rows)).int.signedness == .signed) {
+                        if (rows < 0) {
+                            std.log.warn(
+                                "nilo_sql: `.{s}` on {s} was {d}, and was refused before it was " ++
+                                    "sent: it counts rows, so it cannot be negative.",
+                                .{ path[0], @typeName(Row), rows },
+                            );
+                            return error.QueryFailed;
+                        }
+                    }
+                }
                 // A list under a `sql.given`: null is the term dropping and
                 // binds as null, and a list present, empty or not, is the
                 // list (ADR 149).
@@ -4001,8 +4019,10 @@ const traps_enabled = builtin.mode == .Debug;
 /// a `usize` is the shape everybody writes, and a `usize` does not coerce to
 /// an `i64`, so it stopped with Zig's own message pointing inside this file
 /// rather than with one of nilo's. Binding a count as whatever integer the
-/// caller is holding costs nothing — the driver already narrows to the
-/// column's width and says so when a value will not fit.
+/// caller is holding costs nothing: pg.zig narrows to the column's width and
+/// answers `IntWontFit` when a value will not fit, and the SQLite Wire checks
+/// every integer into `i64` before zqlite binds it (`sqlite.intsFit`). A
+/// negative count is refused in `valuesOf`.
 fn Values(
     comptime D: type,
     comptime Row: type,
@@ -5778,7 +5798,7 @@ test "an order survives the ceiling one puts on the end" {
     try testing.expectEqual(@as(?Person, null), found);
     try testing.expectEqualStrings(
         "SELECT \"id\", \"email\", \"nickname\", \"age\" FROM \"people\"" ++
-            " ORDER BY \"age\" DESC LIMIT 1",
+            " ORDER BY \"age\" DESC, \"id\" ASC LIMIT 1",
         db.wire.?.last_sql,
     );
 }
@@ -8822,6 +8842,8 @@ test "an update or a delete whose condition the request emptied is refused befor
     const blank: []const u8 = "";
     try testing.expectError(error.QueryFailed, db.delete(SqliteAccount, &run, .{ .where = .{ .id = .{ .not_in = none } } }));
     try testing.expectError(error.QueryFailed, db.deleteReturning(SqliteAccount, &run, .{ .where = .{ .email = .{ .istarts_with = blank } } }));
+    // A search box's `%` handed to a raw pattern, which `.ilike` binds as it is.
+    try testing.expectError(error.QueryFailed, db.delete(SqliteAccount, &run, .{ .where = .{ .email = .{ .ilike = @as([]const u8, "%") } } }));
     try testing.expectError(error.QueryFailed, db.update(SqliteAccount, &run, .{
         .set = .{ .email = "all@example.dev" },
         .where = .{ .any = .{ .{ .id = @as(i64, 1) }, .{ .email = .{ .iends_with = blank } } } },
@@ -8849,6 +8871,83 @@ test "an update or a delete whose condition the request emptied is refused befor
     // refused as if the `.where` were empty, because it takes no parameter.
     try testing.expectEqual(@as(usize, 0), try db.delete(SqliteAccount, &run, .{ .where = .{ .email = null } }));
     try testing.expectEqual(@as(usize, 1), try db.count(SqliteAccount, &run, .{}));
+}
+
+test "on SQLite, a count or a value past what an i64 holds is refused rather than taking the server down" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = try abortedDb(&threaded, "wide-integers", &run);
+    defer db.deinit();
+
+    // What `?offset=9223372036854775808` read into a `usize` is. zqlite
+    // binds it with `@intCast`, which panicked.
+    const past: usize = @as(usize, std.math.maxInt(i64)) + 1;
+    try testing.expectError(error.QueryFailed, db.select(SqliteAccount, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(usize, 10),
+        .offset = past,
+    }));
+    try testing.expectError(error.QueryFailed, db.select(SqliteAccount, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(u64, std.math.maxInt(u64)),
+    }));
+    // And a raw statement's own parameter, which no Row types.
+    try testing.expectError(
+        error.QueryFailed,
+        db.raw(i64, &run, "SELECT id FROM accounts WHERE id = ?1", .{past}),
+    );
+
+    // The edge itself is an i64, and binds.
+    const edge: usize = std.math.maxInt(i64);
+    try testing.expectEqual(@as(usize, 0), (try db.select(SqliteAccount, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(usize, 10),
+        .offset = edge,
+    })).len);
+    try testing.expectEqual(@as(usize, 1), (try db.select(SqliteAccount, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(u64, 10),
+    })).len);
+}
+
+test "a negative limit or offset is refused, where SQLite would read LIMIT -1 as no limit" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db = try abortedDb(&threaded, "negative-counts", &run);
+    defer db.deinit();
+    _ = try db.insert(SqliteAccount, &run, .{ .id = @as(i64, 2), .public = types.Uuid.nil, .email = "two@example.dev" });
+
+    // `@min(q.limit, 100)` passes -1, and SQLite answered with every row.
+    const limit: i64 = @min(@as(i64, -1), 100);
+    try testing.expectError(error.QueryFailed, db.select(SqliteAccount, &run, .{
+        .order = .{ .id = .asc },
+        .limit = limit,
+    }));
+    try testing.expectError(error.QueryFailed, db.select(SqliteAccount, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(i32, 10),
+        .offset = @as(i32, -1),
+    }));
+    try testing.expectError(error.QueryFailed, db.page(SqliteAccount, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(i64, 10),
+        .offset = @as(i64, -5),
+    }));
+
+    // Zero is a count, and so is one.
+    try testing.expectEqual(@as(usize, 0), (try db.select(SqliteAccount, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(i64, 0),
+    })).len);
+    try testing.expectEqual(@as(usize, 1), (try db.select(SqliteAccount, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(i64, 1),
+        .offset = @as(i64, 0),
+    })).len);
 }
 
 test "deleteReturningOne takes the row the key pins, once, and answers null the second time" {

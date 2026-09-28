@@ -138,6 +138,8 @@ Authoring a version needs a Zig compiler: the source is a type, the diff runs at
 
 **`db generate` writes a `.sql` twin beside every version file, and `db check` fails when one is stale.** It holds the statements in order with each `why` as a comment, inside `BEGIN`/`COMMIT`, with a `CREATE TABLE IF NOT EXISTS "nilo_migrations"` first and the ledger row last, so a database brought to head by `psql` is one `migrate.expect` serves and `verify` still holds to the hash. `ms` is 0 because nobody timed it.
 
+**Its first line stops the shell at the first failed step**: `\set ON_ERROR_STOP on` for `psql`, `.bail on` for `sqlite3`, each the dialect's `script_stop_on_error`. `BEGIN`/`COMMIT` alone did not make a version all or nothing. A failed statement does not abort a SQLite transaction and `sqlite3` carries on past it, so the `COMMIT` kept the steps that ran together with the ledger row, and `expect` then passed a version that never finished. `psql` did roll back, and exited 0, so a deploy script read the failure as success. The price is that the file is a script for the database's own shell rather than SQL any driver can send.
+
 **It is an output and never an input.** A version written in SQL by somebody else and picked up by nilo has no snapshot behind it, so the next `generate` would diff against a schema that does not describe the database.
 
 The twin is written from the compiled `Version`, because the hash is chained and a twin needs the versions before it. For a new version, and for `--baseline` deriving version 1 the first time, it is exact. For `--baseline` rewriting a version 1 that has hand-written steps, the new `before` and `after` are Zig this binary did not compile, so **no twin is written**, the outcome says so, and `check` asks for it after the rebuild. Every run refreshes every twin, including a `generate` with nothing to generate, which is exactly when a stale one is easiest to leave behind.
@@ -179,6 +181,8 @@ It needs one declaration on the Dialect contract, `columnType(T)`, beside `accep
 **`status --sql` redirected to a file** in place of the twin. It opens a database to know which versions are waiting, which is the whole problem, and it prints no ledger row, so applying it leaves the next boot refusing a database whose tables are all at head.
 
 **A twin without the ledger row.** Applying it by hand would then be half a job, and the missing half is the one that stops the next boot; the row is the only part of the twin a shell script over `status --sql` could not have made.
+
+**A twin of plain SQL, which any driver could send**, which is what it was. `BEGIN`/`COMMIT` was taken to make it all or nothing, and in both shells it did not: `sqlite3` committed half a version with its ledger row, and `psql` rolled back and exited 0. A shell's directive on the first line is the only thing in the file that stops it, and SQL has no statement that does.
 
 **A hash in the version file**, so a twin could be written from the file alone. A hash written beside the statements it covers is decoration, because whoever edits a statement is looking straight at it.
 

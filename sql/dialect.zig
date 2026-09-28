@@ -621,6 +621,12 @@ pub const Postgres = struct {
     /// place. Postgres can, and answers so plainly.
     pub const can_alter_column = true;
 
+    /// The first line of a `.sql` twin, a `psql` meta-command rather than SQL.
+    /// Without it `psql -f` carries on past a failed step, the aborted
+    /// transaction's `COMMIT` becomes a rollback, and `psql` still exits 0, so
+    /// a deploy script reads a version that ran nothing as one that ran.
+    pub const script_stop_on_error = "\\set ON_ERROR_STOP on";
+
     /// `DROP TRIGGER "touch_updated_at" ON "work_items"`. Postgres keeps
     /// trigger names per table, so dropping one needs the table; SQLite keeps
     /// them per database and refuses the clause.
@@ -1168,6 +1174,13 @@ pub const SQLite = struct {
     /// answer `.lock` and `insertMany` already give here, one layer up
     /// ([ADR 055](../docs/adr/055-the-second-dialect-is-the-test-of-the-seam.md)).
     pub const can_alter_column = false;
+
+    /// The first line of a `.sql` twin, a `sqlite3` dot-command rather than
+    /// SQL. A failed statement does not abort a SQLite transaction, so without
+    /// it `sqlite3 app.db < 0002_x.sql` runs past the failure and the closing
+    /// `COMMIT` keeps the steps that ran together with the ledger row saying
+    /// the version did: `expect` passes and nothing ever retries it.
+    pub const script_stop_on_error = ".bail on";
 
     /// SQLite keeps trigger names per database rather than per table, so
     /// `DROP TRIGGER` takes the name alone and refuses `ON`.

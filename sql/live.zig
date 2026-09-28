@@ -793,6 +793,11 @@ test "a delete whose list arrived empty is refused before it is sent, rather tha
         .set = .{ .age = @as(i32, 1) },
         .where = .{ .email = .{ .contains = @as([]const u8, "") } },
     }));
+    // The same box holding `%`, handed to a raw pattern as it arrived.
+    try testing.expectError(
+        error.QueryFailed,
+        stack.db.delete(Person, &run, .{ .where = .{ .email = .{ .ilike = @as([]const u8, "%") } } }),
+    );
     try testing.expectEqual(@as(usize, 3), try stack.db.count(Person, &run, .{}));
 
     // Beside a term that narrows, the empty list narrows nothing more and
@@ -805,6 +810,30 @@ test "a delete whose list arrived empty is refused before it is sent, rather tha
         .where = .{ .id = .{ .not_in = @as([]const i64, &.{ 1, 2, 3 }) } },
     }));
     try testing.expectEqual(@as(usize, 3), try stack.db.count(Person, &run, .{}));
+}
+
+test "a negative limit or offset is refused before it is sent, as it is on SQLite" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    try testing.expectError(error.QueryFailed, stack.db.select(Person, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(i64, -1),
+    }));
+    try testing.expectError(error.QueryFailed, stack.db.page(Person, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(i64, 10),
+        .offset = @as(i64, -1),
+    }));
+    // The connection is fine afterwards: nothing was sent.
+    try testing.expectEqual(@as(usize, 3), (try stack.db.select(Person, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(i64, 10),
+    })).len);
 }
 
 fn rollbackAnInsert(db: *db_mod.Db, c: *nilo.Ctx) ![]Person {
@@ -2784,6 +2813,15 @@ const Loose = struct {
     tags: []const ?nilo.Str,
 };
 
+/// And as bytes, which reaches the Wire's list without `keptElement` in
+/// between.
+const LooseBytes = struct {
+    pub const nilo_table = .{ .name = list_table, .key = .id };
+
+    id: i64,
+    tags: []const ?[]const u8,
+};
+
 test "a slice of optionals reads the array the strict one refused" {
     const gpa = testing.allocator;
     var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
@@ -2793,10 +2831,22 @@ test "a slice of optionals reads the array the strict one refused" {
     defer run.deinit();
 
     const found = try stack.db.select(Loose, &run, .{ .where = .{ .id = @as(i64, 3) } });
+    const bytes = try stack.db.select(LooseBytes, &run, .{ .where = .{ .id = @as(i64, 3) } });
+
+    // Four statements more through the pool, each of whose answers
+    // lands in the read buffer the elements above were read out of. pg.zig
+    // copies an element only when it is exactly `[]const u8`, and these used
+    // to point into that buffer and read "ZZZZ".
+    for (0..4) |_| _ = try stack.db.raw([]const u8, &run, "SELECT repeat('Z', 64)", .{});
+
     try testing.expectEqual(@as(usize, 1), found.len);
     try testing.expectEqual(@as(usize, 2), found[0].tags.len);
     try testing.expectEqualStrings("solo", found[0].tags[0].?.view());
     try testing.expectEqual(@as(?nilo.Str, null), found[0].tags[1]);
+
+    try testing.expectEqual(@as(usize, 1), bytes.len);
+    try testing.expectEqualStrings("solo", bytes[0].tags[0].?);
+    try testing.expectEqual(@as(?[]const u8, null), bytes[0].tags[1]);
 }
 
 test "an array two dimensions deep is refused, because a slice is one" {
@@ -3606,6 +3656,46 @@ test "a batch goes in as one statement and comes back in the order it was sent" 
     try testing.expectEqual(@as(i32, 23), stored[2].age);
 
     try testing.expectEqual(before + 3, try stack.db.count(Person, &run, .{}));
+}
+
+test "paging through an order that ties sees every row once" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // A thousand rows over ten ages. Without the key at the end of the order,
+    // Postgres ordered the ties differently at each `OFFSET`, and 179 of these
+    // came back twice and 179 never.
+    const count = 1000;
+    const first: i64 = 10_000;
+    var rows: [count]Newcomer = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{
+        .id = first + @as(i64, @intCast(i)),
+        .email = try std.fmt.allocPrint(run.arena(), "tie{d}@page.dev", .{i}),
+        .age = @intCast(i % 10),
+    };
+    _ = try stack.db.insertMany(Person, &run, @as([]const Newcomer, &rows));
+
+    var seen = [_]bool{false} ** count;
+    var offset: i64 = 0;
+    while (offset < count) : (offset += 25) {
+        const page = try stack.db.page(Person, &run, .{
+            .where = .{ .id = .{ .gte = first } },
+            .order = .{ .age = .asc },
+            .limit = @as(i64, 25),
+            .offset = offset,
+        });
+        try testing.expectEqual(@as(@TypeOf(page.total), count), page.total);
+        for (page.rows) |p| {
+            const at: usize = @intCast(p.id - first);
+            try testing.expect(!seen[at]);
+            seen[at] = true;
+        }
+    }
+    for (seen) |was| try testing.expect(was);
 }
 
 test "an empty batch is a statement that stores nothing, not a special case" {
