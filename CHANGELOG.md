@@ -12,6 +12,8 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ### Breaking
 
+- **A Row or a raw read of a `u64`, a `usize`, an integer past 64 bits or a float other than `f32` and `f64` is a Refusal**, since neither database stores one; a list column holds `i16`, `i32`, `i64`, `f32` or `f64`. Each used to compile and fail at the first row, or inside pg.zig with its own message. Read a `u64` as `i64` (ADR 055).
+
 - **A Wire's `Tx.commit` takes `(arena, problem)` and a Dialect's `offset` takes `(placeholder, limited)`**, for a Wire or Dialect written outside nilo. `commit` fills `problem` the way `run` does, since a deferred constraint is checked there; `offset` is told whether a `LIMIT` came first, since SQLite takes an `OFFSET` only after one.
 
 - **A `sql.Timestamp` reads a Postgres `timestamptz` column and no longer a `timestamp` one.** A zoneless column moved `.now` by the session's zone: `now()` was stored as local wall time and read back as UTC, seven hours off under `Asia/Jakarta`, and `WHERE at < now()` compared it shifted the same way. `db.checking` and a raw statement's first-run check now refuse the column. What to change: `ALTER TABLE t ALTER COLUMN at TYPE timestamptz USING at AT TIME ZONE 'UTC'`, which keeps the values nilo wrote there; the refusal prints it with the names filled in (ADR 067).
@@ -80,6 +82,7 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ### Fixed
 
+- **A Postgres number column reads into a field of another width**, range-checked: an `i32` over `int8`, a `u8` over `int2`, an `f64` over `float4`. The schema check accepted each and every read answered `QueryFailed`, and a `u16` or an `i8` did not compile inside pg.zig. A value past the field is `error.QueryFailed` naming the column. `db.raw`'s first-run check takes a column as wide as the field or narrower (ADR 233).
 - **`tx.deadline(0)` times the next statement out**, where it sent `statement_timeout = 0`, which Postgres reads as no limit. A number past `maxInt(i32)` is sent as `maxInt(i32)` rather than aborting the transaction with Postgres's range error (ADR 043).
 - **`.in` and `.not_in` over a `sql.Timestamp`, `sql.Date`, `sql.Decimal` or `sql.Bytes` column compile on Postgres and match on SQLite.** Each element is bound the way one value of the column is; a date or decimal list is cast through `text[]`. On SQLite a list of bytes compiled and matched nothing.
 - **`.offset` with no `.limit` runs on SQLite**, written `LIMIT -1 OFFSET …`, where it was a syntax error there and a working statement on Postgres.

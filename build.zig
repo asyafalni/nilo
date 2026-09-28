@@ -399,6 +399,19 @@ const sql_refusals = [_]Refusal{
         .name = "row_column_no_dialect_can_decode",
         .says = "row_column_no_dialect_can_decode.User reads `address` as row_column_no_dialect_can_decode.Address, which no Dialect can decode.",
     },
+    // A number neither database stores, refused by name (ADR 055).
+    .{
+        .name = "row_column_read_as_a_u64",
+        .says = "row_column_read_as_a_u64.Counter reads `hits` as u64, which holds numbers neither database stores: both keep an integer in a signed 64 bits.",
+    },
+    .{
+        .name = "list_column_of_an_unsigned",
+        .says = "list_column_of_an_unsigned.Grid reads `cells` as []const u16, and Postgres decodes an array element only as the width it stores.",
+    },
+    .{
+        .name = "raw_read_as_an_f16",
+        .says = "a raw statement is read as f16, and a float column holds 32 or 64 bits.",
+    },
     .{
         .name = "streamed_json",
         .says = "streamed_json.Account reads `settings` as a Json column, and a streamed row cannot hold one.",

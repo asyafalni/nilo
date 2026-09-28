@@ -33,7 +33,7 @@ One parameter carrying a JSON array as text, constant statement, any length. It 
 
 - **No row locks.** SQLite serialises writers over the whole database, so there is no row to hold. `.lock` is the Refusal `noRowLock` writes, naming the dialect.
 - **No `insertMany`.** There is no `unnest` and no array parameter. The batch form SQLite has is `VALUES (…), (…), (…)`, whose text grows with the batch, no longer a constant, which is the rule this module is built on. A row at a time inside one transaction is the answer, and it is cheaper here than it sounds because there is no round trip to pay per statement.
-- **A coarser schema check.** A SQLite column's declared type is free text; what the database enforces is one of five affinities. `accepts` answers with affinity names, catching a `Str` field over an `INTEGER` column and not catching an `i32` field over a column holding values that do not fit. It declines a `u64` rather than accepting it optimistically, the safe direction to be coarse in.
+- **A coarser schema check.** A SQLite column's declared type is free text; what the database enforces is one of five affinities. `accepts` answers with affinity names, catching a `Str` field over an `INTEGER` column and not catching an `i32` field over a column holding values that do not fit. It declines a `u64` rather than accepting it optimistically, the safe direction to be coarse in; so does Postgres, and a Row reading a `u64` or a `usize` is a Refusal on both, since neither database keeps an integer past a signed 64 bits.
 
 ### `.like` and `.not_like` are Refusals on SQLite too, naming `.ilike` and `.not_ilike`
 

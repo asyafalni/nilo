@@ -3299,6 +3299,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             plan: ?[]const u8,
             values: anytype,
         ) ![]T {
+            comptime {
+                const Inner = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
+                if (numberNoneStores(Inner, false)) |why| @compileError(
+                    "nilo: a raw statement is read as " ++ @typeName(T) ++ ", " ++ why,
+                );
+            }
             const arena = c.arena();
             const w = try db.wireOf();
             const started = db.timing();
@@ -4525,10 +4531,15 @@ fn assertReadable(comptime Row: type) void {
                 .optional => |o| o.child,
                 else => f.type,
             };
+            const listed = types.listElement(Column) != null;
             const Item = if (types.listElement(Column)) |I| switch (@typeInfo(I)) {
                 .optional => |o| o.child,
                 else => I,
             } else Column;
+            if (numberNoneStores(Item, listed)) |why| @compileError(
+                "nilo: " ++ @typeName(Row) ++ " reads `" ++ f.name ++ "` as " ++
+                    @typeName(f.type) ++ ", " ++ why,
+            );
             if (readable(Item)) continue;
             @compileError(
                 "nilo: " ++ @typeName(Row) ++ " reads `" ++ f.name ++ "` as " ++
@@ -4560,6 +4571,34 @@ fn scalarColumn(comptime T: type) bool {
     };
     if (@typeInfo(Inner) == .@"struct" and @hasDecl(Inner, row_mod.marker)) return false;
     return readable(Inner);
+}
+
+/// Why a number type is one no database here stores, or null when one does.
+///
+/// **A signed 64-bit integer is the widest either database holds**, so a
+/// `u64` or a `usize` has values neither can store, and a Row reading one
+/// would be told so at the first row past `maxInt(i64)` rather than while
+/// compiling (ADR 055). Every narrower integer reads, range-checked against
+/// the column. Floats are `f32` and `f64`, the two widths both store. An
+/// array element is decoded by its exact type on Postgres, so a list holds
+/// `i16`, `i32`, `i64`, `f32` or `f64` and nothing between.
+fn numberNoneStores(comptime T: type, comptime listed: bool) ?[]const u8 {
+    return switch (@typeInfo(T)) {
+        .int => |i| if (i.bits > 64 or (i.signedness == .unsigned and i.bits == 64))
+            "which holds numbers neither database stores: both keep an integer in a signed 64 bits.\n" ++
+                "  Read it as `i64`, and convert where the program needs the unsigned type."
+        else if (listed and (i.signedness == .unsigned or (i.bits != 16 and i.bits != 32 and i.bits != 64)))
+            "and Postgres decodes an array element only as the width it stores.\n" ++
+                "  A list holds `i16`, `i32` or `i64`, the elements of `int2[]`, `int4[]` and `int8[]`."
+        else
+            null,
+        .float => |fl| if (fl.bits != 32 and fl.bits != 64)
+            "and a float column holds 32 or 64 bits.\n" ++
+                "  Read it as `f64`, or as `sql.Decimal` for a `numeric` column."
+        else
+            null,
+        else => null,
+    };
 }
 
 /// What `kept` and `WireRead` between them know how to read. Kept next to

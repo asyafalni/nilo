@@ -85,10 +85,12 @@ over `text` or an enum's label whatever the type is called.
 
 The list a field is held to is `Dialect.reads`, not `Dialect.accepts`.
 `accepts` is about a table a Row both reads and writes, and lets an `i32` stand
-over an `int8` column. The read is pg.zig's, which decodes an `i32` out of
-`int4` and nothing else, so `reads` makes the numbers exact. That is the
-mistake a raw statement makes most: `count(*)` is `int8`, `sum` of an `int8`
-is `numeric`, and neither reads into the field it usually goes into. A text
+over an `int8` column, which the Postgres Wire reads range-checked. `reads`
+takes a number column as wide as the field or narrower, and no wider: a
+narrower one widens without a value that can fail to fit, and a wider one is a
+read that works until the day a value passes the field. That is the mistake a
+raw statement makes most: `count(*)` is `int8`, `sum` of an `int8` is
+`numeric`, and neither is safe in the field it usually goes into. A text
 column (`Decimal`, `Interval`, an `AsText` type) is `text` in `reads`, because
 a raw statement asks for it as `::text` ([ADR 124](124-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
 
@@ -176,7 +178,9 @@ a place to hide; the second is the paragraph above.
 
 **`accepts` for the types**, which is what `checkSchema` holds a table to. It
 lets an `i32` stand over an `int8`, which is the one mistake a raw statement
-makes most.
+makes most. **Exact widths** were the first version of `reads`; once the Wire
+read any integer column into any integer field range-checked, refusing an
+`int4` into an `i64` was a check failing a statement that could not fail.
 
 **`std.json` for the plan.** It was the first version and it cost +88,496 B on the Postgres program: an array hash map per object and a float parser for every number, to read four string keys. A reader of its own that skips numbers unread took it to +35,184, and moving the once-only half of the check out of the generic call to +30,864.
 
@@ -190,6 +194,5 @@ stale-plan retry's (ADR 051).
   wire.Described`; null is "cannot say", which the Fake answers unless a test
   sets `described`. A Dialect owes `reads`.
 - `checkSchema`'s `accepts` still lets an `i32` field stand over an `int8`
-  column, and a typed read of that Row fails at the row. That is recorded as
-  an open risk rather than changed here, because a Row that only writes is
-  correct under it and the change would stop a server starting.
+  column. The Postgres Wire reads it range-checked, so a typed read of that
+  Row fails only at a row whose value does not fit, with the column named.

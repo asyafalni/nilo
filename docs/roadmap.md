@@ -95,10 +95,6 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 #### P1: wrong and loud, a migration that fails, a measured multiple, or a gap in the gate
 
-**The Postgres schema check passes a Row it can never read.** `intAccepts` (`dialect.zig:896-905`) lets an `i32` sit on int8, an `i16` on int4 and a `u8` on any integer, and `dialect.zig:787` lets an `f64` sit on float4, but pg.zig decodes only the exact type, so the check says nothing and every read answers `QueryFailed`; `schema.zig:569` asserts the wrong list. `u16`, `u32`, `u64`, `i8` and the odd floats pass `readable` (`db.zig:4402`) and fail inside pg.zig with its own compile error, the mangled one `assertReadable` exists to replace, and a `u64` is not judged at all (`dialect.zig:1449`) where [ADR 055](./adr/055-the-second-dialect-is-the-test-of-the-seam.md) says it is declined.
-
-**Needs:** each accepted list made exactly what the driver decodes, or a widening read with a range check, and a nilo Refusal for every type no dialect reads.
-
 **A pooled connection that died while idle fails the next request.** `pool.acquire` hands back what it holds without asking (`postgres.zig:430`), so after a database restart, a failover or a NAT dropping an idle socket, every dead connection costs one request a 5xx. Reproduced through `severed.zig`'s proxy.
 
 **Needs:** a failed first write on a freshly acquired connection, with nothing yet sent in a transaction, answered by one reconnect and a resend, or a check on acquire after a connection has idled.

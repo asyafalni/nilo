@@ -791,7 +791,7 @@ test "a raw column is held to the read the driver makes, not to the table's loos
     }, &out, testing.allocator);
     try testing.expectEqual(@as(usize, 1), out.items.len);
     try testing.expectEqual(@as(usize, 1), out.items[0].column);
-    try testing.expectEqualStrings("int4", out.items[0].expected);
+    try testing.expectEqualStrings("int4 or int2", out.items[0].expected);
     try testing.expectEqualStrings("int8", out.items[0].found);
 }
 
@@ -817,5 +817,5 @@ test "a raw column nobody described, or past the Row's end, is not judged" {
     var said: std.Io.Writer.Allocating = .init(testing.allocator);
     defer said.deinit();
     try out.items[0].write(&said.writer);
-    try testing.expect(std.mem.indexOf(u8, said.written(), "reads int8, and the statement answers numeric") != null);
+    try testing.expect(std.mem.indexOf(u8, said.written(), "reads int8, int4 or int2, and the statement answers numeric") != null);
 }

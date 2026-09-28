@@ -4056,6 +4056,61 @@ test "a batch carries the column types that bind as something else" {
     try testing.expectEqual(@as(i64, 931), priced[0].id);
 }
 
+/// Numbers in fields of another width than their columns, each a pair the
+/// schema check accepts.
+const Widths = struct {
+    pub const nilo_table = .{ .name = "nilo_live_widths_" ++ mode_suffix, .key = .id };
+    id: i64,
+    small: u8,
+    tiny: i8,
+    big: i32,
+    half: f64,
+    whole: ?f64,
+};
+
+test "a number is read out of whichever width its column is, and refused where it does not fit" {
+    // pg.zig decodes only the exact type, so an `i32` over `int8` and an
+    // `f64` over `float4` passed the schema check and failed every read, and
+    // a `u8` or an `i8` did not compile inside the driver.
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const widths = "nilo_live_widths_" ++ mode_suffix;
+    _ = try stack.db.exec(&run, "DROP TABLE IF EXISTS " ++ widths, .{});
+    defer _ = stack.db.exec(&run, "DROP TABLE IF EXISTS " ++ widths, .{}) catch {};
+    _ = try stack.db.exec(&run, "CREATE TABLE " ++ widths ++ " (id int8 PRIMARY KEY, small int2 NOT NULL, " ++
+        "tiny int2 NOT NULL, big int8 NOT NULL, half float4 NOT NULL, whole float8)", .{});
+
+    const made = try stack.db.insert(Widths, &run, .{
+        .id = @as(i64, 1),
+        .small = @as(u8, 200),
+        .tiny = @as(i8, -100),
+        .big = @as(i32, 7),
+        .half = @as(f64, 1.5),
+        .whole = @as(?f64, 2.25),
+    });
+    try testing.expectEqual(@as(u8, 200), made.small);
+    try testing.expectEqual(@as(i8, -100), made.tiny);
+    try testing.expectEqual(@as(i32, 7), made.big);
+    try testing.expectEqual(@as(f64, 1.5), made.half);
+    try testing.expectEqual(@as(?f64, 2.25), made.whole);
+
+    // Past what the field holds: refused, with the column named, rather
+    // than truncated.
+    _ = try stack.db.exec(&run, "UPDATE " ++ widths ++ " SET big = 5000000000", .{});
+    try testing.expectError(error.QueryFailed, stack.db.find(Widths, &run, @as(i64, 1)));
+    _ = try stack.db.exec(&run, "UPDATE " ++ widths ++ " SET big = 1, small = -1", .{});
+    try testing.expectError(error.QueryFailed, stack.db.find(Widths, &run, @as(i64, 1)));
+
+    // A raw statement's narrower column widens into the field.
+    try testing.expectEqual(@as(i64, 5), try stack.db.rawExactlyOne(i64, &run, "SELECT 5::int4", .{}));
+    try testing.expectEqual(@as(f64, 0.5), try stack.db.rawExactlyOne(f64, &run, "SELECT 0.5::float4", .{}));
+}
+
 /// A child whose key to its parent is checked at the COMMIT.
 const Deferred = struct {
     pub const nilo_table = .{ .name = "nilo_live_deferred_" ++ mode_suffix, .key = .id };

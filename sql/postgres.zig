@@ -879,7 +879,118 @@ pub const Wire = struct {
                 return std.math.add(i64, since_y2k, micros_from_epoch_to_y2k) catch error.QueryFailed;
             }
         }
+        // **A number read out of whichever width the column is, and held to
+        // the field's.** pg.zig decodes an `i32` out of `int4` and nothing
+        // else, while the schema check lets an `i32` stand over an `int8` and
+        // an `f64` over a `float4`, so every read of those answered
+        // `QueryFailed` and a `u16` or an `i8` did not compile inside the
+        // driver. Here a value that fits is read, and one that does not is
+        // refused with its column named rather than truncated. Any other
+        // column, a `numeric` read into an `f64` among them, is pg.zig's.
+        if (comptime numberOf(T)) |N| {
+            const oid = row.oids[col];
+            // pg.zig decodes these five widths out of other columns too, a
+            // `numeric` into an `f64` among them; any other width has no
+            // decoder there at all.
+            const theirs = comptime N == i16 or N == i32 or N == i64 or N == f32 or N == f64;
+            if (isNumber(oid) or !theirs) {
+                const raw = row.values[col];
+                if (raw.is_null) {
+                    if (comptime @typeInfo(T) == .optional) return null;
+                    return error.QueryFailed;
+                }
+                if (!isNumber(oid)) return notANumber(N, oid, col);
+                return try numberFrom(N, oid, raw.data, col);
+            }
+        }
         return row.get(T, col) catch return error.QueryFailed;
+    }
+
+    /// The number `T` holds, or null when it holds something else. An `i64`
+    /// counts: a `Timestamp` over a moment was taken above by its OID, and
+    /// one over an `int8` is the number it is.
+    fn numberOf(comptime T: type) ?type {
+        const Inner = switch (@typeInfo(T)) {
+            .optional => |o| o.child,
+            else => T,
+        };
+        return switch (@typeInfo(Inner)) {
+            .int, .float => Inner,
+            else => null,
+        };
+    }
+
+    fn numberName(oid: i32) []const u8 {
+        return switch (oid) {
+            pg.types.Int16.oid.decimal => "int2",
+            pg.types.Int32.oid.decimal => "int4",
+            pg.types.Int64.oid.decimal => "int8",
+            pg.types.Float32.oid.decimal => "float4",
+            pg.types.Float64.oid.decimal => "float8",
+            else => "another type",
+        };
+    }
+
+    fn isNumber(oid: i32) bool {
+        return switch (oid) {
+            pg.types.Int16.oid.decimal,
+            pg.types.Int32.oid.decimal,
+            pg.types.Int64.oid.decimal,
+            pg.types.Float32.oid.decimal,
+            pg.types.Float64.oid.decimal,
+            => true,
+            else => false,
+        };
+    }
+
+    /// A column of `int2`, `int4`, `int8`, `float4` or `float8`, in the
+    /// binary form Postgres sends, as `N`. An integer is range-checked into
+    /// any integer field; a float widens into an `f64` and reads into an
+    /// `f32` only out of a `float4`, since narrowing a double loses digits
+    /// without saying so.
+    fn numberFrom(comptime N: type, oid: i32, data: []const u8, col: usize) wire.Error!N {
+        switch (@typeInfo(N)) {
+            .int => {
+                const wide: i64 = switch (oid) {
+                    pg.types.Int16.oid.decimal => if (data.len == 2) std.mem.readInt(i16, data[0..2], .big) else return error.QueryFailed,
+                    pg.types.Int32.oid.decimal => if (data.len == 4) std.mem.readInt(i32, data[0..4], .big) else return error.QueryFailed,
+                    pg.types.Int64.oid.decimal => if (data.len == 8) std.mem.readInt(i64, data[0..8], .big) else return error.QueryFailed,
+                    // A float column into an integer field: not a number
+                    // this reads without losing what is after the point.
+                    else => return notANumber(N, oid, col),
+                };
+                return std.math.cast(N, wide) orelse {
+                    std.log.warn(
+                        "nilo_sql: column {d} holds {d}, which does not fit the Row's " ++ @typeName(N) ++
+                            ". Widen the field, or narrow the column.",
+                        .{ col, wide },
+                    );
+                    return error.QueryFailed;
+                };
+            },
+            .float => switch (oid) {
+                pg.types.Float32.oid.decimal => {
+                    if (data.len != 4) return error.QueryFailed;
+                    const narrow: f32 = @bitCast(std.mem.readInt(u32, data[0..4], .big));
+                    return narrow;
+                },
+                pg.types.Float64.oid.decimal => {
+                    if (N != f64 or data.len != 8) return notANumber(N, oid, col);
+                    return @bitCast(std.mem.readInt(u64, data[0..8], .big));
+                },
+                else => return notANumber(N, oid, col),
+            },
+            else => comptime unreachable,
+        }
+    }
+
+    fn notANumber(comptime N: type, oid: i32, col: usize) wire.Error {
+        std.log.warn(
+            "nilo_sql: column {d} arrived as {s}, which the Row's " ++ @typeName(N) ++ " does not read. " ++
+                "Cast the column in the statement, or change the field's type.",
+            .{ col, numberName(oid) },
+        );
+        return error.QueryFailed;
     }
 
     /// 2000-01-01 as microseconds since the epoch: where Postgres counts a

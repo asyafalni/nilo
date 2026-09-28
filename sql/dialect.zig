@@ -876,12 +876,12 @@ pub const Postgres = struct {
     /// time it runs
     /// ([ADR 233](../docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
     ///
-    /// **`accepts` with the numbers made exact.** That list is about a table
-    /// a Row both reads and writes, and lets an `i32` stand over an `int8`
-    /// column; the read is pg.zig's, which decodes an `i32` out of `int4`
-    /// and nothing else. So the `int8` a `count(*)` answers and the
-    /// `numeric` a `sum(int8)` answers are both a statement that fails on
-    /// its first row, and this is where that is said before the row.
+    /// **`accepts` with the numbers made lossless.** That list is about a
+    /// table a Row both reads and writes, and lets an `i32` stand over an
+    /// `int8` column, read range-checked (`postgres.Wire.read`). A raw
+    /// statement's `count(*)` into an `i32` reads the same way and fails on
+    /// the day the count passes two billion, so this says so while it is
+    /// small; the `numeric` a `sum(int8)` answers fails on its first row.
     ///
     /// A text column is `text` here because a raw statement asks for it as
     /// `::text`, which `rawcheck.assertCasts` holds it to (ADR 124). A
@@ -898,16 +898,20 @@ pub const Postgres = struct {
             else => T,
         };
         if (!types.isBytes(Inner) and types.asText(Inner) != null) return text_accepts;
+        // What reads without a value that can fail to fit: a column as wide
+        // as the field or narrower. The Wire reads a wider one too, range-
+        // checked, and a count of rows fitting an `i32` today is the case
+        // that stops fitting in production; so the check still says so.
         return switch (@typeInfo(Inner)) {
             .int => |i| if (i.signedness == .unsigned) null else switch (i.bits) {
                 16 => &.{"int2"},
-                32 => &.{"int4"},
-                64 => &.{"int8"},
+                32 => &.{ "int4", "int2" },
+                64 => &.{ "int8", "int4", "int2" },
                 else => null,
             },
             .float => |f| switch (f.bits) {
                 32 => &.{"float4"},
-                64 => &.{"float8"},
+                64 => &.{ "float8", "float4" },
                 else => null,
             },
             else => accepts(T),
@@ -916,7 +920,11 @@ pub const Postgres = struct {
 
     fn intAccepts(comptime info: std.builtin.Type.Int) Accepts {
         // Postgres has no unsigned integers, so an unsigned Zig type reads
-        // out of the next width up — the one that can hold all of it.
+        // out of the next width up — the one that can hold all of it. A
+        // wider column is read range-checked (`postgres.Wire.read`): a value
+        // that does not fit the field fails its statement with the column
+        // named. The list is also what the field is written into, and a
+        // write narrower than the column always fits.
         const effective = if (info.signedness == .signed) info.bits else info.bits + 1;
         return switch (effective) {
             0...16 => &.{ "int2", "int4", "int8" },
@@ -2001,10 +2009,13 @@ test "SQLite's affinity is its own substring rule, and no declared type is none"
     try testing.expectEqual(@as(?[]const u8, null), SQLite.affinityOf(""));
 }
 
-test "a raw read on Postgres takes a number of exactly its width" {
-    try testing.expectEqualSlices([]const u8, &.{"int4"}, Postgres.reads(i32).?);
-    try testing.expectEqualSlices([]const u8, &.{"int8"}, Postgres.reads(?i64).?);
-    try testing.expectEqualSlices([]const u8, &.{"float8"}, Postgres.reads(f64).?);
+test "a raw read on Postgres takes a number of its width or narrower, never wider" {
+    // A wider column reads range-checked, and a raw `count(*)` into an `i32`
+    // is the one that fails the day it passes two billion, so it is said.
+    try testing.expectEqualSlices([]const u8, &.{ "int4", "int2" }, Postgres.reads(i32).?);
+    try testing.expectEqualSlices([]const u8, &.{ "int8", "int4", "int2" }, Postgres.reads(?i64).?);
+    try testing.expectEqualSlices([]const u8, &.{ "float8", "float4" }, Postgres.reads(f64).?);
+    try testing.expectEqualSlices([]const u8, &.{"float4"}, Postgres.reads(f32).?);
     // Where `accepts` is the table's list, wider on both sides.
     try testing.expect(Postgres.accepts(i32).?.len > 1);
     // A text column arrives as text, because a raw statement casts it.
