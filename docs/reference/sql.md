@@ -372,7 +372,35 @@ SELECT "id", "status", count(*) OVER () FROM "orders"
 
 `tx.page` is the same call inside a transaction. `sql.Page(Row)` is the result type, for a handler that returns one.
 
-A page too deep for `OFFSET` to stay fast needs [the keyset form](../guide/sql/reading.md#keyset-pagination-for-deep-pages) instead: a condition you write yourself rather than a call here, and without `db.page`'s total.
+**The total costs a pass over every row the condition matches**, before the limit: 124 ms against 0.024 ms for the same twenty rows of a million ([ADR 150](../adr/150-a-page-knows-what-it-left-out.md)). A list that shows no total is `db.feed`.
+
+#### `db.feed`
+
+**`db.feed` is a `select` that also says whether any row came after the ones it returned**, for a "load more" button or an endless scroll ([ADR 150](../adr/150-a-page-knows-what-it-left-out.md#a-feed-counts-nothing)):
+
+```zig
+const found = try db.feed(Order, c, .{
+    .order = .{ .created_at = .desc, .id = .desc },
+    .after = .{ .created_at = last.created_at, .id = last.id },
+    .limit = 20,
+});
+// found.rows is []Order, found.more says whether there is a next screen.
+```
+
+```sql
+SELECT "id", "created_at", … FROM "orders"
+  WHERE ("created_at", "id") < ($1, $2) ORDER BY "created_at" DESC, "id" DESC LIMIT 21
+```
+
+**It counts nothing.** It reads one row past `.limit` and drops it; that row is `more`. `.limit` and `.order` are required and `.lock` is refused, as on a page. `tx.feed` is the same call inside a transaction, and `sql.Feed(Row)` is the result type, `{"rows":[…],"more":true}` from a handler.
+
+**`.after` is a cursor: the last row seen, as the value of each column `.order` sorts by.** The rows after it are one row comparison, which an index over the same columns answers with a seek, so a deep screen costs what the first does, where `.offset` reads every row it skips. The first screen has no cursor, so it is the same call without `.after`. `db.select` and `db.explain` take `.after` too. Each of these is a compile error, because each is a cursor that skips or repeats rows:
+
+- `.after` naming other columns than `.order`, or in another order, or beside an order the request chose;
+- an order that runs both ways, since a row comparison runs one way (write that condition with `.any` in `.where`, which cannot seek);
+- a direction that says where NULLs go, or a column that may be null, since a comparison with a NULL in it is true of nothing;
+- an order that does not end in the table's key, since two rows sharing every sorted column stand at one cursor;
+- `.after` on `db.page`, which counts every match and skips by `OFFSET`.
 
 ### A batch
 
@@ -413,6 +441,7 @@ There are two calls rather than one option, because the results differ: `DO NOTH
 | `.where` | a condition; see [Conditions](#conditions). On a narrower Row it may name a column of the table that the Row does not carry, bound as the table's column type ([ADR 218](../adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)) |
 | `.order` | `.{ .created_at = .desc }`, one column per field. `.asc_nulls_last` and its three siblings say where NULLs go, which the two databases otherwise disagree about. A narrower Row that is not grouped may order by any column of its table, whether it carries it or not, so a tiebreak column does not have to be sent to the client; a grouped Row is a Refusal there, since the column has no single value per group. Where a `.limit` or an `.offset` cuts the answer (and always on `db.page` and `db.one`), the table's key is added at the end, ascending, unless the order names it already, so rows the order ties are never repeated or skipped from one page to the next ([ADR 150](../adr/150-a-page-knows-what-it-left-out.md#a-page-ends-in-the-key)). Or a value of an `sql.Ordering`, for an order the request chose; see [`sql.Ordering`](#sqlordering-an-order-chosen-at-run-time) |
 | `.limit` / `.offset` | a literal is written into the SQL; a variable becomes a parameter. A literal limit is also the row ceiling, so the result list is allocated once |
+| `.after` | a cursor, the last row seen: `.{ .created_at = last.created_at, .id = last.id }` over the same columns as `.order`, which must run one way and end in the key. One row comparison an index seeks on ([`db.feed`](#dbfeed)) |
 | `.set` | update only: columns to new values, or `.{ .views = .{ .plus = 1 } }` for arithmetic on the column's own value. A bare `null` on a nullable column is `= NULL`, with no `@as(?T, null)` needed, while in `.where` the same null is `IS NULL`. `.title = sql.given(maybe)` is `COALESCE($1, "title")`, which keeps the column when the value is null; it is refused on an optional column. `.updated_at = .now` is the database's clock on a `sql.Timestamp` (the moment the transaction began on Postgres, the moment the statement runs on SQLite), and `.start_date = .today` its date (`CURRENT_DATE`) on a `sql.Date`, with nothing bound for either. A column read as text takes the word its column type names: `.today` on `sql.AsText("date")`, `.now` on `sql.AsText("timestamptz")`. Using either on the other's column type is a Refusal |
 
 ### Conditions

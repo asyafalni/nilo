@@ -164,7 +164,7 @@ pub const Statement = struct {
 
 /// The option names a `SELECT` takes. Anything else is a Refusal, so a
 /// misspelled `.limti` stops at `zig build` rather than being ignored.
-const known = [_][]const u8{ "where", "order", "limit", "offset", "lock" };
+const known = [_][]const u8{ "where", "order", "limit", "offset", "lock", "after" };
 
 /// The same list without `.limit`, for `one` — which compiles its own and so
 /// has none to give away.
@@ -174,13 +174,18 @@ const known_one = [_][]const u8{ "where", "order", "offset", "lock" };
 /// function cannot be in one statement, and Postgres says so at run time.
 const known_page = [_][]const u8{ "where", "order", "limit", "offset" };
 
+/// A feed's: a page's, and a cursor (`afterOf`).
+const known_feed = [_][]const u8{ "where", "order", "limit", "offset", "after" };
+
 /// How many rows the caller is asking for. `one` is not a `select` somebody
 /// narrowed: the ceiling is the module's rather than the caller's, which is
 /// why writing a second one is a Refusal instead of a silent argument.
 ///
 /// `page` is a select carrying the count the condition matched before the
-/// `LIMIT` cut it ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md)).
-const Answers = enum { many, first, page };
+/// `LIMIT` cut it ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md)),
+/// and `feed` one reading a row past its `LIMIT` to say whether there are
+/// more.
+const Answers = enum { many, first, page, feed };
 
 /// Compile a `SELECT` for `Row` in `D`'s grammar from the options type `O`.
 pub fn select(comptime D: type, comptime Row: type, comptime O: type) Statement {
@@ -197,6 +202,13 @@ pub fn select(comptime D: type, comptime Row: type, comptime O: type) Statement 
 /// cannot.
 pub fn page(comptime D: type, comptime Row: type, comptime O: type) Statement {
     return comptime rowsOf(D, Row, O, .page);
+}
+
+/// The same statement reading one row past its `.limit`, for `db.feed`: the
+/// row that says there are more, which the call drops
+/// ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md#a-feed-counts-nothing)).
+pub fn feed(comptime D: type, comptime Row: type, comptime O: type) Statement {
+    return comptime rowsOf(D, Row, O, .feed);
 }
 
 /// The same statement with `LIMIT 1` on the end, for `db.one`.
@@ -225,8 +237,15 @@ fn rowsOf(
             .many => .many,
             .first => .first,
             .page => .page,
+            .feed => .feed,
         });
         budget(Row, O);
+        const call = switch (answers) {
+            .first => "`db.one`",
+            .page => "`db.page`",
+            .feed => "`db.feed`",
+            .many => "`db.select`",
+        };
 
         // Said before `assertOptions`, so that a `.limit` written on a `one`
         // gets the sentence about `one` rather than the generic list of what
@@ -238,6 +257,13 @@ fn rowsOf(
         );
         // A page with no ceiling is the whole table, and the window function
         // it paid for answers `rows.len` (ADR 150).
+        if (answers == .feed) assertFeed(Row, O);
+        if (answers == .page and @hasField(O, "after")) @compileError(
+            "nilo: `db.page` on " ++ @typeName(Row) ++ " was given an `.after`.\n" ++
+                "  A page skips rows by `OFFSET` and counts every match; a cursor reads the rows " ++
+                "after one and has no page for a count to be relative to. Read it with `db.feed`, " ++
+                "which says whether there are more.",
+        );
         if (answers == .page and !@hasField(O, "limit")) @compileError(
             "nilo: `db.page` on " ++ @typeName(Row) ++ " was given no `.limit`.\n" ++
                 "  A page is a slice of the rows and a total for the rest of them. With no " ++
@@ -273,11 +299,13 @@ fn rowsOf(
             switch (answers) {
                 .first => &known_one,
                 .page => &known_page,
+                .feed => &known_feed,
                 .many => &known,
             },
             switch (answers) {
                 .first => "`db.one`",
                 .page => "`db.page`",
+                .feed => "`db.feed`",
                 .many => "a select",
             },
         );
@@ -294,6 +322,7 @@ fn rowsOf(
         var next: usize = 1;
         var reserve: ?usize = null;
 
+        var narrowed = false;
         if (@hasField(O, "where")) {
             const p = where_mod.planAt(D, Row, @FieldType(O, "where"), next, &.{"where"});
             if (!p.isEmpty()) {
@@ -301,7 +330,15 @@ fn rowsOf(
                 paths = paths ++ p.paths;
                 params = params ++ p.params;
                 next += p.paths.len;
+                narrowed = true;
             }
+        }
+        if (@hasField(O, "after")) {
+            const k = afterOf(D, Row, O, "", next, call);
+            sql = sql ++ (if (narrowed) " AND " else " WHERE ") ++ k.sql;
+            paths = paths ++ k.paths;
+            params = params ++ k.params;
+            next += k.paths.len;
         }
 
         // An ordering chosen at run time splits the statement here: what
@@ -314,11 +351,7 @@ fn rowsOf(
             const Order = @FieldType(O, "order");
             const cut = @hasField(O, "limit") or @hasField(O, "offset") or answers != .many;
             if (ordering.orderingOf(Order) != null) {
-                ordering.assertFor(Order, Row, switch (answers) {
-                    .first => "`db.one`",
-                    .page => "`db.page`",
-                    .many => "`db.select`",
-                }, true);
+                ordering.assertFor(Order, Row, call, true);
                 ordered = true;
                 if (cut) ties = tiesOf(D, Row, "");
                 head = sql;
@@ -330,7 +363,7 @@ fn rowsOf(
         }
 
         if (@hasField(O, "limit")) {
-            const bound = boundary(D, O, "limit", next);
+            const bound = if (answers == .feed) past(boundary(D, O, "limit", next)) else boundary(D, O, "limit", next);
             sql = sql ++ D.limit(bound.text);
             reserve = bound.written;
             if (bound.path) |path| {
@@ -371,6 +404,173 @@ fn rowsOf(
         };
         break :blk .{ .sql = sql, .paths = paths, .params = params, .reserve = reserve };
     };
+}
+
+/// A written `.limit` one higher, for a feed: the row past the page is the
+/// whole of how it knows there are more. A bound one is raised by `db.feed`
+/// as it is sent, so the statement is the same text whatever the request.
+pub fn past(comptime bound: Bound) Bound {
+    comptime {
+        const n = bound.written orelse return bound;
+        return .{ .text = std.fmt.comptimePrint("{d}", .{n + 1}), .path = null, .written = n + 1 };
+    }
+}
+
+/// What a feed needs that a select does not: a ceiling to read one past, an
+/// order for "more" to mean anything, and no lock on a row it will drop.
+pub fn assertFeed(comptime Row: type, comptime O: type) void {
+    comptime {
+        if (!@hasField(O, "limit")) @compileError(
+            "nilo: `db.feed` on " ++ @typeName(Row) ++ " was given no `.limit`.\n" ++
+                "  A feed is the rows up to a ceiling and whether there are more past it. With no " ++
+                "ceiling there is never more, and `db.select` is the call.",
+        );
+        if (!@hasField(O, "order")) @compileError(
+            "nilo: `db.feed` on " ++ @typeName(Row) ++ " was given no `.order`.\n" ++
+                "  `LIMIT` without `ORDER BY` takes whichever rows the planner reached first, so the " ++
+                "next call can show a row again and skip another. Add `.order = .{ .<column> = .asc }`.",
+        );
+        if (@hasField(O, "lock")) @compileError(
+            "nilo: `db.feed` on " ++ @typeName(Row) ++ " was given a `.lock`.\n" ++
+                "  A feed reads one row past its limit to see whether there are more, and a lock " ++
+                "would hold that row too. Hold the rows with `tx.select` once you know which ones they are.",
+        );
+    }
+}
+
+/// A cursor's condition: the rows after the one `.after` holds, in `.order`.
+pub const After = struct {
+    sql: []const u8,
+    paths: []const where_mod.Path,
+    params: []const where_mod.Param,
+};
+
+/// `.after = .{ .created_at = last.created_at, .id = last.id }` beside
+/// `.order = .{ .created_at = .desc, .id = .desc }`: one row comparison,
+/// `("created_at", "id") < ($1, $2)`, which both databases seek on an index
+/// over the same columns. The `.any` of `<` and `= … AND <` the guide wrote
+/// before filtered rather than sought, and cost what the `OFFSET` it replaced
+/// did: 17.8 ms against 0.013 ms at a million rows (bench/result/sql.md §18).
+///
+/// **Each rule below is a cursor that skips or repeats rows otherwise**, so
+/// each is a Refusal: the columns are the order's, in its order; the order
+/// runs one way, since a row comparison does; it says nothing about NULLs
+/// and no column may hold one, since a row comparison with a NULL in it is
+/// true of nothing; and it ends in the table's key, or two rows sharing
+/// every column sorted by stand at one cursor and the second is skipped.
+pub fn afterOf(
+    comptime D: type,
+    comptime Row: type,
+    comptime O: type,
+    comptime prefix: []const u8,
+    comptime first: usize,
+    comptime call: []const u8,
+) After {
+    comptime {
+        const A = @FieldType(O, "after");
+        const example = "`.after = .{ .created_at = last.created_at, .id = last.id }`";
+        if (@typeInfo(A) != .@"struct" or @typeInfo(A).@"struct".fields.len == 0) @compileError(
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " was given an `.after` of " ++ @typeName(A) ++ ".\n" ++
+                "  A cursor is the last row seen, as the value of each column `.order` sorts by: " ++ example ++ ".",
+        );
+        if (!@hasField(O, "order")) @compileError(
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " was given an `.after` and no `.order`.\n" ++
+                "  Which rows come after a cursor is what the order says. Write `.order` over the same columns.",
+        );
+        const Order = @FieldType(O, "order");
+        if (ordering.orderingOf(Order) != null) @compileError(
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " was given an `.after` beside an order the request chose.\n" ++
+                "  The comparison is settled while compiling, and a request can sort by other columns than the " ++
+                "cursor holds. Write `.order` out.",
+        );
+        const sorted = @typeInfo(Order).@"struct".fields;
+        const held = @typeInfo(A).@"struct".fields;
+        var same = sorted.len == held.len;
+        if (same) for (sorted, held) |x, y| {
+            if (!std.mem.eql(u8, x.name, y.name)) same = false;
+        };
+        if (!same) @compileError(
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " has an `.after` over " ++ fieldList(held) ++
+                " and an `.order` over " ++ fieldList(sorted) ++ ".\n" ++
+                "  A cursor holds the last row's value of each column the order sorts by, in the same order.",
+        );
+        const keys = row_mod.keysIfAnyOf(Row);
+        if (keys.len == 0) @compileError(
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " was given an `.after`, and its table has no key.\n" ++
+                "  Two rows can share every column the order sorts by, and a cursor at one of them skips the other.",
+        );
+        for (keys) |key| if (!@hasField(Order, key)) @compileError(
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " reads after a cursor, and its `.order` does not end in `" ++
+                key ++ "`.\n" ++
+                "  Two rows can share every column it sorts by, and a cursor at one of them skips the other. " ++
+                "Add `." ++ key ++ "` to the order and to `.after`, running the same way.",
+        );
+        var descending: ?bool = null;
+        for (sorted) |f| {
+            const direction: Direction = writtenValue(Order, f.name, Direction);
+            if (direction.placement() != null) @compileError(
+                "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " reads after a cursor, and `.order." ++ f.name ++
+                    "` says where NULLs go.\n" ++
+                    "  A row comparison with a NULL in it is true of nothing, so a cursor over a column that may " ++
+                    "be null loses those rows. Order by columns that are never null, with `.asc` or `.desc`.",
+            );
+            if (descending) |d| if (d != direction.descending()) @compileError(
+                "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " reads after a cursor over an order that runs " ++
+                    "both ways.\n" ++
+                    "  A row comparison runs one way. Make every term `.asc` or every term `.desc`, or write the " ++
+                    "condition out with `.any` in `.where`, which cannot seek.",
+            );
+            descending = direction.descending();
+        }
+
+        var lhs: []const u8 = "";
+        var rhs: []const u8 = "";
+        var paths: []const where_mod.Path = &.{};
+        var params: []const where_mod.Param = &.{};
+        const shaped = row_mod.isShaped(Row);
+        for (held, 0..) |f, i| {
+            const Column = if (shaped)
+                row_mod.ownerOf(Row)
+            else if (row_mod.hasColumn(Row, f.name))
+                Row
+            else if (row_mod.tableHasColumn(Row, f.name))
+                row_mod.ownerOf(Row)
+            else
+                row_mod.noSuchColumn(Row, f.name, "`.after`");
+            const T = row_mod.ColumnType(Column, f.name);
+            if (@typeInfo(T) == .optional) @compileError(
+                "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " reads after a cursor over `" ++ f.name ++
+                    "`, which may be null.\n" ++
+                    "  A row comparison with a NULL in it is true of nothing, so the rows holding one never come " ++
+                    "after any cursor. Order by columns that are never null.",
+            );
+            if (f.type != T and !where_mod.comptimeOnly(f.type)) @compileError(
+                "nilo: `.after." ++ f.name ++ "` on " ++ @typeName(Row) ++ " is " ++ @typeName(f.type) ++
+                    ", and the column is " ++ @typeName(T) ++ ".\n" ++
+                    "  A cursor holds the last row's own value: " ++ example ++ ".",
+            );
+            lhs = lhs ++ (if (i == 0) "" else ", ") ++ prefix ++ D.quote(f.name);
+            rhs = rhs ++ (if (i == 0) "" else ", ") ++ D.placeholder(first + i);
+            paths = paths ++ &[_]where_mod.Path{&.{ "after", f.name }};
+            params = params ++ &[_]where_mod.Param{.{ .column = f.name, .of = if (Column == Row) null else Column }};
+        }
+        // One column is a plain comparison; brackets are what make two a row.
+        const row = held.len > 1;
+        return .{
+            .sql = (if (row) "(" ++ lhs ++ ")" else lhs) ++ (if (descending.?) " < " else " > ") ++
+                (if (row) "(" ++ rhs ++ ")" else rhs),
+            .paths = paths,
+            .params = params,
+        };
+    }
+}
+
+fn fieldList(comptime fields: []const std.builtin.Type.StructField) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (fields, 0..) |f, i| out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ f.name ++ "`";
+        return out;
+    }
 }
 
 /// The option names an aggregate takes: a condition, and nothing else.
@@ -2091,6 +2291,48 @@ test "the whole statement is one constant, condition and order and limit" {
             .order = .{ .created_at = .desc },
             .limit = 10,
         }),
+    );
+}
+
+test "a feed reads one row past its limit and counts nothing" {
+    const written = comptime feed(Pg, User, @TypeOf(.{ .order = .{ .id = .asc }, .limit = 20 }));
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"email\", \"age\", \"created_at\" FROM \"users\" ORDER BY \"id\" ASC LIMIT 21",
+        written.sql,
+    );
+    try testing.expectEqual(@as(?usize, 21), written.reserve);
+
+    // A bound limit is the same text; `db.feed` raises the value it sends.
+    const bound = comptime feed(Pg, User, @TypeOf(.{ .order = .{ .id = .asc }, .limit = @as(i64, 20) }));
+    try testing.expect(std.mem.endsWith(u8, bound.sql, "LIMIT $1"));
+    try testing.expect(bound.params[0].isCount());
+}
+
+test "a cursor is one row comparison the index seeks on, running the way the order does" {
+    const Cursor = struct { created_at: i64, id: i64 };
+    const desc = comptime feed(Pg, User, @TypeOf(.{
+        .where = .{ .age = .{ .gt = 18 } },
+        .order = .{ .created_at = .desc, .id = .desc },
+        .after = @as(Cursor, undefined),
+        .limit = 20,
+    }));
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"email\", \"age\", \"created_at\" FROM \"users\"" ++
+            " WHERE \"age\" > $1 AND (\"created_at\", \"id\") < ($2, $3)" ++
+            " ORDER BY \"created_at\" DESC, \"id\" DESC LIMIT 21",
+        desc.sql,
+    );
+    try testing.expectEqualStrings("created_at", desc.params[1].column);
+
+    const asc = comptime select(Lite, User, @TypeOf(.{
+        .order = .{ .id = .asc },
+        .after = .{ .id = @as(i64, 0) },
+        .limit = 20,
+    }));
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"email\", \"age\", \"created_at\" FROM \"users\" WHERE \"id\" > ?1" ++
+            " ORDER BY \"id\" ASC LIMIT 20",
+        asc.sql,
     );
 }
 

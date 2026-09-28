@@ -269,27 +269,42 @@ A `.where` may name such a column too, so a lookup by email does not need `email
 
 **For deep pages, carry the last row seen instead of an offset.** `db.page` above uses `OFFSET`, and `OFFSET` makes the database read every row it skips: page 4,000 of `/orders` scans and throws away 12,000 rows to reach the twenty this call wants, and it gets slower the deeper a caller goes. No index fixes that, because an index tells the database *where* a row is, not how many rows come before it.
 
-**Keyset pagination** asks a different question: not *the twenty after the twelve-thousandth*, but *the twenty after this one*. The caller keeps the last row it saw instead of a page number, and the condition is a tuple comparison, `(created_at, id) < (…)`, written as `.any` like every OR in this module:
+**Keyset pagination** asks a different question: not *the twenty after the twelve-thousandth*, but *the twenty after this one*. The caller keeps the last row it saw instead of a page number, and hands it back as `.after`:
 
 <!-- compiles -->
 ```zig
-fn olderThan(db: *sql.Db, c: *nilo.Ctx, after: sql.Timestamp, after_id: i64) ![]User {
-    return db.select(User, c, .{
-        .where = .{ .any = .{
-            .{ .created_at = .{ .lt = after } },
-            .{ .created_at = after, .id = .{ .lt = after_id } },
-        } },
-        .order = .{ .created_at = .desc_nulls_last, .id = .desc },
+const Post = struct {
+    pub const nilo_table = .{ .name = "posts", .key = .id };
+    id: i64,
+    title: []const u8,
+    created_at: sql.Timestamp,
+};
+
+fn older(db: *sql.Db, c: *nilo.Ctx, last: ?Post) !sql.Feed(Post) {
+    const order = .{ .created_at = .desc, .id = .desc };
+    const seen = last orelse return db.feed(Post, c, .{ .order = order, .limit = 20 });
+    return db.feed(Post, c, .{
+        .order = order,
+        .after = .{ .created_at = seen.created_at, .id = seen.id },
         .limit = 20,
     });
 }
+
+comptime {
+    _ = &older;
+}
 ```
 
-`after` and `after_id` are the `created_at` and `id` of the last row the previous call returned: a cursor the caller carries, rather than a page number the database counts up to. The first call has no cursor: read the first page with `.order` and `.limit` only, and start passing a cursor once there is a last row to take it from.
+`.after` becomes one row comparison, `("created_at", "id") < ($1, $2)`, which the database answers by seeking straight to the cursor on an index over `(created_at, id)`: 0.013 ms at a million rows, the same as the first screen. The `.any` of `<` and `= … AND <` this page used to show filtered from the first row instead and cost 17.8 ms, what the `OFFSET` did. The first screen has no cursor, so it is the call without `.after`.
 
-`.order` does two jobs here. `.desc_nulls_last` is one of four directions, beside plain `.asc` and `.desc`, that also say where a NULL goes, so a row with no `created_at` sorts to the same place on every call. The `id` after it breaks ties between rows with the same `created_at`, which is why the condition needs two terms. Drop either one and two calls can disagree about where the page boundary was, the same problem `.limit` without `.order` has with `OFFSET`.
+`db.feed` answers `found.rows` and `found.more`, whether any row came after them, which is what a "load more" button needs. It reads one row past the limit to know, and counts nothing, so it costs what `db.select` does. `db.page`'s total is a pass over every matching row, 124 ms at a million, which a list with no "20 of 47" on it should not pay.
 
-**The trade-off is the total.** `db.page`'s `count(*) OVER ()` counts alongside the page; a keyset query has no "page 4,000" for a count to be relative to. To know whether there is a next page, ask for one row more than the page needs and drop it. For a total, call `db.count` beside it, if it does not have to be exact this second.
+**Each rule the compiler holds `.after` to is a cursor that would skip or repeat rows:**
+
+- `.after` names the columns `.order` sorts by, in the same order;
+- every term runs the same way: all `.desc` here, since a row comparison runs one way;
+- no column may be null, since a row comparison with a NULL in it is true of nothing, and no direction says where NULLs go;
+- the order ends in the table's key, here `id`: two posts written in the same microsecond stand at one cursor, and the key is what puts one after the other.
 
 `DISTINCT` is not supported and is not planned: over one table with a key, every row appears once anyway. [ADR 052](../../adr/052-a-set-operation-over-one-table-is-a-condition.md) makes the same argument for `UNION`.
 

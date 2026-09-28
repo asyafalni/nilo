@@ -1507,6 +1507,36 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             return .{ .rows = rows, .total = total };
         }
 
+        /// Rows up to `.limit`, and whether any came after them: the list a
+        /// "load more" button or an endless scroll reads
+        /// ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md#a-feed-counts-nothing)).
+        ///
+        /// ```zig
+        /// const found = try db.feed(Order, c, .{
+        ///     .order = .{ .created_at = .desc, .id = .desc },
+        ///     .after = .{ .created_at = last.created_at, .id = last.id },
+        ///     .limit = 20,
+        /// });
+        /// // found.rows is []Order, found.more says whether to show the button.
+        /// ```
+        ///
+        /// **It counts nothing.** `db.page`'s `count(*) OVER ()` is read once
+        /// and computed over every row the condition matches, before the
+        /// limit: 124 ms against 0.024 ms for the same twenty rows at a
+        /// million (bench/result/sql.md §18). A feed reads one row past its
+        /// limit and drops it, which is all "is there more" needs.
+        ///
+        /// `.after` reads the rows after a cursor, the last row seen, as one
+        /// row comparison an index seeks on; with it a deep list costs what
+        /// its first screen does, where `.offset` reads every row it skips.
+        /// It is written out only when there is a cursor, so the first
+        /// screen is a call without it. `.limit` and `.order` are required
+        /// and `.lock` is refused, as on a page.
+        pub fn feed(self: *Self, comptime Row: type, c: anytype, options: anytype) !Feed(Row) {
+            opening(c, "db.feed");
+            return feeding(Row, self, null, c, options);
+        }
+
         /// Whether any row matches `options`.
         ///
         /// `EXISTS` rather than `count(…) > 0`: the database stops at the
@@ -2640,6 +2670,12 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 return .{ .rows = rows, .total = total };
             }
 
+            /// `db.feed` inside the transaction.
+            pub fn feed(self: *Tx, comptime Row: type, c: anytype, options: anytype) !Feed(Row) {
+                opening(c, "tx.feed");
+                return feeding(Row, self.db, &self.inner, c, options);
+            }
+
             pub fn insertOrIgnore(
                 self: *Tx,
                 comptime Row: type,
@@ -2908,6 +2944,20 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 /// Every row the condition matched, `.limit` and `.offset`
                 /// ignored. What a trimmed list needs to say *"20 of 47"*.
                 total: i64,
+            };
+        }
+
+        /// What `db.feed` answers: the rows, and whether a row came after
+        /// the last of them. The rows live in the request arena.
+        pub fn Feed(comptime Row: type) type {
+            return struct {
+                /// What a nilo compile error calls this type (ADR 074).
+                pub const nilo_type_name = "nilo.sql.Feed";
+
+                rows: []Row,
+                /// Whether the statement found a row past `.limit`: the next
+                /// call, after the last of `rows`, has at least one to show.
+                more: bool,
             };
         }
 
@@ -3404,6 +3454,33 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // `rows` gets what a `SELECT` would have given it.
             db.told(c, started, sql, plan, 1, false, null);
             return answer;
+        }
+
+        /// A feed, on the pool or inside a transaction: the rows up to the
+        /// limit, and whether the one read past it came back.
+        fn feeding(comptime Row: type, db: *Self, tx: ?*W.Tx, c: anytype, options: anytype) !Feed(Row) {
+            const stmt = comptime statement.feed(D, Row, @TypeOf(options));
+            var values = try valuesOf(stmt, Row, options, c);
+            // A `.limit` a request handed over goes one higher on the way,
+            // for the row that says there are more; a written one was raised
+            // while compiling (`statement.past`), so the text is one
+            // statement whatever the request asked for.
+            inline for (stmt.paths, 0..) |path, i| {
+                if (comptime stmt.params[i].isCount() and std.mem.eql(u8, path[0], "limit")) {
+                    values[i] = std.math.add(@TypeOf(values[i]), values[i], 1) catch {
+                        std.log.warn(
+                            "nilo_sql: `.limit` on {s} is the largest its type holds, and a feed reads one row past it.",
+                            .{@typeName(Row)},
+                        );
+                        return error.QueryFailed;
+                    };
+                }
+            }
+            const rows = try fill(Row, stmt.reserve, db, tx, c, try textOf(stmt, options, c), db.planOf(stmt), values);
+            // Not negative: `valuesOf` refused that before it was sent.
+            const limit: usize = @intCast(options.limit);
+            if (rows.len > limit) return .{ .rows = rows[0..limit], .more = true };
+            return .{ .rows = rows, .more = false };
         }
 
         /// Whether a typed page that came back empty could still have rows
@@ -8423,6 +8500,61 @@ test "a problem left by somebody else's request is not this one's to read" {
     _ = db.select(Person, &mine, .{}) catch {};
     try testing.expect(lastProblem(&mine) != null);
     try testing.expectEqual(@as(?wire_mod.Problem, null), lastProblem(&theirs));
+}
+
+test "a feed walks a list by cursor, says when there is more, and never counts" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:fed-list?mode=memory&cache=shared",
+        .{ .size = 2, .unchecked = true },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, accounts_ddl, .{});
+
+    for (0..7) |i| {
+        var mail: [16]u8 = undefined;
+        var bytes: [16]u8 = @splat(0);
+        bytes[15] = @intCast(i);
+        _ = try db.insert(SqliteAccount, &run, .{
+            .public = types.Uuid.v4(bytes),
+            .email = try std.fmt.bufPrint(&mail, "n{d}@example.dev", .{i}),
+        });
+    }
+
+    var seen: usize = 0;
+    var screens: usize = 0;
+    var first = try db.feed(SqliteAccount, &run, .{ .order = .{ .id = .desc }, .limit = 3 });
+    var found = first;
+    while (true) {
+        screens += 1;
+        seen += found.rows.len;
+        if (!found.more) break;
+        const last = found.rows[found.rows.len - 1];
+        // A limit a request handed over, which goes one higher on the way.
+        found = try db.feed(SqliteAccount, &run, .{
+            .order = .{ .id = .desc },
+            .after = .{ .id = last.id },
+            .limit = @as(i64, 3),
+        });
+        try testing.expect(found.rows.len == 0 or found.rows[0].id == last.id - 1);
+    }
+    // Three, three and one, and the last screen knows it is the last.
+    try testing.expectEqual(@as(usize, 7), seen);
+    try testing.expectEqual(@as(usize, 3), screens);
+    try testing.expectEqual(@as(i64, 7), first.rows[0].id);
+
+    // A list of exactly the limit has no more, which reading one past is
+    // the whole of.
+    first = try db.feed(SqliteAccount, &run, .{ .order = .{ .id = .asc }, .limit = 7 });
+    try testing.expectEqual(@as(usize, 7), first.rows.len);
+    try testing.expect(!first.more);
 }
 
 test "a page carries the total the condition matched, in one statement" {

@@ -204,6 +204,7 @@ Every heading of every page, in page order. Find a name here, then read it on it
     - [Casting to text in a raw statement](./sql.md#casting-to-text-in-a-raw-statement)
     - [`rawOne`, `updateReturningOne`, `deleteReturningOne`](./sql.md#rawone-updatereturningone-deletereturningone)
     - [`db.page`](./sql.md#dbpage)
+    - [`db.feed`](./sql.md#dbfeed)
   - [A batch](./sql.md#a-batch)
     - [`insertMany`](./sql.md#insertmany)
     - [`updateMany`](./sql.md#updatemany)

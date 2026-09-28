@@ -994,11 +994,11 @@ fn assertAggregate(comptime Row: type, comptime Owner: type, comptime field: []c
 // -- the statements -------------------------------------------------------
 
 /// How many rows a caller is asking for, the way `statement.zig` says it.
-pub const Answers = enum { many, first, page };
+pub const Answers = enum { many, first, page, feed };
 
 /// What a read of a shaped Row takes. No `.lock`, which `assertNoLock` says
 /// why; `db.one` has no `.limit`, because it compiles its own.
-const known = [_][]const u8{ "where", "order", "limit", "offset" };
+const known = [_][]const u8{ "where", "order", "limit", "offset", "after" };
 const known_first = [_][]const u8{ "where", "order", "offset" };
 
 /// The `SELECT` list: every output under its name.
@@ -1019,6 +1019,7 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
             .many => "`db.select`",
             .first => "`db.one`",
             .page => "`db.page`",
+            .feed => "`db.feed`",
         };
         if (row_mod.isTally(Row)) @compileError(
             "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ ", whose every field is an aggregate.\n" ++
@@ -1030,6 +1031,13 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
         if (answers == .first and @hasField(O, "limit")) @compileError(
             "nilo: `db.one` on " ++ @typeName(Row) ++ " was given a `.limit`.\n" ++
                 "  It answers with one row or with none, and compiles its own `LIMIT 1`.",
+        );
+        if (answers == .feed) statement.assertFeed(Row, O);
+        if (answers == .page and @hasField(O, "after")) @compileError(
+            "nilo: `db.page` on " ++ @typeName(Row) ++ " was given an `.after`.\n" ++
+                "  A page skips rows by `OFFSET` and counts every match; a cursor reads the rows " ++
+                "after one and has no page for a count to be relative to. Read it with `db.feed`, " ++
+                "which says whether there are more.",
         );
         if (answers == .page and !@hasField(O, "limit")) @compileError(
             "nilo: `db.page` on " ++ @typeName(Row) ++ " was given no `.limit`.\n" ++
@@ -1075,7 +1083,10 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
             }
         }
         if (@hasField(O, "limit")) {
-            const bound = statement.boundary(D, O, "limit", next);
+            const bound = if (answers == .feed)
+                statement.past(statement.boundary(D, O, "limit", next))
+            else
+                statement.boundary(D, O, "limit", next);
             sql = sql ++ D.limit(bound.text);
             reserve = bound.written;
             if (bound.path) |path| {
@@ -1404,6 +1415,20 @@ fn bodyOf(
                 params = params ++ groups_plan.params;
                 next += groups_plan.paths.len;
             }
+        }
+
+        // A cursor, on the table's own columns, beside whatever `.where` said.
+        if (@hasField(O, "after")) {
+            if (grouped) @compileError(
+                "nilo: " ++ @typeName(Row) ++ " is read after a cursor, and its rows are groups, which have " ++
+                    "no key to end the order in.\n" ++
+                    "  Page the groups with `.offset`.",
+            );
+            const k = statement.afterOf(D, Row, O, layout.relation ++ ".", next, "a read");
+            where = if (where.len > 0) where ++ " AND " ++ k.sql else k.sql;
+            paths = paths ++ k.paths;
+            params = params ++ k.params;
+            next += k.paths.len;
         }
 
         // A join that leaves rows out is reached by every count, with the

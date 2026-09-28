@@ -19,7 +19,7 @@ The code is `sql/where.zig` (conditions, `sql.given`, `.across`, `.exists`), `sq
                                  ▼
                   runtime: the Wire binds the values, runs it
                                  ▼
-                     Row, [Row], Page(Row) or ?Row back,
+                     Row, [Row], Page(Row), Feed(Row) or ?Row back,
                             in the request's Scope
 ```
 
@@ -40,7 +40,7 @@ Everything after the first arrow is a `const`. The request can only supply a val
 11. **`DO NOTHING` does not ask for a key it does not need.** A pure join table with a composite key and no `id` can still use `insertOrIgnore`, because for the one upsert that writes no `SET`, the part that would name a key is removed while compiling. [ADR 114](../adr/114-do-nothing-has-no-key-to-leave-out.md)
 12. **A conflict target is named once, and must be backed by a constraint.** On a managed table it must be the key or a declared `.unique`, and not a case-insensitive unique. `.key` at the call site reuses the tuple already declared on `nilo_table` instead of spelling it out again. `key` as an ordinary column name is only rejected where a conflict target is expected. [ADR 151](../adr/151-a-key-is-named-once.md)
 13. **A sort order chosen at run time picks from constants; it never writes SQL.** `sql.Ordering(Row, keys)` builds every possible ORDER BY fragment while compiling; the request picks one by an enum value it parses itself. The statement then runs unnamed, because once its text depends on the request, it is no longer the single fixed text a plan name assumes. Where a `LIMIT` or an `OFFSET` cuts it, it ends in the key the request did not order by, as a written `.order` does. [ADR 165](../adr/165-an-order-chosen-at-run-time-from-a-closed-set.md), [ADR 150](../adr/150-a-page-knows-what-it-left-out.md#a-page-ends-in-the-key)
-14. **A page returns its own total in the same statement as its rows.** `db.page` reads `count(*) OVER ()` together with the page, so the count and the rows come from one snapshot, not two queries a write could land between. `.order` and `.limit` are required, and `.lock` is rejected next to a window function. [ADR 150](../adr/150-a-page-knows-what-it-left-out.md)
+14. **A page returns its own total in the same statement as its rows.** `db.page` reads `count(*) OVER ()` together with the page, so the count and the rows come from one snapshot, not two queries a write could land between. `.order` and `.limit` are required, and `.lock` is rejected next to a window function. The total costs a pass over every match, so a list that shows no total is `db.feed`: the rows and whether there are more, read as one row past the limit. Its `.after` is a cursor, one row comparison an index seeks on, refused wherever it would skip or repeat a row. [ADR 150](../adr/150-a-page-knows-what-it-left-out.md)
 15. **A compile-time walk over a wide Row gets a budget sized for it.** `statement.budget` raises the evaluation quota before every builder, based on the Row's width and the number of values written, so a twenty-column table with seventeen values written compiles where the default quota did not. [ADR 169](../adr/169-a-statement-pays-for-the-width-of-its-row.md)
 16. **A column of another table can be a flat field.** `nilo_through` names the reference columns to follow and, last, the column to read. It is joined like a parent and named in `.where` and `.order` like a column, so a response whose contract is flat needs no second struct. `.otherwise` says what a row the path does not reach reads, and `.join = .inner` leaves that row out. [ADR 235](../adr/235-a-column-of-another-table-may-be-read-flat.md)
 
@@ -55,7 +55,7 @@ Everything after the first arrow is a `const`. The request can only supply a val
 | [114](../adr/114-do-nothing-has-no-key-to-leave-out.md) | `DO NOTHING` does not ask a join table without a key to name one |
 | [140](../adr/140-the-database-escapes-the-pattern-it-is-going-to-match.md) | `contains`/`starts_with`/`ends_with` build and escape the pattern inside the statement |
 | [149](../adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md) | `sql.given` removes a condition instead of sending it as null, and where it cannot be used |
-| [150](../adr/150-a-page-knows-what-it-left-out.md) | `db.page` returns rows and total from one statement |
+| [150](../adr/150-a-page-knows-what-it-left-out.md) | `db.page` returns rows and total from one statement; `db.feed` returns rows and whether there are more, and reads after a cursor |
 | [151](../adr/151-a-key-is-named-once.md) | `.key` reuses the conflict target from `nilo_table` instead of repeating it |
 | [165](../adr/165-an-order-chosen-at-run-time-from-a-closed-set.md) | `sql.Ordering` lets a request choose an order from constants fixed while compiling |
 | [169](../adr/169-a-statement-pays-for-the-width-of-its-row.md) | The compile-time budget a statement builder gets, sized to its Row |

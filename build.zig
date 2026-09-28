@@ -400,6 +400,28 @@ const sql_refusals = [_]Refusal{
         .says = "row_column_no_dialect_can_decode.User reads `address` as row_column_no_dialect_can_decode.Address, which no Dialect can decode.",
     },
     // A number neither database stores, refused by name (ADR 055).
+    // A cursor that would skip or repeat rows, and a feed with no ceiling
+    // (ADR 150).
+    .{
+        .name = "after_over_an_order_that_runs_both_ways",
+        .says = "`db.feed` on after_over_an_order_that_runs_both_ways.Post reads after a cursor over an order that runs both ways.",
+    },
+    .{
+        .name = "after_without_the_key",
+        .says = "`db.feed` on after_without_the_key.Post reads after a cursor, and its `.order` does not end in `id`.",
+    },
+    .{
+        .name = "after_over_a_column_that_may_be_null",
+        .says = "`db.feed` on after_over_a_column_that_may_be_null.Task reads after a cursor over `due`, which may be null.",
+    },
+    .{
+        .name = "after_on_a_page",
+        .says = "`db.page` on after_on_a_page.Post was given an `.after`.",
+    },
+    .{
+        .name = "feed_without_a_limit",
+        .says = "`db.feed` on feed_without_a_limit.Post was given no `.limit`.",
+    },
     .{
         .name = "row_column_read_as_a_u64",
         .says = "row_column_read_as_a_u64.Counter reads `hits` as u64, which holds numbers neither database stores: both keep an integer in a signed 64 bits.",

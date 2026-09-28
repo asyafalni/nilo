@@ -95,10 +95,6 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 #### P1: wrong and loud, a migration that fails, a measured multiple, or a gap in the gate
 
-**A page's total costs a scan of every match, which ADR 150 says it does not.** `count(*) OVER ()` is read once but computed over the whole match before the limit applies: over a million rows with an index on the order, a page took 124 ms against 0.024 ms without the window. The guide's keyset condition, an `.any` of `<` and `= … AND <`, filters rather than seeks and costs what `OFFSET` does: 17.8 ms against 0.013 ms for a row comparison at a million rows ([sql.md §18](../bench/result/sql.md#18-the-count-a-page-reads-keyset-paging-and-a-stream-let-go-early)).
-
-**Needs:** [ADR 150](./adr/150-a-page-knows-what-it-left-out.md)'s cost corrected with the fix, a page with no total and a row comparison (both under Next), and the guide's keyset example rewritten on the second.
-
 **A stream let go early reads the rest of its result off the socket first.** `drain` runs the result to its end on the connection it holds (`postgres.zig:938`), so a stream given back after one of two million 200-byte rows took 295 ms in Debug and 327 ms in ReleaseSafe to return its connection ([sql.md §18](../bench/result/sql.md#18-the-count-a-page-reads-keyset-paging-and-a-stream-let-go-early)).
 
 **Needs:** a CancelRequest past some bound, or a named portal read in batches, which is the decision.
@@ -206,14 +202,6 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 **Needs:** a live test that a statement past the number comes back `error.TimedOut` on a connection nobody set anything on, and that a reconnect sends it again.
 
 #### P1
-
-**A page cannot leave its total out.** `db.page` always computes `count(*) OVER ()` over the whole match, 124 ms against 0.024 ms on a million rows ([sql.md §18](../bench/result/sql.md#18-the-count-a-page-reads-keyset-paging-and-a-stream-let-go-early)), and an infinite list or a "load more" button needs only whether there is another row: `limit + 1` read and one dropped.
-
-**Needs:** the shape, a second call or an option on `page`, and what `sql.Page(Row)` says when it has no total.
-
-**A condition cannot compare a row of columns, so keyset paging cannot seek.** `(created_at, id) < ($1, $2)` is an index seek on both databases, 0.013 ms at a million rows where the guide's `.any` form scans to the cursor ([sql.md §18](../bench/result/sql.md#18-the-count-a-page-reads-keyset-paging-and-a-stream-let-go-early)). [The reference](./reference/sql.md) refuses a keyset *call*; this is an operator, `.after = .{ .created_at = t, .id = i }` or similar, and the call stays the caller's.
-
-**Needs:** the operator's name, and what it does with an order whose columns do not all run the same way, which a row comparison cannot express.
 
 **A migration takes its locks with no timeout, and several of its steps lock longer than they have to.** `apply` sets no `lock_timeout`, so an `ALTER` queued behind a long transaction blocks every read and write to the table until that transaction ends. Behind it: `SET NOT NULL` scans the table under ACCESS EXCLUSIVE, the widenings the diff calls safe (int4 to int8, float4 to float8) rewrite it, every `ADD CONSTRAINT … CHECK` validates every row under the same lock where `NOT VALID` and `VALIDATE` would take a weaker one, and a foreign-key column is never indexed, so a parent's delete scans its children. None of it is said in the step's `why`.
 

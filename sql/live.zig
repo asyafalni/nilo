@@ -5287,6 +5287,57 @@ test "a column `.was` renamed carries its index, its unique and its foreign key 
     try testing.expectError(error.ForeignKeyViolated, db.insert(After, &run, .{ .id = 3, .writer_id = 9, .handle = "b" }));
 }
 
+const fed_table = "nilo_live_fed_" ++ mode_suffix;
+
+test "a feed after a cursor over a column rows share pages every row once on Postgres" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Post = struct {
+        pub const nilo_table = .{ .name = fed_table, .key = .id, .index = .{.{ .columns = .{ .posted, .id } }} };
+        id: i64,
+        posted: types.Timestamp,
+    };
+    _ = try db.exec(&run, "DROP TABLE IF EXISTS \"" ++ fed_table ++ "\"", .{});
+    defer _ = db.exec(&run, "DROP TABLE IF EXISTS \"" ++ fed_table ++ "\"", .{}) catch {};
+    try migrate.createMissing(&db, &run, .{ .tables = &.{Post} });
+    // Forty rows over four moments, ten sharing each: a cursor over the
+    // moment alone would skip nine of every ten it landed among.
+    for (0..40) |i| _ = try db.insert(Post, &run, .{
+        .id = @as(i64, @intCast(i + 1)),
+        .posted = types.Timestamp{ .micros = @as(i64, @intCast(i / 10)) * 1_000_000 },
+    });
+
+    var seen: [41]bool = @splat(false);
+    var found = try db.feed(Post, &run, .{ .order = .{ .posted = .desc, .id = .desc }, .limit = 7 });
+    var total: usize = 0;
+    while (true) {
+        for (found.rows) |row| {
+            try testing.expect(!seen[@intCast(row.id)]);
+            seen[@intCast(row.id)] = true;
+        }
+        total += found.rows.len;
+        if (!found.more) break;
+        const last = found.rows[found.rows.len - 1];
+        found = try db.feed(Post, &run, .{
+            .order = .{ .posted = .desc, .id = .desc },
+            .after = .{ .posted = last.posted, .id = last.id },
+            .limit = 7,
+        });
+    }
+    try testing.expectEqual(@as(usize, 40), total);
+}
+
 test "a Db told to keep no plans still answers, one Parse at a time" {
     const gpa = testing.allocator;
     var live = (try Live.open(gpa)) orelse return error.SkipZigTest;

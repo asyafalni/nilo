@@ -170,6 +170,11 @@ pub const Sent = db.Sent;
 /// returning `!sql.Page(Order)` sends `{"rows":[…],"total":47}`.
 pub const Page = db.Db.Page;
 
+/// What `db.feed` answers with: the rows up to the `.limit`, and whether a
+/// row came after them. A handler returning `!sql.Feed(Order)` sends
+/// `{"rows":[…],"more":true}`.
+pub const Feed = db.Db.Feed;
+
 /// What `db.watching` takes: `fn (sql.Sent) void`.
 pub const Watcher = db.Watcher;
 
