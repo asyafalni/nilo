@@ -77,10 +77,22 @@ pub const Problem = struct {
                 "nilo: {s}.{s} has no column in table \"{s}\"",
                 .{ self.row, self.column, self.table },
             ),
-            .wrong_type => try w.print(
-                "nilo: {s}.{s} expects {s}, but {s}.{s} is {s}",
-                .{ self.row, self.column, self.expected, self.table, self.column, self.found },
-            ),
+            .wrong_type => {
+                try w.print(
+                    "nilo: {s}.{s} expects {s}, but {s}.{s} is {s}",
+                    .{ self.row, self.column, self.expected, self.table, self.column, self.found },
+                );
+                // The one mismatch whose fix is not "change the field": a
+                // zoneless column moves `.now` by the session's zone, and
+                // what nilo wrote into it before is UTC wall time, which this
+                // `USING` keeps.
+                if (std.mem.eql(u8, self.expected, "timestamptz") and std.mem.eql(u8, self.found, "timestamp"))
+                    try w.print(
+                        " — `ALTER TABLE \"{s}\" ALTER COLUMN \"{s}\" TYPE timestamptz " ++
+                            "USING \"{s}\" AT TIME ZONE 'UTC'`",
+                        .{ self.table, self.column, self.column },
+                    );
+            },
             .unexpected_null => try w.print(
                 "nilo: {s}.{s} is not optional, but {s}.{s} may be null",
                 .{ self.row, self.column, self.table, self.column },
@@ -577,6 +589,23 @@ test "a column holding something else says both types" {
     var buf: [128]u8 = undefined;
     try testing.expectEqualStrings(
         "nilo: schema.User.age expects int4 or int8, but users.age is text",
+        try textOf(problems.items[0], &buf),
+    );
+}
+
+test "a Timestamp over a zoneless timestamp column is refused, with the ALTER that keeps its values" {
+    var cols = good;
+    cols[4].udt = "timestamp";
+    var problems = try problemsFor(User, &cols);
+    defer problems.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqual(Mismatch.wrong_type, problems.items[0].kind);
+
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings(
+        "nilo: schema.User.created_at expects timestamptz, but users.created_at is timestamp — " ++
+            "`ALTER TABLE \"users\" ALTER COLUMN \"created_at\" TYPE timestamptz " ++
+            "USING \"created_at\" AT TIME ZONE 'UTC'`",
         try textOf(problems.items[0], &buf),
     );
 }

@@ -849,9 +849,53 @@ pub const Wire = struct {
             }
             if (raw.data.len != 4) return error.QueryFailed;
             const since_y2k = std.mem.readInt(i32, raw.data[0..4], .big);
-            return .{ .days = since_y2k + types.Date.days_from_epoch_to_y2k };
+            if (since_y2k == std.math.maxInt(i32) or since_y2k == std.math.minInt(i32))
+                return infinite("date", col, since_y2k > 0);
+            return .{ .days = std.math.add(i32, since_y2k, types.Date.days_from_epoch_to_y2k) catch
+                return error.QueryFailed };
+        }
+        // **A `timestamp` read out of its own eight bytes**, for the reason the
+        // `date` above is: pg.zig's decoder adds the offset from 2000 to the
+        // epoch unchecked, so `'infinity'` (the largest `i64`) overflowed
+        // inside the driver and took the process down, and `'-infinity'` read
+        // as a moment 292,000 years ago. A `Timestamp` arrives here as `i64`
+        // (`db.WireRead`), and the column's OID is what says it is a moment
+        // rather than a `bigint`.
+        if (comptime T == i64 or T == ?i64) {
+            const oid = row.oids[col];
+            if (oid == pg.types.Timestamp.oid.decimal or oid == pg.types.TimestampTz.oid.decimal) {
+                const raw = row.values[col];
+                if (raw.is_null) {
+                    if (comptime T == ?i64) return null;
+                    return error.QueryFailed;
+                }
+                if (raw.data.len != 8) return error.QueryFailed;
+                const since_y2k = std.mem.readInt(i64, raw.data[0..8], .big);
+                if (since_y2k == std.math.maxInt(i64) or since_y2k == std.math.minInt(i64))
+                    return infinite("timestamp", col, since_y2k > 0);
+                return std.math.add(i64, since_y2k, micros_from_epoch_to_y2k) catch error.QueryFailed;
+            }
         }
         return row.get(T, col) catch return error.QueryFailed;
+    }
+
+    /// 2000-01-01 as microseconds since the epoch: where Postgres counts a
+    /// `timestamp` from, and the number pg.zig's own decoder adds.
+    const micros_from_epoch_to_y2k: i64 = 946_684_800_000_000;
+
+    /// **Refused by name rather than given a constant.** `infinity` and
+    /// `-infinity` are legal in a `date` or a `timestamp` column and any other
+    /// client may write them, but no `Date` or `Timestamp` holds one, and a
+    /// sentinel the Row could compare against would be a moment every caller
+    /// has to remember is not a moment.
+    fn infinite(comptime what: []const u8, col: usize, positive: bool) wire.Error {
+        std.log.warn(
+            "nilo_sql: column {d} holds '{s}infinity', which no " ++ what ++ " field can " ++
+                "hold. Store a real moment or NULL for an open end, or read the column " ++
+                "through a CASE in a raw statement.",
+            .{ col, if (positive) "" else "-" },
+        );
+        return error.QueryFailed;
     }
 
     /// Column `col` as a slice of its elements, allocated in the arena.

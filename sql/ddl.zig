@@ -363,7 +363,7 @@ fn primaryKeyClause(comptime D: type, comptime keys: []const []const u8) []const
     }
 }
 
-fn referenceClause(comptime D: type, comptime desc: Desc, comptime name: []const u8) []const u8 {
+pub fn referenceClause(comptime D: type, comptime desc: Desc, comptime name: []const u8) []const u8 {
     comptime {
         for (desc.references) |r| {
             if (r.columns.len != 1) continue;

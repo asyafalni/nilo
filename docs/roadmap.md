@@ -93,40 +93,6 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 Every entry here was reproduced by a probe test that fails at `462d84d`, in Debug and ReleaseSafe, against Postgres 18 where Postgres is named. A fix lands with its probe as the test that would have caught it.
 
-#### P0: a crash, freed memory, lost data, or a wrong answer with no error
-
-**An `infinity` date or timestamp in a Postgres row panics the process.** `'infinity'::date` overflows `since_y2k + days_from_epoch_to_y2k` (`postgres.zig:852`), `'infinity'::timestamptz` overflows inside pg.zig's `decodeKnown`, and both `-infinity`s read back as real moments millions of years away. They are legal values any other client may write.
-
-**Needs:** the four sentinels refused by name or given constants (a decision), `Timestamp` read from its raw bytes the way `Date` already is, and the arithmetic checked.
-
-**A savepoint an outer rollback ended comes back to life once a newer one is taken.** `sp_live` is a high-water mark (`db.zig:2317-2406`): `outer.rollback()` lowers it, the next `tx.savepoint()` raises it past `inner` again, and `inner`'s `defer` then sends `ROLLBACK TO nilo_sp_2`, which Postgres has already dropped. The transaction aborts and its `commit` fails, losing work the handler meant to keep. The savepoint tests only ever nest tidily.
-
-**Needs:** the live savepoints kept as a stack, so that ending one ends everything above it for good, and a test that rolls an outer one back before taking another.
-
-**An order a request chooses through `sql.Ordering` still pages over ties unevenly.** A written `.order` that a `.limit` or an `.offset` cuts ends in the table's key ([ADR 150](./adr/150-a-page-knows-what-it-left-out.md#a-page-ends-in-the-key)); an `Ordering` is written at run time, after the statement is compiled, and takes none, so a list screen whose sort the request picks repeats and skips rows the chosen column ties.
-
-**Needs:** the key appended when the chosen terms do not name it, which is a run-time check of the chosen keys against the Row's key and room for it in `most`, and a paged test over a tied `Ordering`.
-
-**`addMissingColumns` adds a column without the foreign key, unique or index its Row declares.** `ddl.addColumn` (`ddl.zig:417`) writes no `REFERENCES`, and nothing creates the indexes of a column it has just made, so an insert pointing at a parent that does not exist succeeds for ever, and the startup check, which reads columns only, never notices.
-
-**Needs:** `REFERENCES … ON DELETE …` in the `ADD COLUMN`, the new column's indexes created after it, and a test inserting the row the key must refuse.
-
-**SQLite reads a value of the wrong storage class as a number, without a word.** `sqlite.zig:1028-1031` asks zqlite for an integer, a float or a bool without looking at what the column holds: text in an INTEGER column reads 0, a REAL 2.7 reads 2, a BOOLEAN 2 reads false where `WHERE flag` calls it true, and a `DATETIME DEFAULT CURRENT_TIMESTAMP`, which the schema check accepts for a `Timestamp`, reads as the year. Text storage for a moment is decided ([ADR 067](./adr/067-a-value-is-whatever-the-database-stores.md)); reading text as a number is not. No SQLite test reads a fractional REAL, and turning the float read into an integer read passes the suite.
-
-**Needs:** the column's storage class checked before each numeric read, anything else refused, and a test per class.
-
-**The cast check of ADR 124 is passed by a `DISTINCT` or a comment in front of the column.** `assertCasts` (`rawcheck.zig:302`) refuses only an expression that is a bare path, and `DISTINCT total` or `/* amount */ total` is not one, so a Decimal field read by `tx.raw`, where nothing describes the statement, is filled with Postgres's binary numeric. Outside a transaction the first-run check catches it, and a server logs it and hands the bytes over anyway ([ADR 124](./adr/124-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
-
-**Needs:** `DISTINCT`, `ALL`, `DISTINCT ON (…)` and comments taken off the expression before `isPath` reads it.
-
-**`.now` written into a `timestamp` column comes back shifted by the session's zone.** `dialect.zig:768` accepts `timestamp` without a zone for a `Timestamp`; `now()` is stored there as local wall time and read back as UTC, seven hours off under `Asia/Jakarta`. A test in `dialect.zig` asserts the pair, so the fix breaks it on purpose.
-
-**Needs:** `timestamptz` only, or `.now` spelled `now() AT TIME ZONE 'UTC'` for such a column, which is the decision.
-
-**A NaN bound on SQLite is stored as NULL.** `sqlite3_bind_double` turns NaN into NULL, so a NOT NULL column answers `NotNullViolated` and a nullable one reads back `null`; Postgres keeps the NaN.
-
-**Needs:** a non-finite float refused on SQLite's write path, with a message that names it.
-
 #### P1: wrong and loud, a migration that fails, a measured multiple, or a gap in the gate
 
 **The Postgres schema check passes a Row it can never read.** `intAccepts` (`dialect.zig:896-905`) lets an `i32` sit on int8, an `i16` on int4 and a `u8` on any integer, and `dialect.zig:787` lets an `f64` sit on float4, but pg.zig decodes only the exact type, so the check says nothing and every read answers `QueryFailed`; `schema.zig:569` asserts the wrong list. `u16`, `u32`, `u64`, `i8` and the odd floats pass `readable` (`db.zig:4402`) and fail inside pg.zig with its own compile error, the mangled one `assertReadable` exists to replace, and a `u64` is not judged at all (`dialect.zig:1449`) where [ADR 055](./adr/055-the-second-dialect-is-the-test-of-the-seam.md) says it is declined.

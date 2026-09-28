@@ -1048,16 +1048,18 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
         var reserve: ?usize = null;
 
         var ordered = false;
+        var ties: []const statement.Tie = &.{};
         var head: []const u8 = "";
         if (@hasField(O, "order")) {
             const Sort = @FieldType(O, "order");
+            const cut = @hasField(O, "limit") or @hasField(O, "offset") or answers != .many;
             if (ordering.orderingOf(Sort) != null) {
                 ordering.assertFor(Sort, Row, call, true);
                 ordered = true;
+                if (cut) ties = statement.tiesOf(D, Row, layout.relation ++ ".");
                 head = sql;
                 sql = "";
             } else {
-                const cut = @hasField(O, "limit") or @hasField(O, "offset") or answers != .many;
                 const written = orderBy(D, Row, Sort);
                 sql = sql ++ if (cut)
                     statement.cutOrder(written, statement.tiebreak(D, Row, Sort, layout.relation ++ "."))
@@ -1096,6 +1098,7 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
             .reserve = reserve,
             .ordered = true,
             .tail = sql,
+            .ties = ties,
         };
         break :blk .{ .sql = sql, .paths = paths, .params = params, .reserve = reserve };
     };

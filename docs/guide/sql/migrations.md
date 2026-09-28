@@ -310,6 +310,8 @@ _ = try sql.migrate.addMissingColumns(&db, &run, .{ .tables = &.{User} });
 
 It runs one `ALTER TABLE … ADD COLUMN` per missing field, typed from the same `Desc` that `createMissing` reads (`pragma_table_info` on SQLite, `pg_catalog` on Postgres), in one transaction. It returns how many columns it added: three the first time, zero on every start after.
 
+**A new column comes with its foreign key**, written inline, and with every unique and index the Row declares over it, created right after. On SQLite a new column inside a foreign key of several columns is `error.NeedsVersion`, because SQLite writes that key only when it creates the table; write a version that rebuilds it.
+
 **A required column with no default is rejected** with `error.NeedsBackfill`; the statement it would have sent is logged, and nothing is sent. SQLite rejects that `ALTER` outright and Postgres rejects it on a table with rows, so nilo cannot send it safely. Give the field a `.default` in the marker (the existing rows get it and there is nothing to backfill), make it optional, or write a version. A table that does not exist is skipped, because creating it is `createMissing`'s job. Nothing else changes: a column the table has and the Row does not is left alone, a changed type is left alone, and `db.checking` is what reports them.
 
 ## Changing tables: the diff

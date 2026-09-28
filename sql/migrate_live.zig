@@ -951,6 +951,61 @@ test "addMissingColumns adds what the Row has and the table has not, typed as cr
     try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{Elsewhere} }));
 }
 
+test "addMissingColumns adds a column with its foreign key, its unique and its index" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "keyed");
+    defer fx.deinit(gpa);
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id };
+        id: i64,
+        url: []const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{
+            .name = "downloads",
+            .key = .id,
+            .references = .{ .org_id = .{ Org, .id, .cascade } },
+            .unique = .{.sha256},
+            .index = .{.org_id},
+        };
+        id: i64,
+        url: []const u8,
+        org_id: ?i64,
+        sha256: ?[]const u8,
+    };
+    const Count = struct {
+        pub const nilo_table = .projection;
+        n: i64,
+    };
+
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{ Org, Before } });
+    try testing.expectEqual(@as(usize, 2), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{ Org, After } }));
+
+    // The key: a parent that is not there used to be taken for ever.
+    try testing.expectError(error.ForeignKeyViolated, fx.db.insert(After, &fx.run, .{
+        .url = "http://a/1",
+        .org_id = @as(?i64, 999),
+        .sha256 = @as(?[]const u8, null),
+    }));
+    const org = try fx.db.insert(Org, &fx.run, .{ .name = "o" });
+    _ = try fx.db.insert(After, &fx.run, .{ .url = "http://a/2", .org_id = @as(?i64, org.id), .sha256 = @as(?[]const u8, "x") });
+
+    // The unique, and the index beside it, which only the catalog shows.
+    try testing.expectError(error.AlreadyExists, fx.db.insert(After, &fx.run, .{
+        .url = "http://a/3",
+        .org_id = @as(?i64, null),
+        .sha256 = @as(?[]const u8, "x"),
+    }));
+    const indexes = try fx.db.raw(
+        Count,
+        &fx.run,
+        "SELECT count(*) AS n FROM sqlite_master WHERE type = 'index' AND tbl_name = 'downloads' AND sql IS NOT NULL",
+        .{},
+    );
+    try testing.expectEqual(@as(i64, 2), indexes[0].n);
+}
+
 test "addMissingColumns refuses a required column with no default, and sends nothing" {
     const gpa = testing.allocator;
     var fx = try Fixture.init(gpa, "refused");

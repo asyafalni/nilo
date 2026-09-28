@@ -771,7 +771,14 @@ pub const Postgres = struct {
         if (types.isBytes(Inner)) return &.{"bytea"};
 
         if (types.declaredColumn(Inner)) |declared| {
-            if (std.mem.eql(u8, declared, "timestamptz")) return &.{ "timestamptz", "timestamp" };
+            // **`timestamptz` only.** A `timestamp` column holds a wall clock
+            // with no zone, and Postgres reads one against the session's zone
+            // wherever it meets a moment: `.now` written into it is local
+            // time read back as UTC, seven hours off under `Asia/Jakarta`,
+            // and `WHERE at < now()` compares it shifted the same way. Every
+            // spelling of `.now` would have to route around that, so the
+            // column is refused at startup instead, with the `ALTER` that
+            // keeps what nilo wrote there (`schema.Problem`).
             if (std.mem.eql(u8, declared, "jsonb")) return &.{ "jsonb", "json" };
             const one = [_][]const u8{declared};
             return &one;
@@ -1650,7 +1657,8 @@ test "an optional column is judged by what it wraps" {
 test "a type that names its own column is taken at its word" {
     try testing.expectEqualStrings("uuid", Postgres.accepts(types.Uuid).?[0]);
     try testing.expectEqualStrings("timestamptz", Postgres.accepts(types.Timestamp).?[0]);
-    try testing.expectEqualStrings("timestamp", Postgres.accepts(types.Timestamp).?[1]);
+    // And only that: a `timestamp` column moves `.now` by the session's zone.
+    try testing.expectEqual(@as(usize, 1), Postgres.accepts(types.Timestamp).?.len);
     try testing.expectEqualStrings("jsonb", Postgres.accepts(types.Json(struct { a: u8 })).?[0]);
 }
 

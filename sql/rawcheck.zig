@@ -299,7 +299,7 @@ fn assertCasts(
 
         for (list.exprs, fields, 1..) |expr, field, at| {
             if (types.asText(field.type) == null) continue;
-            const source = trim(beforeAlias(expr));
+            const source = valueOf(beforeAlias(expr));
             // Anything that is not a bare column already does something to the
             // value, and this file does not read SQL well enough to say what.
             if (!isPath(source)) continue;
@@ -855,6 +855,54 @@ fn beforeAlias(comptime column: []const u8) []const u8 {
     }
 }
 
+/// The column with what does nothing to its value taken off: comments, and a
+/// `DISTINCT`, `DISTINCT ON (…)` or `ALL` in front of the first column.
+///
+/// **`isPath` is only as good as what it is handed.** `DISTINCT total` and
+/// `/* amount */ total` are a bare column to the database and were an
+/// expression to this file, so the cast check of ADR 124 let a `Decimal` read
+/// as the binary wire format through either one.
+fn valueOf(comptime column: []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        var i: usize = 0;
+        while (i < column.len) {
+            const past = skipPast(column, i);
+            if (past != i) {
+                // A comment is a space; a quoted name or a string stays.
+                out = out ++ if (column[i] == '-' or column[i] == '/') " " else column[i..past];
+                i = past;
+                continue;
+            }
+            out = out ++ column[i .. i + 1];
+            i += 1;
+        }
+        var text = trim(out);
+        if (wordAt(text, 0, "ALL")) return trim(text["ALL".len..]);
+        if (!wordAt(text, 0, "DISTINCT")) return text;
+        text = trim(text["DISTINCT".len..]);
+        if (!wordAt(text, 0, "ON")) return text;
+        text = trim(text["ON".len..]);
+        if (text.len == 0 or text[0] != '(') return text;
+        var depth: usize = 0;
+        var j: usize = 0;
+        while (j < text.len) {
+            const past = skipPast(text, j);
+            if (past != j) {
+                j = past;
+                continue;
+            }
+            if (text[j] == '(') depth += 1;
+            if (text[j] == ')') {
+                depth -= 1;
+                if (depth == 0) return trim(text[j + 1 ..]);
+            }
+            j += 1;
+        }
+        return text;
+    }
+}
+
 /// The last part of an identifier path, or null when `text` is anything else.
 ///
 /// Two callers, and they want opposite halves of the same answer: `nameOf`
@@ -1002,6 +1050,17 @@ test "a comment does not hide a comma or invent one" {
 test "DISTINCT does not become a column of its own" {
     try testing.expectEqual(@as(?usize, 2), comptime scan("SELECT DISTINCT id, email FROM users").count);
     try testing.expectEqual(@as(?usize, 2), comptime scan("SELECT DISTINCT ON (id) id, email FROM users").count);
+}
+
+test "a DISTINCT, an ALL or a comment in front of a column leaves it a bare column" {
+    try testing.expectEqualStrings("total", comptime valueOf("DISTINCT total"));
+    try testing.expectEqualStrings("total", comptime valueOf("distinct on (id, \"a)\") total"));
+    try testing.expectEqualStrings("total", comptime valueOf("ALL total"));
+    try testing.expectEqualStrings("total", comptime valueOf("/* amount */ total"));
+    try testing.expectEqualStrings("total", comptime valueOf("-- amount\n total"));
+    // And an expression stays one, so a working statement is not refused.
+    try testing.expect(!isPath(comptime valueOf("DISTINCT total::text")));
+    try testing.expect(!isPath(comptime valueOf("'/* not a comment */'")));
 }
 
 test "lower case reads the same as upper" {

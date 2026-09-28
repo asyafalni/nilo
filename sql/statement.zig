@@ -151,6 +151,11 @@ pub const Statement = struct {
     /// exactly what it would have been.
     ordered: bool = false,
     tail: []const u8 = "",
+    /// The key columns an ordering chosen per request is ended in, for a
+    /// statement a `LIMIT` or an `OFFSET` cuts: the run-time half of
+    /// `tiebreak`. Each is written after the chosen terms unless one of them
+    /// already names its column.
+    ties: []const Tie = &.{},
 
     pub fn paramCount(self: Statement) usize {
         return self.paths.len;
@@ -303,9 +308,11 @@ fn rowsOf(
         // was built so far is the head, and everything from here on is the
         // tail (ADR 165). The clause between them is the request's.
         var ordered = false;
+        var ties: []const Tie = &.{};
         var head: []const u8 = "";
         if (@hasField(O, "order")) {
             const Order = @FieldType(O, "order");
+            const cut = @hasField(O, "limit") or @hasField(O, "offset") or answers != .many;
             if (ordering.orderingOf(Order) != null) {
                 ordering.assertFor(Order, Row, switch (answers) {
                     .first => "`db.one`",
@@ -313,10 +320,10 @@ fn rowsOf(
                     .many => "`db.select`",
                 }, true);
                 ordered = true;
+                if (cut) ties = tiesOf(D, Row, "");
                 head = sql;
                 sql = "";
             } else {
-                const cut = @hasField(O, "limit") or @hasField(O, "offset") or answers != .many;
                 const written = orderBy(D, Row, Order);
                 sql = sql ++ if (cut) cutOrder(written, tiebreak(D, Row, Order, "")) else written;
             }
@@ -360,6 +367,7 @@ fn rowsOf(
             .reserve = reserve,
             .ordered = true,
             .tail = sql,
+            .ties = ties,
         };
         break :blk .{ .sql = sql, .paths = paths, .params = params, .reserve = reserve };
     };
@@ -1855,6 +1863,25 @@ pub fn tiebreak(comptime D: type, comptime Row: type, comptime Order: type, comp
             if (@hasField(Order, key)) continue;
             if (out.len > 0) out = out ++ ", ";
             out = out ++ prefix ++ D.quote(key) ++ " ASC";
+        }
+        return out;
+    }
+}
+
+/// One key column a cut statement's chosen ordering ends in: the column, to
+/// see whether the request already ordered by it, and the term to write when
+/// it did not.
+pub const Tie = struct { column: []const u8, text: []const u8 };
+
+/// `tiebreak` for an ordering chosen at run time, where which key columns the
+/// request named is not known yet: every key column, each with its term, and
+/// the Ordering leaves out the ones it chose ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md#a-page-ends-in-the-key)).
+pub fn tiesOf(comptime D: type, comptime Row: type, comptime prefix: []const u8) []const Tie {
+    comptime {
+        if (@hasDecl(Row, row_mod.aggregate_marker)) return &.{};
+        var out: []const Tie = &.{};
+        for (row_mod.keysIfAnyOf(Row)) |key| {
+            out = out ++ &[_]Tie{.{ .column = key, .text = prefix ++ D.quote(key) ++ " ASC" }};
         }
         return out;
     }

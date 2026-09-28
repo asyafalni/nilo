@@ -1150,7 +1150,6 @@ fn diffIndexes(
             .why = try std.fmt.allocPrint(gpa, "index {s}; writes to {s} wait while it builds", .{ x.name, t.desc.table }),
         });
     }
-
 }
 
 /// Dropped: in the snapshot, named by nothing the types declare.
@@ -1534,6 +1533,10 @@ pub const Error = error{
     /// `addMissingColumns` found a required column with no default, which is
     /// an `ALTER` that fails on a table with rows in it. Nothing was sent.
     NeedsBackfill,
+    /// `addMissingColumns` found a new column inside a foreign key of several
+    /// columns, on SQLite, which writes such a key only when it creates the
+    /// table. Nothing was kept.
+    NeedsVersion,
     /// `applyPending` found a version the ledger has under another hash: its
     /// steps were edited after it ran. Nothing was applied, including the
     /// versions after it, which were written against what it used to say.
@@ -1654,29 +1657,97 @@ pub fn addMissingColumns(db: anytype, scope: anytype, comptime schema: Schema) !
             const q = comptime row_mod.qualifiedOf(R);
             const live = try db.liveColumns(scope, q.schema, q.table);
             if (live.len != 0) {
-                for (t.desc.columns) |c| {
-                    if (hasNamed(live, c.name)) continue;
-                    const sql = try ddl.addColumn(D, arena, t.desc, c);
-                    if (!c.nullable and c.default == null) {
-                        // A warning rather than an error, for the reason
-                        // `wireOf`'s is one: the call already fails on its
-                        // own, and `std.log.err` fails the test runner for
-                        // the test that provokes it.
-                        std.log.warn(
-                            "nilo_sql: {s} has a required column `{s}` that the table has not got, and no default to fill the rows already there. " ++
-                                "Not sent: `{s}`. Give the field a `.default` in the marker, make it optional, or write the version.",
-                            .{ @typeName(R), c.name, sql },
-                        );
-                        return Error.NeedsBackfill;
+                var fresh: std.ArrayList([]const u8) = .empty;
+                inline for (t.desc.columns) |c| {
+                    if (!hasNamed(live, c.name)) {
+                        // **With its `REFERENCES`**, which `ddl.addColumn` leaves
+                        // off because the diff refuses a key on a table that
+                        // exists and names the safe statements instead. Here the
+                        // column is new and empty, so the key costs no scan and
+                        // cannot fail; without it an insert pointing at a parent
+                        // that is not there succeeded for ever, and the startup
+                        // check, which reads columns only, never said.
+                        const sql = try std.mem.concat(arena, u8, &.{
+                            try ddl.addColumn(D, arena, t.desc, c),
+                            comptime ddl.referenceClause(D, t.desc, c.name),
+                        });
+                        if (!c.nullable and c.default == null) {
+                            // A warning rather than an error, for the reason
+                            // `wireOf`'s is one: the call already fails on its
+                            // own, and `std.log.err` fails the test runner for
+                            // the test that provokes it.
+                            std.log.warn(
+                                "nilo_sql: {s} has a required column `{s}` that the table has not got, and no default to fill the rows already there. " ++
+                                    "Not sent: `{s}`. Give the field a `.default` in the marker, make it optional, or write the version.",
+                                .{ @typeName(R), c.name, sql },
+                            );
+                            return Error.NeedsBackfill;
+                        }
+                        _ = try tx.exec(scope, sql, .{});
+                        added += 1;
+                        try fresh.append(arena, c.name);
                     }
-                    _ = try tx.exec(scope, sql, .{});
-                    added += 1;
                 }
+                if (fresh.items.len != 0) try keysOfAdded(D, R, &tx, scope, fresh.items);
             }
         }
     }
     try tx.commit();
     return added;
+}
+
+/// What a column `addMissingColumns` just added carries besides itself: a
+/// foreign key of several columns that names it, and every unique and index
+/// over it, each of which `createMissing` would have written with the table.
+fn keysOfAdded(
+    comptime D: type,
+    comptime R: type,
+    tx: anytype,
+    scope: anytype,
+    fresh: []const []const u8,
+) !void {
+    const t = comptime tableOf(D, R);
+    inline for (t.desc.references) |r| {
+        if (r.columns.len > 1 and namesAny(r.columns, fresh)) {
+            if (comptime !D.can_alter_constraint) {
+                std.log.warn(
+                    "nilo_sql: {s} adds a column to the foreign key {s}, which SQLite writes only " ++
+                        "when it creates the table. Nothing was kept; write a version that rebuilds it.",
+                    .{ @typeName(R), r.name },
+                );
+                return Error.NeedsVersion;
+            }
+            _ = try tx.exec(scope, comptime "ALTER TABLE " ++ D.qualify(t.desc.schema, t.desc.table) ++
+                " ADD " ++ ddl.foreignKeyClause(D, r), .{});
+        }
+    }
+    inline for (t.desc.uniques) |u| {
+        if (namesAny(u.columns, fresh)) _ = try tx.exec(scope, comptime sqlFor(t, u.name), .{});
+    }
+    inline for (t.desc.indexes) |x| {
+        if (namesAny(x.columns, fresh) or whereNamesAny(D, x.where, fresh))
+            _ = try tx.exec(scope, comptime sqlFor(t, x.name), .{});
+    }
+}
+
+fn namesAny(columns: []const []const u8, fresh: []const []const u8) bool {
+    for (columns) |c| for (fresh) |f| if (std.mem.eql(u8, c, f)) return true;
+    return false;
+}
+
+/// Whether a partial index's `WHERE` names one of `fresh`, by its quoted name,
+/// which is how the Dialect rendered it.
+fn whereNamesAny(comptime D: type, where: []const u8, fresh: []const []const u8) bool {
+    if (where.len == 0) return false;
+    const quote = D.quote("")[0];
+    for (fresh) |f| {
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, where, at, f)) |i| : (at = i + 1) {
+            if (i > 0 and where[i - 1] == quote and i + f.len < where.len and where[i + f.len] == quote)
+                return true;
+        }
+    }
+    return false;
 }
 
 fn hasNamed(columns: []const wire_mod.Column, name: []const u8) bool {

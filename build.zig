@@ -477,6 +477,10 @@ const sql_refusals = [_]Refusal{
         .says = "column 2 of the statement handed to `db.raw` is `total`, and field 2 of raw_text_column_not_cast.Invoice is a `numeric` column read as text.",
     },
     .{
+        .name = "raw_text_column_behind_distinct",
+        .says = "column 1 of the statement handed to `db.raw` is `total`, and field 1 of raw_text_column_behind_distinct.Invoice is a `numeric` column read as text.",
+    },
+    .{
         .name = "raw_star_over_a_text_column",
         .says = "the statement handed to `db.raw` selects `*`, and field 2 of raw_star_over_a_text_column.Invoice is a `numeric` column read as text.",
     },

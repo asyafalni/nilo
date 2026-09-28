@@ -777,6 +777,7 @@ pub fn Wire(comptime opts_in: Options) type {
             // `@intCast` into `i64`: a `u64` past it from a request panics in
             // Debug and ReleaseSafe and is undefined in ReleaseFast.
             try intsFit(values);
+            try floatsKept(values);
             // Once, at the top, rather than at the four `bind` calls below —
             // a conversion applied at three of four sites is a bug that only
             // shows up on the fourth path (`blobbed`).
@@ -997,7 +998,8 @@ pub fn Wire(comptime opts_in: Options) type {
             // What it costs is one `sqlite3_column_type` — a couple of loads,
             // no allocation — per non-optional column per row. The optional
             // ones were already paying it.
-            if (stmt.columnType(col) == .null) {
+            const class = stmt.columnType(col);
+            if (class == .null) {
                 if (optional) return null;
                 // `warn` rather than `err` for the reason `db.wireOf`'s is
                 // one: `std.log.err` fails the test runner for every test
@@ -1029,8 +1031,25 @@ pub fn Wire(comptime opts_in: Options) type {
             if (comptime Inner == types.Date) return types.Date.nilo_parse(stmt.text(col)) orelse
                 error.QueryFailed;
 
+            // **The storage class is asked before a number is read**, because
+            // `sqlite3_column_int64` and `sqlite3_column_double` convert
+            // whatever the value is without a word: text in an INTEGER column
+            // reads 0, a REAL 2.7 read as an integer is 2, and a `DATETIME
+            // DEFAULT CURRENT_TIMESTAMP` read as a `Timestamp` is the year. A
+            // moment stored as text is decided (ADR 067); a number read out of
+            // text is not, so it is refused like the NULL above. An integer is
+            // let into a float, which loses nothing a Row could have kept.
+            switch (@typeInfo(Inner)) {
+                .bool, .int => if (class != .int) return wrongClass(Inner, col, class),
+                .float => if (class != .int and class != .float) return wrongClass(Inner, col, class),
+                else => {},
+            }
+
             return switch (@typeInfo(Inner)) {
-                .bool => stmt.boolean(col),
+                // **Anything but 0 is true**, which is what `WHERE flag` says
+                // about the same value. zqlite's `boolean` is `== 1`, so a 2
+                // read false out of a row the filter had called true.
+                .bool => stmt.int(col) != 0,
                 .int => std.math.cast(Inner, stmt.int(col)) orelse error.QueryFailed,
                 .float => @floatCast(stmt.float(col)),
                 .pointer => |ptr| if (ptr.size == .slice and ptr.child == u8)
@@ -1039,6 +1058,17 @@ pub fn Wire(comptime opts_in: Options) type {
                     error.QueryFailed,
                 else => error.QueryFailed,
             };
+        }
+
+        fn wrongClass(comptime Inner: type, col: usize, class: zqlite.ColumnType) wire.Error {
+            std.log.warn(
+                "nilo_sql: column {d} holds {s} and the Row reads it as {s}. SQLite " ++
+                    "stores what it is given whatever the column's type says; write the " ++
+                    "value as the field's type, or read the column into a field that " ++
+                    "holds {s} (ADR 067).",
+                .{ col, @tagName(class), @typeName(Inner), @tagName(class) },
+            );
+            return error.QueryFailed;
         }
 
         /// **Refused.** SQLite has no array type, so there is no column for
@@ -1342,6 +1372,32 @@ fn intsFit(values: anytype) wire.Error!void {
     }
 }
 
+/// Every float in `values` checked for a NaN, which SQLite cannot store.
+///
+/// `sqlite3_bind_double` binds a NaN as NULL, so a NOT NULL column answered
+/// `NotNullViolated` for a value that was never null and a nullable one read
+/// back `null`, where Postgres keeps the NaN. Refused here, before it is
+/// bound, with a message that names it. An infinity is not refused: SQLite
+/// stores and reads it back as itself, the same as Postgres does.
+fn floatsKept(values: anytype) wire.Error!void {
+    inline for (@typeInfo(@TypeOf(values)).@"struct".fields) |f| {
+        const F = switch (@typeInfo(f.type)) {
+            .float => f.type,
+            .optional => |o| if (@typeInfo(o.child) == .float) o.child else continue,
+            else => continue,
+        };
+        const held: ?F = @field(values, f.name);
+        if (held) |x| if (std.math.isNan(x)) {
+            std.log.warn(
+                "nilo_sql: a NaN was refused before it was bound: SQLite stores a NaN " ++
+                    "as NULL, so the row would not hold the value it was given.",
+                .{},
+            );
+            return error.QueryFailed;
+        };
+    }
+}
+
 /// The integer type behind `T`, optional or not, when it holds a value `i64`
 /// cannot: a `u64`, a `usize`, an `i128`. Null for everything else.
 fn wideInt(comptime T: type) ?type {
@@ -1581,6 +1637,91 @@ test "a NULL reads as null, and an integer too wide for the field is refused not
             // like a right one.
             try testing.expectError(error.QueryFailed, w.read(&rows, i16, 1));
             try testing.expectEqual(@as(i32, 70_000), try w.read(&rows, i32, 1));
+        }
+    }.run);
+}
+
+test "a number is read only out of a number, so text and a fraction are refused rather than guessed" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:classes?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(
+                gpa,
+                "CREATE TABLE t(n INTEGER, r REAL, flag BOOLEAN, at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                .{},
+                null,
+                null,
+            );
+            _ = try w.exec(gpa, "INSERT INTO t(n, r, flag) VALUES ('seven', 2.7, 2)", .{}, null, null);
+            _ = try w.exec(gpa, "INSERT INTO t(n, r, flag) VALUES (7, 3, 'yes')", .{}, null, null);
+
+            var rows = try w.run(gpa, "SELECT n, r, flag, at FROM t ORDER BY rowid", .{}, null, null);
+            defer rows.close();
+
+            try testing.expect(try w.next(&rows));
+            // Text in an INTEGER column read 0, and a REAL read 2: both were
+            // answers that look like data.
+            try testing.expectError(error.QueryFailed, w.read(&rows, i64, 0));
+            try testing.expectError(error.QueryFailed, w.read(&rows, i64, 1));
+            try testing.expectEqual(@as(f64, 2.7), try w.read(&rows, f64, 1));
+            // A 2 is true to `WHERE flag`, so it is true here too.
+            try testing.expectEqual(true, try w.read(&rows, bool, 2));
+            // What `CURRENT_TIMESTAMP` stores is text, which a `Timestamp`'s
+            // microseconds used to read as the year.
+            try testing.expectError(error.QueryFailed, w.read(&rows, i64, 3));
+            try testing.expectError(error.QueryFailed, w.read(&rows, ?i64, 3));
+
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(i64, 7), try w.read(&rows, i64, 0));
+            // An integer is a float with nothing lost.
+            try testing.expectEqual(@as(f64, 3), try w.read(&rows, f64, 1));
+            try testing.expectError(error.QueryFailed, w.read(&rows, bool, 2));
+            try testing.expectError(error.QueryFailed, w.read(&rows, f64, 2));
+        }
+    }.run);
+}
+
+test "a NaN is refused before SQLite stores it as NULL, and an infinity is kept" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:nan?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE t(x REAL NOT NULL, y REAL)", .{}, null, null);
+            // It used to arrive as `NotNullViolated` on a value that was never
+            // null, and as a `null` read back from the nullable column.
+            try testing.expectError(error.QueryFailed, w.exec(
+                gpa,
+                "INSERT INTO t(x, y) VALUES (?1, ?2)",
+                .{ @as(f64, 1), @as(?f64, std.math.nan(f64)) },
+                null,
+                null,
+            ));
+            try testing.expectError(error.QueryFailed, w.exec(
+                gpa,
+                "INSERT INTO t(x) VALUES (?1)",
+                .{std.math.nan(f32)},
+                null,
+                null,
+            ));
+
+            _ = try w.exec(
+                gpa,
+                "INSERT INTO t(x, y) VALUES (?1, ?2)",
+                .{ std.math.inf(f64), @as(?f64, null) },
+                null,
+                null,
+            );
+            var rows = try w.run(gpa, "SELECT x, y FROM t", .{}, null, null);
+            defer rows.close();
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(std.math.inf(f64), try w.read(&rows, f64, 0));
+            try testing.expectEqual(@as(?f64, null), try w.read(&rows, ?f64, 1));
+            try testing.expect(!try w.next(&rows));
         }
     }.run);
 }

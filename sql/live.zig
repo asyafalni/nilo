@@ -1532,6 +1532,46 @@ test "a date the database wrote comes back as the day, out of the column's own b
     try testing.expectEqual(@as(i32, 16_495), kid.born.?.days);
 }
 
+const Endless = struct {
+    pub const nilo_table = .projection;
+
+    at: ?types.Timestamp,
+    day: ?types.Date,
+};
+
+test "an infinite date or timestamp another client wrote is refused by name, not a panic or a moment" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // `'infinity'::timestamptz` overflowed inside pg.zig's decoder and took
+    // the process down; `'-infinity'` read back as a moment 292,000 years
+    // ago. A `date` overflowed nilo's own shift the same way.
+    inline for (.{
+        "SELECT 'infinity'::timestamptz AS at, NULL::date AS day",
+        "SELECT '-infinity'::timestamptz AS at, NULL::date AS day",
+        "SELECT NULL::timestamptz AS at, 'infinity'::date AS day",
+        "SELECT NULL::timestamptz AS at, '-infinity'::date AS day",
+    }) |statement| {
+        try testing.expectError(error.QueryFailed, stack.db.raw(Endless, &run, statement, .{}));
+    }
+
+    // The moments either side of them still read, and a null is still a null.
+    const ends = try stack.db.raw(
+        Endless,
+        &run,
+        "SELECT '1969-12-31 23:59:59.999999+00'::timestamptz AS at, '4000-01-01'::date AS day",
+        .{},
+    );
+    try testing.expectEqual(@as(i64, -1), ends[0].at.?.micros);
+    try testing.expectEqual(types.Date.nilo_parse("4000-01-01").?.days, ends[0].day.?.days);
+    const nothing = try stack.db.raw(Endless, &run, "SELECT NULL::timestamptz AS at, NULL::date AS day", .{});
+    try testing.expectEqual(@as(?types.Timestamp, null), nothing[0].at);
+}
+
 test "a date goes out as ten characters and comes back as the same day" {
     const gpa = testing.allocator;
     var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
@@ -2452,6 +2492,44 @@ test "a savepoint rolled back takes its work with it, and released keeps it" {
     try testing.expect(try stack.db.exists(Person, &run, .{ .where = .{ .id = kept } }));
 }
 
+test "a savepoint an outer rollback ended stays ended after a newer one is taken" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const kept = scratch_id + 9;
+    defer _ = stack.db.delete(Person, &run, .{ .where = .{ .id = kept } }) catch {};
+
+    {
+        var tx = try stack.db.begin(&run, .{});
+        defer tx.deinit();
+
+        var outer = try tx.savepoint();
+        defer outer.deinit();
+        var later = later: {
+            var inner = try tx.savepoint();
+            // The `defer` that used to send `ROLLBACK TO` a mark Postgres had
+            // already dropped with `outer`, once `later` was taken, which
+            // aborted the transaction and failed the commit below.
+            defer inner.deinit();
+            outer.rollback();
+            break :later try tx.savepoint();
+        };
+        _ = try tx.insert(Person, &run, .{
+            .id = kept,
+            .email = "kept-after-unwind@example.dev",
+            .age = @as(i32, 24),
+        });
+        try later.release();
+        try tx.commit();
+    }
+
+    try testing.expect(try stack.db.exists(Person, &run, .{ .where = .{ .id = kept } }));
+}
+
 test "a commit after a failed statement nobody undid is refused, and nothing in the transaction was kept" {
     const gpa = testing.allocator;
     var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
@@ -3221,12 +3299,15 @@ const Widened = struct {
         .name = shipped_table,
         .key = .id,
         .default = .{ .named = false, .tries = 0 },
+        .references = .{ .parent_id = .{ @This(), .id } },
+        .index = .{.parent_id},
     };
     id: i64,
     url: []const u8,
     sha256: ?[]const u8,
     named: bool,
     tries: i64,
+    parent_id: ?i64,
 };
 
 const shipped_table = "nilo_live_shipped_" ++ mode_suffix;
@@ -3335,8 +3416,22 @@ test "addMissingColumns widens a Postgres table the way createMissing would have
 
     // Through `pg_catalog` rather than `pragma_table_info`, which is the
     // half of ADR 123 the SQLite file cannot reach.
-    try testing.expectEqual(@as(usize, 3), try migrate.addMissingColumns(&db, &run, .{ .tables = &.{Widened} }));
+    try testing.expectEqual(@as(usize, 4), try migrate.addMissingColumns(&db, &run, .{ .tables = &.{Widened} }));
     try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&db, &run, .{ .tables = &.{Widened} }));
+
+    // The added column's key came with it, and so did its index.
+    try testing.expectError(error.ForeignKeyViolated, db.insert(Widened, &run, .{
+        .url = "http://a/orphan",
+        .sha256 = @as(?[]const u8, null),
+        .parent_id = @as(?i64, 999_999),
+    }));
+    const indexes = try db.raw(
+        []const u8,
+        &run,
+        "SELECT indexname::text FROM pg_indexes WHERE tablename = $1 AND indexname <> $2",
+        .{ @as([]const u8, shipped_table), @as([]const u8, shipped_table ++ "_pkey") },
+    );
+    try testing.expectEqual(@as(usize, 1), indexes.len);
 
     const rows = try db.select(Widened, &run, .{});
     try testing.expectEqual(@as(usize, 1), rows.len);
@@ -3353,7 +3448,7 @@ test "addMissingColumns widens a Postgres table the way createMissing would have
         "SELECT column_name::text FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position",
         .{@as([]const u8, shipped_table)},
     );
-    try testing.expectEqual(@as(usize, 5), names.len);
+    try testing.expectEqual(@as(usize, 6), names.len);
     try testing.expectEqualStrings("tries", names[4]);
 }
 

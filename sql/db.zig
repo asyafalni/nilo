@@ -636,19 +636,42 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// once at a size settled while compiling (ADR 165).
         fn textOf(comptime stmt: statement.Statement, options: anytype, c: anytype) ![]const u8 {
             if (comptime !stmt.ordered) return stmt.sql;
-            return spliced(stmt.sql, options.order, stmt.tail, c);
+            return splicedTied(stmt.sql, options.order, stmt.ties, stmt.tail, c);
         }
 
         /// `head`, the ordering's clause, `tail` — one arena allocation, no
         /// larger than the widest clause the ordering can write.
         fn spliced(comptime head: []const u8, order: anytype, comptime tail: []const u8, c: anytype) ![]const u8 {
+            return splicedTied(head, order, &.{}, tail, c);
+        }
+
+        /// The same, ending the clause in each key column of `ties` the
+        /// request did not order by. **The key is what gives every row one
+        /// place** in a statement a `LIMIT` or an `OFFSET` cuts: a list
+        /// screen sorted by a column two rows share showed one of them on two
+        /// pages and the other on neither, where a written `.order` already
+        /// ended in the key (ADR 150).
+        fn splicedTied(
+            comptime head: []const u8,
+            order: anytype,
+            comptime ties: []const statement.Tie,
+            comptime tail: []const u8,
+            c: anytype,
+        ) ![]const u8 {
             const Order = @TypeOf(order);
-            const room = comptime head.len + Order.most(D) + tail.len;
+            const room = comptime blk: {
+                var n = head.len + Order.most(D) + tail.len;
+                for (ties) |t| n += ", ".len + t.text.len;
+                break :blk n;
+            };
             const buf = try c.arena().alloc(u8, room);
             var w = std.Io.Writer.fixed(buf);
             // Sized for the widest clause, so none of these can run out.
             w.writeAll(head) catch unreachable;
             order.write(D, &w) catch unreachable;
+            inline for (ties) |t| {
+                if (!order.names(t.column)) w.writeAll(", " ++ t.text) catch unreachable;
+            }
             w.writeAll(tail) catch unreachable;
             return w.buffered();
         }
@@ -2231,14 +2254,21 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             /// reused, so a savepoint taken inside a loop is a fresh mark
             /// each time around rather than one that shadows the last.
             sp_next: u32 = 0,
-            /// The highest savepoint this transaction will still send SQL
-            /// for. Undoing or dropping one destroys every savepoint taken
-            /// after it — that is Postgres's rule, not a choice made here —
-            /// so a handle above this line names a mark the server no longer
-            /// has, and sending its `RELEASE` would abort the transaction
-            /// with *no such savepoint*. It is a stale handle rather than a
-            /// mistake, and `deinit` on one does nothing.
-            sp_live: u32 = 0,
+            /// The savepoints this transaction will still send SQL for,
+            /// oldest first. Undoing or dropping one destroys every savepoint
+            /// taken after it — that is Postgres's rule, not a choice made
+            /// here — so a handle not in this list names a mark the server no
+            /// longer has, and sending its `RELEASE` would abort the
+            /// transaction with *no such savepoint*. It is a stale handle
+            /// rather than a mistake, and `deinit` on one does nothing.
+            ///
+            /// **A list rather than the highest live number**, which is what
+            /// this was: an outer rollback lowered the number, the next
+            /// savepoint raised it past the inner handle again, and the inner
+            /// handle's `defer` sent `ROLLBACK TO` a mark Postgres had
+            /// dropped, aborting the transaction and losing its work. One
+            /// allocation, on the first savepoint a transaction takes.
+            sp_stack: std.ArrayList(u32) = .empty,
 
             /// Roll back unless something already committed. Written to be
             /// called from a `defer`, which is the only way it will be.
@@ -2316,10 +2346,13 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             /// try something and carry on has no other way to do it.
             pub fn savepoint(self: *Tx) !Savepoint {
                 if (self.finished) return error.QueryFailed;
+                // Room first, so a mark the server holds is never missing
+                // from the list.
+                try self.sp_stack.ensureUnusedCapacity(self.db.gpa, 1);
                 self.sp_next += 1;
                 const id = self.sp_next;
                 try self.inner.savepoint(self.arenaOf(), .mark, id);
-                self.sp_live = id;
+                self.sp_stack.appendAssumeCapacity(id);
                 return .{ .tx = self, .id = id };
             }
 
@@ -2377,11 +2410,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 /// Whether there is still a mark on the server this handle
                 /// names. False once this handle has been used, and false
                 /// when an outer savepoint or the transaction itself has
-                /// already taken it — see `Tx.sp_live`.
+                /// already taken it — see `Tx.sp_stack`.
                 fn live(self: *Savepoint) bool {
                     if (self.finished) return false;
                     if (self.tx.finished) return false;
-                    return self.id <= self.tx.sp_live;
+                    return std.mem.indexOfScalar(u32, self.tx.sp_stack.items, self.id) != null;
                 }
 
                 /// Whichever way this handle was used, it is spent, and the
@@ -2402,12 +2435,15 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 /// that.
                 fn end(self: *Savepoint) void {
                     self.finished = true;
-                    self.tx.sp_live = self.id - 1;
+                    const at = std.mem.indexOfScalar(u32, self.tx.sp_stack.items, self.id) orelse return;
+                    self.tx.sp_stack.shrinkRetainingCapacity(at);
                 }
             };
 
             fn end(self: *Tx) void {
                 self.finished = true;
+                self.sp_stack.deinit(self.db.gpa);
+                self.sp_stack = .empty;
                 if (traps_enabled) self.db.hold(&self.db.open_transactions, .Sub);
             }
 
@@ -5504,6 +5540,47 @@ test "undoing a savepoint leaves the ones inside it stale rather than wrong" {
     try testing.expectEqual(@as(usize, 0), db.wire.?.kept);
 }
 
+/// A handler that unwinds an outer savepoint and then takes a newer one.
+/// `inner` was dropped on the server with `outer`, and taking `later` must
+/// not bring it back: its `defer` used to send `ROLLBACK TO` a mark Postgres
+/// no longer had, which aborted the transaction.
+fn unwindThenMark(db: *FakeDb, c: *nilo.Ctx) !void {
+    var tx = try db.begin(c, .{});
+    defer tx.deinit();
+
+    var outer = try tx.savepoint();
+    defer outer.deinit();
+    var inner = try tx.savepoint();
+    defer inner.deinit();
+
+    outer.rollback();
+    var later = try tx.savepoint();
+    defer later.deinit();
+    try testing.expectError(error.QueryFailed, inner.release());
+}
+
+test "a savepoint an outer rollback ended stays ended after a newer one is taken" {
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer db.deinit();
+    db.wire = .{};
+
+    var app = nilo.App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&db);
+    try app.get("/unwind", unwindThenMark);
+
+    var client = try nilo.testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+    const answer = try client.get(&app, "/unwind");
+    try testing.expectEqual(@as(u16, 200), answer.status);
+
+    // Three marks, and two undos: `outer`'s and `later`'s. `inner` sent
+    // nothing, before `later` was taken or after.
+    try testing.expectEqual(@as(usize, 3), db.wire.?.marked);
+    try testing.expectEqual(@as(usize, 2), db.wire.?.undone);
+    try testing.expectEqual(@as(usize, 0), db.wire.?.kept);
+}
+
 /// A handler that keeps the work a savepoint marked, and then takes another.
 /// The second one has to be a fresh mark: reusing the number would name a
 /// savepoint the server dropped with the release.
@@ -8146,9 +8223,10 @@ test "the order a request chose is the order the rows come back in, on a page an
     try testing.expectEqualStrings("carol@example.dev", by_mail.rows[0].email.view());
     try testing.expectEqualStrings("bob@example.dev", by_mail.rows[1].email.view());
     // The watcher sees the text as it went, and no plan name to go with it.
+    // It ends in the key, because the `LIMIT` cuts it (ADR 150).
     try testing.expectEqualStrings(
         "SELECT \"id\", \"public\", \"email\", count(*) OVER () FROM \"accounts\"" ++
-            " ORDER BY \"email\" DESC NULLS LAST LIMIT 2",
+            " ORDER BY \"email\" DESC NULLS LAST, \"id\" ASC LIMIT 2",
         watched.sql,
     );
     try testing.expect(watched.plan == null);
@@ -8195,6 +8273,68 @@ test "the order a request chose is the order the rows come back in, on a page an
     try testing.expectEqual(@as(usize, 3), in_tx.len);
     try testing.expectEqual(@as(i64, 3), in_tx[0].id);
     try tx.commit();
+}
+
+test "an ordering a request chose ends in the key where a limit cuts it, so tied rows page evenly" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:ordered-ties?mode=memory&cache=shared",
+        .{ .size = 2, .unchecked = true },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+    watched = .{};
+    db.watching(recordSent);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, accounts_ddl, .{});
+
+    // Ten rows, every one tied on the column the request sorts by.
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const mail = try std.fmt.allocPrint(run.arena(), "tie{d}@example.dev", .{i});
+        _ = try db.insert(SqliteAccount, &run, .{ .public = types.Uuid.nil, .email = mail });
+    }
+    const TieSort = ordering.Ordering(SqliteAccount, .{ .who = .public, .id = .id });
+
+    var seen = [_]bool{false} ** 10;
+    var offset: i64 = 0;
+    while (offset < 10) : (offset += 3) {
+        const page = try db.page(SqliteAccount, &run, .{
+            .order = TieSort.nilo_parse("who:desc").?,
+            .limit = 3,
+            .offset = offset,
+        });
+        for (page.rows) |row| {
+            const at: usize = @intCast(row.id - 1);
+            try testing.expect(!seen[at]);
+            seen[at] = true;
+        }
+    }
+    for (seen) |was| try testing.expect(was);
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"public\", \"email\", count(*) OVER () FROM \"accounts\"" ++
+            " ORDER BY \"public\" DESC, \"id\" ASC LIMIT 3 OFFSET ?1",
+        watched.sql,
+    );
+
+    // A request that ordered by the key itself gets no second copy of it.
+    _ = try db.page(SqliteAccount, &run, .{ .order = TieSort.nilo_parse("id:desc").?, .limit = 3 });
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"public\", \"email\", count(*) OVER () FROM \"accounts\"" ++
+            " ORDER BY \"id\" DESC LIMIT 3",
+        watched.sql,
+    );
+    // And an answer nothing cuts is left as the request wrote it.
+    _ = try db.select(SqliteAccount, &run, .{ .order = TieSort.nilo_parse("who").? });
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"public\", \"email\" FROM \"accounts\" ORDER BY \"public\" ASC",
+        watched.sql,
+    );
 }
 
 test "a page reads the same columns a select does, and one more" {

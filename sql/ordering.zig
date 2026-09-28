@@ -170,6 +170,21 @@ pub fn Ordering(comptime Row: type, comptime keys: anytype) type {
             }
         }
 
+        /// Whether a chosen term orders by `column` itself, so a key column
+        /// the statement would end in is already there (`statement.Tie`).
+        pub fn names(self: *const Self, column: []const u8) bool {
+            const columns = comptime blk: {
+                var out: [max]?[]const u8 = undefined;
+                for (specs, 0..) |s, i| out[i] = s.column;
+                break :blk out;
+            };
+            for (self.chosen()) |t| {
+                const named = columns[@intFromEnum(t.key)] orelse continue;
+                if (std.mem.eql(u8, named, column)) return true;
+            }
+            return false;
+        }
+
         /// The longest clause `write` can produce in `D`'s grammar, so the
         /// statement it goes into can be sized while compiling.
         pub fn most(comptime D: type) usize {

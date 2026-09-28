@@ -582,6 +582,9 @@ test {
     _ = ordering;
     _ = shape;
     _ = composed;
+    // Reached only through `db.zig` and `schema.zig`, which import it for its
+    // checks and so never ran its own tests: 29 of them sat here unrun.
+    _ = @import("rawcheck.zig");
     _ = schema;
     _ = types;
     _ = postgres;
