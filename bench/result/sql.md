@@ -1366,6 +1366,26 @@ Every shape that goes through a cached statement lost 2.1 to 3.1 µs, one unix-s
 
 **Can it be pushed further:** by the caller, with the index above. Leaving the key off an order that is unique already is the other half, and nilo cannot see that today: `.unique` columns may be NULL, so only the key counts.
 
+## 20. What a stream let go early costs to give back
+
+**Run:** `91c34a0` plus the working tree of the change that bounds the drain, 2026-09-29. Postgres 17.10 (`timescale/timescaledb-ha:pg17`) over its Docker port on loopback, SCRAM-SHA-256 at 4,096 iterations, defaults otherwise. Intel Xeon Platinum 8255C, 2 vCPU, Linux 6.8.0, Zig 0.16.0. The live test "a stream let go early keeps its connection…" in a ReleaseSafe build forced onto LLVM, with timers around `rows.close()` and inside the drain, run on its own with the budget read from an environment variable, three budgets interleaved for two rounds of six closes each. The table is 200,000 rows of 200 bytes, and each close follows the first row, leaving 43,599,796 bytes of the result.
+
+**Why:** §18 found a stream given back after its first row reads the whole rest first. The bound replaces the connection past a budget, and the budget is worth what a connect costs against what a read does.
+
+| Budget | Read before giving up | Dial of the replacement | `rows.close()` |
+|---|---|---|---|
+| none, as before | 178 to 313 ms, all 43.6 MB | none | 178 to 313 ms |
+| 1 MiB | 4.3 to 7.0 ms | 16 to 27 ms | 21 to 34 ms |
+| 2 MiB | 8.8 to 18 ms | 17 to 54 ms | 26 to 72 ms |
+
+A raw SCRAM connect from Python over the same port, with and without `TCP_NODELAY`, took 8.2 to 17 ms, so pg.zig's dial is within a few milliseconds of the protocol's own.
+
+**Measured through a test binary, a connect is ten times what it costs.** The same dial timed inside `zig build test-sql` read 115 to 360 ms, and the ReleaseSafe binary was slower than the Debug one. Test builds here use the self-hosted backend (ADR 138), which leaves SCRAM's PBKDF2 unoptimised: 113 ms in Debug against 5.5 ms in ReleaseSafe on LLVM, timed alone. Run beside the Debug binary on two cores, the LLVM build's dial read 36 to 46 ms. The table above is the LLVM binary run by itself.
+
+**What it changed:** [ADR 238](../../docs/adr/238-a-stream-let-go-early-reads-a-megabyte-of-what-is-left.md). `drain_budget` is 1 MiB: a rest past it costs at most one connect more than reading it would have, and a 42 MB rest costs a tenth of what it did. 2 MiB reads twice as much on every long rest to save a connect on a rest between the two.
+
+**Can it be pushed further:** by a CancelRequest, which keeps the connection and needs the key pg.zig does not keep, or by a portal read in batches. Both are in the ADR's rejected list with what would reopen them. §18's 295 and 327 ms were taken through test binaries as well, so they are about the build as much as the drain.
+
 ## What is still missing
 
 - **A second box.** Everything here shares eight physical cores between nilo,

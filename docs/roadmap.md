@@ -95,10 +95,6 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 #### P1: wrong and loud, a migration that fails, a measured multiple, or a gap in the gate
 
-**A stream let go early reads the rest of its result off the socket first.** `drain` runs the result to its end on the connection it holds (`postgres.zig:938`), so a stream given back after one of two million 200-byte rows took 295 ms in Debug and 327 ms in ReleaseSafe to return its connection ([sql.md §18](../bench/result/sql.md#18-the-count-a-page-reads-keyset-paging-and-a-stream-let-go-early)).
-
-**Needs:** a CancelRequest past some bound, or a named portal read in batches, which is the decision.
-
 **The live half of the suite skips without a word when `DATABASE_URL` is missing.** 122 tests in `live.zig` and 2 in `severed.zig` return `SkipZigTest` without it; CI sets it, and nothing asserts that the skips are zero, so losing the variable turns every decode test green. A transaction that is never rolled back hangs the suite at no CPU rather than failing it.
 
 **Needs:** CI's `test-sql` failing on a skip, and a bound on the wait a leaked connection causes.

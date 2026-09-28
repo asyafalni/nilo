@@ -1129,16 +1129,67 @@ pub const Wire = struct {
 
     /// Throw away what is left and give the connection back.
     ///
-    /// Not optional, and not only good manners: pg.zig's pool checks that a
-    /// connection is idle on release, and on finding it is not, destroys it
-    /// and dials a new one. A handler that stops reading early is an
-    /// ordinary thing to write, so the cost of it must not be a reconnect.
+    /// pg.zig's pool checks that a connection is idle on release, and on
+    /// finding it is not, destroys it and dials a new one. A handler that
+    /// stops reading early is an ordinary thing to write, so a short rest is
+    /// read off the socket and the connection kept.
+    ///
+    /// **A long rest is not** (ADR 238). Reading it held the connection for
+    /// as long as the server took to send it: a stream let go after one of
+    /// 200,000 rows of 200 bytes took 178 to 313 ms to give its connection
+    /// back (bench/result/sql.md §20). Past `drain_budget` bytes the connection is
+    /// given back as failed, so the pool closes it, which ends the query on
+    /// the server at its next write, and dials a replacement: one connect in
+    /// place of however long the rest was. Postgres's own way to stop a
+    /// query, a CancelRequest, needs the key the server sends at startup,
+    /// which pg.zig reads past without keeping.
+    ///
+    /// Inside a transaction the rest is read whatever its length: the
+    /// connection is the transaction, and closing it would roll back what
+    /// the caller has not committed.
     pub fn drain(self: *Wire, rows: *Rows) void {
         // A cancellation that lands while the rest is thrown away is the
         // caller's, like any other a statement is cut off by (ADR 223).
-        rows.result.drain() catch |err| if (err == error.Canceled) self.io.recancel();
+        if (!rows.owns_conn) {
+            rows.result.drain() catch |err| if (err == error.Canceled) self.io.recancel();
+            rows.close();
+            return;
+        }
+        const conn = rows.conn;
+        var thrown: usize = 0;
+        while (conn._state == .query) {
+            const msg = conn.read() catch |err| {
+                if (err == error.Canceled) self.io.recancel();
+                break;
+            };
+            switch (msg.type) {
+                'Z' => break,
+                'C', 'D' => {},
+                else => {
+                    conn._state = .fail;
+                    break;
+                },
+            }
+            thrown += msg.data.len;
+            if (thrown > drain_budget and conn._state == .query) {
+                std.log.info(
+                    "nilo_sql: a stream was let go with more than {d} bytes still to come; its connection is replaced rather than read to the end",
+                    .{drain_budget},
+                );
+                conn._state = .fail;
+                break;
+            }
+        }
         rows.close();
     }
+
+    /// How much of a stream let go early is read off the socket before its
+    /// connection is replaced instead. A megabyte is read in 4 to 7 ms and a
+    /// replacement dialled in 16 to 27 on loopback, so a rest past it costs
+    /// at most one connect more than reading it would have, and a rest of
+    /// forty megabytes costs 21 to 34 ms where it cost 178 to 313 (ADR 238,
+    /// bench/result/sql.md §20).
+    pub const drain_budget: usize = 1024 * 1024;
 
     /// Run a statement that answers with a count rather than with rows, and
     /// give the count back. An `UPDATE` that matched nothing and one that

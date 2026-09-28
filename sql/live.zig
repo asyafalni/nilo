@@ -5338,6 +5338,61 @@ test "a feed after a cursor over a column rows share pages every row once on Pos
     try testing.expectEqual(@as(usize, 40), total);
 }
 
+const long_table = "nilo_live_long_" ++ mode_suffix;
+
+test "a stream let go early keeps its connection when the rest is short, and replaces it when it is long" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    // One connection, so the backend each statement reaches is the one the
+    // pool holds.
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Long = struct {
+        pub const nilo_table = .{ .name = long_table, .key = .id };
+        id: i64,
+        body: []const u8,
+    };
+    const Backend = struct {
+        pub const nilo_table = .projection;
+        pid: i32,
+    };
+    _ = try db.exec(&run, "DROP TABLE IF EXISTS \"" ++ long_table ++ "\"", .{});
+    defer _ = db.exec(&run, "DROP TABLE IF EXISTS \"" ++ long_table ++ "\"", .{}) catch {};
+    // 200,000 rows of 200 bytes: forty times the budget.
+    _ = try db.exec(&run, "CREATE TABLE \"" ++ long_table ++ "\" AS SELECT g::int8 AS id, repeat('x', 200) AS body " ++
+        "FROM generate_series(1, 200000) AS g", .{});
+
+    const first = (try db.raw(Backend, &run, "SELECT pg_backend_pid() AS pid", .{}))[0].pid;
+
+    // A hundred rows: read to the end, and the connection kept.
+    {
+        var rows = try db.stream(Long, &run, .{ .order = .{ .id = .asc }, .limit = 100 });
+        defer rows.close();
+        _ = try rows.next();
+    }
+    try testing.expectEqual(first, (try db.raw(Backend, &run, "SELECT pg_backend_pid() AS pid", .{}))[0].pid);
+
+    // The whole table: past the budget the connection is given up, and the
+    // next statement runs on its replacement.
+    {
+        var rows = try db.stream(Long, &run, .{ .order = .{ .id = .asc } });
+        defer rows.close();
+        _ = try rows.next();
+    }
+    const after = (try db.raw(Backend, &run, "SELECT pg_backend_pid() AS pid", .{}))[0].pid;
+    try testing.expect(after != first);
+    try testing.expectEqual(@as(usize, 200_000), try db.count(Long, &run, .{}));
+}
+
 test "a Db told to keep no plans still answers, one Parse at a time" {
     const gpa = testing.allocator;
     var live = (try Live.open(gpa)) orelse return error.SkipZigTest;

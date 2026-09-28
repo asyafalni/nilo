@@ -707,6 +707,8 @@ defer rows.close();                       // required
 while (try rows.next()) |u| try s.print("{d},{s}\n", .{ u.id, u.email });
 ```
 
+**Closing a stream early is cheap, whatever is left.** Postgres has already sent the rest, so `close` reads up to 1 MiB of it off the socket and keeps the connection. Past that it gives the connection back to be closed and dialled again, one connect in place of the rest ([ADR 238](../adr/238-a-stream-let-go-early-reads-a-megabyte-of-what-is-left.md)).
+
 ### `Tx`
 
 ```zig
