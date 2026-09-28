@@ -547,7 +547,8 @@ pub const Wire = struct {
         "user, password, dbname, host, port, sslmode (disable, require or " ++
         "verify-full), sslrootcert (beside sslmode=verify-full), application_name, " ++
         "fallback_application_name, connect_timeout, tcp_user_timeout, keepalives, " ++
-        "keepalives_idle, keepalives_interval and keepalives_count";
+        "keepalives_idle, keepalives_interval, keepalives_count, options and " ++
+        "client_encoding=UTF8";
 
     /// A URI taken apart into what pg.zig needs to dial with.
     ///
@@ -672,6 +673,25 @@ pub const Wire = struct {
                 out.connect.keepalive_interval = try std.fmt.parseInt(u32, value, 10);
             } else if (eql(key, "keepalives_count")) {
                 out.connect.keepalive_count = try std.fmt.parseInt(u32, value, 10);
+            } else if (eql(key, "options")) {
+                // Handed to the server as written, in the startup message,
+                // which parses it the way `postgres -c` does. It is how a
+                // URL sets `statement_timeout` for every connection of a
+                // pool, and how Neon is told which endpoint is meant.
+                const params = try startupParams(arena, &out);
+                if (params.get(key)) |was| {
+                    if (!eql(was, value)) return twice(key);
+                }
+                try params.put(key, value);
+            } else if (eql(key, "client_encoding")) {
+                // Every `Str` nilo hands out is UTF-8, so UTF-8 is the one
+                // encoding a connection may ask for. Postgres takes the
+                // name in any case and with or without its hyphen.
+                if (!std.ascii.eqlIgnoreCase(value, "UTF8") and !std.ascii.eqlIgnoreCase(value, "UTF-8"))
+                    return refuse(key, value, "would send text in an encoding other " ++
+                        "than UTF-8, and every `Str` nilo_sql hands out is read as " ++
+                        "UTF-8. Drop it, or say `UTF8`", error.UnsupportedConnectionParamValue);
+                try (try startupParams(arena, &out)).put(key, "UTF8");
 
                 // Dropped. `pgbouncer=true` and `pool_mode` are a pooler's
                 // notes to a client library that prepares statements by
@@ -690,10 +710,6 @@ pub const Wire = struct {
             } else if (eql(key, "sslcert") or eql(key, "sslkey")) {
                 return refuse(key, value, "names a client certificate, and pg.zig " ++
                     "presents none", error.UnsupportedConnectionParam);
-            } else if (eql(key, "options")) {
-                return refuse(key, value, "would set server-side settings at connect " ++
-                    "time, and pg.zig's startup message has no room for them. Run " ++
-                    "the `SET` after connecting, or put the setting on the role", error.UnsupportedConnectionParam);
             } else if (eql(key, "channel_binding")) {
                 return refuse(key, value, "asks for SCRAM channel binding, which pg.zig " ++
                     "does not do; the server would take the connection without it " ++
@@ -707,11 +723,6 @@ pub const Wire = struct {
             } else if (eql(key, "sslsni")) {
                 return refuse(key, value, "would leave the host name out of the TLS " ++
                     "handshake, and pg.zig always sends it", error.UnsupportedConnectionParamValue);
-            } else if (eql(key, "client_encoding")) {
-                return refuse(key, value, "is never sent: pg.zig's startup message " ++
-                    "names the user, the database and the application name, so the " ++
-                    "session takes the database's own encoding. Drop it, or make " ++
-                    "the database UTF8", error.UnsupportedConnectionParamValue);
             } else {
                 return refuse(key, value, "is not a parameter nilo_sql understands", error.UnsupportedConnectionParam);
             }
@@ -749,6 +760,13 @@ pub const Wire = struct {
 
     /// One piece of a query string, percent-decoded into the arena when
     /// the URI came in encoded — which `std.Uri.parse` always leaves it.
+    /// The startup message's own settings, made on first use in the arena
+    /// `dialOpts` builds in; `Pool.init` copies the map and what is in it.
+    fn startupParams(arena: std.mem.Allocator, out: *pg.Pool.Opts) !*std.StringHashMap([]const u8) {
+        if (out.auth.startup_parameters == null) out.auth.startup_parameters = .init(arena);
+        return &out.auth.startup_parameters.?;
+    }
+
     fn decodeParam(arena: std.mem.Allocator, piece: []const u8, encoded: bool) ![]const u8 {
         if (!encoded) return piece;
         const buf = try arena.alloc(u8, piece.len);
@@ -1878,6 +1896,20 @@ test "a parameter pg.zig has a field for is carried onto it" {
     try testing.expectEqualStrings("db.internal", query_form.connect.host.?);
     try testing.expectEqual(@as(?u16, 5433), query_form.connect.port);
 
+    // Server settings ride in the startup message as written: `options`
+    // is parsed by the server like `postgres -c`, and UTF-8 is the one
+    // encoding asked for, spelled the way Postgres spells it.
+    const set = try Wire.dialOpts(try std.Uri.parse(
+        "postgres://h/db?options=-c%20statement_timeout%3D5s&client_encoding=utf-8",
+    ), aa);
+    try testing.expectEqualStrings("-c statement_timeout=5s", set.auth.startup_parameters.?.get("options").?);
+    try testing.expectEqualStrings("UTF8", set.auth.startup_parameters.?.get("client_encoding").?);
+    try testing.expect(hosted.auth.startup_parameters == null);
+    try testing.expectError(
+        error.ConflictingConnectionParam,
+        Wire.dialOpts(try std.Uri.parse("postgres://h/db?options=-c%20a%3D1&options=-c%20a%3D2"), aa),
+    );
+
     // Said twice and the same, fine; said twice and different, refused.
     _ = try Wire.dialOpts(try std.Uri.parse("postgres://app@h:5433/shop?user=app&port=5433"), aa);
     try testing.expectError(
@@ -1942,10 +1974,9 @@ test "a URL nobody can read is refused rather than half understood" {
     );
 
     // Known parameters asking for what pg.zig does not do: a client
-    // certificate, connect-time settings, channel binding, GSSAPI, a
-    // read-write check, SNI off, an encoding the startup message never
-    // carries.
-    for ([_][]const u8{ "sslcert=/c.crt", "sslkey=/c.key", "options=-c%20statement_timeout%3D5" }) |param| {
+    // certificate, channel binding, GSSAPI, a read-write check, SNI off,
+    // text in an encoding other than UTF-8.
+    for ([_][]const u8{ "sslcert=/c.crt", "sslkey=/c.key" }) |param| {
         const url = try std.fmt.allocPrint(aa, "postgres://h/db?{s}", .{param});
         try testing.expectError(
             error.UnsupportedConnectionParam,
@@ -1954,7 +1985,7 @@ test "a URL nobody can read is refused rather than half understood" {
     }
     for ([_][]const u8{
         "channel_binding=require", "gssencmode=require",   "target_session_attrs=read-write",
-        "sslsni=0",                "client_encoding=UTF8",
+        "sslsni=0",                "client_encoding=LATIN1",
     }) |param| {
         const url = try std.fmt.allocPrint(aa, "postgres://h/db?{s}", .{param});
         try testing.expectError(

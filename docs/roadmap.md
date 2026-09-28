@@ -95,10 +95,6 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 #### P1: wrong and loud, a migration that fails, a measured multiple, or a gap in the gate
 
-**The live half of the suite skips without a word when `DATABASE_URL` is missing.** 122 tests in `live.zig` and 2 in `severed.zig` return `SkipZigTest` without it; CI sets it, and nothing asserts that the skips are zero, so losing the variable turns every decode test green. A transaction that is never rolled back hangs the suite at no CPU rather than failing it.
-
-**Needs:** CI's `test-sql` failing on a skip, and a bound on the wait a leaked connection causes.
-
 **The Fake cannot fail and cannot tell columns apart.** `wire.Fake.read` ignores `col` and answers 0 or `"fake"`, and its `describe` and `next` never fail, so a column read from the wrong index, or `vetFirst`'s path for a statement it could not describe, cannot be caught through it. `db.stream` has no test of a Row with an optional parent, and a mutation dropping its column step survived.
 
 **Needs:** a Fake that answers per column and fails on request.
@@ -193,7 +189,7 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 **Needs:** a harness — a build step that stands up a second writer, which here is a second process on the same file rather than a socket.
 
-**A pool-wide `statement_timeout` rides in the startup packet, and nothing upstream blocks it any more.** It is the only way a plain `db.select` gets a deadline without a second round trip ([ADR 043](./adr/043-a-deadline-needs-a-connection-you-hold.md)). The pin has sent `startup_parameters` since `nevindra/pg.zig@0a8dab4`, so what is left is nilo's side: `Db.Opts.statement_timeout_ms` handed to `Conn.Opts.startup_parameters`, and `options=` and `client_encoding` in a URL carried on the same packet instead of refused. Meanwhile it is `ALTER ROLE app SET statement_timeout`, from the side that can already do it.
+**A pool-wide `statement_timeout` rides in the startup packet, and nothing upstream blocks it any more.** It is the only way a plain `db.select` gets a deadline without a second round trip ([ADR 043](./adr/043-a-deadline-needs-a-connection-you-hold.md)). The pin has sent `startup_parameters` since `nevindra/pg.zig@0a8dab4`, and a URL's `options=` already rides on it ([ADR 239](./adr/239-a-live-test-skips-on-a-laptop-and-fails-on-ci.md)), so what is left is `Db.Opts.statement_timeout_ms` handed to the same map, for a program that sets its ceiling in code rather than in the URL.
 
 **Needs:** a live test that a statement past the number comes back `error.TimedOut` on a connection nobody set anything on, and that a reconnect sends it again.
 

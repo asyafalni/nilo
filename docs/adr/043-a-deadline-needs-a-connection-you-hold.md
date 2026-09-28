@@ -54,7 +54,7 @@ Two tests hold it. The first runs a second statement after the cut and then a co
 
 ## What was rejected
 
-**A pool-wide ceiling in the startup packet.** This was the intended design and it is the one that costs nothing per query: PostgreSQL treats an unknown startup parameter as a run-time setting, so `statement_timeout` handed over at connect would apply to every statement on every connection with no round trip at all. It could not be built against the driver pinned when this was decided: `auth.zig` constructed the startup message from `username`, `application_name` and `database` and never passed the parameter map, though the field existed on both sides. The pin has carried the fix since `nevindra/pg.zig@0a8dab4` (upstream `2907296`), so this is no longer rejected but not yet built; it is under Next in the roadmap.
+**A pool-wide ceiling in the startup packet.** This was the intended design and it is the one that costs nothing per query: PostgreSQL treats an unknown startup parameter as a run-time setting, so `statement_timeout` handed over at connect would apply to every statement on every connection with no round trip at all. It could not be built against the driver pinned when this was decided: `auth.zig` constructed the startup message from `username`, `application_name` and `database` and never passed the parameter map, though the field existed on both sides. The pin has carried the fix since `nevindra/pg.zig@0a8dab4` (upstream `2907296`), so this is no longer rejected. Half of it is built: a URL's `options=-c statement_timeout=30s` rides in every connection's startup message ([ADR 239](./239-a-live-test-skips-on-a-laptop-and-fails-on-ci.md)). `Db.Opts.statement_timeout_ms` is the other half, under Next in the roadmap.
 
 **Adding `Db.Opts.statement_timeout_ms` anyway**, to be honoured when the pin moves. An option that is declared, plumbed and silently does nothing is the defect above; the option arrives with the pin.
 
@@ -88,7 +88,7 @@ The severed-connection test itself costs nothing on any of the four axes: a test
 ## Consequences
 
 - A handler can bound a query, and can tell when the bound was what stopped it. Both halves are opt-in and neither costs anything to a caller who does not use them.
-- A pool-wide floor is an operator's job today, not nilo's: `ALTER ROLE app SET statement_timeout = '30s'` does what the startup parameter would have done, from the side that can already do it.
+- A pool-wide floor is set in the URL, `?options=-c%20statement_timeout%3D30s`, which reaches every connection's startup message, or with `ALTER ROLE app SET statement_timeout = '30s'` from the server's side.
 - `postgres.zig` reads one pg.zig private field, `conn._state`, in one function, and that function says what it depends on and when to delete it.
 - Two upstream defects are written down here rather than in a comment nobody finds: `startup_parameters` never reaching the startup message (fixed in the pin since `0a8dab4`), and `.fail` conflating an aborted transaction with a broken connection.
 - Whether zio spells a peer's reset and a peer's plain close the same way `std.Io.Threaded` does is not known, and is a note rather than a change.

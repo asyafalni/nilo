@@ -146,7 +146,8 @@ A statement that failed also carries `sent.problem`: the database's own `message
 
 **The URL is read the way libpq reads it, and a parameter the driver would not act on is rejected by name.**
 
-- Supported: `user`, `password`, `dbname`, `host` and `port` as query parameters, `sslmode` (`disable`, `require`, `verify-full`), `sslrootcert` with `verify-full` (`system` for the platform's store), `application_name` and `fallback_application_name`, `connect_timeout` in seconds, `tcp_user_timeout` in milliseconds, and `keepalives`, `keepalives_idle`, `keepalives_interval`, `keepalives_count`.
+- Supported: `user`, `password`, `dbname`, `host` and `port` as query parameters, `sslmode` (`disable`, `require`, `verify-full`), `sslrootcert` with `verify-full` (`system` for the platform's store), `application_name` and `fallback_application_name`, `connect_timeout` in seconds, `tcp_user_timeout` in milliseconds, `keepalives`, `keepalives_idle`, `keepalives_interval`, `keepalives_count`, and `client_encoding=UTF8`.
+- `options`, handed to the server in every connection's startup message and read there like `postgres -c`: `?options=-c%20statement_timeout%3D30s` is a ceiling on every statement of the pool with no round trip, and Neon's `options=endpoint%3D…` names the endpoint.
 - Ignored with one `warn` line, because the driver does it already or nothing observable changes: `pgbouncer`, `pool_mode`, `sslsni=1`, `gssencmode=disable`, `channel_binding=prefer`, `target_session_attrs=any`.
 - Everything else is rejected with a line naming the parameter, the reason, and the list above. `sslmode=prefer` is the most common, because it would fall back to plaintext and pg.zig does not.
 

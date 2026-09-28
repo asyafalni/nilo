@@ -231,7 +231,7 @@ const Stack = struct {
 
 It is heap-allocated because the App holds a pointer to the Db and the client hands out a `Ctx` pointing at the App, so none of the three may move. A bare `:memory:` is refused when the pool opens it: a pool of them is several separate empty databases, with writes going to one and reads finding nothing ([SQLite](./sql/sqlite.md#the-database-filename)).
 
-A program on Postgres tests against Postgres. `sql/live.zig` shows how this repository does it: the URL comes from `DATABASE_URL` through `build.zig`, and every test skips when there is none, so the everyday loop never needs a server running, while CI sets it so the coverage is not optional there.
+A program on Postgres tests against Postgres. `sql/live.zig` shows how this repository does it: the URL comes from `DATABASE_URL` through `build.zig`, and every test skips when there is none, so the everyday loop never needs a server running. Where `$CI` is set, a missing URL fails the build instead, so losing the variable cannot turn the suite green ([ADR 239](../adr/239-a-live-test-skips-on-a-laptop-and-fails-on-ci.md)).
 
 ## Running the suite
 

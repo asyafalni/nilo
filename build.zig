@@ -5010,8 +5010,42 @@ pub fn build(b: *std.Build) void {
         "Postgres for the SQL module's live tests (default: $DATABASE_URL, else they skip)",
     ) orelse b.graph.environ_map.get("DATABASE_URL");
 
+    // **On CI a missing URL fails `test-sql` rather than skipping every live
+    // test.** A skip prints nothing a run is read for, so losing the variable
+    // from the workflow turned 124 tests green without running them. `CI` is
+    // what GitHub Actions and every other runner set, so the rule holds
+    // without a flag anybody has to remember; `-Ddatabase-required=false`
+    // is the way out for a runner with no Postgres on purpose.
+    const database_required = b.option(
+        bool,
+        "database-required",
+        "Fail test-sql when no database URL is given (default: on where $CI is set)",
+    ) orelse (b.graph.environ_map.get("CI") != null);
+    if (database_required and database_url == null) test_sql_step.dependOn(&b.addFail(
+        "test-sql needs a database here: $CI is set and neither $DATABASE_URL nor " ++
+            "-Ddatabase-url= names one, so every live test would skip. Set one, or " ++
+            "pass -Ddatabase-required=false to skip them on purpose",
+    ).step);
+
+    // **A live test waits on a leaked transaction for ten seconds, not for
+    // ever.** A transaction a test forgets to end keeps its locks on the
+    // server, and the next statement to want one, the next test's fixture
+    // `DROP TABLE` most often, waited at no CPU until somebody killed the
+    // run. Postgres ends an idle transaction's session past
+    // `idle_in_transaction_session_timeout`, and fails a wait past
+    // `lock_timeout`; both ride on every connection a live test dials, as
+    // `options=` in the URL, unless the URL already sets its own.
+    const live_url: ?[]const u8 = if (database_url) |url|
+        if (std.mem.indexOf(u8, url, "options=") != null) url else b.fmt("{s}{s}{s}", .{
+            url,
+            if (std.mem.indexOfScalar(u8, url, '?') == null) "?" else "&",
+            "options=-c%20lock_timeout%3D10s%20-c%20idle_in_transaction_session_timeout%3D10s",
+        })
+    else
+        null;
+
     const live_config = b.addOptions();
-    live_config.addOption(?[]const u8, "database_url", database_url);
+    live_config.addOption(?[]const u8, "database_url", live_url);
 
     // What a per-connection statement cache is worth, which ADR 017's 10%
     // needed a number for before anything was built (ADR 051). Its own step

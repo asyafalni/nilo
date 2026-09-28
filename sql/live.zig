@@ -24,8 +24,11 @@
 //! Skipping rather than failing is the decision, and it is the same one
 //! `test` and `test-all` already make about each other: the loop somebody
 //! runs every thirty seconds must not need a service to be up, or it stops
-//! being run every thirty seconds. CI sets the variable, so the coverage is
-//! not optional there.
+//! being run every thirty seconds. On CI it is not optional: with `$CI` set
+//! and no URL, `build.zig` fails `test-sql` before anything runs, and every
+//! connection dialled here gives up on a lock or an idle transaction after
+//! ten seconds, so a leaked one fails a test rather than hanging the run
+//! (ADR 239).
 //!
 //! ## Why there is no event loop here
 //!
@@ -326,7 +329,18 @@ const Live = struct {
         return .{ .threaded = threaded, .wire = wire, .arena = arena };
     }
 
+    /// **A connection still out when the test ends fails the test.** It is
+    /// a transaction or a stream the test never ended, and it used to show
+    /// up as the next test's fixture waiting on its locks at no CPU. An
+    /// `err` line is what fails a test from a `defer`; the session itself is
+    /// ended by the server, past the `idle_in_transaction_session_timeout`
+    /// `build.zig` puts on every live connection.
     fn close(self: *Live, gpa: std.mem.Allocator) void {
+        const out = self.wire.pool.stats().in_use;
+        if (out != 0) std.log.err(
+            "the test ended with {d} of its pool's connections still out: a transaction or a stream it never closed",
+            .{out},
+        );
         self.arena.deinit();
         self.wire.close();
         self.threaded.deinit();
@@ -377,6 +391,26 @@ test "a null column reads as null and a present one does not" {
 
     try testing.expect(try live.wire.next(&rows));
     try testing.expectEqual(@as(?[]const u8, null), try live.wire.read(&rows, ?[]const u8, 0));
+}
+
+test "every connection a live test dials gives up on a lock or an idle transaction after ten seconds" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    // Both of the pool's connections at once, so each is asked: the bound
+    // is the URL's `options=`, which rides in every startup message rather
+    // than in a `SET` somebody has to remember per connection.
+    const show = "SELECT current_setting('lock_timeout'), current_setting('idle_in_transaction_session_timeout')";
+    var first = try live.wire.run(live.arena.allocator(), show, .{}, null, null);
+    defer live.wire.drain(&first);
+    var second = try live.wire.run(live.arena.allocator(), show, .{}, null, null);
+    defer live.wire.drain(&second);
+    for ([_]*postgres.Wire.Rows{ &first, &second }) |rows| {
+        try testing.expect(try live.wire.next(rows));
+        try testing.expectEqualStrings("10s", try live.wire.read(rows, []const u8, 0));
+        try testing.expectEqualStrings("10s", try live.wire.read(rows, []const u8, 1));
+    }
 }
 
 test "the schema comparison agrees with the table it was written against" {
