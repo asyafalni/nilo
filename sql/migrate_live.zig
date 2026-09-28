@@ -1034,6 +1034,71 @@ test "addMissingColumns refuses a required column with no default, and sends not
     try testing.expectEqual(@as(usize, 2), live.len);
 }
 
+test "createMissing leaves a unique over a field the table lacks to addMissingColumns, which is the boot order" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "boot-order");
+    defer fx.deinit(gpa);
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id };
+        id: i64,
+        url: []const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id, .unique = .{.code} };
+        id: i64,
+        url: []const u8,
+        code: ?[]const u8,
+    };
+
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Before} });
+    _ = try fx.db.insert(Before, &fx.run, .{ .url = "http://a/1" });
+    _ = try fx.db.insert(Before, &fx.run, .{ .url = "http://a/2" });
+
+    // The two lines a program runs at every boot. The `CREATE UNIQUE INDEX`
+    // over `"code"` came first and SQLite, finding no such column, indexed
+    // the string "code" and refused the second row.
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{After} });
+    try testing.expectEqual(@as(usize, 1), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+
+    _ = try fx.db.update(After, &fx.run, .{ .where = .{ .id = 1 }, .set = .{ .code = @as(?[]const u8, "x") } });
+    try testing.expectError(
+        error.AlreadyExists,
+        fx.db.update(After, &fx.run, .{ .where = .{ .id = 2 }, .set = .{ .code = @as(?[]const u8, "x") } }),
+    );
+    // And a second boot is quiet.
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{After} });
+    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+}
+
+test "addMissingColumns says why a clock default cannot be added to a table with rows, and adds it to an empty one" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "clock-default");
+    defer fx.deinit(gpa);
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "stamps", .key = .id };
+        id: i64,
+        url: []const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{ .name = "stamps", .key = .id, .default = .{ .at = .now } };
+        id: i64,
+        url: []const u8,
+        at: types.Timestamp,
+    };
+
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Before} });
+    try testing.expectEqual(@as(usize, 1), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+    _ = try fx.db.exec(&fx.run, "DROP TABLE \"stamps\"", .{});
+
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Before} });
+    _ = try fx.db.insert(Before, &fx.run, .{ .url = "http://a/1" });
+    try testing.expectError(error.NeedsVersion, migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+    const live = try fx.db.liveColumns(&fx.run, null, "stamps");
+    try testing.expectEqual(@as(usize, 2), live.len);
+}
+
 test "applyPending runs what is missing and leaves what is there, in order" {
     const gpa = testing.allocator;
     var fx = try Fixture.init(gpa, "pending");
@@ -1228,6 +1293,23 @@ test "a version that leaves a row pointing at nothing is refused at its commit, 
         error.ForeignKeyViolated,
         fx.db.insert(Child, &fx.run, .{ .id = 3, .parent_id = 99 }),
     );
+}
+
+test "a version that deletes a parent cascades as the schema says" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "cascade");
+    defer fx.deinit(gpa);
+    try family(fx);
+
+    // No table is dropped, so foreign keys stay on. Every version used to run
+    // with them off, the cascade did not fire, and the check before the
+    // COMMIT refused the child left behind.
+    var digest: [64]u8 = undefined;
+    const v, const hash = lone(1, "drop_parent", &.{
+        .{ .kind = .data, .why = "", .sql = "DELETE FROM \"parents\" WHERE \"id\" = 1" },
+    }, &digest);
+    try testing.expect(try migrate.apply(&fx.db, &fx.run, v, hash));
+    try testing.expectEqual(@as(usize, 1), (try fx.db.select(Child, &fx.run, .{})).len);
 }
 
 test "`status` says `edited` for a version whose file no longer matches what ran" {

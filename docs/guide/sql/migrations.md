@@ -275,7 +275,7 @@ An extension is just a name: `CREATE EXTENSION IF NOT EXISTS` when it is added t
 try sql.migrate.createMissing(&db, &run, .{ .tables = &.{User} });
 ```
 
-**`createMissing` runs one `CREATE TABLE IF NOT EXISTS` per Row, plus its indexes, all in one transaction.** **The order comes from the references, not from your list**: foreign keys are written inline (the only form SQLite supports), so `orgs` is created before `members` whichever order you wrote them in. Two tables that point at each other are a compile error naming both, with the way out in the message.
+**`createMissing` runs one `CREATE TABLE IF NOT EXISTS` per Row, plus its indexes, all in one transaction.** **The order comes from the references, not from your list**: foreign keys are written inline (the only form SQLite supports), so `orgs` is created before `members` whichever order you wrote them in. Two tables that point at each other are a compile error naming both, with the way out in the message. A unique or index on a field the table does not have yet waits for `addMissingColumns`, which adds the column and then the index.
 
 Running it again does nothing, which is what startup code needs. It is for a test, a fixture, or a single-file SQLite application: it creates what is missing and never changes what is there.
 
@@ -359,6 +359,8 @@ comptime {
 
 Other tools guess that a dropped `handle` and a new `email` are the same column, then ask you at a prompt. The answer is in your head; putting it in the type means the same code produces the same migration for you, for CI, and for the next person.
 
+An index, a unique or a foreign key over the column goes with it, since `RENAME COLUMN` carries them. On Postgres, one named after the old column (`members_handle_key`) is renamed to match the new one in the same version; on SQLite, which cannot rename an index, the index is dropped and made again.
+
 ## Applying migrations
 
 <!-- compiles: body -->
@@ -371,7 +373,7 @@ const ran = try sql.migrate.applyPending(&db, &run, chain);
 
 Each version's hash covers its own steps chained onto the hash of the version before it, so editing a migration that has already run changes that version's hash and every later one. `applyPending` refuses to run anything when it finds such an edit (`error.SchemaDrift`), because the later versions were written against what the edited one used to say. `sql.migrate.drift` lists them.
 
-**On SQLite, each version runs with foreign keys off**, and they are checked once before its COMMIT. Changing a column on SQLite means rebuilding the table, and the `DROP TABLE` in a rebuild deletes the old table's rows first. With foreign keys on, every `ON DELETE CASCADE` pointing at that table would fire, and the child rows would be gone when the version commits. With them off, the children stay. A row left pointing at nothing (for example, after a copy that skipped some rows) causes `error.ForeignKeyViolated`, and the version is rolled back.
+**On SQLite, a version that drops a table runs with foreign keys off**, and they are checked once before its COMMIT. Any other version keeps them on, so a `DELETE` of a parent in it cascades as the schema says. Changing a column on SQLite means rebuilding the table, and the `DROP TABLE` in a rebuild deletes the old table's rows first. With foreign keys on, every `ON DELETE CASCADE` pointing at that table would fire, and the child rows would be gone when the version commits. With them off, the children stay. A row left pointing at nothing (for example, after a copy that skipped some rows) causes `error.ForeignKeyViolated`, and the version is rolled back.
 
 The hash is not a field you write on the version. `chainOf` computes the whole list in one pass, because a hash somebody can type in is a hash somebody can type wrong, and a wrong one would make the drift check look like it works when it does not.
 

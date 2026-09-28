@@ -42,6 +42,8 @@ pub const nilo_table = .{
 
 `generate` writes `ALTER TABLE "users" RENAME COLUMN "e_mail" TO "email"`, and only while the snapshot still has `e_mail`; once it does not, the tool says the entry is spent and can be deleted. A `.was` naming a column the Row does not have is a Refusal.
 
+**What `RENAME COLUMN` carries goes with it.** An index, a unique or a foreign key over a renamed column is the same object with its columns under their new names: kept under its old name it needs nothing, and under the name derived from the new column it is one `ALTER INDEX … RENAME TO` or `RENAME CONSTRAINT` on Postgres. SQLite renames no index, so there it is a drop and a create of the index, and a foreign key, which nothing on SQLite drops by name, needs nothing. The foreign key used to be refused as a new one on a table that exists, and the index rebuilt under a lock.
+
 ### A version is a list of steps, and one Zig file holds it
 
 A data migration cannot be derived from a struct diff and is not attempted. So a version is a list, and a step written by hand sits in the list beside the generated ones, all applied in order inside one transaction. That is what makes expand and contract expressible, which `up`/`down` cannot: the data step sits **between** two DDL steps, and a pair has nowhere to put it.
@@ -81,7 +83,26 @@ Each step carries its kind, a `why`, its SQL and a `destructive` flag, so a revi
 
 `migrations/manifest.zig` is what the tool imports and what `generate` writes, so it has to exist before the first build: seven lines written once (`head` at 0, an empty list, the `chain` function), the tool's from then on. A build step that walks the directory would remove them and the merge conflict two branches get there, and adds a build-time API every dependent calls; not built.
 
+**`generate` writes the version file, then the manifest, then the snapshot, and refuses a directory a run left halfway** (`Error.SnapshotBehind`): a snapshot recording a lower version than the newest version file means the run stopped before the snapshot, and planning against it wrote the same steps again as the version after. The refusal names the file to delete. A version number is padded to four digits and no further, so the ten thousandth is `10000_x.zig`, which a reader held to exactly four refused.
+
 **A step that runs Zig rather than SQL is not expressible.** `Step.sql` is text with nowhere to put a function, and re-hashing every password with `nilo_pw` is the case that wants it. The shape it needs is a `Version` whose pieces are a comptime tuple of steps and functions; not built.
+
+### The order a version's steps go in
+
+The tool owns it, and each rule in it is a statement Postgres or SQLite refused the other way:
+
+1. **Views that have to come down**, in the reverse of the order the snapshot has them, so a view goes before one it reads.
+2. Extensions, then functions.
+3. **Each table in reference order**: its renames; its columns added and changed; its checks and triggers, dropped and made; the indexes that are going; the columns that are going; the indexes being made. A check or a trigger over a column goes before the column, because a named check went with it on Postgres and its `DROP CONSTRAINT` then named nothing, and a trigger `BEFORE UPDATE OF` it refuses the drop.
+4. **The tables that are going, in the reverse of the order they were created in**, so a child dropped in the same change goes before its parent, which Postgres otherwise refuses without `CASCADE`.
+5. The views going back up, then the functions and extensions that are going.
+
+**A view comes down when it is gone, when its text moved, when it reads a table a step drops, renames a column of or retypes a column of, and when it reads a view that is coming down.** Both databases refuse each of those changes under a view that reads the table. **Views are created in the order they read each other**, whatever order the list has, since the Schema says order inside a list does not matter; `createMissing` sends them in the same order. What a view reads is a word match of the names in its text, and it errs one way: a column or a string spelling a table's name remakes a view that did not need it, which holds no rows.
+
+**An enum's words are a set.** Reordering its tags in Zig moved nothing in the database and planned a drop and an add of the check, a scan under ACCESS EXCLUSIVE on Postgres and a rebuild Problem on SQLite. A tag holding a quote is written with it doubled.
+
+**Two Refusals hold what planning cannot see.** Two tables naming an index alike passed the plan and failed the second `CREATE INDEX`, because an index's name is its schema's; it no longer compiles. A function whose name has capitals, written without quotes in its body, is kept in lower case by Postgres and dropped by nilo in quotes, so the drop found nothing and its `IF EXISTS` said nothing; that no longer compiles either.
+
 
 ### Re-deriving version 1 is a flag, `--baseline`
 
@@ -113,6 +134,8 @@ Destructive means a table, a column or an extension dropped, and **a column type
 
 A step flagged `needs_backfill` says what it wants for its kind. An added required column cannot be filled by a step in front of it, because it does not exist yet: it wants a `.default` in the marker, or to ship optional first and be made required a version later. A `NOT NULL` or a check that the rows break wants a `.kind = .data` step in `before`.
 
+A text column becoming an enum is flagged the way a word taken off one is: every row holding other text fails the new check. **A column added on SQLite with a default SQLite works out per row, `.now`, is a Problem**: SQLite adds such a column only to a table with no rows, so the step failed at the deploy on every table that mattered. The Problem gives the rebuild, and the way round it of shipping the field optional and filling it in a step.
+
 The honest argument for `down` is the local loop, and its answer is two commands: `reset`, which drops the objects nilo owns and replays from zero, and `squash`, which folds applied history into one baseline. **Neither is built**; they are the debt forward-only creates, and the roadmap holds them. `--baseline` is not `reset`: it touches three files and no database.
 
 ### Applying: in process, and the binary knows its version
@@ -121,7 +144,7 @@ The honest argument for `down` is the local loop, and its answer is two commands
 
 **A version the ledger has under another hash stops the run before anything is applied** (`Error.SchemaDrift`). The versions after an edited one were written against what it used to say. `db migrate` has always refused this; a program migrating itself at boot applied on top of it until the one read of the ledger started answering both questions. A version already recorded is skipped without a transaction, so a boot with nothing to do costs that one read.
 
-**On SQLite each version runs with foreign keys off, and checked once before its COMMIT** (`wire.Begin.rebuilding`). SQLite changes a column by rebuilding the table: create the new one, copy the rows, drop the old one, rename. With foreign keys on, that drop deletes the old table's rows first, and every `ON DELETE CASCADE` pointing at it fires inside the version's own transaction. The children are gone and the COMMIT keeps it. The pragma does nothing inside a transaction, so it is an option on the `BEGIN`; `PRAGMA foreign_key_check` finding a row that points at nothing answers `error.ForeignKeyViolated` and rolls the version back. The `.sql` twin for SQLite carries the same pragmas around its `BEGIN` and `COMMIT`.
+**On SQLite a version that drops a table runs with foreign keys off, and checked once before its COMMIT** (`wire.Begin.rebuilding`). SQLite changes a column by rebuilding the table: create the new one, copy the rows, drop the old one, rename. With foreign keys on, that drop deletes the old table's rows first, and every `ON DELETE CASCADE` pointing at it fires inside the version's own transaction. The children are gone and the COMMIT keeps it. The pragma does nothing inside a transaction, so it is an option on the `BEGIN`; `PRAGMA foreign_key_check` finding a row that points at nothing answers `error.ForeignKeyViolated` and rolls the version back. **Any other version keeps them on**, so a `DELETE` of a parent in it cascades as the schema says, where it used to leave the child and have the check refuse the version, and nothing reads every key in the file at the end of it. A version drops a table when `DROP` then `TABLE` appear in a step (`migrate.rebuilds`), a comment or a string included: wrong only toward the old behaviour, and no table is dropped without those two words. The `.sql` twin for SQLite carries the same pragmas around the `BEGIN` and `COMMIT` of the same versions.
 
 The manifest holds the version list as comptime constants, so a server has its expected version as a number inside the binary, and one query at boot (`migrate.expect`) says whether the database agrees:
 
@@ -151,6 +174,8 @@ The twin is written from the compiled `Version`, because the hash is chained and
 **`migrate.addMissingColumns(db, scope, schema)` adds one `ALTER TABLE … ADD COLUMN` per field a table lacks, from the same `Desc` the create reads, in one transaction, and answers how many.** The live columns come from `db.liveColumns`, the question `checkSchema` asks. A required column with no default is refused with `error.NeedsBackfill` and nothing is sent: SQLite refuses that `ALTER` outright and Postgres refuses it on a table with rows, so it is not a statement this can send and mean. The log carries the statement and the three ways out (a `.default`, an optional field, or a version). A table that is not there is skipped, and nothing else is touched: a dropped or retyped column is `db.checking`'s to report.
 
 **A column goes in with what its Row declares on it**: its `REFERENCES … ON DELETE …` inline, then a foreign key of several columns that names it (`ALTER TABLE … ADD CONSTRAINT`, and `error.NeedsVersion` on SQLite, which writes one only when it creates the table), then every unique and index over it or whose `WHERE` names it. The column is new and empty, so the key costs no scan and cannot fail, which is why this is not the diff's refusal of a key on a table that exists. Without them an insert pointing at a parent that did not exist succeeded for ever, and the startup check, which reads columns only, never said.
+
+**`createMissing` leaves an index over a column the table lacks to it.** The boot order is `createMissing` then `addMissingColumns`, and a new field with a unique or an index broke it: the `CREATE INDEX IF NOT EXISTS` came first, Postgres refused it, and SQLite, reading a double-quoted name it could not find as a string, indexed the constant and refused the second row. `createMissing` now reads the columns of each table that has an index before it begins, and sends only the indexes whose columns are there; `addMissingColumns` makes the rest with their column. It costs one catalog read per such table at boot and none per request.
 
 ### It lives in `sql/`
 
@@ -201,6 +226,16 @@ It needs one declaration on the Dialect contract, `columnType(T)`, beside `accep
 **Refusing an older snapshot and telling people to delete it.** The snapshot is the other half of every diff: deleting it at version 7 and running `generate` writes a version 8 that creates every table the database has. **A format version in the snapshot** is a number somebody has to remember to bump, and forgetting is this bug again; trying both shapes needs no bookkeeping. **Writing the upgrade back to disk** makes a command that silently rewrites a committed file; the next `generate` rewrites it anyway, in a diff everybody reads.
 
 **`addMissingColumns` as a `Step` for `applyPending` too.** A step that reads the live schema is a version whose contents depend on the database it runs against, which is what the hash chain refuses; the DDL is already shared, through `ddl.addColumn`. **Sending the `ALTER` for a required column and letting the database refuse** works on an empty table and fails on a full one, which is a program that passes in development and fails at the first customer.
+
+**Foreign keys off for every SQLite version**, which is what it was. It protected the rebuild and changed what every other version meant: a `DELETE` of a parent did not cascade, the check before the COMMIT refused the child left behind, and every version read every foreign key in the file at its end.
+
+**Every view dropped and made again whenever a table moved.** Simpler than the word match and never wrong, and it puts every view of a schema into every version, which is the noise a reviewer then stops reading.
+
+**Limiting SQLite's foreign-key check to the tables a version rebuilt.** Their names are in hand-written SQL, and a parse that missed one would skip that table's check without a word; a version that rebuilds already reads every row of the table twice, so the whole check is the same order of cost.
+
+**A constant default followed by an `UPDATE`, for `.now` on a SQLite table with rows.** It fills the rows there, and leaves the column's default the constant for ever, since SQLite cannot alter a default: every insert after it gets the constant rather than the clock.
+
+**Replaying a `generate` that stopped halfway**, writing the manifest and snapshot for the version file it left. The file may have been written from types that moved since; refusing and naming the file costs one command.
 
 ## What it costs
 

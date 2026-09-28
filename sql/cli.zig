@@ -280,6 +280,7 @@ pub fn Tool(comptime Db: type, comptime schema: migrate.Schema) type {
                 migrations.Error.BaselineHasOthers,
                 migrations.Error.BaselineRenames,
                 migrations.Error.NoGeneratedBlock,
+                migrations.Error.SnapshotBehind,
                 => return try baselineRefused(a, io, dir, w, req, err),
                 error.ParseZon => return try snapshotRefused(a, io, dir, w, req),
                 else => return err,
@@ -694,7 +695,8 @@ fn writeProblems(w: *std.Io.Writer, problems: []const migrate.Problem) !void {
     }
 }
 
-/// The three ways `--baseline` refuses, each naming the file it is about.
+/// The ways `generate` refuses before writing anything, each naming the file
+/// it is about.
 ///
 /// Free rather than inside `Tool` so that the wording is reachable without a
 /// `Db`, which is how the rest of this file's sentences are held in place.
@@ -730,6 +732,16 @@ fn writeBaselineRefusal(
                     "nothing can read. Nothing was written: pass `--name {s}`, or delete " ++
                     "{s}/0001_{s}.zig first if the new name is the one you want.\n",
                 .{ was, req.name, was, req.dir, was },
+            );
+        },
+        migrations.Error.SnapshotBehind => {
+            const last = if (entries.len > 0) entries[entries.len - 1].file else "";
+            try w.print(
+                "db: {s}/{s} is newer than {s}/snapshot.zon, so a `db generate` stopped " ++
+                    "after writing the version and before the snapshot. Planning now would " ++
+                    "write the same steps again as the version after it. Nothing was written: " ++
+                    "delete {s}/{s} and run `db generate` again.\n",
+                .{ req.dir, last, req.dir, req.dir, last },
             );
         },
         migrations.Error.NoGeneratedBlock => {

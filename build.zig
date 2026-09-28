@@ -907,6 +907,17 @@ const sql_refusals = [_]Refusal{
             " `CREATE FUNCTION set_updated_at() RETURNS…`.",
     },
     .{
+        .name = "schema_function_named_in_mixed_case",
+        .says = "`.functions` entry \"setUpdatedAt\" names the function without quotes, and Postgres" ++
+            " keeps it as `setupdatedat`. nilo drops a function by the name in the entry, in quotes," ++
+            " so that drop would find nothing. Write the name in lower case, or quote it in the body:" ++
+            " `CREATE OR REPLACE FUNCTION \"setUpdatedAt\"`.",
+    },
+    .{
+        .name = "schema_two_tables_one_index_name",
+        .says = "`orders` and `invoices` both have an index named `by_created_at`.",
+    },
+    .{
         .name = "schema_view_begins_with_create",
         .says = "`.views` entry \"names\" begins `CREATE`, and nilo writes the `CREATE VIEW" ++
             " \"names\" AS` itself — the entry is the SELECT.",

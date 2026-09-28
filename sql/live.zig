@@ -5125,6 +5125,168 @@ test "a plan that drops an indexed column runs on Postgres, index first" {
     try testing.expectEqual(@as(i64, 7), kept.count);
 }
 
+const shape_parent = "nilo_live_shape_parent_" ++ mode_suffix;
+const shape_child = "nilo_live_shape_child_" ++ mode_suffix;
+const shape_counter = "nilo_live_shape_counter_" ++ mode_suffix;
+const shape_list = "nilo_live_shape_list_" ++ mode_suffix;
+const shape_top = "nilo_live_shape_top_" ++ mode_suffix;
+
+test "a plan that drops two related tables, a checked column and retypes a column two views read runs on Postgres" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Parent = struct {
+        pub const nilo_table = .{ .name = shape_parent, .key = .id };
+        id: i64,
+    };
+    const Child = struct {
+        pub const nilo_table = .{ .name = shape_child, .key = .id, .references = .{ .parent_id = .{ Parent, .id } } };
+        id: i64,
+        parent_id: i64,
+    };
+    const Before = struct {
+        pub const nilo_table = .{
+            .name = shape_counter,
+            .key = .id,
+            .check = .{ .nilo_live_shape_note_said = "note <> ''" },
+        };
+        id: i64,
+        count: i32,
+        note: ?[]const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{ .name = shape_counter, .key = .id };
+        id: i64,
+        count: i64,
+    };
+    // The one that reads the other listed first.
+    const views = [_]migrate.Schema.Text{
+        .{ .name = shape_top, .body = "SELECT * FROM " ++ shape_list ++ " WHERE count > 1" },
+        .{ .name = shape_list, .body = "SELECT id, count FROM " ++ shape_counter },
+    };
+    const before_schema: migrate.Schema = .{ .tables = &.{ Child, Parent, Before }, .views = &views };
+    const after_schema: migrate.Schema = .{ .tables = &.{After}, .views = &views };
+
+    const drops = "DROP VIEW IF EXISTS \"" ++ shape_top ++ "\"; DROP VIEW IF EXISTS \"" ++ shape_list ++
+        "\"; DROP TABLE IF EXISTS \"" ++ shape_child ++ "\", \"" ++ shape_parent ++ "\", \"" ++ shape_counter ++ "\"";
+    _ = try db.exec(&run, drops, .{});
+    defer _ = db.exec(&run, drops, .{}) catch {};
+    try migrate.createMissing(&db, &run, before_schema);
+    _ = try db.insert(Parent, &run, .{ .id = 1 });
+    _ = try db.insert(Child, &run, .{ .id = 1, .parent_id = 1 });
+    _ = try db.insert(Before, &run, .{ .id = 1, .count = 7, .note = @as(?[]const u8, "kept") });
+
+    const a = run.arena();
+    const before = try migrate.snapshotOf(a, dialect.Postgres, 1, comptime migrate.desiredOf(dialect.Postgres, before_schema));
+    const change = try migrate.plan(a, dialect.Postgres, comptime migrate.desiredOf(dialect.Postgres, after_schema), before);
+    try testing.expectEqual(@as(usize, 0), change.problems.len);
+
+    // Each of these failed the version on Postgres's own error: the parent
+    // dropped before its child, the check's `DROP CONSTRAINT` after the
+    // column had taken it, and the `ALTER … TYPE` under two views.
+    var tx = try db.begin(&run, .{});
+    defer tx.deinit();
+    for (change.steps) |step| _ = try tx.exec(&run, step.sql, .{});
+    try tx.commit();
+
+    const Top = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        count: i64,
+    };
+    const top = try db.raw(Top, &run, "SELECT id, count FROM \"" ++ shape_top ++ "\"", .{});
+    try testing.expectEqual(@as(usize, 1), top.len);
+    try testing.expectEqual(@as(i64, 7), top[0].count);
+}
+
+const renamed_parent = "nilo_live_renamed_parent_" ++ mode_suffix;
+const renamed_posts = "nilo_live_renamed_posts_" ++ mode_suffix;
+
+test "a column `.was` renamed carries its index, its unique and its foreign key on Postgres" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Parent = struct {
+        pub const nilo_table = .{ .name = renamed_parent, .key = .id };
+        id: i64,
+    };
+    const Before = struct {
+        pub const nilo_table = .{
+            .name = renamed_posts,
+            .key = .id,
+            .references = .{ .author_id = .{ Parent, .id } },
+            .unique = .{.slug},
+            .index = .{.author_id},
+        };
+        id: i64,
+        author_id: i64,
+        slug: []const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{
+            .name = renamed_posts,
+            .key = .id,
+            .was = .{ .writer_id = "author_id", .handle = "slug" },
+            .references = .{ .writer_id = .{ Parent, .id } },
+            .unique = .{.handle},
+            .index = .{.writer_id},
+        };
+        id: i64,
+        writer_id: i64,
+        handle: []const u8,
+    };
+
+    const drops = "DROP TABLE IF EXISTS \"" ++ renamed_posts ++ "\", \"" ++ renamed_parent ++ "\"";
+    _ = try db.exec(&run, drops, .{});
+    defer _ = db.exec(&run, drops, .{}) catch {};
+    try migrate.createMissing(&db, &run, .{ .tables = &.{ Parent, Before } });
+    _ = try db.insert(Parent, &run, .{ .id = 1 });
+    _ = try db.insert(Before, &run, .{ .id = 1, .author_id = 1, .slug = "a" });
+
+    const a = run.arena();
+    const before = try migrate.snapshotOf(a, dialect.Postgres, 1, comptime migrate.desiredOf(dialect.Postgres, .{ .tables = &.{ Parent, Before } }));
+    const change = try migrate.plan(a, dialect.Postgres, comptime migrate.desiredOf(dialect.Postgres, .{ .tables = &.{ Parent, After } }), before);
+    try testing.expectEqual(@as(usize, 0), change.problems.len);
+    var tx = try db.begin(&run, .{});
+    defer tx.deinit();
+    for (change.steps) |step| _ = try tx.exec(&run, step.sql, .{});
+    try tx.commit();
+
+    // The names the next diff will drop by are the names the database has.
+    const Named = struct {
+        pub const nilo_table = .projection;
+        n: i64,
+    };
+    const found = try db.raw(Named, &run,
+        \\SELECT count(*) AS n FROM pg_class WHERE relname IN ('
+    ++ renamed_posts ++ "_handle_key', '" ++ renamed_posts ++ "_writer_id_idx')" ++
+        " UNION ALL SELECT count(*) FROM pg_constraint WHERE conname = '" ++ renamed_posts ++ "_writer_id_fkey'", .{});
+    try testing.expectEqual(@as(i64, 2), found[0].n);
+    try testing.expectEqual(@as(i64, 1), found[1].n);
+    try testing.expectError(error.AlreadyExists, db.insert(After, &run, .{ .id = 2, .writer_id = 1, .handle = "a" }));
+    try testing.expectError(error.ForeignKeyViolated, db.insert(After, &run, .{ .id = 3, .writer_id = 9, .handle = "b" }));
+}
+
 test "a Db told to keep no plans still answers, one Parse at a time" {
     const gpa = testing.allocator;
     var live = (try Live.open(gpa)) orelse return error.SkipZigTest;

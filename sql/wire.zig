@@ -341,7 +341,7 @@ pub const Begin = struct {
     /// nothing.
     ///
     /// **It is what rebuilding a table needs**, and `migrate.apply` asks for it
-    /// on every version. SQLite cannot change a column in place, so a changed
+    /// on a version that drops a table (`migrate.rebuilds`). SQLite cannot change a column in place, so a changed
     /// column is CREATE a new table, copy the rows, DROP the old one, RENAME.
     /// With foreign keys on, that DROP deletes every row of the old table
     /// first, and every `ON DELETE CASCADE` pointing at it fires: the child

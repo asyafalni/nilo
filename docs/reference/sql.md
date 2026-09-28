@@ -694,7 +694,7 @@ try tx.commit();
 | | |
 |---|---|
 | `db.begin(c, .{ .isolation = …, .read_only = … })` | both go on the `BEGIN` itself, so neither costs a round trip. `.isolation` is `.read_committed`, `.repeatable_read` or `.serializable`; if left out, it is whatever the server is set to |
-| `db.begin(c, .{ .rebuilding = true })` | SQLite only: foreign keys are off for the transaction and checked once before the COMMIT, which returns `error.ForeignKeyViolated` for a row pointing at nothing. This is what rebuilding a table needs, and what `migrate.apply` asks for. A compile error on Postgres |
+| `db.begin(c, .{ .rebuilding = true })` | SQLite only: foreign keys are off for the transaction and checked once before the COMMIT, which returns `error.ForeignKeyViolated` for a row pointing at nothing. This is what rebuilding a table needs, and what `migrate.apply` asks for on a version that drops a table. A compile error on Postgres |
 | `tx.deadline(ms)` | a time limit on every statement after it, for the life of this transaction. `error.TimedOut` past it. 0 is the shortest, 1 ms, and a number past `maxInt(i32)` is sent as that |
 | `tx.savepoint()` | `!Savepoint`: a mark that part of the transaction can be undone back to; see [Savepoints](#savepoints) |
 
@@ -1004,7 +1004,7 @@ pub const schema = sql.Schema{
 try sql.migrate.createMissing(&db, &run, schema);
 ```
 
-**`createMissing` runs one `CREATE TABLE IF NOT EXISTS` per Row plus its indexes, in one transaction.** Before them come the schema's extensions and functions, and after them its views, each in the form that is safe to run again (`CREATE OR REPLACE VIEW` on Postgres, which has no `IF NOT EXISTS` for a view, and `IF NOT EXISTS` on SQLite). **The order is worked out while compiling**, not taken from the list: foreign keys are written inline, which is the only form SQLite has, so `orgs` is created before `users` whichever order they are listed in. Two tables pointing at each other is a compile error naming both.
+**`createMissing` runs one `CREATE TABLE IF NOT EXISTS` per Row plus its indexes, in one transaction.** Before them come the schema's extensions and functions, and after them its views, each in the form that is safe to run again (`CREATE OR REPLACE VIEW` on Postgres, which has no `IF NOT EXISTS` for a view, and `IF NOT EXISTS` on SQLite). **The order is worked out while compiling**, not taken from the list: foreign keys are written inline, which is the only form SQLite has, so `orgs` is created before `users` whichever order they are listed in, and a view after any view its text names. Two tables pointing at each other is a compile error naming both, and so are two tables giving an index the same name. **An index over a column the table does not have yet is left to `addMissingColumns`**, which makes it with the column: `createMissing` reads the columns of each table that has an index before it begins, so the two calls in that order stay the boot order when a new field has a unique.
 
 It is for a test, a fixture or a single-file SQLite application. It is not a migration: it creates what is missing and never alters what is there.
 
@@ -1066,7 +1066,7 @@ The hash is **chained**: each one covers the version before it, so editing versi
 
 `apply` is one transaction: take the advisory lock, check whether this version is already there, run every step, insert the row, commit. It returns `false` when the version had already been applied, which is what nine of ten replicas booting together get.
 
-`migrate.applyPending(&db, &run, chain)` applies the whole list, in order, one transaction each, and returns how many ran. That is the in-process runner a single-file SQLite application calls from `app.before`, inside `listen()`. It creates the ledger if it is missing and reads it once: a version recorded under a different hash stops it before anything runs (`error.SchemaDrift`), and a version already recorded is skipped without a transaction. On SQLite each version begins with `.rebuilding`, so a table rebuild's `DROP` does not cascade into the rows pointing at it. `migrate.ensureLedger` is the first half on its own, under the same lock.
+`migrate.applyPending(&db, &run, chain)` applies the whole list, in order, one transaction each, and returns how many ran. That is the in-process runner a single-file SQLite application calls from `app.before`, inside `listen()`. It creates the ledger if it is missing and reads it once: a version recorded under a different hash stops it before anything runs (`error.SchemaDrift`), and a version already recorded is skipped without a transaction. On SQLite a version that drops a table begins with `.rebuilding`, so a table rebuild's `DROP` does not cascade into the rows pointing at it; any other version keeps foreign keys on, so a `DELETE` of a parent cascades. `migrate.ensureLedger` is the first half on its own, under the same lock.
 
 `migrate.drift(&db, &run, chain)` returns which applied versions have been edited since they ran: a `Drift` per version with what the ledger recorded and what the steps hash to now.
 

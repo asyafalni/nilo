@@ -157,7 +157,7 @@ pub const Column = struct {
             self.key == other.key and
             self.generated == other.generated and
             sameOptionalText(self.default, other.default) and
-            sameColumns(self.values, other.values) and
+            sameWords(self.values, other.values) and
             std.mem.eql(u8, self.check, other.check);
     }
 
@@ -189,6 +189,22 @@ pub fn sameColumns(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
         if (!std.mem.eql(u8, x, y)) return false;
+    }
+    return true;
+}
+
+/// Two sets of words an enum column may hold, in any order.
+///
+/// **Order is not part of it**, where it is for columns: the check is `IN
+/// (…)`, and reordering an enum's tags in Zig moved nothing in the database
+/// but planned a drop and an add of the check, a scan of the table under
+/// ACCESS EXCLUSIVE on Postgres and a rebuild Problem on SQLite.
+pub fn sameWords(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a) |x| {
+        for (b) |y| {
+            if (std.mem.eql(u8, x, y)) break;
+        } else return false;
     }
     return true;
 }

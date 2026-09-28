@@ -103,30 +103,6 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 **Needs:** a CancelRequest past some bound, or a named portal read in batches, which is the decision.
 
-**Two tables dropped in one change are dropped parent first.** The drop loop in `migrate.zig` walks the snapshot's order and uses no `CASCADE`, so dropping `orgs` and `users` together fails on Postgres with `cannot drop table orgs because other objects depend on it`.
-
-**Needs:** drops in the reverse of the order creates use.
-
-**What depends on a column is dropped after the column.** `diffTable` drops a column before it diffs checks and triggers (`migrate.zig:906-927`), so a named check over it names nothing by the time its `DROP CONSTRAINT` runs, and a trigger `BEFORE UPDATE OF` it blocks the drop. A view over a column that changes type or is dropped is not dropped and recreated around the change, because only a view whose own text changed is (`migrate.zig:583`), and views are created in list order although the Schema says order inside a list does not matter. Each fails with Postgres's own error.
-
-**Needs:** checks and triggers dropped before the column, every view dropped before a type change, drop or rename and recreated after, and views sorted by what they read.
-
-**The documented boot order breaks when a new field has a unique or an index.** `createMissing` sends every `CREATE INDEX IF NOT EXISTS` against a table that exists (`migrate.zig:1592-1603`) before `addMissingColumns` has made the column: Postgres refuses it, and SQLite, with double-quoted strings on, indexes the constant `"code"` and fails at the second row.
-
-**Needs:** an index over a column the table lacks left to `addMissingColumns`.
-
-**A `.default = .now` on a SQLite table with rows fails, and the plan calls it safe.** SQLite refuses a default that is not a constant in `ADD COLUMN` once the table has rows, and `needs_backfill` is false for it (`migrate.zig:772`). Every SQLite `ADD COLUMN` test runs on an empty table.
-
-**Needs:** a constant default followed by an `UPDATE`, or a Problem, and the tests run on tables with rows.
-
-**A SQLite version that deletes a parent does not cascade.** Every SQLite version runs with foreign keys off (`.rebuilding = !D.can_alter_column`, `migrate.zig:1824`) whether it rebuilds anything or not, so an `ON DELETE CASCADE` does not fire and the closing `foreign_key_check` rolls the version back. The same check reads every foreign key in the database at the end of every version.
-
-**Needs:** `.rebuilding` only on a version that rebuilds, and the check limited to the tables it rebuilt.
-
-**The rest of the migration diff's reproduced faults, each small.** A renamed foreign-key column with `.was` is refused as a new key (`migrate.zig:1315`), and a renamed indexed column rebuilds its index, where `RENAME COLUMN` carries both. Two tables naming an index alike pass planning and fail at apply. An enum's tags reordered are a change: a full scan under ACCESS EXCLUSIVE on Postgres and a rebuild Problem on SQLite (`migrate.zig:1041`). A tag containing `'` writes invalid `CREATE TABLE` (`ddl.zig:348`). A text column becoming an enum is not marked `needs_backfill` (`migrate.zig:1076`). An unquoted mixed-case function head is dropped under its quoted name, which skips without a word. The rebuild recipe in the SQLite Problem leaves out triggers and views. A `generate` that dies between the version file and the snapshot writes the version a second time (`migrations.zig:352-393`), and version 10000 cannot be read back (`migrations.zig:226`).
-
-**Needs:** each fixed with its probe kept as the test, and a comptime check that index names are unique across a schema.
-
 **The live half of the suite skips without a word when `DATABASE_URL` is missing.** 122 tests in `live.zig` and 2 in `severed.zig` return `SkipZigTest` without it; CI sets it, and nothing asserts that the skips are zero, so losing the variable turns every decode test green. A transaction that is never rolled back hangs the suite at no CPU rather than failing it.
 
 **Needs:** CI's `test-sql` failing on a skip, and a bound on the wait a leaked connection causes.
@@ -265,11 +241,11 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 **Needs:** which module it belongs in, since the 400 is `nilo_http`'s and the statement is this one's.
 
-**A table cannot be renamed, a rename does not carry its names, and a foreign key has no `ON UPDATE`.** A renamed table is a drop and a create, which loses its rows; `.was` on `nilo_table` is the word columns already have. A column renamed keeps its old index and constraint names, where `ALTER INDEX … RENAME` and `RENAME CONSTRAINT` would follow it. Only `ON DELETE` is expressible.
+**A table cannot be renamed, and a foreign key has no `ON UPDATE`.** A renamed table is a drop and a create, which loses its rows; `.was` on `nilo_table` is the word columns already have. Only `ON DELETE` is expressible.
 
 **Needs:** a caller for each, the table rename first because its failure is data.
 
-**The SQLite rebuild is a recipe in a Problem rather than a step.** A column type or a key SQLite cannot `ALTER` is answered with four statements to run by hand, which leave out the triggers and views. The diff knows everything the rebuild needs: create, copy, drop, rename, then indexes, triggers and views.
+**The SQLite rebuild is a recipe in a Problem rather than a step.** A column type or a key SQLite cannot `ALTER` is answered with four statements to run by hand, and a list of what to make again after them. The diff knows everything the rebuild needs: create, copy, drop, rename, then indexes, triggers and views.
 
 **Needs:** how a generated rebuild is shown in the plan, since it is the one step that copies every row.
 
