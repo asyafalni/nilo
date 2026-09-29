@@ -164,6 +164,7 @@ Through v1 the model was **GoFiber**: the feel of Express on a fast engine, for 
 | no process, no `Build Summary`, no log | the machine was taken (macOS): read `vm.swapusage` and physical footprint, not `ps` RSS |
 | an empty output file | `2>&1 \| tail` holding the log until the pipe closes |
 | green | possibly about a tree edited since the step read it: stop editing, then run, then commit |
+| eighty live tests failing at once | one cause, most often the machine (a full disk failed every fixture): read the first failure's message before the count |
 
 **A wait needs a bound, and the giving-up path has to set something.** `fetch/deadline.zig` gave up a port scan by returning without setting the flag the test waited on, and its third deadlock was an `accept` six lines below the second, unbounded by `done`. A suite that never finishes reports nothing, which is strictly worse than the failure that caused it, and **work that lands behind a hang is unreviewed**: three broken tests shipped behind one.
 

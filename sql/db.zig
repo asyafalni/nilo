@@ -7077,6 +7077,14 @@ test "a raw SELECT list shorter than the Row is refused, not read past the end" 
         "SELECT * FROM people",
         .{},
     ));
+
+    // The edge itself: one column short is refused, and exactly the Row's
+    // width is read. A guard written `<=` or off by one passed the case two
+    // short and the case far over.
+    db.wire = .{ .answers = 1, .columns_back = 3 };
+    try testing.expectError(error.QueryFailed, db.raw(Person, &run, "SELECT * FROM people", .{}));
+    db.wire = .{ .answers = 1, .columns_back = 4 };
+    try testing.expectEqual(@as(usize, 1), (try db.raw(Person, &run, "SELECT * FROM people", .{})).len);
 }
 
 test "a raw SELECT list wider than the Row is read, because the extra columns are nobody's" {
@@ -8582,6 +8590,40 @@ test "a call refused before it is sent leaves no earlier statement's problem beh
     try testing.expectEqual(@as(?wire_mod.Problem, null), lastProblem(&run));
 }
 
+test "every write through a Db or a Tx whose condition narrows nothing is refused before it is sent" {
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{ .unchecked = true });
+    defer db.deinit();
+    db.wire = .{ .answers = 1 };
+
+    var run = nilo.Run.init(testing.allocator);
+    defer run.deinit();
+
+    // A list the request emptied: every row, had it been sent.
+    const none: []const i64 = &.{};
+    const everyone = .{ .id = .{ .not_in = none } };
+    const set = .{ .age = @as(i32, 1) };
+
+    try testing.expectError(error.QueryFailed, db.update(Person, &run, .{ .set = set, .where = everyone }));
+    try testing.expectError(error.QueryFailed, db.updateReturning(Person, &run, .{ .set = set, .where = everyone }));
+    try testing.expectError(error.QueryFailed, db.delete(Person, &run, .{ .where = everyone }));
+    try testing.expectError(error.QueryFailed, db.deleteReturning(Person, &run, .{ .where = everyone }));
+
+    var tx = try db.begin(&run, .{});
+    defer tx.deinit();
+    try testing.expectError(error.QueryFailed, tx.update(Person, &run, .{ .set = set, .where = everyone }));
+    try testing.expectError(error.QueryFailed, tx.updateReturning(Person, &run, .{ .set = set, .where = everyone }));
+    try testing.expectError(error.QueryFailed, tx.delete(Person, &run, .{ .where = everyone }));
+    try testing.expectError(error.QueryFailed, tx.deleteReturning(Person, &run, .{ .where = everyone }));
+
+    // Not one of the eight reached the Wire. The `…One` calls need the key
+    // in their condition, which no emptied list can stand in for.
+    try testing.expectEqualStrings("", db.wire.?.last_sql);
+
+    // And the same list with something in it narrows, and is sent.
+    _ = try tx.delete(Person, &run, .{ .where = .{ .id = .{ .not_in = &[_]i64{7} } } });
+    try testing.expect(db.wire.?.last_sql.len > 0);
+}
+
 test "a problem left by somebody else's request is not this one's to read" {
     // Two Scopes are two arenas, which is what makes a fiber that moved
     // between the failure and the `catch` answer null rather than a plausible
@@ -9457,6 +9499,77 @@ test "a Row grouped by nothing is exactly one row, with a null sum over no rows"
     try tx.commit();
 }
 
+const VisitRegion = struct {
+    pub const nilo_table = .{ .name = "visit_regions" };
+    id: i64,
+    name: []const u8,
+};
+
+const VisitClient = struct {
+    pub const nilo_table = .{ .name = "visit_clients", .references = .{ .region_id = .{ VisitRegion, .id } } };
+    id: i64,
+    region_id: i64,
+    name: []const u8,
+};
+
+const Visit = struct {
+    pub const nilo_table = .{ .name = "visits", .references = .{ .client_id = .{ VisitClient, .id } } };
+    id: i64,
+    client_id: ?i64,
+};
+
+const VisitRegionName = struct {
+    pub const nilo_table = VisitRegion;
+    name: []const u8,
+};
+
+const VisitClientCard = struct {
+    pub const nilo_table = VisitClient;
+    name: []const u8,
+    region: VisitRegionName,
+};
+
+/// A parent that may be missing, over a grandparent every client has.
+const VisitCard = struct {
+    pub const nilo_table = Visit;
+    id: i64,
+    client: ?VisitClientCard,
+};
+
+test "a required grandparent under a missing parent leaves the row in, and reads as the parent's null" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var db: SqliteDb = .init(testing.allocator, "file:visit-grandparent?mode=memory&cache=shared", .{ .size = 2, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+    for ([_][]const u8{
+        "CREATE TABLE visit_regions (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        "CREATE TABLE visit_clients (id INTEGER PRIMARY KEY, region_id INTEGER NOT NULL, name TEXT NOT NULL)",
+        "CREATE TABLE visits (id INTEGER PRIMARY KEY, client_id INTEGER)",
+        "INSERT INTO visit_regions VALUES (1, 'west')",
+        "INSERT INTO visit_clients VALUES (1, 1, 'Acme')",
+        "INSERT INTO visits VALUES (1, 1), (2, NULL)",
+    }) |text| _ = try db.exec(&run, text, .{});
+
+    // The region is required of a client and joined from the client, which
+    // may be missing. Joined inner, it would take the visit with no client
+    // out of the list with it.
+    const cards = try db.select(VisitCard, &run, .{ .order = .{ .id = .asc } });
+    try testing.expectEqual(@as(usize, 2), cards.len);
+    try testing.expectEqualStrings("Acme", cards[0].client.?.name);
+    try testing.expectEqualStrings("west", cards[0].client.?.region.name);
+    try testing.expect(cards[1].client == null);
+    try testing.expectEqual(@as(usize, 2), try db.count(VisitCard, &run, .{}));
+
+    var rows = try db.stream(VisitCard, &run, .{ .order = .{ .id = .asc } });
+    defer rows.close();
+    try testing.expectEqualStrings("west", (try rows.next()).?.client.?.region.name);
+    try testing.expect((try rows.next()).?.client == null);
+    try testing.expect((try rows.next()) == null);
+}
+
 test "a streamed Row with a parent borrows the parent's columns too" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -9492,6 +9605,37 @@ fn abortedDb(threaded: *std.Io.Threaded, comptime name: []const u8, run: *nilo.R
     _ = try db.exec(run, accounts_ddl, .{});
     _ = try db.insert(SqliteAccount, run, .{ .id = @as(i64, 1), .public = types.Uuid.nil, .email = "one@example.dev" });
     return db;
+}
+
+test "a read inside a transaction that has written sees the write, because it goes down the same connection" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    // A file in WAL, as a program runs one, rather than a shared in-memory
+    // database: there a read sent down the pool by mistake waits on the
+    // writer's table lock with nothing to bound it, and the test would hang
+    // where it should fail. Here it reads its own snapshot and counts one.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [96]u8 = undefined;
+    const url = try std.fmt.bufPrintZ(&path, ".zig-cache/tmp/{s}/tx-reads.db", .{tmp.sub_path});
+    var db: SqliteDb = .init(testing.allocator, url, .{ .size = 2, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+    _ = try db.exec(&run, accounts_ddl, .{});
+    _ = try db.insert(SqliteAccount, &run, .{ .id = @as(i64, 1), .public = types.Uuid.nil, .email = "one@example.dev" });
+
+    var tx = try db.begin(&run, .{});
+    defer tx.deinit();
+    _ = try tx.insert(SqliteAccount, &run, .{ .id = @as(i64, 2), .public = types.Uuid.nil, .email = "two@example.dev" });
+    // Sent down the pool rather than the transaction, each of these would
+    // count one row, or meet the writer's lock, rather than two.
+    try testing.expectEqual(@as(usize, 2), try tx.count(SqliteAccount, &run, .{}));
+    try testing.expect(try tx.exists(SqliteAccount, &run, .{ .where = .{ .id = @as(i64, 2) } }));
+    try testing.expect((try tx.find(SqliteAccount, &run, @as(i64, 2))) != null);
+    try tx.commit();
+    try testing.expectEqual(@as(usize, 2), try db.count(SqliteAccount, &run, .{}));
 }
 
 test "on SQLite, a commit after a failed statement nobody undid rolls back, as it does on Postgres" {

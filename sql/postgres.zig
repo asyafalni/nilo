@@ -680,7 +680,9 @@ pub const Wire = struct {
                 // pool, and how Neon is told which endpoint is meant.
                 const params = try startupParams(arena, &out);
                 if (params.get(key)) |was| {
-                    if (!eql(was, value)) return twice(key);
+                    if (!eql(was, value)) return refuse(key, value, "is the second `options` " ++
+                        "in the URL, and the two disagree. Put every setting in one, " ++
+                        "`-c a=1 -c b=2`", error.ConflictingConnectionParam);
                 }
                 try params.put(key, value);
             } else if (eql(key, "client_encoding")) {

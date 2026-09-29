@@ -93,13 +93,11 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 Every entry here was reproduced by a probe test that fails at `462d84d`, in Debug and ReleaseSafe, against Postgres 18 where Postgres is named. A fix lands with its probe as the test that would have caught it.
 
-#### P1: wrong and loud, a migration that fails, a measured multiple, or a gap in the gate
-
-**A mutation run left fourteen of forty-four changes alive, and seven more aimed at suspected gaps all survived.** No test parses 29 February in 1900 or 2000, or refuses a second of 60 or the 31st of April; the width guard of [ADR 106](./adr/106-a-select-list-shorter-than-the-row-is-refused.md) is never tried one column short; Postgres's foreign-key and deadlock codes and SQLite's busy, locked and interrupt are never produced; an optional parent over a required grandparent is never read; and `SchemaBehind`, the advisory locks around `apply`, `generate`'s write order, the `narrowing` guard on `tx.update` and its kin, a count inside a transaction that has written, and the length guard on a Postgres `Date` could each be removed without a test failing. The other thirty were killed, many by the live tests, so the suite is not written to pass: its holes are boundaries, hard-to-produce errors and the paths the Fake cannot reach.
-
-**Needs:** a test for each survivor.
-
 #### P2: statements that work refused, and the ends of the types
+
+**A `Date` read through `db.raw` or a composed statement checks only that the value is four bytes wide.** A typed read knows its column is a `date` from the schema, but `tx.raw(Row, "SELECT n FROM t")` with `n int4` into a `Date` field reads the integer as a count of days since 2000, and says nothing. Checking the column's type OID (1082) would refuse it, and would also refuse a domain over `date`, which reaches the client under its own OID.
+
+**Needs:** the OID checked with domains resolved to their base type, or the gap written into `db.raw`'s reference as the caller's to hold.
 
 **`db.raw`'s reader refuses statements Postgres runs.** `rawcheck.zig` tracks brackets, quotes and comments and nothing else: a trailing `-- comment` or `;` becomes part of the alias (`nameOf`, `rawcheck.zig:808`), `IS DISTINCT FROM` ends the list, `*` as multiplication reads as a star and skips the count, `ID` does not match `id`, `$$…$$` and `E'\''` are not skipped (and a `$5` inside one raises the parameter count), and nested block comments, `EXCEPT` and `INTERSECT`, `p.offset` and SQLite's backticks all miscount. The file calls a false Refusal the one outcome it cannot afford.
 

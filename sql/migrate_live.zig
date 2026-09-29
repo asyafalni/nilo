@@ -804,9 +804,8 @@ test "a Db told what to expect asks the ledger at boot, on the pool it just open
     // sequence — from `nilo_check`, after the boot work, which is where the
     // guard sees the ledger a migration in `before` just wrote (ADR 180).
     // What is pinned here is that boot *reaches* the ledger — a fresh file
-    // has none, and after this boot it has one — and that level and ahead go
-    // through. Behind is `migrate.expect`'s own refusal, pinned above
-    // through `standing` for the reason given there.
+    // has none, and after this boot it has one — that level and ahead go
+    // through, and that behind stops the boot.
     const gpa = testing.allocator;
     var fx = try Fixture.initWith(gpa, "expect_at_boot", .{ .size = 2, .unchecked = true }, 0);
     defer fx.deinit(gpa);
@@ -834,6 +833,15 @@ test "a Db told what to expect asks the ledger at boot, on the pool it just open
     ahead.expecting(2);
     try ahead.nilo_start(fx.threaded.io(), .off);
     try ahead.nilo_check(fx.threaded.io());
+
+    // And one built for a version the database has not reached: the boot
+    // stops. Every other failure to read the ledger is a warning there, so
+    // this is the one error the guard must not swallow with them.
+    var behind = Db.init(gpa, fx.path, .{ .size = 1, .unchecked = true });
+    defer behind.deinit();
+    behind.expecting(4);
+    try behind.nilo_start(fx.threaded.io(), .off);
+    try testing.expectError(error.SchemaBehind, behind.nilo_check(fx.threaded.io()));
 }
 
 test "the plan a diff produces is the plan that runs, end to end" {

@@ -2107,6 +2107,63 @@ test "a reader refuses a write, which is what makes routing safe to get wrong" {
     }.run);
 }
 
+test "a write that waits past busy_timeout on a lock another program holds answers Locked" {
+    // With one writer in the pool, a lock held elsewhere is another program
+    // on the same file, and only a file can have one: `busy_timeout` counts
+    // down and the write answers `Locked`, the word Postgres's `55P03` gets.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    tmp_sub_path = tmp.sub_path;
+
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var path: [96]u8 = undefined;
+            const url = try std.fmt.bufPrintZ(&path, ".zig-cache/tmp/{s}/busy.db", .{tmp_sub_path});
+            const Quick = Wire(.{ .threading = .in_fiber, .busy_timeout_ms = 50 });
+            var w = try Quick.open(io, testing.allocator, url, .{ .size = 2 });
+            defer w.close();
+            const gpa = testing.allocator;
+            _ = try w.exec(gpa, "CREATE TABLE t(id INTEGER PRIMARY KEY)", .{}, null, null);
+
+            const other = try zqlite.open(url, zqlite.OpenFlags.ReadWrite | zqlite.OpenFlags.EXResCode);
+            defer other.close();
+            try other.execNoArgs("BEGIN IMMEDIATE");
+            try testing.expectError(error.Locked, w.exec(gpa, "INSERT INTO t(id) VALUES (1)", .{}, null, null));
+
+            // Let go of, the same write goes through on the same pool.
+            try other.execNoArgs("ROLLBACK");
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t(id) VALUES (1)", .{}, null, null));
+        }
+    }.run);
+}
+
+test "each SQLite failure a caller branches on has the name the Postgres one has" {
+    // The table, one row a case. Most of these cannot be produced on demand
+    // (an interrupt nothing here calls, a snapshot that went stale, a disk
+    // that went away), so the mapping is held here rather than by accident.
+    const conn = try zqlite.open(":memory:", zqlite.OpenFlags.ReadWrite | zqlite.OpenFlags.Create);
+    defer conn.close();
+    const cases = [_]struct { anyerror, wire.Error }{
+        .{ error.ConstraintUnique, error.AlreadyExists },
+        .{ error.ConstraintPrimaryKey, error.AlreadyExists },
+        .{ error.ConstraintForeignKey, error.ForeignKeyViolated },
+        .{ error.ConstraintNotNull, error.NotNullViolated },
+        .{ error.ConstraintCheck, error.CheckViolated },
+        .{ error.Constraint, error.ConstraintViolated },
+        .{ error.ConstraintTrigger, error.ConstraintViolated },
+        .{ error.Busy, error.Locked },
+        .{ error.BusyTimeout, error.Locked },
+        .{ error.BusySnapshot, error.Locked },
+        .{ error.Locked, error.Locked },
+        .{ error.LockedSharedCache, error.Locked },
+        .{ error.Interrupt, error.TimedOut },
+        .{ error.CantOpen, error.Disconnected },
+        .{ error.IoErr, error.Disconnected },
+        .{ error.Corrupt, error.Disconnected },
+    };
+    for (cases) |case| try testing.expectEqual(case[1], translate(conn, case[0]));
+}
+
 /// Where `std.testing.tmpDir` put the directory the test above uses. A file
 /// rather than a shared in-memory database, and the path has to reach a
 /// closure `withIo` calls as a plain function.

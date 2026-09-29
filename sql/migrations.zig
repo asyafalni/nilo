@@ -1091,6 +1091,32 @@ test "a generate that stopped before the snapshot is refused, not written a seco
     try testing.expect(std.meta.isError(box.slurp("0003_users.zig")));
 }
 
+test "a generate that fails halfway leaves the version file and the snapshot where it was" {
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    _ = try generate(box.a(), box.io(), box.dir(), Pg, comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} }), .{ .name = "initial" });
+    const snap = try box.slurp(snapshot_file);
+
+    // The manifest cannot be written: a directory stands where it goes.
+    try box.dir().deleteFile(box.io(), manifest_file);
+    try box.dir().createDir(box.io(), manifest_file, .default_dir);
+    const grown = comptime migrate.desiredOf(Pg, .{ .tables = &.{ User, Org } });
+    try testing.expect(std.meta.isError(generate(box.a(), box.io(), box.dir(), Pg, grown, .{ .name = "users" })));
+
+    // The order the doc comment promises, seen from what is left: the
+    // version file went first and is there, and the snapshot, last, did not
+    // move. A snapshot written ahead of the manifest would claim a version
+    // the manifest never named.
+    _ = try box.slurp("0002_users.zig");
+    try testing.expectEqualStrings(snap, try box.slurp(snapshot_file));
+
+    // Which is the state the next run refuses rather than plans again.
+    try box.dir().deleteDir(box.io(), manifest_file);
+    try testing.expectError(Error.SnapshotBehind, generate(box.a(), box.io(), box.dir(), Pg, grown, .{ .name = "users" }));
+}
+
 test "generating twice against the same types writes nothing the second time" {
     const gpa = testing.allocator;
     var box = try Sandbox.init(gpa);

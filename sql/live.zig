@@ -1606,6 +1606,29 @@ test "an infinite date or timestamp another client wrote is refused by name, not
     try testing.expectEqual(@as(?types.Timestamp, null), nothing[0].at);
 }
 
+const Dated = struct {
+    pub const nilo_table = .projection;
+
+    day: types.Date,
+};
+
+test "a column that is not four bytes wide, read into a Date nothing checked first, is refused rather than cut to four" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // `tx.raw` is not held against its Row on its first run (ADR 233), so
+    // the width is what stands between a timestamp's eight bytes and a day
+    // made of the first four of them.
+    var tx = try stack.db.begin(&run, .{});
+    defer tx.deinit();
+    try testing.expectError(error.QueryFailed, tx.raw(Dated, &run, "SELECT now() AS day", .{}));
+    try testing.expectError(error.QueryFailed, tx.raw(Dated, &run, "SELECT 1::int8 AS day", .{}));
+}
+
 test "a date goes out as ten characters and comes back as the same day" {
     const gpa = testing.allocator;
     var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
@@ -2709,6 +2732,122 @@ test "a serialization failure answers RolledBack, and the transaction run again 
     // 30, one from the other writer, ten from the retry that read it.
     const now = (try stack.db.one(Person, &run, .{ .where = .{ .id = id } })).?;
     try testing.expectEqual(@as(i32, 41), now.age);
+}
+
+/// What the second half of a deadlock found: its transaction rolled back
+/// for the other's sake, or went through once the other one was.
+const Deadlocked = enum { rolled_back, went_through, failed };
+
+/// Hold `first`, say so, then reach for `second`, which the test's own
+/// transaction holds. One of the two transactions is the one Postgres
+/// breaks the cycle with.
+fn holdThenReach(db: *db_mod.Db, gpa: std.mem.Allocator, holding: *std.atomic.Value(bool), first: i64, second: i64) Deadlocked {
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    var tx = db.begin(&run, .{}) catch return .failed;
+    defer tx.deinit();
+    _ = tx.update(Person, &run, .{ .set = .{ .age = @as(i32, 1) }, .where = .{ .id = first } }) catch return .failed;
+    holding.store(true, .release);
+    _ = tx.update(Person, &run, .{ .set = .{ .age = @as(i32, 2) }, .where = .{ .id = second } }) catch |err|
+        return if (err == error.RolledBack) .rolled_back else .failed;
+    tx.commit() catch return .failed;
+    return .went_through;
+}
+
+test "a deadlock answers RolledBack to the transaction Postgres broke it with, and the other goes through" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const a = scratch_id + 30;
+    const b = scratch_id + 31;
+    _ = try stack.db.insert(Person, &run, .{ .id = a, .email = "deadlock-a@example.dev", .age = @as(i32, 30) });
+    _ = try stack.db.insert(Person, &run, .{ .id = b, .email = "deadlock-b@example.dev", .age = @as(i32, 30) });
+    defer _ = stack.db.delete(Person, &run, .{ .where = .{ .id = .{ .in = &[_]i64{ a, b } } } }) catch {};
+
+    const io = stack.live.threaded.io();
+    var tx = try stack.db.begin(&run, .{});
+    defer tx.deinit();
+    _ = try tx.update(Person, &run, .{ .set = .{ .age = @as(i32, 3) }, .where = .{ .id = a } });
+
+    // The other transaction takes `b`, and then waits on `a`.
+    var holding: std.atomic.Value(bool) = .init(false);
+    var other = io.concurrent(holdThenReach, .{ &stack.db, gpa, &holding, b, a }) catch return error.SkipZigTest;
+    var waited: usize = 0;
+    while (!holding.load(.acquire)) : (waited += 1) {
+        if (waited == 500) {
+            _ = other.cancel(io);
+            return error.TestUnexpectedResult;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+
+    // This one reaches for `b`: a cycle, which Postgres finds after its
+    // `deadlock_timeout` and breaks by rolling one side back with `40P01`.
+    const mine: Deadlocked = if (tx.update(Person, &run, .{ .set = .{ .age = @as(i32, 4) }, .where = .{ .id = b } })) |_| blk: {
+        try tx.commit();
+        break :blk .went_through;
+    } else |err| if (err == error.RolledBack) .rolled_back else return err;
+    const theirs = other.await(io);
+
+    try testing.expect((mine == .rolled_back and theirs == .went_through) or
+        (mine == .went_through and theirs == .rolled_back));
+    // The code is kept for the call that met it, on its own thread.
+    if (mine == .rolled_back) try testing.expectEqualStrings("40P01", db_mod.lastProblem(&run).?.code);
+}
+
+/// `migrate.apply` on a task of its own, saying when it came back.
+fn applyAndSay(db: *db_mod.Db, gpa: std.mem.Allocator, v: migrate.Version, hash: []const u8, done: *std.atomic.Value(bool)) bool {
+    defer done.store(true, .release);
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    return migrate.apply(db, &run, v, hash) catch false;
+}
+
+test "a version waits for the advisory lock another process holds, so two replicas never run it twice" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    try migrate.ensureLedger(&stack.db, &run);
+
+    // A version number of this build's own: both optimize modes run this
+    // file against one database at once, and share its ledger.
+    const number: i64 = if (builtin.mode == .Debug) 990_001 else 990_002;
+    const made = "nilo_live_locked_" ++ mode_suffix;
+    const forget = "DELETE FROM \"nilo_migrations\" WHERE \"version\" = " ++
+        (if (builtin.mode == .Debug) "990001" else "990002");
+    _ = try stack.db.exec(&run, forget, .{});
+    _ = try stack.db.exec(&run, "DROP TABLE IF EXISTS \"" ++ made ++ "\"", .{});
+    defer _ = stack.db.exec(&run, forget, .{}) catch {};
+    defer _ = stack.db.exec(&run, "DROP TABLE IF EXISTS \"" ++ made ++ "\"", .{}) catch {};
+
+    const steps = [_]migrate.Step{.{ .kind = .create_table, .sql = "CREATE TABLE \"" ++ made ++ "\" (\"id\" int)", .why = "" }};
+    const v: migrate.Version = .{ .number = number, .name = "locked", .steps = &steps };
+    var digest: [64]u8 = undefined;
+    const hash = migrate.hashOf("", v.steps, &digest);
+
+    // Another replica, part way through its own migration, holding the lock.
+    var holder = try stack.db.begin(&run, .{});
+    defer holder.deinit();
+    _ = try holder.exec(&run, comptime dialect.Postgres.advisoryLock(migrate.lock_key).?, .{});
+
+    const io = stack.live.threaded.io();
+    var done: std.atomic.Value(bool) = .init(false);
+    var task = io.concurrent(applyAndSay, .{ &stack.db, gpa, v, hash, &done }) catch return error.SkipZigTest;
+    try std.Io.sleep(io, .fromMilliseconds(300), .awake);
+    // Still waiting: without the lock it would have run the version by now.
+    const waited = !done.load(.acquire);
+
+    try holder.commit();
+    const ran = task.await(io);
+    try testing.expect(waited);
+    try testing.expect(ran);
 }
 
 // -- the column type nothing checks at startup ----------------------------

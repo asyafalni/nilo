@@ -759,6 +759,36 @@ test "a leap day is a day, and the year after it is not" {
     );
 }
 
+test "a day is checked against its own month and its own century, and a second stops at 59" {
+    // The century rule both ways: 1900 is divisible by 100 and not by 400,
+    // so it has no 29 February; 2000 is divisible by 400, so it does.
+    try testing.expect(Timestamp.nilo_parse("1900-02-29T00:00:00Z") == null);
+    try testing.expect(Date.nilo_parse("1900-02-29") == null);
+    try testing.expectEqual(
+        @as(i64, 11_016 * std.time.s_per_day),
+        Timestamp.nilo_parse("2000-02-29T00:00:00Z").?.seconds(),
+    );
+    try testing.expectEqual(@as(i32, 11_016), Date.nilo_parse("2000-02-29").?.days);
+    try testing.expect(Date.nilo_parse("2023-02-29") == null);
+    try testing.expect(Date.nilo_parse("2024-02-29") != null);
+
+    // A thirty-day month has no 31st, and a thirty-one-day one has.
+    try testing.expect(Timestamp.nilo_parse("2026-04-31T00:00:00Z") == null);
+    try testing.expect(Date.nilo_parse("2026-04-31") == null);
+    try testing.expect(Date.nilo_parse("2026-04-30") != null);
+    try testing.expect(Date.nilo_parse("2026-12-31") != null);
+    for ([_][]const u8{ "2026-00-10", "2026-13-01", "2026-01-00", "2026-01-32" }) |text| {
+        try testing.expect(Date.nilo_parse(text) == null);
+    }
+
+    // A leap second, a sixtieth minute and a twenty-fourth hour are all
+    // refused: none of them has a microsecond to come back to.
+    try testing.expect(Timestamp.nilo_parse("2016-12-31T23:59:60Z") == null);
+    try testing.expect(Timestamp.nilo_parse("2026-06-30T23:60:00Z") == null);
+    try testing.expect(Timestamp.nilo_parse("2026-06-30T24:00:00Z") == null);
+    try testing.expect(Timestamp.nilo_parse("2026-06-30T23:59:59Z") != null);
+}
+
 test "the epoch itself is the first moment it can write" {
     var buf: [40]u8 = undefined;
     try testing.expectEqualStrings(
