@@ -45,6 +45,7 @@ A program that wants no ledger and no version files stays at the left edge of th
 13. **A run refuses edited history, and on SQLite a version that drops a table runs with foreign keys off.** `applyPending` reads the ledger once and stops at a version recorded under a different hash. A SQLite version whose steps drop a table starts with `.rebuilding`, so the `DROP` in a table rebuild cannot cascade, and the COMMIT checks every foreign key once; any other version keeps them on, so a `DELETE` of a parent cascades. [ADR 123](../adr/123-a-migration-is-a-diff-against-a-snapshot.md)
 14. **A column the table's Row does not read is declared with `.unread`, with its type.** It is in the table, the diff and the startup check, can be named in `.where`, `.order` and `.set`, and is in no `SELECT` list of that Row. [ADR 234](../adr/234-a-table-row-may-declare-a-column-it-does-not-read.md)
 15. **Each step goes where the database accepts it.** Views that read a table about to lose, rename or retype a column come down first and go back up last, in the order they read each other; a check or trigger over a column goes before the column; tables that are going go child first; what `RENAME COLUMN` carries (an index, a foreign key) is renamed with it on Postgres, not rebuilt. [ADR 123](../adr/123-a-migration-is-a-diff-against-a-snapshot.md)
+16. **A step waits five seconds for a table, and says when it holds one while reading every row.** `Version.lock_timeout_ms` (5,000; `0` waits for good) is set for the transaction after the advisory lock, and a step past it fails with `error.Locked` and nothing kept. The diff writes one-statement forms, because the two-statement ones only help across transactions and a version is one; the `why` names the whole-table read or rewrite instead. [ADR 240](../adr/240-a-migration-waits-five-seconds-for-a-table.md)
 
 ## Decisions
 
@@ -54,6 +55,7 @@ A program that wants no ledger and no version files stays at the left edge of th
 | [181](../adr/181-the-marker-has-two-kinds-of-word.md) | What the marker and the Schema may say, and how each word is checked |
 | [130](../adr/130-a-table-this-program-reads-and-does-not-build.md) | A Row for a table someone else creates |
 | [234](../adr/234-a-table-row-may-declare-a-column-it-does-not-read.md) | `.unread`: a column the table has and its Row (often the response) does not read |
+| [240](../adr/240-a-migration-waits-five-seconds-for-a-table.md) | How long a step waits for a table's lock, and what a step that holds one says |
 
 Related topics: where the startup phase runs is [ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md) (lifecycle); every statement is prepared, which is why a version is not a `.sql` file, [ADR 051](../adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md); why the code is in `sql/` and not in a module of its own is [ADR 038](../adr/038-a-module-sits-where-the-loop-puts-it.md).
 

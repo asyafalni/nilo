@@ -371,6 +371,19 @@ const ran = try sql.migrate.applyPending(&db, &run, chain);
 
 **`applyPending` runs each version that has not run yet, one transaction per version, under an advisory lock.** `nilo_migrations` is an ordinary Row, and `applyPending` creates it if it is not there. It reads this ledger once and skips any version already in it, so a start with nothing to do is one query. Each version that has not run is one transaction: take the advisory lock, check again whether the version is there, run every step, write the ledger row, commit. The second check is what matters when nine out of ten replicas start at the same time. **The lock is essential**, and it is the part a hand-written migration runner usually leaves out.
 
+**On Postgres, a step gives up after five seconds waiting for its table.** An `ALTER TABLE` needs a lock nothing else can share, and while it waits for one, every read and write to that table waits behind it. So a report or a forgotten `psql` session holding the table open would stall your whole app for as long as it stays open. After five seconds the version fails with `error.Locked`, the log names the step, and nothing is kept; start again once whatever held the table is done. A version that should wait longer says so in its file:
+
+```zig
+pub const version: migrate.Version = .{
+    .number = 7,
+    .name = "widen_counts",
+    .steps = before ++ generated ++ after,
+    .lock_timeout_ms = 30_000, // 0 waits for as long as it takes
+};
+```
+
+The comment above each generated step also says when it reads or rewrites the whole table while holding it: `SET NOT NULL`, a new `CHECK`, and a type change like `int4` to `int8`. On a big table, that line is the one to read before you deploy.
+
 Each version's hash covers its own steps chained onto the hash of the version before it, so editing a migration that has already run changes that version's hash and every later one. `applyPending` refuses to run anything when it finds such an edit (`error.SchemaDrift`), because the later versions were written against what the edited one used to say. `sql.migrate.drift` lists them.
 
 **On SQLite, a version that drops a table runs with foreign keys off**, and they are checked once before its COMMIT. Any other version keeps them on, so a `DELETE` of a parent in it cascades as the schema says. Changing a column on SQLite means rebuilding the table, and the `DROP TABLE` in a rebuild deletes the old table's rows first. With foreign keys on, every `ON DELETE CASCADE` pointing at that table would fire, and the child rows would be gone when the version commits. With them off, the children stay. A row left pointing at nothing (for example, after a copy that skipped some rows) causes `error.ForeignKeyViolated`, and the version is rolled back.

@@ -622,6 +622,16 @@ pub fn renderSql(
         \\
     );
     try w.writeAll("BEGIN;\n\n");
+    // What `migrate.apply` sets through `Dialect.lock_timeout`, as the
+    // statement a shell reads: a step that waits longer for its table gives
+    // up, and the script stops there with nothing kept.
+    if (D.lock_timeout != null) try w.print(
+        \\-- A step waiting longer than this for its table's lock gives up, rather
+        \\-- than holding every read and write to the table behind it.
+        \\SET LOCAL lock_timeout = {d};
+        \\
+        \\
+    , .{version.lock_timeout_ms});
 
     try w.print("{s};\n\n", .{comptime ddl.createIfMissing(D, migrate.Applied)});
 
@@ -1287,6 +1297,28 @@ test "a SQLite twin runs a version that drops a table with foreign keys off and 
     const pg = try renderSql(gpa, Pg, .{ .number = 2, .name = "x", .steps = &.{} }, "x", "abc", "0002_x.zig");
     defer gpa.free(pg);
     try testing.expect(std.mem.indexOf(u8, pg, "PRAGMA") == null);
+}
+
+test "a Postgres twin bounds each step's wait for its table as `db migrate` does, and a SQLite one has nothing to bound" {
+    const gpa = testing.allocator;
+    const steps: []const Step = &.{.{ .kind = .data, .why = "x", .sql = "ALTER TABLE \"orgs\" ADD COLUMN \"n\" int8" }};
+
+    const pg = try renderSql(gpa, Pg, .{ .number = 2, .name = "x", .steps = steps }, "x", "abc", "0002_x.zig");
+    defer gpa.free(pg);
+    const set = std.mem.indexOf(u8, pg, "\nSET LOCAL lock_timeout = 5000;\n").?;
+    // Inside the transaction, since `LOCAL` means nothing outside one, and
+    // before the first step that takes a table's lock.
+    try testing.expect(std.mem.indexOf(u8, pg, "BEGIN;").? < set);
+    try testing.expect(set < std.mem.indexOf(u8, pg, "ALTER TABLE").?);
+
+    // The version's own number, `0` included, which is the way to wait for good.
+    const patient = try renderSql(gpa, Pg, .{ .number = 2, .name = "x", .steps = steps, .lock_timeout_ms = 0 }, "x", "abc", "0002_x.zig");
+    defer gpa.free(patient);
+    try testing.expect(std.mem.indexOf(u8, patient, "\nSET LOCAL lock_timeout = 0;\n") != null);
+
+    const lite = try renderSql(gpa, Lite, .{ .number = 2, .name = "x", .steps = steps }, "x", "abc", "0002_x.zig");
+    defer gpa.free(lite);
+    try testing.expect(std.mem.indexOf(u8, lite, "lock_timeout") == null);
 }
 
 test "a SQLite twin stops at its first failed step, so the COMMIT cannot keep half a version" {

@@ -625,6 +625,17 @@ pub const Postgres = struct {
         return "SELECT pg_advisory_xact_lock(" ++ std.fmt.comptimePrint("{d}", .{key}) ++ ")";
     }
 
+    /// The statement that bounds how long a migration waits for a table's
+    /// lock, taking the milliseconds as `$1`, or `null` for a database whose
+    /// lock waits are bounded some other way.
+    ///
+    /// `set_config(…, true)` rather than `SET LOCAL`, because `SET` takes no
+    /// parameter and this one is a constant, so it is prepared once. The
+    /// `true` makes it last to the end of the transaction, as `SET LOCAL`
+    /// does, so the connection goes back to the pool with the setting it
+    /// came out with ([ADR 240](../docs/adr/240-a-migration-waits-five-seconds-for-a-table.md)).
+    pub const lock_timeout: ?[]const u8 = "SELECT set_config('lock_timeout', $1, true)";
+
     /// Whether this database can change a column's type or nullability in
     /// place. Postgres can, and answers so plainly.
     pub const can_alter_column = true;
@@ -1195,6 +1206,10 @@ pub const SQLite = struct {
         return null;
     }
 
+    /// **None**: a write waits on the database's one write lock, and
+    /// `busy_timeout` is what bounds that wait, per connection.
+    pub const lock_timeout: ?[]const u8 = null;
+
     /// **No.** `ALTER TABLE` here adds, drops and renames a column and does
     /// nothing else: a type and a `NOT NULL` are fixed at creation. Changing
     /// either means building a new table, copying the rows across, dropping the
@@ -1558,6 +1573,7 @@ pub fn assertDialect(comptime D: type) void {
             "foldedColumn",
             "can_alter_column",
             "advisoryLock",
+            "lock_timeout",
             "nulls",
             "pattern",
             "like_folds",

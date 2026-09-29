@@ -1104,6 +1104,8 @@ The hash is **chained**: each one covers the version before it, so editing versi
 
 **The lock matters.** `pg_advisory_xact_lock` is taken inside the transaction and released by the commit, so ten replicas starting at once run the migration once. SQLite has no advisory lock and needs none: it only ever has one writer.
 
+**A step waits at most `Version.lock_timeout_ms` for a table's lock**, 5,000 unless the version file says otherwise, on Postgres. `apply` sets it for the transaction after the advisory lock, so waiting for another replica is not bounded by it. A step that waits longer fails with `error.Locked`, one `warn` line names the version and the step, and nothing is kept. `.lock_timeout_ms = 0` waits for good, and the `.sql` twin writes `SET LOCAL lock_timeout = <ms>;` after its `BEGIN`. The number is not in the hash. A step that reads or rewrites every row while it holds the table (`SET NOT NULL`, a new `CHECK`, a type change such as `int4` to `int8`) says so in its `why` ([ADR 240](../adr/240-a-migration-waits-five-seconds-for-a-table.md)).
+
 A version is a **list of steps**, and `Kind.data` is the kind the diff never produces. That is what makes expand and contract possible: the backfill goes between the `add_column` that made the column and the `change_null` that tightens it, in one transaction, in one version.
 
 #### Refusing to serve a database that is behind

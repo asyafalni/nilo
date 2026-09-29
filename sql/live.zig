@@ -2850,6 +2850,60 @@ test "a version waits for the advisory lock another process holds, so two replic
     try testing.expect(ran);
 }
 
+test "a version gives up on a table another transaction holds after its own lock_timeout, and keeps nothing" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    try migrate.ensureLedger(&stack.db, &run);
+
+    const number: i64 = if (builtin.mode == .Debug) 990_003 else 990_004;
+    const held = "nilo_live_waited_" ++ mode_suffix;
+    const forget = "DELETE FROM \"nilo_migrations\" WHERE \"version\" = " ++
+        (if (builtin.mode == .Debug) "990003" else "990004");
+    _ = try stack.db.exec(&run, forget, .{});
+    _ = try stack.db.exec(&run, "DROP TABLE IF EXISTS \"" ++ held ++ "\"", .{});
+    _ = try stack.db.exec(&run, "CREATE TABLE \"" ++ held ++ "\" (\"id\" int)", .{});
+    defer _ = stack.db.exec(&run, forget, .{}) catch {};
+    defer _ = stack.db.exec(&run, "DROP TABLE IF EXISTS \"" ++ held ++ "\"", .{}) catch {};
+
+    const steps = [_]migrate.Step{.{
+        .kind = .add_column,
+        .sql = "ALTER TABLE \"" ++ held ++ "\" ADD COLUMN \"n\" int8",
+        .why = "add " ++ held ++ ".n",
+    }};
+    var digest: [64]u8 = undefined;
+    const hash = migrate.hashOf("", &steps, &digest);
+
+    // A report part way through: a read in an open transaction holds the
+    // weakest lock there is, and an `ALTER` needs the strongest.
+    var holder = try stack.db.begin(&run, .{});
+    defer holder.deinit();
+    _ = try holder.exec(&run, "SELECT * FROM \"" ++ held ++ "\"", .{});
+
+    // Well under the URL's own ten seconds (ADR 239), so a `Locked` that
+    // came from that bound rather than the version's cannot pass this.
+    const started = core.monotonicMicros();
+    try testing.expectError(error.Locked, migrate.apply(&stack.db, &run, .{
+        .number = number,
+        .name = "waited",
+        .steps = &steps,
+        .lock_timeout_ms = 200,
+    }, hash));
+    const waited_ms = @divFloor(core.monotonicMicros() - started, std.time.us_per_ms);
+    try testing.expect(waited_ms >= 150 and waited_ms < 5_000);
+
+    // Nothing kept, the ledger row included.
+    try testing.expect(try stack.db.find(migrate.Applied, &run, number) == null);
+
+    // Once the report ends, the same version runs under the default.
+    try holder.commit();
+    try testing.expect(try migrate.apply(&stack.db, &run, .{ .number = number, .name = "waited", .steps = &steps }, hash));
+    _ = try stack.db.exec(&run, "SELECT \"n\" FROM \"" ++ held ++ "\"", .{});
+}
+
 // -- the column type nothing checks at startup ----------------------------
 
 /// The Row that reads `role`, and **`Role` is missing `moderator` on

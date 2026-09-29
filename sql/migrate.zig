@@ -1074,17 +1074,24 @@ fn diffTable(
                 // them can be told apart from here, so all of them are named
                 // at the command line like a dropped column is.
                 const safe = widens(was.sql_type, c.sql_type);
+                // A widening that is not in place still writes every row
+                // again under the strongest lock there is, which is the
+                // step's real cost on a big table and the reason to say it.
+                const rewrite: []const u8 = if (inPlace(was.sql_type, c.sql_type))
+                    ""
+                else
+                    try std.fmt.allocPrint(gpa, rewrites ++ "{s} wait", .{t.desc.table});
                 try steps.append(gpa, .{
                     .kind = .change_type,
                     .sql = try ddl.alterType(D, gpa, t.desc, c),
                     .why = if (safe) try std.fmt.allocPrint(
                         gpa,
-                        "{s}.{s} becomes {s}, from {s}",
-                        .{ t.desc.table, c.name, c.sql_type, was.sql_type },
+                        "{s}.{s} becomes {s}, from {s}{s}",
+                        .{ t.desc.table, c.name, c.sql_type, was.sql_type, rewrite },
                     ) else try std.fmt.allocPrint(
                         gpa,
-                        "{s}.{s} becomes {s}, from {s}, which can refuse, round or reinterpret the rows already there",
-                        .{ t.desc.table, c.name, c.sql_type, was.sql_type },
+                        "{s}.{s} becomes {s}, from {s}, which can refuse, round or reinterpret the rows already there{s}",
+                        .{ t.desc.table, c.name, c.sql_type, was.sql_type, rewrite },
                     ),
                     .destructive = !safe,
                     .target = if (safe) "" else try targetOf(gpa, t.desc.schema, t.desc.table, c.name),
@@ -1094,10 +1101,14 @@ fn diffTable(
                 try steps.append(gpa, .{
                     .kind = .change_null,
                     .sql = try ddl.alterNullability(D, gpa, t.desc, c),
-                    .why = try std.fmt.allocPrint(
+                    .why = if (c.nullable) try std.fmt.allocPrint(
                         gpa,
-                        "{s}.{s} {s} be null",
-                        .{ t.desc.table, c.name, if (c.nullable) "may now" else "may no longer" },
+                        "{s}.{s} may now be null",
+                        .{ t.desc.table, c.name },
+                    ) else try std.fmt.allocPrint(
+                        gpa,
+                        "{s}.{s} may no longer be null" ++ reads_all ++ "{s} wait",
+                        .{ t.desc.table, c.name, t.desc.table },
                     ),
                     // A column being tightened is filled by its own default
                     // from here on, and the rows already there are the
@@ -1161,6 +1172,36 @@ fn diffTable(
 
     try diffIndexes(gpa, D, t, old, renamed.items, steps);
     try diffReferences(gpa, D, t, old, renamed.items, steps, problems);
+}
+
+/// What a step that reads the whole table under `ACCESS EXCLUSIVE` says about
+/// it, followed by the table's name: a `SET NOT NULL`, or a check added in one
+/// statement.
+///
+/// **Said rather than split into two steps.** The two-statement forms (`ADD
+/// CONSTRAINT … NOT VALID` then `VALIDATE`, a check then `SET NOT NULL` over
+/// it) take the weaker lock only when the second runs in a transaction of its
+/// own, and a version is one transaction: in the same one, the first
+/// statement's lock is still held when the second reads the table. A version
+/// of its own for the second half is written by hand (ADR 240).
+const reads_all = ", which reads every row while reads and writes to ";
+
+/// The same, for a type change that writes every row again.
+const rewrites = ", which writes every row again while reads and writes to ";
+
+/// Whether Postgres changes a column's type without touching a row: a
+/// `varchar` into `text` or a longer one, and a `numeric` given more digits
+/// before the point or none at all. Every other change, a widening like
+/// `int4` to `int8` included, writes the table again.
+fn inPlace(from: []const u8, to: []const u8) bool {
+    if (std.mem.startsWith(u8, from, "varchar")) return widens(from, to);
+    if (std.mem.startsWith(u8, from, "numeric")) {
+        if (std.mem.eql(u8, to, "numeric")) return true;
+        const f = precision(from) orelse return false;
+        const g = precision(to) orelse return false;
+        return g.scale == f.scale and g.digits >= f.digits;
+    }
+    return false;
 }
 
 /// Whether every value `from` can hold is a value `to` holds unchanged.
@@ -1306,8 +1347,8 @@ fn diffWords(
         .sql = try ddl.addCheck(D, gpa, t.desc, c),
         .why = try std.fmt.allocPrint(
             gpa,
-            "{s}.{s}: the {d} word(s) its type has now",
-            .{ t.desc.table, c.name, c.values.len },
+            "{s}.{s}: the {d} word(s) its type has now" ++ reads_all ++ "{s} wait",
+            .{ t.desc.table, c.name, c.values.len, t.desc.table },
         ),
         // A column that held any text becoming one that holds a few words
         // is the same question: every row not holding one of them fails it.
@@ -1561,7 +1602,7 @@ fn diffChecks(
         try steps.append(gpa, .{
             .kind = .create_check,
             .sql = try ddl.addNamedCheck(D, gpa, t.desc, ck),
-            .why = try std.fmt.allocPrint(gpa, "check {s}", .{ck.name}),
+            .why = try std.fmt.allocPrint(gpa, "check {s}" ++ reads_all ++ "{s} wait", .{ ck.name, t.desc.table }),
             // The rows already there are what the database tests the moment
             // this runs, and it refuses the lot rather than removing any. That
             // is a backfill, the same way a word taken off an enum is.
@@ -1854,7 +1895,24 @@ pub const Version = struct {
     number: i64,
     name: []const u8,
     steps: []const Step,
+    /// How long one step may wait for a lock before the version gives up,
+    /// in milliseconds; `0` waits for as long as it takes. Postgres only.
+    ///
+    /// **An `ALTER` waiting for its lock stops every read and write to the
+    /// table behind it**, because Postgres queues a request behind a waiting
+    /// stronger one. So this is the longest a migration can stall a table
+    /// before it has done anything, not how long it runs: once a step holds
+    /// its lock, it keeps it to the commit. Not part of the hash, which
+    /// covers the statements alone, so moving it after a version ran is
+    /// not drift ([ADR 240](../docs/adr/240-a-migration-waits-five-seconds-for-a-table.md)).
+    lock_timeout_ms: u32 = default_lock_timeout_ms,
 };
+
+/// Five seconds: a stall a request sits out well inside the thirty to sixty
+/// a proxy usually gives it, and longer than a request's own transaction. What is holding a
+/// table longer than this is a report, a stuck transaction or somebody's
+/// `psql`, and waiting behind it is the outage (ADR 240).
+pub const default_lock_timeout_ms: u32 = 5_000;
 
 /// Every version with its chained hash worked out.
 ///
@@ -2325,6 +2383,10 @@ pub fn rebuilds(steps: []const Step) bool {
 /// 3. **The record, in the same transaction as the steps.** A ledger row that
 ///    can be committed without its own DDL is a database nobody can reason
 ///    about afterwards.
+///
+/// Between the check and the steps, Postgres is told how long a step may wait
+/// for a table's lock (`Version.lock_timeout_ms`). A step that waits longer
+/// fails with `error.Locked` and a line naming it, and nothing is kept.
 pub fn apply(
     db: anytype,
     scope: anytype,
@@ -2358,7 +2420,29 @@ pub fn apply(
         return false;
     }
 
-    for (v.steps) |s| _ = try tx.exec(scope, s.sql, .{});
+    // **After the advisory lock, not before**: waiting for another replica's
+    // migration is the wait that lock exists for, and it holds no table. Set
+    // for the transaction alone, and always, so a `0` also overrides a
+    // `lock_timeout` the connection's URL gave it.
+    if (comptime D.lock_timeout) |bound| {
+        var digits: [10]u8 = undefined;
+        const ms = std.fmt.bufPrint(&digits, "{d}", .{v.lock_timeout_ms}) catch unreachable;
+        _ = try tx.exec(scope, bound, .{ms});
+    }
+
+    for (v.steps) |s| _ = tx.exec(scope, s.sql, .{}) catch |err| {
+        // `warn`, as `expect`'s refusal is: the error is the refusal, and
+        // this is the sentence an operator needs to act on it (ADR 145).
+        if (err == error.Locked) std.log.warn(
+            "nilo_sql: version {d} ({s}) waited {d} ms for a lock on a table at the step " ++
+                "\"{s}\", and gave up. Nothing was applied. A transaction open on that table " ++
+                "is in the way, and every read and write to it was queued behind this step " ++
+                "while it waited. Run it again once that transaction ends, or set " ++
+                "`.lock_timeout_ms` in the version file (0 waits for good).",
+            .{ v.number, v.name, v.lock_timeout_ms, s.why },
+        );
+        return err;
+    };
 
     _ = try tx.insert(Applied, scope, .{
         .version = v.number,
@@ -3717,6 +3801,80 @@ test "a check and a trigger that have not moved plan nothing, because the hash i
     const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{Ledger} }), before);
     try testing.expect(change.isEmpty());
     try testing.expectEqual(@as(usize, 0), change.problems.len);
+}
+
+test "a step that holds the whole table while it reads or writes every row says so in its why" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "readings", .key = .id };
+        id: i64,
+        count: i32,
+        note: ?[]const u8,
+        label: ?[]const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{
+            .name = "readings",
+            .key = .id,
+            .check = .{ .readings_count_is_positive = "count > 0" },
+        };
+        id: i64,
+        count: i64, // a widening, and still a rewrite
+        note: []const u8, // SET NOT NULL reads every row
+        label: ?[]const u8, // untouched, so no step
+    };
+
+    const before = try snapshotFrom(a, Pg, &.{Before});
+    const change = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{After} }), before);
+    try testing.expectEqual(@as(usize, 0), change.problems.len);
+
+    var said: usize = 0;
+    for (change.steps) |step| switch (step.kind) {
+        .change_type => {
+            try testing.expectEqualStrings(
+                "readings.count becomes int8, from int4, which writes every row again " ++
+                    "while reads and writes to readings wait",
+                step.why,
+            );
+            said += 1;
+        },
+        .change_null => {
+            try testing.expectEqualStrings(
+                "readings.note may no longer be null, which reads every row " ++
+                    "while reads and writes to readings wait",
+                step.why,
+            );
+            said += 1;
+        },
+        .create_check => {
+            try testing.expectEqualStrings(
+                "check readings_count_is_positive, which reads every row " ++
+                    "while reads and writes to readings wait",
+                step.why,
+            );
+            said += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 3), said);
+}
+
+test "a type change is in place only where Postgres touches no row" {
+    try testing.expect(inPlace("varchar(20)", "text"));
+    try testing.expect(inPlace("varchar(20)", "varchar(40)"));
+    try testing.expect(inPlace("numeric(10,2)", "numeric(12,2)"));
+    try testing.expect(inPlace("numeric(10,2)", "numeric"));
+
+    try testing.expect(!inPlace("int4", "int8"));
+    try testing.expect(!inPlace("float4", "float8"));
+    try testing.expect(!inPlace("int8", "numeric"));
+    // More digits after the point is a widening, and every value is written
+    // again with the new scale.
+    try testing.expect(!inPlace("numeric(10,2)", "numeric(12,3)"));
+    try testing.expect(!inPlace("varchar(40)", "varchar(20)"));
 }
 
 test "a changed body under the same name is one drop and one create, for both kinds" {
