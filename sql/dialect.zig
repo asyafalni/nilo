@@ -352,17 +352,22 @@ pub const Postgres = struct {
     /// `null` when this Dialect cannot express the combination, and the caller
     /// gets `noPatternForm` naming it rather than a match that folds case when
     /// it was asked not to.
+    ///
+    /// `whole` says the parameter already is the finished pattern, escaped
+    /// and ending in `%` by the binder, which a Dialect asks for with
+    /// `prefix_bound` (ADR 140).
     pub fn pattern(
         comptime quoted: []const u8,
         comptime bound: []const u8,
         comptime shape: Pattern,
         comptime fold: bool,
         comptime negate: bool,
+        comptime whole: bool,
     ) ?[]const u8 {
         comptime {
             const escaped = "replace(replace(replace(" ++ bound ++
                 ", '\\', '\\\\'), '%', '\\%'), '_', '\\_')";
-            const built = switch (shape) {
+            const built = if (whole) bound else switch (shape) {
                 .contains => "'%' || " ++ escaped ++ " || '%'",
                 .starts_with => escaped ++ " || '%'",
                 .ends_with => "'%' || " ++ escaped,
@@ -635,6 +640,13 @@ pub const Postgres = struct {
     /// does, so the connection goes back to the pool with the setting it
     /// came out with ([ADR 240](../docs/adr/240-a-migration-waits-five-seconds-for-a-table.md)).
     pub const lock_timeout: ?[]const u8 = "SELECT set_config('lock_timeout', $1, true)";
+
+    /// **No**: the prefix is escaped inside the statement and binds as the
+    /// caller's text, with nothing allocated. Postgres folds the expression
+    /// into a constant when it plans for the value, and reads the same index
+    /// range off it that it reads off a pattern bound whole; on a plan made
+    /// for any value, neither form uses the index (ADR 140).
+    pub const prefix_bound = false;
 
     /// Whether this database can change a column's type or nullability in
     /// place. Postgres can, and answers so plainly.
@@ -1091,10 +1103,11 @@ pub const SQLite = struct {
         comptime shape: Pattern,
         comptime fold: bool,
         comptime negate: bool,
+        comptime whole: bool,
     ) ?[]const u8 {
         comptime {
             if (!fold) return null;
-            const written = Postgres.pattern(quoted, bound, shape, true, negate).?;
+            const written = Postgres.pattern(quoted, bound, shape, true, negate, whole).?;
             // `ILIKE` is Postgres's word for what this database's `LIKE`
             // already does, so the same expression with the one word swapped
             // is the whole difference.
@@ -1209,6 +1222,13 @@ pub const SQLite = struct {
     /// **None**: a write waits on the database's one write lock, and
     /// `busy_timeout` is what bounds that wait, per connection.
     pub const lock_timeout: ?[]const u8 = null;
+
+    /// **Yes**: SQLite reads an index range off `LIKE ?1` only when `?1` is
+    /// the pattern itself, and off `replace(…) || '%'` never, so an
+    /// `istarts_with` over a `NOCASE` index scanned the table. The binder
+    /// escapes the prefix into the Scope's arena instead, one allocation a
+    /// condition (ADR 140).
+    pub const prefix_bound = true;
 
     /// **No.** `ALTER TABLE` here adds, drops and renames a column and does
     /// nothing else: a type and a `NOT NULL` are fixed at creation. Changing
@@ -1574,6 +1594,7 @@ pub fn assertDialect(comptime D: type) void {
             "can_alter_column",
             "advisoryLock",
             "lock_timeout",
+            "prefix_bound",
             "nulls",
             "pattern",
             "like_folds",

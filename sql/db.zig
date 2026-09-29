@@ -4001,6 +4001,22 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                         try jsonList(comptime WireWrite(D, where_mod.ParamType(Row, param)), list, c)
                     else
                         try forWire(List, list, c)) else null;
+                } else if (comptime param.prefix) {
+                    // A `starts_with` the Dialect wants whole: the caller's
+                    // text escaped and ended with `%` here, into the Scope's
+                    // arena, so the planner is handed a pattern it can read
+                    // an index range off (ADR 140).
+                    const Given = comptime where_mod.ValueAt(@TypeOf(options), path);
+                    const Wanted = comptime if (where_mod.comptimeOnly(Given))
+                        where_mod.ParamType(Row, param)
+                    else
+                        Given;
+                    const Text = comptime if (param.nullable) ?[]const u8 else []const u8;
+                    const text = try forWire(Text, where_mod.valueAtAs(Wanted, options, path), c);
+                    out[i] = if (comptime param.nullable)
+                        (if (text) |t| try prefixPattern(t, c) else null)
+                    else
+                        try prefixPattern(text, c);
                 } else if (comptime param.list and D.list_form == .json_each) {
                     // The one parameter that is not one value: a list the
                     // Dialect wants as JSON text rather than as an array
@@ -4298,6 +4314,8 @@ fn Values(
             // dropping (ADR 149).
             fields[i] = if (param.list)
                 (if (param.nullable) ?List else List)
+            else if (param.prefix)
+                (if (param.nullable) ?[]const u8 else []const u8)
             else if (param.nullable) Maybe(F) else F;
         }
         const frozen = fields;
@@ -5164,6 +5182,37 @@ fn jsonList(comptime F: type, values: anytype, c: anytype) ![]const u8 {
     const converted = c.arena().alloc(F, values.len) catch return error.QueryFailed;
     for (values, converted) |item, *slot| slot.* = try forWire(F, item, c);
     return std.json.Stringify.valueAlloc(c.arena(), converted, .{}) catch error.QueryFailed;
+}
+
+/// A prefix as the pattern `LIKE … ESCAPE '\'` reads it: each `\`, `%` and
+/// `_` escaped so it matches itself, and `%` after. One allocation in the
+/// Scope's arena, the text's length plus one plus one a character escaped,
+/// which is what `Dialect.prefix_bound` trades for an index (ADR 140).
+///
+/// One pass over the text, so a `\` written in front of a `%` is never
+/// escaped a second time, which is the order `dialect.pattern`'s three
+/// `replace` calls have to get right.
+fn prefixPattern(text: []const u8, c: anytype) ![]const u8 {
+    var escapes: usize = 0;
+    for (text) |ch| switch (ch) {
+        '\\', '%', '_' => escapes += 1,
+        else => {},
+    };
+    const out = c.arena().alloc(u8, text.len + escapes + 1) catch return error.QueryFailed;
+    var n: usize = 0;
+    for (text) |ch| {
+        switch (ch) {
+            '\\', '%', '_' => {
+                out[n] = '\\';
+                n += 1;
+            },
+            else => {},
+        }
+        out[n] = ch;
+        n += 1;
+    }
+    out[n] = '%';
+    return out;
 }
 
 /// Bytes as lowercase hex, in the Scope's arena.

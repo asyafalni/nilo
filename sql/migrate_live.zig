@@ -408,6 +408,54 @@ test "starts_with anchors, and a backslash in the term is still just a backslash
     try testing.expectEqualStrings("a\\b", backslash[0].label);
 }
 
+test "istarts_with reads the case-folding unique as a range, and a wildcard in the prefix is still only itself" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "prefix");
+    defer fx.deinit(gpa);
+
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{ Org, User } });
+    const org = try fx.db.insert(Org, &fx.run, .{ .name = "acme" });
+    for ([_][]const u8{ "ann@x.dev", "Anna@x.dev", "a_n@x.dev", "a%n@x.dev", "a\\n@x.dev", "bob@x.dev" }) |email| {
+        _ = try fx.db.insert(User, &fx.run, .{
+            .org_id = org.id,
+            .email = email,
+            .nickname = null,
+            .created_at = types.Timestamp.fromSeconds(0),
+        });
+    }
+
+    // The index the unique made, searched rather than every row read: the
+    // prefix reaches SQLite as the finished pattern, which is what its LIKE
+    // optimisation reads a range off (ADR 140).
+    const plan = try fx.db.explain(User, &fx.run, .{ .where = .{ .email = .{ .istarts_with = @as([]const u8, "an") } } });
+    try testing.expect(std.mem.indexOf(u8, plan, "SEARCH") != null);
+    try testing.expect(std.mem.indexOf(u8, plan, "SCAN users") == null);
+
+    const Case = struct { prefix: []const u8, want: usize };
+    for ([_]Case{
+        .{ .prefix = "an", .want = 2 }, // and `Anna`, since it folds case
+        .{ .prefix = "a_", .want = 1 }, // not `ann`: `_` is not any character
+        .{ .prefix = "a%", .want = 1 }, // not every `a…`
+        .{ .prefix = "a\\", .want = 1 }, // the escape character, escaped first
+        .{ .prefix = "", .want = 6 },
+        .{ .prefix = "zed", .want = 0 },
+    }) |case| {
+        const found = try fx.db.select(User, &fx.run, .{ .where = .{ .email = .{ .istarts_with = case.prefix } } });
+        try testing.expectEqual(case.want, found.len);
+    }
+
+    // Under a `sql.given`: absent is no filter, present is the prefix.
+    const none: ?[]const u8 = null;
+    try testing.expectEqual(@as(usize, 6), (try fx.db.select(User, &fx.run, .{ .where = .{ .email = .{ .istarts_with = sql.given(none) } } })).len);
+    const some: ?[]const u8 = "BO";
+    try testing.expectEqual(@as(usize, 1), (try fx.db.select(User, &fx.run, .{ .where = .{ .email = .{ .istarts_with = sql.given(some) } } })).len);
+
+    // Negated, it reads every row either way, and keeps the form that
+    // allocates nothing.
+    const others = try fx.db.select(User, &fx.run, .{ .where = .{ .email = .{ .not_istarts_with = @as([]const u8, "a") } } });
+    try testing.expectEqual(@as(usize, 1), others.len);
+}
+
 test "an exists narrows to the rows with a match over there, and counts the same" {
     const gpa = testing.allocator;
     var fx = try Fixture.init(gpa, "exists");

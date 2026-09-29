@@ -78,16 +78,28 @@ letter. That is the seam refusing rather than lying, which is the standard
 
 `.ilike` used to write the word `ILIKE` on both Dialects, because the operator table in `where.zig` predates the second one and spells its own SQL, and SQLite has no `ILIKE`: a runtime syntax error from a statement that compiled. The new family went through `dialect.pattern` so it did not inherit that, and the old one was fixed on its own afterwards. On a Dialect whose `LIKE` already folds case (`like_folds`, SQLite), `.ilike` is spelled `LIKE` and `.not_ilike` `NOT LIKE`, and `.like` and `.not_like` are a Refusal naming `ilike`, because a case-sensitive match that folds would match more than it was asked to on one database only ([ADR 055](./055-the-second-dialect-is-the-test-of-the-seam.md)).
 
+## A prefix on SQLite is bound whole
+
+**`istarts_with` on SQLite binds the finished pattern**, `"email" LIKE ?1 ESCAPE '\'`, with the caller's text escaped and ended with `%` on this side, into the Scope's arena (`db.prefixPattern`). SQLite reads an index range off `LIKE` only when the right-hand side is a literal or a parameter holding the pattern, and off `replace(…) || '%'` never. So an `istarts_with` over a column with a unique that ignores case (a `NOCASE` index) read every row: 16.5 ms against 0.012 ms a query on 200,000 rows, `SCAN` against `SEARCH … USING COVERING INDEX` ([sql.md §21](../../bench/result/sql.md#21-where-a-prefix-pattern-is-built)).
+
+The Dialect says which way it goes (`prefix_bound`), and only a prefix that is not negated takes it: a `NOT LIKE`, a `contains` and an `ends_with` read every row whatever the parameter holds, so they keep the form that allocates nothing. A plain `.index` is a `BINARY` one on SQLite, which a folding `LIKE` cannot use either way; only a unique can ignore case today.
+
+**Postgres keeps the statement form**, because there the two cost the same. On a plan made for the value, it folds `replace(…) || '%'` into a constant and reads `~>=~`/`~<~` bounds off a `text_pattern_ops` index exactly as it does off a bound pattern; it chose that plan all eight times it was asked. On a plan made for any value (`plan_cache_mode = force_generic_plan`), neither form uses the index, since the prefix is not known when the plan is made. Binding it whole would cost the allocation and buy nothing.
+
 ## Against ADR 017's four axes
 
 - **Allocations per request: zero**, which is the entire point of the design
-  and the reason it is not the design the roadmap assumed.
+  and the reason it is not the design the roadmap assumed, **except one per
+  `istarts_with` on SQLite**: an arena allocation of the prefix's length plus
+  one, plus one a `\`, `%` or `_` in it, on a request that asked for the
+  prefix. It was not timed on its own; it is a bump of a few bytes beside a
+  statement that went from 16.5 ms to 12 µs.
 - **Memory per idle connection: zero.**
 - **Throughput and p99:** three `replace` calls per matching row, run by the
   database on a parameter rather than on a column. Unmeasured, and it is the
   database's cost rather than nilo's. A leading `%` already rules out the index
-  on `contains`; `starts_with` loses it to the bound parameter rather than to
-  the `replace`, since Postgres cannot prove a prefix it has not seen.
+  on `contains`. A prefix keeps its index on Postgres and, bound whole, on
+  SQLite (above).
 - **Binary size: zero for a program that writes none of the twelve.**
 
 ## Consequences
@@ -97,3 +109,9 @@ letter. That is the seam refusing rather than lying, which is the standard
 - The roadmap entry moves from *Waiting on: a design* to gone, and its lesson —
   that the allocation was an assumption about one implementation — goes to
   `docs/history.md`.
+
+## What was rejected
+
+- **The prefix built inside the statement on SQLite too**, which was the rule until the plan was read: it made `istarts_with` a `SCAN` over a table with a `NOCASE` index on the column ([sql.md §18](../../bench/result/sql.md#18-the-count-a-page-reads-keyset-paging-and-a-stream-let-go-early), [§21](../../bench/result/sql.md#21-where-a-prefix-pattern-is-built)).
+- **Every pattern bound whole on both databases.** One allocation a condition for eleven operators out of twelve that no planner reads a range off, and for a Postgres plan that is the same either way.
+- **A range beside the `LIKE`**, `"email" >= $1 AND "email" < $2`, which a plan for any value can use. It is right only under a collation that orders by bytes. Under Danish, `aa` sorts after `z`, so `>= 'a' AND < 'b'` leaves out `aase`, which `LIKE 'a%'` matches.

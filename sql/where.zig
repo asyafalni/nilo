@@ -212,6 +212,12 @@ pub const Param = struct {
     /// `UPDATE` or a `DELETE`: what stands between those and the whole table
     /// is not something to leave to a value that may not arrive.
     droppable: bool = false,
+    /// Whether the value is a prefix the binder turns into the finished
+    /// pattern, escaped and ending in `%`, rather than text the statement
+    /// escapes itself. Set by `starts_with` on a Dialect whose planner reads
+    /// an index range only off a pattern it is handed whole
+    /// (`Dialect.prefix_bound`, [ADR 140](../docs/adr/140-the-database-escapes-the-pattern-it-is-going-to-match.md)).
+    prefix: bool = false,
 
     /// The `column` of a parameter that is not a column.
     pub const none = "";
@@ -2066,10 +2072,12 @@ fn listSpelling(comptime name: []const u8) ?ListOp {
 /// and `not_` in front negates, which is the spelling `like`/`ilike`/`not_like`
 /// already set.
 ///
-/// **All twelve cost no allocation**, which is what took this from a design
-/// nobody had to a Dialect call: the pattern is assembled and escaped inside
-/// the statement (`dialect.pattern`), so what binds is the caller's own text
-/// and the statement is the same constant every other one here is.
+/// **All twelve cost no allocation but one**, which is what took this from a
+/// design nobody had to a Dialect call: the pattern is assembled and escaped
+/// inside the statement (`dialect.pattern`), so what binds is the caller's own
+/// text and the statement is the same constant every other one here is. The
+/// one is `istarts_with` on SQLite, whose planner needs the pattern whole to
+/// search an index with it, and pays an arena allocation for that (ADR 140).
 const PatternOp = struct {
     shape: dialect_mod.Pattern,
     fold: bool,
@@ -2239,15 +2247,20 @@ fn operator(
 
         // A pattern, whose text is assembled and escaped by the statement
         // rather than by this side — so the parameter is the caller's own
-        // text and nothing here allocates (`dialect.pattern`).
+        // text and nothing here allocates (`dialect.pattern`). Except a
+        // prefix on a Dialect that wants it whole: SQLite reads an index
+        // range off `LIKE ?1` and not off an expression, so there the binder
+        // escapes it into the arena and the statement takes it as it is. A
+        // negated one reads every row either way and keeps the free form.
         if (patternSpelling(op.name)) |pat| {
             assertTextPattern(Row, column, op.name, op.T);
+            const whole = D.prefix_bound and pat.shape == .starts_with and !pat.negate;
             const bound = D.bindAs(
-                D.placeholder(state.take(path, .{ .column = column })),
+                D.placeholder(state.take(path, .{ .column = column, .prefix = whole })),
                 row_mod.ColumnType(Row, column),
                 false,
             );
-            return D.pattern(quoted, bound, pat.shape, pat.fold, pat.negate) orelse
+            return D.pattern(quoted, bound, pat.shape, pat.fold, pat.negate, whole) orelse
                 dialect_mod.noPatternForm(D, column, op.name, pat.folding);
         }
 
@@ -2521,6 +2534,35 @@ test "one parameter per pattern, holding the caller's own text and nothing built
     // column would, which is why this family needed no change in `db.zig`.
     try testing.expect(!p.params[0].list);
     try testing.expect(!p.params[0].nullable);
+}
+
+test "a prefix binds whole on sqlite and is built in the statement on postgres" {
+    // Four statements planned in one comptime scope, each searched for text.
+    @setEvalBranchQuota(20_000);
+    const Lite = dialect_mod.SQLite;
+    const Prefix = @TypeOf(.{ .email = .{ .istarts_with = @as([]const u8, "a") } });
+
+    // SQLite: the finished pattern is the parameter, and the binder makes it.
+    const lite = comptime plan(Lite, User, Prefix, 1);
+    try testing.expectEqualStrings("\"email\" LIKE ?1 ESCAPE '\\'", lite.sql);
+    try testing.expect(lite.params[0].prefix);
+
+    // Postgres: the caller's text, escaped by the statement, nothing allocated.
+    const pg = comptime plan(Pg, User, Prefix, 1);
+    try testing.expect(std.mem.indexOf(u8, pg.sql, "replace(") != null);
+    try testing.expect(!pg.params[0].prefix);
+
+    // Only the prefix that can use an index: negated, or any other shape,
+    // stays in the statement on SQLite too.
+    inline for (.{
+        @TypeOf(.{ .email = .{ .not_istarts_with = @as([]const u8, "a") } }),
+        @TypeOf(.{ .email = .{ .icontains = @as([]const u8, "a") } }),
+        @TypeOf(.{ .email = .{ .iends_with = @as([]const u8, "a") } }),
+    }) |W| {
+        const other = comptime plan(Lite, User, W, 1);
+        try testing.expect(std.mem.indexOf(u8, other.sql, "replace(") != null);
+        try testing.expect(!other.params[0].prefix);
+    }
 }
 
 test "sqlite writes LIKE where postgres writes ILIKE, because that is what its LIKE is" {

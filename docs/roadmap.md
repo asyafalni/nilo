@@ -187,17 +187,15 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 **Needs:** a live test that a statement past the number comes back `error.TimedOut` on a connection nobody set anything on, and that a reconnect sends it again.
 
-#### P1
-
-**A `starts_with` cannot use an index on SQLite, and stops using one on Postgres once its statement goes generic.** The pattern is built inside the statement, `replace(replace(replace($1 …))) || '%'` (`dialect.zig:352-370`), and both planners want a constant ([sql.md §18](../bench/result/sql.md#18-the-count-a-page-reads-keyset-paging-and-a-stream-let-go-early)). Escaping the prefix in Zig and binding the finished pattern fixes it and costs an allocation a condition.
-
-**Needs:** that allocation priced against [ADR 017](./adr/017-the-trade-budget-has-four-axes.md).
-
 #### P2
 
 **A foreign-key column is never indexed, so deleting a parent reads every child.** Postgres indexes the key a reference points at and not the column that points, and neither the marker nor the diff adds one: `ON DELETE CASCADE` and the check behind a parent's delete each scan the whole child table. An index per reference by default costs every insert into the child and a migration for every existing schema.
 
 **Needs:** whether the diff writes the index by default or the plan names the missing one, and what an index per reference costs a write-heavy child.
+
+**On SQLite, only a unique can serve `istarts_with`.** A `.unique` with `.ignoring_case` is a `NOCASE` index, and a plain `.index` is a `BINARY` one, which a folding `LIKE` cannot read a range off; a prefix search over a column that is not unique reads every row ([sql.md §21](../bench/result/sql.md#21-where-a-prefix-pattern-is-built)).
+
+**Needs:** an `.index` entry that ignores case, `COLLATE NOCASE` on SQLite and `lower(…)` on Postgres, and what the diff does with one that changes.
 
 **A transaction that loses a serialization or deadlock race is retried by hand.** Both come back as `error.RolledBack`, and `live.zig` shows the loop every caller writes around it. A runner that takes the transaction's body and a bound is the shape the rest of the module would expect.
 

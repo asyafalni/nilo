@@ -1386,6 +1386,26 @@ A raw SCRAM connect from Python over the same port, with and without `TCP_NODELA
 
 **Can it be pushed further:** by a CancelRequest, which keeps the connection and needs the key pg.zig does not keep, or by a portal read in batches. Both are in the ADR's rejected list with what would reopen them. §18's 295 and 327 ms were taken through test binaries as well, so they are about the build as much as the drain.
 
+## 21. Where a prefix pattern is built
+
+**Run:** `eddc05d`, 2026-09-29. Intel Xeon Platinum 8255C, two vCPUs. Postgres 17.10 (`timescale/timescaledb-ha:pg17`) through `psql` inside its container; SQLite 3.45.1 through Python's `sqlite3`, in memory. Both tables 200,000 rows of `md5(n) || '@x.dev'`, analysed, the prefix `abc1` matching 4.
+
+**Why:** §18 found `istarts_with` a `SCAN` on SQLite and a sequential scan on a generic Postgres plan, and the roadmap priced the fix, binding the pattern whole, at an allocation a condition. The question was which database the allocation buys anything on.
+
+| Database, index | Pattern | Plan | Per query |
+|---|---|---|---|
+| SQLite, `email COLLATE NOCASE` | `LIKE replace(replace(replace(?1 …))) \|\| '%' ESCAPE '\'`, as nilo wrote it | `SCAN t` | 16.5 ms |
+| SQLite, `email COLLATE NOCASE` | `LIKE ?1 ESCAPE '\'`, bound `abc1%` | `SEARCH t USING COVERING INDEX t_nocase (email>? AND email<?)` | 0.012 ms |
+| Postgres, `text_pattern_ops`, prepared, eight runs | built in the statement | Index Scan, `email ~>=~ 'abc1' AND email ~<~ 'abc2'`; 8 custom plans, 0 generic | 0.021 ms |
+| the same | bound whole | the same plan; 8 custom, 0 generic | 0.015 ms |
+| the same, `plan_cache_mode = force_generic_plan` | either | Parallel Seq Scan | |
+
+The two Postgres timings are one `EXPLAIN ANALYZE` each and inside each other's noise; the plan is the finding.
+
+**What it changed:** [ADR 140](../../docs/adr/140-the-database-escapes-the-pattern-it-is-going-to-match.md), in place. On SQLite a non-negated `istarts_with` binds the escaped pattern, one arena allocation, and is `SEARCH` over a unique that ignores case. Postgres keeps the form that allocates nothing: it plans for the value every time here, folds the expression, and uses the index; §18's scan was a forced generic plan, where binding it whole scans as well.
+
+**Can it be pushed further:** on SQLite, only with an index that folds case on a column with no unique over it, which the marker cannot yet write. On a Postgres plan made for any value, not with a `LIKE`: a byte range beside it would seek, and is wrong under a collation that does not order by bytes.
+
 ## What is still missing
 
 - **A second box.** Everything here shares eight physical cores between nilo,
