@@ -225,6 +225,20 @@ pub const Wire = struct {
             return .{ .conn = self.conn, .result = result, .owns_conn = false, .io = self.wire.io, .limits = self.wire.limits, .wait = w };
         }
 
+        /// `Wire.columnsOf` down this transaction's connection, so a
+        /// migration that holds one does not ask the pool for a second.
+        pub fn columnsOf(
+            self: *Tx,
+            arena: std.mem.Allocator,
+            query: []const u8,
+            schema: ?[]const u8,
+            table: []const u8,
+        ) wire.Error![]const wire.Column {
+            var rows = try self.run(arena, query, .{ schema, table }, null, null);
+            defer rows.close();
+            return self.wire.columnList(arena, &rows);
+        }
+
         /// Remember a plan Postgres refused as stale, for `rollback` to
         /// deallocate. It cannot be done here: the refusal aborted the
         /// transaction, and an aborted transaction takes no `DEALLOCATE`.
@@ -527,7 +541,11 @@ pub const Wire = struct {
     ) !pg.Pool.Opts {
         var out = try dialOpts(uri, arena);
         out.size = opts.size;
-        out.timeout = opts.timeout_ms;
+        // **Zero is no bound, as `wire.OpenOpts` says**, and pg.zig reads it
+        // as a deadline that has already passed: an empty pool would fail
+        // the moment it was asked. The largest value it takes is about
+        // forty-nine days, which is no bound to a request.
+        out.timeout = if (opts.timeout_ms == 0) std.math.maxInt(u32) else opts.timeout_ms;
         out.connect_on_init_count = opts.connect_on_init;
         // `result_state_size` is left at pg.zig's 32, on purpose. It looked
         // free to size from the widest Row a `Db` reads, since every
@@ -794,10 +812,13 @@ pub const Wire = struct {
     /// The one sentence a refused parameter gets: which, why, and what
     /// would have been read.
     fn refuse(key: []const u8, value: []const u8, why: []const u8, comptime err: anytype) @TypeOf(err) {
+        // A refused `sslpassword` is still a secret, and this line prints
+        // the value of what it refuses.
+        const shown = if (std.ascii.eqlIgnoreCase(key, "sslpassword")) "***" else value;
         std.log.warn(
             "nilo_sql: the database URL carries `{s}={s}`, which {s}. The " ++
                 "parameters understood are {s}.",
-            .{ key, value, why, understood_params },
+            .{ key, shown, why, understood_params },
         );
         return err;
     }
@@ -1343,12 +1364,18 @@ pub const Wire = struct {
         // caller already has a sentence for a check it could not run.
         var rows = try self.run(arena, query, .{ schema, table }, null, null);
         defer rows.close();
+        return self.columnList(arena, &rows);
+    }
 
+    /// The rows of the introspection query as columns. Shared by `columnsOf`
+    /// and the one on `Tx`, so a migration reads the table through the
+    /// connection it already holds (ADR 123).
+    fn columnList(self: *Wire, arena: std.mem.Allocator, rows: *Rows) wire.Error![]const wire.Column {
         var found: std.ArrayList(wire.Column) = .empty;
-        while (try self.next(&rows)) {
-            const name = try self.read(&rows, []const u8, 0);
-            const udt = try self.read(&rows, []const u8, 1);
-            const is_nullable = try self.read(&rows, []const u8, 2);
+        while (try self.next(rows)) {
+            const name = try self.read(rows, []const u8, 0);
+            const udt = try self.read(rows, []const u8, 1);
+            const is_nullable = try self.read(rows, []const u8, 2);
             found.append(arena, .{
                 .name = arena.dupe(u8, name) catch return error.QueryFailed,
                 .udt = arena.dupe(u8, udt) catch return error.QueryFailed,
@@ -1630,8 +1657,21 @@ fn hungUp(conn: *pg.Conn) bool {
 
 /// A connection that could not be had. A cancellation while waiting for
 /// one is re-armed for the caller, as `translate` does (ADR 223).
+///
+/// **The pool's own bound is `TimedOut`**, which is what `wire.OpenOpts`
+/// promises for `timeout_ms` and what the SQLite Wire answers for the same
+/// wait (ADR 107). Every other failure is `Disconnected`, a cancellation
+/// included.
 fn acquireFailed(io: std.Io, err: anyerror) wire.Error {
     if (err == error.Canceled) io.recancel();
+    if (err == error.Timeout) {
+        std.log.warn(
+            "nilo_sql: a statement waited for a connection from the pool and gave up. " ++
+                "Raise `size`, or shorten what a request holds one for. `timeout_ms` is the bound.",
+            .{},
+        );
+        return error.TimedOut;
+    }
     return error.Disconnected;
 }
 
@@ -1895,6 +1935,23 @@ test "how many connections to dial reaches the pool, which it did not" {
     try testing.expectEqual(@as(?u16, 0), opts.connect_on_init_count);
     try testing.expectEqual(@as(u16, 10), opts.size);
     try testing.expectEqual(@as(u32, 3_000), opts.timeout);
+}
+
+test "a pool wait of zero is no bound, and pg.zig's own timeout is TimedOut" {
+    // pg.zig reads `timeout = 0` as a deadline already passed, so an empty
+    // pool would fail at once for a caller who documented "no bound".
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const uri = try std.Uri.parse("postgres://app@db.internal/shop");
+    const unbounded = try Wire.poolOpts(uri, arena.allocator(), .{ .size = 4, .timeout_ms = 0 });
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), unbounded.timeout);
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try testing.expectEqual(wire.Error.TimedOut, acquireFailed(io, error.Timeout));
+    try testing.expectEqual(wire.Error.Disconnected, acquireFailed(io, error.PoolExhausted));
 }
 
 test "a URL is taken apart the way pg.zig would have taken it apart" {

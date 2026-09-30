@@ -396,11 +396,21 @@ pub fn Tool(comptime Db: type, comptime schema: migrate.Schema) type {
                 else => return err,
             };
             try olderSnapshot(a, io, dir, w, req);
+
+            // **Before the plan is read**, because a plan is only as good as
+            // the directory it was made against: a version file the manifest
+            // lost is never applied, and a snapshot ahead of the newest file
+            // would have `generate` reuse a number.
+            const state = try migrations.read(a, io, dir, D);
+            const found = try migrations.audit(a, state, versions);
+            if (found.len > 0) {
+                try writeAudit(w, req, found);
+                return acted;
+            }
             if (change.isEmpty()) {
                 // The other half of "up to date": a `.sql` twin that no longer
                 // says what its `.zig` says is a file somebody applies by hand
                 // six months later, and nothing else would ever look at it.
-                const state = try migrations.read(a, io, dir, D);
                 const stale = try migrations.staleSql(a, io, dir, D, versions, state.entries);
                 if (stale.len > 0) {
                     try writeStale(w, req, stale);
@@ -653,6 +663,49 @@ fn writeStale(w: *std.Io.Writer, req: Request, stale: []const []const u8) !void 
             "`db generate --name <what you changed>` writes them, and so does the " ++
             "next `db generate` of any kind.\n",
     );
+}
+
+/// Where the directory, the manifest and the snapshot disagree, one line for
+/// each, because the fix differs for each and a list says which.
+fn writeAudit(w: *std.Io.Writer, req: Request, found: []const migrations.Finding) !void {
+    try w.print("The {s}/ directory and its manifest do not agree ({d}):\n\n", .{ req.dir, found.len });
+    for (found) |f| {
+        const number: u64 = @intCast(f.number);
+        switch (f.kind) {
+            .unlisted => try w.print(
+                "  {s}/{s} is not in {s}. No `@import` line names it, so it is never " ++
+                    "applied. A merge of the manifest usually lost the line: put it back.\n",
+                .{ req.dir, f.file, migrations.manifest_file },
+            ),
+            .no_file => try w.print(
+                "  {s} lists version {d:0>4} ({s}), and {s}/ has no file numbered {d:0>4}.\n",
+                .{ migrations.manifest_file, number, f.name, req.dir, number },
+            ),
+            .renamed => try w.print(
+                "  {s}/{s} says it is version {d:0>4} named `{s}`, and the name in the " ++
+                    "file name is another. A file copied to a new name keeps the old " ++
+                    "`.number` and `.name`: change them to match.\n",
+                .{ req.dir, f.file, number, f.name },
+            ),
+            .duplicate => try w.print(
+                "  {s} lists version {d:0>4} twice (`{s}` is the second). The second is " ++
+                    "skipped when versions are applied.\n",
+                .{ migrations.manifest_file, number, f.name },
+            ),
+            .snapshot_behind => try w.print(
+                "  {s}/{s} is newer than {s}/{s}, which says version {d}. A `db generate` " ++
+                    "stopped after writing the version and before the snapshot. Delete the " ++
+                    "file and run `db generate` again.\n",
+                .{ req.dir, f.file, req.dir, migrations.snapshot_file, number },
+            ),
+            .snapshot_ahead => try w.print(
+                "  {s}/{s} says version {d}, and the newest file is {s}. A version file " ++
+                    "was deleted or lost in a merge, and `db generate` would write that " ++
+                    "number again. Put the file back, or restore the snapshot from before it.\n",
+                .{ req.dir, migrations.snapshot_file, number, f.file },
+            ),
+        }
+    }
 }
 
 fn writeIndented(w: *std.Io.Writer, text: []const u8) !void {
@@ -1167,4 +1220,19 @@ test "drift with a ledger hash shorter than sixteen bytes is printed whole rathe
     const out = w.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "ran as   abc\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "now says \n") != null);
+}
+
+test "a version file the manifest lost is named on screen with the fix" {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try writeAudit(&w, .{ .command = .check }, &.{
+        .{ .kind = .unlisted, .number = 8, .file = "0008_tags.zig" },
+        .{ .kind = .snapshot_ahead, .number = 9, .file = "0007_notes.zig" },
+    });
+    const said = w.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, said, "migrations/0008_tags.zig is not in manifest.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, said, "`@import` line") != null);
+    try testing.expect(std.mem.indexOf(u8, said, "says version 9") != null);
 }

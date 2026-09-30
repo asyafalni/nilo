@@ -982,6 +982,28 @@ fn diffTable(
 
     for (t.desc.columns) |c| {
         const was = columnBefore(old, c.name, renamed.items) orelse {
+            // **A Problem on SQLite rather than a step that fails at the
+            // deploy.** `ADD COLUMN … NOT NULL` with no default is refused on
+            // a table with rows, and a plan cannot see the rows. The same
+            // column is refused up front by `addMissingColumns`
+            // ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
+            if (comptime std.mem.eql(u8, D.name, "sqlite")) if (!c.nullable and c.default == null) {
+                try problems.append(gpa, .{
+                    .table = t.desc.table,
+                    .column = c.name,
+                    .text = try std.fmt.allocPrint(
+                        gpa,
+                        "{s}.{s} is added required with no default, and SQLite refuses `ADD " ++
+                            "COLUMN … NOT NULL` without one on a table with rows: the ALTER " ++
+                            "fails at the deploy rather than here, and nothing fills the rows " ++
+                            "already there. Give the field a `.default` in the marker, so the " ++
+                            "rows get it as the column is added, or make it optional and fill " ++
+                            "it in a step. Or rebuild the table. " ++ sqlite_rebuild,
+                        .{ t.desc.table, c.name },
+                    ),
+                });
+                continue;
+            };
             if (c.default) |text| if (!constantOnSqlite(D, text)) {
                 try problems.append(gpa, .{
                     .table = t.desc.table,
@@ -1009,6 +1031,31 @@ fn diffTable(
             });
             continue;
         };
+
+        // **The check follows the column's name unless `.check` named it.**
+        // Postgres keeps `t_old_check` through `RENAME COLUMN`, and the next
+        // snapshot derives `t_new_check`, so a later change to the words would
+        // `DROP CONSTRAINT` a name the database does not have. SQLite writes
+        // the constraint at creation, never refers to it by name, and follows
+        // the rename inside its text, so it has nothing to rename. When the
+        // words moved as well, `diffWords` drops the old name and makes the
+        // new one, which comes to the same.
+        if (comptime D.can_alter_constraint) {
+            if (!std.mem.eql(u8, was.name, c.name) and was.values.len > 0 and
+                !was.checkNamed() and !c.checkNamed() and table_mod.sameWords(c.values, was.values))
+            {
+                try steps.append(gpa, .{
+                    .kind = .rename_constraint,
+                    .sql = try ddl.renameCheck(D, gpa, t.desc, was.name, c.name),
+                    .why = try std.fmt.allocPrint(
+                        gpa,
+                        "{s}'s check over its words is called after {s} now",
+                        .{ t.desc.table, c.name },
+                    ),
+                });
+            }
+        }
+
         if (c.sameAs(was)) continue;
 
         if (c.key != was.key or c.generated != was.generated) {
@@ -1418,11 +1465,7 @@ fn diffIndexes(
             });
             continue;
         };
-        if (before != null) try steps.append(gpa, .{
-            .kind = .drop_index,
-            .sql = try ddl.dropIndex(D, gpa, t.desc.schema, u.name),
-            .why = try std.fmt.allocPrint(gpa, "{s} is defined differently now", .{u.name}),
-        });
+        // A redefined one was dropped by `dropGoneIndexes`, before any column.
         try steps.append(gpa, .{
             .kind = .create_index,
             .sql = sqlFor(t, u.name),
@@ -1440,11 +1483,6 @@ fn diffIndexes(
             });
             continue;
         };
-        if (before != null) try steps.append(gpa, .{
-            .kind = .drop_index,
-            .sql = try ddl.dropIndex(D, gpa, t.desc.schema, x.name),
-            .why = try std.fmt.allocPrint(gpa, "{s} is defined differently now", .{x.name}),
-        });
         try steps.append(gpa, .{
             .kind = .create_index,
             .sql = sqlFor(t, x.name),
@@ -1455,8 +1493,15 @@ fn diffIndexes(
     }
 }
 
-/// Dropped: in the snapshot, named by nothing the types declare, and not
-/// renamed onto a name they do.
+/// Dropped: in the snapshot and named by nothing the types declare (and not
+/// renamed onto a name they do), or named by them and defined differently.
+///
+/// **Both kinds before any column goes**, because a redefined index is as
+/// much in a dropped column's way as a gone one: Postgres takes an index down
+/// with the column it covers or its partial `WHERE` reads, so a `DROP INDEX`
+/// after the column names nothing and fails the version, and SQLite refuses
+/// the column's drop while the index is there. `diffIndexes` makes the new
+/// one, after the columns (ADR 123).
 fn dropGoneIndexes(
     gpa: std.mem.Allocator,
     comptime D: type,
@@ -1466,7 +1511,14 @@ fn dropGoneIndexes(
     steps: *std.ArrayList(Step),
 ) !void {
     for (old.uniques) |u| {
-        if (findUnique(t.desc.uniques, u.name) != null) continue;
+        if (findUnique(t.desc.uniques, u.name)) |now| {
+            if (!sameUniqueThrough(u, now, renames)) try steps.append(gpa, .{
+                .kind = .drop_index,
+                .sql = try ddl.dropIndex(D, gpa, t.desc.schema, u.name),
+                .why = try std.fmt.allocPrint(gpa, "{s} is defined differently now", .{u.name}),
+            });
+            continue;
+        }
         if (renamedUnique(D, u, t.desc, renames)) continue;
         try steps.append(gpa, .{
             .kind = .drop_index,
@@ -1475,7 +1527,14 @@ fn dropGoneIndexes(
         });
     }
     for (old.indexes) |x| {
-        if (findIndex(t.desc.indexes, x.name) != null) continue;
+        if (findIndex(t.desc.indexes, x.name)) |now| {
+            if (!try sameIndexThrough(gpa, x, now, renames)) try steps.append(gpa, .{
+                .kind = .drop_index,
+                .sql = try ddl.dropIndex(D, gpa, t.desc.schema, x.name),
+                .why = try std.fmt.allocPrint(gpa, "{s} is defined differently now", .{x.name}),
+            });
+            continue;
+        }
         if (try renamedIndex(gpa, D, x, t.desc, renames)) continue;
         try steps.append(gpa, .{
             .kind = .drop_index,
@@ -2034,42 +2093,86 @@ pub fn createMissing(db: anytype, scope: anytype, comptime schema: Schema) !void
     const D = comptime DialectOf(@TypeOf(db));
     comptime core.checkScope(@TypeOf(scope), "migrate.createMissing");
 
-    // **The columns of each table that has an index, read before anything is
-    // sent.** A field added to a shipped Row with a unique or an index on it
-    // is a column the table has not got until `addMissingColumns` runs, and
-    // the `CREATE INDEX IF NOT EXISTS` over it came first: Postgres refused
-    // it, and SQLite, reading a double-quoted name it cannot find as a
-    // string, indexed the constant and refused the second row. Such an
-    // index is left to `addMissingColumns`, which makes it with the column.
+    var tx = try db.begin(scope, .{});
+    errdefer tx.rollback();
+    try enterLocked(D, &tx, scope, default_lock_timeout_ms);
+
+    // **The columns of each table that has an index, read under the lock and
+    // through the transaction.** A field added to a shipped Row with a unique
+    // or an index on it is a column the table has not got until
+    // `addMissingColumns` runs, and the `CREATE INDEX IF NOT EXISTS` over it
+    // came first: Postgres refused it, and SQLite, reading a double-quoted
+    // name it cannot find as a string, indexed the constant and refused the
+    // second row. Such an index is left to `addMissingColumns`, which makes it
+    // with the column. Read under the lock because another replica may be
+    // adding that column this moment.
     const ordered = comptime orderOf(D, schema);
     var live: [ordered.len][]const wire_mod.Column = @splat(&.{});
     inline for (ordered, 0..) |R, i| {
         if (comptime row_mod.managedOf(R) and ddl.createdIfMissing(D, R).indexes.len > 0) {
             const q = comptime row_mod.qualifiedOf(R);
-            live[i] = try db.liveColumns(scope, q.schema, q.table);
+            live[i] = try tx.liveColumns(scope, q.schema, q.table);
         }
     }
 
-    var tx = try db.begin(scope, .{});
-    errdefer tx.rollback();
-
     // The order the tool owns: extensions, functions, tables, views (ADR 181).
-    for (comptime leadingOf(D, schema)) |sql| _ = try tx.exec(scope, sql, .{});
+    for (comptime leadingOf(D, schema)) |sql| try sendBounded(&tx, scope, sql, "createMissing");
     inline for (ordered, 0..) |R, i| {
         if (comptime row_mod.managedOf(R)) {
             const made = comptime ddl.createdIfMissing(D, R);
             const t = comptime tableOf(D, R);
-            _ = try tx.exec(scope, made.table, .{});
+            try sendBounded(&tx, scope, made.table, "createMissing");
             for (made.indexes) |ix| {
                 // A table that was not there has every column now.
                 if (live[i].len == 0 or !overMissing(D, t.desc, ix.name, live[i]))
-                    _ = try tx.exec(scope, ix.sql, .{});
+                    try sendBounded(&tx, scope, ix.sql, "createMissing");
             }
-            for (made.triggers) |tr| _ = try tx.exec(scope, tr.sql, .{});
+            for (made.triggers) |tr| try sendBounded(&tx, scope, tr.sql, "createMissing");
         }
     }
-    for (comptime trailingOf(D, schema)) |sql| _ = try tx.exec(scope, sql, .{});
+    for (comptime trailingOf(D, schema)) |sql| try sendBounded(&tx, scope, sql, "createMissing");
     try tx.commit();
+}
+
+/// What every transaction that changes a schema does first: the advisory lock
+/// `apply` takes, then the bound on how long a step waits for a table's lock
+/// (ADR 240). One place, so `createMissing` and `addMissingColumns` cannot
+/// drift from `apply`.
+///
+/// **The lock first, the bound after it**, for the reason `apply` gives:
+/// waiting for another replica is the wait the advisory lock exists for, and
+/// it holds no table. `apply` reads the ledger between the two.
+fn enterLocked(comptime D: type, tx: anytype, scope: anytype, lock_timeout_ms: u32) !void {
+    try takeAdvisory(D, tx, scope);
+    try boundTableWaits(D, tx, scope, lock_timeout_ms);
+}
+
+fn takeAdvisory(comptime D: type, tx: anytype, scope: anytype) !void {
+    if (comptime D.advisoryLock(lock_key)) |held| _ = try tx.exec(scope, held, .{});
+}
+
+/// Set for the transaction alone, and always, so a `0` also overrides a
+/// `lock_timeout` the connection's URL gave it.
+fn boundTableWaits(comptime D: type, tx: anytype, scope: anytype, lock_timeout_ms: u32) !void {
+    if (comptime D.lock_timeout) |bound| {
+        var digits: [10]u8 = undefined;
+        const ms = std.fmt.bufPrint(&digits, "{d}", .{lock_timeout_ms}) catch unreachable;
+        _ = try tx.exec(scope, bound, .{ms});
+    }
+}
+
+/// One statement of `createMissing` or `addMissingColumns`, with the line an
+/// operator needs when the table lock it waited for never came.
+fn sendBounded(tx: anytype, scope: anytype, sql: []const u8, comptime who: []const u8) !void {
+    _ = tx.exec(scope, sql, .{}) catch |err| {
+        if (err == error.Locked) std.log.warn(
+            "nilo_sql: " ++ who ++ " waited {d} ms for a lock on a table at `{s}`, and gave up. " ++
+                "Nothing was kept. A transaction open on that table is in the way; run it " ++
+                "again once that transaction ends.",
+            .{ default_lock_timeout_ms, sql },
+        );
+        return err;
+    };
 }
 
 /// Whether the index or unique called `name` names a column `live` lacks,
@@ -2124,13 +2227,14 @@ pub fn addMissingColumns(db: anytype, scope: anytype, comptime schema: Schema) !
 
     var tx = try db.begin(scope, .{});
     errdefer tx.rollback();
+    try enterLocked(D, &tx, scope, default_lock_timeout_ms);
 
     var added: usize = 0;
     inline for (schema.tables) |R| {
         if (comptime row_mod.managedOf(R)) {
             const t = comptime tableOf(D, R);
             const q = comptime row_mod.qualifiedOf(R);
-            const live = try db.liveColumns(scope, q.schema, q.table);
+            const live = try tx.liveColumns(scope, q.schema, q.table);
             if (live.len != 0) {
                 var fresh: std.ArrayList([]const u8) = .empty;
                 inline for (t.desc.columns) |c| {
@@ -2170,6 +2274,12 @@ pub fn addMissingColumns(db: anytype, scope: anytype, comptime schema: Schema) !
                                 );
                                 return Error.NeedsVersion;
                             }
+                            if (err == error.Locked) std.log.warn(
+                                "nilo_sql: addMissingColumns waited {d} ms for a lock on {s} at `{s}`, and gave up. " ++
+                                    "Nothing was kept. A transaction open on that table is in the way; run it " ++
+                                    "again once that transaction ends.",
+                                .{ default_lock_timeout_ms, t.desc.table, sql },
+                            );
                             return err;
                         };
                         added += 1;
@@ -2414,21 +2524,14 @@ pub fn apply(
         try db.begin(scope, .{})) else try db.begin(scope, .{});
     errdefer tx.rollback();
 
-    if (comptime D.advisoryLock(lock_key)) |held| _ = try tx.exec(scope, held, .{});
+    try takeAdvisory(D, &tx, scope);
     if (try tx.find(Applied, scope, v.number) != null) {
         try tx.commit();
         return false;
     }
 
-    // **After the advisory lock, not before**: waiting for another replica's
-    // migration is the wait that lock exists for, and it holds no table. Set
-    // for the transaction alone, and always, so a `0` also overrides a
-    // `lock_timeout` the connection's URL gave it.
-    if (comptime D.lock_timeout) |bound| {
-        var digits: [10]u8 = undefined;
-        const ms = std.fmt.bufPrint(&digits, "{d}", .{v.lock_timeout_ms}) catch unreachable;
-        _ = try tx.exec(scope, bound, .{ms});
-    }
+    // **After the advisory lock, not before**: see `enterLocked`.
+    try boundTableWaits(D, &tx, scope, v.lock_timeout_ms);
 
     for (v.steps) |s| _ = tx.exec(scope, s.sql, .{}) catch |err| {
         // `warn`, as `expect`'s refusal is: the error is the refusal, and
@@ -4002,6 +4105,119 @@ test "naming an enum column's check is one drop by the old name and one add by t
             "CHECK (\"kind\" IN ('low', 'high'))",
         change.steps[1].sql,
     );
+}
+
+test "an index redefined over a column that is dropped goes before the column and comes back after it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The partial index's `WHERE` reads `closed_at`, and the column goes. The
+    // name is derived from the columns, so it stays and the definition moves:
+    // Postgres took the index down with the column, and a `DROP INDEX` after it
+    // named nothing; SQLite refuses the column while the index is there.
+    const Before = struct {
+        pub const nilo_table = .{
+            .name = "jobs",
+            .key = .id,
+            .index = .{.{ .columns = .{.owner}, .where = .{ .closed_at = null } }},
+        };
+        id: i64,
+        owner: i64,
+        closed_at: ?types.Timestamp,
+    };
+    const After = struct {
+        pub const nilo_table = .{ .name = "jobs", .key = .id, .index = .{.owner} };
+        id: i64,
+        owner: i64,
+    };
+
+    inline for (.{ Pg, Lite }) |D| {
+        const change = try plan(a, D, comptime desiredOf(D, .{ .tables = &.{After} }), try snapshotFrom(a, D, &.{Before}));
+        try testing.expectEqual(@as(usize, 0), change.problems.len);
+        const kinds = [_]Kind{ .drop_index, .drop_column, .create_index };
+        try testing.expectEqual(kinds.len, change.steps.len);
+        for (kinds, change.steps) |want, step| try testing.expectEqual(want, step.kind);
+    }
+}
+
+test "renaming an enum column with `.was` renames its check on Postgres, and SQLite has none to rename" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "moods", .key = .id };
+        id: i64,
+        mood: Mood,
+    };
+    const After = struct {
+        pub const nilo_table = .{ .name = "moods", .key = .id, .was = .{ .feeling = "mood" } };
+        id: i64,
+        feeling: Mood,
+    };
+
+    // The database keeps `moods_mood_check` through the rename, and the next
+    // snapshot derives `moods_feeling_check`: a later change to the words
+    // would drop a name the database does not have.
+    const pg = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{After} }), try snapshotFrom(a, Pg, &.{Before}));
+    try testing.expectEqual(@as(usize, 0), pg.problems.len);
+    try testing.expectEqual(@as(usize, 2), pg.steps.len);
+    try testing.expectEqual(Kind.rename_column, pg.steps[0].kind);
+    try testing.expectEqual(Kind.rename_constraint, pg.steps[1].kind);
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"moods\" RENAME CONSTRAINT \"moods_mood_check\" TO \"moods_feeling_check\"",
+        pg.steps[1].sql,
+    );
+
+    // SQLite follows the rename inside the constraint's text and never names it.
+    const lite = try plan(a, Lite, comptime desiredOf(Lite, .{ .tables = &.{After} }), try snapshotFrom(a, Lite, &.{Before}));
+    try testing.expectEqual(@as(usize, 0), lite.problems.len);
+    try testing.expectEqual(@as(usize, 1), lite.steps.len);
+    try testing.expectEqual(Kind.rename_column, lite.steps[0].kind);
+
+    // The words changing as well: the old name is dropped and the new one made,
+    // which needs no rename.
+    const Fewer = enum { calm, glad };
+    const Changed = struct {
+        pub const nilo_table = .{ .name = "moods", .key = .id, .was = .{ .feeling = "mood" } };
+        id: i64,
+        feeling: Fewer,
+    };
+    const both = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{Changed} }), try snapshotFrom(a, Pg, &.{Before}));
+    const kinds = [_]Kind{ .rename_column, .drop_check, .create_check };
+    try testing.expectEqual(kinds.len, both.steps.len);
+    for (kinds, both.steps) |want, step| try testing.expectEqual(want, step.kind);
+    try testing.expect(std.mem.indexOf(u8, both.steps[1].sql, "\"moods_mood_check\"") != null);
+}
+
+test "a required column with no default is a Problem on SQLite, which refuses the ALTER, and a backfill on Postgres" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Bare = struct {
+        pub const nilo_table = .{ .name = "notes", .key = .id };
+        id: i64,
+        body: []const u8,
+        views: i64,
+    };
+
+    const lite = try plan(a, Lite, comptime desiredOf(Lite, .{ .tables = &.{Bare} }), try snapshotFrom(a, Lite, &.{Plain}));
+    try testing.expectEqual(@as(usize, 0), lite.steps.len);
+    try testing.expectEqual(@as(usize, 1), lite.problems.len);
+    try testing.expectEqualStrings("views", lite.problems[0].column);
+    try testing.expect(std.mem.indexOf(u8, lite.problems[0].text, "NOT NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, lite.problems[0].text, "CREATE a new table") != null);
+
+    const pg = try plan(a, Pg, comptime desiredOf(Pg, .{ .tables = &.{Bare} }), try snapshotFrom(a, Pg, &.{Plain}));
+    try testing.expectEqual(@as(usize, 0), pg.problems.len);
+    try testing.expect(pg.needsBackfill());
+
+    // With a default, or optional, SQLite takes it as it always did.
+    const filled = try plan(a, Lite, comptime desiredOf(Lite, .{ .tables = &.{PlainWithCount} }), try snapshotFrom(a, Lite, &.{Plain}));
+    try testing.expectEqual(@as(usize, 0), filled.problems.len);
+    try testing.expectEqual(@as(usize, 1), filled.steps.len);
 }
 
 test {

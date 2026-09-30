@@ -88,18 +88,42 @@ entry, and **the same SQL the port already writes by hand** — its `db.raw` has
 needs on Postgres; the amendment above is how the generated one does without). Nothing about `Statement` changes, so no
 consumer of one has to learn that it might be a set of statements.
 
-**What the guard costs is the planner, and it is smaller than it looks.**
-`plan_cache_mode` defaults to `auto`: Postgres plans a prepared statement as a
-custom plan for its first five executions, substituting the actual parameter
-values, and keeps doing so while the custom plan beats the generic one by more
-than the planning cost. With `$1` null, `$1 IS NULL` folds to true and the whole
-disjunct disappears; with `$1` set it folds to false and `false OR EXISTS(…)`
-simplifies back to a plain `EXISTS`, which Postgres then pulls up into a
-semi-join. So on a custom plan the guarded statement plans to what the 2ᵏ
-version would have compiled. It is on a *generic* plan that the guard blocks an
-index, and for this shape the generic plan is exactly the one the cost
-comparison rejects. `SET plan_cache_mode = force_custom_plan` is the lever if a
-particular query disagrees.
+**What the guard costs is the planner, and what it costs depends on the database.**
+
+On **Postgres a statement with a `sql.given` in it is sent unnamed**, so
+every call is planned for its own values (`Dialect.plan_may_go_generic`,
+`statement.dropsTerms`, `db.planOf`). With `$1` null, `$1 IS NULL` folds to
+true and the disjunct disappears; with `$1` set it folds to false and
+`false OR term` is `term`, which seeks. That is the plan the 2ᵏ version would
+have compiled, one statement instead of 2ᵏ. A statement with nothing that can
+drop keeps its name and its 12 µs (ADR 051): the choice is made while
+compiling, from the parameters, and costs no branch a request can see.
+
+**A kept plan was the bug, not the lever.** This section used to say a
+custom plan is used for the first five executions and for as long after as it
+beats the generic one, and that the generic plan "is exactly the one the cost
+comparison rejects". The comparison is against the *average* custom cost, and
+a screen where most calls leave the filter out has an average that is a
+scan's. The generic plan costs the same scan, wins, and the next call that
+sets the filter reads the whole table: 500,000 rows, `Parallel Seq Scan` at
+115 ms where the same call planned for its value is an index scan at 0.27 ms
+([sql.md §22](../../bench/result/sql.md#22-a-guard-and-the-plan-a-kept-statement-settles-on)).
+`SET plan_cache_mode = force_custom_plan` would have cured it and is a setting
+of the connection, so it would also have taken the generic plan away from the
+cheap key lookups that are the reason the default exists.
+
+**On SQLite the guard stays and so does the scan.** A statement there is
+planned once, when it is prepared, before any value is bound, so
+`("cust" = ?1 OR ?1 IS NULL)` is `SCAN` on the first call and on every one
+after, and preparing it again would plan it the same way: 29 ms a query
+against 0.044 ms for the bare term on 500,000 rows (§22). The only cure is a
+text without the term when the filter is absent and without the guard when it
+is present, which is the 2ᵏ statements rejected above. SQLite is the Dialect
+whose tables are read out of one file's page cache and whose lists are
+usually short; a table where it matters branches once on the filter and calls
+`db.select` twice, which is the cost this ADR started from. If a port on
+SQLite files a list screen that scans a large table, that is the number that
+reopens the question.
 
 ## Inside an `EXISTS` the guard goes round the outside
 
@@ -227,13 +251,22 @@ statements, so all nine stayed `db.raw`, `$n::text[] IS NULL OR x = ANY($n)`
 written by hand. That is the guard this section already writes for one value,
 held back from a list by a rule about a case the caller was not asking about.
 
+**A kept, named statement with the guard left to the planner**, the rule
+this ADR shipped with. It relied on Postgres choosing a custom plan for as long
+as it matters, and it does not: see above and §22.
+
+**`SET plan_cache_mode = force_custom_plan` on the connection**, which was
+offered as the lever. It applies to every statement the connection prepares,
+so the key lookups and inserts that gain from a generic plan lose their
+skipped planning to fix the one shape that needed it.
+
 ## Against ADR 017's four axes
 
 - **Allocations per request: zero.** The wrapper is a struct holding an
   optional, passed by value into the same tuple every other parameter goes
   into.
 - **Memory per idle connection: zero.**
-- **Throughput: zero on nilo's side**, and the parameter binds as an optional
+- **Throughput: on Postgres a statement holding a `sql.given` is parsed on every call, ~12 µs (ADR 051), in return for a plan that seeks; zero elsewhere.** The parameter binds as an optional
   where it would have bound as a value — the same branch `not_distinct_from`
   has had since ADR 040. What it costs the *database* is the section above.
 - **Binary size: one statement rather than 2ᵏ**, which is the axis that decided

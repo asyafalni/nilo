@@ -2663,6 +2663,27 @@ test "a prefix binds whole on sqlite and is built in the statement on postgres" 
     }
 }
 
+test "a folding prefix on postgres is lower(col) LIKE, the expression the case-folding unique is indexed on" {
+    // `ILIKE` over the bare column reads no index (ADR 140). The escape is
+    // still inside the statement, and only the non-negated prefix changes.
+    const escaped = "replace(replace(replace($1, '\\', '\\\\'), '%', '\\%'), '_', '\\_')";
+    try testing.expectEqualStrings(
+        "lower(\"email\") LIKE lower(" ++ escaped ++ ") || '%' ESCAPE '\\'",
+        sqlOf(.{ .email = .{ .istarts_with = @as([]const u8, "a") } }),
+    );
+    try testing.expect(std.mem.indexOf(
+        u8,
+        sqlOf(.{ .email = .{ .not_istarts_with = @as([]const u8, "a") } }),
+        "\"email\" NOT ILIKE ",
+    ) != null);
+    // The case-sensitive prefix keeps its own word and reads the column bare.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        sqlOf(.{ .email = .{ .starts_with = @as([]const u8, "a") } }),
+        "\"email\" LIKE replace(",
+    ) != null);
+}
+
 test "sqlite writes LIKE where postgres writes ILIKE, because that is what its LIKE is" {
     const Lite = dialect_mod.SQLite;
     const written = comptime plan(Lite, User, @TypeOf(.{

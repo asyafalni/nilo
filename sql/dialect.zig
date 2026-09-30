@@ -233,6 +233,13 @@ pub const Postgres = struct {
 
     pub const list_form: ListForm = .any_array;
 
+    /// **Yes**: a statement kept prepared here is planned for the values of
+    /// its first five calls, and then for none of them if that is not dearer
+    /// on average. A `sql.given` term, `("cust" = $1 OR $1 IS NULL)`, cannot
+    /// seek on a plan made for no value, so a statement holding one is sent
+    /// unnamed and planned for each call's own values (ADR 149).
+    pub const plan_may_go_generic = true;
+
     /// Whether this database's plain `LIKE` already folds ASCII case. Postgres
     /// has two words for the two behaviours; a Dialect whose one word folds
     /// answers `.ilike` with it, since `ILIKE` would be a syntax error there
@@ -377,6 +384,15 @@ pub const Postgres = struct {
                 .starts_with => escaped ++ " || '%'",
                 .ends_with => "'%' || " ++ escaped,
             };
+            // **A folding prefix is `lower(col) LIKE lower(…) || '%'`, not
+            // `ILIKE`**, because that is the expression the index on a
+            // `.unique` that ignores case is over (`foldedIndexColumn`).
+            // `ILIKE` over the bare column reads no index at all, so the
+            // prefix scanned the table while the unique sat beside it
+            // (ADR 140, sql.md section 23). The negation and the other two
+            // shapes read every row whichever word they use, and keep `ILIKE`.
+            if (fold and shape == .starts_with and !negate and !whole) return Postgres.foldedColumn(quoted) ++
+                " LIKE " ++ Postgres.foldedColumn(escaped) ++ " || '%' ESCAPE '\\'";
             return quoted ++ (if (negate) " NOT " else " ") ++
                 (if (fold) "ILIKE " else "LIKE ") ++ built ++ " ESCAPE '\\'";
         }
@@ -570,7 +586,12 @@ pub const Postgres = struct {
     /// want the same list: `acceptsInner` for a `Str` and for a byte slice,
     /// `columnType` for the first of them, and `schema.expectationsOf` for an
     /// enum column that this program built and therefore knows is `text`.
-    pub const text_accepts: []const []const u8 = &.{ "text", "varchar", "bpchar", "char", "name" };
+    ///
+    /// `citext` is last, and matched by name because it is an extension's type
+    /// and has no fixed oid: it reads as text, and a case-insensitive email
+    /// column is the usual reason to have one. A domain over any of these is
+    /// judged by the type under it (`introspect`).
+    pub const text_accepts: []const []const u8 = &.{ "text", "varchar", "bpchar", "char", "name", "citext" };
 
     /// What a `.default` of `.now` writes.
     pub const now_default = "now()";
@@ -617,6 +638,21 @@ pub const Postgres = struct {
     /// not allowed it.
     pub fn foldedColumn(comptime quoted: []const u8) []const u8 {
         return "lower(" ++ quoted ++ ")";
+    }
+
+    /// The same expression as the index is built over: `foldedColumn` plus
+    /// `text_pattern_ops`, so the one index serves `.ieq` (equality is in that
+    /// operator class) **and** `istarts_with`, which is `lower(col) LIKE …`
+    /// (ADR 140).
+    ///
+    /// Outside a `C` collation a plain `lower(col)` index is ordered by the
+    /// collation and no `LIKE` can read a range off it; `text_pattern_ops` is
+    /// the class that orders by bytes, and is the only way to ask for a
+    /// prefix range that is right under every collation. Uniqueness is
+    /// unchanged: two strings are equal under it exactly when they are
+    /// equal, which holds under any deterministic collation.
+    pub fn foldedIndexColumn(comptime quoted: []const u8) []const u8 {
+        return "lower(" ++ quoted ++ ") text_pattern_ops";
     }
 
     /// The statement that stops two processes migrating at once, or `null` for
@@ -742,22 +778,43 @@ pub const Postgres = struct {
     /// The five kinds accepted are an ordinary table, a partitioned one, a
     /// view, a materialized view and a foreign table. An index and a sequence
     /// are relations too and are not things a Row reads.
+    ///
+    /// **A domain answers the type under it** (ADR 055). `email_address`
+    /// over `text` used to answer `email_address`, which no list names, so a
+    /// `Str` over it stopped a server whose table was right; `describe`
+    /// already resolved a domain (`postgres.zig`) and this did not. The
+    /// recursive `base` follows `typbasetype` because a domain may sit over
+    /// another domain, and the last join keeps the row that is not one. A
+    /// domain's own `NOT NULL` is not read: the column still answers by
+    /// `attnotnull`, the direction that reports too much rather than too
+    /// little.
     pub const introspect =
-        \\SELECT a.attname,
+        \\WITH RECURSIVE col AS (
+        \\  SELECT a.attnum, a.attname, a.attnotnull, c.relkind, a.atttypid
+        \\  FROM pg_catalog.pg_attribute a
+        \\  JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+        \\  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        \\  WHERE n.nspname = COALESCE($1, current_schema())
+        \\    AND c.relname = $2
+        \\    AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+        \\    AND a.attnum > 0
+        \\    AND NOT a.attisdropped
+        \\), base(attnum, typid) AS (
+        \\  SELECT attnum, atttypid FROM col
+        \\  UNION ALL
+        \\  SELECT b.attnum, t.typbasetype
+        \\  FROM base b
+        \\  JOIN pg_catalog.pg_type t ON t.oid = b.typid AND t.typtype = 'd'
+        \\)
+        \\SELECT col.attname,
         \\       t.typname,
-        \\       CASE WHEN c.relkind IN ('v', 'm') THEN 'UNKNOWN'
-        \\            WHEN a.attnotnull THEN 'NO'
+        \\       CASE WHEN col.relkind IN ('v', 'm') THEN 'UNKNOWN'
+        \\            WHEN col.attnotnull THEN 'NO'
         \\            ELSE 'YES' END
-        \\FROM pg_catalog.pg_attribute a
-        \\JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
-        \\JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-        \\JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
-        \\WHERE n.nspname = COALESCE($1, current_schema())
-        \\  AND c.relname = $2
-        \\  AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
-        \\  AND a.attnum > 0
-        \\  AND NOT a.attisdropped
-        \\ORDER BY a.attnum
+        \\FROM col
+        \\JOIN base ON base.attnum = col.attnum
+        \\JOIN pg_catalog.pg_type t ON t.oid = base.typid AND t.typtype <> 'd'
+        \\ORDER BY col.attnum
     ;
 
     /// The values an enum type has, one row each and in the type's own order,
@@ -1224,6 +1281,12 @@ pub const SQLite = struct {
         return quoted ++ " COLLATE NOCASE";
     }
 
+    /// The collation is already the whole of the index here, so what the
+    /// index is built over and what a lookup writes are one text.
+    pub fn foldedIndexColumn(comptime quoted: []const u8) []const u8 {
+        return quoted ++ " COLLATE NOCASE";
+    }
+
     /// None, and that is not a gap being papered over.
     ///
     /// SQLite serialises writers over the whole database, and the Wire here
@@ -1253,6 +1316,15 @@ pub const SQLite = struct {
     /// escapes the prefix into the Scope's arena instead, one allocation a
     /// condition (ADR 140).
     pub const prefix_bound = true;
+
+    /// **No, and that is the cost of the guard here rather than a saving**:
+    /// a statement is planned once, when it is prepared, with no value in
+    /// sight, so `("cust" = ?1 OR ?1 IS NULL)` is a `SCAN` on the first call
+    /// and on every one after, and sending it unnamed would prepare it again
+    /// to plan it the same way. The only cure is a different text per
+    /// combination of filters, which ADR 149 refuses. So nothing changes
+    /// here, and the guide says what to do for a table where it matters.
+    pub const plan_may_go_generic = false;
 
     /// **No.** `ALTER TABLE` here adds, drops and renames a column and does
     /// nothing else: a type and a `NOT NULL` are fixed at creation. Changing
@@ -1297,7 +1369,9 @@ pub const SQLite = struct {
 
     /// The column types text reads out of, named for the three callers that
     /// want the same list — the same arrangement the Postgres Dialect has.
-    pub const text_accepts: []const []const u8 = &.{ "TEXT", "VARCHAR", "CLOB", "CHARACTER" };
+    /// An affinity name, because `introspect` answers one: `VARCHAR(255)` and
+    /// `CLOB` are TEXT by SQLite's own rule.
+    pub const text_accepts: []const []const u8 = &.{"TEXT"};
 
     /// What a `.default` of `.now` writes.
     ///
@@ -1418,13 +1492,35 @@ pub const SQLite = struct {
     /// That is a check that fails to fire rather than one that fires wrongly,
     /// which is the direction this whole branch exists to move.
     ///
+    /// **The type it answers is the affinity, not the declared text** (ADR 055).
+    /// It used to answer `upper(i.type)` and `accepts` wanted an exact name, so
+    /// `VARCHAR(255)` under a `Str`, `DATE` under a `Date` and a column with no
+    /// type at all each stopped a server whose table was right. The `CASE` is
+    /// SQLite's five rules in their own order
+    /// (<https://sqlite.org/datatype3.html#determination_of_column_affinity>),
+    /// `instr` over `upper` rather than `LIKE` because `LIKE` follows
+    /// `case_sensitive_like`. **No declared type is `ANY`**, not `BLOB`: that
+    /// column has BLOB affinity and holds whatever it is given, and a column
+    /// declared `BLOB` is a different claim (`schema.Expectation.untyped`).
+    /// The rowid test below still reads the declared text, because the alias
+    /// is spelled exactly `INTEGER` and INTEGER affinity is wider.
+    ///
     /// **`pragma_table_info` is named twice from here on**, which is a fact
     /// `sqlite.Wire.columnsOf` has to know: it qualifies the name with the
     /// schema, and qualifying only the first would ask two databases one
     /// question.
     pub const introspect =
         \\SELECT i.name,
-        \\       upper(i.type),
+        \\       CASE WHEN coalesce(i.type, '') = '' THEN 'ANY'
+        \\            WHEN instr(upper(i.type), 'INT') > 0 THEN 'INTEGER'
+        \\            WHEN instr(upper(i.type), 'CHAR') > 0
+        \\              OR instr(upper(i.type), 'CLOB') > 0
+        \\              OR instr(upper(i.type), 'TEXT') > 0 THEN 'TEXT'
+        \\            WHEN instr(upper(i.type), 'BLOB') > 0 THEN 'BLOB'
+        \\            WHEN instr(upper(i.type), 'REAL') > 0
+        \\              OR instr(upper(i.type), 'FLOA') > 0
+        \\              OR instr(upper(i.type), 'DOUB') > 0 THEN 'REAL'
+        \\            ELSE 'NUMERIC' END,
         \\       CASE WHEN m.type = 'view' THEN 'UNKNOWN'
         \\            WHEN i."notnull" = 1 THEN 'NO'
         \\            WHEN i.pk = 1 AND upper(i.type) = 'INTEGER'
@@ -1523,10 +1619,11 @@ pub const SQLite = struct {
         // that passed stored microseconds as digits in a TEXT column, where
         // `ORDER BY` sorts them as text and no date function reads them.
         //
-        // Every name here keeps an integer an integer: INTEGER affinity for
-        // the three carrying `INT`, and NUMERIC for the rest — which is what
-        // `DATETIME` and `TIMESTAMP` are, and they are what somebody writing
-        // the table by hand reaches for.
+        // Both affinities here keep an integer an integer: INTEGER for every
+        // declared type carrying `INT`, and NUMERIC for the rest, which is
+        // what `DATETIME` and `TIMESTAMP` are and what somebody writing the
+        // table by hand reaches for.
+        //
         // BLOB, and this row was already half here: `acceptsSqlite` has
         // always listed `BLOB` among what a byte slice may read out of, and
         // nothing could ever write one, because `WireWrite` sent a
@@ -1534,15 +1631,17 @@ pub const SQLite = struct {
         // anything else.
         if (types.isBytes(Inner)) return &.{"BLOB"};
 
-        if (Inner == types.Timestamp) return &.{
-            "INTEGER", "INT", "BIGINT", "NUMERIC", "DATETIME", "TIMESTAMP",
-        };
+        if (Inner == types.Timestamp) return &.{ "INTEGER", "NUMERIC" };
 
         // A type that declared its Postgres column name declared a Postgres
         // one. `jsonb` and `uuid` are both TEXT here, which is what SQLite
         // stores them as and what `json_form`, `enum_form` and `uuid_form`
         // all send.
-        if (types.declaredColumn(Inner) != null) return &.{ "TEXT", "VARCHAR", "CLOB" };
+        //
+        // NUMERIC is here for the names a hand-written table gives them:
+        // `DATE`, `UUID`, `JSON`, `DECIMAL(10,2)` and `DATETIME` are NUMERIC
+        // affinity, which keeps text that is not a number as text.
+        if (types.declaredColumn(Inner) != null) return &.{ "TEXT", "NUMERIC" };
 
         // No array type at all, so a list column has nowhere to live and
         // this declines rather than naming something that would not hold it.
@@ -1551,8 +1650,8 @@ pub const SQLite = struct {
         return switch (@typeInfo(Inner)) {
             // No boolean either: SQLite stores 0 and 1 in an INTEGER, and
             // `BOOLEAN` is a declared type with NUMERIC affinity.
-            .bool => &.{ "INTEGER", "BOOLEAN", "NUMERIC" },
-            .float => &.{ "REAL", "DOUBLE", "FLOAT", "NUMERIC" },
+            .bool => &.{ "INTEGER", "NUMERIC" },
+            .float => &.{ "REAL", "NUMERIC" },
             // One integer type, and it is 64 bits. Every Zig width that fits
             // in an i64 reads out of it, which makes the check coarser than
             // the Postgres one and correct rather than optimistic — a `u64`
@@ -1560,10 +1659,10 @@ pub const SQLite = struct {
             .int => |i| if (i.bits > 64 or (i.signedness == .unsigned and i.bits >= 64))
                 null
             else
-                &.{ "INTEGER", "INT", "BIGINT", "NUMERIC" },
-            .@"enum" => &.{ "TEXT", "VARCHAR" },
+                &.{ "INTEGER", "NUMERIC" },
+            .@"enum" => &.{"TEXT"},
             .pointer => |ptr| if (ptr.size == .slice and ptr.child == u8)
-                &.{ "TEXT", "VARCHAR", "CLOB", "BLOB" }
+                &.{ "TEXT", "BLOB" }
             else
                 null,
             else => null,
@@ -1615,10 +1714,12 @@ pub fn assertDialect(comptime D: type) void {
             "columnType",
             "keyColumn",
             "foldedColumn",
+            "foldedIndexColumn",
             "can_alter_column",
             "advisoryLock",
             "lock_timeout",
             "prefix_bound",
+            "plan_may_go_generic",
             "nulls",
             "pattern",
             "like_folds",
@@ -1857,12 +1958,13 @@ test "a Timestamp is checked against the column it is actually bound into" {
 
     // `DATETIME` and `TIMESTAMP` are NUMERIC affinity, so an integer stays an
     // integer in one — and they are what somebody writing the table by hand
-    // reaches for.
-    var found_datetime = false;
+    // reaches for. The list names affinities, which is what `introspect`
+    // answers, so NUMERIC is the one that stands for them.
+    var found_numeric = false;
     for (accepts) |name| {
-        if (std.mem.eql(u8, name, "DATETIME")) found_datetime = true;
+        if (std.mem.eql(u8, name, "NUMERIC")) found_numeric = true;
     }
-    try testing.expect(found_datetime);
+    try testing.expect(found_numeric);
 
     // Optional or not is the same question, since the check strips it.
     try testing.expectEqualStrings("INTEGER", SQLite.accepts(?types.Timestamp).?[0]);

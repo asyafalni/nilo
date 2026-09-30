@@ -615,8 +615,8 @@ pub fn renderSql(
         \\-- Foreign keys off for the version, as `db migrate` runs one that drops
         \\-- a table: dropping it to rebuild it would otherwise delete the rows
         \\-- pointing at it.
-        \\-- The check before COMMIT prints any row left pointing at nothing, and
-        \\-- a script cannot stop on it, so read what it prints.
+        \\-- The check before COMMIT stops the script when any row is left pointing
+        \\-- at nothing, and nothing is kept.
         \\PRAGMA foreign_keys = OFF;
         \\
         \\
@@ -659,7 +659,18 @@ pub fn renderSql(
     // operator reads when they ask which migration is the slow one, and a
     // number invented here would be a worse answer than none.
     try w.print("', {s}, 0);\n\n", .{D.now_default});
-    if (off) try w.writeAll("PRAGMA foreign_key_check;\n\n");
+    // **`PRAGMA foreign_key_check` only prints**, and `.bail on` stops a script
+    // on an error, so the check is made into one: a row inserted into a table
+    // that refuses any count but nought. `apply` rolls back with
+    // `ForeignKeyViolated` on the same rows, and the twin carries the same
+    // pragmas as `apply` does (ADR 123).
+    if (off) try w.writeAll(
+        \\CREATE TEMP TABLE "nilo_foreign_key_check" ("violations" INTEGER CONSTRAINT "foreign_key_check_found_rows" CHECK ("violations" = 0));
+        \\INSERT INTO "nilo_foreign_key_check" SELECT count(*) FROM pragma_foreign_key_check;
+        \\DROP TABLE "nilo_foreign_key_check";
+        \\
+        \\
+    );
     try w.writeAll("COMMIT;\n");
     if (off) try w.writeAll("\nPRAGMA foreign_keys = ON;\n");
     return aw.toOwnedSlice();
@@ -726,6 +737,95 @@ pub fn staleSql(
         const text = try renderSql(gpa, D, v, entry.name, hash, entry.file);
         if (try sameOnDisk(gpa, io, dir, twin, text)) continue;
         try out.append(gpa, twin);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// One way the directory and the manifest disagree, or the snapshot and the
+/// newest version file do.
+pub const Finding = struct {
+    kind: Kind,
+    /// The version number it is about.
+    number: i64,
+    /// The file on disk, or empty when there is none.
+    file: []const u8 = "",
+    /// What the manifest calls the version, or empty when it has none.
+    name: []const u8 = "",
+
+    pub const Kind = enum {
+        /// A version file no manifest entry has the number of: the `@import`
+        /// line lost in a merge, so the version is never applied.
+        unlisted,
+        /// A manifest entry with no file of that number on disk.
+        no_file,
+        /// A manifest entry whose `.number` is a file's and whose `.name` is
+        /// not: a file copied to a new name without its number changed.
+        renamed,
+        /// Two manifest entries with one number, of which `apply` skips the
+        /// second.
+        duplicate,
+        /// `snapshot.zon` records a version lower than the newest file.
+        snapshot_behind,
+        /// `snapshot.zon` records a version higher than the newest file, so
+        /// the next `generate` would reuse a number the snapshot has spent.
+        snapshot_ahead,
+    };
+};
+
+/// What `check` compares that needs no database and no plan: the directory
+/// against the manifest compiled into the binary, the number in each against
+/// the file name, and the snapshot against the newest file, both ways
+/// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
+///
+/// **The directory is listed against the manifest, not the manifest walked**,
+/// because `staleSql` walks the manifest and a file whose `@import` line was
+/// lost resolving a conflict in `manifest.zig` is then in nobody's list: never
+/// applied, and `check` green. The ADR calls that conflict ordinary.
+///
+/// A pure function of two values, so the sentence is tested without a disk.
+pub fn audit(gpa: std.mem.Allocator, state: State, versions: []const Version) ![]const Finding {
+    var out: std.ArrayList(Finding) = .empty;
+
+    for (versions, 0..) |v, i| {
+        var seen: usize = 0;
+        for (versions[0..i]) |earlier| {
+            if (earlier.number == v.number) seen += 1;
+        }
+        // Once per extra copy would say the same thing twice.
+        if (seen == 1) try out.append(gpa, .{ .kind = .duplicate, .number = v.number, .name = v.name });
+        if (seen > 0) continue;
+
+        const entry = entryFor(state.entries, v.number) orelse {
+            try out.append(gpa, .{ .kind = .no_file, .number = v.number, .name = v.name });
+            continue;
+        };
+        if (!std.mem.eql(u8, entry.name, v.name)) {
+            try out.append(gpa, .{ .kind = .renamed, .number = v.number, .file = entry.file, .name = v.name });
+        }
+    }
+
+    for (state.entries) |e| {
+        const listed = for (versions) |v| {
+            if (v.number == e.number) break true;
+        } else false;
+        if (!listed) try out.append(gpa, .{ .kind = .unlisted, .number = e.number, .file = e.file });
+    }
+
+    // A snapshot written before snapshots carried a version says 0, and is
+    // not ahead of or behind anything.
+    if (state.had_snapshot and state.before.version != 0) {
+        const head = state.head();
+        const last = if (state.entries.len > 0) state.entries[state.entries.len - 1].file else "";
+        if (state.before.version < head) try out.append(gpa, .{
+            .kind = .snapshot_behind,
+            .number = state.before.version,
+            .file = last,
+        });
+        if (state.before.version > head) try out.append(gpa, .{
+            .kind = .snapshot_ahead,
+            .number = state.before.version,
+            .file = last,
+        });
     }
     return out.toOwnedSlice(gpa);
 }
@@ -1277,11 +1377,17 @@ test "a SQLite twin runs a version that drops a table with foreign keys off and 
 
     const off = std.mem.indexOf(u8, text, "PRAGMA foreign_keys = OFF;").?;
     const begin = std.mem.indexOf(u8, text, "BEGIN;").?;
-    const checked = std.mem.indexOf(u8, text, "PRAGMA foreign_key_check;").?;
+    const checked = std.mem.indexOf(u8, text, "FROM pragma_foreign_key_check;").?;
     const commit = std.mem.indexOf(u8, text, "COMMIT;").?;
     const on = std.mem.indexOf(u8, text, "PRAGMA foreign_keys = ON;").?;
     // Off before the BEGIN, because SQLite ignores it inside a transaction.
     try testing.expect(off < begin and begin < checked and checked < commit and commit < on);
+
+    // And the check fails the script rather than printing: it is an INSERT
+    // into a table whose CHECK refuses a non-zero count, so `.bail on` stops
+    // before the COMMIT and nothing of the version is kept.
+    try testing.expect(std.mem.indexOf(u8, text, "CHECK (\"violations\" = 0)") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "PRAGMA foreign_key_check") == null);
 
     // A version that drops no table keeps them on, so a `DELETE` of a parent
     // in it cascades, as it does under `db migrate`.
@@ -2015,4 +2121,93 @@ test "a binary behind the directory writes no twin rather than one with a wrong 
         error.FileNotFound,
         box.dir().readFileAlloc(box.io(), "0002_orgs_get_a_note.sql", box.a(), .limited(1024)),
     );
+}
+
+test "check finds a version file the manifest lost, a number that is not its file's, and a duplicate" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const state: State = .{
+        .before = snapshot.empty(Pg),
+        .had_snapshot = false,
+        .entries = &.{
+            .{ .number = 1, .name = "initial", .file = "0001_initial.zig" },
+            .{ .number = 2, .name = "notes", .file = "0002_notes.zig" },
+            .{ .number = 3, .name = "tags", .file = "0003_tags.zig" },
+        },
+    };
+
+    // All three files listed, in order: nothing to say.
+    const all: []const Version = &.{
+        .{ .number = 1, .name = "initial", .steps = &.{} },
+        .{ .number = 2, .name = "notes", .steps = &.{} },
+        .{ .number = 3, .name = "tags", .steps = &.{} },
+    };
+    try testing.expectEqual(@as(usize, 0), (try audit(a, state, all)).len);
+
+    // The `@import` line for 0003 lost in a merge: the version is never
+    // applied, and the manifest-walking checks could not see it.
+    const lost = try audit(a, state, all[0..2]);
+    try testing.expectEqual(@as(usize, 1), lost.len);
+    try testing.expectEqual(Finding.Kind.unlisted, lost[0].kind);
+    try testing.expectEqualStrings("0003_tags.zig", lost[0].file);
+
+    // A file copied to a new name with its `.number` left as it was: 0003 says
+    // it is version 2, so 2 is listed twice and 3 by no one.
+    const copied: []const Version = &.{ all[0], all[1], .{ .number = 2, .name = "tags", .steps = &.{} } };
+    const twice = try audit(a, state, copied);
+    try testing.expectEqual(@as(usize, 2), twice.len);
+    try testing.expectEqual(Finding.Kind.duplicate, twice[0].kind);
+    try testing.expectEqual(Finding.Kind.unlisted, twice[1].kind);
+    try testing.expectEqualStrings("0003_tags.zig", twice[1].file);
+
+    // The right number under another name, and a number with no file.
+    const renamed: []const Version = &.{ all[0], .{ .number = 2, .name = "other", .steps = &.{} }, .{ .number = 4, .name = "x", .steps = &.{} } };
+    const odd = try audit(a, state, renamed);
+    try testing.expectEqual(Finding.Kind.renamed, odd[0].kind);
+    try testing.expectEqual(Finding.Kind.no_file, odd[1].kind);
+    try testing.expectEqual(Finding.Kind.unlisted, odd[2].kind);
+}
+
+test "check compares the snapshot with the newest file both ways" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const versions: []const Version = &.{
+        .{ .number = 1, .name = "initial", .steps = &.{} },
+        .{ .number = 2, .name = "notes", .steps = &.{} },
+    };
+    var state: State = .{
+        .before = snapshot.empty(Pg),
+        .had_snapshot = true,
+        .entries = &.{
+            .{ .number = 1, .name = "initial", .file = "0001_initial.zig" },
+            .{ .number = 2, .name = "notes", .file = "0002_notes.zig" },
+        },
+    };
+
+    state.before.version = 2;
+    try testing.expectEqual(@as(usize, 0), (try audit(a, state, versions)).len);
+
+    // Behind: `generate` stopped between the version file and the snapshot.
+    state.before.version = 1;
+    const behind = try audit(a, state, versions);
+    try testing.expectEqual(@as(usize, 1), behind.len);
+    try testing.expectEqual(Finding.Kind.snapshot_behind, behind[0].kind);
+
+    // Ahead: a version file lost, and the next `generate` would write its
+    // number again.
+    state.before.version = 3;
+    const ahead = try audit(a, state, versions);
+    try testing.expectEqual(@as(usize, 1), ahead.len);
+    try testing.expectEqual(Finding.Kind.snapshot_ahead, ahead[0].kind);
+    try testing.expectEqual(@as(i64, 3), ahead[0].number);
+
+    // Written before snapshots carried a version: ahead of and behind nothing.
+    state.before.version = 0;
+    try testing.expectEqual(@as(usize, 0), (try audit(a, state, versions)).len);
 }

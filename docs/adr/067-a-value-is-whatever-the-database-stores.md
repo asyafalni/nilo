@@ -48,13 +48,15 @@ On the write side, `WireWrite` reads `uuid_form` and answers `[16]u8` or `[]cons
 
 `WireWrite` reads the Dialect and answers `[]const u8` for either column under `.text`; `forWire` reads the answer back off the destination type on the way in, which is how the conversion stays in one place, the arrangement `Uuid` made and the reason the Dialect is not threaded into `forWire` itself. A tag under `.text` is `@tagName`, a constant in the binary; a `Json(T)` document is written into the request arena.
 
+**A `Json(T)` is read with `ignore_unknown_fields`.** The document is what the database holds, and a newer binary may have written a field this one's `T` lacks: a rolling deploy that adds a field to a jsonb otherwise makes every old instance answer `QueryFailed` for rows nothing is wrong with. The default parse refused them. A request body is the other way round, where an unknown field is the client's typo and `ctx.json` refuses it; a missing field is still an error, so a document that lacks one `T` needs is refused as before.
+
 ### `.in` and `.not_in`: written as JSON when the Dialect says so
 
 `Values` answers `[]const u8` rather than `[]const F` for a list parameter when `list_form == .json_each`, and each element is converted through `forWire` into a slice in the request arena, then serialised with `std.json` over that slice. Converting first is what makes a list of `Str`, of `Uuid`, or of tags come out as what the column holds rather than as whatever Zig would stringify the struct as.
 
 ### `Timestamp`: checked against what is actually bound
 
-One branch in `acceptsSqlite`, ahead of the declared-name branch every other column type falls into, keeps an integer an integer: the three names carrying `INT` are INTEGER affinity, and `NUMERIC`, `DATETIME`, `TIMESTAMP` fall through to NUMERIC, which also stores an integer as an integer. `DATETIME` and `TIMESTAMP` are in the list because they are what somebody writing the table by hand reaches for, and they are correct, not a courtesy. `TEXT` is refused for this column, which is the point of the branch rather than a side effect: it used to be accepted and silently store the wrong sort order.
+One branch in `acceptsSqlite`, ahead of the declared-name branch every other column type falls into, keeps an integer an integer: the list is `INTEGER` and `NUMERIC`, the two affinities that store an integer as an integer (`introspect` answers affinities, ADR 055). Every declared type carrying `INT` is the first, and `DATETIME`, `TIMESTAMP` and `NUMERIC` are the second: they are what somebody writing the table by hand reaches for, and they are correct, not a courtesy. `TEXT` is refused for this column, which is the point of the branch rather than a side effect: it used to be accepted and silently store the wrong sort order.
 
 ### A number is read only out of a number, and a NaN is not bound
 

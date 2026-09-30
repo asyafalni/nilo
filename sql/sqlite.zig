@@ -208,7 +208,7 @@ pub fn Wire(comptime opts_in: Options) type {
         /// **`broadcast` rather than `signal` within a queue**, which is the
         /// second half. This Wire's wait is cancellable on purpose — a fiber
         /// whose request is gone gives its turn up rather than holding it — and
-        /// a `signal` consumed by a waiter that then answers `TimedOut` is a
+        /// a `signal` consumed by a waiter that then gives up is a
         /// wakeup nobody else receives. Waking everybody queued for the one
         /// thing that just became free costs a re-test of one `bool` each, on
         /// a path that is by definition already waiting.
@@ -361,6 +361,23 @@ pub fn Wire(comptime opts_in: Options) type {
                     self.wire.conns[self.at].aborted = true;
                     return err;
                 };
+            }
+
+            /// `Wire.columnsOf` down this transaction's connection, so a
+            /// migration that holds one does not ask for a second.
+            pub fn columnsOf(
+                self: *Tx,
+                arena: std.mem.Allocator,
+                query: []const u8,
+                schema: ?[]const u8,
+                table: []const u8,
+            ) wire.Error![]const wire.Column {
+                var pragma_buf: [1024]u8 = undefined;
+                var master_buf: [1024]u8 = undefined;
+                const text = try Self.qualifiedQuery(&pragma_buf, &master_buf, query, schema);
+                var rows = try self.run(arena, text, .{table}, null, null);
+                defer rows.close();
+                return self.wire.columnList(arena, &rows);
             }
 
             /// Refuse a statement on a transaction a failed one has aborted,
@@ -608,12 +625,16 @@ pub fn Wire(comptime opts_in: Options) type {
         /// queue — which is the database's own behaviour surfaced as a wait
         /// rather than as a `SQLITE_BUSY` somebody has to interpret.
         ///
-        /// **A cancelled wait answers `TimedOut`**, which is the one place
-        /// this Wire has a deadline at all: `tx.deadline` is refused
-        /// (ADR 065), but a request whose fiber is cancelled while queueing
-        /// gives its turn up rather than holding it. The name is right for
-        /// what the handler has to decide — this statement is not going to
-        /// run.
+        /// **A wait cut short answers by whose cancellation it was.** This
+        /// Wire's own timer (`timeout_ms`) is `TimedOut`, the one place it
+        /// has a deadline at all: `tx.deadline` is refused (ADR 065). Any
+        /// other cancellation, a request that went away or a server shutting
+        /// down, gives its turn up rather than holding it, answers
+        /// `Disconnected` as the Postgres Wire's failed `acquire` does, and
+        /// **is handed back with `recancel`** so the caller's next
+        /// cancellation point sees it (ADR 223). Answering `TimedOut` and
+        /// leaving the cancellation spent is how a background loop queued
+        /// for the writer at shutdown slept on and kept the process alive.
         ///
         /// **The queue is bounded by `timeout_ms`, and the timer is armed
         /// only by a fiber that is actually going to wait** (ADR 107). A
@@ -624,7 +645,7 @@ pub fn Wire(comptime opts_in: Options) type {
         /// way, which is stack a handler touches and therefore per
         /// connection (ADR 062).
         fn takeWriter(self: *Self, holder: []const u8) wire.Error!usize {
-            self.lock.lock(self.io) catch return error.TimedOut;
+            self.lock.lock(self.io) catch return self.cancelled();
             defer self.lock.unlock(self.io);
 
             if (!self.conns[0].busy) return self.hold(0, holder);
@@ -648,7 +669,7 @@ pub fn Wire(comptime opts_in: Options) type {
         /// Any free reader, or wait for one — bounded the same way, and armed
         /// only once every reader has turned out to be busy.
         fn takeReader(self: *Self, holder: []const u8) wire.Error!usize {
-            self.lock.lock(self.io) catch return error.TimedOut;
+            self.lock.lock(self.io) catch return self.cancelled();
             defer self.lock.unlock(self.io);
 
             var bound: core.Limits.Bound = .idle;
@@ -663,6 +684,13 @@ pub fn Wire(comptime opts_in: Options) type {
                 self.free_reader.wait(self.io, &self.lock) catch
                     return self.gaveUp(&bound, .reader);
             }
+        }
+
+        /// A wait ended by a cancellation that is not this Wire's own
+        /// timer: hand it back and answer `Disconnected` (ADR 223).
+        fn cancelled(self: *Self) wire.Error {
+            self.io.recancel();
+            return error.Disconnected;
         }
 
         /// What a wait that ended without a connection means, and the one
@@ -686,7 +714,7 @@ pub fn Wire(comptime opts_in: Options) type {
         /// a one-line statement held past `timeout_ms` is waiting for a
         /// thread rather than for the database.
         fn gaveUp(self: *Self, bound: *core.Limits.Bound, want: enum { writer, reader }) wire.Error {
-            if (!bound.fired()) return error.TimedOut;
+            if (!bound.fired()) return self.cancelled();
             switch (want) {
                 .writer => std.log.warn(
                     "nilo_sql: a statement waited {d}ms for the writer connection and gave up; " ++
@@ -1234,22 +1262,38 @@ pub fn Wire(comptime opts_in: Options) type {
             // failure ADR 050 was written to remove.
             var pragma_buf: [1024]u8 = undefined;
             var master_buf: [1024]u8 = undefined;
-            const text = if (schema) |db_name| blk: {
-                const with_pragma = try qualifyEvery(&pragma_buf, query, "pragma_table_info", db_name);
-                break :blk try qualifyEvery(&master_buf, with_pragma, "sqlite_master", db_name);
-            } else query;
+            const text = try qualifiedQuery(&pragma_buf, &master_buf, query, schema);
 
             // No problem slot: this runs once per Row while the server is
             // starting, and the one caller already has a sentence for a check
             // it could not run.
             var rows = try self.run(arena, text, .{table}, null, null);
             defer rows.close();
+            return self.columnList(arena, &rows);
+        }
 
+        /// `query` with the schema in front of the two relations it reads,
+        /// or as it is when the table has no schema of its own.
+        fn qualifiedQuery(
+            pragma_buf: []u8,
+            master_buf: []u8,
+            query: []const u8,
+            schema: ?[]const u8,
+        ) wire.Error![]const u8 {
+            const db_name = schema orelse return query;
+            const with_pragma = try qualifyEvery(pragma_buf, query, "pragma_table_info", db_name);
+            return qualifyEvery(master_buf, with_pragma, "sqlite_master", db_name);
+        }
+
+        /// The rows of the introspection query as columns. Shared by the
+        /// Wire's `columnsOf` and the one on `Tx`, so a migration reads the
+        /// table through the connection it already holds (ADR 123).
+        fn columnList(self: *Self, arena: std.mem.Allocator, rows: *Rows) wire.Error![]const wire.Column {
             var found: std.ArrayList(wire.Column) = .empty;
-            while (try self.next(&rows)) {
-                const name = try self.read(&rows, []const u8, 0);
-                const udt = try self.read(&rows, []const u8, 1);
-                const nullable = try self.read(&rows, []const u8, 2);
+            while (try self.next(rows)) {
+                const name = try self.read(rows, []const u8, 0);
+                const udt = try self.read(rows, []const u8, 1);
+                const nullable = try self.read(rows, []const u8, 2);
                 found.append(arena, .{
                     .name = arena.dupe(u8, name) catch return error.QueryFailed,
                     .udt = arena.dupe(u8, udt) catch return error.QueryFailed,
@@ -1820,6 +1864,42 @@ test "a returning reader wakes the fiber that wanted a reader, not the one that 
     }.run);
 }
 
+test "a fiber cancelled while it queues for a connection keeps its cancellation" {
+    // A background loop queued for the writer at shutdown used to be told
+    // `TimedOut` with the cancellation spent, so its next `sleep` ran and the
+    // process never exited (ADR 223).
+    try withIoPair(struct {
+        const After = enum { still_cancelled, lost, took };
+
+        fn waitThenAsk(w: *TestWire, io: std.Io, want_writer: bool) After {
+            _ = (if (want_writer) w.takeWriter("test") else w.takeReader("test")) catch |err| {
+                std.debug.assert(err == error.Disconnected);
+                std.Io.checkCancel(io) catch return .still_cancelled;
+                return .lost;
+            };
+            return .took;
+        }
+
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:cancel-in-queue?mode=memory&cache=shared", 2);
+            defer w.close();
+
+            // Everything taken, so both askers have to park.
+            try testing.expectEqual(@as(usize, 0), try w.takeWriter("test"));
+            try testing.expectEqual(@as(usize, 1), try w.takeReader("test"));
+
+            for ([_]bool{ true, false }) |want_writer| {
+                var task = io.concurrent(waitThenAsk, .{ &w, io, want_writer }) catch return error.SkipZigTest;
+                try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+                try testing.expectEqual(After.still_cancelled, task.cancel(io));
+            }
+
+            w.release(0);
+            w.release(1);
+        }
+    }.run);
+}
+
 test "the introspection query reads the rowid alias as not-null, and its near misses as null" {
     // `dialect.SQLite.introspect` is asked directly rather than through
     // `db.checkSchema`, which reports a problem with `std.log.err` and so
@@ -1850,7 +1930,7 @@ test "the introspection query reads the rowid alias as not-null, and its near mi
                 "CREATE TABLE composite (tenant_id INTEGER, id INTEGER, PRIMARY KEY (tenant_id, id))",
                 // A column with no declared type at all, which SQLite allows.
                 // Here because ADR 094 made a NULL in a non-optional field an
-                // error, and this query reads `upper(i.type)` as a
+                // error, and this query reads `i.type` as a
                 // `[]const u8`: if the pragma answered NULL rather than the
                 // empty string for an untyped column, the schema check would
                 // have started failing on a table it used to read.
@@ -1894,6 +1974,40 @@ test "the introspection query reads the rowid alias as not-null, and its near mi
             // sits behind the view branch so this cannot be turned into a
             // `false` by an `id` that came from an aliased column.
             try testing.expectEqual(@as(?bool, null), try nullableOf(&w, arena, "as_view", "id"));
+        }
+    }.run);
+}
+
+test "the introspection query answers the affinity of a hand-written declared type" {
+    // The startup check used to be handed `upper(i.type)` and wanted an exact
+    // name, so a `VARCHAR(255)` under a `Str` refused to start a server whose
+    // table was right (ADR 055). Asked directly, for the reason the test
+    // above gives.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:affinity-introspect?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa,
+                \\CREATE TABLE hand (
+                \\  a VARCHAR(255), b DATE, c uuid, d BIGINT, e DOUBLE PRECISION,
+                \\  f BOOLEAN, g DATETIME, h CLOB, i blob, j, k NVARCHAR(10),
+                \\  l DECIMAL(10,2), m FLOAT, n INTEGER, o POINT
+                \\)
+            , .{}, null, null);
+
+            var scratch = std.heap.ArenaAllocator.init(gpa);
+            defer scratch.deinit();
+            const columns = try w.columnsOf(scratch.allocator(), dialect.SQLite.introspect, null, "hand");
+
+            const want = [_][]const u8{
+                "TEXT",    "NUMERIC", "NUMERIC", "INTEGER", "REAL",
+                "NUMERIC", "NUMERIC", "TEXT",    "BLOB",    "ANY",
+                "TEXT",    "NUMERIC", "REAL",    "INTEGER", "INTEGER",
+            };
+            try testing.expectEqual(want.len, columns.len);
+            for (want, columns) |udt, c| try testing.expectEqualStrings(udt, c.udt);
         }
     }.run);
 }

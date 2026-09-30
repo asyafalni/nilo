@@ -124,8 +124,18 @@ pub const Expectation = struct {
     expected: []const u8,
     optional: bool,
 
+    /// **A column with no declared type fits any field** (ADR 055). SQLite's
+    /// `pragma_table_info` answers an empty type for `CREATE TABLE t (x)` and
+    /// for an expression in a view, and such a column has BLOB affinity, which
+    /// converts nothing and stores whatever it is given. The SQLite
+    /// `introspect` says `ANY` for it, in capitals no Postgres `typname`
+    /// uses, so the one test here serves both Dialects. Refusing it would be
+    /// the check refusing a correct table again.
+    pub const untyped = "ANY";
+
     pub fn accepted(self: Expectation, udt: []const u8) bool {
         if (self.accepts.len == 0) return true;
+        if (std.mem.eql(u8, udt, untyped)) return true;
         for (self.accepts) |name| {
             if (std.mem.eql(u8, name, udt)) return true;
         }
@@ -818,4 +828,45 @@ test "a raw column nobody described, or past the Row's end, is not judged" {
     defer said.deinit();
     try out.items[0].write(&said.writer);
     try testing.expect(std.mem.indexOf(u8, said.written(), "reads int8, int4 or int2, and the statement answers numeric") != null);
+}
+
+test "SQLite columns are judged by affinity, so a hand-written declared type passes and a wrong affinity does not" {
+    const Lite = @import("dialect.zig").SQLite;
+    const Hand = struct {
+        pub const nilo_table = .{ .name = "hand", .key = .id };
+
+        id: i64,
+        name: []const u8,
+        born: types.Date,
+        ref: types.Uuid,
+        price: f64,
+        active: bool,
+        seen: types.Timestamp,
+        note: ?[]const u8,
+    };
+    // What `introspect` answers for `id INTEGER`, `name VARCHAR(255)`,
+    // `born DATE`, `ref UUID`, `price DOUBLE PRECISION`, `active BOOLEAN`,
+    // `seen DATETIME` and `note` with no type at all.
+    const columns = [_]wire_mod.Column{
+        .{ .name = "id", .udt = "INTEGER", .nullable = false },
+        .{ .name = "name", .udt = "TEXT", .nullable = false },
+        .{ .name = "born", .udt = "NUMERIC", .nullable = false },
+        .{ .name = "ref", .udt = "NUMERIC", .nullable = false },
+        .{ .name = "price", .udt = "REAL", .nullable = false },
+        .{ .name = "active", .udt = "NUMERIC", .nullable = false },
+        .{ .name = "seen", .udt = "NUMERIC", .nullable = false },
+        .{ .name = "note", .udt = Expectation.untyped, .nullable = true },
+    };
+    var out: std.ArrayList(Problem) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), try compare(Lite, Hand, &columns, &out, testing.allocator));
+
+    // A `Str` over INTEGER affinity is still the mismatch this check is for,
+    // and a column with no type fits any field, not only the optional one.
+    var wrong = columns;
+    wrong[1].udt = "INTEGER";
+    wrong[4].udt = Expectation.untyped;
+    try testing.expectEqual(@as(usize, 1), try compare(Lite, Hand, &wrong, &out, testing.allocator));
+    try testing.expectEqualStrings("name", out.items[0].column);
+    try testing.expectEqualStrings("INTEGER", out.items[0].found);
 }

@@ -1486,3 +1486,30 @@ fn stripComments(chunk: []const u8) []const u8 {
         rest = rest[nl + 1 ..];
     }
 }
+
+test "createMissing and addMissingColumns read the table through their own transaction, so a pool of one is enough" {
+    const gpa = testing.allocator;
+    // One connection: a second one asked for while the transaction holds it
+    // is a wait that ends in a failure, which is what `db.liveColumns` from
+    // inside them did on a pool this size.
+    var fx = try Fixture.initWith(gpa, "pool-of-one", .{ .size = 1, .unchecked = true }, null);
+    defer fx.deinit(gpa);
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id, .unique = .{.url} };
+        id: i64,
+        url: []const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id, .unique = .{.url} };
+        id: i64,
+        url: []const u8,
+        note: ?[]const u8,
+    };
+
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Before} });
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{After} });
+    try testing.expectEqual(@as(usize, 1), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+    try testing.expectEqual(@as(usize, 3), (try fx.db.liveColumns(&fx.run, null, "downloads")).len);
+}

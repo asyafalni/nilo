@@ -93,72 +93,6 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 The entries under *statements that work refused* were reproduced by a probe test that fails at `462d84d`, in Debug and ReleaseSafe, against Postgres 18 where Postgres is named. The rest were found by reading the code at `cb45ea9` and checked in it; **reproduced** marks one that was also run. A fix lands with a probe as the test that would have caught it.
 
-#### P1
-
-**`sql.given` turns an indexed filter into a full scan on both databases.** The guard is `("cust" = $1 OR $1 IS NULL)` (`where.zig:1483`). SQLite plans without the value and never uses the index for it: `EXPLAIN QUERY PLAN` gives `SCAN t` where the unguarded condition gives `SEARCH t USING INDEX`. Postgres, whose statements are prepared by default (`db.zig:608`), switches to a generic plan after five calls without the filter, and a call with it then reads the whole table; reproduced on Postgres 17 with `EXPLAIN EXECUTE` and `pg_prepared_statements.generic_plans`. ADR 149 says the generic plan is the one the cost comparison rejects; ADR 150 refuses `.after = sql.given(…)` because an `OR` stops the seek on a generic plan. Both cannot be true.
-
-**Needs:** a guarded statement planned per call on Postgres (no named plan for one with a droppable condition, or `plan_cache_mode` set for it), a choice written for SQLite, and the run in `bench/result/sql.md`.
-
-**`istarts_with` on Postgres never uses an index.** It is `ILIKE … || '%'` (`dialect.zig:370`), a sequential scan, where `LIKE` with `text_pattern_ops` reads a range; Postgres stops taking a prefix at the first character that has a case. The case-folding unique is an index on `lower(col)`, which `ILIKE` over the bare column does not read, and a marker cannot ask for `text_pattern_ops`, so outside a C collation no pattern operator nilo writes uses an index. Reproduced with `EXPLAIN`. [`sql.md` §21](../bench/result/sql.md#21-where-a-prefix-pattern-is-built) says the two were read the same way. The SQLite half is under Next.
-
-**Needs:** `lower(col) LIKE lower($1) || '%'` over a `lower(col) text_pattern_ops` index, and §21 corrected.
-
-**`.after` binds its cursor without the cast every other condition has.** `statement.zig:553` writes `D.placeholder` where every other writer writes `D.bindAs`, and for `Date`, `Decimal`, `Interval`, `Inet` and `Bytes` the cast is what makes pg.zig's bind work (`dialect.zig:446`). A feed over `due_date, id` should fail from its second page on Postgres. Found by reading; the live cursors are `Timestamp` and `i64` only.
-
-**Needs:** `bindAs` there, and a live cursor over a `Date` and a `Decimal`.
-
-**The SQLite startup check compares the declared type, not its affinity, and refuses to start on correct tables.** The introspection answers `upper(i.type)` (`dialect.zig:1403`) and `accepted` wants an exact match (`schema.zig:130`) against `TEXT`, `VARCHAR`, `CLOB` and `CHARACTER`. `VARCHAR(255)` under a `Str`, `DATE` under a `Date`, `UUID` under a `Uuid` and a column with no type are all mismatches, and `schema_mismatch_is_fatal` defaults to true. ADR 055 and the comment at `dialect.zig:1415` say affinity; `affinityOf` exists and only `describe` calls it.
-
-**Needs:** the introspection answering affinity, and a test over a hand-written `VARCHAR(255)`.
-
-**The Postgres startup check refuses a domain or `citext` under a `Str`.** It compares the column's own `typname` (`dialect.zig:742`) with `text_accepts`, so a domain `email_address` over text is a mismatch; `describe` already resolves a domain to its base type (`postgres.zig:1437`).
-
-**Needs:** the base type read for a domain, and `citext` accepted where text is.
-
-**On SQLite, the readiness probe waits behind every write transaction.** `nilo_ready` runs `SELECT 1` through `exec` (`db.zig:1276`), which always takes the writer (`sqlite.zig:885`), so a long write makes `/healthz` a 503 and a balancer pulls a healthy instance. ADR 107's own account is this probe, and only the log line was fixed. The doc comment says the probe is prepared; `exec` passes no plan.
-
-**Needs:** the probe on a reader, and the comment corrected.
-
-**A fiber cancelled while it waits for a SQLite connection is told `TimedOut` and stays cancellable.** `takeWriter` and `takeReader` answer `error.TimedOut` for a cancellation that is not their own bound (`sqlite.zig:627`, `:636`, `:663`, `gaveUp` at `:689`) and never call `io.recancel()`, which the Postgres Wire does (`postgres.zig:1547`, ADR 223). A background loop queued for the writer at shutdown sees `TimedOut`, its next `sleep` is not cancelled, and the process does not exit.
-
-**Needs:** the recancel, and ADR 223 covering both Wires.
-
-**The Postgres pool's wait does not answer as its contract says.** Every `acquire` error becomes `Disconnected` (`postgres.zig:1547`), including pg.zig's `Timeout`, where `wire.OpenOpts` promises `TimedOut` and the SQLite Wire gives it. `timeout_ms = 0`, documented as no bound (`wire.zig:386`), fails the moment the pool is empty, because pg.zig takes it as the deadline.
-
-**Needs:** `Timeout` mapped to `TimedOut`, and zero passed as "no bound" or documented as what it does.
-
-**A password given as `?password=` is written to the log.** `redacted` (`db.zig:5232`) hides only `user:pass@`, and the URL parser takes `password` as a query parameter (`postgres.zig:632`); a pool that fails to open prints the URL whole.
-
-**Needs:** every `password` parameter masked, with the test at `db.zig:5271` covering it.
-
-**A `Json(T)` column fails to read a document carrying a field the type lacks.** `parseFromSliceLeaky` runs with the default options (`db.zig:3804`), which refuse unknown fields, so a rolling deploy whose new binary adds a field to a jsonb makes every old instance answer `QueryFailed` for those rows. ADR 147 ignores unknown fields when reading what the server itself wrote.
-
-**Needs:** `ignore_unknown_fields`, or the reason not to written into ADR 147.
-
-**A redefined index is dropped after the column it covered, and the version fails.** `dropGoneIndexes` handles an index whose name went (`migrate.zig:1155`); one whose name stayed and whose columns or `WHERE` changed is dropped in `diffIndexes` (`:1443`), which runs after `DROP COLUMN` (`:1157`). On Postgres the index went with the column and `DROP INDEX` names nothing; on SQLite the column's drop is refused first. `2f2cd67` fixed the case with the name gone.
-
-**Needs:** every index being dropped or redefined dropped before any column, and a test that drops the column a partial index's `WHERE` reads.
-
-**Renaming an enum column with `.was` leaves its check under the old name.** Postgres does not rename `t_old_check`, and the next snapshot derives `t_new_check` (`migrate.zig:975`; `Column.sameAs`, `table.zig:154`, sees no change), so the next change to the enum's words fails on `DROP CONSTRAINT "t_new_check"`. Indexes and references are carried across a rename; checks are not.
-
-**Needs:** a `RENAME CONSTRAINT` step beside the column's rename, and the rename test over an enum column.
-
-**A required column with no default is a step SQLite refuses.** `plan` writes `ADD COLUMN … NOT NULL` with `needs_backfill` (`migrate.zig:1001`), which SQLite refuses even on an empty table; `addMissingColumns` refuses the same column up front (`:2149`), and the hint at `cli.zig:676` describes only Postgres.
-
-**Needs:** a Problem on SQLite naming the rebuild, as `addMissingColumns` gives.
-
-**`db check` does not notice a version file missing from the manifest.** `staleSql` walks the manifest (`migrations.zig:713`), so a `0008_x.zig` whose `@import` line was lost resolving a conflict in `manifest.zig` is never applied, and `check` stays green; ADR 123 calls that conflict ordinary. `SnapshotBehind` is checked one way (`migrations.zig:383`), so a snapshot ahead of the last version reuses its number, and `check` never reports it and sends the reader to a `generate` that refuses. A version's `.number` is not matched with its file name, and a duplicate is skipped on the first `apply` (`migrate.zig:2418`).
-
-**Needs:** the directory listed against the manifest, the snapshot compared both ways, and the number matched with the name, all in `check`.
-
-**`createMissing` and `addMissingColumns` take no advisory lock and no `lock_timeout`.** (`migrate.zig:2053`, `:2125`.) Replicas booting together on an empty database race the way the comment on `ensureLedger` (`:2249`) says they would, and an `ADD COLUMN` here waits for `ACCESS EXCLUSIVE` without the bound ADR 240 gave versions. `addMissingColumns` also calls `db.liveColumns` while it holds its `tx` (`:2133`), a second connection, so a pool of one waits out its bound and fails.
-
-**Needs:** the lock and bound `apply` takes, and the introspection sent through the `tx`.
-
-**The SQLite twin commits a rebuild whose foreign-key check found rows.** `PRAGMA foreign_key_check;` in the twin (`migrations.zig:618`) prints, and `COMMIT` follows, where `apply` rolls back with `ForeignKeyViolated`. ADR 123 says the twin carries the same pragmas.
-
-**Needs:** the twin stopping on a non-empty check: `.bail on` and a statement that fails when `pragma_foreign_key_check` has a row.
-
 #### P2: statements that work refused, and the ends of the types
 
 **A `Date` read through `db.raw` or a composed statement checks only that the value is four bytes wide.** A typed read knows its column is a `date` from the schema, but `tx.raw(Row, "SELECT n FROM t")` with `n int4` into a `Date` field reads the integer as a count of days since 2000, and says nothing. Checking the column's type OID (1082) would refuse it, and would also refuse a domain over `date`, which reaches the client under its own OID.
@@ -292,6 +226,18 @@ Two more, found by reading: `assertParams` checks only that the highest placehol
 **A foreign-key column is never indexed, so deleting a parent reads every child.** Postgres indexes the key a reference points at and not the column that points, and neither the marker nor the diff adds one: `ON DELETE CASCADE` and the check behind a parent's delete each scan the whole child table. An index per reference by default costs every insert into the child and a migration for every existing schema.
 
 **Needs:** whether the diff writes the index by default or the plan names the missing one, and what an index per reference costs a write-heavy child.
+
+**On SQLite, a statement holding a `sql.given` still reads the whole table.** SQLite plans a statement when it is prepared, before a value is bound, so the guard `("cust" = ?1 OR ?1 IS NULL)` is a `SCAN` whatever the call gives: 29.4 ms against 0.044 ms on 500,000 rows ([sql.md §22](../bench/result/sql.md#22-a-guard-and-the-plan-a-kept-statement-settles-on)). Postgres was fixed by sending such a statement unnamed; re-preparing on SQLite plans the same text the same way.
+
+**Needs:** the `WHERE` spliced per call without the terms that dropped, the way ADR 165 splices an `ORDER BY`, with its binary-size cost against ADR 149's refusal of one statement per combination.
+
+**A case-folding unique made before `text_pattern_ops` keeps the index `istarts_with` cannot read.** The migrator compares a unique `ignoring_case` and not its operator class, so an existing database never gets the new index and its prefix search still scans on Postgres.
+
+**Needs:** the operator class in the snapshot's index and a step that rebuilds it, or a `db check` finding that names it.
+
+**`db generate` reuses a version number when the snapshot is ahead of the newest file.** `db check` reports it through `migrations.audit`, and `generate` still refuses only a snapshot behind.
+
+**Needs:** `generate` refusing a snapshot ahead too, with the tests that build unusual snapshots checked.
 
 **On SQLite, only a unique can serve `istarts_with`.** A `.unique` with `.ignoring_case` is a `NOCASE` index, and a plain `.index` is a `BINARY` one, which a folding `LIKE` cannot read a range off; a prefix search over a column that is not unique reads every row ([sql.md §21](../bench/result/sql.md#21-where-a-prefix-pattern-is-built)).
 

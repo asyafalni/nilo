@@ -495,7 +495,7 @@ const found = try db.page(Partner, c, .{
 ("name" ILIKE … OR $1 IS NULL) AND (EXISTS (SELECT 1 FROM …) OR $2 IS NULL)
 ```
 
-**One statement, one parameter list and one prepared plan, however the screen is set**, instead of one statement per combination of filters. Postgres removes `$1 IS NULL` while a custom plan is in use (the first five executions, and for as long after that as the custom plan wins), so a term that *is* set is planned as if the guard were not there. `SET plan_cache_mode = force_custom_plan` is the setting to use if one query disagrees.
+**One statement, one parameter list and one prepared plan, however the screen is set**, instead of one statement per combination of filters. On Postgres a statement with a `sql.given` in it is sent unnamed and planned for each call's values, so `$1 IS NULL` folds away and a term that *is* set is planned as if the guard were not there: it seeks an index. The price is a Parse a call, about 12 µs. **On SQLite the guard is a `SCAN` whether or not the filter is set**, because the statement is planned once before any value is bound; on a large table, branch on the filter and make two calls ([ADR 149](../adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
 
 Inside an `.exists` it drops the **whole subquery**, not one term of it. With only the term dropped, the subquery would ask whether *any* joined row exists, which would exclude every row that has none. For the same reason it cannot sit next to an always-present condition in one `.exists`; write a second entry.
 
@@ -1146,6 +1146,7 @@ An `Outcome` says which of three things happened. `isEmpty()` means the Rows and
 | `migrations.renderSql(gpa, D, version, name, hash, source)` | one `.sql` twin, as text |
 | `migrations.writeSql(gpa, io, dir, D, versions, entries)` | every twin, written; how many changed |
 | `migrations.staleSql(gpa, io, dir, D, versions, entries)` | the twins that are missing or out of date, by name |
+| `migrations.audit(gpa, state, versions)` | where the directory, the manifest and the snapshot disagree: a version file the manifest lost, a number that is not its file's, a duplicate, a snapshot ahead of or behind the newest file |
 | `migrations.sqlTwin(gpa, file)` | `0007_name.zig` → `0007_name.sql` |
 | `migrations.checkName(name)` | `a-z`, `0-9` and `_`, or `error.BadName` |
 

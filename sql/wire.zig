@@ -785,6 +785,17 @@ pub const Fake = struct {
             self.wire.deadline_ms = ms;
         }
 
+        /// `Fake.columnsOf`, down the transaction.
+        pub fn columnsOf(
+            self: *Tx,
+            arena: std.mem.Allocator,
+            query: []const u8,
+            schema: ?[]const u8,
+            table: []const u8,
+        ) Error![]const Column {
+            return self.wire.columnsOf(arena, query, schema, table);
+        }
+
         /// The same arrangement as `deadline`: the number arrived, and what
         /// it becomes is `postgres.zig`'s business and `live.zig`'s to pin.
         pub fn savepoint(

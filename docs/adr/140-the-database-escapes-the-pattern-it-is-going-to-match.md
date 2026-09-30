@@ -84,7 +84,9 @@ letter. That is the seam refusing rather than lying, which is the standard
 
 The Dialect says which way it goes (`prefix_bound`), and only a prefix that is not negated takes it: a `NOT LIKE`, a `contains` and an `ends_with` read every row whatever the parameter holds, so they keep the form that allocates nothing. A plain `.index` is a `BINARY` one on SQLite, which a folding `LIKE` cannot use either way; only a unique can ignore case today.
 
-**Postgres keeps the statement form**, because there the two cost the same. On a plan made for the value, it folds `replace(…) || '%'` into a constant and reads `~>=~`/`~<~` bounds off a `text_pattern_ops` index exactly as it does off a bound pattern; it chose that plan all eight times it was asked. On a plan made for any value (`plan_cache_mode = force_generic_plan`), neither form uses the index, since the prefix is not known when the plan is made. Binding it whole would cost the allocation and buy nothing.
+**Postgres keeps the escaping in the statement and folds case on the column's own expression.** A folding, non-negated prefix is `lower("email") LIKE lower(replace(…)) || '%' ESCAPE '\'`, and the unique that ignores case is built over `lower("email") text_pattern_ops` (`Dialect.foldedIndexColumn`). It was `"email" ILIKE replace(…) || '%'`, and that read no index: not the unique, which is over `lower("email")`, and not a `text_pattern_ops` index on the bare column either, since `ILIKE` over the column is `~~*` and no operator class has one. On 200,000 rows it was a `Seq Scan` at 266 ms; the lowered form over the new index is an `Index Scan` on `lower(email) ~>=~ 'abc1' AND lower(email) ~<~ 'abc2'` at 0.065 ms ([sql.md §23](../../bench/result/sql.md#23-istarts_with-on-postgres-and-the-expression-it-reads)). `text_pattern_ops` is there because a plain `lower()` index is ordered by the collation and no `LIKE` reads a range off it, whatever the collation is: the plain one was a `Seq Scan` on this database's `C.UTF-8`. Uniqueness and `.ieq` are unchanged, since that class has `=`.
+
+On a plan made for the value the database folds `replace(…)` and `lower(…)` into a constant, so binding the pattern whole would still buy nothing; on a plan made for any value (`plan_cache_mode = force_generic_plan`) neither form can use the index, since the prefix is not known when the plan is made. A statement with a `sql.given` is sent unnamed ([ADR 149](149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)), which is what keeps that plan from being chosen for it. **A unique made before this keeps its old index**: the migrator compares `ignoring_case`, not the operator class, so the prefix reads correctly and scans until the index is dropped and made again. The negated prefix, `icontains` and `iends_with` read every row either way and keep `ILIKE`.
 
 ## Against ADR 017's four axes
 
@@ -98,8 +100,8 @@ The Dialect says which way it goes (`prefix_bound`), and only a prefix that is n
 - **Throughput and p99:** three `replace` calls per matching row, run by the
   database on a parameter rather than on a column. Unmeasured, and it is the
   database's cost rather than nilo's. A leading `%` already rules out the index
-  on `contains`. A prefix keeps its index on Postgres and, bound whole, on
-  SQLite (above).
+  on `contains`. A prefix uses its index on Postgres, over the lowered expression, and on
+  SQLite bound whole (above).
 - **Binary size: zero for a program that writes none of the twelve.**
 
 ## Consequences
@@ -113,5 +115,6 @@ The Dialect says which way it goes (`prefix_bound`), and only a prefix that is n
 ## What was rejected
 
 - **The prefix built inside the statement on SQLite too**, which was the rule until the plan was read: it made `istarts_with` a `SCAN` over a table with a `NOCASE` index on the column ([sql.md §18](../../bench/result/sql.md#18-the-count-a-page-reads-keyset-paging-and-a-stream-let-go-early), [§21](../../bench/result/sql.md#21-where-a-prefix-pattern-is-built)).
+- **`ILIKE` over the bare column on Postgres**, the rule until the plan was read: a `Seq Scan` next to a unique built for it. §21 took the plan for a range; §23 has the one nilo's own unique gets.
 - **Every pattern bound whole on both databases.** One allocation a condition for eleven operators out of twelve that no planner reads a range off, and for a Postgres plan that is the same either way.
 - **A range beside the `LIKE`**, `"email" >= $1 AND "email" < $2`, which a plan for any value can use. It is right only under a collation that orders by bytes. Under Danish, `aa` sorts after `z`, so `>= 'a' AND < 'b'` leaves out `aase`, which `LIKE 'a%'` matches.

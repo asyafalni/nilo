@@ -1402,9 +1402,57 @@ A raw SCRAM connect from Python over the same port, with and without `TCP_NODELA
 
 The two Postgres timings are one `EXPLAIN ANALYZE` each and inside each other's noise; the plan is the finding.
 
+**Corrected by [§23](#23-istarts_with-on-postgres-and-the-expression-it-reads):** the Postgres rows were read over an index on the bare column, which the marker cannot make and a case-folding unique is not. `istarts_with` is `ILIKE`, and §23 reads it as a `Seq Scan` over that index too, on 17.10 (Ubuntu build), so the "uses a `text_pattern_ops` index" finding does not hold for the statement nilo wrote.
+
 **What it changed:** [ADR 140](../../docs/adr/140-the-database-escapes-the-pattern-it-is-going-to-match.md), in place. On SQLite a non-negated `istarts_with` binds the escaped pattern, one arena allocation, and is `SEARCH` over a unique that ignores case. Postgres keeps the form that allocates nothing: it plans for the value every time here, folds the expression, and uses the index; §18's scan was a forced generic plan, where binding it whole scans as well.
 
 **Can it be pushed further:** on SQLite, only with an index that folds case on a column with no unique over it, which the marker cannot yet write. On a Postgres plan made for any value, not with a `LIKE`: a byte range beside it would seek, and is wrong under a collation that does not order by bytes.
+
+## 22. A guard and the plan a kept statement settles on
+
+**Run:** `911001c` plus the working tree of the change that sends a guarded statement unnamed, 2026-09-30. Intel Xeon Platinum 8255C, 2 vCPUs, Linux 6.8.0. Postgres 17.10 (Ubuntu build, `nodeflux-os-db-1`, defaults) through `psql` 17 inside its container; SQLite 3.45.1 through Python's `sqlite3`, in memory. Both tables 500,000 rows, `cust` holding 1,000 values (500 rows each), an index on `cust`, analysed. The statement is `db.count`'s: `SELECT count(*) … WHERE (cust = $1 OR $1 IS NULL)`.
+
+**Why:** the roadmap said the guard turns an indexed filter into a full scan on both databases, and [ADR 149](../../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md) said the plan that would do it is the one the cost comparison rejects. Both cannot be true.
+
+| Database | How the statement runs | Call that sets `cust = 'c5'` | Plan |
+|---|---|---|---|
+| Postgres, `PREPARE`d (nilo's default) | after six calls with `NULL` | 115 ms | `Parallel Seq Scan`, `Filter: ((cust = $1) OR ($1 IS NULL))`, `Rows Removed by Filter: 249750`; `pg_prepared_statements` says 2 generic, 5 custom |
+| Postgres, `PREPARE`d | after six calls with `'c5'` | 0.5 ms | `Bitmap Index Scan` on `cust`; 0, then 7 custom |
+| Postgres, the guard with `'c5'` written in as a literal | | 0.27 ms | `Index Only Scan`, `Index Cond: (cust = 'c5')` |
+| Postgres, unnamed (`\bind`), after seven other values | | 0.099 ms | `Index Only Scan`, `Index Cond: (cust = 'c5'::text)`, planning 0.05 ms |
+| Postgres, the guard with `NULL` written in | | 60 ms | `Parallel Seq Scan`, no `Filter`: every row is the answer, so the scan is the right plan |
+| SQLite, the guard | `?1 = 'c5'` | 29.4 ms per query, 20 runs | `SCAN t` |
+| SQLite, the term alone | | 0.044 ms per query, 20 runs | `SEARCH t USING COVERING INDEX t_cust (cust=?)` |
+
+The Postgres switch is the cost comparison working as designed and being wrong for this shape: the six calls without the filter make the average custom plan a scan's cost, the generic plan is the same scan, and it wins. An unnamed statement is planned at `Bind` for that call's values, so it is always the custom plan.
+
+**What it changed:** [ADR 149](../../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md), in place. On Postgres a statement holding a `sql.given` is sent unnamed (`Dialect.plan_may_go_generic`), which costs the Parse and Describe a named statement skips (ADR 051's 12 µs, not measured again here) and buys the 0.1 ms plan. `plan_cache_mode = force_custom_plan` was rejected because it is the connection's, so it also takes the generic plan from the key lookups that gain from it. SQLite keeps the guard and the `SCAN`, and the ADR and the reference say so: a statement is planned once, before a value is bound, so preparing it again plans it the same way, and the cure is a text per combination of filters, which ADR 149 refused for binary size.
+
+**Can it be pushed further:** on SQLite, only with the text changed: the term left out when the filter is absent and written bare when it is present, either 2ᵏ statements or a `WHERE` spliced into the arena the way ADR 165 splices an `ORDER BY`, with the placeholders renumbered. The second was not built; 29 ms against 0.044 ms on 500,000 rows is the number that would ask for it. The unnamed Parse was not timed through nilo's Wire: `psql` shares nothing with pg.zig's round trips.
+
+## 23. `istarts_with` on Postgres and the expression it reads
+
+**Run:** `911001c` plus the working tree of the change, 2026-09-30, on the machine and Postgres of §22 (database collation `C.UTF-8`). One table of 200,000 rows of `md5(n) || '@x.dev'`, analysed, the prefix `abc1` matching 4; the statement is what `dialect.pattern` writes, with the escape inside it.
+
+**Why:** [§21](#21-where-a-prefix-pattern-is-built) found Postgres reading a `text_pattern_ops` index for `istarts_with`, and the roadmap said it never does: the statement is `"email" ILIKE …`, and the case-folding unique nilo builds is over `lower("email")`.
+
+| Statement | Index | Plan | Execution |
+|---|---|---|---|
+| `email ILIKE replace(…) \|\| '%'`, as written before | `lower(email)` unique | `Seq Scan`, `email ~~* 'abc1%'` | 266 ms |
+| `lower(email) LIKE lower(replace(…)) \|\| '%'` | `lower(email)` unique | `Parallel Seq Scan` | 242 ms |
+| the same | `lower(email) text_pattern_ops` unique | `Index Scan`, `lower(email) ~>=~ 'abc1' AND lower(email) ~<~ 'abc2'` | 0.065 ms |
+| `email ILIKE …` | `lower(email) text_pattern_ops` unique | `Seq Scan` | 277 ms |
+| `email ILIKE …` | `email text_pattern_ops` on the bare column | `Seq Scan` | 274 ms |
+| `lower(email) = lower('ABC1@x.dev')` | `lower(email) text_pattern_ops` unique | `Index Scan`, `Index Cond: (lower(email) = 'abc1@x.dev')` | 0.019 ms |
+| `PREPARE`d lowered form, nine runs | `lower(email) text_pattern_ops` unique | `Index Scan`; 0 generic, 9 custom | 0.038 ms |
+| the same, `plan_cache_mode = force_generic_plan` | | `Parallel Seq Scan` | 335 ms |
+
+Inserting `upper(email)` of an existing row into the table still fails on the unique, and `=` on the lowered expression seeks it.
+
+**What it changed:** [ADR 140](../../docs/adr/140-the-database-escapes-the-pattern-it-is-going-to-match.md), in place. A folding, non-negated prefix on Postgres is `lower(col) LIKE lower(escaped) || '%'`, and a case-folding unique there is `lower(col) text_pattern_ops` (`Dialect.foldedIndexColumn`), so one index serves `.ieq` and `istarts_with`. §21's Postgres finding did not reproduce here for `ILIKE` over either index, so it is corrected in place; What plan it read is not known; a case-sensitive `LIKE` would give the one it printed. A unique made before this keeps its old index and scans until it is dropped and made again: the migrator compares `ignoring_case`, not the operator class.
+
+**Can it be pushed further:** not on a plan made for any value, which the last row shows and ADR 149 now keeps a guarded statement away from. A plain `.index` on `lower(col)` cannot be written by the marker, so only a unique serves the prefix.
+
 
 ## What is still missing
 

@@ -177,8 +177,13 @@ only reason to want a cursor; a caller who needs the mixed order writes it in
 **`.after = sql.given(cursor)`, one statement for the first screen and the
 rest**, dropping the comparison when the cursor is null. The dropped term is
 spelled `$1 IS NULL OR …`, and an `OR` beside the comparison is what stops the
-seek on a generic plan. Two calls, with a cursor and without, are two prepared
-statements each with its own plan.
+seek on a plan made for no value. Postgres would now plan that statement for
+each call's values ([ADR 149](149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)
+sends a statement with a `sql.given` unnamed, which is where this reasoning and
+that one used to disagree), so the seek would survive there at the price of a
+Parse a page. SQLite plans once, before any value, and keeps the scan. Two
+calls, with a cursor and without, are two statements each planned for what it
+asks, on both.
 
 ## Consequences
 

@@ -6488,3 +6488,273 @@ test "an order over a numeric sorts the numbers, not the text they are read as" 
     try testing.expectEqual(@as(i64, 711), second.rows[0].id);
     try testing.expectEqual(@as(i64, 710), second.rows[1].id);
 }
+
+test "the startup check reads a domain as the type under it, and citext as text" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    const arena = live.arena.allocator();
+    const home = "nilo_live_domains_" ++ mode_suffix;
+
+    // `typname` of a domain column is the domain's own name, which no list
+    // names, so a `Str` over `email_address` stopped a server whose table was
+    // right. The introspection now follows `typbasetype`, through a domain
+    // over a domain too (ADR 055).
+    for ([_][]const u8{
+        "DROP SCHEMA IF EXISTS " ++ home ++ " CASCADE",
+        "CREATE SCHEMA " ++ home,
+        "CREATE DOMAIN " ++ home ++ ".email_address AS text CHECK (position('@' in value) > 0)",
+        "CREATE DOMAIN " ++ home ++ ".work_email AS " ++ home ++ ".email_address",
+        "CREATE DOMAIN " ++ home ++ ".count AS integer",
+    }) |statement| {
+        var rows = try live.wire.run(arena, statement, .{}, null, null);
+        live.wire.drain(&rows);
+    }
+    defer {
+        var rows = live.wire.run(arena, "DROP SCHEMA IF EXISTS " ++ home ++ " CASCADE", .{}, null, null) catch null;
+        if (rows) |*r| live.wire.drain(r);
+    }
+
+    // `citext` is an extension's type. It is created if the role may, and it
+    // is left installed afterwards: the Debug and ReleaseSafe runs share the
+    // database, and one dropping it under the other is a race, not a cleanup.
+    // Without the privilege that half is skipped, the domains are not.
+    const has_citext = blk: {
+        var rows = live.wire.run(arena, "CREATE EXTENSION IF NOT EXISTS citext", .{}, null, null) catch break :blk false;
+        live.wire.drain(&rows);
+        break :blk true;
+    };
+    var made = false;
+    if (has_citext) {
+        var rows = live.wire.run(arena, "CREATE TABLE " ++ home ++ ".people (" ++
+            "id bigint PRIMARY KEY, email " ++ home ++ ".email_address NOT NULL, " ++
+            "work " ++ home ++ ".work_email, shout citext NOT NULL, visits " ++ home ++ ".count NOT NULL)", .{}, null, null) catch null;
+        if (rows) |*r| {
+            live.wire.drain(r);
+            made = true;
+        }
+    }
+    if (!made) {
+        var rows = try live.wire.run(arena, "CREATE TABLE " ++ home ++ ".people (" ++
+            "id bigint PRIMARY KEY, email " ++ home ++ ".email_address NOT NULL, " ++
+            "work " ++ home ++ ".work_email, visits " ++ home ++ ".count NOT NULL)", .{}, null, null);
+        live.wire.drain(&rows);
+    }
+
+    const columns = try live.wire.columnsOf(arena, dialect.Postgres.introspect, home, "people");
+    try testing.expectEqualStrings("text", columns[1].udt);
+    try testing.expectEqualStrings("text", columns[2].udt);
+    try testing.expectEqualStrings("int4", columns[columns.len - 1].udt);
+
+    const Domains = struct {
+        pub const nilo_table = .{ .name = "people", .key = .id };
+
+        id: i64,
+        email: []const u8,
+        work: ?[]const u8,
+        visits: i32,
+    };
+    var problems: std.ArrayList(schema.Problem) = .empty;
+    try testing.expectEqual(@as(usize, 0), try schema.compare(dialect.Postgres, Domains, columns, &problems, arena));
+
+    // A domain is no looser than what is under it: a `Str` over the integer
+    // one is still the mismatch this check is for.
+    const Wrong = struct {
+        pub const nilo_table = .{ .name = "people", .key = .id };
+
+        id: i64,
+        visits: []const u8,
+    };
+    try testing.expectEqual(@as(usize, 1), try schema.compare(dialect.Postgres, Wrong, columns, &problems, arena));
+    try testing.expectEqualStrings("int4", problems.items[0].found);
+
+    if (made) {
+        try testing.expectEqualStrings("citext", columns[3].udt);
+        const Shout = struct {
+            pub const nilo_table = .{ .name = "people", .key = .id };
+
+            id: i64,
+            shout: []const u8,
+        };
+        try testing.expectEqual(@as(usize, 0), try schema.compare(dialect.Postgres, Shout, columns, &problems, arena));
+    }
+}
+
+const dated_table = "nilo_live_dated_" ++ mode_suffix;
+
+test "a feed after a cursor over a Date binds it through its cast and reads every page on Postgres" {
+    // `.after` bound its cursor with a bare `$n` where every other condition
+    // writes `bindAs`, and pg.zig has no `date` encoder: the first page has no
+    // cursor and worked, and the second was a type error from the database.
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Due = struct {
+        pub const nilo_table = .{ .name = dated_table, .key = .id, .index = .{.{ .columns = .{ .due, .id } }} };
+        id: i64,
+        due: types.Date,
+    };
+    _ = try db.exec(&run, "DROP TABLE IF EXISTS \"" ++ dated_table ++ "\"", .{});
+    defer _ = db.exec(&run, "DROP TABLE IF EXISTS \"" ++ dated_table ++ "\"", .{}) catch {};
+    try migrate.createMissing(&db, &run, .{ .tables = &.{Due} });
+    // Twenty-five rows over five days, five sharing each, so the cursor needs
+    // the key as well as the day.
+    for (0..25) |i| _ = try db.insert(Due, &run, .{
+        .id = @as(i64, @intCast(i + 1)),
+        .due = types.Date.fromDays(19_000 + @as(i32, @intCast(i / 5))),
+    });
+
+    var seen: [26]bool = @splat(false);
+    var found = try db.feed(Due, &run, .{ .order = .{ .due = .asc, .id = .asc }, .limit = 4 });
+    var total: usize = 0;
+    while (true) {
+        for (found.rows) |row| {
+            try testing.expect(!seen[@intCast(row.id)]);
+            seen[@intCast(row.id)] = true;
+        }
+        total += found.rows.len;
+        if (!found.more) break;
+        const last = found.rows[found.rows.len - 1];
+        found = try db.feed(Due, &run, .{
+            .order = .{ .due = .asc, .id = .asc },
+            .after = .{ .due = last.due, .id = last.id },
+            .limit = 4,
+        });
+    }
+    try testing.expectEqual(@as(usize, 25), total);
+}
+
+const guarded_table = "nilo_live_guarded_" ++ mode_suffix;
+
+test "a statement holding a given is planned for each call's values, and a plain one stays kept on Postgres" {
+    // A kept plan goes generic after five calls, and on the generic plan
+    // `("cust" = $1 OR $1 IS NULL)` cannot seek: with a table this size the
+    // call that finally sets the filter read all of it (sql.md section 22).
+    // One connection, so `pg_prepared_statements` is the pool's whole session.
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Stock = struct {
+        pub const nilo_table = .{ .name = guarded_table, .key = .id, .index = .{.{ .columns = .{.cust} }} };
+        id: i64,
+        cust: []const u8,
+    };
+    _ = try db.exec(&run, "DROP TABLE IF EXISTS \"" ++ guarded_table ++ "\"", .{});
+    defer _ = db.exec(&run, "DROP TABLE IF EXISTS \"" ++ guarded_table ++ "\"", .{}) catch {};
+    try migrate.createMissing(&db, &run, .{ .tables = &.{Stock} });
+    for (0..30) |i| _ = try db.insert(Stock, &run, .{
+        .id = @as(i64, @intCast(i + 1)),
+        .cust = switch (i % 3) {
+            0 => "c0",
+            1 => "c1",
+            else => "c2",
+        },
+    });
+
+    const given = @import("where.zig").given;
+    for (0..8) |_| try testing.expectEqual(@as(usize, 30), try db.count(Stock, &run, .{
+        .where = .{ .cust = given(@as(?[]const u8, null)) },
+    }));
+    try testing.expectEqual(@as(usize, 10), try db.count(Stock, &run, .{
+        .where = .{ .cust = given(@as(?[]const u8, "c1")) },
+    }));
+    try testing.expectEqual(@as(usize, 10), try db.count(Stock, &run, .{
+        .where = .{ .cust = @as([]const u8, "c1") },
+    }));
+
+    const named = "SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE '%" ++ guarded_table ++
+        "%' AND statement NOT LIKE '%pg_prepared_statements%'";
+    const guarded = try db.rawExactlyOne(i64, &run, named ++ " AND statement LIKE '%IS NULL%'", .{});
+    try testing.expectEqual(@as(i64, 0), guarded);
+    const plain = try db.rawExactlyOne(i64, &run, named ++ " AND statement NOT LIKE '%IS NULL%'", .{});
+    try testing.expect(plain >= 1);
+}
+
+const prefixed_table = "nilo_live_prefixed_" ++ mode_suffix;
+
+test "istarts_with reads the case-folding unique as a range on Postgres, and a wildcard in the prefix is only itself" {
+    // `ILIKE` over the bare column read no index; the unique is on
+    // `lower("email") text_pattern_ops` and the prefix is written over that
+    // expression (ADR 140, sql.md section 23).
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Mailbox = struct {
+        pub const nilo_table = .{
+            .name = prefixed_table,
+            .key = .id,
+            .unique = .{.{ .columns = .{.email}, .ignoring_case = true }},
+        };
+        id: i64,
+        email: []const u8,
+    };
+    _ = try db.exec(&run, "DROP TABLE IF EXISTS \"" ++ prefixed_table ++ "\"", .{});
+    defer _ = db.exec(&run, "DROP TABLE IF EXISTS \"" ++ prefixed_table ++ "\"", .{}) catch {};
+    try migrate.createMissing(&db, &run, .{ .tables = &.{Mailbox} });
+    // Enough rows, and hex only, so no `zed`, `an` or `a_` is in the bulk.
+    _ = try db.exec(
+        &run,
+        "INSERT INTO \"" ++ prefixed_table ++ "\" (id, email) " ++
+            "SELECT n, md5(n::text) || '@x.dev' FROM generate_series(1, 20000) n",
+        .{},
+    );
+    for ([_][]const u8{ "Ann@x.dev", "a_n@x.dev", "a%n@x.dev", "a\\n@x.dev" }, 0..) |email, i| {
+        _ = try db.insert(Mailbox, &run, .{ .id = @as(i64, @intCast(20_001 + i)), .email = email });
+    }
+    _ = try db.exec(&run, "ANALYZE \"" ++ prefixed_table ++ "\"", .{});
+
+    const plan = try db.explain(Mailbox, &run, .{
+        .where = .{ .email = .{ .istarts_with = @as([]const u8, "abc1") } },
+    });
+    try testing.expect(std.mem.indexOf(u8, plan, "Index") != null);
+    try testing.expect(std.mem.indexOf(u8, plan, "Seq Scan") == null);
+
+    const Case = struct { prefix: []const u8, want: usize };
+    for ([_]Case{
+        .{ .prefix = "an", .want = 1 }, // `Ann`, since it folds case
+        .{ .prefix = "AN", .want = 1 },
+        .{ .prefix = "a_", .want = 1 }, // not `Ann`: `_` is not any character
+        .{ .prefix = "a%", .want = 1 }, // not every `a…`
+        .{ .prefix = "a\\", .want = 1 }, // the escape character, escaped first
+        .{ .prefix = "zed", .want = 0 },
+    }) |case| {
+        const rows = try db.select(Mailbox, &run, .{ .where = .{ .email = .{ .istarts_with = case.prefix } } });
+        try testing.expectEqual(case.want, rows.len);
+    }
+
+    // The unique still enforces what it always did, and serves `.ieq`.
+    try testing.expectError(error.AlreadyExists, db.insert(Mailbox, &run, .{ .id = 30_000, .email = "ANN@X.DEV" }));
+    const one = try db.select(Mailbox, &run, .{ .where = .{ .email = .{ .ieq = @as([]const u8, "ANN@x.dev") } } });
+    try testing.expectEqual(@as(usize, 1), one.len);
+}

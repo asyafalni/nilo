@@ -116,6 +116,25 @@ pub fn planName(comptime sql: []const u8) []const u8 {
     };
 }
 
+/// Whether a term of this statement can drop out at run time: it holds a
+/// `sql.given`, so it is written `(term OR $n IS NULL)`.
+///
+/// **That guard is the one shape a kept plan gets wrong.** A plan made for
+/// any value cannot fold `$n IS NULL`, so the `OR` stops an index seek, and
+/// Postgres switches a prepared statement to that plan after five calls
+/// whenever the calls that leave the filter out make the average custom plan
+/// as dear as a scan. A call that sets the filter then reads the whole table.
+/// `db.zig` sends such a statement unnamed on a Dialect that does this
+/// (`plan_may_go_generic`), so every call is planned for its own values
+/// ([ADR 149](../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md),
+/// [sql.md section 22](../bench/result/sql.md#22-a-guard-and-the-plan-a-kept-statement-settles-on)).
+pub fn dropsTerms(comptime stmt: Statement) bool {
+    return comptime blk: {
+        for (stmt.params) |p| if (p.droppable) break :blk true;
+        break :blk false;
+    };
+}
+
 /// The Row's table, quoted, with its schema in front when the Row named one.
 /// One function rather than seven call sites, because a `FROM` and an
 /// `INSERT INTO` have to spell the same relation the same way.
@@ -553,7 +572,11 @@ pub fn afterOf(
                     "  A cursor holds the last row's own value: " ++ example ++ ".",
             );
             lhs = lhs ++ (if (i == 0) "" else ", ") ++ prefix ++ D.quote(f.name);
-            rhs = rhs ++ (if (i == 0) "" else ", ") ++ D.placeholder(first + i);
+            // `bindAs`, as every other condition binds: a `Date`, `Decimal`,
+            // `Interval`, `Inet` or `Bytes` cursor is only bindable on
+            // Postgres through its cast, so a feed over `due_date, id`
+            // returned its first page and failed on its second.
+            rhs = rhs ++ (if (i == 0) "" else ", ") ++ D.bindAs(D.placeholder(first + i), T, false);
             paths = paths ++ &[_]where_mod.Path{&.{ "after", f.name }};
             params = params ++ &[_]where_mod.Param{.{ .column = f.name, .of = if (Column == Row) null else Column }};
         }
@@ -3457,6 +3480,18 @@ test "a clock moved by an offset is written into the statement, and binds nothin
             "\"seen_at\" <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 minutes')",
         (comptime update(Lite, Text, @TypeOf(t))).sql,
     );
+}
+
+test "only a statement with a term that can drop is one a kept plan gets wrong" {
+    const maybe: ?[]const u8 = null;
+    const guarded = comptime select(Pg, User, @TypeOf(.{ .where = .{ .email = where_mod.given(maybe) } }));
+    try testing.expect(comptime dropsTerms(guarded));
+    const plain = comptime select(Pg, User, @TypeOf(.{ .where = .{ .email = @as([]const u8, "a") } }));
+    try testing.expect(!comptime dropsTerms(plain));
+    // A `.set` given keeps its column and never drops a term, so an update
+    // with one keeps its name.
+    const o = .{ .set = .{ .kind = where_mod.given(@as(?[]const u8, null)) }, .where = .{ .id = 7 } };
+    try testing.expect(!comptime dropsTerms(update(Pg, RabLine, @TypeOf(o))));
 }
 
 test "a given in a set keeps the column when the value is null, which is a patch" {

@@ -656,6 +656,11 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // A statement whose `ORDER BY` is chosen per request is not one
             // text, so there is no one name to keep it under (ADR 165).
             if (comptime stmt.ordered) return null;
+            // A statement with a `sql.given` in it is sent unnamed where a
+            // kept plan can go generic: a plan made for any value cannot seek
+            // on `(term OR $n IS NULL)`, and this is the one place that says
+            // so for every call (ADR 149).
+            if (comptime D.plan_may_go_generic and statement.dropsTerms(stmt)) return null;
             return comptime statement.planName(stmt.sql);
         }
 
@@ -1137,13 +1142,13 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 // that both logs and returns, so the line is a diagnostic
                 // beside the answer rather than the answer itself.
                 if (isUrlProblem(err)) std.log.warn(
-                    "nilo could not read the database URL \"{s}\" ({s}). This is the URL " ++
+                    "nilo could not read the database URL \"{f}\" ({s}). This is the URL " ++
                         "itself rather than the database: the scheme has to be `postgres://` " ++
                         "or `postgresql://`, and a parameter the driver would not act on is " ++
                         "refused — the line above names it and lists the ones understood.",
                     .{ redacted(self.url), @errorName(err) },
                 ) else std.log.warn(
-                    "nilo could not open {d} of the {d} connections to \"{s}\" ({s}). " ++
+                    "nilo could not open {d} of the {d} connections to \"{f}\" ({s}). " ++
                         "`connect_on_init` is {d}, so startup dials that many and stops when it " ++
                         "cannot — the database may be down, the credentials wrong, or `size` " ++
                         "past the server's `max_connections`. Set `connect_on_init = 0` to " ++
@@ -1285,16 +1290,42 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
         /// becomes a 503 rather than a 200 over a pool with nothing in it.
         ///
         /// One statement per probe, on the balancer's schedule rather than a
-        /// request's. It goes through `exec`, so it is prepared like any other
-        /// and a watcher sees it.
+        /// request's. It is not prepared under a plan name, and a watcher sees
+        /// it.
+        ///
+        /// **It goes through `run`, not `exec`, and that is the fix for a 503
+        /// that was a healthy instance.** `exec` always takes SQLite's one
+        /// writer, so behind a long write transaction `/healthz` queued for
+        /// `timeout_ms` and answered 503, and a balancer pulled an instance
+        /// that was fine (ADR 107). A statement that begins with `SELECT`
+        /// takes a reader (`sqlite.wantsWriter`), which a write does not
+        /// hold. On Postgres the two take a connection from the same pool, so
+        /// nothing changes there.
         pub fn nilo_ready(self: *Self, scope: *core.AnyScope) ?[]const u8 {
             if (self.wire == null) return "not started: `listen()` has not run";
-            _ = self.exec(scope, "SELECT 1", .{}) catch |err| return switch (err) {
+            const w = self.wireOf() catch return "not started: `listen()` has not run";
+            const sql = "SELECT 1";
+            const started = self.timing();
+            var problem: ?wire_mod.Problem = null;
+            var rows = w.run(scope.arena(), sql, .{}, null, &problem) catch |err| {
+                self.told(scope, started, sql, null, null, true, problem);
+                return probeFailed(err);
+            };
+            defer w.drain(&rows);
+            _ = w.next(&rows) catch |err| {
+                self.told(scope, started, sql, null, null, true, null);
+                return probeFailed(err);
+            };
+            self.told(scope, started, sql, null, 1, false, null);
+            return null;
+        }
+
+        fn probeFailed(err: anyerror) []const u8 {
+            return switch (err) {
                 error.Disconnected => "the database is not answering",
                 error.TimedOut => "the database took too long to answer",
                 else => "the database refused SELECT 1",
             };
-            return null;
         }
 
         // -- reading ---------------------------------------------------------
@@ -2949,6 +2980,16 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 opening(c, "tx.exec");
                 return self.db.execTold(&self.inner, c, sql, null, try rawValuesOf(values, c));
             }
+
+            /// `db.liveColumns` inside the transaction, down the connection
+            /// it holds. **Not a second connection**: a migration that asks
+            /// the pool for one while it holds another waits out its bound
+            /// on a pool of one and then fails (ADR 123).
+            pub fn liveColumns(self: *Tx, c: anytype, schema_name: ?[]const u8, table: []const u8) ![]const wire_mod.Column {
+                comptime core.checkScope(@TypeOf(c), "tx.liveColumns");
+                if (self.finished) return error.QueryFailed;
+                return self.inner.columnsOf(c.arena(), D.introspect, schema_name, table);
+            }
         };
 
         /// What `db.page` answers with: the rows on this page, and how many
@@ -3838,9 +3879,18 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 // at the next row. The same trap `nilo_jwt` found in its own
                 // parse (ADR 111); a payload's text is copied the way a
                 // text column's is.
+                //
+                // **`ignore_unknown_fields`, because the document is the
+                // database's and a newer binary may have written it.** A
+                // rolling deploy that adds a field to a jsonb makes every old
+                // instance read rows carrying it; refusing them answered
+                // `QueryFailed` for a row nothing was wrong with. A request
+                // body is the other way round: there an unknown field is the
+                // client's typo, and `ctx.json` refuses it.
                 return .{
                     .value = std.json.parseFromSliceLeaky(Payload, c.arena(), value, .{
                         .allocate = .alloc_always,
+                        .ignore_unknown_fields = true,
                     }) catch return error.QueryFailed,
                 };
             }
@@ -5264,15 +5314,77 @@ fn hexOf(bytes: []const u8, c: anytype) ![]const u8 {
     return out;
 }
 
-/// A connection URL with the password taken out, for the one log line that
-/// prints one. `postgres://user:secret@host/db` has exactly one field worth
-/// hiding and it is always in the same place.
-fn redacted(url: []const u8) []const u8 {
-    const at = std.mem.indexOfScalar(u8, url, '@') orelse return url;
-    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return url;
-    const colon = std.mem.indexOfScalarPos(u8, url, scheme_end + 3, ':') orelse return url;
-    if (colon > at) return url;
-    return url[0..colon];
+/// A connection URL with every secret taken out, for the log lines that
+/// print one. Written with `{f}`, so masking a value in the middle of the
+/// string costs no buffer.
+///
+/// **There are two places a password can be**, because the URL parser takes
+/// both: `user:secret@host` in the authority, and `?password=secret` (or
+/// `sslpassword=`) in the query. Hiding only the first left a pool that
+/// failed to open printing the second whole. The query keys are matched
+/// without regard to case and after percent-decoding, so `Password=` and
+/// `pass%77ord=` do not slip past a parser that would have read them.
+const Redacted = struct {
+    url: []const u8,
+
+    pub fn format(self: Redacted, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const q = std.mem.indexOfAny(u8, self.url, "?#") orelse self.url.len;
+        const head = self.url[0..q];
+        const password_at: ?struct { from: usize, to: usize } = found: {
+            const scheme_end = std.mem.indexOf(u8, head, "://") orelse break :found null;
+            const start = scheme_end + 3;
+            const end = std.mem.indexOfScalarPos(u8, head, start, '/') orelse head.len;
+            const at = std.mem.lastIndexOfScalar(u8, head[start..end], '@') orelse break :found null;
+            const colon = std.mem.indexOfScalar(u8, head[start .. start + at], ':') orelse break :found null;
+            break :found .{ .from = start + colon, .to = start + at };
+        };
+        if (password_at) |p| {
+            try w.writeAll(head[0..p.from]);
+            try w.writeAll(":***");
+            try w.writeAll(head[p.to..]);
+        } else try w.writeAll(head);
+
+        if (q == self.url.len or self.url[q] != '?') return w.writeAll(self.url[q..]);
+        const fragment = std.mem.indexOfScalarPos(u8, self.url, q, '#') orelse self.url.len;
+        var it = std.mem.splitScalar(u8, self.url[q + 1 .. fragment], '&');
+        var first = true;
+        while (it.next()) |param| {
+            try w.writeByte(if (first) '?' else '&');
+            first = false;
+            const eq = std.mem.indexOfScalar(u8, param, '=') orelse {
+                try w.writeAll(param);
+                continue;
+            };
+            try w.writeAll(param[0 .. eq + 1]);
+            try w.writeAll(if (secretKey(param[0..eq])) "***" else param[eq + 1 ..]);
+        }
+        try w.writeAll(self.url[fragment..]);
+    }
+
+    /// Whether a query key names something the log must not carry. The one
+    /// secret `dialOpts` accepts is `password`; `sslpassword` is not
+    /// accepted, and a refused parameter is logged with its value.
+    fn secretKey(encoded: []const u8) bool {
+        var buf: [16]u8 = undefined;
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < encoded.len) : (n += 1) {
+            if (n == buf.len) return false;
+            if (encoded[i] == '%' and i + 3 <= encoded.len) {
+                buf[n] = std.fmt.parseInt(u8, encoded[i + 1 .. i + 3], 16) catch return false;
+                i += 3;
+            } else {
+                buf[n] = encoded[i];
+                i += 1;
+            }
+        }
+        return std.ascii.eqlIgnoreCase(buf[0..n], "password") or
+            std.ascii.eqlIgnoreCase(buf[0..n], "sslpassword");
+    }
+};
+
+fn redacted(url: []const u8) Redacted {
+    return .{ .url = url };
 }
 
 /// Whether a failure to open a pool is about the URL or about the database.
@@ -5306,15 +5418,22 @@ fn isUrlProblem(err: anyerror) bool {
 
 const testing = std.testing;
 
-test "a password never reaches the log" {
-    try testing.expectEqualStrings(
-        "postgres://app",
-        redacted("postgres://app:hunter2@localhost:5432/shop"),
-    );
-    try testing.expectEqualStrings(
-        "postgres://localhost:5432/shop",
-        redacted("postgres://localhost:5432/shop"),
-    );
+test "a password never reaches the log, wherever the URL carries it" {
+    const cases = [_][2][]const u8{
+        .{ "postgres://app:hunter2@localhost:5432/shop", "postgres://app:***@localhost:5432/shop" },
+        .{ "postgres://localhost:5432/shop", "postgres://localhost:5432/shop" },
+        .{ "postgres://app@localhost/shop?password=hunter2", "postgres://app@localhost/shop?password=***" },
+        .{ "postgres:///?user=app&password=p%26w%3D1&dbname=shop", "postgres:///?user=app&password=***&dbname=shop" },
+        .{ "postgres://h/db?Password=hunter2&sslmode=require", "postgres://h/db?Password=***&sslmode=require" },
+        .{ "postgres://h/db?pass%77ord=hunter2", "postgres://h/db?pass%77ord=***" },
+        .{ "postgres://h/db?sslpassword=hunter2", "postgres://h/db?sslpassword=***" },
+        .{ "postgres://a:b@h/db?password=c&application_name=x", "postgres://a:***@h/db?password=***&application_name=x" },
+    };
+    for (cases) |case| {
+        const shown = try std.fmt.allocPrint(testing.allocator, "{f}", .{redacted(case[0])});
+        defer testing.allocator.free(shown);
+        try testing.expectEqualStrings(case[1], shown);
+    }
 }
 
 /// A Db over the Fake: the whole of `db.zig` with no database behind it.
@@ -6796,6 +6915,29 @@ test "the name a statement is prepared under is the one that reaches the wire" {
     const first = db.wire.?.last_plan.?;
     _ = try db.count(Person, &run, .{});
     try testing.expect(!std.mem.eql(u8, first, db.wire.?.last_plan.?));
+}
+
+test "a statement holding a given goes down unnamed on postgres, so each call is planned for its values" {
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer db.deinit();
+    db.wire = .{ .answers = 1 };
+
+    var run = nilo.Run.init(testing.allocator);
+    defer run.deinit();
+
+    // A kept plan goes generic after five calls, and a generic plan cannot
+    // seek on `(term OR $1 IS NULL)` (ADR 149, sql.md section 22). The one
+    // statement that has such a term is the one sent unnamed.
+    const none: ?i32 = null;
+    _ = try db.select(Person, &run, .{ .where = .{ .age = where_mod.given(none) } });
+    try testing.expect(db.wire.?.last_plan == null);
+    const some: ?i32 = 30;
+    _ = try db.count(Person, &run, .{ .where = .{ .age = where_mod.given(some) } });
+    try testing.expect(db.wire.?.last_plan == null);
+
+    // A statement with nothing that can drop keeps its name.
+    _ = try db.select(Person, &run, .{ .where = .{ .age = @as(i32, 30) } });
+    try testing.expect(db.wire.?.last_plan != null);
 }
 
 test "a statement this module did not write is prepared too, because its text is comptime" {
@@ -10143,4 +10285,64 @@ test "on SQLite, a patch keeps every column it was not given, and .now is the da
     try testing.expectEqualStrings("first", again.title);
     try testing.expectEqual(@as(i32, 12), again.words);
     try testing.expectEqual(patched.edited_at.micros, again.edited_at.micros);
+}
+
+test "a Json column reads a document that carries a field its type does not have" {
+    // A rolling deploy: the new binary wrote `added_later`, this one has
+    // never heard of it, and the row is still fine (ADR 067).
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:json-newer-field?mode=memory&cache=shared",
+        .{ .size = 2, .unchecked = true },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try db.exec(&run, "CREATE TABLE newer_docs (id INTEGER PRIMARY KEY, prefs TEXT NOT NULL)", .{});
+    _ = try db.exec(
+        &run,
+        "INSERT INTO newer_docs VALUES (1, '{\"theme\":\"dark\",\"added_later\":[1,2],\"rows\":25}')",
+        .{},
+    );
+
+    const Doc = struct {
+        pub const nilo_table = .{ .name = "newer_docs", .key = .id };
+
+        id: i64,
+        prefs: types.Json(Prefs),
+    };
+    const docs = try db.select(Doc, &run, .{});
+    try testing.expectEqual(@as(usize, 1), docs.len);
+    try testing.expectEqualStrings("dark", docs[0].prefs.value.theme);
+    try testing.expectEqual(@as(u32, 25), docs[0].prefs.value.rows);
+}
+
+test "the readiness probe on SQLite does not wait behind a write transaction" {
+    // `exec` always takes the writer, so this used to queue behind the
+    // transaction below for as long as it stayed open, and `/healthz` was a
+    // 503 over a healthy database (ADR 107). If this test ever hangs, the
+    // probe is back on the writer.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:ready-during-write?mode=memory&cache=shared",
+        .{ .size = 2, .unchecked = true },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+    var scope = nilo.AnyScope.of(&run);
+
+    var tx = try db.begin(&run, .{});
+    defer tx.deinit();
+    try testing.expect(db.nilo_ready(&scope) == null);
 }
