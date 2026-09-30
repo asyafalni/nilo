@@ -1091,6 +1091,26 @@ pub const Wire = struct {
         }
         try arrayFits(Item, raw.data);
 
+        // **An enum list is read as its text and converted here.** pg.zig's
+        // own decoder is `std.meta.stringToEnum(T, data).?`, so one label the
+        // Zig enum lacks took the process down (ADR 007). Each label goes
+        // through the same refusal a scalar enum does (`labelOf`), and the
+        // cost is one more slice in the arena per row that reads one.
+        if (comptime enumOfList(Item)) |E| {
+            const Text = if (comptime @typeInfo(Item) == .optional) ?[]const u8 else []const u8;
+            const texts_it = row.iterator(Text, col) catch return error.QueryFailed;
+            const texts = texts_it.alloc(arena) catch return error.QueryFailed;
+            const tags = arena.alloc(Item, texts.len) catch return error.QueryFailed;
+            for (tags, texts) |*tag, text| {
+                if (comptime @typeInfo(Item) == .optional) {
+                    tag.* = if (text) |held| try labelOf(E, held) else null;
+                } else {
+                    tag.* = try labelOf(E, text);
+                }
+            }
+            return tags;
+        }
+
         const it = row.iterator(Item, col) catch return error.QueryFailed;
         const list = it.alloc(arena) catch return error.QueryFailed;
         // pg.zig copies an element out of its read buffer only when the
@@ -1106,9 +1126,51 @@ pub const Wire = struct {
         return list;
     }
 
-    /// The two array shapes pg.zig asserts on rather than refuses, checked
-    /// here so they answer with a 500 for one request instead of taking the
-    /// process down (ADR 007, and the same argument as `db.zig`'s `enumOf`).
+    /// The enum a list's element is, when it is one (`Item` or `?Item`).
+    fn enumOfList(comptime Item: type) ?type {
+        const Bare = if (@typeInfo(Item) == .optional) @typeInfo(Item).optional.child else Item;
+        return if (@typeInfo(Bare) == .@"enum") Bare else null;
+    }
+
+    /// The tag whose name a list element held, or a refusal naming the value.
+    /// `db.zig`'s `enumOf` for a scalar, which this file cannot import.
+    fn labelOf(comptime E: type, raw: []const u8) wire.Error!E {
+        return std.meta.stringToEnum(E, raw) orelse {
+            std.log.warn(
+                "nilo_sql: a column held `{s}` in a list, which is not a value of {s}. " ++
+                    "The database has a value the Zig enum does not.",
+                .{ raw, @typeName(E) },
+            );
+            return error.QueryFailed;
+        };
+    }
+
+    /// The element types (their OIDs) a list of `Item` may be read from, or
+    /// `null` for an `Item` this does not know, which is then not judged.
+    /// Exact, like `dialect.listAccepts`: an `int4[]` does not read into a
+    /// `[]const i64`.
+    fn elementOids(comptime Item: type) ?[]const i32 {
+        const Bare = if (@typeInfo(Item) == .optional) @typeInfo(Item).optional.child else Item;
+        const varchar = 1043;
+        if (comptime @typeInfo(Bare) == .@"enum") return &.{ pg.types.String.oid.decimal, varchar };
+        return switch (Bare) {
+            // A `Uuid` list arrives as `[]const u8` too (`db.WireList`), so the
+            // `uuid` element is in the set with the two text ones.
+            []const u8 => &.{ pg.types.String.oid.decimal, varchar, pg.types.UUID.oid.decimal },
+            bool => &.{pg.types.Bool.oid.decimal},
+            i16 => &.{pg.types.Int16.oid.decimal},
+            i32 => &.{pg.types.Int32.oid.decimal},
+            i64 => &.{pg.types.Int64.oid.decimal},
+            f32 => &.{pg.types.Float32.oid.decimal},
+            f64 => &.{pg.types.Float64.oid.decimal},
+            else => null,
+        };
+    }
+
+    /// The array shapes pg.zig asserts or panics on rather than refuses,
+    /// checked here so they answer with a 500 for one request instead of
+    /// taking the process down (ADR 007, and the same argument as `db.zig`'s
+    /// `enumOf`).
     ///
     /// This reads the array header out of the column's own bytes, which is
     /// reaching past pg.zig's API — the second place in this file that does,
@@ -1120,8 +1182,32 @@ pub const Wire = struct {
     /// count, a null flag, the element OID, then per dimension a length and a
     /// lower bound. A zero-dimension array — Postgres's `'{}'` — stops after
     /// the first three.
+    ///
+    /// **The element OID is checked first, and before the empty array is let
+    /// through.** pg.zig picks its element decoder from the column's type
+    /// before it looks at the length, and for an `i64` or `f64` list of any
+    /// other element type it is `std.debug.panic`: one `int4[]` read into a
+    /// `[]const i64` took the process down, empty or not.
     fn arrayFits(comptime Item: type, data: []const u8) wire.Error!void {
         if (data.len < 12) return error.QueryFailed;
+
+        if (comptime elementOids(Item)) |accepted| {
+            const element = std.mem.readInt(i32, data[8..12], .big);
+            const fits = for (accepted) |oid| {
+                if (oid == element) break true;
+            } else false;
+            if (!fits) {
+                std.log.warn(
+                    "nilo_sql: a column held an array of elements with type OID {d}, " ++
+                        "which a list of {s} cannot be read from. Declare the field to " ++
+                        "match the column (`int4[]` is a list of i32, `int8[]` of i64, " ++
+                        "`text[]` of text or of an enum).",
+                    .{ element, @typeName(Item) },
+                );
+                return error.QueryFailed;
+            }
+        }
+
         // The empty array, which has no dimension to describe.
         if (data.len == 12) return;
         if (data.len < 20) return error.QueryFailed;

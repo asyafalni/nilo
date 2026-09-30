@@ -314,7 +314,7 @@ fn rowsOf(
         // same pass as the rows — the same text in both Dialects, because a
         // window function is SQL:2003 and SQLite has had them since 3.25.
         const total = if (answers == .page) ", count(*) OVER ()" else "";
-        var sql: []const u8 = "SELECT " ++ columnList(D, Row) ++ total ++
+        var sql: []const u8 = "SELECT " ++ readList(D, Row) ++ total ++
             " FROM " ++ relation(D, Row);
 
         var paths: []const where_mod.Path = &.{};
@@ -538,6 +538,9 @@ pub fn afterOf(
             else
                 row_mod.noSuchColumn(Row, f.name, "`.after`");
             const T = row_mod.ColumnType(Column, f.name);
+            // The cursor is a `<` or `>` over the column, so it is the text's
+            // order on a Dialect that holds a number as text (ADR 049).
+            dialect_mod.assertDecimalCompares(D, Row, f.name, T, "`.after." ++ f.name ++ "`");
             if (@typeInfo(T) == .optional) @compileError(
                 "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " reads after a cursor over `" ++ f.name ++
                     "`, which may be null.\n" ++
@@ -1537,6 +1540,34 @@ fn notAConflictTarget(comptime Row: type, comptime On: type) noreturn {
     );
 }
 
+/// **The conflict target has to be among the values written.** `ON CONFLICT
+/// ("id")` fires when the row being inserted has an `id` that is already
+/// there; a row that leaves `id` to its default has a new one every time, so
+/// the statement never conflicts. It compiled, and it either inserted a
+/// duplicate on every call or failed on the unique that was really meant (a
+/// `.email` beside an `.id` the call did not carry).
+fn assertTargetWritten(
+    comptime Row: type,
+    comptime V: type,
+    comptime targets: []const []const u8,
+    comptime action: OnConflict,
+) void {
+    comptime {
+        for (targets) |name| {
+            if (@hasField(V, name)) continue;
+            @compileError(
+                "nilo: `" ++ (if (action == .update) "db.insertOrUpdate" else "db.insertOrIgnore") ++
+                    "` on " ++ @typeName(Row) ++ " conflicts on ." ++ columnTuple(targets) ++
+                    ", and the values written do not carry `" ++ name ++ "`.\n" ++
+                    "  A row conflicts on the value it is inserted with. Without `" ++ name ++
+                    "` it takes its default, which is new every time, so the statement never " ++
+                    "conflicts and inserts a duplicate on every call.\n" ++
+                    "  Write `." ++ name ++ " = …` in the values, or conflict on the columns they do carry.",
+            );
+        }
+    }
+}
+
 /// Both upserts, which differ by four words of SQL and by whether the answer
 /// can be empty.
 ///
@@ -1554,6 +1585,7 @@ fn upserting(
     return comptime blk: {
         const base = insert(D, Row, V);
         const targets = conflictColumns(Row, on);
+        assertTargetWritten(Row, V, targets, action);
 
         var conflict: []const u8 = "";
         for (targets, 0..) |name, i| {
@@ -2002,6 +2034,31 @@ pub fn columnList(comptime D: type, comptime Row: type) []const u8 {
     return comptime columnListFrom(D, Row, "");
 }
 
+/// `columnList` for a `SELECT` that may be ordered: a column read as text is
+/// answered under a name that is not its own.
+///
+/// **Postgres reads a bare name in `ORDER BY` against the answer's names
+/// first**, and `"total"::text` is answered as `total`, so `ORDER BY "total"`
+/// sorted the printing: `9.00`, `100.5`, `10.00`. Under another name the same
+/// `ORDER BY "total"` finds no answer of that name and reads the column, which
+/// is the number. The name is `total#`, and `#` begins no field name, so no
+/// column meets it; the statement reads its answer by position and never looks
+/// at it ([ADR 036](../docs/adr/036-the-shape-of-a-query-is-settled-while-compiling.md)). Everything
+/// that names the column, an `.order`, an `Ordering`, a tiebreak, stays as it
+/// was written.
+fn readList(comptime D: type, comptime Row: type) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (row_mod.columnsOf(Row), 0..) |c, i| {
+            const quoted = D.quote(c);
+            const asked = D.readAs(quoted, row_mod.ColumnType(Row, c));
+            const named = if (std.mem.eql(u8, asked, quoted)) asked else asked ++ " AS " ++ D.quote(c ++ "#");
+            out = out ++ (if (i == 0) "" else ", ") ++ named;
+        }
+        return out;
+    }
+}
+
 /// The same list, every column reached through a relation alias. Wanted by
 /// exactly one statement — a batched update, whose `FROM` puts a second
 /// relation with the same column names in scope, so an unqualified
@@ -2042,9 +2099,11 @@ fn lockedBy(comptime D: type, comptime Row: type, comptime O: type) []const u8 {
     }
 }
 
-/// The table's key, ascending, after an order that does not name all of it:
-/// the terms alone, with no comma in front. Empty for a grouped Row, whose
-/// rows are groups and have no key, and for a Row whose table has none.
+/// The table's key after an order that does not name all of it, running the
+/// way the order's last term runs (`lastDescending`): the terms alone, with no
+/// comma in front. Empty for a Row whose table has none, and for a grouped
+/// Row here: its rows are groups with no key, and `shape.zig` ends them in the
+/// columns they group by.
 ///
 /// **Written only where a `LIMIT` or an `OFFSET` cuts the answer.** Rows the
 /// order ties come back in whatever order the plan reaches them, and that can
@@ -2058,13 +2117,32 @@ fn lockedBy(comptime D: type, comptime Row: type, comptime O: type) []const u8 {
 pub fn tiebreak(comptime D: type, comptime Row: type, comptime Order: type, comptime prefix: []const u8) []const u8 {
     comptime {
         if (@hasDecl(Row, row_mod.aggregate_marker)) return "";
+        const way = if (lastDescending(Order)) " DESC" else " ASC";
         var out: []const u8 = "";
         for (row_mod.keysIfAnyOf(Row)) |key| {
             if (@hasField(Order, key)) continue;
             if (out.len > 0) out = out ++ ", ";
-            out = out ++ prefix ++ D.quote(key) ++ " ASC";
+            out = out ++ prefix ++ D.quote(key) ++ way;
         }
         return out;
+    }
+}
+
+/// Whether the last term an `.order` names runs descending, which is the way
+/// its tiebreak runs
+/// ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md#a-page-ends-in-the-key)).
+/// A cursor compares every column one way (`afterOf`), so a first page ended
+/// `"id" ASC` under `"created_at" DESC` could not be followed by the page
+/// after it: they were ordered two different ways, and rows sharing a
+/// `created_at` across the boundary were repeated or lost. Nothing named is
+/// ascending. A nested term (a parent's column) is read at its own leaf.
+pub fn lastDescending(comptime Order: type) bool {
+    comptime {
+        const fields = @typeInfo(Order).@"struct".fields;
+        if (fields.len == 0) return false;
+        const last = fields[fields.len - 1];
+        if (@typeInfo(last.type) == .@"struct") return lastDescending(last.type);
+        return writtenValue(Order, last.name, Direction).descending();
     }
 }
 
@@ -2074,7 +2152,9 @@ pub fn tiebreak(comptime D: type, comptime Row: type, comptime Order: type, comp
 pub const Tie = struct { column: []const u8, text: []const u8 };
 
 /// `tiebreak` for an ordering chosen at run time, where which key columns the
-/// request named is not known yet: every key column, each with its term, and
+/// request named is not known yet: every key column, each with its term (always
+/// ascending: nothing follows a run-time ordering with a cursor, which is the
+/// one reader that needs the two to agree, `afterOf`), and
 /// the Ordering leaves out the ones it chose ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md#a-page-ends-in-the-key)).
 pub fn tiesOf(comptime D: type, comptime Row: type, comptime prefix: []const u8) []const Tie {
     comptime {
@@ -2115,6 +2195,13 @@ fn orderBy(comptime D: type, comptime Row: type, comptime T: type) []const u8 {
             if (!row_mod.hasColumn(Row, f.name) and !row_mod.tableHasColumn(Row, f.name)) {
                 row_mod.noSuchColumn(Row, f.name, "`.order`");
             }
+            dialect_mod.assertDecimalCompares(
+                D,
+                Row,
+                f.name,
+                if (row_mod.hasColumn(Row, f.name)) row_mod.ColumnType(Row, f.name) else row_mod.ColumnType(row_mod.ownerOf(Row), f.name),
+                "`.order." ++ f.name ++ "`",
+            );
             if (f.type != Direction and f.type != @TypeOf(.enum_literal)) @compileError(
                 "nilo: `.order` on column `" ++ f.name ++ "` was given a " ++
                     @typeName(f.type) ++ ".\n" ++
@@ -2285,7 +2372,7 @@ test "a narrower Row selects only what it reads, from the table it borrows" {
 test "the whole statement is one constant, condition and order and limit" {
     try testing.expectEqualStrings(
         "SELECT \"id\", \"email\", \"age\", \"created_at\" FROM \"users\"" ++
-            " WHERE \"age\" > $1 ORDER BY \"created_at\" DESC, \"id\" ASC LIMIT 10",
+            " WHERE \"age\" > $1 ORDER BY \"created_at\" DESC, \"id\" DESC LIMIT 10",
         sqlOf(.{
             .where = .{ .age = .{ .gt = 18 } },
             .order = .{ .created_at = .desc },
@@ -2970,7 +3057,7 @@ test "a numeric column is read as text and written back as numeric" {
     // Both casts in one statement, which is the whole of what makes the round
     // trip exact — the digits never become a float in either direction.
     try testing.expectEqualStrings(
-        "SELECT \"id\", \"total\"::text, \"refunded\"::text FROM \"invoices\"" ++
+        "SELECT \"id\", \"total\"::text AS \"total#\", \"refunded\"::text AS \"refunded#\" FROM \"invoices\"" ++
             " WHERE \"total\" > $1::numeric",
         comptime select(Pg, Invoice, @TypeOf(.{
             .where = .{ .total = .{ .gt = types_mod.Decimal{ .text = "0" } } },
@@ -2998,12 +3085,78 @@ test "a numeric is cast where it is inserted, and where it is set" {
 
 test "a numeric in a list is cast as an array, so the statement stays a constant" {
     try testing.expectEqualStrings(
-        "SELECT \"id\", \"total\"::text, \"refunded\"::text FROM \"invoices\"" ++
+        "SELECT \"id\", \"total\"::text AS \"total#\", \"refunded\"::text AS \"refunded#\" FROM \"invoices\"" ++
             " WHERE \"total\" = ANY($1::text[]::numeric[])",
         comptime select(Pg, Invoice, @TypeOf(.{
             .where = .{ .total = .{ .in = &[_]types_mod.Decimal{} } },
         })).sql,
     );
+}
+
+test "a Decimal is compared for equality and listed on SQLite, which only refuses to order it" {
+    // The column is TEXT there and the digits are bound as they were stored, so
+    // `=`, `<>` and `IN` answer what the caller wrote. `>` and `ORDER BY`
+    // would compare text, and are Refusals (`sql/refusals/sqlite_decimal_*`,
+    // ADR 049).
+    const same = comptime select(Lite, Invoice, @TypeOf(.{
+        .where = .{ .total = types_mod.Decimal{ .text = "9.99" }, .refunded = .{ .ne = types_mod.Decimal{ .text = "0" } } },
+    }));
+    try testing.expect(std.mem.indexOf(u8, same.sql, "\"total\" = ?1") != null);
+    try testing.expect(std.mem.indexOf(u8, same.sql, "\"refunded\" <> ?2") != null);
+    const listed = comptime select(Lite, Invoice, @TypeOf(.{
+        .where = .{ .total = .{ .in = &[_]types_mod.Decimal{} } },
+    }));
+    try testing.expect(std.mem.indexOf(u8, listed.sql, "\"total\" IN (SELECT value FROM json_each(?1))") != null);
+    // Ordering by a column that is not a number held as text is untouched.
+    const plain = comptime select(Lite, Invoice, @TypeOf(.{ .order = .{ .id = .desc }, .limit = 5 }));
+    try testing.expect(std.mem.indexOf(u8, plain.sql, " ORDER BY \"id\" DESC") != null);
+}
+
+test "a Dialect says whether a Decimal compares as a number" {
+    try testing.expect(Pg.decimal_compares);
+    try testing.expect(!Lite.decimal_compares);
+    // Postgres still writes the ordered comparison and the order.
+    const gt = comptime select(Pg, Invoice, @TypeOf(.{
+        .where = .{ .total = .{ .gte = types_mod.Decimal{ .text = "50" } } },
+        .order = .{ .total = .asc },
+        .limit = 5,
+    }));
+    try testing.expect(std.mem.indexOf(u8, gt.sql, "\"total\" >= $1::numeric") != null);
+}
+
+test "an order over a column read as text names the column, which the text is answered under another name" {
+    // `"total"::text` would be answered as `total`, and Postgres reads a bare
+    // name in `ORDER BY` against the answers first: 9.00, 100.5, 10.00.
+    const found = comptime select(Pg, Invoice, @TypeOf(.{ .order = .{ .total = .desc }, .limit = 5 }));
+    try testing.expect(std.mem.indexOf(u8, found.sql, "\"total\"::text AS \"total#\"") != null);
+    try testing.expect(std.mem.endsWith(u8, found.sql, " ORDER BY \"total\" DESC, \"id\" DESC LIMIT 5"));
+    // A column that is not read as text is answered under its own name.
+    const plain = comptime select(Pg, User, @TypeOf(.{}));
+    try testing.expect(std.mem.indexOf(u8, plain.sql, " AS ") == null);
+}
+
+test "a tiebreak runs the way the last term of the order runs, so a feed's pages agree with its first" {
+    const Cursor = struct { created_at: i64, id: i64 };
+    const first = comptime feed(Pg, User, @TypeOf(.{ .order = .{ .created_at = .desc }, .limit = 20 }));
+    const later = comptime feed(Pg, User, @TypeOf(.{
+        .order = .{ .created_at = .desc, .id = .desc },
+        .after = @as(Cursor, undefined),
+        .limit = 20,
+    }));
+    const clause = " ORDER BY \"created_at\" DESC, \"id\" DESC LIMIT 21";
+    try testing.expect(std.mem.endsWith(u8, first.sql, clause));
+    try testing.expect(std.mem.endsWith(u8, later.sql, clause));
+    // The last term decides, not the first.
+    try testing.expect(std.mem.endsWith(
+        u8,
+        sqlOf(.{ .order = .{ .created_at = .desc, .age = .asc }, .limit = 5 }),
+        " ORDER BY \"created_at\" DESC, \"age\" ASC, \"id\" ASC LIMIT 5",
+    ));
+    try testing.expect(std.mem.endsWith(
+        u8,
+        sqlOf(.{ .order = .{ .age = .asc, .created_at = .desc_nulls_last }, .limit = 5 }),
+        " ORDER BY \"age\" ASC, \"created_at\" DESC NULLS LAST, \"id\" DESC LIMIT 5",
+    ));
 }
 
 test "an upsert that ignores a conflict adds four words and no parameters" {
@@ -3561,9 +3714,9 @@ test "an upsert can conflict on the key the Row already declares" {
 }
 
 test "a Row whose key is one column conflicts on that column" {
-    const values = @TypeOf(.{ .email = "a@b.c", .age = 30 });
+    const values = @TypeOf(.{ .id = @as(i64, 7), .email = "a@b.c", .age = 30 });
     try testing.expectEqualStrings(
-        "INSERT INTO \"users\" (\"email\", \"age\") VALUES ($1, $2)" ++
+        "INSERT INTO \"users\" (\"id\", \"email\", \"age\") VALUES ($1, $2, $3)" ++
             " ON CONFLICT (\"id\") DO NOTHING" ++
             " RETURNING \"id\", \"email\", \"age\", \"created_at\"",
         comptime insertOrIgnore(Pg, User, values, .key).sql,
@@ -3655,8 +3808,29 @@ test "a write seventeen columns wide on a twenty-column Row compiles, and its te
     try testing.expect(std.mem.startsWith(u8, batch.sql, "UPDATE \"rab_lines\" AS t SET \"section_id\" = v.\"section_id\","));
     try testing.expectEqual(@as(usize, 17), batch.params.len);
 
-    const ignored = comptime insertOrIgnore(Pg, RabLine, Saved, .key);
+    // Conflicting on the key needs the key written, or the row never conflicts.
+    const Keyed = struct {
+        id: i64,
+        rab_id: i64,
+        section_id: ?i64,
+        position: i32,
+        kind: []const u8,
+        commitment_id: ?i64,
+        sku_id: ?i64,
+        description: []const u8,
+        quantity: types_mod.Decimal,
+        unit: []const u8,
+        unit_cost_currency: ?[]const u8,
+        unit_cost_amount_minor: ?i64,
+        cost_source: []const u8,
+        notes: ?[]const u8,
+        partner_id: ?i64,
+        lead_days: ?i32,
+        risk: ?[]const u8,
+        reference: ?[]const u8,
+    };
+    const ignored = comptime insertOrIgnore(Pg, RabLine, Keyed, .key);
     try testing.expect(std.mem.containsAtLeast(u8, ignored.sql, 1, "ON CONFLICT (\"id\") DO NOTHING"));
-    const upserted = comptime insertOrUpdate(Pg, RabLine, Saved, .key);
+    const upserted = comptime insertOrUpdate(Pg, RabLine, Keyed, .key);
     try testing.expect(std.mem.containsAtLeast(u8, upserted.sql, 1, "ON CONFLICT (\"id\") DO UPDATE SET \"rab_id\" = EXCLUDED.\"rab_id\","));
 }

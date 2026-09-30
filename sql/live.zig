@@ -1250,10 +1250,10 @@ test "a Timestamp, a Uuid and a Json column come back as themselves" {
 
     try testing.expectEqual(@as(u16, 200), answer.status);
     try testing.expectEqualStrings(
-        "[{\"id\":1,\"seen_at\":\"2026-08-16T09:30:00Z\"," ++
+        "[{\"id\":1,\"seen_at\":\"2026-08-16T09:30:00.000000Z\"," ++
             "\"token\":\"550e8400-e29b-41d4-a716-446655440000\"," ++
             "\"settings\":{\"theme\":\"dark\"}}," ++
-            "{\"id\":2,\"seen_at\":\"2026-08-16T09:30:00Z\"," ++
+            "{\"id\":2,\"seen_at\":\"2026-08-16T09:30:00.000000Z\"," ++
             "\"token\":null,\"settings\":null}]",
         answer.body,
     );
@@ -1286,7 +1286,7 @@ test "the same three types go out to a column and come back unchanged" {
 
     try testing.expectEqual(@as(u16, 200), answer.status);
     try testing.expectEqualStrings(
-        "[{\"id\":2,\"seen_at\":\"2026-08-17T09:30:00Z\"," ++
+        "[{\"id\":2,\"seen_at\":\"2026-08-17T09:30:00.000000Z\"," ++
             "\"token\":\"11111111-2222-3333-4444-555555555555\"," ++
             "\"settings\":{\"theme\":\"midnight\"}}]",
         answer.body,
@@ -1370,7 +1370,7 @@ test "a borrowed row builds a Timestamp and a Uuid without allocating" {
 
     try testing.expectEqual(@as(u16, 200), answer.status);
     try testing.expectEqualStrings(
-        "1:2026-08-16T09:30:00Z:550e8400-e29b-41d4-a716-446655440000;",
+        "1:2026-08-16T09:30:00.000000Z:550e8400-e29b-41d4-a716-446655440000;",
         answer.body,
     );
 }
@@ -4372,6 +4372,8 @@ test "a commit a deferred key refuses says which key it was" {
     const refusal = db_mod.lastProblem(&run) orelse return error.NoProblemReported;
     try testing.expectEqualStrings("deferred_parent_later", refusal.constraint);
     try testing.expectEqualStrings("23503", refusal.code);
+    // A retry is refused too; it used to reach a Wire that was done and succeed.
+    try testing.expectError(error.QueryFailed, tx.commit());
 }
 
 test "a list condition over a date or bytes binds each element the way one is bound" {
@@ -6263,4 +6265,226 @@ test "a parent, its children and a sum come back from a real Postgres" {
     try testing.expect(std.mem.indexOf(u8, plan, "\n") != null);
 
     for (shape_setup[0..3]) |text| _ = try stack.db.exec(&run, text, .{});
+}
+
+const GroupCustomer = struct {
+    pub const nilo_table = .{ .name = "nilo_group_customers" };
+    id: i64,
+    name: []const u8,
+};
+
+const GroupOrder = struct {
+    pub const nilo_table = .{
+        .name = "nilo_group_orders",
+        .references = .{ .customer_id = .{ GroupCustomer, .id } },
+    };
+    id: i64,
+    customer_id: i64,
+    total: i64,
+};
+
+const GroupByCustomerName = struct {
+    pub const nilo_table = GroupOrder;
+    pub const nilo_through = .{ .customer_name = .{ .customer_id, .name } };
+    pub const nilo_aggregate = .{ .orders = .count, .revenue = .{ .sum = .total } };
+    customer_name: []const u8,
+    orders: i64,
+    revenue: i64,
+};
+
+test "a grouped Row reading a name through a reference keeps two customers of one name apart" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    const group_setup = [_][]const u8{
+        "DROP TABLE IF EXISTS nilo_group_orders",
+        "DROP TABLE IF EXISTS nilo_group_customers",
+        "CREATE TABLE nilo_group_customers (id bigint PRIMARY KEY, name text NOT NULL)",
+        "CREATE TABLE nilo_group_orders (id bigint PRIMARY KEY, customer_id bigint NOT NULL, total bigint NOT NULL)",
+        "INSERT INTO nilo_group_customers VALUES (1, 'Ani'), (2, 'Ani'), (3, 'Budi')",
+        "INSERT INTO nilo_group_orders VALUES (1, 1, 100), (2, 1, 50), (3, 2, 7), (4, 3, 1)",
+    };
+    for (group_setup) |text| _ = try stack.db.exec(&run, text, .{});
+    defer for (group_setup[0..2]) |text| {
+        _ = stack.db.exec(&run, text, .{}) catch {};
+    };
+
+    const groups = try stack.db.select(GroupByCustomerName, &run, .{
+        .order = .{ .revenue = .desc },
+    });
+    try testing.expectEqual(@as(usize, 3), groups.len);
+    try testing.expectEqualStrings("Ani", groups[0].customer_name);
+    try testing.expectEqual(@as(i64, 150), groups[0].revenue);
+    try testing.expectEqual(@as(i64, 2), groups[0].orders);
+    try testing.expectEqualStrings("Ani", groups[1].customer_name);
+    try testing.expectEqual(@as(i64, 7), groups[1].revenue);
+    try testing.expectEqual(@as(i64, 1), groups[1].orders);
+    try testing.expectEqualStrings("Budi", groups[2].customer_name);
+
+    // Two pages of one, ordered by a tie: the second Ani is not lost.
+    const first = try stack.db.page(GroupByCustomerName, &run, .{ .order = .{ .revenue = .desc }, .limit = 2 });
+    try testing.expectEqual(@as(i64, 3), first.total);
+    try testing.expectEqual(@as(usize, 2), first.rows.len);
+}
+
+const TicketKind = enum { urgent, billing };
+const TicketKindShort = enum { urgent };
+
+const KindedTicket = struct {
+    pub const nilo_table = .{ .name = list_table, .key = .id };
+
+    id: i64,
+    tags: []const TicketKind,
+};
+
+const ShortKindedTicket = struct {
+    pub const nilo_table = .{ .name = list_table, .key = .id };
+
+    id: i64,
+    tags: []const TicketKindShort,
+};
+
+const WideScores = struct {
+    pub const nilo_table = .{ .name = list_table, .key = .id };
+
+    id: i64,
+    scores: ?[]const i64,
+};
+
+const FloatScores = struct {
+    pub const nilo_table = .{ .name = list_table, .key = .id };
+
+    id: i64,
+    scores: ?[]const f64,
+};
+
+const TextScores = struct {
+    pub const nilo_table = .{ .name = list_table, .key = .id };
+
+    id: i64,
+    scores: ?[]const []const u8,
+};
+
+test "a list of enums reads each label, and one the enum lacks is a refusal rather than a panic" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    const was = std.testing.log_level;
+    defer std.testing.log_level = was;
+    std.testing.log_level = .err;
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const found = try stack.db.select(KindedTicket, &run, .{ .where = .{ .id = @as(i64, 1) } });
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqual(@as(usize, 2), found[0].tags.len);
+    try testing.expectEqual(TicketKind.urgent, found[0].tags[0]);
+    try testing.expectEqual(TicketKind.billing, found[0].tags[1]);
+
+    // The empty array has a label to be wrong about in no element at all.
+    const empty = try stack.db.select(KindedTicket, &run, .{ .where = .{ .id = @as(i64, 2) } });
+    try testing.expectEqual(@as(usize, 0), empty[0].tags.len);
+
+    // pg.zig decodes with `std.meta.stringToEnum(T, data).?`: `billing` is a
+    // label of the column and not of this enum, and that took the process down.
+    try testing.expectError(error.QueryFailed, stack.db.select(ShortKindedTicket, &run, .{
+        .where = .{ .id = @as(i64, 1) },
+    }));
+}
+
+test "an array read into a list of another element type is a refusal, empty or not, in place of pg.zig's panic" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    const was = std.testing.log_level;
+    defer std.testing.log_level = was;
+    std.testing.log_level = .err;
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // `scores` is `integer[]`. pg.zig panics on an `i64` or an `f64` list of
+    // any element type but its own.
+    try testing.expectError(error.QueryFailed, stack.db.select(WideScores, &run, .{
+        .where = .{ .id = @as(i64, 1) },
+    }));
+    try testing.expectError(error.QueryFailed, stack.db.select(FloatScores, &run, .{
+        .where = .{ .id = @as(i64, 1) },
+    }));
+    // Text over an `integer[]` decoded as raw bytes without a word.
+    try testing.expectError(error.QueryFailed, stack.db.select(TextScores, &run, .{
+        .where = .{ .id = @as(i64, 1) },
+    }));
+}
+
+test "an order over a numeric sorts the numbers, not the text they are read as" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // Different widths: as text `9.00` sorts after `100.5`, which sorts after
+    // `10.00`. `"balance"::text` is answered as `balance`, and Postgres reads a
+    // bare name in `ORDER BY` against the answers first. Two of them share a
+    // balance, so the tiebreak has to matter.
+    const balances = [_][]const u8{ "9.00", "10.00", "100.5", "10.00" };
+    const emails = [_][]const u8{ "w0@example.dev", "w1@example.dev", "w2@example.dev", "w3@example.dev" };
+    for (balances, emails, 0..) |text, email, i| {
+        _ = try stack.db.insert(Account, &run, .{
+            .id = @as(i64, 710) + @as(i64, @intCast(i)),
+            .email = email,
+            .age = @as(i32, 30),
+            .balance = types.Decimal{ .text = text },
+        });
+    }
+    const ids = [_]i64{ 710, 711, 712, 713 };
+
+    const down = try stack.db.select(Account, &run, .{
+        .where = .{ .id = .{ .in = &ids } },
+        .order = .{ .balance = .desc },
+        .limit = 10,
+    });
+    try testing.expectEqual(@as(usize, 4), down.len);
+    try testing.expectEqualStrings("100.5", down[0].balance.text);
+    try testing.expectEqualStrings("10.00", down[1].balance.text);
+    try testing.expectEqualStrings("10.00", down[2].balance.text);
+    try testing.expectEqualStrings("9.00", down[3].balance.text);
+
+    const up = try stack.db.select(Account, &run, .{
+        .where = .{ .id = .{ .in = &ids } },
+        .order = .{ .balance = .asc },
+    });
+    try testing.expectEqualStrings("9.00", up[0].balance.text);
+    try testing.expectEqualStrings("100.5", up[3].balance.text);
+
+    // A feed compares its cursor as a number, so the rows it walks have to be
+    // in that order or it skips them. Its first page names only the balance,
+    // and the tiebreak has to run the way the later pages, which name the key,
+    // do: 713 and 711 share a balance.
+    const first = try stack.db.feed(Account, &run, .{
+        .where = .{ .id = .{ .in = &ids } },
+        .order = .{ .balance = .desc },
+        .limit = 2,
+    });
+    try testing.expectEqual(@as(usize, 2), first.rows.len);
+    try testing.expectEqual(@as(i64, 712), first.rows[0].id);
+    try testing.expectEqual(@as(i64, 713), first.rows[1].id);
+    const last = first.rows[1];
+    const second = try stack.db.feed(Account, &run, .{
+        .where = .{ .id = .{ .in = &ids } },
+        .order = .{ .balance = .desc, .id = .desc },
+        .after = .{ .balance = last.balance, .id = last.id },
+        .limit = 2,
+    });
+    try testing.expectEqual(@as(usize, 2), second.rows.len);
+    try testing.expectEqual(@as(i64, 711), second.rows[0].id);
+    try testing.expectEqual(@as(i64, 710), second.rows[1].id);
 }

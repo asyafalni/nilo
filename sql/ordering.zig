@@ -47,6 +47,7 @@ const std = @import("std");
 const statement = @import("statement.zig");
 const dialect_mod = @import("dialect.zig");
 const row_mod = @import("row.zig");
+const shape = @import("shape.zig");
 
 pub const Direction = statement.Direction;
 
@@ -70,6 +71,10 @@ const Key = struct {
     expr: ?[]const u8,
     /// Where NULLs go under either direction, when the caller said.
     nulls: ?dialect_mod.Nulls,
+    /// The type of the column a key names, when the database sorts it as it
+    /// stores it: not an aggregate, whose call is what is sorted. Read by
+    /// `assertDecimalCompares` (ADR 049).
+    of: ?type = null,
 };
 
 /// The orderings a list can be read in, declared once.
@@ -224,7 +229,16 @@ pub fn Ordering(comptime Row: type, comptime keys: anytype) type {
 
                 var out: [max][directions][]const u8 = undefined;
                 for (specs, 0..) |s, i| {
-                    const what = if (s.column) |c| D.quote(c) else s.expr.?;
+                    // A column of a shaped Row that is read as text is named by
+                    // the expression under the cast, or Postgres sorts the text
+                    // (`shape.orderExpr`). A flat Row's is answered under
+                    // another name (`statement.readList`), so its bare name is
+                    // the column.
+                    const what = if (s.column) |c|
+                        (if (row_mod.isShaped(Row)) shape.orderExpr(D, Row, c) else null) orelse D.quote(c)
+                    else
+                        s.expr.?;
+                    if (s.of) |T| dialect_mod.assertDecimalCompares(D, Row, s.name, T, "the ordering key `" ++ s.name ++ "`");
                     for (@typeInfo(Direction).@"enum".fields) |f| {
                         const d: Direction = @field(Direction, f.name);
                         var frag: []const u8 = what ++ (if (d.descending()) " DESC" else " ASC");
@@ -357,7 +371,7 @@ fn readKey(comptime Row: type, comptime name: []const u8, comptime said: anytype
     comptime {
         const S = @TypeOf(said);
         if (S == @TypeOf(.enum_literal) or isPath(S)) {
-            return .{ .name = name, .column = columnOf(Row, name, said), .expr = null, .nulls = null };
+            return .{ .name = name, .column = columnOf(Row, name, said), .expr = null, .nulls = null, .of = storedTypeOf(Row, said) };
         }
         if (isText(S)) {
             return .{ .name = name, .column = null, .expr = textOf(Row, name, said), .nulls = null };
@@ -367,6 +381,7 @@ fn readKey(comptime Row: type, comptime name: []const u8, comptime said: anytype
             for (@typeInfo(S).@"struct".fields) |f| {
                 if (std.mem.eql(u8, f.name, "column")) {
                     key.column = columnOf(Row, name, said.column);
+                    key.of = storedTypeOf(Row, said.column);
                 } else if (std.mem.eql(u8, f.name, "expr")) {
                     key.expr = textOf(Row, name, said.expr);
                 } else if (std.mem.eql(u8, f.name, "nulls")) {
@@ -443,6 +458,29 @@ fn columnOf(comptime Row: type, comptime name: []const u8, comptime said: anytyp
             Level = row_mod.parentRowOf(T).?;
         }
         return row_mod.pathName(path);
+    }
+}
+
+/// The type of the column a key names, or null when the key is an aggregate
+/// or a figure over the children, which `shape` checked against the column
+/// they read. `said` has already passed `columnOf`.
+fn storedTypeOf(comptime Row: type, comptime said: anytype) ?type {
+    comptime {
+        if (@TypeOf(said) == @TypeOf(.enum_literal)) {
+            const column = @tagName(said);
+            const carried = row_mod.fieldTypeOf(Row, column) orelse return row_mod.ColumnType(Row, column);
+            return switch (row_mod.kindOf(Row, column)) {
+                .column, .through => carried,
+                else => null,
+            };
+        }
+        var Level = Row;
+        for (said, 0..) |step, i| {
+            const field = @tagName(step);
+            if (i + 1 == said.len) return row_mod.ColumnType(Level, field);
+            Level = row_mod.parentRowOf(row_mod.fieldTypeOf(Level, field).?).?;
+        }
+        unreachable;
     }
 }
 

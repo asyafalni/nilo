@@ -75,6 +75,19 @@ NULL, and there is only ever one statement. The Refusal lives in `where.zig`,
 which is the file both reads and conditions go through and neither write
 does.
 
+**A list holds no null either.** `.tag = .{ .not_in = &[_]?i64{ 1, null } }` is
+`= NULL` through another door: `"tag" <> ALL('{1,NULL}')` is NULL for every
+row, so the select comes back empty, and `.in` with a null in its list never
+matches a NULL row, which reads as if it would. The type says it, so it is
+refused the same way, while compiling: a list whose element is an optional, or
+a `null` written in it, stops at `zig build`
+(`refusals/not_in_a_list_that_holds_null.zig`,
+`refusals/in_a_literal_list_that_holds_null.zig`, `where.zig`'s
+`assertNoNullInList`). It used to compile, because a list for a nullable
+column had `?T` for its element. A plain `[]const i64` is still a fine list
+for a nullable column, and to have its NULL rows in the answer the caller says
+so beside the list, with `.any = .{ .{ .tag = .{ .in = list } }, .{ .tag = null } }`.
+
 ## Why not the alternatives
 
 **Read a null optional as `IS NULL`.** The obvious kindness, and it is the

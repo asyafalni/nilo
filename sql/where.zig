@@ -376,6 +376,16 @@ pub fn aggregateCall(
     comptime aggregate: row_mod.Aggregate,
 ) []const u8 {
     return comptime blk: {
+        if (aggregate.column) |c| switch (aggregate.kind) {
+            .sum, .avg, .min, .max => dialect_mod.assertDecimalCompares(
+                D,
+                Shape,
+                c,
+                row_mod.ColumnType(row_mod.ownerOf(Shape), c),
+                "`" ++ @tagName(aggregate.kind) ++ "` (field `." ++ aggregate.field ++ "`)",
+            ),
+            .count, .count_distinct => {},
+        };
         const call = aggregate.kind.call(if (aggregate.column) |c| relation ++ "." ++ D.quote(c) else null);
         if (!aggregate.filtered) break :blk call;
         break :blk call ++ " FILTER (WHERE " ++ aggregateFilter(D, Shape, relation, aggregate).sql ++ ")";
@@ -2009,6 +2019,13 @@ fn spelling(comptime name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Whether `name` asks which of two values comes first: the four comparisons
+/// that are not equality.
+fn isOrderingWord(comptime name: []const u8) bool {
+    return comptime std.mem.eql(u8, name, "gt") or std.mem.eql(u8, name, "gte") or
+        std.mem.eql(u8, name, "lt") or std.mem.eql(u8, name, "lte");
+}
+
 /// The two operators that compare **null-safely**, and the one place an
 /// optional is allowed in a condition.
 ///
@@ -2165,6 +2182,75 @@ fn assertTextPattern(
     }
 }
 
+/// **A list that holds a null is refused where it is written**, because one
+/// null changes the answer for every row and says nothing.
+///
+/// SQL compares a NULL with nothing and gets NULL, not false. So
+/// `"tag" <> ALL('{a,NULL}')` and `"tag" NOT IN ('a', NULL)` are NULL for every
+/// row, the `WHERE` keeps only what is true, and a `.not_in` with one null in
+/// its list selects nothing at all, with no error. `.in` is quieter: the null
+/// in the list matches no row, not even one whose column is NULL, so a list
+/// that reads as "these, and the ones with no value" finds only "these"
+/// (ADR 040, ADR 052).
+///
+/// The type says it, so the check costs nothing at run time: a list whose
+/// element is an optional or a `null` literal. The column's own nullability
+/// is not the question, since a plain `[]const i64` is a fine list for a
+/// nullable column.
+fn assertNoNullInList(
+    comptime Row: type,
+    comptime column: []const u8,
+    comptime op: []const u8,
+    comptime T: type,
+) void {
+    comptime {
+        if (!listHoldsNull(T)) return;
+        @compileError(
+            "nilo: `." ++ column ++ " = .{ ." ++ op ++ " = … }` on " ++ @typeName(Row) ++
+                " was given a list that holds null.\n" ++
+                "  SQL never finds a value equal to NULL, so one null makes `" ++ op ++
+                "` NULL for every row: `.not_in` selects nothing, and `.in` skips the " ++
+                "rows whose `" ++ column ++ "` is NULL as well. The query runs and says " ++
+                "nothing.\n" ++
+                "  Take the null out of the list. To have the rows with no value in the " ++
+                "answer as well, say so beside it: `.any = .{ .{ ." ++ column ++ " = .{ ." ++
+                op ++ " = list } }, .{ ." ++ column ++ " = null } }`.",
+        );
+    }
+}
+
+/// Whether a list written in a condition has a null among its elements, in
+/// any of the shapes one is written in: a slice, a pointer to an array, an
+/// array, a tuple, and any of them behind a `sql.given`'s optional.
+fn listHoldsNull(comptime T: type) bool {
+    comptime {
+        return switch (@typeInfo(T)) {
+            .optional => |o| listHoldsNull(o.child),
+            .pointer => |p| switch (p.size) {
+                .slice => p.child != u8 and elementIsNull(p.child),
+                .one => listHoldsNull(p.child),
+                else => false,
+            },
+            .array => |a| a.child != u8 and elementIsNull(a.child),
+            .@"struct" => |st| blk: {
+                if (!st.is_tuple) break :blk false;
+                for (st.fields) |f| {
+                    if (elementIsNull(f.type)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+}
+
+fn elementIsNull(comptime E: type) bool {
+    comptime return switch (@typeInfo(E)) {
+        .optional, .null => true,
+        else => false,
+    };
+}
+
 /// Whether `T` is text this module will match a pattern against. `Str` is
 /// Core's and is the ordinary one, because the text a search box sends arrives
 /// as one.
@@ -2277,6 +2363,7 @@ fn operator(
         }
 
         if (listSpelling(op.name)) |list_op| {
+            assertNoNullInList(Row, column, op.name, op.T);
             // Taken once, outside the switch: the counter is what numbers
             // every placeholder in the statement, and a branch that took it
             // twice or not at all would renumber everything after it.
@@ -2304,6 +2391,17 @@ fn operator(
                 .expanded, .unsupported => dialect_mod.noListForm(D, column),
             };
         }
+
+        // An ordering comparison over a number held as text is the text's
+        // order on a Dialect that stores it so (ADR 049). Equality is not
+        // asked, so `.eq`, `.ne` and the lists pass.
+        if (isOrderingWord(op.name)) dialect_mod.assertDecimalCompares(
+            D,
+            Row,
+            column,
+            row_mod.ColumnType(Row, column),
+            "`." ++ column ++ " = .{ ." ++ op.name ++ " = … }`",
+        );
 
         // `ILIKE` is Postgres's word for what SQLite's `LIKE` already does, so
         // on a Dialect whose `LIKE` folds the folding spelling drops the `I` —
@@ -3305,4 +3403,24 @@ test "a term pins its column only when it is `=` to a value that is always there
     try testing.expect(comptime !pinsEquality(struct { eq: ?i64 }));
     try testing.expect(comptime !pinsEquality(struct { in: []const i64 }));
     try testing.expect(comptime !pinsEquality(Given(i64)));
+}
+
+test "a list is read as holding null in every shape one is written in" {
+    const ints = [_]i64{ 1, 2 };
+    const maybe = [_]?i64{ 1, null };
+    try testing.expect(comptime listHoldsNull(@TypeOf(&maybe)));
+    try testing.expect(comptime listHoldsNull([]const ?i64));
+    try testing.expect(comptime listHoldsNull(?[]const ?i64));
+    try testing.expect(comptime listHoldsNull([2]?i64));
+    try testing.expect(comptime listHoldsNull(@TypeOf(&.{ 1, null })));
+    try testing.expect(comptime listHoldsNull(@TypeOf(.{ .a, null })));
+
+    try testing.expect(comptime !listHoldsNull(@TypeOf(&ints)));
+    try testing.expect(comptime !listHoldsNull([]const i64));
+    try testing.expect(comptime !listHoldsNull(?[]const i64));
+    try testing.expect(comptime !listHoldsNull(@TypeOf(&.{ 1, 2 })));
+    try testing.expect(comptime !listHoldsNull(@TypeOf(.{ .done, .cancelled })));
+    // Text is a value, not a list of bytes.
+    try testing.expect(comptime !listHoldsNull([]const u8));
+    try testing.expect(comptime !listHoldsNull([]const []const u8));
 }

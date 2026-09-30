@@ -140,6 +140,12 @@ pub const Run = struct {
         return .fromRequest(bytes, &self._lifetime);
     }
 
+    /// Which tick this is: moved by every `reset`, never the same on two
+    /// Runs. nilo's own; `serialOf` is how a module reads it.
+    pub fn serial(self: *const Run) u64 {
+        return self._lifetime.serial();
+    }
+
     /// `n` bytes from the operating system's entropy source
     /// ([ADR 128](../docs/adr/128-a-scope-that-can-mint-a-key.md)).
     ///
@@ -335,7 +341,7 @@ pub const AnyScope = struct {
     _scope: *anyopaque,
     _table: *const Table,
 
-    /// The five calls a Scope makes across a function pointer. `arena` and
+    /// The six calls a Scope makes across a function pointer. `arena` and
     /// `str` are what `check` above asks of every Scope; `entropyInto` is the
     /// third because minting a key is what a reaction does that a query does
     /// not, and it is spelled `Into` rather than `entropy` because a function
@@ -346,13 +352,16 @@ pub const AnyScope = struct {
     /// ([ADR 158](../docs/adr/158-a-request-id-goes-out-with-the-call.md)).
     /// `resolved` is the fifth, by type name for the reason `entropyInto` is
     /// by buffer: the value a request resolved or a tick was given, so that
-    /// who is acting reaches the far side of the pointer (ADR 144).
+    /// who is acting reaches the far side of the pointer (ADR 144). `serial`
+    /// is the sixth, so that `sql.problem` asked through an erased Scope can
+    /// still tell this request's failure from the last one's (ADR 117).
     pub const Table = struct {
         arena: *const fn (*anyopaque) std.mem.Allocator,
         str: *const fn (*anyopaque, []const u8) Str,
         entropyInto: *const fn (*anyopaque, []u8) anyerror!void,
         requestId: *const fn (*anyopaque) ?Str,
         resolved: *const fn (*anyopaque, []const u8) ?*const anyopaque,
+        serial: *const fn (*anyopaque) ?u64,
     };
 
     /// Erase `scope`, which is a `*Ctx` or a `*Run`.
@@ -386,6 +395,7 @@ pub const AnyScope = struct {
                 .entropyInto = takeEntropy,
                 .requestId = takeRequestId,
                 .resolved = takeResolved,
+                .serial = takeSerial,
             };
             fn takeArena(p: *anyopaque) std.mem.Allocator {
                 return S.arena(@ptrCast(@alignCast(p)));
@@ -408,6 +418,9 @@ pub const AnyScope = struct {
                 if (comptime !@hasDecl(S, "resolvedNamed")) return null;
                 return S.resolvedNamed(@ptrCast(@alignCast(p)), type_name);
             }
+            fn takeSerial(p: *anyopaque) ?u64 {
+                return serialOf(@as(*S, @ptrCast(@alignCast(p))));
+            }
         };
         return .{ ._scope = @ptrCast(@constCast(scope)), ._table = &erased.table };
     }
@@ -424,6 +437,12 @@ pub const AnyScope = struct {
     /// made from something that is not a request (ADR 158).
     pub fn requestId(self: *AnyScope) ?Str {
         return self._table.requestId(self._scope);
+    }
+
+    /// The serial of the Scope behind this one, or null when it keeps none.
+    /// nilo's own; `serialOf` is how a module reads it.
+    pub fn serial(self: *const AnyScope) ?u64 {
+        return self._table.serial(self._scope);
     }
 
     /// `n` bytes of randomness, the width said where the call is written.
@@ -487,6 +506,24 @@ pub fn routeNameOf(scope: anytype) ?[]const u8 {
     };
     if (comptime !@hasDecl(S, "routeName")) return null;
     return scope.routeName();
+}
+
+/// Which piece of work a Scope is on, or null for a Scope that keeps no
+/// count: moved at every request end and every `Run.reset`, and never the
+/// same on two connections (ADR 117).
+///
+/// **What `sql.problem` compares, because nothing cheaper tells two requests
+/// on one connection apart.** The arena's pointer and vtable are the same for
+/// all of them, and the failure it keeps has strings the arena's reset handed
+/// back. A read of a counter the Scope already moves: no allocation, no call
+/// at request end.
+pub fn serialOf(scope: anytype) ?u64 {
+    const S = switch (@typeInfo(@TypeOf(scope))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(scope),
+    };
+    if (comptime !@hasDecl(S, "serial")) return null;
+    return scope.serial();
 }
 
 /// Two `@typeName` results naming the same type.
@@ -757,6 +794,39 @@ test "an erased Scope carries the request id of the Scope it was made from, and 
     var erased = AnyScope.of(&named);
     try testing.expectEqualStrings("req-7f3a", erased.requestId().?.view());
     try testing.expectEqualStrings("req-7f3a", requestIdOf(Named, &named).?.view());
+}
+
+test "a Run's serial moves at every reset, and reaches an erased Scope" {
+    var run = Run.init(testing.allocator);
+    defer run.deinit();
+    var other = Run.init(testing.allocator);
+    defer other.deinit();
+
+    const first = serialOf(&run).?;
+    try testing.expect(first != serialOf(&other).?);
+    run.reset();
+    try testing.expect(serialOf(&run).? != first);
+
+    var erased = AnyScope.of(&run);
+    try testing.expectEqual(serialOf(&run), serialOf(&erased));
+
+    // A Scope that counts nothing answers null, here and through the erasure.
+    const Bare = struct {
+        run: *Run,
+        pub fn arena(self: *@This()) std.mem.Allocator {
+            return self.run.arena();
+        }
+        pub fn str(self: *@This(), bytes: []const u8) Str {
+            return self.run.str(bytes);
+        }
+        pub fn entropyInto(self: *@This(), buf: []u8) !void {
+            return self.run.entropyInto(buf);
+        }
+    };
+    var bare: Bare = .{ .run = &run };
+    try testing.expect(serialOf(&bare) == null);
+    var blind = AnyScope.of(&bare);
+    try testing.expect(serialOf(&blind) == null);
 }
 
 test "a Scope names the route its request matched, and a Run names none" {

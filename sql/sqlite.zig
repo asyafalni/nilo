@@ -794,7 +794,7 @@ pub fn Wire(comptime opts_in: Options) type {
                     stmt.bind(args) catch |err| return translate(conn.handle, err);
                     return .{ stmt, true };
                 }
-                const stmt = conn.handle.prepare(sql) catch |err|
+                const stmt = prepareOne(conn.handle, sql) catch |err|
                     return translate(conn.handle, err);
                 conn.kept.put(self.gpa, name, stmt) catch {
                     // A cache that cannot grow is a slower Wire, not a broken
@@ -807,7 +807,7 @@ pub fn Wire(comptime opts_in: Options) type {
                 return .{ stmt, true };
             }
 
-            const stmt = conn.handle.prepare(sql) catch |err| return translate(conn.handle, err);
+            const stmt = prepareOne(conn.handle, sql) catch |err| return translate(conn.handle, err);
             stmt.bind(args) catch |err| {
                 stmt.deinit();
                 return translate(conn.handle, err);
@@ -1285,7 +1285,7 @@ pub fn Wire(comptime opts_in: Options) type {
             const at = if (wantsWriter(sql)) try self.takeWriter(sql) else try self.takeReader(sql);
             defer self.release(at);
             const conn = self.conns[at].handle;
-            const stmt = conn.prepare(sql) catch |err| return translate(conn, err);
+            const stmt = prepareOne(conn, sql) catch |err| return translate(conn, err);
             defer stmt.deinit();
 
             const count: usize = @intCast(zqlite.c.sqlite3_column_count(stmt.stmt));
@@ -1431,6 +1431,37 @@ fn blobbed(values: anytype) Blobbed(@TypeOf(values)) {
     return out;
 }
 
+/// `conn.prepare`, and a refusal of a second statement in **every** optimize
+/// mode. zqlite makes that check only under `builtin.mode == .Debug`, so a
+/// release build ran the first of two statements given to one call and dropped
+/// the rest without a word: `exec("INSERT …; INSERT …")` inserted one row and
+/// reported success, and a test in Debug could not have shown it.
+///
+/// SQLite reports the first statement's text through `sqlite3_sql` (exactly
+/// what `sqlite3_prepare_v2` consumed, up to the tail), so what follows it is
+/// found without a second `prepare` on the common path. A tail that compiles to
+/// nothing, whitespace or comments or a lone `;`, is not a statement and is
+/// let through, the way the Debug check treats it. In Debug zqlite's own check
+/// runs first and answers the same `error.MultipleStatements`.
+fn prepareOne(conn: zqlite.Conn, sql: []const u8) !zqlite.Stmt {
+    const stmt = try conn.prepare(sql);
+    errdefer stmt.deinit();
+
+    const c = zqlite.c;
+    const consumed_ptr = c.sqlite3_sql(stmt.stmt) orelse return stmt;
+    const consumed = std.mem.len(consumed_ptr);
+    if (consumed >= sql.len) return stmt;
+    const rest = sql[consumed..];
+
+    var tail_stmt: ?*c.sqlite3_stmt = null;
+    defer if (tail_stmt != null) {
+        _ = c.sqlite3_finalize(tail_stmt);
+    };
+    const rc = c.sqlite3_prepare_v2(conn.conn, rest.ptr, @intCast(rest.len), &tail_stmt, null);
+    if (rc != c.SQLITE_OK or tail_stmt != null) return error.MultipleStatements;
+    return stmt;
+}
+
 /// **Cleaner than the Postgres mapping, and for a reason worth recording**:
 /// SQLite's extended result codes tell a unique violation apart from every
 /// other constraint natively, so this is a switch over an error set rather
@@ -1483,6 +1514,17 @@ fn translate(conn: zqlite.Conn, err: anyerror) wire.Error {
             return error.QueryFailed;
         },
         error.CantOpen, error.IoErr, error.NotADB, error.Corrupt => error.Disconnected,
+
+        // `prepareOne`'s refusal. `lastError` would name whatever the
+        // connection said last, which is not this.
+        error.MultipleStatements => {
+            std.log.warn(
+                "nilo_sql: a statement text held more than one statement, and SQLite " ++
+                    "runs only the first. Send each as its own call.",
+                .{},
+            );
+            return error.QueryFailed;
+        },
 
         else => {
             // The text never reaches the client (ADR 024); it goes here,
@@ -2233,6 +2275,76 @@ test "each constraint a caller branches on arrives under its own name" {
                 null,
                 null,
             ));
+        }
+    }.run);
+}
+
+test "a statement text holding a second statement is refused in every optimize mode, and a tail of nothing is not" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:two-statements?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE t(id INTEGER PRIMARY KEY)", .{}, null, null);
+
+            // zqlite refuses this only in Debug; a release build ran the
+            // first INSERT and dropped the second without a word.
+            try testing.expectError(error.QueryFailed, w.exec(
+                gpa,
+                "INSERT INTO t(id) VALUES (1); INSERT INTO t(id) VALUES (2)",
+                .{},
+                null,
+                null,
+            ));
+
+            // A trailing semicolon, whitespace and a comment are not statements.
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t(id) VALUES (3);", .{}, null, null));
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t(id) VALUES (4); \n\t", .{}, null, null));
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t(id) VALUES (5); -- done", .{}, null, null));
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t(id) VALUES (6); /* done */", .{}, null, null));
+
+            // Nothing from the refused text ran: 3, 4, 5 and 6 only.
+            var rows = try w.run(gpa, "SELECT count(*) FROM t", .{}, null, null);
+            defer rows.close();
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(i64, 4), try w.read(&rows, i64, 0));
+        }
+    }.run);
+}
+
+test "the numbered list of blob keys joins a blob column, because it is read back out of its hex" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:blob-children?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE child(id INTEGER PRIMARY KEY, parent BLOB NOT NULL)", .{}, null, null);
+            _ = try w.exec(gpa, "INSERT INTO child(id, parent) VALUES (1, x'0a0b'), (2, x'ff'), (3, x'0a0b')", .{}, null, null);
+
+            // The same statement `shape.children` builds: the list, then a
+            // join on its `value`. The parameter is what `jsonList` writes
+            // for a `Bytes` key: a JSON array of hex text.
+            const listed = comptime dialect.SQLite.ordinalList("?1", wire.Bytes, "\"#k\"").?;
+            var rows = try w.run(
+                gpa,
+                "SELECT child.id, \"#k\".\"key\" FROM " ++ listed ++
+                    " JOIN child ON child.parent = \"#k\".\"value\" ORDER BY \"#k\".\"key\", child.id",
+                .{"[\"ff\",\"0a0b\"]"},
+                null,
+                null,
+            );
+            defer rows.close();
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(i64, 2), try w.read(&rows, i64, 0));
+            try testing.expectEqual(@as(i64, 0), try w.read(&rows, i64, 1));
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(i64, 1), try w.read(&rows, i64, 0));
+            try testing.expectEqual(@as(i64, 1), try w.read(&rows, i64, 1));
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(i64, 3), try w.read(&rows, i64, 0));
+            try testing.expect(!try w.next(&rows));
         }
     }.run);
 }

@@ -66,6 +66,7 @@ const core = @import("nilo_core");
 const row_mod = @import("row.zig");
 const where_mod = @import("where.zig");
 const types_mod = @import("types.zig");
+const dialect_mod = @import("dialect.zig");
 
 /// The longest identifier Postgres keeps, in bytes.
 ///
@@ -1747,6 +1748,17 @@ fn literalTerm(
                         "nilo: " ++ what ++ " asks whether `" ++ column ++ "` is `." ++ f.name ++
                             "` null.\n  Nothing is greater or less than null: `null` is IS NULL " ++
                             "and `.{ .ne = null }` is IS NOT NULL.",
+                    );
+                }
+                // A written-out condition orders text as text on a Dialect
+                // that holds a number so (ADR 049), the same as `.where`.
+                if (!std.mem.eql(u8, op, "=") and !std.mem.eql(u8, op, "<>")) {
+                    dialect_mod.assertDecimalCompares(
+                        D,
+                        Row,
+                        column,
+                        row_mod.ColumnType(Row, column),
+                        "`." ++ f.name ++ "` in " ++ what,
                     );
                 }
                 break :blk quoted ++ " " ++ op ++ " " ++

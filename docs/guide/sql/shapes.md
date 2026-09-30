@@ -329,7 +329,7 @@ The aggregate words are `.count`, `.{ .count = .col }`, `.{ .count_distinct = .c
 | word | field |
 |---|---|
 | any count | `i64`, never null |
-| `sum` | `i64` over whole numbers, `f64` over floating ones, the column's own type over a `Decimal` |
+| `sum` | `i64` over whole numbers, `f64` over floating ones, the column's own type over a `Decimal` (Postgres only; SQLite refuses an aggregate over a `Decimal`) |
 | `min`, `max` | the column's type |
 | `avg` | `f64` |
 

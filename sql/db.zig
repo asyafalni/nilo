@@ -236,6 +236,13 @@ pub const Watcher = *const fn (Sent) void;
 /// in the request arena, which is reset between requests on the same
 /// connection, so a slot only ever written on failure would hand back freed
 /// bytes to whoever asked after a statement that worked.
+///
+/// **And stamped with the Scope's serial, because clearing is not enough.** A
+/// request that fails on a unique and the next one on the same connection
+/// that fails on something that is not SQL send no statement in between, so
+/// nothing clears the slot, and the arena's pointer is the same for both. The
+/// serial moves when the request ends (`core.serialOf`), so the second
+/// request reads null rather than the first's Problem out of freed memory.
 threadlocal var recent: Recent = .{};
 
 const Recent = struct {
@@ -245,12 +252,16 @@ const Recent = struct {
     /// what makes a problem left behind by a fiber that moved unreadable
     /// rather than wrong.
     arena: ?std.mem.Allocator = null,
+    /// The Scope's serial when the statement ran, or null for a Scope that
+    /// keeps none; the arena's pointer is then all there is to compare.
+    serial: ?u64 = null,
 };
 
 /// What every statement leaves behind, success included.
-fn remember(arena: std.mem.Allocator, problem: ?wire_mod.Problem) void {
+fn remember(arena: std.mem.Allocator, serial: ?u64, problem: ?wire_mod.Problem) void {
     recent.problem = problem;
     recent.arena = if (problem == null) null else arena;
+    recent.serial = if (problem == null) null else serial;
 }
 
 /// The first line of every call that sends a statement: the Scope checked
@@ -265,7 +276,7 @@ fn remember(arena: std.mem.Allocator, problem: ?wire_mod.Problem) void {
 /// touched. Two stores to a thread-local.
 inline fn opening(c: anytype, comptime call: []const u8) void {
     comptime core.checkScope(@TypeOf(c), call);
-    remember(c.arena(), null);
+    remember(c.arena(), null, null);
 }
 
 /// What the database said about the last statement **this fiber** ran, or null
@@ -303,6 +314,9 @@ pub fn lastProblem(c: anytype) ?wire_mod.Problem {
     // request. Two pointers rather than a lock, and the answer is null rather
     // than a plausible sentence about the wrong row.
     if (mine.ptr != asked.ptr or mine.vtable != asked.vtable) return null;
+    // The same arena on a later request of the same connection: its reset
+    // handed the Problem's strings back, and they are not this request's.
+    if (recent.serial != core.serialOf(c)) return null;
     return held;
 }
 
@@ -953,14 +967,16 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             failed: bool,
             problem: ?wire_mod.Problem,
         ) void {
-            self.toldFor(c.arena(), core.routeNameOf(c), started, sql, plan, rows, failed, problem);
+            self.toldFor(c.arena(), core.serialOf(c), core.routeNameOf(c), started, sql, plan, rows, failed, problem);
         }
 
-        /// `told` for a caller holding no Scope, only its arena and route: a
-        /// stream's rows are pulled after the call that opened it returned.
+        /// `told` for a caller holding no Scope, only its arena, serial and
+        /// route: a stream's rows are pulled after the call that opened it
+        /// returned.
         fn toldFor(
             self: *const Self,
             arena: std.mem.Allocator,
+            serial: ?u64,
             route: ?[]const u8,
             started: ?i64,
             sql: []const u8,
@@ -973,7 +989,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // watcher's half: a `Db` with no watcher and a `Db` with timing off
             // both still owe the caller an answer about the statement it just
             // ran (ADR 117).
-            remember(arena, problem);
+            remember(arena, serial, problem);
             const f = self.watch orelse return;
             const at = started orelse return;
             const took = core.monotonicMicros() - at;
@@ -1599,6 +1615,8 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 "what comes back.");
             const stmt = comptime statement.select(D, Row, @TypeOf(options));
             const arena = c.arena();
+            const closed = try arena.create(bool);
+            closed.* = false;
             const text = try textOf(stmt, options, c);
             const w = try self.wireOf();
             const started = self.timing();
@@ -1626,7 +1644,9 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 .db = self,
                 .w = w,
                 .rows = rows,
+                .closed = closed,
                 .arena = arena,
+                .serial = core.serialOf(c),
                 .route = core.routeNameOf(c),
                 .text = text,
                 .plan = self.planOf(stmt),
@@ -2334,7 +2354,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             const w = try self.wireOf();
             const inner = try w.begin(c.arena(), opts);
             if (traps_enabled) self.hold(&self.open_transactions, .Add);
-            return .{ .db = self, .w = w, .inner = inner, .scope = c.arena() };
+            return .{ .db = self, .w = w, .inner = inner, .scope = c.arena(), .serial = core.serialOf(c) };
         }
 
         /// One transaction. Every call on it is the `Db` call of the same
@@ -2344,8 +2364,10 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             w: *W,
             inner: W.Tx,
             /// The arena of the Scope that began it, where a refused COMMIT
-            /// leaves the database's words for `sql.problem`.
+            /// leaves the database's words for `sql.problem`, and the serial
+            /// that says which request they belong to.
             scope: std.mem.Allocator,
+            serial: ?u64,
             finished: bool = false,
             /// The number the next savepoint gets. Counted up and never
             /// reused, so a savepoint taken inside a loop is a fresh mark
@@ -2383,10 +2405,16 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 if (self.finished) return error.QueryFailed;
                 var problem: ?wire_mod.Problem = null;
                 self.inner.commit(self.scope, &problem) catch |err| {
-                    remember(self.scope, problem);
+                    remember(self.scope, self.serial, problem);
+                    // **A refused COMMIT ends the transaction**, as both Wires
+                    // have by the time they fail: the connection is already
+                    // back in the pool. Left open here, a second `commit`
+                    // reached the Wire's `if (self.done) return;` and told the
+                    // caller the work was kept.
+                    self.end();
                     return err;
                 };
-                remember(self.scope, null);
+                remember(self.scope, self.serial, null);
                 self.end();
             }
 
@@ -2970,7 +2998,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 db: *Self,
                 w: *W,
                 rows: W.Rows,
-                /// Whether `close` has run.
+                /// Whether `close` has run, **on any copy of this handle**.
                 ///
                 /// **A plain `bool` rather than a Debug-only one, and that is
                 /// the fix rather than a tidying** (ADR 093). This used to be
@@ -2983,18 +3011,23 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 /// Reachable from the shape this API teaches. `rows.close()`
                 /// early plus the `defer rows.close()` the doc comment on
                 /// `stream` recommends is exactly two calls, and a `Streamed`
-                /// is a value the handler holds, so two copies close twice as
-                /// readily as one does. The SQLite Wire's own `Rows.closed` is
-                /// an unconditional `bool` and never had it, which is what
-                /// made this an oversight rather than a trade.
+                /// is a value the handler holds. The SQLite Wire's own
+                /// `Rows.closed` is an unconditional `bool` and never had it,
+                /// which is what made this an oversight rather than a trade.
+                ///
+                /// **A pointer, so that two copies of the handle share it**
+                /// (ADR 093). A `bool` inside the value was per copy: closing
+                /// `a` and then its copy `b` drained twice, and `b.next()`
+                /// after `a.close()` read a result set already gone. The one
+                /// byte lives in the request arena, taken by `stream` before
+                /// the statement is sent so that running out of memory cannot
+                /// leave a result set open.
                 ///
                 /// The **counter** stays Debug-only, which is the part that
                 /// was meant to be: `open_streams` watches a result set nobody
                 /// closed, and paying for it in a release build would be a
-                /// trap running where nothing reads it. What this costs
-                /// instead is one byte on the stack of a handler that streams,
-                /// and nothing at all to one that does not.
-                closed: bool = false,
+                /// trap running where nothing reads it.
+                closed: *bool,
                 /// What a row that fails to arrive is told with, since the
                 /// call that opened the stream has returned: `sql.problem`
                 /// reads the arena, and the watcher the rest. A step is where
@@ -3002,6 +3035,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 /// division by zero on the ten-thousandth row, and it used to
                 /// reach neither.
                 arena: std.mem.Allocator,
+                serial: ?u64,
                 route: ?[]const u8,
                 text: []const u8,
                 plan: ?[]const u8,
@@ -3012,6 +3046,10 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 /// The next row, or null at the end. **Everything read out
                 /// of the row before this returns is invalid afterwards.**
                 pub fn next(self: *Rows) !?row_mod.Borrowed(Row) {
+                    // A closed result set has given its connection back, which
+                    // another fiber may hold by now: reading it is reading
+                    // freed memory, so the end of the rows is all it answers.
+                    if (self.closed.*) return null;
                     const more = self.w.next(&self.rows) catch |err| {
                         self.failed(stepProblem(self.w, &self.rows, err, self.arena));
                         return err;
@@ -3024,14 +3062,14 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
                 }
 
                 fn failed(self: *const Rows, problem: ?wire_mod.Problem) void {
-                    self.db.toldFor(self.arena, self.route, self.started, self.text, self.plan, null, true, problem);
+                    self.db.toldFor(self.arena, self.serial, self.route, self.started, self.text, self.plan, null, true, problem);
                 }
 
                 /// Give the connection back. Wanted on every path out,
                 /// including the ones that stopped reading early.
                 pub fn close(self: *Rows) void {
-                    if (self.closed) return;
-                    self.closed = true;
+                    if (self.closed.*) return;
+                    self.closed.* = true;
                     if (traps_enabled) self.db.hold(&self.db.open_streams, .Sub);
                     self.w.drain(&self.rows);
                 }
@@ -6136,6 +6174,38 @@ test "a result set closed twice is drained once, in both optimize modes" {
     if (traps_enabled) try testing.expectEqual(@as(usize, 0), db.open_streams);
 }
 
+/// A handler that copies the handle it holds, as passing it by value to a
+/// helper does, and closes one copy while the other is still being read.
+fn streamCopiedAndClose(db: *FakeDb, c: *nilo.Ctx) !void {
+    var rows = try db.stream(Person, c, .{});
+    var copy = rows;
+    try testing.expect((try copy.next()) != null);
+    rows.close();
+    // The result set is gone: this copy must not read it, whatever it still
+    // thinks is left in it.
+    try testing.expect((try copy.next()) == null);
+    copy.close();
+    rows.close();
+}
+
+test "a copy of a stream handle neither reads nor closes a result set its sibling closed" {
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer db.deinit();
+    db.wire = .{ .answers = 2 };
+
+    var app = nilo.App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&db);
+    try app.get("/stream", streamCopiedAndClose);
+
+    var client = try nilo.testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+    const answer = try client.get(&app, "/stream");
+    try testing.expectEqual(@as(u16, 200), answer.status);
+    try testing.expectEqual(@as(usize, 1), db.wire.?.drains);
+    if (traps_enabled) try testing.expectEqual(@as(usize, 0), db.open_streams);
+}
+
 test "a committed transaction is not rolled back on the way out" {
     var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
     defer db.deinit();
@@ -6323,7 +6393,7 @@ test "an order survives the ceiling one puts on the end" {
     try testing.expectEqual(@as(?Person, null), found);
     try testing.expectEqualStrings(
         "SELECT \"id\", \"email\", \"nickname\", \"age\" FROM \"people\"" ++
-            " ORDER BY \"age\" DESC, \"id\" ASC LIMIT 1",
+            " ORDER BY \"age\" DESC, \"id\" DESC LIMIT 1",
         db.wire.?.last_sql,
     );
 }
@@ -8691,6 +8761,35 @@ test "a problem left by somebody else's request is not this one's to read" {
     try testing.expectEqual(@as(?wire_mod.Problem, null), lastProblem(&theirs));
 }
 
+test "a problem left by the previous request on the same connection is not the next one's" {
+    // One connection is one arena, so its pointer and vtable are the same for
+    // every request on it. A request that failed on a unique and the next one,
+    // which fails on something that is not SQL and sends no statement, used
+    // to read the first one's Problem out of memory the reset had handed back.
+    // `Run.reset` is where a tick ends the way `serve.zig` ends a request.
+    var db = FakeDb.init(testing.allocator, "postgres://test/test", .{});
+    defer db.deinit();
+    db.wire = .{ .refuses = .{ .message = "boom", .code = "23505", .constraint = "people_pkey" } };
+
+    var run = nilo.Run.init(testing.allocator);
+    defer run.deinit();
+
+    _ = db.select(Person, &run, .{}) catch {};
+    try testing.expect(lastProblem(&run) != null);
+    try testing.expect(violated(&run, Person, .{.id}));
+
+    run.reset();
+    try testing.expectEqual(@as(?wire_mod.Problem, null), lastProblem(&run));
+    try testing.expect(!violated(&run, Person, .{.id}));
+
+    // The same through an erased Scope, which carries the serial across.
+    _ = db.select(Person, &run, .{}) catch {};
+    var erased = nilo.AnyScope.of(&run);
+    try testing.expect(lastProblem(&erased) != null);
+    run.reset();
+    try testing.expectEqual(@as(?wire_mod.Problem, null), lastProblem(&erased));
+}
+
 test "a feed walks a list by cursor, says when there is more, and never counts" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
@@ -9775,6 +9874,9 @@ test "on SQLite, a commit refused by a deferred foreign key leaves no transactio
         // Accepted now, checked at COMMIT: the account is not there.
         _ = try tx.insert(Note, &run, .{ .id = @as(i64, 1), .account = @as(i64, 404) });
         try testing.expectError(error.ForeignKeyViolated, tx.commit());
+        // Told again, not told that the work was kept: the Wire is done with
+        // this transaction, so a retry that reached it would succeed.
+        try testing.expectError(error.QueryFailed, tx.commit());
     }
 
     // SQLite leaves the transaction open when it refuses a COMMIT. Were the

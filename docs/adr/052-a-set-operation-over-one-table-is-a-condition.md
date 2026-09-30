@@ -23,24 +23,41 @@ and the module can already write all of it.
 |---|---|
 | `… WHERE a UNION … WHERE b` | `.where = .{ .any = .{ .{ a }, .{ b } } }` |
 | `… WHERE a INTERSECT … WHERE b` | `.where = .{ a, b }` — different fields are ANDed |
-| `… WHERE a EXCEPT … WHERE b` | `.where = .{ a, not_b }` |
+| `… WHERE a EXCEPT … WHERE b` | `.where = .{ a, not_b }`, **when `b`'s column cannot be NULL** |
 
 The first two are obvious. The third is the one worth writing down, because
-"there is no `NOT`" is the objection and it is wrong:
+"there is no `NOT`" is the objection and it is wrong, and because it is right
+about one thing:
 
-- **Every leaf has a negation.** `.ne` and `.distinct_from` against `=`,
+- **`not_b` is not "every row `b` did not pick" when the column may be NULL.**
+  `NOT (tag ILIKE '%spam%')` is NULL on a row whose `tag` is NULL, and `WHERE`
+  keeps only what is true, so `.tag = .{ .not_icontains = "spam" }` drops the
+  rows with no tag, where `EXCEPT` would keep them. The same holds for `.ne`,
+  `.not_in` and every negated pattern. Over a column that is `NOT NULL` the two
+  agree exactly. Over one that is not, say what happens to the rows with no
+  value: `.any = .{ .{ .tag = .{ .not_icontains = "spam" } }, .{ .tag = null } }`
+  keeps them, and `.distinct_from` is that already written for a single value
+  (`"tag" IS DISTINCT FROM $1`). A NULL inside a `.not_in` list is worse, since
+  it empties the select, and it is refused while compiling
+  ([ADR 040](./040-a-condition-holds-a-value-not-a-maybe.md)).
+
+- **Every leaf has a negation**, and over a column that cannot be NULL each is
+  the exact complement. `.ne` and `.distinct_from` against `=`,
   `.not_in`, `.not_like`, `.not_ilike`, `.not_ieq`, `not_` in front of each
   pattern, and the comparisons negate each other.
 - **De Morgan holds in SQL's three-valued logic.** `NOT (a OR b)` and
   `NOT a AND NOT b` agree on `NULL` as well as on `TRUE` and `FALSE`, so the
-  rewrite is not an approximation.
+  rewrite is not an approximation. What it does not do is turn NULL into
+  TRUE, which is what `EXCEPT` does to a row `b` did not pick.
 - **AND is a struct and OR is `.any`, and `.any` nests inside itself.** That
   last one is what makes the rewrite always terminate, and it now has a test
   in `sql/where.zig` rather than being a property nobody checked.
 
 So `NOT (x AND y)` is `.any = .{ .{ not_x }, .{ not_y } }`, `NOT (x OR y)` is
 `.{ not_x, not_y }`, and any combination of the two is reached by applying
-those twice. **The algebra is closed**, which is the whole claim.
+those twice. **The algebra is closed**, which is the whole claim, and it is
+SQL's own three-valued algebra: it is `EXCEPT` exactly where no NULL can
+reach a negated leaf.
 
 One difference is real and is in nilo's favour: `UNION` deduplicates and
 `.any` does not. Over one table with a key, every row appears once anyway, so

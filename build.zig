@@ -286,6 +286,14 @@ const sql_refusals = [_]Refusal{
         .says = "the condition on `handle` was given a ?[]const u8.",
     },
     .{
+        .name = "not_in_a_list_that_holds_null",
+        .says = "`.tag = .{ .not_in = … }` on not_in_a_list_that_holds_null.Ticket was given a list that holds null.",
+    },
+    .{
+        .name = "in_a_literal_list_that_holds_null",
+        .says = "`.tag = .{ .in = … }` on in_a_literal_list_that_holds_null.Ticket was given a list that holds null.",
+    },
+    .{
         .name = "given_beside_a_condition_in_an_exists",
         .says = "an entry of `.exists` over given_beside_a_condition_in_an_exists.Capability holds a `sql.given` beside another condition.",
     },
@@ -382,6 +390,10 @@ const sql_refusals = [_]Refusal{
     .{
         .name = "upsert_target_not_a_name",
         .says = "an upsert on upsert_target_not_a_name.User was given a *const [5:0]u8 as its conflict target.",
+    },
+    .{
+        .name = "upsert_target_not_written",
+        .says = "`db.insertOrUpdate` on upsert_target_not_written.User conflicts on .{ .id }, and the values written do not carry `id`.",
     },
     .{
         .name = "update_without_condition",
@@ -1124,6 +1136,26 @@ const sql_refusals = [_]Refusal{
     .{
         .name = "pattern_given_something_that_is_not_text",
         .says = "`.email = .{ .contains = … }` was given a i32.",
+    },
+    .{
+        .name = "sqlite_decimal_compared",
+        .says = "`.total = .{ .gt = … }` on sqlite_decimal_compared.Invoice's `total` would run as text on the sqlite dialect.",
+    },
+    .{
+        .name = "sqlite_decimal_ordered",
+        .says = "`.order.total` on sqlite_decimal_ordered.Invoice's `total` would run as text on the sqlite dialect.",
+    },
+    .{
+        .name = "sqlite_decimal_ordering_key",
+        .says = "the ordering key `total` on sqlite_decimal_ordering_key.Invoice's `total` would run as text on the sqlite dialect.",
+    },
+    .{
+        .name = "sqlite_decimal_cursor",
+        .says = "`.after.total` on sqlite_decimal_cursor.Invoice's `total` would run as text on the sqlite dialect.",
+    },
+    .{
+        .name = "sqlite_decimal_summed",
+        .says = "`sum` (field `.billed`) on sqlite_decimal_summed.Billed's `amount` would run as text on the sqlite dialect.",
     },
     .{
         .name = "sqlite_case_sensitive_pattern",

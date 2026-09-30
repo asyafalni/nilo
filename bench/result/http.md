@@ -3024,6 +3024,18 @@ The same A and B, now from `9630a47`, with `nilo-hello` moved to port 18787 in b
 
 **Can it be pushed further.** Yes. C is 2.07M against 3.12M inline, and 3.75 µs a call against 2.5; the fiber measured 0.23 µs on one executor, so about a microsecond is still unaccounted for and was not run down. The connection an acceptor spawns is the other round-robin hop left, and `.local` there is a separate run: the engine chose round-robin for connections on purpose (`http/engine/zio.zig`, above `Acceptor`).
 
+## What a request serial in every build costs
+
+Asked when `core.Lifetime`'s counter stopped being Debug-only, so that `sql.problem` can tell the request that failed from the next one on its connection ([ADR 117](../../docs/adr/117-a-statement-that-failed-says-what-the-database-said.md)). The claim was that eight bytes on the connection loop's frame, one atomic add per connection and one add per request move none of the four axes by a number worth quoting. Measured 2026-09-30 on a 2-vCPU Xeon Platinum 8255C VM, Linux 6.8, Zig 0.16.0, `-Dtarget=x86_64-linux-gnu`: before is a `git archive` of `cb45ea9`, after is the same with `core/str.zig`, `core/scope.zig`, `core/core.zig` and `http/ctx.zig` from the change, each in a scratch directory of the same path length.
+
+**Memory per idle connection does not move.** `bench/mem.py --port 8787 --path /health --steps 1000,5000,10000` against `nilo-hello`, `ReleaseFast`, stripped, three runs interleaved after, before, after: 5,247, 5,197 and 5,190 bytes a connection at the three steps, identical in all three. The frame grew by eight bytes and stayed inside the page it was already in.
+
+**Binary size**, stripped `ReleaseFast`: `examples/hello` 987,992 → 988,016 (**+24 B**), `examples/rest` 1,177,504 → 1,177,528 (**+24 B**), `nilo-hello` 995,888 → 995,912.
+
+**Allocations per request** do not move: the counter is a field that already existed in Debug. Throughput was not run: one add per request against a round trip is below what wrk on a shared 2-vCPU box can see.
+
+Whether it can be pushed further: the eight bytes could go to four by dropping the span in a release build, at the cost of a new connection in a reused stack counting through the numbers an old one left in `sql.problem`'s slot. Not worth four bytes that do not show up in RSS.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

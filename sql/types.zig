@@ -94,10 +94,15 @@ pub const Timestamp = struct {
         return @divFloor(self.micros, std.time.us_per_s);
     }
 
-    /// RFC 3339 in UTC, to the second: `2026-08-16T09:30:00Z`. Fractional
-    /// microseconds are dropped rather than printed, because a body that
-    /// sometimes carries them and sometimes does not is worse to consume than
-    /// one that never does.
+    /// RFC 3339 in UTC with six fractional digits, always:
+    /// `2026-08-16T09:30:00.700000Z`. **Whole seconds were the old shape and
+    /// they lost data**: a keyset cursor is a timestamp this server printed one
+    /// request ago, and one that dropped its microseconds compared as earlier
+    /// than the row it came from, so the next page repeated or skipped rows
+    /// (ADR 127). Six digits every time, rather than only when there is a
+    /// fraction, because a body that sometimes carries them and sometimes does
+    /// not is worse to consume than one that always does, and the column has
+    /// exactly that resolution.
     pub fn writeRfc3339(self: Timestamp, w: *std.Io.Writer) !void {
         const secs = self.seconds();
         if (secs < 0) return error.BeforeEpoch;
@@ -108,13 +113,14 @@ pub const Timestamp = struct {
         const year_day = day.calculateYearDay();
         const month_day = year_day.calculateMonthDay();
 
-        try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z", .{
             year_day.year,
             month_day.month.numeric(),
             month_day.day_index + 1,
             time.getHoursIntoDay(),
             time.getMinutesIntoHour(),
             time.getSecondsIntoMinute(),
+            @as(u32, @intCast(@mod(self.micros, std.time.us_per_s))),
         });
     }
 
@@ -603,6 +609,17 @@ pub const Interval = AsText("interval");
 /// not this one under another name.
 pub const Inet = AsText("inet");
 
+/// Whether `T` is a number carried as text: `Decimal`, or any
+/// `AsText("numeric")`, optional included. The one question a Dialect that
+/// stores it as text has to be asked before it orders, compares or sums it,
+/// because there `"100.00" < "9.99"` (ADR 049, `dialect.decimal_compares`).
+pub fn isNumericText(comptime T: type) bool {
+    return comptime blk: {
+        const column = asText(T) orelse break :blk false;
+        break :blk std.mem.eql(u8, column, "numeric");
+    };
+}
+
 /// The Postgres type a text column names, or null when `T` is not one.
 ///
 /// A type is one when it carries `nilo_read` and `nilo_write` beside its
@@ -741,20 +758,40 @@ fn textOf(value: anytype, buf: []u8) ![]const u8 {
     return w.buffered();
 }
 
-test "a Timestamp writes itself as RFC 3339 in UTC" {
+test "a Timestamp writes itself as RFC 3339 in UTC, with six fractional digits" {
     var buf: [40]u8 = undefined;
     const t = Timestamp.fromSeconds(1_786_872_600);
-    try testing.expectEqualStrings("2026-08-16T09:30:00Z", try textOf(t, &buf));
+    try testing.expectEqualStrings("2026-08-16T09:30:00.000000Z", try textOf(t, &buf));
+    const frac: Timestamp = .{ .micros = t.micros + 700_000 };
+    try testing.expectEqualStrings("2026-08-16T09:30:00.700000Z", try textOf(frac, &buf));
+    const last: Timestamp = .{ .micros = t.micros + 999_999 };
+    try testing.expectEqualStrings("2026-08-16T09:30:00.999999Z", try textOf(last, &buf));
+}
+
+test "what a Timestamp prints, with its microseconds, reads back to the same microsecond" {
+    var buf: [40]u8 = undefined;
+    for ([_]i64{ 0, 1, 700_000, 999_999, 1_786_872_600_000_001, 1_786_872_600_700_000, 4_102_444_799_999_999 }) |micros| {
+        const t: Timestamp = .{ .micros = micros };
+        const back = Timestamp.nilo_parse(try textOf(t, &buf)).?;
+        try testing.expectEqual(micros, back.micros);
+    }
+}
+
+test "a Timestamp written to JSON keeps its microseconds" {
+    const Row = struct { at: Timestamp };
+    const text = try std.json.Stringify.valueAlloc(testing.allocator, Row{ .at = .{ .micros = 1_786_872_600_700_000 } }, .{});
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("{\"at\":\"2026-08-16T09:30:00.700000Z\"}", text);
 }
 
 test "a leap day is a day, and the year after it is not" {
     var buf: [40]u8 = undefined;
     try testing.expectEqualStrings(
-        "2024-02-29T12:00:00Z",
+        "2024-02-29T12:00:00.000000Z",
         try textOf(Timestamp.fromSeconds(1_709_208_000), &buf),
     );
     try testing.expectEqualStrings(
-        "2025-03-01T12:00:00Z",
+        "2025-03-01T12:00:00.000000Z",
         try textOf(Timestamp.fromSeconds(1_740_830_400), &buf),
     );
 }
@@ -792,7 +829,7 @@ test "a day is checked against its own month and its own century, and a second s
 test "the epoch itself is the first moment it can write" {
     var buf: [40]u8 = undefined;
     try testing.expectEqualStrings(
-        "1970-01-01T00:00:00Z",
+        "1970-01-01T00:00:00.000000Z",
         try textOf(Timestamp.fromSeconds(0), &buf),
     );
 }
@@ -1068,6 +1105,18 @@ test "the types that have an opinion about their column say so" {
     try testing.expectEqualStrings("uuid", declaredColumn(Uuid).?);
     try testing.expectEqualStrings("jsonb", declaredColumn(Json(struct { a: u8 })).?);
     try testing.expectEqual(@as(?[]const u8, null), declaredColumn(i64));
+}
+
+test "only a numeric text column is a number held as text" {
+    try testing.expect(isNumericText(Decimal));
+    try testing.expect(isNumericText(?Decimal));
+    try testing.expect(isNumericText(AsText("numeric")));
+    // Other text columns are not asked to order as numbers, and a plain
+    // integer or string never is.
+    try testing.expect(!isNumericText(Interval));
+    try testing.expect(!isNumericText(Inet));
+    try testing.expect(!isNumericText(i64));
+    try testing.expect(!isNumericText([]const u8));
 }
 
 test "a Decimal keeps the digits it was given, however many there are" {

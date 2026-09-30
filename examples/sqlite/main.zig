@@ -108,8 +108,10 @@ fn seed(run: *nilo.Run, db: *Db) !void {
     const wati = try tx.insert(Customer, run, .{ .name = "wati", .email = "wati@example.dev" });
     const budi = try tx.insert(Customer, run, .{ .name = "budi", .email = "budi@example.dev" });
 
-    // Issued over three months, so the per-month report has three lines.
-    const month: i64 = 30 * std.time.us_per_day;
+    // Issued over three months, so the per-month report has three lines. A
+    // step of 31 days, because no month is longer: 30 put the 30th of
+    // September and the 31st and 1st of August in two months, not three.
+    const month: i64 = 31 * std.time.us_per_day;
     const now = sql.Timestamp.now().micros;
     _ = try tx.insert(Invoice, run, .{ .customer_id = wati.id, .total = 250, .issued_at = sql.Timestamp{ .micros = now - 2 * month } });
     _ = try tx.insert(Invoice, run, .{ .customer_id = wati.id, .total = 400, .issued_at = sql.Timestamp{ .micros = now - month } });

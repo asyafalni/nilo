@@ -29,6 +29,12 @@ each half: for a set of instants, what `writeRfc3339` prints, `nilo_parse` reads
 back to the same microsecond. A parser held only against a spec can be correct
 and still not be the inverse of the writer beside it.
 
+## What it prints
+
+`writeRfc3339` always prints six fractional digits: `2026-08-16T09:30:00.700000Z`. It printed whole seconds first, and that broke the property this ADR is about: a cursor built from a row whose `created_at` was `09:30:00.700000` came back as `09:30:00`, compared as earlier than the row, and the next page repeated it (or, going the other way, skipped rows). The round trip test now uses values with microseconds.
+
+Six digits every time rather than only when the fraction is not zero, because a body that sometimes carries a fraction is worse to consume than one that always does, and the column has exactly that resolution. The cost is seven bytes per timestamp in a JSON body. A client that compared the old text byte for byte has to change; one that parses RFC 3339 does not.
+
 ## What it accepts, and the one thing it refuses
 
 Wider than what the writer prints, because both of these arrive from clients

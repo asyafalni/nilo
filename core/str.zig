@@ -27,10 +27,16 @@ pub const trap_enabled = builtin.mode == .Debug;
 /// Str stashed by the first compared equal to the second and came back with
 /// nobody the wiser — which is the one mistake this type exists to catch,
 /// and the shape it takes when somebody tests it with two `curl` calls.
+///
+/// **The counter runs in every build; only the trap is Debug's.** A release
+/// `Str` still carries no marker, but something below the framework has to
+/// tell two requests on one connection apart without one: `sql.problem` keeps
+/// the last failure in a thread-local whose strings the arena's reset hands
+/// back, and the arena's pointer is the same for every request on the
+/// connection (ADR 117). Eight bytes on the connection's frame, one atomic
+/// add per connection, and `end` is one add.
 pub const Lifetime = struct {
-    gen: Gen = if (trap_enabled) 0 else {},
-
-    const Gen = if (trap_enabled) u64 else void;
+    gen: u64 = 0,
 
     /// One span per connection. Wide enough that a connection would have to
     /// serve four billion requests to reach the next one, and there would
@@ -41,19 +47,24 @@ pub const Lifetime = struct {
     /// A Lifetime for one connection. `.{}` is span zero, which is what a
     /// test driving one request wants; a server calls this.
     pub fn init() Lifetime {
-        if (!trap_enabled) return .{};
         return .{ .gen = @as(u64, next_span.fetchAdd(1, .monotonic)) << 32 };
     }
 
     pub fn end(self: *Lifetime) void {
-        if (trap_enabled) self.gen +%= 1;
+        self.gen +%= 1;
     }
 
     /// The connection is over. Everything from it is stale for good, and
     /// saying so here means a Str that outlived its connection is caught
     /// even while the memory this sat in is still readable.
     pub fn deinit(self: *Lifetime) void {
-        if (trap_enabled) self.gen = dead;
+        self.gen = dead;
+    }
+
+    /// Which piece of work this is: moved by every `end`, and never the same
+    /// on two connections made by `init`. What a Scope's `serial` answers.
+    pub fn serial(self: *const Lifetime) u64 {
+        return self.gen;
     }
 
     /// A generation `init` can never hand out and `end` can never reach
@@ -401,6 +412,19 @@ test "two connections never count through the same generations" {
         first.end();
         try testing.expect(!stashed.alive());
     }
+}
+
+test "the serial moves at every request end and differs between connections, in every build" {
+    // Not behind `trap_enabled`: `sql.problem` reads this in a release build
+    // to tell the request that failed from the next one on the connection.
+    var a = Lifetime.init();
+    var b = Lifetime.init();
+    try testing.expect(a.serial() != b.serial());
+
+    const before = a.serial();
+    a.end();
+    try testing.expect(a.serial() != before);
+    try testing.expect(a.serial() != b.serial());
 }
 
 test "a Lifetime made with .{} is still a working one, for a test holding a single request" {

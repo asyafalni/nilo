@@ -13,7 +13,7 @@ Erasing `arena`, `str` and entropy was not the end of it. Every event a later po
 
 ## Decision
 
-**`AnyScope`, a pointer and a table of five function pointers, made by whoever is about to cross a function pointer and paid for only there.**
+**`AnyScope`, a pointer and a table of six function pointers, made by whoever is about to cross a function pointer and paid for only there.**
 
 ```zig
 pub const AnyScope = struct {
@@ -39,6 +39,8 @@ pub const AnyScope = struct {
 ### The table carries a lookup by name, for `resolve` too
 
 `resolved: fn (*anyopaque, type_name) ?*const anyopaque` is the fifth entry, carried the way `entropy` is: a lookup by type name in the table, with the typed `resolve(comptime V)` written on top of it on `AnyScope`'s side. That is the same move `entropy` makes over `entropyInto`, and the same move `Run.resolve` already made over its own list of given values.
+
+`serial: fn (*anyopaque) ?u64` is the sixth, so that `sql.problem` asked through an erased Scope still tells this request's failure from the previous one on the connection ([ADR 117](./117-a-statement-that-failed-says-what-the-database-said.md)). Null for a Scope that keeps no count.
 
 **What it answers is what the Scope behind it holds, and never more.** A `Run` answers from what it was given; a `Ctx` from what the request already resolved, through `resolvedNamed` (which `Ctx.cachedResolved` now reads through too); a hand-made Scope with neither answers nothing. An erased Scope cannot run a resolver: a resolver may take services, and a function pointer has no type to look them up by. So a `nilo_resolve` type nobody asked for before the erasure is `error.NotGiven`, the same answer a `Run` nobody told gives, and for the same reason. In practice the value a reaction wants is the one a middleware or the handler's own argument list resolved on the way in, which is before anybody erased anything, and a value nobody set has to be louder than a value nobody read.
 

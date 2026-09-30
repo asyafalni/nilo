@@ -239,6 +239,11 @@ pub const Postgres = struct {
     /// (`where.zig`, ADR 055).
     pub const like_folds = false;
 
+    /// Whether a `numeric` column compares, orders and sums as a number.
+    /// Here it does: the column is `numeric`, and the bound text is cast back
+    /// to it (`bindAs`), so `"100.00" > "9.99"` (ADR 049).
+    pub const decimal_compares = true;
+
     /// `LIMIT`/`OFFSET`, which most dialects agree on and one day one will not.
     pub fn limit(comptime placeholder_text: []const u8) []const u8 {
         return " LIMIT " ++ placeholder_text;
@@ -1037,6 +1042,16 @@ pub const SQLite = struct {
     /// Dialects and this one answered with a syntax error at run time.
     pub const like_folds = true;
 
+    /// No. A `sql.Decimal` is a `TEXT` column here, and SQLite compares and
+    /// sorts text as text: `"100.00" < "9.99"`, and a `sum` over it is
+    /// computed in floating point, so `0.1 + 0.2` comes back
+    /// `0.30000000000000004`. So an ordering comparison, an `.order`, an
+    /// `.after` and a `sum`, `avg`, `min` or `max` over one are Refusals here
+    /// (`assertDecimalCompares`, ADR 049); equality stays, because two
+    /// spellings of one number are the only thing it can miss, and the caller
+    /// writes the digits they stored.
+    pub const decimal_compares = false;
+
     /// None. SQLite has no enum type — a Zig enum is stored as its name in a
     /// TEXT column, and there is no list in the database to hold it against.
     pub const enum_values: ?[]const u8 = null;
@@ -1064,9 +1079,18 @@ pub const SQLite = struct {
     /// The same numbered list, out of the JSON array `.in` already binds here:
     /// `json_each` answers a `key` and a `value` per element without being
     /// asked, so nothing is renamed.
+    ///
+    /// **A blob key is read through `eachValue`**, like `.in` reads one. JSON
+    /// has no bytes, so `jsonList` writes each as hex, and the join
+    /// `"#k"."value"` was comparing a blob column with that hex text and
+    /// matching no child. The wrapping select keeps the two column names the
+    /// join reads, so `shape.children` is the same text for every other key.
     pub fn ordinalList(comptime placeholder_text: []const u8, comptime T: type, comptime alias: []const u8) ?[]const u8 {
-        _ = T;
-        return "json_each(" ++ placeholder_text ++ ") AS " ++ alias;
+        return comptime if (types.isBytes(T))
+            "(SELECT \"key\", " ++ eachValue(T) ++ " AS \"value\" FROM json_each(" ++
+                placeholder_text ++ ")) AS " ++ alias
+        else
+            "json_each(" ++ placeholder_text ++ ") AS " ++ alias;
     }
 
     /// `json_each` counts from zero.
@@ -1598,6 +1622,7 @@ pub fn assertDialect(comptime D: type) void {
             "nulls",
             "pattern",
             "like_folds",
+            "decimal_compares",
             "enum_values",
             "now_default",
             "now_text",
@@ -1645,6 +1670,37 @@ pub fn noNullsOrder(comptime D: type, comptime Row: type, comptime column: []con
             "  Order by a column that has no NULLs in it, or sort them into place " ++
             "with a condition the database can express.",
     );
+}
+
+/// The Refusal for asking a Dialect whose `decimal_compares` is false to order,
+/// compare or add up a number it holds as text (ADR 049). `what` names the
+/// thing asked for (`.total = .{ .gt = … }`, `.order.total`, `sum(total)`),
+/// `T` is the type of the column it is asked of, and a type that is not
+/// numeric text, or a Dialect that does compare it, passes untouched.
+///
+/// **Refused rather than emulated**, because the emulations all cost the
+/// index or the exactness: `CAST(… AS REAL)` is the floating point a
+/// `Decimal` is chosen to avoid, and a padded text form is a second column.
+/// A quiet wrong answer on one of the two databases is the lie the seam
+/// exists not to tell (ADR 055).
+pub fn assertDecimalCompares(
+    comptime D: type,
+    comptime Row: type,
+    comptime column: []const u8,
+    comptime T: type,
+    comptime what: []const u8,
+) void {
+    comptime {
+        if (D.decimal_compares or !types.isNumericText(T)) return;
+        @compileError(
+            "nilo: " ++ what ++ " on " ++ @typeName(Row) ++ "'s `" ++ column ++ "` would run as text on the " ++
+                D.name ++ " dialect.\n" ++
+                "  A `sql.Decimal` is a TEXT column here, and " ++ D.name ++ " compares and sorts text as text, so " ++
+                "\"100.00\" comes before \"9.99\" and a sum is added in floating point (`0.30000000000000004`). " ++
+                "`.eq`, `.ne` and `.in` are still fine.\n" ++
+                "  Store the amount as an integer of its smallest unit (cents in an `i64`), or use Postgres.",
+        );
+    }
 }
 
 /// The message a pattern operator stops with on a Dialect that cannot spell
@@ -2058,4 +2114,12 @@ test "a raw read on Postgres takes a number of its width or narrower, never wide
     // A text column arrives as text, because a raw statement casts it.
     try testing.expectEqualStrings("text", Postgres.reads(types.Decimal).?[0]);
     try testing.expectEqualStrings("timestamptz", Postgres.reads(types.Timestamp).?[0]);
+}
+
+test "on SQLite a blob key's numbered list is read through unhex, and any other key's is not wrapped" {
+    try testing.expectEqualStrings(
+        "(SELECT \"key\", unhex(value) AS \"value\" FROM json_each(?1)) AS \"#k\"",
+        SQLite.ordinalList("?1", types.Bytes, "\"#k\"").?,
+    );
+    try testing.expectEqualStrings("json_each(?1) AS \"#k\"", SQLite.ordinalList("?1", i64, "\"#k\"").?);
 }

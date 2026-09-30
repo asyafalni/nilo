@@ -91,7 +91,73 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 ### `nilo_sql`
 
-Every entry here was reproduced by a probe test that fails at `462d84d`, in Debug and ReleaseSafe, against Postgres 18 where Postgres is named. A fix lands with its probe as the test that would have caught it.
+The entries under *statements that work refused* were reproduced by a probe test that fails at `462d84d`, in Debug and ReleaseSafe, against Postgres 18 where Postgres is named. The rest were found by reading the code at `cb45ea9` and checked in it; **reproduced** marks one that was also run. A fix lands with a probe as the test that would have caught it.
+
+#### P1
+
+**`sql.given` turns an indexed filter into a full scan on both databases.** The guard is `("cust" = $1 OR $1 IS NULL)` (`where.zig:1483`). SQLite plans without the value and never uses the index for it: `EXPLAIN QUERY PLAN` gives `SCAN t` where the unguarded condition gives `SEARCH t USING INDEX`. Postgres, whose statements are prepared by default (`db.zig:608`), switches to a generic plan after five calls without the filter, and a call with it then reads the whole table; reproduced on Postgres 17 with `EXPLAIN EXECUTE` and `pg_prepared_statements.generic_plans`. ADR 149 says the generic plan is the one the cost comparison rejects; ADR 150 refuses `.after = sql.given(…)` because an `OR` stops the seek on a generic plan. Both cannot be true.
+
+**Needs:** a guarded statement planned per call on Postgres (no named plan for one with a droppable condition, or `plan_cache_mode` set for it), a choice written for SQLite, and the run in `bench/result/sql.md`.
+
+**`istarts_with` on Postgres never uses an index.** It is `ILIKE … || '%'` (`dialect.zig:370`), a sequential scan, where `LIKE` with `text_pattern_ops` reads a range; Postgres stops taking a prefix at the first character that has a case. The case-folding unique is an index on `lower(col)`, which `ILIKE` over the bare column does not read, and a marker cannot ask for `text_pattern_ops`, so outside a C collation no pattern operator nilo writes uses an index. Reproduced with `EXPLAIN`. [`sql.md` §21](../bench/result/sql.md#21-where-a-prefix-pattern-is-built) says the two were read the same way. The SQLite half is under Next.
+
+**Needs:** `lower(col) LIKE lower($1) || '%'` over a `lower(col) text_pattern_ops` index, and §21 corrected.
+
+**`.after` binds its cursor without the cast every other condition has.** `statement.zig:553` writes `D.placeholder` where every other writer writes `D.bindAs`, and for `Date`, `Decimal`, `Interval`, `Inet` and `Bytes` the cast is what makes pg.zig's bind work (`dialect.zig:446`). A feed over `due_date, id` should fail from its second page on Postgres. Found by reading; the live cursors are `Timestamp` and `i64` only.
+
+**Needs:** `bindAs` there, and a live cursor over a `Date` and a `Decimal`.
+
+**The SQLite startup check compares the declared type, not its affinity, and refuses to start on correct tables.** The introspection answers `upper(i.type)` (`dialect.zig:1403`) and `accepted` wants an exact match (`schema.zig:130`) against `TEXT`, `VARCHAR`, `CLOB` and `CHARACTER`. `VARCHAR(255)` under a `Str`, `DATE` under a `Date`, `UUID` under a `Uuid` and a column with no type are all mismatches, and `schema_mismatch_is_fatal` defaults to true. ADR 055 and the comment at `dialect.zig:1415` say affinity; `affinityOf` exists and only `describe` calls it.
+
+**Needs:** the introspection answering affinity, and a test over a hand-written `VARCHAR(255)`.
+
+**The Postgres startup check refuses a domain or `citext` under a `Str`.** It compares the column's own `typname` (`dialect.zig:742`) with `text_accepts`, so a domain `email_address` over text is a mismatch; `describe` already resolves a domain to its base type (`postgres.zig:1437`).
+
+**Needs:** the base type read for a domain, and `citext` accepted where text is.
+
+**On SQLite, the readiness probe waits behind every write transaction.** `nilo_ready` runs `SELECT 1` through `exec` (`db.zig:1276`), which always takes the writer (`sqlite.zig:885`), so a long write makes `/healthz` a 503 and a balancer pulls a healthy instance. ADR 107's own account is this probe, and only the log line was fixed. The doc comment says the probe is prepared; `exec` passes no plan.
+
+**Needs:** the probe on a reader, and the comment corrected.
+
+**A fiber cancelled while it waits for a SQLite connection is told `TimedOut` and stays cancellable.** `takeWriter` and `takeReader` answer `error.TimedOut` for a cancellation that is not their own bound (`sqlite.zig:627`, `:636`, `:663`, `gaveUp` at `:689`) and never call `io.recancel()`, which the Postgres Wire does (`postgres.zig:1547`, ADR 223). A background loop queued for the writer at shutdown sees `TimedOut`, its next `sleep` is not cancelled, and the process does not exit.
+
+**Needs:** the recancel, and ADR 223 covering both Wires.
+
+**The Postgres pool's wait does not answer as its contract says.** Every `acquire` error becomes `Disconnected` (`postgres.zig:1547`), including pg.zig's `Timeout`, where `wire.OpenOpts` promises `TimedOut` and the SQLite Wire gives it. `timeout_ms = 0`, documented as no bound (`wire.zig:386`), fails the moment the pool is empty, because pg.zig takes it as the deadline.
+
+**Needs:** `Timeout` mapped to `TimedOut`, and zero passed as "no bound" or documented as what it does.
+
+**A password given as `?password=` is written to the log.** `redacted` (`db.zig:5232`) hides only `user:pass@`, and the URL parser takes `password` as a query parameter (`postgres.zig:632`); a pool that fails to open prints the URL whole.
+
+**Needs:** every `password` parameter masked, with the test at `db.zig:5271` covering it.
+
+**A `Json(T)` column fails to read a document carrying a field the type lacks.** `parseFromSliceLeaky` runs with the default options (`db.zig:3804`), which refuse unknown fields, so a rolling deploy whose new binary adds a field to a jsonb makes every old instance answer `QueryFailed` for those rows. ADR 147 ignores unknown fields when reading what the server itself wrote.
+
+**Needs:** `ignore_unknown_fields`, or the reason not to written into ADR 147.
+
+**A redefined index is dropped after the column it covered, and the version fails.** `dropGoneIndexes` handles an index whose name went (`migrate.zig:1155`); one whose name stayed and whose columns or `WHERE` changed is dropped in `diffIndexes` (`:1443`), which runs after `DROP COLUMN` (`:1157`). On Postgres the index went with the column and `DROP INDEX` names nothing; on SQLite the column's drop is refused first. `2f2cd67` fixed the case with the name gone.
+
+**Needs:** every index being dropped or redefined dropped before any column, and a test that drops the column a partial index's `WHERE` reads.
+
+**Renaming an enum column with `.was` leaves its check under the old name.** Postgres does not rename `t_old_check`, and the next snapshot derives `t_new_check` (`migrate.zig:975`; `Column.sameAs`, `table.zig:154`, sees no change), so the next change to the enum's words fails on `DROP CONSTRAINT "t_new_check"`. Indexes and references are carried across a rename; checks are not.
+
+**Needs:** a `RENAME CONSTRAINT` step beside the column's rename, and the rename test over an enum column.
+
+**A required column with no default is a step SQLite refuses.** `plan` writes `ADD COLUMN … NOT NULL` with `needs_backfill` (`migrate.zig:1001`), which SQLite refuses even on an empty table; `addMissingColumns` refuses the same column up front (`:2149`), and the hint at `cli.zig:676` describes only Postgres.
+
+**Needs:** a Problem on SQLite naming the rebuild, as `addMissingColumns` gives.
+
+**`db check` does not notice a version file missing from the manifest.** `staleSql` walks the manifest (`migrations.zig:713`), so a `0008_x.zig` whose `@import` line was lost resolving a conflict in `manifest.zig` is never applied, and `check` stays green; ADR 123 calls that conflict ordinary. `SnapshotBehind` is checked one way (`migrations.zig:383`), so a snapshot ahead of the last version reuses its number, and `check` never reports it and sends the reader to a `generate` that refuses. A version's `.number` is not matched with its file name, and a duplicate is skipped on the first `apply` (`migrate.zig:2418`).
+
+**Needs:** the directory listed against the manifest, the snapshot compared both ways, and the number matched with the name, all in `check`.
+
+**`createMissing` and `addMissingColumns` take no advisory lock and no `lock_timeout`.** (`migrate.zig:2053`, `:2125`.) Replicas booting together on an empty database race the way the comment on `ensureLedger` (`:2249`) says they would, and an `ADD COLUMN` here waits for `ACCESS EXCLUSIVE` without the bound ADR 240 gave versions. `addMissingColumns` also calls `db.liveColumns` while it holds its `tx` (`:2133`), a second connection, so a pool of one waits out its bound and fails.
+
+**Needs:** the lock and bound `apply` takes, and the introspection sent through the `tx`.
+
+**The SQLite twin commits a rebuild whose foreign-key check found rows.** `PRAGMA foreign_key_check;` in the twin (`migrations.zig:618`) prints, and `COMMIT` follows, where `apply` rolls back with `ForeignKeyViolated`. ADR 123 says the twin carries the same pragmas.
+
+**Needs:** the twin stopping on a non-empty check: `.bail on` and a statement that fails when `pragma_foreign_key_check` has a row.
 
 #### P2: statements that work refused, and the ends of the types
 
@@ -101,6 +167,8 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 **`db.raw`'s reader refuses statements Postgres runs.** `rawcheck.zig` tracks brackets, quotes and comments and nothing else: a trailing `-- comment` or `;` becomes part of the alias (`nameOf`, `rawcheck.zig:808`), `IS DISTINCT FROM` ends the list, `*` as multiplication reads as a star and skips the count, `ID` does not match `id`, `$$…$$` and `E'\''` are not skipped (and a `$5` inside one raises the parameter count), and nested block comments, `EXCEPT` and `INTERSECT`, `p.offset` and SQLite's backticks all miscount. The file calls a false Refusal the one outcome it cannot afford.
 
+Two more, found by reading: `assertParams` checks only that the highest placeholder equals the values given (`rawcheck.zig:657`), so `$1, $3` with three values compiles, where ADR 204 and `sql-raw.md` say a gap is refused, and on SQLite the second value is ignored; and `*` read as a star turns `assertCasts` (`:265`) into a Refusal naming `*` for a statement that has none.
+
 **Needs:** each fixed with its probe kept, trailing comments and dollar quotes first.
 
 **The plan check calls a column certainly NULL where it cannot be, and misses one that always is.** Postgres keeps `Left` for a `LEFT JOIN` through a `NOT NULL REFERENCES` key and under a filter that is not strict, such as `coalesce(o.name, '') <> ''`, and `plan.zig` refuses both, where [ADR 233](./adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md) promises only what is certain; an `Anti` join, `LEFT JOIN … WHERE o.id IS NULL`, outputs NULL on every row and is not flagged.
@@ -109,7 +177,39 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 
 **Timestamps and dates at the ends of their range do not survive JSON.** A `Timestamp` before 1970 is written as `null` (`types.zig:243`) although `nilo_parse` reads one, a `Timestamp` after 9999 is written as text its own parser refuses, a `Date` after 9999 is written as `null`, and `Date.atMidnightUtc` overflows for a date Postgres can hold (`types.zig:338`).
 
+`Date` accepts the year 0 (`types.zig:352`), which Postgres does not have, so `0000-01-01` is refused on insert and 1 BC reads back as year 0.
+
 **Needs:** a civil-from-days writer for `Timestamp` like the one `Date` has, and the rest refused rather than written wrong.
+
+#### P2: the rest
+
+**Statements Postgres refuses at run time compile.** `.min` and `.max` take any type (`shape.zig:960`), and Postgres has no `max(boolean)`. A parent field named like its table passes the alias check when the table has a schema (`shape.zig:188` compares `"orders"` with `"app"."orders"`), and Postgres refuses *table name specified more than once*. A list column of `Timestamp`, `Date`, `Decimal`, `Bytes` or `Json` passes `assertReadable` (`db.zig:4629`) and fails to compile inside pg.zig with its own message, which is what the comment at `db.zig:4589` exists to prevent.
+
+**Needs:** each refused where the Row is named, with a file under `sql/refusals/`.
+
+**Conditions that compile to something other than what they say.** `.across` takes a negated operator and joins the columns with `OR` (`where.zig:1384`, `:1410`), so `.not_icontains = "test"` over `code` and `name` keeps a row whose name contains it. The `sql.given` Refusal for `not_distinct_from` is unreachable (`where.zig:2200` returns before `:2219`), so ADR 149's promised message is a compile error from elsewhere. `Composed.text` refuses `$n` and not `?n` (`composed.zig:133`); `checkComposed` compares the highest placeholder rather than counting them (`db.zig:1988`), so `param(2)` with no `param(1)` passes; `ident` quotes a name with capitals, so `"streamId"` misses a column created unquoted, where the comment at `composed.zig:88` says it does not fold. SQLite's `LIKE` is written by replacing the first `ILIKE ` in the Postgres text (`dialect.zig:1114`), a column named with those letters included.
+
+**Needs:** negation refused in `.across`, the Refusal reached, and `Composed` checked the way a raw statement is.
+
+**The SQLite Wire answers differently from the Postgres one where a handler can see it.** A `float8` column read into an `f32` is narrowed silently (`sqlite.zig:1058`) where Postgres refuses (`postgres.zig:1020`). A value refused before binding marks the transaction aborted (`sqlite.zig:335`, `:359`), where on Postgres it aborts nothing. `db.exec` of a statement that is not DML answers the count of the last one that was (`sqlite.zig:834`, `changes()`). `db.rawExplain` opens a transaction (`db.zig:1345`), `BEGIN IMMEDIATE` here (`sqlite.zig:1122`), so the one writer is held for `EXPLAIN QUERY PLAN`, and a handler holding a `tx` waits for itself. A pool that fails to open is opened twice and reported in Postgres's words, advising `connect_on_init = 0` when it is already 0 (`db.zig:1060` to `:1142`).
+
+**Needs:** each answered as Postgres answers it, or refused on SQLite and written into its guide page.
+
+**The transaction handle has three small faults.** `Savepoint.release` ends the handle before it sends `RELEASE` (`db.zig:2500`), so a failed release leaves a mark nothing can roll back to. A savepoint's stack is allocated on `db.gpa` (`db.zig:2464`, `:2558`), an allocation and a free on the general allocator per transaction that takes one, where the request's arena is already in reach. A child statement that fails is not told to the watcher (`db.zig:3709`), and `readChild` returns `QueryFailed` with no line (`:3737`).
+
+**Needs:** `RELEASE` sent before the handle ends, the stack on the scope's arena, and the children's read reported like every other.
+
+**Migration steps and their words disagree with what runs.** ADR 240 calls five seconds the longest a migration can stall a table; `lock_timeout` bounds each acquisition, so a version over ten tables can hold the first for the sum of the rest. On SQLite a `Locked` version names `.lock_timeout_ms` and 5000 ms (`migrate.zig:2436`), where `busy_timeout_ms` is what applied. `expect` is called one query (`migrate.zig:26`, ADR 123) and is `ensureLedger`'s four round trips and a lock before it. `Kind.data`'s comment (`migrate.zig:574`) places a backfill between two steps `generate` never writes as a pair. An `ADD COLUMN` with an enum's `CHECK` reads every row under `ACCESS EXCLUSIVE` and its `why` does not say so (`migrate.zig:1001`).
+
+**Needs:** each sentence made true, and the enum check's `why` saying what it reads.
+
+**`checkSchema` logs at `err` when it is not going to stop the server.** `db.zig:3914` writes `std.log.err` under `schema_mismatch_is_fatal = false`, where `err` means the server is refusing to start and fails any test that reaches it.
+
+**Needs:** `warn` when the mismatch is not fatal.
+
+**Doc comments that describe something else.** `db.raw` is called never kept (`db.zig:595`, `wire.zig:30`, `sqlite.zig:237`), where `rawPlanOf` keeps it (ADR 051). `nilo_ready` is called prepared (`db.zig:1272`). `sql.zig:100` still says pg.zig is kept out by `.lazy = true`, where `-Dsql` does it (ADR 066). Comments sit on the wrong declaration at `types.zig:572`, `postgres.zig:1406`, `sqlite.zig:1320`, `sql.zig:309` and `db.zig:134`, and `dialect.zig:157` sits on none; `wire.zig:41` counts seven errors of ten; `db.zig:4575` says `err` where it logs `warn`; `postgres.zig:2` names `src/engine/zio.zig`. `sql.zig:504` counts seventeen statement constants where `on()` has seventeen and the top level nineteen. `docs/reference/sql.md` does not list `tx.feed` or `tx.rawPageOrdered`. `docs/risks.md` still says pg.zig reads only `i32` from `int4`. `.today` is `CURRENT_DATE` in the session's zone on Postgres and UTC on SQLite (`dialect.zig:584`, `:1314`), said only in a comment at `where.zig:1711`.
+
+**Needs:** each corrected, and `.today`'s difference on the reference page.
 
 ---
 
@@ -228,6 +328,66 @@ Every entry here was reproduced by a probe test that fails at `462d84d`, in Debu
 **Two reads copy more than they need.** A `[]const Uuid` column costs one allocation an element and a copy, where the sixteen bytes could be read straight out of the array payload into one list, and a Postgres row larger than the connection's buffer is placed in the arena by pg.zig and then kept again column by column.
 
 **Needs:** a number from a list screen of uuids, and a caller with rows that size.
+
+**Migrations write more statements, and take more locks, than the change needs.** Two column changes on one table are two `ALTER TABLE`s (`migrate.zig:1084`, `ddl.zig:494`), so `int4` to `int8` on two columns rewrites the table and rebuilds its indexes twice, and a `SET NOT NULL` beside them scans it again, all under `ACCESS EXCLUSIVE`; Postgres takes them as one statement with commas. `createMissing` sends its DDL on every boot (`migrate.zig:2057`): `CREATE INDEX IF NOT EXISTS` takes its table's SHARE lock before it finds the index there, and `CREATE OR REPLACE` takes a trigger's or view's lock, in one transaction with no `lock_timeout`, so each boot queues behind running writes and holds new ones behind it.
+
+**Needs:** a table's column steps joined into one statement where Postgres allows it, and whether `createMissing` reads the catalog first or is bounded like a version.
+
+**Startup and the ledger ask one question at a time.** `checkSchema` sends a catalog query per Row and another per enum column (`db.zig:3883`), where one query over `relname = ANY($2)` answers all of them. `migrate.drift` and `cli.doStatus` read the ledger with a `find` per version (`migrate.zig:2541`, `cli.zig:447`), the hash comparison is written three times (with `applyPending`, `:2480`), and `db migrate` runs `ensureLedger`, a BEGIN, a lock, a CREATE and a COMMIT, three times.
+
+**Needs:** one ledger read and one comparison shared by the three, and the startup check as one query.
+
+**A read pays small costs it could skip.** A count over children used in `.where` is written twice, in `WHERE` and in the select list (the test at `shape.zig:2167`), and Postgres runs identical subplans twice. A grouped Row reaching one table through `nilo_through` and through an aggregate's filter joins it twice under two aliases (`shape.zig:367`, `table.zig:1704`). A feed with children reads the children of the row it fetched only to see whether there is a next page, then throws them away (`db.zig:3479`). SQLite resets and clears a statement's bindings twice per use (`sqlite.zig:305`, `:827`, then `:792`). `kept` copies each text column of a row with its own arena allocation (`db.zig:3775`). `insertMany` and `updateMany` over an empty slice make a round trip for nothing (`db.zig:2069`).
+
+**Needs:** a yes; none of them changes what a caller sees, and each has a test to hold it.
+
+**A Problem from the diff has no way out but editing `snapshot.zon` by hand.** While one stands, `generate` writes nothing, and the step it suggests does not move the snapshot, so the same Problem comes back (`migrations.zig:394`, `migrate.zig:1704`). The common case is a new column with a foreign key to an existing table, which both dialects refuse here and `addMissingColumns` does; a new column is all NULL, so `ADD COLUMN` then `ADD CONSTRAINT … NOT VALID` cannot fail on old rows. The Problem's sentence that SQLite needs a rebuild is wrong for a new column, which `ADD COLUMN … REFERENCES` takes.
+
+**Needs:** the new column's key written by the diff, and a way for an accepted Problem to be recorded in the snapshot.
+
+**Views and triggers from `createMissing` behave differently on the two databases.** Postgres replaces every one on every boot; SQLite writes `IF NOT EXISTS` (`dialect.zig:1257`, `:1266`), so a view or trigger whose text changed is never updated and nothing says so. On Postgres a view remade because a table under it changed (`migrate.zig:776`) loses its grants and comment.
+
+**Needs:** one behaviour for both, and whether a remade view carries its grants or the step's `why` warns about them.
+
+**Case folding outside ASCII differs between the two databases.** SQLite's `LIKE` and `NOCASE` fold ASCII only (`dialect.zig:1110`, `:1199`); Postgres's `ILIKE` and `lower()` fold Unicode (`:613`). `.ieq = "ÉLISE@x.id"` matches `élise@x.id` on Postgres and not on SQLite, and a `NOCASE` unique keeps both. ADR 055 asks for a difference like this to be refused or written down, and the reference says only that SQLite folds ASCII.
+
+**Needs:** whether the SQLite half is refused for non-ASCII text or the difference is written on both pages.
+
+**The Postgres URL's defaults are not libpq's.** A URL with no `sslmode` is plaintext (`postgres.zig:614`), where libpq's default `prefer` encrypts whenever the server can, and no ADR decides this. `pgbouncer=true` is dropped (`postgres.zig:698`), although it is the one signal that prepared statements must be off (`db.zig:598`), and `26000` from a pooler is not handled by `replanned`, so the connection keeps going back to the pool and failing. `connect_timeout` and `tcp_user_timeout` both write `auth.timeout` (`postgres.zig:661`), and the later wins.
+
+**Needs:** the `sslmode` default decided in an ADR, `pgbouncer=true` turning `prepared` off, and `tcp_user_timeout` refused or given its own meaning.
+
+**`.rebuilding` checks every foreign key in the database.** `PRAGMA foreign_key_check` runs with no table name (`sqlite.zig:1147`), so an old violation in a table the migration never touched fails every rebuild with `ForeignKeyViolated`.
+
+**Needs:** the check limited to the rebuilt tables, or a reason the whole database is the right scope.
+
+#### P2: code to take out
+
+Nothing here changes behaviour, and the suite covers every line of it, so each **Needs** a yes and `test-all` green. The module is 54,538 lines: 19,087 of code, 11,124 of comments and 22,244 of tests.
+
+**`Tx` repeats `Db` body by body.** Twenty-eight of `Tx`'s methods (`db.zig:2563` to `:2923`, about 360 lines) copy `Db`'s, differing in `self.db`, `&self.inner` for `null`, and `"tx."` for `"db."`. Opening a result and telling the watcher on failure is written out six times (`:1009`, `:1606`, `:3231`, `:3363`, `:3425`, `:3579`). `raw`, `rawOne` and `rawExactlyOne` repeat their scalar and Row branches on both types (`:1664` to `:1820`, `:2756` to `:2866`), and the four `rawPage` bodies are near copies (`:1850`, `:2871`). One private body per operation taking `tx: ?*W.Tx` and the call's name removes about 350 lines, and halves the instantiations each call site costs.
+
+**Needs:** a yes.
+
+**`rawcheck.zig` walks a statement seven times with seven copies of the skipping.** `scan`, `paging`, `uses`, `highestParam`, `spelled`, `listStart` and `aliasAt` each re-implement depth and quote tracking. One comptime tokenizer is about 70 lines fewer, and is also where the rawcheck defect above gets fixed once rather than seven times.
+
+**Needs:** a yes, landing with that defect's fix.
+
+**`ddl.zig` writes most statements twice, once while compiling and once at run time.** `addColumn` and `columnClause`, `writeLiteral` and `valueList`, `writeCheckIdent` and `checkName`, `createTrigger` and `triggerStatement`, `createView` and `viewStatement`, `createExtension` and `createExtensionIfMissing` are pairs, and `addColumn` already disagrees with `columnClause`. The desired side is comptime whole, so only a drop or rename, whose name comes from the snapshot, needs the run-time writer. About 150 lines.
+
+**Needs:** a yes.
+
+**Helpers are copied between files.** A backticked name list is written seven times (`shape.zig:673`, `where.zig:1498`, `table.zig:1293`, `row.zig:220`, `:950`, `:1266`, `statement.zig:568`); an unordered set comparison three (`statement.zig:1507`, `db.zig:395`, `table.zig:202`); `columnTuple` is `tupleOf` (`statement.zig:1520`, `db.zig:415`); `writtenValue` is `fieldValue` (`statement.zig:2147`, `where.zig:1676`); `relation` is `relationOf` (`statement.zig:122`, `where.zig:1490`); `snapshot.sameSchema` is `table.sameSchema`; the SQL literal escape is in `ddl.zig:770` and `migrations.zig:670`; and an optional is unwrapped by an inline `switch` 33 times across ten files. Inside `migrate.zig`, `findUnique`, `findIndex`, `findReference` and `findNamed`, and the six `carried*` and `renamed*` functions, are one generic each. In `shape.zig`, `parentLink` and `backLink`, and `throughColumn` and `throughOf`, resolve the same path twice, and the second pair is where the `.through` defect above came from. A direction with its `NULLS` is written in three places (`shape.zig:1331`, `:1531`, `statement.zig:2125`). About 400 lines in all, with name helpers in `row.zig` and type helpers in `types.zig`, which every file already imports.
+
+**Needs:** a yes.
+
+**Declarations that nothing uses.** `table.columnList` (`table.zig:2077`), `ddl.dropTable` (`ddl.zig:280`), `Tx.w` (`db.zig:2344`), `strList` (`db.zig:5100`, covered by `mappedList`), `ListForm.expanded` and `.unsupported` (`dialect.zig:61`), `Unique.sameAs` and `Index.sameAs` (`table.zig:179`, `:234`), and `sql.table_marker`, a string no Zig program can use as a declaration name. Used only by tests: `where.each` and `where.paramCount` (whose comment says a Wire binds this way, and `valuesOf` does), `Plan.needsBackfill`, `Chain.headHash`, `Outcome.wasHeld`, and `sqlite.labelsOf`, which exists because `assertWire` asks for it. `Dialect.nulls` answers an optional that is never null in either dialect, so `noNullsOrder` and its four call sites cannot be reached. The top-level `…For` constants can be `on(Postgres)`'s, with the two `on()` lacks added.
+
+**Needs:** a yes, and the names that are public decided with the read-back under Every module.
+
+**Files import each other in two rings.** `types` and `wire` import each other, and `ordering`, `shape`, `statement`, `table` and `where` form one ring: `table` reaches `where` for three clock helpers, `ordering` reaches `statement` for `Direction` and `Tie`, and `shape` and `statement` share seventeen names. `assertDialect` (`dialect.zig:1573`) does not check `has_extensions`, `has_functions`, `view_repeatable_head` or `script_stop_on_error`, which `migrate.zig` and `migrations.zig` read, and `migrate.zig:908` compares `D.name` with `"sqlite"` where a capability belongs.
+
+**Needs:** whether the rings are worth breaking, and the four capabilities added to `assertDialect`.
 
 ---
 
@@ -437,9 +597,29 @@ Suspected from the code, and not yet made to fail through nilo. Each becomes a d
 
 **What would settle it:** a Postgres statement that it does, or `WITH ORDINALITY` and an `ORDER BY` in the statement.
 
-**Smaller suspicions, each needing a probe.** `Composed.text` refuses `$n` but not SQLite's `?n` or `?` (`composed.zig:133`). `Ordering.by` guards its length with `std.debug.assert`, which is out of bounds in ReleaseFast, and `nilo_parse` takes `?order=id,id`. `Savepoint.release` ends the handle before it sends `RELEASE`, so a failed release leaves a mark nothing can roll back to. `violated` guesses a constraint by `_pkey` and `_key`, which breaks once Postgres truncates a name at 63 bytes. `.x = null` on a column that cannot be null compiles to an `IS NULL` that is always false, the silent shape [ADR 040](./adr/040-a-condition-holds-a-value-not-a-maybe.md) refuses for `= NULL`. A stale `sql.problem` may be read from an arena that `reset` has handed back. `rawExplain` on SQLite takes the writer rather than a reader.
+**Smaller suspicions, each needing a probe.** `Ordering.by` guards its length with `std.debug.assert`, which is out of bounds in ReleaseFast, and `nilo_parse` takes `?order=id,id`. `violated` guesses a constraint by `_pkey` and `_key`, which breaks once Postgres truncates a name at 63 bytes. `.x = null` on a column that cannot be null compiles to an `IS NULL` that is always false, the silent shape [ADR 040](./adr/040-a-condition-holds-a-value-not-a-maybe.md) refuses for `= NULL`. `.now` against an `AsText("timestamp")` column writes `now()`, a `timestamptz` that Postgres converts to the session's zone, so a session in Asia/Jakarta stores and compares seven hours off (`where.zig:1838`). Changing the type of a column an unchanged trigger names in `UPDATE OF` or `WHEN` is refused by Postgres, and `diffTriggers` remakes a trigger only when its hash moved (`migrate.zig:1066`). The introspection resolves a Row with no schema through `current_schema()` (`dialect.zig:750`), where a query resolves it through the whole `search_path`. The others (`Composed.text`, `Savepoint.release`, a stale `sql.problem`, `rawExplain` on SQLite) were checked and are under Defects.
 
 **What would settle it:** a probe each, kept as a test if it fails.
+
+**Whether a failed statement's Problem can be overwritten before it is recorded.** `told` runs before the deferred `drain` (`db.zig:3243` against `:3252`, and the same in `fillScalar`, `only` and `rawTotalBehind`), and a drain can suspend: Postgres reads up to a megabyte off the socket, and `pool.release` may dial. Another fiber on the same thread can then overwrite `recent`, and `sql.violated` answers false for a unique that was hit. ADR 117 rests on there being no suspension point there.
+
+**What would settle it:** a probe with two fibers on one executor, or `told` moved after the drain, which makes the question moot.
+
+**Whether SQLite's `Problem` can carry the previous statement's message.** `intsFit` and `floatsKept` fail before SQLite is called (`sqlite.zig:783`), and `said` then reads `lastError()` (`:909`), which after a reset holds the last statement's error. An INSERT refused on `users.email` followed on the writer by an oversized `u64` would make `sql.violated(c, User, .{.email})` true.
+
+**What would settle it:** a probe of that pair, or `said` reading `errmsg` only for an error that came from SQLite.
+
+**Whether `describe` pays five round trips on every raw call behind a pooler.** `DEALLOCATE nilo_describe` is sent after the `ROLLBACK` (`postgres.zig:1476`), in a transaction of its own, which pgbouncer in transaction mode may route to another server connection. The statement is left behind on the first, the next describe there fails on `42P05`, and `vetRaw` (`db.zig:770`) keeps trying. ADR 233 says it costs a round trip only while the statement beside it is failing too.
+
+**What would settle it:** a run behind pgbouncer in transaction mode, or the `DEALLOCATE` sent before the `ROLLBACK`.
+
+**Whether `expect` can boot under a role that may only read and write rows.** `expect` reaches `ensureLedger` (`migrate.zig:2305`), whose `CREATE TABLE IF NOT EXISTS` is checked against the schema's CREATE privilege, so an application role that is not the migration's owner may be refused at boot.
+
+**What would settle it:** a live test under a role granted DML only.
+
+**Whether one request can pay for re-dialling the whole pool after Postgres restarts.** Each connection found hung up is released as failed (`postgres.zig:456`, `giveBack` at `:1519`), and pg.zig dials its replacement inside `release`, synchronously and with cancellation held off. One request can pay the pool's size in TCP, TLS and authentication, and its deadline cannot cut it short.
+
+**What would settle it:** a live test that restarts Postgres under a pool of ten and times the first request after.
 
 ---
 
@@ -450,6 +630,7 @@ A decision that is waiting on a number, and the run that would produce it. [`ben
 | Module | What the number decides | The run | Needs |
 |---|---|---|---|
 | `nilo_sql` | why the arena's `async-db` profile reads 66k req/s at 874% of sixty-four CPUs with neither the server nor Postgres busy — 3.9 ms a query for a 0.1 ms scan. Decoding is 116 µs of nilo's 284 µs a request and none of the wait ([`sql.md` §12](../bench/result/sql.md#12-the-arenas-query-at-one-connection)); the suspect is pg.zig's one pool mutex taken twice a request by 1,024 fibers on 64 threads, which two threads cannot convoy. The arena's rerun with stealing off (ADR 199) read 59.7k with the p99 at 245–362 ms from 50, which is what a fiber queued on a mutex that no other thread can now run looks like, and does not yet name the lock ([`http.md`](../bench/result/http.md#the-arenas-two-readings-and-what-changed-between-them)) | `bench-sql-server`'s three `/async-db*` routes under `wrk -c1024`, pool 256 then 32, Postgres on `--network host` | a box |
+| `nilo_sql` | what the module costs a dependent's build: every query is settled while compiling, and ADR 017 has no axis for compile time, so there is no number at all. Each call site's anonymous literal instantiates its statement, `valuesOf` and `fill`, `Tx` doubles them, and several eval quotas grow with the square of the schema (`table.zig:456`, `:2151`) | `bench/result/build.md` extended: a schema of 10, 50 and 100 tables with one and ten call sites a table, cold and after one edit | an afternoon |
 | `nilo_cache` | where the 60% between nilo and quick_cache on eight threads goes — the levers named so far are each a few percent ([`cache.md`](../bench/result/cache.md)) | `perf` on both binaries, not another guess | a box |
 | `nilo_cache` | whether a bucket should have sixteen ways rather than eight: two cache lines touched against better retention at load | the retention curve and the read cost, both swept across ways | a box where the read cost is not mostly memory latency |
 | `nilo_jwt` | whether a sign-in endpoint should cache a verification or just do it — an RSA exponentiation at 2048 bits is not small | one verify of each kind, and a row in `bench/result/` for it | an afternoon |

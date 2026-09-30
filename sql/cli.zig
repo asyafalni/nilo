@@ -805,8 +805,11 @@ fn writeDrift(w: *std.Io.Writer, moved: []const migrate.Drift) !void {
     for (moved) |d| {
         const number: u64 = @intCast(d.version);
         try w.print("  {d:0>4} {s}\n", .{ number, d.name });
-        try w.print("    ran as   {s}\n", .{d.recorded[0..16]});
-        try w.print("    now says {s}\n", .{d.now[0..16]});
+        // `@min`, because a hand-edited or older ledger row may hold fewer
+        // than sixteen bytes and a slice past the end panics the command
+        // that exists to explain it (`migrate.applyPending` does the same).
+        try w.print("    ran as   {s}\n", .{d.recorded[0..@min(d.recorded.len, 16)]});
+        try w.print("    now says {s}\n", .{d.now[0..@min(d.now.len, 16)]});
     }
     try w.writeAll(
         "\nThe hash is chained, so the first line is the one that was edited and " ++
@@ -1153,4 +1156,15 @@ test "--drop's names are split on commas, with the spaces and empties left out" 
     try testing.expectEqual(@as(usize, 2), list.len);
     try testing.expectEqualStrings("orgs.note", list[0]);
     try testing.expectEqualStrings("extension:pgcrypto", list[1]);
+}
+
+test "drift with a ledger hash shorter than sixteen bytes is printed whole rather than sliced past its end" {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeDrift(&w, &.{
+        .{ .version = 4, .name = "four", .recorded = "abc", .now = "" },
+    });
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "ran as   abc\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "now says \n") != null);
 }
