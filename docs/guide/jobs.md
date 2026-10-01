@@ -281,7 +281,7 @@ const Nightly = struct {
 
 | | |
 |---|---|
-| `job.cron("0 3 * * *")` | `minute hour day month weekday`, UTC, parsed while compiling. `*`, lists, ranges and `*/n` |
+| `job.cron("0 3 * * *")` | `minute hour day month weekday`, UTC, parsed while compiling. `*`, lists, ranges and `*/n`; a date that never comes (`0 0 31 2 *`) is a compile error. When either day field starts with `*`, the day must match both |
 | `job.every(600_000)` | every ten minutes from whenever the worker started, for when it does not matter which ten |
 
 A field out of range, a sixth field or a backwards range is a compile error naming the field. **UTC only**: a program in Jakarta writes `0 20 * * *` with a comment, and `docs/roadmap.md` records the gap.
@@ -325,7 +325,7 @@ It is a queue, not a cache: a full `Memory` returns `error.QueueFull` instead of
 | `poll_ms` | 1,000 | how long a worker with nothing to do waits before asking again, **when nothing wakes it first**. A `push` from this process wakes a worker itself, so this is only the delay for a row *another* process pushed, and the cost of an idle queue: one claim per worker per interval ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
 | `timeout_ms` | 60,000 | how long one run may take, for a kind that sets no `timeout_ms` of its own. Also the lease |
 
-A third store needs nine methods, listed in `job/contract.zig`, for whoever brings that deployment.
+A third store needs ten methods, listed in `job/contract.zig`, for whoever brings that deployment.
 
 ## Monitoring the queue
 

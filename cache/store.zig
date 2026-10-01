@@ -144,6 +144,14 @@ const Slot = packed struct(u64) {
         @atomicStore(u64, @as(*u64, @ptrCast(slot)), 0, .release);
     }
 
+    /// Clear the slot only if it still holds `seen`, and give up if it does
+    /// not. For a caller holding no lock, whose view of the slot may be stale
+    /// by the time it acts. `Weak` may fail spuriously, which costs a slot
+    /// freed a read later and nothing else.
+    inline fn clearIf(slot: *Slot, seen: Slot) void {
+        _ = @cmpxchgWeak(u64, @as(*u64, @ptrCast(slot)), @bitCast(seen), 0, .release, .monotonic);
+    }
+
     /// One warmer, and **nothing at all once it is saturated.** The guard is
     /// not a micro-optimisation: on Zipfian traffic most hits are to keys that
     /// are already warm, so without it every read of a hot key dirties the
@@ -879,9 +887,15 @@ pub const Store = struct {
     /// `get` followed by a `put` (ADR 109). The value already there has to
     /// be exactly `@sizeOf(Int)` long, or it is treated as absent — which
     /// cannot happen inside one Space.
-    pub fn add(self: *Store, comptime Int: type, space: u32, key: []const u8, delta: Int, ttl_s: u32) Int {
+    ///
+    /// **A refused write is `error.TooLarge`, never a count.** A key over
+    /// 65,535 bytes, or an entry over a quarter of a shard's ring, is
+    /// refused before the sum is set, and answering `Int` anyway read as
+    /// garbage that a limit check such as `incr(email, 1) > 5` walked
+    /// through.
+    pub fn add(self: *Store, comptime Int: type, space: u32, key: []const u8, delta: Int, ttl_s: u32) error{TooLarge}!Int {
         var sum: Int = undefined;
-        _ = self.write(.{ .add = Int }, space, key, std.mem.asBytes(&delta), ttl_s, &sum);
+        if (self.write(.{ .add = Int }, space, key, std.mem.asBytes(&delta), ttl_s, &sum) == .refused) return error.TooLarge;
         return sum;
     }
 
@@ -945,7 +959,11 @@ pub const Store = struct {
         // outside it.
         const now: u32 = if (ttl_s == 0 and mode == .put) 0 else self.elapsed();
         var head_bytes: [header]u8 = undefined;
-        std.mem.writeInt(u32, head_bytes[0..4], if (ttl_s == 0) 0 else now + ttl_s, .little);
+        // Saturating: `now + ttl_s` overflows a u32 for a ttl near its ceiling,
+        // which panics in a safe build and wraps in ReleaseFast. The ceiling is
+        // never 0, which is the word for "never expires", so a saturated entry
+        // is live for as long as a u32 of seconds can say.
+        std.mem.writeInt(u32, head_bytes[0..4], if (ttl_s == 0) 0 else now +| ttl_s, .little);
         std.mem.writeInt(u32, head_bytes[4..8], space, .little);
         std.mem.writeInt(u16, head_bytes[8..10], @intCast(key.len), .little);
         std.mem.writeInt(u16, head_bytes[10..12], @intCast(value.len), .little);
@@ -1013,6 +1031,13 @@ pub const Store = struct {
                 // doorkeeper by being written again. It earned the nine tenths
                 // once; a refresh is the same key, not a new one.
                 returning = returning or !in_small;
+                // **A counter asked again is a key asked for twice.** Only a
+                // `get` promotes out of the doorkeeper, and a counter that is
+                // only ever incremented is never read, so it sat in `small`
+                // and the churn that laps `small` reset it to zero. Another
+                // add finding it live there is the second ask, and sends the
+                // new entry to `main`, which is what a promotion does (ADR 109).
+                if (adding) returning = true;
                 break;
             }
         }
@@ -1190,8 +1215,12 @@ pub const Store = struct {
             if (e.expires != 0 and now >= e.expires) {
                 // Forgotten now rather than at a sweep that does not exist.
                 // Two readers may do this at once and it is the same store
-                // either way.
-                slot.clear();
+                // either way. **Cleared only if the slot is still the word
+                // this reader judged**: no lock is held, so a `put` may have
+                // refilled the slot since, and an unconditional store would
+                // wipe the fresh entry. A lost race leaves the slot to
+                // whoever won it, the way `warmer` does.
+                slot.clearIf(seen);
                 Counters.bump(&shard.stats.expired);
                 return null;
             }
@@ -1412,8 +1441,8 @@ test "an add counts from zero, keeps the expiry it found, and saturates" {
     defer store.deinit();
 
     // Nobody wrote the key: the delta is the count, and it lives ttl_s.
-    try testing.expectEqual(@as(u32, 1), store.add(u32, 1, "otp:+62", 1, 10));
-    try testing.expectEqual(@as(u32, 3), store.add(u32, 1, "otp:+62", 2, 10));
+    try testing.expectEqual(@as(u32, 1), try store.add(u32, 1, "otp:+62", 1, 10));
+    try testing.expectEqual(@as(u32, 3), try store.add(u32, 1, "otp:+62", 2, 10));
     var out: [8]u8 = undefined;
     try testing.expectEqual(@as(usize, 4), store.get(1, "otp:+62", &out).?);
     try testing.expectEqual(@as(u32, 3), std.mem.bytesToValue(u32, out[0..4]));
@@ -1423,18 +1452,18 @@ test "an add counts from zero, keeps the expiry it found, and saturates" {
     // starts again rather than carrying on — a window that is not slid by
     // the attempts inside it.
     store.opened_s -= 2;
-    try testing.expectEqual(@as(u32, 4), store.add(u32, 1, "otp:+62", 1, 10));
+    try testing.expectEqual(@as(u32, 4), try store.add(u32, 1, "otp:+62", 1, 10));
     store.opened_s -= 9;
-    try testing.expectEqual(@as(u32, 1), store.add(u32, 1, "otp:+62", 1, 10));
+    try testing.expectEqual(@as(u32, 1), try store.add(u32, 1, "otp:+62", 1, 10));
 
     // A delta the type cannot hold stops at the ceiling rather than wrapping
     // to a small number, which would be the quota opening again.
-    try testing.expectEqual(@as(u8, 250), store.add(u8, 1, "cap", 250, 0));
-    try testing.expectEqual(std.math.maxInt(u8), store.add(u8, 1, "cap", 250, 0));
-    try testing.expectEqual(std.math.maxInt(u8), store.add(u8, 1, "cap", 1, 0));
+    try testing.expectEqual(@as(u8, 250), try store.add(u8, 1, "cap", 250, 0));
+    try testing.expectEqual(std.math.maxInt(u8), try store.add(u8, 1, "cap", 250, 0));
+    try testing.expectEqual(std.math.maxInt(u8), try store.add(u8, 1, "cap", 1, 0));
     // A signed count goes down as well as up.
-    try testing.expectEqual(@as(i64, -3), store.add(i64, 1, "signed", -3, 0));
-    try testing.expectEqual(@as(i64, 2), store.add(i64, 1, "signed", 5, 0));
+    try testing.expectEqual(@as(i64, -3), try store.add(i64, 1, "signed", -3, 0));
+    try testing.expectEqual(@as(i64, 2), try store.add(i64, 1, "signed", 5, 0));
 }
 
 test "two threads adding one each count two — the reason this is not a get and a put" {
@@ -1445,14 +1474,14 @@ test "two threads adding one each count two — the reason this is not a get and
 
     const Adder = struct {
         fn run(s: *Store) void {
-            for (0..20_000) |_| _ = s.add(u64, 1, "hits", 1, 0);
+            for (0..20_000) |_| _ = s.add(u64, 1, "hits", 1, 0) catch return;
         }
     };
     var threads: [4]std.Thread = undefined;
     for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Adder.run, .{&store});
     for (threads) |t| t.join();
 
-    try testing.expectEqual(@as(u64, 80_000), store.add(u64, 1, "hits", 0, 0));
+    try testing.expectEqual(@as(u64, 80_000), try store.add(u64, 1, "hits", 0, 0));
 }
 
 test "a deleted key is gone and says so" {
@@ -1856,4 +1885,111 @@ test "a lookup that holds no lock never hands back a value that is not the key's
     // And it really did answer things, or the assertion above passed because
     // the cache never held anything.
     try testing.expect(hits > 1_000);
+}
+
+test "a reader clearing an expired slot never wipes the entry a writer just put there" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // `get` forgets an expired entry with no lock held, so what it clears has
+    // to be the word it judged, not whatever the slot holds by then (ADR 152).
+    // The writer expires each entry by moving the epoch back, then puts a
+    // fresh one into the very slot the readers are about to clear, and reads
+    // it straight back. Before the compare-and-swap that read was lost
+    // whenever a reader sat between its expiry check and its store.
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    defer store.deinit();
+
+    const Shared = struct {
+        store: *Store,
+        stop: std.atomic.Value(bool) = .init(false),
+        fn read(self: *@This()) void {
+            var out: [16]u8 = undefined;
+            while (!self.stop.load(.acquire)) _ = self.store.get(1, "k", &out);
+        }
+    };
+    var shared: Shared = .{ .store = &store };
+    var readers: [3]std.Thread = undefined;
+    for (&readers) |*t| t.* = try std.Thread.spawn(.{}, Shared.read, .{&shared});
+
+    var out: [16]u8 = undefined;
+    var lost: usize = 0;
+    for (0..200_000) |_| {
+        _ = store.put(1, "k", "old", 1);
+        store.opened_s -= 2;
+        _ = store.put(1, "k", "new", 0);
+        if (store.get(1, "k", &out) == null) lost += 1;
+    }
+    shared.stop.store(true, .release);
+    for (readers) |t| t.join();
+
+    try testing.expectEqual(@as(usize, 0), lost);
+}
+
+test "an add refused for its size is an error and never a count" {
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    defer store.deinit();
+
+    // A key the header cannot express, which `write` refuses before it has
+    // set the sum. This used to answer whatever the stack held.
+    const long_key = "k" ** (std.math.maxInt(u16) + 1);
+    try testing.expectError(error.TooLarge, store.add(u32, 1, long_key, 1, 10));
+    try testing.expectEqual(@as(u64, 1), store.stats().refused);
+
+    // And an entry over a quarter of the shard's ring, with a key that is
+    // itself within the header's limit.
+    const wide_key = "k" ** (1 << 15);
+    var small = try Store.open(testing.allocator, .{ .bytes = 1 << 16, .shards = 1 });
+    defer small.deinit();
+    try testing.expectError(error.TooLarge, small.add(u32, 1, wide_key, 1, 10));
+
+    // A key that fits still counts.
+    try testing.expectEqual(@as(u32, 1), try store.add(u32, 1, "ok", 1, 10));
+}
+
+test "a ttl as large as a u32 holds is a live entry rather than an overflow" {
+    var store = try openTest();
+    defer store.deinit();
+
+    // The Store has to be older than a second for `now + ttl_s` to overflow.
+    store.opened_s -= 100;
+    const forever = std.math.maxInt(u32);
+    try testing.expect(store.put(1, "k", "v", forever));
+    try testing.expectEqual(Store.Claim.stored, store.putIfAbsent(1, "claimed", "v", forever));
+    try testing.expectEqual(@as(u32, 1), try store.add(u32, 1, "n", 1, forever));
+
+    var out: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), store.get(1, "k", &out).?);
+    try testing.expectEqual(@as(usize, 1), store.get(1, "claimed", &out).?);
+    try testing.expectEqual(@as(usize, 4), store.get(1, "n", &out).?);
+    // Saturated is not zero, and zero would read as "never expires" rather
+    // than as an entry that is merely a long way off.
+    try testing.expectEqual(Store.Claim.taken, store.putIfAbsent(1, "claimed", "w", forever));
+}
+
+test "a counter that is only ever incremented survives the churn that laps the doorkeeper" {
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    defer store.deinit();
+
+    var key: [32]u8 = undefined;
+    // Past the filling phase, or every write skips the doorkeeper and the
+    // test measures nothing.
+    for (0..30_000) |i| {
+        _ = store.put(1, try std.fmt.bufPrint(&key, "warm{d}", .{i}), "x" ** 32, 0);
+    }
+
+    // Two adds back to back, which is the second ask, then enough one-shot
+    // keys to lap `small` several times over. The count may only go up.
+    var expect: u32 = 0;
+    var churn: usize = 0;
+    for (0..500) |_| {
+        for (0..2) |_| {
+            expect += 1;
+            try testing.expectEqual(expect, try store.add(u32, 1, "hits", 1, 0));
+        }
+        for (0..3_000) |_| {
+            churn += 1;
+            _ = store.put(1, try std.fmt.bufPrint(&key, "flood{d}", .{churn}), "x" ** 32, 0);
+        }
+    }
+    try testing.expectEqual(@as(u32, 1_000), try store.add(u32, 1, "hits", 0, 0));
 }

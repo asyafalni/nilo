@@ -1435,6 +1435,10 @@ const s3_refusals = [_]Refusal{
         .name = "a_streamed_put_with_no_length",
         .says = "bucket.putStream needs `.len` on what it reads from.",
     },
+    .{
+        .name = "a_session_token_larger_than_sign_can_carry",
+        .says = "s3.Bucket(\"sts\") has a `session_token_max` of 4096 bytes, and a presigned URL has room for a token of 2048 (`sign.token_max`).",
+    },
 };
 
 /// The same, for `config/refusals/`. A separate list for the same reason the
@@ -1579,6 +1583,10 @@ const job_refusals = [_]Refusal{
     .{
         .name = "job_cron_out_of_range",
         .says = "the schedule \"0 25 * * *\" has 25 in its hour field, and that field runs from 0 to 23.",
+    },
+    .{
+        .name = "job_cron_date_never_comes",
+        .says = "the schedule \"0 0 31 2 *\" never fires, because no month it names has a day it names.",
     },
     .{
         .name = "job_push_in_on_memory",
@@ -4884,18 +4892,12 @@ pub fn build(b: *std.Build) void {
 
     const s3_config = b.addOptions();
     s3_config.addOption(?[]const u8, "endpoint", s3_endpoint);
-    s3_config.addOption(
-        ?[]const u8,
-        "access_key",
-        b.option([]const u8, "s3-access-key", "Access key id for the live tests") orelse
-            b.graph.environ_map.get("S3_ACCESS_KEY"),
-    );
-    s3_config.addOption(
-        ?[]const u8,
-        "secret_key",
-        b.option([]const u8, "s3-secret-key", "Secret access key for the live tests") orelse
-            b.graph.environ_map.get("S3_SECRET_KEY"),
-    );
+    const s3_access_key = b.option([]const u8, "s3-access-key", "Access key id for the live tests") orelse
+        b.graph.environ_map.get("S3_ACCESS_KEY");
+    const s3_secret_key = b.option([]const u8, "s3-secret-key", "Secret access key for the live tests") orelse
+        b.graph.environ_map.get("S3_SECRET_KEY");
+    s3_config.addOption(?[]const u8, "access_key", s3_access_key);
+    s3_config.addOption(?[]const u8, "secret_key", s3_secret_key);
     s3_config.addOption(
         []const u8,
         "region",
@@ -4912,18 +4914,28 @@ pub fn build(b: *std.Build) void {
             b.graph.environ_map.get("S3_BUCKET") orelse "nilo-test",
     );
 
+    // The suite is its own step so that `test` can run it without the
+    // live-store rule below: the macOS job sets `$CI`, runs `test`, and has no
+    // object store, which is the case ADR 239 leaves alone for `test-sql` by
+    // keeping it off `test`. `test-s3` and `test-all` carry the rule.
+    const s3_suite_step = b.step(
+        "test-s3-suite",
+        "nilo_s3's tests without the rule that CI must have an object store",
+    );
     const test_s3_step = b.step(
         "test-s3",
         "Run nilo_s3's tests — a fake S3 that checks signatures, and no Engine",
     );
+    test_s3_step.dependOn(s3_suite_step);
+    test_all_step.dependOn(test_s3_step);
     for (test_modes) |mode| {
         const tests = b.addTest(.{
             .root_module = s3For(b, target, mode, coreFor(b, target, mode), s3_config.createModule()),
             .use_llvm = testBackend(target, mode),
         });
-        test_s3_step.dependOn(&b.addRunArtifact(tests).step);
+        s3_suite_step.dependOn(&b.addRunArtifact(tests).step);
     }
-    test_step.dependOn(test_s3_step);
+    test_step.dependOn(s3_suite_step);
 
     // The fifth Refusals table, and CLAUDE.md's warning applies with more
     // force at five than it did at four: adding a row to one table while
@@ -4947,7 +4959,26 @@ pub fn build(b: *std.Build) void {
         refused.expect_errors = .{ .contains = b.fmt("error: nilo: {s}", .{refusal.says}) };
         refusals_s3_step.dependOn(&refused.step);
     }
-    test_s3_step.dependOn(refusals_s3_step);
+    s3_suite_step.dependOn(refusals_s3_step);
+
+    // **On CI a missing endpoint or key fails `test-s3` rather than skipping
+    // its eleven live tests**, the rule ADR 239 made for `test-sql` and in the
+    // same shape: `$CI` is what runners set, so it holds without a flag
+    // anybody has to remember, and `-Ds3-required=false` is the way out for a
+    // runner with no object store on purpose. `s3/live.zig` skips unless it
+    // has all three values, so all three are asked for here.
+    const s3_required = b.option(
+        bool,
+        "s3-required",
+        "Fail test-s3 when no object store is given (default: on where $CI is set)",
+    ) orelse (b.graph.environ_map.get("CI") != null);
+    if (s3_required and (s3_endpoint == null or s3_access_key == null or s3_secret_key == null))
+        test_s3_step.dependOn(&b.addFail(
+            "test-s3 needs an object store here: $CI is set and one of $S3_ENDPOINT, " ++
+                "$S3_ACCESS_KEY and $S3_SECRET_KEY (or -Ds3-endpoint=, -Ds3-access-key=, " ++
+                "-Ds3-secret-key=) is missing, so every live test would skip. Set them, " ++
+                "or pass -Ds3-required=false to skip them on purpose",
+        ).step);
 
     // TLS and a real endpoint, which nothing else here touches.
     //

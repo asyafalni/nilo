@@ -19,7 +19,7 @@ Six sections, and an entry is in exactly one of them by what it is waiting for:
 | [**Measurements outstanding**](#measurements-outstanding) | a decision waiting on a number, and the run that would produce it | the table's last column |
 | [**Waiting on upstream**](#waiting-on-upstream) | the change is in somebody else's repository, with the pin it was last checked at | the table's last column |
 
-Inside the first four, entries are grouped by module, because **two modules touch no file in common** ([ADR 038](./adr/038-a-module-sits-where-the-loop-puts-it.md)): two entries under different modules can be worked at the same time, by two people or by one person on two days. Under a module whose entries are ranked, `nilo_sql` for now, they are grouped once more by priority, `P0` to `P2`, as [rule 6](#how-this-file-is-written) says.
+Inside the first four, entries are grouped by module, because **two modules touch no file in common** ([ADR 038](./adr/038-a-module-sits-where-the-loop-puts-it.md)): two entries under different modules can be worked at the same time, by two people or by one person on two days. Under a module whose entries are ranked, `nilo_sql`, `nilo_cache`, `nilo_job` and `nilo_s3` for now, they are grouped once more by priority, `P0` to `P2`, as [rule 6](#how-this-file-is-written) says.
 
 **A `Waiting on upstream` row is the line to distrust.** This repository has been wrong about a blocker six times, and each time the code it was waiting for already did the thing ([history](./history.md)): the latest was a signer hook in tls.zig, whose fork nilo already publishes. Nothing downstream ever re-tests a blocker, so re-test it before repeating it.
 
@@ -134,6 +134,128 @@ The entries under *statements that work refused* were reproduced by a probe test
 **Migration steps and their words disagree with what runs.** ADR 240 calls five seconds the longest a migration can stall a table; `lock_timeout` bounds each acquisition, so a version over ten tables can hold the first for the sum of the rest. On SQLite a `Locked` version names `.lock_timeout_ms` and 5000 ms (`migrate.zig:2436`), where `busy_timeout_ms` is what applied. `expect` is called one query (`migrate.zig:26`, ADR 123) and is `ensureLedger`'s four round trips and a lock before it. `Kind.data`'s comment (`migrate.zig:574`) places a backfill between two steps `generate` never writes as a pair. An `ADD COLUMN` with an enum's `CHECK` reads every row under `ACCESS EXCLUSIVE` and its `why` does not say so (`migrate.zig:1001`).
 
 **Needs:** each sentence made true, and the enum check's `why` saying what it reads.
+
+### `nilo_cache`
+
+The entries here came from an audit of `cache/` at `1738286` that read every line of the module; **reproduced** marks one a throwaway test also ran, in Debug and ReleaseSafe. A fix lands with that test kept.
+
+#### P1
+
+**The fingerprint carries 8 bits where its comment says 14.** `shardFor` and `fingerprint` both read `hash >> 32` (`store.zig:838`, `:1290`), so at 64 shards the low six bits of every fingerprint in a shard are the same, and `| 1` drops one more. Among 2M keys landing in one shard, 256 distinct fingerprints occurred out of 16,384, so a miss on a full bucket reads the ring for nothing about 3% of the time against the 0.05% the comment at `store.zig:105` claims, and `evicted`, the number the guide says to size the ring by, counts every such collision with a dead slot. Reproduced; not timed.
+
+**Needs:** the fingerprint taken from bits the shard does not use and the `| 1` dropped, with the miss path timed into [`bench/result/cache.md`](../bench/result/cache.md).
+
+#### P2
+
+**A flat Space turns a refusal into a plausible answer.** `claimFlat` returns `== .stored`, so a refused `putIfAbsent` reads as "somebody else was first", and `putFlatFor` discards the result under a comment saying a flat value cannot be too large, which is false on a small store: a 20,000-byte struct on a 64 KiB store is refused twice and `get` returns null (`space.zig:186-207`). `flat.kindOf` checks only the 65,535 ceiling. Reproduced.
+
+**Needs:** `Space.open` refusing a `V` whose entry cannot fit a quarter of a shard's ring, the way `registerSpace` refuses a collision.
+
+**A TTL of one second can last none.** Expiry is whole seconds of `MONOTONIC_COARSE` truncated at both ends (`clock.zig:48`, `store.zig:841`), so an entry put at 5.99 s with `ttl_s = 1` expires at 6.00, and an `incr` window can be arbitrarily short. The coarse clock also stops during a suspend, so nothing ages across a laptop sleep or a VM pause, which nothing says.
+
+**Needs:** expiry stored as `now + ttl + 1`, so an entry lives at least its TTL, and the suspend behaviour written on the design page.
+
+**The shard lock spins on a write and never backs off.** `while (l.held.swap(true, .acquire))` (`store.zig:340`) bounces the line between waiting cores, and a holder preempted by the OS leaves the waiters burning their timeslice; the module's own soak tests run more threads than cores. The refusal path also takes the lock only to bump an atomic counter (`store.zig:934`). Not measured.
+
+**Needs:** test-and-test-and-set with a yield after some spins, the refusal's lock dropped, and both measured under contention.
+
+**The hash is seeded by the Space's public name.** `Wyhash.hash(space, key)` with `space = Wyhash(0, name)`, so keys an attacker controls (emails, URLs) can be precomputed into one shard and one bucket, evicting a chosen victim and serialising on one lock. Cache only, no memory safety.
+
+**Needs:** a per-Store seed mixed in at `open`, from an `Options.seed` or the loop's entropy ([ADR 042](./adr/042-entropy-belongs-to-the-loop.md)).
+
+**The 16-bit pass counter wraps.** After 65,536 laps of a region a dead slot looks live again (`store.zig:576`), guarded only by the bounds check in `entry()` and the key compare; a crafted value carrying a fake header could forge a hit. Found by reading; not reproduced.
+
+**Needs:** `gen` widened into the bits the fingerprint fix frees, or a sweep of the slots when it wraps.
+
+**Small things that say the wrong thing.** `open` answers `error.TooSmall` when a shard would exceed 4 GiB (`store.zig:747`); `flat.zig:44`, `space.zig:107` and the `cache_value_over_the_ceiling` refusal still say a bucket's four ways are a cache line, where it is eight; `registerSpace` is documented as not thread-safe while the guide calls `Space.open` from handlers, so two at once race on `n_spaces`.
+
+**Needs:** each corrected, the refusal's `.says` with its text, and `registerSpace` made safe to call twice for one name.
+
+### `nilo_job`
+
+The entries here came from an audit of `job/` at `1738286` that read every line of the module and the SQL it sends through `sql/`; **reproduced** marks one a throwaway test also ran.
+
+#### P1
+
+**A schedule can stop until the process restarts.** The next tick is pushed after `done`, in a second statement, and `pushNext` swallows its error (`job.zig:835-941`); a crash between the two, a database blip, or `cancel` on the tick row leaves no queued row for the kind, and seeding happens only when `serve` starts (`:645`). One `err` line is all that says so.
+
+**Needs:** a re-seed on a cadence, such as a claim that comes back empty at most once a minute with an idempotent insert on the unique key, or the successor pushed before the tick is marked done.
+
+#### P2
+
+**The status Space never says `running`.** `note` is called with `queued`, `done` and `dead` only (`job.zig:443-888`), so a polling route reads `queued` for the whole run, where the guide and `Status.attempts` promise `running`. A row pushed on one instance and run on another stays `queued` in the first one's Space until its TTL, which the guide should say next to the multi-instance claim. Reproduced.
+
+**Needs:** `note(id, .running, attempts)` before the run, and the per-instance limit written in the guide.
+
+**`Memory.claim` flips the row before it allocates.** State, lease and `attempts` are written, then `arena.dupe` can fail (`memory.zig:149-157`), leaving the row `running` until the lease lapses with an attempt spent; the allocation is also made under the spin lock, as in `deadOnes`, against the file header. Reproduced.
+
+**Needs:** the copy made first and the state flipped after it.
+
+**Transient failures are treated as permanent.** A payload parse that fails with `OutOfMemory` sends the row dead (`job.zig:807`), and `push(.within)` reserves its window before `store.push` (`job.zig:435`), so a push that fails with `QueueFull` or a database error suppresses the retries for the whole window though nothing was queued. `pushIn` notes `queued` before its transaction commits (`job.zig:484`), so a rollback leaves a status for a row that never existed.
+
+**Needs:** only the parse error set made final, the window taken after a successful push or released on failure, and the note made after commit.
+
+**`retryDead` can start a second chain of ticks.** A dead row is revived with its unique key already cleared, and `finishDead` has already pushed the successor (`table.zig:269`, `memory.zig:252`), so a scheduled kind runs on two chains; a revived row of any kind can duplicate a newer one with the same key.
+
+**Needs:** `retryDead` restoring the key or refusing when a row holds it, and refusing scheduled kinds.
+
+**`Memory` and `Table` disagree in small places.** `unique = ""` deduplicates on `Table` and never on `Memory` (`memory.zig:321`); `Table.insertOn` writes `created_at = run_at` (`table.zig:130`); `finished_at` reads the wall clock where every other time uses the injected one; `Memory.release` does not check `state == running`.
+
+**Needs:** one behaviour for each, held by a test run against both stores.
+
+**Inputs nothing refuses.** `every(0)` makes a worker busy-loop and `every` of a huge period overflows; `Backoff.exponential` with `from_ms = 0` stays at zero and has no jitter, so a downstream outage retries every row at the same instant; one `Canceled` propagated from a child future sets `stopping` for every worker (`job.zig:846`); dead rows are never purged from `Memory`, which fills up and answers `QueueFull`.
+
+**Needs:** `every(0)` and `from_ms = 0` refused at compile time with a refusal file each, a jitter option, a cancelled child told apart from shutdown, and a purge for `Memory`'s dead rows.
+
+### `nilo_s3`
+
+The entries here came from an audit of `s3/` at `1738286`, by two readers between them covering every line; **reproduced** marks one a throwaway test also ran against the public API.
+
+#### P1
+
+**A credential `fetch` has no deadline.** The Store cannot bound a function it did not write, so a hung IMDS call holds the refresh gate until it returns; the other fibers sign with the old key meanwhile, but once the credentials expire every request waits on it ([ADR 060](./adr/060-a-signing-key-changes-once-a-day.md)).
+
+**Needs:** a timeout the Store arms around `fetch`, which is an API change to `Source`, or the guide's `fetch` example bounding its own call.
+
+**A streamed transfer is cut at the Store's 30-second call timeout.** The Store's client gets `timeout_ms` and no stall bound (`store.zig:168`), and `stream` and `putStream` pass no override, so the guide's `watch()` cuts a large video to a slow browser mid-body under a declared length, and a 1 GB upload at 100 Mbit/s fails after 30 s. Raising the timeout for the Store also removes the fast failure from `get`, `head` and `list`. A `Reading` also holds one of the 32 permits every bucket shares for its whole life. Found by reading.
+
+**Needs:** a stall bound on `s3.Options` and a per-call timeout for the two streaming calls, defaulting to no whole-call limit, and a decision on a gate of their own.
+
+**`putStream` has no stale-connection retry.** `replayable` is false for a `.stream` body (`fetch.zig:1219`), so the first streamed put after an idle gap lands on a connection the server closed, consumes the reader, and fails; `put` is protected. Found by reading.
+
+**Needs:** a streamed body sent on a fresh connection, or a pooled one probed before the first byte, with a test against a reaped connection.
+
+#### P2
+
+**A header value with two spaces in a row is signed wrong.** SigV4 folds runs of spaces to one and `sign.zig:351` only trims, so `filename="a  b.pdf"` is a 403 reported as `Rejected`. An empty `content_type` is signed and sent as an empty header. Found by reading against the spec.
+
+**Needs:** runs folded in the canonical value, an empty content type treated as absent, and a vector for each.
+
+**`list` can stop early or hand back a cursor that fails.** `IsTruncated=true` with no token returns a null cursor, which ends the caller's loop as if complete, and an empty token sends `continuation-token=` for a 400 (`listing.zig:155`); a response without `<EncodingType>url</EncodingType>` is decoded anyway, and a returned cursor is not held to `cursor_max`. Reproduced for the first two.
+
+**Needs:** each answered with `Failed`, and the length checked on the way out.
+
+**A streamed object cannot be read from an offset.** `stream` has no range and `getRange` is bounded by `max_bytes`, so the guide's `.length = reading.len` "lets it resume with a `Range`" has no way to serve one for an object over `max_bytes`, and `getRange` returns no total size. `getRange` with `from > to` gets the whole object back as a 200 that is not checked for 206 (`bucket.zig:266`); `stream` and `head` report `len = 0` when `content-length` is missing (`:373`, `:541`).
+
+**Needs:** a range on `stream` with `Reading.total` from `content-range`, a reversed range refused, 206 required, and a missing length made `Failed`.
+
+**Failures that say nothing or the wrong thing.** `head` logs nothing on failure (`bucket.zig:538`), so a wrong region or a skewed clock is silent; `NoSuchBucket` maps to `NotFound` like a missing key; `blame` says "could not be reached" for `SessionTokenTooLong`; `presign` with `seconds = 0` is accepted.
+
+**Needs:** `head` logging the status and `x-amz-bucket-region`, `NoSuchBucket` told apart, credential errors named, and a zero life refused.
+
+**The configuration is trusted too far.** `.static` credentials are the caller's slices until `nilo_start` copies them, where the doc says the Store keeps its own; an empty `access_key_id` or past `expires_at` is never refused, so every request takes the write lock and gets a 403; region and key id are not checked for `,`, `/` or CRLF; an endpoint authority over 255 bytes reaches `catch unreachable` in `urlForList`; derived keys and freed credentials are never zeroed.
+
+**Needs:** credentials copied and validated at `open`, the endpoint bounded there, and `std.crypto.secureZero` on the secrets.
+
+**`canned.zig` checks less than S3 does.** `check()` verifies only the headers the client listed in `SignedHeaders`, so a sent `x-amz-*` header left unsigned still passes, where S3 refuses it; its `Seen` copies into fixed buffers with no bound; two comments refer to `finishGet`, which is now `bounded`; `code.zig`'s header still says `LIST` is not in v1.
+
+**Needs:** every `x-amz-*` header on the wire required in `SignedHeaders`, the harness bounded, and the stale text corrected.
+
+### `nilo_fetch`
+
+**`test-fetch` passes without running its live tests.** It skips when its endpoint is unset, where [ADR 239](./adr/239-a-live-test-skips-on-a-laptop-and-fails-on-ci.md) makes the same skip fail under `$CI` for `test-sql` and `test-s3`. Found by the `nilo_s3` audit at `1738286`.
+
+**Needs:** the `$CI` rule extended to `test-fetch`, with the same split `test-s3-suite` made so the macOS job's `test` is unaffected.
 
 ---
 
@@ -570,6 +692,7 @@ A decision that is waiting on a number, and the run that would produce it. [`ben
 | `nilo_fetch` | what a call costs through TLS: 59,151 bytes per HTTPS connection is std's number read out of its buffer sizes, 3.6× plain HTTP if it holds | `zig build smoke-tls -Dnetwork` already reaches a real endpoint; the measurement beside it is missing | an afternoon |
 | `nilo_http` | whether a connection should start on the executor whose acceptor took it (`spawnInto(.local)`, which a gRPC call already does, 2.7x there: [`http.md`](../bench/result/http.md#what-placing-a-grpc-call-on-its-own-executor-buys)) rather than be dealt round-robin: it removes the last per-connection cross-thread hop, and it leaves the spread across threads to whichever acceptor the kernel wakes ([ADR 200](./adr/200-every-executor-accepts.md)) | gcannon's short-lived and keep-alive shapes, `.local` against round-robin, interleaved, with the connections each executor ends up holding | an afternoon |
 | `nilo_job` | whether a claim should take ten rows rather than one: a Postgres claim is 1.2 ms across a Docker port ([`job.md`](../bench/result/job.md)), and the price of ten is ten rows held by a worker that may die | `bench-job` extended to several workers | a box |
+| `nilo_job` | whether the claim should probe each priority on an index of `(state, priority, run_at)` rather than sort every due row: `ORDER BY priority, run_at LIMIT 1` over `(state, run_at)` sorts the whole due backlog, so a bulk enqueue slows every claim, and [ADR 214](./adr/214-a-job-says-how-urgent-it-is.md)'s finding that the wide index is slower was for that one ordering, not for one `ORDER BY run_at LIMIT 1` a priority. The `nilo_job` audit at `1738286` ran both once in a scratch container and wrote nothing down, and `SKIP LOCKED` is refused inside a `UNION ALL`, so the shape is up to three statements or a CTE a priority | both shapes on Postgres at a backlog of 1, 50k and 200k due rows beside 300k done ones, into [`job.md`](../bench/result/job.md), and ADR 214 edited in place with the result | an afternoon |
 | `nilo_job` | whether `LISTEN/NOTIFY` is worth a pool connection held open: a push wakes a worker in the same process ([ADR 160](./adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)), so `poll_ms` is only the latency of a row a *second* binary pushed | who is running two processes on one queue, and what they wait | a caller |
 | `nilo_job` | whether sixteen workers on one SQLite file cost the lock: a single claimer handing rows over a channel takes fifteen of them off it, and ADR 160 chose the wake without measuring the lock | a queue on one SQLite file with more workers than cores | a box |
 | `nilo_http` | what `permessage-deflate` costs per connection, against the 4,669 bytes an idle one holds | a compressor per connection, weighed | an afternoon |

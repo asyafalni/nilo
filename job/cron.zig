@@ -35,12 +35,23 @@ pub const Cron = struct {
     month: u13,
     /// Bit 0 is Sunday.
     weekday: u7,
-    /// Whether the day field was `*`, which decides the either-or rule above.
+    /// Whether the day field *started with* `*` (`*`, `*/2`), which decides
+    /// the either-or rule above: Vixie and cronie set the flag on the first
+    /// character, so `*/2` is "unrestricted" for that rule while still
+    /// limiting the days itself.
     any_day: bool,
     any_weekday: bool,
 
+    /// What `next` answers when no minute ever comes: the largest moment
+    /// there is, a row due at which is never claimed. `parse` refuses the
+    /// dates that cause it, so a schedule written as text cannot get here;
+    /// it is what a `Cron` built by hand, or an AND of day and weekday no
+    /// calendar satisfies, answers instead of a worker that never returns.
+    pub const never: i64 = std.math.maxInt(i64);
+
     /// The first minute strictly after `after_micros` that this admits, in
     /// microseconds since the epoch — the unit `nilo.nowMicros` answers in.
+    /// `never` when there is none.
     ///
     /// Strictly after, so a schedule asked "what comes after the tick that
     /// just ran" never answers the tick that just ran.
@@ -50,12 +61,15 @@ pub const Cron = struct {
         // fires on the minute could first fire.
         var t: u64 = (after_secs / 60 + 1) * 60;
 
-        // A bound rather than a `while (true)`: every field admits at least
-        // one value, so a match is found inside the next four years — the
-        // longest gap `29 feb` can open — and a loop that could not stop is
-        // a suite that never finishes (CLAUDE.md, on waits without a bound).
-        var guard: u32 = 0;
-        while (guard < 366 * 24 * 60 * 5) : (guard += 1) {
+        // A bound rather than a `while (true)`, and a bound in *time*: a count
+        // of turns of the loop was a bound on nothing, because most turns
+        // step a whole day or month, so a date that never comes took years of
+        // simulated calendar to exhaust, each turn walking the years since
+        // 1970 (ADR 161). The Gregorian calendar repeats, weekdays and all,
+        // every 400 years, so a match that is not found inside one is not
+        // coming.
+        const stop = t + @as(u64, 400 * 366) * std.time.epoch.secs_per_day;
+        while (t < stop) {
             const es: std.time.epoch.EpochSeconds = .{ .secs = t };
             const epoch_day = es.getEpochDay();
             const year_day = epoch_day.calculateYearDay();
@@ -92,14 +106,16 @@ pub const Cron = struct {
 
             return @intCast(t * std.time.us_per_s);
         }
-        unreachable;
+        return never;
     }
 
     fn dayMatches(self: Cron, dom: u6, dow: u3) bool {
         const dom_ok = bitSet(u32, self.day, dom);
         const dow_ok = bitSet(u7, self.weekday, dow);
-        if (self.any_day) return dow_ok;
-        if (self.any_weekday) return dom_ok;
+        // Either field starting with `*` makes it an AND, as in Vixie's
+        // `if (dom_star || dow_star) dom && dow`. A bare `*` has every bit
+        // set, so for it this is what the code said before.
+        if (self.any_day or self.any_weekday) return dom_ok and dow_ok;
         return dom_ok or dow_ok;
     }
 };
@@ -143,16 +159,48 @@ pub fn parse(comptime text: []const u8) Cron {
         // `7` is Sunday too, the way every cron reads it.
         if (weekday & (1 << 7) != 0) weekday |= 1;
 
+        const any_day = fields[2][0] == '*';
+        const any_weekday = fields[4][0] == '*';
+
+        // With either field starred a day must satisfy both, so the day
+        // field has to name a day some month has. Otherwise (`0 0 31 2 *`,
+        // `0 0 30 feb *`, `0 0 31 4,6,9,11 *`) the schedule is a worker
+        // that never finds its next tick, which a compile error says now
+        // and `next` used to say as a loop that did not end (ADR 161). When
+        // both are restricted a weekday alone is enough to fire.
+        if ((any_day or any_weekday) and !someDayExists(day, month)) @compileError(
+            "nilo: the schedule \"" ++ text ++ "\" never fires, because no month it names has a day it names.\n" ++
+                "  Its day field (`" ++ fields[2] ++ "`) and month field (`" ++ fields[3] ++ "`) share no date: " ++
+                "February has at most 29 days, and April, June, September and November have 30.",
+        );
+
         break :blk .{
             .minute = minute,
             .hour = hour,
             .day = day,
             .month = month,
             .weekday = @truncate(weekday),
-            .any_day = std.mem.eql(u8, fields[2], "*"),
-            .any_weekday = std.mem.eql(u8, fields[4], "*"),
+            .any_day = any_day,
+            .any_weekday = any_weekday,
         };
     };
+}
+
+/// Whether some month in `months` has a day in `days`. February counts 29,
+/// because a leap year comes round.
+fn someDayExists(days: u32, months: u13) bool {
+    for (1..13) |m| {
+        if (months & (@as(u13, 1) << @intCast(m)) == 0) continue;
+        const longest: u5 = switch (m) {
+            2 => 29,
+            4, 6, 9, 11 => 30,
+            else => 31,
+        };
+        // Bits 1 to `longest`.
+        const mask: u64 = (@as(u64, 1) << longest << 1) - 2;
+        if (@as(u64, days) & mask != 0) return true;
+    }
+    return false;
 }
 
 const month_names = [_][]const u8{ "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec" };
@@ -331,4 +379,47 @@ test "a list and a range with a step" {
     try testing.expectEqual(micros("2026-09-14T18:00"), c.next(micros("2026-09-14T13:00")));
     // Then Wednesday.
     try testing.expectEqual(micros("2026-09-16T08:00"), c.next(micros("2026-09-14T18:00")));
+}
+
+test "a day field that starts with a star is unrestricted, so the weekday must match as well" {
+    // Vixie and cronie set DOM_STAR on any field that starts with `*`, and a
+    // day matches by AND when either field is starred: odd days (`*/2`
+    // counts from the 1st) that are also Mondays, not odd days or Mondays.
+    const c = comptime parse("0 0 */2 * mon");
+    // Monday the 14th is even, so the first is Monday the 21st.
+    try testing.expectEqual(micros("2026-09-21T00:00"), c.next(micros("2026-09-13T10:00")));
+    // The 28th is even too; the 5th of October is the next odd Monday.
+    try testing.expectEqual(micros("2026-10-05T00:00"), c.next(micros("2026-09-21T00:00")));
+}
+
+test "a weekday field that starts with a star is unrestricted, so the day must match as well" {
+    // Sunday, Tuesday, Thursday and Saturday, and also the 13th: the 13th of
+    // October 2026 is the first that falls on one (a Tuesday).
+    const c = comptime parse("0 0 13 * */2");
+    try testing.expectEqual(micros("2026-10-13T00:00"), c.next(micros("2026-09-13T10:00")));
+}
+
+test "a date that never comes answers never rather than looping for minutes" {
+    // Built by hand, since `parse` refuses it: the 31st of February.
+    const never: Cron = .{
+        .minute = 1,
+        .hour = 1,
+        .day = 1 << 31,
+        .month = 1 << 2,
+        .weekday = 0x7f,
+        .any_day = false,
+        .any_weekday = true,
+    };
+    try testing.expectEqual(Cron.never, never.next(micros("2026-09-13T10:00")));
+}
+
+test "a date exists when some month named has some day named, and February has twenty-nine" {
+    const feb: u13 = 1 << 2;
+    const thirty_day: u13 = (1 << 4) | (1 << 6) | (1 << 9) | (1 << 11);
+    try testing.expect(!someDayExists(1 << 31, feb));
+    try testing.expect(!someDayExists(1 << 30, feb));
+    try testing.expect(someDayExists(1 << 29, feb));
+    try testing.expect(!someDayExists(1 << 31, thirty_day));
+    try testing.expect(someDayExists(1 << 30, thirty_day));
+    try testing.expect(someDayExists(1 << 31, feb | (1 << 1)));
 }

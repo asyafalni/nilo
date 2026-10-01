@@ -103,7 +103,7 @@ test "on SQLite a row is pushed, claimed once, and finished" {
     const again = (try table.claim(&f.run, live_kinds, 1_001, 2_000)).?;
     try testing.expectEqual(@as(u32, 2), again.attempts);
 
-    try table.done(&f.run, id);
+    try testing.expect(try table.done(&f.run, id, again.attempts));
     const s = try table.stats(&f.run);
     try testing.expectEqual(@as(u64, 0), s.queued + s.running + s.dead);
 }
@@ -120,7 +120,7 @@ test "on SQLite a unique key is the index, and is free again once the row is fin
 
     const claimed = (try table.claim(&f.run, live_kinds, 1, 100)).?;
     try testing.expect((try table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "u1" })) == null);
-    try table.dead(&f.run, claimed.id, "Gone");
+    try testing.expect(try table.dead(&f.run, claimed.id, claimed.attempts, "Gone"));
     try testing.expect((try table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "u1" })) != null);
 
     const listed = try table.deadOnes(&f.run);
@@ -270,11 +270,11 @@ test "on Postgres a row is claimed with SKIP LOCKED, once, and a unique key hold
     try testing.expectEqualStrings("{\"text\":\"a\"}", claimed.payload);
     try testing.expect((try table.claim(&p.run, live_kinds, 150, 1_000)) == null);
 
-    try table.retry(&p.run, id, 500, "Later");
+    try testing.expect(try table.retry(&p.run, id, claimed.attempts, 500, "Later"));
     try testing.expect((try table.claim(&p.run, live_kinds, 200, 1_000)) == null);
     const again = (try table.claim(&p.run, live_kinds, 600, 1_000)).?;
     try testing.expectEqual(@as(u32, 2), again.attempts);
-    try table.done(&p.run, id);
+    try testing.expect(try table.done(&p.run, id, again.attempts));
     try testing.expect((try table.push(&p.run, "write-note", "{}", .{ .run_at = 100, .unique = "pg1" })) != null);
 
     // Two rows due, claimed inside two open transactions at once: each
@@ -346,7 +346,7 @@ test "on SQLite the claim takes the most urgent due row, not the oldest" {
     for (order) |want| {
         const c = (try table.claim(&f.run, live_kinds, 100, 1_000)).?;
         try testing.expectEqualStrings(want, c.kind);
-        try table.done(&f.run, c.id);
+        try testing.expect(try table.done(&f.run, c.id, c.attempts));
     }
     try testing.expect((try table.claim(&f.run, live_kinds, 100, 1_000)) == null);
 }
@@ -386,9 +386,60 @@ test "on Postgres the claim takes the most urgent due row, not the oldest" {
     for (order) |want| {
         const c = (try table.claim(&p.run, live_kinds, 100, 1_000)).?;
         try testing.expectEqualStrings(want, c.kind);
-        try table.done(&p.run, c.id);
+        try testing.expect(try table.done(&p.run, c.id, c.attempts));
     }
     try testing.expect((try table.claim(&p.run, live_kinds, 100, 1_000)) == null);
+}
+
+/// A worker whose lease lapsed, against a real table: the second worker's
+/// claim stands and the first one's four late answers match nothing.
+fn lapsedLease(table: anytype, run: *core.Run) !void {
+    const id = (try table.push(run, "write-note", "{}", .{ .run_at = 0, .unique = "lapse" })).?;
+    const w1 = (try table.claim(run, live_kinds, 10, 100)).?;
+    const w2 = (try table.claim(run, live_kinds, 101, 200)).?;
+    try testing.expectEqual(id, w2.id);
+    try testing.expect(w2.attempts != w1.attempts);
+
+    try testing.expect(!(try table.retry(run, id, w1.attempts, 0, "Late")));
+    try testing.expect(!(try table.dead(run, id, w1.attempts, "Late")));
+    try testing.expect(!(try table.release(run, id, w1.attempts)));
+    try testing.expect(!(try table.done(run, id, w1.attempts)));
+
+    try testing.expectEqual(@as(u64, 1), (try table.stats(run)).running);
+    try testing.expect((try table.claim(run, live_kinds, 102, 300)) == null);
+    // The key is still held by the row the second worker has.
+    try testing.expect((try table.push(run, "write-note", "{}", .{ .run_at = 0, .unique = "lapse" })) == null);
+    try testing.expect(try table.done(run, id, w2.attempts));
+}
+
+test "on SQLite a worker whose lease lapsed cannot touch the row a second worker holds" {
+    const f = try Fixture.open("job-fence");
+    defer f.close();
+    var table = SqliteTable.open(&f.db);
+    try lapsedLease(&table, &f.run);
+}
+
+test "on Postgres a worker whose lease lapsed cannot touch the row a second worker holds" {
+    const p = (try Pg.open()) orelse return error.SkipZigTest;
+    defer p.close();
+    var table = PgTable.open(&p.db);
+    try lapsedLease(&table, &p.run);
+}
+
+test "on SQLite unkey frees the key of a running row and leaves it running" {
+    const f = try Fixture.open("job-unkey");
+    defer f.close();
+    var table = SqliteTable.open(&f.db);
+
+    const id = (try table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "schedule" })).?;
+    const claimed = (try table.claim(&f.run, live_kinds, 1, 100)).?;
+    try testing.expect((try table.push(&f.run, "write-note", "{}", .{ .run_at = 500, .unique = "schedule" })) == null);
+    try testing.expect(!(try table.unkey(&f.run, id, claimed.attempts + 1)));
+    try testing.expect(try table.unkey(&f.run, id, claimed.attempts));
+    try testing.expect((try table.push(&f.run, "write-note", "{}", .{ .run_at = 500, .unique = "schedule" })) != null);
+    const s = try table.stats(&f.run);
+    try testing.expectEqual(@as(u64, 1), s.running);
+    try testing.expectEqual(@as(u64, 1), s.queued);
 }
 
 /// The kinds these tests push. A worker passes its own `kind_names`; the

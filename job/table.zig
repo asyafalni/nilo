@@ -2,7 +2,7 @@
 //! ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 //!
 //! `Table(Db)` takes the `nilo_sql` Db *type* and calls `insert`, `update`,
-//! `select` and `rawOne` on it — the same nine questions `contract.zig`
+//! `select` and `rawOne` on it, the same questions `contract.zig`
 //! lists, answered in SQL. `job/` never imports `nilo_sql`: the Db arrives
 //! as a parameter, which is what keeps this module a Fitting and lets
 //! `zig build layering` say so.
@@ -213,32 +213,58 @@ pub fn Table(comptime Db: type) type {
             };
         }
 
-        pub fn done(self: *Self, scope: anytype, id: contract.Id) !void {
-            _ = try self.db.update(Row, scope, .{
+        /// The four calls a worker makes about the row it holds are **fenced
+        /// on the claim**: `state = 'running' AND attempts = ?`, with the
+        /// number the claim handed back. A worker whose lease lapsed finds the
+        /// row claimed again at a higher number, and its late answer then
+        /// matches nothing rather than freeing, requeuing or killing a row a
+        /// second worker holds. `false` is that: no row was changed
+        /// (ADR 160, `contract.zig`).
+        pub fn done(self: *Self, scope: anytype, id: contract.Id, attempts: u32) !bool {
+            const n = try self.db.update(Row, scope, .{
                 .set = .{ .state = contract.State.done, .lease_until = @as(i64, 0), .unique_key = null, .finished_at = nowMicros() },
-                .where = .{ .id = @as(i64, @intCast(id)) },
+                .where = fence(id, attempts),
             });
+            return n == 1;
         }
 
-        pub fn retry(self: *Self, scope: anytype, id: contract.Id, run_at: i64, err: []const u8) !void {
-            _ = try self.db.update(Row, scope, .{
+        pub fn retry(self: *Self, scope: anytype, id: contract.Id, attempts: u32, run_at: i64, err: []const u8) !bool {
+            const n = try self.db.update(Row, scope, .{
                 .set = .{ .state = contract.State.queued, .lease_until = @as(i64, 0), .run_at = run_at, .last_error = err },
-                .where = .{ .id = @as(i64, @intCast(id)) },
+                .where = fence(id, attempts),
             });
+            return n == 1;
         }
 
-        pub fn dead(self: *Self, scope: anytype, id: contract.Id, err: []const u8) !void {
-            _ = try self.db.update(Row, scope, .{
+        pub fn dead(self: *Self, scope: anytype, id: contract.Id, attempts: u32, err: []const u8) !bool {
+            const n = try self.db.update(Row, scope, .{
                 .set = .{ .state = contract.State.dead, .lease_until = @as(i64, 0), .unique_key = null, .last_error = err, .finished_at = nowMicros() },
-                .where = .{ .id = @as(i64, @intCast(id)) },
+                .where = fence(id, attempts),
             });
+            return n == 1;
         }
 
-        pub fn release(self: *Self, scope: anytype, id: contract.Id) !void {
-            _ = try self.db.update(Row, scope, .{
-                .set = .{ .state = contract.State.queued, .lease_until = @as(i64, 0), .attempts = .{ .minus = 1 } },
-                .where = .{ .id = @as(i64, @intCast(id)), .state = contract.State.running },
+        /// The running row's `unique_key` goes to NULL and the row stays
+        /// running, the way a finished row's does, so the key is free for
+        /// the next tick of a schedule that queues over a run (ADR 161).
+        pub fn unkey(self: *Self, scope: anytype, id: contract.Id, attempts: u32) !bool {
+            const n = try self.db.update(Row, scope, .{
+                .set = .{ .unique_key = null },
+                .where = fence(id, attempts),
             });
+            return n == 1;
+        }
+
+        pub fn release(self: *Self, scope: anytype, id: contract.Id, attempts: u32) !bool {
+            const n = try self.db.update(Row, scope, .{
+                .set = .{ .state = contract.State.queued, .lease_until = @as(i64, 0), .attempts = .{ .minus = 1 } },
+                .where = fence(id, attempts),
+            });
+            return n == 1;
+        }
+
+        fn fence(id: contract.Id, attempts: u32) struct { id: i64, state: contract.State, attempts: i32 } {
+            return .{ .id = @intCast(id), .state = contract.State.running, .attempts = @intCast(attempts) };
         }
 
         pub fn stats(self: *Self, scope: anytype) !contract.Stats {

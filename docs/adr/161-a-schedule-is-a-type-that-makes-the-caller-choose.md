@@ -50,7 +50,12 @@ The three policies, and how each is a row rather than a timer:
   (ADR 160's unique index). Whoever claims it runs it. There is no leader.
 - **`overlap`** decides *when* the next row is pushed. `.queue` pushes it
   when the tick is claimed, so another worker may take it while this one is
-  still running. `.skip` pushes it when the tick finishes, so a tick that
+  still running. The running tick first gives up the schedule's unique key
+  through the store's `unkey`, and the successor takes it, so a schedule
+  always has exactly one keyed row and seeding after a restart stays
+  idempotent. As first built it pushed under the key the running tick still
+  held, so the push collided and `.queue` behaved exactly like `.skip`; a key
+  per tick was rejected because a restart could then seed a second chain. `.skip` pushes it when the tick finishes, so a tick that
   falls inside a run has no row and does not happen — and the next is
   computed from the clock at the end of the run, not from the tick that was
   skipped.
@@ -74,7 +79,13 @@ is a promise about that email, and a default nobody read is not one.
 
 **The schedule is parsed while compiling.** `job.cron("0 25 * * *")` is a
 compile error naming the field and its range, and so is a sixth field or a
-backwards range. A schedule read from a config file at start-up would be a
+backwards range. So is a date that never comes: `0 0 31 2 *` passed every
+field's range, and `next` then looped for minutes and reached `unreachable`,
+stalling a worker at seeding. When either day field starts with `*` the two
+must both match, as in Vixie and cronie (`*/2` counts too, not only a bare
+`*`), and when both are restricted either may; `next` is bounded by 400 years
+of calendar rather than by a count of turns, and answers `Cron.never` past
+it. A schedule read from a config file at start-up would be a
 schedule the compiler cannot check, which is the one property that makes
 this a type rather than a string.
 

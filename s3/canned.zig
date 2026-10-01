@@ -1521,3 +1521,184 @@ test "a bounded get stays inside its allocation budget" {
         }
     }.run);
 }
+
+test "an empty key is refused by every object call, because it addresses the bucket" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            testing.log_level = .err;
+            var canned = try Canned.open(io);
+            defer canned.close();
+            // Nothing is served: a refusal here never reaches the wire.
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+
+            var files = try Files.open(&store);
+            defer files.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            try testing.expectError(error.Rejected, files.get(&scope, ""));
+            try testing.expectError(error.Rejected, files.getRange(&scope, "", .{ .from = 0, .to = 1 }));
+            try testing.expectError(error.Rejected, files.getIf(&scope, "", "\"e\""));
+            try testing.expectError(error.Rejected, files.head(&scope, ""));
+            try testing.expectError(error.Rejected, files.delete(&scope, ""));
+            try testing.expectError(error.Rejected, files.put(&scope, "", .{
+                .bytes = scope.str("x"),
+                .content_type = scope.str("text/plain"),
+            }));
+            var source = std.Io.Reader.fixed("x");
+            try testing.expectError(error.Rejected, files.putStream(&scope, "", .{
+                .reader = &source,
+                .len = @as(u64, 1),
+                .content_type = "text/plain",
+            }));
+            var reading: Files.Reading = .idle;
+            defer reading.close();
+            try testing.expectError(error.Rejected, files.stream(&scope, "", &reading));
+            try testing.expectError(error.Rejected, files.presign(&scope, "", 60));
+            try testing.expectError(error.Rejected, files.presignPost(&scope, "", .{ .seconds = 60 }));
+        }
+    }.run);
+}
+
+test "an empty prefix is still a prefix policy and a listing of the root still lists" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.answer = .{
+                .content_type = "application/xml",
+                .body = "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+            };
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+
+            var files = try Files.open(&store);
+            defer files.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            const posted = try files.presignPost(&scope, "", .{ .seconds = 60, .prefix = true });
+            try testing.expect(posted.fields.len != 0);
+
+            const page = try files.list(&scope, .{});
+            try testing.expectEqual(@as(usize, 0), page.objects.len);
+            served.await(io) catch {};
+            try expectVerified(&canned);
+        }
+    }.run);
+}
+
+test "a header value with a control byte is refused before anything is sent" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            testing.log_level = .err;
+            var canned = try Canned.open(io);
+            defer canned.close();
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+
+            var files = try Files.open(&store);
+            defer files.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            try testing.expectError(error.Rejected, files.put(&scope, "a.txt", .{
+                .bytes = scope.str("x"),
+                .content_type = "text/plain",
+                .content_disposition = "attachment; filename=\"a\r\nx-evil: 1\"",
+            }));
+            try testing.expectError(error.Rejected, files.put(&scope, "a.txt", .{
+                .bytes = scope.str("x"),
+                .content_type = "text/plain\r\nx-evil: 1",
+            }));
+            try testing.expectError(error.Rejected, files.put(&scope, "a.txt", .{
+                .bytes = scope.str("x"),
+                .content_type = "text/plain",
+                .cache_control = "no-cache\x00",
+            }));
+            try testing.expectError(error.Rejected, files.put(&scope, "a.txt", .{
+                .bytes = scope.str("x"),
+                .content_type = "text/plain",
+                .content_disposition = "attachment\x7f",
+            }));
+            try testing.expectError(error.Rejected, files.getIf(&scope, "a.txt", "\"e\"\r\nx-evil: 1"));
+            var source = std.Io.Reader.fixed("x");
+            try testing.expectError(error.Rejected, files.putStream(&scope, "a.txt", .{
+                .reader = &source,
+                .len = @as(u64, 1),
+                .content_type = "text/plain\n",
+            }));
+        }
+    }.run);
+}
+
+test "a tab in a header value is allowed" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+            var files = try Files.open(&store);
+            defer files.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            try files.put(&scope, "a.txt", .{
+                .bytes = scope.str("x"),
+                .content_type = "text/plain",
+                .cache_control = "no-cache,\tno-store",
+            });
+            served.await(io) catch {};
+            try expectVerified(&canned);
+        }
+    }.run);
+}
+
+test "a presign with the largest token a bucket may declare fits its buffer" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            // `+` is the worst case: three bytes once percent-encoded.
+            const token = "+" ** sign.token_max;
+            var buf: [64]u8 = undefined;
+            var store = try Store.open(testing.allocator, .{
+                .endpoint = try canned.endpoint(&buf),
+                .credentials = .{ .static = .{
+                    .access_key_id = akid,
+                    .secret_access_key = secret,
+                    .session_token = token,
+                } },
+            });
+            defer store.deinit();
+            try store.nilo_start(io, .off);
+
+            const Temp = bucket_mod.Bucket("temp", .{ .style = .path, .session_token_max = sign.token_max });
+            var temp = try Temp.open(&store);
+            defer temp.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            const link = try temp.presign(&scope, "one.txt", 60);
+            try testing.expect(std.mem.indexOf(u8, link.url.view(), "X-Amz-Security-Token=%2B%2B") != null);
+        }
+    }.run);
+}

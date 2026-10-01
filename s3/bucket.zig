@@ -611,6 +611,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             try self.prepare(&sig, &headers, .{
                 .method = "GET",
                 .key = "",
+                .root = true,
                 .query = query,
                 .payload = self.store.payloadNoBody(),
                 .token_buf = &token_buf,
@@ -681,6 +682,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             wanted_seconds: u32,
         ) Error!Presigned {
             comptime core.checkScope(@TypeOf(c), "bucket.presign");
+            if (key.len == 0) return refuseEmptyKey("presign");
             if (key.len > settings.key_max) return error.Rejected;
 
             const io = self.store.client.inner.io;
@@ -772,6 +774,8 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// a stack buffer is held per *connection* (ADR 017's second axis).
         pub fn presignPost(self: *Self, c: anytype, key: []const u8, post: Post) Error!Posted {
             comptime core.checkScope(@TypeOf(c), "bucket.presignPost");
+            // An empty key is fine for a prefix policy, where it means any key.
+            if (key.len == 0 and !post.prefix) return refuseEmptyKey("presignPost");
             if (key.len > settings.key_max) return error.Rejected;
 
             const io = self.store.client.inner.io;
@@ -922,11 +926,47 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             /// every call but `list`, which is the one call here whose
             /// request is a question rather than a key.
             query: []const u8 = "",
+            /// Set by `list` alone: the one call whose request is addressed
+            /// to the bucket itself, so the one call whose key is empty.
+            root: bool = false,
             token_buf: []u8,
         };
 
+        /// An empty key is not an object, it is the bucket: `GET` on it is a
+        /// listing, `DELETE` is DeleteBucket and `PUT` is CreateBucket, so it
+        /// changes the operation rather than naming a smaller object. Refused
+        /// here, before anything is signed (ADR 059). `list` is the call that
+        /// means the root and does not come through here.
+        fn refuseEmptyKey(call: []const u8) Error {
+            std.log.warn(
+                "nilo_s3: `{s}`.{s} was given an empty key, which addresses the " ++
+                    "bucket and not an object",
+                .{ name, call },
+            );
+            return error.Rejected;
+        }
+
+        /// A header value goes into the request head as it is, and std's
+        /// client only asserts against a line break, so a filename from a
+        /// user in `content_disposition` would panic a ReleaseSafe build and
+        /// split the request on a pooled connection in ReleaseFast. Any byte
+        /// under 0x20 but tab, and 0x7f, is refused (RFC 9110 field values).
+        fn checkHeader(header_name: []const u8, value: ?[]const u8) Error!void {
+            const v = value orelse return;
+            for (v) |b| {
+                if ((b < 0x20 and b != '\t') or b == 0x7f) {
+                    std.log.warn(
+                        "nilo_s3: `{s}` was given a `{s}` with a control byte (0x{x:0>2}) in it",
+                        .{ name, header_name, b },
+                    );
+                    return error.Rejected;
+                }
+            }
+        }
+
         /// Sign, and fill in the headers that go out beside the signature.
         fn prepare(self: *Self, sig: *sign.Signature, headers: *Headers, req: Prepare) Error!void {
+            if (req.key.len == 0 and !req.root) return refuseEmptyKey(req.method);
             if (req.key.len > settings.key_max) {
                 std.log.warn(
                     "nilo_s3: a key of {d} bytes is longer than `{s}`'s `key_max` of {d}",
@@ -934,6 +974,10 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 );
                 return error.Rejected;
             }
+            try checkHeader("content-type", req.content_type);
+            try checkHeader("cache-control", req.cache_control);
+            try checkHeader("content-disposition", req.content_disposition);
+            try checkHeader("if-none-match", req.if_none_match);
 
             const io = self.store.client.inner.io;
             const now_ms = core.nowMillis();
@@ -1306,6 +1350,14 @@ fn check(comptime name: []const u8, comptime opts: anytype) Options {
                 std.fmt.comptimePrint("{d}", .{settings.presign_max}) ++
                 " seconds, and SigV4 refuses anything over seven days (604800).\n" ++
                 "  A URL that cannot be signed for that long is better said here than by AWS.",
+        );
+
+        if (settings.session_token_max > sign.token_max) @compileError(
+            "nilo: s3.Bucket(\"" ++ name ++ "\") has a `session_token_max` of " ++
+                std.fmt.comptimePrint("{d}", .{settings.session_token_max}) ++
+                " bytes, and a presigned URL has room for a token of " ++
+                std.fmt.comptimePrint("{d}", .{sign.token_max}) ++ " (`sign.token_max`).\n" ++
+                "  AWS documents 2048 as the ceiling of the header, so a larger one is not an STS token.",
         );
 
         if (settings.key_max == 0) @compileError(

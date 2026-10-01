@@ -71,6 +71,10 @@ A queue naming a `*Jobs` in its own `.deps`, or in a `run`'s argument list that 
 
 **`drainAt(&run, now)` and `runOneAt(&run, now)`**, with `drain` and `runOne` as the same calls at `core.nowMicros()`, are what let a test move time without sleeping: whether a row is due, whether a schedule's tick is later than its successor, when a failed run retries, when the next tick is, are all one read of a private `Clock` (`.wall` under a worker, `.fixed` under `drainAt`), passed down `execute`. `seed(&run)` and `seedAt(&run, now)` are the seeding `serve` does at start, made callable, since a test of a schedule has to put the first tick in the table before moving the clock to it. `drain` now reads the clock once rather than per row, so a drain that used to run as long as its ticks did (a schedule of `every(1)` staying due against a slow tick) finishes against one reading of what was due at that moment.
 
+### A row is finished by whoever still holds it
+
+**`done`, `retry`, `dead` and `release` match `state = 'running' AND attempts = ?`, the `attempts` the claim returned, and answer `false` when the row is no longer this worker's**, which the worker logs at `warn` and otherwise ignores. The lease is how a crashed worker's row comes back, so it is also how a slow one's does, and a worker whose lease lapsed used to requeue, free or kill the row a second worker held by matching on `id` alone: an audit reproduced three runs of one row. `attempts` is the fence because every claim bumps it, so it names the claim and costs no column. A store also has `unkey`, the same fence, which takes a running row's unique key off it and leaves it running; an `Overlap.queue` tick is what calls it ([ADR 161](./161-a-schedule-is-a-type-that-makes-the-caller-choose.md)). The rejected alternative is a lease token column: a second value to carry for what `attempts` already says.
+
 ### A queued row can be taken back
 
 **`jobs.cancel(scope, id) !bool` deletes a row while it is `queued`, and answers `false` for one that is running, finished or absent.** It is one statement on the table, `DELETE … WHERE id = ? AND state = 'queued'`, and one slot flip under the lock in memory, so a worker claiming the row in the same instant either got it or did not.
@@ -92,7 +96,7 @@ The entry condition is met the way `nilo_fetch` meets it: the worker loop is wri
 
 ## What was rejected
 
-**Redis as the store.** Two clients exist in Zig and both are alpha with no pub/sub. A queue over Redis cannot join the transaction that made the work, which is the bug the database-backed queues were written to close. A third store written against `job/contract.zig` is nine methods, the list there for whoever brings the deployment.
+**Redis as the store.** Two clients exist in Zig and both are alpha with no pub/sub. A queue over Redis cannot join the transaction that made the work, which is the bug the database-backed queues were written to close. A third store written against `job/contract.zig` is ten methods, the list there for whoever brings the deployment.
 
 **A file of its own.** A queue in a file is a database with one table and none of the tooling; SQLite is that with the tooling.
 

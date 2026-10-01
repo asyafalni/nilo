@@ -120,7 +120,7 @@ Given to `open`:
 
 | | |
 |---|---|
-| `pub const schedule = job.cron("0 3 * * *")` | `minute hour day month weekday`, UTC, parsed while compiling. Supports `*`, lists, ranges and `*/n`; a field out of range is a Refusal naming it |
+| `pub const schedule = job.cron("0 3 * * *")` | `minute hour day month weekday`, UTC, parsed while compiling. Supports `*`, lists, ranges and `*/n`; a field out of range, or a day and month that never meet, is a Refusal naming it. When either day field starts with `*`, a day must match both |
 | `pub const schedule = job.every(600_000)` | at a fixed interval, counted from when the worker started |
 | `pub const overlap: job.Overlap` | required: `.skip` (a tick during a run does not happen) or `.queue` (it runs on another worker) |
 | `pub const missed: job.Missed` | required: `.drop` (a tick that is later than its own successor is forgotten) or `.catch_up` (it runs once) |

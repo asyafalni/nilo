@@ -63,6 +63,8 @@ this design needs none. The unlucky request pays the fetch; everything
 concurrent with it keeps using the old key, which is still valid, because the
 margin is why the refresh happens early.
 
+**How that holds, in the code.** One fiber refreshes at a time, through a `std.Io.Mutex` gate of its own, and the user's `fetch` runs under the gate and outside the `RwLock`: the lock is taken exclusively only to install what came back. A fiber that finds the gate taken while the credentials have not expired signs with the old key rather than waiting on somebody else's I/O. A fetch that fails while they have not expired logs once at `warn` and is not tried again for `retry_after_s` (five seconds); only past `expires_at` does a failed fetch fail the request. The margin is `refresh_margin_s` or half the life the credentials arrived with, whichever is less, so credentials that live less than the margin are refreshed at half their life rather than on every request. `fetch`'s strings only have to outlive the call: the Store copies them and frees nothing of the caller's. The Store cannot bound a function it did not write, so `fetch` bounds its own I/O.
+
 `.static` is the same mechanism with `expires_at` null: fetched once, never
 refetched.
 
@@ -150,6 +152,8 @@ ADR 054 refused. A program that wants it writes `fromIrsa` and owns it.
 throws away the four HMACs, which is the only per-request saving available in
 signing at all.
 
+**The margin check alone, refreshing under the exclusive lock.** What shipped first: inside the margin every request took the write lock and called `fetch`, and a `fetch` that failed failed the request, so an IMDS outage failed every call for the five minutes the old key still had, the opposite of what this ADR promised, and credentials living less than the margin were fetched on every request. Found by an audit of `s3/` and reproduced: `presign` failed with 200 seconds of credentials left. A second hole sat in the same function: it dropped the lock between deriving and taking the snapshot, so a fiber overtaken at UTC midnight could sign a request stamped one day with the next day's scope.
+
 **Always hashing the payload.** End-to-end integrity independent of TLS, and S3
 rejects a mismatch. Refused at 5–200 ms of fiber CPU per `put` on the path that
 carries production load, for a guarantee TLS already makes there.
@@ -172,9 +176,10 @@ Against [ADR 017](./017-the-trade-budget-has-four-axes.md)'s four axes.
 - **The refresh is lazy, so one request per credential lifetime is slower**, by
   whatever `fetch` costs. On IMDS that is a link-local round trip of about a
   millisecond, paid roughly four times a day.
-- **A `fetch` that throws fails the request that called it**, and the previous
-  key stays in place if it is still valid. A credential source that is down does
-  not take the process with it until the old key actually expires.
+- **A `fetch` that throws fails nobody while the previous key is still valid**,
+  and is tried again five seconds later. A credential source that is down does
+  not take the process with it until the old key actually expires; past that,
+  each request that tries and fails gets the error.
 - **The clock is the one the rest of the process uses.** SigV4 rejects a request
   whose `X-Amz-Date` is more than fifteen minutes from the server's, so a
   container with a drifting clock returns `Rejected` for everything —

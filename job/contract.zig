@@ -1,7 +1,7 @@
 //! What a store has to answer, and the shapes it answers in.
 //!
 //! A `Jobs` never names a store type: it is handed one, and asks it these
-//! seven questions through whatever methods it has, the way `nilo.Idempotent`
+//! eight questions through whatever methods it has, the way `nilo.Idempotent`
 //! asks a Space for `getInto` and `putIfAbsent` rather than for `nilo_cache`
 //! ([ADR 155](../docs/adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
 //! That is what keeps `job/` importing `nilo_core` and nothing else while
@@ -16,11 +16,20 @@
 //! |---|---|
 //! | `push(scope, kind, payload, Enqueue) !?Id` | queue one; `null` when `unique` already has a row queued or running |
 //! | `claim(scope, comptime kinds, now, lease_until) !?Claimed` | take the most urgent due row **of these kinds**, or one whose lease ran out, marking it running and counting the attempt. Urgency first, then how long it has been due; a kind not in the list is left where it is, for the binary that knows it (ADR 215) |
-//! | `done(scope, id) !void` | it worked |
-//! | `retry(scope, id, run_at, err) !void` | it failed and will be tried again then |
-//! | `dead(scope, id, err) !void` | it failed for the last time |
-//! | `release(scope, id) !void` | put it back untouched — the server is going |
+//! | `done(scope, id, attempts) !bool` | it worked |
+//! | `retry(scope, id, attempts, run_at, err) !bool` | it failed and will be tried again then |
+//! | `dead(scope, id, attempts, err) !bool` | it failed for the last time |
+//! | `release(scope, id, attempts) !bool` | put it back untouched: the server is going |
+//! | `unkey(scope, id, attempts) !bool` | a running row stops holding its `unique` key and goes on running, so a successor can be queued under the same key: what a schedule with `overlap = .queue` needs (ADR 161) |
 //! | `stats(scope) !Stats` | how many are waiting, running and dead |
+//!
+//! **The four calls about a held row are fenced on the claim.** `attempts` is
+//! the number `claim` returned in `Claimed`, and a call changes the row only
+//! while it is still `running` at that number, answering `true`. A worker
+//! whose lease lapsed finds the row claimed again at a higher number, so its
+//! late answer matches nothing and answers `false`: it must not requeue, free
+//! or kill what a second worker now holds. `false` is not an error, and a
+//! `Jobs` logs it at `warn` and carries on (ADR 160).
 //!
 //! Three more are optional, and a `Jobs` refuses a call that its store does
 //! not carry rather than faking it: `pushIn(tx, scope, …)` for a store that

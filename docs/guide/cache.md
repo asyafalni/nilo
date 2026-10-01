@@ -148,16 +148,16 @@ There is no allocator to pass anywhere in this module, and the signatures show i
 const Attempts = cache.Space("signin", u32, .{ .ttl_s = 3600 });
 
 fn signIn(attempts: *Attempts, email: []const u8) !void {
-    if (attempts.incr(email, 1) > 5) {
+    if ((try attempts.incr(email, 1)) > 5) {
         return nilo.fail.tooManyRequests("too many attempts; try again in an hour", .{});
     }
     // … check the password, and `attempts.del(email)` when it matches …
 }
 ```
 
-`incr(key, delta)` returns the new count, and the read, the add and the write all happen under the shard's lock. That is the same lock a `put`'s copy runs under, and one add is not a wait, which is what the rule in [ADR 109](../adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md) turned out to be about. Two requests arriving at once count two.
+`incr(key, delta)` returns the new count, and the read, the add and the write all happen under the shard's lock. That is the same lock a `put`'s copy runs under, and one add is not a wait, which is what the rule in [ADR 109](../adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md) turned out to be about. Two requests arriving at once count two. A key too long to hold, over 65,535 bytes or a quarter of a shard's ring, is `error.TooLarge`, never a count, so the limit cannot be walked through with an oversized key.
 
-A key nobody wrote starts from zero and lives for `ttl_s`. A key that already exists **keeps the expiry it had**, so the hour above is counted from the first attempt, not a window that slides with every attempt; `del` resets it early. The arithmetic saturates: a counter at its type's maximum stays there rather than wrapping to zero and reopening the quota. `incr(key, 0)` reads the count under the lock. `delta` has the Space's own type, so an unsigned Space only counts up; a counter that has to go down needs a Space of `i64`.
+A key nobody wrote starts from zero and lives for `ttl_s`. A key that already exists **keeps the expiry it had**, so the hour above is counted from the first attempt, not a window that slides with every attempt; `del` resets it early. The arithmetic saturates: a counter at its type's maximum stays there rather than wrapping to zero and reopening the quota. `incr(key, 0)` reads the count under the lock. A counter that is incremented again while it is still in the doorkeeper is promoted the way a read promotes, so unrelated writes do not reset it. `delta` has the Space's own type, so an unsigned Space only counts up; a counter that has to go down needs a Space of `i64`.
 
 `nilo.Allowance` does the same thing keyed by client address only; use `incr` when the key is a user, a phone number or an API key. A Space of anything other than an integer has no `incr`, and the compiler says so.
 

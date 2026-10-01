@@ -77,6 +77,9 @@ the four `build.zig` already carries (ADR 026):
   is a secret compiled into the binary, and it must not be possible to write
 - `presign_max` above seven days, which SigV4 refuses at 604,800 seconds
 - `max_bytes` of zero
+- `session_token_max` above `sign.token_max` (2,048 bytes), the token the
+  presign buffer is sized for; a longer one reached a `catch unreachable` in
+  `presign`
 
 **A constant `SignedHeaders`.** This is the one that decided the API surface
 rather than merely decorating it. SigV4 signs a sorted list of header names and
@@ -92,7 +95,12 @@ So the header set is fixed: `content-type`, `content-disposition`,
 `x-amz-server-side-encryption` when the bucket asks for it. **Arbitrary object
 metadata is refused**, and there is a second reason it is a good refusal: a
 `\r\n` in a metadata value is header injection into the request nilo is signing,
-and a fixed set makes that unwriteable.
+and a fixed set makes that unwriteable. A fixed set of *names* does not fix the
+*values*, though: a `content_disposition` built from a user's filename, or an
+etag handed to `getIf`, reached std's client unchecked, which only asserts
+against CRLF, so a safe build panicked and `ReleaseFast` split the request. A
+value with a byte under 0x20 other than tab, or 0x7f, is `error.Rejected` before
+anything is signed.
 
 **A key is not a type, and that is deliberate.** A comptime key template —
 `s3.Key(struct { user: Uuid, size: Size })` producing `users/{uuid}/{size}.png`
@@ -101,6 +109,8 @@ template DSL, and `README.md` refuses templates on the grounds that the
 comptime-checked shape is a compiler of its own. A key is a string the
 application decides; nilo's job is to encode it correctly, once, per RFC 3986
 with `/` left alone ([ADR 057](./057-percent-is-needed-by-two-layers.md)).
+
+**The one key nilo refuses is the empty one**, because it does not name a different object but a different operation: the URL is the bucket's root, so `get("")` was a listing returned as an object, `delete("")` DeleteBucket, `put("")` CreateBucket and `presign("")` a signed listing for a browser. Every object call, `presign` and a `presignPost` without `.prefix` answer `error.Rejected`; `list` and a prefix policy, where `""` means "any key", take it.
 
 ## What the API is, and why each piece is that shape
 

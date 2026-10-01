@@ -49,6 +49,7 @@ The read-modify-write is the portable answer, and it loses on aarch64 for the sa
 - The bucket scan's eight loads are **unordered**, the weakest ordering that is still not a race: it may see any one write but never half of two, which is all the scan needs, since what it returns is a list of candidate ways and every one is loaded again with its whole key compared.
 - Every other slot access is an atomic load or store of the whole eight bytes, because a slot is written by `put`, by `carry`, by a reader clearing an expired entry and by a reader warming one, so a plain field write would be a race whatever the hardware does; it costs nothing, eight aligned bytes is one `mov` either way.
 - `carry` swaps the slot rather than storing it, because a reader may have warmed or cleared it while the copy was being made, the first a reason to try again, the second a reason to stop.
+- A reader clears an expired slot with a **compare-and-swap against the word it judged**, failure ignored, the way it warms one. It was a plain store, and a reader descheduled between its expiry check and that store wiped the entry a `put` had written into the slot meanwhile, a `putIfAbsent` claim included, which let a second claimant in ([ADR 155](./155-a-request-answered-once-is-answered-the-same-way-again.md)). Found by an audit of `cache/`; three readers against one writer lost the fresh entry 88,098 times in 200,000 rounds, and none with the swap.
 
 x86 is byte-for-byte what was first measured; its figures stand.
 

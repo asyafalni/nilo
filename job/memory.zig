@@ -163,44 +163,71 @@ pub const Memory = struct {
     /// A finished row gives its slot back at once. There is nothing to keep
     /// it for: a status somebody may poll lives in the Space a `Jobs` was
     /// given, not here.
-    pub fn done(self: *Memory, scope: anytype, id: contract.Id) !void {
+    ///
+    /// **Fenced on the claim.** `attempts` is the number the claim handed
+    /// back, and the call does something only to a row that is still
+    /// `running` at that number. A worker whose lease lapsed finds the row
+    /// claimed again, at a higher number, and its late answer must not free,
+    /// requeue or kill what a second worker now holds. `false` says it did
+    /// nothing, and the same holds for `retry`, `dead` and `release`
+    /// (ADR 160, `contract.zig`).
+    pub fn done(self: *Memory, scope: anytype, id: contract.Id, attempts: u32) !bool {
         _ = scope;
         self.lock.take();
         defer self.lock.release();
-        if (self.find(id)) |s| s.* = .{};
+        const s = self.held(id, attempts) orelse return false;
+        s.* = .{};
+        return true;
     }
 
-    pub fn retry(self: *Memory, scope: anytype, id: contract.Id, run_at: i64, err: []const u8) !void {
+    pub fn retry(self: *Memory, scope: anytype, id: contract.Id, attempts: u32, run_at: i64, err: []const u8) !bool {
         _ = scope;
         self.lock.take();
         defer self.lock.release();
-        const s = self.find(id) orelse return;
+        const s = self.held(id, attempts) orelse return false;
         s.state = .queued;
         s.run_at = run_at;
         s.lease_until = 0;
         s.setError(err);
+        return true;
     }
 
-    pub fn dead(self: *Memory, scope: anytype, id: contract.Id, err: []const u8) !void {
+    pub fn dead(self: *Memory, scope: anytype, id: contract.Id, attempts: u32, err: []const u8) !bool {
         _ = scope;
         self.lock.take();
         defer self.lock.release();
-        const s = self.find(id) orelse return;
+        const s = self.held(id, attempts) orelse return false;
         s.state = .dead;
         s.lease_until = 0;
         s.unique_len = 0;
         s.setError(err);
+        return true;
     }
 
-    pub fn release(self: *Memory, scope: anytype, id: contract.Id) !void {
+    /// A running row lets go of its unique key and goes on running. A
+    /// scheduled kind with `overlap = .queue` does this to the tick it has
+    /// claimed, so the next tick can be queued under the same key while this
+    /// one is still going, and a restart seeding the schedule still finds
+    /// exactly one row holding it (ADR 161).
+    pub fn unkey(self: *Memory, scope: anytype, id: contract.Id, attempts: u32) !bool {
         _ = scope;
         self.lock.take();
         defer self.lock.release();
-        const s = self.find(id) orelse return;
+        const s = self.held(id, attempts) orelse return false;
+        s.unique_len = 0;
+        return true;
+    }
+
+    pub fn release(self: *Memory, scope: anytype, id: contract.Id, attempts: u32) !bool {
+        _ = scope;
+        self.lock.take();
+        defer self.lock.release();
+        const s = self.held(id, attempts) orelse return false;
         s.state = .queued;
         s.lease_until = 0;
         // Not this worker's attempt any more: it never ran.
         s.attempts -|= 1;
+        return true;
     }
 
     pub fn stats(self: *Memory, scope: anytype) !contract.Stats {
@@ -283,6 +310,15 @@ pub const Memory = struct {
             if (s.state != .free and s.id == id) return s;
         }
         return null;
+    }
+
+    /// The row, if it is still the claim that `attempts` names: running, at
+    /// that attempt. A lapsed lease gives the row to a second claim at a
+    /// higher number, which is how the first one is told apart from it.
+    fn held(self: *Memory, id: contract.Id, attempts: u32) ?*Slot {
+        const s = self.find(id) orelse return null;
+        if (s.state != .running or s.attempts != attempts) return null;
+        return s;
     }
 
     fn payloadOf(self: *Memory, i: usize) []u8 {
@@ -403,8 +439,8 @@ test "a pushed row is claimed once, in run_at order, and not before it is due" {
     const second = (try store.claim(&run, test_kinds, 250, 1_000)).?;
     try testing.expectEqual(later.?, second.id);
 
-    try store.done(&run, first.id);
-    try store.done(&run, second.id);
+    _ = try store.done(&run, first.id, first.attempts);
+    _ = try store.done(&run, second.id, second.attempts);
     const s = try store.stats(&run);
     try testing.expectEqual(@as(u64, 0), s.queued + s.running + s.dead);
 }
@@ -439,7 +475,7 @@ test "a unique key admits one queued row and another once it is done" {
     const claimed = (try store.claim(&run, test_kinds, 1, 100)).?;
     // Still held while running.
     try testing.expect((try store.push(&run, "digest", "{}", .{ .run_at = 0, .unique = "u42" })) == null);
-    try store.done(&run, claimed.id);
+    _ = try store.done(&run, claimed.id, claimed.attempts);
     try testing.expect((try store.push(&run, "digest", "{}", .{ .run_at = 0, .unique = "u42" })) != null);
 }
 
@@ -465,13 +501,13 @@ test "retry, dead and retryDead move a row through its states" {
     defer run.deinit();
 
     const id = (try store.push(&run, "a", "{}", .{ .run_at = 0 })).?;
-    _ = (try store.claim(&run, test_kinds, 1, 100)).?;
-    try store.retry(&run, id, 500, "Boom");
+    const first = (try store.claim(&run, test_kinds, 1, 100)).?;
+    try testing.expect(try store.retry(&run, id, first.attempts, 500, "Boom"));
     try testing.expect((try store.claim(&run, test_kinds, 100, 200)) == null);
     const again = (try store.claim(&run, test_kinds, 500, 600)).?;
     try testing.expectEqual(@as(u32, 2), again.attempts);
 
-    try store.dead(&run, id, "StillBoom");
+    try testing.expect(try store.dead(&run, id, again.attempts, "StillBoom"));
     try testing.expectEqual(@as(u64, 1), (try store.stats(&run)).dead);
     const listed = try store.deadOnes(&run);
     try testing.expectEqual(@as(usize, 1), listed.len);
@@ -498,9 +534,9 @@ test "cancel takes a queued row out, and leaves one that is running or finished"
     // a push.
     const later = (try store.push(&run, "a", "{}", .{ .run_at = 0, .unique = "k" })).?;
 
-    _ = (try store.claim(&run, test_kinds, 1, 100)).?;
+    const running = (try store.claim(&run, test_kinds, 1, 100)).?;
     try testing.expect(!(try store.cancel(&run, later)));
-    try store.done(&run, later);
+    _ = try store.done(&run, later, running.attempts);
     try testing.expect(!(try store.cancel(&run, later)));
     try testing.expect(!(try store.cancel(&run, 999)));
 }
@@ -512,8 +548,8 @@ test "release puts a claimed row back without spending the attempt" {
     defer run.deinit();
 
     const id = (try store.push(&run, "a", "{}", .{ .run_at = 0 })).?;
-    _ = (try store.claim(&run, test_kinds, 1, 100)).?;
-    try store.release(&run, id);
+    const taken = (try store.claim(&run, test_kinds, 1, 100)).?;
+    try testing.expect(try store.release(&run, id, taken.attempts));
     const again = (try store.claim(&run, test_kinds, 2, 100)).?;
     try testing.expectEqual(@as(u32, 1), again.attempts);
 }
@@ -537,7 +573,7 @@ test "a high-priority row goes first, and among equals the one due longest" {
     for (order) |want| {
         const c = (try store.claim(&run, test_kinds, 100, 1000)).?;
         try testing.expectEqualStrings(want, c.kind);
-        try store.done(&run, c.id);
+        _ = try store.done(&run, c.id, c.attempts);
     }
     try testing.expect((try store.claim(&run, test_kinds, 100, 1000)) == null);
 }
@@ -554,4 +590,56 @@ test "a kind that declares no priority is normal, and sorts by run_at as before"
     try testing.expectEqualStrings("first", a.kind);
     const b = (try store.claim(&run, test_kinds, 100, 1000)).?;
     try testing.expectEqualStrings("second", b.kind);
+}
+
+test "a worker whose lease lapsed cannot finish, requeue, kill or release the row a second worker holds" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    const id = (try store.push(&run, "a", "{}", .{ .run_at = 0, .unique = "k" })).?;
+    const w1 = (try store.claim(&run, test_kinds, 10, 100)).?;
+    // The lease lapses and the second worker takes the row.
+    const w2 = (try store.claim(&run, test_kinds, 101, 200)).?;
+    try testing.expectEqual(id, w2.id);
+    try testing.expect(w2.attempts != w1.attempts);
+
+    // The first worker's late answers, every one of them, do nothing.
+    try testing.expect(!(try store.retry(&run, w1.id, w1.attempts, 0, "Late")));
+    try testing.expect(!(try store.dead(&run, w1.id, w1.attempts, "Late")));
+    try testing.expect(!(try store.release(&run, w1.id, w1.attempts)));
+    try testing.expect(!(try store.done(&run, w1.id, w1.attempts)));
+
+    // The second worker still owns it: running, not claimable by a third,
+    // and the unique key still held.
+    const s = try store.stats(&run);
+    try testing.expectEqual(@as(u64, 1), s.running);
+    try testing.expect((try store.claim(&run, test_kinds, 102, 300)) == null);
+    try testing.expect((try store.push(&run, "a", "{}", .{ .run_at = 0, .unique = "k" })) == null);
+
+    // And its own answer lands.
+    try testing.expect(try store.done(&run, w2.id, w2.attempts));
+    try testing.expectEqual(@as(u64, 0), (try store.stats(&run)).running);
+}
+
+test "unkey lets a running row go on running while its unique key is taken again" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    const id = (try store.push(&run, "a", "{}", .{ .run_at = 0, .unique = "k" })).?;
+    const claimed = (try store.claim(&run, test_kinds, 1, 100)).?;
+    try testing.expect((try store.push(&run, "a", "{}", .{ .run_at = 500, .unique = "k" })) == null);
+
+    // A claim that is not the row's current one changes nothing.
+    try testing.expect(!(try store.unkey(&run, id, claimed.attempts + 1)));
+    try testing.expect((try store.push(&run, "a", "{}", .{ .run_at = 500, .unique = "k" })) == null);
+
+    try testing.expect(try store.unkey(&run, id, claimed.attempts));
+    try testing.expect((try store.push(&run, "a", "{}", .{ .run_at = 500, .unique = "k" })) != null);
+    const s = try store.stats(&run);
+    try testing.expectEqual(@as(u64, 1), s.running);
+    try testing.expectEqual(@as(u64, 1), s.queued);
 }

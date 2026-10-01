@@ -49,7 +49,7 @@
 //!
 //! ```zig
 //! const Attempts = cache.Space("signin", u32, .{ .ttl_s = 3600 });
-//! if (attempts.incr(email, 1) > 5) return fail.tooMany("try again in an hour", .{});
+//! if ((try attempts.incr(email, 1)) > 5) return fail.tooMany("try again in an hour", .{});
 //! ```
 //!
 //! `incr` is one add under the shard's lock, so two requests arriving at
@@ -152,7 +152,10 @@ pub fn Space(comptime name: []const u8, comptime V: type, comptime opts: Options
         /// Add `delta` to the count under `key` and answer the new count
         /// — see the file header. A Space whose value is not an integer has
         /// nothing to add to, and says so while compiling.
-        pub fn incr(self: Self, key: []const u8, delta: V) V {
+        ///
+        /// A key over 65,535 bytes, or an entry over a quarter of a shard's
+        /// ring, is `error.TooLarge`: a refusal is never a count.
+        pub fn incr(self: Self, key: []const u8, delta: V) PutError!V {
             comptime if (@typeInfo(V) != .int) @compileError(
                 "nilo: the cache Space \"" ++ name ++ "\" holds " ++ shortName(V) ++
                     ", and `incr` adds to an integer.\n" ++
@@ -290,14 +293,14 @@ test "a Space of integers counts, and a key nobody wrote counts from zero" {
     var attempts = Attempts.open(&store);
 
     try testing.expectEqual(@as(?u32, null), attempts.get("ada@example"));
-    try testing.expectEqual(@as(u32, 1), attempts.incr("ada@example", 1));
-    try testing.expectEqual(@as(u32, 4), attempts.incr("ada@example", 3));
+    try testing.expectEqual(@as(u32, 1), try attempts.incr("ada@example", 1));
+    try testing.expectEqual(@as(u32, 4), try attempts.incr("ada@example", 3));
     try testing.expectEqual(@as(?u32, 4), attempts.get("ada@example"));
     // Adding nothing reads the count under the same lock, and a delete
     // starts it over.
-    try testing.expectEqual(@as(u32, 4), attempts.incr("ada@example", 0));
+    try testing.expectEqual(@as(u32, 4), try attempts.incr("ada@example", 0));
     try testing.expect(attempts.del("ada@example"));
-    try testing.expectEqual(@as(u32, 1), attempts.incr("ada@example", 1));
+    try testing.expectEqual(@as(u32, 1), try attempts.incr("ada@example", 1));
 }
 
 test "a bytes Space reads into the array it hands out" {
@@ -413,4 +416,14 @@ test "Held is the value's own size for a flat Space, and nothing at all" {
     try testing.expectEqual(void, Space("cart", Cart, .{}).Held);
     try testing.expectEqual(@sizeOf(Cart), Space("cart", Cart, .{}).max_bytes);
     try testing.expectEqual([32]u8, Space("page", []const u8, .{ .max_bytes = 32 }).Held);
+}
+
+test "incr on a key too large for the cache is an error rather than a count" {
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    defer store.deinit();
+    const Attempts = Space("attempts", u32, .{ .ttl_s = 60 });
+    var attempts = Attempts.open(&store);
+
+    try testing.expectError(error.TooLarge, attempts.incr("k" ** 70_000, 1));
+    try testing.expectEqual(@as(u32, 1), try attempts.incr("ada@example", 1));
 }

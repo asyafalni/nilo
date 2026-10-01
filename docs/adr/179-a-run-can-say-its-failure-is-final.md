@@ -35,7 +35,11 @@ final. A `run` that fails with one of them is dead on that attempt, whatever
 `retry.times` says, and the row keeps the error's name as it does for every
 other failure. Everything not in the set retries as before. A timeout is
 never final — it is the queue's own word for a run that did not finish, and
-the next attempt may.
+the next attempt may. Whether the deadline fired is read once, right after
+the run returns, and the deadline is released there rather than after the
+row is written: `Bound.fired()` consumes its answer, and asking it three
+times made a timed-out run that returned one of its own `final` errors dead,
+and recorded a timeout as `Canceled`.
 
 The set is on the kind rather than in the error because that is where
 `retry` is: the two halves of "what happens when this fails" sit side by

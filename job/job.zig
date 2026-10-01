@@ -775,9 +775,25 @@ pub fn Jobs(comptime options: anytype) type {
             // ours to run and not ours to lose: back in the queue, where the
             // binary that pushed it will find it.
             std.log.scoped(.nilo_job).warn("row {d} is a \"{s}\", which this program has no job for; leaving it", .{ claimed.id, claimed.kind });
-            self.store.release(scope, claimed.id) catch |err| {
-                std.log.scoped(.nilo_job).err("releasing row {d}: {t}", .{ claimed.id, err });
+            _ = self.settled(claimed.id, "release", self.store.release(scope, claimed.id, claimed.attempts));
+        }
+
+        /// What a fenced store call answered, said where it is read: `true`
+        /// when this worker's claim still held the row (or the store failed,
+        /// which is logged and not a reason to skip the bookkeeping after
+        /// it), `false` when the row was no longer this worker's. A lapsed
+        /// lease is that, and it is not an error: the worker that holds the
+        /// row now is the one whose answer counts, so this one logs at `warn`
+        /// and the caller leaves the status and the schedule alone
+        /// ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
+        fn settled(self: *Self, id: Id, comptime what: []const u8, answer: anyerror!bool) bool {
+            _ = self;
+            const held = answer catch |err| {
+                std.log.scoped(.nilo_job).err("row {d} ({s}): {t}", .{ id, what, err });
+                return true;
             };
+            if (!held) std.log.scoped(.nilo_job).warn("row {d} is no longer this worker's, so {s} did nothing", .{ id, what });
+            return held;
         }
 
         fn executeKind(self: *Self, comptime K: type, scope: anytype, claimed: Claimed, clock: Clock) void {
@@ -796,12 +812,22 @@ pub fn Jobs(comptime options: anytype) type {
             if (comptime scheduled(K)) {
                 // A tick later than its own successor is a missed one.
                 if (K.missed == .drop and K.schedule.next(claimed.run_at) <= now) {
-                    self.store.done(scope, claimed.id) catch |err| log.err("row {d}: {t}", .{ claimed.id, err });
+                    if (!self.settled(claimed.id, "done", self.store.done(scope, claimed.id, claimed.attempts))) return;
                     self.note(claimed.id, .done, claimed.attempts);
                     self.pushNext(K, scope, now);
                     return;
                 }
-                if (K.overlap == .queue) self.pushNext(K, scope, now);
+                if (K.overlap == .queue) {
+                    // The tick being run still holds the schedule's unique
+                    // key, which is why the successor pushed here used to
+                    // collide with it and queue nothing: `.queue` behaved as
+                    // `.skip`. It lets go of the key first, so the successor
+                    // takes it, and a restart seeding the schedule still
+                    // finds one row holding it and adds no second chain
+                    // (ADR 161). A claim that is no longer ours is not run.
+                    if (!self.settled(claimed.id, "unkey", self.store.unkey(scope, claimed.id, claimed.attempts))) return;
+                    self.pushNext(K, scope, now);
+                }
             }
 
             var value = std.json.parseFromSliceLeaky(K, scope.arena(), claimed.payload, .{
@@ -820,9 +846,10 @@ pub fn Jobs(comptime options: anytype) type {
             // Scope is reset.
             core.stampWith(&value, scope);
 
+            const timeout_ms: u32 = if (@hasDecl(K, "timeout_ms")) K.timeout_ms else self.settings.timeout_ms;
             var bound: core.Limits.Bound = .idle;
             defer bound.release();
-            bound.arm(self.limits, if (@hasDecl(K, "timeout_ms")) K.timeout_ms else self.settings.timeout_ms);
+            bound.arm(self.limits, timeout_ms);
 
             const tick: Tick = .{
                 .id = claimed.id,
@@ -830,9 +857,30 @@ pub fn Jobs(comptime options: anytype) type {
                 .run_at = claimed.run_at,
                 .last = claimed.attempts > retry.times,
             };
-            const outcome = self.call(K, value, scope, tick);
+            // With no Engine to cancel a fiber the deadline is kept here, as
+            // `nilo_fetch` keeps its own: the run goes out as a task of the
+            // `Io` and is cancelled when the time is up (ADR 056). Without an
+            // `Io` at all (`drain` in a test) or a `timeout_ms` of zero there
+            // is nothing to wait with, and the run is unbounded as it was.
+            var timed_out = false;
+            var outcome: anyerror!void = undefined;
+            if (self.limits.engineless() and timeout_ms != 0 and self.io != null) {
+                outcome = self.callTask(K, value, scope, tick, timeout_ms, &timed_out);
+            } else {
+                outcome = self.call(K, value, scope, tick);
+                // Asked once, here, and the deadline taken off in the same
+                // breath: `fired` consumes its answer, so a second question
+                // would be told no, and the deadline would otherwise still be
+                // armed while the store makes its round trip, where a run that
+                // finished near it could fail its own `done` and be run again
+                // (ADR 056, `core/limits.zig`). `release` is idempotent, so
+                // the `defer` above stays for the paths that return before
+                // this.
+                timed_out = bound.fired();
+                bound.release();
+            }
             if (outcome) |_| {
-                self.store.done(scope, claimed.id) catch |err| log.err("row {d}: {t}", .{ claimed.id, err });
+                if (!self.settled(claimed.id, "done", self.store.done(scope, claimed.id, claimed.attempts))) return;
                 self.note(claimed.id, .done, claimed.attempts);
                 // The clock read again, not `now`: under a worker the next
                 // tick is counted from when this one ended, which is what
@@ -840,20 +888,20 @@ pub fn Jobs(comptime options: anytype) type {
                 if (comptime scheduled(K)) self.pushNext(K, scope, clock.now());
                 return;
             } else |err| {
-                if (err == error.Canceled and !bound.fired()) {
+                if (err == error.Canceled and !timed_out) {
                     // The server is going. The row never ran to the end, so
                     // it goes back untouched; whoever starts next takes it.
                     self.stopping.store(true, .release);
-                    self.store.release(scope, claimed.id) catch |e| log.err("row {d}: {t}", .{ claimed.id, e });
+                    if (!self.settled(claimed.id, "release", self.store.release(scope, claimed.id, claimed.attempts))) return;
                     self.note(claimed.id, .queued, claimed.attempts -| 1);
                     return;
                 }
-                const name = if (bound.fired()) "TimedOut" else @errorName(err);
+                const name = if (timed_out) "TimedOut" else @errorName(err);
                 // A failure the kind said is final is dead on this attempt,
                 // whatever the count says; a timeout never is, because the
                 // next attempt may finish
                 // ([ADR 179](../docs/adr/179-a-run-can-say-its-failure-is-final.md)).
-                if (claimed.attempts > retry.times or (!bound.fired() and isFinal(K, err))) {
+                if (claimed.attempts > retry.times or (!timed_out and isFinal(K, err))) {
                     self.finishDead(scope, claimed.id, K, name, claimed.attempts, clock);
                     return;
                 }
@@ -861,7 +909,7 @@ pub fn Jobs(comptime options: anytype) type {
                 log.warn("\"{s}\" row {d} failed with {s} on attempt {d}; again in {d}ms", .{
                     K.nilo_job, claimed.id, name, claimed.attempts, retry.delayMs(claimed.attempts),
                 });
-                self.store.retry(scope, claimed.id, again, name) catch |e| log.err("row {d}: {t}", .{ claimed.id, e });
+                if (!self.settled(claimed.id, "retry", self.store.retry(scope, claimed.id, claimed.attempts, again, name))) return;
                 self.note(claimed.id, .queued, claimed.attempts);
             }
         }
@@ -884,10 +932,67 @@ pub fn Jobs(comptime options: anytype) type {
         /// purpose.
         fn finishDead(self: *Self, scope: anytype, id: Id, comptime K: type, name: []const u8, attempts: u32, clock: Clock) void {
             std.log.scoped(.nilo_job).warn("\"{s}\" row {d} is dead after {d} attempt(s): {s}", .{ K.nilo_job, id, attempts, name });
-            self.store.dead(scope, id, name) catch |e| std.log.scoped(.nilo_job).err("row {d}: {t}", .{ id, e });
+            if (!self.settled(id, "dead", self.store.dead(scope, id, attempts, name))) return;
             self.note(id, .dead, attempts);
             // A schedule whose tick died still has a next tick.
             if (comptime scheduled(K)) self.pushNext(K, scope, clock.now());
+        }
+
+        /// `call` as a task of the `Io`, cancelled at `timeout_ms`; what a
+        /// worker with no Engine under it does in place of a `Bound`
+        /// (ADR 056). `timed_out` says the deadline is what stopped it.
+        ///
+        /// Cancelling is cooperative: the run ends at its next `Io` call, so
+        /// a run that never makes one is not stopped, which is true of an
+        /// Engine's fiber too. `Future.cancel` returns only once the task has
+        /// come out, so nothing is still running when the row is handed back,
+        /// and the lease (the timeout plus a second) cannot lapse under a
+        /// run that is being waited for.
+        ///
+        /// **What it costs**: one `io.concurrent`, a thread hop on
+        /// `std.Io.Threaded`, for a worker that has no Engine; none on the
+        /// Engine's path, which never comes here, so the allocation budget
+        /// and the connection floor of ADR 062 are unchanged. A single-threaded
+        /// `Io` cannot start the task and runs the call unbounded, as before.
+        ///
+        /// A cancellation of the *worker*, the shutdown, comes back through
+        /// the wait and is passed to the task. The task's own answer is what
+        /// the caller reads: `Canceled` goes back to the queue untouched, and
+        /// anything else keeps the cancellation pending with `recancel` so
+        /// the loop still sees it.
+        fn callTask(self: *Self, comptime K: type, value: K, scope: anytype, tick: Tick, timeout_ms: u32, timed_out: *bool) anyerror!void {
+            const io = self.io.?;
+            const Task = struct {
+                fn run(me: *Self, v: K, on: @TypeOf(scope), t: Tick, done: *std.atomic.Value(u32), loop: std.Io) anyerror!void {
+                    defer {
+                        done.store(1, .release);
+                        loop.futexWake(u32, &done.raw, 1);
+                    }
+                    return me.call(K, v, on, t);
+                }
+            };
+            var done: std.atomic.Value(u32) = .init(0);
+            var future = io.concurrent(Task.run, .{ self, value, scope, tick, &done, io }) catch
+                return self.call(K, value, scope, tick);
+            const deadline = core.monotonicMicros() + @as(i64, timeout_ms) * std.time.us_per_ms;
+            while (done.load(.acquire) == 0) {
+                const left = deadline - core.monotonicMicros();
+                if (left <= 0) {
+                    timed_out.* = true;
+                    return future.cancel(io);
+                }
+                io.futexWaitTimeout(u32, &done.raw, 0, .{ .duration = .{
+                    .raw = .fromMicroseconds(left),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Canceled => {
+                        const answer = future.cancel(io);
+                        if (answer) |_| io.recancel() else |e| if (e != error.Canceled) io.recancel();
+                        return answer;
+                    },
+                };
+            }
+            return future.await(io);
         }
 
         /// `K.run` with its arguments found: the value, the Scope, the tick
@@ -1251,11 +1356,11 @@ fn checkRun(comptime K: type, comptime name: []const u8, comptime Deps: type) vo
 
 fn checkStore(comptime Store: type) void {
     const name = shortName(Store);
-    const wanted = [_][]const u8{ "push", "claim", "done", "retry", "dead", "release", "stats", "deadOnes", "retryDead" };
+    const wanted = [_][]const u8{ "push", "claim", "done", "retry", "dead", "release", "unkey", "stats", "deadOnes", "retryDead" };
     for (wanted) |w| {
         if (!@hasDecl(Store, w)) @compileError(
             "nilo: `job.Jobs`'s `.store` is " ++ name ++ ", and it has no `" ++ w ++ "`.\n" ++
-                "  A store answers the nine questions in `job/contract.zig`: `job.Memory` and `job.Table(Db)` do, " ++
+                "  A store answers the ten questions in `job/contract.zig`: `job.Memory` and `job.Table(Db)` do, " ++
                 "and so does anything else written against that list.",
         );
     }
@@ -2143,4 +2248,282 @@ test "progress from inside a run reaches the status Space, and a finished row ke
     try testing.expectEqual(State.done, after.state);
     try testing.expectEqual(@as(u32, 1), after.attempts);
     try testing.expectEqual(@as(u32, 7), after.progress);
+}
+
+// -- a deadline that answers once (ADR 056, ADR 179) ------------------------
+
+/// A `Limits` whose `fired` consumes its answer, as zio's `AutoCancel.check`
+/// does and `core/limits.zig` says to expect. `arm` sets it, so every run
+/// under it has timed out.
+const OneShot = struct {
+    var pending: bool = false;
+    var released: u32 = 0;
+
+    fn arm(_: ?*anyopaque, _: *anyopaque, _: u32) void {
+        pending = true;
+    }
+    fn release(_: ?*anyopaque, _: *anyopaque) void {
+        released += 1;
+    }
+    fn fired(_: ?*anyopaque, _: *anyopaque) bool {
+        const p = pending;
+        pending = false;
+        return p;
+    }
+    const vtable: core.Limits.VTable = .{
+        .arm = arm,
+        .release = release,
+        .fired = fired,
+        .waiting = core.Limits.noop.waiting,
+        .waited = core.Limits.noop.waited,
+    };
+    const limits: core.Limits = .{ .vtable = &vtable };
+};
+
+/// Returns one of its own final errors, as a run cancelled by its deadline
+/// may when it catches the cancellation and reports what it was doing.
+const TimesOutFinal = struct {
+    pub const nilo_job = "times-out-final";
+    pub const retry: Retry = .{ .times = 3, .backoff = .{ .fixed_ms = 0 } };
+    pub const final = error{Rejected};
+    pub fn run(self: TimesOutFinal, scope: *core.Run) !void {
+        _ = self;
+        _ = scope;
+        return error.Rejected;
+    }
+};
+
+/// Returns `Canceled`, which is what an Engine's deadline makes of a run.
+const TimesOutCanceled = struct {
+    pub const nilo_job = "times-out-canceled";
+    pub const retry: Retry = .none;
+    pub fn run(self: TimesOutCanceled, scope: *core.Run) !void {
+        _ = self;
+        _ = scope;
+        return error.Canceled;
+    }
+};
+
+const TimeoutJobs = Jobs(.{ .kinds = .{ TimesOutFinal, TimesOutCanceled }, .store = Memory });
+
+test "a run that timed out is retried even when it returns one of its own final errors" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+    var jobs: TimeoutJobs = .open(testing.allocator, &store, .{}, .{});
+    jobs.limits = OneShot.limits;
+
+    _ = try jobs.push(&run, TimesOutFinal{}, .{});
+    OneShot.pending = false;
+    try testing.expect(try jobs.runOne(&run));
+    const s = try jobs.stats(&run);
+    try testing.expectEqual(@as(u64, 0), s.dead);
+    try testing.expectEqual(@as(u64, 1), s.queued);
+    const slot = store.slots[0];
+    try testing.expectEqualStrings("TimedOut", slot.err_buf[0..slot.err_len]);
+}
+
+test "a run cancelled by its deadline is recorded as TimedOut and not as Canceled" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+    var jobs: TimeoutJobs = .open(testing.allocator, &store, .{}, .{});
+    jobs.limits = OneShot.limits;
+
+    _ = try jobs.push(&run, TimesOutCanceled{}, .{});
+    OneShot.pending = false;
+    try testing.expect(try jobs.runOne(&run));
+    // Not the shutdown: nothing stopped, and the row is dead on its last
+    // attempt under the name the deadline gives.
+    try testing.expect(!jobs.stopping.load(.acquire));
+    const dead = try jobs.deadOnes(&run);
+    try testing.expectEqual(@as(usize, 1), dead.len);
+    try testing.expectEqualStrings("TimedOut", dead[0].err);
+}
+
+// -- a run bounded with no Engine under it (ADR 056) -----------------------
+
+/// What `Sleeper` counts, shared with the test thread.
+const Napper = struct {
+    io: std.Io,
+    starts: std.atomic.Value(u32) = .init(0),
+    in_flight: std.atomic.Value(u32) = .init(0),
+    most_in_flight: std.atomic.Value(u32) = .init(0),
+    finished: std.atomic.Value(u32) = .init(0),
+};
+
+/// Sleeps far past its own `timeout_ms`, so that only a deadline ends it.
+const Sleeper = struct {
+    pub const nilo_job = "sleeper";
+    pub const retry: Retry = .none;
+    pub const timeout_ms = 100;
+
+    pub fn run(self: Sleeper, scope: *core.Run, nap: *Napper) !void {
+        _ = self;
+        _ = scope;
+        _ = nap.starts.fetchAdd(1, .acq_rel);
+        const now = nap.in_flight.fetchAdd(1, .acq_rel) + 1;
+        _ = nap.most_in_flight.fetchMax(now, .acq_rel);
+        defer _ = nap.in_flight.fetchSub(1, .acq_rel);
+        try nap.io.sleep(.fromMilliseconds(2_500), .awake);
+        _ = nap.finished.fetchAdd(1, .acq_rel);
+    }
+};
+
+const NapJobs = Jobs(.{ .kinds = .{Sleeper}, .store = Memory, .deps = struct { nap: *Napper } });
+
+test "a worker with no Engine cancels a run at its timeout, and no second worker takes the row meanwhile" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var nap: Napper = .{ .io = io };
+    // The lease is the timeout plus a second, so a run that is not stopped at
+    // its timeout outlives it and is claimed again by the other worker.
+    var jobs: NapJobs = .open(testing.allocator, &store, .{ .nap = &nap }, .{ .workers = 2, .poll_ms = 5 });
+    try jobs.nilo_start(io, .none);
+
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+    _ = try jobs.push(&run, Sleeper{}, .{});
+
+    var serving = try io.concurrent(NapJobs.serveOn, .{ &jobs, io });
+    defer serving.cancel(io) catch {};
+
+    // Dead, as `.none` retry and a timeout make it, well inside the 2.5 s the
+    // run would otherwise take.
+    var waited: u32 = 0;
+    while ((try jobs.stats(&run)).dead == 0 and waited < 2_000) : (waited += 1) try io.sleep(.fromMilliseconds(1), .awake);
+    // Past the lease, in case a second claim was coming.
+    try io.sleep(.fromMilliseconds(1_300), .awake);
+
+    try testing.expectEqual(@as(u64, 1), (try jobs.stats(&run)).dead);
+    try testing.expectEqual(@as(u32, 1), nap.starts.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), nap.most_in_flight.load(.acquire));
+    try testing.expectEqual(@as(u32, 0), nap.finished.load(.acquire));
+    const dead = try jobs.deadOnes(&run);
+    try testing.expectEqualStrings("TimedOut", dead[0].err);
+}
+
+// -- a worker that lost its lease (ADR 160) --------------------------------
+
+/// Where a second worker's claim is kept, and what it needs to make one.
+const Heist = struct {
+    store: *Memory,
+    run: *core.Run,
+    second: ?Claimed = null,
+};
+
+/// Fails, but not before its lease lapses and a second worker takes the row:
+/// the shape of a run that outlived its lease.
+const Lapses = struct {
+    pub const nilo_job = "lapses";
+    pub const retry: Retry = .{ .times = 3, .backoff = .{ .fixed_ms = 0 } };
+
+    pub fn run(self: Lapses, scope: *core.Run, heist: *Heist) !void {
+        _ = self;
+        _ = scope;
+        heist.second = try heist.store.claim(heist.run, &.{"lapses"}, 1_000 * std.time.us_per_s, 2_000 * std.time.us_per_s);
+        return error.NotYet;
+    }
+};
+
+const LapseJobs = Jobs(.{ .kinds = .{Lapses}, .store = Memory, .deps = struct { heist: *Heist } });
+
+test "a worker that lost its lease does not requeue the row the second worker holds" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+    var other: core.Run = .init(testing.allocator);
+    defer other.deinit();
+    var heist: Heist = .{ .store = &store, .run = &other };
+    var jobs: LapseJobs = .open(testing.allocator, &store, .{ .heist = &heist }, .{});
+
+    _ = try jobs.push(&run, Lapses{}, .{ .at = @as(i64, 0) });
+    try testing.expect(try jobs.runOneAt(&run, 0));
+
+    // The second worker got the row at the second attempt and still has it:
+    // the first one's `retry` found the claim gone and left it alone.
+    try testing.expectEqual(@as(u32, 2), heist.second.?.attempts);
+    const s = try jobs.stats(&run);
+    try testing.expectEqual(@as(u64, 1), s.running);
+    try testing.expectEqual(@as(u64, 0), s.queued);
+    try testing.expect(try store.done(&run, heist.second.?.id, heist.second.?.attempts));
+}
+
+// -- overlap (ADR 161) ------------------------------------------------------
+
+/// What a tick sees of the queue while it runs.
+const Overheard = struct {
+    queued_queue: u64 = 99,
+    queued_skip: u64 = 99,
+    queued_after_reseed: u64 = 99,
+};
+
+const QueueTick = struct {
+    pub const nilo_job = "queue-tick";
+    pub const retry: Retry = .none;
+    pub const schedule = every(60_000);
+    pub const overlap: Overlap = .queue;
+    pub const missed: Missed = .catch_up;
+
+    pub fn run(self: QueueTick, scope: *core.Run, heard: *Overheard, jobs: *OverlapJobs) !void {
+        _ = self;
+        heard.queued_queue = (try jobs.stats(scope)).queued;
+        // A restart seeding while the tick runs must not start a second chain.
+        try jobs.seedAt(scope, 0);
+        heard.queued_after_reseed = (try jobs.stats(scope)).queued;
+    }
+};
+
+const SkipTick = struct {
+    pub const nilo_job = "skip-tick";
+    pub const retry: Retry = .none;
+    pub const schedule = every(60_000);
+    pub const overlap: Overlap = .skip;
+    pub const missed: Missed = .catch_up;
+
+    pub fn run(self: SkipTick, scope: *core.Run, heard: *Overheard, jobs: *SkipJobs) !void {
+        _ = self;
+        heard.queued_skip = (try jobs.stats(scope)).queued;
+    }
+};
+
+fn overlapDeps(comptime J: type) type {
+    return struct { heard: *Overheard, jobs: *J };
+}
+
+const OverlapJobs = Jobs(.{ .kinds = .{QueueTick}, .store = Memory, .deps = overlapDeps });
+const SkipJobs = Jobs(.{ .kinds = .{SkipTick}, .store = Memory, .deps = overlapDeps });
+
+test "overlap .queue has the next tick queued while this one runs, and .skip does not" {
+    var heard: Overheard = .{};
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    var qstore = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer qstore.deinit();
+    var qjobs: OverlapJobs = undefined;
+    qjobs = .open(testing.allocator, &qstore, .{ .heard = &heard, .jobs = &qjobs }, .{});
+    try qjobs.seedAt(&run, 0);
+    try testing.expectEqual(@as(usize, 1), try qjobs.drainAt(&run, 61 * std.time.us_per_s));
+    try testing.expectEqual(@as(u64, 1), heard.queued_queue);
+    // Seeding while it ran added nothing: the successor holds the key.
+    try testing.expectEqual(@as(u64, 1), heard.queued_after_reseed);
+    // And one chain is what is left once it is over.
+    try testing.expectEqual(@as(u64, 1), (try qjobs.stats(&run)).queued);
+
+    var sstore = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer sstore.deinit();
+    var sjobs: SkipJobs = undefined;
+    sjobs = .open(testing.allocator, &sstore, .{ .heard = &heard, .jobs = &sjobs }, .{});
+    try sjobs.seedAt(&run, 0);
+    try testing.expectEqual(@as(usize, 1), try sjobs.drainAt(&run, 61 * std.time.us_per_s));
+    try testing.expectEqual(@as(u64, 0), heard.queued_skip);
+    try testing.expectEqual(@as(u64, 1), (try sjobs.stats(&run)).queued);
 }
