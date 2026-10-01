@@ -90,5 +90,5 @@ The severed-connection test itself costs nothing on any of the four axes: a test
 - A handler can bound a query, and can tell when the bound was what stopped it. Both halves are opt-in and neither costs anything to a caller who does not use them.
 - A pool-wide floor is set in the URL, `?options=-c%20statement_timeout%3D30s`, which reaches every connection's startup message, or with `ALTER ROLE app SET statement_timeout = '30s'` from the server's side.
 - `postgres.zig` reads one pg.zig private field, `conn._state`, in one function, and that function says what it depends on and when to delete it.
-- Two upstream defects are written down here rather than in a comment nobody finds: `startup_parameters` never reaching the startup message (fixed in the pin since `0a8dab4`), and `.fail` conflating an aborted transaction with a broken connection.
+- Two upstream defects are written down here rather than in a comment nobody finds: `startup_parameters` never reaching the startup message (fixed in the pin since `2907296`), and `.fail` conflating an aborted transaction with a broken connection.
 - Whether zio spells a peer's reset and a peer's plain close the same way `std.Io.Threaded` does is not known, and is a note rather than a change.

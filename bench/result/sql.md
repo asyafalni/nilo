@@ -1303,6 +1303,8 @@ Every shape that goes through a cached statement lost 2.1 to 3.1 µs, one unix-s
 
 **Two harness faults turned up on the way.** `bench/sql.zig` released its one connection twice, so every `bench-sql` since `987764b` ended in SEGV inside `Pool.deinit`, after its numbers had printed. `compare-sql/zigsql` no longer built, because it never passed `.sql = true` (ADR 066). Its pin had also drifted to `a2c9887` while the root's was `ec8cf27`, so its control was on a different driver. All three are fixed.
 
+**Since:** both commits reached `lalinsky/pg.zig`'s `master` under the same hashes, and nilo pins `lalinsky/pg.zig@2bc3405` (2026-10-01), no longer the fork. The figures above were measured on `0a8dab4` and not re-run on the new pin, which also carries lalinsky's later commits (`d24a0fa`, `2bc3405`); `test-all` and `test-sql` against Postgres 17 pass on it.
+
 **Can it be pushed further:** what is left against tokio-postgres is under 10% and is CPU, not packets. The next thing to measure is the pool behind many threads (§12), not the single query.
 
 ## 17. What holding a raw statement against its Row costs the binary

@@ -19,7 +19,7 @@ The other way a live suite failed to fail was a transaction a test forgot to end
 
 **A test that ends with a connection still out fails, and says so.** `Live.close` asks the pool how many connections are in use and logs at `err` if any are, which is how a `defer` fails a Zig test: "the test ended with 1 of its pool's connections still out: a transaction or a stream it never closed".
 
-This needed the URL to carry `options`, which `dialOpts` refused as something pg.zig's startup message had no room for. It has had room since the pin carried `nevindra/pg.zig@0a8dab4` ([ADR 043](./043-a-deadline-needs-a-connection-you-hold.md)), so `options` and `client_encoding=UTF8` are now handed to the server in the startup message.
+This needed the URL to carry `options`, which `dialOpts` refused as something pg.zig's startup message had no room for. It has had room since the pin carried lalinsky's `2907296` ([ADR 043](./043-a-deadline-needs-a-connection-you-hold.md)), so `options` and `client_encoding=UTF8` are now handed to the server in the startup message.
 
 ## What it costs
 
