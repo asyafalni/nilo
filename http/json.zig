@@ -28,6 +28,9 @@
 const std = @import("std");
 const Str = @import("nilo_core").Str;
 const mark = @import("jsonmark.zig");
+const convert = @import("convert.zig");
+const fail = @import("fail.zig");
+const patch_mod = @import("patch.zig");
 
 /// Serialise `value` as JSON. Uses the generated writer when the type is one
 /// it covers, and `std.json` when it is not — decided while compiling, so
@@ -37,6 +40,239 @@ pub fn write(w: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
     if (comptime covers(T)) return writeValue(T, w, value);
     comptime refuseRenameOnTheFallback(T);
     return std.json.Stringify.value(value, .{}, w);
+}
+
+/// Read a JSON body into a `T`, with every number read the way a query's is
+/// ([ADR 084](../docs/adr/084-a-number-in-a-request-is-not-a-zig-literal.md)).
+///
+/// **`std.json` reads a number token with `parseInt` and `parseFloat`, which is
+/// Zig's literal grammar**, and a *string* token is handed to them too: `"1_0"`
+/// was 10, `"+7"` was 7, `"nan"` was a NaN and `1e999` was infinity. A `u128`
+/// posted as `2e38` was worse than a wrong value: `sliceToInt` converts through
+/// an `i128` and the cast panics in ReleaseSafe. `std.json` offers no hook for a
+/// number, so this is the same walk it makes over a struct, a list and an
+/// optional, with the two leaves swapped for `convert.spelledAsNumber` and the
+/// parse that follows it. Everything else, a type with its own `jsonParse`
+/// included, is handed to `std.json.innerParse` unchanged, so what it reads and
+/// how it refuses is what it always was.
+///
+/// One pass over the bytes, no allocation `std.json` did not make: the number's
+/// token is the one `std.json` would have taken, and a body that was fine is
+/// still fine. A number inside a type this walk does not enter (a map, a
+/// `std.json.Value`) still goes by `std.json`'s rules.
+pub fn parseLeaky(
+    comptime T: type,
+    gpa: std.mem.Allocator,
+    input: []const u8,
+    options: std.json.ParseOptions,
+) std.json.ParseError(std.json.Scanner)!T {
+    const Body = struct {
+        value: T,
+
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            resolved: std.json.ParseOptions,
+        ) std.json.ParseError(@TypeOf(source.*))!@This() {
+            return .{ .value = try innerRead(T, allocator, source, resolved) };
+        }
+    };
+    const parsed = std.json.parseFromSliceLeaky(Body, gpa, input, options) catch |err| {
+        if (err == error.DuplicateField) saySecondKey(gpa, input);
+        return err;
+    };
+    return parsed.value;
+}
+
+/// Put a sentence about the key an object has twice on this request's Failure.
+///
+/// `std.json` refuses a repeated key and says only that it did, which reached a
+/// client as a bare `Bad Request`. It is refused rather than resolved because
+/// two parsers that keep a different one of the two read two different
+/// requests, which is the disagreement ADR 084 and ADR 070 are about, and a
+/// tagged union's discriminator is the key where it matters most: a front end
+/// that keeps the last one sees another variant (ADR 016). Reached only after a
+/// parse that already failed, so the second walk costs a body nobody wanted.
+fn saySecondKey(gpa: std.mem.Allocator, input: []const u8) void {
+    const key = firstRepeatedKey(gpa, input) orelse return;
+    // The Failure rather than a returned error: the caller returns the error
+    // `std.json` gave, and the status table already maps it to a 400.
+    if (fail.current()) |failure| failure.set(
+        400,
+        "the request body has the key \"{s}\" twice, and nilo does not guess which one is meant",
+        .{key},
+    );
+}
+
+/// The first key that an object in `input` has more than once, or null.
+fn firstRepeatedKey(gpa: std.mem.Allocator, input: []const u8) ?[]const u8 {
+    const Level = struct {
+        is_object: bool,
+        expect_key: bool = true,
+        keys: std.ArrayList([]const u8) = .empty,
+    };
+    var scan = std.json.Scanner.initCompleteInput(gpa, input);
+    defer scan.deinit();
+    var stack: std.ArrayList(Level) = .empty;
+
+    while (true) {
+        const token = scan.nextAlloc(gpa, .alloc_if_needed) catch return null;
+        switch (token) {
+            .end_of_document => return null,
+            .object_begin, .array_begin => {
+                stack.append(gpa, .{ .is_object = token == .object_begin }) catch return null;
+                continue;
+            },
+            .object_end, .array_end => _ = stack.pop(),
+            .string, .allocated_string => |text| if (stack.items.len > 0) {
+                const top = &stack.items[stack.items.len - 1];
+                if (top.is_object and top.expect_key) {
+                    for (top.keys.items) |seen| if (std.mem.eql(u8, seen, text)) return text;
+                    top.keys.append(gpa, text) catch return null;
+                    top.expect_key = false;
+                    continue;
+                }
+            },
+            else => {},
+        }
+        // A value is over, so an object around it wants a key next.
+        if (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            if (top.is_object) top.expect_key = true;
+        }
+    }
+}
+
+/// What `parseLeaky` does at each level, public because a type that hands over
+/// its own `jsonParse` and holds a `T` (`Patch`, a tagged variant) reads that
+/// `T` through it.
+pub fn innerRead(
+    comptime T: type,
+    gpa: std.mem.Allocator,
+    source: anytype,
+    options: std.json.ParseOptions,
+) std.json.ParseError(@TypeOf(source.*))!T {
+    // A `Patch` is a number in a body as often as any field is, and its own
+    // reader hands the value to `std.json`, so it is read here instead: null is
+    // `.cleared` and anything else is the value, read by this walk.
+    if (comptime patch_mod.isPatch(T)) {
+        if (try source.peekNextTokenType() == .null) {
+            _ = try source.next();
+            return .cleared;
+        }
+        return .{ .value = try innerRead(T.nilo_patch, gpa, source, options) };
+    }
+    // A type that parses itself, and `Str`, are the type's to read.
+    if (comptime T == Str or readsItself(T)) return std.json.innerParse(T, gpa, source, options);
+
+    switch (@typeInfo(T)) {
+        .int => |i| {
+            const token = try source.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?);
+            const text = switch (token) {
+                inline .number, .allocated_number, .string, .allocated_string => |slice| slice,
+                else => return error.UnexpectedToken,
+            };
+            if (!convert.spelledAsNumber(text, i.signedness == .signed, false)) return error.InvalidNumber;
+            return std.fmt.parseInt(T, text, 10);
+        },
+        .float => {
+            const token = try source.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?);
+            const text = switch (token) {
+                inline .number, .allocated_number, .string, .allocated_string => |slice| slice,
+                else => return error.UnexpectedToken,
+            };
+            if (!convert.spelledAsNumber(text, true, true)) return error.InvalidNumber;
+            const parsed = try std.fmt.parseFloat(T, text);
+            if (!std.math.isFinite(parsed)) return error.Overflow;
+            return parsed;
+        },
+        .optional => |o| switch (try source.peekNextTokenType()) {
+            .null => {
+                _ = try source.next();
+                return null;
+            },
+            else => return try innerRead(o.child, gpa, source, options),
+        },
+        .@"struct" => |s| {
+            if (comptime s.is_tuple) return std.json.innerParse(T, gpa, source, options);
+            if (.object_begin != try source.next()) return error.UnexpectedToken;
+
+            var r: T = undefined;
+            var seen = [_]bool{false} ** s.fields.len;
+
+            while (true) {
+                const name_token = try source.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?);
+                const name = switch (name_token) {
+                    inline .string, .allocated_string => |slice| slice,
+                    .object_end => break,
+                    else => return error.UnexpectedToken,
+                };
+
+                inline for (s.fields, 0..) |field, i| {
+                    if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+                    if (std.mem.eql(u8, field.name, name)) {
+                        if (seen[i]) switch (options.duplicate_field_behavior) {
+                            .use_first => {
+                                // Read and dropped: the type check is the point.
+                                _ = try innerRead(field.type, gpa, source, options);
+                                break;
+                            },
+                            .@"error" => return error.DuplicateField,
+                            .use_last => {},
+                        };
+                        @field(r, field.name) = try innerRead(field.type, gpa, source, options);
+                        seen[i] = true;
+                        break;
+                    }
+                } else {
+                    if (options.ignore_unknown_fields) {
+                        try source.skipValue();
+                    } else {
+                        return error.UnknownField;
+                    }
+                }
+            }
+            inline for (s.fields, 0..) |field, i| {
+                if (!seen[i]) {
+                    if (field.defaultValue()) |default| @field(r, field.name) = default else return error.MissingField;
+                }
+            }
+            return r;
+        },
+        .array => |a| {
+            if (comptime a.child == u8) return std.json.innerParse(T, gpa, source, options);
+            if (.array_begin != try source.next()) return error.UnexpectedToken;
+            var r: T = undefined;
+            for (&r) |*element| element.* = try innerRead(a.child, gpa, source, options);
+            if (.array_end != try source.next()) return error.UnexpectedToken;
+            return r;
+        },
+        .pointer => |p| {
+            if (comptime p.size != .slice or p.child == u8) return std.json.innerParse(T, gpa, source, options);
+            if (.array_begin != try source.peekNextTokenType()) return error.UnexpectedToken;
+            _ = try source.next();
+            var list: std.array_list.Managed(p.child) = .init(gpa);
+            while (true) {
+                if (.array_end == try source.peekNextTokenType()) {
+                    _ = try source.next();
+                    break;
+                }
+                try list.ensureUnusedCapacity(1);
+                list.appendAssumeCapacity(try innerRead(p.child, gpa, source, options));
+            }
+            if (p.sentinel()) |sentinel| return try list.toOwnedSliceSentinel(sentinel);
+            return try list.toOwnedSlice();
+        },
+        else => return std.json.innerParse(T, gpa, source, options),
+    }
+}
+
+/// Whether a type reads itself, which is the one thing `std.json` asks of it.
+fn readsItself(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum" => std.meta.hasFn(T, "jsonParse"),
+        else => false,
+    };
 }
 
 /// A struct that renames its fields cannot be written by `std.json`, which does
@@ -240,8 +476,17 @@ fn writeValue(comptime T: type, w: *std.Io.Writer, value: T) std.Io.Writer.Error
     switch (@typeInfo(T)) {
         .bool => return w.writeAll(if (value) "true" else "false"),
         .int, .comptime_int => return w.printInt(value, 10, .lower, .{}),
-        // Left to std.json on purpose — see the header comment.
-        .float, .comptime_float => return std.json.Stringify.value(value, .{}, w),
+        // Left to std.json on purpose — see the header comment. Except for a
+        // value JSON has no spelling for: `std.json` writes infinity as the
+        // bare word `inf` and NaN as the string `"nan"`, so what comes out is
+        // not JSON or not a number. It is `null`, which is what a JavaScript
+        // client's own `JSON.stringify` makes of both (ADR 096).
+        .float, .comptime_float => {
+            if (comptime T != comptime_float) {
+                if (!std.math.isFinite(value)) return w.writeAll("null");
+            }
+            return std.json.Stringify.value(value, .{}, w);
+        },
         // A tag name is a Zig identifier, so it can never need escaping and the
         // quotes around it belong in the same literal as the name. That is what
         // makes `rename_all` free: the spelling is settled while compiling, so
@@ -490,6 +735,77 @@ test "floats are left to std.json rather than reimplemented" {
     try expectSame(@as(f32, 1.5));
     try expectSame(@as(f64, 1e300));
     try expectSame(@as(f64, 1234567890.0));
+}
+
+test "a float that is not finite is written as null, never as inf or nan" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const inf = std.math.inf(f64);
+    try write(&out.writer, .{ .a = inf, .b = -inf, .c = std.math.nan(f64), .d = std.math.inf(f32), .e = @as(?f64, inf), .f = 1.5 });
+    try testing.expectEqualStrings("{\"a\":null,\"b\":null,\"c\":null,\"d\":null,\"e\":null,\"f\":1.5}", out.written());
+}
+
+const Reading = struct {
+    id: u32,
+    delta: i16 = 0,
+    ratio: ?f64 = null,
+    tags: []const u32 = &.{},
+    pair: [2]u8 = .{ 0, 0 },
+    name: []const u8 = "",
+    inner: struct { n: u8 = 0 } = .{},
+    edit: patch_mod.Patch(u8) = .absent,
+};
+
+test "a body is read the way std.json reads it, wherever its numbers are not in dispute" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const text =
+        \\{"id":7,"delta":-3,"ratio":2.5e1,"tags":[1,2,3],"pair":[4,5],"name":"wati","inner":{"n":9},"edit":12}
+    ;
+    const mine = try parseLeaky(Reading, arena.allocator(), text, .{});
+    const theirs = try std.json.parseFromSliceLeaky(Reading, arena.allocator(), text, .{});
+    try testing.expectEqual(theirs.id, mine.id);
+    try testing.expectEqual(theirs.delta, mine.delta);
+    try testing.expectEqual(theirs.ratio, mine.ratio);
+    try testing.expectEqualSlices(u32, theirs.tags, mine.tags);
+    try testing.expectEqual(theirs.pair, mine.pair);
+    try testing.expectEqualStrings(theirs.name, mine.name);
+    try testing.expectEqual(theirs.inner.n, mine.inner.n);
+    try testing.expectEqual(@as(u8, 12), mine.edit.value);
+
+    // Defaults, a null optional, and a cleared patch.
+    const sparse = try parseLeaky(Reading, arena.allocator(), "{\"id\":1,\"ratio\":null,\"edit\":null}", .{});
+    try testing.expectEqual(@as(?f64, null), sparse.ratio);
+    try testing.expect(sparse.edit == .cleared);
+}
+
+test "a body refuses what std.json refuses, and what its numbers are spelled wrong for" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.MissingField, parseLeaky(Reading, a, "{}", .{}));
+    try testing.expectError(error.UnknownField, parseLeaky(Reading, a, "{\"id\":1,\"x\":2}", .{}));
+    try testing.expectError(error.DuplicateField, parseLeaky(Reading, a, "{\"id\":1,\"id\":2}", .{}));
+    try testing.expectError(error.UnexpectedToken, parseLeaky(Reading, a, "{\"id\":true}", .{}));
+    try testing.expectError(error.InvalidNumber, parseLeaky(Reading, a, "{\"id\":\"1_0\"}", .{}));
+    try testing.expectError(error.InvalidNumber, parseLeaky(Reading, a, "{\"id\":\"+7\"}", .{}));
+    try testing.expectError(error.InvalidNumber, parseLeaky(Reading, a, "{\"id\":1.0}", .{}));
+    try testing.expectError(error.InvalidNumber, parseLeaky(Reading, a, "{\"id\":1,\"ratio\":\"nan\"}", .{}));
+    try testing.expectError(error.InvalidNumber, parseLeaky(Reading, a, "{\"id\":1,\"tags\":[1,\"0x1\"]}", .{}));
+    try testing.expectError(error.InvalidNumber, parseLeaky(Reading, a, "{\"id\":1,\"edit\":\"+1\"}", .{}));
+    try testing.expectError(error.Overflow, parseLeaky(Reading, a, "{\"id\":1,\"ratio\":1e999}", .{}));
+    try testing.expectError(error.Overflow, parseLeaky(Reading, a, "{\"id\":4294967296}", .{}));
+    // A quoted number that is spelled like a number is still one.
+    try testing.expectEqual(@as(u32, 10), (try parseLeaky(Reading, a, "{\"id\":\"10\"}", .{})).id);
+}
+
+test "a repeated key is found at any depth, and a body without one has none" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("k", firstRepeatedKey(a, "{\"k\":1,\"k\":2}").?);
+    try testing.expectEqualStrings("kind", firstRepeatedKey(a, "{\"s\":{\"kind\":\"a\",\"r\":[{\"x\":1}],\"kind\":\"b\"}}").?);
+    try testing.expect(firstRepeatedKey(a, "{\"k\":{\"k\":1},\"j\":[{\"k\":1},{\"k\":2}],\"v\":\"k\"}") == null);
 }
 
 test "a string with nothing to escape, and one with everything" {

@@ -185,6 +185,11 @@ pub fn statusFor(err: anyerror) u16 {
 
         error.NotFound, error.FileNotFound => 404,
 
+        // A body the client stopped sending before its end, read through
+        // `bodyStream()`. `Ctx.body()` says the same in a sentence of its
+        // own. Not `EndOfStream`: that name is every reader's, and a file a
+        // handler read too far is not the client's fault (ADR 019).
+        error.BodyTruncated,
         error.BadChunk,
         error.InvalidCharacter,
         error.Overflow,
@@ -282,6 +287,7 @@ test "the error mapping table" {
     try testing.expectEqual(@as(u16, 404), statusFor(error.NotFound));
     try testing.expectEqual(@as(u16, 400), statusFor(error.InvalidCharacter));
     try testing.expectEqual(@as(u16, 413), statusFor(error.BodyTooLarge));
+    try testing.expectEqual(@as(u16, 400), statusFor(error.BodyTruncated));
     try testing.expectEqual(@as(u16, 500), statusFor(error.SomethingUnrecognised));
     // A database that gave a transaction up, or is not there, is not the
     // request's fault, and the same request may go through if sent again.

@@ -221,7 +221,7 @@ const Rule = struct { id: u32, severity: Severity, condition: Condition };
 {"id":3,"severity":"NEEDS_ATTENTION","condition":{"signal":"logs","query":"level:error","count_over":5}}
 ```
 
-A variant carrying nothing is just the tag: `{"signal":"disabled"}`.
+A variant carrying nothing is just the tag: `{"signal":"disabled"}`. Read as a request body, an object with the tag key twice is a 400 naming the key, since a client that keeps the other one would mean another variant ([ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md)).
 
 **`rename_all` spells names the way the wire wants them**: an enum's tags, a union's variant names, and a struct's field names.
 

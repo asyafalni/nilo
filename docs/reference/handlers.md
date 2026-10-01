@@ -450,7 +450,7 @@ It also makes such a response 33% faster whether or not anything is renamed: `co
 
 ### Unions
 
-**Without a marker, a `union(enum)` is externally tagged**: `{"metrics":{…}}`, which is what `std.json` writes. It is written by nilo's own writer either way. An *untagged* union has nothing saying which variant is active, and is left entirely to `std.json`. A variant with no payload is allowed under `.tag` and is just the discriminator; under the default encoding it is not supported.
+**Without a marker, a `union(enum)` is externally tagged**: `{"metrics":{…}}`, which is what `std.json` writes. It is written by nilo's own writer either way. An *untagged* union has nothing saying which variant is active, and is left entirely to `std.json`. A variant with no payload is allowed under `.tag` and is just the discriminator; under the default encoding it is not supported. A tagged object read from a body with its discriminator twice is a 400 naming the key.
 
 The generated API description follows whichever encoding the type chose: `oneOf` of one-key objects for the default, and `oneOf` with a `discriminator` plus a per-variant `allOf` for a tagged one. See [Responses](../guide/responses.md#json-field-names-and-union-tags).
 

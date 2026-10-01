@@ -125,6 +125,16 @@ allocation as before.
 arena to it"` announces eight megabytes, sends a dozen bytes, and asks the arena
 what it holds. The amplification is the same 256× at the default `max_body`.
 
+## A body that stops arriving is a 400, and the connection is closed
+
+Taking the bytes as they arrive means the client can stop sending them: `Content-Length: 100`, ten bytes, then a FIN. That is `error.EndOfStream` from the reader, and it was nobody's name: `statusFor` had no arm, so it was a 500 and a warning for something that is the client's doing, and the same cut inside a chunk's data was a 500 where a size line cut short was already a 400.
+
+**`c.body()` answers it with a 400, `the request body ended before all of it had been sent`, and marks the stream unusable**, so the connection is closed rather than carried to a next request. Every failure of a sized read marks it, whatever the cause, because a read that stopped part way leaves the connection at a byte nothing knows. A second `c.body()` after any failure is the same 400 and never a second read from the wire.
+
+A gzip body that fails to inflate is the same shape: the compressed bytes are read, the inflated ones are what `_body` holds, and **`_body` is assigned only on success**. It used to be assigned the compressed bytes first, so a middleware that logged the first error and carried on was handed them by the second call as the body. The wire is read to its end in that case, so the connection stays good.
+
+The read through `c.bodyStream()` has the same failure and a worse way to hide it: [ADR 019](./019-a-request-that-lasts-is-still-one-request.md).
+
 ## What was rejected
 
 **Saying the chunked path "already grew as chunks arrived"**, which this ADR
@@ -132,6 +142,8 @@ claimed when it was written and the audit of `http/` at `39896d2` found false.
 It grew by chunks, not by bytes: one allocation per chunk at the announced size,
 before any of it arrived. The claim was read off the loop shape and never run
 against a chunk that did not come.
+
+**An arm for `error.EndOfStream` in `statusFor`.** The name is every reader's, and a file a handler read too far is not the client's fault, so the table would answer 400 for a bug of the server's. The body reader says what happened in a name of its own, `BodyTruncated`, which is the 400. The audit of `http/` at `39896d2` is what moved it.
 
 ## What is not changed
 

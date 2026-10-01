@@ -87,6 +87,8 @@ says so with `pub const nilo_reads_caller = true;` and is refused the same
 way. A `*Ctx` can read anything and is not checked; that is the gap the rule
 leaves, and the reference says so.
 
+**An answer that sets a cookie is sent and not kept.** A `Response(T)` keeps its headers whole, so a cached page that set an anonymous session or a CSRF cookie would hand the first visitor's cookie to every visitor for the TTL. `cachedFinish` looks for `Set-Cookie` in the handler's own headers, releases the claim, logs a `warn` naming the route and sends the answer unkept, so the page is made for each request, which is what a page that sets a cookie is. A cookie set through the `*Ctx` (`c.setCookie`, a `Session(T).set`) is not in the answer's headers and is never put in the record: the visitor who made the miss gets it and a hit carries none. The claim is released on every error after it is taken (a header that will not set, an encode that fails for a reason other than size), not only on a handler failure, so a failed request cannot leave the marker for every request after it to wait out.
+
 ## What it costs
 
 Put against [ADR 017](./017-the-trade-budget-has-four-axes.md)'s four
@@ -112,6 +114,8 @@ axes, and all of it on the route that asks:
   time.
 
 ## What was rejected
+
+**Keeping a `Response(T)`'s headers whole, `Set-Cookie` included.** The first position: the headers are the handler's and a replay carries them. The audit of `http/` at `39896d2` found that it replays a cookie made for one visitor to all of them, which is the risk the caller rule above names for an argument that reads the caller, arriving through a header instead. A `Set-Cookie` in the answer is now the reason it is not kept.
 
 **A middleware — `app.with(nilo.cache(Pages, 60)).get(…)`.** It is the
 shape every other framework ships, and it has to intercept the response on

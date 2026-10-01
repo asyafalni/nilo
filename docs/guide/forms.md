@@ -150,6 +150,8 @@ The fiber pauses for the write while the thread keeps serving every other connec
 
 For a bigger upload, raise the limit for that one route with [`app.with(nilo.maxBody(50 << 20))`](../reference/middleware.md#nilomaxbody), rather than for the whole server. Or read the body in pieces yourself with [`c.bodyStream()`](./requests.md#streaming-a-large-body), which holds nothing in memory at all. `Form(T)` is the convenient option; the stream is the one with no limit.
 
+**A form is also bounded by how many fields it carries**: 256 parts of a multipart form, and 1,024 pairs of a urlencoded one. Past either it is a 400 that says so, rather than a form with the rest silently left blank ([ADR 030](../adr/030-a-form-is-the-body-read-by-another-rule.md)).
+
 Within the limit nothing is copied: a file's bytes are a slice of the body that was already read, not a second copy.
 
 ## Collecting every field error (`Bound`)

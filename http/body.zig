@@ -41,6 +41,10 @@ pub const Error = error{
     /// The chunk sizes and the stream have come apart. Where this body ends
     /// is now a guess, so the connection cannot be reused.
     BadChunk,
+    /// The connection ended while body bytes were still owed: a client that
+    /// promised a `Content-Length` and stopped short, or closed inside a
+    /// chunk's data. Not the clean end `read` reports as null (ADR 019).
+    BodyTruncated,
     ReadFailed,
     EndOfStream,
     WriteFailed,
@@ -71,6 +75,11 @@ pub const Progress = struct {
         /// Something went wrong in a way that leaves the connection at an
         /// unknown byte. Nothing may be read from it again.
         broken,
+        /// The connection ended with body bytes still owed. Like `broken`
+        /// nothing may be read from it again, and it is told apart so the
+        /// reader answers `BodyTruncated`, a 400, where `broken` is a
+        /// chunk framing fault or a body over the ceiling.
+        cut,
     };
 
     pub fn start(request: *const http1.Request, max_bytes: u64) Progress {
@@ -96,7 +105,7 @@ pub const Progress = struct {
         return switch (self.state) {
             .sized => |left| left,
             .chunk, .between => self.max_bytes -| self.seen,
-            .done, .broken => 0,
+            .done, .broken, .cut => 0,
         };
     }
 };
@@ -176,6 +185,7 @@ pub const Body = struct {
     /// that actually happened. `stream` may only fail with `ReadFailed`, so
     /// what went wrong is recorded on the way past and read back here.
     fn explain(self: *Body, err: anyerror) Error {
+        if (self._progress.state == .cut) return error.BodyTruncated;
         if (self._progress.state == .broken) {
             return if (self._progress.seen > self._progress.max_bytes)
                 error.BodyTooLarge
@@ -231,8 +241,20 @@ pub const Body = struct {
                 p.state = .{ .chunk = size_of_chunk };
             },
             .done => return 0,
-            .broken => return error.ReadFailed,
+            .broken, .cut => return error.ReadFailed,
         };
+    }
+
+    /// The connection ran out while `run` bytes of body were still owed. The
+    /// connection's `EndOfStream` is the clean end of a body only when none
+    /// are, and `run` is never zero here, so it is not: record it, and let
+    /// `explain` say so (ADR 019).
+    fn cutShort(self: *Body, err: std.Io.Reader.Error) std.Io.Reader.Error {
+        if (err == error.EndOfStream) {
+            self._progress.state = .cut;
+            return error.ReadFailed;
+        }
+        return err;
     }
 
     fn breakOff(self: *Body) error{ReadFailed} {
@@ -265,7 +287,11 @@ pub const Body = struct {
 
         const run = try self.runLength();
         if (run == 0) return error.EndOfStream;
-        const n = try self._in.stream(w, limit.min(.limited64(run)));
+        const n = self._in.stream(w, limit.min(.limited64(run))) catch |err| switch (err) {
+            // The writer's own failure is not the connection's end.
+            error.WriteFailed => return error.WriteFailed,
+            else => |e| return self.cutShort(e),
+        };
         self.advance(n);
         return n;
     }
@@ -277,7 +303,7 @@ pub const Body = struct {
 
         const run = try self.runLength();
         if (run == 0) return error.EndOfStream;
-        const n = try self._in.discard(limit.min(.limited64(run)));
+        const n = self._in.discard(limit.min(.limited64(run))) catch |err| return self.cutShort(err);
         self.advance(n);
         return n;
     }
@@ -435,4 +461,36 @@ test "the announced size is still there after the body has been read" {
     // ended — which is exactly when a handler wants to report on it.
     try testing.expectEqual(@as(?u64, 12), incoming.size());
     try testing.expectEqual(@as(u64, 12), incoming.seen());
+}
+
+test "an upload the connection ended before its Content-Length is a failure on every way of reading it" {
+    var buf: [16]u8 = undefined;
+
+    var by_read: Case = undefined;
+    by_read.init("hello", sized(12), 1024);
+    var a = by_read.body();
+    try testing.expectEqualStrings("hello", (try a.read(&buf)).?);
+    try testing.expectError(error.BodyTruncated, a.read(&buf));
+    try testing.expectEqual(Progress.State.cut, by_read.progress.state);
+
+    var by_write: Case = undefined;
+    by_write.init("hello", sized(12), 1024);
+    var b = by_write.body();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try testing.expectError(error.BodyTruncated, b.writeTo(&out.writer));
+
+    var by_discard: Case = undefined;
+    by_discard.init("hello", sized(12), 1024);
+    var c = by_discard.body();
+    try testing.expectError(error.BodyTruncated, c.discardRest());
+
+    // Inside a chunk's data too, and nothing can be read from it after.
+    var chunked: Case = undefined;
+    chunked.init("a\r\n01234", chunked_request, 1024);
+    var d = chunked.body();
+    try testing.expectEqualStrings("01234", (try d.read(&buf)).?);
+    try testing.expectError(error.BodyTruncated, d.read(&buf));
+    try testing.expectError(error.BodyTruncated, d.read(&buf));
+    try testing.expectEqual(Progress.State.cut, chunked.progress.state);
 }

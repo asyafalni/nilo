@@ -24,7 +24,8 @@ first request runs the handler and keeps what it returned — status, the
 `Response(T)`'s own headers, the body — under the key; every later request
 with that key gets that back, byte for byte, with `Idempotent-Replayed:
 true` on it, and the handler does not run. Before the handler, three
-refusals with the header named: 400 for no key or one over 255 bytes, 409
+refusals with the header named: 400 for no key, one over 255 bytes or one
+the Space cannot hold once `.by` is joined to it, 409
 for a key still being answered, 422 for a key reused on a different request
 — method, path, query and body are fingerprinted with it. What the handler
 *failed* with is not kept, so a retry after a failure runs it again.
@@ -102,6 +103,8 @@ axes before it was written, and all of it on the route that asks:
 - **Binary size.** One record codec, one arm in the engine.
 
 ## What is deliberately not built
+
+**Running a request whose key the Space cannot hold.** A key is `by`, a NUL and the client's key, and a long `by(c)` string or a Space sized small cannot hold it, so the claim answers `TooLarge`. The first position treated that as unreachable (a marker is thirteen bytes) and crashed; the audit of `http/` at `39896d2` found it. Running the handler and sending the answer unkept, the way `Cached` answers a key too long for its Space (ADR 188), was the next position and was rejected: a cached page run twice costs a render, and a payment run twice costs a payment, which is the one thing the key exists to prevent. The request is refused with a 400 before the handler runs, with a `warn` naming the route and the length for the operator, whose fix is a larger Space or a shorter `by`. The claim is also released on every error after it is taken, not only on a handler failure.
 
 **Keeping what the handler failed with.** Stripe keeps error responses too.
 Here a `fail.…` is not kept because a failure is the case a retry exists

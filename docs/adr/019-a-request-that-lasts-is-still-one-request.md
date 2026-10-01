@@ -37,6 +37,8 @@ The arena stays available for what it was always for — things whose size is bo
 
 The same rule going the other way is stricter still. `c.bodyStream()` reads a request body in pieces into a buffer **the handler already has**, so it allocates nothing whatsoever — not even the one buffer a response stream takes. Measured end to end on the streaming example: five rounds of a 3 MB upload plus a 50,000-row streamed report moved the server's RSS by 72 KB.
 
+**An upload the client cut short is a failure, not a whole file.** `Body.read`, `writeTo` and `discardRest` read the connection's `EndOfStream` as the clean end of the body, so a `Content-Length: 1000000` upload that stopped at 300,000 bytes was stored as a whole file unless the handler compared `seen()` with `size()`, while `c.body()` refused the same truncation. The end of a body is now where the framing says it is and nowhere else: an `EndOfStream` from the connection while bytes are still owed is `error.BodyTruncated` (a 400 through `statusFor`), and it moves the reader to a state in which nothing can be read again. A handler that swallowed the error and answered anyway still has the connection closed, because App's discard of what is left fails on that state (the audit of `http/` at `39896d2`).
+
 ## Shutdown: a stream is told, and is expected to listen
 
 `listen()` waits for requests in flight before returning, which is what makes a deploy not drop anything. A twenty-minute stream is in flight for twenty minutes, so the naive reading is that one SSE client can hold a deploy hostage.
@@ -76,6 +78,7 @@ Left as is. The alternative — a line when the head goes out, and another when 
 Two cases where "write the body in pieces" is not available, decided here so the implementation has no room to improvise:
 
 - **HTTP/1.0 has no chunked encoding.** A stream to a 1.0 client writes its pieces with no framing, sends `Connection: close`, and the connection ends with the body. That is the only way a 1.0 client can know where the response stopped.
+- **A status that has no body cannot be streamed.** 204, 304 and 1xx have their `Transfer-Encoding` and `Content-Length` dropped by the head writer, because what follows the head would start the next response. `c.stream` and `c.streamWith` return an error under one (a 500 naming the status, if the handler passes it up) before a byte is written. The audit of `http/` at `39896d2` found the head going out with the framing dropped and the chunks after it.
 - **A HEAD gets the head and nothing else.** The stream is created, the handler runs and writes normally, and every write is dropped. A handler should not have to know which verb it is answering (`Ctx.send` already works this way).
 
 ## What is deliberately not decided here

@@ -110,6 +110,16 @@ fn placeOrder(b: nilo.Bound(NewOrder)) !nilo.Status(201, Order) {
 
 One difference to know: in JSON a quoted value **is** text, so `{"quantity":"12"}` fails as `"quantity" has to be a whole number, not text`, not as a number that would not parse. A form has only text to work with; a JSON body says what kind each value is.
 
+**A number in a body is read by the same rule a query's is** ([ADR 084](../adr/084-a-number-in-a-request-is-not-a-zig-literal.md)). Digits, a `-` where the type has one, and for a real number a fraction and an exponent, so a quoted `"10"` is still ten and `"1_0"`, `"+7"` and `"nan"` are refused. A whole number is digits: `5.0` and `1e2` are not read as 5 and 100, and `1e999` is not read as infinity. A number that is the right kind and does not fit its field says so and quotes the number, as a query does:
+
+```
+"age" has to be a whole number, not 300, which is outside 0 to 255
+"qty" has to be a whole number, not 1.5
+"count" has to be a whole number, not -1, which is outside 0 to 4294967295
+```
+
+Under `Bound` those are collected with the other fields. A key that appears twice in an object is a 400 naming it, and nilo does not guess which one was meant.
+
 ### PATCH: telling "not sent" from "sent as null"
 
 **`Patch(T)` tells apart a field that was not sent, one sent as null, and one sent with a value.** `?T` has two states and a PATCH needs three. With `due: ?Str = null`, the bodies `{}` and `{"due":null}` arrive identical, so "leave the due date alone" and "clear the due date" cannot be told apart. `Patch(T)` keeps all three:
@@ -188,6 +198,8 @@ Measured on the streaming example: 5 × (a 3 MB upload plus a 50,000-row streame
 | `incoming.reader` | a plain `std.Io.Reader`, for handing to the standard library |
 
 A body left half-read is fine: nilo discards the rest so the connection is clean for the next request.
+
+**An upload the client cut short is an error, not a short file.** If the connection ends while bytes are still owed (`Content-Length: 1000000` and the client stops at 300,000), `read`, `writeTo` and `discardRest` fail with `error.BodyTruncated`, which is a 400 if you let it through, and the connection is closed afterwards. The same cut under `c.body()` is the same 400, `the request body ended before all of it had been sent`. You do not need to compare `seen()` with `size()` to know the file is whole.
 
 See [ADR 019](../adr/019-a-request-that-lasts-is-still-one-request.md).
 

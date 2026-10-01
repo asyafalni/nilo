@@ -787,23 +787,30 @@ fn Reader(comptime T: type) type {
             defer scan.deinit();
             if (.object_begin != try scan.next()) return error.UnexpectedToken;
 
-            const found = while (true) {
+            // The whole object is walked rather than stopping at the first
+            // discriminator, because a second one is refused: `std.json` refuses
+            // a repeated key everywhere else, and a front end that keeps the
+            // last one would see another variant than the one read here
+            // (ADR 016). `json.parseLeaky` says which key on the way out.
+            var found: ?[]const u8 = null;
+            while (true) {
                 const token = try scan.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?);
                 const name = switch (token) {
                     inline .string, .allocated_string => |slice| slice,
-                    .object_end => break null,
+                    .object_end => break,
                     else => return error.UnexpectedToken,
                 };
                 if (!std.mem.eql(u8, name, key)) {
                     try scan.skipValue();
                     continue;
                 }
+                if (found != null) return error.DuplicateField;
                 const value = try scan.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?);
-                break switch (value) {
+                found = switch (value) {
                     inline .string, .allocated_string => |slice| slice,
                     else => return error.UnexpectedToken,
                 };
-            } else null;
+            }
 
             const arm = found orelse return error.MissingField;
 
@@ -816,7 +823,7 @@ fn Reader(comptime T: type) type {
             inline for (@typeInfo(T).@"union".fields, comptime wireNames(T)) |f, on_the_wire| {
                 if (std.mem.eql(u8, arm, on_the_wire)) {
                     if (f.type == void) return @unionInit(T, f.name, {});
-                    const payload = try std.json.parseFromSliceLeaky(f.type, gpa, span, inner);
+                    const payload = try @import("json.zig").parseLeaky(f.type, gpa, span, inner);
                     if (!options.ignore_unknown_fields) try refuseUnknown(f.type, gpa, span, options);
                     return @unionInit(T, f.name, payload);
                 }
@@ -1123,6 +1130,26 @@ const Condition = union(enum) {
 
 fn read(comptime T: type, gpa: std.mem.Allocator, body: []const u8) !T {
     return std.json.parseFromSliceLeaky(T, gpa, body, .{});
+}
+
+test "a second discriminator is refused, wherever it sits and whatever it says" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectError(error.DuplicateField, read(
+        Condition,
+        a,
+        "{\"signal\":\"metrics\",\"signal\":\"logs\",\"metric_name\":\"x\",\"threshold\":1}",
+    ));
+    try testing.expectError(error.DuplicateField, read(
+        Condition,
+        a,
+        "{\"signal\":\"logs\",\"query\":\"q\",\"signal\":\"logs\"}",
+    ));
+    // One is still one.
+    const only = try read(Condition, a, "{\"query\":\"q\",\"signal\":\"logs\"}");
+    try testing.expectEqualStrings("q", only.logs.query);
 }
 
 test "an internally tagged union is read back into the variant its tag names" {

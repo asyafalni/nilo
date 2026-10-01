@@ -41,6 +41,10 @@ Three things, each of which is silent when got wrong:
 
 The number of parts is bounded (`max_parts`, 256). The arrays are sized from a count of boundaries in the body, and without a cap a megabyte of nothing but boundaries — about 15,000 of them — would turn into half a megabyte of arena for a request carrying no data at all.
 
+**A urlencoded form is bounded the same way: `max_pairs`, 1,024**, and a form past it is a 400 saying so, in the words of the multipart one. `parseQuery` allocates a `Param` for every `&` before it reads a byte, so a megabyte of `&` was 33,554,464 bytes of arena, thirty-two times the body, for a request carrying nothing. The pairs are counted before `parseQuery` runs, and 1,024 is 32 KiB of arena at most. The number is past anything a browser sends, a page of a thousand checkboxes being one pair each; a form that needs more reads `c.body()` and takes it apart itself.
+
+**The search for the blank line that ends a part's head stops at the first one.** It looked for `\r\n\r\n` and then for `\n\n` over the rest of the body, once per part, so 255 parts and a megabyte of padding cost parts times bytes in CPU, 4.7 seconds of search in a Debug build where one pass is a few milliseconds. `max_parts` bounded the arrays and did nothing about that. One walk now ends at whichever blank line comes first, bare LF or CRLF (the audit of `http/` at `39896d2`, [`bench/result/http.md`](../../bench/result/http.md)).
+
 ## `Upload` is three `Str`s, and its filename is not a path
 
 `filename`, `content_type`, `bytes`. All three are `Str`, so they die with the request and `keep` is what takes one out (ADR 003) — including `bytes`, where `Str` is doing lifetime duty rather than claiming the contents are text.

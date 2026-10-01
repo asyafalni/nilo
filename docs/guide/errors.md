@@ -39,6 +39,7 @@ The message is formatted into a fixed slot of **240 bytes**, with no allocation.
 
 - `error.FileNotFound` is a 404.
 - The JSON and number-parsing errors (`error.InvalidCharacter`, `error.SyntaxError`, `error.MissingField`, …) are 400s.
+- `error.BodyTruncated` is a 400: a body read through `c.bodyStream()` that the client cut short. `c.body()` answers the same cut with a 400 of its own, and both close the connection.
 - `error.BodyTooLarge` is a 413.
 - `error.BodyTooSlow` is a 408: the body the client announced never finished arriving.
 - `error.Timeout` and `error.Canceled` are 503s.

@@ -566,7 +566,24 @@ fn idempotentBegin(comptime P: type, c: *Ctx) !BeginOutcome {
     // The claim is what makes two requests racing for one key get one
     // handler run between them: the cache takes the marker under its lock.
     const claimed = replays.putIfAbsent(under, &idempotent_mod.marker(fingerprint)) catch |err| switch (err) {
-        error.TooLarge => unreachable, // a marker is thirteen bytes and `max_bytes` is at least 256
+        // A key the Space cannot hold: a long `by(c)`, or a Space sized
+        // small. The marker is thirteen bytes, so it is the key. Refused
+        // before the handler runs, not answered as `cachedBegin` answers it:
+        // a cached page run twice costs a render, and a payment run twice
+        // costs a payment, which is what the key exists to prevent. The
+        // warning is for the operator, whose fix is a number in the Space
+        // or a shorter `by` (ADR 155).
+        error.TooLarge => {
+            std.log.warn(
+                "route \"{s}\" has an idempotency key of {d} bytes, more than its Space {s} can hold a key to; " ++
+                    "the request was refused before its handler ran",
+                .{ c._path, under.len, @typeName(Replays) },
+            );
+            return fail.badRequest(
+                "the {s} header is too long for this endpoint to keep; send a shorter one",
+                .{idempotent_mod.header_name},
+            );
+        },
     };
     if (claimed) return .{ .fresh = .{ .key = key, .under = under, .fingerprint = fingerprint } };
 
@@ -603,10 +620,15 @@ fn idempotentFinish(comptime P: type, c: *Ctx, begun: Begun, result: anytype) !v
     const Replays = P.nilo_idempotent.replays;
     const replays = c._services.get(*Replays).?; // `idempotentBegin` found it
 
-    const answer = renderAnswer(c, result) catch |err| {
+    // From the claim on, nothing leaves here with the marker still in the
+    // Space: a retry would be told 409 until it expired. Released on every
+    // error; the `put` below replaces it on success.
+    var placed = false;
+    errdefer if (!placed) {
         _ = replays.del(begun.under);
-        return err;
     };
+
+    const answer = try renderAnswer(c, result);
 
     const record = idempotent_mod.encode(c._arena, answer.kind, answer.status, begun.fingerprint, answer.headers, answer.content_type, answer.body) catch |err| switch (err) {
         error.TooLarge => {
@@ -628,6 +650,7 @@ fn idempotentFinish(comptime P: type, c: *Ctx, begun: Begun, result: anytype) !v
             );
         },
     };
+    placed = true;
     return sendRendered(c, answer);
 }
 
@@ -715,12 +738,35 @@ fn cachedFinish(comptime P: type, c: *Ctx, begun: cached_mod.Begun, result: anyt
     const Pages = spec.pages;
     const pages = c._services.get(*Pages).?; // `begin` found it
 
-    const answer = renderAnswer(c, result) catch |err| {
-        if (begun.keep) _ = pages.del(begun.under);
-        return err;
+    // From the claim on, nothing leaves here with the marker still in the
+    // Space: every request after would wait out the cap for an answer
+    // nobody is making. Released on every error; the `putFor` below
+    // replaces it on success.
+    var placed = !begun.keep;
+    errdefer if (!placed) {
+        _ = pages.del(begun.under);
     };
+
+    const answer = try renderAnswer(c, result);
     try c.setStaticHeader(cached_mod.status_name, cached_mod.miss_value);
     if (!begun.keep) return sendRendered(c, answer);
+
+    // A cookie in the handler's own headers belongs to the visitor it was
+    // made for. Kept, it would be handed to every one after, and for a
+    // session or CSRF cookie that is the first visitor's identity (ADR 188).
+    // The answer is sent and not kept; one set through the Ctx is not in
+    // `answer.headers` and so was never going to be.
+    for (answer.headers) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "Set-Cookie")) continue;
+        _ = pages.del(begun.under);
+        placed = true;
+        std.log.warn(
+            "route \"{s}\" answered with a Set-Cookie, and a kept answer is served to everybody; " ++
+                "the answer was sent and not kept. Set the cookie on a route that is not `Cached`.",
+            .{c._path},
+        );
+        return sendRendered(c, answer);
+    }
 
     const record = idempotent_mod.encode(
         c._arena,
@@ -733,6 +779,7 @@ fn cachedFinish(comptime P: type, c: *Ctx, begun: cached_mod.Begun, result: anyt
     ) catch |err| switch (err) {
         error.TooLarge => {
             _ = pages.del(begun.under);
+            placed = true;
             std.log.warn("route \"{s}\" answered with more headers than a kept answer holds; the answer was sent and not kept", .{c._path});
             return sendRendered(c, answer);
         },
@@ -750,6 +797,7 @@ fn cachedFinish(comptime P: type, c: *Ctx, begun: cached_mod.Begun, result: anyt
             );
         },
     };
+    placed = true;
     return sendRendered(c, answer);
 }
 

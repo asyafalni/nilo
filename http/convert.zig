@@ -303,6 +303,9 @@ pub fn tryConvert(comptime P: type, comptime slot: Slot, s: Str, out: *P) ?Reaso
         .float => {
             if (!spelledAsNumber(text, true, true)) return .not_a_number;
             out.* = std.fmt.parseFloat(P, text) catch return .not_a_number;
+            // `1e999` is well spelled and does not fit: `parseFloat` answers
+            // infinity, which is `inf` on the way back out (ADR 084).
+            if (!std.math.isFinite(out.*)) return .not_a_number;
         },
         .bool => out.* = boolFrom(text, slot) orelse return .not_true_or_false,
         .@"enum" => out.* = std.meta.stringToEnum(P, text) orelse return .not_a_choice,
@@ -679,6 +682,19 @@ test "a float in a request is not inf, nan or a hex literal" {
         try testing.expectEqual(@as(?Reason, null), tryConvert(f64, .query, given(good), &f));
     }
     try testing.expectEqual(@as(f64, 150), f);
+}
+
+test "a float whose exponent overflows is refused, not read as infinity" {
+    const previous = bulkhead.setFallbackSlot(null);
+    defer _ = bulkhead.setFallbackSlot(previous);
+
+    var f: f64 = 0;
+    try testing.expectEqual(Reason.not_a_number, tryConvert(f64, .query, given("1e999"), &f).?);
+    try testing.expectEqual(Reason.not_a_number, tryConvert(f64, .query, given("-1e999"), &f).?);
+    // Finite as an f64 and not as the f32 the field asked for.
+    var small: f32 = 0;
+    try testing.expectEqual(Reason.not_a_number, tryConvert(f32, .query, given("1e39"), &small).?);
+    try testing.expectEqual(@as(?Reason, null), tryConvert(f64, .query, given("1e300"), &f));
 }
 
 test "text that does not fit fails with the label in it" {

@@ -283,10 +283,34 @@ fn parsedFor(
     return parse(arena, kind, body);
 }
 
+/// The most pairs one urlencoded form may hold, and the urlencoded half of
+/// what `max_parts` is to multipart (ADR 034).
+///
+/// `parseQuery` sizes its array from a count of `&` before it reads a byte, so
+/// the arena a form costs was the client's to choose: a megabyte of `&` is a
+/// million empty pairs and 33 MB of `Param`, thirty times the body. 1,024 is
+/// 32 KiB of arena at most, and past anything a browser sends: a page of a
+/// thousand checkboxes is one pair each.
+pub const max_pairs = 1024;
+
+/// Said out loud rather than cut short, for `tooManyParts`' reason: the
+/// fields past the wall would look exactly like fields never sent.
+fn tooManyPairs() fail.Error {
+    return fail.badRequest(
+        "this form has more pairs than nilo reads from one, which is {d}",
+        .{max_pairs},
+    );
+}
+
 /// Take a form body apart, without yet knowing what struct it is going into.
 pub fn parse(arena: std.mem.Allocator, kind: Kind, body: []const u8) !Fields {
     return switch (kind) {
-        .urlencoded => .{ .text = try ctx_mod.parseQuery(arena, body) },
+        .urlencoded => blk: {
+            // Counted before `parseQuery` allocates for it, which is the
+            // whole point: it sizes its array from this same count.
+            if (std.mem.count(u8, body, "&") >= max_pairs) return tooManyPairs();
+            break :blk .{ .text = try ctx_mod.parseQuery(arena, body) };
+        },
         .multipart => |boundary| try parseMultipart(arena, boundary, body),
         // Never reached from `readInto`, which refuses this above; here so
         // the switch is total for anyone calling `parse` directly.
@@ -740,17 +764,28 @@ const PartHead = struct { head_end: usize, data_start: usize };
 /// The blank line between a part's headers and its contents. CRLF is what a
 /// browser sends; a bare LF is accepted for the same reason the request head
 /// parser accepts one — a handwritten test fixture should not be a 400.
+///
+/// **One walk, from line end to line end, that stops at whichever blank line
+/// comes first.** It used to look for `\r\n\r\n` and then, to see whether a
+/// bare-LF one came earlier, for `\n\n` over the rest of the whole body, once
+/// per part: 255 parts and a megabyte of padding cost 78 ms of CPU where 1 ms
+/// is enough, a cost in parts times bytes that `max_parts` did nothing about
+/// (the audit of `http/` at `39896d2`). Neither search may now read past the
+/// blank line that ends this head.
 fn endOfPartHead(body: []const u8, from: usize) ?PartHead {
-    if (std.mem.indexOfPos(u8, body, from, "\r\n\r\n")) |at| {
-        // A bare-LF blank line could still come first, so whichever is
-        // nearer wins.
-        if (std.mem.indexOfPos(u8, body, from, "\n\n")) |bare| {
-            if (bare < at) return .{ .head_end = bare, .data_start = bare + 2 };
+    var at = from;
+    while (std.mem.indexOfScalarPos(u8, body, at, '\n')) |lf| : (at = lf + 1) {
+        // `\n\n`: a bare-LF blank line, the head ends at the first of them.
+        if (lf + 1 < body.len and body[lf + 1] == '\n') {
+            return .{ .head_end = lf, .data_start = lf + 2 };
         }
-        return .{ .head_end = at, .data_start = at + 4 };
-    }
-    if (std.mem.indexOfPos(u8, body, from, "\n\n")) |bare| {
-        return .{ .head_end = bare, .data_start = bare + 2 };
+        // `\r\n\r\n`: this LF is the first one's, and the line before it
+        // was CRLF-terminated. The head ends at that `\r`.
+        if (lf > from and body[lf - 1] == '\r' and
+            lf + 2 < body.len and body[lf + 1] == '\r' and body[lf + 2] == '\n')
+        {
+            return .{ .head_end = lf - 1, .data_start = lf + 3 };
+        }
     }
     return null;
 }
@@ -808,6 +843,7 @@ fn beforeParameter(text: []const u8) []const u8 {
 // ---- tests ----
 
 const testing = std.testing;
+const budget = @import("budget.zig");
 
 test "a content type says which kind of form it is, or that it is not one" {
     try testing.expectEqual(Kind.urlencoded, kindOf("application/x-www-form-urlencoded"));
@@ -1369,4 +1405,74 @@ test "an upload is written under a name the handler chose, and the client's own 
         error.NameNotAllowed,
         filled.avatar.saveTo(dir, filled.avatar.filename.view()),
     );
+}
+
+test "a megabyte of ampersands is refused for its pair count, before an arena byte is spent on it" {
+    var counting = budget.Counting{ .child = testing.allocator };
+
+    const body = try testing.allocator.alloc(u8, 1024 * 1024);
+    defer testing.allocator.free(body);
+    @memset(body, '&');
+
+    var in_flight = fail.InFlight{};
+    in_flight.startRequest("POST", "/form");
+    const previous = bulkhead.setFallbackSlot(&in_flight);
+    defer _ = bulkhead.setFallbackSlot(previous);
+
+    // It used to be 33 MB of `Param`s for a request carrying no data at all.
+    try testing.expectError(error.Failed, parse(counting.allocator(), .urlencoded, body));
+    try testing.expectEqual(@as(usize, 0), counting.bytes);
+    try testing.expectEqualStrings(
+        "this form has more pairs than nilo reads from one, which is 1024",
+        in_flight.failure.message(),
+    );
+    try testing.expectEqual(@as(u16, 400), in_flight.failure.status);
+}
+
+test "a urlencoded form of exactly max_pairs pairs is read, and one more is not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    for (0..max_pairs) |i| try body.print(testing.allocator, "{s}f{d}=v", .{ if (i == 0) "" else "&", i });
+
+    const fields = try parse(arena.allocator(), .urlencoded, body.items);
+    try testing.expectEqual(@as(usize, max_pairs), fields.text.len);
+
+    try body.appendSlice(testing.allocator, "&one=more");
+    var in_flight = fail.InFlight{};
+    in_flight.startRequest("POST", "/form");
+    const previous = bulkhead.setFallbackSlot(&in_flight);
+    defer _ = bulkhead.setFallbackSlot(previous);
+    try testing.expectError(error.Failed, parse(arena.allocator(), .urlencoded, body.items));
+}
+
+test "a multipart body's parts are not each searched for a blank line to the end of the body" {
+    // 255 parts, then a megabyte of epilogue that holds no `\n\n` at all.
+    // The search for a part's bare-LF blank line ran to the end of the body
+    // for every part, 78 ms of CPU where one pass is enough (the audit of
+    // `http/` at `39896d2`).
+    var body = try formOfParts(testing.allocator, max_parts - 1);
+    defer body.deinit(testing.allocator);
+    try body.appendNTimes(testing.allocator, 'x', 1024 * 1024);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // What one pass over the body costs, taken twenty times over so the
+    // clock's grain is not what is being compared.
+    var passes: usize = 0;
+    const reference_start = str_mod.monotonicMicros();
+    for (0..20) |_| passes += std.mem.count(u8, body.items, "\n\n");
+    const reference = str_mod.monotonicMicros() - reference_start;
+    try testing.expectEqual(@as(usize, 0), passes);
+
+    const start = str_mod.monotonicMicros();
+    const fields = try parse(arena.allocator(), kindOf(multipart_type), body.items);
+    const spent = str_mod.monotonicMicros() - start;
+
+    try testing.expectEqual(@as(usize, max_parts - 1), fields.text.len);
+    // A parse is a handful of passes. Searching to the end per part is 255.
+    try testing.expect(spent < reference);
 }

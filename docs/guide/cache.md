@@ -234,7 +234,7 @@ GET /?lang=en               → the handler runs: another query is another entry
 GET /  (a minute later)     → the handler runs, and its new answer is the one kept
 ```
 
-The first request runs the handler and **keeps what it returned** (the status, the body, and a `Response(T)`'s own headers) under the path and the query. Every request for the same thing within `ttl_s` gets that answer back, byte for byte, and the handler does not run. A handler *failure* is not kept; the next request runs the handler again.
+The first request runs the handler and **keeps what it returned** (the status, the body, and a `Response(T)`'s own headers) under the path and the query. Every request for the same thing within `ttl_s` gets that answer back, byte for byte, and the handler does not run. A handler *failure* is not kept; the next request runs the handler again. **An answer whose own headers include `Set-Cookie` is sent and not kept**, with a `warn`, because a kept one would give the first visitor's cookie to everybody; a cookie set through `c.setCookie` is not kept either, so only the visitor who made the miss gets it. Set cookies on a route that is not `Cached`.
 
 `FrontPages` is a bytes Space, opened on the Store and given to the App as a service, the same way as [`Replays`](./idempotency.md#wiring-it-up). The record in it is the same record: `Cached` is `Idempotent` with a key made from the request line instead of a header ([ADR 188](../adr/188-a-route-can-say-cache-this-answer-for-a-minute.md)). The TTL belongs to the route, not the Space, so one Space can hold a page kept for a minute next to one kept for an hour.
 

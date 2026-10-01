@@ -217,6 +217,10 @@ pub const Ctx = struct {
     /// connection at an unknown byte. App reads it and does not reuse the
     /// connection.
     _stream_desynced: bool = false,
+    /// Set when `body()` took the bytes off the wire and could not hand them
+    /// over, a gzip stream that did not inflate: a second `body()` is refused
+    /// rather than answered from `_body`, which is empty then.
+    _body_refused: bool = false,
     _sent: bool = false,
     /// Set once `100 Continue` has gone out, so it goes out at most once even
     /// though two body paths can each be the first to read (ADR 073). App
@@ -873,8 +877,13 @@ pub const Ctx = struct {
     ///
     /// Empty text when there is no socket, which is what a handler called
     /// straight from a test gets.
-    pub fn peer(self: *const Ctx) bulkhead.Peer {
-        return self._peer;
+    ///
+    /// A pointer into the Ctx and not a copy: a `Peer` holds its address
+    /// inline, so `c.peer().address()` on a copy was a slice into a
+    /// temporary that was gone by the end of the expression. This one lives
+    /// as long as the request, and so does what `address()` returns.
+    pub fn peer(self: *const Ctx) *const bulkhead.Peer {
+        return &self._peer;
     }
 
     /// Give this request a deadline, `ms` from now.
@@ -1114,6 +1123,14 @@ pub const Ctx = struct {
     /// `body().len` as the length and no `Content-Encoding`, or forward the
     /// wire bytes through `bodyStream()`, which hands them over as they came.
     pub fn body(self: *Ctx) !Str {
+        // A body that failed once has used up the bytes on the wire, so
+        // asking again can only read someone else's, or nothing. The answer
+        // is the same refusal, and never the compressed bytes a failed
+        // inflate used to leave behind (the audit of `http/` at `39896d2`).
+        if (self._stream_desynced or self._body_refused) return fail.badRequest(
+            "the request body could not be read, and reading it again does not change that",
+            .{},
+        );
         if (self._body == null) {
             // Waiting for a client to finish sending is not the handler
             // holding its thread — the fiber parks and the thread serves
@@ -1122,6 +1139,7 @@ pub const Ctx = struct {
             const w = watchdog.waiting(self._watch);
             defer watchdog.waited(self._watch, w);
 
+            var received: []const u8 = undefined;
             if (self._request.chunked) {
                 try self.aboutToReadBody();
                 // A chunked body announces nothing, so the only length there
@@ -1130,7 +1148,7 @@ pub const Ctx = struct {
                 // `max_body` and no more, which is the point: neither framing
                 // is the cheaper way to hold a connection (ADR 022).
                 self._deadlines.armBodyRun(self._limits.max_body);
-                self._body = http1.readChunkedBody(self._in, self._arena, self._limits.max_body) catch |err| {
+                received = http1.readChunkedBody(self._in, self._arena, self._limits.max_body) catch |err| {
                     // The chunk sizes and the stream have come apart, so
                     // where this body ends is now a guess. Reading on and
                     // hoping to land on the next request is exactly how a
@@ -1148,12 +1166,18 @@ pub const Ctx = struct {
                 // Taken as it arrives rather than as it was announced, so a
                 // client that promises a megabyte and trickles holds what it
                 // sent and not what it said. See `readSizedBody`.
-                self._body = http1.readSizedBody(
+                received = http1.readSizedBody(
                     self._in,
                     self._arena,
                     @intCast(self._request.content_length),
                     self._deadlines,
-                ) catch |err| return self.slowBody(err);
+                ) catch |err| {
+                    // A read that stopped part way leaves the stream at a
+                    // byte nothing knows, whether the client went away, was
+                    // too slow or the socket broke.
+                    self._stream_desynced = true;
+                    return self.slowBody(err);
+                };
             }
 
             // A gzipped body is the bytes above, inflated once into the arena
@@ -1163,16 +1187,28 @@ pub const Ctx = struct {
             // above was bounded by `max_body` as compressed bytes; what it
             // inflates to is bounded by the same number, checked against the
             // length the stream announces before a byte is inflated.
+            //
+            // **Held only once it has inflated.** The compressed bytes used
+            // to be assigned first and replaced on success, so a second
+            // `body()` after a failure was handed them as the body (ADR 089).
             if (self._request.content_encoding == .gzip) {
-                self._body = encoded.inflate(self._arena, self._body.?, self._limits.max_body) catch |err| switch (err) {
-                    error.BodyTooLarge, error.OutOfMemory => |e| return e,
-                    error.BadEncodedBody => return fail.badRequest(
-                        "the request body is not a gzip stream this server could decode — " ++
-                            "it arrived under Content-Encoding: gzip",
-                        .{},
-                    ),
+                received = encoded.inflate(self._arena, received, self._limits.max_body) catch |err| {
+                    // Nothing is held as the body, and the wire has been
+                    // read to its end, which is what a non-null `_body`
+                    // tells App's drain: the connection is still good.
+                    self._body = &.{};
+                    self._body_refused = true;
+                    switch (err) {
+                        error.BodyTooLarge, error.OutOfMemory => |e| return e,
+                        error.BadEncodedBody => return fail.badRequest(
+                            "the request body is not a gzip stream this server could decode — " ++
+                                "it arrived under Content-Encoding: gzip",
+                            .{},
+                        ),
+                    }
                 };
             }
+            self._body = received;
         }
         return Str.fromRequest(self._body.?, self._lifetime);
     }
@@ -1184,8 +1220,17 @@ pub const Ctx = struct {
     /// they deserve different answers: 408 says the request never finished
     /// arriving and inviting a retry is correct, where 500 blames the server
     /// for something the client did (ADR 022).
+    ///
+    /// And a third: a client that closed before it had sent what it said it
+    /// would. That is `error.EndOfStream` from the reader, which names no one
+    /// and fell through to a 500 and a warning, where the fault is the
+    /// client's and the answer is a 400 (the audit of `http/` at `39896d2`).
     fn slowBody(self: *Ctx, err: anyerror) anyerror {
         if (err == error.ReadFailed and self._deadlines.timedOut()) return error.BodyTooSlow;
+        if (err == error.EndOfStream) return fail.badRequest(
+            "the request body ended before all of it had been sent",
+            .{},
+        );
         return err;
     }
 
@@ -1251,8 +1296,10 @@ pub const Ctx = struct {
     pub fn json(self: *Ctx, comptime T: type) !T {
         const b = (try self.body()).view();
         try refuseTooDeep(T, b);
-        var value = std.json.parseFromSliceLeaky(T, self._arena, b, .{}) catch |err|
-            return describeBadBody(T, self._arena, b, err);
+        // A repeated key already said which on the Failure (`json.parseLeaky`),
+        // and the dynamic re-read below cannot hold a repeated key at all.
+        var value = json_mod.parseLeaky(T, self._arena, b, .{}) catch |err|
+            return if (err == error.DuplicateField) err else describeBadBody(T, self._arena, b, err);
         str_mod.stamp(&value, self._lifetime);
         // A struct that checks itself is checked once it is whole, and a
         // rule that did not hold is a 422 naming it (ADR 193).
@@ -1320,12 +1367,13 @@ pub const Ctx = struct {
     ) !T {
         const b = (try self.body()).view();
         try refuseTooDeep(T, b);
-        if (std.json.parseFromSliceLeaky(T, self._arena, b, .{})) |parsed| {
+        if (json_mod.parseLeaky(T, self._arena, b, .{})) |parsed| {
             var value = parsed;
             str_mod.stamp(&value, self._lifetime);
             for (outcomes) |*o| o.* = .{};
             return value;
         } else |err| {
+            if (err == error.DuplicateField) return err;
             return collectBadBody(T, self._arena, self._lifetime, b, err, outcomes);
         }
     }
@@ -1629,8 +1677,14 @@ pub const Ctx = struct {
         return self.sendEmpty(status);
     }
 
+    /// **A second answer is `error.AlreadyAnswered`, not an assert.** A
+    /// middleware that answers an error after the handler's own write failed
+    /// is an ordinary thing to write, and the assert panicked a ReleaseSafe
+    /// build and wrote a second response in ReleaseFast. The first answer
+    /// stands, and App closes the connection, because a half-sent response
+    /// cannot be taken back (the audit of `http/` at `39896d2`).
     pub fn send(self: *Ctx, status: u16, content_type: []const u8, response_body: []const u8) !void {
-        std.debug.assert(self.answered() == null); // one request, one response
+        if (self.answered() != null) return error.AlreadyAnswered; // one request, one response
         try self.contentTypeOk(content_type);
         self.markAnswered(status);
 
@@ -1780,6 +1834,9 @@ pub const Ctx = struct {
     /// The head goes out immediately, so every `setHeader` has to be called
     /// before this. `finish()` is required: it writes the marker saying
     /// where the body ends.
+    ///
+    /// A status with no body (204, 304, any 1xx) is refused with a 500 that
+    /// says so, before anything is written.
     pub fn stream(self: *Ctx, status: u16, content_type: []const u8) !stream_mod.Stream {
         return self.streamWith(status, content_type, .{});
     }
@@ -1803,6 +1860,15 @@ pub const Ctx = struct {
     ) !stream_mod.Stream {
         std.debug.assert(self.answered() == null); // one request, one response
         try self.contentTypeOk(content_type);
+        // `writeHead` drops the framing for these, so the chunks that
+        // followed would be read as the next response (ADR 019).
+        if (http1.bodyless(status)) return fail.internal(
+            "the handler streams a {d}, a status that has no body: the head cannot carry " ++
+                "the chunked framing or the length a stream needs, so what it wrote next " ++
+                "would be read as the start of the next response. Answer it with " ++
+                "`c.send({d}, …)` and no body, or stream under a status that has one.",
+            .{ status, status },
+        );
 
         // A length already says where the body stops, so there is nothing for
         // chunked framing to add and a head must not carry both. Otherwise
@@ -2273,6 +2339,16 @@ pub const max_json_nesting = 64;
 /// declaration, pays nothing, and is not scanned.
 fn refuseTooDeep(comptime T: type, body: []const u8) !void {
     if (comptime !nestsWithoutBound(T)) return;
+    return refuseDeepBody(body);
+}
+
+/// The scan itself, for whatever type: **a body that failed to parse is read
+/// again as a `std.json.Value`, which nests without a bound whatever `T` is**
+/// and allocates for every level, so `describeBadBody` and `collectBadBody`
+/// run it before that second parse. A megabyte of `[` sent to a plain struct
+/// route cost the arena 130 times the body, and ADR 226's bound covered only
+/// the first parse (the audit of `http/` at `39896d2`).
+fn refuseDeepBody(body: []const u8) !void {
     if (!nestedDeeperThan(body, max_json_nesting)) return;
     return fail.badRequest(
         "the body nests deeper than {d} levels, which is as deep as this endpoint reads",
@@ -2356,6 +2432,8 @@ fn describeBadBody(
 
     // Read again with no shape to satisfy. If even this fails, the text is
     // not JSON at all, and where it stopped making sense is the useful part.
+    // Not before the depth is known to be one a second parse can afford.
+    try refuseDeepBody(body);
     var scanner = std.json.Scanner.initCompleteInput(arena, body);
     defer scanner.deinit();
     var diagnostics: std.json.Diagnostics = .{};
@@ -2411,6 +2489,8 @@ fn collectBadBody(
         .{comptime fieldList(T)},
     );
 
+    // The same bound `describeBadBody` puts in front of its second parse.
+    try refuseDeepBody(body);
     var scanner = std.json.Scanner.initCompleteInput(arena, body);
     defer scanner.deinit();
     var diagnostics: std.json.Diagnostics = .{};
@@ -2481,7 +2561,16 @@ fn collectBadBody(
                     if (f.defaultValue()) |default| @field(out, f.name) = default;
                 }
             } else {
-                if (std.json.parseFromValueLeaky(f.type, arena, given, .{})) |value| {
+                // `std.json` would read `"1_0"` into a number, so a number is
+                // asked of `fits` first, which reads it the way a query's is
+                // (ADR 084).
+                const read: anyerror!f.type = if (comptime numberOf(f.type) == null)
+                    std.json.parseFromValueLeaky(f.type, arena, given, .{})
+                else if (fits(f.type, given))
+                    std.json.parseFromValueLeaky(f.type, arena, given, .{})
+                else
+                    error.InvalidNumber;
+                if (read) |value| {
                     @field(out, f.name) = value;
                 } else |_| if (!fits(f.type, given)) {
                     // A word that is not one of the choices is the one wrong
@@ -2489,6 +2578,11 @@ fn collectBadBody(
                     // bad `?stage=` gets rather than one arguing with itself.
                     if (given == .string and comptime choicesOf(f.type) != null) {
                         outcomes[i].reason = .not_a_choice;
+                    } else if (numberFault(f.type, arena, given)) |said| {
+                        // The number is the right kind and not a value of
+                        // this field, so it is quoted back like a query's.
+                        outcomes[i].reason = .wrong_kind;
+                        outcomes[i].kind = said;
                     } else {
                         outcomes[i].reason = .wrong_kind;
                         outcomes[i].kind = kindOf(given);
@@ -2595,6 +2689,15 @@ fn describeField(
             if (comptime choicesOf(T)) |choices| return fail.badRequest(
                 "\"{s}\" is not one of the known choices ({s}): \"{s}\"",
                 .{ name, choices, given.string },
+            );
+        }
+        // A number that is not a value of its field names the field and quotes
+        // the number, the way `?age=300` does, rather than calling a number
+        // "a number" (ADR 084).
+        if (comptime numberOf(T)) |N| {
+            if (numberFault(T, arena, given)) |said| return fail.badRequest(
+                "\"{s}\" has to be {s}, not {s}",
+                .{ name, comptime expectedOf(N), said },
             );
         }
         // The same for a type that parses itself and said no: what arrived
@@ -2857,6 +2960,78 @@ fn textOf(value: std.json.Value, buf: []u8) ?[]const u8 {
     };
 }
 
+/// The text a JSON number was written as, for a number inside a message. A
+/// `.float` has lost its spelling, so it is printed the way `{d}` prints it.
+fn numberText(arena: std.mem.Allocator, value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .integer => |n| std.fmt.allocPrint(arena, "{d}", .{n}) catch null,
+        .float => |n| std.fmt.allocPrint(arena, "{d}", .{n}) catch null,
+        .number_string => |s| s,
+        else => null,
+    };
+}
+
+/// The number type inside `T`, through an optional or a `Patch`, or null when
+/// `T` is not one.
+fn numberOf(comptime T: type) ?type {
+    comptime {
+        if (T == Str or convert.parsesItself(T)) return null;
+        if (patch_mod.isPatch(T)) return numberOf(T.nilo_patch);
+        return switch (@typeInfo(T)) {
+            .optional => |o| numberOf(o.child),
+            .int, .float => T,
+            else => null,
+        };
+    }
+}
+
+/// Whether a JSON number, or a string spelling one, is a value of the number
+/// type `N`: the same grammar a query value is read with, and the range of the
+/// type, which is what makes `300` a refusal for a `u8` and `1.5` for an
+/// integer (ADR 084). Asked of what `std.json.Value` kept, so `5.0` is a
+/// `.float` and not a whole number, as it is not in a query either.
+fn numberFits(comptime N: type, value: std.json.Value) bool {
+    const text: []const u8 = switch (value) {
+        .integer => |n| {
+            if (@typeInfo(N) == .float) return true;
+            return std.math.cast(N, n) != null;
+        },
+        // A float token is spelled with a point or an exponent. It is a value
+        // of a float type when it is finite in *that* width, and never of an
+        // integer one.
+        .float => |f| return @typeInfo(N) == .float and std.math.isFinite(@as(N, @floatCast(f))),
+        .number_string, .string => |s| s,
+        else => return false,
+    };
+    if (!convert.spelledAsNumber(text, @typeInfo(N) == .float or @typeInfo(N).int.signedness == .signed, @typeInfo(N) == .float)) return false;
+    if (@typeInfo(N) == .float) return std.math.isFinite(std.fmt.parseFloat(N, text) catch return false);
+    _ = std.fmt.parseInt(N, text, 10) catch return false;
+    return true;
+}
+
+/// What is wrong with a number that is the right kind of value and still not a
+/// value of its field, in the words `?age=300` gets: the field is named and the
+/// number is quoted back. Null when `T` is not a number or the value is not
+/// one, which are the kind's to say (`"age" has to be a whole number, not
+/// text`).
+fn numberFault(comptime T: type, arena: std.mem.Allocator, given: std.json.Value) ?[]const u8 {
+    if (comptime numberOf(T) == null) return null;
+    const N = comptime numberOf(T).?;
+    // A float token that overflowed has no spelling left to quote.
+    if (given == .float and !std.math.isFinite(given.float)) return "one too large for it to hold";
+    const text = numberText(arena, given) orelse return null;
+    // A whole number that is not in the field's range says what the range is:
+    // `300` for a `u8` is the right kind and the wrong size.
+    if (comptime @typeInfo(N) == .int) {
+        if ((given == .integer or given == .number_string) and convert.spelledAsNumber(text, true, false)) {
+            return std.fmt.allocPrint(arena, "{s}, which is outside {d} to {d}", .{
+                text, std.math.minInt(N), std.math.maxInt(N),
+            }) catch text;
+        }
+    }
+    return text;
+}
+
 /// Whether a JSON value could have become a `T`. Loose on purpose: it is
 /// only ever asked about a parse std.json has already refused, so its job is
 /// to find the field that explains the refusal, not to re-decide it.
@@ -2874,7 +3049,7 @@ fn fits(comptime T: type, value: std.json.Value) bool {
     return switch (@typeInfo(T)) {
         .optional => |o| value == .null or fits(o.child, value),
         .bool => value == .bool,
-        .int, .float => value == .integer or value == .float or value == .number_string,
+        .int, .float => numberFits(T, value),
         // A string that is not one of the names is the whole reason an enum
         // field fails, so the tag has to be checked and not just the kind.
         .@"enum" => value == .string and std.meta.stringToEnum(T, value.string) != null,

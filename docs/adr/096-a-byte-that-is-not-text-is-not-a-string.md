@@ -98,3 +98,30 @@ A non-exhaustive enum does not reach `writeString` either. Its named values
 are literals settled while compiling, as an exhaustive enum's are, and a value
 no field names is written as its number: `@tagName` on one is a panic, and
 std.json reads `{"kind":7}` into exactly that.
+
+## A float that is not a number is `null`
+
+The same file's other promise, that the output is JSON, was broken by a float
+too. `std.json` writes infinity as the bare word `inf`, which is not JSON at
+all, and NaN as the string `"nan"`, which is JSON that is not a number. The
+generated writer now writes `null` for both, for a `f16`, `f32` or `f64`
+anywhere in a covered value.
+
+Three answers were on the table, and the same argument as for a stray byte
+picks one. **An error** would be a server deciding that a row with an infinity
+in it may not be served at all, which turns a cosmetic problem into an outage;
+and the only error a writer has is a write failure, which a connection treats
+as a dead socket. **Writing what `std.json` writes** is the position this
+replaces: the output cannot be parsed. **`null`** is what a browser's own
+`JSON.stringify` makes of both, parses everywhere, and is a value the reader
+of a `?f64` already has to handle.
+
+It costs one `isFinite` per float on the covered path. **A value that goes to
+`std.json` whole** (a type `covers` does not recognise, one with its own
+`jsonStringify`, a `std.json.Value`) still gets `std.json`'s spelling of
+infinity, because nothing in `std.json` can be told otherwise; that gap is the
+fallback's own.
+
+*What moved it: the audit of `http/` at `39896d2`, which found
+`{"p":inf}` coming back out of a number a request had sent in
+([ADR 084](./084-a-number-in-a-request-is-not-a-zig-literal.md)).*

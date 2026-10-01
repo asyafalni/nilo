@@ -95,7 +95,7 @@ A resolved value is worked out once per request, so a handler that also takes `C
 | **409** | the same key is still being answered. The first request is in flight and the second arrived before it finished: a client retrying too soon. It waits by asking again |
 | **422** | the same key on a *different* request: another body, path, query or method. All four are fingerprinted with the key, because answering a new body with the old order would ship the wrong order |
 
-A request with no key, or a key over 255 bytes, gets a **400**. In the OpenAPI document the route lists the header as a required parameter, along with the two extra answers.
+A request with no key, or a key over 255 bytes, gets a **400**. So does a key the Space itself cannot hold (a long `.by` string joined to it, or a very small Space), before the handler runs, with a `warn` naming the route: running it unkept would let a retry run it twice, which is what the key is for. In the OpenAPI document the route lists the header as a required parameter, along with the two extra answers.
 
 ## Which answers are kept
 

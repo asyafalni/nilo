@@ -373,6 +373,15 @@ fn showByPath(page: Cached(FakePages, .{ .ttl_s = 60, .by = .path }), renders: *
     return .{ .id = 1, .served = renders.count };
 }
 
+fn showWithCookie(page: Cached(FakePages, .{ .ttl_s = 60 }), renders: *Renders) typed.Response(Page) {
+    _ = page;
+    renders.count += 1;
+    return .{
+        .value = .{ .id = 1, .served = renders.count },
+        .headers = .of(&.{ .{ .name = "Set-Cookie", .value = "sid=first; Path=/" }, .{ .name = "X-Page-Version", .value = "v1" } }),
+    };
+}
+
 const Fixture = struct {
     pages: FakePages,
     renders: Renders = .{},
@@ -436,6 +445,14 @@ const nilo_testing = @import("testing.zig");
 const deadline = @import("deadline.zig");
 const typed = @import("typed.zig");
 const fail = @import("fail.zig");
+const Ctx = @import("ctx.zig").Ctx;
+
+fn showSettingCookie(page: Cached(FakePages, .{ .ttl_s = 60 }), renders: *Renders, c: *Ctx) !Page {
+    _ = page;
+    renders.count += 1;
+    try c.setCookie(.{ .name = "sid", .value = "first" });
+    return .{ .id = 1, .served = renders.count };
+}
 
 test "a different query string is a different entry, and the path with no query is a third" {
     var f = try Fixture.init();
@@ -629,4 +646,36 @@ test "the Space is a service the route needs, so listen() refuses a missing one 
         }
     }
     try testing.expect(named);
+}
+
+test "an answer that sets a cookie is sent and not kept, so no visitor is handed another's" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.wire();
+    try f.app.get("/front", showWithCookie);
+
+    const first = try f.client.get(&f.app, "/front");
+    try testing.expectEqualStrings("sid=first; Path=/", first.header("Set-Cookie").?);
+    try testing.expect(!f.pages.has("/front"));
+
+    // Not a hit: the handler ran again, and made its own cookie.
+    const second = try f.client.get(&f.app, "/front");
+    try testing.expect(second.header(status_name) == null or !std.mem.eql(u8, second.header(status_name).?, hit_value));
+    try testing.expectEqualStrings("sid=first; Path=/", second.header("Set-Cookie").?);
+    try testing.expectEqual(@as(u32, 2), f.renders.count);
+}
+
+test "a cookie set through the Ctx during a cached handler is not kept" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.wire();
+    try f.app.get("/front", showSettingCookie);
+
+    const first = try f.client.get(&f.app, "/front");
+    try testing.expect(first.header("Set-Cookie") != null);
+
+    const hit = try f.client.get(&f.app, "/front");
+    try testing.expectEqualStrings(hit_value, hit.header(status_name).?);
+    try testing.expect(hit.header("Set-Cookie") == null);
+    try testing.expectEqual(@as(u32, 1), f.renders.count);
 }

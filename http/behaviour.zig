@@ -847,6 +847,8 @@ test "the health route says stopping from the moment the server is told to stop"
 const FakeReplays = struct {
     pub const Held = [max_bytes]u8;
     pub const max_bytes: usize = 4096;
+    /// What a real Space holds a key to; a longer one is `TooLarge`.
+    const max_key: usize = 512;
 
     map: std.StringHashMap([]const u8),
     gpa: std.mem.Allocator,
@@ -878,7 +880,7 @@ const FakeReplays = struct {
     }
 
     pub fn put(self: *FakeReplays, key: []const u8, value: []const u8) error{TooLarge}!void {
-        if (value.len > max_bytes) return error.TooLarge;
+        if (value.len > max_bytes or key.len > max_key) return error.TooLarge;
         const k = self.gpa.dupe(u8, key) catch return error.TooLarge;
         const v = self.gpa.dupe(u8, value) catch return error.TooLarge;
         if (self.map.fetchRemove(k)) |old| {
@@ -1163,6 +1165,33 @@ test "a key is the caller's when `by` says whose, and a request with no caller i
 
     const nobody = h.send(&app, "POST /orders HTTP/1.1\r\nHost: t\r\nIdempotency-Key: k\r\nContent-Length: 0\r\n\r\n").response;
     try testing.expect(std.mem.startsWith(u8, nobody, "HTTP/1.1 403"));
+}
+
+test "a key too long for the Space is refused before the handler runs, not a crash" {
+    var replays = FakeReplays.init(testing.allocator);
+    defer replays.deinit();
+    var counter = OrderCounter{};
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&replays);
+    try app.provide(&counter);
+    try app.post("/orders", placeForAccount);
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    // `by` says whose; a caller string longer than the Space holds a key to
+    // is not something it can claim, and a write that cannot be claimed is
+    // a write a retry would make twice, so it is not made at all.
+    const who = "a" ** 600;
+    const raw = "POST /orders HTTP/1.1\r\nHost: t\r\nX-Account: " ++ who ++ "\r\nIdempotency-Key: k\r\nContent-Length: 0\r\n\r\n";
+    for (0..2) |_| {
+        const answer = h.send(&app, raw).response;
+        try testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 400"));
+        try testing.expect(try Harness.saysFailure(answer, "the Idempotency-Key header is too long for this endpoint to keep; send a shorter one"));
+    }
+    try testing.expectEqual(@as(u32, 0), counter.placed);
+    try testing.expectEqual(@as(u32, 0), replays.map.count());
 }
 
 test "an idempotent route promises the header, a 409 and a 422 in the document" {
@@ -5819,6 +5848,66 @@ fn streamAfterHeader(c: *Ctx) anyerror!void {
     try body.finish();
 }
 
+fn streamNoContent(c: *Ctx) anyerror!void {
+    var body = try c.stream(204, "text/plain");
+    try body.finish();
+}
+
+fn streamNotModifiedWithLength(c: *Ctx) anyerror!void {
+    var body = try c.streamWith(304, "text/plain", .{ .length = 5 });
+    try body.finish();
+}
+
+test "a stream under a status that has no body is refused as an error the handler sees" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/nothing", streamNoContent);
+    try app.get("/same", streamNotModifiedWithLength);
+
+    var h = Harness.init();
+    defer h.deinit();
+    // Before the fix the head went out as a 204 carrying `Transfer-Encoding:
+    // chunked`, which `writeHead` drops, and the chunks that followed were
+    // read by the client as the next response.
+    const none = h.send(&app, "GET /nothing HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, none.response, "HTTP/1.1 500"));
+    try testing.expect(std.mem.indexOf(u8, none.response, "Transfer-Encoding") == null);
+    try testing.expect(std.mem.indexOf(u8, none.response, "no body") != null);
+
+    const same = h.send(&app, "GET /same HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, same.response, "HTTP/1.1 500"));
+}
+
+test "peer() hands back the connection's Peer, not a copy whose address dies with the call" {
+    // A `Peer` holds its address inline, so `address()` is a slice into the
+    // Peer it is called on. Returned by value, `c.peer().address()` pointed
+    // into a temporary; a pointer into the Ctx lives as long as the request.
+    const Returned = @typeInfo(@TypeOf(Ctx.peer)).@"fn".return_type.?;
+    try testing.expect(@typeInfo(Returned) == .pointer);
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/peer", struct {
+        fn run(c: *Ctx) anyerror!void {
+            // Read off the call with nothing bound: on a `Peer` returned by
+            // value this slice pointed into a temporary. The stack is
+            // dirtied before it is read so a dangling one cannot pass by
+            // luck in either optimize mode.
+            const addr = c.peer().address();
+            var clobber: [256]u8 = undefined;
+            @memset(&clobber, 0xAA);
+            std.mem.doNotOptimizeAway(&clobber);
+            try c.sendText(200, try c._arena.dupe(u8, addr));
+        }
+    }.run);
+
+    var h = Harness.init();
+    defer h.deinit();
+    h.peer = try bulkhead.Peer.from("198.51.100.7");
+    const answer = h.send(&app, "GET /peer HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.endsWith(u8, answer.response, "198.51.100.7"));
+}
+
 test "a streamed response is chunked, and the connection survives it" {
     var app = App.init(testing.allocator);
     defer app.deinit();
@@ -9405,4 +9494,368 @@ test "a body field that parses itself is described as what it said, and so is a 
     const json = try docsFor(&app);
     try testing.expect(std.mem.indexOf(u8, json, "\"sku\":{\"type\":\"string\",\"format\":\"sku\"}") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200}") != null);
+}
+
+// ---- a body that cannot be read to its end, and an answer given twice (the audit of `http/` at `39896d2`) ----
+
+test "a body the client cut short is the client's fault: a 400, and the connection is closed" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/echo", echoBody);
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    // A hundred bytes promised, ten sent, then the client closes.
+    const sized = h.send(&app, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\n0123456789");
+    try testing.expect(std.mem.startsWith(u8, sized.response, "HTTP/1.1 400"));
+    try testing.expect(try Harness.saysFailure(sized.response, "ended before"));
+    try testing.expect(!sized.keep_alive);
+
+    // The same inside a chunk's data, which used to be a 500 where a size
+    // line cut short was already a 400.
+    const chunked = h.send(
+        &app,
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++ "a\r\n01234",
+    );
+    try testing.expect(std.mem.startsWith(u8, chunked.response, "HTTP/1.1 400"));
+    try testing.expect(!chunked.keep_alive);
+
+    const size_line = h.send(&app, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++ "a");
+    try testing.expect(std.mem.startsWith(u8, size_line.response, "HTTP/1.1 400"));
+    try testing.expect(!size_line.keep_alive);
+}
+
+fn bodyTwice(c: *Ctx) anyerror!void {
+    // A middleware that logged the first error and carried on.
+    _ = c.body() catch {};
+    const again = try c.body();
+    try c.sendText(200, again.view());
+}
+
+test "a gzip body that did not inflate is not handed over as the body by the second read" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/twice", bodyTwice);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(
+        &app,
+        "POST /twice HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\n" ++
+            "Content-Length: 27\r\n\r\n{\"name\":\"wati\",\"a\":1,\"b\":2}",
+    );
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 400"));
+    try testing.expect(std.mem.indexOf(u8, result.response, "\"name\":\"wati\"") == null);
+}
+
+var second_answer: ?anyerror = null;
+
+fn answerTwice(c: *Ctx) anyerror!void {
+    try c.sendText(200, "first");
+    c.sendText(500, "second") catch |err| {
+        second_answer = err;
+        return err;
+    };
+}
+
+test "a second answer is an error, not an assert, and the first answer stands" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/twice", answerTwice);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+    second_answer = null;
+    const result = h.send(&app, "GET /twice HTTP/1.1\r\nHost: t\r\n\r\n");
+
+    try testing.expectEqual(@as(?anyerror, error.AlreadyAnswered), second_answer);
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 200"));
+    try testing.expect(std.mem.endsWith(u8, result.response, "first"));
+    try testing.expect(std.mem.indexOf(u8, result.response, "second") == null);
+    try testing.expect(!result.keep_alive);
+}
+
+fn storeUpload(c: *Ctx) anyerror!void {
+    var incoming = try c.bodyStream();
+    var buf: [64]u8 = undefined;
+    var stored: u64 = 0;
+    while (try incoming.read(&buf)) |part| stored += part.len;
+    try c.sendJson(200, .{ .stored = stored });
+}
+
+fn pourUpload(c: *Ctx) anyerror!void {
+    var incoming = try c.bodyStream();
+    var sink: std.Io.Writer.Discarding = .init(&.{});
+    const total = try incoming.writeTo(&sink.writer);
+    try c.sendJson(200, .{ .stored = total });
+}
+
+test "an upload read through bodyStream that the client cut short is a failure, not a whole file" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/store", storeUpload);
+    try app.post("/pour", pourUpload);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    for ([_][]const u8{ "/store", "/pour" }) |path| {
+        var request_buf: [512]u8 = undefined;
+        const request = try std.fmt.bufPrint(
+            &request_buf,
+            "POST {s} HTTP/1.1\r\nHost: t\r\nContent-Length: 1000\r\n\r\n{s}",
+            .{ path, "x" ** 300 },
+        );
+        const result = h.send(&app, request);
+        try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 400"));
+        try testing.expect(std.mem.indexOf(u8, result.response, "\"stored\"") == null);
+        try testing.expect(!result.keep_alive);
+    }
+}
+
+fn swallowUpload(c: *Ctx) anyerror!void {
+    var incoming = try c.bodyStream();
+    var buf: [64]u8 = undefined;
+    // A handler that read a cut-short upload and answered anyway.
+    while (incoming.read(&buf) catch null) |_| {}
+    try c.sendText(200, "ok");
+}
+
+test "a cut-short upload whose error the handler swallowed still closes the connection" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/swallow", swallowUpload);
+    try app.resolveChains();
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(&app, "POST /swallow HTTP/1.1\r\nHost: t\r\nContent-Length: 1000\r\n\r\n" ++ ("x" ** 300));
+    try testing.expect(!result.keep_alive);
+}
+
+/// What the request arena was asked for across one POST of `[` repeated
+/// `depth` times to `/echo`, whose handler reads a plain struct. The bytes the
+/// arena was asked for, not the bytes the process held: the same instrument
+/// `bench/result/http.md` reports this with.
+fn arenaBytesForOpenBrackets(depth: usize) !usize {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/echo", testEchoJson);
+    try app.resolveChains();
+    app.limits.max_body = 2 * 1024 * 1024;
+
+    const brackets = try testing.allocator.alloc(u8, depth);
+    defer testing.allocator.free(brackets);
+    @memset(brackets, '[');
+    const request = try std.fmt.allocPrint(
+        testing.allocator,
+        "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ depth, brackets },
+    );
+    defer testing.allocator.free(request);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var counting = budget.Counting{ .child = arena.allocator() };
+    var lifetime = str_mod.Lifetime{};
+    var in_flight = fail.InFlight{};
+    var buf: [4096]u8 = undefined;
+    var in = std.Io.Reader.fixed(request);
+    var out = std.Io.Writer.fixed(&buf);
+    const previous = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = previous;
+    _ = app.handleRequest(counting.allocator(), &lifetime, &in_flight, &in, &out, .off, .off, .{});
+    lifetime.end();
+    try testing.expect(std.mem.startsWith(u8, out.buffered(), "HTTP/1.1 400"));
+    return counting.bytes;
+}
+
+test "a body that fails to parse is not read a second time to its full depth, whatever the type" {
+    // A plain struct cannot nest, so `refuseTooDeep` let this through, and
+    // `describeBadBody` then read it again as a `std.json.Value`, which
+    // allocates for every level (ADR 226, the audit of `http/` at `39896d2`).
+    const depth = 4000;
+    const bytes = try arenaBytesForOpenBrackets(depth);
+    // The body itself, and some room for the head and the answer.
+    try testing.expect(bytes < depth + 16 * 1024);
+}
+
+// ---- numbers in a JSON body (ADR 084) ----
+
+const Counts = struct { small: u8, whole: u32, ratio: f64 = 0 };
+
+fn takeCounts(incoming: Counts) !struct { ratio: f64 } {
+    return .{ .ratio = incoming.ratio };
+}
+
+const Wide = struct { n: u128 };
+
+fn takeWide(incoming: Wide) !struct { ok: bool } {
+    _ = incoming;
+    return .{ .ok = true };
+}
+
+/// One JSON POST, answered. The body is copied after a head built here.
+fn postJson(h: *Harness, app: *App, path: []const u8, body: []const u8) []const u8 {
+    var request_buf: [512]u8 = undefined;
+    const request = std.fmt.bufPrint(
+        &request_buf,
+        "POST {s} HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ path, body.len, body },
+    ) catch unreachable;
+    return h.send(app, request).response;
+}
+
+test "a number in a JSON body is spelled the way a query's is" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/counts", takeCounts);
+    var h = Harness.init();
+    defer h.deinit();
+
+    // std.json hands a quoted number to `parseInt` and `parseFloat`, which read
+    // Zig's literal grammar: these were 10, 7 and a NaN (ADR 084).
+    for ([_][]const u8{
+        "{\"small\":1,\"whole\":\"1_0\"}",
+        "{\"small\":1,\"whole\":\"+7\"}",
+        "{\"small\":1,\"whole\":1,\"ratio\":\"nan\"}",
+        "{\"small\":1,\"whole\":1,\"ratio\":\"0x1p3\"}",
+        // A whole number is digits: `1e2` and `5.0` are not, in a query either.
+        "{\"small\":1e2,\"whole\":1}",
+        "{\"small\":5.0,\"whole\":1}",
+    }) |body| {
+        const response = postJson(&h, &app, "/counts", body);
+        testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400 Bad Request\r\n")) catch |err| {
+            std.debug.print("body {s}\n  got: {s}\n", .{ body, response });
+            return err;
+        };
+    }
+
+    // What a query takes, a body takes: digits, a quoted number, an exponent.
+    for ([_][]const u8{
+        "{\"small\":1,\"whole\":\"10\"}",
+        "{\"small\":1,\"whole\":1,\"ratio\":1e3}",
+        "{\"small\":1,\"whole\":1,\"ratio\":\"2.5\"}",
+        "{\"small\":1,\"whole\":1,\"ratio\":-1.5E-3}",
+    }) |body| {
+        const response = postJson(&h, &app, "/counts", body);
+        testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n")) catch |err| {
+            std.debug.print("body {s}\n  got: {s}\n", .{ body, response });
+            return err;
+        };
+    }
+}
+
+test "a float no float holds is refused in a body, not read as infinity" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/counts", takeCounts);
+    var h = Harness.init();
+    defer h.deinit();
+
+    const response = postJson(&h, &app, "/counts", "{\"small\":1,\"whole\":1,\"ratio\":1e999}");
+    try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expect(try Harness.saysFailure(response, "\"ratio\" has to be a number"));
+}
+
+test "a u128 field posted as 2e38 is a 400, not a panic inside std" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/wide", takeWide);
+    var h = Harness.init();
+    defer h.deinit();
+
+    const response = postJson(&h, &app, "/wide", "{\"n\":2e38}");
+    try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400 Bad Request\r\n"));
+    // The digits are what a u128 reads.
+    const exact = postJson(&h, &app, "/wide", "{\"n\":200000000000000000000000000000000000000}");
+    try testing.expect(std.mem.startsWith(u8, exact, "HTTP/1.1 200 OK\r\n"));
+}
+
+test "a body number that does not fit its field is a 400 naming the field" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/counts", takeCounts);
+    var h = Harness.init();
+    defer h.deinit();
+
+    const cases = [_]struct { body: []const u8, says: []const u8 }{
+        .{ .body = "{\"small\":300,\"whole\":1}", .says = "\"small\" has to be a whole number, not 300" },
+        .{ .body = "{\"small\":1,\"whole\":1.5}", .says = "\"whole\" has to be a whole number, not 1.5" },
+        .{ .body = "{\"small\":1,\"whole\":-1}", .says = "\"whole\" has to be a whole number, not -1" },
+    };
+    for (cases) |case| {
+        const response = postJson(&h, &app, "/counts", case.body);
+        try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400 Bad Request\r\n"));
+        testing.expect(try Harness.saysFailure(response, case.says)) catch |err| {
+            std.debug.print("body {s}\n  wanted: {s}\n  got:    {s}\n", .{ case.body, case.says, response });
+            return err;
+        };
+    }
+}
+
+const Tally = struct { small: u8, whole: u32 };
+
+fn placeTally(b: bound_mod.Bound(Tally)) ![]const u8 {
+    _ = b.value() orelse return b.fail();
+    return "ok";
+}
+
+test "under Bound a body number that does not fit is collected like any other field" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/tally", placeTally);
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    var request_buf: [512]u8 = undefined;
+    const body = "{\"small\":300,\"whole\":-1}";
+    const request = std.fmt.bufPrint(
+        &request_buf,
+        "POST /tally HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    ) catch unreachable;
+    const answer = h.send(&app, request);
+    try testing.expect(std.mem.startsWith(u8, answer.response, "HTTP/1.1 422"));
+    try testing.expect(try Harness.saysFailure(answer.response, "2 fields did not fit"));
+    try testing.expect(try Harness.saysFailure(answer.response, "\"small\" has to be a whole number, not 300"));
+    try testing.expect(try Harness.saysFailure(answer.response, "\"whole\" has to be a whole number, not -1"));
+}
+
+const Sketch = struct {
+    shape: Shape,
+
+    const Shape = union(enum) {
+        pub const nilo_json = .{ .tag = "kind" };
+        pub const jsonParse = @import("jsonmark.zig").parseFor(@This());
+
+        circle: struct { r: u8 },
+        square: struct { side: u8 },
+    };
+};
+
+fn takeSketch(incoming: Sketch) !struct { ok: bool } {
+    _ = incoming;
+    return .{ .ok = true };
+}
+
+test "a second discriminator in a tagged body is a 400 naming the key" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/sketch", takeSketch);
+    var h = Harness.init();
+    defer h.deinit();
+
+    const fine = postJson(&h, &app, "/sketch", "{\"shape\":{\"kind\":\"circle\",\"r\":3}}");
+    try testing.expect(std.mem.startsWith(u8, fine, "HTTP/1.1 200 OK\r\n"));
+
+    const twice = postJson(&h, &app, "/sketch", "{\"shape\":{\"kind\":\"circle\",\"kind\":\"square\",\"r\":3,\"side\":1}}");
+    try testing.expect(std.mem.startsWith(u8, twice, "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expect(try Harness.saysFailure(twice, "\"kind\""));
 }

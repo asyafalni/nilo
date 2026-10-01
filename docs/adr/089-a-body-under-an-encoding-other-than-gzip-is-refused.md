@@ -49,6 +49,8 @@ In `finish`, at the blank line, rather than in the header arm that reads the val
 
 **Growing into an `Allocating` writer** rather than trusting the trailer. Works for a stream with no trailer, and gzip always has one; reading the four bytes costs nothing and buys an exact allocation and a ceiling check that runs before the work rather than partway through it.
 
+**A body that did not inflate is not the body.** `_body` is assigned only once the inflate has succeeded; it used to hold the compressed bytes first, so a second `c.body()` after a failed one (a middleware that logged the error and carried on) was handed them. A failure now leaves it empty and refuses every later call with a 400, and the connection stays good, because the wire was read to its end ([ADR 083](./083-a-body-is-taken-as-it-arrives.md)).
+
 ## What it costs
 
 | Axis | Cost |

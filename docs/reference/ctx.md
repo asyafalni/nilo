@@ -42,7 +42,7 @@ This page covers reading a request, answering it, its cookies, session and uploa
 | `nilo.verifyPassword(gpa, stored, text)` | the same check with no request in hand: a CLI, a job, a test. Same Gate; see [`nilo_pw`](./pw.md) |
 | `c.bodyStream()` | `!Body`: the body in pieces |
 | `c.bodyStreamWith(.{ .max_bytes = … })` | the same, with a ceiling. Default 64 MB |
-| `c.peer()` | the address the connection came from: the proxy's, if there is one |
+| `c.peer()` | a `*const Peer` for the address the connection came from: the proxy's, if there is one. `c.peer().address()` is valid for the whole request |
 | `c.clientIp()` | `Str`: the client, looking through `trusted_proxies` or `trusted_hops`. Empty on a unix socket with neither set |
 | `c.stopping()` | `bool`: the server has been told to stop and is draining. What the health page answers `stopping` on |
 | `c.overdue()` | whether the deadline `nilo.deadline(ms)` gave this route has passed. Always false without one |
@@ -65,12 +65,12 @@ This page covers reading a request, answering it, its cookies, session and uploa
 | `c.setCookie(cookie)` | a `Set-Cookie`. Calling it twice sets two, not one |
 | `c.clearCookie(.{ .name = …, .path = …, .domain = … })` | delete one. Path and domain have to match |
 | `c.redirect(status, location)` | a `Location` and no body |
-| `c.send(status, content_type, bytes)` | gzipped on the way out when `app.compress` is on and the body, the type and the client all qualify ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)); so are the two below |
+| `c.send(status, content_type, bytes)` | **a second answer is `error.AlreadyAnswered`**, and the first stands; gzipped on the way out when `app.compress` is on and the body, the type and the client all qualify ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)); so are the two below |
 | `c.sendText(status, text)` | `text/plain` |
 | `c.sendJson(status, value)` | `application/json` |
 | `c.sendEmpty(status)` | no body and no `Content-Type`: a 204, usually |
 | `c.sendFile(.{ .file = f, .content_type = … })` | an open file. **Closed here**, on every way out |
-| `c.stream(status, content_type)` | `!Stream` |
+| `c.stream(status, content_type)` | `!Stream`. A status with no body (204, 304, 1xx) is refused with a 500 saying so |
 | `c.streamWith(status, content_type, .{ .buffer = … })` | the same, buffer of your own. Default 4 KB |
 | `c.streamWith(…, .{ .length = n })` | a stream whose length is already known: `Content-Length` and no chunk framing ([ADR 101](../adr/101-a-stream-that-knows-its-length-says-so.md)) |
 | `c.url(pattern, args)` | `!Str`: a URL for a route, every value percent-encoded and every mistake a compile error ([ADR 100](../adr/100-a-route-pattern-is-the-name-of-its-url.md)) |

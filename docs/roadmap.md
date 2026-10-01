@@ -39,10 +39,6 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** the write limit clamped with the read ones, or the claim narrowed in both places.
 
-**A form body can cost thirty times its size, and a multipart one CPU in proportion to parts times bytes.** `parseQuery` allocates a `Param` per `&` before it reads anything, so a megabyte of `&` to a `Form(T)` route is 33 MB of arena; multipart has `max_parts` against exactly this and urlencoded has nothing. `endOfPartHead` searches for `\n\n` to the end of the body for every part, so 255 parts and a megabyte of padding cost 78 ms of CPU where 1 ms is enough. Reproduced.
-
-**Needs:** a pair limit on urlencoded, and the bare-LF search bounded by the CRLF match.
-
 **An `Idempotent` replay leaves out what the handler set through `*Ctx`.** Only a `Response(T)`'s or a `Bytes`' own headers are kept, so a sign-up that sets its session and is retried gets the kept 201 with no `Set-Cookie`, where [the idempotency page](./design/idempotency.md) promises the answer byte for byte. The in-flight marker is kept under the Space's own TTL, so with a Space that outlives the process, a crash mid-handler answers 409 for the whole TTL. The marker also outlives a request that never reached the handler: `idempotentBegin` claims before the other arguments are read, and the `errdefer` in `typed.zig`'s `wrap` releases only a `Cached` claim, so a body that fails to parse, a `Bound` 422 or an `Authorization` 401 leaves the key answering 409 to the same retry and 422 to a corrected one for the whole TTL, where [ADR 155](./adr/155-a-request-answered-once-is-answered-the-same-way-again.md) says a failure runs again. Without `.by`, a caller who is refused later can still fill the Space with markers.
 
 **Needs:** every header of the answer kept, a lifetime of its own for the marker, and the marker released by the same `errdefer` as `Cached`'s, with a test that sends a bad body and then the same key with a good one.
@@ -55,10 +51,6 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** the table keyed by the decoded path, with `/` and `..` refused after decoding, and a symlink either served by a stated rule or named at load and refused at open.
 
-**A request can bind infinity, and a body still reaches the Zig literal grammar.** `spelledAsNumber("1e999")` passes and `parseFloat` returns `inf`, which [ADR 084](./adr/084-a-number-in-a-request-is-not-a-zig-literal.md) refuses by name, and echoed back it writes `{"p":inf}`, which is not JSON. In a body, std.json converts a string token with `parseInt` and `parseFloat`, so `"1_0"` is 10, `"+7"` is 7 and `"nan"` is NaN, where ADR 084 says a body already refuses them. A `u128` field posted as `2e38` panics inside std in ReleaseSafe.
-
-**Needs:** an overflowing exponent refused in `convert`, a non-finite float refused on the way out, and a body's numbers read by the same grammar, which also brings the `u128` case onto nilo's side of std.
-
 **`?T` with no default means optional in a query and required in a body.** `Query(T)` reads an absent field as null and std.json refuses it, while `openapi.zig` says both follow the same rule. The guides always write `= null`, which is why nobody has met it.
 
 **Needs:** one rule, and the description following it.
@@ -70,10 +62,6 @@ The entries from the WebSocket one down to the end of this module, other than th
 **A failure body is not JSON when its message carries a byte that is not UTF-8.** `writeFailureBody` escapes `"`, `\` and control bytes and writes every byte from `0x80` as it came, and a path or query value is decoded without a UTF-8 check, so `GET /items?page=%ff` against an integer `page` answers `application/json` that `res.json()` throws on, which is what [ADR 024](./adr/024-every-failure-answers-as-json.md) exists to prevent. A message truncated at `max_message` can also end inside a character. The success path already handles this ([ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md)); the failure writer is a copy that does not.
 
 **Needs:** one JSON string writer for both paths, replacing a byte that is not UTF-8 and cutting at a character boundary, with a test for `%ff` in a query and a path param.
-
-**A body that fails to parse is read a second time with no bound on its depth.** `refuseTooDeep` scans only for a type that can nest without a bound, which an ordinary struct cannot, and on a failed parse `describeBadBody` reads the whole body again as a `std.json.Value`, which allocates for every level, so a megabyte of `[` sent to a plain struct route is parsed to its full depth in the arena. [ADR 226](./adr/226-a-body-that-can-nest-for-ever-is-read-sixty-four-deep.md) bounds the first parse only. Not measured.
-
-**Needs:** the depth scan run before the second parse whatever the type, and the arena cost of the worst body measured into `bench/result/`.
 
 **A failure a handler caught colours a later error that has nothing to do with it.** `Failure` is cleared only when a request starts, and `resolveStatus` answers `failure.status` whenever it is set, so a handler that catches a `fail.notFound` and then returns `error.OutOfMemory` answers 404 with the old message, and the log says the same.
 
@@ -99,17 +87,9 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** every check run before anything is registered, and the exemption and attachment appended only after the route is in, with a test per path.
 
-**A `Cached` answer keeps the handler's own `Set-Cookie` and replays it to everybody.** `renderAnswer` keeps a `Response(T)`'s headers whole (`keptHeaders` copies them as they are), so a cached page that sets an anonymous session or a CSRF cookie hands the first visitor's cookie to every visitor for the TTL. [ADR 188](./adr/188-a-route-can-say-cache-this-answer-for-a-minute.md) names exactly this risk and refuses only the arguments that read the caller. A failure in `cachedFinish` after the claim (`setStaticHeader`, or an `encode` error other than `TooLarge`) also leaves the marker, so every request waits out the cap until one overwrites it.
-
-**Needs:** an answer carrying `Set-Cookie` sent and not kept, with a `warn`, and the marker released on every error after the claim.
-
 **Compression ignores what a handler said about the representation.** `Ctx.squeezed` gzips any eligible body, so a handler's 206 with `Content-Range` goes out gzipped against plain offsets, a strong `ETag` names both the gzip and the plain body, which `static.zig` gives two tags to avoid, and `Cache-Control: no-transform` is ignored. There is also no upper size: a 20 MB JSON export is compressed in one go on the executor thread, with nothing else on that thread running meanwhile.
 
 **Needs:** no compression for 206, 416, a `Content-Range` or `no-transform`, a strong `ETag` weakened when the body is compressed, and a `max_bytes` with the cost of its default measured into `bench/result/`.
-
-**A request body has three failure paths that answer wrongly.** A body the client cut short (`Content-Length: 100`, ten bytes, then FIN) is `EndOfStream`, which `statusFor` has no arm for, so it is a 500 and a warning where it is the client's fault; the same truncation inside a chunk's data is a 500 while a truncated size line is a 400. A gzip body that fails to inflate leaves `_body` holding the compressed bytes, so a second `c.body()` (a middleware that logged and ignored the first error) hands them over as the body. And `Ctx.send` only `assert`s it has not answered yet: a middleware that answers an error after the handler's own write failed panics a ReleaseSafe build and writes a second response in ReleaseFast.
-
-**Needs:** `EndOfStream` from a body read mapped to a 400 that closes the connection, the inflated body assigned only on success, and a second answer an error rather than an assert, with a test for each.
 
 **Several comments and pages describe code that is no longer there.** `bulkhead.zig`'s header lists a six-parameter `serve` (it has eight) under `src/engine/` (it is `http/engine/`), and leaves out `Peer`'s fields, `spawnLocal`, `Wake.rawIdle` and `Binding`, which a second Engine has to provide; `proxies.zig` says a `Forwarded` header is walked, and nothing reads it; the `accept` comment in `zio.zig` says a failure raises the stop flag; `middleware.zig`'s header and [ADR 008](./adr/008-middleware-is-an-onion-of-ctx-functions.md) use `std.time.Timer`, which Zig 0.16 removed; a link in `ctx.zig` says ADR 155 and points at 156.
 
@@ -119,13 +99,17 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** the Space added to `requirements`, with a `listen()` refusal test.
 
-**An upload read through `bodyStream` that the client cut short looks complete.** `Body.streamFn` passes the connection's `EndOfStream` up, and `read`, `writeTo` and `discardRest` all read `EndOfStream` as the clean end, so a `Content-Length: 1000000` upload that stops at 300,000 bytes is stored as a whole file unless the handler compares `seen()` with `size()`. `c.body()` refuses the same truncation.
+**A `Cached` or `Idempotent` answer is kept before its headers are checked.** `cachedFinish` and `idempotentFinish` put the record in the Space, then `sendRendered` calls `c.setHeader` on each kept header, so a header the handler built with a CR or LF, which `setHeader` refuses as a 500, is kept anyway and every hit replays that 500 until the TTL runs out, where a miss would have run the handler again. Found by reading `typed.zig`; not reproduced.
 
-**Needs:** an `EndOfStream` from the connection while bytes are still owed turned into a failure that marks the connection unusable, with a test.
+**Needs:** the kept headers checked before the put, or the record released when sending it fails, with a test that returns a bad header twice.
 
-**Five smaller edges on the way in and out.** A JSON number that does not fit its field (`{"age":300}` for a `u8`, `1.5`, `-1` for a `u32`) is a bare "Bad Request" naming no field, and a hard 400 under `Bound`, where the same mistake in a query names the field; `ctx.fits` accepts any number for an integer. `c.stream` and `streamWith` under 204, 304 or 1xx write `Transfer-Encoding: chunked` or a `Content-Length`, which `writeHead` drops for those statuses because the next response would start inside them. `idempotentBegin` handles `TooLarge` from the claim with `unreachable`, and a long `by(c)` string or a small Space reaches it. An internally tagged union takes the first of two discriminator keys where std.json refuses a duplicate everywhere else, so a front end that keeps the last one sees another variant. `c.peer().address()` returns a slice into a temporary `Peer`.
+**A float that is not finite still goes out as `inf` where a type takes `std.json`'s path.** `json.write` writes a non-finite `f32` or `f64` as `null` ([ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md)), but a type `covers` does not take is written by `std.json.Stringify`, which writes `inf` and `nan`, not JSON. On the way in, a number inside a map or a `std.json.Value` field is still read by `std.json`'s grammar, so `"1_0"` there is 10, where [ADR 084](./adr/084-a-number-in-a-request-is-not-a-zig-literal.md) refuses it everywhere else in a body.
 
-**Needs:** `fits` checking range and kind for numbers, a bodyless status refused by `streamWith`, `TooLarge` answered as `cachedBegin` answers it, a second discriminator refused, and `peer()` returning a pointer; a test each.
+**Needs:** the fallback writer given the same float rule, and a caller with a map or `Value` field for the read half.
+
+**`streamWith`, `upgradeWith`, `eventsFrom` and sendfile still only `assert` that nothing answered yet.** `Ctx.send` now returns `error.AlreadyAnswered` for a second answer; these four keep the `std.debug.assert`, so a middleware that streams after the handler answered panics a ReleaseSafe build and writes a second response in ReleaseFast.
+
+**Needs:** each returning the same error, with a test per entry point.
 
 ### `nilo_sql`
 

@@ -1483,6 +1483,36 @@ stat -c "%n %s" zig-out/bin/example-hello zig-out/bin/example-rest
 wrk -t2 -c64 -d10s --latency -s bench/xff.lua http://127.0.0.1:8787/users/42
 ```
 
+## What reading a body's numbers by nilo's grammar costs
+
+ADR 084 moved a JSON body's integers and floats from `std.json`'s `parseInt` and
+`parseFloat` onto `convert.spelledAsNumber` followed by the same two calls
+(`json.parseLeaky`), so `"1_0"`, `"nan"`, `1e999` and a `u128` posted as `2e38`
+are refused. A body read must not gain an allocation or a pass, so this is the
+same body parsed both ways.
+
+Run: `zig build profile -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu` with a
+temporary block (not kept) that parses one body 200,000 times with
+`std.json.parseFromSliceLeaky` and then with `json.parseLeaky`, in the same
+binary, alternating, best of nine. Ryzen 7 9700X, not pinned, a desktop in use,
+Zig 0.16.0, on the tree at `462d84d` plus this change. Two runs:
+
+| body | `std.json` | `parseLeaky` |
+|---|---:|---:|
+| an order: 220 bytes, three lines, strings, ints, floats | 589, 578 ns | 567, 562 ns |
+| 30 integers and 16 floats: 177 bytes | 1003, 976 ns | 971, 948 ns |
+| three strings and no number (control): 118 bytes | 143, 137 ns | 143, 139 ns |
+
+**Unchanged to slightly faster**, 2 to 4 percent on the two bodies with numbers
+and none on the control, which is inside the spread of an unpinned desktop. No
+allocation was added (`the request path stays inside its allocation budget`
+passes unchanged). It decided nothing but the question of whether to gate the
+walk behind a "this type has a number" check: it is not gated, so every struct
+body takes it.
+
+**Can it be pushed further.** Not worth it: the walk is `std.json`'s own with
+the two leaves swapped, and a faster number path is `std.json`'s scanner.
+
 ## Can these be pushed further
 
 Ranked, so the next person starts here rather than at the top of the file.
@@ -3035,6 +3065,33 @@ Asked when `core.Lifetime`'s counter stopped being Debug-only, so that `sql.prob
 **Allocations per request** do not move: the counter is a field that already existed in Debug. Throughput was not run: one add per request against a round trip is below what wrk on a shared 2-vCPU box can see.
 
 Whether it can be pushed further: the eight bytes could go to four by dropping the span in a release build, at the cost of a new connection in a reused stack counting through the numbers an old one left in `sql.problem`'s slot. Not worth four bytes that do not show up in RSS.
+
+## What a body that fails, or is only padding, costs the arena
+
+Three requests that cost the request arena far more than their size, found by the audit of `http/` at `39896d2` and measured here before and after the fix (ADR 226, ADR 030). **The instrument is a test that counts the bytes the arena was asked for** (`budget.Counting` wrapped around the arena, in `http/behaviour.zig` and `http/form.zig`), which is the same number on every machine and says nothing about time.
+
+**Run on** an AMD Ryzen 7 9700X (16 threads), Linux 7.2.5, Zig 0.16.0, at `462d84d` plus the change, `zig build test -Dtarget=x86_64-linux-gnu` (Debug). The before is the same tree with the fix switched off for the run, not a quoted figure. Arena bytes are deterministic, so one run each; the one timing, the multipart search, is the best of five.
+
+**A body that fails to parse, sent to a plain struct route.** `POST /echo` where the handler reads `struct { message: []const u8 }`, body `[` repeated `depth` times. The first parse fails at once (an array where an object was wanted); `describeBadBody` then read the whole body again as a `std.json.Value`.
+
+| depth (= body bytes) | arena before | arena after | before / body |
+|---|---|---|---|
+| 1,000 | 83,200 | 1,183 | 83 |
+| 4,000 | 505,649 | 4,183 | 126 |
+| 16,000 | 2,476,033 | 20,280 | 155 |
+| 64,000 | 8,267,656 | 68,280 | 129 |
+| 250,000 | 50,080,250 | 254,281 | 200 |
+| 1,000,000 | **174,406,291** | **1,004,282** | 174 |
+
+After the fix the arena holds the body and about 4 KB of head and answer, whatever the depth. The 1,000,000 row is the default `max_body` and is what one request can send, so one connection could make the arena ask for 174 MB for a 1 MB request, and it did not crash in this run only because the test thread's stack was deep enough to recurse a million levels; a fiber's is not (ADR 226). The scan costs one pass over a body that has already failed.
+
+**A urlencoded form of nothing but `&`.** `parse(.urlencoded)` on 1,048,576 bytes of `&`: **33,554,464 bytes of arena before**, thirty-two times the body, one `Param` per `&` allocated before a byte is read. After: **0 bytes**, the form is refused for its pair count (`max_pairs`, 1,024, a 400) before `parseQuery` runs. A form of exactly 1,024 pairs reads, one more is refused.
+
+**A multipart form of 255 parts and a megabyte of padding.** The search for each part's blank line ran `\n\n` to the end of the body, once per part. 254 calls of the old search over a 1 MiB body took **4,755,579 µs** in this Debug build (the audit's ReleaseFast figure was 78 ms; the ratio is what carries, and Debug is the slower of the two builds that run in `test-all`); the whole parse after the fix, the same body, took **1,873 µs**, and the test holds it under twenty passes of `std.mem.count` over the same body, where the old search is two hundred and fifty. The search now stops at the first blank line, CRLF or bare LF, so it is parts plus bytes and not parts times bytes.
+
+**What decided what.** The depth scan goes in front of the second parse for every type, not only for one that can nest (ADR 226). The pair limit is 1,024, 32 KiB of arena at most, past anything a browser sends and the same kind of bound `max_parts` is (ADR 030). Neither adds an allocation to a request that did not ask for it: the allocation-budget test passes unchanged.
+
+**Can it be pushed further.** The 174 times is gone and the remaining cost is the body, which `max_body` already bounds. The multipart timing is Debug only; a ReleaseSafe figure beside it would be worth one line the next time this is run. The urlencoded number is bounded, not minimised: 1,024 pairs is 32 KiB for a form that has them, and a form of two fields pays for two.
 
 ## What is still missing
 

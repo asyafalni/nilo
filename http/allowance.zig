@@ -142,11 +142,7 @@ pub fn with(comptime options: Options) mw.Middleware {
         noinline fn sayIfEverybodyLooksTheSame(c: *Ctx) void {
             if (said.load(.monotonic)) return;
             if (c.header("X-Forwarded-For") == null) return;
-            // Bound to a local: `address()` returns a slice into the Peer, so
-            // reading it off a temporary would hand out bytes that are gone
-            // by the end of the expression.
-            const peer = c.peer();
-            if (!std.mem.eql(u8, c.clientIp().view(), peer.address())) return;
+            if (!std.mem.eql(u8, c.clientIp().view(), c.peer().address())) return;
             if (said.swap(true, .monotonic)) return;
             std.log.warn(
                 "an allowance refused {s}, which is the address the connection came from, " ++
@@ -154,7 +150,7 @@ pub fn with(comptime options: Options) mw.Middleware {
                     "of this server then every request looks like it came from the proxy and " ++
                     "the whole table is one slot: name the proxies in `.trusted_proxies` on " ++
                     "listen(), or set `.trusted_hops` to the number of them.",
-                .{peer.address()},
+                .{c.peer().address()},
             );
         }
     }.run;
