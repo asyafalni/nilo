@@ -2115,6 +2115,7 @@ test "an empty key is refused by every object call, because it addresses the buc
             defer reading.close();
             try testing.expectError(error.Rejected, files.stream(&scope, "", &reading));
             try testing.expectError(error.Rejected, files.presign(&scope, "", 60));
+            try testing.expectError(error.Rejected, files.presignPut(&scope, "", 60));
             try testing.expectError(error.Rejected, files.presignPost(&scope, "", .{ .seconds = 60 }));
         }
     }.run);
@@ -2487,4 +2488,45 @@ test "a source smaller than one part is a plain PUT, one round trip" {
             try testing.expectEqualStrings("three dozen bytes, give or take", canned.played[0].bodyPrefix());
         }
     }.run);
+}
+
+test "a presigned PUT signs the method: same key, same moment, different signature" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+            var files = try Files.open(&store);
+            defer files.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            // Presigning opens no socket, so the canned server only has to
+            // exist for `started`; what is under test is the two canonical
+            // requests differing in exactly the method line.
+            const get_link = try files.presign(&scope, "one.bin", 60);
+            const put_link = try files.presignPut(&scope, "one.bin", 60);
+
+            const get_sig = afterLast(get_link.url.view(), "X-Amz-Signature=");
+            const put_sig = afterLast(put_link.url.view(), "X-Amz-Signature=");
+            try testing.expect(get_sig.len == 64 and put_sig.len == 64);
+            try testing.expect(!std.mem.eql(u8, get_sig, put_sig));
+
+            // Everything but the signature is one spelling: same key, same
+            // credential, same query shape.
+            try testing.expectEqualStrings(
+                get_link.url.view()[0 .. get_link.url.view().len - get_sig.len],
+                put_link.url.view()[0 .. put_link.url.view().len - put_sig.len],
+            );
+        }
+    }.run);
+}
+
+fn afterLast(text: []const u8, marker: []const u8) []const u8 {
+    const at = std.mem.lastIndexOf(u8, text, marker) orelse return "";
+    return text[at + marker.len ..];
 }
