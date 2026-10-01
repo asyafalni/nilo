@@ -41,6 +41,7 @@ const fetch = @import("nilo_fetch");
 
 const code = @import("code.zig");
 const listing_mod = @import("listing.zig");
+const multipart_mod = @import("multipart.zig");
 const sign = @import("sign.zig");
 const store_mod = @import("store.zig");
 
@@ -168,6 +169,9 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// rather than a key: sized by the query, which is sized by
         /// `key_max` too, since a prefix is the start of a key.
         const list_url_max = "https://".len + host_max + prefix_max + "/?".len + listing_mod.queryMax(settings.key_max);
+        /// And for a multipart call, whose URL is a key *and* a query: the
+        /// part number and an upload id encoded at three bytes a character.
+        const part_url_max = url_max + "?".len + multipart_mod.query_max;
 
         pub fn open(s: *Store) !Self {
             const host_len = hostLen(s.authority);
@@ -420,7 +424,24 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         pub fn put(self: *Self, c: anytype, key: []const u8, value: anytype) Error!void {
             comptime core.checkScope(@TypeOf(c), "bucket.put");
             comptime checkPayload(@TypeOf(value), "bucket.put");
+            // Null means the Store's own deadline, today's behaviour: a put
+            // is a short call unless `putMultipart`'s small-source branch
+            // says otherwise.
+            return self.putBounded(c, key, value, null, null);
+        }
 
+        /// `put`'s body, with the deadline the caller's to choose: the
+        /// small-source branch of `putMultipart` sends up to a whole part
+        /// this way, which is a transfer rather than a short call, so it
+        /// passes the source's terms where `put` passes the Store's.
+        fn putBounded(
+            self: *Self,
+            c: anytype,
+            key: []const u8,
+            value: anytype,
+            timeout_ms: ?u32,
+            stall_ms: ?u32,
+        ) Error!void {
             const bytes = viewOf(value.bytes);
 
             var url_buf: [url_max]u8 = undefined;
@@ -452,6 +473,8 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .headers = headers.slice(),
                 .body = .{ .slice = bytes },
                 .redirects = .expose,
+                .timeout_ms = timeout_ms,
+                .stall_ms = stall_ms,
             }) catch |err| return blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
@@ -463,8 +486,8 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// **The length is not optional and that is the point**: S3 answers
         /// `411` to a body of unknown length, so asking for it here makes
         /// *I do not know* a compile error rather than a production surprise.
-        /// Unknown-size upload needs multipart, which is on the roadmap with
-        /// its reason attached.
+        /// An upload whose size is unknown before it starts is
+        /// `putMultipart`'s.
         pub fn putStream(self: *Self, c: anytype, key: []const u8, source: anytype) Error!void {
             comptime core.checkScope(@TypeOf(c), "bucket.putStream");
             comptime checkSource(@TypeOf(source), "bucket.putStream");
@@ -508,6 +531,353 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             }) catch |err| return blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
+        }
+
+        /// Put an object whose size is not known before it starts, or one
+        /// too large to send as one body: S3's multipart upload, the whole
+        /// protocol in one call
+        /// ([ADR 058](../docs/adr/058-most-of-an-s3-client-is-not-s3.md)).
+        ///
+        /// `source` is anything with `.reader` and `.content_type` — no
+        /// `.len`, which is what this call is for. The reader is read to its
+        /// end in parts of `.part_bytes` (8 MiB unless the source says
+        /// otherwise; under S3's 5 MiB part floor is refused before any byte
+        /// moves), each part goes up as its own PUT, and a completion
+        /// document seals them into one object. **A source that ends inside
+        /// the first part becomes a plain `put`**: one round trip instead of
+        /// three, and the ETag stays the content's own MD5 rather than a
+        /// multipart digest, which matters to a caller comparing by hash.
+        /// **A 200 on the completion is not believed on its own**: S3 can
+        /// answer it with an error in the body, so the body is read and has
+        /// to say so too. Any failure after the initiate aborts the upload
+        /// on the way out, so a lost connection does not leave paid-for
+        /// parts parked in the bucket. One bound only a server can hold: the
+        /// 10,000-part ceiling is S3's own, and for a reader of unknown
+        /// length it can only be met on the way, after those parts went up.
+        ///
+        /// Each part and the completion run under the source's optional
+        /// `.timeout_ms` (none unless it says one) and the Store's
+        /// `stall_ms` bound on silence, the same terms `putStream` gives its
+        /// one body — the Store's `timeout_ms` is for the short calls, and a
+        /// part is not one (ADR 060). `.cache_control` and
+        /// `.content_disposition` are read off the source if it has them,
+        /// as `put` reads them off its value.
+        ///
+        /// What it costs in the Scope: one buffer of `part_bytes`, one copy
+        /// of each part's ETag, and the completion document. Parts go up one
+        /// at a time on the pooled connections — a part is bytes in hand, so
+        /// a connection the server reaped retries the way every other call
+        /// here does — and the call holds one stream share for its whole
+        /// life, the same bound `putStream` honours.
+        pub fn putMultipart(self: *Self, c: anytype, key: []const u8, source: anytype) Error!void {
+            comptime core.checkScope(@TypeOf(c), "bucket.putMultipart");
+            comptime checkMultipartSource(@TypeOf(source));
+
+            const part_bytes: usize = if (comptime @hasField(@TypeOf(source), "part_bytes"))
+                source.part_bytes
+            else
+                multipart_mod.default_part_bytes;
+            if (part_bytes < multipart_mod.part_min) {
+                std.log.warn(
+                    "nilo_s3: `{s}`.putMultipart was asked for parts of {d} bytes; S3 refuses any part but the last under {d}",
+                    .{ name, part_bytes, multipart_mod.part_min },
+                );
+                return error.Rejected;
+            }
+
+            // The first part is read before anything is sent, because a
+            // source that ends inside it has a known length after all and
+            // deserves the plain PUT: one round trip, the content's own MD5.
+            const buffer = try c.arena().alloc(u8, part_bytes);
+            var n = source.reader.readSliceShort(buffer) catch
+                return readerFailed();
+            const timeout_ms = optionalMs(source, "timeout_ms") orelse 0;
+
+            // The stream share bounds long uploads exactly as it bounds
+            // `putStream`, taken once for the whole protocol — the
+            // small-source PUT included, because up to a whole part on a
+            // slow link is the long-transfer shape `max_streams` exists to
+            // bound, and the caller chose the transfer call (ADR 060).
+            try self.store.takeStream();
+            defer self.store.giveStream();
+
+            if (n < buffer.len) {
+                return self.putBounded(c, key, .{
+                    .bytes = buffer[0..n],
+                    .content_type = source.content_type,
+                    .cache_control = optional(source, "cache_control"),
+                    .content_disposition = optional(source, "content_disposition"),
+                }, timeout_ms, self.store.options.stall_ms);
+            }
+
+            const upload_id = try self.initiateMultipart(
+                c,
+                key,
+                contentTypeOf(source.content_type),
+                optional(source, "cache_control"),
+                optional(source, "content_disposition"),
+            );
+            errdefer self.abortMultipart(c, key, upload_id);
+
+            var etags: std.ArrayList([]const u8) = .empty;
+            while (true) {
+                if (etags.items.len == multipart_mod.parts_max) {
+                    std.log.warn(
+                        "nilo_s3: `{s}`.putMultipart reached S3's {d}-part ceiling; raise `.part_bytes`",
+                        .{ name, multipart_mod.parts_max },
+                    );
+                    return error.Rejected;
+                }
+                const etag = try self.putPart(c, key, upload_id, etags.items.len + 1, buffer[0..n], timeout_ms);
+                etags.append(c.arena(), etag) catch return error.OutOfMemory;
+                if (n < buffer.len) break;
+                n = source.reader.readSliceShort(buffer) catch
+                    return readerFailed();
+                if (n == 0) break;
+            }
+
+            try self.completeMultipart(c, key, upload_id, etags.items, timeout_ms);
+        }
+
+        fn readerFailed() Error {
+            std.log.warn("nilo_s3: `{s}`.putMultipart: the source reader failed", .{name});
+            return error.Failed;
+        }
+
+        /// The initiate POST. Hands back the `UploadId`, a slice into the
+        /// answer's body in the Scope. An id too long for the part calls'
+        /// URL buffer is refused — after aborting the upload the initiate
+        /// just opened, because by then the id is the one thing in hand.
+        fn initiateMultipart(
+            self: *Self,
+            c: anytype,
+            key: []const u8,
+            content_type: ?[]const u8,
+            cache_control: ?[]const u8,
+            content_disposition: ?[]const u8,
+        ) Error![]const u8 {
+            var url_buf: [part_url_max]u8 = undefined;
+            var token_buf: [settings.session_token_max]u8 = undefined;
+            var sig: sign.Signature = .none;
+            var headers: Headers = .{};
+
+            const at = try self.urlToQuery(&url_buf, key);
+            const query = multipart_mod.initiate_query;
+            @memcpy(url_buf[at..][0..query.len], query);
+            const target = url_buf[0 .. at + query.len];
+            try self.prepare(&sig, &headers, .{
+                .method = "POST",
+                .key = key,
+                .query = query,
+                .payload = self.store.payloadNoBody(),
+                .content_type = content_type,
+                .cache_control = cache_control,
+                .content_disposition = content_disposition,
+                .token_buf = &token_buf,
+            });
+
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+
+            const got = ex.begin(&self.store.client, .{
+                .method = .POST,
+                .url = target,
+                .host = self.host,
+                .authorization = sig.value(),
+                .content_type = content_type,
+                .headers = headers.slice(),
+                .redirects = .expose,
+            }) catch |err| return blame(err);
+
+            if (!got.ok()) return self.failure(c, &ex, got);
+
+            const body = ex.take(c, 8 << 10) catch |err| return blame(err);
+            const upload_id = multipart_mod.uploadIdOf(body.view()) orelse {
+                std.log.warn("nilo_s3: `{s}` answered the initiate with no usable UploadId", .{name});
+                return error.Failed;
+            };
+            if (upload_id.len > multipart_mod.upload_id_max) {
+                self.abortMultipart(c, key, upload_id);
+                std.log.warn(
+                    "nilo_s3: `{s}` handed out an UploadId of {d} bytes, over the {d} a part call can carry; the upload was aborted",
+                    .{ name, upload_id.len, multipart_mod.upload_id_max },
+                );
+                return error.Failed;
+            }
+            return upload_id;
+        }
+
+        /// One part up, its ETag back, copied into the Scope: the head's
+        /// bytes are read over by the next call. The query is written into
+        /// the URL buffer once and sliced back out for `prepare`, so the
+        /// bytes signed are the bytes sent by construction, the shape
+        /// `urlForList` uses.
+        fn putPart(
+            self: *Self,
+            c: anytype,
+            key: []const u8,
+            upload_id: []const u8,
+            part_number: usize,
+            bytes: []const u8,
+            timeout_ms: u32,
+        ) Error![]const u8 {
+            var url_buf: [part_url_max]u8 = undefined;
+            var token_buf: [settings.session_token_max]u8 = undefined;
+            var hash_buf: [64]u8 = undefined;
+            var sig: sign.Signature = .none;
+            var headers: Headers = .{};
+
+            const at = try self.urlToQuery(&url_buf, key);
+            const query = multipart_mod.partQuery(url_buf[at..], part_number, upload_id);
+            const target = url_buf[0 .. at + query.len];
+            try self.prepare(&sig, &headers, .{
+                .method = "PUT",
+                .key = key,
+                .query = query,
+                .payload = self.store.payloadFor(bytes, &hash_buf),
+                .token_buf = &token_buf,
+            });
+
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+
+            const got = ex.begin(&self.store.client, .{
+                .method = .PUT,
+                .url = target,
+                .host = self.host,
+                .authorization = sig.value(),
+                .headers = headers.slice(),
+                .body = .{ .slice = bytes },
+                .redirects = .expose,
+                // A part is minutes on a slow uplink, not a short call: no
+                // whole-call limit unless the source named one, and the
+                // stall bound on silence, the terms `putStream` set (ADR 060).
+                .timeout_ms = timeout_ms,
+                .stall_ms = self.store.options.stall_ms,
+            }) catch |err| return blame(err);
+
+            if (!got.ok()) return self.failure(c, &ex, got);
+            const etag = got.header("etag") orelse "";
+            if (etag.len == 0) {
+                // Sent on anyway, the completion would be refused later with
+                // `InvalidPart`, an error about the wrong call.
+                std.log.warn("nilo_s3: `{s}` answered part {d} without an ETag", .{ name, part_number });
+                return error.Failed;
+            }
+            return keepIn(c, etag);
+        }
+
+        /// The completion POST, and the one place a 200 is not an answer:
+        /// the body has to say `CompleteMultipartUploadResult`.
+        fn completeMultipart(
+            self: *Self,
+            c: anytype,
+            key: []const u8,
+            upload_id: []const u8,
+            etags: []const []const u8,
+            timeout_ms: u32,
+        ) Error!void {
+            const completion = try c.arena().alloc(u8, multipart_mod.completionLen(etags));
+            var doc = std.Io.Writer.fixed(completion);
+            multipart_mod.writeCompletion(&doc, etags) catch return error.Failed;
+            const body_bytes = doc.buffered();
+
+            var url_buf: [part_url_max]u8 = undefined;
+            var token_buf: [settings.session_token_max]u8 = undefined;
+            var hash_buf: [64]u8 = undefined;
+            var sig: sign.Signature = .none;
+            var headers: Headers = .{};
+
+            const at = try self.urlToQuery(&url_buf, key);
+            const query = multipart_mod.finishQuery(url_buf[at..], upload_id);
+            const target = url_buf[0 .. at + query.len];
+            try self.prepare(&sig, &headers, .{
+                .method = "POST",
+                .key = key,
+                .query = query,
+                .payload = self.store.payloadFor(body_bytes, &hash_buf),
+                .token_buf = &token_buf,
+            });
+
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+
+            const got = ex.begin(&self.store.client, .{
+                .method = .POST,
+                .url = target,
+                .host = self.host,
+                .authorization = sig.value(),
+                .headers = headers.slice(),
+                .body = .{ .slice = body_bytes },
+                .redirects = .expose,
+                // On AWS a large completion is assembled while this waits,
+                // which can take minutes: the same terms as a part.
+                .timeout_ms = timeout_ms,
+                .stall_ms = self.store.options.stall_ms,
+            }) catch |err| return blame(err);
+
+            if (!got.ok()) return self.failure(c, &ex, got);
+
+            const answer = ex.take(c, 8 << 10) catch |err| return blame(err);
+            if (!multipart_mod.completedOk(answer.view())) {
+                std.log.warn(
+                    "nilo_s3: `{s}` answered the completion 200 with an error in the body",
+                    .{name},
+                );
+                return error.Failed;
+            }
+        }
+
+        /// Best effort, on the way out of a failed upload: parked parts are
+        /// paid-for bytes, and a bucket with no lifecycle rule keeps them
+        /// forever. A failed abort is logged and the original error stands.
+        ///
+        /// The URL is built in the Scope rather than on the stack: an abort
+        /// only runs on a failure path, where an allocation is cheap, and it
+        /// must carry even an `UploadId` the part calls refused as too long,
+        /// which no stack buffer here is sized for.
+        fn abortMultipart(self: *Self, c: anytype, key: []const u8, upload_id: []const u8) void {
+            var token_buf: [settings.session_token_max]u8 = undefined;
+            var sig: sign.Signature = .none;
+            var headers: Headers = .{};
+
+            const room = self.base.len + self.prefix.len + 1 + key.len * 3 +
+                "?uploadId=".len + upload_id.len * 3;
+            const url_buf = c.arena().alloc(u8, room) catch return;
+            var w = std.Io.Writer.fixed(url_buf);
+            w.writeAll(self.base) catch return;
+            w.writeAll(self.prefix) catch return;
+            w.writeByte('/') catch return;
+            core.percent.encodeWrite(&w, key, .path) catch return;
+            w.writeByte('?') catch return;
+            const at = w.buffered().len;
+            const query = multipart_mod.finishQuery(url_buf[at..], upload_id);
+            const target = url_buf[0 .. at + query.len];
+            self.prepare(&sig, &headers, .{
+                .method = "DELETE",
+                .key = key,
+                .query = query,
+                .payload = self.store.payloadNoBody(),
+                .token_buf = &token_buf,
+            }) catch return;
+
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+
+            const got = ex.begin(&self.store.client, .{
+                .method = .DELETE,
+                .url = target,
+                .host = self.host,
+                .authorization = sig.value(),
+                .headers = headers.slice(),
+                .redirects = .expose,
+            }) catch return;
+            if (!got.ok()) {
+                std.log.warn(
+                    "nilo_s3: `{s}` could not abort a failed multipart upload; its parts remain until a lifecycle rule or an abort by hand",
+                    .{name},
+                );
+            }
         }
 
         /// Delete an object. S3 answers 204 whether or not it was there, and
@@ -1181,6 +1551,21 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             return w.buffered();
         }
 
+        /// `https://files.s3.amazonaws.com/big.mp4?` and where the query
+        /// goes: the multipart calls write their canonical query into the
+        /// same buffer after this, once, and slice it back out for
+        /// `prepare` — signed bytes and sent bytes are one spelling by
+        /// construction, the same one-buffer shape `urlForList` uses.
+        fn urlToQuery(self: *Self, buf: *[part_url_max]u8, key: []const u8) Error!usize {
+            var w = std.Io.Writer.fixed(buf);
+            w.writeAll(self.base) catch return error.Rejected;
+            w.writeAll(self.prefix) catch return error.Rejected;
+            w.writeByte('/') catch return error.Rejected;
+            core.percent.encodeWrite(&w, key, .path) catch return error.Rejected;
+            w.writeByte('?') catch return error.Rejected;
+            return w.buffered().len;
+        }
+
         /// `https://s3.amazonaws.com/files/?encoding-type=url&list-type=2…`:
         /// the bucket's root and a query, for the one call that asks about
         /// the bucket rather than about a key. Cannot fail: `list_url_max`
@@ -1574,6 +1959,25 @@ fn checkSource(comptime T: type, comptime called: []const u8) void {
         for ([_][]const u8{ "reader", "len", "content_type" }) |field| {
             if (!@hasField(T, field)) @compileError(
                 "nilo: " ++ called ++ " needs `." ++ field ++ "` on what it reads from.\n  " ++
+                    @typeName(T) ++ " has none." ++ advice,
+            );
+        }
+    }
+}
+
+fn checkMultipartSource(comptime T: type) void {
+    comptime {
+        const advice = "\n  A multipart put takes `.reader` and `.content_type`, and reads until" ++
+            " the reader ends: the length does not need to be known, which is what this call" ++
+            " is for. `.part_bytes` is optional.";
+
+        if (@typeInfo(T) != .@"struct") @compileError(
+            "nilo: bucket.putMultipart takes what to read the object from, and " ++ @typeName(T) ++
+                " is not one." ++ advice,
+        );
+        for ([_][]const u8{ "reader", "content_type" }) |field| {
+            if (!@hasField(T, field)) @compileError(
+                "nilo: bucket.putMultipart needs `." ++ field ++ "` on what it reads from.\n  " ++
                     @typeName(T) ++ " has none." ++ advice,
             );
         }
