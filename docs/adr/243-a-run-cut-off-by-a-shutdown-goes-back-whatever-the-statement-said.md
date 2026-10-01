@@ -26,9 +26,6 @@ The worker loop's claim has the same shape. A claim the shutdown cut off
 answered `QueryFailed`, and the loop logged `claim: QueryFailed` as an error
 before its sleep collected the cancellation.
 
-`Bound.fired` was also asked twice on a failure, once in the condition and
-once for the error name, though its answer is consumed by the first ask.
-
 ## Decision
 
 **After a run, the worker asks the fiber rather than the error.** A run that
@@ -46,8 +43,6 @@ it at its next check.
 
 **A claim that fails while the fiber is cancelled leaves the loop** without
 logging a failure.
-
-`Bound.fired` is asked once, after the run, and the answer is kept.
 
 ## Rejected
 

@@ -653,4 +653,3 @@ test "on Postgres a run cut off by a shutdown in the middle of a statement goes 
     try testing.expectEqual(@as(i32, 0), row.attempts);
     try testing.expectEqual(@as(?[]const u8, null), row.last_error);
 }
-
