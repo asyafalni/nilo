@@ -1939,3 +1939,62 @@ test "a target's own permit is given back after every call, and its ready path i
         }
     }.run);
 }
+
+/// What a server does that refuses a request on its head: read the head,
+/// answer, and close with the body still unread, which the kernel turns into
+/// an RST. `accepted` counts connections so a test can say none was reused.
+fn answerEarly(canned: *Canned, status: []const u8, body: []const u8, count: usize) !void {
+    for (0..count) |_| {
+        var stream = try canned.server.accept(canned.io);
+        defer stream.close(canned.io);
+        canned.accepted += 1;
+        var in_buf: [4 << 10]u8 = undefined;
+        var reader = stream.reader(canned.io, &in_buf);
+        while (std.mem.trimEnd(u8, try reader.interface.takeDelimiterInclusive('\n'), "\r\n").len != 0) {}
+        var out_buf: [1 << 10]u8 = undefined;
+        var writer = stream.writer(canned.io, &out_buf);
+        try writer.interface.print(
+            "HTTP/1.1 {s}\r\nContent-Type: application/xml\r\nContent-Length: {d}\r\n\r\n{s}",
+            .{ status, body.len, body },
+        );
+        try writer.interface.flush();
+    }
+}
+
+test "a refusal sent before the body was finished is the answer, not WriteFailed" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            const xml = "<Error><Code>AuthorizationHeaderMalformed</Code></Error>";
+            var served = try io.concurrent(answerEarly, .{ &canned, "400 Bad Request", xml, @as(usize, 2) });
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{});
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            // **Far past what loopback buffers**, so the write is still going
+            // when the server's close arrives and really fails. A body that
+            // fits the send and receive buffers is written whole before the
+            // answer is read, and proves nothing.
+            const big = try testing.allocator.alloc(u8, 64 << 20);
+            defer testing.allocator.free(big);
+            @memset(big, 'x');
+
+            var buf: [64]u8 = undefined;
+            const url = try canned.url(&buf);
+            const res = try client.put(&scope, url, big, .{});
+            try testing.expectEqual(std.http.Status.bad_request, res.status);
+            try testing.expectEqualStrings(xml, res.body.view());
+
+            // The connection the request was left half-written on is not
+            // reused: the second call is a second accept.
+            _ = try client.put(&scope, url, big, .{});
+            try testing.expectEqual(@as(usize, 2), canned.accepted);
+        }
+    }.run);
+}

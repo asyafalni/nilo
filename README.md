@@ -29,7 +29,7 @@
 
 ---
 
-Zig gives you a fast compiler and leaves the rest to you: routing, settings, password hashing, tables, Postgres. **nilo is that rest**, as eleven small modules you import one at a time.
+Zig gives you a fast compiler and leaves the rest to you: routing, settings, password hashing, tables, Postgres. **nilo is that rest**, as twelve small modules you import one at a time.
 
 Every module runs on the same idea. **A plain function is a route. A plain struct is a table.** nilo reads your types while the program compiles, so there is nothing to annotate and nothing to keep in sync.
 
@@ -121,7 +121,7 @@ const exe = b.addExecutable(.{
 
 Run `zig build run` and it's serving. [Getting started](./docs/guide/getting-started.md) walks through the same steps line by line.
 
-The package is `nilo`, and each module is its own import: `nilo_http`, `nilo_sql`, `nilo_s3`, `nilo_fetch`, `nilo_job`, `nilo_cache`, `nilo_jwt`, `nilo_config`, `nilo_pw`, `nilo_id` and `nilo_core`. **There is no module called `nilo`**, so alias the one you use: `const nilo = @import("nilo_http");`.
+The package is `nilo`, and each module is its own import: `nilo_http`, `nilo_sql`, `nilo_s3`, `nilo_fetch`, `nilo_job`, `nilo_cache`, `nilo_jwt`, `nilo_proto`, `nilo_config`, `nilo_pw`, `nilo_id` and `nilo_core`. **There is no module called `nilo`**, so alias the one you use: `const nilo = @import("nilo_http");`.
 
 > **Upgrading from 0.5.0?** [Read this before you deploy](https://github.com/nevindra/nilo/releases/tag/v0.6.0#read-this-before-you-deploy): each change, and how to fix it. From 0.4.0, read [v0.5.0's](https://github.com/nevindra/nilo/releases/tag/v0.5.0#read-this-before-you-deploy) first.
 
@@ -285,6 +285,7 @@ Against eight other servers returning the same JSON, nilo is 1st on throughput, 
 | **`nilo_job`** | Background and scheduled work, queued in the database you already have, with three levels of urgency and cron schedules | Exactly-once, time zones |
 | **`nilo_cache`** | An expiring in-process cache on a fixed memory budget | Pointers in cached values |
 | **`nilo_jwt`** | Verifying tokens: RS256, ES256 and rotating JWKS | Signing tokens, HS256 |
+| **`nilo_proto`** | Protobuf as plain structs: decode, encode, OTLP-sized messages in a handful of allocations | A `.proto` compiler, proto2 |
 | **`nilo_config`** | Settings from the environment | Config files |
 | **`nilo_pw`** | Password hashing with argon2id | |
 | **`nilo_id`** | UUID v4 and v7 | |

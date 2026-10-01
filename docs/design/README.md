@@ -41,6 +41,7 @@ Start here to understand a part of nilo. Each page links into [`docs/adr/`](../a
 - [The clock, entropy, and a UUID](id-clock-entropy.md): `nilo_core`'s clock and `nilo_id`.
 - [The in-process cache](cache.md): `nilo_cache`.
 - [JWT verification](jwt.md): `nilo_jwt`.
+- [Protobuf](proto.md): `nilo_proto`.
 - [Outbound calls](fetch.md): `nilo_fetch`.
 - [Jobs](job.md): `nilo_job`.
 - [Object storage](s3.md): `nilo_s3`.

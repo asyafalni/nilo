@@ -14,7 +14,7 @@ const std = @import("std");
 ///
 /// `dev` is not a module — nothing imports it — but a dependent builds
 /// `nilo.artifact("nilo-dev")` from it, so it ships the same way (ADR 190).
-const shipped_roots = [_][]const u8{ "core", "id", "config", "pw", "cache", "jwt", "fetch", "job", "http", "sql", "s3", "dev" };
+const shipped_roots = [_][]const u8{ "core", "id", "config", "pw", "cache", "jwt", "proto", "fetch", "job", "http", "sql", "s3", "dev" };
 
 comptime {
     const manifest = @embedFile("build.zig.zon");
@@ -74,6 +74,10 @@ const layers = [_]Layer{
     // other way round, which is why the row is empty.
     .{ .root = "cache", .may_import = &.{} },
     .{ .root = "jwt", .may_import = &.{} },
+    // The sixth, and it names nothing either (ADR 245): protobuf is bytes in
+    // and bytes out, the allocator is the caller's and a message is a struct
+    // the caller declared. `zig test proto/proto.zig` is the whole suite.
+    .{ .root = "proto", .may_import = &.{} },
     // The first Fitting (ADR 061): it borrows the loop and owns no
     // destination. That is what puts it below a Service and above a tool
     // module — `zig test fetch/fetch.zig` needs `nilo_core` and so needs the
@@ -163,7 +167,7 @@ const http_core = [_][]const u8{
 const http_above_core = [_][]const u8{
     "logger",    "cors",      "csrf",      "allowance", "deadline",
     "maxbody",   "http",      "behaviour", "live",      "profile",
-    "fuzz",      "fuzz_main", "fuzz_llhttp", "test_root",
+    "fuzz",      "fuzz_main", "fuzz_llhttp", "test_root", "wide",
 };
 
 const Layer = struct {
@@ -178,6 +182,11 @@ const examples = [_]Example{
     .{ .name = "orders", .about = "Nested resources, nested bodies, a state machine, an upsert" },
     .{ .name = "forms", .about = "An HTML form, a session cookie, an upload and a redirect" },
     .{ .name = "spa", .about = "A single-page app's files plus a JSON API" },
+    .{
+        .name = "embedded",
+        .about = "A single-page app carried inside the binary, listed from its build output",
+        .embeds = "examples/embedded/dist",
+    },
     .{ .name = "stream", .about = "A streamed report and a stream of events" },
     .{ .name = "chat", .about = "A WebSocket, from the handshake to the last frame" },
     .{ .name = "scheduled", .about = "Work that is not a request, and a shutdown that reaches it" },
@@ -204,6 +213,9 @@ const Example = struct {
     /// (`-Dsql`, on for this repository), and its tests hang off `test-sql`
     /// rather than `test` for the reason the module's own do (ADR 066).
     needs_sql: bool = false,
+    /// A directory (relative to the build root) listed into a `frontend`
+    /// module with `embedDir`, which is how a program carries its front end.
+    embeds: []const u8 = "",
 };
 
 /// The same, for `sql/refusals/`. A separate list because they hang off
@@ -1410,6 +1422,11 @@ const s3_refusals = [_]Refusal{
             " named that way.",
     },
     .{
+        .name = "bucket_name_with_a_slash_by_path",
+        .says = "`tenants/a` has a character in it that a URL path cannot carry as a bucket name" ++
+            " (letters, digits, dot, dash and underscore only).",
+    },
+    .{
         .name = "a_secret_in_a_bucket_option",
         .says = "`secret_access_key` is a credential, and a bucket's type is not where one goes.",
     },
@@ -1506,6 +1523,117 @@ const pw_refusals = [_]Refusal{
     .{
         .name = "pw_token_from_a_uuid",
         .says = "a Token is made from 32 bytes of entropy and was given 16.",
+    },
+};
+
+/// The same, for `proto/refusals/`, hanging off `test-proto` for the reason
+/// the others hang off theirs: a module in the bottom layer keeps its own
+/// (ADR 245). One file a comptime check in `proto/schema.zig`, each a message
+/// type written wrong in the way somebody will write it.
+const proto_refusals = [_]Refusal{
+    .{
+        .name = "proto_message_without_wire",
+        .says = "`proto_message_without_wire.Msg` is used as a message but declares no field numbers. Add `pub const wire = .{ .field_name = 1, ... };` to it.",
+    },
+    .{
+        .name = "proto_field_without_number",
+        .says = "`proto_field_without_number.Msg.name` has no field number. Add it to `proto_field_without_number.Msg.wire`, like `.name = 1`.",
+    },
+    .{
+        .name = "proto_wire_names_a_missing_field",
+        .says = "`proto_wire_names_a_missing_field.Msg.wire` numbers `nmae`, and `proto_wire_names_a_missing_field.Msg` has no field of that name.",
+    },
+    .{
+        .name = "proto_number_twice",
+        .says = "`proto_number_twice.Msg` gives field number 1 to both `id` and `name`. A number names one field.",
+    },
+    .{
+        .name = "proto_number_zero",
+        .says = "`proto_number_zero.Msg.id` has field number 0, and a field number is between 1 and 536,870,911.",
+    },
+    .{
+        .name = "proto_number_too_big",
+        .says = "`proto_number_too_big.Msg.id` has field number 536870912, and a field number is between 1 and 536,870,911.",
+    },
+    .{
+        .name = "proto_number_reserved",
+        .says = "`proto_number_reserved.Msg.id` uses 19500, and 19,000 to 19,999 are reserved by protobuf itself.",
+    },
+    .{
+        .name = "proto_entry_is_not_a_number",
+        .says = "`proto_entry_is_not_a_number.Msg.wire.id` must be a field number (`.id = 1`) or a number and an encoding (`.id = .{ 1, .fixed64 }`).",
+    },
+    .{
+        .name = "proto_unknown_encoding",
+        .says = "`proto_unknown_encoding.Msg.wire.id` says `.sint`, which is not an encoding. They are .fixed64, .fixed32, .sfixed64, .sfixed32, .sint64, .sint32, .bytes and .string, and `.unpacked` for a repeated number.",
+    },
+    .{
+        .name = "proto_two_encodings",
+        .says = "`proto_two_encodings.Msg.wire.id` names two encodings. A field travels one way.",
+    },
+    .{
+        .name = "proto_encoding_the_type_cannot_take",
+        .says = "`proto_encoding_the_type_cannot_take.Msg.id` is a u32: its encoding is `.fixed32`, or none for uint32.",
+    },
+    .{
+        .name = "proto_bool_with_an_encoding",
+        .says = "`proto_bool_with_an_encoding.Msg.on` is a bool, which travels as a varint and takes no encoding.",
+    },
+    .{
+        .name = "proto_not_a_protobuf_type",
+        .says = "`proto_not_a_protobuf_type.Msg.port` has type `u16`, which is not a protobuf type. A field is a bool, an integer (i32, i64, u32 or u64), a float, a `[]const u8`, an `enum(i32)`, a struct with a `wire` table, a slice of any of those, or a `?union(enum)` with a `wire` table for a oneof.",
+    },
+    .{
+        .name = "proto_mutable_bytes",
+        .says = "`proto_mutable_bytes.Msg.name` is `[]u8`; a decoded string borrows the input, so write `[]const u8`.",
+    },
+    .{
+        .name = "proto_enum_tag_is_not_i32",
+        .says = "`proto_enum_tag_is_not_i32.Msg.kind` is an enum whose tag is not i32, and a protobuf enum is an int32. Declare it `enum(i32)`.",
+    },
+    .{
+        .name = "proto_optional_slice",
+        .says = "`proto_optional_slice.Msg.ids` is an optional slice, and a repeated field is never absent, only empty. Drop the `?`.",
+    },
+    .{
+        .name = "proto_slice_of_optionals",
+        .says = "`proto_slice_of_optionals.Msg.ids` is a slice of optionals, and a repeated field has no holes. Drop the `?`.",
+    },
+    .{
+        .name = "proto_unpacked_on_a_scalar",
+        .says = "`proto_unpacked_on_a_scalar.Msg.id` says `.unpacked`, which is for a repeated number, and this field is not repeated.",
+    },
+    .{
+        .name = "proto_unpacked_on_text",
+        .says = "`proto_unpacked_on_text.Msg.tags` says `.unpacked`, which is for a repeated number; repeated text is never packed.",
+    },
+    .{
+        .name = "proto_message_with_an_encoding",
+        .says = "`proto_message_with_an_encoding.Msg.inner` is a message, which takes no encoding.",
+    },
+    .{
+        .name = "proto_oneof_is_not_optional",
+        .says = "make `proto_oneof_is_not_optional.Msg.choice` optional (`?proto_oneof_is_not_optional.Choice`): a oneof that is not on the wire is none of its members.",
+    },
+    .{
+        .name = "proto_oneof_number_in_the_message",
+        .says = "`proto_oneof_number_in_the_message.Msg.choice` is a oneof, so its numbers belong on its members in `proto_oneof_number_in_the_message.Choice.wire`, not in `proto_oneof_number_in_the_message.Msg.wire`.",
+    },
+    .{
+        .name = "proto_oneof_member_without_a_number",
+        .says = "oneof member `proto_oneof_member_without_a_number.Choice.b` has no field number. Add it to `proto_oneof_member_without_a_number.Choice.wire`, like `.b = 1`.",
+    },
+    .{
+        .name = "proto_oneof_table_names_a_missing_member",
+        .says = "`proto_oneof_table_names_a_missing_member.Choice.wire` numbers `c`, and the union has no member of that name.",
+    },
+    .{
+        .name = "proto_oneof_member_is_repeated",
+        .says = "oneof member `proto_oneof_member_is_repeated.Choice.a` is repeated, and protobuf does not allow a repeated field in a oneof.",
+    },
+    .{
+        .name = "proto_union_as_a_message",
+        .says = "`proto_union_as_a_message.Choice` is a union with a `wire` table, and a union is only a oneof: put it in a message as `?proto_union_as_a_message.Choice`.",
     },
 };
 
@@ -2075,6 +2203,22 @@ const refusals = [_]Refusal{
         .says = "`json_marker_says_nothing.Condition`'s `nilo_json` is empty, so it says nothing about this type's JSON and nothing changes.",
     },
     .{
+        .name = "json_unknown_fields_refuse_written_out",
+        .says = "`json_unknown_fields_refuse_written_out.Settings` says `.unknown_fields = .refuse`, which is what every type already does with a key it has no field for, so it would change nothing.",
+    },
+    .{
+        .name = "json_unknown_fields_on_an_enum",
+        .says = "`json_unknown_fields_on_an_enum.Severity` says `.unknown_fields`, and it is an enum, which is read from one string and has no keys to skip.",
+    },
+    .{
+        .name = "json_unknown_fields_on_a_union",
+        .says = "`json_unknown_fields_on_a_union.Condition` says `.unknown_fields`, and it is a union, whose keys are the ones its variant's struct has.",
+    },
+    .{
+        .name = "json_unknown_fields_says_something_else",
+        .says = "`json_unknown_fields_says_something_else.Settings` says `.unknown_fields = .warn`, which is not something it can do with a key it has no field for.",
+    },
+    .{
         .name = "json_reader_for_a_renamed_union",
         .says = "`json_reader_for_a_renamed_union.Channel` hands nilo's JSON reader a `nilo_json` that only renames, and it is a union.",
     },
@@ -2493,10 +2637,12 @@ const Snippets = struct {
         .{ .path = "docs/reference/pw.md" },
         .{ .path = "docs/reference/cache.md" },
         .{ .path = "docs/reference/jwt.md" },
+        .{ .path = "docs/reference/proto.md" },
         .{ .path = "docs/reference/fetch.md" },
         .{ .path = "docs/reference/streaming.md" },
         .{ .path = "docs/guide/sessions.md" },
         .{ .path = "docs/guide/errors.md" },
+        .{ .path = "docs/guide/static-files.md" },
         .{ .path = "docs/guide/config.md" },
         .{ .path = "docs/guide/forms.md" },
         // These three were carrying `<!-- compiles -->` marks that nothing
@@ -2514,12 +2660,14 @@ const Snippets = struct {
         // world: its `Carts`, its `client` and `run`, its `Doc`.
         .{ .path = "docs/guide/id.md" },
         .{ .path = "docs/guide/jwt.md" },
+        .{ .path = "docs/guide/proto.md" },
         .{ .path = "docs/guide/cache.md" },
         .{ .path = "docs/guide/idempotency.md" },
         .{ .path = "docs/guide/deploying.md" },
         .{ .path = "docs/guide/fetch.md" },
         .{ .path = "docs/guide/s3.md" },
         .{ .path = "docs/guide/jobs.md" },
+        .{ .path = "docs/guide/background.md" },
         // Marked on 13 September and read by nothing until the roadmap's own
         // standing risk about exactly this was checked against the tree.
         .{ .path = "docs/guide/openapi.md" },
@@ -3072,6 +3220,22 @@ fn jwtFor(
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path("jwt/jwt.zig"),
+        .target = target,
+        .optimize = mode,
+    });
+}
+
+/// A copy of `nilo_proto` for one optimize mode (ADR 245).
+///
+/// Self contained the way `pwFor` and `jwtFor` are: it names nothing, so
+/// there is no shared type to keep the two modes agreeing about.
+fn protoFor(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    mode: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("proto/proto.zig"),
         .target = target,
         .optimize = mode,
     });
@@ -4264,6 +4428,96 @@ const SkipNotice = struct {
     }
 };
 
+/// A directory of files as the module `app.embedded` takes, for a dependent's
+/// own `build.zig` (ADR 009).
+///
+/// ```zig
+/// const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize });
+/// const frontend = @import("nilo").embedDir(b, nilo.module("nilo_http"), "frontend/dist");
+/// exe.root_module.addImport("frontend", frontend);
+/// ```
+///
+/// and, in the program, `try app.embedded("/", &@import("frontend").files);`.
+///
+/// `dir` is relative to the build root, or absolute. It is walked every time
+/// `zig build` configures, so a front end rebuilt with new hashed names is
+/// picked up by the next build with nothing to regenerate, and each file is
+/// copied beside a generated `embedded.zig` because `@embedFile` reaches only
+/// files inside its own module's directory. The module exports `files`, an
+/// array of `nilo_http.static.Embedded`.
+///
+/// **Which files**: regular files only, sorted by path so the cache key does
+/// not follow directory order. A name with a `.` segment (`.env`, `.git/`) and
+/// a symlink are left out, the two rules `app.static` walks by, so a tree
+/// served from the binary is the tree served from a disk. There is no size
+/// cap: the binary carries what the caller points this at. An empty or
+/// missing directory stops the build, naming it, because a front end that was
+/// not built yet is not a binary to ship.
+pub fn embedDir(b: *std.Build, nilo_http: *std.Build.Module, dir: []const u8) *std.Build.Module {
+    const io = b.graph.io;
+    var tree = (if (std.fs.path.isAbsolute(dir))
+        std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true })
+    else
+        b.build_root.handle.openDir(io, dir, .{ .iterate = true })) catch |err|
+        std.process.fatal("nilo: embedDir cannot open \"{s}\" ({s})", .{ dir, @errorName(err) });
+    defer tree.close(io);
+
+    var paths: std.ArrayList([]const u8) = .empty;
+    var walker = tree.walk(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    while (walker.next(io) catch |err|
+        std.process.fatal("nilo: embedDir cannot walk \"{s}\" ({s})", .{ dir, @errorName(err) })) |entry|
+    {
+        if (entry.kind != .file) continue;
+        var segments = std.mem.tokenizeAny(u8, entry.path, "/\\");
+        const hidden = while (segments.next()) |segment| {
+            if (segment[0] == '.') break true;
+        } else false;
+        if (hidden) continue;
+        paths.append(b.allocator, b.dupe(entry.path)) catch @panic("OOM");
+    }
+    if (paths.items.len == 0) std.process.fatal(
+        "nilo: embedDir found no files in \"{s}\"; build the front end before the program that carries it",
+        .{dir},
+    );
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lt(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.lessThan(u8, a, c);
+        }
+    }.lt);
+
+    const copies = b.addWriteFiles();
+    var source: std.Io.Writer.Allocating = .init(b.allocator);
+    const w = &source.writer;
+    w.print(
+        "//! Generated by nilo's `embedDir` from \"{f}\". Do not edit.\n" ++
+            "const Embedded = @import(\"nilo_http\").static.Embedded;\n\n" ++
+            "pub const files = [_]Embedded{{\n",
+        .{std.zig.fmtString(dir)},
+    ) catch @panic("OOM");
+    for (paths.items) |path| {
+        // Forward slashes whatever the host spelled them with: the path is a
+        // URL once `embed` has joined it to a prefix.
+        const url_path = b.dupe(path);
+        std.mem.replaceScalar(u8, url_path, '\\', '/');
+        w.print("    .{{ .path = \"{f}\", .bytes = @embedFile(\"tree/{f}\") }},\n", .{
+            std.zig.fmtString(url_path), std.zig.fmtString(url_path),
+        }) catch @panic("OOM");
+        const from = b.fmt("{s}/{s}", .{ dir, path });
+        const source_path: std.Build.LazyPath = if (std.fs.path.isAbsolute(dir))
+            .{ .cwd_relative = from }
+        else
+            b.path(from);
+        _ = copies.addCopyFile(source_path, b.fmt("tree/{s}", .{url_path}));
+    }
+    w.writeAll("};\n") catch @panic("OOM");
+
+    return b.createModule(.{
+        .root_source_file = copies.add("embedded.zig", source.written()),
+        .imports = &.{.{ .name = "nilo_http", .module = nilo_http }},
+    });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -4381,6 +4635,17 @@ pub fn build(b: *std.Build) void {
     // an HTTPS GET, which `nilo_fetch` already sends.
     const nilo_jwt = b.addModule("nilo_jwt", .{
         .root_source_file = b.path("jwt/jwt.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // The sixth tool module: protobuf from plain structs (ADR 245). It
+    // imports nothing at all, which `zig build layering` checks, and
+    // `nilo_http` does not name it: a gRPC method is an ordinary route (ADR
+    // 220) and the codec for its message is the caller's choice to import. A
+    // program that speaks no protobuf links none of it.
+    const nilo_proto = b.addModule("nilo_proto", .{
+        .root_source_file = b.path("proto/proto.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -4768,6 +5033,39 @@ pub fn build(b: *std.Build) void {
         test_jwt_step.dependOn(&b.addRunArtifact(tests).step);
     }
     test_step.dependOn(test_jwt_step);
+
+    // And the sixth (ADR 245). `zig test proto/proto.zig` is this without
+    // `build.zig` at all: bytes in, a struct out, and the allocator an argument.
+    // Both modes matter more here than anywhere: the decoder indexes slices it
+    // sized itself, and a miscount is a write past the end that Debug and
+    // ReleaseSafe catch and ReleaseFast does not.
+    const test_proto_step = b.step(
+        "test-proto",
+        "Run nilo_proto's tests: no Engine, no module graph",
+    );
+    for (test_modes) |mode| {
+        const tests = b.addTest(.{ .root_module = protoFor(b, target, mode), .use_llvm = testBackend(target, mode) });
+        test_proto_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // The ninth Refusals table, held the way the other eight are.
+    const refusals_proto_step = b.step(
+        "refusals-proto",
+        "Check that each message-type mistake stops in nilo's own words",
+    );
+    for (proto_refusals) |refusal| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("proto/refusals/{s}.zig", .{refusal.name})),
+            .target = target,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "nilo_proto", .module = nilo_proto }},
+        });
+        const refused = b.addObject(.{ .name = refusal.name, .root_module = module });
+        refused.expect_errors = .{ .contains = b.fmt("error: nilo: {s}", .{refusal.says}) };
+        refusals_proto_step.dependOn(&refused.step);
+    }
+    test_proto_step.dependOn(refusals_proto_step);
+    test_step.dependOn(test_proto_step);
 
     // The Fitting layer's entry condition, as something that runs (ADR 061).
     // A Tool module proves its layer under a plain `zig test`; a Fitting
@@ -5196,6 +5494,44 @@ pub fn build(b: *std.Build) void {
         const run = b.addRunArtifact(bench_cache);
         if (b.args) |args| run.addArgs(args);
         b.step("bench-cache", "Time a cache operation, and weigh an entry")
+            .dependOn(&run.step);
+    }
+
+    // What reading and writing a protobuf message costs, against a decoder
+    // written by hand for the same fields (ADR 245). No Engine and no server.
+    const bench_proto = b.addExecutable(.{
+        .name = "nilo-bench-proto",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/proto_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "nilo_proto", .module = nilo_proto }},
+        }),
+    });
+    {
+        const run = b.addRunArtifact(bench_proto);
+        if (b.args) |args| run.addArgs(args);
+        b.step("bench-proto", "Time protobuf decode and encode, against a decoder written by hand")
+            .dependOn(&run.step);
+    }
+
+    // What writing a float as JSON costs, `std.json`'s way against
+    // `http/jsonfloat.zig`'s (ADR 096). No Engine, no server.
+    const bench_json_float = b.addExecutable(.{
+        .name = "nilo-bench-json-float",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/json_float.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{
+                .name = "jsonfloat",
+                .module = b.createModule(.{ .root_source_file = b.path("http/jsonfloat.zig"), .target = target, .optimize = optimize }),
+            }},
+        }),
+    });
+    {
+        const run = b.addRunArtifact(bench_json_float);
+        b.step("bench-json-float", "Time writing a float as JSON, std.json's spelling against serde_json's")
             .dependOn(&run.step);
     }
 
@@ -5762,6 +6098,7 @@ pub fn build(b: *std.Build) void {
             if (example.needs_fetch) {
                 module.addImport("nilo_fetch", fetchFor(b, target, mode, core_mod));
             }
+            if (example.embeds.len > 0) module.addImport("frontend", embedDir(b, library, example.embeds));
             const tests = b.addTest(.{ .root_module = module, .use_llvm = testBackend(target, mode) });
             step.dependOn(&b.addRunArtifact(tests).step);
         }
@@ -5797,7 +6134,7 @@ pub fn build(b: *std.Build) void {
     // pass, and believe a `sql/refusals/` file had been checked.
     const refusals_step = b.step(
         "refusals",
-        "Check the framework's 116 compile errors — see refusals-sql, -s3, -config, -pw, -cache for the rest",
+        "Check the framework's 116 compile errors — see refusals-sql, -s3, -config, -pw, -cache, -proto for the rest",
     );
     for (refusals) |refusal| {
         const module = b.createModule(.{
@@ -5866,6 +6203,7 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "nilo_s3", .module = nilo_s3 },
                     .{ .name = "nilo_cache", .module = nilo_cache },
                     .{ .name = "nilo_jwt", .module = nilo_jwt },
+                    .{ .name = "nilo_proto", .module = nilo_proto },
                     .{ .name = "nilo_job", .module = nilo_job },
                 },
             });
@@ -5924,6 +6262,7 @@ pub fn build(b: *std.Build) void {
         if (example.needs_fetch) {
             module.addImport("nilo_fetch", fetchFor(b, target, optimize, nilo_core));
         }
+        if (example.embeds.len > 0) module.addImport("frontend", embedDir(b, nilo_http, example.embeds));
         if (example.needs_sql) {
             module.addImport("nilo_sql", nilo_sql);
         }

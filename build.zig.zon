@@ -88,6 +88,7 @@
         "pw",
         "cache",
         "jwt",
+        "proto",
         "fetch",
         "job",
         "http",

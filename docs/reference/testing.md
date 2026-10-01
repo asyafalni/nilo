@@ -60,6 +60,7 @@ const answer = try wired.post("/partners", body);
 | `wired.app` | a plain `App`: every registration call is the one documented in [The App](./app.md) |
 | `wired.get(path)` / `post(path, body)` / `postWith(…)` / `request(…)` | the `Client` calls, without the `&app` |
 | `wired.sendRequest(r)` / `send(raw)` / `setHeader(n, v)` / `cookie(n)` | likewise |
+| `wired.io()` | the `std.Io` a handler gets from `c.io()` or an `io: std.Io` argument in a test: a process-wide `std.Io.Threaded`. Start a writer fiber on it with `io.concurrent`; `Wired` cannot run `app.spawn` ([ADR 244](../adr/244-a-handler-is-given-the-loop-it-runs-on.md)) |
 | `wired.deinit()` | deinits the client, then the App |
 
 **Your routes and services stay yours.** `app` is a field, not something behind methods, so nothing here is a second API and no database is assumed. `Client` is unchanged, and is still what to use when a test needs two clients against one App: two addresses, two cookie jars.

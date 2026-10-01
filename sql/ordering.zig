@@ -358,6 +358,8 @@ fn readKeys(comptime Row: type, comptime keys: anytype) []const Key {
                 "there is nothing a request could choose.\n" ++
                 "  Name at least one: `.{ .due = .due_date }`.",
         );
+        // Every key is looked up in the Row, so the walk grows with both.
+        @setEvalBranchQuota(row_mod.budget(Row) + 2_000 * fields.len);
         var out: []const Key = &.{};
         for (fields) |f| {
             const said = @field(keys, f.name);

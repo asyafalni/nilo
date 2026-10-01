@@ -311,7 +311,7 @@ Whatever every named place in a module shares, held once for the program. In `ni
 _Avoid_: client, connection, session, provider, backend
 
 **Bucket**:
-A named place objects go, and a type rather than a string. The name is compiled in, so the host and the path prefix are built once and a name that could never work is refused before the program runs. Two buckets over one Store are two types and one pool.
+A named place objects go, and a type rather than a string. The name is a compiled-in default, so the host and the path prefix are built once and a name that could never work is refused before the program runs; a program whose name is configuration opens the same type under a run-time name, refused by the same rules with `error.BadBucketName`. Two buckets over one Store are two types and one pool.
 _Avoid_: container, namespace, folder, prefix, handle
 
 **Key**:
@@ -372,6 +372,20 @@ _Avoid_: JWKS as a noun on its own, keyring, key store, certificate
 **Claims**:
 A struct of the caller's own, one field per thing the application wants out of a token. Fields the token carries and the struct does not name are ignored. Separate from the registered claims — `iss`, `aud`, `exp`, `nbf` — which nilo checks whether or not the struct mentions them.
 _Avoid_: payload, body, subject, principal, identity
+
+### Protobuf
+
+**Message**:
+A struct of the caller's own that `nilo_proto` reads and writes, with a `wire` table naming each field's number. The type is the schema: there is no `.proto` file and nothing generated. Not a Job's payload, not a WebSocket frame.
+_Avoid_: proto message type, generated class, schema file
+
+**Wire table**:
+The `pub const wire = .{ .field = 1, ... }` on a message, or on a oneof's union, that says what number each field has and, where its Zig type allows more than one way to travel, which. Complete or the build fails, naming the field.
+_Avoid_: tag map, field options, annotations, descriptor
+
+**Oneof**:
+A `?union(enum)` with its own wire table, at most one member on the wire, `null` for none. The numbers sit on its members.
+_Avoid_: variant, either, sum type (in the docs for this module)
 
 ### Jobs
 

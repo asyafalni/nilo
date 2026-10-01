@@ -170,6 +170,7 @@ A 206, a 416, a `Content-Range` and `Cache-Control: no-transform` are never comp
 | `nilo.sleep(ms)` | waits without blocking the thread |
 | `nilo.spawn(f, args)` | runs something that is not a request, now. `error.NoServer` if nothing is listening |
 | `app.spawn(f, args)` | the same fiber, registered before the server starts and started once it is up ([the guide](../guide/background.md)) |
+| `nilo.io()` | the server's `std.Io`, for a spawned fiber that waits on a queue a handler fills ([ADR 244](../adr/244-a-handler-is-given-the-loop-it-runs-on.md)) |
 | `nilo.randomSecure(&buf)` | fills a buffer you already hold, off the event loop |
 | `nilo.verifyPassword(gpa, stored, text)` | `c.verifyPassword` with no request in hand: the same Gate and pool, or inline with no loop ([`nilo_pw`](./pw.md)) |
 | `nilo.monotonicNanos()` | a clock reading, for measuring durations |
@@ -184,6 +185,7 @@ A 206, a 416, a `Content-Range` and `Cache-Control: no-transform` are never comp
 |---|---|
 | `index` | `"index.html"` |
 | `cache_control` | `"public, max-age=3600"` |
+| `cache_rules` | none. A list of `.{ .prefix, .suffix, .cache_control }`, the first match by a file's path in the tree giving its header instead of `cache_control` |
 | `spa_fallback` | `""` (off) |
 | `spa_fallback_for` | `.navigations`, or `.any_path`, which was the behaviour before 0.2.0 |
 | `max_file_bytes` | `8 * 1024 * 1024` |
@@ -193,13 +195,17 @@ A 206, a 416, a `Content-Range` and `Cache-Control: no-transform` are never comp
 
 **A name on disk is matched as a browser sends it, and a symlink is never served.** A request for `/caf%C3%A9.png` finds `café.png`, and a path that decodes to an escaped `/`, a NUL, a backslash or a `.` or `..` segment finds nothing. The directory walk skips symlinks and names them in one startup warning; a spilled file, and every file under `reload`, is opened with `O_NOFOLLOW` and answers 404 if it became a link. A `FileBody` an application returns still follows links ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)).
 
-**`spa_fallback_for` decides which requests the fallback answers.** `.navigations` means a request that asks for `text/html`, or one that asks for nothing and has no file extension in its last path segment; every other request under the prefix gets a 404 naming the path. See [Static files](../guide/static-files.md#the-spa-fallback).
+**`spa_fallback_for` decides which requests the fallback answers.** `.navigations` means a `GET` or `HEAD` with `Sec-Fetch-Mode: navigate` or, when the header is absent, an `Accept` that lists `text/html`; `*/*` alone, no `Accept` and every `fetch` are not, and get a 404 naming the path. The path is never read. `static.navigational(.{ .accept, .fetch_mode })` is the test. See [Static files](../guide/static-files.md#the-spa-fallback).
 
 **`max_file_bytes` is a threshold, not a limit.** A file over it is listed but not read into memory, and each request opens it and sends it from disk: no gzipped copy, an ETag made from the modification time and size, and one file descriptor for as long as the response takes. `max_total_bytes` counts only the bytes held in memory. See [Static files](../guide/static-files.md#large-files-served-from-disk).
 
 Both the length and the ETag of a file served from disk come from one look at the descriptor whose bytes are about to be sent, so editing a file under a running server cannot serve a stale length under a stale tag ([ADR 098](../adr/098-a-file-is-described-by-the-descriptor-being-sent.md)).
 
-`app.embeddedWith(prefix, files, …)` takes `index`, `cache_control`, `spa_fallback`, `spa_fallback_for`, `compress` and `compress_min_bytes`, with the defaults above, and none of the others: nothing in the binary is served from disk, there is no total to exceed, every name was written by the caller, and there is no disk to reload from. A path listed twice, and a fallback that names no entry, are refused at startup ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)).
+**`cache_rules` is settled while the files load.** A rule matches a file's path in the tree (relative, forward slashes, no leading `/`) by `.prefix` and `.suffix`, both of which must hold and an empty one holds for every file; the first rule a file matches wins and an empty `.cache_control` leaves the header off. A request does no matching: the result is the header each file already carried ([Static files](../guide/static-files.md#one-tree-two-cache-policies)).
+
+`app.embeddedWith(prefix, files, …)` takes `index`, `cache_control`, `cache_rules`, `spa_fallback`, `spa_fallback_for`, `compress` and `compress_min_bytes`, with the defaults above, and none of the others: nothing in the binary is served from disk, there is no total to exceed, every name was written by the caller, and there is no disk to reload from.
+
+**`embedDir(b, nilo_http, dir)` is a function of nilo's `build.zig`**, imported by a dependent as `@import("nilo").embedDir`. It walks `dir` (relative to the build root, or absolute) when the build is configured and returns a module exporting `files`, an array of `static.Embedded`, to hand to `app.embedded("/", &frontend.files)`. Regular files only, a `.` segment and symlinks left out, an empty directory stops the build ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md), [Static files](../guide/static-files.md#a-vue-or-react-build-in-the-binary)). A path listed twice, and a fallback that names no entry, are refused at startup ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)).
 
 **`reload = true` is the same as `max_file_bytes = 0`**: nothing is held, every file is opened per request, and edits show up without a restart. It is for development, since it gives up the in-memory and gzipped copies. A file that did not exist at startup still needs a restart, because the list of names comes from the directory walk at startup.
 

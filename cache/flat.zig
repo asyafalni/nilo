@@ -60,8 +60,16 @@ fn ensureFlat(comptime V: type, comptime what: []const u8, comptime path: []cons
         .array => |a| ensureFlat(a.child, what, path ++ "[0]"),
         .vector => |v| ensureFlat(v.child, what, path ++ "[0]"),
         .optional => |o| ensureFlat(o.child, what, path ++ ".?"),
-        .@"struct" => |s| for (s.fields) |f| ensureFlat(f.type, what, path ++ "." ++ f.name),
+        .@"struct" => |s| {
+            // One step a field and the path grows with each, and 1,200 fields
+            // stopped at "evaluation exceeded 1000 backwards branches" at a
+            // line in this file
+            // ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)).
+            @setEvalBranchQuota(1_000 + 20 * @as(u32, @intCast(s.fields.len)));
+            for (s.fields) |f| ensureFlat(f.type, what, path ++ "." ++ f.name);
+        },
         .@"union" => |u| {
+            @setEvalBranchQuota(1_000 + 20 * @as(u32, @intCast(u.fields.len)));
             if (u.tag_type == null) @compileError(
                 "nilo: a cached " ++ what ++ " cannot keep `" ++ path ++
                     "`, which is an untagged union.\n" ++
@@ -150,4 +158,22 @@ test "a flat value survives the trip through bytes" {
     try testing.expectEqual(before.owner, after.owner);
     try testing.expectEqual(before.items, after.items);
     try testing.expectEqualStrings(&before.label, &after.label);
+}
+
+/// 1,500 fields with 40-character names, which is 6 KB and a value nobody
+/// caches, and is what it takes to run out of the default quota here. Declared
+/// apart from the test, so the test's own quota does not pay for it.
+const Wide = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var names: [1500][:0]const u8 = undefined;
+    var types: [1500]type = undefined;
+    for (&names, &types, 0..) |*name, *T, i| {
+        name.* = std.fmt.comptimePrint("a_cached_field_with_a_long_name_{d:0>4}", .{i});
+        T.* = u32;
+    }
+    break :blk @Struct(.auto, null, &names, &types, &@splat(.{}));
+};
+
+test "a struct of 1,500 fields is found flat without a quota of the caller's" {
+    try testing.expectEqual(Kind.flat, comptime kindOf(Wide, "Wide"));
 }

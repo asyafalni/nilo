@@ -344,6 +344,13 @@ pub fn checkName(comptime desc: Desc, comptime c: Column) []const u8 {
 
 fn valueList(comptime values: []const []const u8) []const u8 {
     comptime {
+        // One step for every byte of every word, and an enum of a thousand
+        // values reaches the quota on its own
+        // ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)).
+        var bytes: usize = 0;
+        @setEvalBranchQuota(10_000 + 2 * values.len);
+        for (values) |v| bytes += v.len;
+        @setEvalBranchQuota(10_000 + 8 * bytes + 100 * values.len);
         var out: []const u8 = "";
         // A quote inside a word doubled, as `writeLiteral` does at run time:
         // an enum tag `@"it's"` wrote `'it's'` and the CREATE TABLE failed.

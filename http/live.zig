@@ -40,6 +40,7 @@
 const std = @import("std");
 const nilo = @import("http.zig");
 const bulkhead = @import("bulkhead.zig");
+const watchdog = @import("watchdog.zig");
 
 const testing = std.testing;
 
@@ -492,12 +493,15 @@ test "a stop closes the listener before it waits for the requests in flight" {
 const ServingAt = struct {
     app: *nilo.App,
     bound: std.atomic.Value(bool) = .init(true),
+    /// `block_warning_ms` for the server; the default is the shipped one.
+    warn_ms: u32 = 250,
 
     fn run(self: *ServingAt) void {
         self.app.tryListen(.{
             .port = 0,
             .threads = 1,
             .stop_on_signal = false,
+            .block_warning_ms = self.warn_ms,
         }) catch {
             self.bound.store(false, .release);
         };
@@ -1126,4 +1130,163 @@ test "a route deadline shortens the write to a client that reads nothing" {
         std.debug.print("the write was still parked after {d} ms\n", .{took_ms});
         return error.DeadlineDidNotCutTheWrite;
     }
+}
+
+// ---- the detector against waits it was not told about (ADR 013) ----
+//
+// A handler may wait through the server's `Io`, which parks the fiber without
+// saying so to the watchdog. These run each shape against a real loop and read
+// `watchdog.caught`, because the loop's turn stamp is the signal and only a
+// real loop has one.
+
+const watched_ms = 100;
+
+fn parkedOnAnEvent(c: *nilo.Ctx) anyerror!void {
+    // Nobody ever sets it: the wait ends by its timeout, 4x the limit.
+    var never: std.Io.Event = .unset;
+    never.waitTimeout(c.io(), .{ .duration = .{ .raw = .fromMilliseconds(400), .clock = .awake } }) catch {};
+    try c.sendEmpty(200);
+}
+
+fn parkedOnNiloSleep(c: *nilo.Ctx) anyerror!void {
+    try nilo.sleep(400);
+    try c.sendEmpty(200);
+}
+
+fn spinFor(ms: u64) void {
+    const until = bulkhead.monotonicNanos() + ms * std.time.ns_per_ms;
+    while (bulkhead.monotonicNanos() < until) {}
+}
+
+fn spins(c: *nilo.Ctx) anyerror!void {
+    spinFor(300);
+    try c.sendEmpty(200);
+}
+
+fn blocksInTheKernel(c: *nilo.Ctx) anyerror!void {
+    const ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
+    _ = std.os.linux.nanosleep(&ts, null);
+    try c.sendEmpty(200);
+}
+
+fn parksThenSpinsBriefly(c: *nilo.Ctx) anyerror!void {
+    // 150ms of unannounced park and 60ms of the handler's own: 210ms between
+    // the two ends of the stretch, past the limit, and only the 60 is a hold.
+    var never: std.Io.Event = .unset;
+    never.waitTimeout(c.io(), .{ .duration = .{ .raw = .fromMilliseconds(150), .clock = .awake } }) catch {};
+    spinFor(60);
+    try c.sendEmpty(200);
+}
+
+fn parksThenSpins(c: *nilo.Ctx) anyerror!void {
+    // 150ms of unannounced park, then 300ms of the handler's own: the report
+    // is for the 300, and exactly one of them.
+    var never: std.Io.Event = .unset;
+    never.waitTimeout(c.io(), .{ .duration = .{ .raw = .fromMilliseconds(150), .clock = .awake } }) catch {};
+    spinFor(300);
+    try c.sendEmpty(200);
+}
+
+/// One GET to `route` on a one-thread server whose limit is `watched_ms`, and
+/// how many reports it drew.
+fn reportsFor(comptime route: []const u8, handler: anytype) !u64 {
+    hush();
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get(route, handler);
+
+    var serving: ServingAt = .{ .app = &app, .warn_ms = watched_ms };
+    const thread = try std.Thread.spawn(.{}, ServingAt.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    const port = try waitForPort(gpa, &serving);
+
+    const before = watchdog.caught.load(.monotonic);
+    const answer = try ask(gpa, port, "GET " ++ route ++ " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    defer answer.deinit(gpa);
+    try testing.expect(std.mem.startsWith(u8, answer.head, "HTTP/1.1 200"));
+    return watchdog.caught.load(.monotonic) - before;
+}
+
+test "a wait on an Event past the limit is a parked fiber, not a held thread" {
+    try testing.expectEqual(@as(u64, 0), try reportsFor("/event", parkedOnAnEvent));
+}
+
+test "nilo.sleep past the limit is still not reported" {
+    try testing.expectEqual(@as(u64, 0), try reportsFor("/sleep", parkedOnNiloSleep));
+}
+
+test "a handler that spins past the limit is reported, loop or no loop" {
+    try testing.expectEqual(@as(u64, 1), try reportsFor("/spin", spins));
+}
+
+test "a blocking syscall past the limit is reported" {
+    try testing.expectEqual(@as(u64, 1), try reportsFor("/syscall", blocksInTheKernel));
+}
+
+test "a park the detector was not told about, then a spin, is reported once for the spin" {
+    try testing.expectEqual(@as(u64, 1), try reportsFor("/both", parksThenSpins));
+}
+
+test "a park the detector was not told about, then a spin under the limit, is not" {
+    // The half that says the rule measures the run since the park rather than
+    // the whole stretch: 210ms on the clock, 60ms of it the handler's own.
+    try testing.expectEqual(@as(u64, 0), try reportsFor("/brief", parksThenSpinsBriefly));
+}
+
+var released: std.Io.Event = .unset;
+
+fn waitsForTheRelease(c: *nilo.Ctx) anyerror!void {
+    released.waitTimeout(c.io(), .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } }) catch {};
+    spinFor(300);
+    try c.sendEmpty(200);
+}
+
+fn release(c: *nilo.Ctx) anyerror!void {
+    released.set(c.io());
+    try c.sendEmpty(200);
+}
+
+fn askAndKeep(gpa: std.mem.Allocator, port: u16, request: []const u8) void {
+    const a = ask(gpa, port, request) catch return;
+    a.deinit(gpa);
+}
+
+test "a fiber woken by another request in the same turn is charged for its own spin, once" {
+    // The shape of the write-ahead log: one request waits on an Event, another
+    // sets it, and the woken fiber runs in the turn that ran the setter. The
+    // turn's stamp is the setter's start, so the woken fiber's spin is
+    // measured from there, and the setter, which ended its own stretch first,
+    // is not reported.
+    hush();
+    const gpa = std.heap.smp_allocator;
+    released = .unset;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/h", waitsForTheRelease);
+    try app.get("/r", release);
+
+    var serving: ServingAt = .{ .app = &app, .warn_ms = watched_ms };
+    const thread = try std.Thread.spawn(.{}, ServingAt.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    const port = try waitForPort(gpa, &serving);
+
+    const before = watchdog.caught.load(.monotonic);
+    const waiter = try std.Thread.spawn(.{}, askAndKeep, .{ gpa, port, "GET /h HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n" });
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    std.Io.sleep(threaded.io(), .fromMilliseconds(300), .awake) catch {};
+    const answer = try ask(gpa, port, "GET /r HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    answer.deinit(gpa);
+    waiter.join();
+    try testing.expectEqual(@as(u64, 1), watchdog.caught.load(.monotonic) - before);
 }

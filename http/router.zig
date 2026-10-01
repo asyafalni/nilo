@@ -581,6 +581,13 @@ pub const Router = struct {
 /// instead of an `unreachable` at startup.
 pub fn validatePattern(comptime pattern: []const u8) void {
     comptime {
+        // The pattern is read a byte at a time by the split, the checks of
+        // each segment, and the comparison of every param name with the ones
+        // before it, so the cost grows with its length and its params. Eight
+        // params of 24 characters ran past the default 1,000 backwards
+        // branches at a line in `std`, which reads as a fault in the route
+        // ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)).
+        @setEvalBranchQuota(10_000 + 20 * @as(u32, @intCast(pattern.len)) + @as(u32, @intCast(pattern.len * pattern.len)));
         if (pattern.len == 0) @compileError(
             "nilo: a route pattern cannot be empty.\n" ++
                 "  The path a browser asks for always starts with a slash, so the pattern does " ++

@@ -112,6 +112,7 @@ fn valueWithin(comptime V: type, comptime being_resolved: []const type, c: *Ctx)
                 .{@typeName(P)},
             ),
             .arena => args[i] = c._arena,
+            .io => args[i] = c.io(),
             .resolved => args[i] = try valueWithin(P, deeper, c),
         }
     }
@@ -163,7 +164,7 @@ fn requirementsWithin(
 
 // ---- the compile-time side ----
 
-const Role = enum { ctx, service, arena, resolved };
+const Role = enum { ctx, service, arena, io, resolved };
 
 /// Everything that has to be true of `V` before it can be worked out, said
 /// while compiling. The check runs before anything else in both entry
@@ -222,6 +223,7 @@ fn rolesOf(comptime V: type, comptime params: []const std.builtin.Type.Fn.Param)
 fn roleOf(comptime V: type, comptime P: type, comptime i: usize) Role {
     if (P == *Ctx or P == *const Ctx) return .ctx;
     if (P == std.mem.Allocator) return .arena;
+    if (P == std.Io) return .io;
     if (isResolved(P)) return .resolved;
     if (@typeInfo(P) == .pointer and @typeInfo(P).pointer.size == .one) return .service;
 
@@ -231,7 +233,7 @@ fn roleOf(comptime V: type, comptime P: type, comptime i: usize) Role {
             "  A resolver belongs to the request, not to a route, so there is no `:id` for it to " ++
             "be handed and no query struct to fill in.\n" ++
             "  What it can ask for: a `*Ctx`, a service (`*Db`), a `std.mem.Allocator` for the " ++
-            "request arena, or another resolved value.\n" ++
+            "request arena, a `std.Io`, or another resolved value.\n" ++
             "  For anything else — a path param, the query string, the body — take a `*Ctx` and " ++
             "read it: `c.param(\"id\")`, `c.query(\"page\")`, `c.json(T)`.",
     );

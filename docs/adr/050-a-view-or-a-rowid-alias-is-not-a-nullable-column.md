@@ -1,4 +1,4 @@
-# A view or a rowid alias is not a column that may be null
+# A view, a rowid alias or a primary key is not a column that may be null
 
 **Status:** accepted
 **Topic:** [sql-runtime](../design/sql-runtime.md)
@@ -12,6 +12,8 @@ The schema check read `information_schema.columns`, the obvious source and wrong
 - A view's columns are all nullable, whatever their source columns were. Postgres does not track `NOT NULL` through a view and never has, so a Row over a view reported one `unexpected_null` per non-optional field, which is every field anybody would write.
 
 The third was the check reading the answer correctly. The database said nullable; it was the question that was wrong, and a second, unrelated case turned out to be the same question asked on SQLite. `id INTEGER PRIMARY KEY` is an alias for the rowid rather than a constraint, so SQLite's `pragma_table_info` reports `notnull = 0` for it, meaning there is no `NOT NULL` clause here, not this may be null, because a rowid never is. Reading that `0` as nullable stopped the server on the most ordinary SQLite table there is, the spelling every tutorial, every migration tool and SQLite's own documentation writes. It survived because the suite's own fixture wrote the redundant `id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL`, a spelling nobody uses, so the one SQLite schema-check test walked around the bug.
+
+A third case, found porting an application whose keys are `id TEXT PRIMARY KEY`: SQLite is technically right that such a column may hold a NULL (only the rowid alias is implicitly `NOT NULL`; in every other rowid table the primary key admits NULL, a legacy bug kept for compatibility, and a `WITHOUT ROWID` table enforces it), and answering `YES` made every key of a hand-written schema an `?Str` in the Row and every use of it an `id.?`, for a value no program models as absent.
 
 ## Decision
 
@@ -57,7 +59,14 @@ A SQLite view answers `notnull = 0` for every column exactly as a Postgres view 
 - **The declared type is exactly `INTEGER`, not INTEGER affinity.** `INT PRIMARY KEY` and `BIGINT PRIMARY KEY` share the affinity, are not aliases, and really do accept a NULL. SQLite's rule is the spelling, narrower and simpler than the affinity rule once proposed for it.
 - **Not a view**, which the branch above already answered.
 
-`PRIMARY KEY (id DESC)` over an INTEGER column is not an alias either, and this answers `NO` for it: a check that fails to fire rather than one that fires wrongly, the direction the whole branch exists to move in.
+**A primary-key column that is not the rowid alias and has no `NOT NULL` answers `UNKNOWN`** (`i.pk > 0`, after the branches above), the fourth case and the third answer. This covers `TEXT PRIMARY KEY`, `INT PRIMARY KEY`, every column of a composite key and `PRIMARY KEY (id DESC)`, which used to answer `YES`. The reasoning:
+
+- **A NULL key is a corruption, not a value the program models.** The database says the column may hold one only because of a compatibility quirk; no table written on purpose means it, and a Row whose key is `?Str` to appease the quirk makes every caller pay for it.
+- **`UNKNOWN`, not `NO`.** `NO` would claim the database enforces the key, which it does not for these columns, and the schema check would be asserting something nobody checked. `UNKNOWN` is the third answer already meant for "the database cannot tell the truth here", and the check skips exactly the nullability and still compares the type.
+- **The NULL that does arrive is not silent.** A NULL read into a non-optional field is `error.QueryFailed` with the column named, on both Wires, whatever the introspection said (ADR 094), so the cost of skipping the check is one runtime error on a corrupt row rather than an empty `Str`.
+- **An optional field over a key is still accepted**, since the check only refuses a non-optional field over a column that may be null.
+- **A table nilo creates makes the rule true.** `keyColumn` writes `NOT NULL PRIMARY KEY` for a single key and every column of a composite key carries its own `NOT NULL`, so a managed key is `notnull = 1` and answers `NO`; a hand-written table that wants the check's full strength writes `NOT NULL` or `WITHOUT ROWID`.
+- **Postgres is already this**: a primary key is always `NOT NULL` there, so `attnotnull` answers `NO` and nothing changes.
 
 `pragma_table_info` is now named twice in the query, once in the `FROM` and once in the subquery that counts a table's primary-key columns, and `sqlite.Wire.columnsOf` qualifies **every** occurrence with the schema, not the first. Qualifying only the first would ask the attached database for the columns and `main` for the key, one question answered by two databases: a table absent from `main` would report no primary key at all, and every `INTEGER PRIMARY KEY` in an attached schema would go back to being reported as nullable. The rewrite buffer in `columnsOf` is 1,024 bytes of stack, on a function that runs once per Row at startup.
 
@@ -84,6 +93,12 @@ A Row names its columns and its key, and nothing else about the table is sayable
 
 ## What was rejected
 
+**Answering `YES` for a non-alias primary key**, the first position and the literal reading of SQLite. It is exact about a quirk and wrong about every program: the Row's key becomes optional for a value that cannot meaningfully be absent. Replaced by `UNKNOWN` above.
+
+**Answering `NO` for every primary-key column**, which would also let the check pass, by claiming the database enforces a key it does not. `UNKNOWN` gets the same result for the Row without the claim.
+
+**Requiring `NOT NULL` or `WITHOUT ROWID` on every key** (photon's alternative: rebuild its tables). Right for a table somebody is writing now, and it makes the check refuse every existing schema; the Row's contract is what the program reads, and the runtime refusal covers the corrupt row.
+
 **Matching INTEGER affinity for the rowid alias**, the first instinct. It says `NO` for `INT PRIMARY KEY`, which accepts a NULL, trading a check that fires wrongly for a check that silently does not fire. The exact spelling costs nothing and is the actual rule.
 
 **Asking `pragma_index_list` whether a `pk`-origin index exists**, which would make the rule exact for `PRIMARY KEY (id DESC)` as well. It is a second table-valued function to schema-qualify for one exotic spelling, and the error it leaves is a check that does not fire rather than one that fires wrongly. Written down here rather than built.
@@ -98,11 +113,12 @@ Against [ADR 017](./017-the-trade-budget-has-four-axes.md)'s four axes:
 |---|---|
 | Allocations per request | None. Introspection runs once per Row at startup, in a scratch arena, and never again. |
 | Memory per idle connection | Nothing. |
-| Throughput and p99 | Nothing on the request path. The Postgres startup query is cheaper than the one it replaced: `information_schema.columns` is a view over several catalog joins with privilege filtering on top. The SQLite query adds one correlated subquery over `pragma_table_info`, once per Row while the server starts. |
+| Throughput and p99 | Nothing on the request path, and the primary-key branch is one more `WHEN` in a query that runs once per Row at startup. The Postgres startup query is cheaper than the one it replaced: `information_schema.columns` is a view over several catalog joins with privilege filtering on top. The SQLite query adds one correlated subquery over `pragma_table_info`, once per Row while the server starts. |
 | Binary size | +0 stripped ReleaseFast on every example. |
 
 ## Consequences
 
+- A SQLite key that is not the rowid alias is not checked for nullability, and a NULL in one fails at read, by name (ADR 094).
 - A Row over a view is checked for its column types and not for nullability, and that is stated in the reference rather than left to be discovered.
 - A Wire now has three things to say about a column instead of two; the Fake says all three.
 - The next relation kind Postgres adds is a one-character change to a `WHERE` clause rather than a second query.

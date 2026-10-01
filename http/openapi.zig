@@ -125,6 +125,13 @@ pub const Object = struct {
     /// where it was written.
     name: ?[]const u8,
     fields: []const Field,
+    /// Whether the type says it skips a key it has no field for
+    /// (`.unknown_fields = .ignore`, ADR 168), written as
+    /// `additionalProperties: true`. A type that says nothing is left silent
+    /// rather than `false`: ADR 016 promises a 400 for an unknown key in a
+    /// request and no such thing for a response, which this schema is shared
+    /// with and which a client reads ignoring keys it does not know.
+    open: bool = false,
 };
 
 /// A `union(enum)` and its two encodings.
@@ -454,6 +461,10 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
                 // `fullName` is the failure ADR 016 already recorded once.
                 const said = mark.of(T);
                 var fields: []const Field = &.{};
+                // Each field is described, and a field that is a struct is a
+                // walk of its own: 200 fields stopped at "evaluation exceeded
+                // 20000 backwards branches" at this line.
+                @setEvalBranchQuota(20_000 + 4 * convert.budget(s.fields));
                 for (s.fields) |f| {
                     fields = fields ++ [_]Field{.{
                         .name = mark.wire(f.name, said),
@@ -461,7 +472,11 @@ fn schemaWithin(comptime T: type, comptime depth: usize) *const Schema {
                         .required = f.default_value_ptr == null,
                     }};
                 }
-                break :blk held(.{ .object = .{ .name = nameOf(T), .fields = fields } });
+                break :blk held(.{ .object = .{
+                    .name = nameOf(T),
+                    .fields = fields,
+                    .open = mark.ignoresUnknown(T),
+                } });
             },
 
             .pointer => |p| switch (p.size) {
@@ -931,6 +946,7 @@ const Components = struct {
             .nullable => |inner| rendersTheSame(inner, b.nullable),
             .object => |o| blk: {
                 if (o.fields.len != b.object.fields.len) break :blk false;
+                if (o.open != b.object.open) break :blk false;
                 for (o.fields, b.object.fields) |f, g| {
                     if (!std.mem.eql(u8, f.name, g.name)) break :blk false;
                     if (f.required != g.required) break :blk false;
@@ -1528,6 +1544,7 @@ fn writeObject(
         try writeString(w, f.name);
     }
     if (required) try w.writeByte(']');
+    if (object.open) try w.writeAll(",\"additionalProperties\":true");
     try w.writeByte('}');
 }
 
@@ -2005,4 +2022,38 @@ test "a nilo pattern becomes an OpenAPI path template" {
         defer testing.allocator.free(got);
         try testing.expectEqualStrings(case[1], got);
     }
+}
+
+test "a struct that says .ignore is described as open, and one that says nothing is left silent" {
+    const Loose = struct {
+        pub const nilo_json = .{ .unknown_fields = .ignore };
+        id: u32,
+    };
+    const Cased = struct {
+        pub const nilo_json = .{ .rename_all = .camelCase, .unknown_fields = .ignore };
+        full_name: Str,
+    };
+    const Tight = struct { id: u32 };
+    try expectSchema(Loose,
+        \\{"type":"object","properties":{"id":{"type":"integer","minimum":0}},"required":["id"],"additionalProperties":true}
+    );
+    try expectSchema(Cased,
+        \\{"type":"object","properties":{"fullName":{"type":"string"}},"required":["fullName"],"additionalProperties":true}
+    );
+    // ADR 016 does not promise `false`: the schema is the response's too, and
+    // a client reads a response ignoring the keys it does not know.
+    try expectSchema(Tight,
+        \\{"type":"object","properties":{"id":{"type":"integer","minimum":0}},"required":["id"]}
+    );
+}
+
+test "openness is the type's own: a strict struct holding an open one says nothing about itself" {
+    const Loose = struct {
+        pub const nilo_json = .{ .unknown_fields = .ignore };
+        id: u32,
+    };
+    const Outer = struct { inner: Loose };
+    try expectSchema(Outer,
+        \\{"type":"object","properties":{"inner":{"type":"object","properties":{"id":{"type":"integer","minimum":0}},"required":["id"],"additionalProperties":true}},"required":["inner"]}
+    );
 }

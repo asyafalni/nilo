@@ -9,7 +9,7 @@ The code is `http/json.zig` (`write`, `covers`, `isByteSlice`, `writesItsOwnScal
 ## Overview
 
 ```
-              nilo_json (.tag, .rename_all, .rename)
+              nilo_json (.tag, .rename_all, .rename, .unknown_fields)
                          |
         Mark.of(T) ── checkTag, checkRenames ── comptime refusal
                          |
@@ -37,11 +37,12 @@ nilo writes a struct with its own generated writer (the struct is "covered") unl
 6. **A type that writes its own JSON and declares a scalar with `nilo_openapi` is a leaf.** `sql.Uuid`, `sql.Timestamp`, `sql.AsText` and `id.Uuid` are all leaves, so a Row holding one can still rename its other fields, and it is faster too (measured 250 ns down to 165 ns on a row with three uuids). [ADR 148](../adr/148-a-field-name-is-a-spelling-too.md)
 7. **A type that declares it is a document of another type (`nilo_json_of`) and has a `value` field of that type is written and described as that type**, using the generated writer instead of handing the whole value to `std.json`. `sql.Json(T)` is the first such type. [ADR 163](../adr/163-a-document-is-its-value.md)
 8. **A byte slice or `Str` that is not valid UTF-8 is written as an array of byte values**, the same as `std.json` does with those bytes. The document still describes the field as a string, because the type is text even when one value is not. [ADR 096](../adr/096-a-byte-that-is-not-text-is-not-a-string.md)
-    A float that is not finite (infinity, NaN) is written as `null`, never as `inf` or `"nan"`, which `std.json` would write, on the generated writer and on the fallback alike (a type with its own `jsonStringify` that names `*std.json.Stringify` is the exception, and the author's). [ADR 096](../adr/096-a-byte-that-is-not-text-is-not-a-string.md)
+    A float that is not finite (infinity, NaN) is written as `null`, never as `inf` or `"nan"`, which `std.json` would write, on the generated writer and on the fallback alike (a type with its own `jsonStringify` that names `*std.json.Stringify` is the exception, and the author's). [ADR 096](../adr/096-a-byte-that-is-not-text-is-not-a-string.md) **A float is spelled the way serde_json 1.0.150 spells it, not the way `std.json` does**, on the generated writer and on every fallback alike, `nilo.writeJson` and `nilo.jsonAlloc` included: the shortest digits that read back as the same bits, a decimal exponent from -5 to 15 positional with an integral value keeping `.0` (`0.0`, `1.0`, `1000000000000000.0`), anything outside scientific with an explicit sign (`1e+16`, `1e-7`, `5e-324`), an `f32` from its own digits (`1.1`) with the range -6 to 12. The output is bounded at 24 bytes an `f64`, where `std.json` writes `f64::MAX` as 309 digits. Reading is unchanged: a body `1` still fills an `f64`. [ADR 096](../adr/096-a-byte-that-is-not-text-is-not-a-string.md)
 9. **One function, `json.isByteSlice`, decides what counts as a byte slice.** The writer, `typed.contentTypeFor` and `openapi.schemaWithin` all use it, so a `[:0]const u8` is never a string to one and a list to another. [ADR 081](../adr/081-one-file-decides-what-counts-as-text.md)
 10. **The walk that works out a type's shape stops at eight levels on both sides**: `coversWithin` for the writer and `schemaWithin` for the document, so they never disagree about what is too deep. [ADR 081](../adr/081-one-file-decides-what-counts-as-text.md)
 11. **A body field is read back the same way it is written.** A type with `nilo_parse` adds `pub const jsonParse = nilo.jsonParseFor(@This());` and is read from the single string or number token `nilo_parse` already accepts. A body containing such a type without a reader is rejected, naming the route. [ADR 166](../adr/166-a-body-field-that-parses-itself.md)
 12. **A type can describe what input it expects with `nilo_expects`**, and every place a value can arrive (path, query, form, body) uses it; see [request-input](request-input.md) for the wider conversion rules this is part of. [ADR 166](../adr/166-a-body-field-that-parses-itself.md)
+13. **A struct can skip the keys a body has that it has no field for**, with `.unknown_fields = .ignore`. It is per type, so a strict parent still refuses its own keys and a tolerant one still has its strict child refuse; on a union it goes on the variant's payload. A skipped value is held to 64 levels, a repeated known key is still a 400, the document says `additionalProperties: true` for it and nothing for any other struct, and a payload under an externally tagged union stays strict because `std.json` reads it. [ADR 168](../adr/168-one-field-can-be-spelled-on-its-own.md)
 
 ## Decisions
 
@@ -49,11 +50,11 @@ nilo writes a struct with its own generated writer (the struct is "covered") unl
 |---|---|
 | [072](../adr/072-two-renamed-names-that-collide-are-refused.md) | An enum's values or a union's variants that collide under `rename_all` are rejected, naming both |
 | [081](../adr/081-one-file-decides-what-counts-as-text.md) | `json.isByteSlice` is the only answer to "is this text", and the depth limit is shared |
-| [096](../adr/096-a-byte-that-is-not-text-is-not-a-string.md) | A byte slice that is not valid UTF-8 is written as an array of byte values, like `std.json` |
+| [096](../adr/096-a-byte-that-is-not-text-is-not-a-string.md) | A byte slice that is not valid UTF-8 is written as an array of byte values, like `std.json`; a float is `null` when not finite and is spelled the way serde_json spells it |
 | [148](../adr/148-a-field-name-is-a-spelling-too.md) | `rename_all` on a struct's fields, the wall and leaf split, and the rejection on the read side |
 | [163](../adr/163-a-document-is-its-value.md) | `nilo_json_of`: a type that names a document is written and described as that document |
 | [166](../adr/166-a-body-field-that-parses-itself.md) | A body field is read through `jsonParseFor`, backed by `nilo_parse`; `nilo_expects` |
-| [168](../adr/168-one-field-can-be-spelled-on-its-own.md) | `.rename`: one field named on its own, alongside `.rename_all` |
+| [168](../adr/168-one-field-can-be-spelled-on-its-own.md) | `.rename`: one field named on its own, alongside `.rename_all`; `.unknown_fields = .ignore` |
 
 Related topics: the tagged-union encoding and the API document built from the same markers are [ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md); the wider conversion rules, including `nilo_parse` and `nilo_expects` outside a JSON body, are [request-input](request-input.md); the response wrappers a JSON value is sent through (`?T`, `Status`, `Response`) and types that write something other than JSON are [responses](responses.md).
 

@@ -1693,6 +1693,11 @@ pub fn serve(
     // "the server did not start" has to mean.
     background.store(&group, .release);
     defer background.store(null, .release);
+    // The loop a handler's `c.io()` answers with (ADR 238). Set beside
+    // `background` because it has the same lifetime and the same
+    // one-server-per-process limit, and cleared before the Runtime goes.
+    serving.store(rt, .release);
+    defer serving.store(null, .release);
 
     // After the port is taken, before anything is accepted, and before the
     // line below says the server is up — because until this returns it is
@@ -2540,6 +2545,22 @@ pub const File = struct {
 // the state `serve` already carries.
 var background: std.atomic.Value(?*zio.Group) = .init(null);
 
+/// The Runtime of the server that is running, for `serverIo`. A pointer to
+/// the Runtime rather than a stored `std.Io`, so the read is one atomic load
+/// and the `Io` is built from it on the way out; nothing is held per
+/// connection (ADR 017).
+var serving: std.atomic.Value(?*zio.Runtime) = .init(null);
+
+/// The `std.Io` the running server's fibers run on, or null when no server
+/// is running (a unit test, a `Client` driving an App). Readable from a
+/// fiber and from a pool thread alike, which a lookup of the current
+/// executor would not be: a handler handed to `nilo.blocking` runs on a
+/// thread that has none.
+pub fn serverIo() ?std.Io {
+    const rt = serving.load(.acquire) orelse return null;
+    return rt.io();
+}
+
 /// Start `func` in a fiber of its own, owned by the running server.
 ///
 /// `error.NoServer` if there is no server running, which is what a unit
@@ -2602,6 +2623,31 @@ pub fn bindsOn(io: std.Io) bool {
 /// (a unit test calling App directly, for instance).
 pub fn slot() ?*anyopaque {
     return fiber_slot.get();
+}
+
+/// When the run loop of the executor this fiber runs on last began a turn, as
+/// nanoseconds of `CLOCK_MONOTONIC`, or null off a fiber (a pool thread, a
+/// test with no server) or before the first turn.
+///
+/// **This is the signal that tells a park from a hold** (ADR 013). zio writes
+/// the stamp once per turn of its run loop, after the poll and before the
+/// batch of ready fibers, and a turn cannot end while a fiber is running, so a
+/// stamp newer than the moment a stretch began means the fiber parked in
+/// between, whatever it waited on: `std.Io.Event`, a `Queue`, a socket of a
+/// service the Bulkhead never heard of. It costs the run loop nothing, because
+/// zio writes the field for its own scheduling, and the fiber nothing, because
+/// the watchdog reads it only for a stretch already past its limit.
+///
+/// zio does not export `Executor`, so the field is reached through the type of
+/// `Runtime.executors`. `noinline` for the reason zio's own accessor is: a
+/// threadlocal read must not be cached across a context switch. A fiber is
+/// pinned here, so the answer could not differ, but the property is cheap to
+/// keep and costly to find out about later.
+pub noinline fn loopTurnNanos() ?u64 {
+    const Executor = @typeInfo(@typeInfo(@TypeOf(@as(zio.Runtime, undefined).executors.items)).pointer.child).pointer.child;
+    const exec = Executor.current_DO_NOT_ACCESS_DIRECTLY orelse return null;
+    const at: u64 = @intCast(exec.tick_started_at.toNanoseconds());
+    return if (at == 0) null else at;
 }
 
 const testing = std.testing;

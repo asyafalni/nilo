@@ -312,6 +312,128 @@ pub const Timestamp = struct {
     }
 };
 
+/// The unit a Unix-count column counts in.
+pub const Unit = enum { seconds, millis };
+
+/// **A moment held as a plain count of a stated unit since the epoch**, for the
+/// `INTEGER` column somebody else's schema already has. `Timestamp` is
+/// microseconds and says so; a table whose `created_at` holds Unix
+/// milliseconds read through it is the wrong year with no error, because an
+/// `INTEGER` column has no unit for the schema check to compare (ADR 067).
+/// The unit goes in the type, where a reader and the compiler can see it, and
+/// the conversion is one multiply or one divide at the edge of the column
+/// (ADR 036).
+///
+/// ```zig
+/// created_at: sql.UnixMillis,   // INTEGER, milliseconds
+/// seen_at: sql.UnixSeconds,     // INTEGER, seconds
+/// ```
+///
+/// **It is an integer column on both databases** (`int8` on Postgres, `INTEGER`
+/// on SQLite), so the check refuses a `timestamptz`, a `TEXT` and a `date`
+/// under it, which is the half of the wrong-unit mistake a database can see.
+/// What it cannot see is an `INTEGER` holding microseconds under
+/// `UnixMillis`: both are integers, and that is on the caller's schema.
+///
+/// `.count` is the number as stored; `toTimestamp` and `fromTimestamp` cross to
+/// `Timestamp` (one multiply, saturating, and one floor division). JSON is the
+/// number, not RFC 3339, because a column kept as a count is almost always a
+/// contract that says count; go through `toTimestamp` to print a date.
+pub fn Unix(comptime unit: Unit) type {
+    return struct {
+        const Self = @This();
+
+        count: i64,
+
+        /// What marks the type for the Wires and the Dialects, which treat it
+        /// as the `i64` it is on the wire.
+        pub const nilo_unix = unit;
+        pub const nilo_openapi = .{ .type = "integer", .format = "int64" };
+
+        const per_second: i64 = switch (unit) {
+            .seconds => 1,
+            .millis => std.time.ms_per_s,
+        };
+
+        pub fn now() Self {
+            return fromTimestamp(Timestamp.now());
+        }
+
+        /// Floor division, so a moment before 1970 truncates toward the past
+        /// and a round trip through `toTimestamp` is the identity.
+        pub fn fromTimestamp(t: Timestamp) Self {
+            return .{ .count = @divFloor(t.micros, std.time.us_per_s / per_second) };
+        }
+
+        /// Saturates rather than overflowing, so a column holding something
+        /// that is not a moment at all (a microsecond count under
+        /// `UnixMillis`) reaches `writeRfc3339` as `error.OutOfRange`, not as a
+        /// panic in Debug or a wrapped year in ReleaseFast.
+        pub fn toTimestamp(self: Self) Timestamp {
+            return .{ .micros = self.count *| (std.time.us_per_s / per_second) };
+        }
+
+        /// The decimal digits, which is what a path param, a query field and a
+        /// keyset cursor carry (`nilo_parse` is what makes a type one, ADR 113).
+        pub fn nilo_parse(text: []const u8) ?Self {
+            const n = std.fmt.parseInt(i64, text, 10) catch return null;
+            return .{ .count = n };
+        }
+
+        pub fn jsonStringify(self: Self, jw: anytype) !void {
+            try jw.write(self.count);
+        }
+
+        pub fn jsonParse(
+            gpa: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) std.json.ParseError(@TypeOf(source.*))!Self {
+            const token = try source.nextAllocMax(gpa, .alloc_if_needed, options.max_value_len.?);
+            const text = switch (token) {
+                inline .number, .allocated_number => |slice| slice,
+                else => return error.UnexpectedToken,
+            };
+            defer switch (token) {
+                .allocated_number => gpa.free(text),
+                else => {},
+            };
+            return nilo_parse(text) orelse error.InvalidCharacter;
+        }
+
+        pub fn jsonParseFromValue(
+            gpa: std.mem.Allocator,
+            source: std.json.Value,
+            options: std.json.ParseOptions,
+        ) std.json.ParseFromValueError!Self {
+            _ = gpa;
+            _ = options;
+            return switch (source) {
+                .integer => |n| .{ .count = n },
+                else => error.UnexpectedToken,
+            };
+        }
+    };
+}
+
+/// Unix milliseconds in an integer column: the unit JavaScript and most
+/// observability stores keep.
+pub const UnixMillis = Unix(.millis);
+/// Unix seconds in an integer column.
+pub const UnixSeconds = Unix(.seconds);
+
+/// Whether `T` is a `Unix(unit)`, optional included. Asked by both Wires and
+/// both Dialects, which treat one as the `i64` it travels as.
+pub fn isUnix(comptime T: type) bool {
+    return comptime blk: {
+        const Inner = switch (@typeInfo(T)) {
+            .optional => |o| o.child,
+            else => T,
+        };
+        break :blk @typeInfo(Inner) == .@"struct" and @hasDecl(Inner, "nilo_unix");
+    };
+}
+
 /// A calendar day, as days since 1970-01-01 — no hour, no zone, nothing to
 /// convert.
 ///
@@ -1374,4 +1496,37 @@ test "a value that is not a slice is not a list" {
     try testing.expectEqual(@as(?type, null), listElement(i64));
     try testing.expectEqual(@as(?type, null), listElement(Timestamp));
     try testing.expectEqual(@as(?type, null), listElement(Json(struct { a: u8 })));
+}
+
+test "a UnixMillis crosses to a Timestamp by one multiply, and back by one floor division" {
+    const ms = UnixMillis{ .count = 1_790_846_995_323 };
+    try testing.expectEqual(@as(i64, 1_790_846_995_323_000), ms.toTimestamp().micros);
+    try testing.expectEqual(ms.count, UnixMillis.fromTimestamp(ms.toTimestamp()).count);
+    // Before 1970 truncates toward the past, not toward zero.
+    try testing.expectEqual(@as(i64, -1), UnixMillis.fromTimestamp(.{ .micros = -1 }).count);
+    try testing.expectEqual(@as(i64, 7), UnixSeconds.fromTimestamp(.{ .micros = 7_999_999 }).count);
+    try testing.expectEqual(@as(i64, 7_000_000), (UnixSeconds{ .count = 7 }).toTimestamp().micros);
+}
+
+test "a count that is no moment saturates instead of overflowing, and then will not print" {
+    const absurd = UnixMillis{ .count = std.math.maxInt(i64) };
+    try testing.expectEqual(std.math.maxInt(i64), absurd.toTimestamp().micros);
+    var buf: [40]u8 = undefined;
+    try testing.expectError(error.OutOfRange, textOf(absurd.toTimestamp(), &buf));
+}
+
+test "a Unix count is a number in JSON both ways, and the type says so" {
+    const gpa = testing.allocator;
+    const out = try std.json.Stringify.valueAlloc(gpa, UnixMillis{ .count = 42 }, .{});
+    defer gpa.free(out);
+    try testing.expectEqualStrings("42", out);
+
+    const back = try std.json.parseFromSlice(UnixSeconds, gpa, "1790846995", .{});
+    defer back.deinit();
+    try testing.expectEqual(@as(i64, 1_790_846_995), back.value.count);
+    try testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(UnixSeconds, gpa, "\"2026\"", .{}));
+
+    try testing.expect(isUnix(UnixMillis) and isUnix(?UnixSeconds));
+    try testing.expect(!isUnix(Timestamp) and !isUnix(i64));
+    try testing.expectEqual(@as(?UnixMillis, null), UnixMillis.nilo_parse("12ms"));
 }

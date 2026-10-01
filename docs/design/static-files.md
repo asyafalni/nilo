@@ -15,8 +15,8 @@ app.static(prefix, dir) ──► walk once ──► Set        GET prefix/name
   held file:   bytes, ETag, gzip copy                     │
   spilled file (over max_file_bytes): name, size, mtime   ├─ held  ──► slice, maybe gzip (211), maybe a Range (020)
 app.embedded(prefix, files) ──► same Set,                 ├─ spilled ──► open, stat the descriptor, sendfile (098)
-  bytes borrowed from the binary, owns_bytes = false       └─ miss  ──► fallbackFor(path, Accept) (087)
-                                                                  HTML navigation → spa_fallback
+  bytes borrowed from the binary, owns_bytes = false       └─ miss  ──► fallbackFor(path, Sec-Fetch-Mode, Accept) (087)
+                                                                  a navigation → spa_fallback
                                                                   otherwise → 404 naming the path
 ```
 
@@ -28,7 +28,7 @@ app.embedded(prefix, files) ──► same Set,                 ├─ spilled �
 4. **`app.embedded` serves the same kind of `Set`, without reading from disk.** The bytes are borrowed from the binary through `@embedFile` (`Set.owns_bytes` is false), and `max_file_bytes`, `max_total_bytes`, `dotfiles` and `.reload` do not apply, because there is no disk behind any of them. [ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)
 5. **A `Range` header that cannot be understood is ignored, and the whole file is sent**, because RFC 9110 makes that a correct answer in every case. The exceptions are a range past the end of the file and the suffix `bytes=-0` (which asks for nothing): both answer `416` with `Content-Range: bytes */<total>`. [ADR 020](../adr/020-a-range-is-a-slice-and-two-headers.md)
 6. **`If-Range` is compared against the same ETag `If-None-Match` uses**, and anything else (a stale tag, a date, a nonsense value) sends the whole file. Ignoring a range only costs a bigger download; honouring one wrongly produces a corrupt file. [ADR 020](../adr/020-a-range-is-a-slice-and-two-headers.md)
-7. **The fallback answers page navigations, never a missing asset.** `spa_fallback` is used for a request whose `Accept` includes `text/html`, or, when the client sent no `Accept`, for a path whose last segment has no extension. Anything else under the prefix is a 404 naming the path. `spa_fallback_for` defaults to `.navigations`; `.any_path` exists only to keep the behaviour from before `0.2.0`. [ADR 087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)
+7. **The fallback answers page navigations, never a missing asset or an API typo.** A request is a navigation when it is a `GET` or `HEAD` that sent `Sec-Fetch-Mode: navigate`, or, when it sent no such header, an `Accept` that lists `text/html` by name; `*/*` alone is not one and the path is never read. Anything else under the prefix is a 404 naming the path, so no catch-all route is needed to keep an unknown `/api/` path from being the page, and a path a route spells keeps its 405. `spa_fallback_for` defaults to `.navigations`; `.any_path` exists only to keep the behaviour from before `0.2.0`. There is no list of prefixes that never fall back. [ADR 087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)
 8. **Every static set is checked for a real file before any set's fallback is used**, so a single-page app mounted at `/` cannot answer another set's asset with its own `index.html`. [ADR 087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)
 9. **A large (spilled) file's headers come from one `stat` of the descriptor about to be sent, not from what the startup walk remembered.** So its `Content-Length` and ETag come from the same moment and can never disagree with each other or with the bytes that follow. [ADR 098](../adr/098-a-file-is-described-by-the-descriptor-being-sent.md)
 10. **`.reload` just sets the spill threshold to zero.** Every file is opened, `stat`ed and read on each request, so an edit shows up without a restart, and no Set is ever swapped under a reader. A file created after startup still needs a restart. [ADR 098](../adr/098-a-file-is-described-by-the-descriptor-being-sent.md)
@@ -37,14 +37,16 @@ app.embedded(prefix, files) ──► same Set,                 ├─ spilled �
 13. **The compressor is reset in place, not re-initialised.** `compress.reset` sets the same fields as the standard library's `init`, using 40 bytes of stack instead of `init`'s 99,048, because a fiber keeps whatever stack it touched for the life of the connection. [ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)
 14. **What the handler said about the representation stands, and a body is capped.** A 206, a 416, a `Content-Range` and `Cache-Control: no-transform` are never compressed; a strong `ETag` is weakened on an answer that is; a body over `max_bytes` (1 MiB, about 7 ms of the thread) goes out as it is, because deflate runs whole with no point where the fiber parks. [ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)
 15. **Streams and event streams are never compressed, and gzip is the only encoding offered.** Neither has a whole body that could be gzipped into the arena without holding the compressor across a write, which the borrowing rule forbids. [ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)
+16. **One set can carry two `Cache-Control` policies.** `cache_rules` matches a file's path in the tree by prefix and suffix, first match wins, and the result is written into the header each file already carries while the Set is built, so a request does no matching and allocates nothing. [ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)
+17. **A directory is listed into an embed set by `embedDir` in nilo's `build.zig`**, walked when the build is configured: regular files, no `.` segment, no symlink, no size cap, and an empty directory stops the build. It is a build function and not a module, so `layering` has nothing to say about it. [ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)
 
 ## Decisions
 
 | ADR | What it decides |
 |---|---|
-| [009](../adr/009-static-files-are-held-in-memory-or-opened.md) | A directory is held in memory, or opened per request above a size threshold; `app.embedded` is the same Set without the disk read |
+| [009](../adr/009-static-files-are-held-in-memory-or-opened.md) | A directory is held in memory, or opened per request above a size threshold; `app.embedded` is the same Set without the disk read, listed from a directory by `embedDir`; `cache_rules` give files their own header |
 | [020](../adr/020-a-range-is-a-slice-and-two-headers.md) | What `Range` and `If-Range` mean for a file in memory or on disk |
-| [087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md) | When `spa_fallback` answers, and when a miss is a 404 instead |
+| [087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md) | When `spa_fallback` answers (a request that says it is a navigation), and when a miss is a 404 instead |
 | [098](../adr/098-a-file-is-described-by-the-descriptor-being-sent.md) | A spilled file's `Content-Length` and ETag come from one `stat` of the descriptor being sent |
 | [207](../adr/207-a-try-call-hands-back-the-error-and-says-nothing.md) | The `try` version of a static call returns the error without logging |
 | [211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md) | Gzip on a per-thread compressor pool, and why streams are left out |

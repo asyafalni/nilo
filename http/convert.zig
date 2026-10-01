@@ -492,10 +492,27 @@ pub fn spelledAsNumber(text: []const u8, signed: bool, real: bool) bool {
     return i > from and i == rest.len;
 }
 
+/// A branch quota for a walk over `fields` that touches every byte of every
+/// name, written at the site that loops: an enum of a thousand values listed
+/// in a 400's message stopped at "evaluation exceeded 1000 backwards
+/// branches" from a line in this file
+/// ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)). Generous
+/// rather than exact, because the compiler keeps the larger of two quotas.
+pub fn budget(comptime fields: anytype) u32 {
+    comptime {
+        // Adding the sizes up is itself a loop over the fields.
+        @setEvalBranchQuota(1000 + 2 * fields.len);
+        var n: u32 = 2000;
+        for (fields) |f| n += 100 + 20 * @as(u32, @intCast(f.name.len));
+        return n;
+    }
+}
+
 /// The names an enum's values answer to, for the message that says what was
 /// expected. Built once at compile time.
 pub fn enumChoices(comptime E: type) []const u8 {
     comptime {
+        @setEvalBranchQuota(budget(@typeInfo(E).@"enum".fields));
         var out: []const u8 = "";
         for (@typeInfo(E).@"enum".fields, 0..) |f, i| {
             out = out ++ (if (i == 0) "" else ", ") ++ f.name;

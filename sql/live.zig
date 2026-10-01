@@ -1606,6 +1606,32 @@ test "an infinite date or timestamp another client wrote is refused by name, not
     try testing.expectEqual(@as(?types.Timestamp, null), nothing[0].at);
 }
 
+const Counted = struct {
+    pub const nilo_table = .projection;
+
+    at_ms: types.UnixMillis,
+    at_s: ?types.UnixSeconds,
+};
+
+test "a UnixMillis and a UnixSeconds read an integer column as the count it holds, and write it back" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const rows = try stack.db.raw(
+        Counted,
+        &run,
+        "SELECT 1790846995323::int8 AS at_ms, NULL::int8 AS at_s",
+        .{},
+    );
+    try testing.expectEqual(@as(i64, 1_790_846_995_323), rows[0].at_ms.count);
+    try testing.expectEqual(@as(?types.UnixSeconds, null), rows[0].at_s);
+    try testing.expectEqual(@as(i64, 1_790_846_995_323_000), rows[0].at_ms.toTimestamp().micros);
+}
+
 const Dated = struct {
     pub const nilo_table = .projection;
 

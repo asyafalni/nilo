@@ -50,6 +50,23 @@ if (row) |r| if (try pw.needsRehash(r.password.view(), .default)) {
 
 **`stored` is optional on purpose.** A sign-in for an address with no account has no hash to check. Returning early there answers in a millisecond instead of thirty, which turns the sign-in form into a way to ask which addresses are registered. Passing null does the work anyway and returns false, **at the Cost you give `verifyPasswordWith`**. That is why the method exists: the work done for a missing account has to match the work done for a real one ([ADR 044](../adr/044-a-password-hash-is-gated-because-forgetting-is-silent.md)).
 
+### A stored string that is not a hash
+
+**`verify` returns `error.NotAHash`, not `false`, for a `stored` it cannot read as an Argon2id hash**: an empty string, a bcrypt or plaintext value left in the column, a PHC string for another algorithm or version, a digest or salt too short to check, parameters Argon2 refuses. It does no hashing work and answers at once. `needsRehash` answers it the same way, and every Ctx and `nilo.` method above passes it through.
+
+`false` means "the password is wrong", which is a fact about the person signing in. `NotAHash` is a fact about the row, which a retry will not change and a password cannot cure. **Treat it as a fault in your data, not as a failed sign-in**: log which account it was (never the stored string), answer 500 or a generic sign-in failure, and do not let the person in. Do not catch it as `false`, which hides every row an import or a migration left half-converted, and do not rehash on the strength of it, which would write a new hash over a row nobody has explained. A `null` is the other case: no account, `false`, and the same work as a real one.
+
+<!-- compiles -->
+```zig
+fn signIn(gpa: std.mem.Allocator, user_id: i64, stored: ?[]const u8, text: []const u8) !void {
+    const ok = nilo.verifyPassword(gpa, stored, text) catch |err| switch (err) {
+        error.NotAHash => return nilo.fail.internal("account {d} has a password that is not an Argon2id hash", .{user_id}),
+        else => |e| return e,
+    };
+    if (!ok) return nilo.fail.unauthorized("wrong email or password", .{});
+}
+```
+
 ### The allocator
 
 **`gpa` is an argument because 19 MiB should be visible.** Do not pass `c.arena()`: the request arena is reset per request and keeps `arena_keep` bytes, and pushing 19 MiB through it breaks the memory budget nilo treats as an invariant. Pass `pw.huge_pages` and the same 19 MiB arrives in ten pages instead of 4,864: 11.0 ms a hash instead of 13.6, with nothing held between hashes. On any system other than Linux it *is* `std.heap.page_allocator`, so the call reads the same everywhere.

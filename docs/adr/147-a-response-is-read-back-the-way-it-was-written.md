@@ -42,6 +42,11 @@ is a 400 naming it. A response with more fields than the test asked about is the
 ordinary case — the test is asking a question about part of it. A test that means
 to assert the whole shape asks for `std.json.Value` and compares that.
 
+A request type can opt out of the refusal, one type at a time, with
+`.unknown_fields = .ignore` in its marker
+([ADR 168](168-one-field-can-be-spelled-on-its-own.md)); the default is still the
+one this section describes.
+
 ## An `App` and a `Client` were assembled by hand
 
 The caller had a `Wired` struct in each http test file — two copies driving 17

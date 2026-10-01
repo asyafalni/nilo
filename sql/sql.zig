@@ -251,6 +251,9 @@ pub const Postgres = dialect.Postgres;
 pub const SQLite = dialect.SQLite;
 
 pub const Timestamp = types.Timestamp;
+pub const Unix = types.Unix;
+pub const UnixMillis = types.UnixMillis;
+pub const UnixSeconds = types.UnixSeconds;
 /// A calendar day, read out of the column rather than out of a `::text`
 /// ([ADR 181](../docs/adr/181-the-marker-has-two-kinds-of-word.md)).
 pub const Date = types.Date;
@@ -594,6 +597,8 @@ test {
     // Reached only through `db.zig` and `schema.zig`, which import it for its
     // checks and so never ran its own tests: 29 of them sat here unrun.
     _ = @import("rawcheck.zig");
+    // Types far wider than any program's, for the branch quotas (ADR 126).
+    _ = @import("wide.zig");
     _ = schema;
     _ = types;
     _ = postgres;

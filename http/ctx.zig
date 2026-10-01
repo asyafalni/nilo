@@ -17,6 +17,7 @@ const cookie_mod = @import("cookie.zig");
 const encoded = @import("encoded.zig");
 const http1 = @import("http1.zig");
 const json_mod = @import("json.zig");
+const jsonmark = @import("jsonmark.zig");
 const password_mod = @import("password.zig");
 const router = @import("router.zig");
 const scan = @import("scan.zig");
@@ -700,6 +701,41 @@ pub const Ctx = struct {
             value >>= 4;
         }
         return Str.fromRequest(self._request_id_buf[0..], self._lifetime);
+    }
+
+    /// The `std.Io` the server runs on, for what a handler hands to
+    /// something that takes one: a `std.Io.Queue`, a `std.Io.Event`, a
+    /// `std.Io.Select`, a `std.Io.sleep` (ADR 244).
+    ///
+    /// ```zig
+    /// fn append(c: *nilo.Ctx, wal: *Wal) !void {
+    ///     var done: std.Io.Event = .unset;
+    ///     var item: Append = .{ .bytes = (try c.body()).view(), .done = &done };
+    ///     try wal.queue.putOne(c.io(), &item);
+    ///     done.waitUncancelable(c.io()); // the writer holds &item now
+    /// }
+    /// ```
+    ///
+    /// **A wait on it parks the fiber, not the thread**, which is what the
+    /// rule of ADR 013 asks of a wait, and the other end of the queue is a
+    /// fiber started with `app.spawn`, which runs on the same loop
+    /// ([ADR 028](../docs/adr/028-a-spawned-fiber-belongs-to-the-server.md)).
+    /// A handler that asks for it with `fn (io: std.Io, …)` gets the same
+    /// value; this is for a handler or a middleware that already holds the
+    /// `*Ctx`.
+    ///
+    /// **A wait here is not reported as a handler holding its thread**: the
+    /// detector (ADR 013) is not told about it, but sees that the loop turned
+    /// over while the fiber waited, so a wait of any length is a park. What it
+    /// reports is the handler running past `block_warning_ms` (250 ms) after
+    /// the wait.
+    ///
+    /// In a `testing.Client` or `testing.Wired` there is no server, and this
+    /// is a process-wide `std.Io.Threaded` (`Wired.io()` is the same one), so
+    /// a handler written against it runs in memory.
+    pub fn io(self: *const Ctx) std.Io {
+        _ = self;
+        return bulkhead.loopIo();
     }
 
     /// `n` bytes from the operating system's entropy source, off the event
@@ -2415,10 +2451,12 @@ const max_body_depth = 8;
 pub const max_json_nesting = 64;
 
 /// Refuse a body nested past `max_json_nesting`, before it is parsed, when
-/// `T` can nest without a bound. A type that cannot is bounded by its own
-/// declaration, pays nothing, and is not scanned.
+/// `T` can nest without a bound, or holds a struct that skips unknown keys
+/// (`.unknown_fields = .ignore`, ADR 168): a skipped value is read by no
+/// field, so the declaration bounds nothing about it. A type that does neither
+/// is bounded by its own declaration, pays nothing, and is not scanned.
 fn refuseTooDeep(comptime T: type, body: []const u8) !void {
-    if (comptime !nestsWithoutBound(T)) return;
+    if (comptime !nestsWithoutBound(T) and !jsonmark.ignoresUnknownWithin(T)) return;
     return refuseDeepBody(body);
 }
 
@@ -2501,14 +2539,22 @@ fn describeBadBody(
     body: []const u8,
     err: anyerror,
 ) anyerror {
-    // Anything but a struct is somebody using `Ctx.json` directly for a
-    // list or a number, where there are no field names to talk about.
-    if (@typeInfo(T) != .@"struct") return err;
+    // Anything but a struct, or a union with a discriminator, is somebody
+    // using `Ctx.json` directly for a list or a number, where there are no
+    // field names to talk about.
+    const tagged = comptime tagOf(T) != null;
+    if (@typeInfo(T) != .@"struct" and !tagged) return err;
 
-    if (std.mem.trim(u8, body, " \t\r\n").len == 0) return fail.badRequest(
-        "the request body is empty. This endpoint expects a JSON object with: {s}",
-        .{comptime fieldList(T)},
-    );
+    if (std.mem.trim(u8, body, " \t\r\n").len == 0) {
+        if (comptime tagged) return fail.badRequest(
+            "the request body is empty. This endpoint expects an object whose \"{s}\" is one of {s}",
+            .{ comptime tagOf(T).?, comptime variantList(T) },
+        );
+        return fail.badRequest(
+            "the request body is empty. This endpoint expects a JSON object with: {s}",
+            .{comptime fieldList(T)},
+        );
+    }
 
     // Read again with no shape to satisfy. If even this fails, the text is
     // not JSON at all, and where it stopped making sense is the useful part.
@@ -2529,13 +2575,23 @@ fn describeBadBody(
         .{ diagnostics.getLine(), diagnostics.getColumn() },
     );
 
-    if (dynamic != .object) return fail.badRequest(
-        "the request body has to be a JSON object with: {s} — this is {s}",
-        .{ comptime fieldList(T), kindOf(dynamic) },
-    );
+    if (dynamic != .object) {
+        if (comptime tagged) return fail.badRequest(
+            "the request body has to be an object whose \"{s}\" is one of {s}, not {s}",
+            .{ comptime tagOf(T).?, comptime variantList(T), kindOf(dynamic) },
+        );
+        return fail.badRequest(
+            "the request body has to be a JSON object with: {s} — this is {s}",
+            .{ comptime fieldList(T), kindOf(dynamic) },
+        );
+    }
 
     var deeper = false;
-    if (describeObject(T, arena, dynamic.object, "", max_body_depth, &deeper)) |found| return found;
+    const found = if (comptime tagged)
+        describeTagged(T, arena, dynamic.object, "", max_body_depth, &deeper)
+    else
+        describeObject(T, arena, dynamic.object, "", .{}, max_body_depth, &deeper);
+    if (found) |explained| return explained;
     return if (deeper) tooDeep() else err;
 }
 
@@ -2706,6 +2762,7 @@ fn describeObject(
     arena: std.mem.Allocator,
     object: std.json.ObjectMap,
     where: []const u8,
+    comptime within: Within,
     comptime depth: u8,
     deeper: *bool,
 ) ?anyerror {
@@ -2719,9 +2776,14 @@ fn describeObject(
     var it = object.iterator();
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
+        // The discriminator is read with the variant's own fields and is not
+        // one of them (`describeTagged`).
+        if (within.tag.len > 0 and std.mem.eql(u8, name, within.tag)) continue;
+        // A type that skips what it does not know has nothing to say about it.
+        if (comptime jsonmark.ignoresUnknown(T)) continue;
         if (!hasField(T, name)) return fail.badRequest(
-            "the request body has a field \"{s}\" this endpoint does not know. It takes: {s}",
-            .{ nameWithin(arena, where, name), comptime fieldList(T) },
+            "the request body has a field \"{s}\" {s} does not know. It takes: {s}",
+            .{ nameWithin(arena, where, name), comptime thatWhat(within), comptime takes(T, within) },
         );
     }
 
@@ -2746,6 +2808,96 @@ fn describeObject(
     }
 
     return null;
+}
+
+/// Which variant of an internally tagged union an object is being read as, so
+/// that its unknown-field sentence says so. Empty for a plain struct.
+const Within = struct { tag: []const u8 = "", variant: []const u8 = "" };
+
+fn thatWhat(comptime within: Within) []const u8 {
+    return if (within.tag.len == 0) "this endpoint" else "the \"" ++ within.variant ++ "\" variant";
+}
+
+/// What a struct takes, with the discriminator first when it is one variant of
+/// a tagged union: the key goes beside the variant's fields on the wire.
+fn takes(comptime T: type, comptime within: Within) []const u8 {
+    comptime {
+        if (within.tag.len == 0) return fieldList(T);
+        if (@typeInfo(T) != .@"struct") return within.tag;
+        const fields = @typeInfo(T).@"struct".fields;
+        var entries: [fields.len + 1][]const u8 = undefined;
+        entries[0] = within.tag;
+        for (fields, 1..) |f, i| {
+            entries[i] = f.name ++ (if (f.default_value_ptr != null) " (optional)" else "");
+        }
+        return nameList(&entries);
+    }
+}
+
+/// The discriminator key of an internally tagged union, or null for a type
+/// that is not one.
+fn tagOf(comptime T: type) ?[]const u8 {
+    comptime {
+        if (@typeInfo(T) != .@"union") return null;
+        const m = jsonmark.of(T) orelse return null;
+        return m.tag;
+    }
+}
+
+/// The variants of a tagged union as the wire spells them.
+fn variantList(comptime U: type) []const u8 {
+    return comptime nameList(jsonmark.wireNames(U));
+}
+
+/// What is wrong inside an internally tagged union's object: the discriminator
+/// missing, not text, or not a variant this type has, a key the variant it
+/// names does not take, and then whatever is wrong inside the variant's own
+/// fields. **Every sentence names what was received and what would have been
+/// accepted**, the way the struct's do; a 400 of `Bad Request` and nothing else
+/// was all a union ever got.
+fn describeTagged(
+    comptime U: type,
+    arena: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    name: []const u8,
+    comptime depth: u8,
+    deeper: *bool,
+) ?anyerror {
+    const key = comptime tagOf(U).?;
+    const at = nameWithin(arena, name, key);
+
+    const given = object.get(key) orelse return fail.badRequest(
+        "the request body is missing \"{s}\", which names the variant: one of {s}",
+        .{ at, comptime variantList(U) },
+    );
+    if (given != .string) return fail.badRequest(
+        "\"{s}\" has to be text naming the variant, one of {s}, not {s}",
+        .{ at, comptime variantList(U), kindOf(given) },
+    );
+
+    inline for (@typeInfo(U).@"union".fields, comptime jsonmark.wireNames(U)) |f, on_the_wire| {
+        if (std.mem.eql(u8, given.string, on_the_wire)) {
+            const within: Within = .{ .tag = key, .variant = on_the_wire };
+            if (f.type == void) {
+                var it = object.iterator();
+                while (it.next()) |entry| {
+                    const k = entry.key_ptr.*;
+                    if (std.mem.eql(u8, k, key)) continue;
+                    return fail.badRequest(
+                        "the request body has a field \"{s}\" {s} does not know. It takes: {s}",
+                        .{ nameWithin(arena, name, k), comptime thatWhat(within), comptime takes(void, within) },
+                    );
+                }
+                return null;
+            }
+            return describeObject(f.type, arena, object, name, within, depth, deeper);
+        }
+    }
+
+    return fail.badRequest(
+        "\"{s}\" is not one of the known variants ({s}): \"{s}\"",
+        .{ at, comptime variantList(U), given.string },
+    );
 }
 
 /// What is wrong with one value, given the type it landed in. Answers about
@@ -2832,7 +2984,8 @@ fn describeField(
     if (comptime convert.parsesItself(Inner)) return null;
 
     if (Inner != Str) switch (@typeInfo(Inner)) {
-        .@"struct" => return describeObject(Inner, arena, given.object, name, depth - 1, deeper),
+        .@"struct" => return describeObject(Inner, arena, given.object, name, .{}, depth - 1, deeper),
+        .@"union" => if (comptime tagOf(Inner) != null) return describeTagged(Inner, arena, given.object, name, depth - 1, deeper),
         .pointer => |p| {
             // `[]const u8` is text, which has nothing inside it to describe.
             if (p.size != .slice or p.child == u8) return null;
@@ -2859,6 +3012,7 @@ fn hasInsides(comptime T: type, given: std.json.Value) bool {
     if (comptime convert.parsesItself(Inner)) return false;
     return switch (@typeInfo(Inner)) {
         .@"struct" => given == .object,
+        .@"union" => comptime tagOf(Inner) != null and given == .object,
         .pointer => |p| p.size == .slice and p.child != u8 and given == .array and
             given.array.items.len > 0,
         else => false,
@@ -2926,6 +3080,7 @@ pub fn expectedOf(comptime T: type) []const u8 {
                 break :blk out;
             },
             .@"struct" => "an object",
+            .@"union" => if (tagOf(T)) |key| "an object whose \"" ++ key ++ "\" is one of " ++ variantList(T) else "something this endpoint understands",
             .pointer => |p| if (p.size == .slice and p.child == u8) "text" else "a list",
             else => "something this endpoint understands",
         };
@@ -2954,11 +3109,41 @@ fn choicesOf(comptime T: type) ?[]const u8 {
 /// The field names of `T`, for saying what the endpoint does take.
 fn fieldList(comptime T: type) []const u8 {
     comptime {
-        var out: []const u8 = "";
-        for (@typeInfo(T).@"struct".fields, 0..) |f, i| {
-            out = out ++ (if (i == 0) "" else ", ") ++ f.name;
-            if (f.default_value_ptr != null) out = out ++ " (optional)";
+        const fields = @typeInfo(T).@"struct".fields;
+        var entries: [fields.len][]const u8 = undefined;
+        for (fields, 0..) |f, i| {
+            entries[i] = f.name ++ (if (f.default_value_ptr != null) " (optional)" else "");
         }
+        return nameList(&entries);
+    }
+}
+
+/// How many bytes of names a message carries before it says "and N more".
+///
+/// **The bound is here and not on the buffer.** A `Failure` is 256 bytes, one a
+/// connection, so a longer ceiling is paid by every idle connection for the
+/// sake of the few endpoints with wide bodies (ADR 006, ADR 017); the stack
+/// buffer that answers it is six times `fail.max_message` as well (ADR 024).
+/// A list that stops by itself keeps the whole sentence inside the 240 bytes
+/// it has, with room for the quoted name a client sent, and costs nothing at
+/// run time: it is spelled while compiling.
+const name_list_budget = 100;
+
+/// `names` joined by commas, as many as fit `name_list_budget` (always at least
+/// one), then how many were left out. The ones named are the first ones, which
+/// are the ones a struct's author put first.
+fn nameList(comptime names: []const []const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(2_000 + 40 * names.len);
+        var out: []const u8 = "";
+        var shown: usize = 0;
+        for (names, 0..) |name, i| {
+            const next = out ++ (if (i == 0) "" else ", ") ++ name;
+            if (i > 0 and next.len > name_list_budget) break;
+            out = next;
+            shown += 1;
+        }
+        if (shown < names.len) out = out ++ std.fmt.comptimePrint(", and {d} more", .{names.len - shown});
         return out;
     }
 }
@@ -3134,6 +3319,7 @@ fn fits(comptime T: type, value: std.json.Value) bool {
         // field fails, so the tag has to be checked and not just the kind.
         .@"enum" => value == .string and std.meta.stringToEnum(T, value.string) != null,
         .@"struct" => value == .object,
+        .@"union" => if (comptime tagOf(T) != null) value == .object else true,
         .pointer => |p| if (p.size == .slice and p.child == u8) value == .string else value == .array,
         else => true,
     };

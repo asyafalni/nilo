@@ -3150,6 +3150,73 @@ Waiting, at 1 MiB: 10,086,625 sent, 0 refused.
 
 **What it does not say.** Single runs on a laptop, with the Collector and the generator sharing it; the absolute records a second are about this machine. Peak memory of the server was not taken. Whether more than two calls side by side would help is not answered here, because the generator and the WAL's fsync are in the way before the budget is; that is the roadmap's budget-as-an-option entry, which waits for a caller held back by it.
 
+## What writing a float costs, `std.json`'s spelling against serde_json's
+
+Writing a float went from `std.json`'s `print("{}")` to `http/jsonfloat.zig`
+(ADR 096): serde_json 1.0.150's layout over the same shortest digits, in a stack
+buffer of 24 bytes an `f64`, and whole numbers below 2^53 written as the integer
+they are.
+
+**What was run.** `zig build bench-json-float -Dtarget=x86_64-linux-gnu
+-Doptimize=ReleaseFast` under `taskset -c 5` (`bench/json_float.zig`), nilo
+`1fe86dd` plus the earlier staged round plus this change, uncommitted. AMD Ryzen 7
+9700X, Linux 7.2.5, Zig 0.16.0, **load average 8.6 while it ran** (other
+sessions compiling), so each figure is the minimum of 41 rounds of 4,096 floats
+with the old and new writers interleaved round by round, and the spread is
+the minimum to the maximum. Old is `std.json.Stringify.value` after an
+`isFinite` check, which is what the generated writer did; new is
+`jsonfloat.write`. Both write into one rewound fixed buffer, so the number is the
+formatter and the write and nothing else.
+
+| values | old, ns a float | new, ns a float |
+|---|---:|---:|
+| short (`0.0`, `1.0`, `12.5`, `100.0`, `0.25`, ...) | 31.1 to 31.2 (31 to 37) | **14.0 to 14.1** (14 to 25) |
+| 17 digits (`rnd.float`) | 24.3 to 25.3 (24 to 49) | **23.6 to 24.2** (24 to 32) |
+| random bit patterns | 55.9 to 57.2 (56 to 79) | **35.4 to 36.5** (35 to 48) |
+
+Three runs; the first, taken while the load was highest, read 46, 37 and 78
+old against 22, 34 and 48 new and is not quoted. An earlier build of the new
+writer without the whole-number path read 25 ns on the short set, so that path is
+the 11 ns.
+
+**Binary size**, `-Doptimize=ReleaseFast -Dstrip=true -Dcpu=x86_64_v3`, the old
+tree built from the index: `hello` with one `f64` and one `f32` field,
+**1,029,584 to 1,020,720 bytes (-8,864)**, because the decimal printer
+`print("{}")` linked for a float is gone; `hello` and `rest` as they are (no
+float anywhere) are byte-identical, 1,005,840 and 1,208,280. The request-path
+allocation budget (`test "the request path stays inside its allocation budget"`)
+passes in Debug and ReleaseSafe.
+
+**What it moved.** Nothing was blocked on the speed, and the decision (ADR 096)
+is for the spelling; the measurement is that it costs nothing: faster on every
+set, smaller to link. **Whether it can be pushed further:** the 17-digit and
+random sets are Ryu's (`std.fmt.float.binaryToDecimal`, about 20 ns), which is
+what a faster formatter (Schubfach, `zmij`'s own) would have to beat; nobody
+has needed it, and a float on a response is rarely the largest cost of the row.
+
+## What telling a park from a hold costs a request
+
+Taken for [ADR 013](../../docs/adr/013-handlers-must-not-block-the-thread.md): a wait through the server's `Io` is told from a handler holding its thread by asking the run loop, in `watchdog.reportIfTooLong`, whether a turn began since the stretch did. The claim is that this costs a request that does not wait long nothing, because the ask comes after the early exit every request takes.
+
+**Method.** `bench/main.zig` (`GET /users/42`, about 1 KB of JSON, keep-alive) built `ReleaseFast` from two trees: the staged tree exported with `git checkout-index -a --prefix=` as the before, and that tree plus the change as the after. The server pinned to one core (`taskset -c 2`), a load generator of four processes by sixteen connections pinned to others, 2.56 million requests a run after a warm-up, eight runs of each **interleaved and alternating in order**. The figure is the server's own CPU time a request, from `/proc/<pid>/schedstat`, so it does not depend on how fast the generator is. `wrk`, `oha` and `valgrind` are not installed, so the generator is a short Python script and there are no instruction counts.
+
+**Result.**
+
+| | median | best | worst |
+|---|---|---|---|
+| before | 1,911 ns | 1,807 ns | 2,428 ns |
+| after | 1,885 ns | 1,793 ns | 2,370 ns |
+
+The difference is inside the noise: the machine was shared with other builds, and the runs fall into two groups, about 1.8 to 1.9 us and about 2.3 to 2.4 us, in both trees. Within a group the two are within 2 percent of each other and the after is the lower, which is not a claim that it is faster. What can be said is that it is not slower by anything this method sees.
+
+**Why there is nothing to see.** The disassembly of `watchdog.reportIfTooLong` (`-Dstrip=false`) is the same through the load of the clock and the compare against the limit, where a request under it returns; the after has one more register move and a frame 16 bytes larger. The call to `engine.zio.loopTurnNanos` sits after that return. No hot-path function changed.
+
+**Idle connections.** No field was added, `Watch` and `fail.InFlight` are untouched, and `bench/mem.py --port 8787 --path /health --steps 100,1000` reads the same on both, twice each: 5,816 bytes a connection at 100 and 5,247 at 1,000. The stripped benchmark binary is 272 bytes larger (1,015,464 to 1,015,736).
+
+**Not measured.** A request that does wait long pays one thread-local read and one load, once, on the way to a report or a pass; a handler that waits 250 ms is not one whose nanoseconds are in question.
+
+**Can it be pushed further.** There is nothing on the hot path to remove. The check itself is bounded by the limit: it runs at most once a stretch, and only for one past `block_warning_ms`.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

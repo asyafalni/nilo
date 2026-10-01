@@ -3314,6 +3314,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
 
         fn borrowed(comptime B: type, value: WireRead(B)) !B {
             if (B == types.Timestamp) return .{ .micros = value };
+            if (comptime types.isUnix(B)) return .{ .count = value };
             if (B == types.Uuid) return uuidOf(value);
             // An enum costs no allocation to decode, so a streamed row is
             // held to the same standard as a kept one rather than being let
@@ -4102,6 +4103,7 @@ pub fn DbOf(comptime W: type, comptime D: type, comptime name: []const u8) type 
             // copied — there is no version of this that is free.
             if (F == types.Bytes) return .{ .bytes = try c.arena().dupe(u8, value.bytes) };
             if (F == types.Timestamp) return .{ .micros = value };
+            if (comptime types.isUnix(F)) return .{ .count = value };
             if (F == types.Uuid) return uuidOf(value);
             if (comptime types.jsonPayload(F)) |Payload| {
                 // The cost `types.zig` states: a Json column is parsed per
@@ -4801,6 +4803,7 @@ fn WireRead(comptime F: type) type {
         if (types.isDate(F)) return F;
         if (F == core.Str) return []const u8;
         if (F == types.Timestamp) return i64;
+        if (types.isUnix(F)) return i64;
         if (F == types.Uuid) return []const u8;
         if (types.jsonPayload(F) != null) return []const u8;
         if (@typeInfo(F) == .@"enum") return []const u8;
@@ -5081,6 +5084,7 @@ fn listReadable(comptime T: type) bool {
 fn readable(comptime T: type) bool {
     if (T == core.Str or T == []const u8) return true;
     if (T == types.Bytes or T == types.Timestamp or T == types.Uuid or T == types.Date) return true;
+    if (types.isUnix(T)) return true;
     if (types.jsonPayload(T) != null) return true;
     if (types.asText(T) != null) return true;
     return switch (@typeInfo(T)) {
@@ -5256,6 +5260,7 @@ fn WireWrite(comptime D: type, comptime F: type) type {
         if (F == ?core.Str) return ?[]const u8;
         if (F == types.Timestamp) return i64;
         if (F == ?types.Timestamp) return ?i64;
+        if (types.isUnix(F)) return if (@typeInfo(F) == .optional) ?i64 else i64;
         if (F == types.Uuid) return switch (D.uuid_form) {
             .bytes => [types.Uuid.byte_len]u8,
             .text => []const u8,
@@ -5310,6 +5315,7 @@ fn forWire(comptime To: type, value: anytype, c: anytype) !To {
     if (V == ?core.Str) return if (value) |text| text.view() else null;
     if (V == types.Timestamp) return value.micros;
     if (V == ?types.Timestamp) return if (value) |t| t.micros else null;
+    if (comptime types.isUnix(V)) return if (@typeInfo(V) == .optional) (if (value) |t| t.count else null) else value.count;
     // The ten characters, in the Scope's arena for the reason a `Uuid`'s text
     // is: the tuple this fills is what the driver reads from, and a pointer
     // into this frame would not outlive the call.
@@ -8570,11 +8576,121 @@ test "the startup check reads every table in one query and tells the one that is
     try testing.expectEqual(@as(usize, 1), try db.checkSchema(&.{ Alpha, Gamma, Beta }));
 }
 
-// The other direction — the spellings SQLite does *not* turn into the rowid,
-// which have to keep answering that they may be null — is checked one layer
-// down, in `sqlite.zig`, against `columnsOf` itself. Not here, because
-// `checkSchema` reports a problem with `std.log.err` and the test runner
-// counts that as a failure: the same reason `wireOf` warns rather than errs.
+test "a TEXT PRIMARY KEY is a key the Row may read as a plain Str, and a NULL in it is refused at read" {
+    // SQLite lets a rowid table hold a NULL in `id TEXT PRIMARY KEY`, so the
+    // introspection says it does not know rather than "may be null", and a
+    // non-optional field passes the check (ADR 050). The NULL itself is the
+    // Wire's to refuse when it is actually read (ADR 094), and an optional
+    // field over the same column is still allowed.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:text-key?mode=memory&cache=shared",
+        .{ .size = 1, .unchecked = true, .schema_mismatch_is_fatal = false },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    _ = try db.exec(&run, "CREATE TABLE rules (id TEXT PRIMARY KEY, label TEXT NOT NULL)", .{});
+    _ = try db.exec(&run, "CREATE TABLE loose_rules (id TEXT PRIMARY KEY, label TEXT NOT NULL)", .{});
+    _ = try db.exec(&run, "CREATE TABLE tuples (tenant TEXT, id TEXT, PRIMARY KEY (tenant, id))", .{});
+
+    const Rule = struct {
+        pub const nilo_table = .{ .name = "rules", .key = .id };
+        id: nilo.Str,
+        label: nilo.Str,
+    };
+    const MaybeRule = struct {
+        pub const nilo_table = .{ .name = "loose_rules", .key = .id };
+        id: ?nilo.Str,
+        label: nilo.Str,
+    };
+    const Tuple = struct {
+        pub const nilo_table = .{ .name = "tuples", .key = .{ .tenant, .id } };
+        tenant: nilo.Str,
+        id: nilo.Str,
+    };
+    try testing.expectEqual(@as(usize, 0), try db.checkSchema(&.{ Rule, MaybeRule, Tuple }));
+
+    // A key that is NULL anyway: SQLite accepted the insert, and the read says
+    // so rather than handing back an empty `Str`.
+    _ = try db.exec(&run, "INSERT INTO rules (id, label) VALUES (NULL, 'ghost')", .{});
+    _ = try db.exec(&run, "INSERT INTO loose_rules (id, label) VALUES (NULL, 'ghost')", .{});
+    try testing.expectError(error.QueryFailed, db.select(Rule, &run, .{}));
+    const loose = try db.select(MaybeRule, &run, .{});
+    try testing.expectEqual(@as(usize, 1), loose.len);
+    try testing.expect(loose[0].id == null);
+}
+
+test "a UnixMillis column reads and writes milliseconds, and a Timestamp over it would be a thousand times off" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var db: SqliteDb = .init(
+        testing.allocator,
+        "file:unix-millis?mode=memory&cache=shared",
+        .{ .size = 1, .unchecked = true, .schema_mismatch_is_fatal = false },
+    );
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .none);
+
+    var run: nilo.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    _ = try db.exec(&run,
+        \\CREATE TABLE beats (id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL,
+        \\  at_s INTEGER, label TEXT NOT NULL, born TEXT NOT NULL DEFAULT '')
+    , .{});
+
+    const Beat = struct {
+        pub const nilo_table = .{ .name = "beats", .key = .id };
+        id: i64,
+        at_ms: types.UnixMillis,
+        at_s: ?types.UnixSeconds,
+        label: nilo.Str,
+    };
+    try testing.expectEqual(@as(usize, 0), try db.checkSchema(&.{Beat}));
+
+    const made = try db.insert(Beat, &run, .{
+        .at_ms = types.UnixMillis{ .count = 1_790_846_995_323 },
+        .at_s = types.UnixSeconds{ .count = 1_790_846_995 },
+        .label = "x",
+    });
+    try testing.expectEqual(@as(i64, 1_790_846_995_323), made.at_ms.count);
+
+    const found = try db.select(Beat, &run, .{
+        .where = .{ .at_ms = .{ .gt = types.UnixMillis{ .count = 1_790_846_995_000 } } },
+    });
+    try testing.expectEqual(@as(usize, 1), found.len);
+    const listed = try db.select(Beat, &run, .{
+        .where = .{ .at_ms = .{ .in = &[_]types.UnixMillis{.{ .count = 1_790_846_995_323 }} } },
+    });
+    try testing.expectEqual(@as(usize, 1), listed.len);
+
+    // Crossing to the microsecond type is one multiply, and back one divide.
+    const as_moment = found[0].at_ms.toTimestamp();
+    try testing.expectEqual(@as(i64, 1_790_846_995_323_000), as_moment.micros);
+    try testing.expectEqual(@as(i64, 1_790_846_995), found[0].at_s.?.count);
+
+    // The half of the wrong-unit mistake a database can see: a text column
+    // under a count is refused, and so is a count under a text field.
+    const Wrong = struct {
+        pub const nilo_table = .{ .name = "beats", .key = .id };
+        id: i64,
+        born: types.UnixMillis,
+    };
+    try testing.expectEqual(@as(usize, 1), try db.checkSchema(&.{Wrong}));
+}
+
+// The other direction, the spellings that must still be refused, is checked
+// one layer down, in `sqlite.zig`, against `columnsOf` itself. Not here,
+// because `checkSchema` reports a problem with `std.log.err` and the test
+// runner counts that as a failure: the same reason `wireOf` warns rather than errs.
 
 test "db.exec answers with the rows it changed and needs no Row to do it" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});

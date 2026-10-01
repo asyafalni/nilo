@@ -25,6 +25,7 @@ pub const programs = [_]Program{
     .{ .name = "pw", .imports = &.{"nilo_pw"} },
     .{ .name = "cache", .imports = &.{"nilo_cache"} },
     .{ .name = "jwt", .imports = &.{"nilo_jwt"} },
+    .{ .name = "proto", .imports = &.{"nilo_proto"} },
     .{ .name = "fetch", .imports = &.{ "nilo_fetch", "nilo_core" } },
     .{ .name = "job", .imports = &.{ "nilo_job", "nilo_core" } },
     .{ .name = "sql", .imports = &.{ "nilo_sql", "nilo_core" }, .sql = true },

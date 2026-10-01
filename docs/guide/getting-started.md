@@ -219,4 +219,4 @@ Use `std.heap.smp_allocator` for a server: it is built for allocating from sever
 
 - [Handlers](./handlers.md): the rule that decides what each argument means.
 - [Routing](./routing.md): patterns, priority, and groups.
-- The ten examples in [`examples/`](../../examples/), each runnable with `zig build run-<name>`.
+- The eleven examples in [`examples/`](../../examples/), each runnable with `zig build run-<name>`.

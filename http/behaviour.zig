@@ -1739,6 +1739,135 @@ test "a field below the top level is named by where it is, not left to a bare 40
     }
 }
 
+const Metrics = struct { metric_name: Str, agg: ?Str = null };
+const Rule = struct {
+    name: Str,
+    condition: union(enum) {
+        pub const nilo_json = .{ .tag = "signal" };
+        pub const jsonParse = @import("jsonmark.zig").parseFor(@This());
+
+        metrics: Metrics,
+        logs: struct { query: Str },
+        off,
+    },
+};
+
+fn takeRule(incoming: Rule) !struct { name: []const u8 } {
+    return .{ .name = incoming.name.view() };
+}
+
+test "a 400 inside a tagged union names the variant or the key, as a struct's does" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/rules", takeRule);
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    const cases = [_]struct { body: []const u8, says: []const u8 }{
+        // An unknown variant: what arrived, and what would have been taken.
+        .{
+            .body = "{\"name\":\"r\",\"condition\":{\"signal\":\"traces\"}}",
+            .says = "\"condition.signal\" is not one of the known variants (metrics, logs, off): \"traces\"",
+        },
+        // An unknown key: which one, which variant it was in, what that takes.
+        .{
+            .body = "{\"name\":\"r\",\"condition\":{\"signal\":\"metrics\",\"metric_nme\":\"x\"}}",
+            .says = "a field \"condition.metric_nme\" the \"metrics\" variant does not know. It takes: signal, metric_name, agg (optional)",
+        },
+        // A variant with no fields takes the discriminator and nothing else.
+        .{
+            .body = "{\"name\":\"r\",\"condition\":{\"signal\":\"off\",\"extra\":1}}",
+            .says = "a field \"condition.extra\" the \"off\" variant does not know. It takes: signal",
+        },
+        // The discriminator itself: absent, and not text.
+        .{
+            .body = "{\"name\":\"r\",\"condition\":{\"query\":\"x\"}}",
+            .says = "missing \"condition.signal\", which names the variant: one of metrics, logs, off",
+        },
+        .{
+            .body = "{\"name\":\"r\",\"condition\":{\"signal\":7}}",
+            .says = "\"condition.signal\" has to be text naming the variant, one of metrics, logs, off, not a number",
+        },
+        // What is wrong inside the variant is named by where it is.
+        .{
+            .body = "{\"name\":\"r\",\"condition\":{\"signal\":\"logs\"}}",
+            .says = "missing \"condition.query\"",
+        },
+        .{
+            .body = "{\"name\":\"r\",\"condition\":{\"signal\":\"logs\",\"query\":5}}",
+            .says = "\"condition.query\" has to be text, not a number",
+        },
+        // Not an object at all.
+        .{
+            .body = "{\"name\":\"r\",\"condition\":\"metrics\"}",
+            .says = "\"condition\" has to be an object whose \"signal\" is one of metrics, logs, off, not text",
+        },
+    };
+
+    for (cases) |case| {
+        var request_buf: [512]u8 = undefined;
+        const request = std.fmt.bufPrint(
+            &request_buf,
+            "POST /rules HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n{s}",
+            .{ case.body.len, case.body },
+        ) catch unreachable;
+        const response = h.send(&app, request).response;
+
+        try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400 Bad Request\r\n"));
+        testing.expect(try Harness.saysFailure(response, case.says)) catch |err| {
+            std.debug.print("body {s}\n  wanted: {s}\n  got:    {s}\n", .{ case.body, case.says, response });
+            return err;
+        };
+    }
+
+    // And a body that is right still reads.
+    const ok = "{\"name\":\"r\",\"condition\":{\"signal\":\"metrics\",\"metric_name\":\"cpu\"}}";
+    var buf: [256]u8 = undefined;
+    const good = std.fmt.bufPrint(&buf, "POST /rules HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n{s}", .{ ok.len, ok }) catch unreachable;
+    try testing.expect(std.mem.startsWith(u8, h.send(&app, good).response, "HTTP/1.1 200"));
+}
+
+const NatoForm = struct {
+    alpha_first: u8,
+    bravo_second: u8,
+    charlie_third: u8,
+    delta_fourth: u8,
+    echo_fifth: u8,
+    foxtrot_sixth: u8,
+    golf_seventh: u8,
+    hotel_eighth: u8,
+    india_ninth: u8,
+    juliet_tenth: u8,
+    kilo_eleventh: u8,
+    lima_twelfth: u8 = 0,
+};
+
+fn takeNato(incoming: NatoForm) !struct { n: u8 } {
+    return .{ .n = incoming.alpha_first };
+}
+
+test "the field list in a 400 stops at a bound and says how many it left out, so the sentence is never cut" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/nato", takeNato);
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    const body = "{\"alpha_frist\":1}";
+    var buf: [256]u8 = undefined;
+    const request = std.fmt.bufPrint(&buf, "POST /nato HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    const response = h.send(&app, request).response;
+
+    try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expect(try Harness.saysFailure(
+        response,
+        "a field \"alpha_frist\" this endpoint does not know. It takes: alpha_first, bravo_second, charlie_third, " ++
+            "delta_fourth, echo_fifth, foxtrot_sixth, golf_seventh, and 5 more",
+    ));
+}
+
 // Nine levels, which is one more than the walk follows. The bottom is where
 // the mistake goes, so nothing above it can account for the refusal.
 const Deep9 = struct { value: u32 };
@@ -3728,7 +3857,7 @@ test "static files: routes win, a prefix scopes, and middleware still wraps" {
 
     // The SPA fallback catches a deep link under the prefix — and CORS,
     // registered as ordinary middleware, wraps the static response too.
-    const deep = h.send(&app, "GET /assets/users/42 HTTP/1.1\r\nHost: t\r\n\r\n");
+    const deep = h.send(&app, "GET /assets/users/42 HTTP/1.1\r\nHost: t\r\nSec-Fetch-Mode: navigate\r\n\r\n");
     try testing.expect(std.mem.endsWith(u8, deep.response, "spa"));
     try testing.expect(std.mem.indexOf(u8, deep.response, "Access-Control-Allow-Origin: *") != null);
 
@@ -3768,13 +3897,14 @@ test "an asset that is not there is a 404, and a deep link is still the page" {
     );
     try testing.expect(std.mem.startsWith(u8, call.response, "HTTP/1.1 404"));
 
-    // The reload the fallback exists for still works, from a browser…
+    // The reload the fallback exists for still works, from a browser that
+    // sends fetch metadata…
     const browser = "GET /users/42 HTTP/1.1\r\nHost: t\r\n" ++
-        "Accept: text/html,application/xhtml+xml,*/*;q=0.8\r\n\r\n";
+        "Sec-Fetch-Mode: navigate\r\nAccept: text/html,application/xhtml+xml,*/*;q=0.8\r\n\r\n";
     try testing.expect(std.mem.endsWith(u8, h.send(&app, browser).response, "<h1>spa</h1>"));
-    // …and from anything that said nothing about what it wanted.
-    const bare = h.send(&app, "GET /users/42 HTTP/1.1\r\nHost: t\r\n\r\n");
-    try testing.expect(std.mem.endsWith(u8, bare.response, "<h1>spa</h1>"));
+    // …and from one that does not but asks for HTML by name.
+    const older = "GET /users/42 HTTP/1.1\r\nHost: t\r\nAccept: text/html,*/*;q=0.8\r\n\r\n";
+    try testing.expect(std.mem.endsWith(u8, h.send(&app, older).response, "<h1>spa</h1>"));
 
     // The file that is there is unaffected, whatever it asked for.
     const real = h.send(&app, "GET /app.js HTTP/1.1\r\nHost: t\r\nAccept: */*\r\n\r\n");
@@ -5690,7 +5820,7 @@ test "a single-page app serving everything does not swallow the document" {
     // this test exists for rather than an aside.
     try testing.expect(std.mem.indexOf(
         u8,
-        h.send(&app, "GET /whatever/deep HTTP/1.1\r\nHost: t\r\n\r\n").response,
+        h.send(&app, "GET /whatever/deep HTTP/1.1\r\nHost: t\r\nSec-Fetch-Mode: navigate\r\n\r\n").response,
         "<h1>app</h1>",
     ) != null);
 
@@ -10252,4 +10382,190 @@ test "a second discriminator in a tagged body is a 400 naming the key" {
     const twice = postJson(&h, &app, "/sketch", "{\"shape\":{\"kind\":\"circle\",\"kind\":\"square\",\"r\":3,\"side\":1}}");
     try testing.expect(std.mem.startsWith(u8, twice, "HTTP/1.1 400 Bad Request\r\n"));
     try testing.expect(try Harness.saysFailure(twice, "\"kind\""));
+}
+
+// ---- a type that skips the keys it does not know (ADR 168) ----
+
+const LooseNote = struct {
+    pub const nilo_json = .{ .unknown_fields = .ignore };
+    text: Str,
+};
+const TightNote = struct { text: Str };
+/// Tolerant itself, strict about what it holds.
+const LooseOuter = struct {
+    pub const nilo_json = .{ .unknown_fields = .ignore };
+    note: TightNote,
+};
+/// Strict itself, tolerant about what it holds.
+const TightOuter = struct { note: LooseNote };
+
+fn takeLooseNote(incoming: LooseNote) !struct { text: []const u8 } {
+    return .{ .text = incoming.text.view() };
+}
+fn takeTightNote(incoming: TightNote) !struct { text: []const u8 } {
+    return .{ .text = incoming.text.view() };
+}
+fn takeLooseOuter(incoming: LooseOuter) !struct { text: []const u8 } {
+    return .{ .text = incoming.note.text.view() };
+}
+fn takeTightOuter(incoming: TightOuter) !struct { text: []const u8 } {
+    return .{ .text = incoming.note.text.view() };
+}
+
+/// The whole body is a tagged union, one variant of which skips unknown keys.
+const Switch = union(enum) {
+    pub const nilo_json = .{ .tag = "kind" };
+    pub const jsonParse = @import("jsonmark.zig").parseFor(@This());
+
+    loose: struct {
+        pub const nilo_json = .{ .unknown_fields = .ignore };
+        n: u8,
+    },
+    tight: struct { n: u8 },
+    off,
+};
+
+/// A union is not a handler argument, so it is the whole body by `Ctx.json`.
+fn takeSwitch(c: *Ctx) anyerror!void {
+    const incoming = try c.json(Switch);
+    try c.sendJson(200, .{ .kind = @tagName(incoming) });
+}
+
+fn postBig(h: *Harness, app: *App, path: []const u8, body: []const u8) []const u8 {
+    var request_buf: [2048]u8 = undefined;
+    const request = std.fmt.bufPrint(
+        &request_buf,
+        "POST {s} HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ path, body.len, body },
+    ) catch unreachable;
+    return h.send(app, request).response;
+}
+
+fn expectOk(response: []const u8) !void {
+    testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n")) catch |err| {
+        std.debug.print("wanted 200, got: {s}\n", .{response});
+        return err;
+    };
+}
+
+fn expect400(response: []const u8, says: []const u8) !void {
+    try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 400 Bad Request\r\n"));
+    testing.expect(try Harness.saysFailure(response, says)) catch |err| {
+        std.debug.print("  wanted: {s}\n  got:    {s}\n", .{ says, response });
+        return err;
+    };
+}
+
+test "a type that says .ignore reads a body with keys it has no field for" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/loose", takeLooseNote);
+    try app.post("/tight", takeTightNote);
+    var h = Harness.init();
+    defer h.deinit();
+
+    const body = "{\"extra\":{\"a\":[1,2,{\"b\":null}]},\"text\":\"hi\",\"also\":1}";
+    const loose = postJson(&h, &app, "/loose", body);
+    try expectOk(loose);
+    try testing.expect(std.mem.indexOf(u8, loose, "hi") != null);
+
+    // A type that says nothing still refuses the same body, naming the key.
+    try expect400(postJson(&h, &app, "/tight", body), "a field \"extra\" this endpoint does not know. It takes: text");
+
+    // Skipping is not leniency about what the type does know.
+    try expect400(postJson(&h, &app, "/loose", "{\"extra\":1}"), "the request body is missing \"text\"");
+    try expect400(postJson(&h, &app, "/loose", "{\"text\":5,\"extra\":1}"), "\"text\" has to be text, not a number");
+}
+
+test "an unknown-field opt-out applies to its own type, not to the struct holding it" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/loose-outer", takeLooseOuter);
+    try app.post("/tight-outer", takeTightOuter);
+    var h = Harness.init();
+    defer h.deinit();
+
+    // A tolerant parent skips its own keys and still refuses its strict child's.
+    try expectOk(postJson(&h, &app, "/loose-outer", "{\"extra\":1,\"note\":{\"text\":\"a\"}}"));
+    try expect400(
+        postJson(&h, &app, "/loose-outer", "{\"note\":{\"text\":\"a\",\"extra\":1}}"),
+        "a field \"note.extra\" this endpoint does not know. It takes: text",
+    );
+
+    // A strict parent refuses its own keys and lets its tolerant child skip.
+    try expectOk(postJson(&h, &app, "/tight-outer", "{\"note\":{\"text\":\"a\",\"extra\":{\"x\":1}}}"));
+    try expect400(
+        postJson(&h, &app, "/tight-outer", "{\"extra\":1,\"note\":{\"text\":\"a\"}}"),
+        "a field \"extra\" this endpoint does not know. It takes: note",
+    );
+}
+
+test "a repeated known key is still refused under .ignore" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/loose", takeLooseNote);
+    var h = Harness.init();
+    defer h.deinit();
+
+    try expect400(postJson(&h, &app, "/loose", "{\"text\":\"a\",\"extra\":1,\"text\":\"b\"}"), "the key \"text\" twice");
+}
+
+test "a value skipped under .ignore is held to the depth a read body is" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/loose", takeLooseNote);
+    var h = Harness.init();
+    defer h.deinit();
+
+    const shallow = "{\"text\":\"a\",\"extra\":" ++ "[" ** 30 ++ "]" ** 30 ++ "}";
+    try expectOk(postBig(&h, &app, "/loose", shallow));
+
+    const deep = "{\"text\":\"a\",\"extra\":" ++ "[" ** 100 ++ "]" ** 100 ++ "}";
+    try expect400(postBig(&h, &app, "/loose", deep), "nests deeper than 64 levels");
+}
+
+test "a tagged union that is the whole body says which variant and which key is wrong" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/switch", takeSwitch);
+    var h = Harness.init();
+    defer h.deinit();
+
+    try expectOk(postJson(&h, &app, "/switch", "{\"kind\":\"tight\",\"n\":1}"));
+    try expectOk(postJson(&h, &app, "/switch", "{\"kind\":\"off\"}"));
+    // The variant that says .ignore skips what it does not know, and the one
+    // that says nothing refuses it, inside a union exactly as outside one.
+    try expectOk(postJson(&h, &app, "/switch", "{\"kind\":\"loose\",\"n\":1,\"extra\":[1]}"));
+
+    const cases = [_]struct { body: []const u8, says: []const u8 }{
+        .{
+            .body = "{\"n\":1}",
+            .says = "the request body is missing \"kind\", which names the variant: one of loose, tight, off",
+        },
+        .{
+            .body = "{\"kind\":\"nope\"}",
+            .says = "\"kind\" is not one of the known variants (loose, tight, off): \"nope\"",
+        },
+        .{
+            .body = "{\"kind\":7}",
+            .says = "\"kind\" has to be text naming the variant, one of loose, tight, off, not a number",
+        },
+        .{
+            .body = "{\"kind\":\"tight\",\"n\":1,\"x\":2}",
+            .says = "a field \"x\" the \"tight\" variant does not know. It takes: kind, n",
+        },
+        .{
+            .body = "{\"kind\":\"loose\"}",
+            .says = "the request body is missing \"n\"",
+        },
+        .{
+            .body = "[1]",
+            .says = "the request body has to be an object whose \"kind\" is one of loose, tight, off, not a list",
+        },
+        .{
+            .body = "",
+            .says = "the request body is empty. This endpoint expects an object whose \"kind\" is one of loose, tight, off",
+        },
+    };
+    for (cases) |case| try expect400(postJson(&h, &app, "/switch", case.body), case.says);
 }

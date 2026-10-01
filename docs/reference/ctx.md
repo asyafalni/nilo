@@ -53,6 +53,7 @@ This page covers reading a request, answering it, its cookies, session and uploa
 | `c.resolve(V)` | `!V`: a resolved value, worked out once per request |
 | `c.keepAlive()` | whether the connection will carry another request |
 | `c.connection()` | the same as the `Connection` line the response will carry: `.implied` (HTTP/1.1, staying open, no line), `.keep_alive` (HTTP/1.0, kept), `.close` |
+| `c.io()` | `std.Io`: the server's loop, for a `std.Io.Queue`, `Event` or `Select`. Nothing is held per connection. With no server (a `testing.Client`) it is a process-wide `std.Io.Threaded` ([ADR 244](../adr/244-a-handler-is-given-the-loop-it-runs-on.md)) |
 | `c.arena()` | `std.mem.Allocator`: memory that lasts exactly this request. Never freed by hand |
 | `c.str(bytes)` | `Str`: text you allocated from `c.arena()`, stamped with this request's lifetime |
 

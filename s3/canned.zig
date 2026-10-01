@@ -2535,3 +2535,159 @@ fn afterLast(text: []const u8, marker: []const u8) []const u8 {
     const at = std.mem.lastIndexOf(u8, text, marker) orelse return "";
     return text[at + marker.len ..];
 }
+
+/// A server that refuses on the head and closes with the body unread, the way
+/// Garage answers a wrong region: the client's write is still going when the
+/// RST arrives.
+fn answerEarly(canned: *Canned) !void {
+    var stream = try canned.server.accept(canned.io);
+    defer stream.close(canned.io);
+    var in_buf: [4 << 10]u8 = undefined;
+    var reader = stream.reader(canned.io, &in_buf);
+    while (std.mem.trimEnd(u8, try reader.interface.takeDelimiterInclusive('\n'), "\r\n").len != 0) {}
+    var out_buf: [1 << 10]u8 = undefined;
+    var writer = stream.writer(canned.io, &out_buf);
+    const xml = "<Error><Code>AuthorizationHeaderMalformed</Code><Message>wrong region</Message></Error>";
+    try writer.interface.print(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/xml\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ xml.len, xml },
+    );
+    try writer.interface.flush();
+}
+
+test "a put refused before its body was read is Rejected, not a failure to reach" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = try io.concurrent(answerEarly, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+            const Big = bucket_mod.Bucket("big", .{ .style = .path, .max_bytes = 128 << 20 });
+            var files = try Big.open(&store);
+            defer files.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            // Far past what loopback buffers, so the write really fails.
+            const bytes = try testing.allocator.alloc(u8, 64 << 20);
+            defer testing.allocator.free(bytes);
+            @memset(bytes, 'x');
+
+            try testing.expectError(error.Rejected, files.put(&scope, "big.bin", .{
+                .bytes = core.Str.static(bytes),
+                .content_type = core.Str.static("application/octet-stream"),
+            }));
+        }
+    }.run);
+}
+
+test "a bucket opened under a name read at run time signs and sends that name" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.answer = .{ .body = "kept" };
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+
+            // The name comes from a config the program may free, so it is
+            // overwritten after `openAs` to prove the bucket holds its own.
+            var from_config: [8]u8 = "tenant-b".*;
+            var tenant = try Files.openAs(&store, &from_config);
+            defer tenant.deinit();
+            @memset(&from_config, 'x');
+
+            // The type is `Files` and its declared name is still "files".
+            try testing.expectEqualStrings("files", Files.bucket);
+            try testing.expectEqualStrings("tenant-b", tenant.name);
+            try testing.expectEqualStrings("/tenant-b", tenant.prefix);
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+            const object = try tenant.get(&scope, "photos/wati.png");
+
+            served.await(io) catch {};
+            // The server recomputes the signature over what it saw, so a
+            // verified request is one signed for the path it was sent to.
+            try expectVerified(&canned);
+            try testing.expectEqualStrings("kept", object.bytes.view());
+            try testing.expectEqualStrings("/tenant-b/photos/wati.png", canned.seen.path());
+        }
+    }.run);
+}
+
+test "a presigned POST from a bucket opened at run time names that bucket" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+
+            var tenant = try Files.openAs(&store, "tenant-b");
+            defer tenant.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            const posted = try tenant.presignPost(&scope, "receipts/09.pdf", .{ .seconds = 900 });
+
+            var action: [64]u8 = undefined;
+            try testing.expectEqualStrings(
+                try std.fmt.bufPrint(&action, "http://127.0.0.1:{d}/tenant-b", .{canned.port}),
+                posted.url,
+            );
+            try testing.expectEqualStrings("tenant-b", fieldOfForm(posted, "bucket").?);
+
+            const policy = fieldOfForm(posted, "policy").?;
+            const decoder = std.base64.standard.Decoder;
+            const doc = try scope.arena().alloc(u8, try decoder.calcSizeForSlice(policy));
+            try decoder.decode(doc, policy);
+            try testing.expect(std.mem.indexOf(u8, doc, "{\"bucket\":\"tenant-b\"}") != null);
+            try testing.expect(std.mem.indexOf(u8, doc, "\"files\"") == null);
+        }
+    }.run);
+}
+
+test "a name the bucket's style cannot carry is BadBucketName, and opening it allocates once" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var counting: Counting = .{ .child = testing.allocator };
+            var buf: [64]u8 = undefined;
+            var store = try Store.open(counting.allocator(), .{
+                .endpoint = try canned.endpoint(&buf),
+                .region = "us-east-1",
+                .credentials = .{ .static = .{ .access_key_id = akid, .secret_access_key = secret } },
+            });
+            defer store.deinit();
+
+            const before = counting.allocs;
+            try testing.expectError(error.BadBucketName, Files.openAs(&store, ""));
+            try testing.expectError(error.BadBucketName, Files.openAs(&store, "ab"));
+            try testing.expectError(error.BadBucketName, Files.openAs(&store, "a" ** 64));
+            try testing.expectError(error.BadBucketName, Files.openAs(&store, "has/slash"));
+            try testing.expectError(error.BadBucketName, Files.openAs(&store, "has space"));
+            try testing.expectError(error.BadBucketName, Files.openAs(&store, "q?x=1"));
+            // Refused before anything is built: no allocation to give back.
+            try testing.expectEqual(before, counting.allocs);
+
+            var ok = try Files.openAs(&store, "a" ** 63);
+            defer ok.deinit();
+            try testing.expectEqual(before + 1, counting.allocs);
+        }
+    }.run);
+}

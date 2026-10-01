@@ -22,6 +22,7 @@
 | `Bound(W)` | any of the three above, with its failures handed to you instead of a 400 |
 | `Session(T)` | the session, read from its cookie |
 | `std.mem.Allocator` | the request arena |
+| `std.Io` | the server's loop, for a `std.Io.Queue` or `std.Io.Event` a handler waits on while a fiber from `app.spawn` answers ([ADR 244](../adr/244-a-handler-is-given-the-loop-it-runs-on.md)). A resolver may take it too |
 | a type with `nilo_resolve` | a resolved value |
 | any other struct | the body, parsed from JSON |
 
@@ -440,6 +441,25 @@ const Contact = struct {
 
 It also makes such a response 33% faster whether or not anything is renamed: `covers` is decided for the *whole* value, so one leaf used to send every string next to it to `std.json` as well. That was 250 ns and is now 165 ns, on a 305-byte row with three uuids ([`bench/result/http.md`](../../bench/result/http.md)). Your own type gets the same by adding the same two declarations.
 
+#### Skipping the keys a body struct does not know
+
+**A request body struct refuses a key it has no field for, and a type can say it should skip them instead**, with `.unknown_fields = .ignore` ([ADR 168](../adr/168-one-field-can-be-spelled-on-its-own.md)):
+
+```zig
+const Span = struct {
+    pub const nilo_json = .{ .unknown_fields = .ignore };
+
+    name: nilo.Str,
+    start_unix_nano: u64,
+};
+```
+
+It is for payloads whose sender is allowed to grow: OTLP/HTTP JSON must be read ignoring unknown fields, and a third-party webhook adds them without warning. **It is per type**: a strict struct holding this one still refuses its own unknown keys, and this one holding a strict struct still has that child refuse. Put it on a union variant's payload struct to make that variant skip them; the others keep refusing. A known key given twice is still a 400, and a skipped value is held to the same 64 levels of nesting a body is.
+
+The API document says `additionalProperties: true` for such a type and says nothing for any other. Four things are compile errors: `.unknown_fields = .refuse` (it is the default), the marker on an enum or on a union, and any value but `.ignore`.
+
+**A payload under an externally tagged union** (`{"metrics":{...}}`, with no `nilo_json` on the union) is read by `std.json`, which cannot see the marker, so it stays strict. Give the union a `.tag` to get the marker honoured.
+
 #### The marker is not inherited
 
 **The marker is per type.** A struct renames its own fields; a union renames its *variants* and leaves a payload struct's fields to that struct's own marker; a nested struct without a marker keeps its own spelling.
@@ -450,9 +470,27 @@ It also makes such a response 33% faster whether or not anything is renamed: `co
 
 ### Unions
 
-**Without a marker, a `union(enum)` is externally tagged**: `{"metrics":{…}}`, which is what `std.json` writes. It is written by nilo's own writer either way. An *untagged* union has nothing saying which variant is active, and is left entirely to `std.json`. A variant with no payload is allowed under `.tag` and is just the discriminator; under the default encoding it is not supported. A tagged object read from a body with its discriminator twice is a 400 naming the key.
+**Without a marker, a `union(enum)` is externally tagged**: `{"metrics":{…}}`, which is what `std.json` writes. It is written by nilo's own writer either way. An *untagged* union has nothing saying which variant is active, and is left entirely to `std.json`. A variant with no payload is allowed under `.tag` and is just the discriminator; under the default encoding it is not supported. A tagged object read from a body with its discriminator twice is a 400 naming the key. Every other mistake inside one is a 400 that says what arrived and what would have been taken: `"condition.signal" is not one of the known variants (metrics, logs, off): "traces"`, `a field "condition.metric_nme" the "metrics" variant does not know. It takes: signal, metric_name, agg (optional)`, or a missing discriminator with the variants listed. A key beside a variant that has no fields is refused the same way.
 
 The generated API description follows whichever encoding the type chose: `oneOf` of one-key objects for the default, and `oneOf` with a `discriminator` plus a per-variant `allOf` for a tagged one. See [Responses](../guide/responses.md#json-field-names-and-union-tags).
+
+### Writing JSON outside a request
+
+**`nilo.writeJson(w, value)` writes `value` by the rules a response is written by, with no request in hand**: for a job's payload, an alert body, or the expected text in a test. It is the function `c.json` calls, so the two cannot disagree: fields in declaration order, a float the way serde_json spells it (`1.0` not `1`, `1e+16` not seventeen digits, `null` when it is not finite), a `Str` as text, `nilo_json` markers honoured, and the bytes `std.json` writes for anything the generated writer does not cover. `nilo.jsonAlloc(gpa, value)` is the same into a slice you free.
+
+<!-- compiles -->
+```zig
+fn alertBody(gpa: std.mem.Allocator, w: *std.Io.Writer, free: f64) !void {
+    // To a writer you already hold: a file, a socket, a buffer.
+    try nilo.writeJson(w, .{ .alert = "disk", .free = free });
+
+    // Or to memory you own.
+    const text = try nilo.jsonAlloc(gpa, .{ .alert = "disk", .free = free });
+    defer gpa.free(text);
+}
+```
+
+`writeJson` returns `std.Io.Writer.Error` and `jsonAlloc` returns `error.OutOfMemory`; neither allocates beyond what the writer or `gpa` is asked for. Only writing is public: reading is `std.json`, with `nilo.jsonParseFor` on a type that needs it.
 
 ### Text that is not UTF-8
 

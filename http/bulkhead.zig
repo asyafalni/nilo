@@ -706,6 +706,10 @@ pub const Options = struct {
     /// watched on the same terms: a stream by its writes, a body reader by
     /// its reads, a WebSocket by one message at a time.
     ///
+    /// A wait through the server's `Io` (a `std.Io.Event` or `Queue`) is a
+    /// park however long it is: what counts is the run since the loop's last
+    /// turn after the stretch began (ADR 013).
+    ///
     /// A quarter of a second is far longer than any handler that is not
     /// waiting, and long enough that ordinary CPU work does not trip it.
     /// Deliberately on outside `Debug` too: the cost is two clock readings
@@ -948,6 +952,40 @@ pub const bindSlot = engine.bindSlot;
 pub const unbindSlot = engine.unbindSlot;
 pub const bindsOn = engine.bindsOn;
 pub const monotonicNanos = engine.monotonicNanos;
+
+/// The `std.Io` a handler's work runs on (ADR 244).
+///
+/// **The running server's loop** when there is one, so a `std.Io.Queue` or
+/// `std.Io.Event` a handler waits on parks the fiber and is woken by a fiber
+/// started with `app.spawn`, which holds the same loop. Anywhere else (a
+/// `testing.Client` driving an App, a handler called as a function) a
+/// process-wide `std.Io.Threaded`, started the first time it is asked for and
+/// left running: it has real threads, so a writer fiber started on it with
+/// `io.concurrent` makes progress while the test waits on it, and it is one
+/// `Io` for every caller, which a queue shared between two of them needs.
+///
+/// A read of one atomic when the server is up, and nothing at all is held per
+/// connection or per request (ADR 017).
+pub fn loopIo() std.Io {
+    if (engine.serverIo()) |served| return served;
+    return fallbackIo();
+}
+
+/// 0 not started, 1 starting, 2 started.
+var fallback_state: std.atomic.Value(u8) = .init(0);
+var fallback_threaded: std.Io.Threaded = undefined;
+
+fn fallbackIo() std.Io {
+    while (fallback_state.load(.acquire) != 2) {
+        if (fallback_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+            fallback_threaded = .init(std.heap.page_allocator, .{});
+            fallback_state.store(2, .release);
+            break;
+        }
+        std.Thread.yield() catch {};
+    }
+    return fallback_threaded.io();
+}
 
 /// Bytes from the operating system's entropy source, off the event loop.
 /// What a session nonce is made of.
@@ -1840,6 +1878,12 @@ pub fn setFallbackSlot(p: ?*anyopaque) ?*anyopaque {
 pub fn fiberSlot() ?*anyopaque {
     return engine.slot();
 }
+
+/// When the loop this fiber runs on last began a turn, in `CLOCK_MONOTONIC`
+/// nanoseconds, or null when there is no loop. What the blocking detector asks
+/// to tell a park it was not told about from a handler holding its thread
+/// (ADR 013).
+pub const loopTurnNanos = engine.loopTurnNanos;
 
 /// The slot of the request currently running, or null if there is none.
 pub fn slot() ?*anyopaque {

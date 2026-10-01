@@ -755,6 +755,17 @@ pub const Wired = struct {
     pub fn cookie(self: *const Wired, name: []const u8) ?[]const u8 {
         return self.client.cookie(name);
     }
+
+    /// The `std.Io` a handler gets from `c.io()` or an `io: std.Io` argument
+    /// while no server is running (ADR 244): a process-wide
+    /// `std.Io.Threaded`, so a writer fiber the test starts on it with
+    /// `io.concurrent` makes progress while a handler waits on a queue it
+    /// reads. `Wired` cannot run `app.spawn`, which needs a server; this is
+    /// where such a fiber is started instead.
+    pub fn io(self: *const Wired) std.Io {
+        _ = self;
+        return bulkhead.loopIo();
+    }
 };
 
 /// Whether a `Set-Cookie`'s attributes say the cookie is going away.
@@ -1716,4 +1727,88 @@ test "show writes into whatever is formatting it, and allocates nothing" {
     var w = std.Io.Writer.fixed(&buf);
     try w.print("{f}", .{show(Small{ .n = 7 })});
     try std.testing.expectEqualStrings("{\"n\":7}", w.buffered());
+}
+
+const GroupCommit = struct {
+    const Append = struct { done: std.Io.Event = .unset, at: u64 = 0 };
+
+    queue: std.Io.Queue(*Append),
+    slots: [8]*Append = undefined,
+    committed: std.atomic.Value(u64) = .init(0),
+
+    fn writer(self: *GroupCommit, io: std.Io) void {
+        while (self.queue.getOne(io)) |item| {
+            item.at = self.committed.fetchAdd(1, .monotonic) + 1;
+            item.done.set(io);
+        } else |_| {}
+    }
+};
+
+const Committed = struct { at: u64 };
+
+fn appendWithIo(io: std.Io, wal: *GroupCommit) !Committed {
+    var item: GroupCommit.Append = .{};
+    try wal.queue.putOne(io, &item);
+    item.done.waitUncancelable(io);
+    return .{ .at = item.at };
+}
+
+fn appendThroughCtx(c: *@import("ctx.zig").Ctx, wal: *GroupCommit) !Committed {
+    var item: GroupCommit.Append = .{};
+    try wal.queue.putOne(c.io(), &item);
+    item.done.waitUncancelable(c.io());
+    return .{ .at = item.at };
+}
+
+test "a handler that asks for an std.Io waits on a writer fiber in a Wired test" {
+    var wired = try Wired.init(testing.allocator, .{});
+    defer wired.deinit();
+
+    var wal: GroupCommit = .{ .queue = undefined };
+    wal.queue = .init(&wal.slots);
+    try wired.app.provide(&wal);
+    try wired.app.post("/append", appendWithIo);
+
+    var writing = try wired.io().concurrent(GroupCommit.writer, .{ &wal, wired.io() });
+    defer {
+        wal.queue.close(wired.io());
+        _ = writing.cancel(wired.io());
+    }
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for (1..4) |n| {
+        const answer = try wired.post("/append", "");
+        try testing.expectEqual(@as(u16, 200), answer.status);
+        try testing.expectEqual(@as(u64, n), (try answer.json(Committed, arena.allocator())).at);
+    }
+}
+
+test "c.io() is the same Io a Wired test starts its writer on" {
+    var wired = try Wired.init(testing.allocator, .{});
+    defer wired.deinit();
+
+    var wal: GroupCommit = .{ .queue = undefined };
+    wal.queue = .init(&wal.slots);
+    try wired.app.provide(&wal);
+    try wired.app.post("/append", appendThroughCtx);
+
+    var writing = try wired.io().concurrent(GroupCommit.writer, .{ &wal, wired.io() });
+    defer {
+        wal.queue.close(wired.io());
+        _ = writing.cancel(wired.io());
+    }
+
+    const answer = try wired.post("/append", "");
+    try testing.expectEqual(@as(u16, 200), answer.status);
+    try testing.expectEqual(@as(u64, 1), wal.committed.load(.monotonic));
+}
+
+test "nilo.io, c.io() and Wired.io() are one Io when no server is running" {
+    var wired = try Wired.init(testing.allocator, .{});
+    defer wired.deinit();
+
+    const here = @import("http.zig").io();
+    try testing.expectEqual(wired.io().userdata, here.userdata);
+    try testing.expectEqual(wired.io().userdata, bulkhead.loopIo().userdata);
 }
