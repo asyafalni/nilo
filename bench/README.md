@@ -15,6 +15,7 @@ One file an area, each carrying what was run, the machine, the commit, the numbe
 | [`cache.md`](./result/cache.md) | the cache |
 | [`job.md`](./result/job.md) | the queue |
 | [`build.md`](./result/build.md) | waiting on the build itself |
+| [`releases.md`](./result/releases.md) | each release against the one before it, every module |
 
 [`RESULTS.md`](./RESULTS.md) holds the older binary-size runs.
 
@@ -26,6 +27,16 @@ zig build run -Doptimize=ReleaseFast   # the benchmark server (bench/main.zig): 
 zig build profile      # where the time inside one request goes, in-process
 zig build profile -- --routes <file>   # and matching on a real route table, `METHOD /pattern` a line
 ```
+
+## Every release
+
+```
+python3 bench/release.py main              # main against the tag before it, every module
+python3 bench/release.py v0.5.0 v0.6.0     # any refs, oldest first
+python3 bench/release.py --only sql,fetch v0.6.0 main   # some modules (and always the server)
+```
+
+Each ref is exported into a tree of its own and built pinned, and `bench/release/` (one program a module) is copied in and built against that ref's modules, so today's harness measures last month's tag. It reports instructions and allocations an operation, bytes an idle connection and stripped binary bytes, refs side by side from one run; it needs `valgrind` and x86-64, and **Release numbers** in GitHub Actions runs it on every published release ([ADR 242](../docs/adr/242-a-release-is-measured-against-the-one-before-it.md)). A program that runs one operation `n` times is `zig build <module>` in `bench/release/`.
 
 ## Microbenchmarks
 

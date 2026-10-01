@@ -12,6 +12,8 @@ What happens between `## Unreleased` and a tag. Read it when you cut one; the re
 
 The version follows the size of the change: a fix or any small change is a patch, minor is for new features, major for breaks.
 
+**Read the numbers before tagging.** Run **Release numbers** by hand (`gh workflow run release-numbers.yml -f ref=<the release commit>`), which measures that commit against the last tag on every module ([ADR 242](./adr/242-a-release-is-measured-against-the-one-before-it.md)). A change outside the spread is either the cost a feature already wrote into its ADR and ADR 017's running total, or something to look at before the tag exists. Publishing the release runs it again and attaches `numbers-vX.Y.Z.json` and `.md` to the release page; the table then goes into [`bench/result/releases.md`](../bench/result/releases.md) under its version, in the next commit.
+
 **The two `?ref=` lines carry the tag's commit after a `#`.** A `?ref=` alone is not a pin: the tags are annotated and Zig 0.16's fetcher hands back `main` for one (`docs/history.md`, under "Claims that decay"). The commit exists only once the tag does, so either write the lines with the commit `git rev-parse vX.Y.Z^{commit}` will answer *after* tagging, or tag first and amend.
 
 **Tagging moves the section onto that tag's release page**: `gh release create vX.Y.Z --verify-tag --notes-file …`, with every `](./` link rewritten to a blob URL pinned to the tag, because a relative link does not resolve on a release page. What stays in `CHANGELOG.md` is one line under `## Released` pointing at the page, and any README link into the section becomes a link to that page. The file is then the next release again, and never grows past one.

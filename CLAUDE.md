@@ -37,7 +37,7 @@ The repository is written to be worked on by somebody who did not write it, a pe
 | **Ctx** | `http/ctx.zig` | one request in flight, and nilo's real API. |
 | **Typed** | `http/typed.zig` | the compile-time engine: turns a typed handler into a Ctx handler. **A pointer is a service, a value is request data.** Path params match by position, because Zig keeps no argument names. |
 
-**The layering rule is a build step**: `zig build layering` reads the `@import`s of every module but `http/` and refuses one missing from that module's row of `layers` in `build.zig`. Adding a module means a row there, in `shipped_roots`, and in `.paths` in `build.zig.zon`.
+**The layering rule is a build step**: `zig build layering` reads the `@import`s of every module but `http/` and refuses one missing from that module's row of `layers` in `build.zig`. Adding a module means a row there, in `shipped_roots`, and in `.paths` in `build.zig.zon`, and a program in `bench/release/`, which `bench/release.py` refuses to run without.
 
 A request: `readHead` → `parseHead` → the head is *borrowed* from the read buffer unless the request will read again, when it is copied into the arena (read `borrowed` in `app.zig` before touching that path) → route match → middleware chain → resolved values → handler → response. The arena is reset per request, keeping `arena_keep` bytes. The rest of `http/`, by what it serves: `str` (request-lifetime text and the Debug-only use-after-request trap), `fail` (ADR 006), `resolve`, `service`, `middleware`, `form`/`bound`/`convert`/`patch`, `session`/`cookie`, `password` (the Gate in front of `nilo_pw`, ADR 044), `static`/`sendfile`/`filebody`/`range`, `stream`/`body`/`websocket`, `openapi`, `watchdog`, `logger`, `cors`.
 
@@ -116,6 +116,8 @@ ADR 017 splits performance into four axes that do not recover the same way:
 **Every change is put against all four before it is written**, the axis it spends and the number, in a design argued in a session as much as in a diff. **A feature that cannot be made to fit does not ship in a worse shape**: it waits for the shape that fits.
 
 ### A benchmark that was run gets written down
+
+**Every release is measured against the one before it** on every module by `python3 bench/release.py`, which the **Release numbers** workflow runs on a published release and by hand before tagging: instructions and allocations an operation, bytes an idle connection, stripped binary bytes, never req/s (ADR 242). A module's new everyday operation belongs in `bench/release/`.
 
 **Every run that changed a decision gets an entry in [`bench/result/`](bench/result/)**, one file an area (the list is in [`bench/README.md`](bench/README.md)), saying what was run, on which machine, at which commit, the numbers, the decision they moved, and whether the number can be pushed further. Not the terminal, not a commit body. A run that changed nothing still earns one if somebody would otherwise repeat it. The lesson then goes to `docs/history.md` and the decision to an ADR. **A number with no run behind it decays into a claim, and a premise decays the same way and costs more.**
 

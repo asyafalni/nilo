@@ -1,0 +1,47 @@
+# The one place the Zig a workflow uses is pinned, for every job that builds.
+#
+# Downloaded and checksummed rather than installed by a third-party action:
+# one fewer thing to trust, and the version is the same
+# `minimum_zig_version` that build.zig.zon names. It used to be pinned in
+# each workflow; a second workflow that builds (release-numbers.yml) made two
+# copies of a version and its checksums that could drift apart.
+
+name: Zig
+description: Install the pinned Zig and restore its global cache.
+
+runs:
+  using: composite
+  steps:
+    - name: Install Zig
+      shell: bash
+      run: |
+        set -euo pipefail
+        version=0.16.0
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64)
+            name=zig-x86_64-linux-$version
+            sum=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
+          macOS-ARM64)
+            name=zig-aarch64-macos-$version
+            sum=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489 ;;
+          *)
+            echo "no Zig is pinned for $RUNNER_OS-$RUNNER_ARCH" >&2
+            exit 1 ;;
+        esac
+        curl -fsSL --retry 3 -o zig.tar.xz "https://ziglang.org/download/$version/$name.tar.xz"
+        echo "$sum  zig.tar.xz" | shasum -a 256 -c -
+        mkdir -p "$HOME/zig"
+        tar -xf zig.tar.xz -C "$HOME/zig" --strip-components=1
+        rm zig.tar.xz
+        echo "$HOME/zig" >> "$GITHUB_PATH"
+        echo "ZIG_VERSION=$version" >> "$GITHUB_ENV"
+
+    - name: Cache Zig's global cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/zig
+        key: zig-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon') }}
+        restore-keys: zig-${{ runner.os }}-${{ env.ZIG_VERSION }}-
+
+    - shell: bash
+      run: zig version

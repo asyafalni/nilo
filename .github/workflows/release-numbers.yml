@@ -1,0 +1,78 @@
+# Every module of a release measured against the release before it, on the
+# axes a shared runner can read exactly (ADR 242): instructions and
+# allocations an operation, bytes an idle connection, stripped binary bytes.
+# Both refs are built and measured in this one job, interleaved, so nothing
+# is compared with a number from another machine or another day.
+#
+# Two ways in, and no others: a published release measures its tag against
+# the tag before it and attaches the numbers to the release page; a manual
+# run measures any ref against any other, which is how a release candidate
+# is read before it is tagged (docs/releasing.md) and how an old tag is
+# backfilled. Not on every push: the report is for a person to read, not a
+# gate, and a red mark on main for a change that is not wrong yet is noise.
+
+name: Release numbers
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'What to measure: a branch, a tag or a commit'
+        default: main
+      base:
+        description: 'What to measure it against. Empty is the tag before it'
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-numbers-${{ github.event.release.tag_name || inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      REF: ${{ github.event.release.tag_name || inputs.ref }}
+      BASE: ${{ inputs.base }}
+    steps:
+      # Every tag and branch: `release.py` exports both refs with
+      # `git archive` and finds the tag before one with `git describe`.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/zig
+
+      - name: Install valgrind
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq valgrind
+
+      - name: Measure
+        run: python3 bench/release.py --json numbers.json --markdown numbers.md ${BASE:+"$BASE"} "$REF"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f numbers.md ]; then
+            { echo "## $REF against ${BASE:-the tag before it}"; echo; cat numbers.md; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-numbers
+          path: numbers.*
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp numbers.json "numbers-$REF.json"
+          cp numbers.md "numbers-$REF.md"
+          gh release upload "$REF" "numbers-$REF.json" "numbers-$REF.md" --clobber

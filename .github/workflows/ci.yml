@@ -6,9 +6,7 @@
 # to happen on every local test run and now happens here, so being fast locally
 # does not mean shipping without it.
 #
-# Zig is downloaded and checksummed rather than installed by a third-party
-# action: one fewer thing to trust, and the version is pinned to the same
-# `minimum_zig_version` that build.zig.zon names.
+# Zig is pinned once, in .github/actions/zig, for this and every workflow.
 
 name: CI
 
@@ -21,10 +19,6 @@ on:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  ZIG_VERSION: 0.16.0
-  ZIG_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
 
 jobs:
   test:
@@ -78,24 +72,7 @@ jobs:
           done
           python3 bench/s3_setup.py
 
-      - name: Cache Zig's global cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/zig
-          key: zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon') }}
-          restore-keys: zig-${{ env.ZIG_VERSION }}-
-
-      - name: Install Zig ${{ env.ZIG_VERSION }}
-        run: |
-          set -euo pipefail
-          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          curl -fsSL --retry 3 -o zig.tar.xz "$url"
-          echo "${ZIG_SHA256}  zig.tar.xz" | sha256sum -c -
-          mkdir -p "$HOME/zig"
-          tar -xf zig.tar.xz -C "$HOME/zig" --strip-components=1
-          echo "$HOME/zig" >> "$GITHUB_PATH"
-
-      - run: zig version
+      - uses: ./.github/actions/zig
 
       # Both modes. This is the job that exists.
       - name: zig build test-all
@@ -131,29 +108,10 @@ jobs:
   macos:
     runs-on: macos-latest
     timeout-minutes: 30
-    env:
-      ZIG_SHA256_MACOS: b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Zig's global cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/zig
-          key: zig-macos-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon') }}
-          restore-keys: zig-macos-${{ env.ZIG_VERSION }}-
-
-      - name: Install Zig ${{ env.ZIG_VERSION }}
-        run: |
-          set -euo pipefail
-          url="https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
-          curl -fsSL --retry 3 -o zig.tar.xz "$url"
-          echo "${ZIG_SHA256_MACOS}  zig.tar.xz" | shasum -a 256 -c -
-          mkdir -p "$HOME/zig"
-          tar -xf zig.tar.xz -C "$HOME/zig" --strip-components=1
-          echo "$HOME/zig" >> "$GITHUB_PATH"
-
-      - run: zig version
+      - uses: ./.github/actions/zig
 
       - name: zig build test
         run: zig build test
