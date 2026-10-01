@@ -33,6 +33,8 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 ### `nilo_http`
 
+The entries from the WebSocket one down to the end of this module, other than the thirteen that were here before, came from an audit of `http/` at `39896d2` that read the code and checked every entry in it; none was run. **A fix lands with a probe**: a test that fails on the code before it, in Debug and ReleaseSafe, written first, the way the `nilo_sql` audit's were. The order to take them in is the harm: the WebSocket buffer, `useOn` skipped by a pattern, the two panics a request can reach (`Patch(Enum)` under `Bound`, an unnamed enum written as JSON), the session a subdomain can plant, and the stop that waits on idle connections. Most of the rest fall into the four patterns under [Next](#next).
+
 **A WebSocket client can make `receive` write into a message buffer that has gone back to the free list.** A first fragment with `FIN=0` and length 0 takes the buffer (`buf = takeScratch()`) and leaves `filled` at 0, so the next wait is `park(true)`; 200 ms of quiet and `park` gives the buffer back, while `receive`'s local `buf` still holds the slice. A continuation that is not whole in the read buffer then skips `takeScratch`, because `buf.len != 0`, and `readPayload` writes the client's bytes into memory the free list owns: over its `next` pointer, into another connection's message on the same executor, or into unmapped pages. Unauthenticated, on any WebSocket route. The comment above the `park` call says `filled == 0` means nothing is wanted, which holds for the slot and not for the local.
 
 **Needs:** `buf` emptied whenever `park` may have given it back, with a test that sends an empty first fragment, stays quiet past the peek, and sends the continuation in pieces, in Debug and ReleaseSafe.
@@ -99,7 +101,9 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 **A stop waits on every idle keep-alive connection for up to twice the idle limit, and the idle limit is itself twice what is set.** `waitForRequest` swallows every error, `error.Canceled` included, and zio delivers a cancel once, so after a stop the loop parks in `readHead` again under a fresh `idle_timeout_ms` and `group.cancel()` waits for it; the TLS test in `tls_live.zig` says as much, while [deploying](./guide/deploying.md) says idle connections close at once. The idle wait is armed as `.within_ms`, which applies per read, so a silent client that outlasts the wait in `waitForRequest` gets a second full period in `readHead`, where the comment above `waitForRequest` says the expired deadline fails it at once.
 
-**Needs:** `waitForRequest` returning whether the connection should end (cancelled, closed, timed out) and `handleConnection` returning on it, with a live test that stops a server holding an idle connection under a long `idle_timeout_ms`.
+The Engine swallows a cancel in two more places: `Link.settle` and its TLS twin `ClearLink.streamSettled` flush with `catch {}` before every read, so a stop landing while a pipelined answer is still buffered is consumed there and the read after it parks fresh. A parked WebSocket is not told either: `receive` checks `stopping()` only when it loops, and the `.closed` the cancel wakes it with returns without the 1001 that [ADR 046](./adr/046-a-message-is-copied-once-and-framed-once.md) and the WebSocket guide promise.
+
+**Needs:** `waitForRequest` returning whether the connection should end (cancelled, closed, timed out) and `handleConnection` returning on it, the two Engine flushes passing a cancel on, and a WebSocket woken by a stop sending its 1001; with live tests that stop a server holding an idle connection under a long `idle_timeout_ms` and one holding a parked WebSocket.
 
 **A stop keeps the listening socket open, and an `accept` error outside three skips the drain.** The listener closes in a `defer` after `drain` and `group.cancel()`, so for the whole grace period the kernel completes handshakes into the backlog that nobody accepts, which [deploying](./guide/deploying.md) argues against for `max_connections`. `Acceptor.run` treats every error but the three [ADR 194](./adr/194-an-accept-loop-that-is-out-of-descriptors-waits.md) names as the listener's own, and `accept(2)` says Linux passes a pending network error on a new connection (`EPROTO`, `EPERM`, `ENETUNREACH`) through `accept` to be retried; one of those makes `listen()` return before `drain`, and the deferred `group.cancel()` cuts every request in flight.
 
@@ -168,6 +172,58 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 **The test `Client` accepts a request head of any size.** Its reader is `Reader.fixed` over the whole request, and `readHead` refuses a head only once it fills the buffer, so a test sending a large cookie or many headers passes where a server answers 431. Its cookie jar also keeps a cookie deleted by `Expires` alone and ignores the `__Host-` and `__Secure-` rules a browser applies.
 
 **Needs:** the test reader given the server's read-buffer size, and the jar honouring a past `Expires` and the two prefixes.
+
+**A middleware that returns without answering and without calling `next` answers an empty 200.** `serveRequest` fills in `sendDirect(200, "", "")` whenever nothing answered, which [ADR 120](./adr/120-a-ctx-handler-that-returns-nothing-may-have-written-it.md) means for a handler returning `void`; a guard written `if (!ok(c)) return;` that forgot its 401 therefore lets the request through as a success, with the handler never run, and nothing in the type system or the tests notices.
+
+**Needs:** the empty answer given only when the terminal handler ran, and a 500 naming the middleware otherwise, with a test.
+
+**A failed `tryRoute` changes what covers the route that is already there.** Each `GroupWith` method calls `excepting` and `attaching` before `routeNamed`, and an `Exemption` is keyed on pattern, method and middleware, so `v1.without(auth).tryRoute(.POST, "/sign-in", b)` returning `DuplicateRoute` has already exempted the first `/v1/sign-in` from `auth`; `with(m)` attaches `m` the same way. A `DuplicateName` is found after `router.addNamed` succeeded, so the route stays live and the API description leaves it out.
+
+**Needs:** every check run before anything is registered, and the exemption and attachment appended only after the route is in, with a test per path.
+
+**A `Cached` answer keeps the handler's own `Set-Cookie` and replays it to everybody.** `renderAnswer` keeps a `Response(T)`'s headers whole (`keptHeaders` copies them as they are), so a cached page that sets an anonymous session or a CSRF cookie hands the first visitor's cookie to every visitor for the TTL. [ADR 188](./adr/188-a-route-can-say-cache-this-answer-for-a-minute.md) names exactly this risk and refuses only the arguments that read the caller. A failure in `cachedFinish` after the claim (`setStaticHeader`, or an `encode` error other than `TooLarge`) also leaves the marker, so every request waits out the cap until one overwrites it.
+
+**Needs:** an answer carrying `Set-Cookie` sent and not kept, with a `warn`, and the marker released on every error after the claim.
+
+**`FileBody.send` leaks the descriptor when a header is refused.** It opens the file and then runs `try c.setHeader` for each header with no `errdefer file.close()`, so a `Content-Disposition` built from an uploaded name with a CR in it, or any header nilo writes itself, answers 500 and keeps the descriptor; the comment above that loop says no failure can come between the two.
+
+**Needs:** the headers set before the open, or an `errdefer` closing the file, with a test that counts descriptors.
+
+**Compression ignores what a handler said about the representation.** `Ctx.squeezed` gzips any eligible body, so a handler's 206 with `Content-Range` goes out gzipped against plain offsets, a strong `ETag` names both the gzip and the plain body, which `static.zig` gives two tags to avoid, and `Cache-Control: no-transform` is ignored. There is also no upper size: a 20 MB JSON export is compressed in one go on the executor thread, with nothing else on that thread running meanwhile.
+
+**Needs:** no compression for 206, 416, a `Content-Range` or `no-transform`, a strong `ETag` weakened when the body is compressed, and a `max_bytes` with the cost of its default measured into `bench/result/`.
+
+**A request body has three failure paths that answer wrongly.** A body the client cut short (`Content-Length: 100`, ten bytes, then FIN) is `EndOfStream`, which `statusFor` has no arm for, so it is a 500 and a warning where it is the client's fault; the same truncation inside a chunk's data is a 500 while a truncated size line is a 400. A gzip body that fails to inflate leaves `_body` holding the compressed bytes, so a second `c.body()` (a middleware that logged and ignored the first error) hands them over as the body. And `Ctx.send` only `assert`s it has not answered yet: a middleware that answers an error after the handler's own write failed panics a ReleaseSafe build and writes a second response in ReleaseFast.
+
+**Needs:** `EndOfStream` from a body read mapped to a 400 that closes the connection, the inflated body assigned only on success, and a second answer an error rather than an assert, with a test for each.
+
+**Two kinds of state in the Engine give wrong diagnostics.** `Clocks.timedOut()` reads `reader.err`, which zio never clears, so after the idle peek every connection reports a timeout: `warnFailedAfterAnswering` logs "gave up writing" for a reset, and a TLS peer that closes without `close_notify` mid-head gets a 408 written to a dead socket and counted in the metrics. `onStopSignal` reads "second signal" from `stop.isRequested()`, which `App.shutdown()` also sets, so one SIGTERM after a programmatic shutdown exits at once, and it calls `std.process.exit` inside a signal handler.
+
+**Needs:** the clock errors cleared whenever a limit is armed, a flag of its own for a signal already seen, and `_exit` in the handler.
+
+**Several comments and pages describe code that is no longer there.** `bulkhead.zig`'s header lists a six-parameter `serve` (it has eight) under `src/engine/` (it is `http/engine/`), and leaves out `Peer`'s fields, `spawnLocal`, `Wake.rawIdle` and `Binding`, which a second Engine has to provide; `proxies.zig` says a `Forwarded` header is walked, and nothing reads it; the `accept` comment in `zio.zig` says a failure raises the stop flag; `middleware.zig`'s header and [ADR 008](./adr/008-middleware-is-an-onion-of-ctx-functions.md) use `std.time.Timer`, which Zig 0.16 removed; a link in `ctx.zig` says ADR 155 and points at 156.
+
+**Needs:** each corrected, and the module headers' code examples brought under `zig build snippets` so the next one cannot rot.
+
+**One request with a bad enum word kills a process whose `Bound(T)` body has a `Patch(Enum)` field.** `collectBadBody` sees through `Patch` and records `.not_a_choice`, but `bound.innerOf` unwraps only `?T`, so `canFail(Patch(Stage))` asks `convert` about a union, gets false, and `sayerFor` reaches `unreachable` on `{"stage":"nope"}`: a panic in a safe build, undefined behaviour in `ReleaseFast`. `describeField` and `choicesOf` both handle `Patch`; this is the third copy of the rule, and the one that drifted.
+
+**Needs:** `innerOf` unwrapping `Patch`, the `unreachable` replaced by a generic sentence, and a test with `Bound` over `Patch(Enum)` in both optimize modes.
+
+**A non-exhaustive enum holding a value no field names panics the JSON writer.** `json.writeValue` calls `@tagName(value)` for a non-exhaustive enum, which is checked illegal behaviour for an unnamed value, and std.json reads `{"kind":7}` into exactly that, as can a database integer; echoing it back panics where std.json writes `7`. [ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md) and the comment at that line say `@tagName` cannot fail there.
+
+**Needs:** `std.enums.tagName` with the integer written when it is null, ADR 096 corrected, and a test with an unnamed value.
+
+**`listen()` does not refuse an `Idempotent` route whose Space was never provided.** `typed.requirements` adds the Space of a `Cached` argument and the Verifier of a `Verified` one, and `.idempotent` falls into `else`, so the server starts and every request to the route logs a warning and answers 500, where [ADR 005](./adr/005-services-via-a-runtime-registry.md) has `listen()` catch a missing service. The `wrap` comment says `listen()` catches it.
+
+**Needs:** the Space added to `requirements`, with a `listen()` refusal test.
+
+**An upload read through `bodyStream` that the client cut short looks complete.** `Body.streamFn` passes the connection's `EndOfStream` up, and `read`, `writeTo` and `discardRest` all read `EndOfStream` as the clean end, so a `Content-Length: 1000000` upload that stops at 300,000 bytes is stored as a whole file unless the handler compares `seen()` with `size()`. `c.body()` refuses the same truncation.
+
+**Needs:** an `EndOfStream` from the connection while bytes are still owed turned into a failure that marks the connection unusable, with a test.
+
+**Five smaller edges on the way in and out.** A JSON number that does not fit its field (`{"age":300}` for a `u8`, `1.5`, `-1` for a `u32`) is a bare "Bad Request" naming no field, and a hard 400 under `Bound`, where the same mistake in a query names the field; `ctx.fits` accepts any number for an integer. `c.stream` and `streamWith` under 204, 304 or 1xx write `Transfer-Encoding: chunked` or a `Content-Length`, which `writeHead` drops for those statuses because the next response would start inside them. `idempotentBegin` handles `TooLarge` from the claim with `unreachable`, and a long `by(c)` string or a small Space reaches it. An internally tagged union takes the first of two discriminator keys where std.json refuses a duplicate everywhere else, so a front end that keeps the last one sees another variant. `c.peer().address()` returns a slice into a temporary `Peer`.
+
+**Needs:** `fits` checking range and kind for numbers, a bodyless status refused by `streamWith`, `TooLarge` answered as `cachedBegin` answers it, a second discriminator refused, and `peer()` returning a pointer; a test each.
 
 ### `nilo_sql`
 
@@ -238,6 +294,18 @@ The entries under *statements that work refused* were reproduced by a probe test
 **Nothing tells a handler its client has gone.** `error.Canceled` comes from a shutdown or from one of the deadlines the Engine sets; a client closing its connection in the middle of a handler produces neither, so the work runs to the end and the response is written into a socket nobody is reading. The other half of this — cutting a slow handler off — is `nilo.deadline(ms)` ([ADR 105](./adr/105-a-route-can-say-how-long-it-has.md)). This half is not simply unbuilt: **the obvious implementation is wrong.** A read-side EOF is not "the client left" — a client that sent `Connection: close` and then `shutdown(SHUT_WR)` produces exactly that and is still waiting for its response, so answering "peer gone" from it would abandon correct requests. Gin gets the disconnect from `net/http` for nothing; Fiber does not have it either.
 
 **Needs:** two named signals rather than one flag — "the client half-closed and is waiting" and "the socket is gone". What is already real is a write that fails, and a handler sees that today.
+
+**One rule, one function: the audit's largest source of defects is a decision written in several places that stopped agreeing.** Whether a field may be absent is decided in six (`form.fill`, `form.fillCollecting`, `typed.queryValue`, `typed.queryValueCollecting`, `ctx.collectBadBody`, `ctx.describeObject`) and has drifted three times: `Patch` under `Bound`, `?T` in a query and a body, a number described in a query and not in JSON. Path prefixes are matched three ways (`middleware.underPrefix`, `static.underPrefix`, the router) and disagree on `//` and on a param, which is the `useOn` defect. A JSON string is written by `json.zig` and again by `writeFailureBody`, and only one checks UTF-8. `If-None-Match`, `If-Range` and `Range` are answered in `serve.zig`, `sendfile.zig` and through `Versioned`. `fieldList` exists twice with different output. Each is a fix that closes its defects for good, where a patch to each copy closes them until the next copy.
+
+**Needs:** the shape of each shared piece decided — a comptime `FieldRule` that the six callers ask, one prefix matcher the router's split defines, one JSON string writer, one conditional-request ladder — and the order, which the Defects above suggest: the field rule and the prefix matcher first.
+
+**A rule a build step holds against the patterns the audit kept finding.** Three of the four kinds of defect are spellable: `catch {}` and `else => {}` that swallow `error.Canceled` or `EndOfStream` on a connection path (the stop that waits, the upload that looks complete, the middleware's empty 200); `unreachable`, `std.debug.assert` and `catch unreachable` on a path a request reaches (`Room.print`, `Ctx.send`, `sayerFor`, `idempotentBegin`), each a remote panic in ReleaseSafe and undefined behaviour in ReleaseFast; and a module header's code example that no longer compiles (`std.time.Timer` in `middleware.zig` and ADR 008). The fourth kind, a comment or ADR claiming what the code does not do, a dozen of them, has no mechanism but probes. A step that refuses the three in `http/` unless the line carries a marked reason makes the next one a build failure rather than an audit finding.
+
+**Needs:** the decision on how a justified case is marked (a comment tag, or a list in `build.zig` the way `layers` is), and whether the step starts as a report over today's tree or as a refusal with the existing cases listed.
+
+**A mutation pass over the request path.** The `nilo_sql` audit found what reading could not by changing one comparison or deleting one check and seeing which change no test noticed (`57c8bbb`); `http/` has not had one. `http1.zig`, `router.zig`, `middleware.zig` and `serve.zig` are where a survivor costs most, and the fuzzers and the llhttp differential ([ADR 231](./adr/231-a-second-parser-reads-what-the-first-one-reads.md)) cover the parser's bytes, not the dispatch's decisions.
+
+**Needs:** the run, one file at a time because a run is the whole `zig build test`, and a test for each mutation that survives.
 
 ### `nilo_sql`
 
