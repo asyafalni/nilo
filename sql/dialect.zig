@@ -154,7 +154,6 @@ pub const Aggregate = enum {
     }
 };
 
-/// Postgres, and for now the only one.
 /// How a database stores a `Uuid`, which is the one column type the two Wires
 /// disagree about (ADR 067).
 pub const UuidForm = enum {
@@ -183,6 +182,7 @@ pub const ValueForm = enum {
     text,
 };
 
+/// Postgres, the default Dialect (SQLite is the other, further down).
 pub const Postgres = struct {
     pub const name = "postgres";
 
@@ -237,8 +237,25 @@ pub const Postgres = struct {
     /// its first five calls, and then for none of them if that is not dearer
     /// on average. A `sql.given` term, `("cust" = $1 OR $1 IS NULL)`, cannot
     /// seek on a plan made for no value, so a statement holding one is sent
-    /// unnamed and planned for each call's own values (ADR 149).
+    /// unnamed and planned for each call's own values (ADR 149). A statement
+    /// whose guards are spliced (`splice_given`) has none left to seek on and
+    /// keeps its name.
     pub const plan_may_go_generic = true;
+
+    /// **Yes**: a statement holding a `sql.given` is written per call without
+    /// the guard, so the plan is made for the text and not for a value
+    /// (`statement.guardsOf`, ADR 149).
+    pub const splice_given = true;
+
+    /// What stands in the statement for a guarded term that is not there.
+    /// **Cast to `text`, because the term that used to type `$n` is gone**:
+    /// pg.zig sends a `Parse` with no parameter types, and `$n IS NULL` alone
+    /// is *could not determine data type of parameter $n* (`42P08`). The value
+    /// is NULL whenever this is written, and a NULL is the same bytes under
+    /// every type, so `text` is right for an enum, a `uuid` and an array alike.
+    pub fn absentTerm(comptime n: usize) []const u8 {
+        return "(" ++ placeholder(n) ++ "::text IS NULL)";
+    }
 
     /// Whether this database's plain `LIKE` already folds ASCII case. Postgres
     /// has two words for the two behaviours; a Dialect whose one word folds
@@ -323,6 +340,10 @@ pub const Postgres = struct {
     /// much of it came off the disk.
     pub const explain = "EXPLAIN (ANALYZE, BUFFERS) ";
     pub const explain_width = 1;
+    /// `ANALYZE` executes what it plans, so `db.rawExplain` asks inside a
+    /// transaction it always rolls back. Optional for a Dialect; absent means
+    /// true.
+    pub const explain_runs = true;
 
     /// Where NULLs sit in an ordered result, or `null` for a database that
     /// cannot be told. Written the same way `lock` is, and for the same
@@ -376,6 +397,25 @@ pub const Postgres = struct {
         comptime negate: bool,
         comptime whole: bool,
     ) ?[]const u8 {
+        return patternText(quoted, bound, shape, fold, negate, whole, "ILIKE ", true);
+    }
+
+    /// The text of a pattern condition, with the word a Dialect folds case
+    /// with handed in: `ILIKE ` here and `LIKE ` on SQLite, which writes its
+    /// own operator rather than rewriting this one's text, so a column named
+    /// with those letters cannot be rewritten (ADR 055). `lowered` says the
+    /// folding prefix is the `lower(col) LIKE lower(…)` form of the index a
+    /// `.unique` that ignores case is over, which only this Dialect has.
+    fn patternText(
+        comptime quoted: []const u8,
+        comptime bound: []const u8,
+        comptime shape: Pattern,
+        comptime fold: bool,
+        comptime negate: bool,
+        comptime whole: bool,
+        comptime folding_word: []const u8,
+        comptime lowered: bool,
+    ) []const u8 {
         comptime {
             const escaped = "replace(replace(replace(" ++ bound ++
                 ", '\\', '\\\\'), '%', '\\%'), '_', '\\_')";
@@ -391,10 +431,10 @@ pub const Postgres = struct {
             // prefix scanned the table while the unique sat beside it
             // (ADR 140, sql.md section 23). The negation and the other two
             // shapes read every row whichever word they use, and keep `ILIKE`.
-            if (fold and shape == .starts_with and !negate and !whole) return Postgres.foldedColumn(quoted) ++
+            if (lowered and fold and shape == .starts_with and !negate and !whole) return Postgres.foldedColumn(quoted) ++
                 " LIKE " ++ Postgres.foldedColumn(escaped) ++ " || '%' ESCAPE '\\'";
             return quoted ++ (if (negate) " NOT " else " ") ++
-                (if (fold) "ILIKE " else "LIKE ") ++ built ++ " ESCAPE '\\'";
+                (if (fold) folding_word else "LIKE ") ++ built ++ " ESCAPE '\\'";
         }
     }
 
@@ -817,18 +857,63 @@ pub const Postgres = struct {
         \\ORDER BY col.attnum
     ;
 
-    /// The values an enum type has, one row each and in the type's own order,
-    /// for `checkSchema` to hold a Zig enum against. `$1` is the type name a
-    /// column declared with `nilo_column`. The name alone rather than
-    /// schema-qualified: a type is looked up the way the column's own
-    /// `typname` above is, and a program with two enums of one name in two
-    /// schemas has a problem this check is not the first to have.
+    /// **`introspect` for every table of one schema at once**, which is what
+    /// the startup check sends: one round trip however many Rows there are,
+    /// where it sent one per Row. `$1` is the schema (null for the session's
+    /// own) and `$2` the table names as `text[]`; the answer is the same three
+    /// columns preceded by the table's name, ordered by table and then by
+    /// position, so the Wire cuts it into one list per table.
+    ///
+    /// **It has to answer exactly what `introspect` answers**, domains
+    /// resolved and views `UNKNOWN` included (ADR 055): the recursive `base`
+    /// is keyed by the relation as well as the column now, because two tables
+    /// both have an `attnum` 1. A test in `live.zig` holds the two together
+    /// against a real Postgres. `::text[]::name[]` because `relname` is a
+    /// `name` and pg.zig sends a `text[]`.
+    pub const introspect_all =
+        \\WITH RECURSIVE col AS (
+        \\  SELECT a.attrelid, c.relname, a.attnum, a.attname, a.attnotnull, c.relkind, a.atttypid
+        \\  FROM pg_catalog.pg_attribute a
+        \\  JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+        \\  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        \\  WHERE n.nspname = COALESCE($1, current_schema())
+        \\    AND c.relname = ANY($2::text[]::name[])
+        \\    AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+        \\    AND a.attnum > 0
+        \\    AND NOT a.attisdropped
+        \\), base(attrelid, attnum, typid) AS (
+        \\  SELECT attrelid, attnum, atttypid FROM col
+        \\  UNION ALL
+        \\  SELECT b.attrelid, b.attnum, t.typbasetype
+        \\  FROM base b
+        \\  JOIN pg_catalog.pg_type t ON t.oid = b.typid AND t.typtype = 'd'
+        \\)
+        \\SELECT col.relname,
+        \\       col.attname,
+        \\       t.typname,
+        \\       CASE WHEN col.relkind IN ('v', 'm') THEN 'UNKNOWN'
+        \\            WHEN col.attnotnull THEN 'NO'
+        \\            ELSE 'YES' END
+        \\FROM col
+        \\JOIN base ON base.attrelid = col.attrelid AND base.attnum = col.attnum
+        \\JOIN pg_catalog.pg_type t ON t.oid = base.typid AND t.typtype <> 'd'
+        \\ORDER BY col.relname, col.attnum
+    ;
+
+    /// The values the enum types have, one row each, the type's name first
+    /// and its values in the type's own order, for `checkSchema` to hold a
+    /// Zig enum against. `$1` is the type names a column declared with
+    /// `nilo_column`, as `text[]`, so one query serves every enum column of
+    /// every Row. The name alone rather than schema-qualified: a type is
+    /// looked up the way the column's own `typname` above is, and a program
+    /// with two enums of one name in two schemas has a problem this check is
+    /// not the first to have.
     pub const enum_values: ?[]const u8 =
-        \\SELECT e.enumlabel
+        \\SELECT t.typname, e.enumlabel
         \\FROM pg_catalog.pg_enum e
         \\JOIN pg_catalog.pg_type t ON t.oid = e.enumtypid
-        \\WHERE t.typname = $1
-        \\ORDER BY e.enumsortorder
+        \\WHERE t.typname = ANY($1::text[]::name[])
+        \\ORDER BY t.typname, e.enumsortorder
     ;
 
     /// The column types this Dialect will read `T` out of.
@@ -1158,6 +1243,9 @@ pub const SQLite = struct {
     /// text last.
     pub const explain = "EXPLAIN QUERY PLAN ";
     pub const explain_width = 4;
+    /// Plans and does not run, so `db.rawExplain` opens no transaction here:
+    /// `BEGIN IMMEDIATE` would hold the one writer for a plan.
+    pub const explain_runs = false;
 
     /// The same two words, and **that is the finding rather than the
     /// coincidence.** SQLite has taken `NULLS FIRST`/`NULLS LAST` since 3.30
@@ -1188,12 +1276,12 @@ pub const SQLite = struct {
     ) ?[]const u8 {
         comptime {
             if (!fold) return null;
-            const written = Postgres.pattern(quoted, bound, shape, true, negate, whole).?;
             // `ILIKE` is Postgres's word for what this database's `LIKE`
-            // already does, so the same expression with the one word swapped
-            // is the whole difference.
-            const at = std.mem.indexOf(u8, written, "ILIKE ").?;
-            return written[0..at] ++ "LIKE " ++ written[at + "ILIKE ".len ..];
+            // already does, so the same expression is written with `LIKE`.
+            // Written directly: the text used to be Postgres's with its first
+            // `ILIKE ` replaced, which rewrote a column named with those
+            // letters instead of the operator.
+            return Postgres.patternText(quoted, bound, shape, true, negate, whole, "LIKE ", false);
         }
     }
 
@@ -1322,9 +1410,23 @@ pub const SQLite = struct {
     /// sight, so `("cust" = ?1 OR ?1 IS NULL)` is a `SCAN` on the first call
     /// and on every one after, and sending it unnamed would prepare it again
     /// to plan it the same way. The only cure is a different text per
-    /// combination of filters, which ADR 149 refuses. So nothing changes
-    /// here, and the guide says what to do for a table where it matters.
+    /// combination of filters. That is what `splice_given` now writes: the
+    /// guard is cut out of the text per call, as ADR 165 cuts an `ORDER BY`
+    /// in (ADR 149).
     pub const plan_may_go_generic = false;
+
+    /// **Yes**: a statement holding a `sql.given` is written per call without
+    /// the guard, so the text SQLite plans when it prepares seeks
+    /// (`statement.guardsOf`, ADR 149).
+    pub const splice_given = true;
+
+    /// What stands in the statement for a guarded term that is not there.
+    /// **The placeholder stays in the text**, so every `?n` the values tuple
+    /// binds still exists: SQLite counts parameters by the highest number it
+    /// finds, and a value bound past it is `SQLITE_RANGE`.
+    pub fn absentTerm(comptime n: usize) []const u8 {
+        return "(" ++ placeholder(n) ++ " IS NULL)";
+    }
 
     /// **No.** `ALTER TABLE` here adds, drops and renames a column and does
     /// nothing else: a type and a `NOT NULL` are fixed at creation. Changing
@@ -1360,6 +1462,25 @@ pub const SQLite = struct {
     pub const has_extensions = false;
     pub const has_functions = false;
     pub const view_repeatable_head = "CREATE VIEW IF NOT EXISTS ";
+
+    /// **`IF NOT EXISTS` never updates**, so a view or trigger whose text
+    /// changed stayed as it was and nothing said so, where Postgres replaces
+    /// every one on every boot. SQLite keeps the text each was made with
+    /// (`sqlite_master.sql`, `IF NOT EXISTS` taken out), so `createMissing`
+    /// reads this once, compares it with the plain `CREATE VIEW` or `CREATE
+    /// TRIGGER` it would send, and drops and remakes only the ones that
+    /// differ. A boot that changed nothing sends no DDL, which also leaves the
+    /// schema version alone, and one that changed a definition updates it, on
+    /// both databases. One column, `kind:name`, the unit separator (byte 31),
+    /// then the text, so it reads as a single `[]const u8` and a view and a
+    /// trigger of one name are two entries. A Dialect without this replaces
+    /// in place and reads nothing (Postgres: `CREATE OR REPLACE` keeps a
+    /// view's grants and comment, and compares nothing because
+    /// `pg_get_viewdef` prints a normalised text that is not the text that
+    /// was written).
+    pub const stored_definitions: []const u8 =
+        "SELECT type || ':' || name || char(31) || sql FROM sqlite_master " ++
+        "WHERE type IN ('view', 'trigger')";
 
     /// **No either**, and for the same reason: a table constraint here is
     /// written at creation and is part of the table from then on. A changed
@@ -1530,6 +1651,50 @@ pub const SQLite = struct {
         \\FROM pragma_table_info(?1) i
         \\LEFT JOIN sqlite_master m ON m.name = ?1
         \\ORDER BY i.cid
+    ;
+
+    /// **`introspect` for every table at once**, which is what the startup
+    /// check sends: one query however many Rows there are, where it sent one
+    /// per Row. `?1` is the table names as one JSON array, the way this
+    /// Dialect binds every list (`list_form`), and the answer is the same
+    /// three columns preceded by the table's name, ordered by table and
+    /// position. `pragma_table_info(m.name)` takes its argument from the row
+    /// of `sqlite_master` beside it, which SQLite allows of a table-valued
+    /// function.
+    ///
+    /// **It has to answer exactly what `introspect` answers**, affinity and
+    /// the rowid alias and `UNKNOWN` for a view (ADR 050, ADR 055). Two
+    /// differences in the text and neither in the answer: the join is inner,
+    /// since a name in the array that is no table or view has nothing to
+    /// report, and `COLLATE NOCASE` because `pragma_table_info` folds the
+    /// name's case and `m.name = ?1` did not have to. **`pragma_table_info`
+    /// and `sqlite_master` are each named as often here as the qualifying
+    /// rewrite expects** (`sqlite.Wire.columnsOfMany`): every occurrence gets
+    /// the schema in front of it.
+    pub const introspect_all =
+        \\SELECT m.name,
+        \\       i.name,
+        \\       CASE WHEN coalesce(i.type, '') = '' THEN 'ANY'
+        \\            WHEN instr(upper(i.type), 'INT') > 0 THEN 'INTEGER'
+        \\            WHEN instr(upper(i.type), 'CHAR') > 0
+        \\              OR instr(upper(i.type), 'CLOB') > 0
+        \\              OR instr(upper(i.type), 'TEXT') > 0 THEN 'TEXT'
+        \\            WHEN instr(upper(i.type), 'BLOB') > 0 THEN 'BLOB'
+        \\            WHEN instr(upper(i.type), 'REAL') > 0
+        \\              OR instr(upper(i.type), 'FLOA') > 0
+        \\              OR instr(upper(i.type), 'DOUB') > 0 THEN 'REAL'
+        \\            ELSE 'NUMERIC' END,
+        \\       CASE WHEN m.type = 'view' THEN 'UNKNOWN'
+        \\            WHEN i."notnull" = 1 THEN 'NO'
+        \\            WHEN i.pk = 1 AND upper(i.type) = 'INTEGER'
+        \\                 AND (SELECT count(*) FROM pragma_table_info(m.name) k
+        \\                      WHERE k.pk > 0) = 1 THEN 'NO'
+        \\            ELSE 'YES' END
+        \\FROM sqlite_master m
+        \\JOIN pragma_table_info(m.name) i
+        \\WHERE m.type IN ('table', 'view')
+        \\  AND m.name COLLATE NOCASE IN (SELECT value FROM json_each(?1))
+        \\ORDER BY m.name, i.cid
     ;
 
     /// **The widest difference, and the one that decides how much a schema
@@ -1703,6 +1868,7 @@ pub fn assertDialect(comptime D: type) void {
             "accepts",
             "reads",
             "introspect",
+            "introspect_all",
             "readAs",
             "bindAs",
             "arrayOf",
@@ -1747,6 +1913,81 @@ pub fn assertDialect(comptime D: type) void {
         }
     }
 }
+
+/// The tables a piece of SQL drops, read off its words: what a SQLite
+/// `.rebuilding` transaction and the `.sql` twin of a version need in order
+/// to check the foreign keys of the tables that were rebuilt and not those of
+/// every table in the file.
+///
+/// **Read off the words, and wrong only the safe way**, as `migrate.rebuilds`
+/// is: `DROP` then `TABLE` anywhere, a comment included, names a table that
+/// is then checked when it need not have been. A name it cannot read (a quote
+/// doubled inside it) is `error.Unreadable`, and the caller checks every key,
+/// which is what every rebuild did before.
+pub const Drops = struct {
+    text: []const u8,
+    at: usize = 0,
+
+    pub fn next(self: *Drops) error{Unreadable}!?[]const u8 {
+        while (self.word()) |first| {
+            if (!std.ascii.eqlIgnoreCase(first, "DROP")) continue;
+            const second = self.word() orelse return null;
+            if (!std.ascii.eqlIgnoreCase(second, "TABLE")) continue;
+            // `IF EXISTS`, when it is there.
+            const before = self.at;
+            if (self.word()) |maybe_if| {
+                if (std.ascii.eqlIgnoreCase(maybe_if, "IF")) {
+                    const exists = self.word() orelse return error.Unreadable;
+                    if (!std.ascii.eqlIgnoreCase(exists, "EXISTS")) return error.Unreadable;
+                } else self.at = before;
+            }
+            var name = try self.identifier();
+            // `main."t"`: the table is the last part.
+            while (self.at < self.text.len and self.text[self.at] == '.') {
+                self.at += 1;
+                name = try self.identifier();
+            }
+            return name;
+        }
+        return null;
+    }
+
+    /// The next run of letters, digits and underscores.
+    fn word(self: *Drops) ?[]const u8 {
+        while (self.at < self.text.len and !isWordByte(self.text[self.at])) self.at += 1;
+        if (self.at >= self.text.len) return null;
+        const start = self.at;
+        while (self.at < self.text.len and isWordByte(self.text[self.at])) self.at += 1;
+        return self.text[start..self.at];
+    }
+
+    fn isWordByte(b: u8) bool {
+        return std.ascii.isAlphanumeric(b) or b == '_';
+    }
+
+    fn identifier(self: *Drops) error{Unreadable}![]const u8 {
+        while (self.at < self.text.len and std.ascii.isWhitespace(self.text[self.at])) self.at += 1;
+        if (self.at >= self.text.len) return error.Unreadable;
+        const open = self.text[self.at];
+        const close: u8 = switch (open) {
+            '"' => '"',
+            '`' => '`',
+            '[' => ']',
+            else => {
+                if (!isWordByte(open)) return error.Unreadable;
+                return self.word().?;
+            },
+        };
+        const start = self.at + 1;
+        const end = std.mem.indexOfScalarPos(u8, self.text, start, close) orelse return error.Unreadable;
+        // A doubled quote is one quote inside the name, which a slice of the
+        // text cannot be.
+        if (close != ']' and end + 1 < self.text.len and self.text[end + 1] == close)
+            return error.Unreadable;
+        self.at = end + 1;
+        return self.text[start..end];
+    }
+};
 
 /// The message a `.lock` stops with on a Dialect that has no row locks. Its
 /// database serialises writers some other way, so the honest answer is a
@@ -2224,4 +2465,37 @@ test "on SQLite a blob key's numbered list is read through unhex, and any other 
         SQLite.ordinalList("?1", types.Bytes, "\"#k\"").?,
     );
     try testing.expectEqualStrings("json_each(?1) AS \"#k\"", SQLite.ordinalList("?1", i64, "\"#k\"").?);
+}
+
+test "SQLite writes its own LIKE, so a column named with the letters ILIKE keeps its name" {
+    // The text used to be Postgres's with its first `ILIKE ` replaced, which
+    // found the one inside the column's name before the operator.
+    const written = comptime SQLite.pattern("\"ILIKE x\"", "?1", .contains, true, false, false).?;
+    try testing.expectEqualStrings(
+        "\"ILIKE x\" LIKE '%' || replace(replace(replace(?1, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%' ESCAPE '\\'",
+        written,
+    );
+    const negated = comptime SQLite.pattern("\"ILIKE x\"", "?1", .ends_with, true, true, false).?;
+    try testing.expect(std.mem.startsWith(u8, negated, "\"ILIKE x\" NOT LIKE "));
+    // Postgres keeps its word.
+    const pg = comptime Postgres.pattern("\"x\"", "$1", .contains, true, false, false).?;
+    try testing.expect(std.mem.startsWith(u8, pg, "\"x\" ILIKE "));
+}
+
+test "the tables a piece of SQL drops are read off its words, and a name that cannot be read says so" {
+    var one: Drops = .{ .text = "DROP TABLE \"orgs\"" };
+    try testing.expectEqualStrings("orgs", (try one.next()).?);
+    try testing.expectEqual(@as(?[]const u8, null), try one.next());
+
+    var loose: Drops = .{ .text = "drop  table if exists main.[Old Things];\nDROP TABLE `b`; DROP TABLE plain" };
+    try testing.expectEqualStrings("Old Things", (try loose.next()).?);
+    try testing.expectEqualStrings("b", (try loose.next()).?);
+    try testing.expectEqualStrings("plain", (try loose.next()).?);
+    try testing.expectEqual(@as(?[]const u8, null), try loose.next());
+
+    var none: Drops = .{ .text = "DROP INDEX \"x\"; DELETE FROM t" };
+    try testing.expectEqual(@as(?[]const u8, null), try none.next());
+
+    var doubled: Drops = .{ .text = "DROP TABLE \"a\"\"b\"" };
+    try testing.expectError(error.Unreadable, doubled.next());
 }

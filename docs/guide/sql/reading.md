@@ -119,7 +119,7 @@ const found = try db.page(User, c, .{
 ("email" ILIKE … OR $1 IS NULL) AND ("age" >= $2 OR $2 IS NULL)
 ```
 
-**It is one statement whatever the filters are set to**, so one parameter list and one prepared plan. The alternative, a statement per combination of filters, is four statements for two filters and sixteen for four, each with its own parameters. Postgres removes `$1 IS NULL` while planning with the actual values, which it does for the first five executions and for as long afterwards as the custom plan wins, so a filter that *is* set is planned as if the guard were not there.
+**It is one statement whatever the filters are set to**, so one parameter list. The alternative, a statement per combination of filters, is four statements for two filters and sixteen for four, each with its own parameters. What is sent leaves the guard out: a filter that is set is written as its term alone, and one that is not as a test that is always true, so the database plans for the filters that are there and an index is used on both Postgres and SQLite. Up to three filters in one statement, each combination is kept prepared; past that the text is prepared on every call, which costs microseconds.
 
 Inside an `.exists` it drops the **whole subquery**, not just the term:
 
@@ -173,6 +173,8 @@ AND (("email" ILIKE … $2 … OR "name" ILIKE … $2 …) OR $2 IS NULL)
 ```
 
 The columns have to read as one Zig type: a nullable column beside a non-nullable one is fine, but a number beside text needs two conditions in `.any`. A `sql.given` beside a fixed operator in one entry is rejected, as it is in `.exists`; write a second entry.
+
+**A negated operator is rejected in `.across`** (`.not_icontains`, `.ne`, `.not_in` and the rest): ORed, "does not contain it" would keep a row whose other column still does. "None of these columns contains it" is one condition per column, each with its own `sql.given` if the box may be empty: `.code = .{ .not_icontains = q }, .name = .{ .not_icontains = q }`.
 
 ## Fetching all rows, one row, or a row by key
 

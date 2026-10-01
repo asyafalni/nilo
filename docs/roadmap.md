@@ -33,6 +33,10 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 ### `nilo_http`
 
+**A WebSocket client can make `receive` write into a message buffer that has gone back to the free list.** A first fragment with `FIN=0` and length 0 takes the buffer (`buf = takeScratch()`) and leaves `filled` at 0, so the next wait is `park(true)`; 200 ms of quiet and `park` gives the buffer back, while `receive`'s local `buf` still holds the slice. A continuation that is not whole in the read buffer then skips `takeScratch`, because `buf.len != 0`, and `readPayload` writes the client's bytes into memory the free list owns: over its `next` pointer, into another connection's message on the same executor, or into unmapped pages. Unauthenticated, on any WebSocket route. The comment above the `park` call says `filled == 0` means nothing is wanted, which holds for the slot and not for the local.
+
+**Needs:** `buf` emptied whenever `park` may have given it back, with a test that sends an empty first fragment, stays quiet past the peek, and sends the continuation in pieces, in Debug and ReleaseSafe.
+
 **`nilo.deadline(ms)` never shortens the write limit.** The write limit is armed once per connection before any request, and `giveDeadline` stores `until_ns` without re-arming it, so a route with a two-second deadline sending a large body to a slow reader runs for minutes, where `deadline.zig`'s header and [the deadlines page](./design/deadlines.md) say the clamp covers the write.
 
 **Needs:** the write limit clamped with the read ones, or the claim narrowed in both places.
@@ -45,9 +49,9 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 **Needs:** a pair limit on urlencoded, and the bare-LF search bounded by the CRLF match.
 
-**An `Idempotent` replay leaves out what the handler set through `*Ctx`.** Only a `Response(T)`'s or a `Bytes`' own headers are kept, so a sign-up that sets its session and is retried gets the kept 201 with no `Set-Cookie`, where [the idempotency page](./design/idempotency.md) promises the answer byte for byte. The in-flight marker is kept under the Space's own TTL, so with a Space that outlives the process, a crash mid-handler answers 409 for the whole TTL.
+**An `Idempotent` replay leaves out what the handler set through `*Ctx`.** Only a `Response(T)`'s or a `Bytes`' own headers are kept, so a sign-up that sets its session and is retried gets the kept 201 with no `Set-Cookie`, where [the idempotency page](./design/idempotency.md) promises the answer byte for byte. The in-flight marker is kept under the Space's own TTL, so with a Space that outlives the process, a crash mid-handler answers 409 for the whole TTL. The marker also outlives a request that never reached the handler: `idempotentBegin` claims before the other arguments are read, and the `errdefer` in `typed.zig`'s `wrap` releases only a `Cached` claim, so a body that fails to parse, a `Bound` 422 or an `Authorization` 401 leaves the key answering 409 to the same retry and 422 to a corrected one for the whole TTL, where [ADR 155](./adr/155-a-request-answered-once-is-answered-the-same-way-again.md) says a failure runs again. Without `.by`, a caller who is refused later can still fill the Space with markers.
 
-**Needs:** every header of the answer kept, and a lifetime of its own for the marker.
+**Needs:** every header of the answer kept, a lifetime of its own for the marker, and the marker released by the same `errdefer` as `Cached`'s, with a test that sends a bad body and then the same key with a good one.
 
 **A failure keeps the representation headers the handler set before it failed.** `sendFailure` writes every collected header, which [ADR 024](./adr/024-every-failure-answers-as-json.md) decides for `Allow`, `WWW-Authenticate` and CORS, and which also carries `Content-Encoding`, `Cache-Control`, `ETag`, `Content-Range`, `Location` and `Content-Disposition`: a JSON 409 labelled gzip and cacheable for a year. Reproduced.
 
@@ -77,7 +81,7 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 **Needs:** the rest of the path handed to a `*` once the budget is reached.
 
-**A target without a leading `/` is routed as though it had one.** `GET users/7` matches `/users/:id` and `OPTIONS *` matches a root `/*`, while `http1.zig` says these keep the 404 or 405 they had; a middleware checking `c.path()` for `/admin` is walked round by `GET admin/x`. The `Allow` header on an OPTIONS 204 also leaves out OPTIONS.
+**A target without a leading `/` can still be routed as though it had one.** A plain word such as `users/7` is now a 400 (`parseRequestLine` sends it to `otherForm`, which refuses it), but `OPTIONS *` matches a root `/*`, and a target shaped like a scheme, `admin:1/x`, passes `otherForm` and reaches the router, while `http1.zig` says these keep the 404 or 405 they had. The `Allow` header on an OPTIONS 204 also leaves out OPTIONS.
 
 **Needs:** an origin-form target required to begin with `/`, and `*` kept for a server-wide OPTIONS.
 
@@ -89,6 +93,82 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 **Needs:** `maximum` taken from the type, and `required` in a response schema meaning "always written".
 
+**Middleware scoped to a path is skipped by a route whose pattern has a `:param` or `*` there.** `resolveChains` asks `middleware.underPrefix` about each route's *pattern*, and only a `:` in the prefix is a wildcard, so `useOn("/files/private", auth)` beside `GET /files/*` compares `private` with `*`, attaches nothing, and `GET /files/private/x` is served without `auth`. The same holds for `useOn("/admin")` beside `/:page/settings` or a root `/*` fallback. A path that matches no route goes through the middleware, because the 404 path in `serve.zig` resolves against the real path. `behaviour.zig` tests only literal prefixes over literal routes, and [ADR 008](./adr/008-middleware-is-an-onion-of-ctx-functions.md) and [ADR 099](./adr/099-a-route-can-say-what-covers-it.md) do not say which way this goes.
+
+**Needs:** a non-literal pattern segment opposite a literal prefix segment treated as possibly under it, or the chain for such a route resolved per request from the real path, with a test for each of `:param` and `*`.
+
+**A stop waits on every idle keep-alive connection for up to twice the idle limit, and the idle limit is itself twice what is set.** `waitForRequest` swallows every error, `error.Canceled` included, and zio delivers a cancel once, so after a stop the loop parks in `readHead` again under a fresh `idle_timeout_ms` and `group.cancel()` waits for it; the TLS test in `tls_live.zig` says as much, while [deploying](./guide/deploying.md) says idle connections close at once. The idle wait is armed as `.within_ms`, which applies per read, so a silent client that outlasts the wait in `waitForRequest` gets a second full period in `readHead`, where the comment above `waitForRequest` says the expired deadline fails it at once.
+
+**Needs:** `waitForRequest` returning whether the connection should end (cancelled, closed, timed out) and `handleConnection` returning on it, with a live test that stops a server holding an idle connection under a long `idle_timeout_ms`.
+
+**A stop keeps the listening socket open, and an `accept` error outside three skips the drain.** The listener closes in a `defer` after `drain` and `group.cancel()`, so for the whole grace period the kernel completes handshakes into the backlog that nobody accepts, which [deploying](./guide/deploying.md) argues against for `max_connections`. `Acceptor.run` treats every error but the three [ADR 194](./adr/194-an-accept-loop-that-is-out-of-descriptors-waits.md) names as the listener's own, and `accept(2)` says Linux passes a pending network error on a new connection (`EPROTO`, `EPERM`, `ENETUNREACH`) through `accept` to be retried; one of those makes `listen()` return before `drain`, and the deferred `group.cancel()` cuts every request in flight.
+
+**Needs:** the listeners closed and unix paths removed once the acceptors are cancelled, the per-connection errors backed off like the three, and `drain` run on the failure path as well; ADR 194 corrected with it.
+
+**A chunked body is allocated at each chunk's announced size before any of it arrives.** `readChunkedBody` calls `addManyAsSlice(size)` and then `readSliceAll`, so `100000\r\n` and silence holds a megabyte per connection, up to `max_body`; `readSizedBody` takes one page first for exactly this reason, and [ADR 083](./adr/083-a-body-is-taken-as-it-arrives.md) says the chunked path already grew as chunks arrived.
+
+**Needs:** each chunk read a page at a time before the rest of it is committed, as `readSizedBody` does, and ADR 083 corrected with it.
+
+**A failure body is not JSON when its message carries a byte that is not UTF-8.** `writeFailureBody` escapes `"`, `\` and control bytes and writes every byte from `0x80` as it came, and a path or query value is decoded without a UTF-8 check, so `GET /items?page=%ff` against an integer `page` answers `application/json` that `res.json()` throws on, which is what [ADR 024](./adr/024-every-failure-answers-as-json.md) exists to prevent. A message truncated at `max_message` can also end inside a character. The success path already handles this ([ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md)); the failure writer is a copy that does not.
+
+**Needs:** one JSON string writer for both paths, replacing a byte that is not UTF-8 and cutting at a character boundary, with a test for `%ff` in a query and a path param.
+
+**A body that fails to parse is read a second time with no bound on its depth.** `refuseTooDeep` scans only for a type that can nest without a bound, which an ordinary struct cannot, and on a failed parse `describeBadBody` reads the whole body again as a `std.json.Value`, which allocates for every level, so a megabyte of `[` sent to a plain struct route is parsed to its full depth in the arena. [ADR 226](./adr/226-a-body-that-can-nest-for-ever-is-read-sixty-four-deep.md) bounds the first parse only. Not measured.
+
+**Needs:** the depth scan run before the second parse whatever the type, and the arena cost of the worst body measured into `bench/result/`.
+
+**The `Host` header's value is never checked.** `http1.zig` counts `Host` but reads nothing inside it, and `Ctx.host()` returns it raw, while the same function drops an `X-Forwarded-Host` that is not host-like "because this ends up in URLs"; `Host: evil.com/reset?x=` reaches a password-reset link built from `c.host()`. `authorityOk` already checks the absolute-form authority.
+
+**Needs:** `authorityOk(value, false)` on `Host` in the parser, a 400 on failure, and a test.
+
+**A failure a handler caught colours a later error that has nothing to do with it.** `Failure` is cleared only when a request starts, and `resolveStatus` answers `failure.status` whenever it is set, so a handler that catches a `fail.notFound` and then returns `error.OutOfMemory` answers 404 with the old message, and the log says the same.
+
+**Needs:** `failure.status` trusted only when the error is `error.Failed`, with a test.
+
+**`armBodyRun` multiplies a caller's number and can overflow.** `bytes * std.time.ms_per_s` in `bulkhead.zig` is fed from `progress.mostLeft()`, and the comment says `bytes` is bounded by `max_body`, which `bodyStreamWith(.{ .max_bytes = maxInt(u64) })` is not, so a handler that stops reading early panics the process in ReleaseSafe and gets a deadline near zero in ReleaseFast.
+
+**Needs:** a saturating multiply, and the comment corrected.
+
+**An IPv6 address with a long tail after `::` gets the wrong allowance key.** `parseIp6` in `allowance.zig` moves the tail with a forward loop over overlapping memory, so `2001:db8::1:2:3:4` reads as `…:1:2:1:2` and shares a key with `2001:db8::1:2:5:6`. Nothing shows under the default `/64`; with `ipv6_prefix` above 64 distinct clients share one allowance, and a `::` standing for one group corrupts the first half as well.
+
+**Needs:** `std.mem.copyBackwards`, and a test with a five-group tail.
+
+**`Versioned` answers 304 to a method that is not safe.** `sendResult` in `typed.zig` checks `c.clientHas` whatever the method, so a `PUT` returning `Versioned(T)` with a matching `If-None-Match` has already run and answers an empty 304, where RFC 9110 §13.1.2 says 412 and no change. [ADR 189](./adr/189-a-version-a-handler-names-is-an-etag.md) is about polling a `GET`.
+
+**Needs:** the conditional applied to `GET` and `HEAD` only, with a test for a `PUT`.
+
+**The status line is wrong for a version nilo does not speak and for statuses outside one table.** `UnsupportedVersion` becomes the static 400 in `serve.zig` where RFC 9110 §15.6.6 has 505, and `http1.statusPhrase` has no 408, 410, 415, 502 or 504, so `fail.status(502, …)` goes out as `HTTP/1.1 502 \r\n`; two of those phrases are already spelled in `serve.zig`'s static answers.
+
+**Needs:** a static 505, and one table of phrases that the static answers are built from.
+
+**A sibling subdomain can still plant a session, because the plain `session` cookie is still read.** `Session.read` takes `__Host-session` and falls back to `session`, so a visitor with no prefixed cookie (signed out, or never signed in) who carries `session=<the attacker's own sealed value>; Domain=example.com` opens the attacker's account. `clearWith` deletes the host-only plain cookie and cannot reach one set with a `Domain`, so signing out brings the planted one back. [The sessions guide](./guide/sessions.md) and rule 15 of [the cookies page](./design/cookies-sessions.md) say another subdomain cannot plant one.
+
+**Needs:** the plain name read only behind an option that says it is for the migration from 0.6.0, or the guide and design page narrowed to a visitor who already holds a `__Host-session`.
+
+**A gRPC call reset while its message is arriving keeps its share of the connection's budget.** `Conn.onReset` removes and destroys a stream in `.headers` or `.body` without `letGo`, which `forget` and `dispatch` both call, so `collected` keeps the dead call's bytes for the life of the connection; once it passes the budget, `mayGrow` tops up only the oldest collecting call, and a client that cancels its uploads serialises everybody else's on a shared connection.
+
+**Needs:** `letGo` in `onReset`, with a test that resets a half-sent call and checks `collected` is back to zero.
+
+**A gRPC connection holds far more than [ADR 220](./adr/220-grpc-is-served-over-h2c-behind-a-flag.md) counts.** `dispatch` gives a message's bytes back to the budget when the call starts, while the running call still holds `s.body`, an inflated copy for gzip, and the text copy `asRequest` builds, so a hundred whole messages to a slow route hold a hundred times `max_body` or more. The ADR's worst case covers the stacks and the messages still arriving. The answer is also held twice, in `out` and in `framed`, until the client's window lets it go. The header block has a bound of its own missing: `overdue` skips `collect_until_ns` while that call's block is unfinished, and the silence limit it leaves is reset by every `CONTINUATION`, so one byte a frame just inside `body_ms` holds a slot for as long as `max_header_block` lasts. Not measured.
+
+**Needs:** a running call's message counted against a connection-wide budget, or the real figure in ADR 220 with the `asRequest` copy taken out; and a `GOAWAY` once a header block outlives `collect_until_ns`.
+
+**The gRPC bridge accepts a few requests RFC 9113 and the gRPC spec refuse, and refuses one they allow.** `content-type` is matched with `startsWith("application/grpc")`, so `application/grpc-web` gets a native answer; a duplicate, unknown or late pseudo-header and a missing `:scheme` pass; a client sending both `:authority` and `host` gets `INVALID_ARGUMENT`, because `asRequest` writes `host` twice and `http1.zig` refuses two. `grpc-timeout` starts at dispatch rather than when the headers arrived; `control_run` is zeroed before a call is validated, so one malformed call in every 999 `PING`s defeats the flood cap, and empty `DATA` to a stream that is not collecting is not counted; `SETTINGS_INITIAL_WINDOW_SIZE` can lift a send window past 2^31−1 without the `FLOW_CONTROL_ERROR` §6.9.2 asks for.
+
+**Needs:** each answered as its section says, with a frame-level test per case in `grpc.zig`.
+
+**`Room.print` and `Room.json` assert that their two passes agree.** They count, then write into `.fixed` with `catch unreachable` and a `std.debug.assert` on the length, so arguments that change between the passes panic a safe build, and in `ReleaseFast`, where the assert is gone, a shorter second pass sends uninitialised heap to every member. [ADR 076](./adr/076-a-frame-that-lies-about-its-length-is-not-sent.md) refused exactly this for `Socket.print` and `Socket.json`.
+
+**Needs:** ADR 076's answer for the Room: a disagreement drops the post and returns an error.
+
+**Four WebSocket frames and headers are read more loosely than RFC 6455 says.** A length not in its minimal form (5 spelled in 16 bits) is accepted; `Socket.ping` sends a payload over 125 bytes, which the client must fail the connection over; `isUpgrade` finds `upgrade` as a substring of `Connection`, so `noupgrade` passes. A post and a direct `socket.send` can also leave out of order, because the room is written only inside `receive`.
+
+**Needs:** the minimal-length check in `nextHeader`, `ping` refusing or truncating past 125, `Connection` split into tokens, and the ordering either fixed by `send` delivering first or written down.
+
+**The test `Client` accepts a request head of any size.** Its reader is `Reader.fixed` over the whole request, and `readHead` refuses a head only once it fills the buffer, so a test sending a large cookie or many headers passes where a server answers 431. Its cookie jar also keeps a cookie deleted by `Expires` alone and ignores the `__Host-` and `__Secure-` rules a browser applies.
+
+**Needs:** the test reader given the server's read-buffer size, and the jar honouring a past `Expires` and the two prefixes.
+
 ### `nilo_sql`
 
 The entries under *statements that work refused* were reproduced by a probe test that fails at `462d84d`, in Debug and ReleaseSafe, against Postgres 18 where Postgres is named. The rest were found by reading the code at `cb45ea9` and checked in it; **reproduced** marks one that was also run. A fix lands with a probe as the test that would have caught it.
@@ -99,51 +179,19 @@ The entries under *statements that work refused* were reproduced by a probe test
 
 **Needs:** the OID checked with domains resolved to their base type, or the gap written into `db.raw`'s reference as the caller's to hold.
 
-**`db.raw`'s reader refuses statements Postgres runs.** `rawcheck.zig` tracks brackets, quotes and comments and nothing else: a trailing `-- comment` or `;` becomes part of the alias (`nameOf`, `rawcheck.zig:808`), `IS DISTINCT FROM` ends the list, `*` as multiplication reads as a star and skips the count, `ID` does not match `id`, `$$…$$` and `E'\''` are not skipped (and a `$5` inside one raises the parameter count), and nested block comments, `EXCEPT` and `INTERSECT`, `p.offset` and SQLite's backticks all miscount. The file calls a false Refusal the one outcome it cannot afford.
-
-Two more, found by reading: `assertParams` checks only that the highest placeholder equals the values given (`rawcheck.zig:657`), so `$1, $3` with three values compiles, where ADR 204 and `sql-raw.md` say a gap is refused, and on SQLite the second value is ignored; and `*` read as a star turns `assertCasts` (`:265`) into a Refusal naming `*` for a statement that has none.
-
 **Needs:** each fixed with its probe kept, trailing comments and dollar quotes first.
 
 **The plan check calls a column certainly NULL where it cannot be, and misses one that always is.** Postgres keeps `Left` for a `LEFT JOIN` through a `NOT NULL REFERENCES` key and under a filter that is not strict, such as `coalesce(o.name, '') <> ''`, and `plan.zig` refuses both, where [ADR 233](./adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md) promises only what is certain; an `Anti` join, `LEFT JOIN … WHERE o.id IS NULL`, outputs NULL on every row and is not flagged.
 
 **Needs:** the wording made "may", or those cases recognised, and `Anti` handled.
 
-**Timestamps and dates at the ends of their range do not survive JSON.** A `Timestamp` before 1970 is written as `null` (`types.zig:243`) although `nilo_parse` reads one, a `Timestamp` after 9999 is written as text its own parser refuses, a `Date` after 9999 is written as `null`, and `Date.atMidnightUtc` overflows for a date Postgres can hold (`types.zig:338`).
-
-`Date` accepts the year 0 (`types.zig:352`), which Postgres does not have, so `0000-01-01` is refused on insert and 1 BC reads back as year 0.
-
 **Needs:** a civil-from-days writer for `Timestamp` like the one `Date` has, and the rest refused rather than written wrong.
 
 #### P2: the rest
 
-**Statements Postgres refuses at run time compile.** `.min` and `.max` take any type (`shape.zig:960`), and Postgres has no `max(boolean)`. A parent field named like its table passes the alias check when the table has a schema (`shape.zig:188` compares `"orders"` with `"app"."orders"`), and Postgres refuses *table name specified more than once*. A list column of `Timestamp`, `Date`, `Decimal`, `Bytes` or `Json` passes `assertReadable` (`db.zig:4629`) and fails to compile inside pg.zig with its own message, which is what the comment at `db.zig:4589` exists to prevent.
-
-**Needs:** each refused where the Row is named, with a file under `sql/refusals/`.
-
-**Conditions that compile to something other than what they say.** `.across` takes a negated operator and joins the columns with `OR` (`where.zig:1384`, `:1410`), so `.not_icontains = "test"` over `code` and `name` keeps a row whose name contains it. The `sql.given` Refusal for `not_distinct_from` is unreachable (`where.zig:2200` returns before `:2219`), so ADR 149's promised message is a compile error from elsewhere. `Composed.text` refuses `$n` and not `?n` (`composed.zig:133`); `checkComposed` compares the highest placeholder rather than counting them (`db.zig:1988`), so `param(2)` with no `param(1)` passes; `ident` quotes a name with capitals, so `"streamId"` misses a column created unquoted, where the comment at `composed.zig:88` says it does not fold. SQLite's `LIKE` is written by replacing the first `ILIKE ` in the Postgres text (`dialect.zig:1114`), a column named with those letters included.
-
-**Needs:** negation refused in `.across`, the Refusal reached, and `Composed` checked the way a raw statement is.
-
-**The SQLite Wire answers differently from the Postgres one where a handler can see it.** A `float8` column read into an `f32` is narrowed silently (`sqlite.zig:1058`) where Postgres refuses (`postgres.zig:1020`). A value refused before binding marks the transaction aborted (`sqlite.zig:335`, `:359`), where on Postgres it aborts nothing. `db.exec` of a statement that is not DML answers the count of the last one that was (`sqlite.zig:834`, `changes()`). `db.rawExplain` opens a transaction (`db.zig:1345`), `BEGIN IMMEDIATE` here (`sqlite.zig:1122`), so the one writer is held for `EXPLAIN QUERY PLAN`, and a handler holding a `tx` waits for itself. A pool that fails to open is opened twice and reported in Postgres's words, advising `connect_on_init = 0` when it is already 0 (`db.zig:1060` to `:1142`).
-
-**Needs:** each answered as Postgres answers it, or refused on SQLite and written into its guide page.
-
-**The transaction handle has three small faults.** `Savepoint.release` ends the handle before it sends `RELEASE` (`db.zig:2500`), so a failed release leaves a mark nothing can roll back to. A savepoint's stack is allocated on `db.gpa` (`db.zig:2464`, `:2558`), an allocation and a free on the general allocator per transaction that takes one, where the request's arena is already in reach. A child statement that fails is not told to the watcher (`db.zig:3709`), and `readChild` returns `QueryFailed` with no line (`:3737`).
-
-**Needs:** `RELEASE` sent before the handle ends, the stack on the scope's arena, and the children's read reported like every other.
-
 **Migration steps and their words disagree with what runs.** ADR 240 calls five seconds the longest a migration can stall a table; `lock_timeout` bounds each acquisition, so a version over ten tables can hold the first for the sum of the rest. On SQLite a `Locked` version names `.lock_timeout_ms` and 5000 ms (`migrate.zig:2436`), where `busy_timeout_ms` is what applied. `expect` is called one query (`migrate.zig:26`, ADR 123) and is `ensureLedger`'s four round trips and a lock before it. `Kind.data`'s comment (`migrate.zig:574`) places a backfill between two steps `generate` never writes as a pair. An `ADD COLUMN` with an enum's `CHECK` reads every row under `ACCESS EXCLUSIVE` and its `why` does not say so (`migrate.zig:1001`).
 
 **Needs:** each sentence made true, and the enum check's `why` saying what it reads.
-
-**`checkSchema` logs at `err` when it is not going to stop the server.** `db.zig:3914` writes `std.log.err` under `schema_mismatch_is_fatal = false`, where `err` means the server is refusing to start and fails any test that reaches it.
-
-**Needs:** `warn` when the mismatch is not fatal.
-
-**Doc comments that describe something else.** `db.raw` is called never kept (`db.zig:595`, `wire.zig:30`, `sqlite.zig:237`), where `rawPlanOf` keeps it (ADR 051). `nilo_ready` is called prepared (`db.zig:1272`). `sql.zig:100` still says pg.zig is kept out by `.lazy = true`, where `-Dsql` does it (ADR 066). Comments sit on the wrong declaration at `types.zig:572`, `postgres.zig:1406`, `sqlite.zig:1320`, `sql.zig:309` and `db.zig:134`, and `dialect.zig:157` sits on none; `wire.zig:41` counts seven errors of ten; `db.zig:4575` says `err` where it logs `warn`; `postgres.zig:2` names `src/engine/zio.zig`. `sql.zig:504` counts seventeen statement constants where `on()` has seventeen and the top level nineteen. `docs/reference/sql.md` does not list `tx.feed` or `tx.rawPageOrdered`. `docs/risks.md` still says pg.zig reads only `i32` from `int4`. `.today` is `CURRENT_DATE` in the session's zone on Postgres and UTC on SQLite (`dialect.zig:584`, `:1314`), said only in a comment at `where.zig:1711`.
-
-**Needs:** each corrected, and `.today`'s difference on the reference page.
 
 ---
 
@@ -223,14 +271,6 @@ Two more, found by reading: `assertParams` checks only that the highest placehol
 
 #### P2
 
-**A foreign-key column is never indexed, so deleting a parent reads every child.** Postgres indexes the key a reference points at and not the column that points, and neither the marker nor the diff adds one: `ON DELETE CASCADE` and the check behind a parent's delete each scan the whole child table. An index per reference by default costs every insert into the child and a migration for every existing schema.
-
-**Needs:** whether the diff writes the index by default or the plan names the missing one, and what an index per reference costs a write-heavy child.
-
-**On SQLite, a statement holding a `sql.given` still reads the whole table.** SQLite plans a statement when it is prepared, before a value is bound, so the guard `("cust" = ?1 OR ?1 IS NULL)` is a `SCAN` whatever the call gives: 29.4 ms against 0.044 ms on 500,000 rows ([sql.md §22](../bench/result/sql.md#22-a-guard-and-the-plan-a-kept-statement-settles-on)). Postgres was fixed by sending such a statement unnamed; re-preparing on SQLite plans the same text the same way.
-
-**Needs:** the `WHERE` spliced per call without the terms that dropped, the way ADR 165 splices an `ORDER BY`, with its binary-size cost against ADR 149's refusal of one statement per combination.
-
 **A case-folding unique made before `text_pattern_ops` keeps the index `istarts_with` cannot read.** The migrator compares a unique `ignoring_case` and not its operator class, so an existing database never gets the new index and its prefix search still scans on Postgres.
 
 **Needs:** the operator class in the snapshot's index and a step that rebuilds it, or a `db check` finding that names it.
@@ -279,33 +319,21 @@ Two more, found by reading: `assertParams` checks only that the highest placehol
 
 **Needs:** a table's column steps joined into one statement where Postgres allows it, and whether `createMissing` reads the catalog first or is bounded like a version.
 
-**Startup and the ledger ask one question at a time.** `checkSchema` sends a catalog query per Row and another per enum column (`db.zig:3883`), where one query over `relname = ANY($2)` answers all of them. `migrate.drift` and `cli.doStatus` read the ledger with a `find` per version (`migrate.zig:2541`, `cli.zig:447`), the hash comparison is written three times (with `applyPending`, `:2480`), and `db migrate` runs `ensureLedger`, a BEGIN, a lock, a CREATE and a COMMIT, three times.
+**A read pays two small costs it could skip.** A count over children used in `.where` is written twice, in `WHERE` and in the select list, and Postgres runs the identical subplans twice; a `LATERAL` join computes it once ([sql.md §26](../bench/result/sql.md#26-small-costs-a-read-pays)). A grouped Row reaching one table through `nilo_through` and through an aggregate's filter joins it twice under two aliases.
 
-**Needs:** one ledger read and one comparison shared by the three, and the startup check as one query.
+**Needs:** the `LATERAL` form for Postgres and what SQLite writes instead, and one join shared by a through and a filter that reach the same table.
 
-**A read pays small costs it could skip.** A count over children used in `.where` is written twice, in `WHERE` and in the select list (the test at `shape.zig:2167`), and Postgres runs identical subplans twice. A grouped Row reaching one table through `nilo_through` and through an aggregate's filter joins it twice under two aliases (`shape.zig:367`, `table.zig:1704`). A feed with children reads the children of the row it fetched only to see whether there is a next page, then throws them away (`db.zig:3479`). SQLite resets and clears a statement's bindings twice per use (`sqlite.zig:305`, `:827`, then `:792`). `kept` copies each text column of a row with its own arena allocation (`db.zig:3775`). `insertMany` and `updateMany` over an empty slice make a round trip for nothing (`db.zig:2069`).
+**`.min` and `.max` over an enum answer differently on the two databases.** Postgres orders an enum by its declaration and SQLite by its text, so the same grouped Row names a different label on each, with no error.
 
-**Needs:** a yes; none of them changes what a caller sees, and each has a test to hold it.
+**Needs:** a refusal on SQLite, or the SQLite column ordered by the enum's position.
 
 **A Problem from the diff has no way out but editing `snapshot.zon` by hand.** While one stands, `generate` writes nothing, and the step it suggests does not move the snapshot, so the same Problem comes back (`migrations.zig:394`, `migrate.zig:1704`). The common case is a new column with a foreign key to an existing table, which both dialects refuse here and `addMissingColumns` does; a new column is all NULL, so `ADD COLUMN` then `ADD CONSTRAINT … NOT VALID` cannot fail on old rows. The Problem's sentence that SQLite needs a rebuild is wrong for a new column, which `ADD COLUMN … REFERENCES` takes.
 
 **Needs:** the new column's key written by the diff, and a way for an accepted Problem to be recorded in the snapshot.
 
-**Views and triggers from `createMissing` behave differently on the two databases.** Postgres replaces every one on every boot; SQLite writes `IF NOT EXISTS` (`dialect.zig:1257`, `:1266`), so a view or trigger whose text changed is never updated and nothing says so. On Postgres a view remade because a table under it changed (`migrate.zig:776`) loses its grants and comment.
-
-**Needs:** one behaviour for both, and whether a remade view carries its grants or the step's `why` warns about them.
-
 **Case folding outside ASCII differs between the two databases.** SQLite's `LIKE` and `NOCASE` fold ASCII only (`dialect.zig:1110`, `:1199`); Postgres's `ILIKE` and `lower()` fold Unicode (`:613`). `.ieq = "ÉLISE@x.id"` matches `élise@x.id` on Postgres and not on SQLite, and a `NOCASE` unique keeps both. ADR 055 asks for a difference like this to be refused or written down, and the reference says only that SQLite folds ASCII.
 
 **Needs:** whether the SQLite half is refused for non-ASCII text or the difference is written on both pages.
-
-**The Postgres URL's defaults are not libpq's.** A URL with no `sslmode` is plaintext (`postgres.zig:614`), where libpq's default `prefer` encrypts whenever the server can, and no ADR decides this. `pgbouncer=true` is dropped (`postgres.zig:698`), although it is the one signal that prepared statements must be off (`db.zig:598`), and `26000` from a pooler is not handled by `replanned`, so the connection keeps going back to the pool and failing. `connect_timeout` and `tcp_user_timeout` both write `auth.timeout` (`postgres.zig:661`), and the later wins.
-
-**Needs:** the `sslmode` default decided in an ADR, `pgbouncer=true` turning `prepared` off, and `tcp_user_timeout` refused or given its own meaning.
-
-**`.rebuilding` checks every foreign key in the database.** `PRAGMA foreign_key_check` runs with no table name (`sqlite.zig:1147`), so an old violation in a table the migration never touched fails every rebuild with `ForeignKeyViolated`.
-
-**Needs:** the check limited to the rebuilt tables, or a reason the whole database is the right scope.
 
 #### P2: code to take out
 
@@ -314,10 +342,6 @@ Nothing here changes behaviour, and the suite covers every line of it, so each *
 **`Tx` repeats `Db` body by body.** Twenty-eight of `Tx`'s methods (`db.zig:2563` to `:2923`, about 360 lines) copy `Db`'s, differing in `self.db`, `&self.inner` for `null`, and `"tx."` for `"db."`. Opening a result and telling the watcher on failure is written out six times (`:1009`, `:1606`, `:3231`, `:3363`, `:3425`, `:3579`). `raw`, `rawOne` and `rawExactlyOne` repeat their scalar and Row branches on both types (`:1664` to `:1820`, `:2756` to `:2866`), and the four `rawPage` bodies are near copies (`:1850`, `:2871`). One private body per operation taking `tx: ?*W.Tx` and the call's name removes about 350 lines, and halves the instantiations each call site costs.
 
 **Needs:** a yes.
-
-**`rawcheck.zig` walks a statement seven times with seven copies of the skipping.** `scan`, `paging`, `uses`, `highestParam`, `spelled`, `listStart` and `aliasAt` each re-implement depth and quote tracking. One comptime tokenizer is about 70 lines fewer, and is also where the rawcheck defect above gets fixed once rather than seven times.
-
-**Needs:** a yes, landing with that defect's fix.
 
 **`ddl.zig` writes most statements twice, once while compiling and once at run time.** `addColumn` and `columnClause`, `writeLiteral` and `valueList`, `writeCheckIdent` and `checkName`, `createTrigger` and `triggerStatement`, `createView` and `viewStatement`, `createExtension` and `createExtensionIfMissing` are pairs, and `addColumn` already disagrees with `columnClause`. The desired side is comptime whole, so only a drop or rename, whose name comes from the snapshot, needs the run-time writer. About 150 lines.
 
@@ -530,6 +554,14 @@ A question nobody has answered. Not a backlog item, and not blocked: what a read
 **Multipart, streamed.** `Form(T)` reads a multipart body whole, bounded by `max_body` ([ADR 030](./adr/030-a-form-is-the-body-read-by-another-rule.md)), which is right for a form with a photo in it and wrong for a 2 GB video. The streaming version wants a parser that resumes across reads and an `Upload` that is a reader rather than bytes; it inherits nothing from `sendfile`, because sending is a descriptor handed to the kernel and receiving is a parser holding its place.
 
 **What would settle it:** somebody designing it. Until then the answer is `c.bodyStream()`, which holds nothing and makes the framing the handler's problem.
+
+**Does a WebSocket over TLS park with a whole frame already decrypted-able in the record layer's buffer?** `websocket.zig`'s `park` checks only the cleartext buffer before `Wake.wait`, which polls the socket; tls.zig can pull two records in one socket read and decrypts one a call, so the second frame could wait on a socket the kernel has already emptied, until the client sends again or the idle ping fires. Read from the code, not run, and `tls_live.zig` has no WebSocket test.
+
+**What would settle it:** a live test sending two frames in one TLS write and timing the second; if it stalls, `Wake.wait` returns `.readable` while the raw buffer holds a whole record.
+
+**Should a JSON body be refused when the request says it is something else?** `Ctx.json` parses whatever `Content-Type` came, while `Form(T)` refuses the wrong one, so a cross-site `<form enctype="text/plain">` can deliver valid JSON with no preflight, which matters to an app with a cookie sent cross-site and no `nilo.csrf`. A 415 is safer and breaks a client that sends JSON unlabelled.
+
+**What would settle it:** a decision between a 415 for a present non-JSON type and an absent one allowed, or the gap written into the CSRF guide as the reason `nilo.csrf` exists.
 
 ### `nilo_sql`
 

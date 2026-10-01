@@ -54,6 +54,41 @@ A leap second is refused too, one notch narrower than RFC 3339: `:60` has no
 microsecond to come back to, so accepting it would break the round trip in the
 one place this type is used for.
 
+## The ends of the range
+
+**A `Timestamp` and a `Date` are writable from 0001-01-01 to 9999-12-31, and
+that is the range the parser reads.** RFC 3339 and ISO 8601 spell four digits,
+and Postgres has no year 0 (1 BC is the year before 1 AD; `0000-01-01` is refused
+on insert). Outside it:
+
+- **The writer says `error.OutOfRange` and the JSON writer fails**, where it
+  used to write `null` (a moment before 1970, a date after 9999) or text
+  `nilo_parse` refused (a moment after 9999). `null` reads as "no value" and a
+  client cannot tell the two apart; a failed write is a 500 before the head goes
+  out, because `ctx.sendJson` builds the body first. The error `std.json` lets a
+  `jsonStringify` return is `WriteFailed`, so that is the one it surfaces as.
+- **Both parsers refuse year 0**, and `Timestamp.nilo_parse` refuses a text whose
+  offset carries it past either end (`0001-01-01T00:00:00+07:00` is year 0 in
+  UTC). A value the writer would refuse is not one the reader mints.
+- **`writeRfc3339` walks `Date.civilFromDays`**, Hinnant's `civil_from_days`,
+  which is good for negative days. It used `std.time.epoch`, which starts at the
+  epoch, and that is why a moment before 1970 was refused (`BeforeEpoch`). The
+  writer still allocates nothing and prints six fractional digits.
+- **`Date.atMidnightUtc` returns `error{OutOfRange}!Timestamp`.** Postgres holds a
+  `date` to year 5,874,897 and the day count is an `i32`, but the microseconds of
+  its midnight overflow an `i64` from about year 294,000; the multiplication is
+  checked instead of trapping.
+
+**What a Postgres value beyond 9999 does on read: it is read.** The Wire hands
+back the moment or the day, because the type is a number with a stated unit and
+comparing, sorting and binding it back are all right. Only writing it as text
+refuses. Refusing at read was the alternative: it would have failed a query that
+never meant to serialise the value, and it would have needed a range check in
+both Wires on the row path (ADR 017's allocation and round-trip budget is not
+touched either way). If a caller finds an error at response time too late, that
+is the case for a range check in the Wire, and it is a smaller change than this
+one.
+
 ## Why the date arithmetic is written out
 
 `std.time.epoch` walks days into a civil date and nothing in std walks one back.

@@ -451,6 +451,8 @@ $ db verify                      # has an applied version been edited since?
 
 `generate` and `check` never open the database. They diff your Rows against `migrations/snapshot.zon`, which is why they run on a laptop with nothing installed, and in CI with no database container.
 
+**A foreign key with no index behind it is a note under the result, and never a failure.** Neither database indexes the column that points, so deleting a row of the parent reads every row of the child. `check` (and `generate`, when it wrote a version) names each such key with the line that adds the index, say `.index = .{ .customer_id }` in the Row. Nothing is added for you, because the index slows every insert into that table and a small table does not need it. It reads your Rows and not a database, so it runs in CI too.
+
 **The exit code is all CI needs.** `0` means it did what was asked, `1` means you have something to do, and `2` means the command line was wrong. `db check` in a pipeline needs no output parsing.
 
 ### Dropping data needs a name

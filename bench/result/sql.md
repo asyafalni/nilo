@@ -1454,6 +1454,80 @@ Inserting `upper(email)` of an existing row into the table still fails on the un
 **Can it be pushed further:** not on a plan made for any value, which the last row shows and ADR 149 now keeps a guarded statement away from. A plain `.index` on `lower(col)` cannot be written by the marker, so only a unique serves the prefix.
 
 
+## 24. The startup check and the ledger ask once
+
+**Run:** `39896d2` plus the working tree of the change, 2026-09-30. Postgres 17.10 in the `nodeflux-os-db-1` container, database `nilo_test`, 50 scratch tables of eight columns each (`id int8` key, `text`, `int4`, `timestamptz`, `bool`, `numeric`, `text`, `int8`), dropped afterwards. The query texts are the ones in `dialect.zig`, taken out of the file by a script and sent through `psql` inside the container (a unix socket), so a round trip here costs almost nothing; SQLite is python's `sqlite3`, in memory, in process. **Not run through nilo**: the change was written under a rule that forbids `zig build`, so the round trips of the tool and of a boot below are counted from the code, and the times are the queries alone.
+
+**Why:** `checkSchema` sent the introspection query once per Row and the enum query once per enum column, on the boot path of every replica; `db status` read the ledger with a `find` per version in the manifest, and `db migrate` made the ledger (a BEGIN, a lock, a CREATE and a COMMIT) three times.
+
+| Ask | Before | After |
+|---|---|---|
+| Startup check, 50 Rows, none with an enum, Postgres | 50 queries | **1** |
+| Startup check, 50 Rows, 5 named enum columns over 3 types, Postgres | 55 queries | **2** |
+| The same, SQLite | 50 queries | **1** |
+| Postgres, 50 tables, the queries alone, median of 7 interleaved runs | 26.7 ms | **7.7 ms** (`23.4`-`41.4` against `5.9`-`9.0`) |
+| SQLite, 50 tables, in process, median of 15 | 5.3 ms | **2.5 ms** |
+| `db status`, V versions, Postgres | 5 + V round trips | **5** |
+| `db migrate` with nothing to apply, V versions, Postgres | 14 + V | **5** (one `ensureLedger` of four, and one read) |
+
+The Postgres time is the 50 statements' server time and a unix-socket hop each. Over a network the difference is 49 round trips, at 0.5 ms 25 ms and at 2 ms 100 ms, added to the 19 ms above. The batch returned all 400 rows and the ordered lists matched the single query's for every table; a test in `live.zig` holds that, and one in `db.zig` holds the SQLite side (three tables, one spelled in another case, one missing).
+
+**What it changed:** `dialect.introspect_all` per Dialect and `enum_values` taking the type names as an array; `columnsOfMany` and `labelsOfMany` on the Wire; `migrate.readLedger`, `seen` and `applyRecorded`, so the three readers of the ledger share one read and one comparison ([ADR 055](../../docs/adr/055-the-second-dialect-is-the-test-of-the-seam.md), in place). The single-table `introspect` stays for `liveColumns`, `addMissingColumns` and a migration's own transaction.
+
+**Can it be pushed further:** the check still needs one query per schema a Row names. A boot that also runs `ensureLedger` and `expecting` pays those on top, and folding them into one round trip would put the ledger's `CREATE`, which runs inside a transaction holding the advisory lock, and a catalog read on one statement; not attempted.
+
+## 25. A guard cut out of the text per call
+
+**Run:** `39896d2` plus the working tree of the change, 2026-09-30. The machine, Postgres and SQLite of [§22](#22-a-guard-and-the-plan-a-kept-statement-settles-on). SQLite: python's `sqlite3`, in memory, 500,000 rows in `t(id, cust, stage, note)`, `cust` holding 1,000 values and `stage` 7, an index on each, analysed; the statement is `select count(*) from t where …`, 20 runs each. Postgres: `pgbench` 17 inside the container over a unix socket, one client, 5 s a run, three rounds interleaved, on a 500,000-row scratch table (`custn int4` 1,000 values, `stagen int4` 7, both indexed, vacuumed and analysed; dropped afterwards). pgbench substitutes its variables as `$n` parameters under `-M extended` (Parse, Bind and Execute on every call, unnamed) and `-M prepared` (named), which is what nilo sends unnamed and named. **Not run through nilo**: the change was written under a rule that forbids `zig build`, so the text below is what `statement.spliceOf` is written to produce, checked by hand against the guard `where.zig` writes, and the times are the database's.
+
+**Why:** [§22](#22-a-guard-and-the-plan-a-kept-statement-settles-on) left SQLite reading the whole table for a `sql.given`, and Postgres parsing every such statement on every call. The roadmap named the cure, the `WHERE` written per call the way [ADR 165](../../docs/adr/165-an-order-chosen-at-run-time-from-a-closed-set.md) writes an `ORDER BY`, and the price it had to be weighed against, ADR 149's refusal of one statement per combination.
+
+SQLite, two guarded filters (`cust`, `stage`), the guard as written against the text that is sent when a term is absent (`(?2 IS NULL)`) or present (the term alone):
+
+| `cust` | `stage` | The guard `(c = ?1 OR ?1 IS NULL) AND (s = ?2 OR ?2 IS NULL)` | Cut per call | Plan of the cut text |
+|---|---|---|---|---|
+| set | absent | 69.0 ms | **0.055 ms** | `SEARCH t USING COVERING INDEX t_cust (cust=?)` |
+| absent | set | 83.4 ms | **6.6 ms** (71,429 rows counted) | `SEARCH t USING COVERING INDEX t_stage (stage=?)` |
+| absent | absent | 55.4 ms | 13.9 ms (every row is the answer) | `SCAN t USING COVERING INDEX t_stage` |
+| set | set | 63.2 ms | **1.13 ms** | `SEARCH t USING INDEX t_cust (cust=?)` |
+
+The guard is `SCAN t` in all four. Preparing the cut text on every call, which is what a statement with more than three guards does, cost 57 to 73 µs a call against 52 to 58 µs kept, on a seek of about 55 µs (python's per-call overhead is in both; the difference is between 0 and 20 µs).
+
+Postgres, one term set (`custn = :c`), the other absent:
+
+| How it is sent | Per call, three rounds |
+|---|---|
+| Today: the guard, unnamed (`-M extended`) | 0.242 to 0.257 ms |
+| The bare term, unnamed | 0.232 to 0.287 ms |
+| The bare term, **named** (`-M prepared`) | **0.108 to 0.122 ms** |
+| The guard, named, as a kept plan would run it | 0.188 to 0.206 ms |
+| Two terms, one absent as a literal `NULL`: the guard unnamed, the cut text unnamed, the cut text named | 0.254 to 0.267 ms, 0.241 to 0.248 ms, **0.111 to 0.119 ms** |
+
+A statement with `custn = $1 AND ($2::text IS NULL)` `PREPARE`d and run with `NULL` for `$2`: `Index Only Scan … Index Cond: (custn = $1)` under `Result … One-Time Filter: (($2 IS NULL) AND ($3 IS NULL))`, and after eight runs `pg_prepared_statements` says 3 generic and 5 custom plans, the generic one still the index scan. The parameters are typed `{integer,text,text}`: the `text` is the cast, and a NULL is the same bytes under every type. (An earlier set of pgbench runs taken straight after the columns were added read 1.08 ms for the unnamed guard against 0.39 for the bare term; it was stale statistics and hint bits, discarded, and the table was vacuumed before the numbers above.)
+
+**What it changed:** [ADR 149](../../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md), in place. `Dialect.splice_given` and `absentTerm`; `statement.spliceOf` finds each guard in the finished text and cuts the statement into pieces while compiling; `db.zig` writes the pieces, one arena allocation, and names the statement per combination up to three guards (`max_named_guards`), so a Db keeps at most 2³ = 8 texts of one call site on each connection and none of a call site with more, which is sent unnamed. On Postgres it replaces the unnamed statement: the named cut text is about **0.13 ms a call faster** than the unnamed guard on the sample, which is Parse and plan together, ten times the 12 µs ADR 051 counted for the Parse alone. On SQLite it is the difference between 69 ms and 0.055 ms on the sample.
+
+**Can it be pushed further:** the two-column case on SQLite where only the low-cardinality filter is set (6.6 ms) is the count of 71,429 rows, not the plan. The unnamed statements past three guards pay the prepare, 0 to 20 µs here; a limit of four would keep 16 texts a call site and save that for a screen with four filters, and nobody has asked. The times are the databases'; a run through nilo's own Wire would add the driver's work to both sides and is owed. The Postgres numbers are over a unix socket, so the hop a network adds, which is paid once either way, is not in them.
+
+## 26. Small costs a read pays
+
+**Run:** `39896d2` plus the working tree of the change, 2026-09-30, on the machine of §25. Postgres 17.10 scratch tables `o` (20,000 rows) and `l` (60,000 rows, `order_id` indexed), dropped afterwards; SQLite figures are counted from the code. **Not run through nilo**, for the reason in §25.
+
+**Why:** the roadmap's entry *A read pays small costs it could skip*.
+
+| Cost | Before | After | How known |
+|---|---|---|---|
+| A feed with children fetched the children of the row it read past the limit | children statement asked for `limit + 1` parents' children; in the shop fixture (limit 2) it read 3 rows | asks for `limit` parents' and reads **2** | the test `on SQLite, a feed reads the children of the rows it answers with and not of the one past them` counts the rows the second statement read; on Postgres `= ANY` over 21 keys read 61 rows against 20 keys' worth |
+| SQLite reset a kept statement and cleared its bindings on release and again on every use | 2 × (`sqlite3_reset`, `sqlite3_clear_bindings`) per use | one pair, and on the way in a `sqlite3_stmt_busy` test | counted from the code; the test asserts a released statement is idle and holds no value |
+| `insertMany` and `updateMany` over an empty slice | one round trip: `INSERT … SELECT * FROM unnest('{}', '{}')` 0.039 ms prepared, 0.147 ms unnamed, over a unix socket | none | `pgbench`; the test asserts nothing reaches the Wire |
+| A row's text columns each copied with an allocation of their own | k allocations for k plain text columns | **1** for two or more | the test asserts the columns are adjacent in one slab |
+| A count over children used in `.where` and in the select list | two `SubPlan`s: `SubPlan 1` `loops=200` in the select list and `SubPlan 2` `loops=327` in the filter, 2.84 ms on `LIMIT 200 … > 2` | **not built.** The same query with the count as a `LEFT JOIN LATERAL` evaluates once, `loops=327`, 0.65 ms | `EXPLAIN (ANALYZE)`, one run each |
+| One table reached by a `nilo_through` field and by an aggregate's `FILTER` | joined twice, under `#t/…` and `#f.…` | **not built** | read from `shape.zig` and `table.zig` |
+
+A caller sees the same thing from each of the first four: the feed answers the same rows, the SQLite statement binds the same values, the text columns hold the same bytes, and an empty batch answers the empty slice it answered. The one difference is that an empty batch no longer fails on a Db that cannot reach its database or on a table that is not there.
+
+**What it changed:** the four above; the last two are not built in this pass. **Can it be pushed further:** the lateral count took 527 subplan loops to 327 on this sample (the filter passed 327 of the rows it looked at and the select list needed 200), and the saving is the rows the `LIMIT` keeps. It needs the select list to know the `WHERE`, which `layoutOf` (per Row) does not, and SQLite has no `LATERAL`, so it would be Postgres text only.
+
 ## What is still missing
 
 - **A second box.** Everything here shares eight physical cores between nilo,

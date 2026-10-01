@@ -103,26 +103,37 @@ pub const Timestamp = struct {
     /// fraction, because a body that sometimes carries them and sometimes does
     /// not is worse to consume than one that always does, and the column has
     /// exactly that resolution.
+    ///
+    /// **The range is 0001-01-01 to 9999-12-31, the four digits RFC 3339
+    /// spells, and a moment outside it is `error.OutOfRange`** — never `null`
+    /// and never text `nilo_parse` refuses. A moment before 1970 is the
+    /// ordinary case (a date of birth at midnight), so the walk is
+    /// `Date.civilFromDays`, which is good for negative days, and not
+    /// `std.time.epoch`, which stops at the epoch. Year 0 is refused because
+    /// Postgres has none (ADR 127).
     pub fn writeRfc3339(self: Timestamp, w: *std.Io.Writer) !void {
-        const secs = self.seconds();
-        if (secs < 0) return error.BeforeEpoch;
+        if (self.micros < first_micros or self.micros > last_micros) return error.OutOfRange;
 
-        const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
-        const day = epoch_secs.getEpochDay();
-        const time = epoch_secs.getDaySeconds();
-        const year_day = day.calculateYearDay();
-        const month_day = year_day.calculateMonthDay();
+        const secs = self.seconds();
+        const days = @divFloor(secs, std.time.s_per_day);
+        const into_day: u32 = @intCast(secs - days * std.time.s_per_day);
+        const civil = Date.civilFromDays(days);
 
         try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z", .{
-            year_day.year,
-            month_day.month.numeric(),
-            month_day.day_index + 1,
-            time.getHoursIntoDay(),
-            time.getMinutesIntoHour(),
-            time.getSecondsIntoMinute(),
+            @as(u16, @intCast(civil.year)),
+            civil.month,
+            civil.day,
+            into_day / 3600,
+            into_day / 60 % 60,
+            into_day % 60,
             @as(u32, @intCast(@mod(self.micros, std.time.us_per_s))),
         });
     }
+
+    /// 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z as microseconds:
+    /// the ends of what `writeRfc3339` prints and `nilo_parse` reads.
+    const first_micros: i64 = -62_135_596_800_000_000;
+    const last_micros: i64 = 253_402_300_799_999_999;
 
     /// The other half of `writeRfc3339`, so that a value this server printed
     /// can be handed back to it
@@ -159,6 +170,9 @@ pub const Timestamp = struct {
         const minute = fixed(u8, text[14..16]) orelse return null;
         const second = fixed(u8, text[17..19]) orelse return null;
 
+        // Year 0 does not exist in Postgres, which refuses `0000-01-01` on
+        // insert; reading it here would mint a value the database cannot hold.
+        if (year < 1) return null;
         if (month < 1 or month > 12) return null;
         if (day < 1 or day > daysInMonth(year, month)) return null;
         // 59 rather than RFC 3339's 60: a leap second has no microsecond to
@@ -198,7 +212,11 @@ pub const Timestamp = struct {
 
         const secs = daysFromCivil(year, month, day) * std.time.s_per_day +
             @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second) - offset;
-        return .{ .micros = secs * std.time.us_per_s + fraction };
+        const micros = secs * std.time.us_per_s + fraction;
+        // An offset can carry the first or last day past the ends: `0001-01-01T00:00:00+07:00`
+        // is in year 0 in UTC. The writer refuses those, so the reader does.
+        if (micros < first_micros or micros > last_micros) return null;
+        return .{ .micros = micros };
     }
 
     /// A fixed-width run of digits, or null when any byte is not one.
@@ -249,7 +267,12 @@ pub const Timestamp = struct {
     pub fn jsonStringify(self: Timestamp, jw: anytype) !void {
         var buf: [32]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        self.writeRfc3339(&w) catch return jw.write(null);
+        // A moment outside 0001 to 9999 is an error, not `null`: `null` reads
+        // as "no value" and a client cannot tell the two apart (ADR 127).
+        // `WriteFailed` because it is the only error `std.json.Stringify`
+        // lets a `jsonStringify` return; `ctx.sendJson` builds the body
+        // before the head goes out, so the client gets a 500, not half a body.
+        self.writeRfc3339(&w) catch return error.WriteFailed;
         try jw.write(w.buffered());
     }
 
@@ -340,8 +363,17 @@ pub const Date = struct {
 
     /// Midnight UTC on this day, for a comparison against a `timestamptz`
     /// column. The one conversion offered, and it says which zone it made up.
-    pub fn atMidnightUtc(self: Date) Timestamp {
-        return .{ .micros = @as(i64, self.days) * std.time.s_per_day * std.time.us_per_s };
+    ///
+    /// **`error.OutOfRange` for a day whose midnight does not fit in the `i64`
+    /// of microseconds**, about year 294,000 on: Postgres holds a `date` to
+    /// year 5,874,897, so this used to overflow (and trap in Debug) for a value
+    /// the database handed over. A moment past 9999 that does fit is returned;
+    /// it just cannot be written as RFC 3339 (ADR 127).
+    pub fn atMidnightUtc(self: Date) error{OutOfRange}!Timestamp {
+        const per_day = std.time.s_per_day * std.time.us_per_s;
+        const micros = std.math.mul(i64, @as(i64, self.days), per_day) catch
+            return error.OutOfRange;
+        return .{ .micros = micros };
     }
 
     /// `2026-09-17` — ISO 8601, which is what `date` prints, what a JSON body
@@ -352,10 +384,13 @@ pub const Date = struct {
     /// That walk starts at the epoch and returns `error.BeforeEpoch` for
     /// anything earlier, and the first thing anybody puts in a `date` column
     /// is a date of birth. The range that survives a round trip is the four
-    /// digits ISO spells without a sign, so year 0 to 9999 and nothing else.
+    /// digits ISO spells without a sign, so year 1 to 9999 and nothing else:
+    /// Postgres has no year 0 (1 BC is the year before 1 AD), refuses
+    /// `0000-01-01` on insert, and reads 1 BC back as year 0, which is
+    /// therefore refused here rather than printed (ADR 127).
     pub fn writeIso(self: Date, w: *std.Io.Writer) !void {
         const civil = civilFromDays(self.days);
-        if (civil.year < 0 or civil.year > 9999) return error.OutOfRange;
+        if (civil.year < 1 or civil.year > 9999) return error.OutOfRange;
         // `@as(u16, …)` and not the `i64` the arithmetic is in: zero-padding a
         // *signed* integer writes the sign, so `{d:0>4}` on an `i64` 1945 is
         // `+1945`. The year the epoch walk in std hands back is unsigned,
@@ -371,8 +406,11 @@ pub const Date = struct {
     /// `Timestamp.daysFromCivil` the parser above uses. Written out rather
     /// than found in std for the reason that one was: std has the one
     /// direction, and it is the direction that stops at 1970.
-    fn civilFromDays(days: i32) struct { year: i64, month: u8, day: u8 } {
-        const shifted = @as(i64, days) + 719_468;
+    ///
+    /// Takes an `i64` so `Timestamp.writeRfc3339` can share it: it is good for
+    /// negative days, which is what a pre-1970 moment is.
+    fn civilFromDays(days: i64) struct { year: i64, month: u8, day: u8 } {
+        const shifted = days + 719_468;
         const era = @divFloor(shifted, 146_097);
         const day_of_era = shifted - era * 146_097; // [0, 146096]
         const year_of_era = @divTrunc(
@@ -407,6 +445,8 @@ pub const Date = struct {
         const month = Timestamp.fixed(u8, text[5..7]) orelse return null;
         const day = Timestamp.fixed(u8, text[8..10]) orelse return null;
 
+        // No year 0: Postgres refuses `0000-01-01` (see `writeIso`).
+        if (year < 1) return null;
         if (month < 1 or month > 12) return null;
         if (day < 1 or day > Timestamp.daysInMonth(year, month)) return null;
         return .{ .days = @intCast(Timestamp.daysFromCivil(year, month, day)) };
@@ -415,7 +455,8 @@ pub const Date = struct {
     pub fn jsonStringify(self: Date, jw: anytype) !void {
         var buf: [16]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        self.writeIso(&w) catch return jw.write(null);
+        // An error rather than `null`, for the reason `Timestamp` gives (ADR 127).
+        self.writeIso(&w) catch return error.WriteFailed;
         try jw.write(w.buffered());
     }
 
@@ -575,12 +616,6 @@ pub fn AsText(comptime column: []const u8) type {
     };
 }
 
-/// A `interval` column, as Postgres prints it — `3 days 04:05:06`.
-///
-/// Text rather than a struct of months, days and microseconds, for the reason
-/// at the top of this file: an interval is only *useful* as a struct if
-/// something adds it to a date, and calendar arithmetic is the half of a date
-/// library that has nothing to do with a database.
 /// Bytes rather than text — a `bytea` or a `BLOB`. Declared in `wire.zig`
 /// because both Wires have to name it and `postgres.zig` imports that file and
 /// not this one; re-exported here so a Row writes `sql.Bytes` beside
@@ -602,6 +637,12 @@ pub fn isBytes(comptime T: type) bool {
     };
 }
 
+/// A `interval` column, as Postgres prints it — `3 days 04:05:06`.
+///
+/// Text rather than a struct of months, days and microseconds, for the reason
+/// at the top of this file: an interval is only *useful* as a struct if
+/// something adds it to a date, and calendar arithmetic is the half of a date
+/// library that has nothing to do with a database.
 pub const Interval = AsText("interval");
 
 /// An `inet` column — an address, with an optional mask: `192.168.0.1/24`,
@@ -826,7 +867,7 @@ test "a day is checked against its own month and its own century, and a second s
     try testing.expect(Timestamp.nilo_parse("2026-06-30T23:59:59Z") != null);
 }
 
-test "the epoch itself is the first moment it can write" {
+test "the epoch itself is written as the epoch" {
     var buf: [40]u8 = undefined;
     try testing.expectEqualStrings(
         "1970-01-01T00:00:00.000000Z",
@@ -834,13 +875,87 @@ test "the epoch itself is the first moment it can write" {
     );
 }
 
-test "a moment before the epoch is refused rather than printed wrong" {
+test "a moment before the epoch is written, and reads back to the same microsecond" {
+    var buf: [40]u8 = undefined;
+    const before: Timestamp = .{ .micros = -1 };
+    try testing.expectEqualStrings("1969-12-31T23:59:59.999999Z", try textOf(before, &buf));
+    try testing.expectEqual(@as(i64, -1), Timestamp.nilo_parse("1969-12-31T23:59:59.999999Z").?.micros);
+
+    // A date of birth at midnight, and a moment with a fraction before 1970:
+    // both pairs, because a parser that disagrees with the writer by a
+    // microsecond pages past rows (ADR 127).
+    for ([_]i64{
+        -1,
+        -1_000_000,
+        -1_000_001,
+        -86_400_000_000,
+        -1_606 * 86_400_000_000, // 1965-08-09
+        -2_208_988_800_000_000 + 123_456, // 1900-01-01
+        -62_135_596_800_000_000, // 0001-01-01
+    }) |micros| {
+        const t: Timestamp = .{ .micros = micros };
+        const back = Timestamp.nilo_parse(try textOf(t, &buf)) orelse
+            return error.WriterPrintedSomethingTheParserRefused;
+        try testing.expectEqual(micros, back.micros);
+    }
+}
+
+test "the ends of the range a Timestamp can write are 0001-01-01 and 9999-12-31" {
+    var buf: [40]u8 = undefined;
+    const first: Timestamp = .{ .micros = Timestamp.first_micros };
+    const last: Timestamp = .{ .micros = Timestamp.last_micros };
+    try testing.expectEqualStrings("0001-01-01T00:00:00.000000Z", try textOf(first, &buf));
+    try testing.expectEqualStrings("9999-12-31T23:59:59.999999Z", try textOf(last, &buf));
+    try testing.expectEqual(first.micros, Timestamp.nilo_parse("0001-01-01T00:00:00Z").?.micros);
+    try testing.expectEqual(last.micros, Timestamp.nilo_parse("9999-12-31T23:59:59.999999Z").?.micros);
+}
+
+test "a moment outside 0001 to 9999 is an error, never null and never text the parser refuses" {
     var buf: [40]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try testing.expectError(
-        error.BeforeEpoch,
-        Timestamp.fromSeconds(-1).writeRfc3339(&w),
+        error.OutOfRange,
+        (Timestamp{ .micros = Timestamp.first_micros - 1 }).writeRfc3339(&w),
     );
+    try testing.expectError(
+        error.OutOfRange,
+        (Timestamp{ .micros = Timestamp.last_micros + 1 }).writeRfc3339(&w),
+    );
+    try testing.expectError(
+        error.OutOfRange,
+        (Timestamp{ .micros = std.math.minInt(i64) }).writeRfc3339(&w),
+    );
+    try testing.expectError(
+        error.OutOfRange,
+        (Timestamp{ .micros = std.math.maxInt(i64) }).writeRfc3339(&w),
+    );
+
+    // Through JSON it stays an error: `null` reads as "no value".
+    const Row = struct { at: Timestamp };
+    var json_buf: [64]u8 = undefined;
+    var json_sink = std.Io.Writer.fixed(&json_buf);
+    try testing.expectError(error.WriteFailed, std.json.Stringify.value(
+        Row{ .at = .{ .micros = Timestamp.last_micros + 1 } },
+        .{},
+        &json_sink,
+    ));
+    const before = try std.json.Stringify.valueAlloc(
+        testing.allocator,
+        Row{ .at = .{ .micros = -1 } },
+        .{},
+    );
+    defer testing.allocator.free(before);
+    try testing.expectEqualStrings("{\"at\":\"1969-12-31T23:59:59.999999Z\"}", before);
+}
+
+test "year 0 and moments an offset pushes outside the range are refused on read" {
+    try testing.expectEqual(@as(?Timestamp, null), Timestamp.nilo_parse("0000-01-01T00:00:00Z"));
+    try testing.expectEqual(@as(?Timestamp, null), Timestamp.nilo_parse("0000-12-31T23:59:59Z"));
+    try testing.expectEqual(@as(?Date, null), Date.nilo_parse("0000-01-01"));
+    // Year 1 in the text and year 0 in UTC.
+    try testing.expectEqual(@as(?Timestamp, null), Timestamp.nilo_parse("0001-01-01T00:00:00+07:00"));
+    try testing.expectEqual(@as(?Timestamp, null), Timestamp.nilo_parse("9999-12-31T23:59:59-01:00"));
+    try testing.expect(Timestamp.nilo_parse("0001-01-01T07:00:00+07:00") != null);
 }
 
 test "seconds and microseconds are the same moment" {
@@ -989,9 +1104,8 @@ test "what a Date prints, a Date reads back to the same day" {
 }
 
 test "a day before 1970 is a day, because a date of birth usually is one" {
-    // `Timestamp` stops at the epoch and says `BeforeEpoch`, which is the
-    // right answer for a moment and the wrong one for a day: the first thing
-    // anybody puts in a `date` column is somebody's birthday.
+    // Neither type stops at the epoch: the first thing anybody puts in a
+    // `date` column is somebody's birthday.
     var buf: [16]u8 = undefined;
     const born = Date.nilo_parse("1965-08-09").?;
     try testing.expectEqual(@as(i32, -1606), born.days);
@@ -1001,6 +1115,34 @@ test "a day before 1970 is a day, because a date of birth usually is one" {
     // something `nilo_parse` could not read back.
     var w = std.Io.Writer.fixed(&buf);
     try testing.expectError(error.OutOfRange, Date.fromDays(-800_000).writeIso(&w));
+}
+
+test "a Date outside 0001 to 9999 is an error in JSON, never null, and year 0 does not exist" {
+    var buf: [16]u8 = undefined;
+    // 0000-12-31 is what a Postgres `date` of 1 BC reads back as: Postgres
+    // has no year 0, so neither does the writer.
+    const year_zero = Date.fromDays(Date.nilo_parse("0001-01-01").?.days - 1);
+    var w = std.Io.Writer.fixed(&buf);
+    try testing.expectError(error.OutOfRange, year_zero.writeIso(&w));
+    // 9999-12-31 is 2_932_896 days after the epoch; the next day is year 10000.
+    const past = Date.fromDays(Date.nilo_parse("9999-12-31").?.days + 1);
+    try testing.expectError(error.OutOfRange, past.writeIso(&w));
+
+    const Row = struct { on: Date };
+    var json_buf: [64]u8 = undefined;
+    var json_sink = std.Io.Writer.fixed(&json_buf);
+    try testing.expectError(error.WriteFailed, std.json.Stringify.value(
+        Row{ .on = past },
+        .{},
+        &json_sink,
+    ));
+    const before = try std.json.Stringify.valueAlloc(
+        testing.allocator,
+        Row{ .on = Date.nilo_parse("0001-01-01").? },
+        .{},
+    );
+    defer testing.allocator.free(before);
+    try testing.expectEqualStrings("{\"on\":\"0001-01-01\"}", before);
 }
 
 test "the wire counts from 2000 and the type counts from 1970" {
@@ -1078,8 +1220,16 @@ test "the one conversion a Date offers says which zone it made up" {
     const noon = Timestamp.nilo_parse("2026-09-17T12:00:00Z").?;
     try testing.expectEqual(Date.nilo_parse("2026-09-17").?.days, Date.utcOf(noon).days);
 
-    const midnight = Date.nilo_parse("2026-09-17").?.atMidnightUtc();
+    const midnight = try Date.nilo_parse("2026-09-17").?.atMidnightUtc();
     try testing.expectEqual(Timestamp.nilo_parse("2026-09-17T00:00:00Z").?.micros, midnight.micros);
+
+    // A `date` Postgres can hold (it goes to year 5,874,897) whose midnight
+    // does not fit in an i64 of microseconds: an error, not an overflow.
+    try testing.expectError(error.OutOfRange, Date.fromDays(std.math.maxInt(i32)).atMidnightUtc());
+    try testing.expectError(error.OutOfRange, Date.fromDays(std.math.minInt(i32)).atMidnightUtc());
+    // And one that fits, before 1970.
+    const before = try Date.fromDays(-1).atMidnightUtc();
+    try testing.expectEqual(@as(i64, -86_400_000_000), before.micros);
 
     // Late evening in Jakarta is still the 17th in UTC, which is the whole
     // reason the two are separate types.

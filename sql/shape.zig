@@ -225,7 +225,12 @@ fn visit(
                     const link = parentLink(Level, f.name);
                     const optional = @typeInfo(f.type) == .optional;
                     const alias = D.quote(name);
-                    if (std.mem.eql(u8, alias, relation)) @compileError(
+                    // Against the bare table name as well as the relation: a
+                    // table with a schema is `"app"."orders"`, whose name in
+                    // the `FROM` is still `"orders"`, and Postgres refuses
+                    // *table name specified more than once* for the pair.
+                    if (std.mem.eql(u8, alias, relation) or
+                        std.mem.eql(u8, alias, D.quote(row_mod.qualifiedOf(Top).table))) @compileError(
                         "nilo: " ++ @typeName(Top) ++ "'s parent `" ++ name ++ "` would be joined " ++
                             "under the name of the table the statement reads.\n" ++
                             "  A parent is joined under its field's name, so two relations would be " ++
@@ -803,6 +808,7 @@ pub fn assertShape(comptime Row: type) void {
                     );
                     if (over.column) |column| {
                         const C = row_mod.ColumnType(row_mod.ownerOf(over.Child), column);
+                        assertOrdersForMinMax(Row, f.name, over.word, column, C);
                         const Bare = switch (@typeInfo(C)) {
                             .optional => |o| o.child,
                             else => C,
@@ -978,6 +984,56 @@ fn assertChildRow(comptime Row: type) void {
     }
 }
 
+/// `min` and `max` are over a column with an order the database defines for
+/// it. Postgres has no `max(boolean)`, `max(uuid)`, `max(json)`, `max(jsonb)`
+/// or `max(bytea)` (17.10: *function max(boolean) does not exist*), so a Row
+/// reading one compiled and failed on the first request; and SQLite would
+/// answer for all of them, by its storage class's order, which is not an order
+/// anybody asked for and is not the one Postgres would give. So the four are
+/// refused on both (ADR 055). An enum is not in the four: Postgres orders it
+/// by declaration and SQLite by its name as text, which is a difference this
+/// does not close.
+///
+/// `over_children` (`word` is `max` or `min`) is asked the same, so both places
+/// a `min` or `max` is read say the same words.
+fn assertOrdersForMinMax(
+    comptime Row: type,
+    comptime field: []const u8,
+    comptime word: []const u8,
+    comptime column: []const u8,
+    comptime C: type,
+) void {
+    comptime {
+        const Bare = switch (@typeInfo(C)) {
+            .optional => |o| o.child,
+            else => C,
+        };
+        const kind: ?[]const u8 = if (Bare == bool)
+            "a bool"
+        else if (Bare == types_mod.Uuid)
+            "a Uuid"
+        else if (types_mod.isBytes(Bare))
+            "Bytes"
+        else if (types_mod.jsonPayload(Bare) != null)
+            "Json"
+        else if (types_mod.asText(Bare)) |named| blk: {
+            const unordered = [_][]const u8{ "json", "jsonb", "uuid", "bytea", "bool", "boolean" };
+            for (unordered) |name| {
+                if (std.mem.eql(u8, named, name)) break :blk "a " ++ named ++ " column";
+            }
+            break :blk null;
+        } else null;
+        if (kind) |what| @compileError(
+            "nilo: " ++ @typeName(Row) ++ " reads `." ++ field ++ "`, the " ++ word ++ " of `" ++ column ++
+                "`, which is " ++ what ++ ".\n" ++
+                "  Postgres has no `" ++ word ++ "` over it (*function " ++ word ++
+                "(…) does not exist*), and SQLite would answer in an order nobody chose. " ++
+                "Count the rows with the value you mean, or read the first row in the order " ++
+                "you mean with `.order` and a limit of one.",
+        );
+    }
+}
+
 /// The type an aggregate's field has to be, said as a rule rather than
 /// guessed: what the computation answers, and a `?` exactly when it can be
 /// null.
@@ -1028,7 +1084,10 @@ fn assertAggregate(comptime Row: type, comptime Owner: type, comptime field: []c
                         @typeName(C) ++ ".\n  An average is over whole or floating numbers.",
                 ),
             },
-            .min, .max => CBare,
+            .min, .max => blk: {
+                assertOrdersForMinMax(Row, field, words, column, C);
+                break :blk CBare;
+            },
             .count, .count_distinct => unreachable,
         };
         if (Bare != Want) @compileError(

@@ -22,7 +22,7 @@ that name
 
 This usually means a migration has not run.
 
-Set `.schema_mismatch_is_fatal = false` to log the mismatch and carry on.
+Set `.schema_mismatch_is_fatal = false` to log the mismatch and carry on. The lines are then `warn` and not `err`, since nothing is refusing to start.
 
 **A `Db` that never had `checking` called on it logs one `warn` line at startup** saying so: its Rows will only be checked by the first request that reads them, which is later than anybody wants. It is one line and not a failure, because a program with a `Db` and no Rows is a perfectly good program. If that is what you meant, set `.unchecked = true` in the options and the line goes away ([ADR 192](../../adr/192-a-db-with-no-schema-check-says-so-or-is-told.md)):
 
@@ -87,6 +87,8 @@ var db = sql.Db.init(gpa, url, .{ .prepared = false });
 ```
 
 A transaction-mode pooler hands out a different server connection for each transaction, so a statement prepared on one connection is missing on the next. The failure is loud (Postgres says the prepared statement does not exist), which is why the default is the fast setting rather than the safe one.
+
+A URL that says `pgbouncer=true` (or `pool_mode=transaction`) turns it off for you, so the line above is only for a pooler whose URL does not say so ([ADR 241](../../adr/241-a-postgres-url-without-sslmode-is-encrypted-unless-it-stays-on-this-machine.md)).
 
 ## Logging statements (`db.watching`)
 

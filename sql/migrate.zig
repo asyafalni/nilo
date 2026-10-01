@@ -267,6 +267,102 @@ pub fn trailingOf(comptime D: type, comptime schema: Schema) []const []const u8 
     }
 }
 
+/// What a view that is dropped and made again costs on Postgres, in the
+/// `why` of the step that drops it. The diff has no way to read a view's
+/// grants or comment (the snapshot is of Rows, not of a database), so it
+/// cannot write them back; `createMissing` does not have this cost, because
+/// `CREATE OR REPLACE VIEW` keeps them.
+const view_grants_note = " (on Postgres its grants and comment go with it; grant them again in a later step)";
+
+/// A view or a trigger as `createMissing` sends it: the statement that makes
+/// it wherever it may already be, and what it takes to compare and replace
+/// it on a database that cannot replace in place (`Dialect.stored_definitions`).
+const Repeatable = struct {
+    /// `view` or `trigger`, the first half of the key the stored text is
+    /// found under.
+    kind: []const u8,
+    name: []const u8,
+    /// Under the Dialect's repeatable head.
+    sql: []const u8,
+    /// The same statement under a plain `CREATE`, which is what SQLite stores
+    /// once it has taken `IF NOT EXISTS` out.
+    plain: []const u8,
+    drop: []const u8,
+};
+
+/// The views of a schema as `Repeatable`s, each after every view it reads.
+fn viewsRepeatable(comptime D: type, comptime schema: Schema) []const Repeatable {
+    comptime {
+        const views = viewOrder(schema.views);
+        var out: [views.len]Repeatable = undefined;
+        for (views, 0..) |v, i| out[i] = .{
+            .kind = "view",
+            .name = v.name,
+            .sql = ddl.viewStatement(D, D.view_repeatable_head, v),
+            .plain = ddl.viewStatement(D, "CREATE VIEW ", v),
+            .drop = "DROP VIEW " ++ D.quote(v.name),
+        };
+        const frozen = out;
+        return &frozen;
+    }
+}
+
+/// The triggers a table's marker names, as `Repeatable`s.
+fn triggersRepeatable(comptime D: type, comptime desc: Desc) []const Repeatable {
+    comptime {
+        var out: [desc.triggers.len]Repeatable = undefined;
+        for (desc.triggers, 0..) |t, i| out[i] = .{
+            .kind = "trigger",
+            .name = t.name,
+            .sql = ddl.triggerStatement(D, desc, D.trigger_repeatable_head, t),
+            .plain = ddl.triggerStatement(D, desc, "CREATE TRIGGER ", t),
+            .drop = "DROP TRIGGER IF EXISTS " ++ D.quote(t.name) ++
+                (if (D.trigger_drop_names_table) " ON " ++ D.qualify(desc.schema, desc.table) else ""),
+        };
+        const frozen = out;
+        return &frozen;
+    }
+}
+
+/// What the database holds of the views and triggers, read at most once by a
+/// `createMissing`, and only when a view or trigger is about to be sent.
+const Stored = struct {
+    entries: []const []const u8 = &.{},
+    read: bool = false,
+};
+
+/// Send a view or a trigger so that it ends up as written, on either database.
+///
+/// **One behaviour for both** (the Views and triggers entry of the roadmap).
+/// Postgres replaces in place with `CREATE OR REPLACE`, which keeps a view's
+/// grants and comment. SQLite has only `IF NOT EXISTS`, which left a changed
+/// definition as it was without a word, so there the stored text is read once
+/// and compared, and a definition that differs is dropped and made again.
+/// Nothing is sent for one that matches. A drop and a make are one
+/// transaction with the rest of `createMissing`, so a failure keeps neither.
+fn sendRepeatable(
+    comptime D: type,
+    tx: anytype,
+    scope: anytype,
+    stored: *Stored,
+    comptime r: Repeatable,
+) !void {
+    if (comptime !@hasDecl(D, "stored_definitions")) return sendBounded(tx, scope, r.sql, "createMissing");
+    if (!stored.read) {
+        stored.entries = try tx.raw([]const u8, scope, D.stored_definitions, .{});
+        stored.read = true;
+    }
+    const key = comptime r.kind ++ ":" ++ r.name;
+    for (stored.entries) |entry| {
+        const split = std.mem.indexOfScalar(u8, entry, 31) orelse continue;
+        if (!std.ascii.eqlIgnoreCase(entry[0..split], key)) continue;
+        if (std.mem.eql(u8, entry[split + 1 ..], r.plain)) return;
+        try sendBounded(tx, scope, r.drop, "createMissing");
+        break;
+    }
+    try sendBounded(tx, scope, r.sql, "createMissing");
+}
+
 /// The views, each after every view it reads.
 ///
 /// **The Schema says order inside a list does not matter**, and for views
@@ -407,6 +503,92 @@ pub fn missingOf(comptime D: type, comptime schema: Schema) []const ddl.Created 
         const frozen = out[0..n].*;
         return &frozen;
     }
+}
+
+/// A foreign key whose pointing columns no index of its table leads with.
+/// What `db check` prints as a note and never fails on
+/// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
+pub const Unindexed = struct {
+    /// The Row that owns the table, for the sentence that names the marker.
+    row: []const u8,
+    schema: ?[]const u8,
+    table: []const u8,
+    /// The constraint's name.
+    name: []const u8,
+    /// The columns doing the pointing, in the order the marker wrote them.
+    columns: []const []const u8,
+    /// The table pointed at.
+    parent: []const u8,
+    on_delete: table_mod.OnDelete,
+    /// Whether the table already has an `.index` list, which decides whether
+    /// the fix is a new line or one more entry.
+    has_index: bool,
+};
+
+/// **Every reference of a table this program builds whose pointing columns are
+/// not the leading columns of an index, a unique or the key**, in table order.
+///
+/// Postgres indexes the key a reference points *at* and not the column that
+/// points, and neither database indexes that column on its own. Deleting a row
+/// of the parent then reads every row of the child, once for the check that no
+/// child still points at it and again for each `ON DELETE CASCADE` or
+/// `SET NULL`; a parent with a million children is a million-row scan per
+/// delete. Nothing is added by default, because an index costs every insert
+/// into the child and a migration for every schema that exists
+/// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)):
+/// this only names the ones to consider.
+///
+/// **Worked from the tables the types describe, so it costs nothing at boot
+/// and needs no database.** What counts as serving a reference is what a
+/// lookup by equality on all its columns can use: the key, a unique, or a
+/// plain index whose *leading* columns are the reference's, in any order. Not
+/// counted, because equality on the raw column cannot use them: a partial
+/// index (its `WHERE` excludes rows a delete has to find), and a unique that
+/// ignores case (an index over `lower(col)` or `COLLATE NOCASE`). A composite
+/// unique that has the column second (`(tenant_id, org_id)`) does not serve
+/// `org_id`.
+///
+/// A table this program only reads is not asked: its indexes are somebody
+/// else's to add.
+pub fn unindexedReferences(gpa: std.mem.Allocator, tables: []const Table) ![]const Unindexed {
+    var found: std.ArrayList(Unindexed) = .empty;
+    for (tables) |t| {
+        const d = t.desc;
+        if (!d.managed) continue;
+        for (d.references) |ref| {
+            if (leadsWith(d.keys, ref.columns)) continue;
+            var served = false;
+            for (d.uniques) |u| {
+                if (u.ignoring_case) continue;
+                if (leadsWith(u.columns, ref.columns)) served = true;
+            }
+            for (d.indexes) |x| {
+                if (x.where.len > 0) continue;
+                if (leadsWith(x.columns, ref.columns)) served = true;
+            }
+            if (served) continue;
+            try found.append(gpa, .{
+                .row = d.row,
+                .schema = d.schema,
+                .table = d.table,
+                .name = ref.name,
+                .columns = ref.columns,
+                .parent = ref.table,
+                .on_delete = ref.on_delete,
+                .has_index = d.indexes.len > 0,
+            });
+        }
+    }
+    return found.items;
+}
+
+/// Whether the first `wanted.len` of `have` are `wanted`, in any order.
+fn leadsWith(have: []const []const u8, wanted: []const []const u8) bool {
+    if (wanted.len == 0 or have.len < wanted.len) return false;
+    for (wanted) |name| {
+        if (!hasName(have[0..wanted.len], name)) return false;
+    }
+    return true;
 }
 
 /// Two tables naming an index alike, which planning passed and the second
@@ -794,9 +976,9 @@ pub fn plan(
             .why = if (now == null)
                 try std.fmt.allocPrint(gpa, "drop view {s}, which the schema no longer names", .{old.name})
             else if (!now.?.sameAs(old))
-                try std.fmt.allocPrint(gpa, "drop view {s}, whose text moved", .{old.name})
+                try std.fmt.allocPrint(gpa, "drop view {s}, whose text moved" ++ view_grants_note, .{old.name})
             else
-                try std.fmt.allocPrint(gpa, "drop view {s} while what it reads changes", .{old.name}),
+                try std.fmt.allocPrint(gpa, "drop view {s} while what it reads changes" ++ view_grants_note, .{old.name}),
         });
     }
     // Extensions and functions before the tables, because a column type or
@@ -2116,6 +2298,9 @@ pub fn createMissing(db: anytype, scope: anytype, comptime schema: Schema) !void
     }
 
     // The order the tool owns: extensions, functions, tables, views (ADR 181).
+    // A view or trigger goes through `sendRepeatable`, which on SQLite reads
+    // the stored definitions once and sends only those that changed.
+    var stored: Stored = .{};
     for (comptime leadingOf(D, schema)) |sql| try sendBounded(&tx, scope, sql, "createMissing");
     inline for (ordered, 0..) |R, i| {
         if (comptime row_mod.managedOf(R)) {
@@ -2127,10 +2312,10 @@ pub fn createMissing(db: anytype, scope: anytype, comptime schema: Schema) !void
                 if (live[i].len == 0 or !overMissing(D, t.desc, ix.name, live[i]))
                     try sendBounded(&tx, scope, ix.sql, "createMissing");
             }
-            for (made.triggers) |tr| try sendBounded(&tx, scope, tr.sql, "createMissing");
+            inline for (comptime triggersRepeatable(D, t.desc)) |tr| try sendRepeatable(D, &tx, scope, &stored, tr);
         }
     }
-    for (comptime trailingOf(D, schema)) |sql| try sendBounded(&tx, scope, sql, "createMissing");
+    inline for (comptime viewsRepeatable(D, schema)) |v| try sendRepeatable(D, &tx, scope, &stored, v);
     try tx.commit();
 }
 
@@ -2578,35 +2763,103 @@ pub fn apply(
 pub fn applyPending(db: anytype, scope: anytype, chain: Chain) !usize {
     comptime core.checkScope(@TypeOf(scope), "migrate.applyPending");
     try ensureLedger(db, scope);
-    const recorded = try db.select(Recorded, scope, .{ .order = .{ .version = .asc } });
+    return applyRecorded(db, scope, chain, try readLedger(db, scope));
+}
 
+/// `applyPending` for a caller that has already made the ledger and read it,
+/// which `db migrate` has: it asks the ledger what has drifted, and then what
+/// is waiting, of one read (and one `ensureLedger`, which is a BEGIN, a lock,
+/// a CREATE and a COMMIT on Postgres). Same refusal, same order.
+pub fn applyRecorded(db: anytype, scope: anytype, chain: Chain, recorded: []const Recorded) !usize {
+    comptime core.checkScope(@TypeOf(scope), "migrate.applyRecorded");
     for (chain.versions, chain.hashes) |v, hash| {
-        const row = findVersion(recorded, v.number) orelse continue;
-        if (std.mem.eql(u8, row.hash, hash)) continue;
+        const hash_then = switch (seen(recorded, v.number, hash)) {
+            .absent, .same => continue,
+            .moved => |then| then,
+        };
         std.log.warn(
             "nilo_sql: version {d} ({s}) has been edited since it was applied here: the ledger " ++
                 "has it as {s} and the binary as {s}. Nothing was applied. Put that version " ++
                 "back, and write what you meant as a new one; `db verify` lists every version it moved.",
-            .{ v.number, v.name, row.hash[0..@min(16, row.hash.len)], hash[0..16] },
+            .{ v.number, v.name, hash_then[0..@min(16, hash_then.len)], hash[0..16] },
         );
         return Error.SchemaDrift;
     }
 
     var ran: usize = 0;
     for (chain.versions, chain.hashes) |v, hash| {
-        if (findVersion(recorded, v.number) != null) continue;
+        switch (seen(recorded, v.number, hash)) {
+            .absent => {},
+            .same, .moved => continue,
+        }
         if (try apply(db, scope, v, hash)) ran += 1;
     }
     return ran;
 }
 
-/// The two columns of the ledger `applyPending` reads. Narrow, so a boot does
-/// not carry every name and timestamp across.
-const Recorded = struct {
+/// The two columns of the ledger a boot, `status`, `verify` and `migrate`
+/// read. Narrow, so nothing carries every name and timestamp across.
+pub const Recorded = struct {
     pub const nilo_table = Applied;
     version: i64,
     hash: []const u8,
 };
+
+/// **The whole ledger, in one query, in version order.** Every reader of it
+/// (`applyPending`, `drift`, and the `db` tool's `status`) used to ask for
+/// its versions one `find` at a time, a round trip per version in the
+/// manifest; a boot with nothing to do is this one read. The ledger is small
+/// and holds a version per migration ever applied, which is the same order of
+/// magnitude as the manifest. Does not make the ledger: `ensureLedger` first.
+pub fn readLedger(db: anytype, scope: anytype) ![]const Recorded {
+    comptime core.checkScope(@TypeOf(scope), "migrate.readLedger");
+    return db.select(Recorded, scope, .{ .order = .{ .version = .asc } });
+}
+
+/// What the ledger says of one version of the binary's chain.
+pub const Seen = union(enum) {
+    /// Not applied here.
+    absent,
+    /// Applied, and its steps hash to what they did then.
+    same,
+    /// Applied under the hash it carries, and the steps hash to something
+    /// else now: the file was edited after it ran.
+    moved: []const u8,
+
+    /// Whether the ledger has the version at all, edited or not.
+    pub fn applied(self: Seen) bool {
+        return switch (self) {
+            .absent => false,
+            .same, .moved => true,
+        };
+    }
+
+    /// Whether the version ran and its file has been edited since.
+    pub fn edited(self: Seen) bool {
+        return switch (self) {
+            .moved => true,
+            .absent, .same => false,
+        };
+    }
+};
+
+/// **The one comparison of a recorded hash with a chain's**, which
+/// `applyRecorded`, `drift` and the tool's `status` each wrote by hand. A
+/// version is in the ledger or it is not; if it is, the hashes are equal or
+/// the file was edited.
+pub fn seen(recorded: []const Recorded, number: i64, hash: []const u8) Seen {
+    const row = findVersion(recorded, number) orelse return .absent;
+    if (std.mem.eql(u8, row.hash, hash)) return .same;
+    return .{ .moved = row.hash };
+}
+
+/// The highest version the ledger records, or zero: `headVersion`, of a ledger
+/// already read.
+pub fn headOfLedger(recorded: []const Recorded) i64 {
+    var top: i64 = 0;
+    for (recorded) |r| top = @max(top, r.version);
+    return top;
+}
 
 fn findVersion(recorded: []const Recorded, number: i64) ?Recorded {
     for (recorded) |r| {
@@ -2638,16 +2891,22 @@ pub const Drift = struct {
 pub fn drift(db: anytype, scope: anytype, chain: Chain) ![]const Drift {
     comptime core.checkScope(@TypeOf(scope), "migrate.drift");
     try ensureLedger(db, scope);
+    return driftIn(scope.arena(), try readLedger(db, scope), chain);
+}
 
+/// `drift` over a ledger already read, so `db migrate` asks the database
+/// once for what `drift` and `applyRecorded` both need.
+pub fn driftIn(arena: std.mem.Allocator, recorded: []const Recorded, chain: Chain) ![]const Drift {
     var found: std.ArrayList(Drift) = .empty;
-    const arena = scope.arena();
     for (chain.versions, chain.hashes) |v, hash| {
-        const row = try db.find(Applied, scope, v.number) orelse continue;
-        if (std.mem.eql(u8, row.hash, hash)) continue;
+        const then = switch (seen(recorded, v.number, hash)) {
+            .absent, .same => continue,
+            .moved => |was| was,
+        };
         try found.append(arena, .{
             .version = v.number,
             .name = v.name,
-            .recorded = row.hash,
+            .recorded = then,
             .now = hash,
         });
     }
@@ -4224,4 +4483,176 @@ test {
     _ = ddl;
     _ = snapshot;
     _ = table_mod;
+}
+
+test "one ledger read answers whether a version is waiting, applied or edited, and where the head is" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const one: []const Step = &.{.{ .kind = .create_table, .sql = "CREATE TABLE a (id int)", .why = "a" }};
+    const two: []const Step = &.{.{ .kind = .create_table, .sql = "CREATE TABLE b (id int)", .why = "b" }};
+    const three: []const Step = &.{.{ .kind = .create_table, .sql = "CREATE TABLE c (id int)", .why = "c" }};
+    const chain = try chainOf(a, &.{
+        .{ .number = 1, .name = "a", .steps = one },
+        .{ .number = 2, .name = "b", .steps = two },
+        .{ .number = 3, .name = "c", .steps = three },
+    });
+
+    // 1 ran as it is, 2 ran under another hash, 3 never ran.
+    const ledger = [_]Recorded{
+        .{ .version = 1, .hash = chain.hashes[0] },
+        .{ .version = 2, .hash = "not-what-it-hashes-to-now" },
+    };
+
+    try testing.expect(seen(&ledger, 1, chain.hashes[0]).applied());
+    try testing.expect(!seen(&ledger, 1, chain.hashes[0]).edited());
+    try testing.expect(seen(&ledger, 2, chain.hashes[1]).edited());
+    try testing.expectEqualStrings("not-what-it-hashes-to-now", seen(&ledger, 2, chain.hashes[1]).moved);
+    try testing.expect(!seen(&ledger, 3, chain.hashes[2]).applied());
+
+    // The three readers of the ledger are all this one comparison: `drift`
+    // reports exactly the edited version and not the waiting one.
+    const moved = try driftIn(a, &ledger, chain);
+    try testing.expectEqual(@as(usize, 1), moved.len);
+    try testing.expectEqual(@as(i64, 2), moved[0].version);
+    try testing.expectEqualStrings("not-what-it-hashes-to-now", moved[0].recorded);
+    try testing.expectEqualStrings(chain.hashes[1], moved[0].now);
+
+    try testing.expectEqual(@as(i64, 2), headOfLedger(&ledger));
+    try testing.expectEqual(@as(i64, 0), headOfLedger(&.{}));
+}
+
+const Unmarked = struct {
+    pub const nilo_table = .{
+        .name = "unmarked",
+        .key = .id,
+        .references = .{ .org_id = .{ Org, .id, .cascade } },
+    };
+    id: i64,
+    org_id: i64,
+};
+
+const Marked = struct {
+    pub const nilo_table = .{
+        .name = "marked",
+        .key = .id,
+        .index = .{.org_id},
+        .references = .{ .org_id = .{ Org, .id, .cascade } },
+    };
+    id: i64,
+    org_id: i64,
+};
+
+/// The column is second in the only unique, so an equality on it alone
+/// cannot use that unique.
+const Second = struct {
+    pub const nilo_table = .{
+        .name = "second",
+        .key = .id,
+        .unique = .{.{ .columns = .{ .tenant_id, .org_id } }},
+        .references = .{ .org_id = .{ Org, .id } },
+    };
+    id: i64,
+    tenant_id: i64,
+    org_id: i64,
+};
+
+/// The column leads a unique, so the unique serves it.
+const First = struct {
+    pub const nilo_table = .{
+        .name = "first",
+        .key = .id,
+        .unique = .{.{ .columns = .{ .org_id, .slot } }},
+        .references = .{ .org_id = .{ Org, .id } },
+    };
+    id: i64,
+    org_id: i64,
+    slot: i64,
+};
+
+/// A partial index leaves out rows a delete of the parent has to find.
+const Unhelped = struct {
+    pub const nilo_table = .{
+        .name = "unhelped",
+        .key = .id,
+        .index = .{.{ .columns = .{.org_id}, .where = .{ .deleted_at = null } }},
+        .references = .{ .org_id = .{ Org, .id } },
+    };
+    id: i64,
+    org_id: i64,
+    deleted_at: ?i64,
+};
+
+/// The key is an index: a reference that is the key is served.
+const Extension = struct {
+    pub const nilo_table = .{
+        .name = "extension",
+        .key = .org_id,
+        .references = .{ .org_id = .{ Org, .id } },
+    };
+    org_id: i64,
+    note: []const u8,
+};
+
+/// Somebody else's table, and somebody else's indexes.
+const Borrowed = struct {
+    pub const nilo_table = .{
+        .name = "borrowed",
+        .key = .id,
+        .managed = false,
+        .references = .{ .org_id = .{ Org, .id } },
+    };
+    id: i64,
+    org_id: i64,
+};
+
+test "a reference nothing indexes is reported with the table, the column and where the marker goes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tables = comptime desiredOf(Pg, .{ .tables = &.{ Org, Unmarked } }).tables;
+    const found = try unindexedReferences(a, tables);
+
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqualStrings("unmarked", found[0].table);
+    try testing.expectEqualStrings("orgs", found[0].parent);
+    try testing.expectEqual(@as(usize, 1), found[0].columns.len);
+    try testing.expectEqualStrings("org_id", found[0].columns[0]);
+    try testing.expectEqual(table_mod.OnDelete.cascade, found[0].on_delete);
+    try testing.expect(!found[0].has_index);
+}
+
+test "a reference whose column leads an index, a unique or the key is not reported" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tables = comptime desiredOf(Pg, .{ .tables = &.{ Org, Marked, First, Extension } }).tables;
+    try testing.expectEqual(@as(usize, 0), (try unindexedReferences(a, tables)).len);
+}
+
+test "a reference whose column is second in a composite unique is reported, and so is one only a partial index covers" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tables = comptime desiredOf(Pg, .{ .tables = &.{ Org, Second, Unhelped } }).tables;
+    const found = try unindexedReferences(a, tables);
+
+    try testing.expectEqual(@as(usize, 2), found.len);
+    try testing.expectEqualStrings("second", found[0].table);
+    try testing.expect(!found[0].has_index);
+    try testing.expectEqualStrings("unhelped", found[1].table);
+    try testing.expect(found[1].has_index);
+}
+
+test "a table this program only reads is not asked for its indexes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tables = comptime desiredOf(Pg, .{ .tables = &.{ Org, Borrowed } }).tables;
+    try testing.expectEqual(@as(usize, 0), (try unindexedReferences(a, tables)).len);
 }

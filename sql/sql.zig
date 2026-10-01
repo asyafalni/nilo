@@ -101,7 +101,8 @@
 //! does not know this module exists.** That is what makes the feature cost
 //! exactly zero to a project that does not import it — measured, not
 //! assumed: the HTTP-only binary contains no pg or TLS content, and pg.zig
-//! is `.lazy = true`, so it is not even downloaded (ADR 037).
+//! sits behind `-Dsql`, so a build without the flag does not even download
+//! it (ADR 066; `.lazy = true` does not do this, ADR 037 is the history).
 //!
 //! What it costs the projects that *do* import it is 733 KB, of which the
 //! whole write half is 53 KB and the rest is pg.zig's TLS dependency. ADR
@@ -306,10 +307,6 @@ pub const problem = db.lastProblem;
 /// columns, checked against the marker while compiling (ADR 117).
 pub const violated = db.violated;
 
-/// What a transaction is begun with, and what a read holds on to. Both are
-/// written as literals at the call — `db.begin(c, .{ .isolation = .serializable })`,
-/// `.lock = .update` — so naming either type is for a caller keeping one in a
-/// struct of their own.
 /// A value a condition only has *sometimes*: the term is in the statement
 /// when the filter carried one, and out of it when it did not
 /// ([ADR 149](../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
@@ -371,6 +368,11 @@ pub const Ordering = ordering.Ordering;
 pub const Composed = composed.Composed;
 pub const Spelling = composed.Spelling;
 
+/// What a transaction is begun with (`Begin`, `Isolation`), and what a read
+/// holds on to (`Lock`). All are written as literals at the call —
+/// `db.begin(c, .{ .isolation = .serializable })`, `.lock = .update` — so
+/// naming any of the types is for a caller keeping one in a struct of their
+/// own.
 pub const Begin = wire.Begin;
 pub const Isolation = wire.Isolation;
 pub const Lock = dialect.Lock;
@@ -501,7 +503,7 @@ pub fn updateFor(comptime Row: type, comptime Options: type) statement.Statement
     return comptime statement.update(Postgres, Row, Options);
 }
 
-/// The seventeen `…For` functions above, bound to a Dialect of the caller's
+/// The `…For` functions above, bound to a Dialect of the caller's
 /// choosing: `sql.on(sql.SQLite).selectFor(User, Options)` is what a program
 /// on SQLite compiles to, spelled with `?1` and `LIKE` where the Postgres
 /// version says `$1` and `ILIKE`. The bare `selectFor` is `on(Postgres)`,
@@ -509,9 +511,11 @@ pub fn updateFor(comptime Row: type, comptime Options: type) statement.Statement
 /// reader could ask — so a program on SQLite could not see the constant
 /// ADR 036 is about.
 ///
-/// A namespace rather than a Dialect parameter on each of the seventeen,
-/// because every existing call and every refusal names them with two
-/// arguments and nothing about the Postgres default was wrong.
+/// A namespace rather than a Dialect parameter on each of them, because every
+/// existing call and every refusal names them with two arguments and nothing
+/// about the Postgres default was wrong. **It holds seventeen of the nineteen**:
+/// `updateReturningOneFor` and `deleteReturningOneFor` exist at the top level
+/// only, on the Postgres Dialect.
 pub fn on(comptime D: type) type {
     return struct {
         pub fn selectFor(comptime Row: type, comptime Options: type) statement.Statement {

@@ -48,7 +48,7 @@ fn poolOpts(uri: std.Uri, arena: std.mem.Allocator, opts: Opts) !pg.Pool.Opts {
 }
 ```
 
-The copy is tested against pg.zig's own defaults (username `postgres`, a ten-second auth timeout, `sslmode`, `tcp_user_timeout`) so a drift is a failing test rather than a connection to the wrong database. `poolOpts` returns one struct literal naming every field, which is what `initUri` gave up by building the value internally and letting three of its fields, including `connect_on_init_count`, be silently overwritten. `sql/postgres.zig` is the only file allowed to name pg.zig ([ADR 036](./036-the-shape-of-a-query-is-settled-while-compiling.md)), so the workaround has exactly one address.
+The copy is tested against pg.zig's own defaults (username `postgres`, a ten-second auth timeout, and the `sslmode` a URL with no host gets; a URL with a remote host and no `sslmode` is `require` where pg.zig's parser says plaintext, and `tcp_user_timeout` is refused where it wrote the auth timeout, both [ADR 241](./241-a-postgres-url-without-sslmode-is-encrypted-unless-it-stays-on-this-machine.md)) so a drift is a failing test rather than a connection to the wrong database. `poolOpts` returns one struct literal naming every field, which is what `initUri` gave up by building the value internally and letting three of its fields, including `connect_on_init_count`, be silently overwritten. `sql/postgres.zig` is the only file allowed to name pg.zig ([ADR 036](./036-the-shape-of-a-query-is-settled-while-compiling.md)), so the workaround has exactly one address.
 
 ### The reconnector is real, and it does not run everywhere
 

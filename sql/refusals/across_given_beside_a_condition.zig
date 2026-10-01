@@ -19,7 +19,7 @@ export fn refusal() void {
         .where = .{ .across = .{
             .columns = .{ .code, .name },
             .icontains = sql.given(@as(?[]const u8, null)),
-            .ne = "retired",
+            .gt = "retired",
         } },
     }));
     _ = found;

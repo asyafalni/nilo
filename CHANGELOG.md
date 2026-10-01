@@ -12,6 +12,13 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ### Breaking
 
+- **A Postgres URL to a host that is not this machine, with no `sslmode`, requires TLS**, and a server that offers none refuses the connection at startup. It was plaintext. What to change: `?sslmode=disable` for a database you mean to reach unencrypted; `localhost`, `127.0.0.0/8`, `::1` and a unix socket are unchanged, and a Docker Compose service name such as `db` is not this machine ([ADR 241](./docs/adr/241-a-postgres-url-without-sslmode-is-encrypted-unless-it-stays-on-this-machine.md)).
+- **`tcp_user_timeout` in a Postgres URL is refused**, because pg.zig cannot set it; `connect_timeout` is the bound it has (ADR 241).
+- **`.across` with a negated operator does not compile.** `.not_icontains` over two columns kept a row one column matched; write one condition a column, joined the way you mean (ADR 172).
+- **`.min` and `.max` over a `bool`, `Uuid`, `Bytes` or `Json` do not compile**, on either database, where Postgres refused them at run time.
+- **A list column of `Timestamp`, `Date`, `Decimal`, `Bytes` or `Json` does not compile** where its Row is read, where pg.zig failed inside its own code.
+- **`sql.Timestamp` and `sql.Date` are written to JSON between 0001-01-01 and 9999-12-31 or not at all**: outside that range the response is an error where it was `null` or text the parser refused, year 0 is refused as Postgres refuses it, and `Date.atMidnightUtc` answers `error.OutOfRange` (ADR 127).
+- **A Dialect defines `introspect_all`, and a Wire `columnsOfMany` and `labelsOfMany`**, and `enum_values` takes its type names as an array: only a Dialect or Wire of your own changes.
 - **On Postgres, a pool wait that runs out of `timeout_ms` is `error.TimedOut`**, where it was `Disconnected`, and `timeout_ms = 0` is no bound, as `wire.OpenOpts` always said; it failed the moment the pool was empty. A handler that branched on `Disconnected` for a full pool branches on `TimedOut` (ADR 107).
 - **On SQLite, a version's `.sql` twin that rebuilds a table is stale**, because the twin now stops before `COMMIT` when `foreign_key_check` finds rows; `db check` names it, and `db generate` rewrites it (ADR 123).
 - **On SQLite, `.gt`, `.gte`, `.lt`, `.lte`, `.order` (a run-time `sql.Ordering` key included), `.after`, and `sum`, `avg`, `min`, `max` over a `sql.Decimal` are Refusals.** The column is TEXT there, so `"100.00"` compared below `"9.99"` and a sum was added in floating point. Equality and `.in` are unchanged, and so is Postgres. What to change: store an integer of the smallest unit, or use Postgres (ADR 049).
@@ -53,6 +60,7 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ### Added
 
+- **`db check` and `db generate` name each foreign key no index leads with**, and the marker line that adds one; it never fails `check` (ADR 123).
 - **`.istarts_with` on SQLite uses a unique with `.ignoring_case`**, `SEARCH` where it was `SCAN`: 12 µs against 16.5 ms on 200,000 rows. The prefix is escaped in Zig and bound whole, one arena allocation per condition; the statement and the rows it matches are otherwise unchanged. Postgres is unchanged, since it already used the index (ADR 140).
 - **`db.feed(Row, c, options)` and `tx.feed`: the rows up to `.limit` and whether any came after them**, `sql.Feed(Row){ .rows, .more }`, for a "load more" button or an endless scroll. It reads one row past the limit and counts nothing, where `db.page`'s total is a pass over every match: 124 ms against 0.024 ms for twenty rows of a million (ADR 150). ([reference](./docs/reference/sql.md#dbfeed), [guide](./docs/guide/sql/reading.md#keyset-pagination-for-deep-pages))
 - **`.after`, a cursor, on `db.feed`, `db.select` and `db.explain`**: `.after = .{ .created_at = last.created_at, .id = last.id }` beside an `.order` over the same columns is one row comparison an index seeks on, 0.013 ms at a million rows where the `.any` form the guide showed cost 17.8 ms. A cursor that would skip or repeat rows does not compile: other columns than the order's, an order running both ways, a column that may be null, or an order not ending in the key (ADR 150). ([reference](./docs/reference/sql.md#dbfeed), [guide](./docs/guide/sql/reading.md#keyset-pagination-for-deep-pages))
@@ -92,6 +100,13 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ### Changed
 
+- **A statement holding a `sql.given` is sent without the terms the call left out**, so SQLite uses the index again (29.4 ms to an index search on 500,000 rows) and Postgres keeps one named plan a combination of given values, up to three, where it parsed every call ([ADR 149](./docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md), [sql.md §25](./bench/result/sql.md#25-a-guard-cut-out-of-the-text-per-call)).
+- **`pgbouncer=true` or `pool_mode=transaction` in a Postgres URL turns prepared statements off**, and a `26000` from a pooler is prepared again once rather than failing every call (ADR 241).
+- **The startup check asks the catalog once a schema, plus once for every enum**, where it asked once a Row and once an enum column: 26.7 ms to 7.7 ms for 50 tables on Postgres; `db status` and `db migrate` read the ledger once ([sql.md §24](./bench/result/sql.md#24-the-startup-check-and-the-ledger-ask-once)).
+- **On SQLite, `createMissing` remakes a view or trigger whose text changed and sends no DDL when none did**, where a changed one was never updated (ADR 181).
+- **A rebuilding version checks the foreign keys of the tables it dropped and the rows pointing at them**, on SQLite and in its `.sql` twin, where an old violation anywhere failed every rebuild (ADR 123).
+- **`insertMany` and `updateMany` over an empty slice send nothing.**
+- **`db.raw` refuses a gap in its placeholders**, `$1, $3` with three values, and holds SQLite's `?n` the same way, as ADR 204 said it did.
 - **A Postgres statement that holds a `sql.given` is sent unnamed**, so each call is planned for its own values: once the kept plan went generic, a call with the filter read the whole table, 115 ms against 0.27 ms on 500,000 rows. It costs one Parse a call; a statement with nothing that can drop keeps its name. On SQLite such a statement still scans, and the reference says so ([ADR 149](./docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md), [sql.md §22](./bench/result/sql.md#22-a-guard-and-the-plan-a-kept-statement-settles-on)).
 - **`istarts_with` on Postgres is `lower(col) LIKE lower($1) || '%'`, and a case-folding unique is built over `lower(col) text_pattern_ops`**, so the prefix reads the unique as a range: 266 ms to 0.065 ms on 200,000 rows. What to change: a case-folding unique made before this keeps its old index and the prefix still scans until it is dropped and made again (ADR 140, [sql.md §23](./bench/result/sql.md#23-istarts_with-on-postgres-and-the-expression-it-reads)).
 - **On SQLite, a required column with no default is a Problem at `db generate` and `db check`**, naming the rebuild, where it was a step that failed on the deploy against a table with rows (ADR 123).
@@ -103,6 +118,13 @@ in [`docs/history.md`](./docs/history.md); what is coming is in
 
 ### Fixed
 
+- **`db.raw` runs statements its reader used to refuse**: a trailing comment or `;`, `IS DISTINCT FROM`, `a * b`, `ID` for `id`, `$$…$$` and `E'\''`, nested comments, `EXCEPT` and `INTERSECT`, `p.offset` and SQLite's backticks. One tokenizer reads the statement once, and a statement it cannot read is passed to the first-run check rather than refused (ADR 204).
+- **`Composed` refuses `?n` in its text and a gap in its placeholders**, `sql.given` on `not_distinct_from` answers ADR 149's sentence, and SQLite's `LIKE` no longer rewrites a column whose name holds `ILIKE`.
+- **A parent named like its table is refused for a table with a schema too.**
+- **A `Timestamp` before 1970 is written to JSON**, where it was `null`.
+- **On SQLite**: a `float8` read into an `f32` is refused when the value does not survive the narrowing; a value refused before binding no longer aborts the transaction; `db.exec` of a statement that is not DML answers 0; `db.rawExplain` no longer takes the writer, so a handler holding a `tx` does not wait on itself; a pool that fails to open is reported once, in SQLite's words.
+- **A failed `Savepoint.release` leaves the savepoint to roll back to**, a transaction's savepoints live in the request arena rather than an allocation of their own, and a child statement that fails is told to the watcher.
+- **`checkSchema` logs at `warn` when a mismatch is not fatal**, where `err` failed any test that reached it.
 - **The startup check no longer refuses correct tables.** On SQLite it compares the column's affinity, so `VARCHAR(255)` under a `Str`, `DATE` under a `Date`, `UUID` under a `Uuid` and a column with no type pass; on Postgres a domain is read as the type under it, and `citext` is accepted where `text` is (ADR 055).
 - **`.after` over a `Date`, `Decimal`, `Interval`, `Inet` or `Bytes` binds through its cast**, where a feed failed from its second page on Postgres.
 - **On SQLite, the readiness probe runs on a reader**, so `/healthz` stays 200 while a long write holds the writer (ADR 107).

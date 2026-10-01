@@ -7,7 +7,10 @@
 A raw statement's text is comptime, and `rawcheck` holds its `SELECT` list
 against the Row while compiling: how many columns, and the name of each one
 that plainly has a name ([ADR 051](051-a-statement-that-is-a-constant-can-be-prepared-once.md)).
-That is all a comptime pass can do. What a column *is* belongs to the
+That is all a comptime pass can do, and when it is unsure it passes: a name
+is claimed only for a bare path or an `AS name`, an unquoted one is folded to
+lower case as Postgres does, and text it cannot finish (an unterminated quote)
+is not read at all. What a column *is* belongs to the
 database: its type, and whether it can be NULL. ADR 051 left the type to
 `db.checking`, and `db.checking` holds tables, not statements, so for a raw
 statement nothing held either. The type was found by the first row that read

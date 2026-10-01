@@ -311,6 +311,84 @@ pub fn enumColumnsOf(comptime Row: type) []const EnumColumn {
     };
 }
 
+/// The tables of a list of Rows that live in one schema, each once. What the
+/// startup check asks the catalog about in one query (`Wire.columnsOfMany`):
+/// two Rows over one table share an entry, and Rows in different schemas
+/// fall into different groups because a catalog query names one schema.
+pub const Group = struct {
+    schema: ?[]const u8,
+    tables: []const []const u8,
+};
+
+/// Where a Row's table is in `groupsOf`'s answer: the group, and the place in
+/// that group's `tables`, which is the place in the Wire's answer too.
+pub const Place = struct { group: usize, table: usize };
+
+/// The groups, in the order their schemas first appear among `Rows`.
+pub fn groupsOf(comptime Rows: []const type) []const Group {
+    return comptime blk: {
+        @setEvalBranchQuota(20_000 + 5_000 * Rows.len * Rows.len);
+        var groups: [Rows.len]Group = undefined;
+        var n: usize = 0;
+        for (Rows) |Row| {
+            const q = row_mod.qualifiedOf(Row);
+            var g: usize = 0;
+            while (g < n) : (g += 1) {
+                if (table_mod.sameSchema(groups[g].schema, q.schema)) break;
+            }
+            if (g == n) {
+                groups[n] = .{ .schema = q.schema, .tables = &.{} };
+                n += 1;
+            }
+            var seen = false;
+            for (groups[g].tables) |t| {
+                if (std.mem.eql(u8, t, q.table)) seen = true;
+            }
+            if (!seen) groups[g].tables = groups[g].tables ++ &[_][]const u8{q.table};
+        }
+        const frozen = groups[0..n].*;
+        break :blk &frozen;
+    };
+}
+
+/// Where `Row`'s table is among `groups`.
+pub fn placeOf(comptime groups: []const Group, comptime Row: type) Place {
+    return comptime blk: {
+        const q = row_mod.qualifiedOf(Row);
+        for (groups, 0..) |g, gi| {
+            if (!table_mod.sameSchema(g.schema, q.schema)) continue;
+            for (g.tables, 0..) |t, ti| {
+                if (std.mem.eql(u8, t, q.table)) break :blk .{ .group = gi, .table = ti };
+            }
+        }
+        @compileError("nilo: " ++ @typeName(Row) ++ " is in no group of tables; this is a bug in `schema.groupsOf`.");
+    };
+}
+
+/// Every enum type name the Rows' columns declared, each once: what the
+/// startup check asks the catalog for in one query (`Wire.labelsOfMany`).
+pub fn enumTypesOf(comptime Rows: []const type) []const []const u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(20_000 + 5_000 * Rows.len * Rows.len);
+        var out: []const []const u8 = &.{};
+        for (Rows) |Row| {
+            for (enumColumnsOf(Row)) |col| {
+                if (enumTypeAt(out, col.type_name) == null) out = out ++ &[_][]const u8{col.type_name};
+            }
+        }
+        const frozen = out[0..out.len].*;
+        break :blk &frozen;
+    };
+}
+
+/// The place of `name` among `names`, or null.
+pub fn enumTypeAt(names: []const []const u8, name: []const u8) ?usize {
+    for (names, 0..) |t, i| {
+        if (std.mem.eql(u8, t, name)) return i;
+    }
+    return null;
+}
+
 /// Hold a Zig enum against the values the database's type has, appending
 /// what does not line up. Returns how many problems were found.
 ///
@@ -869,4 +947,63 @@ test "SQLite columns are judged by affinity, so a hand-written declared type pas
     try testing.expectEqual(@as(usize, 1), try compare(Lite, Hand, &wrong, &out, testing.allocator));
     try testing.expectEqualStrings("name", out.items[0].column);
     try testing.expectEqualStrings("INTEGER", out.items[0].found);
+}
+
+test "Rows are grouped by schema and share the entry of a table they both read" {
+    const Card = struct {
+        pub const nilo_table = User;
+        id: i64,
+    };
+    const Event = struct {
+        pub const nilo_table = .{ .name = "audit.events", .key = .id };
+        id: i64,
+    };
+    const Other = struct {
+        pub const nilo_table = .{ .name = "orders", .key = .id };
+        id: i64,
+    };
+    const Rows = &[_]type{ User, Event, Card, Other };
+
+    const groups = comptime groupsOf(Rows);
+    // Two groups: the session's own schema, and `audit`.
+    try testing.expectEqual(@as(usize, 2), groups.len);
+    try testing.expectEqual(@as(?[]const u8, null), groups[0].schema);
+    try testing.expectEqualStrings("audit", groups[1].schema.?);
+    // `Card` reads `users` too, so the group holds it once.
+    try testing.expectEqual(@as(usize, 2), groups[0].tables.len);
+    try testing.expectEqualStrings("users", groups[0].tables[0]);
+    try testing.expectEqualStrings("orders", groups[0].tables[1]);
+
+    try testing.expectEqual(Place{ .group = 0, .table = 0 }, comptime placeOf(groups, Card));
+    try testing.expectEqual(Place{ .group = 1, .table = 0 }, comptime placeOf(groups, Event));
+    try testing.expectEqual(Place{ .group = 0, .table = 1 }, comptime placeOf(groups, Other));
+}
+
+test "an enum type two columns name is asked about once" {
+    const Level = enum {
+        low,
+        high,
+        pub const nilo_column = "level_kind";
+    };
+    const Mood = enum {
+        calm,
+        cross,
+        pub const nilo_column = "mood_kind";
+    };
+    const A = struct {
+        pub const nilo_table = .{ .name = "a", .key = .id };
+        id: i64,
+        level: Level,
+        mood: Mood,
+    };
+    const B = struct {
+        pub const nilo_table = .{ .name = "b", .key = .id };
+        id: i64,
+        level: ?Level,
+    };
+    const names = comptime enumTypesOf(&.{ A, B });
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqual(@as(?usize, 0), enumTypeAt(names, "level_kind"));
+    try testing.expectEqual(@as(?usize, 1), enumTypeAt(names, "mood_kind"));
+    try testing.expectEqual(@as(?usize, null), enumTypeAt(names, "nope"));
 }

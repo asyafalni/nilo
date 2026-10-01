@@ -1403,6 +1403,18 @@ fn oneAcross(
                         "`.gt` and the rest, each with its value.",
                 );
             }
+            // ORed columns and a negated operator do not say what they read
+            // as (ADR 172): "not equal to q" over two columns is "some column
+            // differs" to the OR and "no column equals" to a person.
+            if (negatesWord(f.name)) @compileError(
+                "nilo: an entry of `.across` sets `." ++ f.name ++ "`, which is a negation.\n" ++
+                    "  `.across` keeps a row when any column meets the condition, so a negated " ++
+                    "one would keep a row whose other column still matches: `.not_icontains = \"test\"` " ++
+                    "over `code` and `name` would keep a row whose name contains it.\n" ++
+                    "  \"None of these columns\" is one condition per column, ANDed: " ++
+                    "`.code = .{ .not_icontains = q }, .name = .{ .not_icontains = q }`, " ++
+                    "each with its own `sql.given` if the box may be empty.",
+            );
             ops = ops ++ &[_]Operator{.{ .name = f.name, .T = f.type }};
         }
         if (ops.len == 0) @compileError(
@@ -2019,6 +2031,19 @@ fn spelling(comptime name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Whether `name` is an operator that says "not": `.ne`, the `not_` forms,
+/// `.not_in` and `.distinct_from`. `.across` refuses them (ADR 172).
+fn negatesWord(comptime name: []const u8) bool {
+    comptime {
+        if (std.mem.eql(u8, name, "ne") or std.mem.eql(u8, name, "not_in") or
+            std.mem.eql(u8, name, "not_like") or std.mem.eql(u8, name, "not_ilike") or
+            std.mem.eql(u8, name, "distinct_from")) return true;
+        if (patternSpelling(name)) |p| if (p.negate) return true;
+        if (foldedSpelling(name)) |negate| if (negate) return true;
+        return false;
+    }
+}
+
 /// Whether `name` asks which of two values comes first: the four comparisons
 /// that are not equality.
 fn isOrderingWord(comptime name: []const u8) bool {
@@ -2284,6 +2309,16 @@ fn operator(
         // Before the optional check, because this is the operator the check
         // exists to send people to.
         if (nullSafeSpelling(op.name)) |spelled| {
+            // ADR 149's Refusal lives here and nowhere below: this branch
+            // returns, so a check placed after it is never reached.
+            if (givenValue(op.T) != null) @compileError(
+                "nilo: the condition on `" ++ column ++ "` (as `" ++ op.name ++
+                    "`) was given a `sql.given`.\n" ++
+                    "  `" ++ op.name ++ "` already takes an optional and treats null as an " ++
+                    "ordinary value, so it is one statement either way — there is no term " ++
+                    "for `sql.given` to drop.\n" ++
+                    "  Write `." ++ column ++ " = .{ ." ++ op.name ++ " = maybe }`.",
+            );
             // A null written as a literal needs no parameter at all — the
             // comparison is against NULL itself, which is a keyword.
             if (@typeInfo(op.T) == .null) return quoted ++ " " ++ spelled ++ " NULL";
@@ -2302,14 +2337,6 @@ fn operator(
         // (ADR 149). Placed after `nullSafeSpelling`, whose operators already
         // take an optional and mean something else by it.
         if (givenValue(op.T)) |Held| {
-            if (nullSafeSpelling(op.name) != null) @compileError(
-                "nilo: the condition on `" ++ column ++ "` (as `" ++ op.name ++
-                    "`) was given a `sql.given`.\n" ++
-                    "  `" ++ op.name ++ "` already takes an optional and treats null as an " ++
-                    "ordinary value, so it is one statement either way — there is no term " ++
-                    "for `sql.given` to drop.\n" ++
-                    "  Write `." ++ column ++ " = .{ ." ++ op.name ++ " = maybe }`.",
-            );
             // A list is no exception (ADR 149). A filter bar's multi-select
             // asks two questions: absent is *no filter*, and a list is *these*.
             // An empty list keeps meaning what `.in` says it means, and null

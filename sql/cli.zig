@@ -232,7 +232,13 @@ pub fn Tool(comptime Db: type, comptime schema: migrate.Schema) type {
                     break :blk ok;
                 },
                 .generate => try doGenerate(a, io, w, req, versions),
-                .check => try doCheck(a, io, w, req, versions),
+                .check => blk: {
+                    const code = try doCheck(a, io, w, req, versions);
+                    // A note under the result, whatever the result was, and
+                    // never the reason for it.
+                    try writeUnindexed(w, try migrate.unindexedReferences(a, desired.tables));
+                    break :blk code;
+                },
                 .status => try doStatus(gpa, io, w, req, try needs(w, db), versions),
                 .migrate => try doMigrate(gpa, w, try needs(w, db), versions),
                 .verify => try doVerify(gpa, w, try needs(w, db), versions),
@@ -313,6 +319,9 @@ pub fn Tool(comptime Db: type, comptime schema: migrate.Schema) type {
                     );
                 }
                 try writeTwins(w, req, out);
+                // The moment a schema changed is the moment a new foreign key
+                // may have arrived, so it is said here as well as in `check`.
+                try writeUnindexed(w, try migrate.unindexedReferences(a, desired.tables));
                 return ok;
             }
             try writeHeld(w, out, req);
@@ -445,7 +454,11 @@ pub fn Tool(comptime Db: type, comptime schema: migrate.Schema) type {
 
             const chain = try migrate.chainOf(tick.arena(), versions);
             try migrate.ensureLedger(db, &tick);
-            const at = try migrate.headVersion(db, &tick);
+            // The ledger once, whole: the head and every version's row are
+            // in it, where `status` asked for the head and then a `find` per
+            // version in the manifest.
+            const recorded = try migrate.readLedger(db, &tick);
+            const at = migrate.headOfLedger(recorded);
 
             if (versions.len == 0) {
                 try w.writeAll("No migrations. The manifest is empty.\n");
@@ -455,15 +468,15 @@ pub fn Tool(comptime Db: type, comptime schema: migrate.Schema) type {
             var waiting: usize = 0;
             var edited: usize = 0;
             for (chain.versions, chain.hashes) |v, hash| {
-                const row = try db.find(migrate.Applied, &tick, v.number);
-                const applied = row != null;
-                if (!applied) waiting += 1;
                 // The row already carries the hash, so saying `edited` here
                 // costs nothing over saying `applied`. It is worth saying:
                 // `status` is the command people run first, and a version
                 // whose file no longer matches what ran is the one thing it
                 // would otherwise report as fine.
-                const moved = if (row) |r| !std.mem.eql(u8, r.hash, hash) else false;
+                const standing = migrate.seen(recorded, v.number, hash);
+                const applied = standing.applied();
+                if (!applied) waiting += 1;
+                const moved = standing.edited();
                 if (moved) edited += 1;
                 // `{d:0>4}` on a signed integer puts the sign *after* the
                 // padding — version 3 prints as `00+3`. A version number is
@@ -509,17 +522,22 @@ pub fn Tool(comptime Db: type, comptime schema: migrate.Schema) type {
             defer tick.deinit();
 
             const chain = try migrate.chainOf(tick.arena(), versions);
+            // **Made once and read once.** This used to be `ensureLedger`,
+            // then `drift` (which made it again), the head, and `applyPending`
+            // (which made it and read it again): a BEGIN, a lock, a CREATE and
+            // a COMMIT three times on Postgres, and the ledger read three ways.
             try migrate.ensureLedger(db, &tick);
+            const recorded = try migrate.readLedger(db, &tick);
 
-            const moved = try migrate.drift(db, &tick, chain);
+            const moved = try migrate.driftIn(tick.arena(), recorded, chain);
             if (moved.len > 0) {
                 try writeDrift(w, moved);
                 try w.writeAll("\nNothing was applied. Sort that out first.\n");
                 return acted;
             }
 
-            const before = try migrate.headVersion(db, &tick);
-            const ran = try migrate.applyPending(db, &tick, chain);
+            const before = migrate.headOfLedger(recorded);
+            const ran = try migrate.applyRecorded(db, &tick, chain, recorded);
             if (ran == 0) {
                 try w.print("Nothing to do: the database is at {d}.\n", .{before});
                 return ok;
@@ -663,6 +681,49 @@ fn writeStale(w: *std.Io.Writer, req: Request, stale: []const []const u8) !void 
             "`db generate --name <what you changed>` writes them, and so does the " ++
             "next `db generate` of any kind.\n",
     );
+}
+
+/// The foreign keys no index leads with, as a note under whatever `check` or
+/// `generate` had to say. **A note and never a failure**: plenty of small
+/// tables do not need the index, and nothing is added for the caller because
+/// an index costs every insert into that table
+/// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
+/// Each line ends with the marker change that adds it.
+fn writeUnindexed(w: *std.Io.Writer, found: []const migrate.Unindexed) !void {
+    if (found.len == 0) return;
+    try w.print(
+        "\nNote: {d} foreign key(s) have no index that starts with the column that " ++
+            "points. Deleting a row of the table they point at reads every row of the " ++
+            "table they point from, and so does each ON DELETE CASCADE or SET NULL. " ++
+            "This does not fail `check`, and a small table can go without:\n",
+        .{found.len},
+    );
+    for (found) |f| {
+        try w.writeAll("  ");
+        if (f.schema) |s| try w.print("{s}.", .{s});
+        try w.print("{s} (", .{f.table});
+        for (f.columns, 0..) |c, i| try w.print("{s}{s}", .{ if (i == 0) "" else ", ", c });
+        try w.print(") -> {s}{s}: ", .{ f.parent, f.on_delete.clause() });
+
+        if (f.has_index) {
+            try w.writeAll("add `");
+            try writeIndexEntry(w, f.columns);
+            try w.print("` to the `.index` in {s}\n", .{f.row});
+        } else {
+            try w.writeAll("`.index = .{ ");
+            try writeIndexEntry(w, f.columns);
+            try w.print(" }}` in {s}\n", .{f.row});
+        }
+    }
+}
+
+/// One `.index` entry over `columns`: `.org_id` for one, and a tuple for
+/// several, which is one index over all of them and not one each.
+fn writeIndexEntry(w: *std.Io.Writer, columns: []const []const u8) !void {
+    if (columns.len == 1) return w.print(".{s}", .{columns[0]});
+    try w.writeAll(".{ ");
+    for (columns, 0..) |c, i| try w.print("{s}.{s}", .{ if (i == 0) "" else ", ", c });
+    try w.writeAll(" }");
 }
 
 /// Where the directory, the manifest and the snapshot disagree, one line for
@@ -1235,4 +1296,43 @@ test "a version file the manifest lost is named on screen with the fix" {
     try testing.expect(std.mem.indexOf(u8, said, "migrations/0008_tags.zig is not in manifest.zig") != null);
     try testing.expect(std.mem.indexOf(u8, said, "`@import` line") != null);
     try testing.expect(std.mem.indexOf(u8, said, "says version 9") != null);
+}
+
+test "a foreign key nothing indexes is a note with the marker that adds the index, and silence when every one is covered" {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try writeUnindexed(&w, &.{});
+    try testing.expectEqual(@as(usize, 0), w.buffered().len);
+
+    try writeUnindexed(&w, &.{
+        .{
+            .row = "app.Order",
+            .schema = null,
+            .table = "orders",
+            .name = "orders_customer_id_fkey",
+            .columns = &.{"customer_id"},
+            .parent = "customers",
+            .on_delete = .cascade,
+            .has_index = false,
+        },
+        .{
+            .row = "app.Line",
+            .schema = "shop",
+            .table = "lines",
+            .name = "lines_order_id_sku_fkey",
+            .columns = &.{ "order_id", "sku" },
+            .parent = "skus",
+            .on_delete = .no_action,
+            .has_index = true,
+        },
+    });
+    const said = w.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, said, "Note: 2 foreign key(s)") != null);
+    try testing.expect(std.mem.indexOf(u8, said, "does not fail `check`") != null);
+    try testing.expect(std.mem.indexOf(u8, said, "orders (customer_id) -> customers ON DELETE CASCADE: `.index = .{ .customer_id }` in app.Order") != null);
+    // Several columns are one index over all of them, added to the list the
+    // table already has.
+    try testing.expect(std.mem.indexOf(u8, said, "shop.lines (order_id, sku) -> skus: add `.{ .order_id, .sku }` to the `.index` in app.Line") != null);
 }

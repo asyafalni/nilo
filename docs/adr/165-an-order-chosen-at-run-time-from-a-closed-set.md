@@ -146,3 +146,9 @@ compile error. The closed set is declared, the way everything else here is.
   `{order}`.
 - The port's `platform/listsort.zig` — the CASE ladder and its `clause` —
   goes, and the flagship list is one statement.
+- The mechanism is used a second time by [ADR 149](149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md):
+  a statement holding a `sql.given` is cut into constant pieces and written per
+  call, and one that is also ordered writes its cut head, the order and the tail
+  in the one allocation (`db.splicedGuards`). The fixed cost of an ordered
+  statement being unnamed is unchanged; a statement that is cut and not ordered
+  is named per combination of its guards, up to three of them.

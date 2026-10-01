@@ -40,6 +40,7 @@
 const std = @import("std");
 
 const ddl = @import("ddl.zig");
+const dialect_mod = @import("dialect.zig");
 const migrate = @import("migrate.zig");
 const snapshot = @import("snapshot.zig");
 const table_mod = @import("table.zig");
@@ -664,16 +665,55 @@ pub fn renderSql(
     // that refuses any count but nought. `apply` rolls back with
     // `ForeignKeyViolated` on the same rows, and the twin carries the same
     // pragmas as `apply` does (ADR 123).
-    if (off) try w.writeAll(
-        \\CREATE TEMP TABLE "nilo_foreign_key_check" ("violations" INTEGER CONSTRAINT "foreign_key_check_found_rows" CHECK ("violations" = 0));
-        \\INSERT INTO "nilo_foreign_key_check" SELECT count(*) FROM pragma_foreign_key_check;
-        \\DROP TABLE "nilo_foreign_key_check";
-        \\
-        \\
-    );
+    //
+    // **Only the tables the version dropped, and the rows pointing at them**,
+    // the scope `sqlite.zig`'s check before COMMIT has, so an old violation in
+    // a table the version never touched stops neither. A drop it cannot read
+    // leaves the filter off, and every key is checked.
+    if (off) {
+        try w.writeAll(
+            \\CREATE TEMP TABLE "nilo_foreign_key_check" ("violations" INTEGER CONSTRAINT "foreign_key_check_found_rows" CHECK ("violations" = 0));
+            \\INSERT INTO "nilo_foreign_key_check" SELECT count(*) FROM pragma_foreign_key_check
+        );
+        try writeDroppedFilter(w, version.steps);
+        try w.writeAll(
+            \\;
+            \\DROP TABLE "nilo_foreign_key_check";
+            \\
+            \\
+        );
+    }
     try w.writeAll("COMMIT;\n");
     if (off) try w.writeAll("\nPRAGMA foreign_keys = ON;\n");
     return aw.toOwnedSlice();
+}
+
+/// ` WHERE "table" IN (…) OR "parent" IN (…)` over the tables `steps` drop,
+/// or nothing when they name none or one cannot be read
+/// (`dialect.Drops`; `sqlite.zig`'s `foreignKeyCheck` writes the same).
+fn writeDroppedFilter(w: *std.Io.Writer, steps: []const migrate.Step) !void {
+    var any = false;
+    for (steps) |step| {
+        var drops: dialect_mod.Drops = .{ .text = step.sql };
+        while (drops.next() catch return) |_| any = true;
+    }
+    if (!any) return;
+    inline for (.{ "table", "parent" }, 0..) |column, pass| {
+        try w.writeAll(if (pass == 0) " WHERE \"" else " OR \"");
+        try w.writeAll(column ++ "\" COLLATE NOCASE IN (");
+        var first = true;
+        for (steps) |step| {
+            var drops: dialect_mod.Drops = .{ .text = step.sql };
+            while (drops.next() catch return) |name| {
+                if (!first) try w.writeAll(", ");
+                first = false;
+                try w.writeAll("'");
+                try writeSqlLiteral(w, name);
+                try w.writeAll("'");
+            }
+        }
+        try w.writeAll(")");
+    }
 }
 
 /// One piece of text inside a SQL literal, with a quote doubled — the same rule
@@ -1377,7 +1417,14 @@ test "a SQLite twin runs a version that drops a table with foreign keys off and 
 
     const off = std.mem.indexOf(u8, text, "PRAGMA foreign_keys = OFF;").?;
     const begin = std.mem.indexOf(u8, text, "BEGIN;").?;
-    const checked = std.mem.indexOf(u8, text, "FROM pragma_foreign_key_check;").?;
+    const checked = std.mem.indexOf(u8, text, "FROM pragma_foreign_key_check").?;
+    // Narrowed to the table the version dropped and the rows pointing at it,
+    // where it used to count every violation in the file.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        text,
+        "pragma_foreign_key_check WHERE \"table\" COLLATE NOCASE IN ('old') OR \"parent\" COLLATE NOCASE IN ('old');",
+    ) != null);
     const commit = std.mem.indexOf(u8, text, "COMMIT;").?;
     const on = std.mem.indexOf(u8, text, "PRAGMA foreign_keys = ON;").?;
     // Off before the BEGIN, because SQLite ignores it inside a transaction.

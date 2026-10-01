@@ -302,6 +302,30 @@ const sql_refusals = [_]Refusal{
         .says = "an entry of `.across` holds a `sql.given` beside another condition.",
     },
     .{
+        .name = "across_with_a_negated_operator",
+        .says = "an entry of `.across` sets `.not_icontains`, which is a negation.",
+    },
+    .{
+        .name = "given_on_a_null_safe_operator",
+        .says = "the condition on `deleted_at` (as `not_distinct_from`) was given a `sql.given`.",
+    },
+    .{
+        .name = "shape_parent_named_like_a_schema_table",
+        .says = "shape_parent_named_like_a_schema_table.OrderCard's parent `orders` would be joined under the name of the table the statement reads.",
+    },
+    .{
+        .name = "shape_max_over_a_bool",
+        .says = "shape_max_over_a_bool.ByCustomer reads `.any_shipped`, the max of `shipped`, which is a bool.",
+    },
+    .{
+        .name = "children_max_over_a_uuid",
+        .says = "children_max_over_a_uuid.EpicCard reads `.newest`, the max of `public`, which is a Uuid.",
+    },
+    .{
+        .name = "list_column_of_a_timestamp",
+        .says = "list_column_of_a_timestamp.Slot reads `opens` as []const types.Timestamp, a list of types.Timestamp, which the driver cannot decode as an array element.",
+    },
+    .{
         .name = "across_on_one_column",
         .says = "`.across` names one column.",
     },
@@ -483,6 +507,10 @@ const sql_refusals = [_]Refusal{
     .{
         .name = "raw_with_fewer_values_than_placeholders",
         .says = "the statement handed to `db.raw` names $2 and was given 1 value.",
+    },
+    .{
+        .name = "raw_with_a_gap_in_its_placeholders",
+        .says = "the statement handed to `db.raw` names $3 and never uses $2.",
     },
     .{
         .name = "raw_page_without_a_total",

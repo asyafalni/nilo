@@ -82,22 +82,63 @@ Four filters on one screen is sixteen copies of that, sixteen prepared
 statements per connection, and a plan cache that thrashes as somebody clicks the
 dropdowns.
 
-The guard is one statement, one parameter list, one prepared name, one plan
-entry, and **the same SQL the port already writes by hand** — its `db.raw` has a
+The guard is one statement, one parameter list and one values tuple, and
+**the same SQL the port already writes by hand**: its `db.raw` has a
 `$2::text IS NULL OR` in front of it (the cast is what a hand-written guard
 needs on Postgres; the amendment above is how the generated one does without). Nothing about `Statement` changes, so no
 consumer of one has to learn that it might be a set of statements.
 
-**What the guard costs is the planner, and what it costs depends on the database.**
+**What the guard costs is the planner, so the database is never handed it.**
+A statement holding a `sql.given` is still compiled as the guard, and the
+text a call sends is that statement with each guard cut out
+(`statement.spliceOf`, `db.textOf`): a term whose value is there is written
+alone, `("cust" = $1)`, and a term whose value is not is written as an
+always-true test on the same placeholder, `($1::text IS NULL)` on Postgres and
+`(?1 IS NULL)` on SQLite (`Dialect.absentTerm`). There is no `OR` left for a
+plan made before the value was bound to stop on, so SQLite's plan at prepare
+and Postgres's generic plan both seek. This is the way ADR 165 puts an
+`ORDER BY` into a statement, and it keeps that ADR's property: **no run-time
+string reaches the statement.** `spliceOf` reads the guards out of the
+finished text while compiling and cuts it into pieces that are slices of it,
+so every piece was checked with the statement, and the request only chooses,
+for each guard, between two constants. The text is written into the arena in
+one allocation sized while compiling, and an ordered statement writes its
+cut head, the order and its tail into the same one.
 
-On **Postgres a statement with a `sql.given` in it is sent unnamed**, so
-every call is planned for its own values (`Dialect.plan_may_go_generic`,
-`statement.dropsTerms`, `db.planOf`). With `$1` null, `$1 IS NULL` folds to
-true and the disjunct disappears; with `$1` set it folds to false and
-`false OR term` is `term`, which seeks. That is the plan the 2ᵏ version would
-have compiled, one statement instead of 2ᵏ. A statement with nothing that can
-drop keeps its name and its 12 µs (ADR 051): the choice is made while
-compiling, from the parameters, and costs no branch a request can see.
+**The numbering does not move.** The values tuple is the one the guard had,
+and every placeholder stays in the text: the absent stand-in names it, because
+SQLite counts parameters by the highest number it finds and binding one past
+it is `SQLITE_RANGE`, and Postgres cannot leave `$2` out of a `Parse` that
+sends no parameter types. The cast is what types it there. The term that used
+to is gone, and the value is NULL whenever the cast is written, which is the
+same bytes under `text`, an enum, a `uuid` and an array; `sql/live.zig` runs
+each shape of the guard against Postgres, set and unset.
+
+**One name for each combination, up to three guards.** The plan name is the
+name of the full text and the combination after it (`statement.planNames`), so
+a Db keeps at most 2ᵏ prepared texts of one call site on each connection,
+k ≤ `max_named_guards` = 3, that is eight. Past three the statement is cut and
+runs unnamed, so what a request can make a connection remember is a number
+written in `statement.zig` and not the number of filters a screen has, the
+objection ADR 165 raised to naming its thirty thousand texts. **A kept plan
+is safe again because the text no longer holds a term the plan can go wrong on**:
+a generic plan for `("cust" = $1) AND ($2::text IS NULL)` is the index scan
+with a one-time filter (sql.md §25).
+
+**Nothing is instantiated 2ᵏ times.** The tuple and `fill` are the ones of the
+one statement. What the binary carries for a guarded statement is a second copy
+of each guarded term, its stand-in, and the text between guards, which are bytes,
+and none of it is code. That is the difference from the rejected 2ᵏ
+statements.
+
+**A statement whose guards cannot all be found is not cut.** A Dialect without
+`splice_given`, a guard not written in the shape `where.zig` writes it, or one
+nested in another leaves the statement as the guard, which is correct: SQLite
+keeps it under its name and reads the table, and Postgres sends it unnamed and
+plans each call for its values (`Dialect.plan_may_go_generic`,
+`statement.dropsTerms`, `db.planOf`, which is the rule this section held
+before and is still the floor). A statement with nothing that can drop keeps
+its name and its 12 µs (ADR 051).
 
 **A kept plan was the bug, not the lever.** This section used to say a
 custom plan is used for the first five executions and for as long after as it
@@ -112,18 +153,17 @@ sets the filter reads the whole table: 500,000 rows, `Parallel Seq Scan` at
 of the connection, so it would also have taken the generic plan away from the
 cheap key lookups that are the reason the default exists.
 
-**On SQLite the guard stays and so does the scan.** A statement there is
-planned once, when it is prepared, before any value is bound, so
-`("cust" = ?1 OR ?1 IS NULL)` is `SCAN` on the first call and on every one
-after, and preparing it again would plan it the same way: 29 ms a query
-against 0.044 ms for the bare term on 500,000 rows (§22). The only cure is a
-text without the term when the filter is absent and without the guard when it
-is present, which is the 2ᵏ statements rejected above. SQLite is the Dialect
-whose tables are read out of one file's page cache and whose lists are
-usually short; a table where it matters branches once on the filter and calls
-`db.select` twice, which is the cost this ADR started from. If a port on
-SQLite files a list screen that scans a large table, that is the number that
-reopens the question.
+**On SQLite the cut is the whole cure, and the guard as written was a scan.**
+A statement there is planned once, when it is prepared, before any value is
+bound, so `("cust" = ?1 OR ?1 IS NULL)` is `SCAN` on the first call and on every
+one after, and preparing it again plans it the same way: 29 ms a query against
+0.044 ms for the bare term on 500,000 rows (§22). This ADR once left it there
+and told a table where it mattered to branch on the filter and call `db.select`
+twice. The text without the term when the filter is absent and without the guard
+when it is present is what the cut sends, as a piece of the same statement: 69
+ms against 0.055 ms with one of two filters set, and 63 ms against 1.1 ms with
+both (sql.md §25). Past three guards it is prepared on every call, which cost
+0 to 20 µs on a seek of 55 µs.
 
 ## Inside an `EXISTS` the guard goes round the outside
 
@@ -255,6 +295,23 @@ held back from a list by a rule about a case the caller was not asking about.
 this ADR shipped with. It relied on Postgres choosing a custom plan for as long
 as it matters, and it does not: see above and §22.
 
+**The guard sent unnamed on Postgres and left as a scan on SQLite**, the rule
+this ADR held from §22 until the cut. It cost Postgres a Parse and a plan on
+every call, about 0.13 ms against a named cut text on the sample (§25, ten
+times ADR 051's figure for the Parse alone), and it left SQLite reading the
+table. Both come from the guard being in the text; it is not now, and
+`plan_may_go_generic` is the floor for a statement that could not be cut.
+
+**Naming every combination without a bound**, which the cut makes possible: a
+call site with k guards has 2ᵏ texts, and a cache a client can grow by ticking
+boxes is the one ADR 165 refused for an ordering. Up to three guards the 2ᵏ is
+eight and is kept; past that the statement runs unnamed.
+
+**Renumbering the placeholders so the absent one is left out of the text and
+the tuple.** It would need a tuple of a different type per combination, which is
+the 2ᵏ instantiations again. Keeping the placeholder in a test that is true costs
+nothing and leaves the tuple alone.
+
 **`SET plan_cache_mode = force_custom_plan` on the connection**, which was
 offered as the lever. It applies to every statement the connection prepares,
 so the key lookups and inserts that gain from a generic plan lose their
@@ -262,15 +319,25 @@ skipped planning to fix the one shape that needed it.
 
 ## Against ADR 017's four axes
 
-- **Allocations per request: zero.** The wrapper is a struct holding an
-  optional, passed by value into the same tuple every other parameter goes
-  into.
-- **Memory per idle connection: zero.**
-- **Throughput: on Postgres a statement holding a `sql.given` is parsed on every call, ~12 µs (ADR 051), in return for a plan that seeks; zero elsewhere.** The parameter binds as an optional
-  where it would have bound as a value — the same branch `not_distinct_from`
-  has had since ADR 040. What it costs the *database* is the section above.
-- **Binary size: one statement rather than 2ᵏ**, which is the axis that decided
-  the design.
+- **Allocations per request: one, for a statement holding a `sql.given`, and
+  zero for every other.** The wrapper is a struct holding an optional, passed by
+  value into the same tuple every other parameter goes into; the one allocation
+  is the cut text, sized while compiling (`db.splicedGuards`, no larger than the
+  statement as written), and a statement ADR 165 orders takes it in the
+  allocation it already made. A statement with no guard is `stmt.sql`, and the
+  cut is one comptime-false branch.
+- **Memory per idle connection: zero.** What a connection keeps is at most 2ᵏ
+  prepared texts a call site, k ≤ 3, and only for combinations that were sent
+  (the cap is `statement.max_named_guards`).
+- **Throughput: on Postgres about 0.13 ms a call faster than the unnamed guard,
+  and SQLite 69 ms to 0.055 ms on the sample (sql.md §25).** The cost is the
+  writing of the text, one pass over a few hundred bytes, and, past three
+  guards, a Parse or a prepare on each call, 0 to 20 µs on SQLite. The
+  parameter binds as an optional where it would have bound as a value, the same
+  branch `not_distinct_from` has had since ADR 040.
+- **Binary size: the guarded terms twice, not 2ᵏ statements.** One tuple, one
+  `fill`, and per guard a copy of its term, the stand-in and the text between,
+  which is what the axis that decided the design allows.
 
 ## Consequences
 
@@ -284,3 +351,10 @@ skipped planning to fix the one shape that needed it.
 - `Param` carries `droppable`, which is what `statement.zig` reads to refuse the
   update and the delete. It is set in `State.take` rather than at the six call
   sites that build parameters, so no operator has to remember it.
+- `Dialect.splice_given` and `absentTerm`, both optional for a Dialect that does
+  not cut; `statement.spliceOf` finds the guards, `planNames` names a text per
+  combination, and `db.textOf`, `db.planFor` and `db.splicedGuards` are the run
+  time half. The typed reads that take a `sql.given` (`select`, `one`, `page`,
+  `feed`, `stream`, `count`, `exists`, and their `tx` forms) send the cut text.
+  The text `Select`, `Count` and the other public statement types show is the
+  guard as compiled, not the text of a call.

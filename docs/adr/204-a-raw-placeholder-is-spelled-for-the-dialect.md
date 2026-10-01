@@ -34,9 +34,12 @@ runs.
 `n`th placeholder, while compiling, and their count is held against the
 values.**
 
-`rawcheck.spelled(D, sql)` walks the text with the same quote-and-comment
-skipping `scan` uses, and where it finds `$` followed by digits at a word
-boundary writes `D.placeholder(n)` instead. For a Dialect whose own spelling
+`rawcheck.spelled(D, sql)` reads the text as the tokens every reader in
+`rawcheck.zig` shares (one pass; strings, `E'…'` strings, `$$…$$` and
+`$tag$…$tag$` bodies, quoted names and nested comments are single tokens), and
+where it finds a `$n` token writes `D.placeholder(n)` instead. A `$5` inside
+a dollar-quoted body is text and is left alone. Text the tokenizer cannot
+finish, an unterminated quote, is sent as written. For a Dialect whose own spelling
 is `$n` it is the identity and the text is the same slice; Postgres pays
 nothing and nothing about it changes. Every call that takes comptime text
 goes through it: `raw`, `rawOne`, `rawExactlyOne`, `rawPage`, `rawOrdered`,
@@ -44,10 +47,14 @@ and the `Tx` versions. The plan name a prepared statement is kept under is
 the respelled text's.
 
 `rawcheck.assertParams(sql, V, call)` is Postgres's rule said while
-compiling: the placeholders are `$1` up to `$n` with no gap, and a tuple of
-`n` values binds them. A `$n` used twice is one value. A statement with no
-`$n` at all is left alone, so `?1`, a bare `?` and a named struct of values
-are still the driver's to read.
+compiling: the placeholders are `$1` up to `$n` with **no gap**, and a tuple
+of `n` values binds them. `$1, $3` with three values is refused, naming the
+number nothing uses; `$1` alone with two values is refused as before. A `$n`
+used twice is one value. A statement with no `$n` is held by its `?n` the
+same way (SQLite's own spelling: `b=?1 AND c=?3` with three values is the
+same gap), unless it also has a bare `?`, which takes the next free number
+and which Postgres reads as an operator; then, and for a named struct of
+values, the driver reads it.
 
 `db.exec` takes its text at run time and sends it as written. Its
 statements are DDL and `PRAGMA` almost without exception, and rewriting a
@@ -71,14 +78,16 @@ the binding, not the order of appearance.
 
 ## What it costs
 
-A comptime walk of each raw statement's text, paid once per statement per
-compilation, inside the branch quota `scan` already asks for. Nothing at run
-time. Two refusals.
+One comptime tokenizing pass over each raw statement's text, memoized by the
+compiler so `scan`, `paging`, `spelled` and `assertParams` share it (they used
+to walk the text once each, with their own copy of the quote handling), inside
+the branch quota `scan` already asks for. Nothing at run time. Three refusals.
 
 ## Consequences
 
 - `sql/rawcheck.zig`: `highestParam`, `spelled`, `assertParams`.
 - `sql/db.zig`: `rawText`, called by every raw call with comptime text.
-- `sql/refusals/raw_with_fewer_values_than_placeholders.zig`.
+- `sql/refusals/raw_with_fewer_values_than_placeholders.zig` and
+  `sql/refusals/raw_with_a_gap_in_its_placeholders.zig`.
 - The raw guide gains a section on what a parameter may be and what SQLite
   does differently, and the SQLite page says `$n` is one text for both.

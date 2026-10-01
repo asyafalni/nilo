@@ -666,6 +666,62 @@ test "createMissing makes a schema's views after its tables, and a second run le
     try testing.expectEqualStrings("alpha", names[0]);
 }
 
+/// The `orgs` table under a trigger, in two versions of its text.
+const OrgTouchedOnce = struct {
+    pub const nilo_table = .{
+        .name = "orgs",
+        .key = .id,
+        .trigger = .{ .orgs_touch = .{ .when = "AFTER INSERT", .run = "FOR EACH ROW BEGIN SELECT 1; END" } },
+    };
+
+    id: i64,
+    name: []const u8,
+};
+
+const OrgTouchedTwice = struct {
+    pub const nilo_table = .{
+        .name = "orgs",
+        .key = .id,
+        .trigger = .{ .orgs_touch = .{ .when = "AFTER INSERT", .run = "FOR EACH ROW BEGIN SELECT 2; END" } },
+    };
+
+    id: i64,
+    name: []const u8,
+};
+
+test "createMissing updates a view and a trigger whose text changed, and sends nothing for one that did not" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "repeatables");
+    defer fx.deinit(gpa);
+
+    const once: sql.Schema = .{
+        .tables = &.{OrgTouchedOnce},
+        .views = &.{.{ .name = "org_names", .body = "SELECT name FROM orgs ORDER BY name" }},
+    };
+    const twice: sql.Schema = .{
+        .tables = &.{OrgTouchedTwice},
+        .views = &.{.{ .name = "org_names", .body = "SELECT name FROM orgs ORDER BY name DESC" }},
+    };
+    try migrate.createMissing(&fx.db, &fx.run, once);
+    _ = try fx.db.insert(Org, &fx.run, .{ .name = "alpha" });
+    _ = try fx.db.insert(Org, &fx.run, .{ .name = "beta" });
+
+    // A boot with nothing changed sends no DDL, which is visible as the
+    // schema version not moving: `IF NOT EXISTS` sent it every time.
+    const before = try fx.db.raw(i64, &fx.run, "SELECT schema_version FROM pragma_schema_version", .{});
+    try migrate.createMissing(&fx.db, &fx.run, once);
+    const after = try fx.db.raw(i64, &fx.run, "SELECT schema_version FROM pragma_schema_version", .{});
+    try testing.expectEqual(before[0], after[0]);
+
+    // A changed text was never updated here, and Postgres replaced it.
+    try migrate.createMissing(&fx.db, &fx.run, twice);
+    const names = try fx.db.raw([]const u8, &fx.run, "SELECT name FROM org_names", .{});
+    try testing.expectEqualStrings("beta", names[0]);
+    const trigger = try fx.db.raw([]const u8, &fx.run, "SELECT sql FROM sqlite_master WHERE name = 'orgs_touch'", .{});
+    try testing.expectEqual(@as(usize, 1), trigger.len);
+    try testing.expect(std.mem.indexOf(u8, trigger[0], "SELECT 2;") != null);
+}
+
 test "the case-folding unique is the one that stops two addresses differing only in case" {
     const gpa = testing.allocator;
     var fx = try Fixture.init(gpa, "folding");

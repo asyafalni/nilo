@@ -135,6 +135,145 @@ pub fn dropsTerms(comptime stmt: Statement) bool {
     };
 }
 
+/// One guard of a statement, cut out of its text while compiling
+/// ([ADR 149](../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
+pub const Guard = struct {
+    /// The text from the end of the guard before this one (or the start of
+    /// the statement) up to the `(` that opens this one.
+    before: []const u8,
+    /// What stands in for the guard when the value is there: the term alone,
+    /// in brackets, which is the text that seeks.
+    present: []const u8,
+    /// What stands in when it is not: the Dialect's always-true test on the
+    /// same placeholder (`absentTerm`), so `?n` is still in the text.
+    absent: []const u8,
+    /// The placeholder's number, so its value is `paths[n - 1]`.
+    n: usize,
+};
+
+/// A statement's text as pieces: `guards[0].before`, one of its two stand-ins,
+/// `guards[1].before`, … and `rest`. Empty for a statement with no guard, and
+/// for one on a Dialect that does not splice.
+pub const Splice = struct {
+    guards: []const Guard = &.{},
+    /// The text after the last guard.
+    rest: []const u8 = "",
+    /// How many bytes the widest combination is longer than the statement as
+    /// written. The guard is longer than the term alone, so this is nonzero
+    /// only when a Dialect's absent test is longer than a short guard.
+    spare: usize = 0,
+};
+
+/// The most guards whose every combination is kept prepared under a name of
+/// its own: 2³ = 8 texts a statement, on each connection. A statement with
+/// more is still spliced and runs unnamed, so the cache a request can grow is
+/// bounded by a number written here and not by the screen's filter count
+/// ([ADR 149](../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
+pub const max_named_guards = 3;
+
+/// Find each guard in the finished text of `stmt`, so `db.zig` can write the
+/// statement without the ones whose value is not there.
+///
+/// **The text is read for what nilo wrote and nothing else.** `where.zig`
+/// writes a guard as `(term OR <placeholder n> IS NULL)` for a parameter it
+/// marked `droppable`, and this looks for that closing shape and matches its
+/// bracket, stepping over quoted names and literals so a `(` inside one is
+/// not counted. Nothing in it is a value: every piece is a slice of the
+/// constant, and the request only chooses between two of them, which is the
+/// property ADR 165 kept for the `ORDER BY` (no run-time string reaches the
+/// statement).
+///
+/// **A statement whose guards are not all found is not spliced**, and runs as
+/// it always did: the guard as written, which is correct and slow. That is a
+/// fall-back rather than a Refusal because the text is the only thing at
+/// stake, not the answer.
+pub fn spliceOf(comptime D: type, comptime stmt: Statement) Splice {
+    return comptime blk: {
+        if (!dropsTerms(stmt)) break :blk .{};
+        if (!(@hasDecl(D, "splice_given") and D.splice_given)) break :blk .{};
+        const sql = stmt.sql;
+        @setEvalBranchQuota(200 * sql.len + 20 * stmt.params.len * sql.len + 20_000);
+
+        var found: [stmt.params.len]Guard = undefined;
+        var made: usize = 0;
+        var spare: usize = 0;
+        var stack: [256]usize = undefined;
+        var depth: usize = 0;
+        var quote: u8 = 0;
+        var from: usize = 0;
+        var i: usize = 0;
+        while (i < sql.len) : (i += 1) {
+            const ch = sql[i];
+            if (quote != 0) {
+                if (ch == quote) quote = 0;
+                continue;
+            }
+            if (ch == '\'' or ch == '"') {
+                quote = ch;
+                continue;
+            }
+            if (ch == '(') {
+                if (depth == stack.len) break :blk .{};
+                stack[depth] = i;
+                depth += 1;
+                continue;
+            }
+            if (ch != ')' or depth == 0) continue;
+            depth -= 1;
+            const open = stack[depth];
+            for (stmt.params, 0..) |p, at| {
+                if (!p.droppable) continue;
+                const n = at + 1;
+                const suffix = " OR " ++ D.placeholder(n) ++ " IS NULL)";
+                if (i + 1 < suffix.len) continue;
+                if (!std.mem.eql(u8, sql[i + 1 - suffix.len .. i + 1], suffix)) continue;
+                const term_end = i + 1 - suffix.len;
+                // A guard inside a guard is not something `where.zig` writes;
+                // if one ever appears, whole-text is the safe reading.
+                if (open < from or open >= term_end or made == found.len) break :blk .{};
+                const absent = D.absentTerm(n);
+                found[made] = .{
+                    .before = sql[from..open],
+                    .present = sql[open..term_end] ++ ")",
+                    .absent = absent,
+                    .n = n,
+                };
+                made += 1;
+                if (absent.len > i + 1 - open) spare += absent.len - (i + 1 - open);
+                from = i + 1;
+                break;
+            }
+        }
+        // Every droppable parameter has to have been found, or a term would
+        // stay guarded while its neighbours were not.
+        for (stmt.params, 0..) |p, at| {
+            if (!p.droppable) continue;
+            var seen = false;
+            for (found[0..made]) |g| {
+                if (g.n == at + 1) seen = true;
+            }
+            if (!seen) break :blk .{};
+        }
+        if (made == 0) break :blk .{};
+        const frozen = found[0..made].*;
+        break :blk .{ .guards = &frozen, .rest = sql[from..], .spare = spare };
+    };
+}
+
+/// The names a spliced statement is kept under, one for each combination of
+/// its guards: the name of the full text and the combination in hex, so no
+/// two texts share one (ADR 051's collision argument holds per text).
+pub fn planNames(comptime stmt: Statement, comptime k: usize) [1 << k][]const u8 {
+    return comptime blk: {
+        const base = planName(stmt.sql);
+        var out: [1 << k][]const u8 = undefined;
+        for (&out, 0..) |*slot, mask| {
+            slot.* = base ++ std.fmt.comptimePrint("_{x}", .{mask});
+        }
+        break :blk out;
+    };
+}
+
 /// The Row's table, quoted, with its schema in front when the Row named one.
 /// One function rather than seven call sites, because a `FROM` and an
 /// `INSERT INTO` have to spell the same relation the same way.
@@ -3492,6 +3631,53 @@ test "only a statement with a term that can drop is one a kept plan gets wrong" 
     // with one keeps its name.
     const o = .{ .set = .{ .kind = where_mod.given(@as(?[]const u8, null)) }, .where = .{ .id = 7 } };
     try testing.expect(!comptime dropsTerms(update(Pg, RabLine, @TypeOf(o))));
+}
+
+test "a guard is found in the finished text and cut into pieces the request chooses between" {
+    const maybe: ?[]const u8 = null;
+    const age: ?i32 = null;
+    const o = .{ .where = .{ .email = where_mod.given(maybe), .age = .{ .gt = where_mod.given(age) } } };
+    const pg = comptime select(Pg, User, @TypeOf(o));
+    const cut = comptime spliceOf(Pg, pg);
+    try testing.expectEqual(@as(usize, 2), cut.guards.len);
+    try testing.expect(std.mem.endsWith(u8, cut.guards[0].before, " WHERE "));
+    try testing.expectEqualStrings("(\"email\" = $1)", cut.guards[0].present);
+    try testing.expectEqualStrings("($1::text IS NULL)", cut.guards[0].absent);
+    try testing.expectEqualStrings(" AND ", cut.guards[1].before);
+    try testing.expectEqualStrings("(\"age\" > $2)", cut.guards[1].present);
+    try testing.expectEqualStrings("($2::text IS NULL)", cut.guards[1].absent);
+    try testing.expectEqualStrings("", cut.rest);
+    try testing.expectEqual(@as(usize, 1), cut.guards[0].n);
+    try testing.expectEqual(@as(usize, 2), cut.guards[1].n);
+    // Nothing was invented: the pieces, with each guard's tail put back, are
+    // the statement as written.
+    try testing.expectEqualStrings(
+        pg.sql,
+        comptime cut.guards[0].before ++ cut.guards[0].present[0 .. cut.guards[0].present.len - 1] ++
+            " OR $1 IS NULL)" ++ cut.guards[1].before ++
+            cut.guards[1].present[0 .. cut.guards[1].present.len - 1] ++ " OR $2 IS NULL)" ++ cut.rest,
+    );
+
+    // The same statement on SQLite keeps `?n` in the stand-in, so every value
+    // the tuple binds still has a placeholder to bind to.
+    const lite = comptime spliceOf(Lite, select(Lite, User, @TypeOf(o)));
+    try testing.expectEqual(@as(usize, 2), lite.guards.len);
+    try testing.expectEqualStrings("(\"email\" = ?1)", lite.guards[0].present);
+    try testing.expectEqualStrings("(?1 IS NULL)", lite.guards[0].absent);
+    try testing.expectEqualStrings("(?2 IS NULL)", lite.guards[1].absent);
+
+    // No guard, no pieces; and a statement whose only given is a `.set` has
+    // none either, because that one never drops.
+    const plain = comptime spliceOf(Pg, select(Pg, User, @TypeOf(.{ .where = .{ .age = @as(i32, 3) } })));
+    try testing.expectEqual(@as(usize, 0), plain.guards.len);
+    // One name for each combination, and no two alike.
+    const names = comptime planNames(pg, 2);
+    try testing.expectEqual(@as(usize, 4), names.len);
+    inline for (names, 0..) |a, i| {
+        inline for (names, 0..) |b, j| {
+            if (i != j) try testing.expect(!std.mem.eql(u8, a, b));
+        }
+    }
 }
 
 test "a given in a set keeps the column when the value is null, which is a patch" {

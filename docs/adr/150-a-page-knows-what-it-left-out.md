@@ -177,13 +177,14 @@ only reason to want a cursor; a caller who needs the mixed order writes it in
 **`.after = sql.given(cursor)`, one statement for the first screen and the
 rest**, dropping the comparison when the cursor is null. The dropped term is
 spelled `$1 IS NULL OR …`, and an `OR` beside the comparison is what stops the
-seek on a plan made for no value. Postgres would now plan that statement for
-each call's values ([ADR 149](149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)
-sends a statement with a `sql.given` unnamed, which is where this reasoning and
-that one used to disagree), so the seek would survive there at the price of a
-Parse a page. SQLite plans once, before any value, and keeps the scan. Two
-calls, with a cursor and without, are two statements each planned for what it
-asks, on both.
+seek on a plan made for no value. That price is gone:
+[ADR 149](149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md) writes a
+statement holding a `sql.given` without the guard on both databases, the
+comparison alone when the cursor is there and none when it is not, so the seek
+survives on Postgres without a Parse a page and on SQLite without the scan. It is
+still not built (`.after` takes the last row's values and nothing optional), and
+the two calls it would replace, with a cursor and without, are the same two
+texts; this is the place to revisit if a caller asks.
 
 ## Consequences
 

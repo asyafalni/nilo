@@ -277,6 +277,8 @@ comptime {
 }
 ```
 
+A `.max` or `.min` (here and in `nilo_aggregate`) is rejected over a `bool`, a `sql.Uuid`, `sql.Bytes` and `sql.Json`: Postgres has no such aggregate, and SQLite would answer in an order nobody chose.
+
 The second entry's `.where` goes through `approver_id` into the staff row it points at, the same way an aggregate's does below. That table is joined once, inside the subquery, and a reference points at one row or none, so what is counted is still invoices.
 
 Every `.where` here has its values written in, because it is part of the Row, not of a request. It accepts a value, `null`, `.eq`, `.ne`, `.gt`, `.gte`, `.lt`, `.lte`, `.in` and `.not_in`, `.now` and `.today`, and a path through a reference. A filter that comes from the request goes in the read's own `.where`. A `.limit` on a list of children is rejected, because one statement reads the children of every row and a limit there would cut across rows.

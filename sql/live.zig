@@ -4048,7 +4048,7 @@ test "paging through an order that ties sees every row once" {
     for (seen) |was| try testing.expect(was);
 }
 
-test "an empty batch is a statement that stores nothing, not a special case" {
+test "an empty batch stores nothing and sends nothing" {
     const gpa = testing.allocator;
     var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
     defer stack.close(gpa);
@@ -4060,10 +4060,9 @@ test "an empty batch is a statement that stores nothing, not a special case" {
     const none: []const Newcomer = &.{};
     const stored = try stack.db.insertMany(Person, &run, none);
 
-    // `unnest` of empty arrays yields no rows, so the statement runs, inserts
-    // nothing and answers with nothing. Writing a `if (rows.len == 0) return`
-    // here would be a second answer to a question the database already has
-    // one for.
+    // `unnest` of empty arrays yields no rows, so the answer is known without
+    // asking: the call returns it and sends nothing (`db.insertMany`, and
+    // `db.zig` has the test that nothing goes down the wire).
     try testing.expectEqual(@as(usize, 0), stored.len);
     try testing.expectEqual(before, try stack.db.count(Person, &run, .{}));
 }
@@ -6637,7 +6636,7 @@ test "a feed after a cursor over a Date binds it through its cast and reads ever
 
 const guarded_table = "nilo_live_guarded_" ++ mode_suffix;
 
-test "a statement holding a given is planned for each call's values, and a plain one stays kept on Postgres" {
+test "a statement holding a given keeps one plan a combination, none of them the guard a generic plan cannot seek on" {
     // A kept plan goes generic after five calls, and on the generic plan
     // `("cust" = $1 OR $1 IS NULL)` cannot seek: with a table this size the
     // call that finally sets the filter read all of it (sql.md section 22).
@@ -6685,10 +6684,14 @@ test "a statement holding a given is planned for each call's values, and a plain
 
     const named = "SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE '%" ++ guarded_table ++
         "%' AND statement NOT LIKE '%pg_prepared_statements%'";
-    const guarded = try db.rawExactlyOne(i64, &run, named ++ " AND statement LIKE '%IS NULL%'", .{});
+    // The guard is cut out of the text per call (ADR 149): no kept plan holds
+    // `("cust" = $1 OR $1 IS NULL)`, the form a generic plan cannot seek on.
+    const guarded = try db.rawExactlyOne(i64, &run, named ++ " AND statement LIKE '% OR %IS NULL%'", .{});
     try testing.expectEqual(@as(i64, 0), guarded);
-    const plain = try db.rawExactlyOne(i64, &run, named ++ " AND statement NOT LIKE '%IS NULL%'", .{});
-    try testing.expect(plain >= 1);
+    // And each combination is a plan of its own: the filter left out, the
+    // filter given, and the plain statement.
+    const kept = try db.rawExactlyOne(i64, &run, named, .{});
+    try testing.expect(kept >= 3);
 }
 
 const prefixed_table = "nilo_live_prefixed_" ++ mode_suffix;
@@ -6757,4 +6760,90 @@ test "istarts_with reads the case-folding unique as a range on Postgres, and a w
     try testing.expectError(error.AlreadyExists, db.insert(Mailbox, &run, .{ .id = 30_000, .email = "ANN@X.DEV" }));
     const one = try db.select(Mailbox, &run, .{ .where = .{ .email = .{ .ieq = @as([]const u8, "ANN@x.dev") } } });
     try testing.expectEqual(@as(usize, 1), one.len);
+}
+
+const ends_table = "nilo_live_range_ends_" ++ mode_suffix;
+
+test "a timestamp and a date before 1970 and at the ends of 0001 to 9999 survive Postgres and JSON both ways" {
+    // The writer answered `null` for a moment before 1970 and the parser read
+    // one, so a value that round-tripped through the column did not through a
+    // response (ADR 127).
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Ends = struct {
+        pub const nilo_table = .{ .name = ends_table, .key = .id };
+        id: i64,
+        at: types.Timestamp,
+        day: types.Date,
+    };
+    _ = try db.exec(&run, "DROP TABLE IF EXISTS \"" ++ ends_table ++ "\"", .{});
+    defer _ = db.exec(&run, "DROP TABLE IF EXISTS \"" ++ ends_table ++ "\"", .{}) catch {};
+    try migrate.createMissing(&db, &run, .{ .tables = &.{Ends} });
+
+    const Case = struct { at: []const u8, day: []const u8 };
+    for ([_]Case{
+        .{ .at = "1969-12-31T23:59:59.999999Z", .day = "1969-12-31" },
+        .{ .at = "1815-12-10T00:00:00.000001Z", .day = "1815-12-10" },
+        .{ .at = "0001-01-01T00:00:00.000000Z", .day = "0001-01-01" },
+        .{ .at = "9999-12-31T23:59:59.999999Z", .day = "9999-12-31" },
+    }, 1..) |case, key| {
+        const at = types.Timestamp.nilo_parse(case.at).?;
+        const day = types.Date.nilo_parse(case.day).?;
+        _ = try db.insert(Ends, &run, .{ .id = @as(i64, @intCast(key)), .at = at, .day = day });
+
+        const back = (try db.find(Ends, &run, @as(i64, @intCast(key)))).?;
+        try testing.expectEqual(at.micros, back.at.micros);
+        try testing.expectEqual(day.days, back.day.days);
+
+        // And through JSON: the text the response carries is the text sent in.
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try std.json.Stringify.value(back, .{}, &out.writer);
+        try testing.expect(std.mem.indexOf(u8, out.written(), case.at) != null);
+        try testing.expect(std.mem.indexOf(u8, out.written(), case.day) != null);
+    }
+}
+
+test "the startup check's one query per schema answers what one query per table answers" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    const arena = live.arena.allocator();
+    // A table that is there, one that is not, and the same table again in a
+    // different place in the list: one answer each, in the order asked.
+    const names = [_][]const u8{ table, "nilo_no_such_table", table };
+    const many = try live.wire.columnsOfMany(arena, dialect.Postgres.introspect_all, null, &names);
+    try testing.expectEqual(@as(usize, 3), many.len);
+    try testing.expectEqual(@as(usize, 0), many[1].len);
+
+    const one = try live.wire.columnsOf(arena, dialect.Postgres.introspect, null, table);
+    try testing.expect(one.len > 0);
+    for (&[_]usize{ 0, 2 }) |at| {
+        try testing.expectEqual(one.len, many[at].len);
+        for (one, many[at]) |want, got| {
+            try testing.expectEqualStrings(want.name, got.name);
+            try testing.expectEqualStrings(want.udt, got.udt);
+            try testing.expectEqual(want.nullable, got.nullable);
+        }
+    }
+
+    // And the same for the values of the enum types.
+    const kinds = [_][]const u8{ role_type, "nilo_no_such_enum" };
+    const labels = try live.wire.labelsOfMany(arena, dialect.Postgres.enum_values.?, &kinds);
+    try testing.expectEqual(@as(usize, 2), labels.len);
+    try testing.expectEqual(@as(usize, 3), labels[0].len);
+    try testing.expectEqualStrings("moderator", labels[0][2]);
+    try testing.expectEqual(@as(usize, 0), labels[1].len);
 }
