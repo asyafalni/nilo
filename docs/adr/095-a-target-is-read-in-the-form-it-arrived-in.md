@@ -23,19 +23,23 @@ origin-form path the router matches.**
 |---|---|---|
 | origin | `/users/7?x=1` | the path, as before |
 | absolute | `http://example.com/users/7` | split: authority kept, path routed |
-| asterisk | `*` (server-wide `OPTIONS`) | passed through |
-| authority | `example.com:443` (`CONNECT`) | passed through |
-| none of them | `h;tp://x/y`, `?a=1`, `http:/x` | refused, a 400 |
+| asterisk | `*`, with `OPTIONS` | a server-wide OPTIONS, answered without the router |
+| authority | `example.com:443`, with `CONNECT` | read, never routed: a 404 |
+| none of them | `h;tp://x/y`, `?a=1`, `http:/x`, `admin:1/x`, `ftp://x/y`, `GET *` | refused, a 400 |
 
-The last two are passed through rather than special-cased because neither names
-a route here. nilo is not a proxy, so a `CONNECT` has nothing to tunnel to, and
-a server-wide `OPTIONS` is a feature this framework does not have. Both reach
-the router as they arrived and get the 404 or 405 they got before. Refusing
-them outright was the alternative and it fails the rule
-[ADR 070](./070-a-request-nobody-else-would-answer-is-refused.md) states:
-refuse what nobody else would answer, and these are answered by somebody.
+**A target that does not begin with `/` never reaches the router.** The router
+splits on `/` and has no way to know the first one was never there, so
+`admin:1/x` was matched by `/:a/x`, `OPTIONS *` by a root `/*`, and a middleware
+checking `c.path()` for `/admin` was walked round by it. The two forms left are
+kept for the one method each is defined for (RFC 9112 §3.2.3 and §3.2.4), and
+`serve.zig` does not ask the router about either.
 
-**A target in none of the four is a 400** (RFC 9112 §3.2). Not origin-form, not `*`, not a scheme and a colon (the absolute-form of a scheme nilo does not serve, which still passes through), and not `host:port`: `h;tp://x/y` was routed as a path while llhttp refused it ([ADR 231](./231-a-second-parser-reads-what-the-first-one-reads.md)), and a target no form has is one no front end forwards as nilo read it.
+**`OPTIONS *` is answered by the framework**: a 204 whose `Allow` is every method
+some route answers, `HEAD` where there is a `GET`, and `OPTIONS`. It runs through
+the middleware like any other answer. A `CONNECT` is a 404: nilo is not a proxy
+and has nothing to tunnel to.
+
+**A target in none of the four is a 400** (RFC 9112 §3.2). Not origin-form, not an `http(s)` absolute-form, not `*` on an `OPTIONS`, and not `host:port` on a `CONNECT`. An absolute-form of a scheme nilo does not serve (`ftp://x/y`, `urn:isbn:1`) is in this group too: it is a form, but not one nilo can answer, and handing it to the router was the bug. `h;tp://x/y` was routed as a path while llhttp refused it ([ADR 231](./231-a-second-parser-reads-what-the-first-one-reads.md)), and a target no form has is one no front end forwards as nilo read it.
 
 ## The authority *is* the Host, and that is not a preference
 
@@ -79,6 +83,8 @@ the head. A static `"/"` would not survive `App.rebase`, and finding that out
 before shipping it is the only reason this paragraph is short.
 
 ## What was rejected
+
+**Passing asterisk-form and authority-form through to the router**, which this ADR decided first and the audit of `http/` at `39896d2` reversed: the premise was that they get the 404 or 405 they had, and a root `/*` or a `/:a/x` answered them instead. Also reversed: a scheme and a colon (`admin:1/x`, `ftp://x/y`) read as a form nilo does not serve and let through for the same reason.
 
 **Routing a target in no form as a path**, which is what nilo did until ADR 231's run: `h;tp://x/y` and `?a=1` reached the router and found a 404. Harmless to nilo, and the reason it changed is the other parser: llhttp refuses every one of them, and a front end that refuses or rewrites what nilo routes is two readings of one request.
 

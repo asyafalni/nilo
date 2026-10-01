@@ -20,7 +20,8 @@ kept trickling, and `body_timeout_ms` does not stop it: that limit is per
 a client answering inside every window never trips it.
 
 **`readSizedBody` takes one page first and commits the announcement only once
-the client has delivered it.**
+the client has delivered it, and `readChunkedBody` does the same for each
+chunk.**
 
 ## What it was actually costing, which is not what the gap said
 
@@ -107,12 +108,36 @@ deadline for the whole body. `body_timeout_ms` is per read and deliberately so
 a client that keeps answering is never cut off. The roadmap carries that as its
 own gap rather than this one pretending to have closed it.
 
+## A chunk is the same promise
+
+A chunk's size is as much a number a stranger typed as a `Content-Length`, and
+`readChunkedBody` committed it before a byte of it was read:
+`body.addManyAsSlice(gpa, size)`, then the read. A client that sent
+`800000\r\n` and stopped held eight megabytes of arena for a chunk it never
+sent, which is the whole of what this ADR was written to end. **Each chunk is now
+read a page at a time**: up to `sized_body_step` is taken and read, and only then
+is the rest of that chunk committed, **exactly** (`ensureTotalCapacityPrecise`,
+because the list's growth heuristic would round the promise up by half). The
+body is still one contiguous slice, and a chunk of a page or less is one
+allocation as before.
+
+`test "a chunk that announces a large size and sends nothing does not grow the
+arena to it"` announces eight megabytes, sends a dozen bytes, and asks the arena
+what it holds. The amplification is the same 256× at the default `max_body`.
+
+## What was rejected
+
+**Saying the chunked path "already grew as chunks arrived"**, which this ADR
+claimed when it was written and the audit of `http/` at `39896d2` found false.
+It grew by chunks, not by bytes: one allocation per chunk at the announced size,
+before any of it arrived. The claim was read off the loop shape and never run
+against a chunk that did not come.
+
 ## What is not changed
 
-`c.bodyStream()` already had none of this — it allocates nothing and the
-handler's buffer is the ceiling — and the chunked path already grew as chunks
-arrived. This brings the third of the three into line rather than inventing
-anything.
+`c.bodyStream()` already had none of this: it allocates nothing and the
+handler's buffer is the ceiling. This brings the third of the three into line
+rather than inventing anything.
 
 `max_body` still refuses the announcement itself, before any of this runs, so
 the ceiling on a single body is where it was.

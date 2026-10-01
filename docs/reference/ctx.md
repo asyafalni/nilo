@@ -76,7 +76,7 @@ This page covers reading a request, answering it, its cookies, session and uploa
 | `c.url(pattern, args)` | `!Str`: a URL for a route, every value percent-encoded and every mistake a compile error ([ADR 100](../adr/100-a-route-pattern-is-the-name-of-its-url.md)) |
 | `c.events()` | `!Events` |
 | `c.upgrade(loop, state)` | `!void`: the connection becomes a WebSocket and `loop` reads it. `{}` when there is no state |
-| `c.upgradeWith(loop, state, .{ .protocol = "chat.v1" })` | the same, naming a subprotocol |
+| `c.upgradeWith(loop, state, .{ .protocols = &.{ "chat.v2", "chat.v1" } })` | the same, naming the subprotocols the route speaks (`.protocol` is the one-name spelling). The answer is the first the client offered, and none if it offered none of them |
 
 ### Response headers
 

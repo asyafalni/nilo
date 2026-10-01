@@ -135,7 +135,54 @@ with a client that something impossible happened.
 
 1005 and 1006 are the interesting ones: they mean "no code was sent" and "the
 connection died", neither of which an end can observe *about itself* and put in
-a frame.
+a frame. A close frame that is refused does not set `closedCleanly()`: it is a
+framing error and not a goodbye, and `closedCleanly` used to say true for it.
+
+### A header is read as strictly as RFC 6455 §5.2 writes it
+
+A length in a wider form than it needs (a five-byte payload announced in the
+16-bit or 64-bit form), or a 64-bit length with its top bit set, is refused with
+1002. `nextHeader` checks it from `frame.size` and `frame.len`, which `headerFrom`
+already carries, so `headerFrom` stays pure and the fast path costs two
+compares. Reading it loosely was harmless to nilo and not to a proxy in front
+that reads it strictly: the two disagree about where a frame ends.
+
+`Socket.ping` cuts its data to 125 bytes, the most a control frame holds. An
+error was rejected: nilo answers a pong itself and never shows it to the
+handler, so the payload is only a tag, and an error would be one more thing
+every caller handles for bytes nothing reads. `close` already cuts its reason
+the same way.
+
+### A post and a direct send leave in the order they were made
+
+A post waits in the seat until the owning fiber's next `receive`, and a
+`socket.send` used to write at once, so `room.say("a")` then `socket.send("b")`
+put `b` on the wire first. `send`, `print`, `json` and `close` now `deliver` the
+connection's waiting posts first. That is one load of a null on a connection
+seated in no room, no allocation and no per-connection byte. What is not
+ordered is a post another fiber makes at the same moment: there is no "made
+before" between two fibers. A ping, a pong and a close echo are protocol
+housekeeping and keep going out as they were.
+
+### The handshake answers a sub-protocol the client offered, and checks its key
+
+`Options.protocol` was written back whether or not the client offered it, and a
+browser fails a connection whose answer names a protocol it did not offer
+(RFC 6455 §4.1), so a plain `new WebSocket(url)` against such a route failed.
+The answer is now the first protocol in the client's `Sec-WebSocket-Protocol`
+(across every such line) that the route speaks, from `Options.protocol` or the
+new `Options.protocols`, and none when nothing matches. The old spelling still
+works under the new rule, so no caller changes; what changes is that a client
+offering nothing is no longer sent a name. Picking by the server's order was
+rejected: the client lists its protocols in its own order of preference, and a
+route that speaks both has no better reason to prefer one.
+
+`Sec-WebSocket-Key` must be sixteen bytes of base64 or the upgrade is a 400,
+before anything is answered. `Connection` is split into comma-separated tokens
+and `upgrade` must be one of them, case-insensitively; `Upgrade-Insecure` is
+not.
+
+Found by the audit of `http/` at `39896d2`.
 
 ## The numbers
 

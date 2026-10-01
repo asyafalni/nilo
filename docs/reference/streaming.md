@@ -82,13 +82,13 @@ What it cannot do is run any of the handler's own code between events. For that,
 | | |
 |---|---|
 | `s.receive()` | `!?Message`. The buffer belongs to the executor and is lent for one message |
-| `s.send(kind, data)` | `.text` or `.binary` |
+| `s.send(kind, data)` | `.text` or `.binary`. Posts waiting from a room this socket sits in leave first, so what you said into a room and then sent arrives in that order |
 | `s.sendText(text)` / `s.sendBinary(bytes)` | |
 | `s.print(fmt, args)` | one text message, formatted, with no buffer of your own |
 | `s.json(value)` | one text message, serialised |
-| `s.ping(data)` | |
+| `s.ping(data)` | `data` is cut to 125 bytes, the most a control frame holds |
 | `s.close(code, reason)` | safe to call twice |
-| `s.closedCleanly()` | whether the other side closed properly |
+| `s.closedCleanly()` | whether the other side closed properly; a malformed close frame is not a goodbye |
 | `s.live()` | false once the server is stopping |
 
 **`receive` returns `null` when the server is stopping**, after telling the client with a 1001, so a message loop needs no shutdown branch of its own ([ADR 046](../adr/046-a-message-is-copied-once-and-framed-once.md)). `live()` is for a handler doing its own work between messages. Sending on a socket that has already closed writes nothing instead of failing.
@@ -141,7 +141,7 @@ fn chatLoop(socket: *nilo.Socket, room: *nilo.Room) !void {
 | `room.leave(&socket)` | safe to call twice, and safe without joining. Pair it with `defer` |
 | `room.say(kind, data)` | to everybody in the room, sender included |
 | `room.sayText(text)` / `room.sayBinary(bytes)` | |
-| `room.print(fmt, args)` | one text message, formatted into the post itself |
+| `room.print(fmt, args)` | one text message, formatted into the post itself. If the two formatting passes disagree nothing is posted and the call is `error.WriteFailed` |
 | `room.json(value)` | one text message, serialised |
 | `room.event(.{ .name = …, .id = …, .data = … })` | one event: an event stream gets all three fields, a WebSocket gets `data` as text. `error.EventFieldBreaksLine` for a line break in `name` or `id` |
 | `room.count()` | how many connections are in it |

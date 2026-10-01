@@ -51,10 +51,23 @@ const scratch_mod = @import("scratch.zig");
 const handshake_salt = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 pub const Options = struct {
-    /// A sub-protocol to agree to, echoed back in the handshake. Empty
-    /// agrees to nothing, which is what a client that asked for nothing
-    /// expects.
+    /// A sub-protocol this route speaks, the one-name spelling of `protocols`.
+    /// Empty speaks none.
+    ///
+    /// **Answered only when the client offered it** (RFC 6455 §4.1). A browser
+    /// fails a connection whose answer names a protocol it did not ask for, so
+    /// writing the name back unasked, which this used to do, made
+    /// `new WebSocket(url)` against such a route fail. A client that offered
+    /// nothing, or nothing this route speaks, gets a handshake with no
+    /// `Sec-WebSocket-Protocol` at all (ADR 046).
     protocol: []const u8 = "",
+
+    /// The sub-protocols this route speaks. The client's
+    /// `Sec-WebSocket-Protocol` is a list in its order of preference, and the
+    /// answer is the first one of them found here, so a client offering two can
+    /// be met by a route that speaks either. Added to `protocol` when both are
+    /// set. Matching is exact: a protocol name is case-sensitive.
+    protocols: []const []const u8 = &.{},
 
     /// Pages on other origins that may open this socket. Empty — the default —
     /// means only the origin this server is itself serving; `&.{"*"}` means
@@ -642,8 +655,16 @@ pub const Socket = struct {
     /// has to branch on for the one case it cannot prevent: the other end
     /// closing between two of its own sends. That is the same reading
     /// `receive` gives a client that vanished (ADR 021).
+    ///
+    /// **A room's posts waiting for this connection leave first**, so what a
+    /// handler said into a room and then sent here arrive in that order. The
+    /// posts used to wait for the next `receive`, which put a `send` ahead of a
+    /// `say` made before it. The check is one load of a null on a connection
+    /// seated nowhere, and there is no allocation and no per-connection byte in
+    /// it (ADR 046).
     pub fn send(self: *Socket, kind: Kind, data: []const u8) Error!void {
         if (self._closed) return;
+        if (self._seated.room != null) try self.deliver();
         return self.sendFrame(.of(kind), data);
     }
 
@@ -672,6 +693,7 @@ pub const Socket = struct {
     /// ADR 076 is why it is a close and not an assert.
     pub fn print(self: *Socket, comptime fmt: []const u8, args: anytype) Error!void {
         if (self._closed) return;
+        if (self._seated.room != null) try self.deliver();
         const promise = try self.beginCounted(counted(struct {
             fn run(w: *std.Io.Writer, a: anytype) std.Io.Writer.Error!void {
                 return w.print(fmt, a);
@@ -689,6 +711,7 @@ pub const Socket = struct {
     /// them.
     pub fn json(self: *Socket, value: anytype) Error!void {
         if (self._closed) return;
+        if (self._seated.room != null) try self.deliver();
         const promise = try self.beginCounted(counted(json_mod.write, value));
         json_mod.write(self._out, value) catch return error.WriteFailed;
         try self.keptTo(promise);
@@ -698,15 +721,23 @@ pub const Socket = struct {
     /// Ask the other end to answer, which is how a connection through a
     /// proxy that drops quiet ones stays up. Nothing goes out on a socket
     /// that has closed, for the reason `send` gives.
+    ///
+    /// **Data past 125 bytes is cut to 125**, the most a control frame can
+    /// carry (RFC 6455 §5.5). The alternative, an error, would be one more
+    /// thing every caller handles for bytes nothing reads: nilo swallows the
+    /// pong, so the payload is only ever a tag.
     pub noinline fn ping(self: *Socket, data: []const u8) Error!void {
         if (self._closed) return;
-        return self.sendFrame(.ping, data);
+        return self.sendFrame(.ping, data[0..@min(data.len, 125)]);
     }
 
     /// Close, saying why. Safe to call twice, and safe to call after the
     /// other end has already closed.
     pub fn close(self: *Socket, code: Close, reason: []const u8) Error!void {
         if (self._closed) return;
+        // What was said into a room before the goodbye is heard before it. A
+        // connection already failing has nothing more to lose by trying.
+        if (self._seated.room != null) self.deliver() catch {};
         self._closed = true;
 
         var payload: [125]u8 = undefined;
@@ -854,6 +885,14 @@ pub const Socket = struct {
         // broken client or something that is not a client at all, and the
         // RFC says to fail the connection either way.
         if (!frame.masked) return self.fail(error.ProtocolError);
+        // The shortest form that holds the length, and in the 64-bit form
+        // with its top bit clear (RFC 6455 §5.2). A header read loosely here
+        // is one a proxy in front may read strictly, which is how a frame is
+        // smuggled past it.
+        const wide = frame.size - 2 - @as(usize, if (frame.masked) 4 else 0);
+        if ((wide == 2 and frame.len < 126) or (wide == 8 and (frame.len <= 0xffff or frame.len >> 63 != 0))) {
+            return self.fail(error.ProtocolError);
+        }
         // A control frame has to fit in one small frame, because it may
         // arrive in the middle of somebody else's message.
         if (frame.opcode.isControl() and (frame.len > 125 or !frame.fin)) {
@@ -938,12 +977,14 @@ pub const Socket = struct {
             },
             .pong => return true,
             .close => {
-                self._said_goodbye = true;
                 // A goodbye that is not a goodbye — one byte where there
                 // should be two, a code nobody assigned, a reason that is not
                 // UTF-8 — is a framing error like any other, and echoing it
                 // would put the same broken bytes back on the wire.
                 if (!closeIsWellFormed(data)) return self.fail(error.ProtocolError);
+                // Only now: a close frame that was not one is a framing error
+                // and not a goodbye, so `closedCleanly` stays false for it.
+                self._said_goodbye = true;
                 // Echoed back, then this end is done. What the RFC calls the
                 // closing handshake, and what stops a browser reporting an
                 // ordinary goodbye as a connection error.
@@ -1337,18 +1378,58 @@ pub fn isUpgrade(head: []const u8) bool {
         {
             found_upgrade = true;
         }
-        // `Connection` may be a list — `keep-alive, Upgrade` — so this looks
-        // inside it rather than comparing the whole value.
-        if (!found_connection and std.ascii.eqlIgnoreCase(h.name, "connection") and
-            std.ascii.indexOfIgnoreCase(h.value, "upgrade") != null)
-        {
-            found_connection = true;
+        // `Connection` is a comma-separated list of tokens (RFC 9110 §7.6.1),
+        // so `keep-alive, Upgrade` is one, and `Upgrade-Insecure` or
+        // `not-an-upgrade` are not: a substring match took both.
+        if (!found_connection and std.ascii.eqlIgnoreCase(h.name, "connection")) {
+            var tokens = std.mem.tokenizeScalar(u8, h.value, ',');
+            while (tokens.next()) |token| {
+                if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, token, " \t"), "upgrade")) {
+                    found_connection = true;
+                    break;
+                }
+            }
         }
         // Both found, and a head with fifty more headers on it has nothing
         // left to say about this question.
         if (found_upgrade and found_connection) return true;
     }
     return false;
+}
+
+/// The sub-protocol to answer with: the first of the client's offers, across
+/// every `Sec-WebSocket-Protocol` line, that the route speaks, or empty for
+/// none (RFC 6455 §4.2.2). Returns the route's own spelling, which outlives
+/// the request, rather than a view into the head (ADR 046).
+pub fn negotiated(head: []const u8, options: Options) []const u8 {
+    if (options.protocol.len == 0 and options.protocols.len == 0) return "";
+    var headers = http1.HeaderIterator.from(head);
+    while (headers.next()) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "sec-websocket-protocol")) continue;
+        var offers = std.mem.tokenizeScalar(u8, h.value, ',');
+        while (offers.next()) |raw| {
+            const offer = std.mem.trim(u8, raw, " \t");
+            if (offer.len == 0) continue;
+            if (options.protocol.len > 0 and std.mem.eql(u8, offer, options.protocol)) return options.protocol;
+            for (options.protocols) |ours| {
+                if (std.mem.eql(u8, offer, ours)) return ours;
+            }
+        }
+    }
+    return "";
+}
+
+/// Whether a `Sec-WebSocket-Key` is what RFC 6455 §4.1 says it is: the base64
+/// of a sixteen-byte nonce, which is twenty-four characters ending in `==`.
+/// A key that is not one is a client that is not speaking WebSocket, and the
+/// handshake is a 400 rather than a 101 (ADR 046).
+pub fn keyIsValid(key: []const u8) bool {
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(key) catch return false;
+    if (size != 16) return false;
+    var nonce: [16]u8 = undefined;
+    decoder.decode(&nonce, key) catch return false;
+    return true;
 }
 
 /// Whether a page at `origin` may open this socket, given the `Host` the
@@ -2560,4 +2641,87 @@ test "a close frame leaves whatever the read buffer holds" {
     try socket.close(.normal, "bye");
     try testing.expectEqual(@as(usize, 1), wire.writes);
     try testing.expectEqualStrings("\x88\x05\x03\xe8bye", wire.kept.items);
+}
+
+test "a length written in a wider form than it needs is a protocol error" {
+    // RFC 6455 §5.2: the minimal number of bytes MUST be used. A text frame
+    // of five bytes in the sixteen-bit form, then in the sixty-four-bit form,
+    // then a sixty-four-bit length with its top bit set.
+    const key = "\x37\xfa\x21\x3d";
+    const cases = [_][]const u8{
+        "\x81\xfe\x00\x05" ++ key ++ "hello",
+        "\x81\xff\x00\x00\x00\x00\x00\x00\x00\x05" ++ key ++ "hello",
+        "\x81\xff\x00\x00\x00\x00\x00\x00\xff\xff" ++ key,
+        "\x81\xff\x80\x00\x00\x00\x00\x00\x00\x05" ++ key,
+    };
+    for (cases) |bytes| {
+        var peer: Peer = .{};
+        defer peer.deinit();
+        try peer.to_server.appendSlice(testing.allocator, bytes);
+        var socket = peer.socket();
+        try testing.expectError(error.ProtocolError, socket.receive());
+        try testing.expectEqualStrings("\x88\x02\x03\xea", peer.sent()); // 1002
+    }
+}
+
+test "a ping longer than a control frame can carry is cut, not sent broken" {
+    var peer: Peer = .{};
+    defer peer.deinit();
+    var socket = peer.socket();
+
+    try socket.ping("p" ** 300);
+    const sent = peer.sent();
+    // 125 is the most a control frame holds; a 126 here would be the
+    // sixteen-bit length form, which a control frame may not use.
+    try testing.expectEqual(@as(usize, 2 + 125), sent.len);
+    try testing.expectEqual(@as(u8, 0x89), sent[0]);
+    try testing.expectEqual(@as(u8, 125), sent[1]);
+}
+
+test "Connection is a list of tokens, and only a token that is upgrade counts" {
+    try testing.expect(isUpgrade(
+        "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: keep-alive , UPGRADE\r\n\r\n",
+    ));
+    try testing.expect(!isUpgrade(
+        "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade-Insecure\r\n\r\n",
+    ));
+    try testing.expect(!isUpgrade(
+        "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: not-an-upgrade\r\n\r\n",
+    ));
+}
+
+test "a close frame that is malformed does not count as a goodbye" {
+    var peer: Peer = .{};
+    defer peer.deinit();
+    try peer.frame(true, 8, "\x03");
+    var socket = peer.socket();
+
+    try testing.expectError(error.ProtocolError, socket.receive());
+    try testing.expect(!socket.closedCleanly());
+}
+
+test "a sub-protocol is chosen from what the client offered, and only from that" {
+    const head = "GET /ws HTTP/1.1\r\nHost: t\r\nSec-WebSocket-Protocol: graphql-ws, chat.v2\r\n" ++
+        "Sec-WebSocket-Protocol: chat.v1\r\n\r\n";
+    const none = "GET /ws HTTP/1.1\r\nHost: t\r\n\r\n";
+
+    // The client's order wins among what the route speaks, across both lines.
+    try testing.expectEqualStrings("chat.v2", negotiated(head, .{ .protocols = &.{ "chat.v1", "chat.v2" } }));
+    // Spoken but not offered, and offered but not spoken: no answer at all.
+    try testing.expectEqualStrings("", negotiated(head, .{ .protocols = &.{"mqtt"} }));
+    try testing.expectEqualStrings("", negotiated(none, .{ .protocols = &.{"chat.v1"} }));
+    // The single-protocol spelling still works, under the same rule.
+    try testing.expectEqualStrings("chat.v1", negotiated(head, .{ .protocol = "chat.v1" }));
+    try testing.expectEqualStrings("", negotiated(none, .{ .protocol = "chat.v1" }));
+    try testing.expectEqualStrings("", negotiated(head, .{}));
+}
+
+test "a handshake key is sixteen bytes of base64 and nothing else" {
+    try testing.expect(keyIsValid("dGhlIHNhbXBsZSBub25jZQ=="));
+    try testing.expect(!keyIsValid(""));
+    try testing.expect(!keyIsValid("x"));
+    try testing.expect(!keyIsValid("dGhlIHNhbXBsZSBub25jZQ"));
+    try testing.expect(!keyIsValid("dGhlIHNhbXBsZSBub25jZQ=!"));
+    // Eighteen bytes, which is a valid base64 string and the wrong key.
+    try testing.expect(!keyIsValid("dGhlIHNhbXBsZSBub25jZQECAwQF"));
 }

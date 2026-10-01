@@ -37,7 +37,14 @@ pub fn methodFrom(name: []const u8) Method {
 pub const ParseError = error{
     BadRequestLine,
     BadHeader,
+    /// A request line whose version is spelled `HTTP/d.d` and is neither 1.0
+    /// nor 1.1: a 505 (RFC 9110 §15.6.6). A version that is not spelled that
+    /// way is a malformed request line instead.
     UnsupportedVersion,
+    /// A `Transfer-Encoding` that ends in `chunked` and names another coding
+    /// before it: a 501 (RFC 9112 §6.1), because nilo decodes `chunked` and
+    /// nothing else (ADR 070).
+    UnsupportedTransferEncoding,
     /// A body arrived under a `Content-Encoding` nilo cannot decode, which is
     /// every one of them but `identity` and `gzip` (ADR 089). A 415
     /// rather than a 400: the request is well formed and the server cannot
@@ -182,8 +189,21 @@ pub fn readChunkedBody(in: *std.Io.Reader, gpa: std.mem.Allocator, limit: usize)
         const size = try readChunkSize(in);
         if (size == 0) break;
         if (size > limit - body.items.len) return error.BodyTooLarge;
-        const dst = try body.addManyAsSlice(gpa, @intCast(size));
-        try in.readSliceAll(dst);
+        const n: usize = @intCast(size);
+        // **A chunk is taken as it arrives, as `readSizedBody` takes a body**
+        // (ADR 083): a size is a number a stranger typed, and committing it
+        // before a byte of it is here let one connection hold `max_body` on
+        // the strength of eight hex digits. A page first; the rest only once
+        // that page has arrived, and then exactly, because a growth heuristic
+        // would round the promise up.
+        const first = @min(n, sized_body_step);
+        const head = try body.addManyAsSlice(gpa, first);
+        try in.readSliceAll(head);
+        if (n > first) {
+            try body.ensureTotalCapacityPrecise(gpa, body.items.len + (n - first));
+            const rest = body.addManyAsSliceAssumeCapacity(n - first);
+            try in.readSliceAll(rest);
+        }
         try endOfChunk(in);
     }
     try skipTrailers(in);
@@ -472,8 +492,30 @@ pub fn readHead(in: *std.Io.Reader, deadlines: bulkhead.Deadlines) ![]const u8 {
     // index into it stays pointing at the same byte.
     var scanned: usize = 0;
     var counting = false;
+    // Whether the first byte has been looked at for an empty line before the
+    // request line (RFC 9112 §2.2). Once, so the loop's own cost is a flag.
+    var leading_checked = false;
     while (true) {
-        const buf = in.buffered();
+        var buf = in.buffered();
+        if (!leading_checked and buf.len > 0) {
+            // **One empty line is dropped, not parsed**: a server expecting a
+            // request line SHOULD ignore at least one before it. Tossed here
+            // rather than skipped in `parseHead` so the head handed on starts
+            // at the request line, which is what `HeaderIterator` and every
+            // reader of a copied head assume. A CR alone is waited on: the LF
+            // that makes it a line is still on its way.
+            if (buf[0] == '\n') {
+                in.toss(1);
+                buf = in.buffered();
+            } else if (buf[0] == '\r' and buf.len > 1) {
+                if (buf[1] == '\n') {
+                    in.toss(2);
+                    buf = in.buffered();
+                }
+            }
+            leading_checked = buf.len == 0 or buf[0] != '\r' or buf.len > 1;
+            scanned = 0;
+        }
         if (findEndOfHead(buf, scanned)) |end| return buf[0..end];
         // Back up by one less than the longest delimiter, so one split
         // across two reads is still found.
@@ -713,8 +755,14 @@ inline fn tokenAt(buf: []const u8, from: usize, to: usize) bool {
 /// An absolute-form target answers the rule on its own, because it **is** the
 /// authority (ADR 095). A `Host` beside one is still read and a second one is
 /// still a 400.
-fn finish(r: *const Request) ParseError!void {
+fn finish(r: *Request) ParseError!void {
     if (r.minor_version == 1 and !r.has_host and r.authority.len == 0) return error.BadHeader;
+    // HTTP/1.0 has no `Transfer-Encoding` (RFC 9112 §6.1), so a request that
+    // carries one is framed by something its sender and a front end may not
+    // agree on. It is answered and the connection is closed, whatever
+    // `Connection` said on whichever line: asked here, so the order of the
+    // headers cannot matter.
+    if (r.minor_version == 0 and r.chunked) r.keep_alive = false;
     // Asked here rather than in the header arm, so the answer does not depend
     // on whether the framing headers arrived before the encoding one.
     //
@@ -740,8 +788,10 @@ pub fn parseRequestLine(line: []const u8, r: *Request) ParseError!void {
     } else if (std.mem.eql(u8, version, "HTTP/1.0")) {
         r.minor_version = 0;
         r.keep_alive = false;
-    } else {
+    } else if (versionShaped(version)) {
         return error.UnsupportedVersion;
+    } else {
+        return error.BadRequestLine;
     }
 
     // A method is a token (RFC 9110 §9.1). Any token, since one nobody routed
@@ -752,35 +802,32 @@ pub fn parseRequestLine(line: []const u8, r: *Request) ParseError!void {
     r.method = method;
     r.target = target;
     // Origin-form is the whole of what a browser sends, and it is already a
-    // path. Anything else is one of the three other forms, and only one of
-    // them has a route behind it.
+    // path. Of the three other forms only `http(s)` absolute-form names a
+    // route here, and it is turned into one; the other two are kept for the
+    // one method each is defined for, and **nothing else is let through**: a
+    // target that does not begin with `/` reaches the router, which has no
+    // way to know the slash was never there (ADR 095).
     if (target[0] != '/') {
         if (try absoluteForm(target)) |split| {
             r.authority = split.authority;
             r.target = split.target;
-        } else if (!otherForm(target)) return error.BadRequestLine;
+        } else if (std.mem.eql(u8, target, "*")) {
+            // Asterisk-form is `OPTIONS *` and nothing else (RFC 9112 §3.2.4).
+            if (!std.mem.eql(u8, method, "OPTIONS")) return error.BadRequestLine;
+        } else if (std.mem.eql(u8, method, "CONNECT")) {
+            // Authority-form (RFC 9112 §3.2.3), a tunnel request nilo is not
+            // the proxy for. It parses so it can be answered, and is never
+            // routed.
+            if (!authorityOk(target, true)) return error.BadRequestLine;
+        } else return error.BadRequestLine;
     }
 }
 
-/// Whether a target that is neither origin-form nor an `http` absolute-form
-/// is one of the two other forms RFC 9112 §3.2 has: `*`, or a scheme and a
-/// colon (the absolute-form of a scheme nilo does not serve, and the
-/// authority-form `host:port` when the host is spelled like one), or an
-/// authority-form a scheme cannot spell, `[::1]:443` or `10.0.0.1:443`.
-///
-/// Anything else is none of the four, and a 400 (ADR 095). `h;tp://x/y` was
-/// routed as a path while llhttp refused it (ADR 231); no form has it, so
-/// no front end forwards the same thing nilo read.
-fn otherForm(target: []const u8) bool {
-    if (std.mem.eql(u8, target, "*")) return true;
-    const colon = std.mem.indexOfScalar(u8, target, ':') orelse return false;
-    const scheme = target[0..colon];
-    // `http:` or `https:` with no `//` after it has no host, and RFC 9110
-    // §4.2.1 says a recipient must reject that: `absoluteForm` took every
-    // one that had one.
-    if (std.ascii.eqlIgnoreCase(scheme, "http") or std.ascii.eqlIgnoreCase(scheme, "https")) return false;
-    if (isScheme(scheme)) return true;
-    return authorityOk(target, true);
+/// `HTTP/` DIGIT `.` DIGIT, RFC 9112 §2.3: spelled like a version, whether or
+/// not nilo speaks it.
+fn versionShaped(version: []const u8) bool {
+    return version.len == 8 and std.mem.eql(u8, version[0..5], "HTTP/") and
+        std.ascii.isDigit(version[5]) and version[6] == '.' and std.ascii.isDigit(version[7]);
 }
 
 /// `host [ ":" port ]` as RFC 3986 §3.2 spells it, with the host not empty
@@ -817,16 +864,6 @@ fn regNameByte(ch: u8) bool {
     };
 }
 
-/// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, RFC 3986 §3.1.
-fn isScheme(text: []const u8) bool {
-    if (text.len == 0 or !std.ascii.isAlphabetic(text[0])) return false;
-    for (text[1..]) |ch| switch (ch) {
-        'a'...'z', 'A'...'Z', '0'...'9', '+', '-', '.' => {},
-        else => return false,
-    };
-    return true;
-}
-
 /// The authority and the path out of an absolute-form target, or null for a
 /// target that is not in that form.
 ///
@@ -837,11 +874,13 @@ fn isScheme(text: []const u8) bool {
 /// nothing: a 404 on a route that plainly exists
 /// ([ADR 095](../docs/adr/095-a-target-is-read-in-the-form-it-arrived-in.md)).
 ///
-/// The two forms left are passed through untouched, because neither names a
-/// route here: **asterisk-form** (`OPTIONS *`) is server-wide OPTIONS, and
-/// **authority-form** (`CONNECT example.com:443`) asks for a tunnel from a
-/// proxy nilo is not. Both reach the router as they arrived and get the 404 or
-/// 405 they had before.
+/// The two forms left are kept for the one method each is defined for, and
+/// neither is routed: **asterisk-form** (`OPTIONS *`) is a server-wide OPTIONS
+/// that `serve.zig` answers without asking the router, and **authority-form**
+/// (`CONNECT example.com:443`) asks for a tunnel from a proxy nilo is not,
+/// answered 404. Any other target that does not begin with `/`, an `ftp://`
+/// absolute-form or `admin:1/x` included, is a 400: it used to reach the router,
+/// which splits on `/` and matched `admin:1/x` against `/:a/x`.
 ///
 /// Two shapes inside absolute-form are refused rather than served:
 ///
@@ -925,6 +964,12 @@ fn applyHeaderAt(buf: []const u8, from: usize, colon: usize, end: usize, r: *Req
             // one the front end and nilo may route differently.
             if (r.has_host) return error.BadHeader;
             r.has_host = true;
+            // The value is held to what a host can be spelled with (RFC 9110
+            // §7.2). It was only counted, so `evil.com/reset?x=` or `a@b`
+            // reached `Ctx.host` and whatever was built from it. Empty stays
+            // legal: RFC 9112 §3.2 has it for a target with no authority.
+            const host = headerValue(buf, colon, end);
+            if (host.len > 0 and !authorityOk(host, false)) return error.BadHeader;
         },
         "expect".len => {
             // `Cookie` is the same length and reaches here too, so this arm is
@@ -987,7 +1032,7 @@ fn applyHeaderAt(buf: []const u8, from: usize, colon: usize, end: usize, r: *Req
             // the last coding, which RFC 9112 §6.1 requires it to be.
             if (r.chunked) return error.BadHeader;
             // **A final coding that is not `chunked` is a 400**, which RFC 9112
-            // §6.1 requires of a server that cannot decode it — and nilo can
+            // §6.1 requires of a server that cannot decode it, and nilo can
             // decode exactly one. Doing nothing here instead, which is what
             // this arm used to do, left `Transfer-Encoding: gzip` framed as a
             // request with no body at all: answered immediately, with the bytes
@@ -995,7 +1040,15 @@ fn applyHeaderAt(buf: []const u8, from: usize, colon: usize, end: usize, r: *Req
             // request to be parsed out of. That is the fifth way the two
             // parsers ADR 070 is about can disagree, and the four it closed
             // were closed for this reason.
-            if (!saysChunked(headerValue(buf, colon, end))) return error.BadHeader;
+            //
+            // **A coding in front of `chunked` is a 501** (RFC 9112 §6.1), where
+            // it was read as chunked and handed to the handler as its body:
+            // `gzip, chunked` was framed right and its bytes were still gzip.
+            switch (chunkedState(headerValue(buf, colon, end))) {
+                .lone => {},
+                .stacked => return error.UnsupportedTransferEncoding,
+                .not_last => return error.BadHeader,
+            }
             if (r.has_content_length) return error.BadHeader;
             r.chunked = true;
         },
@@ -1058,22 +1111,50 @@ fn digitsOnly(text: []const u8) ?u64 {
     return std.fmt.parseInt(u64, text, 10) catch null;
 }
 
-/// Whether `Transfer-Encoding` says chunked, which RFC 9112 §6.1 allows only
-/// as the **last** coding in the list. Looking for the word anywhere in the
-/// value would take `xchunked` and `chunked-x` for it, and a front end that
-/// reads those as a coding it does not know while nilo reads them as framing
-/// is the same disagreement by another spelling.
-fn saysChunked(value: []const u8) bool {
+/// What a `Transfer-Encoding` value says about `chunked`, which RFC 9112 §6.1
+/// allows only as the **last** coding in the list. Looking for the word
+/// anywhere in the value would take `xchunked` and `chunked-x` for it, and a
+/// front end that reads those as a coding it does not know while nilo reads
+/// them as framing is the same disagreement by another spelling.
+const ChunkedState = enum {
+    /// The whole value is `chunked`, the one coding nilo decodes.
+    lone,
+    /// `chunked` is last and something is before it.
+    stacked,
+    /// The last coding is something else, or nothing.
+    not_last,
+};
+
+fn chunkedState(value: []const u8) ChunkedState {
     const from = if (std.mem.lastIndexOfScalar(u8, value, ',')) |c| c + 1 else 0;
-    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value[from..], " \t"), "chunked");
+    if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, value[from..], " \t"), "chunked")) return .not_last;
+    return if (from == 0) .lone else .stacked;
 }
 
+/// The reason phrase of a status, **the one table every status line is built
+/// from**: the cold path, the compile-time lines, and the static answers in
+/// `serve.zig` (`staticResponse` takes a status and reads it from here).
+///
+/// Every registered status, because a `fail.status(502, …)` or a
+/// `Response(T)` can send any of them, and a status missing from here went out
+/// as `HTTP/1.1 502 \r\n`. RFC 9112 §4 lets the phrase be empty, so a status
+/// nobody registered gets none rather than a made-up one (ADR 024).
 pub fn statusPhrase(status: u16) []const u8 {
     return switch (status) {
+        100 => "Continue",
+        101 => "Switching Protocols",
+        103 => "Early Hints",
         200 => "OK",
         201 => "Created",
+        202 => "Accepted",
+        203 => "Non-Authoritative Information",
         204 => "No Content",
+        205 => "Reset Content",
         206 => "Partial Content",
+        207 => "Multi-Status",
+        208 => "Already Reported",
+        226 => "IM Used",
+        300 => "Multiple Choices",
         301 => "Moved Permanently",
         302 => "Found",
         303 => "See Other",
@@ -1082,18 +1163,44 @@ pub fn statusPhrase(status: u16) []const u8 {
         308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
+        402 => "Payment Required",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        407 => "Proxy Authentication Required",
+        408 => "Request Timeout",
         409 => "Conflict",
+        410 => "Gone",
+        411 => "Length Required",
+        412 => "Precondition Failed",
         413 => "Content Too Large",
+        414 => "URI Too Long",
+        415 => "Unsupported Media Type",
         416 => "Range Not Satisfiable",
+        417 => "Expectation Failed",
+        418 => "I'm a Teapot",
+        421 => "Misdirected Request",
         422 => "Unprocessable Content",
+        423 => "Locked",
+        424 => "Failed Dependency",
+        425 => "Too Early",
+        426 => "Upgrade Required",
+        428 => "Precondition Required",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
+        451 => "Unavailable For Legal Reasons",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        505 => "HTTP Version Not Supported",
+        506 => "Variant Also Negotiates",
+        507 => "Insufficient Storage",
+        508 => "Loop Detected",
+        510 => "Not Extended",
+        511 => "Network Authentication Required",
         else => "",
     };
 }
@@ -1143,13 +1250,12 @@ pub const Static = struct {
 
 pub fn staticResponse(
     comptime status: u16,
-    comptime phrase: []const u8,
     comptime content_type: []const u8,
     comptime body: []const u8,
     comptime connection: Connection,
 ) Static {
     return .{
-        .line = std.fmt.comptimePrint("HTTP/1.1 {d} {s}\r\n", .{ status, phrase }),
+        .line = statusLine(status),
         .rest = std.fmt.comptimePrint(
             "Content-Type: {s}\r\nContent-Length: {d}\r\n{s}\r\n{s}",
             .{ content_type, body.len, comptime connectionLine(connection), body },
@@ -1343,7 +1449,7 @@ pub fn writeFileHead(
 /// constant instead of formatting an integer and pasting three pieces
 /// together — and the status and its phrase cannot drift apart, because
 /// there is only one of them.
-fn statusLine(comptime status: u16) []const u8 {
+pub fn statusLine(comptime status: u16) []const u8 {
     return std.fmt.comptimePrint("HTTP/1.1 {d} {s}\r\n", .{ status, statusPhrase(status) });
 }
 
@@ -1700,7 +1806,9 @@ test "a broken request line" {
     var r = Request{};
     try testing.expectError(error.BadRequestLine, parseRequestLine("GET /", &r));
     try testing.expectError(error.UnsupportedVersion, parseRequestLine("GET / HTTP/2.0", &r));
-    try testing.expectError(error.UnsupportedVersion, parseRequestLine("GET / HTTP/1.1 x", &r));
+    // Spelled like a version and not spoken is a 505; this is not spelled like
+    // one at all.
+    try testing.expectError(error.BadRequestLine, parseRequestLine("GET / HTTP/1.1 x", &r));
 }
 
 test "a header with no colon" {
@@ -1783,7 +1891,7 @@ test "a method and a header name are tokens, and anything else in one is a 400" 
     }
     // Any token: a method nobody routed, and a name nilo does not read.
     var ok = Request{};
-    try parseHead("M-SEARCH * HTTP/1.1\r\nHost: h\r\nContent_Length: 5\r\nX-A-Name-Longer-Than-One-Block-Of-Bytes!: y\r\n\r\n", &ok);
+    try parseHead("M-SEARCH / HTTP/1.1\r\nHost: h\r\nContent_Length: 5\r\nX-A-Name-Longer-Than-One-Block-Of-Bytes!: y\r\n\r\n", &ok);
     try testing.expectEqualStrings("M-SEARCH", ok.method);
     try testing.expect(!ok.has_content_length);
 }
@@ -1796,13 +1904,21 @@ test "a target in none of the four forms is a 400, and each form is read" {
         const text = std.fmt.bufPrint(&line, "GET {s} HTTP/1.0", .{target}) catch unreachable;
         try testing.expectError(error.BadRequestLine, parseRequestLine(text, &r));
     }
-    const read = [_][]const u8{ "*", "example.com:443", "[::1]:443", "10.0.0.1:8080", "ftp://x/y", "urn:isbn:1", "my_host:80", "ht:tp://x/y" };
-    for (read) |target| {
+    // Asterisk-form is read for OPTIONS and authority-form for CONNECT, and
+    // for no other method.
+    const read = [_][2][]const u8{
+        .{ "OPTIONS", "*" },
+        .{ "CONNECT", "example.com:443" },
+        .{ "CONNECT", "[::1]:443" },
+        .{ "CONNECT", "10.0.0.1:8080" },
+        .{ "CONNECT", "my_host:80" },
+    };
+    for (read) |case| {
         var r = Request{};
         var line: [64]u8 = undefined;
-        const text = std.fmt.bufPrint(&line, "GET {s} HTTP/1.0", .{target}) catch unreachable;
+        const text = std.fmt.bufPrint(&line, "{s} {s} HTTP/1.0", .{ case[0], case[1] }) catch unreachable;
         try parseRequestLine(text, &r);
-        try testing.expectEqualStrings(target, r.target);
+        try testing.expectEqualStrings(case[1], r.target);
     }
 }
 
@@ -2003,7 +2119,7 @@ test "chunked has to be the last coding, and has to be spelled that way" {
         try testing.expect(!r.chunked);
     }
 
-    for ([_][]const u8{ "chunked", "CHUNKED", "gzip, chunked", "gzip ,  chunked " }) |value| {
+    for ([_][]const u8{ "chunked", "CHUNKED", " chunked " }) |value| {
         var r = Request{};
         var buf: [128]u8 = undefined;
         const head = try std.fmt.bufPrint(
@@ -2112,15 +2228,13 @@ test "an absolute-form target answers for the Host the request never sent" {
     ));
 }
 
-test "the three targets that are not absolute-form are left where they were" {
+test "the two targets that are not absolute-form are kept for their own method and never routed" {
     // Asterisk-form is server-wide OPTIONS and authority-form asks for a
-    // tunnel; neither names a route here, so both reach the router as they
-    // arrived and get the 404 or 405 they had before.
+    // tunnel; neither names a route here, so both are left as they arrived for
+    // `serve.zig`, which answers the first itself and the second with a 404.
     for ([_][2][]const u8{
         .{ "OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n", "*" },
         .{ "CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n", "example.com:443" },
-        // A scheme nilo is not an origin server for.
-        .{ "GET ftp://example.com/a HTTP/1.1\r\nHost: x\r\n\r\n", "ftp://example.com/a" },
     }) |case| {
         var r = Request{};
         try parseHead(case[0], &r);
@@ -2566,7 +2680,7 @@ const epoch_date = "Date: Thu, 01 Jan 1970 00:00:00 GMT\r\n";
 test "staticResponse and writeResponse produce the same bytes" {
     defer date.pinned = null;
     date.pinned = 0;
-    const fixed = comptime staticResponse(200, "OK", "text/plain", "hello\n", .implied);
+    const fixed = comptime staticResponse(200, "text/plain", "hello\n", .implied);
     var fixed_buf: [256]u8 = undefined;
     var fixed_out = std.Io.Writer.fixed(&fixed_buf);
     try writeStatic(&fixed_out, fixed);
@@ -2912,4 +3026,162 @@ test "a response to a client that sent one request and waits leaves at once" {
     try settle(&wire.writer, &again);
     try testing.expectEqual(@as(usize, 2), wire.writes);
     try testing.expect(std.mem.endsWith(u8, wire.kept.items, "Content-Length: 3\r\n\r\n"));
+}
+
+test "a transfer coding stacked under chunked is a 501, and a final coding that is not chunked stays a 400" {
+    // RFC 9112 §6.1: a coding the server does not understand is a 501. nilo
+    // decodes `chunked` and nothing else, so `gzip, chunked` used to be read
+    // as chunked and the handler was handed gzip bytes as its body.
+    for ([_][]const u8{ "gzip, chunked", "gzip ,  chunked ", "identity, chunked", "chunked, chunked" }) |value| {
+        var r = Request{};
+        var buf: [128]u8 = undefined;
+        const head = try std.fmt.bufPrint(
+            &buf,
+            "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: {s}\r\n\r\n",
+            .{value},
+        );
+        try testing.expectError(error.UnsupportedTransferEncoding, parseHead(head, &r));
+        try testing.expect(!r.chunked);
+    }
+    // §6.3 makes a request whose last coding is not chunked a 400, and that
+    // stays: the length cannot be told.
+    var r = Request{};
+    try testing.expectError(error.BadHeader, parseHead("POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", &r));
+}
+
+test "an HTTP/1.0 request carrying Transfer-Encoding closes the connection after the answer" {
+    // RFC 9112 §6.1: HTTP/1.0 has no Transfer-Encoding, so a message with one
+    // is framed by something other than what its sender and a front end agree
+    // on. It is answered and the connection is not reused, whatever
+    // `Connection` asked for and in whatever order.
+    for ([_][]const u8{
+        "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "POST / HTTP/1.0\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+    }) |head| {
+        var r = Request{};
+        try parseHead(head, &r);
+        try testing.expect(r.chunked);
+        try testing.expect(!r.keep_alive);
+    }
+    // HTTP/1.1 is untouched.
+    var one_one = Request{};
+    try parseHead("POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n", &one_one);
+    try testing.expect(one_one.keep_alive);
+}
+
+test "one empty line before the request line is skipped, and a second one is a 400" {
+    // RFC 9112 §2.2: a server expecting a request line SHOULD ignore at least
+    // one empty line before it. A client that ends a POST body with an extra
+    // CRLF is the one this is for.
+    for ([_][]const u8{ "\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n", "\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n" }) |bytes| {
+        var in = std.Io.Reader.fixed(bytes);
+        const r = try readRequest(&in);
+        try testing.expectEqualStrings("GET", r.method);
+        try testing.expectEqualStrings("/a", r.target);
+        try testing.expectEqual(@as(usize, 0), in.buffered().len);
+    }
+    // The blank line is not part of the head handed on: what follows it is
+    // the request line, so the headers are still the headers.
+    var in = std.Io.Reader.fixed("\r\nGET /a HTTP/1.1\r\nHost: x\r\nAccept: y\r\n\r\n");
+    const head = try readHead(&in, .off);
+    var it = HeaderIterator.from(head);
+    try testing.expectEqualStrings("Host", it.next().?.name);
+    try testing.expectEqualStrings("Accept", it.next().?.name);
+
+    var twice = std.Io.Reader.fixed("\r\n\r\nGET /a HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expectError(error.BadRequestLine, readRequest(&twice));
+}
+
+test "a target that does not begin with a slash is refused unless it is a form nilo has an answer for" {
+    // Nothing that is not origin-form may reach the router, which splits on
+    // `/` and has no idea the first one was never there: `admin:1/x` was
+    // matched by `/:a/x`, and `*` by a root `/*`.
+    for ([_][]const u8{ "admin:1/x", "ftp://example.com/a", "urn:isbn:1", "ht:tp://x/y", "mailto:a@b" }) |target| {
+        var r = Request{};
+        var line: [64]u8 = undefined;
+        const text = std.fmt.bufPrint(&line, "GET {s} HTTP/1.1", .{target}) catch unreachable;
+        try testing.expectError(error.BadRequestLine, parseRequestLine(text, &r));
+    }
+    // Asterisk-form is for OPTIONS and nothing else (RFC 9112 §3.2.4), and
+    // authority-form for CONNECT (§3.2.3).
+    var star = Request{};
+    try testing.expectError(error.BadRequestLine, parseRequestLine("GET * HTTP/1.1", &star));
+    try testing.expectError(error.BadRequestLine, parseRequestLine("POST * HTTP/1.1", &star));
+    var authority = Request{};
+    try testing.expectError(error.BadRequestLine, parseRequestLine("GET example.com:443 HTTP/1.1", &authority));
+    try parseRequestLine("OPTIONS * HTTP/1.1", &star);
+    try testing.expectEqualStrings("*", star.target);
+    try parseRequestLine("CONNECT example.com:443 HTTP/1.1", &authority);
+    try testing.expectEqualStrings("example.com:443", authority.target);
+}
+
+test "a version that is well formed and not spoken here is told apart from one that is not a version" {
+    var r = Request{};
+    // RFC 9110 §15.6.6: a 505 is for a version the server refuses to support.
+    try testing.expectError(error.UnsupportedVersion, parseRequestLine("GET / HTTP/2.0", &r));
+    try testing.expectError(error.UnsupportedVersion, parseRequestLine("GET / HTTP/0.9", &r));
+    try testing.expectError(error.UnsupportedVersion, parseRequestLine("GET / HTTP/1.2", &r));
+    // Not a version at all: a malformed request line.
+    for ([_][]const u8{ "HTTP/1.1 x", "HTTP/2", "http/1.1", "HTTP/1.", "HTTP/11.1", "FOO/1.1", "garbage" }) |version| {
+        var line: [64]u8 = undefined;
+        const text = std.fmt.bufPrint(&line, "GET / {s}", .{version}) catch unreachable;
+        try testing.expectError(error.BadRequestLine, parseRequestLine(text, &r));
+    }
+}
+
+test "every status nilo can send has a reason phrase, from one table" {
+    // `fail.status(502, …)` went out as `HTTP/1.1 502 \r\n`: the table stopped
+    // at the statuses nilo itself sends.
+    for ([_]u16{ 100, 101, 200, 201, 202, 203, 204, 205, 206, 300, 301, 302, 303, 304, 307, 308, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 421, 422, 423, 424, 425, 426, 428, 429, 431, 451, 500, 501, 502, 503, 504, 505, 506, 507, 508, 510, 511 }) |status| {
+        try testing.expect(statusPhrase(status).len > 0);
+        var buf: [128]u8 = undefined;
+        var out = std.Io.Writer.fixed(&buf);
+        try writeStatusLine(&out, status, statusPhrase(status));
+        var expected: [128]u8 = undefined;
+        try testing.expectEqualStrings(
+            try std.fmt.bufPrint(&expected, "HTTP/1.1 {d} {s}\r\n", .{ status, statusPhrase(status) }),
+            out.buffered(),
+        );
+    }
+    try testing.expectEqualStrings("Bad Gateway", statusPhrase(502));
+    try testing.expectEqualStrings("HTTP Version Not Supported", statusPhrase(505));
+    // A status nobody registered has no phrase, which RFC 9112 §4 allows.
+    try testing.expectEqualStrings("", statusPhrase(299));
+}
+
+test "a chunk that announces a large size and sends nothing does not grow the arena to it" {
+    // The size is a number a stranger typed. `readSizedBody` takes a page
+    // before it commits the rest, and a chunk is the same promise (ADR 083).
+    const announced = 8 * 1024 * 1024;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var in = std.Io.Reader.fixed("800000\r\nonly a little");
+    try testing.expectError(error.EndOfStream, readChunkedBody(&in, arena.allocator(), announced));
+    try testing.expect(arena.queryCapacity() < announced / 8);
+
+    // A chunk over a page that does arrive is still one contiguous body.
+    const big = "a" ** 0x2801;
+    var whole = std.Io.Reader.fixed("2801\r\n" ++ big ++ "\r\n0\r\n\r\n");
+    const body = try readChunkedBody(&whole, arena.allocator(), 1 << 20);
+    try testing.expectEqualStrings(big, body);
+}
+
+test "a Host that is not an authority is a 400" {
+    // `Host` was counted and never read, so a value that is a path, carries
+    // userinfo or holds a byte no host holds reached `Ctx.host` and every
+    // redirect or link built from it.
+    for ([_][]const u8{ "evil.com/reset?x=", "a@b", "a b", "a,b/", "http://a", "[::1", "host:80x", "a\x01b", "ex ample.com", "/" }) |host| {
+        var r = Request{};
+        var buf: [128]u8 = undefined;
+        const head = try std.fmt.bufPrint(&buf, "GET / HTTP/1.1\r\nHost: {s}\r\n\r\n", .{host});
+        try testing.expectError(error.BadHeader, parseHead(head, &r));
+    }
+    for ([_][]const u8{ "example.com", "example.com:8080", "[::1]:8080", "127.0.0.1", "EXAMPLE.com" }) |host| {
+        var r = Request{};
+        var buf: [128]u8 = undefined;
+        const head = try std.fmt.bufPrint(&buf, "GET / HTTP/1.1\r\nHost: {s}\r\n\r\n", .{host});
+        try parseHead(head, &r);
+        try testing.expect(r.has_host);
+    }
 }

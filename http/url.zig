@@ -25,7 +25,10 @@
 //! somebody typed rather than a path segment they get to invent:
 //! `url("/users/:id", .{ .id = "a/b" })` is `/users/a%2Fb`, one segment. That
 //! is a property rather than a nicety — the alternative is a value from a form
-//! deciding which route the URL it lands in matches.
+//! deciding which route the URL it lands in matches. The same property is why
+//! a text value of `.`, `..` or nothing at all is refused with
+//! `error.BadValue`: encoding cannot save them, because a browser reads `%2E`
+//! as a dot, so they would still drop or add a segment.
 
 const std = @import("std");
 const core = @import("nilo_core");
@@ -34,12 +37,24 @@ const naming = @import("names.zig");
 
 const Str = core.Str;
 
+/// What building a URL can fail with: the writer, or a value that is not a
+/// path segment.
+pub const WriteError = std.Io.Writer.Error || error{
+    /// A text value that is empty, `.` or `..`. Each is a segment that does
+    /// something other than name itself: `/u/../settings` is `/settings` once
+    /// a browser has followed it, `%2E%2E` is the same to one (WHATWG reads a
+    /// percent-encoded dot as a dot), and an empty one is `/u//settings`,
+    /// which the router gives no param. Refused rather than rewritten, because
+    /// there is no spelling of these that names a segment.
+    BadValue,
+};
+
 /// Write the URL for `pattern`, with `args` filling its params.
 ///
 /// The whole check is at compile time and the run-time work is a walk over the
 /// pattern: no allocation, no lookup, and nothing that can fail but the writer
 /// itself.
-pub fn write(w: *std.Io.Writer, comptime pattern: []const u8, args: anytype) std.Io.Writer.Error!void {
+pub fn write(w: *std.Io.Writer, comptime pattern: []const u8, args: anytype) WriteError!void {
     comptime check(pattern, @TypeOf(args));
 
     comptime var at: usize = 0;
@@ -64,11 +79,15 @@ pub fn write(w: *std.Io.Writer, comptime pattern: []const u8, args: anytype) std
 /// The URL for `pattern` written into a caller's buffer, for somebody who has
 /// no `Ctx` — a link in an email sent from spawned work, a test.
 ///
-/// `error.NoSpaceLeft` is the only way this fails, and `Ctx.url` is the call
-/// that does not have to think about the size.
-pub fn into(buf: []u8, comptime pattern: []const u8, args: anytype) error{NoSpaceLeft}![]u8 {
+/// `error.NoSpaceLeft` is how it fails when the URL does not fit, and
+/// `Ctx.url` is the call that does not have to think about the size.
+/// `error.BadValue` is a text value that is not a segment (see `WriteError`).
+pub fn into(buf: []u8, comptime pattern: []const u8, args: anytype) error{ NoSpaceLeft, BadValue }![]u8 {
     var w: std.Io.Writer = .fixed(buf);
-    write(&w, pattern, args) catch return error.NoSpaceLeft;
+    write(&w, pattern, args) catch |err| switch (err) {
+        error.BadValue => return error.BadValue,
+        error.WriteFailed => return error.NoSpaceLeft,
+    };
     return w.buffered();
 }
 
@@ -77,17 +96,24 @@ pub fn into(buf: []u8, comptime pattern: []const u8, args: anytype) error{NoSpac
 /// Which types get here is settled by `writable` in `check`, so there is no
 /// `else` to fall down: a type that cannot go in a path was a compile error
 /// naming the field, back where somebody wrote it.
-fn writeValue(w: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
+fn writeValue(w: *std.Io.Writer, value: anytype) WriteError!void {
     const V = @TypeOf(value);
-    if (V == Str) return percent.encodeWrite(w, value.view(), .unreserved);
+    if (V == Str) return writeText(w, value.view());
     return switch (@typeInfo(V)) {
         // A number needs no escaping and a bool is two words, so neither pays
         // for the encoder.
         .int, .comptime_int => w.print("{d}", .{value}),
         .bool => w.writeAll(if (value) "true" else "false"),
         .@"enum" => percent.encodeWrite(w, @tagName(value), .unreserved),
-        else => percent.encodeWrite(w, value, .unreserved),
+        else => writeText(w, value),
     };
+}
+
+/// Text as one path segment: percent-encoded, and refused when it is empty or
+/// a dot segment, which no encoding makes safe (see `WriteError`).
+fn writeText(w: *std.Io.Writer, text: []const u8) WriteError!void {
+    if (text.len == 0 or std.mem.eql(u8, text, ".") or std.mem.eql(u8, text, "..")) return error.BadValue;
+    return percent.encodeWrite(w, text, .unreserved);
 }
 
 /// Whether a value of this type can be written into a path segment.
@@ -260,4 +286,17 @@ test "a param at the very end and one in the middle are both filled" {
 test "a buffer too small says so rather than writing half a URL" {
     var buf: [4]u8 = undefined;
     try testing.expectError(error.NoSpaceLeft, into(&buf, "/users/:id", .{ .id = 42 }));
+}
+
+test "a value that is empty or a dot segment is refused rather than built into the path" {
+    // `/u/../settings` is `/settings` once a browser has followed it, and
+    // `%2E%2E` is the same thing to one (WHATWG reads it as a dot segment
+    // too), so encoding is not a way out. An empty value is `/u//settings`.
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.BadValue, into(&buf, "/u/:name/settings", .{ .name = ".." }));
+    try testing.expectError(error.BadValue, into(&buf, "/u/:name/settings", .{ .name = "." }));
+    try testing.expectError(error.BadValue, into(&buf, "/u/:name/settings", .{ .name = "" }));
+    // A value that merely contains dots is an ordinary name.
+    try testing.expectEqualStrings("/u/a..b/settings", try into(&buf, "/u/:name/settings", .{ .name = "a..b" }));
+    try testing.expectEqualStrings("/u/...", try into(&buf, "/u/:name", .{ .name = "..." }));
 }

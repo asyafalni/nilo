@@ -134,8 +134,10 @@ fn refParseHead(head: []const u8, r: *http1.Request) http1.ParseError!void {
 /// The one rule about a head rather than about a line in it. A second `Host`
 /// is caught as it goes past; that there was never a first one is only
 /// knowable once the head has ended, which is why this is separate.
-fn refFinish(r: *const http1.Request) http1.ParseError!void {
+fn refFinish(r: *http1.Request) http1.ParseError!void {
     if (r.minor_version == 1 and !r.has_host and r.authority.len == 0) return error.BadHeader;
+    // HTTP/1.0 has no `Transfer-Encoding` (RFC 9112 §6.1): answered, then closed.
+    if (r.minor_version == 0 and r.chunked) r.keep_alive = false;
 }
 
 /// A byte no line may carry where it is: any control but tab, and in the
@@ -166,14 +168,19 @@ fn refParseRequestLine(line: []const u8, r: *http1.Request) http1.ParseError!voi
     const version = parts.rest();
     if (method.len == 0 or target.len == 0) return error.BadRequestLine;
     // The rest of the line is the version, spaces and all — which is what
-    // makes `GET / HTTP/1.1 x` unsupported rather than accepted.
+    // makes `GET / HTTP/1.1 x` malformed rather than accepted.
     if (std.mem.eql(u8, version, "HTTP/1.1")) {
         r.minor_version = 1;
         r.keep_alive = true;
     } else if (std.mem.eql(u8, version, "HTTP/1.0")) {
         r.minor_version = 0;
         r.keep_alive = false;
-    } else return error.UnsupportedVersion;
+    } else if (std.mem.startsWith(u8, version, "HTTP/") and version.len == 8 and
+        std.ascii.isDigit(version[5]) and std.ascii.isDigit(version[7]) and version[6] == '.')
+    {
+        // Spelled like a version and not spoken: a 505 and not a 400.
+        return error.UnsupportedVersion;
+    } else return error.BadRequestLine;
     // A method is a token, checked with the grammar's own switch where
     // `http1` compares a block against its runs.
     if (!http1.headerNameOk(method)) return error.BadRequestLine;
@@ -192,9 +199,9 @@ fn refSplitTarget(r: *http1.Request) http1.ParseError!void {
     const target = r.target;
     if (target[0] == '/') return;
 
-    const sep = std.mem.indexOf(u8, target, "://") orelse return refOtherForm(target);
+    const sep = std.mem.indexOf(u8, target, "://") orelse return refOtherForm(target, r.method);
     const scheme = target[0..sep];
-    if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https")) return refOtherForm(target);
+    if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https")) return refOtherForm(target, r.method);
 
     const rest = target[sep + 3 ..];
     var cut: usize = rest.len;
@@ -219,24 +226,15 @@ fn refSplitTarget(r: *http1.Request) http1.ParseError!void {
     r.target = rest[cut..];
 }
 
-/// The two forms a target that is not origin-form and not an `http`
-/// absolute-form may still be (RFC 9112 §3.2): `*`, a scheme and a colon, or
-/// `host:port`. Written as the grammar's alternatives one after another,
-/// where `http1.otherForm` shares its search for the colon between them.
-fn refOtherForm(target: []const u8) http1.ParseError!void {
-    if (std.mem.eql(u8, target, "*")) return;
-    if (std.mem.indexOfScalar(u8, target, ':')) |colon| {
-        const scheme = target[0..colon];
-        // An `http` URI with no `//` has no host (RFC 9110 §4.2.1).
-        for ([_][]const u8{ "http", "https" }) |named| {
-            if (std.ascii.eqlIgnoreCase(scheme, named)) return error.BadRequestLine;
-        }
-        var ok = scheme.len > 0 and std.ascii.isAlphabetic(scheme[0]);
-        for (scheme) |c| {
-            if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') ok = false;
-        }
-        if (ok) return;
+/// What a target that is not origin-form and not an `http` absolute-form may
+/// still be (RFC 9112 §3.2): `*` for an OPTIONS and `host:port` for a CONNECT,
+/// and nothing else, where `http1` writes the same as one chain of ifs.
+fn refOtherForm(target: []const u8, method: []const u8) http1.ParseError!void {
+    if (std.mem.eql(u8, target, "*")) {
+        if (std.mem.eql(u8, method, "OPTIONS")) return;
+        return error.BadRequestLine;
     }
+    if (!std.mem.eql(u8, method, "CONNECT")) return error.BadRequestLine;
     try refAuthority(target, true);
 }
 
@@ -292,6 +290,8 @@ fn refApplyHeader(line: []const u8, r: *http1.Request) http1.ParseError!void {
     if (std.ascii.eqlIgnoreCase(name, "host")) {
         if (r.has_host) return error.BadHeader;
         r.has_host = true;
+        // What a host can be spelled with; empty is legal (RFC 9112 §3.2).
+        if (value.len > 0) refAuthority(value, false) catch return error.BadHeader;
     } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
         // A list, split every time, where `http1` answers the two common
         // whole values before splitting. `close` anywhere wins; `keep-alive`
@@ -325,10 +325,16 @@ fn refApplyHeader(line: []const u8, r: *http1.Request) http1.ParseError!void {
         // spellings of "the final coding", which is the pair worth having.
         var codings = std.mem.splitScalar(u8, value, ',');
         var last: []const u8 = "";
-        while (codings.next()) |coding| last = std.mem.trim(u8, coding, " \t");
+        var count: usize = 0;
+        while (codings.next()) |coding| {
+            last = std.mem.trim(u8, coding, " \t");
+            count += 1;
+        }
         // Anything but `chunked` last is a coding nilo cannot decode, which
-        // RFC 9112 §6.1 makes a 400 rather than a request with no body.
+        // RFC 9112 §6.1 makes a 400 rather than a request with no body, and a
+        // coding in front of a final `chunked` is a 501.
         if (!std.ascii.eqlIgnoreCase(last, "chunked")) return error.BadHeader;
+        if (count > 1) return error.UnsupportedTransferEncoding;
         if (r.has_content_length) return error.BadHeader;
         r.chunked = true;
     }

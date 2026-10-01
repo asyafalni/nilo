@@ -64,11 +64,11 @@ A call's metadata arrives as request headers, so `c.header("x-tenant")` reads it
 
 So `return fail.notFound("no order {d}", .{id})` becomes `NOT_FOUND` with that message, and the handler does not need to know gRPC is involved. For a code with no HTTP status of its own, such as `ALREADY_EXISTS`, set a `grpc-status` header on a 200: `try c.setHeader("grpc-status", "6")`.
 
-A path no route answers is `UNIMPLEMENTED`, and a message larger than `max_body` is `RESOURCE_EXHAUSTED`.
+A path no route answers is `UNIMPLEMENTED`, and a message larger than `max_body` is `RESOURCE_EXHAUSTED`. A request whose `content-type` is not `application/grpc` or `application/grpc+` and a subtype (`application/grpc-web` is another protocol) is a 415, and one that is not well-formed HTTP/2 (a pseudo-header twice, unknown or after a regular field, or no `:scheme`) has its stream reset with `PROTOCOL_ERROR`.
 
 ## Deadlines
 
-**A client's `grpc-timeout` becomes the request's deadline**, the same one `nilo.deadline(ms)` gives a route ([deadlines](./deploying.md#deadlines)). Every wait nilo owns is cut short by it, and `c.overdue()` tells a loop of your own when time is up. A route that fails after the client's time is up is answered `DEADLINE_EXCEEDED` whatever it failed with, because that is what happened as far as the client can tell. `limits.request_deadline_ms` does not extend a deadline a call brought with it; a route's own `nilo.deadline` replaces it.
+**A client's `grpc-timeout` becomes the request's deadline**, the same one `nilo.deadline(ms)` gives a route ([deadlines](./deploying.md#deadlines)), counted from when the call's headers arrived and not from when its message was whole. Every wait nilo owns is cut short by it, and `c.overdue()` tells a loop of your own when time is up. A route that fails after the client's time is up is answered `DEADLINE_EXCEEDED` whatever it failed with, because that is what happened as far as the client can tell. `limits.request_deadline_ms` does not extend a deadline a call brought with it; a route's own `nilo.deadline` replaces it.
 
 ## gRPC over TLS
 

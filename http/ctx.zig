@@ -1961,6 +1961,11 @@ pub const Ctx = struct {
         }
         const key = self.header("Sec-WebSocket-Key") orelse
             return fail.badRequest("the handshake is missing Sec-WebSocket-Key", .{});
+        // Sixteen bytes of base64 (RFC 6455 §4.1), refused before anything is
+        // answered: a key that is not one is not a WebSocket client.
+        if (!websocket.keyIsValid(key.view())) {
+            return fail.badRequest("Sec-WebSocket-Key has to be 16 bytes of base64", .{});
+        }
 
         // From here the answer is written, so nothing above may fail.
         self.markAnswered(101);
@@ -1970,7 +1975,7 @@ pub const Ctx = struct {
         self._force_close = true;
 
         const answer = websocket.accept(key.view());
-        try websocket.writeAcceptance(self._out, &answer, options.protocol);
+        try websocket.writeAcceptance(self._out, &answer, websocket.negotiated(self._head, options));
 
         // A WebSocket is allowed to sit quiet. A chat tab with nobody typing
         // is working correctly, and the read limit that protects the HTTP

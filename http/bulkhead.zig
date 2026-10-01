@@ -1623,9 +1623,11 @@ pub const Deadlines = struct {
         if (self.body_ms == 0) return self.set(.read, .none);
         if (self.body_min_rate == 0) return self.armBody();
 
-        // A megabyte at a kilobyte a second is 1,000 seconds; nothing here
-        // comes close to overflowing, since `bytes` is bounded by `max_body`.
-        const budget_ms: u64 = self.body_grace_ms + (bytes * std.time.ms_per_s) / self.body_min_rate;
+        // A megabyte at a kilobyte a second is 1,000 seconds. `bytes` is not
+        // always `max_body`'s: a stream's `max_bytes` is the caller's own
+        // number, up to `maxInt(u64)`, so the multiply and the sum saturate and
+        // the `@min` below caps what is left.
+        const budget_ms: u64 = self.body_grace_ms +| (bytes *| std.time.ms_per_s) / self.body_min_rate;
         self.set(.read, .{ .by_ns = monotonicNanos() + msToNanos(@intCast(@min(budget_ms, std.math.maxInt(u32)))) });
     }
 
@@ -1854,6 +1856,21 @@ test "a buffered body's limit is a deadline sized from the bytes it is waiting f
     const at = caught.limit.by_ns;
     try testing.expect(at >= before + want);
     try testing.expect(at <= after + want);
+}
+
+test "a body of any size the caller names sizes a deadline instead of overflowing it" {
+    // `bodyStreamWith(.{ .max_bytes = maxInt(u64) })` is a caller's number,
+    // not one `max_body` bounded, and `bytes * 1000` wraps in ReleaseFast and
+    // panics in Debug and ReleaseSafe.
+    var caught = Caught{};
+    const d = caught.deadlines(.{ .body_ms = 1100, .body_min_rate = 1024, .body_grace_ms = 500 });
+
+    const before = monotonicNanos();
+    d.armBodyRun(std.math.maxInt(u64));
+    // Capped at the largest budget a deadline is given, rather than the wrapped
+    // (small) one a multiplication that overflowed would have produced.
+    const cap = @as(u64, std.math.maxInt(u32)) * std.time.ns_per_ms;
+    try testing.expect(caught.limit.by_ns >= before + cap);
 }
 
 test "a rate of zero leaves the body on the per-read limit it had" {

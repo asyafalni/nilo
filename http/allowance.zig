@@ -768,8 +768,11 @@ fn parseIp6(text: []const u8) ?[16]u8 {
     if (gap) |g| {
         if (at == 16) return null; // a `::` standing for nothing
         const tail = at - g;
-        var i: usize = 0;
-        while (i < tail) : (i += 1) out[16 - tail + i] = out[g + i];
+        // Backwards, because the tail's old and new places overlap whenever
+        // it is longer than the gap it moves across (five groups after `::`
+        // at group two), and a forward copy reads bytes it has already
+        // overwritten.
+        std.mem.copyBackwards(u8, out[16 - tail ..], out[g..at]);
         @memset(out[g .. 16 - tail], 0);
     } else if (at != 16) return null;
 
@@ -897,6 +900,31 @@ test "an address is the key, and an IPv6 client is a prefix rather than one numb
 
     // Nonsense is hashed as text rather than guessed at.
     try testing.expectEqualStrings("not:an:address:", keyOf(&key, "not:an:address:", 64));
+}
+
+test "a tail after :: of five groups keeps its own bytes, and a :: for one group fills one" {
+    var key: [17]u8 = undefined;
+    var other: [17]u8 = undefined;
+
+    // The tail is moved to the end of the sixteen bytes, and with five groups
+    // the source and the destination overlap, which a forward copy corrupts.
+    // Above a /64 the two addresses below differ in the part that is kept.
+    const a = keyOf(&key, "2001:db8::1:2:3:4", 128);
+    try testing.expectEqualSlices(u8, &.{
+        tag_v6, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 1, 0, 2, 0, 3, 0, 4,
+    }, a);
+    const b = keyOf(&other, "2001:db8::1:2:5:6", 128);
+    try testing.expect(!std.mem.eql(u8, a, b));
+
+    // The longest tail there is, with `::` standing for one group.
+    const c = keyOf(&key, "1:2:3:4:5:6:7::", 128);
+    try testing.expectEqualSlices(u8, &.{
+        tag_v6, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 0,
+    }, c);
+    const d = keyOf(&key, "1::3:4:5:6:7:8", 128);
+    try testing.expectEqualSlices(u8, &.{
+        tag_v6, 0, 1, 0, 0, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8,
+    }, d);
 }
 
 test "one address spelled three ways is one client" {

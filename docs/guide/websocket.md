@@ -24,7 +24,7 @@ try app.get("/ws", echo);
 
 nilo does the handshake, the frame headers, the masking, the reassembly of fragments and the closing handshake. Ping and pong are answered inside `receive`, so a handler never writes those branches.
 
-[`c.upgrade()`](../reference/ctx.md#answering) fails with a 400 if the request is not a WebSocket handshake, so a browser that lands on the URL gets an answer instead of a dropped connection. `c.upgradeWith(loop, state, .{ .protocol = "chat.v1" })` names a subprotocol.
+[`c.upgrade()`](../reference/ctx.md#answering) fails with a 400 if the request is not a WebSocket handshake, so a browser that lands on the URL gets an answer instead of a dropped connection. `c.upgradeWith(loop, state, .{ .protocols = &.{ "chat.v2", "chat.v1" } })` names the subprotocols the route speaks, and the answer is the first one the client offered, or none: a browser fails a connection whose answer names a protocol it did not offer, so `.protocol = "chat.v1"` (one name) is answered only to a client that asked for it. A `Sec-WebSocket-Key` that is not 16 bytes of base64 is a 400.
 
 ### Why the loop is a separate function
 

@@ -1838,7 +1838,8 @@ test "an OPTIONS asking what a path supports is answered, not refused" {
     const result = h.send(&app, "OPTIONS /users HTTP/1.1\r\nHost: x\r\n\r\n");
 
     try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 204 No Content\r\n"));
-    try testing.expect(std.mem.indexOf(u8, result.response, "Allow: GET, HEAD, POST\r\n") != null);
+    // OPTIONS is in it: the path answers the request that asked (RFC 9110 §9.3.7).
+    try testing.expect(std.mem.indexOf(u8, result.response, "Allow: GET, HEAD, POST, OPTIONS\r\n") != null);
 }
 
 test "a route registered for the method still wins over the 405" {
@@ -6736,6 +6737,55 @@ test "a request that is not asking to be upgraded is told which part is missing"
             "Sec-WebSocket-Version: 8\r\nSec-WebSocket-Key: x\r\n\r\n",
     );
     try testing.expect(std.mem.indexOf(u8, wrong_version.response, "speaks WebSocket version 13") != null);
+}
+
+test "a handshake key that is not sixteen bytes of base64 is a 400" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/ws", echoSocket);
+
+    var h = Harness.init();
+    defer h.deinit();
+    for ([_][]const u8{ "x", "dGhlIHNhbXBsZSBub25jZQ", "dGhlIHNhbXBsZSBub25jZQ=!" }) |key| {
+        var buf: [256]u8 = undefined;
+        const request = try std.fmt.bufPrint(
+            &buf,
+            "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+                "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {s}\r\n\r\n",
+            .{key},
+        );
+        const result = h.send(&app, request);
+        try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 400"));
+        try testing.expect(std.mem.indexOf(u8, result.response, "101") == null);
+    }
+}
+
+fn chatSocket(c: *Ctx) anyerror!void {
+    return c.upgradeWith(echoLoop, {}, .{ .protocols = &.{ "chat.v1", "chat.v2" } });
+}
+
+test "a sub-protocol is answered only when the client offered one the route speaks" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/chat", chatSocket);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const base = "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+
+    const offered = h.send(&app, base ++ "Sec-WebSocket-Protocol: mqtt, chat.v2\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, offered.response, "Sec-WebSocket-Protocol: chat.v2\r\n") != null);
+
+    // The browser's plain `new WebSocket(url)` offers nothing, and a name it
+    // did not offer is a connection it fails.
+    const silent = h.send(&app, base ++ "\r\n");
+    try testing.expect(std.mem.startsWith(u8, silent.response, "HTTP/1.1 101"));
+    try testing.expect(std.mem.indexOf(u8, silent.response, "Sec-WebSocket-Protocol") == null);
+
+    const other = h.send(&app, base ++ "Sec-WebSocket-Protocol: mqtt\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, other.response, "HTTP/1.1 101"));
+    try testing.expect(std.mem.indexOf(u8, other.response, "Sec-WebSocket-Protocol") == null);
 }
 
 test "a socket a page on another origin asked for is not opened" {

@@ -199,10 +199,18 @@ pub fn send(c: *Ctx, body: FileBody) !void {
         else => return err,
     };
 
-    // After the open, not before. A failure between the two would otherwise
-    // leave headers set on a response that turns into a 404, and the file is
-    // this function's for exactly as long as the line below takes to reach.
-    for (body.headers.view()) |h| try c.setHeader(h.name, h.value);
+    // After the open, not before: a name that is not there is a 404, and
+    // headers set ahead of it would ride along on that answer.
+    //
+    // A header can be refused (a CR in a value, say), so a failure can come
+    // between the open and the line below, and the file is this function's
+    // until `sendFile` has it. The `errdefer` is scoped to this block so that
+    // it ends where the hand-over begins: `sendFile` closes the file on every
+    // way out, and a second close after it would be a descriptor closed twice.
+    {
+        errdefer file.close();
+        for (body.headers.view()) |h| try c.setHeader(h.name, h.value);
+    }
 
     return c.sendFile(.{
         .file = file,
@@ -476,4 +484,51 @@ test "the document describes a FileBody as bytes, and `?` as the 404" {
     try testing.expect(std.mem.indexOf(u8, document,
         \\"404":{"description":"there is no such thing"
     ) != null);
+}
+
+fn tainted(files: *Files) !FileBody {
+    return .{
+        .dir = files.dir,
+        .name = Files.there,
+        // A CR is what `setHeader` refuses, after the file is already open.
+        .headers = .of(&.{.{ .name = "Content-Disposition", .value = "attachment; filename=\"a\rb.pdf\"" }}),
+    };
+}
+
+fn descriptorsHeld() !usize {
+    var dir = try std.Io.Dir.cwd().openDir(testing.io, "/proc/self/fd", .{ .iterate = true });
+    defer dir.close(testing.io);
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (try it.next(testing.io)) |_| n += 1;
+    return n;
+}
+
+test "a header the response refuses does not leave the file open" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var files = try Files.init();
+    defer files.deinit();
+
+    // The refusal is a warning on the way to a 500, and the runner would show it.
+    const noisy = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = noisy;
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&files);
+    try app.get("/tainted", tainted);
+
+    var client = try nilo_testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+
+    // One round first, so what is opened once and kept is already counted.
+    _ = try client.get(&app, "/tainted");
+    const before = try descriptorsHeld();
+    for (0..8) |_| {
+        const answer = try client.get(&app, "/tainted");
+        try testing.expectEqual(@as(u16, 500), answer.status);
+    }
+    try testing.expectEqual(before, try descriptorsHeld());
 }

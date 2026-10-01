@@ -58,6 +58,14 @@ nicety: `url("/users/:id", .{ .id = "a/b" })` is `/users/a%2Fb`, one segment.
 The alternative is a value out of a form deciding which route the URL it lands
 in matches.
 
+**A text value that is empty, `.` or `..` is refused**, `error.BadValue`, not
+encoded. `.` survives percent-encoding, so `.id = ".."` once built
+`/u/../settings`, which a browser following a redirect reads as `/settings`,
+and `%2E%2E` is no way out because WHATWG treats a percent-encoded dot as a dot
+too. An empty value built `/u//settings`, which the router gives no param. No
+spelling of these names a segment, so the call fails instead of building a URL
+that points elsewhere. `url.into` returns the error; `c.url` passes it up.
+
 **Reading the table** is `app.routes()`, a view rather than a copy:
 
 ```zig
@@ -97,6 +105,11 @@ back as a `:id` sitting literally in a redirect.
 resolved chain, the split segments, the specificity score and the first-segment
 key. Every one of those is how the router does its job today, and publishing
 them is a promise not to change them.
+
+**Encoding `.` and `..` as `%2E` and `%2E%2E`.** The first answer to the audit of
+`http/` at `39896d2`, dropped because a browser normalises a percent-encoded
+dot segment exactly as it does a bare one, so the URL would still point one
+level up.
 
 **Taking a `*` catch-all.** `*` is not an identifier, so there is no field name
 for it, and what it stands for is a whole tail of path rather than one segment

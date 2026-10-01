@@ -25,9 +25,11 @@ pub const Middleware = mw.Middleware;
 
 pub const max_params = 8;
 
-/// The most segments a path can have. A request path with more is matched
-/// by nothing, which is the right answer anyway: no pattern can have more
-/// either, and `add` refuses one that does.
+/// The most segments a pattern can have, and the most a request path is
+/// split into. `add` refuses a pattern with more. A request path with more
+/// is deeper than any fixed route, so only a `*` can answer it, and a `*`
+/// needs no more than the segments before it (at most `max_segments - 1`,
+/// since the `*` is one of the sixteen) to take the rest as text.
 pub const max_segments = 16;
 
 pub const Param = struct {
@@ -375,15 +377,17 @@ pub const Router = struct {
     pub noinline fn matchInto(self: *const Router, method: http1.Method, path: []const u8, out: *Match) bool {
         var buf: [max_segments][]const u8 = undefined;
         const trimmed = trimSlashes(path);
-        const parts = split(trimmed, &buf) orelse return false;
+        const split_path = splitPath(trimmed, &buf);
+        const parts = split_path.items;
+        const deep = split_path.deep;
 
-        if (self.matchExact(method, trimmed, parts, out)) return true;
+        if (self.matchExact(method, trimmed, parts, deep, out)) return true;
         // A HEAD nobody registered is answered by the GET route: the head of
         // a HEAD response has to be what a GET would have sent anyway, and
         // the body is dropped on the way out (Ctx.send). Making people
         // register both would mean every health check and every link
         // checker gets a 404 from a route that plainly exists.
-        if (method == .HEAD) return self.matchExact(.GET, trimmed, parts, out);
+        if (method == .HEAD) return self.matchExact(.GET, trimmed, parts, deep, out);
         return false;
     }
 
@@ -401,11 +405,11 @@ pub const Router = struct {
         var allowed: MethodSet = .initEmpty();
 
         var buf: [max_segments][]const u8 = undefined;
-        const parts = split(trimSlashes(path), &buf) orelse return allowed;
+        const split_path = splitPath(trimSlashes(path), &buf);
 
         for (self.routes.items) |*route| {
             if (allowed.contains(route.method)) continue;
-            if (answers(route, parts)) allowed.insert(route.method);
+            if (answers(route, split_path.items, split_path.deep)) allowed.insert(route.method);
         }
 
         // A HEAD is answered by the GET route, so a path with a GET on it
@@ -416,7 +420,11 @@ pub const Router = struct {
 
     /// Whether this route answers this path, method aside — the length rule
     /// `matchExact` applies before it looks at any text, and then the text.
-    fn answers(route: *const Route, parts: []const []const u8) bool {
+    ///
+    /// `deep` is a path with more segments than `parts` holds: no fixed
+    /// route has that many, so a `*` is the only thing that can answer it.
+    fn answers(route: *const Route, parts: []const []const u8, deep: bool) bool {
+        if (deep) return route.wildcard_tail and matches(route, parts);
         if (route.wildcard_tail) {
             if (parts.len + 1 < route.segments.len) return false;
         } else if (route.segments.len != parts.len) return false;
@@ -431,9 +439,10 @@ pub const Router = struct {
         method: http1.Method,
         trimmed: []const u8,
         parts: []const []const u8,
+        deep: bool,
         out: *Match,
     ) bool {
-        const i = self.find(method, parts) orelse return false;
+        const i = self.find(method, parts, deep) orelse return false;
         const route = &self.routes.items[i];
         out.handler = route.handler;
         out.chain = route.chain;
@@ -457,7 +466,7 @@ pub const Router = struct {
     /// the call stack: a match runs on the request's fiber, and by ADR 062
     /// every byte of stack it touches is held for the life of the
     /// connection. Eighty-five bytes here, whatever the path.
-    fn find(self: *const Router, method: http1.Method, parts: []const []const u8) ?u32 {
+    fn find(self: *const Router, method: http1.Method, parts: []const []const u8, deep: bool) ?u32 {
         const nodes = self.nodes.items;
         if (nodes.len == 0) return null;
         const m = @intFromEnum(method);
@@ -474,8 +483,10 @@ pub const Router = struct {
             const node = &nodes[at[d]];
             if (d == parts.len) {
                 // The whole path is matched. A route ending here is more
-                // specific than a `*` standing for nothing.
-                if (node.ends[m] != none) return node.ends[m];
+                // specific than a `*` standing for nothing. A `deep` path
+                // is not matched whole, there is more of it left, so only
+                // a `*` standing here can take it.
+                if (!deep and node.ends[m] != none) return node.ends[m];
                 if (node.rest[m] != none) return node.rest[m];
             } else {
                 if (next[d] == 0) {
@@ -678,8 +689,9 @@ fn trimSlashes(path: []const u8) []const u8 {
 }
 
 /// Split an already-trimmed path or pattern on "/", into a buffer rather
-/// than onto the heap. Null when there are more segments than fit — for a
-/// request path that simply means nothing matches.
+/// than onto the heap. Null when there are more segments than fit, which
+/// for a pattern is a registration error (a request path goes through
+/// `splitPath`).
 fn split(trimmed: []const u8, out: *[max_segments][]const u8) ?[][]const u8 {
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, trimmed, '/');
@@ -689,6 +701,25 @@ fn split(trimmed: []const u8, out: *[max_segments][]const u8) ?[][]const u8 {
         n += 1;
     }
     return out[0..n];
+}
+
+/// A request path split into at most `max_segments` pieces. `deep` says
+/// there were more, which are not held: only a `*` can answer such a path,
+/// and it takes the rest from the text, not from the pieces.
+const SplitPath = struct {
+    items: [][]const u8,
+    deep: bool,
+};
+
+fn splitPath(trimmed: []const u8, out: *[max_segments][]const u8) SplitPath {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, trimmed, '/');
+    while (it.next()) |part| {
+        if (n == max_segments) return .{ .items = out[0..n], .deep = true };
+        out[n] = part;
+        n += 1;
+    }
+    return .{ .items = out[0..n], .deep = false };
 }
 
 const testing = std.testing;
@@ -828,6 +859,44 @@ test "the rewritten matcher agrees with the one it replaced, path for path" {
             }
         }
     }
+}
+
+test "a * route still matches a path seventeen or more segments deep" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.add(.GET, "/files/*", testHandler);
+
+    var deep: [max_segments + 4][]const u8 = undefined;
+    for (&deep) |*seg| seg.* = "/x";
+    const tail = try std.mem.concat(testing.allocator, u8, &deep);
+    defer testing.allocator.free(tail);
+    const path = try std.mem.concat(testing.allocator, u8, &.{ "/files", tail });
+    defer testing.allocator.free(path);
+
+    const m = r.match(.GET, path) orelse return error.TestExpectedMatch;
+    try testing.expectEqualStrings("x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x/x", m.params[0].value);
+    // The 405 path agrees: a POST to it is a method the route does not have.
+    try testing.expect(r.allowedFor(path).contains(.GET));
+    try testing.expect(!r.allowedFor(path).contains(.POST));
+}
+
+test "a root * fallback matches a path of any depth, and a fixed route never does" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.add(.GET, "/*", testHandler);
+    // Sixteen fixed segments: as deep as a pattern can be, and not as deep
+    // as the path below.
+    try r.add(.POST, "/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16", otherHandler);
+
+    const sixteen = "/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16";
+    const seventeen = sixteen ++ "/17";
+    try testing.expect(r.match(.POST, sixteen) != null);
+    try testing.expect(r.match(.POST, seventeen) == null);
+    try testing.expect(!r.allowedFor(seventeen).contains(.POST));
+
+    const m = r.match(.GET, seventeen) orelse return error.TestExpectedMatch;
+    try testing.expectEqualStrings(seventeen[1..], m.params[0].value);
+    try testing.expect(r.allowedFor(seventeen).contains(.GET));
 }
 
 test "a path with more segments than any route can have matches nothing" {
@@ -1052,7 +1121,7 @@ fn bestByScore(r: *const Router, method: http1.Method, path: []const u8) ?Match 
     var best_score: u32 = 0;
     for (r.routes.items, 0..) |*route, i| {
         if (route.method != method) continue;
-        if (!Router.answers(route, parts)) continue;
+        if (!Router.answers(route, parts, false)) continue;
         const score = Route.specificity(route.segments);
         if (best == null or score > best_score) {
             best = i;

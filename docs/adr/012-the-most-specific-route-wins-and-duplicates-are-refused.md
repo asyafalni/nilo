@@ -17,6 +17,8 @@ And registering the same path twice was accepted without a word. In an app whose
 
 **The ranking is the order a tree of segments is searched in.** Depth first, and at each segment the literal child it names, then the param child, then a `*` standing there, backing out of a branch that reaches the end with no route for the method. The first route that search reaches is the most specific one, so nothing is scored and nothing is compared once a route is found. The tree is built when routes are registered and a match allocates nothing.
 
+**A path deeper than sixteen segments is answered by a `*` and by nothing else.** A pattern has at most sixteen segments, so no fixed route is that deep, but `/files/*` and a root `/*` take however much path is left. The path is split into the first sixteen pieces and marked deep; the walk then ends only at a `*` (and `allowedFor` the same), which takes the rest from the text. Until the audit of `http/` at `39896d2` such a path was a 404 whatever `*` routes existed, on the reasoning that no pattern could be that long.
+
 **A second route of the same shape is refused** with `error.DuplicateRoute`, from the `app.get` call that made it, naming the pattern already there. Param names are not part of the shape: `/users/:id` and `/users/:name` answer the same requests, so they collide.
 
 Order of registration decides nothing at all, which is what `use` and `get` already promised each other.

@@ -14,11 +14,20 @@ desynchronising it.**
 
 ## Why this one and not the others
 
-`Room.print` has the same two passes and has asserted between them since it was
-written (`std.debug.assert(into.end == post.len)`), because it writes into a
-buffer it can measure. `Socket.print` and `Socket.json` write straight to the
-connection and asserted nothing. **So the one place where the mistake cannot be
-recovered from was the one place that was unchecked.**
+`Room.print` and `Room.json` have the same two passes, and write into a buffer
+they can measure, so they compare the two counts too. `Socket.print` and
+`Socket.json` write straight to the connection and asserted nothing. **So the
+one place where the mistake cannot be recovered from was the one place that was
+unchecked.**
+
+The Room used to `std.debug.assert(into.end == post.len)` and
+`catch unreachable` the write, which is the shape rejected below for the same
+reasons: a ReleaseSafe panic takes every connection with it, and a ReleaseFast
+build lets the lie through. The audit of `http/` at `39896d2` found it. A
+disagreement now drops the post (it is released unshared, so no seat ever sees
+it) and returns `error.WriteFailed`, in every optimize mode; the Room stays
+usable, which is the difference from a Socket, whose connection has already
+been told a length and has to close.
 
 Unrecoverable is meant literally. A WebSocket frame states its length and then
 its bytes; a length that is wrong by one leaves the reader at the wrong offset
@@ -57,7 +66,7 @@ the second pass wrote more than it promised, and it is caught.
 
 ## Close, not assert
 
-The obvious shape was `std.debug.assert`, matching `Room.print`, free in
+The obvious shape was `std.debug.assert`, as `Room.print` once did, free in
 `ReleaseFast`. It was rejected for three reasons.
 
 1. **An assert in `ReleaseSafe` takes the process down.** Zig cannot recover

@@ -267,6 +267,9 @@ pub const Error = error{
     /// An event's name or id has a line break in it, which on an event
     /// stream would end the field early and start a field nobody sent.
     EventFieldBreaksLine,
+    /// A `print` or `json` whose two passes disagreed, so its post was
+    /// dropped rather than sent with a length that was wrong (ADR 076).
+    WriteFailed,
     OutOfMemory,
     /// The connection was cancelled while waiting for a lock — a shutdown
     /// landing mid-broadcast. The handler is on its way out anyway.
@@ -550,6 +553,12 @@ pub const Room = struct {
     /// what a message whose length is not known in advance costs when the
     /// alternative is a fixed buffer you have to guess the size of — and the
     /// allocation is the one `say` was going to make anyway, not a second.
+    ///
+    /// **If the two passes disagree** (a value another fiber was writing, a
+    /// format that is not repeatable) nothing is posted and the call is
+    /// `error.WriteFailed`. A Room has a buffer to check the second pass
+    /// against, so it can refuse the post and keep the room; a Socket cannot,
+    /// and closes (ADR 076).
     pub fn print(self: *Room, comptime fmt: []const u8, args: anytype) Error!void {
         if (self.empty()) return;
 
@@ -561,8 +570,7 @@ pub const Room = struct {
         defer self.release(post);
 
         var into: std.Io.Writer = .fixed(post.mutable());
-        into.print(fmt, args) catch unreachable;
-        std.debug.assert(into.end == post.len);
+        try agreed(into.print(fmt, args), &into, post);
 
         return self.handOut(post);
     }
@@ -576,8 +584,7 @@ pub const Room = struct {
         defer self.release(post);
 
         var into: std.Io.Writer = .fixed(post.mutable());
-        json_mod.write(&into, value) catch unreachable;
-        std.debug.assert(into.end == post.len);
+        try agreed(json_mod.write(&into, value), &into, post);
 
         return self.handOut(post);
     }
@@ -882,6 +889,16 @@ pub const Room = struct {
 /// lines, comments included, differing only in this cast: a post's length is
 /// what gets allocated, so a Room wants a `usize` where a frame header wants
 /// the `u64` it puts on the wire.
+/// Whether the writing pass filled exactly the bytes the counting pass
+/// promised. A post whose length is a lie must not reach a seat, so the caller
+/// returns this error with the post still unshared and `defer`ed into the
+/// free (ADR 076). Checked in every optimize mode: it is a failure a request
+/// can reach, and a panic cannot be recovered from (ADR 007).
+fn agreed(wrote: std.Io.Writer.Error!void, into: *const std.Io.Writer, post: *const Post) Error!void {
+    wrote catch return error.WriteFailed;
+    if (into.end != post.len) return error.WriteFailed;
+}
+
 fn sizeOf(comptime write: anytype, value: anytype) usize {
     return @intCast(websocket.counted(write, value));
 }
@@ -1426,4 +1443,64 @@ test "sitting down after an id takes what followed it and nothing already queued
     try testing.expectEqualStrings("4", room.eventOf(next).id);
     room.release(next);
     room.stand(&first);
+}
+
+/// A value whose second formatting is `second` bytes where its first was
+/// `first`: the mistake `Room.print`'s two passes cannot tell from honesty.
+const Fickle = struct {
+    asked: *usize,
+    first: usize,
+    second: usize,
+
+    pub fn format(self: Fickle, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        self.asked.* += 1;
+        try w.splatByteAll('x', if (self.asked.* == 1) self.first else self.second);
+    }
+};
+
+test "a format that disagrees with itself drops the post and says so" {
+    var room = try Room.initWith(testing.allocator, .{ .seats = 1, .backlog = 4 });
+    defer room.deinit();
+    const ticket = sitDown(&room);
+
+    // Longer the second time, and shorter: neither may panic, and neither may
+    // reach a seat (ADR 076).
+    for ([_][2]usize{ .{ 4, 6 }, .{ 6, 4 } }) |sizes| {
+        var asked: usize = 0;
+        try testing.expectError(
+            error.WriteFailed,
+            room.print("{f}", .{Fickle{ .asked = &asked, .first = sizes[0], .second = sizes[1] }}),
+        );
+        try testing.expect(room.take(ticket) == null);
+    }
+
+    // The room is as it was: the next post goes through.
+    try room.print("ok {d}", .{1});
+    const post = room.take(ticket).?;
+    try testing.expectEqualStrings("ok 1", room.contentsOf(post).data);
+    room.release(post);
+}
+
+test "a post and a direct send leave a connection in the order they were made" {
+    var room = try Room.initWith(testing.allocator, .{ .seats = 2, .backlog = 4 });
+    defer room.deinit();
+
+    var in = std.Io.Reader.fixed("");
+    var bytes: [256]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var socket: websocket.Socket = .{ ._in = &in, ._out = &out, ._stopping = null };
+    try room.join(&socket);
+    defer room.leave(&socket);
+
+    try room.sayText("one");
+    try socket.sendText("two");
+    try room.sayText("three");
+    try socket.print("{s}", .{"four"});
+    try room.sayText("five");
+    try socket.close(.normal, "");
+
+    try testing.expectEqualStrings(
+        "\x81\x03one\x81\x03two\x81\x05three\x81\x04four\x81\x04five\x88\x02\x03\xe8",
+        out.buffered(),
+    );
 }

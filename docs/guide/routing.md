@@ -41,7 +41,7 @@ Allow: GET, HEAD, POST
 DELETE is not allowed here. This path answers: GET, HEAD, POST
 ```
 
-`HEAD` is in there without anyone registering one, because the `GET` route already answers it. An `OPTIONS` nobody registered is answered with a 204 and the same `Allow`, that being the question the method exists to ask. Register `app.options(...)` yourself and yours wins.
+`HEAD` is in there without anyone registering one, because the `GET` route already answers it. An `OPTIONS` nobody registered is answered with a 204 and the same `Allow` with `OPTIONS` added, that being the question the method exists to ask. `OPTIONS *` is the server-wide form of it and lists every method any route answers; it is never matched against a route, a root `/*` included. Register `app.options(...)` yourself and yours wins.
 
 ## Groups
 

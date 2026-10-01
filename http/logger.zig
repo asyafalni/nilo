@@ -157,9 +157,14 @@ fn writeLine(
 
     switch (options.format) {
         .text => {
-            try w.print("{s} {s} {d} {d}µs", .{ method, path, status, took });
+            try w.print("{s} ", .{method});
+            try writeEscaped(w, path);
+            try w.print(" {d} {d}µs", .{ status, took });
             if (err_name) |name| try w.print(" error={s}", .{name});
-            if (options.request_id) try w.print(" req={s}", .{c.requestId().view()});
+            if (options.request_id) {
+                try w.writeAll(" req=");
+                try writeEscaped(w, c.requestId().view());
+            }
         },
         // Every value a path could smuggle a delimiter through goes out
         // through the one escaper the response bodies use (`json.zig`).
@@ -179,6 +184,21 @@ fn writeLine(
             }
             try w.writeByte('}');
         },
+    }
+}
+
+/// Text a stranger sent, with every control byte (and DEL) written as `\xNN`.
+/// The target is not checked for them, and a raw ESC steers a terminal while
+/// a raw CR overwrites the line the reader is on; the `.json` format gets the
+/// same effect from its escaper. Bytes above 0x7f pass, so UTF-8 reads as it
+/// came.
+fn writeEscaped(w: *std.Io.Writer, text: []const u8) !void {
+    for (text) |byte| {
+        if (byte < 0x20 or byte == 0x7f) {
+            try w.print("\\x{x:0>2}", .{byte});
+        } else {
+            try w.writeByte(byte);
+        }
     }
 }
 
@@ -287,4 +307,17 @@ test "a line too long for the buffer is cut, not dropped" {
     try testing.expect(line.len > 0);
     try testing.expect(line.len <= buf.len);
     try testing.expect(std.mem.startsWith(u8, line, "GET /xxx"));
+}
+
+test "a text line writes a path's control bytes escaped, so a terminal cannot be steered by it" {
+    var lifetime: str_mod.Lifetime = .{};
+    var c = requestThatWas(&lifetime, "/a\x1b[31mRED\rFAKE\x7f", "id\x1b");
+    var buf: [max_line]u8 = undefined;
+
+    const line = lineFor(.{ .request_id = true }, &buf, &c, 404, 3, null);
+    try testing.expectEqualStrings(
+        "GET /a\\x1b[31mRED\\x0dFAKE\\x7f 404 3µs req=id\\x1b",
+        line,
+    );
+    for (line) |byte| try testing.expect(byte >= 0x20 and byte != 0x7f);
 }

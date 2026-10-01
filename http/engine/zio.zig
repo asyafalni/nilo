@@ -395,7 +395,7 @@ pub fn explained(err: anyerror) bool {
 // ---- stopping on a signal ----
 //
 // A signal handler may do almost nothing safely, so it does almost nothing:
-// one atomic store into the `Stop` below. The accept loop is what notices.
+// one atomic swap and one store into the `Stop` below. The accept loop is what notices.
 
 var signal_target: std.atomic.Value(?*Stop) = .init(null);
 
@@ -406,12 +406,42 @@ const SigNum = @typeInfo(@typeInfo(@typeInfo(
     @FieldType(@FieldType(std.posix.Sigaction, "handler"), "handler"),
 ).optional.child).pointer.child).@"fn".params[0].type.?;
 
+/// Whether this signal is the first, which asks for a graceful stop, or a
+/// later one, which gives up on it.
+const StopSignal = enum { graceful, exit_now };
+
+///
+/// "Seen" is a flag of the handler's own and not `stop.isRequested()`, which
+/// `App.shutdown()` sets too: a SIGTERM arriving after a programmatic shutdown
+/// is the first the operator sent, and reading the shared flag made it look
+/// like the second and exit at once, with the grace period unspent and the
+/// connections in flight cut off. One atomic swap, so two signals racing
+/// cannot both be the first.
+fn stopSignalSeen(stop: *Stop, seen: *std.atomic.Value(bool)) StopSignal {
+    if (seen.swap(true, .acq_rel)) return .exit_now;
+    stop.request();
+    return .graceful;
+}
+
+/// Set by the first stop signal, cleared when the handlers are installed and
+/// again when they are put back.
+var signal_seen: std.atomic.Value(bool) = .init(false);
+
+/// Leave the process now. The handler runs in a signal, where `exit` is not
+/// safe: it runs `atexit` handlers and flushes stdio, and either can be in
+/// the middle of running on the interrupted thread. `_exit` only ends the
+/// process (`exit_group` where there is no libc).
+fn exitNow(status: u8) noreturn {
+    if (builtin.link_libc) std.c._exit(status);
+    if (builtin.os.tag == .linux) std.os.linux.exit_group(status);
+    std.process.exit(status);
+}
+
 fn onStopSignal(_: SigNum) callconv(.c) void {
     const stop = signal_target.load(.acquire) orelse return;
     // A second Ctrl-C means the person has stopped waiting for the graceful
     // part. 130 is the shell's convention for "killed by SIGINT".
-    if (stop.isRequested()) std.process.exit(130);
-    stop.request();
+    if (stopSignalSeen(stop, &signal_seen) == .exit_now) exitNow(130);
 }
 
 /// What was handling these before, so the previous arrangement is put back
@@ -422,6 +452,7 @@ var previous_term: std.posix.Sigaction = undefined;
 
 fn installStopSignals(stop: *Stop) void {
     if (builtin.os.tag == .windows) return;
+    signal_seen.store(false, .release);
     signal_target.store(stop, .release);
     const action = std.posix.Sigaction{
         .handler = .{ .handler = onStopSignal },
@@ -437,6 +468,7 @@ fn restoreStopSignals() void {
     std.posix.sigaction(std.posix.SIG.INT, &previous_int, null);
     std.posix.sigaction(std.posix.SIG.TERM, &previous_term, null);
     signal_target.store(null, .release);
+    signal_seen.store(false, .release);
 }
 
 /// Why the server never got as far as listening. Kept as a value so the
@@ -2570,6 +2602,25 @@ fn ip6Text(buf: *[Peer.max_text]u8, groups: [8]u16) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     writeIp6(&w, bytes);
     return buf[0..w.end];
+}
+
+test "a stop signal after a programmatic shutdown is still the first one" {
+    // The shutdown call sets the same flag a signal does, so reading it back
+    // made the first SIGTERM after a shutdown look like the second and
+    // exit(130) with the grace period unspent.
+    var stop: Stop = .{};
+    var seen: std.atomic.Value(bool) = .init(false);
+
+    stop.request();
+    try testing.expectEqual(StopSignal.graceful, stopSignalSeen(&stop, &seen));
+    try testing.expectEqual(StopSignal.exit_now, stopSignalSeen(&stop, &seen));
+
+    // And with no shutdown first, the same two steps.
+    var fresh: Stop = .{};
+    var fresh_seen: std.atomic.Value(bool) = .init(false);
+    try testing.expectEqual(StopSignal.graceful, stopSignalSeen(&fresh, &fresh_seen));
+    try testing.expect(fresh.isRequested());
+    try testing.expectEqual(StopSignal.exit_now, stopSignalSeen(&fresh, &fresh_seen));
 }
 
 test "an IPv6 address is written the way RFC 5952 says to write it" {

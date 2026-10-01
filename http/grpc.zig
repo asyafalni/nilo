@@ -240,6 +240,10 @@ const Stream = struct {
     /// The message as it arrives, length prefix and all.
     body: std.ArrayList(u8) = .empty,
     body_over_limit: bool = false,
+    /// When the call's first HEADERS frame arrived: what `grpc-timeout` is
+    /// counted from, because the client's clock started when it sent the
+    /// call and not when its message was whole (gRPC over HTTP/2, "Requests").
+    headers_ns: u64 = 0,
     /// When the client stops waiting, from `grpc-timeout`, or 0.
     until_ns: u64 = 0,
     /// When the client has to have finished sending this call, or 0 for no
@@ -587,13 +591,13 @@ const Conn = struct {
         return .again;
     }
 
-    /// The bound on sending one call, from now.
-    fn collectUntil(c: *const Conn) u64 {
+    /// The bound on sending one call, from `now`.
+    fn collectUntil(c: *const Conn, now: u64) u64 {
         const rate = c.deadlines.body_min_rate;
         if (rate == 0) return 0;
         const most: u64 = @as(u64, c.app.max_body) + 5;
         const ms = @as(u64, c.deadlines.body_grace_ms) + most * std.time.ms_per_s / rate;
-        return bulkhead.monotonicNanos() +| ms * std.time.ns_per_ms;
+        return now +| ms * std.time.ns_per_ms;
     }
 
     /// Wait for the calls still running, then write what they answered if
@@ -759,7 +763,8 @@ const Conn = struct {
         c.last_stream = head.stream;
 
         const s = c.newStream(head.stream) catch return error.Internal;
-        s.collect_until_ns = c.collectUntil();
+        s.headers_ns = bulkhead.monotonicNanos();
+        s.collect_until_ns = c.collectUntil(s.headers_ns);
         c.streams.append(c.gpa, s) catch {
             s.destroy();
             return error.Internal;
@@ -839,14 +844,18 @@ const Conn = struct {
             // frame would be a client making this side write, uncounted.
             // The zig build fuzz -- --frames property found it (ADR 220).
             try c.discard(len + pad);
+            if (len == 0) try c.control();
             return;
         };
         if (s.state != .body) {
             try c.discard(len + pad);
             if (s.state == .headers) return error.Protocol;
+            // Empty, to a call nothing is collecting: a frame read for
+            // nothing, as it is to one that is.
+            if (len == 0) try c.control();
             return;
         }
-        if (head.len == 0 and !head.has(h2.Flags.end_stream)) try c.control();
+        if (len == 0 and !head.has(h2.Flags.end_stream)) try c.control();
         s.recv_window -= head.len;
         if (s.recv_window < 0) return error.FlowControl;
         if (s.body_over_limit or s.body.items.len + len > c.app.max_body + 5) {
@@ -954,7 +963,12 @@ const Conn = struct {
                     if (value > h2.max_window) return error.FlowControl;
                     const delta = @as(i64, value) - c.peer_window;
                     c.peer_window = value;
-                    for (c.streams.items) |s| s.send_window += delta;
+                    // A change that lifts any window past 2^31-1 is a
+                    // connection error (§6.9.2).
+                    for (c.streams.items) |s| {
+                        s.send_window += delta;
+                        if (s.send_window > h2.max_window) return error.FlowControl;
+                    }
                 },
                 .max_frame_size => {
                     if (value < h2.default_max_frame or value > 16_777_215) return error.Protocol;
@@ -1004,7 +1018,12 @@ const Conn = struct {
             // Its fiber owns it until it hands it back; the answer is
             // dropped then.
             .running => s.reset = true,
+            // Still arriving or already written: what it held of the
+            // budget goes back now, or `collected` keeps a dead call's
+            // bytes for the life of the connection and the calls beside it
+            // wait on a window nothing is left to give back (ADR 220).
             else => {
+                c.letGo(s);
                 c.remove(s);
                 s.destroy();
             },
@@ -1044,9 +1063,6 @@ const Conn = struct {
     /// The client has sent everything. Check the call, take its message out
     /// of its framing, and run it.
     fn dispatch(c: *Conn, s: *Stream) ReadError!void {
-        // A call, answered or run: what ends a run of frames that moved
-        // nothing forward.
-        c.control_run = 0;
         c.letGo(s);
         const a = s.arena.allocator();
         if (s.headers_over_limit) return c.answerNow(s, 8, "the call's metadata is larger than this server reads");
@@ -1057,9 +1073,16 @@ const Conn = struct {
         if (!std.mem.eql(u8, method, "POST")) return c.malformed(s);
         if (path.len == 0 or path[0] != '/') return c.malformed(s);
         for (s.fields.items) |f| if (!validField(f)) return c.malformed(s);
+        if (!validPseudo(s.fields.items)) return c.malformed(s);
+
+        // A well-formed call, answered or run: what ends a run of frames
+        // that moved nothing forward. Not before this point, where a call
+        // refused as malformed would end it for the cost of one HEADERS
+        // frame, and 999 PINGs between two of them would never be a flood.
+        c.control_run = 0;
 
         const content_type = s.field("content-type") orelse "";
-        if (!std.mem.startsWith(u8, content_type, "application/grpc")) {
+        if (!isGrpcContentType(content_type)) {
             // Not a gRPC call at all: the spec says 415, and nothing else.
             s.head_block = try c.headerBlock(a, &.{
                 .{ .name = ":status", .value = "415" },
@@ -1072,7 +1095,7 @@ const Conn = struct {
         if (s.field("grpc-timeout")) |text| {
             const ns = timeoutNanos(text) orelse
                 return c.answerNow(s, 3, "grpc-timeout is not a number of up to eight digits and a unit");
-            s.until_ns = bulkhead.monotonicNanos() +| ns;
+            s.until_ns = s.headers_ns +| ns;
         }
 
         // Exactly one message: a five-byte prefix and what it says follows.
@@ -1271,7 +1294,10 @@ fn asRequest(a: std.mem.Allocator, s: *const Stream) ![]const u8 {
     try out.writeAll("POST ");
     try out.writeAll(s.field(":path").?);
     try out.writeAll(" HTTP/1.1\r\n");
-    if (s.field(":authority")) |host| {
+    // One `host`, which `http1.zig` insists on: `:authority` when the call
+    // has it, over a `host` field beside it (§8.3.1).
+    const authority = s.field(":authority");
+    if (authority) |host| {
         try out.writeAll("host: ");
         try out.writeAll(host);
         try out.writeAll("\r\n");
@@ -1280,6 +1306,7 @@ fn asRequest(a: std.mem.Allocator, s: *const Stream) ![]const u8 {
     }
     for (s.fields.items) |f| {
         if (f.name.len == 0 or f.name[0] == ':') continue;
+        if (authority != null and std.mem.eql(u8, f.name, "host")) continue;
         if (hopByHop(f.name)) continue;
         if (std.mem.eql(u8, f.name, "content-length")) continue;
         // The whole message is already here, so there is nothing to wait
@@ -1303,6 +1330,39 @@ fn hopByHop(name: []const u8) bool {
     const names = [_][]const u8{ "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "te" };
     for (names) |n| if (std.mem.eql(u8, n, name)) return true;
     return false;
+}
+
+/// The pseudo-headers of a request as §8.3.1 and §8.1.1 have them: only
+/// `:method`, `:scheme`, `:path` and `:authority`, each at most once, all of
+/// them ahead of the regular fields, and the first three present. Anything
+/// else is a malformed request, which is a stream error and not a call.
+fn validPseudo(fields: []const hpack.Field) bool {
+    const names = [_][]const u8{ ":method", ":scheme", ":path", ":authority" };
+    var seen = [_]bool{false} ** names.len;
+    var regular = false;
+    for (fields) |f| {
+        if (f.name.len == 0 or f.name[0] != ':') {
+            regular = true;
+            continue;
+        }
+        if (regular) return false;
+        const i = for (names, 0..) |n, i| {
+            if (std.mem.eql(u8, n, f.name)) break i;
+        } else return false;
+        if (seen[i]) return false;
+        seen[i] = true;
+    }
+    return seen[0] and seen[1] and seen[2];
+}
+
+/// `application/grpc`, or `application/grpc+` and a subtype (gRPC over
+/// HTTP/2, "Requests"). A prefix match took `application/grpc-web`, which is
+/// a different protocol on the wire, for a native call.
+fn isGrpcContentType(value: []const u8) bool {
+    const media = "application/grpc";
+    if (!std.ascii.startsWithIgnoreCase(value, media)) return false;
+    const rest = value[media.len..];
+    return rest.len == 0 or (rest[0] == '+' and rest.len > 1);
 }
 
 /// A field that can be written into an HTTP/1.1 head as it is: a lowercase
@@ -1353,7 +1413,7 @@ fn fromResponse(a: std.mem.Allocator, s: *Stream, raw: []const u8) !void {
 
     var head: std.ArrayList(hpack.Field) = .empty;
     try head.append(a, .{ .name = ":status", .value = "200" });
-    try head.append(a, .{ .name = "content-type", .value = if (std.mem.startsWith(u8, response.content_type, "application/grpc")) response.content_type else "application/grpc" });
+    try head.append(a, .{ .name = "content-type", .value = if (isGrpcContentType(response.content_type)) response.content_type else "application/grpc" });
     for (response.headers) |f| try head.append(a, f);
     s.head_block = try encodeBlock(a, head.items);
 
@@ -1690,10 +1750,14 @@ const Answer = struct {
 };
 
 fn converse(app: *App, client: *TestClient) !Answer {
+    var in: std.Io.Reader = .fixed(client.buf.written());
+    return converseFrom(app, &in);
+}
+
+fn converseFrom(app: *App, in: *std.Io.Reader) !Answer {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    var in: std.Io.Reader = .fixed(client.buf.written());
-    serveConnection(app.grpcHost(), &in, &out.writer, .off, .off, .{});
+    serveConnection(app.grpcHost(), in, &out.writer, .off, .off, .{});
 
     var answer_: Answer = .{ .arena = .init(testing.allocator), .decoder = .init(testing.allocator) };
     const a = answer_.arena.allocator();
@@ -2025,6 +2089,7 @@ test "a request that is not a gRPC call is a 415, and nothing else" {
     var block: std.Io.Writer.Allocating = .init(testing.allocator);
     defer block.deinit();
     try hpack.writeInt(&block.writer, 0x80, 7, 3);
+    try hpack.writeInt(&block.writer, 0x80, 7, 6);
     try hpack.writeLiteral(&block.writer, ":path", "/test.Echo/Say");
     try hpack.writeLiteral(&block.writer, "content-type", "application/json");
     try h2.writeHeaderBlock(client.w(), 1, block.written(), true, h2.default_max_frame);
@@ -2057,6 +2122,7 @@ test "a message split across DATA frames and a header block across CONTINUATION 
     var block: std.Io.Writer.Allocating = .init(testing.allocator);
     defer block.deinit();
     try hpack.writeInt(&block.writer, 0x80, 7, 3);
+    try hpack.writeInt(&block.writer, 0x80, 7, 6);
     try hpack.writeLiteral(&block.writer, ":path", "/test.Echo/Say");
     try hpack.writeLiteral(&block.writer, "content-type", "application/grpc");
     try h2.writeHeaderBlock(client.w(), 1, block.written(), false, 5);
@@ -2361,4 +2427,300 @@ test "a flood of SETTINGS with no call between them is sent away" {
     var got = try converse(&app, &client);
     defer got.deinit();
     try testing.expectEqual(h2.ErrorCode.enhance_your_calm, got.goaway().?);
+}
+
+// ---- what RFC 9113 and the gRPC spec refuse, and allow (the audit of `http/` at 39896d2) ----
+
+const base_fields = [_]hpack.Field{
+    .{ .name = ":method", .value = "POST" },
+    .{ .name = ":scheme", .value = "http" },
+    .{ .name = ":path", .value = "/test.Echo/Say" },
+    .{ .name = ":authority", .value = "localhost" },
+    .{ .name = "content-type", .value = "application/grpc" },
+};
+
+/// A call whose request headers are exactly `fields`, in that order, every
+/// one written as a literal: what the tests below need to say a request wrong.
+fn callWithFields(client: *TestClient, stream: u31, fields: []const hpack.Field) !void {
+    var block: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer block.deinit();
+    for (fields) |f| try hpack.writeLiteral(&block.writer, f.name, f.value);
+    try h2.writeHeaderBlock(client.w(), stream, block.written(), false, h2.default_max_frame);
+    try client.message(stream, "x", false);
+}
+
+fn expectMalformed(fields: []const hpack.Field) !void {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    try callWithFields(&client, 1, fields);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqual(h2.ErrorCode.protocol_error, got.rst(1).?);
+    try testing.expectEqual(@as(usize, 0), Answer.of(.headers, &got, 1).len);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), got.goaway());
+}
+
+fn hostRoute(c: *Ctx) anyerror!void {
+    const host = if (c.header("host")) |v| v.view() else "none";
+    try c.send(200, "application/grpc", host);
+}
+
+fn expectContentType(value: []const u8, status: []const u8) !void {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    var fields = base_fields;
+    fields[4].value = value;
+    try callWithFields(&client, 1, &fields);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    const head = try got.fields(Answer.of(.headers, &got, 1)[0].payload);
+    try testing.expectEqualStrings(status, Answer.value(head, ":status").?);
+}
+
+test "a content-type of application/grpc, or application/grpc+ and a subtype, is a gRPC call" {
+    try expectContentType("application/grpc", "200");
+    try expectContentType("application/grpc+proto", "200");
+    try expectContentType("application/grpc+json", "200");
+}
+
+test "application/grpc-web and other near misses are not a native gRPC call: 415" {
+    try expectContentType("application/grpc-web", "415");
+    try expectContentType("application/grpc-web+proto", "415");
+    try expectContentType("application/grpcx", "415");
+    try expectContentType("application/grpc+", "415");
+    try expectContentType("application/grpc;x", "415");
+}
+
+test "a request with a pseudo-header twice is a stream error PROTOCOL_ERROR" {
+    try expectMalformed(&(base_fields ++ [_]hpack.Field{.{ .name = ":path", .value = "/test.Echo/Say" }}));
+}
+
+test "a request with a pseudo-header that is not defined is a stream error PROTOCOL_ERROR" {
+    // Ahead of the regular fields, where a pseudo-header belongs, so only
+    // its name is wrong.
+    try expectMalformed(&([_]hpack.Field{.{ .name = ":version", .value = "2" }} ++ base_fields));
+}
+
+test "a pseudo-header after a regular field is a stream error PROTOCOL_ERROR" {
+    try expectMalformed(&[_]hpack.Field{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/test.Echo/Say" },
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = ":scheme", .value = "http" },
+    });
+}
+
+test "a request with no :scheme is a stream error PROTOCOL_ERROR" {
+    try expectMalformed(&[_]hpack.Field{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/test.Echo/Say" },
+        .{ .name = "content-type", .value = "application/grpc" },
+    });
+}
+
+test "a request with :authority and host is served, with :authority as its one host" {
+    var app = try testApp();
+    defer app.deinit();
+    try app.post("/test.Host/Which", hostRoute);
+    try app.resolveChains();
+    var client = try TestClient.init();
+    defer client.deinit();
+    var fields = base_fields ++ [_]hpack.Field{.{ .name = "host", .value = "other.example" }};
+    fields[2].value = "/test.Host/Which";
+    try callWithFields(&client, 1, &fields);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqualStrings("0", Answer.value(try got.trailers(1), "grpc-status").?);
+    try testing.expectEqualStrings("localhost", try got.message(1));
+}
+
+/// A client whose bytes arrive in two goes, the second after a wait: what a
+/// call that takes its time sending its message looks like to the connection.
+const Delayed = struct {
+    first: []const u8,
+    second: []const u8,
+    wait_ms: u64,
+    step: u8 = 0,
+    reader: std.Io.Reader,
+
+    fn init(first: []const u8, second: []const u8, wait_ms: u64, buffer: []u8) Delayed {
+        return .{
+            .first = first,
+            .second = second,
+            .wait_ms = wait_ms,
+            .reader = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .end = 0, .seek = 0 },
+        };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Delayed = @alignCast(@fieldParentPtr("reader", r));
+        const part = switch (self.step) {
+            0 => self.first,
+            1 => blk: {
+                // Spun, not slept: no Engine is running to sleep on.
+                const until = bulkhead.monotonicNanos() + self.wait_ms * std.time.ns_per_ms;
+                while (bulkhead.monotonicNanos() < until) std.atomic.spinLoopHint();
+                break :blk self.second;
+            },
+            else => return error.EndOfStream,
+        };
+        self.step += 1;
+        const dest = limit.slice(try w.writableSliceGreedy(part.len));
+        @memcpy(dest[0..part.len], part);
+        w.advance(part.len);
+        return part.len;
+    }
+};
+
+test "grpc-timeout is counted from when the headers arrived, not from when the message was whole" {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    try client.headersFor(1, "/test.Clock/Check", &.{.{ .name = "grpc-timeout", .value = "10m" }}, false);
+    const split = client.buf.written().len;
+    try client.message(1, "", false);
+
+    // The message is whole 40 ms after the headers, and the call had 10.
+    var buffer: [4096]u8 = undefined;
+    var delayed = Delayed.init(client.buf.written()[0..split], client.buf.written()[split..], 40, &buffer);
+    const previous = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = previous;
+    var got = try converseFrom(&app, &delayed.reader);
+    defer got.deinit();
+    try testing.expectEqualStrings("4", Answer.value(try got.trailers(1), "grpc-status").?);
+}
+
+test "a malformed call between runs of PINGs does not start the flood count again" {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    var id: u31 = 1;
+    for (0..3) |_| {
+        for (0..max_control_run / 2) |_| {
+            try h2.writeHeader(client.w(), 8, .ping, 0, 0);
+            try client.w().writeAll("12345678");
+        }
+        // No :scheme: refused, so it moved nothing forward.
+        try callWithFields(&client, id, &.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":path", .value = "/test.Echo/Say" },
+        });
+        id += 2;
+    }
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqual(h2.ErrorCode.enhance_your_calm, got.goaway().?);
+}
+
+test "a call that reaches its route does start the flood count again" {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    var id: u31 = 1;
+    for (0..3) |_| {
+        for (0..max_control_run / 2) |_| {
+            try h2.writeHeader(client.w(), 8, .ping, 0, 0);
+            try client.w().writeAll("12345678");
+        }
+        try client.call(id, "/test.Echo/Say", "x");
+        id += 2;
+    }
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqual(@as(?h2.ErrorCode, null), got.goaway());
+}
+
+test "a flood of empty DATA frames to a stream that is not collecting is sent away" {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    try client.call(1, "/test.Echo/Say", "x");
+    // Stream 1 is answered and gone: the frames are ignored (§5.1), and
+    // each one is still a frame read for nothing.
+    for (0..max_control_run + 1) |_| try h2.writeHeader(client.w(), 0, .data, 0, 1);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqual(h2.ErrorCode.enhance_your_calm, got.goaway().?);
+}
+
+test "a SETTINGS_INITIAL_WINDOW_SIZE that lifts a send window past 2^31-1 is a FLOW_CONTROL_ERROR" {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    try client.headersFor(1, "/test.Echo/Say", &.{}, false);
+    // The stream's window, brought to the most it may be.
+    try h2.writeWindowUpdate(client.w(), 1, h2.max_window - h2.default_window);
+    try h2.writeSettings(client.w(), &.{.{ .initial_window_size, h2.default_window + 1 }});
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqual(h2.ErrorCode.flow_control_error, got.goaway().?);
+}
+
+test "a call reset while its message is arriving gives its bytes back to the connection's budget" {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    try client.headersFor(1, "/test.Echo/Say", &.{}, false);
+    try sendPart(&client, 1, 1000, 5000, false);
+    try h2.writeRstStream(client.w(), 1, .cancel);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var in: std.Io.Reader = .fixed(client.buf.written());
+    const shared = try Shared.create(testing.allocator, .off);
+    var conn: Conn = .{
+        .app = app.grpcHost(),
+        .gpa = testing.allocator,
+        .in = &in,
+        .out = &out.writer,
+        .deadlines = .off,
+        .waker = .off,
+        .peer = .{},
+        .shared = shared,
+        .decoder = hpack.Decoder.init(testing.allocator),
+    };
+    defer conn.deinit();
+    conn.run();
+    try testing.expectEqual(@as(usize, 0), conn.streams.items.len);
+    try testing.expectEqual(@as(usize, 0), conn.collected);
+}
+
+test "a call reset while its message is arriving does not hold back the windows of the calls beside it" {
+    var app = try testApp();
+    defer app.deinit();
+    app.limits.max_body = 200_000;
+    var client = try TestClient.init();
+    defer client.deinit();
+    // Five calls of 64,000 bytes each: from the fourth on the connection is
+    // past its budget, and only the oldest call's window is topped up.
+    for ([_]u31{ 1, 3, 5, 7, 9 }) |id| {
+        try client.headersFor(id, "/test.Echo/Say", &.{}, false);
+        try sendPart(&client, id, 64_000, 79_995, false);
+    }
+    // Two are cancelled: what they held is the budget's again.
+    try h2.writeRstStream(client.w(), 3, .cancel);
+    try h2.writeRstStream(client.w(), 5, .cancel);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expect(windowUpdateAt(&got, 7) != null);
+    try testing.expect(windowUpdateAt(&got, 9) != null);
 }

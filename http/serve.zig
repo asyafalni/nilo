@@ -295,6 +295,11 @@ pub noinline fn serveRequest(
         // one of them any more.
         const answer, const status: u16 = switch (err) {
             error.UnsupportedContentEncoding => .{ RESPONSE_415, 415 },
+            // A version spelled like one and not spoken (RFC 9110 §15.6.6), and
+            // a transfer coding stacked under `chunked` (RFC 9112 §6.1). Neither
+            // is malformed, and neither is a reason to read what follows.
+            error.UnsupportedVersion => .{ RESPONSE_505, 505 },
+            error.UnsupportedTransferEncoding => .{ RESPONSE_501, 501 },
             else => .{ RESPONSE_400, 400 },
         };
         sendFinal(out, answer);
@@ -414,7 +419,13 @@ pub noinline fn serveRequest(
     // params out of it, and they have to outlive the branch below.
     var matched: router.Match = undefined;
 
-    if (self.router.matchInto(c.method, path, &matched)) {
+    // The parser lets exactly two targets through that do not begin with `/`:
+    // `*` for an OPTIONS and an authority for a CONNECT (ADR 095). Neither
+    // names a route, and the router splits on `/` without knowing the first
+    // one was missing, so a root `/*` would have answered both.
+    const routable = path[0] == '/';
+
+    if (routable and self.router.matchInto(c.method, path, &matched)) {
         const match = &matched;
         // Decoded here rather than before matching: `%2F` is a slash of
         // data, and a router that saw it as a separator would let a
@@ -436,7 +447,7 @@ pub noinline fn serveRequest(
             match.chain;
         terminal = match.handler;
         record.at(metrics_mod.fixed_slots + match.index);
-    } else if (findStatic(self, &c, path)) |found| {
+    } else if (if (routable) findStatic(self, &c, path) else null) |found| {
         // Resolved at `listen()` with the routes' chains, so an asset
         // served with a logger or a CORS in front of it allocates
         // nothing — which is the shape nearly every app deploys, and
@@ -460,10 +471,17 @@ pub noinline fn serveRequest(
         // "there is something here, but not for that verb" are
         // different answers, and a 404 for the second one sends you
         // looking for a registration bug that is not there.
-        const allowed = self.router.allowedFor(path);
+        //
+        // A target that is not a path asks the router nothing: `OPTIONS *` is
+        // the server-wide question and is answered by `serverOptionsHandler`
+        // from every route's method, and a CONNECT is a 404 (ADR 095).
+        const allowed = if (routable) self.router.allowedFor(path) else router.MethodSet.initEmpty();
         if (allowed.count() > 0) {
             c._allowed = allowed;
             terminal = methodNotAllowedHandler;
+        } else if (!routable and c.method == .OPTIONS and path[0] == '*') {
+            c._allowed = allowedAnywhere(self);
+            terminal = serverOptionsHandler;
         }
         // Told apart rather than merged, because a spike against one
         // unnamed slot could be a scanner, a deploy that dropped a route
@@ -617,19 +635,26 @@ pub fn hit(
 /// The three answers that go out before there is a Ctx to assemble one with.
 /// They carry the same JSON shape every other failure does (ADR 024), so a
 /// client has one thing to parse and not two.
-const RESPONSE_400 = http1.staticResponse(400, "Bad Request", failure_content_type, staticFailure(400, "malformed request"), .close);
-const RESPONSE_431 = http1.staticResponse(431, "Request Header Fields Too Large", failure_content_type, staticFailure(431, "head too long"), .close);
+const RESPONSE_400 = http1.staticResponse(400, failure_content_type, staticFailure(400, "malformed request"), .close);
+const RESPONSE_431 = http1.staticResponse(431, failure_content_type, staticFailure(431, "head too long"), .close);
 /// Sent when a body arrives under a `Content-Encoding` nilo cannot decode,
 /// which is all of them but `identity` and `gzip` (ADR 089). The
 /// message names the header, because the mistake is one line of client
 /// configuration and the alternative — a 400 about malformed JSON — sends
 /// the reader to the body.
-const RESPONSE_415 = http1.staticResponse(415, "Unsupported Media Type", failure_content_type, staticFailure(415, "this server decodes Content-Encoding: gzip and nothing else — send the body as identity or gzip"), .close);
+const RESPONSE_415 = http1.staticResponse(415, failure_content_type, staticFailure(415, "this server decodes Content-Encoding: gzip and nothing else — send the body as identity or gzip"), .close);
 /// Sent when a request head started arriving and then stopped (ADR 022).
 /// Not when a keep-alive connection simply sat idle: that client has not
 /// asked for anything, and a status answering nothing is noise a proxy has
 /// to decide what to do with.
-const RESPONSE_408 = http1.staticResponse(408, "Request Timeout", failure_content_type, staticFailure(408, "request head timed out"), .close);
+const RESPONSE_408 = http1.staticResponse(408, failure_content_type, staticFailure(408, "request head timed out"), .close);
+
+/// Sent for a version spelled `HTTP/d.d` that is neither 1.0 nor 1.1 (RFC 9110
+/// §15.6.6), where it used to be a 400 that said nothing about versions.
+const RESPONSE_505 = http1.staticResponse(505, failure_content_type, staticFailure(505, "this server speaks HTTP/1.1 and HTTP/1.0"), .close);
+/// Sent for a `Transfer-Encoding` that names a coding in front of `chunked`
+/// (RFC 9112 §6.1): nilo decodes `chunked` and nothing else (ADR 070).
+const RESPONSE_501 = http1.staticResponse(501, failure_content_type, staticFailure(501, "this server decodes Transfer-Encoding: chunked and nothing else"), .close);
 
 const failure_content_type = "application/json";
 
@@ -640,7 +665,7 @@ const failure_content_type = "application/json";
 const RESPONSE_503_SHED: http1.Static = blk: {
     const body = staticFailure(503, "this server is answering as many requests as it was told to; try again in a moment");
     break :blk .{
-        .line = "HTTP/1.1 503 Service Unavailable\r\n",
+        .line = http1.statusLine(503),
         .rest = std.fmt.comptimePrint(
             "Content-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nRetry-After: 1\r\n\r\n{s}",
             .{ failure_content_type, body.len, body },
@@ -750,16 +775,23 @@ fn notFoundHandler(c: *Ctx) anyerror!void {
 /// added — CORS included, since a browser has to be able to read the answer
 /// to see what went wrong.
 fn methodNotAllowedHandler(c: *Ctx) anyerror!void {
-    // Built in the request arena, which outlives the response it is written
-    // into, so there is nothing for `setHeader` to copy.
-    const allow = try allowList(c._arena, c._allowed);
-    try c.setStaticHeader("Allow", allow);
-
     // An OPTIONS asking what a path supports is answered rather than
     // refused: that is the question the method exists for, and the `Allow`
-    // header above is the answer. A preflight never gets this far — CORS
-    // middleware handles those before any handler runs.
-    if (c.method == .OPTIONS) return c.sendEmpty(204);
+    // header is the answer. It names OPTIONS, because the request that got
+    // this answer is one the path answers (RFC 9110 §9.3.7). A preflight
+    // never gets this far: CORS middleware handles those before any handler
+    // runs.
+    if (c.method == .OPTIONS) {
+        var allowed = c._allowed;
+        allowed.insert(.OPTIONS);
+        // Built in the request arena, which outlives the response it is
+        // written into, so there is nothing for `setHeader` to copy.
+        try c.setStaticHeader("Allow", try allowList(c._arena, allowed));
+        return c.sendEmpty(204);
+    }
+
+    const allow = try allowList(c._arena, c._allowed);
+    try c.setStaticHeader("Allow", allow);
 
     // Failing rather than answering, for the reason `notFoundHandler` does:
     // one place assembles a failure body. The `Allow` header set above
@@ -769,6 +801,26 @@ fn methodNotAllowedHandler(c: *Ctx) anyerror!void {
         @tagName(c.method),
         allow,
     });
+}
+
+/// Every method some route answers, which is what `OPTIONS *` is asking for
+/// (RFC 9110 §9.3.7): what the server as a whole supports. OPTIONS is in it,
+/// because this is the answer to one.
+fn allowedAnywhere(self: *const App) router.MethodSet {
+    var all: router.MethodSet = .initEmpty();
+    for (self.router.routes.items) |*route| all.insert(route.method);
+    if (all.contains(.GET)) all.insert(.HEAD);
+    all.insert(.OPTIONS);
+    return all;
+}
+
+/// The innermost call for `OPTIONS *`, asterisk-form (RFC 9112 §3.2.4). A normal
+/// handler so middleware wraps it as it wraps everything else. It is not the
+/// router's to match: `*` is not a path, and a root `/*` single-page fallback
+/// used to answer it.
+fn serverOptionsHandler(c: *Ctx) anyerror!void {
+    try c.setStaticHeader("Allow", try allowList(c._arena, c._allowed));
+    return c.sendEmpty(204);
 }
 
 /// `GET, HEAD, POST` — an `Allow` header's value, in the order the methods
@@ -1258,4 +1310,129 @@ test "a head that does not fit is answered 431 and lingered on" {
     try testing.expect(std.mem.startsWith(u8, out.buffered(), "HTTP/1.1 431"));
     try testing.expect(!served.keep_alive);
     try testing.expect(served.linger);
+}
+
+/// `serveOnce`, keeping what was written: the answer is the thing under test.
+fn serveAnswer(app: *App, request: []const u8, wire: []u8) struct { served: Served, answer: []const u8 } {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var lifetime = str_mod.Lifetime.init();
+    defer lifetime.deinit();
+    var in_flight = fail.InFlight{};
+    var underlying = std.Io.Reader.fixed(request);
+    var read_buf: [4096]u8 = undefined;
+    var limited = std.Io.Reader.Limited.init(&underlying, .unlimited, &read_buf);
+    var out = std.Io.Writer.fixed(wire);
+    var served = serveRequest(app, arena.allocator(), &lifetime, &in_flight, &limited.interface, &out, .off, .off, .{});
+    runHandover(&served);
+    lifetime.end();
+    return .{ .served = served, .answer = out.buffered() };
+}
+
+fn sayHit(c: *Ctx) anyerror!void {
+    try c.sendText(200, "hit");
+}
+
+fn failBadGateway(_: *Ctx) anyerror!void {
+    return fail.status(502, "the upstream said no", .{});
+}
+
+test "a version nilo does not speak is a 505, and a coding it cannot decode is a 501" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/", sayHit);
+    try app.resolveChains();
+    var wire: [4096]u8 = undefined;
+
+    const old = serveAnswer(&app, "GET / HTTP/2.0\r\nHost: x\r\n\r\n", &wire);
+    try testing.expect(std.mem.startsWith(u8, old.answer, "HTTP/1.1 505 HTTP Version Not Supported\r\n"));
+    try testing.expect(!old.served.keep_alive);
+
+    // Not a version at all stays a 400.
+    const junk = serveAnswer(&app, "GET / HTTP/1.1 x\r\nHost: x\r\n\r\n", &wire);
+    try testing.expect(std.mem.startsWith(u8, junk.answer, "HTTP/1.1 400 Bad Request\r\n"));
+
+    const stacked = serveAnswer(&app, "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n", &wire);
+    try testing.expect(std.mem.startsWith(u8, stacked.answer, "HTTP/1.1 501 Not Implemented\r\n"));
+    try testing.expect(!stacked.served.keep_alive);
+}
+
+test "an HTTP/1.0 request that carried Transfer-Encoding is answered and the connection closed" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/echo", echoBody);
+    try app.resolveChains();
+    var wire: [4096]u8 = undefined;
+
+    const served = serveAnswer(
+        &app,
+        "POST /echo HTTP/1.0\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        &wire,
+    );
+    try testing.expect(std.mem.startsWith(u8, served.answer, "HTTP/1.0 200") or std.mem.startsWith(u8, served.answer, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, served.answer, "Connection: close\r\n") != null);
+    try testing.expect(!served.served.keep_alive);
+}
+
+test "OPTIONS * is a server-wide OPTIONS and never reaches a root catch-all" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/*", sayHit);
+    try app.post("/items", sayHit);
+    try app.resolveChains();
+    var wire: [4096]u8 = undefined;
+
+    // Registered for OPTIONS too: matched as the path `*`, this is the handler
+    // that answered.
+    var catching = App.init(testing.allocator);
+    defer catching.deinit();
+    try catching.options("/*", sayHit);
+    try catching.resolveChains();
+    const caught = serveAnswer(&catching, "OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n", &wire);
+    try testing.expect(std.mem.indexOf(u8, caught.answer, "hit") == null);
+
+    const star = serveAnswer(&app, "OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n", &wire);
+    try testing.expect(std.mem.startsWith(u8, star.answer, "HTTP/1.1 204 No Content\r\n"));
+    try testing.expect(std.mem.indexOf(u8, star.answer, "hit") == null);
+    try testing.expect(std.mem.indexOf(u8, star.answer, "Allow: GET, HEAD, POST, OPTIONS\r\n") != null);
+    try testing.expect(star.served.keep_alive);
+
+    // Nothing that is not origin-form reaches the router: a scheme-shaped
+    // target is a 400, and a CONNECT is a 404 though `/*` matches everything.
+    const scheme = serveAnswer(&app, "GET admin:1/x HTTP/1.1\r\nHost: x\r\n\r\n", &wire);
+    try testing.expect(std.mem.startsWith(u8, scheme.answer, "HTTP/1.1 400"));
+    const connect = serveAnswer(&app, "CONNECT example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n", &wire);
+    try testing.expect(std.mem.indexOf(u8, connect.answer, "hit") == null);
+    try testing.expect(std.mem.startsWith(u8, connect.answer, "HTTP/1.1 404"));
+}
+
+test "the Allow on an OPTIONS answer names OPTIONS" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/users", sayHit);
+    try app.post("/users", sayHit);
+    try app.resolveChains();
+    var wire: [4096]u8 = undefined;
+
+    const answered = serveAnswer(&app, "OPTIONS /users HTTP/1.1\r\nHost: x\r\n\r\n", &wire);
+    try testing.expect(std.mem.startsWith(u8, answered.answer, "HTTP/1.1 204 No Content\r\n"));
+    try testing.expect(std.mem.indexOf(u8, answered.answer, "Allow: GET, HEAD, POST, OPTIONS\r\n") != null);
+
+    // A 405 for another method keeps listing what the routes answer.
+    const refused = serveAnswer(&app, "DELETE /users HTTP/1.1\r\nHost: x\r\n\r\n", &wire);
+    try testing.expect(std.mem.indexOf(u8, refused.answer, "Allow: GET, HEAD, POST\r\n") != null);
+}
+
+test "a status a fail function sends outside the old table still has its phrase" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/gateway", failBadGateway);
+    try app.resolveChains();
+    var wire: [4096]u8 = undefined;
+    const previous = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = previous;
+
+    const bad = serveAnswer(&app, "GET /gateway HTTP/1.1\r\nHost: x\r\n\r\n", &wire);
+    try testing.expect(std.mem.startsWith(u8, bad.answer, "HTTP/1.1 502 Bad Gateway\r\n"));
 }

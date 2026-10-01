@@ -39,10 +39,6 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** the write limit clamped with the read ones, or the claim narrowed in both places.
 
-**Three HTTP/1.1 edges are read differently from the RFC.** `Transfer-Encoding: gzip, chunked` is accepted and the handler reads gzip as its body, where RFC 9110 says 501. An HTTP/1.0 request carrying `Transfer-Encoding` stays open. A CRLF before the request line is a 400 rather than skipped (RFC 9112 §2.2).
-
-**Needs:** each one answered as its RFC section says, with a test per section in the parser's file.
-
 **A form body can cost thirty times its size, and a multipart one CPU in proportion to parts times bytes.** `parseQuery` allocates a `Param` per `&` before it reads anything, so a megabyte of `&` to a `Form(T)` route is 33 MB of arena; multipart has `max_parts` against exactly this and urlencoded has nothing. `endOfPartHead` searches for `\n\n` to the end of the body for every part, so 255 parts and a megabyte of padding cost 78 ms of CPU where 1 ms is enough. Reproduced.
 
 **Needs:** a pair limit on urlencoded, and the bare-LF search bounded by the CRLF match.
@@ -55,17 +51,9 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** the representation headers dropped on the failure path, and ADR 024 naming which ones survive.
 
-**The text log writes the request path's control bytes as they came.** The target is not checked for control bytes and the `.text` format prints it with `{s}`, so `GET /a\x1b[31mRED\rFAKE` puts a terminal escape and a line-overwriting CR into the default logger's output; `.json` escapes it. Reproduced.
-
-**Needs:** control bytes escaped in `.text`, or refused in the target.
-
 **A static file whose name has a space or a non-ASCII character is never served.** The lookup uses the raw target, the table is built from names as they are on disk, and neither side is decoded, so `café.png` and `My Doc.pdf` are a 404 to every browser. Reproduced. Symlinks are also skipped at the walk without a line, and a spilled or `.reload` file replaced by one after startup is followed out of the tree, because the open has no `O_NOFOLLOW`.
 
 **Needs:** the table keyed by the decoded path, with `/` and `..` refused after decoding, and a symlink either served by a stated rule or named at load and refused at open.
-
-**The WebSocket subprotocol is echoed rather than negotiated.** `Options.protocol` is written back whether or not the client offered it, and a browser fails a connection whose answer names a protocol it did not offer (RFC 6455 §4.1), so `new WebSocket(url)` against such a route fails and a client offering two protocols cannot be met. `Sec-WebSocket-Key` is not checked to be sixteen bytes of base64, and a malformed close frame still reports `closedCleanly()`.
-
-**Needs:** the offer read and matched against a list in `Options`.
 
 **A request can bind infinity, and a body still reaches the Zig literal grammar.** `spelledAsNumber("1e999")` passes and `parseFloat` returns `inf`, which [ADR 084](./adr/084-a-number-in-a-request-is-not-a-zig-literal.md) refuses by name, and echoed back it writes `{"p":inf}`, which is not JSON. In a body, std.json converts a string token with `parseInt` and `parseFloat`, so `"1_0"` is 10, `"+7"` is 7 and `"nan"` is NaN, where ADR 084 says a body already refuses them. A `u128` field posted as `2e38` panics inside std in ReleaseSafe.
 
@@ -75,25 +63,9 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** one rule, and the description following it.
 
-**A `*` route stops matching past sixteen segments.** `router.split` gives up at `max_segments` and both `matchInto` and `allowedFor` then answer nothing, so `/files/*` and a root `/*` single-page fallback are a 404 for a path seventeen segments deep. The comment says no pattern can have more, which a `*` does.
-
-**Needs:** the rest of the path handed to a `*` once the budget is reached.
-
-**A target without a leading `/` can still be routed as though it had one.** A plain word such as `users/7` is now a 400 (`parseRequestLine` sends it to `otherForm`, which refuses it), but `OPTIONS *` matches a root `/*`, and a target shaped like a scheme, `admin:1/x`, passes `otherForm` and reaches the router, while `http1.zig` says these keep the 404 or 405 they had. The `Allow` header on an OPTIONS 204 also leaves out OPTIONS.
-
-**Needs:** an origin-form target required to begin with `/`, and `*` kept for a server-wide OPTIONS.
-
-**`c.url` lets a value be a dot segment.** Values are encoded as `.unreserved`, which keeps `.`, so `.name = ".."` builds `/u/../settings`, which a browser following a redirect normalises to `/settings`; [the routing page](./design/routing.md) says a value cannot smuggle a segment. An empty value gives `/u//settings`.
-
-**Needs:** a value of `.` or `..` encoded or refused, and an empty one refused.
-
 **The OpenAPI document is looser than the server.** An unsigned integer gets `minimum: 0` and no `maximum`, although a `u8` refuses 256 with a 400, and a field with a default is marked not required in a response schema, although the writer always sends it, so a generated client null-checks every one.
 
 **Needs:** `maximum` taken from the type, and `required` in a response schema meaning "always written".
-
-**A chunked body is allocated at each chunk's announced size before any of it arrives.** `readChunkedBody` calls `addManyAsSlice(size)` and then `readSliceAll`, so `100000\r\n` and silence holds a megabyte per connection, up to `max_body`; `readSizedBody` takes one page first for exactly this reason, and [ADR 083](./adr/083-a-body-is-taken-as-it-arrives.md) says the chunked path already grew as chunks arrived.
-
-**Needs:** each chunk read a page at a time before the rest of it is committed, as `readSizedBody` does, and ADR 083 corrected with it.
 
 **A failure body is not JSON when its message carries a byte that is not UTF-8.** `writeFailureBody` escapes `"`, `\` and control bytes and writes every byte from `0x80` as it came, and a path or query value is decoded without a UTF-8 check, so `GET /items?page=%ff` against an integer `page` answers `application/json` that `res.json()` throws on, which is what [ADR 024](./adr/024-every-failure-answers-as-json.md) exists to prevent. A message truncated at `max_message` can also end inside a character. The success path already handles this ([ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md)); the failure writer is a copy that does not.
 
@@ -103,49 +75,17 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** the depth scan run before the second parse whatever the type, and the arena cost of the worst body measured into `bench/result/`.
 
-**The `Host` header's value is never checked.** `http1.zig` counts `Host` but reads nothing inside it, and `Ctx.host()` returns it raw, while the same function drops an `X-Forwarded-Host` that is not host-like "because this ends up in URLs"; `Host: evil.com/reset?x=` reaches a password-reset link built from `c.host()`. `authorityOk` already checks the absolute-form authority.
-
-**Needs:** `authorityOk(value, false)` on `Host` in the parser, a 400 on failure, and a test.
-
 **A failure a handler caught colours a later error that has nothing to do with it.** `Failure` is cleared only when a request starts, and `resolveStatus` answers `failure.status` whenever it is set, so a handler that catches a `fail.notFound` and then returns `error.OutOfMemory` answers 404 with the old message, and the log says the same.
 
 **Needs:** `failure.status` trusted only when the error is `error.Failed`, with a test.
-
-**`armBodyRun` multiplies a caller's number and can overflow.** `bytes * std.time.ms_per_s` in `bulkhead.zig` is fed from `progress.mostLeft()`, and the comment says `bytes` is bounded by `max_body`, which `bodyStreamWith(.{ .max_bytes = maxInt(u64) })` is not, so a handler that stops reading early panics the process in ReleaseSafe and gets a deadline near zero in ReleaseFast.
-
-**Needs:** a saturating multiply, and the comment corrected.
-
-**An IPv6 address with a long tail after `::` gets the wrong allowance key.** `parseIp6` in `allowance.zig` moves the tail with a forward loop over overlapping memory, so `2001:db8::1:2:3:4` reads as `…:1:2:1:2` and shares a key with `2001:db8::1:2:5:6`. Nothing shows under the default `/64`; with `ipv6_prefix` above 64 distinct clients share one allowance, and a `::` standing for one group corrupts the first half as well.
-
-**Needs:** `std.mem.copyBackwards`, and a test with a five-group tail.
 
 **`Versioned` answers 304 to a method that is not safe.** `sendResult` in `typed.zig` checks `c.clientHas` whatever the method, so a `PUT` returning `Versioned(T)` with a matching `If-None-Match` has already run and answers an empty 304, where RFC 9110 §13.1.2 says 412 and no change. [ADR 189](./adr/189-a-version-a-handler-names-is-an-etag.md) is about polling a `GET`.
 
 **Needs:** the conditional applied to `GET` and `HEAD` only, with a test for a `PUT`.
 
-**The status line is wrong for a version nilo does not speak and for statuses outside one table.** `UnsupportedVersion` becomes the static 400 in `serve.zig` where RFC 9110 §15.6.6 has 505, and `http1.statusPhrase` has no 408, 410, 415, 502 or 504, so `fail.status(502, …)` goes out as `HTTP/1.1 502 \r\n`; two of those phrases are already spelled in `serve.zig`'s static answers.
-
-**Needs:** a static 505, and one table of phrases that the static answers are built from.
-
-**A gRPC call reset while its message is arriving keeps its share of the connection's budget.** `Conn.onReset` removes and destroys a stream in `.headers` or `.body` without `letGo`, which `forget` and `dispatch` both call, so `collected` keeps the dead call's bytes for the life of the connection; once it passes the budget, `mayGrow` tops up only the oldest collecting call, and a client that cancels its uploads serialises everybody else's on a shared connection.
-
-**Needs:** `letGo` in `onReset`, with a test that resets a half-sent call and checks `collected` is back to zero.
-
 **A gRPC connection holds far more than [ADR 220](./adr/220-grpc-is-served-over-h2c-behind-a-flag.md) counts.** `dispatch` gives a message's bytes back to the budget when the call starts, while the running call still holds `s.body`, an inflated copy for gzip, and the text copy `asRequest` builds, so a hundred whole messages to a slow route hold a hundred times `max_body` or more. The ADR's worst case covers the stacks and the messages still arriving. The answer is also held twice, in `out` and in `framed`, until the client's window lets it go. The header block has a bound of its own missing: `overdue` skips `collect_until_ns` while that call's block is unfinished, and the silence limit it leaves is reset by every `CONTINUATION`, so one byte a frame just inside `body_ms` holds a slot for as long as `max_header_block` lasts. Not measured.
 
 **Needs:** a running call's message counted against a connection-wide budget, or the real figure in ADR 220 with the `asRequest` copy taken out; and a `GOAWAY` once a header block outlives `collect_until_ns`.
-
-**The gRPC bridge accepts a few requests RFC 9113 and the gRPC spec refuse, and refuses one they allow.** `content-type` is matched with `startsWith("application/grpc")`, so `application/grpc-web` gets a native answer; a duplicate, unknown or late pseudo-header and a missing `:scheme` pass; a client sending both `:authority` and `host` gets `INVALID_ARGUMENT`, because `asRequest` writes `host` twice and `http1.zig` refuses two. `grpc-timeout` starts at dispatch rather than when the headers arrived; `control_run` is zeroed before a call is validated, so one malformed call in every 999 `PING`s defeats the flood cap, and empty `DATA` to a stream that is not collecting is not counted; `SETTINGS_INITIAL_WINDOW_SIZE` can lift a send window past 2^31−1 without the `FLOW_CONTROL_ERROR` §6.9.2 asks for.
-
-**Needs:** each answered as its section says, with a frame-level test per case in `grpc.zig`.
-
-**`Room.print` and `Room.json` assert that their two passes agree.** They count, then write into `.fixed` with `catch unreachable` and a `std.debug.assert` on the length, so arguments that change between the passes panic a safe build, and in `ReleaseFast`, where the assert is gone, a shorter second pass sends uninitialised heap to every member. [ADR 076](./adr/076-a-frame-that-lies-about-its-length-is-not-sent.md) refused exactly this for `Socket.print` and `Socket.json`.
-
-**Needs:** ADR 076's answer for the Room: a disagreement drops the post and returns an error.
-
-**Four WebSocket frames and headers are read more loosely than RFC 6455 says.** A length not in its minimal form (5 spelled in 16 bits) is accepted; `Socket.ping` sends a payload over 125 bytes, which the client must fail the connection over; `isUpgrade` finds `upgrade` as a substring of `Connection`, so `noupgrade` passes. A post and a direct `socket.send` can also leave out of order, because the room is written only inside `receive`.
-
-**Needs:** the minimal-length check in `nextHeader`, `ping` refusing or truncating past 125, `Connection` split into tokens, and the ordering either fixed by `send` delivering first or written down.
 
 **The test `Client` accepts a request head of any size.** Its reader is `Reader.fixed` over the whole request, and `readHead` refuses a head only once it fills the buffer, so a test sending a large cookie or many headers passes where a server answers 431. Its cookie jar also keeps a cookie deleted by `Expires` alone and ignores the `__Host-` and `__Secure-` rules a browser applies.
 
@@ -163,10 +103,6 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** an answer carrying `Set-Cookie` sent and not kept, with a `warn`, and the marker released on every error after the claim.
 
-**`FileBody.send` leaks the descriptor when a header is refused.** It opens the file and then runs `try c.setHeader` for each header with no `errdefer file.close()`, so a `Content-Disposition` built from an uploaded name with a CR in it, or any header nilo writes itself, answers 500 and keeps the descriptor; the comment above that loop says no failure can come between the two.
-
-**Needs:** the headers set before the open, or an `errdefer` closing the file, with a test that counts descriptors.
-
 **Compression ignores what a handler said about the representation.** `Ctx.squeezed` gzips any eligible body, so a handler's 206 with `Content-Range` goes out gzipped against plain offsets, a strong `ETag` names both the gzip and the plain body, which `static.zig` gives two tags to avoid, and `Cache-Control: no-transform` is ignored. There is also no upper size: a 20 MB JSON export is compressed in one go on the executor thread, with nothing else on that thread running meanwhile.
 
 **Needs:** no compression for 206, 416, a `Content-Range` or `no-transform`, a strong `ETag` weakened when the body is compressed, and a `max_bytes` with the cost of its default measured into `bench/result/`.
@@ -174,10 +110,6 @@ The entries from the WebSocket one down to the end of this module, other than th
 **A request body has three failure paths that answer wrongly.** A body the client cut short (`Content-Length: 100`, ten bytes, then FIN) is `EndOfStream`, which `statusFor` has no arm for, so it is a 500 and a warning where it is the client's fault; the same truncation inside a chunk's data is a 500 while a truncated size line is a 400. A gzip body that fails to inflate leaves `_body` holding the compressed bytes, so a second `c.body()` (a middleware that logged and ignored the first error) hands them over as the body. And `Ctx.send` only `assert`s it has not answered yet: a middleware that answers an error after the handler's own write failed panics a ReleaseSafe build and writes a second response in ReleaseFast.
 
 **Needs:** `EndOfStream` from a body read mapped to a 400 that closes the connection, the inflated body assigned only on success, and a second answer an error rather than an assert, with a test for each.
-
-**A SIGTERM after a programmatic shutdown exits at once.** `onStopSignal` reads "second signal" from `stop.isRequested()`, which `App.shutdown()` also sets, and it calls `std.process.exit` inside a signal handler.
-
-**Needs:** a flag of its own for a signal already seen, and `_exit` in the handler.
 
 **Several comments and pages describe code that is no longer there.** `bulkhead.zig`'s header lists a six-parameter `serve` (it has eight) under `src/engine/` (it is `http/engine/`), and leaves out `Peer`'s fields, `spawnLocal`, `Wake.rawIdle` and `Binding`, which a second Engine has to provide; `proxies.zig` says a `Forwarded` header is walked, and nothing reads it; the `accept` comment in `zio.zig` says a failure raises the stop flag; `middleware.zig`'s header and [ADR 008](./adr/008-middleware-is-an-onion-of-ctx-functions.md) use `std.time.Timer`, which Zig 0.16 removed; a link in `ctx.zig` says ADR 155 and points at 156.
 
