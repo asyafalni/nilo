@@ -1729,8 +1729,25 @@ fn outerNulls(
     conn.begin() catch |err| return translate(io, conn, err);
     var prepared = false;
     defer {
-        conn.rollback() catch {};
-        if (prepared) _ = conn.execOpts("DEALLOCATE nilo_describe", .{}, .{}) catch {};
+        // Cleanup, so it may not spend a cancellation meant for the caller
+        // (ADR 223). Unguarded, a shutdown that landed in the PREPARE or the
+        // EXPLAIN was re-armed by `translate` and then taken by this
+        // ROLLBACK and dropped by its `catch`, so `db.raw` went on to run
+        // the statement it had just been told to stop before: a job cut off
+        // in its first raw statement ran to the end and was marked done.
+        // A cut-off connection is mid-answer or still inside its BEGIN, so
+        // nothing more is sent on it: it is not idle, `release` replaces
+        // it, and the server rolls back when it goes.
+        const cut_off = if (std.Io.checkCancel(io)) |_| false else |_| blk: {
+            io.recancel();
+            break :blk true;
+        };
+        if (!cut_off) {
+            const was = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(was);
+            conn.rollback() catch {};
+            if (prepared) _ = conn.execOpts("DEALLOCATE nilo_describe", .{}, .{}) catch {};
+        }
     }
     _ = conn.execOpts("SET LOCAL plan_cache_mode = force_generic_plan", .{}, .{}) catch |err|
         return translate(io, conn, err);

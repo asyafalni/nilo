@@ -71,6 +71,11 @@ back: the statement the cancellation cut off left the connection mid-answer,
 the `ROLLBACK` cannot be sent at all (`ConnectionBusy`), the connection is
 dropped, and the server rolls the transaction back as it goes. Without a
 cancellation behind it, a rollback that fails is still logged as it was.
+The same holds for the transaction `describe` opens to read a raw
+statement's plan on its first run: cut off, it sends nothing more and the
+connection is replaced; otherwise its `ROLLBACK` and `DEALLOCATE` run held off.
+Unguarded, that `ROLLBACK` took the re-armed cancellation and dropped it, and
+`db.raw` ran the statement it had been told to stop.
 
 **A `COMMIT` is held off too, for the opposite reason.** It is not cleanup,
 it is the one statement whose outcome the caller has to know. Cut off after
