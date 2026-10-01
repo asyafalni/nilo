@@ -423,9 +423,9 @@ The design is known and priced; what is missing is somebody who needs it. Bring 
 
 **Needs:** a caller with a map or `Value` field in a body.
 
-**A gRPC connection's message budget is not an option, and a gzip call over it is refused rather than made to wait.** The budget is `max_body` (at least 64 KiB), and a call is charged its compressed bytes, its inflated copy and the request text built from it, so a Collector sending 3 MB batches side by side gets one at a time per connection at `max_body` 4 MiB and retries the rest as `UNAVAILABLE` ([ADR 220](./adr/220-grpc-is-served-over-h2c-behind-a-flag.md#what-the-budget-refuses-an-opentelemetry-collector)). Two shapes fix it and each is small: a budget option sized from the caller's batches, and a call held back with only its compressed bytes until room is released, which gzip's trailer makes possible because it announces the inflated size.
+**A gRPC connection's message budget is not an option.** The budget is `max_body` (at least 64 KiB), and a call is charged its compressed bytes, its inflated copy and the request text built from it, so a Collector sending 4 MB batches gets about two running at a time per connection at `max_body` 16 MiB and the rest wait ([ADR 220](./adr/220-grpc-is-served-over-h2c-behind-a-flag.md#what-the-budget-does-to-an-opentelemetry-collector)). Waiting replaced the refusal and made a small budget slow rather than lossy; a budget sized from the caller's batches is what would let more run at once.
 
-**Needs:** a Collector, or another client that multiplexes large gzip messages, with its batch size and consumer count, and the per-connection figure measured with them.
+**Needs:** a caller whose throughput per connection is held back by how many calls run at once, rather than by its own work, with the batch size and consumer count that show it.
 
 ### Modules that do not exist yet
 
