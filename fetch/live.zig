@@ -1715,22 +1715,26 @@ test "a body going out that keeps moving is not a stall, however long it takes" 
             defer served.cancel(io) catch {};
 
             // Nothing arrives from the peer while this goes out, so before the
-            // upload counted as progress this was `Stalled` at 150 ms: 8 bytes
-            // 60 ms apart is 480 ms, and every gap is well inside the bound.
-            var client = try started(io, .{ .timeout_ms = 0, .stall_ms = 150 });
+            // upload counted as progress this was `Stalled` once the bound
+            // ran out: 24 bytes 60 ms apart is 1.44 s under a one-second
+            // bound, and every gap is well inside it. A second rather than
+            // 150 ms for the reason the download twin above gives: the gaps
+            // are sleeps, and on the loaded macOS runner a 60 ms sleep went
+            // past 150 on every run.
+            var client = try started(io, .{ .timeout_ms = 0, .stall_ms = 1000 });
             defer client.deinit();
 
             var buf: [64]u8 = undefined;
-            var source: fetch.testing.Dribble = .init(io, 8, 60);
+            var source: fetch.testing.Dribble = .init(io, 24, 60);
             var ex: fetch.Exchange = .idle;
             defer ex.end();
             const head = try ex.begin(&client, .{
                 .method = .PUT,
                 .url = try canned.url(&buf),
-                .body = .{ .stream = .{ .reader = &source.reader, .len = 8 } },
+                .body = .{ .stream = .{ .reader = &source.reader, .len = 24 } },
             });
             try testing.expect(head.ok());
-            try testing.expectEqualStrings("yyyyyyyy", canned.requestBody());
+            try testing.expectEqualStrings("y" ** 24, canned.requestBody());
         }
     }.run);
 }
