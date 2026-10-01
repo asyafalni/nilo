@@ -1947,6 +1947,47 @@ test "a transaction cut off by a cancellation rolls back without calling it a fa
     try testing.expectEqual(AfterCancel.still_cancelled, task.cancel(io));
 }
 
+/// Sleeps while the statement calling it is planned rather than run: an
+/// immutable function with no arguments is folded into a constant by the
+/// planner, so the EXPLAIN a first raw run sends to check its Row is the
+/// step that waits.
+const plan_sleep_fn = "nilo_test_plan_sleep";
+
+fn slowToPlanThenAsk(db: *db_mod.Db, io: std.Io, gpa: std.mem.Allocator) AfterCancel {
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    _ = db.raw(Slept, &run, "SELECT " ++ plan_sleep_fn ++ "() AS ok", .{}) catch {
+        std.Io.checkCancel(io) catch return .still_cancelled;
+        return .lost;
+    };
+    return .finished;
+}
+
+test "a cancellation that lands in a raw statement's first-run check reaches its caller" {
+    // The check's EXPLAIN runs inside a transaction it rolls back, and the
+    // ROLLBACK in its cleanup took the cancellation `translate` had re-armed
+    // and dropped it. `db.raw` then ran the statement anyway, so a job cut
+    // off there by a shutdown finished and was marked done (ADR 223).
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    _ = try stack.db.exec(&run, "CREATE OR REPLACE FUNCTION " ++ plan_sleep_fn ++ "() RETURNS boolean " ++
+        "IMMUTABLE LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(5); RETURN true; END $$", .{});
+    defer _ = stack.db.exec(&run, "DROP FUNCTION IF EXISTS " ++ plan_sleep_fn ++ "()", .{}) catch {};
+
+    const io = stack.live.threaded.io();
+    var task = io.concurrent(slowToPlanThenAsk, .{ &stack.db, io, gpa }) catch return error.SkipZigTest;
+    // Inside the five seconds the EXPLAIN plans for.
+    try std.Io.sleep(io, .fromMilliseconds(500), .awake);
+    const started = nilo.monotonicNanos();
+    try testing.expectEqual(AfterCancel.still_cancelled, task.cancel(io));
+    // Not run anyway: a statement that went on would plan for five more.
+    try testing.expect(nilo.monotonicNanos() - started < 3 * std.time.ns_per_s);
+}
+
 test "a deadline ends with its transaction, so the next one starts clean" {
     const gpa = testing.allocator;
     var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
