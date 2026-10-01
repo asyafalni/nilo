@@ -86,6 +86,7 @@ MODULES = [
     ("pw", "a password checked against its Argon2id hash at the default Cost", 2, 6),
     ("cache", "one `put` and one `get` of a flat value", 1000, 5000),
     ("jwt", "an RS256 token verified, its claims read", 20, 100),
+    ("proto", "a 20-record logs request decoded into structs and written back", 200, 1000),
     ("fetch", "a GET on a pooled keep-alive connection to an upstream in the process", 1000, 5000),
     ("job", "a job pushed onto `job.Memory`, claimed, run and marked done", 2000, 10000),
     ("sql", "a row found by key on SQLite, `.in_fiber`", 1000, 21000),

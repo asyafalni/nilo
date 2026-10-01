@@ -23,6 +23,8 @@ Outside the Engine there are no fibers at all — unit tests call `App` directly
 
 One small departure from ADR 004: the message is not stored in the request arena but in a fixed buffer inside the Failure. The failure path must not have a failure path of its own — running out of memory while trying to report an error is the last place anyone wants to think about. The consequence is that messages are capped at 240 bytes and longer ones are truncated.
 
+**The cap is not raised for a long list of field names; the list is shortened instead.** The `Failure` is one a connection, so every byte of ceiling is paid by every idle connection (256 bytes now; 480 would be +240 on a floor of 4,669, about 5%), and the stack buffer that answers it in ADR 024 grows six bytes for each. A body field list in a 400 stops at 100 bytes of names and says `, and N more` (`nameList` in `ctx.zig`, spelled while compiling), so a struct of any width still ends its sentence inside the 240 bytes, with room left for the name the client sent.
+
 ## Consequences
 
 - Fail functions are safe to call from a handler that sleeps partway through — which is to say, from nearly every handler that touches a network or a database.

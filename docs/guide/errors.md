@@ -29,7 +29,7 @@ Each of them stores the status and the message where the request will find them,
 | `fail.internal(…)` | 500: the message is logged, not sent |
 | `fail.status(code, …)` | any status you like |
 
-The message is formatted into a fixed slot of **240 bytes**, with no allocation. A longer message is cut short, not refused. The message is for the person reading the response, so say what was wrong and what would work: `fail.notFound("no user {d}", .{id})` is better than `fail.notFound("not found", .{})`.
+The message is formatted into a fixed slot of **240 bytes**, with no allocation. A longer message is cut short, not refused; a list of field names in a body's 400 is shortened to `…, and 6 more` before it can be. The message is for the person reading the response, so say what was wrong and what would work: `fail.notFound("no user {d}", .{id})` is better than `fail.notFound("not found", .{})`.
 
 [ADR 004](../adr/004-http-errors-via-fail-functions.md) and [ADR 006](../adr/006-failure-box-bound-to-the-fiber.md) explain how the message gets back to the response without a `Ctx`.
 

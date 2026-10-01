@@ -67,3 +67,32 @@ the thing a build step exists to replace.
 - `operation()` in `typed.zig` already raises its own to 20,000 for a related
   reason and says so; this is the second instance of the same idea, not a new
   one.
+
+## Every module, sized from what it walks
+
+The rule was held in `http/` and `sql/row.zig` and nowhere else, and a walk
+over a caller's type with no quota failed the same way in the other modules.
+Each was found by building a type three to five times what a program here
+reaches (a Row of 200 columns with 40-character names, a queue of forty job
+kinds, a body of 200 fields, an enum of 1,000 values) and compiling it
+through the public API; each test is kept, named as a sentence, and declares
+its type apart from the test so the test's own quota does not pay for it.
+
+- **The quota is set at the site that loops, from what it loops over**, and a
+  module that has several such sites keeps one helper for it: `row.budget`
+  (linear in the fields) and `row.shapeBudget` (quadratic, for a Row whose
+  aggregates and parents are laid out against each other) in `nilo_sql`,
+  `convert.budget` in `http/`, `budget` in `config/convert.zig` and in
+  `job/job.zig`. One constant in `nilo_core` would serve none of them: the
+  layering rule keeps a Tool from importing a sibling, and what each walk
+  costs per field differs.
+- **A lookup by name is `@hasField` and `@FieldType`, not a walk comparing
+  every name.** `row.fieldTypeOf` compared a name a byte at a time, so every
+  loop over a Row's columns paid for the square of the Row's width in bytes,
+  and a quota in each caller could only postpone it. The compiler's own
+  lookup costs no branch.
+- **A flat constant is a guess about somebody else's type.** `@setEvalBranchQuota(200_000)`
+  in `sql/shape.zig` stopped at twenty aggregates, and `1_000_000` in
+  `proto/schema.zig` is still a guess: a message of 300 fields reaches it
+  after a compile that already takes minutes, which is a different problem.
+

@@ -1125,6 +1125,51 @@ pub const Exchange = struct {
         // method; given none, none is, whatever the method — and the two
         // asserts are stepped around rather than tripped, since either would
         // be a panic in a worker thread.
+        self.send(opts) catch |err| {
+            if (err != error.WriteFailed) return err;
+            return self.earlyAnswer(opts, error.WriteFailed);
+        };
+
+        self.res = try self.req.receiveHead(opts.redirects.buffer());
+    }
+
+    /// The write fails with `WriteFailed` after a refusal that came back
+    /// before the body was finished: the answer is already in the
+    /// connection's receive buffer, and the error is all the caller gets.
+    ///
+    /// **A server may answer before it has read the request** (RFC 9110
+    /// §15, RFC 9112 §9.6), and one that refuses a large PUT on its head
+    /// alone does exactly that: S3 and Garage answer a wrong region with
+    /// `400 AuthorizationHeaderMalformed` and close, while the client is still
+    /// writing. The close with unread data is an RST, the write fails, and
+    /// `could not be reached: WriteFailed` hid the one thing that said what
+    /// was wrong (`photon` S4 check 6, gap G2).
+    ///
+    /// So after a failed write the head is read once, under the call's own
+    /// deadline, before the failure is given up. A peer that reset the write
+    /// has no more to wait for, so the read returns at once with what the
+    /// kernel kept or with an error; there is no new clock.
+    ///
+    /// **Only a refusal is taken.** A 2xx before the body was all sent would
+    /// be a success for an upload the server never received whole, and 1xx is
+    /// not final; both stay `WriteFailed`, as does anything unreadable. The
+    /// connection is never reused (`keep_alive` off before the read, so std
+    /// marks it closing whatever the head says), because the request on it
+    /// was left unfinished. No allocation and no syscall on a write that
+    /// succeeds: this is a branch on the error path.
+    fn earlyAnswer(self: *Exchange, opts: Begin, failed: error{WriteFailed}) error{WriteFailed}!void {
+        self.req.keep_alive = false;
+        const res = self.req.receiveHead(opts.redirects.buffer()) catch return failed;
+        const class = res.head.status.class();
+        if (class == .success or class == .informational) {
+            if (self.req.connection) |conn| conn.closing = true;
+            return failed;
+        }
+        self.res = res;
+    }
+
+    /// The head and the body, with no opinion about what a failure means.
+    fn send(self: *Exchange, opts: Begin) !void {
         const framed = opts.method.requestHasBody();
         switch (opts.body) {
             .none => if (framed) {
@@ -1176,8 +1221,6 @@ pub const Exchange = struct {
                 if (self.stall_ms != 0) self.mark();
             },
         }
-
-        self.res = try self.req.receiveHead(opts.redirects.buffer());
     }
 
     /// The head for a body on a method std frames no body for — a DELETE
@@ -1240,7 +1283,8 @@ pub const Exchange = struct {
     /// `ReadFailed` with bytes buffered and stays a failure, because
     /// something did come back and re-sending would be a retry policy. So is
     /// a write that fails with `WriteFailed`: some of the request may have
-    /// reached the far side, and no test here reproduces it.
+    /// reached the far side. That one is not retried; what it can do is
+    /// carry an answer the server sent early (`earlyAnswer`).
     fn nothingCameBack(self: *Exchange, err: anyerror) bool {
         if (err == error.HttpConnectionClosing) return true;
         if (err != error.ReadFailed) return false;
@@ -1721,6 +1765,15 @@ pub fn withQuery(c: anytype, base: []const u8, params: anytype) error{OutOfMemor
 /// to a segment's rules instead (ADR 061).
 pub fn checkQuery(comptime P: type, comptime called: []const u8, comptime skip: []const []const u8) void {
     const info = @typeInfo(P);
+    // A walk over every param, each asked whether it is skipped: a query of
+    // 400 params stopped at "evaluation exceeded 1000 backwards branches" at
+    // a line in this file, and a person reads that as a fault in the 400th
+    // ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)).
+    const width = switch (info) {
+        .@"struct" => |st| st.fields.len,
+        else => 0,
+    };
+    @setEvalBranchQuota(1_000 + 20 * @as(u32, @intCast(width * (skip.len + 1))));
     // `.{}` is the empty tuple to Zig and "no params" to a caller, so it
     // passes; a tuple with something in it has no names to be params.
     const named = switch (info) {
@@ -2096,4 +2149,29 @@ test "text is read as text and a struct is not, which is what the two Refusals r
 test {
     _ = @import("live.zig");
     _ = @import("target.zig");
+}
+
+/// 400 params with 40-character names. Declared apart from the test, so the
+/// test's own quota does not pay for it.
+const WideQuery = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var names: [400][:0]const u8 = undefined;
+    var types: [400]type = undefined;
+    for (&names, &types, 0..) |*name, *T, i| {
+        name.* = std.fmt.comptimePrint("a_query_param_with_a_long_descriptive_name_{d:0>4}", .{i});
+        T.* = u32;
+    }
+    break :blk @Struct(.auto, null, &names, &types, &@splat(.{}));
+};
+
+test "a query of 400 params is checked and written without a quota of the caller's" {
+    // It stopped with "evaluation exceeded 1000 backwards branches" from a
+    // line in `checkQuery`.
+    var run: core.Run = .init(std.testing.allocator);
+    defer run.deinit();
+
+    const params = std.mem.zeroes(WideQuery);
+    const url = try withQuery(&run, "http://example.test/x", params);
+    try std.testing.expect(std.mem.startsWith(u8, url, "http://example.test/x?a_query_param_with_a_long_descriptive_name_0000=0&"));
+    try std.testing.expect(std.mem.endsWith(u8, url, "_0399=0"));
 }

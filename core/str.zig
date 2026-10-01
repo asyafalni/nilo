@@ -257,6 +257,11 @@ pub fn stampLike(value: anytype, like: Str) void {
 fn stampInner(value: anytype, by: anytype, comptime depth: u8) void {
     if (depth == 0) return;
     const T = @typeInfo(@TypeOf(value)).pointer.child;
+    // Asking whether `T` holds a Str walks its fields once and the loop below
+    // walks them again, so a body of 400 fields ran past the default 1,000
+    // backwards branches at a line in this file
+    // ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)).
+    comptime @setEvalBranchQuota(1_000 + 20 * @as(u32, @intCast(fieldCount(T))));
     if (comptime !containsStr(T, depth)) return;
 
     if (T == Str) {
@@ -285,6 +290,15 @@ fn stampInner(value: anytype, by: anytype, comptime depth: u8) void {
         },
         else => {},
     }
+}
+
+/// How many fields `T` has, which is what a walk over it is sized from.
+fn fieldCount(comptime T: type) usize {
+    return switch (@typeInfo(T)) {
+        .@"struct" => |s| s.fields.len,
+        .@"union" => |u| u.fields.len,
+        else => 0,
+    };
 }
 
 /// Whether `T` could hold a Str anywhere inside it. Types that hold none
@@ -530,4 +544,28 @@ test "stamp reaches through optionals and nested structs" {
     try testing.expect(value.maybe.?.text.alive());
     lifetime.end();
     try testing.expect(!value.maybe.?.text.alive());
+}
+
+/// 600 fields with 40-character names and a Str among them, which is a body
+/// no handler declares and a form or a JSON document can still be. Declared
+/// apart from the test, so the test's own quota does not pay for it.
+const WideBody = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var names: [601][:0]const u8 = undefined;
+    var types: [601]type = undefined;
+    for (names[0..600], types[0..600], 0..) |*name, *T, i| {
+        name.* = std.fmt.comptimePrint("a_field_with_a_long_descriptive_name_{d:0>4}", .{i});
+        T.* = u32;
+    }
+    names[600] = "text";
+    types[600] = Str;
+    break :blk @Struct(.auto, null, &names, &types, &@splat(.{}));
+};
+
+test "a struct of 600 fields is stamped without a quota of the caller's" {
+    var lifetime = Lifetime{};
+    var body: WideBody = undefined;
+    body.text = Str.fromRequest("hello", &lifetime);
+    stamp(&body, &lifetime);
+    try testing.expectEqualStrings("hello", body.text.view());
 }

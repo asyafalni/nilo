@@ -607,9 +607,12 @@ pub fn findStatic(self: *const App, c: *const Ctx, path: []const u8) ?StaticHit 
     // Only once every set has been asked for the file itself. A page one
     // directory answers its misses with must not hide a file another
     // directory really holds, and asking set by set would let it.
-    const accept_header: ?[]const u8 = if (c.header("Accept")) |h| h.view() else null;
+    const asked: static_mod.Asked = .{
+        .accept = if (c.header("Accept")) |h| h.view() else null,
+        .fetch_mode = if (c.header("Sec-Fetch-Mode")) |h| h.view() else null,
+    };
     for (self.static_sets.items, 0..) |*set, i| {
-        if (set.fallbackFor(path, accept_header)) |file| return hitIn(self, i, set, file);
+        if (set.fallbackFor(path, asked)) |file| return hitIn(self, i, set, file);
     }
     return null;
 }

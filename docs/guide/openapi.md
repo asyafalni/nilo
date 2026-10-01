@@ -109,6 +109,8 @@ There is one guard per App, because a program has one session cookie. Declaring 
 
 **Shapes.** A type with no JSON shape is `{}`, meaning "anything", which is true. An **untagged** union is such a type: nothing in the type says which variant is active. A `union(enum)` is not, and gets a `oneOf` matching the encoding it actually sends: the one `std.json` writes by default or, if the type carries `nilo_json`, a discriminated one with `discriminator` and each variant pinned to its own tag value ([JSON shapes](./responses.md#json-field-names-and-union-tags)).
 
+**Unknown keys.** A struct that says `.unknown_fields = .ignore` is `additionalProperties: true`. Every other struct says nothing about it, not `false`: a request refuses an unknown key, but the same schema describes a response, and a client reads a response ignoring the keys it does not know ([ADR 168](../adr/168-one-field-can-be-spelled-on-its-own.md)).
+
 ## `Str` and `Text` versions of one type
 
 **`Meta(Str)` for the request body and `Meta(Text)` for the database row become one component called `Meta`.** This is the split nilo asks for, and it used to cost a generated client two identical types. It no longer does: where a `_Str` and a `_Text` version render the same all the way down, they are one component ([ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md)). Two shapes that only look alike, such as `Page_Order` and `Page_User`, keep their own names.

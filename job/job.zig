@@ -1316,12 +1316,35 @@ fn depField(comptime name: []const u8, comptime Deps: type, comptime P: type) []
 
 // -- the checks -----------------------------------------------------------
 
+/// A branch quota for every walk over the queue's kinds, written at the site
+/// that loops. Each kind is checked against every kind before it, comparing
+/// names, and its name is cut out of its type's by a walk from the back, and
+/// each field of its payload is a step more: a queue of twelve kinds with
+/// 40-character names stopped at "evaluation exceeded 1000 backwards
+/// branches" at a line here, which reads as a fault in the twelfth. Generous
+/// rather than exact, because the compiler keeps the larger of two quotas
+/// ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)).
+fn budget(comptime kinds: []const type) u32 {
+    comptime {
+        @setEvalBranchQuota(1_000 + 10 * kinds.len);
+        var longest: u64 = contract.max_kind;
+        var fields: u64 = 0;
+        for (kinds) |K| {
+            longest = @max(longest, @typeName(K).len);
+            if (@typeInfo(K) == .@"struct") fields += @typeInfo(K).@"struct".fields.len;
+        }
+        const n: u64 = kinds.len;
+        return @intCast(@min(20_000 + 100 * (n + 1) * (n + 1) * longest + 4_000 * fields, std.math.maxInt(u32)));
+    }
+}
+
 /// Everything about a kind that can be checked in `Jobs(…)`'s body. `Deps`
 /// is null for a queue whose `.deps` is a function: then the deps and every
 /// `run`'s signature are read by `checkLate` instead, once the queue type
 /// exists, because a `run` that names `*Jobs` cannot be read before it does
 /// ([ADR 160](../docs/adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 fn checkKinds(comptime kinds: []const type, comptime Deps: ?type) void {
+    @setEvalBranchQuota(budget(kinds));
     if (kinds.len == 0) @compileError(
         "nilo: `job.Jobs`'s `.kinds` is empty, so this queue could run nothing.\n" ++
             "  Give it at least one job type.",
@@ -1463,6 +1486,7 @@ fn checkPayload(comptime T: type, comptime job_name: []const u8, comptime path: 
 /// The half of `checkKinds` that waits for the queue type: the deps struct
 /// and every `run`'s signature.
 fn checkLate(comptime kinds: []const type, comptime Deps: type) void {
+    @setEvalBranchQuota(budget(kinds));
     checkDepsShape(Deps);
     for (kinds) |K| checkRun(K, shortName(K), Deps);
 }
@@ -2959,4 +2983,50 @@ test "an empty unique key is refused by the queue, so a missing value cannot fol
     try testing.expectError(error.EmptyUniqueKey, jobs.push(&run, Greet{ .who = .static("a") }, .{ .unique = key }));
     try testing.expectError(error.EmptyUniqueKey, store.push(&run, "greet", "{}", .{ .run_at = 0, .unique = "" }));
     try testing.expectEqual(@as(u64, 0), (try jobs.stats(&run)).queued);
+}
+
+/// One job type per number, with a 40-character name and a payload of its own
+/// width, so a queue of forty of them has the sizes a large program reaches
+/// and then some. A function returns a struct with declarations, which a
+/// generated type could not carry.
+fn WideKind(comptime n: usize) type {
+    return struct {
+        pub const nilo_job = std.fmt.comptimePrint("wide-kind-{d:0>4}-with-a-long-job-name-padding", .{n});
+        pub const retry: Retry = .none;
+
+        first_with_a_long_descriptive_payload_name: u32 = 0,
+        second_with_a_long_descriptive_payload_name: core.Str = .static(""),
+        third_with_a_long_descriptive_payload_name: ?i64 = null,
+
+        pub fn run(self: @This(), scope: *core.Run) !void {
+            _ = self;
+            _ = scope;
+        }
+    };
+}
+
+/// Declared apart from the test, so the test's own quota does not pay for it.
+const wide_kind_count = 40;
+const wide_kinds = blk: {
+    @setEvalBranchQuota(100_000);
+    const Tuple = std.meta.Tuple(&([_]type{type} ** wide_kind_count));
+    var tuple: Tuple = undefined;
+    for (0..wide_kind_count) |i| tuple[i] = WideKind(i);
+    break :blk tuple;
+};
+const WideJobs = Jobs(.{ .kinds = wide_kinds, .store = Memory });
+
+test "a queue of forty kinds with 40-character names is checked without a quota of the caller's" {
+    // Twelve of them stopped with "evaluation exceeded 1000 backwards
+    // branches" from a line in `checkKinds`, which compares every kind's name
+    // with every kind before it.
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var jobs: WideJobs = .open(testing.allocator, &store, .{}, .{});
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    const last = WideKind(wide_kind_count - 1);
+    _ = try jobs.push(&run, last{}, .{});
+    try testing.expectEqual(@as(usize, 1), try jobs.drain(&run));
 }

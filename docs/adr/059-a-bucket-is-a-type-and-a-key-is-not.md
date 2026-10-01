@@ -28,7 +28,7 @@ const Invoices = s3.Bucket("invoices", .{ .max_bytes = 20 << 20, .style = .path 
 var store    = try s3.open(gpa, .{ .endpoint = cfg.s3_endpoint,
                                        .region   = cfg.s3_region,
                                        .credentials = .{ .static = cfg.aws } });
-var avatars  = try Avatars.open(&store);
+var avatars  = try Avatars.open(&store);        // the declared name, "avatars"
 try app.provide(&avatars);
 
 fn getAvatar(id: Uuid, avatars: *Avatars, c: *nilo.Ctx) !s3.Object {
@@ -47,11 +47,11 @@ bucket rather than of the deployment.**
 
 | comptime, on the type | runtime, on the client |
 |---|---|
-| bucket name | endpoint |
+| bucket name, as the default and the type's identity | endpoint |
 | addressing style (`virtual` / `path`) | region |
 | `max_bytes` | credentials |
 | `sse` | `max_in_flight`, drain threshold |
-| `presign_max` | |
+| `presign_max` | the bucket's name, when it is configuration (`openAs`) |
 
 Endpoint and region are runtime because they come from the environment —
 `nilo_config` exists so that development and production are one binary
@@ -65,6 +65,36 @@ win was never *comptime*, it was **not formatting a host per request**.
 holds them. **Zero allocations per request either way** — one at startup instead
 of one at compile time.
 
+**The name is a comptime default with a run-time override.** A program whose
+bucket is configuration (photon reads `PHOTON_DURABLE_BUCKET`, one binary for
+every deployment) declares the type for its identity and opens it under the name
+it was given:
+
+```zig
+const Durable = s3.Bucket("durable", .{ .style = .path });
+
+var durable = try Durable.openAs(&store, cfg.durable_bucket);   // error.BadBucketName
+```
+
+The type is still the Service: `*Durable` is what a handler names, two bucket
+types are two Services whatever they were opened as, and `Durable.open(&store)`
+still opens the declared name. `openAs` checks the name at run time by the same
+predicate the compile-time check runs on the declared one (`badName`, one
+function for both, so the two cannot drift), answers the named error
+`BadBucketName` rather than panicking, and copies the name into the memory the
+bucket already owns, so the config string need not outlive the call.
+`Durable.nameProblem(name)` gives the reason in words for a program that wants
+to say which setting is wrong while it reads its configuration. Every log line
+and a POST policy say the name the bucket was opened under, not the declared
+one: the S4 spike for photon had overwritten `prefix` after `open` to get a
+configured bucket, and its log lines named the wrong bucket.
+
+Path style also refuses, at both times, a name with a byte that would end or
+change a URL path (`/`, `?`, `#`, space, a control byte), because a path-style
+name is written into the URL unencoded and a name from configuration is data.
+Letters of either case, digits, dot, dash and underscore are accepted, which is
+what old buckets carry.
+
 What comptime does buy is the half that cannot be bought any other way.
 
 **Refusals.** Each of these is a compile error with a message nilo wrote, which
@@ -72,7 +102,9 @@ means a file in `refusals/` and a row in a fifth table, `s3_refusals`, beside
 the four `build.zig` already carries (ADR 026):
 
 - a bucket name that virtual-host addressing cannot carry — not 3–63
-  characters, not lowercase, containing an underscore, shaped like an IP
+  characters, not lowercase, containing an underscore, shaped like an IP; or,
+  by path, one that would change the URL (the same check refuses a run-time
+  name with `error.BadBucketName`)
 - a secret in a comptime option. `s3.Bucket("avatars", .{ .secret_access_key = "wJalr…" })`
   is a secret compiled into the binary, and it must not be possible to write
 - `presign_max` above seven days, which SigV4 refuses at 604,800 seconds
@@ -215,15 +247,29 @@ and this repository holds that error messages are a feature.
 ## What it costs
 
 Against [ADR 017](./017-the-trade-budget-has-four-axes.md)'s four axes:
-**nothing this ADR decides costs anything on any of them.** Host and credential
-scope are built once at `open()`; `SignedHeaders` is a constant; the refusals
-run at compile time and are absent from the binary; `Range`, `getIf` and
-`Presigned` are headers and a struct. The costs of this module are
+**nothing this ADR decides costs anything on any of them**, and the run-time
+name costs this much. Allocations: `open` and `openAs` make the one allocation
+`open` always made, none per request, and a refused name allocates nothing (held
+by a test with a counting allocator). Bytes: 16 more in the `Bucket` value (the
+name slice) and the name's own 3 to 63 bytes in the allocation that already
+held the host and prefix; a `Reading` is the same size, because the bucket it
+points to replaces the Store it used to point to. Throughput: nothing on the
+request path reads the name except a log line and `presignPost`. Binary: 160
+bytes more in the stripped `ReleaseFast` `size-s3` program (1,843,128 to
+1,843,288). Host and credential scope are built once at `open()`;
+`SignedHeaders` is a constant; the refusals run at compile time and are absent
+from the binary; `Range`, `getIf` and `Presigned` are headers and a struct. The costs of this module are
 `std.http.Client`'s and are stated in
 [ADR 058](./058-most-of-an-s3-client-is-not-s3.md).
 
 ## Consequences
 
+- **A bucket's name moved from comptime-only to "comptime default, run-time
+  override".** Rejected: keeping it comptime-only. It forced one binary per
+  deployment, or the field overwrite the photon spike used, which left the log
+  lines naming the declared bucket. Also rejected: a `Bucket` with no declared
+  name, which would give up the compile-time refusal and the name that makes
+  the type self-describing for nothing a default does not already give.
 - **Two buckets in one program are two types**, so a handler cannot reach the
   wrong one, and a bucket added later is a new type rather than a new string
   argument threaded through call sites.

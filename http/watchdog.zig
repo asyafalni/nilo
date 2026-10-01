@@ -27,6 +27,12 @@
 //! doing CPU work it should have handed to `nilo.blocking` — which is the same
 //! advice either way, so both are worth saying.
 //!
+//! **A wait through the server's `Io` says nothing here**, and does not need
+//! to: `std.Io.Event` and `Queue` park the fiber, and the run loop's turn
+//! stamp (`bulkhead.loopTurnNanos`) says one began since the stretch did.
+//! `reportIfTooLong` asks only for a stretch already past the limit and
+//! measures from that turn (ADR 013, `chargeFrom`).
+//!
 //! **This used to be elapsed time minus parked time, summed over the whole
 //! request, and that is why a stream, a body reader and a WebSocket had to be
 //! excused entirely.** A sum has no upper bound on a connection that is open
@@ -101,13 +107,58 @@ pub fn finish(w: *Watch) void {
 
 /// The end of a stretch: report it if the handler ran too long, and leave the
 /// watch parked.
+///
+/// A stretch that is long on the clock is not yet a hold. The brackets above
+/// are the waits the Bulkhead was told about; a handler may also wait through
+/// the server's `Io` (`std.Io.Event`, `Queue`), which parks the fiber and
+/// frees the thread without a word to this file. **So a long stretch is asked
+/// one more question, and only once it is long: did the loop turn over since it
+/// began?** If it did, the fiber parked somewhere, and what is measured is the
+/// run since the turn that resumed it. See `chargeFrom`.
 fn reportIfTooLong(w: *Watch, from: u64) void {
     if (w.warn_ns == 0 or from == 0) return;
-    const held = bulkhead.coarseNanos() -| from;
+    const now = bulkhead.coarseNanos();
+    if (now -| from < w.warn_ns) return;
+
+    // The ask is past the early exit above, so nothing here is on the path of
+    // a request that never waits long: no read, no store.
+    const turn = bulkhead.loopTurnNanos();
+    const start = chargeFrom(from, turn, charged_turn) orelse return;
+    const held = now -| start;
     if (held < w.warn_ns) return;
+    if (turn) |t| charged_turn = t;
 
     _ = caught.fetchAdd(1, .monotonic);
     report(w.method, w.path, held / std.time.ns_per_ms);
+}
+
+/// The loop turn a report was last made in, on this thread. One turn runs a
+/// whole batch of fibers one after another, and its stamp is shared by all of
+/// them, so a fiber that blocks for 300ms makes every fiber after it in the
+/// batch look 300ms into its stretch. Once a turn has been charged to one
+/// holder, nobody else is charged for it: the next turn tells the truth about
+/// whoever really holds the thread.
+threadlocal var charged_turn: u64 = 0;
+
+/// How much newer than `from` a loop turn has to be to count as a park.
+/// `from` is a `CLOCK_MONOTONIC_COARSE` reading, which trails the real clock
+/// by up to one kernel tick (4ms at 250 Hz), and the turn stamp is the exact
+/// clock. A turn the fiber is itself running in can therefore look newer than
+/// the stretch by that much without any park having happened. Three ticks is
+/// room for a 100 Hz kernel and some, and a park shorter than this is not
+/// forgiven, it is only charged from `from`, which overstates the hold by the
+/// park (under 12ms against a limit of a quarter of a second).
+const turn_slack_ns: u64 = 12 * std.time.ns_per_ms;
+
+/// Where a long stretch is measured from: `from`, unless the loop turned over
+/// after it began, in which case the fiber parked and the stretch that counts
+/// is the one since that turn. Null when the turn was already charged to a
+/// report, because this fiber came after the holder in the same batch.
+fn chargeFrom(from: u64, turn: ?u64, charged: u64) ?u64 {
+    const t = turn orelse return from;
+    if (t <= from +| turn_slack_ns) return from;
+    if (t == charged) return null;
+    return t;
 }
 
 /// The start of a wait that is not the handler holding the thread. **This is
@@ -229,6 +280,26 @@ fn running(elapsed_ms: u64, warn_ms: u32) Watch {
         .method = "GET",
         .path = "/x",
     };
+}
+
+test "a loop turn newer than the stretch moves where it is measured from" {
+    const ms = std.time.ns_per_ms;
+    const from: u64 = 1_000 * ms;
+    // No loop: the stretch is what the brackets said.
+    try testing.expectEqual(@as(?u64, from), chargeFrom(from, null, 0));
+    // A turn before the stretch, or within the slack of its start: the fiber
+    // has not parked, or the clocks cannot say.
+    try testing.expectEqual(@as(?u64, from), chargeFrom(from, from - 5 * ms, 0));
+    try testing.expectEqual(@as(?u64, from), chargeFrom(from, from + 11 * ms, 0));
+    // A turn well after it: the fiber parked and was resumed there.
+    try testing.expectEqual(@as(?u64, from + 400 * ms), chargeFrom(from, from + 400 * ms, 0));
+    // The same turn already charged: a fiber after the holder in the batch.
+    try testing.expectEqual(@as(?u64, null), chargeFrom(from, from + 400 * ms, from + 400 * ms));
+    // A charged turn is only about that turn.
+    try testing.expectEqual(@as(?u64, from + 400 * ms), chargeFrom(from, from + 400 * ms, from + 100 * ms));
+    // A turn the stretch started inside is never suppressed, charged or not:
+    // it is the holder's own.
+    try testing.expectEqual(@as(?u64, from), chargeFrom(from, from - 1 * ms, from - 1 * ms));
 }
 
 test "a stretch that ran the whole time is reported" {

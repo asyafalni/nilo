@@ -30,6 +30,7 @@ pub const fetch = @import("nilo_fetch");
 pub const s3 = @import("nilo_s3");
 pub const cache = @import("nilo_cache");
 pub const jwt = @import("nilo_jwt");
+pub const proto = @import("nilo_proto");
 pub const job = @import("nilo_job");
 
 pub const Str = nilo.Str;

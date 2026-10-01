@@ -18,7 +18,7 @@ Splitting the repository into modules answered that, but the split had only ever
 | Layer | Module(s) | The loop | Runs under plain `zig test` |
 |---|---|---|---|
 | Core | `nilo_core` | needs none | yes, and that is the point of it |
-| Tool module | `id/`, `config/`, `pw/`, `cache/`, `jwt/` | needs none | yes, the entry condition for the layer |
+| Tool module | `id/`, `config/`, `pw/`, `cache/`, `jwt/`, `proto/` | needs none | yes, the entry condition for the layer |
 | Fitting ([ADR 061](./061-a-fitting-borrows-the-loop.md)) | `fetch/`, `job/` | borrows it, owns no destination | needs `nilo_core`, no Engine |
 | Service ([ADR 063](./063-an-object-store-is-a-service-that-dials.md)) | `sql/`, `s3/` | borrows it, holds a named system it dials | no |
 | App | `http/` | owns it | no |

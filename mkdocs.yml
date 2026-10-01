@@ -107,6 +107,7 @@ nav:
       - jobs.md
       - cache.md
       - jwt.md
+      - proto.md
       - id.md
   - Shipping it:
       - testing.md

@@ -85,6 +85,21 @@ pub const percent = @import("nilo_core").percent;
 /// add a declaration to a type somebody else wrote.
 pub const jsonParseFor = @import("jsonmark.zig").parseFor;
 
+/// Write `value` as JSON to a `*std.Io.Writer` by the rules a response is
+/// written by, outside a request: a job's payload, an alert body, the expected
+/// text in a test. Struct fields in declaration order, a non-finite float as
+/// `null`, a `Str` as text, a `nilo_json` marker honoured, and the bytes
+/// `std.json` would have written for anything the generated writer does not
+/// cover. It is the function `c.json` calls, so the two cannot disagree.
+///
+/// ```zig
+/// try nilo.writeJson(&writer, .{ .alert = "disk", .free = 0.07 });
+/// ```
+pub const writeJson = @import("json.zig").write;
+
+/// `writeJson` into a slice the caller frees with `gpa`.
+pub const jsonAlloc = @import("json.zig").alloc;
+
 pub const Method = @import("http1.zig").Method;
 pub const Options = @import("bulkhead.zig").Options;
 
@@ -201,6 +216,13 @@ pub const Limits = @import("bulkhead.zig").Limits;
 ///   returns a plain error with no message and nobody assembles a response
 ///   from it. Log instead.
 pub const spawn = @import("bulkhead.zig").spawn;
+
+/// The `std.Io` the server runs on, for a fiber `app.spawn` started, which
+/// has no `Ctx` to ask. A handler asks with `io: std.Io` or `c.io()`; this is
+/// the same value (ADR 244). Called before the server is listening, or with
+/// none running, it is a process-wide `std.Io.Threaded` and **not** the
+/// server's loop, so do not keep what it returns across `listen()`.
+pub const io = @import("bulkhead.zig").loopIo;
 
 /// Run a blocking call without stopping the thread it is on.
 ///
@@ -908,6 +930,27 @@ test "every type this module exports is named the way the import line names it" 
     }
 }
 
+
+test "json can be written outside a request by the rules a response is written by" {
+    const Alert = struct {
+        name: []const u8,
+        free: f64,
+        host: Str,
+        note: ?[]const u8 = null,
+    };
+    const value: Alert = .{ .name = "disk \"/\"", .free = std.math.inf(f64), .host = Str.static("db-1") };
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeJson(&out.writer, value);
+    const expected = "{\"name\":\"disk \\\"/\\\"\",\"free\":null,\"host\":\"db-1\",\"note\":null}";
+    try std.testing.expectEqualStrings(expected, out.written());
+
+    const owned = try jsonAlloc(std.testing.allocator, value);
+    defer std.testing.allocator.free(owned);
+    try std.testing.expectEqualStrings(expected, owned);
+}
+
 test {
     // Core is not listed here. It is a module of its own now, with a step of
     // its own (ADR 038) — running it from inside the framework's suite would
@@ -935,6 +978,7 @@ test {
     _ = @import("engine/zio.zig");
     _ = @import("fuzz.zig");
     _ = @import("json.zig");
+    _ = @import("jsonfloat.zig");
     _ = @import("jsonmark.zig");
     _ = @import("scan.zig");
     _ = @import("accept.zig");
@@ -983,6 +1027,9 @@ test {
     _ = @import("serve.zig");
     _ = @import("wiring.zig");
     _ = @import("behaviour.zig");
+    // Types and routes far bigger than any handler declares, for the branch
+    // quotas (ADR 126).
+    _ = @import("wide.zig");
     // Last, and the only one here that stands a real server up. Nothing else
     // in this suite opens a socket at all (ADR 028).
     _ = @import("live.zig");

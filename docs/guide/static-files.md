@@ -27,6 +27,7 @@ The path is relative to the working directory the server runs in. A directory th
 |---|---|
 | `index` | served for a path ending in `/`. Default `"index.html"`; empty turns it off |
 | `cache_control` | sent on every file. Default `"public, max-age=3600"` |
+| `cache_rules` | exceptions to `cache_control` by where a file sits in the tree, so hashed bundles and the page that names them take different headers ([below](#one-tree-two-cache-policies)). Default none |
 | `spa_fallback` | served for a path under the prefix that names no file and could be a browser opening a page. Empty (the default) turns it off |
 | `spa_fallback_for` | which requests that covers. `.navigations` (the default) or `.any_path`, which is how it worked before 0.2.0 ([below](#the-spa-fallback)) |
 | `max_file_bytes` | the size above which a file is opened per request instead of held in memory. Default 8 MB |
@@ -43,18 +44,23 @@ Dotfiles are off because finding out on the first request that a `.env` or a `.g
 
 ### The SPA fallback
 
-**`spa_fallback` answers only a request that could be somebody opening a page**, so a browser reload on `/users/42` reaches your client-side router instead of a 404 ([ADR 087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)):
+**`spa_fallback` answers only a browser opening a page**, so a reload on `/users/42` reaches your client-side router, and a missing asset or a mistyped API path is a 404 that names it ([ADR 087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)):
 
 | The request | The answer |
 |---|---|
-| `GET /users/42`, `Accept: text/html,…`: a reload, a deep link | the page |
-| `GET /users/42` with no `Accept`, or `*/*`: `curl`, a crawler | the page |
-| `GET /app.abc123.js`, `Accept: */*`: a `<script src>` | **404**, naming the path |
-| `GET /api/orders`, `Accept: application/json`: a `fetch` | **404** |
+| `GET /users/42`, `Sec-Fetch-Mode: navigate`: a reload, a deep link, a typed URL | the page |
+| `GET /users/42`, no `Sec-Fetch-Mode`, `Accept: text/html,…`: an older client, or a browser on plain HTTP away from `localhost` | the page |
+| `GET /app.abc123.js`, `Sec-Fetch-Mode: no-cors`: a `<script src>` | **404**, naming the path |
+| `GET /api/orders`, `Sec-Fetch-Mode: cors`: a `fetch`, whatever its `Accept` | **404** |
+| `GET /users/42`, `Accept: */*` or nothing: `curl`, a health check | **404** |
 
-The script row changed in 0.2.0. A page from an older build refers to a bundle the directory no longer holds. Answering that with `index.html` is a 200 that the browser reports as a syntax error on line 1 of something that is not JavaScript, with the name of the missing file nowhere in it. The same thing turns a `fetch` into a JSON parse error.
+**Two tests, in this order.** A browser says what it is doing in `Sec-Fetch-Mode`, and every current one sends it: when the header is there, `navigate` is a navigation and anything else is not. When it is missing, the request has to ask for `text/html` by name, which every browser's page load does. `*/*` alone is never a navigation. The path is not read, so there is no list of API prefixes to keep: a `fetch('/api/nope')` is a 404 whether or not the API has a route registered anywhere near it, and you do not write a catch-all route to stop it being a page. A route you did register keeps its own answers, a 405 for the wrong verb included.
 
-Two things to know about the rule. **A `fetch()` that sends `*/*` to a path with no extension still gets the page**, because at this layer it looks exactly like a deep link; sending `Accept: application/json` is what tells them apart. And a directory that really wants the old behaviour can ask for it:
+The answer to a mistyped API path is nilo's ordinary 404, so a client sees an error where it used to see a 200 and a page.
+
+**Typing `/api/nope` into the address bar is a navigation and gets the page**, because the browser says it is one; your client-side router then shows its own not-found screen, which is the right thing for a person to see. If a path should never fall back, give it a route.
+
+A directory that really wants the old behaviour can ask for it:
 
 ```zig
 try app.staticWith("/", "public", .{
@@ -64,6 +70,24 @@ try app.staticWith("/", "public", .{
 ```
 
 `max_total_bytes` is a real limit, because the held part of the tree goes into RAM, and it is better to hit it at startup than at 3am. `max_file_bytes` is not a limit: a file over it is served from the disk instead of refused, and holds nothing that counts against the total ([below](#large-files-served-from-disk)).
+
+## One tree, two cache policies
+
+**`cache_rules` gives some files a `Cache-Control` of their own**, which is what a front-end build needs: hashed bundles that can be kept for a year, and an `index.html` that must be asked about every time.
+
+```zig
+try app.staticWith("/", "dist", .{
+    .spa_fallback = "index.html",
+    .cache_control = "no-cache",
+    .cache_rules = &.{
+        .{ .prefix = "assets/", .cache_control = "public, max-age=31536000, immutable" },
+    },
+});
+```
+
+A rule matches a file by its path in the tree, relative with forward slashes (`assets/app.3f9a1c.js`): `.prefix` is the start of it, `.suffix` the end, and a rule with both needs both. The first rule a file matches gives its header, and a file no rule matches takes `cache_control`. An empty `.cache_control` in a rule leaves the header off for the files it matches. The page a deep link falls back to answers with the page's own policy, so a reload revalidates.
+
+Rules are settled once while the files are loaded, into the header each file already carries, so a request pays nothing for there being any. Two sets would also do it, and nothing is wrong with them where the tree is already two directories; one set is shorter when it is one build output.
 
 ## Compression
 
@@ -148,13 +172,42 @@ try app.embeddedWith("/", &.{
 
 **`app.embedded` serves files compiled into the binary**, for a product that ships as one binary with no `dist/` on the machine it runs on. It is `static` without the disk read ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)): the bytes come from `@embedFile`, and everything after that is the same code (the sorted list, an ETag per file, a gzipped copy made once for the files worth it, the fallback, and nothing per request). A request cannot tell it apart from a directory read at startup.
 
-You write the `@embedFile` calls, because the path is relative to the file it is written in and nilo cannot know where your `dist/` is. The list is all it needs. A build step that turns a directory into such a list is an ordinary `build.zig` step, and stays yours until two projects have written the same one.
+You can write the `@embedFile` calls yourself, because the path is relative to the file it is written in and nilo cannot know where your `dist/` is. Most programs let `embedDir` write the list from a directory instead ([below](#a-vue-or-react-build-in-the-binary)).
 
 The options are `static`'s minus every one that is about a disk: `index`, `cache_control`, `spa_fallback`, `spa_fallback_for`, `compress` and `compress_min_bytes`, with the same defaults. There is no `max_file_bytes`, because nothing here can be served from disk; no `max_total_bytes`, because the bytes are part of the binary whether or not they are served, so counting them would count memory that is not spent twice; no `dotfiles`, because you wrote every name; and no `reload`, because there is no disk.
 
 Two mistakes a directory cannot make are refused at startup, in one line: a path listed twice (the second entry could never be reached) and a `spa_fallback` that names no entry. There is no `tryEmbedded`: the list was fixed when the program was compiled, so there is nothing the program can do about it at run time but stop.
 
 It costs what a held file costs, minus the bytes: the URL, two ETags and the gzipped copy are allocated once at startup, and the file itself is part of the binary. The log line gives both numbers.
+
+### A Vue or React build in the binary
+
+**`embedDir` in your `build.zig` lists a directory into a module that `app.embedded` takes**, so a front end's build output is carried without a hand-written list ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)). It is a function of nilo's own `build.zig`, which a dependent imports by the name of the dependency:
+
+```zig
+const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize });
+const frontend = @import("nilo").embedDir(b, nilo.module("nilo_http"), "frontend/dist");
+exe.root_module.addImport("frontend", frontend);
+```
+
+The directory is walked each time `zig build` runs, so the next build after `npm run build` carries the new hashed names with nothing to regenerate. It lists regular files only, skips a name with a `.` segment and every symlink (the rules `app.static` follows), and stops the build naming the directory if it holds no files. The module exports `files`. Build the front end before the program: the list is read when the build is configured, so a bundle written while `zig build --watch` is running is carried by the next build you start, not by the running one.
+
+The program mounts it with the page revalidated and the hashed bundles kept:
+
+<!-- compiles -->
+```zig
+fn mountFrontend(app: *nilo.App, files: []const nilo.static.Embedded) !void {
+    try app.embeddedWith("/", files, .{
+        .spa_fallback = "index.html",
+        .cache_control = "no-cache",
+        .cache_rules = &.{
+            .{ .prefix = "assets/", .cache_control = "public, max-age=31536000, immutable" },
+        },
+    });
+}
+```
+
+and calls `mountFrontend(&app, &@import("frontend").files)`. Vite and Vue write `assets/` with a hash in each name; Create React App writes `static/`, and a flat bundle can be matched by `.suffix = ".js"`. A reload on `/users/42` is the page, and a `fetch('/api/typo')` is a 404 with no catch-all route to write, because only a request that says it is a navigation gets the page. The `examples/embedded` program is this, built and tested with the rest of the examples.
 
 ## Reloading files during development
 

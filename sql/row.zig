@@ -209,6 +209,7 @@ pub fn isBeside(comptime Row: type, comptime name: []const u8) bool {
 /// which `besideOf` has made sure it has.
 pub fn besideDefault(comptime Row: type, comptime name: []const u8) @FieldType(Row, name) {
     comptime {
+        @setEvalBranchQuota(budget(Row));
         for (@typeInfo(Row).@"struct".fields) |f| {
             if (std.mem.eql(u8, f.name, name)) return f.defaultValue().?;
         }
@@ -219,6 +220,7 @@ pub fn besideDefault(comptime Row: type, comptime name: []const u8) @FieldType(R
 /// Every field of `Row`, columns and beside alike, as one readable line.
 fn fieldList(comptime Row: type) []const u8 {
     return comptime blk: {
+        @setEvalBranchQuota(budget(Row));
         var out: []const u8 = "";
         for (@typeInfo(Row).@"struct".fields, 0..) |f, i| {
             out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ f.name ++ "`";
@@ -576,19 +578,40 @@ pub fn childRowOf(comptime T: type) ?type {
     };
 }
 
+/// A branch quota for a walk over `Row`'s fields, written at the site that
+/// loops and sized from the Row: a Row of 120 columns stopped at "evaluation
+/// exceeded 1000 backwards branches" from a line in this file, which reads as
+/// a fault in the Row. Generous rather than exact, because the compiler keeps
+/// the larger of two quotas and a walk that does more per column than this
+/// allows raises its own
+/// ([ADR 126](../docs/adr/126-a-check-pays-for-its-own-branches.md)).
+pub fn budget(comptime Row: type) u32 {
+    return 10_000 + 1_000 * @as(u32, @intCast(@typeInfo(Row).@"struct".fields.len));
+}
+
+/// The same for a walk that looks at every field in the light of every
+/// other, the way a shaped Row's aggregates, parents and children are laid
+/// out against each other: it grows with the square of the Row's width. 20
+/// aggregates took 300,000 branches and 60 took 5,000,000, which a flat
+/// 200,000 stopped at a line in `std`.
+pub fn shapeBudget(comptime Row: type) u32 {
+    const n: u64 = @typeInfo(Row).@"struct".fields.len;
+    return @intCast(@min(200_000 + 3_000 * n * n, std.math.maxInt(u32)));
+}
+
 /// The field's type, or null when `Row` has no field by that name.
+///
+/// `@hasField` is the compiler's own lookup and costs no backwards branch,
+/// where a walk comparing every name spent one per byte and made every loop
+/// over a Row's fields pay for the square of its width.
 pub fn fieldTypeOf(comptime Row: type, comptime name: []const u8) ?type {
-    comptime {
-        for (@typeInfo(Row).@"struct".fields) |f| {
-            if (std.mem.eql(u8, f.name, name)) return f.type;
-        }
-        return null;
-    }
+    return if (@hasField(Row, name)) @FieldType(Row, name) else null;
 }
 
 /// Every field of `Row` of one kind, in the order the Row declares them.
 pub fn fieldsOfKind(comptime Row: type, comptime kind: Kind) []const []const u8 {
     return comptime blk: {
+        @setEvalBranchQuota(budget(Row));
         const fields = @typeInfo(Row).@"struct".fields;
         var out: [fields.len][]const u8 = undefined;
         var n: usize = 0;
@@ -607,6 +630,7 @@ pub fn fieldsOfKind(comptime Row: type, comptime kind: Kind) []const []const u8 
 /// written by `shape.zig`; every other one by the flat path it always was.
 pub fn isShaped(comptime Row: type) bool {
     return comptime blk: {
+        @setEvalBranchQuota(budget(Row));
         if (!isRow(Row)) break :blk false;
         if (@hasDecl(Row, aggregate_marker)) break :blk true;
         for (@typeInfo(Row).@"struct".fields) |f| {
@@ -644,7 +668,7 @@ pub fn isTally(comptime Row: type) bool {
 pub fn aggregatesOf(comptime Row: type) []const Aggregate {
     return comptime blk: {
         if (!@hasDecl(Row, aggregate_marker)) break :blk &.{};
-        @setEvalBranchQuota(20_000);
+        @setEvalBranchQuota(shapeBudget(Row));
         const decl = @field(Row, aggregate_marker);
         const D = @TypeOf(decl);
         const shape = "\n  It maps a field to what it computes: " ++
@@ -991,6 +1015,7 @@ pub fn managedOf(comptime Row: type) bool {
 /// `SELECT` list and the order results are filled in, so the two cannot drift.
 pub fn columnsOf(comptime Row: type) []const []const u8 {
     return comptime blk: {
+        @setEvalBranchQuota(budget(Row));
         assertRow(Row);
         const fields = @typeInfo(Row).@"struct".fields;
         var out: [fields.len][]const u8 = undefined;
@@ -1024,6 +1049,7 @@ pub fn columnsOf(comptime Row: type) []const []const u8 {
 /// borrowed row is read it before the next `next()`, and nothing else.
 pub fn Borrowed(comptime Row: type) type {
     return comptime blk: {
+        @setEvalBranchQuota(budget(Row));
         assertRow(Row);
         const fields = @typeInfo(Row).@"struct".fields;
         var names: [fields.len][]const u8 = undefined;
@@ -1110,6 +1136,7 @@ pub const Unread = struct { name: [:0]const u8, T: type };
 /// `.default` or `.filled`.
 pub fn unreadOf(comptime Row: type) []const Unread {
     comptime {
+        @setEvalBranchQuota(budget(Row));
         if (!hasUnread(Row)) return &.{};
         const written = @field(Row, marker).unread;
         const W = @TypeOf(written);
@@ -1171,9 +1198,7 @@ pub fn tableHasColumn(comptime Row: type, comptime column: []const u8) bool {
 /// The type `Row` reads a column into, or the one its `.unread` declares.
 pub fn ColumnType(comptime Row: type, comptime column: []const u8) type {
     comptime {
-        for (@typeInfo(Row).@"struct".fields) |f| {
-            if (std.mem.eql(u8, f.name, column)) return f.type;
-        }
+        if (fieldTypeOf(Row, column)) |T| return T;
         if (unreadType(Row, column)) |T| return T;
         @compileError("nilo: " ++ @typeName(Row) ++ " has no column `" ++ column ++ "`.");
     }
@@ -1184,6 +1209,10 @@ pub fn ColumnType(comptime Row: type, comptime column: []const u8) type {
 /// Refusal that helps and one that only stops you (ADR 026).
 pub fn nearest(comptime Row: type, comptime wrong: []const u8) ?[]const u8 {
     return comptime blk: {
+        // One edit distance per field, each paying `distance`'s own quota
+        // but not the sum of them.
+        @setEvalBranchQuota(budget(Row) + @typeInfo(Row).@"struct".fields.len *
+            64 * (wrong.len + 1) * 65);
         var best: ?[]const u8 = null;
         var best_distance: usize = std.math.maxInt(usize);
         for (@typeInfo(Row).@"struct".fields) |f| {
@@ -1472,6 +1501,7 @@ fn notAKey(comptime Row: type, comptime K: type) noreturn {
 /// (ADR 218).
 fn assertDescribesItsTable(comptime Row: type) void {
     comptime {
+        @setEvalBranchQuota(budget(Row));
         const narrower = "  A Row that names its table describes it column by column, which is what " ++
             "the migration tool builds from. Read the rest through a narrower Row: " ++
             "`pub const " ++ marker ++ " = " ++ @typeName(Row) ++ ";`.";
@@ -1499,6 +1529,7 @@ fn assertDescribesItsTable(comptime Row: type) void {
 /// without it a narrower Row's typo would live until a live Postgres saw it.
 fn assertSubset(comptime Narrow: type, comptime Wide: type) void {
     comptime {
+        @setEvalBranchQuota(budget(Narrow));
         // The aggregate list first: a field it misspells reads as a column
         // the table has not got, and the misspelling is the thing to say.
         if (@hasDecl(Narrow, aggregate_marker)) _ = aggregatesOf(Narrow);

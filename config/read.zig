@@ -86,6 +86,7 @@ pub fn Table(comptime T: type, comptime prefix: []const u8) type {
 
     return struct {
         pub const entries = blk: {
+            @setEvalBranchQuota(convert.budget(fields));
             var t: [fields.len]Entry = undefined;
             for (fields, 0..) |f, i| t[i] = .{
                 .field = f.name,
@@ -179,6 +180,7 @@ pub fn Read(comptime T: type) type {
 
         fn indexOf(comptime field: []const u8) usize {
             comptime {
+                @setEvalBranchQuota(convert.budget(fields));
                 for (fields, 0..) |f, i| {
                     if (std.mem.eql(u8, f.name, field)) return i;
                 }
@@ -254,6 +256,9 @@ pub fn fill(comptime T: type, comptime prefix: []const u8, source: anytype) Read
     var filled: T = undefined;
     var outcomes: Read(T).Outcomes = @splat(.{});
 
+    // The unrolled loop below is analysed in the caller's evaluation, a field
+    // at a time.
+    comptime @setEvalBranchQuota(convert.budget(fields));
     inline for (fields, 0..) |f, i| {
         const P = comptime convert.unwrap(f.type);
 
@@ -312,6 +317,7 @@ fn checkConfig(comptime T: type) void {
         );
 
         const fields = @typeInfo(T).@"struct".fields;
+        @setEvalBranchQuota(convert.budget(fields));
         if (fields.len == 0) @compileError(
             "nilo: the Config `" ++ @typeName(T) ++
                 "` has no fields, so it would read nothing.",

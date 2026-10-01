@@ -92,6 +92,7 @@ In the order the guide teaches them. Each row is one guide page and the referenc
 | [Work that runs later, again, or on a schedule](./guide/jobs.md) | `nilo_job` | [`nilo_job`](./reference/job.md#nilo_job) | [Jobs](./design/job.md) |
 | [A cache in this process](./guide/cache.md) | `nilo_cache` | [`nilo_cache`](./reference/cache.md#nilo_cache), [`Cached(Pages, options)`](./reference/handlers.md#cachedpages-options) | [The in-process cache](./design/cache.md) |
 | [Checking somebody else's token](./guide/jwt.md) | `nilo_jwt` | [`nilo_jwt`](./reference/jwt.md#nilo_jwt), [`jwt.Keyring`](./reference/jwt.md#jwtkeyring), [`jwt.Verifier`](./reference/jwt.md#jwtverifierclaims-client), [`Verified(V)`](./reference/handlers.md#verifiedv) | [JWT verification](./design/jwt.md) |
+| [Protobuf messages](./guide/proto.md) | `nilo_proto` | [`nilo_proto`](./reference/proto.md#nilo_proto), [`proto.decode`](./reference/proto.md#protodecode-and-protomerge), [`proto.encode`](./reference/proto.md#protoencode), [the `wire` table](./reference/proto.md#the-wire-table) | [Protobuf](./design/proto.md) |
 | [Identifiers](./guide/id.md) | `nilo_id` | [`nilo_id`](./reference/id.md#nilo_id) | [The clock, entropy, and a UUID](./design/id-clock-entropy.md) |
 
 ### Shipping it

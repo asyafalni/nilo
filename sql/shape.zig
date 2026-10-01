@@ -150,7 +150,7 @@ pub fn width(comptime Row: type) usize {
 /// columns of its answer, in the order a reader fills them.
 fn layoutOf(comptime D: type, comptime Row: type) Layout {
     comptime {
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(row_mod.shapeBudget(Row));
         const relation = statement.relation(D, Row);
         var joins: []const Join = &.{};
         var outputs: []const Output = &.{};
@@ -761,7 +761,7 @@ fn nameList(comptime columns: []const []const u8) []const u8 {
 /// about the Row and not about whichever statement happened to meet it.
 pub fn assertShape(comptime Row: type) void {
     comptime {
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(row_mod.shapeBudget(Row));
         const decl = @field(Row, row_mod.marker);
         if (@TypeOf(decl) != type) @compileError(
             "nilo: " ++ @typeName(Row) ++ " carries a parent, children or an aggregate, and is " ++
@@ -1209,7 +1209,7 @@ fn selectList(comptime D: type, comptime outputs: []const Output) []const u8 {
 /// A `SELECT` over a shaped Row: `db.select`, `db.one` and `db.page`.
 pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime answers: Answers) Statement {
     return comptime blk: {
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(row_mod.shapeBudget(Row));
         assertShape(Row);
         const call = switch (answers) {
             .many => "`db.select`",
@@ -1323,7 +1323,7 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
 /// table.
 pub fn find(comptime D: type, comptime Row: type, comptime K: type) Statement {
     return comptime blk: {
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(row_mod.shapeBudget(Row));
         assertShape(Row);
         if (row_mod.isGrouped(Row)) @compileError(
             "nilo: `db.find` on " ++ @typeName(Row) ++ ", which is grouped.\n" ++
@@ -1367,7 +1367,7 @@ pub fn find(comptime D: type, comptime Row: type, comptime K: type) Statement {
 /// rows there are, so a join nothing reads is work the answer does not need.
 pub fn tally(comptime D: type, comptime Row: type, comptime O: type, comptime exists: bool) Statement {
     return comptime blk: {
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(row_mod.shapeBudget(Row));
         assertShape(Row);
         const call = if (exists) "`db.exists`" else "`db.count`";
         if (row_mod.isTally(Row)) @compileError(
@@ -1395,7 +1395,7 @@ pub fn tally(comptime D: type, comptime Row: type, comptime O: type, comptime ex
 /// rows its condition matched, which is one row whether it matched any or not.
 pub fn exactlyOne(comptime D: type, comptime Row: type, comptime O: type) Statement {
     return comptime blk: {
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(row_mod.shapeBudget(Row));
         row_mod.assertRow(Row);
         if (!row_mod.isTally(Row)) @compileError(
             "nilo: `db.exactlyOne` on " ++ @typeName(Row) ++ ", which is not grouped by nothing.\n" ++
@@ -1435,7 +1435,7 @@ pub fn exactlyOne(comptime D: type, comptime Row: type, comptime O: type) Statem
 /// parents in the order they were read.
 pub fn children(comptime D: type, comptime Row: type, comptime field: []const u8) Statement {
     return comptime blk: {
-        @setEvalBranchQuota(200_000);
+        @setEvalBranchQuota(row_mod.shapeBudget(Row));
         const found = childrenOf(Row, field);
         const Key = row_mod.ColumnType(Row, found.target);
         const listed = D.ordinalList(D.placeholder(1), Key, D.quote(keys_alias)) orelse @compileError(

@@ -18,12 +18,15 @@
 //!
 //! 1038ns → 126ns on that payload, 75ns → 22ns on a small one.
 //!
-//! **The output is byte-for-byte what `std.json` would have written.** That is
-//! not a hope: `covers` decides while compiling which types this path is
-//! allowed to touch, anything else goes to `std.json` unchanged, and the tests
-//! at the bottom hold the two against each other value by value. A float goes
-//! to `std.json` field by field rather than being reimplemented — how it
-//! chooses between `12.5` and `1.25e1` is not worth copying.
+//! **The output is byte-for-byte what `std.json` would have written, except for
+//! a float.** That is not a hope: `covers` decides while compiling which types
+//! this path is allowed to touch, anything else goes to `std.json` unchanged,
+//! and the tests at the bottom hold the two against each other value by value.
+//! A float is the one thing both paths spell themselves, the way serde_json
+//! does (`jsonfloat.zig`): the same shortest digits, but `1.0` where `std.json`
+//! writes `1`, `1e+16` where it writes seventeen digits, `5e-324` where it
+//! writes 320 characters, and `null` for infinity and NaN
+//! ([ADR 096](../docs/adr/096-a-byte-that-is-not-text-is-not-a-string.md)).
 
 const std = @import("std");
 const Str = @import("nilo_core").Str;
@@ -31,6 +34,7 @@ const mark = @import("jsonmark.zig");
 const convert = @import("convert.zig");
 const fail = @import("fail.zig");
 const patch_mod = @import("patch.zig");
+const jsonfloat = @import("jsonfloat.zig");
 
 /// Serialise `value` as JSON. Uses the generated writer when the type is one
 /// it covers, and `std.json` when it is not — decided while compiling, so
@@ -42,8 +46,21 @@ pub fn write(w: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
     return stringify(w, value);
 }
 
-/// What `std.json.Stringify.value` does, except that a float is asked whether it
-/// is finite first ([ADR 096](../docs/adr/096-a-byte-that-is-not-text-is-not-a-string.md)).
+/// `write` into memory the caller owns: the bytes of `value` as JSON, which
+/// the caller frees with `gpa`. For a job's payload, an alert body or a test's
+/// expected text, where there is no writer in hand and no request to borrow an
+/// arena from. Same rules as `write`, because it is `write` (a response is
+/// written by the same function, so the two cannot drift apart).
+pub fn alloc(gpa: std.mem.Allocator, value: anytype) std.mem.Allocator.Error![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    // An `Allocating` writer fails only by running out of memory.
+    write(&out.writer, value) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+/// What `std.json.Stringify.value` does, except that a float is spelled by
+/// `jsonfloat.zig`, which asks whether it is finite first ([ADR 096](../docs/adr/096-a-byte-that-is-not-text-is-not-a-string.md)).
 ///
 /// **Every value that is not `covers`' goes through here**, so the rule holds on
 /// every path out of `http/` and not only the fast one.
@@ -52,11 +69,11 @@ fn stringify(w: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
     return jw.write(value);
 }
 
-/// A `std.json.Stringify` that writes a float `std.json` cannot spell as `null`.
+/// A `std.json.Stringify` that spells every float the way `jsonfloat.zig` does.
 ///
 /// `Stringify` has no hook for a number: a float is a `print("{}")` inside
-/// `write`, so infinity came out as the bare word `inf` and NaN as the string
-/// `"nan"`. But a type's `jsonStringify(self, jw: anytype)` is handed whatever
+/// `write`, so infinity came out as the bare word `inf`, NaN as the string
+/// `"nan"`, `1.0` as `1` and `f64::MAX` as 309 digits. But a type's `jsonStringify(self, jw: anytype)` is handed whatever
 /// writer the caller has, which is what makes this possible at all: this type
 /// walks the shapes `Stringify.write` walks, calls itself for every child, and
 /// hands the leaves to the `Stringify` it wraps, so the bytes are the ones
@@ -112,9 +129,12 @@ const FiniteJson = struct {
     pub fn write(self: *FiniteJson, v: anytype) Error!void {
         const T = @TypeOf(v);
         switch (@typeInfo(T)) {
-            .float => {
-                if (!std.math.isFinite(v)) return self.inner.write(null);
-                return self.inner.write(v);
+            .float, .comptime_float => {
+                // `std.json` has no hook for a number, so the leaf is written
+                // raw: the comma and the colon are still the `Stringify`'s.
+                try self.inner.beginWriteRaw();
+                try jsonfloat.write(self.writer, v);
+                self.inner.endWriteRaw();
             },
             .optional => {
                 if (v) |payload| return self.write(payload);
@@ -346,6 +366,7 @@ pub fn innerRead(
         },
         .@"struct" => |s| {
             if (comptime s.is_tuple) return std.json.innerParse(T, gpa, source, options);
+            comptime @setEvalBranchQuota(convert.budget(s.fields));
             if (.object_begin != try source.next()) return error.UnexpectedToken;
 
             var r: T = undefined;
@@ -376,7 +397,7 @@ pub fn innerRead(
                         break;
                     }
                 } else {
-                    if (options.ignore_unknown_fields) {
+                    if (options.ignore_unknown_fields or comptime mark.ignoresUnknown(T)) {
                         try source.skipValue();
                     } else {
                         return error.UnknownField;
@@ -627,17 +648,11 @@ fn writeValue(comptime T: type, w: *std.Io.Writer, value: T) std.Io.Writer.Error
     switch (@typeInfo(T)) {
         .bool => return w.writeAll(if (value) "true" else "false"),
         .int, .comptime_int => return w.printInt(value, 10, .lower, .{}),
-        // Left to std.json on purpose — see the header comment. Except for a
-        // value JSON has no spelling for: `std.json` writes infinity as the
-        // bare word `inf` and NaN as the string `"nan"`, so what comes out is
-        // not JSON or not a number. It is `null`, which is what a JavaScript
-        // client's own `JSON.stringify` makes of both (ADR 096).
-        .float, .comptime_float => {
-            if (comptime T != comptime_float) {
-                if (!std.math.isFinite(value)) return w.writeAll("null");
-            }
-            return std.json.Stringify.value(value, .{}, w);
-        },
+        // Spelled the way serde_json spells it, not the way `std.json` does:
+        // `1.0` and not `1`, `1e+16` and not seventeen digits, and `null` for
+        // a value JSON has no spelling for, where `std.json` writes the bare
+        // word `inf` and the string `"nan"` (ADR 096, `jsonfloat.zig`).
+        .float, .comptime_float => return jsonfloat.write(w, value),
         // A tag name is a Zig identifier, so it can never need escaping and the
         // quotes around it belong in the same literal as the name. That is what
         // makes `rename_all` free: the spelling is settled while compiling, so
@@ -922,13 +937,78 @@ test "scalars come out the way std.json writes them" {
     try expectSame(false);
 }
 
-test "floats are left to std.json rather than reimplemented" {
-    try expectSame(@as(f64, 12.5));
-    try expectSame(@as(f64, 0));
-    try expectSame(@as(f64, -0.125));
-    try expectSame(@as(f32, 1.5));
-    try expectSame(@as(f64, 1e300));
-    try expectSame(@as(f64, 1234567890.0));
+test "a float is spelled the way serde_json spells it, and every other scalar the way std.json does" {
+    const Floats = struct { a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f32, h: f32 };
+    try expectJson(
+        "{\"a\":12.5,\"b\":0.0,\"c\":-0.0,\"d\":1000000000000000.0,\"e\":1e+16,\"f\":1e-7,\"g\":1.1,\"h\":3.4028235e+38}",
+        Floats{ .a = 12.5, .b = 0, .c = -0.0, .d = 1e15, .e = 1e16, .f = 1e-7, .g = 1.1, .h = std.math.floatMax(f32) },
+    );
+    try expectJson("1.0", @as(f64, 1));
+    try expectJson("-0.125", @as(f64, -0.125));
+    try expectJson("1.7976931348623157e+308", std.math.floatMax(f64));
+    try expectJson("5e-324", std.math.floatTrueMin(f64));
+    try expectJson("1234567890.0", @as(f64, 1234567890.0));
+}
+
+test "a float is the one place the generated writer and std.json disagree" {
+    var mine: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer mine.deinit();
+    var theirs: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer theirs.deinit();
+    try write(&mine.writer, .{ .whole = @as(f64, 3), .big = @as(f64, 1e300), .f = @as(f32, 1.1) });
+    try std.json.Stringify.value(.{ .whole = @as(f64, 3), .big = @as(f64, 1e300), .f = @as(f32, 1.1) }, .{}, &theirs.writer);
+    try testing.expectEqualStrings("{\"whole\":3.0,\"big\":1e+300,\"f\":1.1}", mine.written());
+    try testing.expect(std.mem.startsWith(u8, theirs.written(), "{\"whole\":3,\"big\":1000000"));
+    try testing.expect(theirs.written().len > 300);
+}
+
+test "a float is spelled the same on every shape, covered or fallen back to std.json" {
+    const Custom = struct {
+        v: f64,
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.write(self.v);
+        }
+    };
+    const Opt = struct { x: ?f64, y: ?f64, list: []const f64, nested: struct { z: f32 } };
+    // Covered: the generated writer.
+    try expectJson(
+        "{\"x\":2.0,\"y\":null,\"list\":[0.0,1e+16,0.1],\"nested\":{\"z\":0.5}}",
+        Opt{ .x = 2, .y = null, .list = &.{ 0, 1e16, 0.1 }, .nested = .{ .z = 0.5 } },
+    );
+    // A tuple, a type that writes itself, a `std.json.Value`, a map and a
+    // comptime literal all miss `covers` and are written by `FiniteJson`.
+    comptime std.debug.assert(!covers(Custom));
+    comptime std.debug.assert(!covers(std.json.Value));
+    comptime std.debug.assert(!covers(std.json.ArrayHashMap(f64)));
+    try expectText("[1.0,2.5,1e-7]", .{ @as(f64, 1), @as(f32, 2.5), @as(f64, 1e-7) });
+    try expectText("{\"c\":4.0,\"t\":[3.0,\"s\"]}", .{ .c = Custom{ .v = 4 }, .t = .{ @as(f64, 3), "s" } });
+    var items = [_]std.json.Value{ .{ .float = 2 }, .{ .float = 1e16 }, .{ .integer = 3 }, .{ .float = 1.5 } };
+    try expectText("[2.0,1e+16,3,1.5]", std.json.Value{ .array = .{ .items = &items, .capacity = items.len, .allocator = testing.allocator } });
+    var map: std.json.ArrayHashMap(f64) = .{};
+    defer map.deinit(testing.allocator);
+    try map.map.put(testing.allocator, "a", 1);
+    try expectText("{\"a\":1.0}", map);
+    try expectText("{\"k\":2.5}", .{ .k = 2.5 });
+}
+
+test "a float written by alloc is the same bytes and reads back as the same value" {
+    const owned = try alloc(testing.allocator, .{ .a = @as(f64, 0.1) + @as(f64, 0.2), .b = @as(f64, 1e21), .c = @as(f64, 3) });
+    defer testing.allocator.free(owned);
+    try testing.expectEqualStrings("{\"a\":0.30000000000000004,\"b\":1e+21,\"c\":3.0}", owned);
+    const back = try std.json.parseFromSlice(struct { a: f64, b: f64, c: f64 }, testing.allocator, owned, .{});
+    defer back.deinit();
+    try testing.expectEqual(@as(f64, 0.1) + @as(f64, 0.2), back.value.a);
+    try testing.expectEqual(@as(f64, 1e21), back.value.b);
+    try testing.expectEqual(@as(f64, 3), back.value.c);
+}
+
+test "a body of 1 still fills an f64, and 1.0 and 1e2 do too" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const B = struct { x: f64 };
+    try testing.expectEqual(@as(f64, 1), (try parseLeaky(B, arena.allocator(), "{\"x\":1}", .{})).x);
+    try testing.expectEqual(@as(f64, 1), (try parseLeaky(B, arena.allocator(), "{\"x\":1.0}", .{})).x);
+    try testing.expectEqual(@as(f64, 100), (try parseLeaky(B, arena.allocator(), "{\"x\":1e2}", .{})).x);
 }
 
 test "a float that is not finite is written as null, never as inf or nan" {
@@ -1235,7 +1315,11 @@ test "a type that writes itself is left alone, and so is a tuple" {
 /// other shape here and the wrong one for these.
 fn expectJson(expected: []const u8, value: anytype) !void {
     comptime std.debug.assert(covers(@TypeOf(value)));
+    return expectText(expected, value);
+}
 
+/// What `expectJson` checks, for a value that may be one `covers` does not touch.
+fn expectText(expected: []const u8, value: anytype) !void {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try write(&out.writer, value);
@@ -1810,4 +1894,18 @@ test "the fallback writes what std.json writes for every value that is not a flo
     defer theirs.deinit();
     try std.json.Stringify.value(value, .{}, &theirs.writer);
     try testing.expectEqualStrings(theirs.written(), mine.written());
+}
+
+test "alloc hands back the bytes write would have written, and frees cleanly" {
+    const Row = struct { id: u32, ratio: f64, tags: []const []const u8 };
+    const row: Row = .{ .id = 7, .ratio = std.math.nan(f64), .tags = &.{ "a", "b\n" } };
+
+    const owned = try alloc(testing.allocator, row);
+    defer testing.allocator.free(owned);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try write(&out.writer, row);
+    try testing.expectEqualStrings(out.written(), owned);
+    try testing.expectEqualStrings("{\"id\":7,\"ratio\":null,\"tags\":[\"a\",\"b\\n\"]}", owned);
 }

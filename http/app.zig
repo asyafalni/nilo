@@ -520,6 +520,9 @@ pub const App = struct {
     /// });
     /// ```
     ///
+    /// A front end's build output is listed into the list by `embedDir` in
+    /// nilo's `build.zig`, called from the dependent's own (ADR 009).
+    ///
     /// Everything `static` does past the read — an ETag per file, a gzipped
     /// copy made once, the SPA fallback, nothing per request — happens here
     /// too, on the same code. What is different is that there is no

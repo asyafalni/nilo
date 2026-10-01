@@ -21,10 +21,12 @@
 //! ## What is settled while compiling, and what is not
 //!
 //! Not "as much as possible": **whatever is a property of the bucket rather
-//! than of the deployment.** The name, the addressing style, the ceilings and
-//! the encryption are the bucket's; the endpoint, the region and the
-//! credentials are the deployment's, and they come from a `Config` so that
-//! development and production are one binary (ADR 039).
+//! than of the deployment.** The default name, the addressing style, the
+//! ceilings and the encryption are the bucket's; the endpoint, the region and
+//! the credentials are the deployment's, and they come from a `Config` so that
+//! development and production are one binary (ADR 039). A name that is
+//! configuration too is given to `openAs`, which checks it at run time by the
+//! predicate the compiler runs on the declared one (`badName`).
 //!
 //! That looks like it gives up what putting the bucket in a type was for, and
 //! it does not: **the win was never comptime, it was not formatting a host per
@@ -116,15 +118,18 @@ pub const Options = struct {
 
 /// The type a handler asks for.
 ///
-/// `name` is checked here rather than by S3, and the four Refusals below are
-/// the whole of what a bucket can be got wrong about at compile time.
+/// `name` is the bucket's default name and the type's identity. It is checked
+/// here rather than by S3, and the Refusals below are the whole of what a
+/// bucket can be got wrong about at compile time; `openAs` takes another name
+/// at run time under the same check.
 pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
     const settings = comptime check(name, opts);
 
     return struct {
         const Self = @This();
 
-        /// The name, so a caller can print it and a test can assert on it.
+        /// The declared name: the default `open` uses, and not necessarily
+        /// the one a value was opened under (`name`, the field).
         pub const bucket = name;
         pub const options = settings;
 
@@ -141,6 +146,11 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         const Bounded = Error || error{NotModified};
 
         store: *Store,
+        /// The name this bucket was opened under: the declared one for
+        /// `open`, the one given for `openAs`. Held in `owned`, 63 bytes at
+        /// most. Every log line and a POST policy say this one, and `bucket`
+        /// (the declaration) stays the type's default.
+        name: []const u8,
         /// `avatars.s3.amazonaws.com`, or `127.0.0.1:9000` for path style.
         /// Built once at `open` and held — the one thing this type exists for.
         host: []const u8,
@@ -173,30 +183,69 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// part number and an upload id encoded at three bytes a character.
         const part_url_max = url_max + "?".len + multipart_mod.query_max;
 
-        pub fn open(s: *Store) !Self {
-            const host_len = hostLen(s.authority);
+        /// What `openAs` refuses with, besides running out of memory.
+        pub const OpenError = error{
+            /// The name is not one this bucket's style can carry. The reason
+            /// is `nameProblem`, which is the text the compile-time check of
+            /// the default name says too.
+            BadBucketName,
+            OutOfMemory,
+        };
+
+        /// Open the bucket under the name it was declared with.
+        pub fn open(s: *Store) error{OutOfMemory}!Self {
+            return build(s, name);
+        }
+
+        /// Open the bucket under a name read at run time, for the program
+        /// whose bucket is configuration and whose binary is one for every
+        /// deployment (`cfg.durable_bucket`). **The type stays the identity**:
+        /// two bucket types are two Services whatever they are opened as, and
+        /// the declared name is still the default `open` uses.
+        ///
+        /// The name is checked by the rules the declared one is checked by
+        /// at compile time, here and now rather than as a 403 from S3 on the
+        /// first request, and copied into the bucket's own memory, so the
+        /// config it came from need not outlive it. One allocation, as
+        /// `open` makes, and none per request.
+        pub fn openAs(s: *Store, runtime_name: []const u8) OpenError!Self {
+            if (nameProblem(runtime_name) != null) return error.BadBucketName;
+            return build(s, runtime_name);
+        }
+
+        /// Why a name could not be this bucket's, or null if it can. The
+        /// same answer `openAs` gives as `BadBucketName`, in words, for a
+        /// program that wants to say which setting is wrong and why while it
+        /// reads its configuration.
+        pub fn nameProblem(candidate: []const u8) ?[]const u8 {
+            const problem = badName(candidate, settings.style) orelse return null;
+            return problem.reason();
+        }
+
+        fn build(s: *Store, bucket_name: []const u8) error{OutOfMemory}!Self {
+            const host_len = hostLen(bucket_name, s.authority);
             const prefix_len = switch (settings.style) {
                 .virtual => 0,
-                .path => 1 + name.len,
+                .path => 1 + bucket_name.len,
             };
             const base_len = baseLen(s.scheme, host_len);
             // A second host and base only when the browser's endpoint is not
             // the dialled one; otherwise the public pair aliases the first.
             const two = s.public_authority.ptr != s.authority.ptr;
-            const public_host_len = if (two) hostLen(s.public_authority) else 0;
+            const public_host_len = if (two) hostLen(bucket_name, s.public_authority) else 0;
             const public_base_len = if (two) baseLen(s.public_scheme, public_host_len) else 0;
 
             const owned = try s.gpa.alloc(
                 u8,
-                host_len + prefix_len + base_len + public_host_len + public_base_len,
+                host_len + prefix_len + base_len + public_host_len + public_base_len + bucket_name.len,
             );
             errdefer s.gpa.free(owned);
 
             var w = std.Io.Writer.fixed(owned);
-            writeHost(&w, s.authority);
+            writeHost(&w, bucket_name, s.authority);
             const host = owned[0..host_len];
 
-            if (settings.style == .path) w.print("/{s}", .{name}) catch unreachable;
+            if (settings.style == .path) w.print("/{s}", .{bucket_name}) catch unreachable;
             const prefix = owned[host_len..][0..prefix_len];
 
             w.print("{s}://{s}", .{ @tagName(s.scheme), host }) catch unreachable;
@@ -204,16 +253,22 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
 
             var public_host = host;
             var public_base = base;
+            var from = host_len + prefix_len + base_len;
             if (two) {
-                const from = host_len + prefix_len + base_len;
-                writeHost(&w, s.public_authority);
+                writeHost(&w, bucket_name, s.public_authority);
                 public_host = owned[from..][0..public_host_len];
                 w.print("{s}://{s}", .{ @tagName(s.public_scheme), public_host }) catch unreachable;
                 public_base = owned[from + public_host_len ..][0..public_base_len];
+                from += public_host_len + public_base_len;
             }
+
+            // Last, so the name a log line or a policy prints is the bucket's
+            // own bytes and not the caller's.
+            @memcpy(owned[from..][0..bucket_name.len], bucket_name);
 
             return .{
                 .store = s,
+                .name = owned[from..][0..bucket_name.len],
                 .host = host,
                 .prefix = prefix,
                 .base = base,
@@ -223,9 +278,9 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             };
         }
 
-        fn hostLen(authority: []const u8) usize {
+        fn hostLen(bucket_name: []const u8, authority: []const u8) usize {
             return switch (settings.style) {
-                .virtual => name.len + 1 + authority.len,
+                .virtual => bucket_name.len + 1 + authority.len,
                 .path => authority.len,
             };
         }
@@ -234,9 +289,9 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             return @tagName(scheme).len + "://".len + host_len;
         }
 
-        fn writeHost(w: *std.Io.Writer, authority: []const u8) void {
+        fn writeHost(w: *std.Io.Writer, bucket_name: []const u8, authority: []const u8) void {
             switch (settings.style) {
-                .virtual => w.print("{s}.{s}", .{ name, authority }) catch unreachable,
+                .virtual => w.print("{s}.{s}", .{ bucket_name, authority }) catch unreachable,
                 .path => w.writeAll(authority) catch unreachable,
             }
         }
@@ -331,16 +386,19 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             /// The Store's `timeout_ms` is for the short calls and is not
             /// applied here (ADR 060).
             timeout_ms: ?u32 = null,
-            /// The Store whose stream slot this holds, null when it holds
-            /// none. Given back by `close`, and by `stream` itself when it
-            /// fails.
-            slot: ?*Store = null,
+            /// The bucket whose Store's stream slot this holds, null when it
+            /// holds none. Given back by `close`, and by `stream` itself when
+            /// it fails. It is the bucket rather than the Store so that a
+            /// failure in `pipe` can say which bucket it was, by the name it
+            /// was opened under, at the same eight bytes.
+            owner: ?*const Self = null,
 
             pub const idle: Reading = .{};
 
             /// The object into `w`, allocating nothing, and how many bytes.
             pub fn pipe(self: *Reading, w: *std.Io.Writer) Error!u64 {
-                return self.ex.pipe(w) catch |err| return blame(err);
+                return self.ex.pipe(w) catch |err|
+                    return blameNamed(if (self.owner) |b| b.name else "", err);
             }
 
             /// Give back the connection, the permit and then the stream slot,
@@ -348,9 +406,9 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             /// one that never began.
             pub fn close(self: *Reading) void {
                 self.ex.end();
-                if (self.slot) |store| {
-                    self.slot = null;
-                    store.giveStream();
+                if (self.owner) |b| {
+                    self.owner = null;
+                    b.store.giveStream();
                 }
             }
         };
@@ -385,7 +443,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             // handful of slow readers can never hold every permit (ADR 060).
             // Taken here, after everything that can fail without waiting.
             try self.store.takeStream();
-            out.slot = self.store;
+            out.owner = self;
             errdefer out.close();
 
             const got = out.ex.begin(&self.store.client, .{
@@ -403,7 +461,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 // and a bound on silence instead.
                 .timeout_ms = out.timeout_ms orelse 0,
                 .stall_ms = self.store.options.stall_ms,
-            }) catch |err| return blame(err);
+            }) catch |err| return self.blame(err);
 
             if (!got.ok()) return self.failure(c, &out.ex, got);
 
@@ -475,7 +533,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .redirects = .expose,
                 .timeout_ms = timeout_ms,
                 .stall_ms = stall_ms,
-            }) catch |err| return blame(err);
+            }) catch |err| return self.blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
         }
@@ -528,7 +586,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 // (`.timeout_ms`), and a bound on silence instead.
                 .timeout_ms = optionalMs(source, "timeout_ms") orelse 0,
                 .stall_ms = self.store.options.stall_ms,
-            }) catch |err| return blame(err);
+            }) catch |err| return self.blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
         }
@@ -580,7 +638,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             if (part_bytes < multipart_mod.part_min) {
                 std.log.warn(
                     "nilo_s3: `{s}`.putMultipart was asked for parts of {d} bytes; S3 refuses any part but the last under {d}",
-                    .{ name, part_bytes, multipart_mod.part_min },
+                    .{ self.name, part_bytes, multipart_mod.part_min },
                 );
                 return error.Rejected;
             }
@@ -590,7 +648,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             // deserves the plain PUT: one round trip, the content's own MD5.
             const buffer = try c.arena().alloc(u8, part_bytes);
             var n = source.reader.readSliceShort(buffer) catch
-                return readerFailed();
+                return self.readerFailed();
             const timeout_ms = optionalMs(source, "timeout_ms") orelse 0;
 
             // The stream share bounds long uploads exactly as it bounds
@@ -624,7 +682,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 if (etags.items.len == multipart_mod.parts_max) {
                     std.log.warn(
                         "nilo_s3: `{s}`.putMultipart reached S3's {d}-part ceiling; raise `.part_bytes`",
-                        .{ name, multipart_mod.parts_max },
+                        .{ self.name, multipart_mod.parts_max },
                     );
                     return error.Rejected;
                 }
@@ -632,15 +690,15 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 etags.append(c.arena(), etag) catch return error.OutOfMemory;
                 if (n < buffer.len) break;
                 n = source.reader.readSliceShort(buffer) catch
-                    return readerFailed();
+                    return self.readerFailed();
                 if (n == 0) break;
             }
 
             try self.completeMultipart(c, key, upload_id, etags.items, timeout_ms);
         }
 
-        fn readerFailed() Error {
-            std.log.warn("nilo_s3: `{s}`.putMultipart: the source reader failed", .{name});
+        fn readerFailed(self: *const Self) Error {
+            std.log.warn("nilo_s3: `{s}`.putMultipart: the source reader failed", .{self.name});
             return error.Failed;
         }
 
@@ -687,20 +745,20 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .content_type = content_type,
                 .headers = headers.slice(),
                 .redirects = .expose,
-            }) catch |err| return blame(err);
+            }) catch |err| return self.blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
 
-            const body = ex.take(c, 8 << 10) catch |err| return blame(err);
+            const body = ex.take(c, 8 << 10) catch |err| return self.blame(err);
             const upload_id = multipart_mod.uploadIdOf(body.view()) orelse {
-                std.log.warn("nilo_s3: `{s}` answered the initiate with no usable UploadId", .{name});
+                std.log.warn("nilo_s3: `{s}` answered the initiate with no usable UploadId", .{self.name});
                 return error.Failed;
             };
             if (upload_id.len > multipart_mod.upload_id_max) {
                 self.abortMultipart(c, key, upload_id);
                 std.log.warn(
                     "nilo_s3: `{s}` handed out an UploadId of {d} bytes, over the {d} a part call can carry; the upload was aborted",
-                    .{ name, upload_id.len, multipart_mod.upload_id_max },
+                    .{ self.name, upload_id.len, multipart_mod.upload_id_max },
                 );
                 return error.Failed;
             }
@@ -754,14 +812,14 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 // stall bound on silence, the terms `putStream` set (ADR 060).
                 .timeout_ms = timeout_ms,
                 .stall_ms = self.store.options.stall_ms,
-            }) catch |err| return blame(err);
+            }) catch |err| return self.blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
             const etag = got.header("etag") orelse "";
             if (etag.len == 0) {
                 // Sent on anyway, the completion would be refused later with
                 // `InvalidPart`, an error about the wrong call.
-                std.log.warn("nilo_s3: `{s}` answered part {d} without an ETag", .{ name, part_number });
+                std.log.warn("nilo_s3: `{s}` answered part {d} without an ETag", .{ self.name, part_number });
                 return error.Failed;
             }
             return keepIn(c, etag);
@@ -814,15 +872,15 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 // which can take minutes: the same terms as a part.
                 .timeout_ms = timeout_ms,
                 .stall_ms = self.store.options.stall_ms,
-            }) catch |err| return blame(err);
+            }) catch |err| return self.blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
 
-            const answer = ex.take(c, 8 << 10) catch |err| return blame(err);
+            const answer = ex.take(c, 8 << 10) catch |err| return self.blame(err);
             if (!multipart_mod.completedOk(answer.view())) {
                 std.log.warn(
                     "nilo_s3: `{s}` answered the completion 200 with an error in the body",
-                    .{name},
+                    .{self.name},
                 );
                 return error.Failed;
             }
@@ -875,7 +933,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             if (!got.ok()) {
                 std.log.warn(
                     "nilo_s3: `{s}` could not abort a failed multipart upload; its parts remain until a lifecycle rule or an abort by hand",
-                    .{name},
+                    .{self.name},
                 );
             }
         }
@@ -909,7 +967,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .authorization = sig.value(),
                 .headers = headers.slice(),
                 .redirects = .expose,
-            }) catch |err| return blame(err);
+            }) catch |err| return self.blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
         }
@@ -942,7 +1000,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .authorization = sig.value(),
                 .headers = headers.slice(),
                 .redirects = .expose,
-            }) catch |err| return blame(err);
+            }) catch |err| return self.blame(err);
 
             // A HEAD carries no body, so there is no `<Code>` to read and the
             // status is the whole of what S3 said.
@@ -990,14 +1048,14 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             if (listing.max_keys == 0 or listing.max_keys > listing_mod.keys_max) {
                 std.log.warn(
                     "nilo_s3: `{s}`.list asked for {d} keys a page; S3 answers 1 to {d}",
-                    .{ name, listing.max_keys, listing_mod.keys_max },
+                    .{ self.name, listing.max_keys, listing_mod.keys_max },
                 );
                 return error.Rejected;
             }
             if (listing.prefix.len > settings.key_max) {
                 std.log.warn(
                     "nilo_s3: a prefix of {d} bytes is longer than `{s}`'s `key_max` of {d}",
-                    .{ listing.prefix.len, name, settings.key_max },
+                    .{ listing.prefix.len, self.name, settings.key_max },
                 );
                 return error.Rejected;
             }
@@ -1038,7 +1096,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .authorization = sig.value(),
                 .headers = headers.slice(),
                 .redirects = .expose,
-            }) catch |err| return blame(err);
+            }) catch |err| return self.blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
 
@@ -1047,7 +1105,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             // three bytes a character. A server sending more than that is
             // not answering the question that was asked.
             const bound = 2048 + @as(usize, listing.max_keys) * (320 + settings.key_max * 3);
-            const body = ex.take(c, bound) catch |err| return blame(err);
+            const body = ex.take(c, bound) catch |err| return self.blame(err);
             const xml = body.view();
 
             // Decided before any key is read, and the cursor before any is
@@ -1138,7 +1196,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             comptime method: []const u8,
             comptime called: []const u8,
         ) Error!Presigned {
-            if (key.len == 0) return refuseEmptyKey(called);
+            if (key.len == 0) return self.refuseEmptyKey(called);
             if (key.len > settings.key_max) return error.Rejected;
 
             const io = self.store.client.inner.io;
@@ -1147,7 +1205,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
 
             var token_buf: [settings.session_token_max]u8 = undefined;
             const signing = self.store.keyFor(io, now_ms, &token_buf) catch |err|
-                return blame(err);
+                return self.blame(err);
 
             const expires = try life(wanted_seconds, signing, now_s);
 
@@ -1231,7 +1289,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         pub fn presignPost(self: *Self, c: anytype, key: []const u8, post: Post) Error!Posted {
             comptime core.checkScope(@TypeOf(c), "bucket.presignPost");
             // An empty key is fine for a prefix policy, where it means any key.
-            if (key.len == 0 and !post.prefix) return refuseEmptyKey("presignPost");
+            if (key.len == 0 and !post.prefix) return self.refuseEmptyKey("presignPost");
             if (key.len > settings.key_max) return error.Rejected;
 
             const io = self.store.client.inner.io;
@@ -1240,7 +1298,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
 
             var token_buf: [settings.session_token_max]u8 = undefined;
             const signing = self.store.keyFor(io, now_ms, &token_buf) catch |err|
-                return blame(err);
+                return self.blame(err);
 
             const expires = try life(post.seconds, signing, now_s);
             const expires_at = now_s + expires;
@@ -1256,7 +1314,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             }) catch unreachable; // both halves are capped by `sign`
 
             const policy: sign.Policy = .{
-                .bucket = name,
+                .bucket = self.name,
                 .key = key,
                 .prefix = post.prefix,
                 .expiration = dies.expiration(&expiry_buf),
@@ -1317,7 +1375,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             // without it — *Key 'bucket' is required in policy, but no value
             // was provided* — and the value is a constant in the binary, so
             // it is sent everywhere (ADR 177).
-            fields[n] = .{ .name = "bucket", .value = name };
+            fields[n] = .{ .name = "bucket", .value = self.name };
             n += 1;
             fields[n] = .{ .name = "key", .value = cut(room, &at, key) };
             n += 1;
@@ -1393,11 +1451,11 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// changes the operation rather than naming a smaller object. Refused
         /// here, before anything is signed (ADR 059). `list` is the call that
         /// means the root and does not come through here.
-        fn refuseEmptyKey(call: []const u8) Error {
+        fn refuseEmptyKey(self: *const Self, call: []const u8) Error {
             std.log.warn(
                 "nilo_s3: `{s}`.{s} was given an empty key, which addresses the " ++
                     "bucket and not an object",
-                .{ name, call },
+                .{ self.name, call },
             );
             return error.Rejected;
         }
@@ -1407,13 +1465,13 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// user in `content_disposition` would panic a ReleaseSafe build and
         /// split the request on a pooled connection in ReleaseFast. Any byte
         /// under 0x20 but tab, and 0x7f, is refused (RFC 9110 field values).
-        fn checkHeader(header_name: []const u8, value: ?[]const u8) Error!void {
+        fn checkHeader(self: *const Self, header_name: []const u8, value: ?[]const u8) Error!void {
             const v = value orelse return;
             for (v) |b| {
                 if ((b < 0x20 and b != '\t') or b == 0x7f) {
                     std.log.warn(
                         "nilo_s3: `{s}` was given a `{s}` with a control byte (0x{x:0>2}) in it",
-                        .{ name, header_name, b },
+                        .{ self.name, header_name, b },
                     );
                     return error.Rejected;
                 }
@@ -1422,23 +1480,23 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
 
         /// Sign, and fill in the headers that go out beside the signature.
         fn prepare(self: *Self, sig: *sign.Signature, headers: *Headers, req: Prepare) Error!void {
-            if (req.key.len == 0 and !req.root) return refuseEmptyKey(req.method);
+            if (req.key.len == 0 and !req.root) return self.refuseEmptyKey(req.method);
             if (req.key.len > settings.key_max) {
                 std.log.warn(
                     "nilo_s3: a key of {d} bytes is longer than `{s}`'s `key_max` of {d}",
-                    .{ req.key.len, name, settings.key_max },
+                    .{ req.key.len, self.name, settings.key_max },
                 );
                 return error.Rejected;
             }
-            try checkHeader("content-type", req.content_type);
-            try checkHeader("cache-control", req.cache_control);
-            try checkHeader("content-disposition", req.content_disposition);
-            try checkHeader("if-none-match", req.if_none_match);
+            try self.checkHeader("content-type", req.content_type);
+            try self.checkHeader("cache-control", req.cache_control);
+            try self.checkHeader("content-disposition", req.content_disposition);
+            try self.checkHeader("if-none-match", req.if_none_match);
 
             const io = self.store.client.inner.io;
             const now_ms = core.nowMillis();
             const signing = self.store.keyFor(io, now_ms, req.token_buf) catch |err|
-                return blame(err);
+                return self.blame(err);
 
             sig.stamp = .at(@divFloor(now_ms, 1000));
 
@@ -1512,7 +1570,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .authorization = sig.value(),
                 .headers = headers.slice(),
                 .redirects = .expose,
-            }) catch |err| return blame(err);
+            }) catch |err| return self.blame(err);
 
             if (got.status == .not_modified) return error.NotModified;
             if (!got.ok()) return self.failure(c, &ex, got);
@@ -1536,7 +1594,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             @memcpy(whole[room + content_type.len ..][0..etag.len], etag);
 
             const body = whole[0..room];
-            ex.readInto(body) catch |err| return blame(err);
+            ex.readInto(body) catch |err| return self.blame(err);
 
             return .{
                 .bytes = c.str(body),
@@ -1549,7 +1607,6 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// Read what S3 said about a failure, log it, and hand the handler one
         /// of the seven.
         fn failure(self: *Self, c: anytype, ex: *fetch.Exchange, got: fetch.Exchange.Head) Error {
-            _ = self;
             // Bounded, because an error body is a few hundred bytes and
             // anything claiming to be more is not one.
             const body = ex.take(c, 8 << 10) catch {
@@ -1561,11 +1618,11 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 std.log.warn(
                     "nilo_s3: {s} refused the request as too far from its own clock, " ++
                         "which reads {s}. The container's clock is what to fix.",
-                    .{ name, reason.server_time },
+                    .{ self.name, reason.server_time },
                 );
             } else if (reason.code.len != 0) {
                 std.log.warn("nilo_s3: {s} answered {d} {s}: {s}", .{
-                    name,
+                    self.name,
                     @intFromEnum(got.status),
                     reason.code,
                     reason.message,
@@ -1618,19 +1675,23 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
 
         /// One place where everything `nilo_fetch` and the Store can fail with
         /// becomes one of the seven.
-        fn blame(err: anyerror) Error {
+        fn blame(self: *const Self, err: anyerror) Error {
+            return blameNamed(self.name, err);
+        }
+
+        fn blameNamed(name_in_log: []const u8, err: anyerror) Error {
             return switch (err) {
                 error.TimedOut => error.TimedOut,
                 // No bytes moved for `stall_ms`, which a handler answers the
                 // way it answers a deadline: the object did not arrive.
                 error.Stalled => {
-                    std.log.warn("nilo_s3: {s}: a streamed transfer stalled; raise `stall_ms` if the peer is slow rather than gone", .{name});
+                    std.log.warn("nilo_s3: {s}: a streamed transfer stalled; raise `stall_ms` if the peer is slow rather than gone", .{name_in_log});
                     return error.TimedOut;
                 },
                 // A credential source that did not answer in
                 // `fetch_timeout_ms`, with no credentials left to sign with.
                 error.CredentialsTimedOut => {
-                    std.log.warn("nilo_s3: {s}: the credential source did not answer within `fetch_timeout_ms`", .{name});
+                    std.log.warn("nilo_s3: {s}: the credential source did not answer within `fetch_timeout_ms`", .{name_in_log});
                     return error.TimedOut;
                 },
                 error.BodyTooLarge => error.TooLarge,
@@ -1640,7 +1701,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                     // The cause is here rather than in the return type,
                     // because no handler does anything different about a
                     // refused socket than about a failed handshake.
-                    std.log.warn("nilo_s3: {s} could not be reached: {s}", .{ name, @errorName(err) });
+                    std.log.warn("nilo_s3: {s} could not be reached: {s}", .{ name_in_log, @errorName(err) });
                     return error.Failed;
                 },
             };
@@ -1822,8 +1883,6 @@ fn optional(value: anytype, comptime field: []const u8) ?[]const u8 {
 /// Everything a bucket can be got wrong about while compiling.
 fn check(comptime name: []const u8, comptime opts: anytype) Options {
     comptime {
-        checkName(name);
-
         const Given = @TypeOf(opts);
         if (@typeInfo(Given) != .@"struct") @compileError(
             "nilo: s3.Bucket's second argument is the bucket's options, and " ++
@@ -1868,7 +1927,7 @@ fn check(comptime name: []const u8, comptime opts: anytype) Options {
             "nilo: s3.Bucket(\"" ++ name ++ "\") has a `key_max` of zero, so no key would fit.",
         );
 
-        if (settings.style == .virtual) checkDnsLabel(name);
+        if (badName(name, settings.style)) |problem| @compileError(nameRefusal(name, problem));
 
         return settings;
     }
@@ -1903,46 +1962,78 @@ fn checkNotASecret(comptime field: []const u8) void {
     }
 }
 
-fn checkName(comptime name: []const u8) void {
-    comptime {
-        if (name.len < 3 or name.len > 63) @compileError(
-            "nilo: `" ++ name ++ "` is " ++ std.fmt.comptimePrint("{d}", .{name.len}) ++
-                " characters, and an S3 bucket name is 3 to 63.",
-        );
+/// What is wrong with a bucket name, if anything. **One predicate for both
+/// times**: `check` runs it while compiling on the declared name, and
+/// `openAs` runs it on a name read at run time, so the two cannot drift
+/// (ADR 059). The checks are in the order the compile-time messages always
+/// had them.
+const NameProblem = enum {
+    length,
+    capital,
+    underscore,
+    character,
+    edge,
+    address,
+    /// Path style only: a byte that would end or change a URL path.
+    path_character,
+
+    /// The run-time wording, without the name in it.
+    fn reason(self: NameProblem) []const u8 {
+        return switch (self) {
+            .length => "is not 3 to 63 characters, which is what an S3 bucket name is",
+            .capital => "has a capital letter in it, and a host name cannot",
+            .underscore => "has an underscore in it, and a host name cannot",
+            .character => "has a character in it that a host name cannot carry",
+            .edge => "starts or ends with a dash or a dot, and a host name cannot",
+            .address => "is shaped like an IP address, and S3 refuses a bucket named that way",
+            .path_character => "has a character in it that a URL path cannot carry as a bucket name (letters, digits, dot, dash and underscore only)",
+        };
     }
+};
+
+fn badName(name: []const u8, style: Style) ?NameProblem {
+    if (name.len < 3 or name.len > 63) return .length;
+    switch (style) {
+        .virtual => {
+            for (name) |ch| switch (ch) {
+                'a'...'z', '0'...'9', '-', '.' => {},
+                'A'...'Z' => return .capital,
+                '_' => return .underscore,
+                else => return .character,
+            };
+            if (name[0] == '-' or name[0] == '.' or name[name.len - 1] == '-' or name[name.len - 1] == '.')
+                return .edge;
+            if (looksLikeAddress(name)) return .address;
+        },
+        // Old buckets may carry a capital or an underscore, and a path takes
+        // them; what it cannot take is a byte that is not part of a segment.
+        .path => for (name) |ch| switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '.', '_' => {},
+            else => return .path_character,
+        },
+    }
+    return null;
 }
 
-/// What virtual-host addressing needs of a name, which is more than S3 needs
-/// of one.
-fn checkDnsLabel(comptime name: []const u8) void {
+/// The compile-time message for a problem `badName` found, with the name in
+/// it and the way out.
+fn nameRefusal(comptime name: []const u8, comptime problem: NameProblem) []const u8 {
     comptime {
         const advice = "\n  Either rename the bucket, or address it by path:" ++
             " s3.Bucket(\"" ++ name ++ "\", .{ .style = .path }).";
-
-        for (name) |ch| switch (ch) {
-            'a'...'z', '0'...'9', '-', '.' => {},
-            'A'...'Z' => @compileError(
-                "nilo: `" ++ name ++ "` has a capital letter in it, and a bucket addressed" ++
-                    " as `" ++ name ++ ".s3.amazonaws.com` cannot." ++ advice,
-            ),
-            '_' => @compileError(
-                "nilo: `" ++ name ++ "` has an underscore in it, and a host name cannot." ++ advice,
-            ),
-            else => @compileError(
-                "nilo: `" ++ name ++ "` has a character in it that a host name cannot carry." ++ advice,
-            ),
-        };
-
-        if (name[0] == '-' or name[0] == '.' or name[name.len - 1] == '-' or name[name.len - 1] == '.')
-            @compileError(
-                "nilo: `" ++ name ++ "` starts or ends with a dash or a dot, and a host name" ++
-                    " cannot." ++ advice,
-            );
-
-        if (looksLikeAddress(name)) @compileError(
-            "nilo: `" ++ name ++ "` is shaped like an IP address, and S3 refuses a bucket" ++
+        return switch (problem) {
+            .length => "nilo: `" ++ name ++ "` is " ++ std.fmt.comptimePrint("{d}", .{name.len}) ++
+                " characters, and an S3 bucket name is 3 to 63.",
+            .capital => "nilo: `" ++ name ++ "` has a capital letter in it, and a bucket addressed" ++
+                " as `" ++ name ++ ".s3.amazonaws.com` cannot." ++ advice,
+            .underscore => "nilo: `" ++ name ++ "` has an underscore in it, and a host name cannot." ++ advice,
+            .character => "nilo: `" ++ name ++ "` has a character in it that a host name cannot carry." ++ advice,
+            .edge => "nilo: `" ++ name ++ "` starts or ends with a dash or a dot, and a host name" ++
+                " cannot." ++ advice,
+            .address => "nilo: `" ++ name ++ "` is shaped like an IP address, and S3 refuses a bucket" ++
                 " named that way." ++ advice,
-        );
+            .path_character => "nilo: `" ++ name ++ "` " ++ problem.reason() ++ ".",
+        };
     }
 }
 
@@ -2186,4 +2277,66 @@ test "a value being stored is read through whichever spelling it carries" {
     try testing.expectEqualStrings("hello", viewOf(uploaded.bytes));
     try testing.expectEqualStrings("image/png", viewOf(uploaded.content_type));
     try testing.expectEqualStrings("max-age=31536000", optional(uploaded, "cache_control").?);
+}
+
+test "a name read at run time is held by the bucket and builds the same host and prefix" {
+    var store = try Store.open(testing.allocator, .{
+        .endpoint = "http://garage:3900",
+        .public_endpoint = "https://files.example.com/",
+        .credentials = .{ .static = .{ .access_key_id = "A", .secret_access_key = "B" } },
+    });
+    defer store.deinit();
+
+    // Virtual style: the name leads the dialled host and the public one.
+    const Durable = Bucket("durable", .{});
+    var name_buf: [10]u8 = "prod-data1".*;
+    var prod = try Durable.openAs(&store, &name_buf);
+    defer prod.deinit();
+    @memset(&name_buf, 'x');
+    try testing.expectEqualStrings("prod-data1", prod.name);
+    try testing.expectEqualStrings("prod-data1.garage:3900", prod.host);
+    try testing.expectEqualStrings("http://prod-data1.garage:3900", prod.base);
+    try testing.expectEqualStrings("prod-data1.files.example.com", prod.public_host);
+    try testing.expectEqualStrings("https://prod-data1.files.example.com", prod.public_base);
+    try testing.expectEqualStrings("", prod.prefix);
+
+    // `open` is the declared name, which is the field too.
+    var declared = try Durable.open(&store);
+    defer declared.deinit();
+    try testing.expectEqualStrings("durable", declared.name);
+    try testing.expectEqualStrings(Durable.bucket, declared.name);
+    try testing.expectEqualStrings("durable.garage:3900", declared.host);
+
+    // Path style takes the legacy spellings a host name cannot.
+    const Legacy = Bucket("legacy", .{ .style = .path });
+    var old = try Legacy.openAs(&store, "My_Old.Bucket");
+    defer old.deinit();
+    try testing.expectEqualStrings("/My_Old.Bucket", old.prefix);
+    try testing.expectEqualStrings("garage:3900", old.host);
+}
+
+test "a run-time name is refused by the rules the declared one is, with the reason in words" {
+    var store = try Store.open(testing.allocator, .{
+        .endpoint = "http://127.0.0.1:9000",
+        .credentials = .{ .static = .{ .access_key_id = "A", .secret_access_key = "B" } },
+    });
+    defer store.deinit();
+
+    const Virtual = Bucket("durable", .{});
+    const bad = [_][]const u8{ "", "ab", "a" ** 64, "Prod-data", "prod_data", "prod data", "-prod", "prod.", "10.0.0.1", "a/b" };
+    for (bad) |name_under_test| {
+        try testing.expectError(error.BadBucketName, Virtual.openAs(&store, name_under_test));
+        try testing.expect(Virtual.nameProblem(name_under_test) != null);
+    }
+    try testing.expect(Virtual.nameProblem("prod-data.v2") == null);
+    try testing.expect(std.mem.indexOf(u8, Virtual.nameProblem("Prod").?, "capital letter") != null);
+    try testing.expect(std.mem.indexOf(u8, Virtual.nameProblem("ab").?, "3 to 63") != null);
+
+    // The same predicate runs at compile time on the declared name, so what
+    // the one refuses the other refuses, in every style.
+    const ByPath = Bucket("legacy", .{ .style = .path });
+    try testing.expect(ByPath.nameProblem("Prod_Data") == null);
+    try testing.expect(ByPath.nameProblem("a/b") != null);
+    try testing.expect(ByPath.nameProblem("a?b") != null);
+    try testing.expect(ByPath.nameProblem("ab") != null);
 }

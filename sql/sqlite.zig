@@ -2127,7 +2127,7 @@ test "a fiber cancelled while it queues for a connection keeps its cancellation"
     }.run);
 }
 
-test "the introspection query reads the rowid alias as not-null, and its near misses as null" {
+test "the introspection query reads the rowid alias as not-null, and a key that may hold a NULL as unknown" {
     // `dialect.SQLite.introspect` is asked directly rather than through
     // `db.checkSchema`, which reports a problem with `std.log.err` and so
     // fails the test runner for every test that provokes one. What is being
@@ -2155,6 +2155,9 @@ test "the introspection query reads the rowid alias as not-null, and its near mi
                 "CREATE TABLE tuple_form (id INTEGER, label TEXT, PRIMARY KEY (id))",
                 "CREATE TABLE not_integer (id INT PRIMARY KEY, label TEXT)",
                 "CREATE TABLE composite (tenant_id INTEGER, id INTEGER, PRIMARY KEY (tenant_id, id))",
+                "CREATE TABLE text_key (id TEXT PRIMARY KEY, label TEXT)",
+                "CREATE TABLE text_key_checked (id TEXT NOT NULL PRIMARY KEY, label TEXT)",
+                "CREATE TABLE no_rowid (id TEXT PRIMARY KEY, label TEXT) WITHOUT ROWID",
                 // A column with no declared type at all, which SQLite allows.
                 // Here because ADR 094 made a NULL in a non-optional field an
                 // error, and this query reads `i.type` as a
@@ -2181,15 +2184,25 @@ test "the introspection query reads the rowid alias as not-null, and its near mi
             try testing.expectEqual(@as(?bool, true), try nullableOf(&w, arena, "tuple_form", "label"));
 
             // `INT` rather than `INTEGER`: the same affinity, and not an alias.
-            // SQLite's rule is the declared type spelled exactly `INTEGER`, and
-            // this column really does accept a NULL.
-            try testing.expectEqual(@as(?bool, true), try nullableOf(&w, arena, "not_integer", "id"));
+            // This column really does accept a NULL, and it is a key, so the
+            // answer is "the database does not say" and not "may be null"
+            // (ADR 050).
+            try testing.expectEqual(@as(?bool, null), try nullableOf(&w, arena, "not_integer", "id"));
+            try testing.expectEqual(@as(?bool, true), try nullableOf(&w, arena, "not_integer", "label"));
 
-            // A composite key over a rowid table — the shape of every
-            // multi-tenant schema. Every column of it may hold a NULL, which is
-            // SQLite's own long-standing quirk, so neither becomes the rowid.
-            try testing.expectEqual(@as(?bool, true), try nullableOf(&w, arena, "composite", "tenant_id"));
-            try testing.expectEqual(@as(?bool, true), try nullableOf(&w, arena, "composite", "id"));
+            // A composite key over a rowid table, the shape of every
+            // multi-tenant schema: SQLite lets any column of it hold a NULL.
+            try testing.expectEqual(@as(?bool, null), try nullableOf(&w, arena, "composite", "tenant_id"));
+            try testing.expectEqual(@as(?bool, null), try nullableOf(&w, arena, "composite", "id"));
+
+            // `id TEXT PRIMARY KEY`, the key photon and most hand-written
+            // schemas have: unknown, so a plain `Str` field passes the check.
+            try testing.expectEqual(@as(?bool, null), try nullableOf(&w, arena, "text_key", "id"));
+            try testing.expectEqual(@as(?bool, true), try nullableOf(&w, arena, "text_key", "label"));
+            // With `NOT NULL`, which is what nilo writes for a table it
+            // creates, and on a `WITHOUT ROWID` table, which enforces it.
+            try testing.expectEqual(@as(?bool, false), try nullableOf(&w, arena, "text_key_checked", "id"));
+            try testing.expectEqual(@as(?bool, false), try nullableOf(&w, arena, "no_rowid", "id"));
 
             // The untyped column reads without the whole query failing, and
             // the rowid beside it is still the rowid.

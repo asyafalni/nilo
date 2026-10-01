@@ -20,6 +20,7 @@ Eleven modules ship, and a project links only the ones it imports ([ADR 038](../
 | `nilo_pw` | password hashing | [`pw.md`](./pw.md) |
 | `nilo_cache` | an expiring cache in this process | [`cache.md`](./cache.md) |
 | `nilo_jwt` | verifying a token someone else signed | [`jwt.md`](./jwt.md) |
+| `nilo_proto` | protobuf messages read and written as plain structs | [`proto.md`](./proto.md) |
 | `nilo_fetch` | calling another service's HTTP API | [`fetch.md`](./fetch.md) |
 | `nilo_job` | work that runs later, again, or on a schedule, queued in your database | [`job.md`](./job.md) |
 | `nilo_core` | `Str`, the [Scope](./core.md#scope) and [percent coding](./core.md#nilo_corepercent), shared by the other modules | [`core.md`](./core.md) |
@@ -33,6 +34,7 @@ const config = @import("nilo_config");// only if you read settings
 const pw = @import("nilo_pw");        // only if you hash passwords or mint a token
 const cache = @import("nilo_cache");  // only if you cache something
 const jwt = @import("nilo_jwt");      // only if you verify somebody else's tokens
+const proto = @import("nilo_proto");  // only if you speak protobuf
 const job = @import("nilo_job");      // only if some work runs later, or on a schedule
 ```
 
@@ -101,9 +103,11 @@ Every heading of every page, in page order. Find a name here, then read it on it
     - [Renaming one field](./handlers.md#renaming-one-field)
     - [Renamed types are for output only](./handlers.md#renamed-types-are-for-output-only)
     - [Leaf types](./handlers.md#leaf-types)
+    - [Skipping the keys a body struct does not know](./handlers.md#skipping-the-keys-a-body-struct-does-not-know)
     - [The marker is not inherited](./handlers.md#the-marker-is-not-inherited)
   - [`nilo.jsonParseFor`](./handlers.md#nilojsonparsefor)
   - [Unions](./handlers.md#unions)
+  - [Writing JSON outside a request](./handlers.md#writing-json-outside-a-request)
   - [Text that is not UTF-8](./handlers.md#text-that-is-not-utf-8)
 
 **[The request](./ctx.md)**: `Ctx` is one request in flight: everything a handler reads from it, answers with, and fails it with.
@@ -318,6 +322,7 @@ Every heading of every page, in page order. Find a name here, then read it on it
 - [`nilo_pw`](./pw.md#nilo_pw-1)
   - [Call the `Ctx` methods](./pw.md#call-the-ctx-methods)
   - [`stored` may be null](./pw.md#stored-may-be-null)
+  - [A stored string that is not a hash](./pw.md#a-stored-string-that-is-not-a-hash)
   - [The allocator](./pw.md#the-allocator)
   - [The PHC format](./pw.md#the-phc-format)
   - [Checking without a request](./pw.md#checking-without-a-request)
@@ -348,3 +353,17 @@ Every heading of every page, in page order. Find a name here, then read it on it
   - [`jwt.Keyring`](./jwt.md#jwtkeyring)
   - [`jwt.Verifier(Claims, Client)`](./jwt.md#jwtverifierclaims-client)
   - [What it does not do](./jwt.md#what-it-does-not-do)
+
+**[nilo_proto](./proto.md)**: `nilo_proto` reads and writes protobuf messages as plain Zig structs, with the field numbers declared on the type and nothing generated.
+
+- [`nilo_proto`](./proto.md#nilo_proto-1)
+  - [`proto.decode` and `proto.merge`](./proto.md#protodecode-and-protomerge)
+  - [`proto.encode`](./proto.md#protoencode)
+  - [The `wire` table](./proto.md#the-wire-table)
+  - [Types](./proto.md#types)
+  - [Maps](./proto.md#maps)
+  - [Merge rules](./proto.md#merge-rules)
+  - [Unknown fields and groups](./proto.md#unknown-fields-and-groups)
+  - [Errors](./proto.md#errors)
+  - [`proto.Reader`](./proto.md#protoreader)
+  - [What it does not do](./proto.md#what-it-does-not-do)

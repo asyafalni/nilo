@@ -270,6 +270,79 @@ test "a prefix reads a .env the same way it reads the environment" {
     try testing.expectEqual(@as(u16, 9000), r.value().?.port);
 }
 
+/// 200 settings with 60-character names, which is photon's size and then
+/// some. Generated, so the test states the sizes and not a wall of fields.
+/// The generators spend their own quota in their own declarations, which are
+/// analysed apart from the reading below them.
+const wide_count = 200;
+const wide_stem = "a_setting_with_a_long_descriptive_name_for_the_quota_";
+
+fn wideName(comptime i: usize) *const [60:0]u8 {
+    comptime {
+        var n: [60:0]u8 = undefined;
+        @memcpy(n[0..wide_stem.len], wide_stem);
+        _ = std.fmt.bufPrint(n[wide_stem.len..], "{d:0>7}", .{i}) catch unreachable;
+        n[60] = 0;
+        const frozen = n;
+        return &frozen;
+    }
+}
+
+const Wide = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var names: [wide_count][:0]const u8 = undefined;
+    var types: [wide_count]type = undefined;
+    for (&names, &types, 0..) |*n, *t, i| {
+        n.* = wideName(i);
+        t.* = u32;
+    }
+    break :blk @Struct(.auto, null, &names, &types, &@splat(.{}));
+};
+
+/// Every name of `Wide` as the environment spells it, set to 7.
+const wide_file = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var p: [wide_count]Fixed.Pair = undefined;
+    for (&p, 0..) |*pair, i| {
+        const name = wideName(i);
+        var up: [60]u8 = undefined;
+        for (name, 0..) |c, j| up[j] = std.ascii.toUpper(c);
+        const frozen = up;
+        pair.* = .{ "APP_" ++ frozen, "7" };
+    }
+    break :blk p;
+};
+
+test "a Config of 200 long names reads through layered sources without a quota of the caller's" {
+    // Ten fields of 34 characters used to stop with "evaluation exceeded
+    // 1000 backwards branches", from a line inside read.zig, and this is the
+    // whole reading: the table, the check and the fill.
+    const first = comptime wideName(0);
+    const last = comptime wideName(wide_count - 1);
+    const first_env = comptime "APP_" ++ upperOf(first);
+
+    // The file answers every name, and the environment overrides one.
+    const r = fromWith(Wide, .{ .prefix = "APP_" }, layered(.{
+        Fixed{ .pairs = &.{.{ first_env, "11" }} },
+        Fixed{ .pairs = &wide_file },
+    }));
+
+    try testing.expect(!r.failed());
+    const v = r.value().?;
+    try testing.expectEqual(@as(u32, 11), @field(v, first));
+    try testing.expectEqual(@as(u32, 7), @field(v, last));
+    try testing.expectEqualStrings(comptime "APP_" ++ upperOf(last), r.nameOf(last));
+}
+
+fn upperOf(comptime name: []const u8) []const u8 {
+    comptime {
+        var up: [name.len]u8 = undefined;
+        for (name, 0..) |c, j| up[j] = std.ascii.toUpper(c);
+        const frozen = up;
+        return &frozen;
+    }
+}
+
 test {
     _ = @import("convert.zig");
     _ = @import("dotenv.zig");

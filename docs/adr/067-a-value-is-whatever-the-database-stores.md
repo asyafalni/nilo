@@ -77,6 +77,14 @@ NULL, so a NOT NULL column answered `NotNullViolated` for a value that was never
 null and a nullable one read back `null`. An infinity is bound: SQLite keeps it,
 as Postgres does.
 
+### `Unix(unit)`: a count in an integer column, with the unit in the type
+
+`Timestamp` is microseconds, and an `INTEGER` column has no unit, so a table whose `created_at` holds Unix milliseconds (an application's own schema, a JavaScript client's `Date.now()`) read through `Timestamp` passes the check and answers 1970-01-21. **The unit goes in the type**: `sql.Unix(.millis)` and `sql.Unix(.seconds)`, spelled `sql.UnixMillis` and `sql.UnixSeconds`, each a struct holding `count: i64`. Every Wire and Dialect branch treats it as the `i64` it travels as (`WireRead`, `WireWrite`, `forWire`, `accepts`, `reads`), so a read or a write moves the count unchanged and the unit costs nothing on either path; `toTimestamp` is one saturating multiply and `fromTimestamp` one floor division, paid only where the caller crosses to the moment type.
+
+**What the check can and cannot catch.** The column is an integer on both databases (`int8`, `INTEGER`), so a `timestamptz`, a `date` or a `TEXT` under it is refused, which is the half of the mistake a database can see. An `INTEGER` holding microseconds under `UnixMillis` is indistinguishable from one holding milliseconds, and no introspection can tell them apart; that stays the caller's schema, as it always was. `toTimestamp` saturates, so a count that is no moment at all reaches `writeRfc3339` as `error.OutOfRange` rather than a panic or a wrapped year.
+
+JSON is the number, both ways (`format: int64` in the document), because a column kept as a count is nearly always a contract that says count; `.toTimestamp()` is the way to print a date. `nilo_parse` takes the decimal digits, so it is a path param and a keyset cursor like any `nilo_parse` type. `.now` and `.default = .now` stay on `Timestamp` only, since they write a `Timestamp` and a count is not one.
+
 ### `Timestamp` on Postgres: `timestamptz` and nothing else
 
 A `timestamp` column holds a wall clock with no zone, and Postgres reads one
@@ -115,6 +123,10 @@ Everything in `db.zig` ran against `wire.Fake`, and that is most of the point: t
 **Threading the Dialect into `forWire`.** `WireWrite` already decided the form; `forWire` reading the decision off the destination type keeps one answer in one place.
 
 **A `time_form` beside `uuid_form`**, so SQLite could store `Timestamp` as RFC 3339 text, the shape the roadmap had sketched and the shape the three text-form declarations already have. Not taken here, because at the time reading it back would have meant **parsing** RFC 3339, and `Timestamp` then only wrote it. `Timestamp.nilo_parse` exists now ([ADR 127](./127-what-a-server-prints-it-can-read.md), built for a paged cursor round-tripping through a path or query param), so the parser this rejection leaned on is no longer missing; a `time_form` for SQLite storage is still not built, and stays open in [`docs/decided.md`](../decided.md) as a caller who needs to read a SQLite file whose times were written as text by something else, which the check that agrees with what is actually bound does not serve. The cheapest true fix for a check that disagreed with the write was to make the check agree with what is actually bound. A program wanting text timestamps on SQLite today has `sql.AsText("timestamptz")`.
+
+**`Timestamp` parameterised by unit** (`Timestamp(.millis)`), which would keep one name. It breaks every `== types.Timestamp` in both Wires, both Dialects, the clock words and the `Timestamp.micros` field every caller already reads, for a type whose RFC 3339 JSON and `timestamptz` column mean nothing for a count. A separate type leaves `Timestamp` byte for byte as it was.
+
+**A `Timestamp` over a millisecond column with a runtime unit option** on the `Db`. The unit is a property of one column, not of the connection, and an option cannot be seen at the field where the mistake is made.
 
 **Accepting both INTEGER and TEXT for `Timestamp`.** Would keep every existing schema starting, at the price of continuing to accept the one that sorts wrongly, the failure this exists to catch.
 

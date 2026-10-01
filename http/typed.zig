@@ -312,6 +312,11 @@ const Role = union(enum) {
     /// The request arena, for a handler that has to build something that
     /// outlives its own stack frame — a `Location` header, usually.
     arena,
+    /// The server's `std.Io`, for a handler that parks on a queue or an
+    /// event a fiber of its own answers (ADR 244). A role of its own and
+    /// not a service, because nothing is registered for it: it is read
+    /// from the running server, as `.arena` is read from the request.
+    io,
     /// A value nilo works out from the request before the handler runs —
     /// the signed-in user, usually (ADR 015).
     resolved,
@@ -413,6 +418,7 @@ pub fn wrap(comptime pattern: []const u8, comptime f: anytype) router.CtxHandler
                         .cached => args[i] = .{ .key = caching.?.key },
                         .form => args[i] = .{ .value = try c.form(P.nilo_form) },
                         .arena => args[i] = c._arena,
+                        .io => args[i] = c.io(),
                         .resolved => args[i] = try resolve.value(P, c),
                         // The outcomes live here, on the stack of the fiber that
                         // is already serving this request, and are copied into
@@ -1673,6 +1679,7 @@ fn roleOf(comptime pattern: []const u8, comptime P: type, comptime i: usize) Rol
     if (P == *Ctx or P == *const Ctx) return .ctx;
     if (P == Str) return .{ .param = 0 };
     if (P == std.mem.Allocator) return .arena;
+    if (P == std.Io) return .io;
     // Before the two below it: a binding wraps one of them, and it is the
     // outer type that says how failures are answered.
     if (comptime hasNamedDecl(P, bound_mod.marker)) return switch (P.nilo_bound_slot) {
@@ -1795,7 +1802,7 @@ fn roleOf(comptime pattern: []const u8, comptime P: type, comptime i: usize) Rol
                 "(`u32`, `nilo.Str`, `bool`, an enum, or a type carrying `nilo_parse`), " ++
                 "`nilo.Query(T)` for the query string, `nilo.FromHeader(\"X-Thing\", T)` for " ++
                 "one header, a `std.mem.Allocator` for the request " ++
-                "arena, or one struct for the request body.",
+                "arena, a `std.Io` for the server's loop, or one struct for the request body.",
         ),
     };
 }
@@ -2094,6 +2101,7 @@ fn collectListCollecting(
 /// default, or to null if it is optional; one with neither is required, and
 /// saying so is a 400 rather than a surprise zero.
 fn queryValue(comptime T: type, c: *const Ctx) !T {
+    comptime @setEvalBranchQuota(convert_mod.budget(@typeInfo(T).@"struct".fields));
     var out: T = undefined;
     inline for (@typeInfo(T).@"struct".fields) |f| {
         const label = "?" ++ f.name;
@@ -2147,6 +2155,7 @@ fn queryValueCollecting(
     c: *const Ctx,
     outcomes: *[@typeInfo(T).@"struct".fields.len]convert_mod.Outcome,
 ) T {
+    comptime @setEvalBranchQuota(convert_mod.budget(@typeInfo(T).@"struct".fields));
     var out: T = undefined;
     inline for (@typeInfo(T).@"struct".fields, 0..) |f, i| {
         outcomes[i] = .{};

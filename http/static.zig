@@ -50,6 +50,20 @@ pub const Options = struct {
     index: []const u8 = "index.html",
     /// Sent as `Cache-Control` on every file. Empty leaves the header off.
     cache_control: []const u8 = "public, max-age=3600",
+    /// Exceptions to `cache_control`, by where a file sits in the tree: the
+    /// first rule a file matches gives its header, and a file no rule matches
+    /// takes `cache_control`. What a single-page app needs is two policies in
+    /// one tree, hashed bundles that never change and a page that always
+    /// does (ADR 009):
+    ///
+    /// ```zig
+    /// .cache_control = "no-cache",
+    /// .cache_rules = &.{.{ .prefix = "assets/", .cache_control = "public, max-age=31536000, immutable" }},
+    /// ```
+    ///
+    /// Settled once at load, into the header each file already carries, so a
+    /// request pays nothing for there being rules.
+    cache_rules: []const CacheRule = &.{},
     /// Served for a path under the prefix that names no file and could be a
     /// browser opening a page — what a single-page app needs so that a reload
     /// on `/users/42` reaches the client-side router instead of a 404. Empty
@@ -153,38 +167,63 @@ pub const Options = struct {
     pub const Fallback = enum { navigations, any_path };
 };
 
-/// Whether a request that named no file could be a browser opening a page,
-/// which is the question `.navigations` asks before it answers with one
-/// (ADR 087).
+/// One exception to a set's `cache_control`, matched against a file's path in
+/// the tree: relative to the directory (or the `path` of an `Embedded`), with
+/// forward slashes and no leading `/`, so `"assets/app.3f9a.js"`.
 ///
-/// Two tests, in the order a client makes them answerable. First the exact
-/// one: a browser opening a page sends an `Accept` naming `text/html`, and no
-/// asset request does — `<script src>`, `<link>` and `<img>` all send `*/*`.
-/// Then, for a client that expressed no preference, the path: a last segment
-/// with an extension is an asset, one without is a deep link. That keeps
-/// `curl /users/42` on the page while `/app.abc123.js` becomes a 404.
-///
-/// What it cannot catch is a `fetch()` sending `*/*` to an extensionless path.
-/// That gets the page, and the guide says so rather than leaving it guessed.
-pub fn navigational(path: []const u8, accept_header: ?[]const u8) bool {
-    return switch (accept_mod.asks(accept_header, "text/html")) {
-        .named => true,
-        .refused => false,
-        .anything, .unsaid => !hasExtension(path),
-    };
+/// Both halves must hold, and an empty one holds for every file, so
+/// `.{ .prefix = "assets/" }` is a directory, `.{ .suffix = ".js" }` is a type
+/// anywhere, and `.{ .prefix = "index.html" }` is that one file (and anything
+/// else starting with the name). An empty `cache_control` leaves the header
+/// off for the files it matches.
+pub const CacheRule = struct {
+    prefix: []const u8 = "",
+    suffix: []const u8 = "",
+    cache_control: []const u8,
+};
+
+/// The `Cache-Control` for the file at `path` in the tree: the first rule it
+/// matches, else `default`. Called once per file while a Set is built.
+fn cacheControlFor(rules: []const CacheRule, default: []const u8, path: []const u8) []const u8 {
+    for (rules) |rule| {
+        if (std.mem.startsWith(u8, path, rule.prefix) and std.mem.endsWith(u8, path, rule.suffix))
+            return rule.cache_control;
+    }
+    return default;
 }
 
-/// Whether the last segment of `path` ends in something that looks like a
-/// file extension.
+/// What a request said about itself that decides whether a single-page
+/// fallback answers it: the two headers, borrowed from the request, null when
+/// it sent none.
+pub const Asked = struct {
+    /// `Accept`.
+    accept: ?[]const u8 = null,
+    /// `Sec-Fetch-Mode`.
+    fetch_mode: ?[]const u8 = null,
+};
+
+/// Whether a request that named no file is a browser opening a page, which is
+/// the question `.navigations` asks before it answers with one (ADR 087).
 ///
-/// A leading dot is not one — `/.well-known/x` and `/.env` are names rather
-/// than extensions — and a trailing dot is not one either, because there is
-/// nothing after it to be the type.
-fn hasExtension(path: []const u8) bool {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/');
-    const name = if (slash) |at| path[at + 1 ..] else path;
-    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
-    return dot > 0 and dot + 1 < name.len;
+/// **The browser says so when it can.** Every current browser sends
+/// `Sec-Fetch-Mode: navigate` on a page load, a reload and a followed link,
+/// and `cors`, `no-cors` or `same-origin` on a `fetch`, a `<script src>` and
+/// an `<img>`. When the header is there it is the whole answer, whatever
+/// `Accept` says.
+///
+/// **Without it, `Accept` has to ask for HTML by name.** A client old enough
+/// to send no fetch metadata (and any browser on plain HTTP away from
+/// `localhost`, where it is withheld) still opens a page with `text/html` at
+/// the front of its list. `*/*` is not a navigation: it is what `curl`, a
+/// health check, a `<script src>` and most of `fetch()` send, so a missing
+/// asset or a mistyped API path is a 404 naming it, never a page.
+///
+/// Nothing is read from the path. The extension test this replaced guessed
+/// for the client that said nothing; that client now gets a 404, which is the
+/// one answer it cannot mistake for success.
+pub fn navigational(asked: Asked) bool {
+    if (asked.fetch_mode) |mode| return std.ascii.eqlIgnoreCase(std.mem.trim(u8, mode, " \t"), "navigate");
+    return accept_mod.asks(asked.accept, "text/html") == .named;
 }
 
 pub const File = struct {
@@ -391,17 +430,17 @@ pub const Set = struct {
     /// The page this set answers a miss under its prefix with, if it has one
     /// and if this request is the kind it is for.
     ///
-    /// `accept_header` is the request's `Accept`, or null when it sent none.
-    /// A set configured `.any_path` never asks.
+    /// `asked` is what the request said about itself. A set configured
+    /// `.any_path` never reads it.
     pub fn fallbackFor(
         self: *const Set,
         path: []const u8,
-        accept_header: ?[]const u8,
+        asked: Asked,
     ) ?*const File {
         const page = self.fallback orelse return null;
         if (!underPrefix(self.prefix, path)) return null;
         if (self.fallback_for == .any_path) return page;
-        return if (navigational(path, accept_header)) page else null;
+        return if (navigational(asked)) page else null;
     }
 
     /// Where a file this Set handed back sits in `files`, for a caller
@@ -773,7 +812,7 @@ pub fn load(
                 .url = try gpa.dupe(u8, url),
                 .content_type = content_type,
                 .etag = try etagForSpilled(gpa, stat.mtime.nanoseconds, stat.size),
-                .cache_control = options.cache_control,
+                .cache_control = cacheControlFor(options.cache_rules, options.cache_control, entry.path),
                 .contents = .{ .spilled = .{
                     .dir = serving,
                     .path = relative,
@@ -834,7 +873,7 @@ pub fn load(
             .url = try gpa.dupe(u8, url),
             .content_type = content_type,
             .etag = try etagFor(gpa, bytes),
-            .cache_control = options.cache_control,
+            .cache_control = cacheControlFor(options.cache_rules, options.cache_control, entry.path),
             .contents = .{ .held = .{
                 .bytes = bytes,
                 .gzip = packed_bytes,
@@ -909,8 +948,8 @@ pub fn load(
 /// `@embedFile` has to be written by the caller: its path is relative to
 /// the file it is written in and the file has to be inside that module, so
 /// nothing in nilo can name a caller's `dist/`. The list is the whole of
-/// what the caller writes, and a build step that walks a directory into one
-/// is theirs until two of them have written the same one (ADR 009).
+/// what the caller writes, or `embedDir` in nilo's `build.zig` writes it from
+/// a directory (ADR 009).
 pub const Embedded = struct {
     /// Where the file sits in the tree, relative and with forward slashes:
     /// `"index.html"`, `"assets/app.js"`. Joined onto the URL prefix the
@@ -933,6 +972,7 @@ pub const Embedded = struct {
 pub const EmbedOptions = struct {
     index: []const u8 = (Options{}).index,
     cache_control: []const u8 = (Options{}).cache_control,
+    cache_rules: []const CacheRule = (Options{}).cache_rules,
     spa_fallback: []const u8 = (Options{}).spa_fallback,
     spa_fallback_for: Options.Fallback = (Options{}).spa_fallback_for,
     compress: bool = (Options{}).compress,
@@ -998,7 +1038,7 @@ pub fn embed(
 
         file.url = try gpa.dupe(u8, url);
         file.content_type = contentTypeFor(url);
-        file.cache_control = options.cache_control;
+        file.cache_control = cacheControlFor(options.cache_rules, options.cache_control, entry.path);
         file.etag = try etagFor(gpa, entry.bytes);
 
         const held = &file.contents.held;
@@ -1459,36 +1499,34 @@ test "the SPA fallback catches unknown paths but not unknown prefixes" {
 
     try testing.expectEqualStrings("/app.js", set.find("/app.js").?.url);
     // A browser reload deep inside a client-side route.
-    const browser = "text/html,application/xhtml+xml,*/*;q=0.8";
     try testing.expect(set.find("/users/42") == null);
     try testing.expectEqualStrings("/index.html", set.fallbackFor("/users/42", browser).?.url);
 }
+
+const browser: Asked = .{
+    .accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    .fetch_mode = "navigate",
+};
+const old_browser: Asked = .{ .accept = "text/html,application/xhtml+xml,*/*;q=0.8" };
+const script: Asked = .{ .accept = "*/*", .fetch_mode = "no-cors" };
+const fetch_any: Asked = .{ .accept = "*/*", .fetch_mode = "cors" };
 
 test "a fallback answers a page a browser asked for and not an asset that is gone" {
     var set = try fakeSet(testing.allocator, "/", &.{ "/index.html", "/app.js" });
     defer set.deinit();
     set.fallback = set.lookup("/index.html").?;
 
-    const browser = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
-    const script = "*/*";
-
     // The whole point: a stale build hash is a 404 naming the file rather
     // than a page a parser then reports a syntax error on (ADR 087). A
     // `<script src>` is the request that fetches one, and it says `*/*`.
     try testing.expect(set.fallbackFor("/app.abc123.js", script) == null);
     // Nor is a JSON call to a path that is not a route a page.
-    try testing.expect(set.fallbackFor("/api/orders", "application/json") == null);
+    try testing.expect(set.fallbackFor("/api/orders", .{ .accept = "application/json", .fetch_mode = "cors" }) == null);
 
     // Somebody typing that same URL into the address bar is a different
-    // request and gets the page: they asked for HTML and there is one.
-    // Nothing fetches a script this way, which is what makes the two
-    // separable at all.
+    // request and gets the page: it is a navigation and there is a page.
     try testing.expectEqualStrings("/index.html", set.fallbackFor("/app.abc123.js", browser).?.url);
-
-    // A deep link still is one, however it arrives.
     try testing.expectEqualStrings("/index.html", set.fallbackFor("/users/42", browser).?.url);
-    try testing.expectEqualStrings("/index.html", set.fallbackFor("/users/42", script).?.url);
-    try testing.expectEqualStrings("/index.html", set.fallbackFor("/users/42", null).?.url);
 
     // And nothing outside the prefix is this set's business either way.
     var under = try fakeSet(testing.allocator, "/app", &.{"/app/index.html"});
@@ -1497,34 +1535,45 @@ test "a fallback answers a page a browser asked for and not an asset that is gon
     try testing.expect(under.fallbackFor("/other/42", browser) == null);
 }
 
+test "a fetch or a curl that accepts anything is not a navigation, whatever the path looks like" {
+    var set = try fakeSet(testing.allocator, "/", &.{ "/index.html", "/app.js" });
+    defer set.deinit();
+    set.fallback = set.lookup("/index.html").?;
+
+    // The bug this rule exists for: `fetch('/api/nope')` sends `*/*` and used
+    // to receive the page with a 200, so a typo looked like success.
+    try testing.expect(set.fallbackFor("/api/nope", fetch_any) == null);
+    try testing.expect(set.fallbackFor("/api/nope", .{ .accept = "*/*" }) == null);
+    try testing.expect(set.fallbackFor("/users/42", .{}) == null);
+}
+
+test "the fetch metadata decides when the browser sent it, and Accept decides when it did not" {
+    // Sent, and it wins in both directions.
+    try testing.expect(navigational(.{ .fetch_mode = "navigate" }));
+    try testing.expect(navigational(.{ .fetch_mode = "Navigate", .accept = "*/*" }));
+    try testing.expect(!navigational(.{ .fetch_mode = "cors", .accept = "text/html" }));
+    try testing.expect(!navigational(.{ .fetch_mode = "no-cors", .accept = "text/html,*/*" }));
+    try testing.expect(!navigational(.{ .fetch_mode = "same-origin" }));
+    try testing.expect(!navigational(.{ .fetch_mode = "websocket" }));
+
+    // Not sent: a client that lists HTML by name is opening a page.
+    try testing.expect(navigational(old_browser));
+    try testing.expect(navigational(.{ .accept = "text/html" }));
+    // `*/*` alone, no header at all, and a refusal are none of them one.
+    try testing.expect(!navigational(.{ .accept = "*/*" }));
+    try testing.expect(!navigational(.{}));
+    try testing.expect(!navigational(.{ .accept = "application/json" }));
+    try testing.expect(!navigational(.{ .accept = "text/html;q=0, */*" }));
+}
+
 test "a set told to answer any path does what it did before 0.2.0" {
     var set = try fakeSet(testing.allocator, "/", &.{ "/index.html", "/app.js" });
     defer set.deinit();
     set.fallback = set.lookup("/index.html").?;
     set.fallback_for = .any_path;
 
-    try testing.expectEqualStrings("/index.html", set.fallbackFor("/app.abc123.js", "*/*").?.url);
-    try testing.expectEqualStrings("/index.html", set.fallbackFor("/api/orders", "application/json").?.url);
-}
-
-test "what a navigation is, when the client said nothing about it" {
-    // An extension means an asset, and a bare segment means a route.
-    try testing.expect(!navigational("/app.abc123.js", null));
-    try testing.expect(!navigational("/assets/logo.png", "*/*"));
-    try testing.expect(navigational("/users/42", null));
-    try testing.expect(navigational("/", null));
-    try testing.expect(navigational("/settings/", "*/*"));
-
-    // A leading dot is a name rather than an extension, and a trailing one
-    // has nothing after it to be a type.
-    try testing.expect(navigational("/.well-known/thing", null));
-    try testing.expect(navigational("/report.", null));
-
-    // What the client says wins over the shape of the path, in both
-    // directions: a browser asking for a page with a dot in the route gets
-    // one, and an asset request that named a type does not.
-    try testing.expect(navigational("/releases/v1.2", "text/html"));
-    try testing.expect(!navigational("/users/42", "application/json"));
+    try testing.expectEqualStrings("/index.html", set.fallbackFor("/app.abc123.js", script).?.url);
+    try testing.expectEqualStrings("/index.html", set.fallbackFor("/api/orders", fetch_any).?.url);
 }
 
 // ---- gzip, done once when the App is built ----
@@ -2175,6 +2224,90 @@ test "a URL listed twice is found by name, whichever way the two were spelled" {
     // An empty list is a Set that answers nothing, and closes.
     var empty = try embed(gpa, "/", &.{}, .{});
     empty.deinit();
+}
+
+fn listItems() []const u8 {
+    return "items";
+}
+
+fn makeItem() []const u8 {
+    return "made";
+}
+
+test "a cache rule gives a file its own header and every other file the default" {
+    const rules = [_]CacheRule{
+        .{ .prefix = "assets/", .cache_control = "public, max-age=31536000, immutable" },
+        .{ .suffix = ".map", .cache_control = "" },
+        .{ .prefix = "assets/", .suffix = ".txt", .cache_control = "never reached" },
+    };
+    try testing.expectEqualStrings("public, max-age=31536000, immutable", cacheControlFor(&rules, "no-cache", "assets/app.3f9a.js"));
+    // The first rule that matches wins, so the narrower one below it is dead
+    // here, and a rule can switch the header off.
+    try testing.expectEqualStrings("public, max-age=31536000, immutable", cacheControlFor(&rules, "no-cache", "assets/notes.txt"));
+    try testing.expectEqualStrings("", cacheControlFor(&rules, "no-cache", "app.js.map"));
+    try testing.expectEqualStrings("no-cache", cacheControlFor(&rules, "no-cache", "index.html"));
+    try testing.expectEqualStrings("no-cache", cacheControlFor(&.{}, "no-cache", "assets/app.js"));
+}
+
+test "a single-page app is one embedded set: hashed assets cached for good, the page never, and a typo in the API a 404" {
+    const gpa = testing.allocator;
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.get("/api/items", listItems);
+    try app.post("/api/make", makeItem);
+    try app.embeddedWith("/", &embedded_tree, .{
+        .spa_fallback = "index.html",
+        .cache_control = "no-cache",
+        .cache_rules = &.{.{ .prefix = "assets/", .cache_control = "public, max-age=31536000, immutable" }},
+    });
+
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+
+    // One set, two policies, settled at load.
+    const js = try client.get(&app, "/assets/app.js");
+    try testing.expectEqualStrings("public, max-age=31536000, immutable", js.header("Cache-Control").?);
+    const index = try client.get(&app, "/index.html");
+    try testing.expectEqualStrings("no-cache", index.header("Cache-Control").?);
+
+    // A reload on a client-side route is the page, with the page's policy.
+    const reload = try client.send(
+        &app,
+        "GET /users/42 HTTP/1.1\r\nHost: t\r\nSec-Fetch-Mode: navigate\r\nAccept: text/html\r\n\r\n",
+    );
+    try testing.expectEqual(@as(u16, 200), reload.status);
+    try testing.expectEqualStrings(embedded_tree[0].bytes, reload.body);
+    try testing.expectEqualStrings("no-cache", reload.header("Cache-Control").?);
+    const head = try client.send(
+        &app,
+        "HEAD /users/42 HTTP/1.1\r\nHost: t\r\nSec-Fetch-Mode: navigate\r\n\r\n",
+    );
+    try testing.expectEqual(@as(u16, 200), head.status);
+
+    // The mistake this exists for: a `fetch` or a `curl` at an API path that
+    // is not there is a 404 and not the page, and there is no catch-all
+    // route standing in for that.
+    const typo = try client.send(&app, "GET /api/nope HTTP/1.1\r\nHost: t\r\nAccept: */*\r\nSec-Fetch-Mode: cors\r\n\r\n");
+    try testing.expectEqual(@as(u16, 404), typo.status);
+    try testing.expect(std.mem.indexOf(u8, typo.body, "/api/nope") != null);
+    const bare = try client.get(&app, "/api/nope");
+    try testing.expectEqual(@as(u16, 404), bare.status);
+    const posted = try client.send(&app, "POST /api/nope HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n");
+    try testing.expectEqual(@as(u16, 404), posted.status);
+
+    // A path some route spells keeps its 405, for a caller that is not a
+    // browser opening a page, and the route itself is untouched.
+    const wrong_verb = try client.send(&app, "GET /api/make HTTP/1.1\r\nHost: t\r\nAccept: */*\r\n\r\n");
+    try testing.expectEqual(@as(u16, 405), wrong_verb.status);
+    const wrong_verb_put = try client.send(&app, "PUT /api/items HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n");
+    try testing.expectEqual(@as(u16, 405), wrong_verb_put.status);
+    const route = try client.get(&app, "/api/items");
+    try testing.expectEqual(@as(u16, 200), route.status);
+    try testing.expectEqualStrings("items", route.body);
+
+    // And a missing bundle named by a `<script src>` is a 404, not a page.
+    const stale = try client.send(&app, "GET /assets/app.old.js HTTP/1.1\r\nHost: t\r\nAccept: */*\r\nSec-Fetch-Mode: no-cors\r\n\r\n");
+    try testing.expectEqual(@as(u16, 404), stale.status);
 }
 
 test "a name with a space or a non-ASCII character is served at the URL a browser sends for it" {

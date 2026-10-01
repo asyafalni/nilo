@@ -58,11 +58,27 @@ A handler that yields between short stretches is no longer reported as one long 
 
 The clock starts before the middleware chain and stops after it, rather than around the terminal handler: a middleware that writes an audit row to a file after `next.run` stops the thread exactly as dead as a handler that does.
 
+### A park nobody announced: the loop's turn
+
+The brackets above are the waits nilo was told about. A handler can also wait through the server's `Io` ([ADR 244](./244-a-handler-is-given-the-loop-it-runs-on.md)): a `std.Io.Event`, a `std.Io.Queue`, a service parked on its own socket. That parks the fiber and frees the thread, and says nothing to the watchdog, so a wait past `block_warning_ms` was reported as a handler holding its thread, with advice to hand it to `nilo.blocking`, which would have made it worse. A false report teaches people to ignore the real one.
+
+**The run loop already knows.** zio writes `Executor.tick_started_at`, a `CLOCK_MONOTONIC` stamp, once per turn of its run loop, after the poll and before the batch of ready fibers. A fiber cannot be running while a turn ends, so **a turn newer than a stretch's start means the fiber parked at some point, whatever it waited on**. `engine/zio.zig` reads it as `loopTurnNanos()` (re-exported by `bulkhead.zig`; zio does not export `Executor`, so the field is reached through the type of `Runtime.executors`, and ADR 001 still holds: only that file names zio).
+
+The check runs only for a stretch that is already past the limit, in `watchdog.reportIfTooLong`, after the early exit every request takes:
+
+1. Ask the loop for its last turn. With no loop (`testing.Client`, in-memory, a pool thread) there is none, and the stretch is what the brackets said.
+2. If the turn is newer than the stretch's start by more than 12 ms, the fiber parked, and the stretch that counts is the one **since that turn**: a park of 400 ms is not a hold, and a park followed by a 300 ms spin is a hold of 300 ms. The 12 ms is the slack between the stretch's start, a `CLOCK_MONOTONIC_COARSE` reading that trails the real clock by up to a kernel tick, and the exact stamp; a park shorter than that is charged from the start of the stretch, which overstates a hold by under 12 ms against a quarter of a second.
+3. A threadlocal `charged_turn` records the turn a report was made in. One turn runs a whole batch of fibers and they share its stamp, so a fiber that blocks for 300 ms would make every fiber after it in the batch look 300 ms into its stretch. Once a turn is charged to one holder, nobody else is charged for it; the next turn tells the truth.
+
+The brackets stay. With no executor they are the only signal, and they give exact ends: a `nilo.sleep` reopens the stretch at the moment the fiber resumed, where the turn only says it was some time since. `Watch` is unchanged and nothing is stored per connection or per request.
+
+**What it still cannot tell.** The turn says the fiber parked, not that the thread was free. A fiber that parks and then blocks in the kernel is a hold from the turn that resumed it, and is reported. A fiber with no request that blocks (an `app.spawn` writer) is never reported by itself, and can be blamed on the next request that ends a stretch in the same turn after an unannounced park: the executor keeps `current_task` for the fiber running now, and no record of the one before it, so there is nothing cheap to tell them apart. The advice in the report is right for the thread either way.
+
 ### What it does not see
 
-**A request that took the connection over** is watched by the message or the chunk, not excused: see the WebSocket row above. **A handler that blocks for less than the threshold, every time**, is a real ceiling on throughput that goes unmentioned; the threshold is a knob, not a claim. **Fibers as a whole**: this reports one request holding its thread, not a thread that is oversubscribed or a pool that is saturated.
+**A request that took the connection over** is watched by the message or the chunk, not excused: see the WebSocket row above. **A handler that blocks for less than the threshold, every time**, is a real ceiling on throughput that goes unmentioned; the threshold is a knob, not a claim. **Fibers as a whole**: this reports one request holding its thread, not a thread that is oversubscribed or a pool that is saturated. **A fiber that is not on zio's loop** has no turn to ask, so a wait through an `Io` of another kind is timed as the handler running.
 
-**A service that waits through its own `Io`**, pg.zig on a socket, `nilo_fetch`'s client, a pool a caller queues on, is a park the fiber makes without going through any of the rows above, and used to be reported as a handler holding its thread with advice to hand it to `nilo.blocking`, which would have made it worse. [ADR 210](./210-a-services-wait-on-its-own-socket-is-a-park.md) closed that: `core.Limits.VTable` carries the same `waiting`/`waited` pair, and a service that parks on its own `Io` reports through it. `nilo_fetch` does not yet call it and still draws the false report on a slow outbound call.
+**A service that waits through its own `Io`**, pg.zig on a socket, `nilo_fetch`'s client, a pool a caller queues on, used to be reported too. [ADR 210](./210-a-services-wait-on-its-own-socket-is-a-park.md) closed it for the services that say so through `core.Limits.VTable`'s `waiting`/`waited` pair, and the turn closes it for the rest on a real loop, including `nilo_fetch`, which does not call the pair.
 
 ## What was rejected
 
@@ -82,7 +98,7 @@ The clock starts before the middleware chain and stops after it, rather than aro
 
 **Measure the fiber's CPU time instead of wall time between parks** (ADR 210's question). The operating system accounts CPU per thread, not per fiber, and a thread serves many; there is no clock to read.
 
-**Have the Engine record every suspend** (ADR 210's question). zio knows when a fiber parks, and an Engine hook would catch every service at once. The right long-term shape and the wrong first change: it reaches into the runtime's scheduler for something two vtable entries already say from the outside.
+**Have the Engine record every suspend** (ADR 210's question). zio knows when a fiber parks, and an Engine hook would catch every service at once. zio has no switch hook and counts none, so this meant patching the runtime. What it does keep, a stamp per run-loop turn, is enough to answer the question that matters (did the fiber park since the stretch began), and is read with no change to zio.
 
 **Exempt `db.*` calls by name** (ADR 210's question). The watchdog has no view of what a handler called, only of whether it parked, and a driver that truly blocks a thread, one that does not go through `Io`, should still be caught.
 
@@ -91,9 +107,9 @@ The clock starts before the middleware chain and stops after it, rather than aro
 | Axis | Cost |
 |---|---|
 | Allocations per request | none. A handler that computes rather than waits never calls `blocking` or `sleep`, and pays nothing for their existence. |
-| Memory per idle connection | `Watch` carries two slices (32 bytes) on `fail.InFlight`, which every connection already holds; the strings are arena slices pointed at, not copied. Against the 4,669-byte framework floor ([ADR 062](./062-where-a-connection-waits-is-what-it-costs.md)), 32 bytes. |
-| Throughput and p99 | on, by default, in every optimize mode, because the bug lives in production. The mechanism is one subtraction and one comparison per wait, on top of a clock read, and nothing on the path between `begin` and `finish` with no wait in between; `block_warning_ms = 0` turns it off and every call becomes a null check. |
-| Binary size | not separately tracked; the detector is part of the request path rather than a module a program opts out of linking. |
+| Memory per idle connection | unchanged by the loop's turn: no field was added, and `bench/mem.py` reads 5,816 bytes at 100 connections and 5,247 at 1,000 before and after. `Watch` carries two slices (32 bytes) on `fail.InFlight`, which every connection already holds; the strings are arena slices pointed at, not copied. Against the 4,669-byte framework floor ([ADR 062](./062-where-a-connection-waits-is-what-it-costs.md)), 32 bytes. |
+| Throughput and p99 | on, by default, in every optimize mode, because the bug lives in production. The mechanism is one subtraction and one comparison per wait, on top of a clock read, and nothing on the path between `begin` and `finish` with no wait in between; `block_warning_ms = 0` turns it off and every call becomes a null check. **The loop's turn adds nothing to it**: it is read only for a stretch already past the limit, so a request that does not wait long executes the same instructions as before (one register move more in `reportIfTooLong` before its early exit, read from the disassembly). Interleaved ReleaseFast runs of the benchmark server show no difference outside the noise ([`bench/result/http.md`](../../bench/result/http.md)). |
+| Binary size | not separately tracked; the detector is part of the request path rather than a module a program opts out of linking. The loop's turn is 272 bytes of the stripped `ReleaseFast` benchmark server. |
 
 **A coarse clock is what keeps the per-request cost low.** `bulkhead.coarseNanos` reads `CLOCK_MONOTONIC_COARSE`, which only moves once a millisecond, against a quarter-second threshold where that resolution is not a compromise. Re-measured on Zig 0.16 ([ADR 041](./041-core-knows-what-time-it-is.md)): the coarse read costs about 2ns against about 15ns for the exact monotonic clock read the same way, through `std.posix.system` on both the libc and non-libc build, an earlier reading that had the non-libc path far slower did not survive Zig 0.16's own vDSO handling and is corrected there. `Watch` holds a pointer on `Ctx` rather than looking one up through the fiber slot on the response-write path; code with no `Ctx` to hand, `nilo.blocking` and friends, still pays the lookup and does not care, because a request reaching one of those is about to park anyway.
 

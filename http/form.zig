@@ -331,6 +331,7 @@ pub fn absentValue(comptime f: std.builtin.Type.StructField) f.type {
 
 /// Fill `T` from an already-parsed form.
 fn fill(comptime T: type, arena: std.mem.Allocator, fields: Fields, lifetime: *const str_mod.Lifetime) !T {
+    comptime @setEvalBranchQuota(convert.budget(@typeInfo(T).@"struct".fields));
     var out: T = undefined;
     inline for (@typeInfo(T).@"struct".fields) |f| {
         const label = "\"" ++ f.name ++ "\"";
@@ -393,6 +394,7 @@ fn fillCollecting(
     lifetime: *const str_mod.Lifetime,
     outcomes: *[@typeInfo(T).@"struct".fields.len]convert.Outcome,
 ) T {
+    comptime @setEvalBranchQuota(convert.budget(@typeInfo(T).@"struct".fields));
     var out: T = undefined;
     inline for (@typeInfo(T).@"struct".fields, 0..) |f, i| {
         const Inner = switch (@typeInfo(f.type)) {
@@ -573,6 +575,7 @@ pub fn checkFields(comptime T: type, comptime what: []const u8) void {
 /// served by a urlencoded form at all.
 pub fn holdsAFile(comptime T: type) bool {
     comptime {
+        @setEvalBranchQuota(convert.budget(@typeInfo(T).@"struct".fields));
         for (@typeInfo(T).@"struct".fields) |f| {
             const Inner = switch (@typeInfo(f.type)) {
                 .optional => |o| o.child,

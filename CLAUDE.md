@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**nilo is a toolkit for Zig 0.16: eleven modules, of which the largest is an HTTP server.** What they share is one idea: **your types are the contract, and the compiler is the check.** A plain Zig function is a route, and its argument list produces routing, typed input, a 400 for anything that does not fit, and an OpenAPI document. A plain struct is a table, and its fields produce the SQL before the program starts. Nothing is annotated.
+**nilo is a toolkit for Zig 0.16: twelve modules, of which the largest is an HTTP server.** What they share is one idea: **your types are the contract, and the compiler is the check.** A plain Zig function is a route, and its argument list produces routing, typed input, a 400 for anything that does not fit, and an OpenAPI document. A plain struct is a table, and its fields produce the SQL before the program starts. Nothing is annotated.
 
 **A module gets built because the job is common, not because it is interesting**, and it gets in only if it is expressible as a type the caller already wrote, checked while compiling, with its cost written down (ADR 017). The README's three words, helpful, quick, cheerful, are the order the trades are made in.
 
@@ -28,7 +28,7 @@ The repository is written to be worked on by somebody who did not write it, a pe
 | Layer | Files | What it is |
 |---|---|---|
 | **Core** | `core/` | `Str`, the Scope, the clock, percent coding: the vocabulary every layer agrees about. Needs no loop, names no Engine, so `zig test core/core.zig` runs all of it. A file gets in by being needed by two layers (ADR 057). |
-| **Tools** | `id/`, `config/`, `pw/`, `cache/`, `jwt/` | one job each, no event loop. They *may* name `nilo_core` and none does: that would cost running under a plain `zig test`, the property that decides the layer (ADR 038, ADR 039). `cache/` spins because `std.Io.Mutex.lock` takes an `Io` this layer has none of, so nothing that waits goes inside its critical section. |
+| **Tools** | `id/`, `config/`, `pw/`, `cache/`, `jwt/`, `proto/` | one job each, no event loop. They *may* name `nilo_core` and none does: that would cost running under a plain `zig test`, the property that decides the layer (ADR 038, ADR 039). `cache/` spins because `std.Io.Mutex.lock` takes an `Io` this layer has none of, so nothing that waits goes inside its critical section. |
 | **Fitting** | `fetch/`, `job/` | borrows the loop, owns no destination: an HTTP client, and a queue whose store is handed to it (`job.Table(Db)` takes the caller's Db type, ADR 160). Import `nilo_core` only; tests run on `std.Io.Threaded` with no Engine, which is the layer's entry condition (ADR 061). |
 | **Services** | `sql/`, `s3/` | borrow the loop and hold a named system: a Postgres pool, a SQLite file, an object store. A SQLite statement blocks with nothing to wait on, which is why `sqlite.Options.threading` has no default (ADR 064). `s3/` imports a Fitting (ADR 063). Neither may name `nilo_http`. |
 | **Engine** | `http/engine/zio.zig` | accept, read, write. **The only file allowed to name zio** (ADR 001). |
@@ -60,7 +60,7 @@ zig build test         # the loop: the suite in Debug, the refusals, every modul
                        #   test-sql, plus layering, adr-check, docs-check and snippets
 zig build test-all     # the above, the suite in ReleaseSafe, test-sql and refusals-sql.
                        #   What CI runs, and the whole gate
-zig build test-{core,id,config,pw,cache,jwt,fetch,job,s3,dev}   # one module, both modes,
+zig build test-{core,id,config,pw,cache,jwt,proto,fetch,job,s3,dev}   # one module, both modes,
                        #   plus its refusals where it has a table
 zig build test-fetch-engine  # an outbound deadline firing against a real port; on `test`
 zig build test-sql     # nilo_sql, with test-job-sql and refusals-sql; Postgres if DATABASE_URL reaches one,
@@ -69,9 +69,9 @@ zig build layering     # no module imports upward or sideways
 zig build adr-check    # ADR files, their Topic lines, and every ADR cited exists; on test
 zig build docs-check   # every doc page's head, prose, links and anchors, the map, the reference's heading list; on test
 zig build docs-index   # rewrite the reference's list of every heading after renaming or adding one
-zig build refusals     # the framework's table only; refusals-{sql,config,pw,cache,s3,job,fetch} for the others
+zig build refusals     # the framework's table only; refusals-{sql,config,pw,cache,s3,job,fetch,proto} for the others
 zig build snippets     # the documentation's marked snippets, which must compile
-zig build examples     # build every example; run-{hello,rest,orders,forms,spa,stream,chat,scheduled,outbound,sqlite}
+zig build examples     # build every example; run-{hello,rest,orders,forms,spa,embedded,stream,chat,scheduled,outbound,sqlite}
 zig build dev-{hello,…}  # an example restarted on a save to its Zig, and on nothing else (ADR 190)
 zig build fuzz -- --iterations 1000000 --seed 0x…   # generated requests at the parser; --frames for gRPC
 zig build fuzz-llhttp -Dllhttp -- --iterations 1000000   # the same heads read by llhttp too; fetches it, exits 1 on an undecided difference (ADR 231)
@@ -97,7 +97,7 @@ No `-Dtest-filter` is wired in, so build steps are all-or-nothing. What runs sta
 
 ```
 zig test http/range.zig --test-filter "a suffix range"   # also cookie, patch, names, json
-zig test core/core.zig                                   # and id/, config/, pw/, cache/, jwt/
+zig test core/core.zig                                   # and id/, config/, pw/, cache/, jwt/, proto/
 zig test --dep nilo_core -Mroot=fetch/fetch.zig -Mnilo_core=core/core.zig
 zig test --dep nilo_core -Mroot=job/job.zig -Mnilo_core=core/core.zig
 ```
@@ -134,7 +134,7 @@ The habits, each of which caught something here (the cases are under *Measuring*
 
 ## Conventions
 
-**Error messages are a feature, and a build step holds them.** Each file in `refusals/` (and `<module>/refusals/`) is a program written wrong on purpose that must fail with a message nilo wrote. Adding a comptime check means adding **both** a file and a row in the matching table in `build.zig`. **There are eight tables and eight steps**, one per module, and adding a row to one while running another is a check that silently never ran. Leave the `nilo: ` prefix off `.says`; the step supplies it, so a failure inside std cannot be recorded as passing. `.says` is matched with `endsWith`, so it is the whole tail of the message's first line. See `refusals/README.md` and ADR 026.
+**Error messages are a feature, and a build step holds them.** Each file in `refusals/` (and `<module>/refusals/`) is a program written wrong on purpose that must fail with a message nilo wrote. Adding a comptime check means adding **both** a file and a row in the matching table in `build.zig`. **There are nine tables and nine steps**, one per module, and adding a row to one while running another is a check that silently never ran. Leave the `nilo: ` prefix off `.says`; the step supplies it, so a failure inside std cannot be recorded as passing. `.says` is matched with `endsWith`, so it is the whole tail of the message's first line. See `refusals/README.md` and ADR 026.
 
 **A published snippet is a program, and a build step compiles it.** `<!-- compiles -->` above a fenced `zig` block in the README, the reference or a guide page makes `zig build snippets` compile it after `docs/snippets/types.zig`; `<!-- compiles: body -->` wraps loose statements in a function with `values.zig`. The block in the page is the only copy. These cache, so marking one is nearly free (ADR 068).
 

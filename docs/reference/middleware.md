@@ -167,7 +167,7 @@ try app.with(nilo.maxBody(1024)).post("/sign-in", signIn);
 
 ## `nilo.accept`
 
-**What the request's `Accept` header says about one media type.** One call, no allocation. It is what the single-page fallback uses to decide ([ADR 087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)).
+**What the request's `Accept` header says about one media type.** One call, no allocation. It is what the single-page fallback reads when a request sent no `Sec-Fetch-Mode` ([ADR 087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)).
 
 ```zig
 switch (nilo.accept.asks(c.header("Accept"), "text/html")) {

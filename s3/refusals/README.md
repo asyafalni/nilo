@@ -1,6 +1,6 @@
 # s3/refusals
 
-Ten programs written wrong on purpose. Each must fail to compile with a message
+Thirteen programs written wrong on purpose. Each must fail to compile with a message
 `nilo_s3` wrote; `zig build refusals-s3` checks the wording, and
 `zig build test-s3` depends on it.
 
@@ -14,6 +14,7 @@ plus the one that is a leak rather than a mistake:
 | `bucket_name_with_an_underscore.zig` | a name virtual-host addressing cannot carry |
 | `bucket_name_with_a_capital.zig` | the same, spelled the way it usually happens |
 | `bucket_name_like_an_address.zig` | a name shaped like an IP address |
+| `bucket_name_with_a_slash_by_path.zig` | a path-style name that would change the URL |
 | `a_secret_in_a_bucket_option.zig` | a credential compiled into the binary |
 | `presign_over_seven_days.zig` | a life SigV4 refuses |
 | `max_bytes_of_zero.zig` | a bucket that could never answer a get |

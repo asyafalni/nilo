@@ -83,6 +83,27 @@ the request body has a field "address.zip" this endpoint does not know. It takes
 "lines[1].qty" has to be a whole number, not text
 ```
 
+A body field that is an internally tagged union ([ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md)) is described the same way, naming the variant it was read as:
+
+```
+"condition.signal" is not one of the known variants (metrics, logs): "traces"
+the request body has a field "condition.metric_nme" the "metrics" variant does not know. It takes: signal, metric_name, agg (optional)
+the request body is missing "condition.signal", which names the variant: one of metrics, logs
+```
+
+A tagged union that is the whole body is described the same way, with the discriminator and the variants:
+
+```
+the request body is missing "kind", which names the variant: one of loose, tight, off
+"kind" is not one of the known variants (loose, tight, off): "nope"
+the request body has a field "x" the "tight" variant does not know. It takes: kind, n
+the request body is empty. This endpoint expects an object whose "kind" is one of loose, tight, off
+```
+
+**To accept a body that carries keys your type does not list**, say so on the type with `pub const nilo_json = .{ .unknown_fields = .ignore };`. That is for a webhook or an OTLP/HTTP JSON receiver whose sender adds fields over time; it applies to that struct alone and not to the ones it holds ([reference](../reference/handlers.md#skipping-the-keys-a-body-struct-does-not-know)).
+
+A struct with many fields lists the first of them and says how many it left out: `It takes: alpha, bravo, charlie, and 9 more`.
+
 That goes eight levels down, the same depth the API description and the staleness check follow. Below that there is no field name left to quote, so the 400 says which limit it hit instead of saying nothing:
 
 ```

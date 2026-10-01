@@ -85,6 +85,113 @@ The function takes the startup's `nilo.Run` first, then whatever it was register
 
 `app.start(io)` is for a program that never listens: a test, a script, a worker on `jobs.serveOn(io)`. Calling `listen()` after it is refused, because a service keeps the `Io` it was started on and `listen()` runs on a loop of its own (ADR 180).
 
+## A queue a handler fills and a fiber empties
+
+**When many requests need one thing done in order, once, for all of them, that thing is a fiber and the requests wait for it.** A write-ahead log is the case: one writer takes whatever has queued, writes it with one `fsync`, and wakes everyone whose bytes were in the batch. A handler gets the server's `std.Io` by asking for it, and puts its work on a `std.Io.Queue`, then waits on a `std.Io.Event` the writer sets ([ADR 244](../adr/244-a-handler-is-given-the-loop-it-runs-on.md)).
+
+<!-- compiles -->
+```zig
+const std = @import("std");
+const nilo = @import("nilo_http");
+
+const Append = struct {
+    bytes: []const u8,
+    done: std.Io.Event = .unset,
+    /// Set by the writer before `done`: false means it never reached disk.
+    written: bool = false,
+};
+
+const Wal = struct {
+    slots: [256]*Append = undefined,
+    queue: std.Io.Queue(*Append) = undefined,
+
+    /// In place: the queue points into `slots`, so a `Wal` returned by value
+    /// would leave it pointing at a copy that is gone.
+    fn init(self: *Wal) void {
+        self.queue = .init(&self.slots);
+    }
+
+    /// The one writer. `app.spawn` starts it; the server cancels it when the
+    /// shutdown grace period is over.
+    fn write(self: *Wal) void {
+        const io = nilo.io();
+        var batch: [64]*Append = undefined;
+        while (true) {
+            // Waits for one, takes whatever else is already there.
+            const n = self.queue.get(io, &batch, 1) catch break;
+            // …write batch[0..n] and sync once, true if it reached disk…
+            const ok = true;
+            for (batch[0..n]) |item| {
+                item.written = ok;
+                item.done.set(io);
+            }
+        }
+        // Cancelled. Close first, so no new append gets in, then answer every
+        // append still queued: each of their handlers is waiting on `done`.
+        self.queue.close(io);
+        while (true) {
+            const n = self.queue.getUncancelable(io, &batch, 1) catch return;
+            for (batch[0..n]) |item| item.done.set(io);
+        }
+    }
+};
+
+fn append(io: std.Io, wal: *Wal, c: *nilo.Ctx) !void {
+    var item: Append = .{ .bytes = (try c.body()).view() };
+    wal.queue.putOne(io, &item) catch |err| switch (err) {
+        error.Closed => return nilo.fail.status(503, "the log is shutting down", .{}),
+        else => |e| return e,
+    };
+    // From here the writer holds a pointer into this frame, so the handler
+    // waits for its answer even if it is cancelled.
+    item.done.waitUncancelable(io);
+    if (!item.written) return nilo.fail.status(503, "the log is shutting down", .{});
+}
+
+pub fn main() !void {
+    var app = nilo.App.init(std.heap.smp_allocator);
+    defer app.deinit();
+
+    var wal: Wal = .{};
+    wal.init();
+    try app.provide(&wal);
+    try app.post("/append", append);
+    try app.spawn(Wal.write, .{&wal});
+
+    try app.listen(.{});
+}
+```
+
+Four things make this safe.
+
+**A wait on the queue or the event parks the fiber, not the thread.** The `Io` is the loop the connections run on, so `putOne` and `wait` suspend the handler exactly as `nilo.sleep` does, and the writer is a fiber on the same loop.
+
+**The item lives on the handler's stack, so once it is queued the handler waits whatever happens.** After `putOne` the writer holds a pointer into the handler's frame, and a handler that returned on `error.Canceled` would leave that pointer dangling. `waitUncancelable` is what holds the frame until the writer answers, and the writer's promise is the other half: every append it takes or finds queued gets `done` set, written or not.
+
+**Shutdown ends the loop the way it ends `flushEvery`.** The server stops accepting, gives in-flight requests the grace period, and only then cancels the writer, so appends already waiting are still written. `get` then returns `error.Canceled`; the writer closes the queue, so a late `putOne` is `error.Closed`, and answers every append still queued with `written` false, so their handlers end with a 503 instead of waiting on an event nobody sets.
+
+**A long wait is not reported as a blocked thread.** The detector ([ADR 013](../adr/013-handlers-must-not-block-the-thread.md)) is not told about an `Io` wait, but it sees that the server's loop turned over while the handler waited, and a handler that parked has not held its thread. What it does report is the handler running for `block_warning_ms` (250 ms) without waiting, counted from when the wait ended. A writer that can stall still needs a deadline on its own write, because a queued handler cannot stop waiting.
+
+**To test it in memory, start the writer yourself.** `nilo.testing.Wired` has no server and cannot run `app.spawn`, but `io: std.Io` and `c.io()` answer a process-wide `std.Io.Threaded` there, and `wired.io()` hands a test the same one:
+
+```zig
+var wired = try nilo.testing.Wired.init(testing.allocator, .{});
+defer wired.deinit();
+
+var wal: Wal = .{};
+wal.init();
+try wired.app.provide(&wal);
+try wired.app.post("/append", append);
+
+var writing = try wired.io().concurrent(Wal.write, .{&wal});
+defer _ = writing.cancel(wired.io());
+
+const answer = try wired.post("/append", "{}");
+try testing.expectEqual(@as(u16, 200), answer.status);
+```
+
+`Wal.write` calls `nilo.io()`, which with no server running is that same `Threaded`, so the writer and the handler share one loop here as they do in production.
+
 ## What not to pass in
 
 **Do not pass a `Str` or use a fail function in background work.** The compiler catches neither, and both apply to `nilo.spawn` in the same way.

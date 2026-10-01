@@ -948,6 +948,10 @@ pub const Postgres = struct {
         // branch both answer `text` for it.
         if (types.isBytes(Inner)) return &.{"bytea"};
 
+        // A count of seconds or milliseconds is an integer column: its unit
+        // is the type's, and no column type carries one (`types.Unix`).
+        if (types.isUnix(Inner)) return intAccepts(@typeInfo(i64).int);
+
         if (types.declaredColumn(Inner)) |declared| {
             // **`timestamptz` only.** A `timestamp` column holds a wall clock
             // with no zone, and Postgres reads one against the session's zone
@@ -1067,6 +1071,7 @@ pub const Postgres = struct {
             .optional => |o| o.child,
             else => T,
         };
+        if (types.isUnix(Inner)) return &.{ "int8", "int4", "int2" };
         if (!types.isBytes(Inner) and types.asText(Inner) != null) return text_accepts;
         // What reads without a value that can fail to fit: a column as wide
         // as the field or narrower. The Wire reads a wider one too, range-
@@ -1608,10 +1613,17 @@ pub const SQLite = struct {
     ///   aliases, and really do accept a NULL.
     /// - not a view, which the branch above has already answered.
     ///
-    /// One case is left over and left alone: `PRIMARY KEY (id DESC)` over an
-    /// INTEGER column is not an alias either, and this answers `NO` for it.
-    /// That is a check that fails to fire rather than one that fires wrongly,
-    /// which is the direction this whole branch exists to move.
+    /// **A primary-key column that is not the rowid and has no `NOT NULL`
+    /// answers `UNKNOWN`, and is not `YES`** (ADR 050). SQLite lets a rowid
+    /// table hold a NULL in `TEXT PRIMARY KEY`, `INT PRIMARY KEY` or any
+    /// column of a composite key, a legacy quirk kept for compatibility; a
+    /// `WITHOUT ROWID` table enforces it and answers `notnull = 1` above.
+    /// Answering `YES` made every `id TEXT PRIMARY KEY` in a hand-written
+    /// schema an `?Str` in the Row. A NULL key is a corrupt row, not a value
+    /// the program models, and one that is actually read is refused by the
+    /// Wire (ADR 094), so the check declines to judge rather than claim
+    /// either answer. `PRIMARY KEY (id DESC)` over an INTEGER column, which
+    /// is not the alias either, lands here too.
     ///
     /// **The type it answers is the affinity, not the declared text** (ADR 055).
     /// It used to answer `upper(i.type)` and `accepts` wanted an exact name, so
@@ -1647,6 +1659,7 @@ pub const SQLite = struct {
         \\            WHEN i.pk = 1 AND upper(i.type) = 'INTEGER'
         \\                 AND (SELECT count(*) FROM pragma_table_info(?1) k
         \\                      WHERE k.pk > 0) = 1 THEN 'NO'
+        \\            WHEN i.pk > 0 THEN 'UNKNOWN'
         \\            ELSE 'YES' END
         \\FROM pragma_table_info(?1) i
         \\LEFT JOIN sqlite_master m ON m.name = ?1
@@ -1689,6 +1702,7 @@ pub const SQLite = struct {
         \\            WHEN i.pk = 1 AND upper(i.type) = 'INTEGER'
         \\                 AND (SELECT count(*) FROM pragma_table_info(m.name) k
         \\                      WHERE k.pk > 0) = 1 THEN 'NO'
+        \\            WHEN i.pk > 0 THEN 'UNKNOWN'
         \\            ELSE 'YES' END
         \\FROM sqlite_master m
         \\JOIN pragma_table_info(m.name) i
@@ -1734,7 +1748,7 @@ pub const SQLite = struct {
             else => T,
         };
         if (types.isBytes(Inner)) return &.{ "BLOB", "TEXT" };
-        if (Inner == types.Timestamp) return &.{ "INTEGER", "NUMERIC" };
+        if (Inner == types.Timestamp or types.isUnix(Inner)) return &.{ "INTEGER", "NUMERIC" };
         if (Inner == core.Str or types.asText(Inner) != null or types.declaredColumn(Inner) != null)
             return &.{ "TEXT", "NUMERIC", "BLOB" };
         if (types.listElement(Inner) != null) return null;
@@ -1796,7 +1810,7 @@ pub const SQLite = struct {
         // anything else.
         if (types.isBytes(Inner)) return &.{"BLOB"};
 
-        if (Inner == types.Timestamp) return &.{ "INTEGER", "NUMERIC" };
+        if (Inner == types.Timestamp or types.isUnix(Inner)) return &.{ "INTEGER", "NUMERIC" };
 
         // A type that declared its Postgres column name declared a Postgres
         // one. `jsonb` and `uuid` are both TEXT here, which is what SQLite
@@ -2498,4 +2512,14 @@ test "the tables a piece of SQL drops are read off its words, and a name that ca
 
     var doubled: Drops = .{ .text = "DROP TABLE \"a\"\"b\"" };
     try testing.expectError(error.Unreadable, doubled.next());
+}
+
+test "a Unix count is an integer column on both databases, so a moment column or a text one is refused" {
+    try testing.expectEqualStrings("int8", Postgres.accepts(types.UnixMillis).?[0]);
+    try testing.expectEqualStrings("int8", Postgres.columnType(?types.UnixSeconds).?);
+    try testing.expectEqualStrings("int8[]", Postgres.arrayOf(types.UnixMillis).?);
+    for (Postgres.accepts(types.UnixMillis).?) |name| try testing.expect(!std.mem.eql(u8, name, "timestamptz"));
+    try testing.expectEqualStrings("INTEGER", SQLite.columnType(types.UnixMillis).?);
+    for (SQLite.accepts(types.UnixSeconds).?) |name| try testing.expect(!std.mem.eql(u8, name, "TEXT"));
+    try testing.expectEqualStrings("int8", Postgres.reads(types.UnixMillis).?[0]);
 }

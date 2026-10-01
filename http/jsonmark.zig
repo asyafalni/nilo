@@ -97,6 +97,10 @@ pub const Mark = struct {
     /// The names spelled one at a time, which win over `rename_all`
     /// ([ADR 168](../docs/adr/168-one-field-can-be-spelled-on-its-own.md)).
     renames: []const Rename = &.{},
+    /// Whether a struct reading a request body skips a key it has no field for
+    /// instead of refusing it (`.unknown_fields = .ignore`, ADR 168). Per type:
+    /// a struct nested inside this one still answers for its own keys.
+    ignores_unknown: bool = false,
 
     /// Whether the marker changes how any field is spelled.
     pub fn renamesFields(self: Mark) bool {
@@ -187,28 +191,121 @@ pub fn of(comptime T: type) ?Mark {
                 mark.rename_all = caseOf(T, said.rename_all);
             } else if (std.mem.eql(u8, f.name, "rename")) {
                 mark.renames = renamesOf(T, said.rename);
+            } else if (std.mem.eql(u8, f.name, "unknown_fields")) {
+                mark.ignores_unknown = unknownFieldsOf(T, said.unknown_fields);
             } else @compileError(
                 "nilo: `" ++ naming.of(T) ++ "`'s `" ++ marker ++ "` has a field `" ++ f.name ++
                     "`, which is not something it can say.\n" ++
-                    "  A marker says three things: `tag`, the key the variant's name goes under; " ++
-                    "`rename_all`, how every name is spelled on the wire; and `rename`, the ones " ++
-                    "spelled on their own.\n" ++
+                    "  A marker says four things: `tag`, the key the variant's name goes under; " ++
+                    "`rename_all`, how every name is spelled on the wire; `rename`, the ones " ++
+                    "spelled on their own; and `unknown_fields`, whether a body key the struct " ++
+                    "has no field for is skipped.\n" ++
                     "    pub const " ++ marker ++ " = .{ .tag = \"signal\", .rename_all = .camelCase, " ++
                     ".rename = .{ .amount_minor = \"amountMinor\" } };",
             );
         }
 
-        if (mark.tag == null and !mark.renamesFields()) @compileError(
+        if (mark.tag == null and !mark.renamesFields() and !mark.ignores_unknown) @compileError(
             "nilo: `" ++ naming.of(T) ++ "`'s `" ++ marker ++ "` is empty, so it says nothing " ++
                 "about this type's JSON and nothing changes.\n" ++
                 "  Either say what it is for, or take the declaration off:\n" ++
                 "    pub const " ++ marker ++ " = .{ .tag = \"signal\" };        // a tagged union\n" ++
-                "    pub const " ++ marker ++ " = .{ .rename_all = .camelCase }; // a cased enum",
+                "    pub const " ++ marker ++ " = .{ .rename_all = .camelCase }; // a cased enum\n" ++
+                "    pub const " ++ marker ++ " = .{ .unknown_fields = .ignore }; // a body struct that skips unknown keys",
         );
 
         if (mark.tag) |key| checkTag(T, key);
         if (mark.renamesFields()) checkRenames(T, mark);
         return mark;
+    }
+}
+
+/// `said.unknown_fields`, which is `.ignore` or it is refused: an unknown key
+/// is a 400 by default (ADR 016) and the marker is the one way to say the
+/// opposite, so the default has no spelling of its own to write out. Only a
+/// struct has keys of its own to skip; a union reads the keys of the variant's
+/// payload struct, which is where the marker goes
+/// ([ADR 168](../docs/adr/168-one-field-can-be-spelled-on-its-own.md)).
+fn unknownFieldsOf(comptime T: type, comptime said: anytype) bool {
+    comptime {
+        const Said = @TypeOf(said);
+        if (Said != @TypeOf(.enum_literal)) @compileError(
+            "nilo: `" ++ naming.of(T) ++ "`'s `unknown_fields` is a " ++ naming.of(Said) ++
+                ", and it says what is done with a key the struct has no field for, which is " ++
+                "written as `.ignore`.\n" ++
+                "    pub const " ++ marker ++ " = .{ .unknown_fields = .ignore };",
+        );
+        const name = @tagName(said);
+        if (std.mem.eql(u8, name, "refuse")) @compileError(
+            "nilo: `" ++ naming.of(T) ++ "` says `.unknown_fields = .refuse`, which is what every " ++
+                "type already does with a key it has no field for, so it would change nothing.\n" ++
+                "  Take the entry off, or say `.ignore` to skip the key instead.",
+        );
+        if (!std.mem.eql(u8, name, "ignore")) @compileError(
+            "nilo: `" ++ naming.of(T) ++ "` says `.unknown_fields = ." ++ name ++ "`, which is not " ++
+                "something it can do with a key it has no field for.\n" ++
+                "  The one choice is `.ignore`; refusing is what a type does when it says nothing.",
+        );
+        switch (@typeInfo(T)) {
+            .@"struct" => {},
+            .@"enum" => @compileError(
+                "nilo: `" ++ naming.of(T) ++ "` says `.unknown_fields`, and it is an enum, which " ++
+                    "is read from one string and has no keys to skip.\n" ++
+                    "  `unknown_fields` belongs on the struct a body is read into.",
+            ),
+            .@"union" => @compileError(
+                "nilo: `" ++ naming.of(T) ++ "` says `.unknown_fields`, and it is a union, whose " ++
+                    "keys are the ones its variant's struct has.\n" ++
+                    "  Put `pub const " ++ marker ++ " = .{ .unknown_fields = .ignore };` on the " ++
+                    "struct each variant carries that should skip them.",
+            ),
+            else => @compileError(
+                "nilo: `" ++ naming.of(T) ++ "` says `.unknown_fields`, and it is a " ++
+                    @tagName(@typeInfo(T)) ++ ", which has no keys to skip.",
+            ),
+        }
+        return true;
+    }
+}
+
+/// Whether `T` skips a key it has no field for when it is read from a body.
+/// Asked by the reader for every struct it walks, so it is the marker's one
+/// declaration looked up first and nothing more for the type that has none.
+pub fn ignoresUnknown(comptime T: type) bool {
+    comptime {
+        if (@typeInfo(T) != .@"struct" or !@hasDecl(T, marker)) return false;
+        @setEvalBranchQuota(20_000);
+        return of(T).?.ignores_unknown;
+    }
+}
+
+/// Whether `T`, or anything it holds, skips unknown keys. What decides that a
+/// body read into `T` is bounded in depth even when `T` cannot nest without
+/// bound itself: a skipped value is read by no field, so nothing else holds
+/// it to a depth (ADR 226).
+pub fn ignoresUnknownWithin(comptime T: type) bool {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        return ignoringWithin(T, &.{});
+    }
+}
+
+fn ignoringWithin(comptime T: type, comptime path: []const type) bool {
+    comptime {
+        for (path) |seen| if (seen == T) return false;
+        const deeper = path ++ [_]type{T};
+        switch (@typeInfo(T)) {
+            .@"struct" => |s| {
+                if (ignoresUnknown(T)) return true;
+                for (s.fields) |f| if (ignoringWithin(f.type, deeper)) return true;
+            },
+            .@"union" => |u| for (u.fields) |f| if (ignoringWithin(f.type, deeper)) return true,
+            .optional => |o| return ignoringWithin(o.child, deeper),
+            .pointer => |p| return ignoringWithin(p.child, deeper),
+            .array => |a| return ignoringWithin(a.child, deeper),
+            else => {},
+        }
+        return false;
     }
 }
 
@@ -822,9 +919,16 @@ fn Reader(comptime T: type) type {
 
             inline for (@typeInfo(T).@"union".fields, comptime wireNames(T)) |f, on_the_wire| {
                 if (std.mem.eql(u8, arm, on_the_wire)) {
-                    if (f.type == void) return @unionInit(T, f.name, {});
+                    if (f.type == void) {
+                        // A key beside a variant with no fields is a typo
+                        // like any other, and was dropped in silence.
+                        if (!options.ignore_unknown_fields) try refuseUnknown(void, gpa, span, options);
+                        return @unionInit(T, f.name, {});
+                    }
                     const payload = try @import("json.zig").parseLeaky(f.type, gpa, span, inner);
-                    if (!options.ignore_unknown_fields) try refuseUnknown(f.type, gpa, span, options);
+                    if (!options.ignore_unknown_fields and !comptime ignoresUnknown(f.type)) {
+                        try refuseUnknown(f.type, gpa, span, options);
+                    }
                     return @unionInit(T, f.name, payload);
                 }
             }
@@ -886,8 +990,10 @@ fn Reader(comptime T: type) type {
 
                 if (std.mem.eql(u8, name, key)) continue;
                 var known = false;
-                inline for (@typeInfo(Payload).@"struct".fields) |f| {
-                    if (std.mem.eql(u8, name, f.name)) known = true;
+                if (comptime Payload != void) {
+                    inline for (@typeInfo(Payload).@"struct".fields) |f| {
+                        if (std.mem.eql(u8, name, f.name)) known = true;
+                    }
                 }
                 if (!known) return error.UnknownField;
             }
@@ -1281,4 +1387,99 @@ test "a variant with no payload is a tag on its own" {
     // flatten and is not a mistake.
     const mark = comptime of(Step).?;
     try testing.expectEqualStrings("step", mark.tag.?);
+}
+
+const parseLeakyBody = @import("json.zig").parseLeaky;
+
+test "a struct that says .ignore has a mark that says so, and one that does not, does not" {
+    const Loose = struct {
+        pub const nilo_json = .{ .unknown_fields = .ignore };
+        id: u32,
+    };
+    const Cased = struct {
+        pub const nilo_json = .{ .rename_all = .camelCase, .unknown_fields = .ignore };
+        full_name: []const u8,
+    };
+    const Plain = struct { id: u32 };
+    const Renamed = struct {
+        pub const nilo_json = .{ .rename_all = .camelCase };
+        full_name: []const u8,
+    };
+
+    try testing.expect(comptime of(Loose).?.ignores_unknown);
+    try testing.expect(comptime of(Cased).?.ignores_unknown);
+    try testing.expect(comptime of(Cased).?.rename_all.? == .camelCase);
+    try testing.expect(!comptime of(Renamed).?.ignores_unknown);
+    try testing.expect(comptime ignoresUnknown(Loose));
+    try testing.expect(!comptime ignoresUnknown(Plain));
+    try testing.expect(!comptime ignoresUnknown(Renamed));
+    try testing.expect(!comptime ignoresUnknown(u32));
+}
+
+test "a struct that says .ignore skips the keys it has no field for, and only its own" {
+    const Loose = struct {
+        pub const nilo_json = .{ .unknown_fields = .ignore };
+        id: u32,
+    };
+    const Tight = struct { id: u32 };
+    const LooseOuter = struct {
+        pub const nilo_json = .{ .unknown_fields = .ignore };
+        inner: Tight,
+    };
+    const TightOuter = struct { inner: Loose };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const got = try parseLeakyBody(Loose, a, "{\"x\":{\"y\":[1,2]},\"id\":7,\"z\":null}", .{});
+    try testing.expectEqual(@as(u32, 7), got.id);
+    try testing.expectError(error.UnknownField, parseLeakyBody(Tight, a, "{\"id\":7,\"x\":1}", .{}));
+
+    // The parent's choice is the parent's, in both directions.
+    _ = try parseLeakyBody(LooseOuter, a, "{\"x\":1,\"inner\":{\"id\":1}}", .{});
+    try testing.expectError(error.UnknownField, parseLeakyBody(LooseOuter, a, "{\"inner\":{\"id\":1,\"x\":1}}", .{}));
+    _ = try parseLeakyBody(TightOuter, a, "{\"inner\":{\"id\":1,\"x\":1}}", .{});
+    try testing.expectError(error.UnknownField, parseLeakyBody(TightOuter, a, "{\"x\":1,\"inner\":{\"id\":1}}", .{}));
+
+    // Skipping a key is not skipping a mistake about one it knows.
+    try testing.expectError(error.DuplicateField, parseLeakyBody(Loose, a, "{\"id\":1,\"x\":0,\"id\":2}", .{}));
+    try testing.expectError(error.MissingField, parseLeakyBody(Loose, a, "{\"x\":0}", .{}));
+}
+
+test "a variant whose payload says .ignore skips unknown keys, and a sibling that does not refuses them" {
+    const Either = union(enum) {
+        pub const nilo_json = .{ .tag = "kind" };
+        pub const jsonParse = parseFor(@This());
+
+        loose: struct {
+            pub const nilo_json = .{ .unknown_fields = .ignore };
+            n: u8,
+        },
+        tight: struct { n: u8 },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const got = try read(Either, a, "{\"kind\":\"loose\",\"n\":3,\"extra\":{\"k\":[1]}}");
+    try testing.expectEqual(@as(u8, 3), got.loose.n);
+    try testing.expectError(error.UnknownField, read(Either, a, "{\"kind\":\"tight\",\"n\":3,\"extra\":1}"));
+}
+
+test "a type that reaches an ignoring struct is asked to bound what it skips" {
+    const Loose = struct {
+        pub const nilo_json = .{ .unknown_fields = .ignore };
+        id: u32,
+    };
+    const Holder = struct { items: []const ?Loose };
+    const Plain = struct { items: []const u32 };
+    const Node = struct { next: ?*const @This() = null };
+
+    try testing.expect(comptime ignoresUnknownWithin(Loose));
+    try testing.expect(comptime ignoresUnknownWithin(Holder));
+    try testing.expect(!comptime ignoresUnknownWithin(Plain));
+    // A type that reaches itself is the walk's own cycle, and ends it.
+    try testing.expect(!comptime ignoresUnknownWithin(Node));
 }

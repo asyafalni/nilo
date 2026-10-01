@@ -228,6 +228,7 @@ pub fn assertOne(
 pub fn assertFlat(comptime Row: type, comptime call: []const u8) void {
     comptime {
         if (!row_mod.isRow(Row)) return;
+        @setEvalBranchQuota(row_mod.budget(Row));
         for (@typeInfo(Row).@"struct".fields) |f| {
             switch (row_mod.kindWith(Row, f.name, f.type)) {
                 .parent, .children => @compileError(
@@ -247,6 +248,7 @@ pub fn assertFlat(comptime Row: type, comptime call: []const u8) void {
 /// beside the columns (ADR 178).
 pub fn columnFields(comptime Row: type) []const std.builtin.Type.StructField {
     comptime {
+        @setEvalBranchQuota(row_mod.budget(Row));
         const all = @typeInfo(Row).@"struct".fields;
         var out: [all.len]std.builtin.Type.StructField = undefined;
         var n: usize = 0;

@@ -109,10 +109,31 @@ fn boolFrom(text: []const u8) ?bool {
     return null;
 }
 
+/// How many backwards branches a comptime loop over `fields` may take,
+/// sized off the input: a fixed number per field, one per byte of every name
+/// (a byte at a time is how names get upper-cased, compared and joined), and a
+/// floor. `fields` is a struct's or an enum's, anything with a `name`.
+///
+/// Called by every comptime loop in this module that walks user fields or
+/// their names, because a quota raised in a callee raises the caller's whole
+/// evaluation and the default 1000 ran out at about 330 characters of field
+/// names (ADR 126). The factors are deliberately generous: the cost of too
+/// many is nothing, and the cost of too few is a message from inside nilo.
+pub fn budget(comptime fields: anytype) u32 {
+    comptime {
+        // Adding the sizes up is itself a loop over the fields.
+        @setEvalBranchQuota(1000 + 2 * fields.len);
+        var n: u32 = 2000;
+        for (fields) |f| n += 100 + 20 * @as(u32, @intCast(f.name.len));
+        return n;
+    }
+}
+
 /// The names an enum's values answer to, for the message that says what was
 /// expected. Built once at compile time.
 pub fn enumChoices(comptime E: type) []const u8 {
     comptime {
+        @setEvalBranchQuota(budget(@typeInfo(E).@"enum".fields));
         var out: []const u8 = "";
         for (@typeInfo(E).@"enum".fields, 0..) |f, i| {
             out = out ++ (if (i == 0) "" else ", ") ++ f.name;
@@ -208,4 +229,21 @@ test "what a field would have taken is settled while compiling" {
 
 test "the choices an enum offers are listed in order" {
     try testing.expectEqualStrings("red, green, blue", comptime enumChoices(enum { red, green, blue }));
+}
+
+const ManyValues = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var names: [1200][:0]const u8 = undefined;
+    var values: [1200]u16 = undefined;
+    for (&names, &values, 0..) |*n, *v, i| {
+        n.* = std.fmt.comptimePrint("a_value_{d}", .{i});
+        v.* = i;
+    }
+    break :blk @Enum(u16, .exhaustive, &names, &values);
+};
+
+test "an enum of 1200 values lists them all without a quota of the caller's" {
+    const text = comptime enumChoices(ManyValues);
+    try testing.expect(std.mem.startsWith(u8, text, "a_value_0, "));
+    try testing.expect(std.mem.endsWith(u8, text, "a_value_1199"));
 }

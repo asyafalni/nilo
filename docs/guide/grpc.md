@@ -42,7 +42,7 @@ A build that did not pass `.grpc = true` rejects the listener at `listen()` with
 
 **The route path is the one in the `.proto`: package, service and method**, such as `/helloworld.Greeter/SayHello`. `c.body()` is the message with gRPC's five-byte prefix removed, and gunzipped if the client sent `grpc-encoding: gzip`, which the Collector does on every call. `c.send(200, "application/grpc", bytes)` is the answer, framed on the way out.
 
-You bring the codec. [zig-protobuf](https://github.com/Arwalk/zig-protobuf) generates a type for each message with an `encode` and a `decode`, and a method calls those on `c.body()` and before `c.send`. nilo reads and writes bytes and never looks inside them.
+**The message is a struct of yours, read and written by [`nilo_proto`](../reference/proto.md)** ([Protobuf messages](./proto.md)). `proto.decode(Request, c.arena(), body.view())` reads the call and `proto.encode(Reply, c.arena(), reply)` writes the answer, with the field numbers declared on the types and nothing generated. A type generator such as [zig-protobuf](https://github.com/Arwalk/zig-protobuf) works as well: nilo reads and writes bytes and never looks inside them.
 
 A call's metadata arrives as request headers, so `c.header("x-tenant")` reads it, and a header the route sets with `c.setHeader` goes back as metadata.
 

@@ -191,6 +191,8 @@ The tag is weak, `W/"1a"`, because a version says the content is the same and pr
 
 **A struct becomes a JSON object and an enum becomes its tag name; one declaration on a type changes how its names or union tags are written.** That default covers nearly everything. The two cases it does not cover are common in REST APIs ([ADR 016](../adr/016-the-api-description-comes-from-the-signatures.md)). The full list is [JSON shapes in the reference](../reference/handlers.md#json-shapes).
 
+**A float is written the way serde_json writes it.** The shortest digits that read back as the same value, with a whole number keeping its `.0` (`1.0`, `0.0`, `1000000000000000.0`) so a typed client can tell it from an integer, a sign-carrying exponent outside 1e-5 to 1e15 (`1e+16`, `1e-7`, never a 300-digit `f64::MAX`), an `f32` from its own digits (`1.1`), and `null` for infinity and NaN. It is the same on every path a value takes out, a `std.json.Value` and a `jsonStringify(self, jw: anytype)` included, and a body is read as before: `1` fills an `f64` ([ADR 096](../adr/096-a-byte-that-is-not-text-is-not-a-string.md)).
+
 **A union is externally tagged by default**: `{"metrics":{…}}`, one object with one key, which is what `std.json` writes and what nilo sends if you say nothing. `.tag` asks for the other encoding, with the variant's name next to its own fields:
 
 <!-- compiles -->

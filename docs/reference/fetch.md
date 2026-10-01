@@ -81,6 +81,8 @@ Given per call: `headers`, and `timeout_ms` / `stall_ms` / `max_body` to overrid
 
 ### What it does not do
 
+**An answer sent before the body was finished is the answer.** When writing a large body fails because the server refused it on the head and closed, `begin` returns that refusal (a 4xx or 5xx) rather than `WriteFailed`, and the connection is not reused. A 2xx in that position is not taken, since the server never received the whole upload.
+
 **No retry policy, circuit breaker or rate limiter.** Those are decisions about somebody else's service, and belong to whoever knows what that service promises.
 
 ### `fetch.Target`
