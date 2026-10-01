@@ -188,7 +188,7 @@ fn postpone(jobs: *Jobs, c: *nilo.Ctx, row: job.Id, user_id: i64, email: nilo.St
 }
 ```
 
-**`.within` is a cheaper version of the same guarantee**, for when a duplicate costs an extra run, not a wrong one. The Space remembers the key for its TTL, a second push inside that window is answered by the cache and never reaches the table, and a restart forgets it. A `.within` without a `.unique` is a compile error, because the window needs a key to remember.
+**`.within` is a cheaper version of the same guarantee**, for when a duplicate costs an extra run, not a wrong one. The Space remembers the key for its TTL, a second push inside that window is answered by the cache and never reaches the table, and a restart forgets it. A `.within` without a `.unique` is a compile error, because the window needs a key to remember. A push the store refuses (the queue is full, the database errors) gives its window back, so retrying it is not answered `null` for the rest of the TTL.
 
 ### Pushing in a transaction
 
@@ -206,6 +206,8 @@ try tx.commit();
 ```
 
 If the commit fails, there is no job; if the job is pushed, the user exists. That is the outbox pattern without a separate outbox, and it is why the queue is a table and not Redis ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)). `pushIn` on a `job.Memory` is a compile error, because a row in memory has nothing to commit with, and so is `pushIn` with `.within`, because a cache cannot roll back.
+
+**A row pushed in a transaction has no status until a worker takes it**, because the `status` Space cannot roll back with the transaction: a `queued` written at `pushIn` would outlive a rollback as the status of a row that never existed. A poll right after the commit reads null, and then `running` once a worker has the row.
 
 **A `push` wakes a worker; a `pushIn` cannot.** The row does not exist until the commit, so a worker woken at the `pushIn` would find nothing and go back to sleep. Call `jobs.wake()` after `tx.commit()` and the row starts at once; otherwise the next poll finds it, a second later at the default ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)).
 
@@ -302,6 +304,8 @@ A field out of range, a sixth field or a backwards range is a compile error nami
 
 A schedule is stored as a row: the next tick is pushed with the unique key `"schedule"`, so ten instances seeding the same schedule at startup produce one row, and whichever worker claims it runs it. There is no leader, a restart loses no tick, and **the first tick is the next one on the clock**: `every(600_000)` first fires ten minutes after the worker started. A program that wants a run at startup pushes one.
 
+**A schedule that lost its row is queued again within a minute.** The next tick is pushed after the last one is marked done, so a crash between the two, a database error on the push or a `cancel` of the queued tick would leave a schedule with nothing to run. Every worker therefore seeds again once a minute, and since a kind with a queued or running tick inserts nothing, the cost is one insert per scheduled kind per minute for the whole process. `drain` does the same, once `seed` or `serve` has run ([ADR 161](../adr/161-a-schedule-is-a-type-that-makes-the-caller-choose.md)).
+
 A tick that fails is retried according to the job's `retry` like any other row, and the schedule's next tick is pushed regardless. A tick that dies is dead like any other row.
 
 ## Choosing a store
@@ -347,6 +351,8 @@ jobs = .openWith(gpa, &table, .{ .db = &db }, .{}, Statuses.open(&store));
 ```
 
 `jobs.status(id)` then returns `.{ .state, .attempts, .progress }` for as long as the Space remembers the row (`queued`, `running`, `done` or `dead`) and null once it has forgotten. For a route answering "is my export ready?" that is the right behaviour. It is deliberately a cache and not the table: a status is the one thing here that may be forgotten, and a poll every second should not be a query every second.
+
+**The status Space is per instance.** With several instances on one table, a row pushed on one and run on another stays `queued` in the first instance's Space until its TTL, and the instance that ran it says `running` and `done`. That is a property of a cache that is not shared, and the way round it is a route that asks the instance that holds the Space, or the table through `stats`.
 
 **`progress` is the run's own number, stored in the same Space.** A `run` that asks for its `job.Tick` and for `*Jobs` calls `jobs.progress(tick.id, n)` as it goes (rows imported, a percentage, a step; the kind decides what the number means), and the route polling `status(id)` reads it next to the state ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)):
 

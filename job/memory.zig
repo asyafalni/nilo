@@ -120,6 +120,15 @@ pub const Memory = struct {
     /// a row of a kind nobody here knows is left where it is, for the binary
     /// that does know it, rather than claimed and handed back forever.
     pub fn claim(self: *Memory, scope: anytype, comptime kinds: []const []const u8, now: i64, lease_until: i64) !?contract.Claimed {
+        // The destination first, at the widths a slot is made of, so the one
+        // thing here that can fail happens before any row is touched: a
+        // claim that ran out of memory after flipping the row would leave it
+        // `running` with an attempt spent until the lease lapsed, and an
+        // allocation under the spin lock is the thing this file's header
+        // rules out. An empty claim leaves the bytes to the arena's next
+        // reset (ADR 160).
+        const buf = try scope.arena().alloc(u8, contract.max_kind + self.max_payload);
+
         self.lock.take();
         defer self.lock.release();
 
@@ -146,15 +155,18 @@ pub const Memory = struct {
         }
         const i = best orelse return null;
         const s = &self.slots[i];
+        const kind = s.kind();
+        @memcpy(buf[0..kind.len], kind);
+        const payload = self.payloadOf(i)[0..s.payload_len];
+        @memcpy(buf[contract.max_kind..][0..payload.len], payload);
+        // Only now: nothing below can fail.
         s.state = .running;
         s.lease_until = lease_until;
         s.attempts += 1;
-
-        const arena = scope.arena();
         return .{
             .id = s.id,
-            .kind = try arena.dupe(u8, s.kind()),
-            .payload = try arena.dupe(u8, self.payloadOf(i)[0..s.payload_len]),
+            .kind = buf[0..kind.len],
+            .payload = buf[contract.max_kind..][0..payload.len],
             .attempts = s.attempts,
             .run_at = s.run_at,
         };
@@ -247,31 +259,47 @@ pub const Memory = struct {
     /// The rows that failed for the last time, newest first, into the
     /// Scope's arena.
     pub fn deadOnes(self: *Memory, scope: anytype) ![]contract.Dead {
+        // Count, let go, allocate, take again: the arena is not touched with
+        // the lock held. Rows may change in between, so the fill takes at
+        // most the count and only what is still dead; a row that died in the
+        // gap is in the next call's answer.
         self.lock.take();
-        defer self.lock.release();
         var n: usize = 0;
         for (self.slots) |s| {
             if (s.state == .dead) n += 1;
         }
+        self.lock.release();
+
         const arena = scope.arena();
         const out = try arena.alloc(contract.Dead, n);
+        const per_row = contract.max_kind + contract.max_error;
+        const text = try arena.alloc(u8, n * per_row);
+
+        self.lock.take();
         var at: usize = 0;
         for (self.slots) |s| {
-            if (s.state != .dead) continue;
+            if (s.state != .dead or at == n) continue;
+            const room = text[at * per_row ..][0..per_row];
+            const kind = s.kind();
+            const err = s.err();
+            @memcpy(room[0..kind.len], kind);
+            @memcpy(room[contract.max_kind..][0..err.len], err);
             out[at] = .{
                 .id = s.id,
-                .kind = try arena.dupe(u8, s.kind()),
+                .kind = room[0..kind.len],
                 .attempts = s.attempts,
-                .err = try arena.dupe(u8, s.err()),
+                .err = room[contract.max_kind..][0..err.len],
             };
             at += 1;
         }
-        std.mem.sort(contract.Dead, out, {}, struct {
+        self.lock.release();
+        const found = out[0..at];
+        std.mem.sort(contract.Dead, found, {}, struct {
             fn newestFirst(_: void, a: contract.Dead, b: contract.Dead) bool {
                 return a.id > b.id;
             }
         }.newestFirst);
-        return out;
+        return found;
     }
 
     /// Queue a dead row again, from the first attempt. `false` when no dead
@@ -642,4 +670,45 @@ test "unkey lets a running row go on running while its unique key is taken again
     const s = try store.stats(&run);
     try testing.expectEqual(@as(u64, 1), s.running);
     try testing.expectEqual(@as(u64, 1), s.queued);
+}
+
+test "a claim that cannot allocate leaves the row queued, with its attempt unspent" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    const id = (try store.push(&run, "a", "{\"n\":1}", .{ .run_at = 0 })).?;
+
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    var starved: core.Run = .init(failing.allocator());
+    defer starved.deinit();
+    try testing.expectError(error.OutOfMemory, store.claim(&starved, test_kinds, 1, 100));
+
+    // Nothing was flipped: not running, no attempt spent, so the next claim
+    // gets it at once and it is the first attempt.
+    try testing.expectEqual(@as(u64, 1), (try store.stats(&run)).queued);
+    const got = (try store.claim(&run, test_kinds, 1, 100)).?;
+    try testing.expectEqual(id, got.id);
+    try testing.expectEqual(@as(u32, 1), got.attempts);
+}
+
+test "deadOnes that cannot allocate changes nothing and gives the lock back" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    const id = (try store.push(&run, "a", "{}", .{ .run_at = 0 })).?;
+    const claimed = (try store.claim(&run, test_kinds, 1, 100)).?;
+    try testing.expect(try store.dead(&run, id, claimed.attempts, "Boom"));
+
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    var starved: core.Run = .init(failing.allocator());
+    defer starved.deinit();
+    try testing.expectError(error.OutOfMemory, store.deadOnes(&starved));
+    // The spin lock was released on the way out: this would hang if not.
+    const listed = try store.deadOnes(&run);
+    try testing.expectEqual(@as(usize, 1), listed.len);
+    try testing.expectEqualStrings("Boom", listed[0].err);
 }

@@ -48,6 +48,21 @@ The three policies, and how each is a row rather than a timer:
 - **The next tick is a row**, pushed with `unique = "schedule"`, so ten
   instances seeding the same schedule at start-up produce one row
   (ADR 160's unique index). Whoever claims it runs it. There is no leader.
+- **The schedule is re-seeded once a minute**, because the next tick is
+  pushed in a statement of its own after the last one is marked done, and
+  nothing else puts it back when that statement does not happen: a crash
+  between the two, a database error on the push, or a `cancel` of the queued
+  tick leaves a kind with no row, and seeding used to be `serve`'s start-up
+  alone, so the schedule stayed dead until a restart. Every worker loop (and
+  `runOneAt`, so `drain` heals too) calls `seedAt` again when a minute has
+  passed since it last ran, whichever caller wins a `cmpxchg` on the time it
+  last ran, so one insert per scheduled kind per minute across all workers
+  and one atomic load per loop; a queue with no scheduled kind pays nothing,
+  and a queue nobody seeded is left alone. Seeding is idempotent (a kind
+  with a queued or running tick inserts nothing, the unique key), which is
+  why this needs no new store method. The interval is a constant, not an
+  option: it is how long a silent schedule is tolerated, and nobody has
+  asked for another number.
 - **`overlap`** decides *when* the next row is pushed. `.queue` pushes it
   when the tick is claimed, so another worker may take it while this one is
   still running. The running tick first gives up the schedule's unique key
@@ -94,6 +109,14 @@ year and a dependency to carry it. `0 20 * * *` with a comment is 03:00
 Jakarta; `docs/roadmap.md` carries the gap.
 
 ## What was rejected
+
+- **Pushing the successor before marking the tick done**, so a crash cannot
+  fall between the two. For `.skip` the running tick still holds the
+  schedule's key, so the successor collides with it and is dropped, which is
+  the bug `.queue`'s early push exists to avoid. **Done-and-push as one
+  transaction** would heal it without a timer but is a new store method every
+  hand-written store must implement; the re-seed covers the crash and the
+  cancel as well, and costs an insert a minute.
 
 - **Defaults for `overlap` and `missed`.** The whole of ADR 028's objection.
   `.skip` and `.drop` are the safer pair and would be the defaults if there

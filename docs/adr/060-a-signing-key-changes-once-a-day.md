@@ -66,7 +66,15 @@ margin is why the refresh happens early.
 **How that holds, in the code.** One fiber refreshes at a time, through a `std.Io.Mutex` gate of its own, and the user's `fetch` runs under the gate and outside the `RwLock`: the lock is taken exclusively only to install what came back. A fiber that finds the gate taken while the credentials have not expired signs with the old key rather than waiting on somebody else's I/O. A fetch that fails while they have not expired logs once at `warn` and is not tried again for `retry_after_s` (five seconds); only past `expires_at` does a failed fetch fail the request. The margin is `refresh_margin_s` or half the life the credentials arrived with, whichever is less, so credentials that live less than the margin are refreshed at half their life rather than on every request. `fetch`'s strings only have to outlive the call: the Store copies them and frees nothing of the caller's. The Store cannot bound a function it did not write, so `fetch` bounds its own I/O.
 
 `.static` is the same mechanism with `expires_at` null: fetched once, never
-refetched.
+refetched. **`open` copies a static pair into memory the Store owns and refuses
+one that could never sign**: an empty key id or secret, one longer than the
+key derivation takes, a key id or region holding `,`, `/`, a space or a control
+byte (both land inside `Credential=`, which is cut at those), or an
+`expires_at` already past. A pair refused later is a 403 on every request, each
+taking the write lock to refresh nothing. The owned copy, and the derived key
+when the date turns, are zeroed with `secureZero` when replaced or freed. An
+endpoint authority over 255 bytes is refused with them, because that is the
+share of every URL buffer the module sizes on a stack.
 
 ## What is held, and what it costs to read
 

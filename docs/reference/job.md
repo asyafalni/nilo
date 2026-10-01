@@ -78,10 +78,10 @@ What a `run` that asks for one receives:
 | `Jobs.Deps` | the struct of pointers `open` takes: `.deps` as written, or what `.deps(Jobs)` returned |
 | `Jobs.Row` | the store's table, for `createMissing` and `db.checking`; `void` for `job.Memory` |
 | `jobs.push(c, value, opts)` | `!Id`, or `!?Id` when `opts` has `.unique`: null when a row already has the key |
-| `jobs.pushIn(&tx, c, value, opts)` | the same inside a transaction you hold. A Refusal on `job.Memory`, and with `.within`. It wakes no worker, because the row does not exist until the commit, so call `wake` after committing |
+| `jobs.pushIn(&tx, c, value, opts)` | the same inside a transaction you hold. A Refusal on `job.Memory`, and with `.within`. It wakes no worker, because the row does not exist until the commit, so call `wake` after committing. It notes nothing in the `status` Space either, because the Space cannot roll back with the transaction: a row pushed here has no status until a worker takes it |
 | `jobs.wake()` | wakes every idle worker, for a row nilo did not see arrive: another process's, or one `pushIn` wrote in a transaction that has since committed. A `push` wakes one worker by itself ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
 | `jobs.stats(c)` | `Stats`: `queued`, `running`, `dead` |
-| `jobs.status(id)` | `?job.Status`: `state`, `attempts` and `progress`, from the Space, for as long as it remembers |
+| `jobs.status(id)` | `?job.Status`: `state`, `attempts` and `progress`, from the Space, for as long as it remembers. `running` from the moment a worker has the row and its payload reads. The Space is per instance |
 | `jobs.progress(id, n)` | writes `n` into the Space's `progress` for the row, from inside a `run` that has a `job.Tick` and a `*Jobs`. Reset by every change of state except `done`, which keeps it. Does nothing without a Space ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
 | `jobs.cancel(c, id)` | `bool`: deletes a `queued` row before it runs, along with its `unique` key; `false` when the row is running, finished or absent. It is one statement, so a claim at the same instant either wins or loses completely. A Refusal on a store with no `cancel` ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
 | `jobs.deadOnes(c)` | `[]Dead`: `id`, `kind`, `attempts`, `err`, newest first |
@@ -90,7 +90,7 @@ What a `run` that asks for one receives:
 | `jobs.serveOn(io)` | the same on an `Io` of your own, for a worker process. Returns when cancelled |
 | `jobs.drain(&run)` / `jobs.runOne(&run)` | runs what is due on this thread, for a test, against one reading of the clock. A `*Ctx` is refused |
 | `jobs.drainAt(&run, now)` / `jobs.runOneAt(&run, now)` | the same as if the time were `now`, in microseconds since the epoch: what is due, when a retry is, and when the next tick is all use that number. This is how a test moves the clock ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
-| `jobs.seed(&run)` / `jobs.seedAt(&run, now)` | queues every schedule's next tick, the way `serve` does at start, for a test that drains instead of serving |
+| `jobs.seed(&run)` / `jobs.seedAt(&run, now)` | queues every schedule's next tick, the way `serve` does at start, for a test that drains instead of serving. Idempotent, and called again by every worker (and by `drain`) once a minute after the first seed, so a schedule whose row was lost is queued again within the minute ([ADR 161](../adr/161-a-schedule-is-a-type-that-makes-the-caller-choose.md)) |
 | `jobs.nilo_ready(scope)` | what `app.health` asks: whether the store is reachable and a worker is alive |
 
 ### Push options
@@ -102,7 +102,7 @@ What a `run` that asks for one receives:
 | `after_ms` | no sooner than this many milliseconds from now |
 | `at` | no sooner than this moment, in microseconds since the epoch. Not together with `after_ms` |
 | `unique` | at most one queued or running row of this kind has the key. A unique index, freed when the row finishes |
-| `within` | a `cache.Space` of `job.Mark` checked before `unique`: a second push within the Space's TTL never reaches the table. Needs `unique` |
+| `within` | a `cache.Space` of `job.Mark` checked before `unique`: a second push within the Space's TTL never reaches the table. Needs `unique`, and a type with a `del`: a push the store refuses deletes the key again |
 
 ### `job.Settings`
 
@@ -125,7 +125,7 @@ Given to `open`:
 | `pub const overlap: job.Overlap` | required: `.skip` (a tick during a run does not happen) or `.queue` (it runs on another worker) |
 | `pub const missed: job.Missed` | required: `.drop` (a tick that is later than its own successor is forgotten) or `.catch_up` (it runs once) |
 
-The next tick is a row with the unique key `"schedule"`, so several instances seed one row and whichever claims it runs it. The first tick is the next one the clock gives; a program that wants one at start-up pushes it. Every field of a scheduled job needs a default, since nobody pushes it.
+The next tick is a row with the unique key `"schedule"`, so several instances seed one row and whichever claims it runs it. The first tick is the next one the clock gives; a program that wants one at start-up pushes it. Every field of a scheduled job needs a default, since nobody pushes it. Every worker seeds again once a minute, so a schedule whose row was lost (a crash between `done` and the push, a failed push, a `cancel`) is queued again within the minute.
 
 ### Stores: `job.Table` and `job.Memory`
 
@@ -137,7 +137,7 @@ The next tick is a row with the unique key `"schedule"`, so several instances se
 
 ### Errors
 
-**A `run` that fails is retried according to its `retry`, and is then dead**: kept in the table with the error's name, counted by `stats`, and listed by `deadOnes`. A `run` that goes past `timeout_ms` is an attempt that failed with `TimedOut`. `error.Canceled` inside `run` means shutdown: the row goes back untouched and whichever worker starts next takes it. A payload this binary cannot parse is dead at once. A row whose kind this binary has no job for is put back, with a warning, for the binary that does.
+**A `run` that fails is retried according to its `retry`, and is then dead**: kept in the table with the error's name, counted by `stats`, and listed by `deadOnes`. A `run` that goes past `timeout_ms` is an attempt that failed with `TimedOut`. `error.Canceled` inside `run` means shutdown: the row goes back untouched and whichever worker starts next takes it. A payload this binary cannot parse is dead at once; one that could not be read for want of memory is retried like a failed `run`. A row whose kind this binary has no job for is put back, with a warning, for the binary that does.
 
 [`docs/guide/jobs.md`](../guide/jobs.md) covers all of it, and [`bench/result/job.md`](../../bench/result/job.md) has what a claim and a push cost on each store.
 

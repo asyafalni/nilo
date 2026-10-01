@@ -38,7 +38,7 @@ const Carts = cache.Space("cart", Cart, .{ .ttl_s = 300 });
 | `cache.Space(name, V, .{ .ttl_s = s })` | a keyspace, as a type |
 | `Space.open(&store)` | the value a handler holds |
 | `space.put(key, value)` | stored for the Space's `ttl_s` |
-| `space.putFor(key, value, ttl_s)` | stored for its own lifetime. `0` means "until the ring writes over it" |
+| `space.putFor(key, value, ttl_s)` | stored for its own lifetime, at least `ttl_s` and at most `ttl_s + 1` seconds. `0` means "until the ring writes over it" |
 | `space.get(key)` | `?V` for a flat value; `?[]const u8` and a `*Held` for bytes |
 | `space.del(key)` | `bool`: whether there was anything to remove |
 | `space.incr(key, delta)` | `PutError!V`: the new count, or `error.TooLarge` for a key over 65,535 bytes or an entry over a quarter of a shard's ring, never a count, for a Space whose `V` is an integer; any other `V` is a Refusal. The read, the add and the write happen under the shard's lock, so two callers count two. A key nobody wrote counts from zero and lives `ttl_s`; an existing key keeps the expiry it had. Saturating ([ADR 109](../adr/109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)) |

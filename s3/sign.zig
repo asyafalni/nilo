@@ -325,6 +325,27 @@ pub fn signedHeaders(out: *[signed_headers_max]u8, headers: Signed) []const u8 {
     return out[0..n];
 }
 
+/// `value` with its leading whitespace dropped, each run of spaces and tabs
+/// inside it written as one space, and its trailing run dropped: a space is
+/// held back until a byte that is not whitespace follows it.
+fn writeFolded(w: *std.Io.Writer, value: []const u8) void {
+    var i: usize = 0;
+    var pending = false;
+    var wrote = false;
+    while (i < value.len) {
+        const start = i;
+        while (i < value.len and (value[i] == ' ' or value[i] == '\t')) i += 1;
+        if (i != start) pending = true;
+        const word = i;
+        while (i < value.len and value[i] != ' ' and value[i] != '\t') i += 1;
+        if (i == word) break;
+        if (pending and wrote) w.writeByte(' ') catch unreachable;
+        w.writeAll(value[word..i]) catch unreachable;
+        wrote = true;
+        pending = false;
+    }
+}
+
 /// SHA-256 of the canonical request, without the canonical request.
 pub fn canonicalHash(req: Request, headers_list: []const u8) [32]u8 {
     var hashing: Hashing = .init();
@@ -348,9 +369,13 @@ pub fn canonicalHash(req: Request, headers_list: []const u8) [32]u8 {
         if (req.headers.valueOf(field)) |value| {
             w.writeAll(Signed.wireName(field.name)) catch unreachable;
             w.writeByte(':') catch unreachable;
-            // Trimmed, because SigV4 canonicalises the value and a stray
-            // space is a signature that does not match.
-            w.writeAll(std.mem.trim(u8, value, " \t")) catch unreachable;
+            // Folded, because SigV4 canonicalises the value: leading and
+            // trailing whitespace go and every run inside becomes one space
+            // (AWS calls it Trimall). Written straight into the hash, so it
+            // costs a pass over the bytes and no buffer. The bytes sent on
+            // the wire stay as the caller gave them; S3 folds its side the
+            // same way.
+            writeFolded(w, value);
             w.writeByte('\n') catch unreachable;
         }
     }
@@ -880,6 +905,35 @@ test "a header value with spaces round it signs as the value without them" {
     });
 
     try testing.expectEqualStrings(tidy.value(), padded.value());
+}
+
+test "a header value with a run of spaces or tabs inside it signs as AWS's Trimall does" {
+    // SigV4 folds every run of sequential whitespace into one space, not only
+    // the ends. The expected signature is botocore's `' '.join(v.split())`
+    // computed apart from this file, for `attachment; filename="a b.pdf"`.
+    const keyed = try exampleKeyed();
+    const want = "7fda9b7672eaa6dcf0f12be3004e4485664b34e68051e4e444eb74da36a7ea7c";
+
+    for ([_][]const u8{
+        "attachment; filename=\"a  b.pdf\"",
+        " attachment;\t\t filename=\"a\t\tb.pdf\"\t",
+    }) |disposition| {
+        var out: Signature = .none;
+        out.stamp = .at(1369353600);
+        authorize(&out, &keyed, .{
+            .method = "GET",
+            .key = "test.txt",
+            .payload = empty_payload,
+            .headers = .{
+                .host = "examplebucket.s3.amazonaws.com",
+                .content_disposition = disposition,
+                .x_amz_content_sha256 = empty_payload,
+                .x_amz_date = "20130524T000000Z",
+            },
+        });
+        const text = out.value();
+        try testing.expect(std.mem.endsWith(u8, text, "Signature=" ++ want));
+    }
 }
 
 test "a secret longer than the ceiling is refused rather than truncated" {

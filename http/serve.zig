@@ -26,6 +26,7 @@ const websocket = @import("websocket.zig");
 const handover_mod = @import("handover.zig");
 const metrics_mod = @import("metrics.zig");
 const failurebody = @import("failurebody.zig");
+const json = @import("json.zig");
 
 const App = app_mod.App;
 const Ctx = ctx_mod.Ctx;
@@ -712,16 +713,35 @@ fn staticFailure(comptime status: u16, comptime message: []const u8) []const u8 
 /// itself is unchanged, so `curl` still shows the sentence — one pair of
 /// braces further in.
 fn writeFailureBody(w: *std.Io.Writer, status: u16, message: []const u8) !void {
-    try w.writeAll("{\"error\":\"");
-    for (message) |ch| switch (ch) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        else => if (ch < 0x20) try w.print("\\u{x:0>4}", .{ch}) else try w.writeByte(ch),
-    };
-    try w.print("\",\"status\":{d}}}", .{status});
+    try w.writeAll("{\"error\":");
+    // The message can hold a stranger's bytes (`%ff` in a path is decoded
+    // without a check), and a body `res.json()` cannot parse is the failure
+    // ADR 024 exists to prevent: so a byte that is not text becomes U+FFFD.
+    try json.writeLossyString(w, message);
+    try w.print(",\"status\":{d}}}", .{status});
+}
+
+/// `message` as text a JSON writer cannot be handed a bad byte by, for a
+/// shape the application named: it writes the struct `nilo_failure` filled
+/// through the ordinary JSON writer, which sends a `[]const u8` that is not
+/// UTF-8 as an array of numbers (ADR 096). Valid text, nearly always, is
+/// returned as it is; otherwise one copy in the request arena, on a failure
+/// the request asked for, and the original if even that fails.
+fn lossyMessage(c: *Ctx, message: []const u8) []const u8 {
+    if (std.unicode.utf8ValidateSlice(message)) return message;
+    var copy = std.ArrayList(u8).initCapacity(c._arena, message.len * 3) catch return message;
+    var i: usize = 0;
+    while (i < message.len) {
+        const n = std.unicode.utf8ByteSequenceLength(message[i]) catch 0;
+        if (n != 0 and i + n <= message.len and std.unicode.utf8ValidateSlice(message[i..][0..n])) {
+            copy.appendSliceAssumeCapacity(message[i..][0..n]);
+            i += n;
+        } else {
+            copy.appendSliceAssumeCapacity("\u{FFFD}");
+            i += 1;
+        }
+    }
+    return copy.items;
 }
 
 /// The same bytes as `slice`, pointed at `to` instead of at `from` — for
@@ -895,12 +915,18 @@ fn serveSpilledFile(
     // The name was written down by the directory walk before the socket
     // opened, and the descriptor it is resolved against was too. Nothing a
     // request carried is being turned into a path (ADR 009).
-    const open = on_disk.dir.openFile(on_disk.path) catch |err| switch (err) {
+    //
+    // Without following a link in the last component: the walk only listed
+    // regular files, so a name that is a link now was put there after
+    // startup, and serving it would send whatever it points at out of the
+    // tree (ADR 009).
+    const open = on_disk.dir.openFileNoFollow(on_disk.path) catch |err| switch (err) {
         // The list said the file was there and the disk disagrees, which
         // from the client's side is indistinguishable from asking for
         // something that never existed. Every other way of failing to open
-        // one is this server's problem and says so with a 500.
-        error.FileNotFound => return fail.notFound("there is no {s}", .{c._path}),
+        // one is this server's problem and says so with a 500. A link is the
+        // disk disagreeing too.
+        error.FileNotFound, error.SymLinkLoop => return fail.notFound("there is no {s}", .{c._path}),
         else => return err,
     };
 
@@ -1151,7 +1177,7 @@ fn sendDirect(c: *Ctx, status: u16, content_type: []const u8, body: []const u8) 
 /// application named with `app.failures` (ADR 024).
 noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror, shape: ?failurebody.Write) !void {
     const status = fail.resolveStatus(failure, err);
-    const message: []const u8 = if (failure.isSet()) failure.message() else blk: {
+    const message: []const u8 = if (fail.failed(failure, err)) failure.message() else blk: {
         if (status == 500) {
             std.log.warn(
                 "handler {s} {s} failed: {s}",
@@ -1171,9 +1197,9 @@ noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror, sh
     // Every 401 carries `WWW-Authenticate` (RFC 9110 §15.5.2), and the
     // endpoint that read the header is the one that knows what to say in
     // it (ADR 153). A comptime string, so `setStaticHeader` is right.
-    if (failure.challenge) |with| {
+    if (fail.failed(failure, err)) if (failure.challenge) |with| {
         c.setStaticHeader("WWW-Authenticate", std.mem.span(with)) catch {};
-    }
+    };
 
     var buf: [failure_body_max]u8 = undefined;
     var body: std.Io.Writer = .fixed(&buf);
@@ -1184,7 +1210,7 @@ noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror, sh
     // `std.log.warn` here on purpose — one measured 1,446 bytes of binary
     // (2,121 with two `{d}`s) for a line an App with no shape can never
     // reach, on every App.
-    if (shape) |write| write(status, message, &body) catch {
+    if (shape) |write| write(status, lossyMessage(c, message), &body) catch {
         body = .fixed(&buf);
         writeFailureBody(&body, status, message) catch unreachable; // sized for it, below
     };

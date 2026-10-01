@@ -456,3 +456,36 @@ fn claimSql() []const u8 {
         "RETURNING \"id\", \"kind\", \"payload\", \"state\", \"run_at\", \"lease_until\", \"attempts\", " ++
         "\"priority\", \"unique_key\", \"last_error\", \"created_at\", \"finished_at\"";
 }
+
+test "a row pushed in a transaction has no status before a worker takes it, and none after a rollback" {
+    const f = try Fixture.open("job-tx-status");
+    defer f.close();
+    var table = SqliteTable.open(&f.db);
+    var store = try cache.open(testing.allocator, .{ .bytes = 1 << 20 });
+    defer store.deinit();
+    var jobs: SqliteJobs = .openWith(testing.allocator, &table, .{ .db = &f.db }, .{}, Statuses.open(&store));
+
+    // Rolled back: the row never existed, and the Space must not say it did.
+    var rolled_back: job.Id = 0;
+    {
+        var tx = try f.db.begin(&f.run, .{});
+        defer tx.deinit();
+        rolled_back = try jobs.pushIn(&tx, &f.run, WriteNote{ .text = .static("gone") }, .{});
+        // No commit.
+    }
+    try testing.expect(jobs.status(rolled_back) == null);
+    try testing.expectEqual(@as(u64, 0), (try jobs.stats(&f.run)).queued);
+
+    // Committed: still nothing until a worker takes it, then `done` as for
+    // any row.
+    var kept: job.Id = 0;
+    {
+        var tx = try f.db.begin(&f.run, .{});
+        defer tx.deinit();
+        kept = try jobs.pushIn(&tx, &f.run, WriteNote{ .text = .static("kept") }, .{});
+        try tx.commit();
+    }
+    try testing.expect(jobs.status(kept) == null);
+    try testing.expectEqual(@as(usize, 1), try jobs.drain(&f.run));
+    try testing.expectEqual(job.State.done, jobs.status(kept).?.state);
+}

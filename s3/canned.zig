@@ -256,7 +256,16 @@ const Canned = struct {
             const value = self.seen.header(name) orelse return false;
             w.writeAll(name) catch return false;
             w.writeByte(':') catch return false;
-            w.writeAll(value) catch return false;
+            // Trimall, as S3 does it: no whitespace at either end, and one
+            // space for every run inside. Written with `tokenizeAny` rather
+            // than the byte walk `sign.zig` uses, so the two can disagree.
+            var words = std.mem.tokenizeAny(u8, value, " \t");
+            var first_word = true;
+            while (words.next()) |word| {
+                if (!first_word) w.writeByte(' ') catch return false;
+                w.writeAll(word) catch return false;
+                first_word = false;
+            }
             w.writeByte('\n') catch return false;
         }
         w.writeByte('\n') catch return false;
@@ -459,6 +468,73 @@ test "a put sends the bytes it signed, and says what they are" {
             var hex: [64]u8 = undefined;
             _ = try std.fmt.bufPrint(&hex, "{x}", .{&digest});
             try testing.expectEqualStrings(&hex, canned.seen.header("x-amz-content-sha256").?);
+        }
+    }.run);
+}
+
+test "a header value with two spaces in a row is signed the way S3 reads it" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+
+            var files = try Files.open(&store);
+            defer files.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            try files.put(&scope, "a.pdf", .{
+                .bytes = "x",
+                .content_type = "application/pdf",
+                .content_disposition = "attachment; filename=\"a  b.pdf\"",
+            });
+
+            served.await(io) catch {};
+            // The wire keeps the caller's bytes, and the signature is over the
+            // folded ones, which the fake rebuilds on its own.
+            try testing.expectEqualStrings(
+                "attachment; filename=\"a  b.pdf\"",
+                canned.seen.header("content-disposition").?,
+            );
+            try expectVerified(&canned);
+        }
+    }.run);
+}
+
+test "an empty content type is neither signed nor sent" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try started(io, &canned, &buf);
+            defer store.deinit();
+
+            var files = try Files.open(&store);
+            defer files.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            try files.put(&scope, "a.bin", .{ .bytes = "x", .content_type = "" });
+
+            served.await(io) catch {};
+            try expectVerified(&canned);
+            try testing.expect(canned.seen.header("content-type") == null);
+            const auth = canned.seen.header("authorization").?;
+            try testing.expect(std.mem.indexOf(u8, fieldOf(auth, "SignedHeaders=").?, "content-type") == null);
         }
     }.run);
 }
@@ -761,6 +837,82 @@ test "a list is a signed question about the bucket, and the answer is a page wit
             );
             try testing.expectEqualStrings(sign.empty_payload, canned.seen.header("x-amz-content-sha256").?);
             try testing.expectEqual(@as(usize, 2), second.objects.len);
+        }
+    }.run);
+}
+
+/// One list answered with `body`, the way a server would. The page is in
+/// `scope`, so it outlives the server and the Store that made it.
+fn listAnswered(io: std.Io, scope: *core.Run, body: []const u8) !bucket_mod.Page {
+    var canned = try Canned.open(io);
+    defer canned.close();
+    canned.answer = .{ .content_type = "application/xml", .body = body };
+
+    var served = try io.concurrent(Canned.serveOne, .{&canned});
+    defer served.cancel(io) catch {};
+
+    var buf: [64]u8 = undefined;
+    var store = try started(io, &canned, &buf);
+    defer store.deinit();
+
+    var files = try Files.open(&store);
+    defer files.deinit();
+
+    return files.list(scope, .{ .max_keys = 2 });
+}
+
+test "a truncated page with no continuation token fails rather than ending the listing" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+            // Read as the last page, this is silent data loss for a loop that
+            // walks a bucket: it looks exactly like a complete listing.
+            try testing.expectError(error.Failed, listAnswered(io, &scope,
+                \\<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>true</IsTruncated>
+                \\<Contents><Key>a</Key><LastModified>t</LastModified><ETag>&quot;e&quot;</ETag><Size>1</Size></Contents>
+                \\</ListBucketResult>
+            ));
+        }
+    }.run);
+}
+
+test "a truncated page with an empty or over-long continuation token fails" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+            // An empty one would go back as `continuation-token=`, a 400.
+            try testing.expectError(error.Failed, listAnswered(io, &scope,
+                \\<ListBucketResult><IsTruncated>true</IsTruncated>
+                \\<NextContinuationToken></NextContinuationToken></ListBucketResult>
+            ));
+            // One past the ceiling `list` itself refuses to send back.
+            const long = "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>" ++
+                "c" ** 1025 ++ "</NextContinuationToken></ListBucketResult>";
+            try testing.expectError(error.Failed, listAnswered(io, &scope, long));
+        }
+    }.run);
+}
+
+test "a key is percent-decoded only when the answer says it is encoded" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+            const plain = try listAnswered(io, &scope,
+                \\<ListBucketResult><IsTruncated>false</IsTruncated>
+                \\<Contents><Key>100%41+a b</Key><LastModified>t</LastModified><ETag>&quot;e&quot;</ETag><Size>1</Size></Contents>
+                \\</ListBucketResult>
+            );
+            try testing.expectEqualStrings("100%41+a b", plain.objects[0].key.view());
+
+            const encoded = try listAnswered(io, &scope,
+                \\<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated>
+                \\<Contents><Key>100%2541+a+b</Key><LastModified>t</LastModified><ETag>&quot;e&quot;</ETag><Size>1</Size></Contents>
+                \\</ListBucketResult>
+            );
+            try testing.expectEqualStrings("100%41 a b", encoded.objects[0].key.view());
         }
     }.run);
 }

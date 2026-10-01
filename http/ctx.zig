@@ -1306,6 +1306,15 @@ pub const Ctx = struct {
         return incoming;
     }
 
+    /// What a body with a key twice is answered with: `error.Failed` when
+    /// `json.parseLeaky` put a sentence naming the key on the Failure, which
+    /// speaks only for that error (`fail.failed`), and the bare error when it
+    /// could not name one.
+    fn repeatedKey(err: anyerror) anyerror {
+        const failure = fail.current() orelse return err;
+        return if (failure.isSet()) error.Failed else err;
+    }
+
     /// Parse the request body as JSON into `T`. The result lives in the
     /// request arena — `keep` the fields you need for longer.
     ///
@@ -1318,7 +1327,7 @@ pub const Ctx = struct {
         // A repeated key already said which on the Failure (`json.parseLeaky`),
         // and the dynamic re-read below cannot hold a repeated key at all.
         var value = json_mod.parseLeaky(T, self._arena, b, .{}) catch |err|
-            return if (err == error.DuplicateField) err else describeBadBody(T, self._arena, b, err);
+            return if (err == error.DuplicateField) repeatedKey(err) else describeBadBody(T, self._arena, b, err);
         str_mod.stamp(&value, self._lifetime);
         // A struct that checks itself is checked once it is whole, and a
         // rule that did not hold is a 422 naming it (ADR 193).
@@ -1392,7 +1401,7 @@ pub const Ctx = struct {
             for (outcomes) |*o| o.* = .{};
             return value;
         } else |err| {
-            if (err == error.DuplicateField) return err;
+            if (err == error.DuplicateField) return repeatedKey(err);
             return collectBadBody(T, self._arena, self._lifetime, b, err, outcomes);
         }
     }

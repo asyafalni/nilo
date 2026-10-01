@@ -2432,6 +2432,16 @@ pub const Dir = struct {
         return .{ ._file = try self._dir.openFile(name, .{ .allow_directory = false }) };
     }
 
+    /// `openFile` that refuses a symlink in the last component: `O_NOFOLLOW`
+    /// on POSIX, which fails with `error.SymLinkLoop` and leaves no window
+    /// between a check and the open, because the kernel does both.
+    pub fn openFileNoFollow(self: Dir, name: []const u8) !File {
+        return .{ ._file = try self._dir.openFile(name, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+        }) };
+    }
+
     /// Write `bytes` to `name` inside this directory, replacing what was
     /// there, and leave nothing half-written behind if the write fails.
     ///

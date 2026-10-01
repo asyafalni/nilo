@@ -1026,6 +1026,12 @@ pub fn requirements(comptime pattern: []const u8, comptime f: anytype) []const s
                 // same reason (ADR 191).
                 .verified => list = list ++
                     [_]service_mod.Requirement{service_mod.requirementFor(*p.type.?.nilo_verified, pattern)},
+                // The Space the kept answers live in, read through the same
+                // type `idempotentBegin` asks the registry for at run time:
+                // without this a route with no Space started, and every
+                // request to it answered 500 (ADR 005, ADR 155).
+                .idempotent => list = list ++
+                    [_]service_mod.Requirement{service_mod.requirementFor(*p.type.?.nilo_idempotent.replays, pattern)},
                 else => {},
             }
         }

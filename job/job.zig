@@ -337,6 +337,25 @@ pub fn Jobs(comptime options: anytype) type {
         /// Whether `serve` has been called, so `nilo_ready` can tell "no
         /// worker yet" from "no worker any more".
         serving: std.atomic.Value(bool) = .init(false),
+        /// When the schedules were last seeded, in the clock `now` reads, or
+        /// `not_seeded` for a queue nobody has seeded. What `reseedAt` wins
+        /// a `cmpxchg` on, so one worker in one interval re-seeds for all of
+        /// them (ADR 161).
+        reseeded_at: std.atomic.Value(i64) = .init(not_seeded),
+
+        const not_seeded = std.math.minInt(i64);
+        /// How long a schedule may be dead before it is queued again. A
+        /// constant and not an option: the cost is one insert per scheduled
+        /// kind per interval, and what a user would tune is how long a
+        /// silent schedule is tolerated, which is a minute for every caller
+        /// who has asked (ADR 161).
+        const reseed_us: i64 = 60 * std.time.us_per_s;
+        const any_scheduled = blk: {
+            for (kinds) |K| {
+                if (scheduled(K)) break :blk true;
+            }
+            break :blk false;
+        };
 
         pub const Error = error{
             /// A row was pushed with a payload the store cannot hold.
@@ -432,8 +451,22 @@ pub fn Jobs(comptime options: anytype) type {
                     "nilo: `jobs.push` was given `.within` and no `.unique`, and a window needs a key to hold.\n" ++
                         "  `.{ .unique = key, .within = window }` — the key is what the window remembers.",
                 );
+                comptime if (!@hasDecl(@TypeOf(opts.within), "del")) @compileError(
+                    "nilo: `jobs.push`'s `.within` is " ++ shortName(@TypeOf(opts.within)) ++ ", which has no `del`.\n" ++
+                        "  A push the store refuses has to give its window back, so a window is a `cache.Space` of `job.Mark` " ++
+                        "or anything with `putIfAbsent(key, Mark) bool` and `del(key) bool` (ADR 160).",
+                );
                 if (!opts.within.putIfAbsent(unique.?, Mark{})) return null;
             }
+            // The window is reserved before the push, because two pushers
+            // agree on one winner only through `putIfAbsent`; so a push that
+            // fails (`QueueFull`, a database error) hands it back, or its
+            // retry would be answered `null` for the window's whole length
+            // with nothing queued. A `null` from the store keeps it: a row
+            // with that key is queued (ADR 160).
+            errdefer if (o.within) {
+                _ = opts.within.del(unique.?);
+            };
 
             const priority: contract.Priority = if (@hasDecl(K, "priority")) K.priority else .normal;
             const bytes = try std.json.Stringify.valueAlloc(scope.arena(), value, .{});
@@ -460,6 +493,12 @@ pub fn Jobs(comptime options: anytype) type {
         /// **Nothing is woken here**, because the row is not there yet: a
         /// worker woken now would claim before the commit and find nothing.
         /// Call `wake` after `tx.commit()`, or let the next poll find it.
+        ///
+        /// **Nothing is noted in the `status` Space either**, for the same
+        /// reason: this cannot see the commit, so a `queued` written now
+        /// would outlive a rollback as a status for a row that never existed.
+        /// A row pushed here has no status until a worker takes it and the
+        /// Space says `running` (ADR 160).
         pub fn pushIn(self: *Self, tx: anytype, scope: anytype, value: anytype, opts: anytype) !PushAnswer(@TypeOf(opts)) {
             comptime core.checkScope(@TypeOf(scope), "jobs.pushIn");
             comptime if (!@hasDecl(Store, "pushIn")) @compileError(
@@ -480,13 +519,8 @@ pub fn Jobs(comptime options: anytype) type {
 
             const bytes = try std.json.Stringify.valueAlloc(scope.arena(), value, .{});
             const id = try self.store.pushIn(tx, scope, K.nilo_job, bytes, .{ .run_at = run_at, .unique = unique, .priority = priority });
-            if (o.unique) {
-                if (id) |i| self.note(i, .queued, 0);
-                return id;
-            }
-            const i = id orelse unreachable;
-            self.note(i, .queued, 0);
-            return i;
+            if (o.unique) return id;
+            return id orelse unreachable;
         }
 
         fn PushAnswer(comptime O: type) type {
@@ -641,8 +675,10 @@ pub fn Jobs(comptime options: anytype) type {
             {
                 var run: core.Run = .initIo(self.gpa, io);
                 defer run.deinit();
+                // `warn`: a failed seed is queued again by the re-seed within
+                // a minute, so it is not a refusal to start (ADR 161).
                 self.seedAt(&run, core.nowMicros()) catch |err| {
-                    std.log.scoped(.nilo_job).err("seeding schedules: {t}", .{err});
+                    std.log.scoped(.nilo_job).warn("seeding schedules: {t}; they are re-seeded within a minute", .{err});
                 };
             }
 
@@ -694,8 +730,10 @@ pub fn Jobs(comptime options: anytype) type {
                 _ = late_checked;
             }
             comptime core.checkScope(@TypeOf(scope), "jobs.runOne");
-            const claimed = try self.store.claim(scope, &kind_names, now, now + self.leaseMicros()) orelse return false;
-            self.execute(scope, claimed, .{ .fixed = now });
+            const claimed = try self.store.claim(scope, &kind_names, now, now + self.leaseMicros());
+            self.reseedAt(scope, now);
+            const c = claimed orelse return false;
+            self.execute(scope, c, .{ .fixed = now });
             return true;
         }
 
@@ -709,11 +747,37 @@ pub fn Jobs(comptime options: anytype) type {
 
         /// `seed` as if it were `now`: the first tick is the first one
         /// strictly after that moment.
+        ///
+        /// **Seeding is idempotent, and that is what lets it heal.** A kind
+        /// that already has a queued or running tick inserts nothing, because
+        /// the tick's key is unique. A tick is pushed in a statement of its
+        /// own after the last one is marked done, so a crash between the two,
+        /// a database error on the push, or a `cancel` of the queued tick
+        /// leaves a kind with no row at all; every worker therefore calls
+        /// this again at most once a minute (`reseedAt`), and a schedule that
+        /// went quiet is back within it. After the first seed or `serve`; a
+        /// queue nobody seeded is not seeded behind its owner's back
+        /// ([ADR 161](../docs/adr/161-a-schedule-is-a-type-that-makes-the-caller-choose.md)).
         pub fn seedAt(self: *Self, scope: anytype, now: i64) !void {
             comptime core.checkScope(@TypeOf(scope), "jobs.seed");
+            self.reseeded_at.store(now, .release);
             inline for (kinds) |K| {
                 if (comptime scheduled(K)) self.pushNext(K, scope, now);
             }
+        }
+
+        /// `seedAt` again when a minute has passed since it last ran, by
+        /// whichever caller wins the exchange. One atomic load per call for
+        /// a queue with schedules, nothing at all for one without, and one
+        /// insert per scheduled kind per minute (ADR 161).
+        fn reseedAt(self: *Self, scope: anytype, now: i64) void {
+            if (comptime !any_scheduled) return;
+            const last = self.reseeded_at.load(.acquire);
+            if (last == not_seeded or now - last < reseed_us) return;
+            if (self.reseeded_at.cmpxchgStrong(last, now, .acq_rel, .acquire) != null) return;
+            self.seedAt(scope, now) catch |err| {
+                std.log.scoped(.nilo_job).warn("re-seeding schedules: {t}; trying again in a minute", .{err});
+            };
         }
 
         fn leaseMicros(self: *Self) i64 {
@@ -752,6 +816,9 @@ pub fn Jobs(comptime options: anytype) type {
                     try io.sleep(poll.duration.raw, .awake);
                     continue;
                 };
+                // Whether the claim was empty or not: a queue that is never
+                // empty has to heal too (ADR 161).
+                self.reseedAt(&run, now);
                 if (claimed) |c| {
                     self.execute(&run, c, .wall);
                 } else {
@@ -797,7 +864,6 @@ pub fn Jobs(comptime options: anytype) type {
         }
 
         fn executeKind(self: *Self, comptime K: type, scope: anytype, claimed: Claimed, clock: Clock) void {
-            const log = std.log.scoped(.nilo_job);
             const retry: Retry = K.retry;
             const now = clock.now();
 
@@ -834,7 +900,14 @@ pub fn Jobs(comptime options: anytype) type {
                 .ignore_unknown_fields = true,
             }) catch |err| {
                 // A payload this binary cannot read is not going to become
-                // readable by trying again.
+                // readable by trying again; running out of memory to read it
+                // in says nothing about the payload, and the next attempt
+                // may have the memory, so that one takes the retry the kind
+                // declared.
+                if (err == error.OutOfMemory) {
+                    self.failedAttempt(K, scope, claimed, "OutOfMemory", false, clock);
+                    return;
+                }
                 self.finishDead(scope, claimed.id, K, @errorName(err), claimed.attempts, clock);
                 return;
             };
@@ -847,6 +920,13 @@ pub fn Jobs(comptime options: anytype) type {
             core.stampWith(&value, scope);
 
             const timeout_ms: u32 = if (@hasDecl(K, "timeout_ms")) K.timeout_ms else self.settings.timeout_ms;
+
+            // This worker has the row and its payload reads: the Space says
+            // so from here to the end of the run, which is what a route
+            // polling `status(id)` was promised (ADR 160). After the parse,
+            // so a row that goes dead on it is never shown `running`.
+            self.note(claimed.id, .running, claimed.attempts);
+
             var bound: core.Limits.Bound = .idle;
             defer bound.release();
             bound.arm(self.limits, timeout_ms);
@@ -901,17 +981,29 @@ pub fn Jobs(comptime options: anytype) type {
                 // whatever the count says; a timeout never is, because the
                 // next attempt may finish
                 // ([ADR 179](../docs/adr/179-a-run-can-say-its-failure-is-final.md)).
-                if (claimed.attempts > retry.times or (!timed_out and isFinal(K, err))) {
-                    self.finishDead(scope, claimed.id, K, name, claimed.attempts, clock);
-                    return;
-                }
-                const again = clock.now() + @as(i64, @intCast(retry.delayMs(claimed.attempts))) * std.time.us_per_ms;
-                log.warn("\"{s}\" row {d} failed with {s} on attempt {d}; again in {d}ms", .{
-                    K.nilo_job, claimed.id, name, claimed.attempts, retry.delayMs(claimed.attempts),
-                });
-                if (!self.settled(claimed.id, "retry", self.store.retry(scope, claimed.id, claimed.attempts, again, name))) return;
-                self.note(claimed.id, .queued, claimed.attempts);
+                self.failedAttempt(K, scope, claimed, name, !timed_out and isFinal(K, err), clock);
             }
+        }
+
+        /// What an attempt that failed becomes: dead when it was the last one
+        /// the kind allows or the failure is `final`, and otherwise queued
+        /// again after the backoff. One place for the run's failure and for a
+        /// failure that is not the run's, a payload that could not be read
+        /// for want of memory, so a transient failure is retried the same
+        /// way whichever it is.
+        fn failedAttempt(self: *Self, comptime K: type, scope: anytype, claimed: Claimed, name: []const u8, final: bool, clock: Clock) void {
+            const log = std.log.scoped(.nilo_job);
+            const retry: Retry = K.retry;
+            if (claimed.attempts > retry.times or final) {
+                self.finishDead(scope, claimed.id, K, name, claimed.attempts, clock);
+                return;
+            }
+            const again = clock.now() + @as(i64, @intCast(retry.delayMs(claimed.attempts))) * std.time.us_per_ms;
+            log.warn("\"{s}\" row {d} failed with {s} on attempt {d}; again in {d}ms", .{
+                K.nilo_job, claimed.id, name, claimed.attempts, retry.delayMs(claimed.attempts),
+            });
+            if (!self.settled(claimed.id, "retry", self.store.retry(scope, claimed.id, claimed.attempts, again, name))) return;
+            self.note(claimed.id, .queued, claimed.attempts);
         }
 
         /// Whether `err` is one the kind declared final. An `inline for` over
@@ -1037,11 +1129,19 @@ pub fn Jobs(comptime options: anytype) type {
         /// declare `.high`, pass every check, and run `.normal` forever —
         /// the schedule is the only path that pushes a row nobody wrote a
         /// `push` call for.
+        ///
+        /// **A failure here is not final**, so it is `warn`: this is a
+        /// statement of its own after the last tick was marked done (it
+        /// cannot go before, because a running `.skip` tick still holds the
+        /// key and would drop it), and the re-seed (`reseedAt`) queues the
+        /// kind again within a minute whatever left it with no row, this
+        /// failure, a crash between the two statements or a `cancel` of the
+        /// tick ([ADR 161](../docs/adr/161-a-schedule-is-a-type-that-makes-the-caller-choose.md)).
         fn pushNext(self: *Self, comptime K: type, scope: anytype, after: i64) void {
             const at = K.schedule.next(after);
             const priority: contract.Priority = if (@hasDecl(K, "priority")) K.priority else .normal;
             _ = self.store.push(scope, K.nilo_job, "{}", .{ .run_at = at, .unique = schedule_key, .priority = priority }) catch |err| {
-                std.log.scoped(.nilo_job).err("queueing the next \"{s}\": {t}", .{ K.nilo_job, err });
+                std.log.scoped(.nilo_job).warn("queueing the next \"{s}\": {t}; the schedule is re-seeded within a minute", .{ K.nilo_job, err });
             };
         }
 
@@ -2526,4 +2626,185 @@ test "overlap .queue has the next tick queued while this one runs, and .skip doe
     try testing.expectEqual(@as(usize, 1), try sjobs.drainAt(&run, 61 * std.time.us_per_s));
     try testing.expectEqual(@as(u64, 0), heard.queued_skip);
     try testing.expectEqual(@as(u64, 1), (try sjobs.stats(&run)).queued);
+}
+
+// -- a schedule that heals (ADR 161) --------------------------------------
+
+test "a schedule whose queued tick was lost is queued again within the re-seed interval" {
+    // The three real causes (a crash between `done` and the push, a database
+    // blip on the push, a `cancel` of the queued tick) all leave a scheduled
+    // kind with no row, and seeding used to happen only at `serve`. A cancel
+    // is the simplest to stage.
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var ledger: Ledger = .{ .gpa = testing.allocator };
+    defer ledger.deinit();
+    var jobs: ClockJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{});
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    const seeded_at: i64 = (20_833 * 86_400 + 10 * 3600) * std.time.us_per_s;
+    try jobs.seedAt(&run, seeded_at);
+    const three = Nightly.schedule.next(seeded_at);
+    try testing.expectEqual(@as(usize, 1), try jobs.drainAt(&run, three));
+    // The next tick is queued, and is lost: its id is the one after the first.
+    try testing.expectEqual(@as(u64, 1), (try jobs.stats(&run)).queued);
+    try testing.expect(try jobs.cancel(&run, 2));
+    try testing.expectEqual(@as(u64, 0), (try jobs.stats(&run)).queued);
+
+    // Inside the interval nothing heals it, and nothing is due.
+    try testing.expectEqual(@as(usize, 0), try jobs.drainAt(&run, three + 30 * std.time.us_per_s));
+    try testing.expectEqual(@as(u64, 0), (try jobs.stats(&run)).queued);
+    // Past it the schedule is queued again, and runs at its next time.
+    try testing.expectEqual(@as(usize, 0), try jobs.drainAt(&run, three + 61 * std.time.us_per_s));
+    try testing.expectEqual(@as(u64, 1), (try jobs.stats(&run)).queued);
+    const after = Nightly.schedule.next(three + 61 * std.time.us_per_s);
+    try testing.expectEqual(@as(usize, 1), try jobs.drainAt(&run, after));
+    try testing.expectEqual(@as(usize, 2), ledger.lines.items.len);
+}
+
+test "a queue that was never seeded is not re-seeded by a drain" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var ledger: Ledger = .{ .gpa = testing.allocator };
+    defer ledger.deinit();
+    var jobs: ClockJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{});
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    try testing.expectEqual(@as(usize, 0), try jobs.drainAt(&run, 1_000 * std.time.us_per_s));
+    try testing.expectEqual(@as(u64, 0), (try jobs.stats(&run)).queued);
+}
+
+// -- a status that says running (ADR 160) ---------------------------------
+
+/// Reads its own status while it runs, which is what a route polling
+/// `status(id)` would see.
+const Peeking = struct {
+    pub const nilo_job = "peeking";
+    pub const retry: Retry = .none;
+
+    var seen: ?Status = null;
+
+    pub fn run(self: Peeking, scope: *core.Run, tick: Tick, jobs: *PeekJobs) !void {
+        _ = self;
+        _ = scope;
+        seen = jobs.status(tick.id);
+    }
+};
+
+const PeekJobs = Jobs(.{
+    .kinds = .{Peeking},
+    .store = Memory,
+    .deps = progressDeps,
+    .status = FakeSpace,
+});
+
+test "a row that is running says so in the status Space, with its attempt" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+    var jobs: PeekJobs = undefined;
+    jobs = .openWith(testing.allocator, &store, .{ .jobs = &jobs }, .{}, .{});
+
+    Peeking.seen = null;
+    const id = try jobs.push(&run, Peeking{}, .{});
+    try testing.expectEqual(@as(usize, 1), try jobs.drain(&run));
+    try testing.expectEqual(State.running, Peeking.seen.?.state);
+    try testing.expectEqual(@as(u32, 1), Peeking.seen.?.attempts);
+    try testing.expectEqual(State.done, jobs.status(id).?.state);
+}
+
+// -- a transient failure is not a final one -------------------------------
+
+/// A payload that needs an allocation to read, and a retry to spend.
+const Fussy = struct {
+    pub const nilo_job = "fussy";
+    pub const retry: Retry = .{ .times = 2, .backoff = .{ .fixed_ms = 0 } };
+
+    nums: []const u32,
+
+    pub fn run(self: Fussy, scope: *core.Run, ledger: *Ledger) !void {
+        _ = scope;
+        try ledger.record(if (self.nums.len == 2) "fussy ran" else "fussy odd");
+    }
+};
+
+const FussyJobs = Jobs(.{
+    .kinds = .{Fussy},
+    .store = Memory,
+    .deps = struct { ledger: *Ledger },
+});
+
+test "a payload that cannot be parsed for want of memory is retried, not dead" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var ledger: Ledger = .{ .gpa = testing.allocator };
+    defer ledger.deinit();
+    var jobs: FussyJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{});
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    const t = core.nowMicros() + std.time.us_per_s;
+    _ = try jobs.push(&run, Fussy{ .nums = &.{ 1, 2 } }, .{});
+    const claimed = (try store.claim(&run, &FussyJobs.kind_names, t, t + 1_000)).?;
+
+    // The tick's arena is out of memory when the payload is read: nothing
+    // about the payload is wrong, so the row goes back for another attempt.
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    var starved: core.Run = .init(failing.allocator());
+    defer starved.deinit();
+    jobs.execute(&starved, claimed, .{ .fixed = t });
+    try testing.expectEqual(@as(u64, 0), (try jobs.stats(&run)).dead);
+    try testing.expectEqual(@as(u64, 1), (try jobs.stats(&run)).queued);
+
+    try testing.expectEqual(@as(usize, 1), try jobs.drainAt(&run, t));
+    try testing.expectEqualStrings("fussy ran", ledger.lines.items[0]);
+}
+
+/// A `.within` window in a test with no `nilo_cache` in the graph: one key.
+const FakeWindow = struct {
+    held: *bool,
+
+    pub fn putIfAbsent(self: FakeWindow, key: []const u8, value: Mark) bool {
+        _ = key;
+        _ = value;
+        if (self.held.*) return false;
+        self.held.* = true;
+        return true;
+    }
+
+    pub fn del(self: FakeWindow, key: []const u8) bool {
+        _ = key;
+        const was = self.held.*;
+        self.held.* = false;
+        return was;
+    }
+};
+
+test "a push whose store refused it does not hold its .within window" {
+    // One slot, taken: the second push is `QueueFull`, nothing was queued,
+    // and the window it reserved first must not outlive the failure.
+    var store = try Memory.open(testing.allocator, .{ .bytes = 1 });
+    defer store.deinit();
+    var ledger: Ledger = .{ .gpa = testing.allocator };
+    defer ledger.deinit();
+    var jobs: TestJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{});
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    const blocker = try jobs.push(&run, Greet{ .who = .static("a") }, .{});
+    var held = false;
+    const window: FakeWindow = .{ .held = &held };
+    try testing.expectError(error.QueueFull, jobs.push(&run, Greet{ .who = .static("b") }, .{ .unique = "k", .within = window }));
+    try testing.expect(!held);
+
+    // Room again, same key, at once.
+    try testing.expect(try jobs.cancel(&run, blocker));
+    const id = try jobs.push(&run, Greet{ .who = .static("b") }, .{ .unique = "k", .within = window });
+    try testing.expect(id != null);
+    try testing.expect(held);
+    // A second push inside the window is still answered by the window.
+    try testing.expect((try jobs.push(&run, Greet{ .who = .static("b") }, .{ .unique = "k", .within = window })) == null);
 }

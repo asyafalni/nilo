@@ -94,6 +94,9 @@ pub fn parseLeaky(
 /// that keeps the last one sees another variant (ADR 016). Reached only after a
 /// parse that already failed, so the second walk costs a body nobody wanted.
 fn saySecondKey(gpa: std.mem.Allocator, input: []const u8) void {
+    // Cleared first: the Failure speaks only when it is set afresh, so what
+    // a handler caught earlier cannot be taken for this sentence (ADR 004).
+    if (fail.current()) |failure| failure.clear();
     const key = firstRepeatedKey(gpa, input) orelse return;
     // The Failure rather than a returned error: the caller returns the error
     // `std.json` gave, and the status table already maps it to a 400.
@@ -622,6 +625,50 @@ fn writeByteArray(w: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void
 /// rather than two is what keeps that true in both places.
 pub fn writeString(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
     try w.writeByte('"');
+    try writeEscaped(w, text);
+    return w.writeByte('"');
+}
+
+/// A JSON string for text that has to be one whatever it holds: every byte
+/// that is not part of a UTF-8 character is written as U+FFFD, the
+/// replacement character, and the rest is escaped exactly as `writeString`
+/// does.
+///
+/// For a sentence a client displays, a failure's message above all, where
+/// `%ff` in a path is a stranger's bytes and a message cut at the byte limit
+/// can end inside a character. ADR 096's byte array is for a value a handler
+/// returns; a message that went out as `[255]` would be shown as numbers
+/// (ADR 024). Valid text, which is nearly all of it, pays one validation pass
+/// and takes `writeString`. Each bad byte becomes three bytes, fewer than the
+/// six a control character takes as `\u00xx`, so a buffer sized for the worst
+/// escape holds the worst replacement.
+pub fn writeLossyString(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
+    if (std.unicode.utf8ValidateSlice(text)) return writeString(w, text);
+    try w.writeByte('"');
+    var run: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const lead = text[i];
+        if (lead < 0x80) {
+            i += 1;
+            continue;
+        }
+        const n = std.unicode.utf8ByteSequenceLength(lead) catch 0;
+        if (n != 0 and i + n <= text.len and std.unicode.utf8ValidateSlice(text[i..][0..n])) {
+            i += n;
+            continue;
+        }
+        try writeEscaped(w, text[run..i]);
+        try w.writeAll("\u{FFFD}");
+        i += 1;
+        run = i;
+    }
+    try writeEscaped(w, text[run..]);
+    return w.writeByte('"');
+}
+
+/// What goes between the quotes of `writeString`.
+fn writeEscaped(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
     var at: usize = 0;
     while (nextEscape(text, at)) |i| {
         try w.writeAll(text[at..i]);
@@ -642,7 +689,6 @@ pub fn writeString(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void
         });
     }
     try w.writeAll(text[at..]);
-    return w.writeByte('"');
 }
 
 const lanes = 32;

@@ -147,15 +147,48 @@ pub const Objects = struct {
     }
 };
 
-/// The cursor for the page after this one, or null when this was the last.
+/// The cursor for the page after this one, null when this was the last, and
+/// `error.Failed` when the page says there is more and gives no way to it.
 ///
 /// Read from `<IsTruncated>` first and `<NextContinuationToken>` second,
 /// because a server may write the token on the last page too and the flag
 /// is the one that says whether it means anything.
-pub fn nextCursor(body: []const u8) ?[]const u8 {
+///
+/// **A truncated page without a usable token is a failure, not the end.** A
+/// loop that walks a bucket (a backup, a cleanup) cannot tell a listing that
+/// stopped early from one that finished, so reading the missing token as
+/// "last page" is silent data loss; an empty token would go back as
+/// `continuation-token=`, a 400, and one over `cursor_max` is one `list`
+/// itself refuses to send. `Failed` is loud and retryable. The length is that
+/// of the token once its entities are characters, which is what goes back.
+pub fn nextCursor(body: []const u8) error{Failed}!?[]const u8 {
     const truncated = between(body, "<IsTruncated>", "</IsTruncated>") orelse return null;
     if (!std.mem.eql(u8, truncated, "true")) return null;
-    return between(body, "<NextContinuationToken>", "</NextContinuationToken>");
+    const token = between(body, "<NextContinuationToken>", "</NextContinuationToken>") orelse {
+        std.log.warn("nilo_s3: a list answered IsTruncated without a NextContinuationToken", .{});
+        return error.Failed;
+    };
+    const len = unescapedLen(token);
+    if (len == 0 or len > cursor_max) {
+        std.log.warn(
+            "nilo_s3: a list answered IsTruncated with a continuation token of {d} bytes, " ++
+                "and a usable one is 1 to {d}",
+            .{ len, cursor_max },
+        );
+        return error.Failed;
+    }
+    return token;
+}
+
+/// Whether the answer says its keys are percent-encoded, which is the server
+/// echoing the `encoding-type=url` the request asked for. A key is decoded
+/// only then: a server that ignores the parameter sends keys as they are, and
+/// decoding those turns a literal `%41` into `A` (the S3 API echoes the
+/// element, and so do MinIO and Garage). An element inside a key cannot match
+/// this, because XML writes its `<` as `&lt;`.
+pub fn keysEncoded(body: []const u8) bool {
+    const kind = between(body, "<EncodingType>", "</EncodingType>") orelse return false;
+    return std.mem.eql(u8, kind, "url");
 }
 
 /// The text between one opening tag and its closing tag, at the first
@@ -313,12 +346,26 @@ test "the objects are read in order, as the encoded slices the body holds" {
 }
 
 test "a truncated page names its cursor, and a whole one names none" {
-    try testing.expectEqualStrings("1dEs3p+aG&amp;e=", nextCursor(two_objects).?);
+    try testing.expectEqualStrings("1dEs3p+aG&amp;e=", (try nextCursor(two_objects)).?);
 
     const last = "<ListBucketResult><IsTruncated>false</IsTruncated>" ++
         "<NextContinuationToken>stale</NextContinuationToken></ListBucketResult>";
-    try testing.expect(nextCursor(last) == null);
-    try testing.expect(nextCursor("<ListBucketResult></ListBucketResult>") == null);
+    try testing.expect((try nextCursor(last)) == null);
+    try testing.expect((try nextCursor("<ListBucketResult></ListBucketResult>")) == null);
+}
+
+test "a truncated page without a usable token is a failure, and the key coding is read from the answer" {
+    const open = "<ListBucketResult><IsTruncated>true</IsTruncated>";
+    try testing.expectError(error.Failed, nextCursor(open ++ "</ListBucketResult>"));
+    try testing.expectError(error.Failed, nextCursor(open ++ "<NextContinuationToken></NextContinuationToken>"));
+    try testing.expectError(error.Failed, nextCursor(
+        open ++ "<NextContinuationToken>" ++ "c" ** (cursor_max + 1) ++ "</NextContinuationToken>",
+    ));
+    try testing.expectEqualStrings("c" ** cursor_max, (try nextCursor(
+        open ++ "<NextContinuationToken>" ++ "c" ** cursor_max ++ "</NextContinuationToken>",
+    )).?);
+    try testing.expect(keysEncoded(two_objects));
+    try testing.expect(!keysEncoded("<ListBucketResult><Key>%41</Key></ListBucketResult>"));
 }
 
 test "a block missing one of the four names is stepped over rather than half-read" {

@@ -158,7 +158,11 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         /// The longest URL this bucket can build, which is what sizes the
         /// buffer on the stack of every call.
         const url_max = "https://".len + host_max + prefix_max + 1 + settings.key_max * 3;
-        const host_max = 63 + 1 + 255;
+        /// A bucket name, a dot, and an authority, which `Store.open` refuses
+        /// past `authority_max`: every `catch unreachable` that formats the
+        /// endpoint into a buffer sized from this (`urlForList`, `presign`,
+        /// `presignPost`) is held by that one check.
+        const host_max = 63 + 1 + store_mod.authority_max;
         const prefix_max = 1 + 63;
         /// The same for a `list`, whose URL is the bucket's root and a query
         /// rather than a key: sized by the query, which is sized by
@@ -401,7 +405,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .method = "PUT",
                 .key = key,
                 .payload = self.store.payloadFor(bytes, &hash_buf),
-                .content_type = viewOf(value.content_type),
+                .content_type = contentTypeOf(value.content_type),
                 .cache_control = optional(value, "cache_control"),
                 .content_disposition = optional(value, "content_disposition"),
                 .token_buf = &token_buf,
@@ -415,7 +419,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .url = target,
                 .host = self.host,
                 .authorization = sig.value(),
-                .content_type = viewOf(value.content_type),
+                .content_type = contentTypeOf(value.content_type),
                 .headers = headers.slice(),
                 .body = .{ .slice = bytes },
                 .redirects = .expose,
@@ -448,7 +452,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 // Always unsigned: hashing what has not been read yet means
                 // reading it twice, and the source may be a socket.
                 .payload = sign.unsigned_payload,
-                .content_type = viewOf(source.content_type),
+                .content_type = contentTypeOf(source.content_type),
                 .token_buf = &token_buf,
             });
 
@@ -460,7 +464,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .url = target,
                 .host = self.host,
                 .authorization = sig.value(),
-                .content_type = viewOf(source.content_type),
+                .content_type = contentTypeOf(source.content_type),
                 .headers = headers.slice(),
                 .body = .{ .stream = .{ .reader = source.reader, .len = source.len } },
                 .redirects = .expose,
@@ -639,14 +643,24 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             const body = ex.take(c, bound) catch |err| return blame(err);
             const xml = body.view();
 
+            // Decided before any key is read, and the cursor before any is
+            // kept: a page that cannot be continued fails whole.
+            const cursor = listing_mod.nextCursor(xml) catch return error.Failed;
+            const encoded = listing_mod.keysEncoded(xml);
+
             const objects = try c.arena().alloc(Listed, listing_mod.Objects.count(xml));
             var walk: listing_mod.Objects = .init(xml);
             for (objects) |*object| {
                 const raw = walk.next() orelse unreachable; // counted a moment ago
                 // `+` is a space here, as in a form: that is how AWS and
                 // MinIO both write one under `encoding-type=url`, and a `+`
-                // in the key itself arrives as `%2B`.
-                const key = core.percent.decode(c.arena(), raw.key, true) catch return error.OutOfMemory;
+                // in the key itself arrives as `%2B`. Only when the answer
+                // echoes `<EncodingType>url</EncodingType>`: a server that
+                // ignored the request sends the key as it is.
+                const key = if (encoded)
+                    core.percent.decode(c.arena(), raw.key, true) catch return error.OutOfMemory
+                else
+                    c.arena().dupe(u8, raw.key) catch return error.OutOfMemory;
                 const etag = try c.arena().alloc(u8, listing_mod.unescapedLen(raw.etag));
                 object.* = .{
                     .key = c.str(key),
@@ -656,7 +670,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 };
             }
 
-            const next: ?Str = if (listing_mod.nextCursor(xml)) |raw| next: {
+            const next: ?Str = if (cursor) |raw| next: {
                 const room = try c.arena().alloc(u8, listing_mod.unescapedLen(raw));
                 break :next c.str(listing_mod.unescapeInto(room, raw));
             } else null;
@@ -1302,6 +1316,16 @@ fn cut(room: []u8, at: *usize, text: []const u8) []const u8 {
 /// more nor less than bytes.
 fn viewOf(value: anytype) []const u8 {
     return if (@TypeOf(value) == Str) value.view() else value;
+}
+
+/// A content type to sign and send, or null when the caller gave none. An
+/// empty (or blank) one is absent: signing `content-type:` and sending it
+/// empty is a header S3 may drop or reject, and either way a 403 that says
+/// nothing. A header left out of the request is left out of `SignedHeaders`
+/// with it, because both are driven by this one value.
+fn contentTypeOf(value: anytype) ?[]const u8 {
+    const v = viewOf(value);
+    return if (std.mem.trim(u8, v, " \t").len == 0) null else v;
 }
 
 fn optional(value: anytype, comptime field: []const u8) ?[]const u8 {

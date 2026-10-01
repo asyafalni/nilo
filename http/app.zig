@@ -1449,7 +1449,7 @@ pub const App = struct {
         const n = self.before_serving.items.len;
         for (self.before_serving.items, 1..) |b, i| runOneBefore(b, self.gpa, io, &in_flight) catch |err| {
             const f = &in_flight.failure;
-            if (f.isSet()) std.log.err(
+            if (fail.failed(f, err)) std.log.err(
                 "nilo will not start: work {d} of {d} registered with `app.before` failed with " ++
                     "{t}, {d} \"{s}\", and a server whose boot work did not finish must not take a request.",
                 .{ i, n, err, f.status, f.message() },

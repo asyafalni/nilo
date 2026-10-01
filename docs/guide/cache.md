@@ -81,7 +81,7 @@ The third argument to `cache.Space`:
 
 | Field | Default | |
 |---|---|---|
-| `ttl_s` | `0` | seconds an entry lives. Zero means until the ring overwrites it, which is a perfectly good answer for a cache, since nothing here sweeps |
+| `ttl_s` | `0` | seconds an entry lives. Zero means until the ring overwrites it, which is a perfectly good answer for a cache, since nothing here sweeps for expired entries |
 | `max_bytes` | 4096 | the largest value a `[]const u8` Space will hold, and the size of its `Held`. **Only used for that kind of Space** |
 
 An empty name is a compile error, because the name is what keeps one Space's keys apart from another's. So is a `[]const u8` Space with a `max_bytes` of zero, or of more than 65,535: the length is stored in sixteen bits so that four slots of a bucket fit in one cache line.
@@ -209,7 +209,7 @@ That last rule is what makes the module safe to use from a fiber. Zig's `std.Io.
 
 **Per request, nothing**: a lookup touches one cache line for the slot and makes one copy for the value, and the request path's allocation budget is unchanged. Per connection, whatever `Held` you declared.
 
-The TTL clock is the coarse monotonic one (a page the kernel updates on its own tick, not a vDSO call), because an operation costing a hundred nanoseconds should not spend a fifth of that on precision a TTL measured in seconds does not need.
+The TTL clock is the coarse monotonic one (a page the kernel updates on its own tick, not a vDSO call), because an operation costing a hundred nanoseconds should not spend a fifth of that on precision a TTL measured in seconds does not need. It reads whole seconds, truncated, so **a TTL of `n` seconds lives at least `n` and at most `n + 1`** (an entry put at 5.99 s with a TTL of one second is stored to expire at second 7). A clock that is monotonic does not advance while the machine is suspended, so nothing ages across a laptop sleep or a VM pause.
 
 ## Caching a route's response (`Cached`)
 

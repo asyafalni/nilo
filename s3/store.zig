@@ -104,11 +104,23 @@ pub const Options = struct {
 /// seconds, and the number of `warn` lines to the same.
 pub const retry_after_s: i64 = 5;
 
+/// The longest endpoint authority `open` accepts, which is what `bucket.zig`'s
+/// `host_max` sizes its buffers for.
+pub const authority_max = 255;
+
 pub const OpenError = error{
     /// The endpoint is not `http://host[:port]` or `https://host[:port]`.
     BadEndpoint,
-    /// A region longer than a credential scope can carry.
+    /// A region longer than a credential scope can carry, or one with a
+    /// byte in it that would end the scope early (`,`, `/`, a space or a
+    /// control byte).
     BadRegion,
+    /// Static credentials that could never sign: an empty key id or secret,
+    /// one longer than `sign` derives from, a byte in the key id the
+    /// `Authorization` header cannot carry, or an `expires_at` already past.
+    /// Refused here, by name, because the alternative is a 403 on every
+    /// request, each of them taking the write lock to refresh nothing.
+    BadCredentials,
     OutOfMemory,
 };
 
@@ -170,6 +182,9 @@ pub const Store = struct {
         const parsed = try parseEndpoint(options.endpoint);
         const public: ?Endpoint = if (options.public_endpoint) |e| try parseEndpoint(e) else null;
         if (options.region.len == 0 or options.region.len > 64) return error.BadRegion;
+        if (!plainText(options.region)) return error.BadRegion;
+        const kept_creds = try ownStatic(gpa, options.credentials);
+        errdefer wipeAndFree(gpa, kept_creds.owned);
 
         // One allocation for every string this holds for the life of the
         // process, sliced up rather than allocated one at a time.
@@ -204,9 +219,18 @@ pub const Store = struct {
                 // is not the one doing the work here.
                 .max_body = std.math.maxInt(usize),
             }),
-            .source = options.credentials,
+            .source = if (kept_creds.creds) |c| .{ .static = c } else options.credentials,
+            .creds = kept_creds.creds orelse .{ .access_key_id = "", .secret_access_key = "" },
+            .creds_owned = kept_creds.owned,
             .options = kept,
-            .margin_s = kept.refresh_margin_s,
+            // As `hold` caps it for a fetched set: half of what is left.
+            .margin_s = if (kept_creds.creds) |c|
+                (if (c.expires_at) |expiry|
+                    @min(kept.refresh_margin_s, @divFloor(@max(expiry - @divFloor(core.nowMillis(), 1000), 0), 2))
+                else
+                    kept.refresh_margin_s)
+            else
+                kept.refresh_margin_s,
             .scheme = parsed.scheme,
             .authority = authority,
             .public_scheme = if (public) |p| p.scheme else parsed.scheme,
@@ -217,7 +241,8 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store) void {
         self.client.deinit();
-        if (self.creds_owned.len != 0) self.gpa.free(self.creds_owned);
+        std.crypto.secureZero(u8, &self.keyed.key);
+        wipeAndFree(self.gpa, self.creds_owned);
         if (self.owned.len != 0) self.gpa.free(self.owned);
     }
 
@@ -378,7 +403,8 @@ pub const Store = struct {
             defer self.lock.unlockShared(io);
             if (self.usable(now_s)) return;
             const wanted = switch (self.source) {
-                .static => self.creds.access_key_id.len == 0,
+                // Held since `open`, which copied them in once.
+                .static => false,
                 .fetch => self.creds.access_key_id.len == 0 or
                     (if (self.creds.expires_at) |expiry|
                         now_s + self.margin_s >= expiry
@@ -391,7 +417,7 @@ pub const Store = struct {
         var fresh: ?Credentials = null;
         var failed = false;
         if (due) switch (self.source) {
-            .static => |fixed| fresh = fixed,
+            .static => unreachable,
             .fetch => |take| fresh = take(self.gpa, io) catch |err| fail: {
                 if (err == error.Canceled) return err;
                 // Safe to read without the lock: only the gate's holder
@@ -434,7 +460,7 @@ pub const Store = struct {
         const secret = copyInto(owned, &at, fresh.secret_access_key);
         const kept_token = copyInto(owned, &at, token);
 
-        if (self.creds_owned.len != 0) self.gpa.free(self.creds_owned);
+        wipeAndFree(self.gpa, self.creds_owned);
         self.creds_owned = owned;
         self.creds = .{
             .access_key_id = akid,
@@ -455,6 +481,8 @@ pub const Store = struct {
     fn deriveLocked(self: *Store, date: *const [8]u8) !void {
         if (self.creds.access_key_id.len > sign.akid_max) return error.AccessKeyIdTooLong;
 
+        // The key it replaces was derived from a secret that may be gone too.
+        std.crypto.secureZero(u8, &self.keyed.key);
         self.keyed = .{
             .key = try sign.derive(self.creds.secret_access_key, date, self.options.region),
             .access_key_id = undefined,
@@ -518,8 +546,71 @@ fn parseEndpoint(text: []const u8) OpenError!Endpoint {
     // an endpoint means somebody expects nilo to join two of them.
     const authority = std.mem.trimEnd(u8, rest, "/");
     if (authority.len == 0) return error.BadEndpoint;
+    // `host_max` in `bucket.zig` gives an authority 255 bytes (the bucket's
+    // own name and a dot come in front of it for virtual hosting), and every
+    // URL buffer on a stack is sized by it: `url_max` and `list_url_max` are
+    // what the `catch unreachable` in `urlForList`, `presign` and
+    // `presignPost` rest on. A longer one is refused here so that none of
+    // them can be driven past its buffer by configuration.
+    if (authority.len > authority_max) return error.BadEndpoint;
     if (std.mem.indexOfScalar(u8, authority, '/') != null) return error.BadEndpoint;
     return .{ .scheme = scheme, .authority = authority };
+}
+
+/// Whether `text` can sit inside a credential scope and an `Authorization`
+/// header: printable, with none of the separators the scope is cut at. The
+/// region and the key id both end up in `Credential=<id>/<date>/<region>/...`.
+fn plainText(text: []const u8) bool {
+    for (text) |b| {
+        if (b <= ' ' or b == 0x7f or b == ',' or b == '/') return false;
+    }
+    return true;
+}
+
+/// Static credentials, validated and copied into memory the Store owns, or
+/// nothing for a `.fetch` source. The caller's slices are a `Config`'s or a
+/// stack buffer's, and the doc says the Store keeps its own copy: one that
+/// reuses its buffer after `open` would otherwise corrupt the signing key at
+/// the next day's rotation.
+const Owned = struct { creds: ?Credentials = null, owned: []u8 = &.{} };
+
+fn ownStatic(gpa: std.mem.Allocator, source: Source) OpenError!Owned {
+    const given = switch (source) {
+        .static => |c| c,
+        .fetch => return .{},
+    };
+    if (given.access_key_id.len == 0 or given.secret_access_key.len == 0) return error.BadCredentials;
+    if (given.access_key_id.len > sign.akid_max or given.secret_access_key.len > sign.secret_max)
+        return error.BadCredentials;
+    if (!plainText(given.access_key_id)) return error.BadCredentials;
+    const token = given.session_token orelse "";
+    if (token.len > sign.token_max) return error.BadCredentials;
+    // The token goes out as a header value.
+    for (token) |b| if (b < ' ' or b == 0x7f) return error.BadCredentials;
+    if (given.expires_at) |at| if (at <= @divFloor(core.nowMillis(), 1000)) return error.BadCredentials;
+
+    const owned = try gpa.alloc(u8, given.access_key_id.len + given.secret_access_key.len + token.len);
+    var at: usize = 0;
+    const akid = copyInto(owned, &at, given.access_key_id);
+    const secret = copyInto(owned, &at, given.secret_access_key);
+    const kept_token = copyInto(owned, &at, token);
+    return .{
+        .creds = .{
+            .access_key_id = akid,
+            .secret_access_key = secret,
+            .session_token = if (given.session_token == null) null else kept_token,
+            .expires_at = given.expires_at,
+        },
+        .owned = owned,
+    };
+}
+
+/// Free memory that held a secret, zeroed first so that it does not sit in
+/// the allocator's free list until something else overwrites it.
+fn wipeAndFree(gpa: std.mem.Allocator, memory: []u8) void {
+    if (memory.len == 0) return;
+    std.crypto.secureZero(u8, memory);
+    gpa.free(memory);
 }
 
 fn copyInto(buf: []u8, at: *usize, text: []const u8) []const u8 {
@@ -777,4 +868,77 @@ test "a fetch that returns strings it does not own is not freed or kept" {
     _ = try keyAt(&store, io, t0 + 3400);
     // `testing.allocator` reports a leak or a double free at `deinit`; the
     // literals `Script.take` returns would be a crash if the Store freed them.
+}
+
+fn staticOpen(options: struct {
+    endpoint: []const u8 = "https://s3.example.com",
+    region: []const u8 = "us-east-1",
+    akid: []const u8 = "AKIAEXAMPLE",
+    secret: []const u8 = "secret",
+    expires_at: ?i64 = null,
+}) OpenError!Store {
+    return Store.open(testing.allocator, .{
+        .endpoint = options.endpoint,
+        .region = options.region,
+        .credentials = .{ .static = .{
+            .access_key_id = options.akid,
+            .secret_access_key = options.secret,
+            .expires_at = options.expires_at,
+        } },
+    });
+}
+
+test "static credentials that can never sign are refused at open, by name" {
+    try testing.expectError(error.BadCredentials, staticOpen(.{ .akid = "" }));
+    try testing.expectError(error.BadCredentials, staticOpen(.{ .secret = "" }));
+    // Already over: every request would take the write lock and get a 403.
+    try testing.expectError(error.BadCredentials, staticOpen(.{ .expires_at = 1 }));
+    try testing.expectError(error.BadCredentials, staticOpen(.{ .akid = "a" ** (sign.akid_max + 1) }));
+    try testing.expectError(error.BadCredentials, staticOpen(.{ .secret = "s" ** (sign.secret_max + 1) }));
+
+    var ok = try staticOpen(.{ .expires_at = std.math.maxInt(i32) });
+    ok.deinit();
+}
+
+test "a region or key id that would break the credential scope is refused at open" {
+    for ([_][]const u8{ "a,b", "a/b", "a\rb", "a\nb", "a\x01b", "a\x7fb" }) |bad| {
+        try testing.expectError(error.BadCredentials, staticOpen(.{ .akid = bad }));
+        try testing.expectError(error.BadRegion, staticOpen(.{ .region = bad }));
+    }
+}
+
+test "an endpoint authority longer than a host buffer holds is refused at open" {
+    // 255 is the share `host_max` in `bucket.zig` gives an authority, and it
+    // sizes every URL buffer on a stack. One more panicked in `urlForList`.
+    const fits = "https://" ++ "h" ** 255;
+    var ok = try staticOpen(.{ .endpoint = fits });
+    ok.deinit();
+    try testing.expectError(error.BadEndpoint, staticOpen(.{ .endpoint = fits ++ "h" }));
+    try testing.expectError(error.BadEndpoint, Store.open(testing.allocator, .{
+        .endpoint = "https://s3.example.com",
+        .public_endpoint = fits ++ "h",
+        .credentials = .{ .static = .{ .access_key_id = "A", .secret_access_key = "B" } },
+    }));
+}
+
+test "a store keeps its own copy of static credentials, and signs after the caller's are gone" {
+    var akid = "AKIAEXAMPLE".*;
+    var secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".*;
+    var store = try staticOpen(.{ .akid = &akid, .secret = &secret });
+    defer store.deinit();
+
+    // The caller's config buffer, freed and reused.
+    @memset(&akid, 'x');
+    @memset(&secret, 'x');
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var token: [8]u8 = undefined;
+    const now_ms = core.nowMillis();
+    const signing = try store.keyFor(threaded.io(), now_ms, &token);
+    try testing.expectEqualStrings("AKIAEXAMPLE", signing.keyed.akid());
+
+    var stamp: sign.Stamp = .at(@divFloor(now_ms, 1000));
+    const want = try sign.derive("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", stamp.date(), "us-east-1");
+    try testing.expectEqualSlices(u8, &want, &signing.keyed.key);
 }

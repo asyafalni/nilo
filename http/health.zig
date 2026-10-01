@@ -34,6 +34,7 @@
 const std = @import("std");
 const core = @import("nilo_core");
 const service = @import("service.zig");
+const json = @import("json.zig");
 
 pub const content_type = "application/json";
 
@@ -66,14 +67,14 @@ pub fn write(
         const hook = e.ready orelse continue;
         const why = hook(e.ptr, scope) orelse continue;
         try w.writeAll(if (waiting == 0)
-            "{\"status\":\"unavailable\",\"waiting\":[{\"service\":\""
+            "{\"status\":\"unavailable\",\"waiting\":[{\"service\":"
         else
-            ",{\"service\":\"");
+            ",{\"service\":");
         waiting += 1;
-        try writeEscaped(w, e.name);
-        try w.writeAll("\",\"why\":\"");
-        try writeEscaped(w, why);
-        try w.writeAll("\"}");
+        try json.writeLossyString(w, e.name);
+        try w.writeAll(",\"why\":");
+        try json.writeLossyString(w, why);
+        try w.writeAll("}");
     }
     if (waiting == 0) {
         try w.writeAll("{\"status\":\"ok\"}");
@@ -81,17 +82,6 @@ pub fn write(
     }
     try w.writeAll("]}");
     return .unavailable;
-}
-
-/// A reason is a sentence somebody wrote, and a type name can carry a
-/// quote; neither may break the JSON around it.
-fn writeEscaped(w: *std.Io.Writer, text: []const u8) !void {
-    for (text) |ch| switch (ch) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        else => if (ch < 0x20) try w.print("\\u{x:0>4}", .{ch}) else try w.writeByte(ch),
-    };
 }
 
 // ---- tests ----
@@ -153,6 +143,6 @@ test "a service that is not ready names itself and says why, and stopping outran
 test "a reason with a quote in it does not break the page" {
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeEscaped(&w, "say \"no\"\n");
-    try testing.expectEqualStrings("say \\\"no\\\"\\n", w.buffered());
+    try json.writeLossyString(&w, "say \"no\"\n\xff");
+    try testing.expectEqualStrings("\"say \\\"no\\\"\\n\u{FFFD}\"", w.buffered());
 }

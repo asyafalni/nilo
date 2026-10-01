@@ -191,6 +191,8 @@ A 206, a 416, a `Content-Range` and `Cache-Control: no-transform` are never comp
 | `dotfiles` | `false` |
 | `reload` | `false`. When true, holds nothing and opens every file per request |
 
+**A name on disk is matched as a browser sends it, and a symlink is never served.** A request for `/caf%C3%A9.png` finds `café.png`, and a path that decodes to an escaped `/`, a NUL, a backslash or a `.` or `..` segment finds nothing. The directory walk skips symlinks and names them in one startup warning; a spilled file, and every file under `reload`, is opened with `O_NOFOLLOW` and answers 404 if it became a link. A `FileBody` an application returns still follows links ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)).
+
 **`spa_fallback_for` decides which requests the fallback answers.** `.navigations` means a request that asks for `text/html`, or one that asks for nothing and has no file extension in its last path segment; every other request under the prefix gets a 404 naming the path. See [Static files](../guide/static-files.md#the-spa-fallback).
 
 **`max_file_bytes` is a threshold, not a limit.** A file over it is listed but not read into memory, and each request opens it and sends it from disk: no gzipped copy, an ETag made from the modification time and size, and one file descriptor for as long as the response takes. `max_total_bytes` counts only the bytes held in memory. See [Static files](../guide/static-files.md#large-files-served-from-disk).

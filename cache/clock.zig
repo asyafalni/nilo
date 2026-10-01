@@ -19,6 +19,17 @@
 //! Monotonic rather than wall clock, for the reason `core/clock.zig` gives:
 //! NTP steps the wall clock, and an operator running `timedatectl` should not
 //! expire every entry in the cache or none of them.
+//!
+//! **Whole seconds, truncated, so a TTL is `ttl` to `ttl + 1` seconds** and
+//! `Store.write` stores `now + ttl + 1` to make the floor hold: a put at 5.99 s
+//! reads 5, and a TTL of one second that expired at 6 lived ten milliseconds.
+//!
+//! **It does not advance while the machine is suspended.** `MONOTONIC_COARSE`
+//! on Linux and the `APPROX` clocks on Darwin stop across a laptop sleep or a
+//! VM pause, so nothing ages while the machine is off. A cache entry outlives
+//! the nap by the length of it, which is the behaviour of any monotonic clock
+//! here and a reason to put a deadline that matters in the value rather than
+//! only in its TTL.
 
 const std = @import("std");
 const builtin = @import("builtin");

@@ -37,6 +37,10 @@ The path is relative to the working directory the server runs in. A directory th
 
 Dotfiles are off because finding out on the first request that a `.env` or a `.git` ended up in the published directory is a bad way to learn it was there.
 
+**File names are matched as a browser sends them.** `café.png` is requested as `/caf%C3%A9.png` and `My Doc.pdf` as `/My%20Doc.pdf`; both are served under their names on disk. A path that decodes to an escaped `/`, a NUL, a backslash or a `.` or `..` segment (`%2e%2e` included), or holds a malformed escape, names no file ([ADR 009](../adr/009-static-files-are-held-in-memory-or-opened.md)).
+
+**A symlink in the tree is not served.** The walk skips every link and says so at startup in one warning (the first three paths and a count). A file that is loaded from disk per request, over `max_file_bytes` or under `reload`, is opened without following a link, so replacing one with a link to somewhere else answers 404 rather than sending what it points at. Copy the file into the directory to serve it.
+
 ### The SPA fallback
 
 **`spa_fallback` answers only a request that could be somebody opening a page**, so a browser reload on `/users/42` reaches your client-side router instead of a 404 ([ADR 087](../adr/087-a-fallback-answers-a-navigation-not-a-missing-asset.md)):

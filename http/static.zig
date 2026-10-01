@@ -415,12 +415,34 @@ pub const Set = struct {
         return (@intFromPtr(file) - @intFromPtr(self.files.ptr)) / @sizeOf(File);
     }
 
+    /// The file whose URL is `url`, a request path as it was sent.
+    ///
+    /// **The table holds names as they are on disk and the request is still
+    /// percent-encoded**: a browser asks for `café.png` as `/caf%C3%A9.png`
+    /// and `My Doc.pdf` as `/My%20Doc.pdf`, and comparing the raw bytes made
+    /// both a 404 to every browser. A path with a `%` in it is compared
+    /// decoded, one byte at a time against each candidate, so nothing is
+    /// allocated and no buffer is held on the connection's stack (ADR 062).
+    /// A path without one, nearly every request, costs the one scan for the
+    /// `%` and then the byte comparison it always had.
+    ///
+    /// Decoding is what could open a traversal, so a path whose decoded form
+    /// holds a `/` that was escaped, a NUL, a backslash or a `.` or `..`
+    /// segment, or whose escape is malformed, is no file (ADR 009). The table
+    /// is searched rather than the disk, so nothing here could walk out of
+    /// the tree; the refusal keeps that true if the lookup ever changes.
     fn lookup(self: *const Set, url: []const u8) ?*const File {
+        const encoded = std.mem.indexOfScalar(u8, url, '%') != null;
+        if (encoded and !decodedPathIsSafe(url)) return null;
         var lo: usize = 0;
         var hi: usize = self.files.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            switch (std.mem.order(u8, self.files[mid].url, url)) {
+            const order = if (encoded)
+                orderDecoded(self.files[mid].url, url)
+            else
+                std.mem.order(u8, self.files[mid].url, url);
+            switch (order) {
                 .lt => lo = mid + 1,
                 .gt => hi = mid,
                 .eq => return &self.files[mid],
@@ -429,6 +451,62 @@ pub const Set = struct {
         return null;
     }
 };
+
+/// One byte of a request path, decoded: what `raw[i..]` starts with, where
+/// the next byte begins, and whether it came from a `%XX`. Null for a `%`
+/// without two hex digits after it.
+fn decodedAt(raw: []const u8, i: usize) ?struct { byte: u8, next: usize, escaped: bool } {
+    if (raw[i] != '%') return .{ .byte = raw[i], .next = i + 1, .escaped = false };
+    if (i + 2 >= raw.len) return null;
+    const hi = std.fmt.charToDigit(raw[i + 1], 16) catch return null;
+    const lo = std.fmt.charToDigit(raw[i + 2], 16) catch return null;
+    return .{ .byte = hi << 4 | lo, .next = i + 3, .escaped = true };
+}
+
+/// Whether a request path with a `%` in it is one a file could be under,
+/// decoded: every escape well formed, no `/`, NUL or backslash that an escape
+/// produced, and no `.` or `..` segment however it was spelled (`%2e%2e`).
+fn decodedPathIsSafe(raw: []const u8) bool {
+    var i: usize = 0;
+    var dots: usize = 0;
+    var other = false;
+    while (i < raw.len) {
+        const d = decodedAt(raw, i) orelse return false;
+        i = d.next;
+        if (d.byte == 0 or d.byte == '\\') return false;
+        if (d.byte == '/') {
+            if (d.escaped) return false;
+            if (!other and dots > 0 and dots <= 2) return false;
+            dots = 0;
+            other = false;
+        } else if (d.byte == '.') {
+            dots += 1;
+        } else {
+            other = true;
+        }
+    }
+    return other or dots == 0 or dots > 2;
+}
+
+/// How `stored`, a URL as written from a name on disk, orders against
+/// `raw`, a request path decoded as it is walked. Only for a path that
+/// `decodedPathIsSafe` has passed, so every escape in it is well formed.
+fn orderDecoded(stored: []const u8, raw: []const u8) std.math.Order {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < stored.len and j < raw.len) {
+        const d = decodedAt(raw, j) orelse return .gt;
+        const order = std.math.order(stored[i], d.byte);
+        if (order != .eq) return order;
+        i += 1;
+        j = d.next;
+    }
+    if (i < stored.len) return .gt;
+    return if (j < raw.len) .lt else .eq;
+}
+
+/// How many skipped symlinks `load` names in its one warning.
+const max_named_links = 3;
 
 /// The longest URL a file can have. Generous for a build output tree, and
 /// bounded so a lookup never allocates.
@@ -621,6 +699,13 @@ pub fn load(
     var packed_total: usize = 0;
     var spilled_files: usize = 0;
     var skipped_dotfiles: usize = 0;
+    // Links the walk passed over, named once at the end: the first few and a
+    // count (ADR 009). A link is not a file the walk listed, so nothing is
+    // served for it and a reader of the directory would otherwise find out
+    // from a 404.
+    var skipped_links: usize = 0;
+    var link_names: std.ArrayList(u8) = .empty;
+    defer link_names.deinit(gpa);
 
     // `.reload` is the threshold set to zero and nothing else, so there is one
     // spill rule below rather than two (see `Options.reload`). Said out loud
@@ -646,6 +731,14 @@ pub fn load(
         );
         return error.StaticReadFailed;
     }) |entry| {
+        if (entry.kind == .sym_link) {
+            skipped_links += 1;
+            if (skipped_links <= max_named_links) {
+                if (link_names.items.len > 0) try link_names.appendSlice(gpa, ", ");
+                try link_names.print(gpa, "\"{s}\"", .{entry.path});
+            }
+            continue;
+        }
         if (entry.kind != .file) continue;
         if (!options.dotfiles and hasDotSegment(entry.path)) {
             skipped_dotfiles += 1;
@@ -749,6 +842,12 @@ pub fn load(
             } },
         });
     }
+
+    if (skipped_links > 0) std.log.warn(
+        "nilo: static directory \"{s}\" holds {d} symlink(s) that are not served: {s}{s}. " ++
+            "A link is never followed out of the tree (ADR 009); copy the file in to serve it.",
+        .{ dir_path, skipped_links, link_names.items, if (skipped_links > max_named_links) " and more" else "" },
+    );
 
     // Handed over, so the list is empty and its `errdefer` above has nothing
     // left to free — from here the Set's own one covers all of it.
@@ -2076,4 +2175,140 @@ test "a URL listed twice is found by name, whichever way the two were spelled" {
     // An empty list is a Set that answers nothing, and closes.
     var empty = try embed(gpa, "/", &.{}, .{});
     empty.deinit();
+}
+
+test "a name with a space or a non-ASCII character is served at the URL a browser sends for it" {
+    const gpa = testing.allocator;
+    var tree = try TmpTree.init(gpa, &.{
+        .{ "café.png", "png bytes" },
+        .{ "My Doc.pdf", "pdf bytes" },
+        .{ "plain.txt", "plain" },
+    });
+    defer tree.deinit(gpa);
+
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.tryStatic("/", tree.path);
+
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+
+    // The table holds the names as the disk spells them (ADR 009).
+    var names_ok = false;
+    for (app.static_sets.items[0].files) |f| {
+        if (std.mem.eql(u8, f.url, "/café.png")) names_ok = true;
+    }
+    try testing.expect(names_ok);
+
+    const accent = try client.get(&app, "/caf%C3%A9.png");
+    try testing.expectEqual(@as(u16, 200), accent.status);
+    try testing.expectEqualStrings("png bytes", accent.body);
+    const lower = try client.get(&app, "/caf%c3%a9.png");
+    try testing.expectEqual(@as(u16, 200), lower.status);
+    const space = try client.get(&app, "/My%20Doc.pdf");
+    try testing.expectEqual(@as(u16, 200), space.status);
+    try testing.expectEqualStrings("pdf bytes", space.body);
+    // An escape for a byte that needs none still names the file.
+    const needless = try client.get(&app, "/pl%61in.txt");
+    try testing.expectEqual(@as(u16, 200), needless.status);
+    try testing.expectEqualStrings("plain", needless.body);
+}
+
+test "a decoded path that could leave the tree names no file" {
+    const gpa = testing.allocator;
+    var tree = try TmpTree.init(gpa, &.{
+        .{ "index.html", "home" },
+        .{ "a.txt", "a" },
+    });
+    defer tree.deinit(gpa);
+    var set = try load(gpa, "/", tree.path, .{}, .reported);
+    defer set.deinit();
+
+    const refused = [_][]const u8{
+        "/%2e%2e/a.txt", "/%2E%2E/a.txt", "/%2e/a.txt", "/.%2e/a.txt", "/x/%2e%2e",
+        "/..%2fa.txt",   "/%2Fa.txt",     "/a.txt%00",  "/a%00.txt",   "/a.txt%zz",
+        "/a.txt%",       "/a.txt%4",      "/%5Ca.txt",  "/x%5Ca.txt",  "/a%2fb",
+    };
+    for (refused) |path| try testing.expect(set.find(path) == null);
+    // The same bytes without an escape in them were never a file either.
+    try testing.expect(set.find("/../a.txt") == null);
+    // And the safe ones still find it.
+    try testing.expect(set.find("/%61.txt") != null);
+    try testing.expect(set.find("/") != null);
+}
+
+test "a symlink in the tree at load is not listed, and the file it pointed at is not served" {
+    const gpa = testing.allocator;
+    var outside = try TmpTree.init(gpa, &.{.{ "secret.txt", "outside" }});
+    defer outside.deinit(gpa);
+    var tree = try TmpTree.init(gpa, &.{.{ "real.txt", "inside" }});
+    defer tree.deinit(gpa);
+
+    const target = try outside.tmp.dir.realPathFileAlloc(std.testing.io, "secret.txt", gpa);
+    defer gpa.free(target);
+    try tree.tmp.dir.symLink(std.testing.io, target, "link.txt", .{});
+
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.tryStatic("/", tree.path);
+    try testing.expectEqual(@as(usize, 1), app.static_sets.items[0].files.len);
+
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 200), (try client.get(&app, "/real.txt")).status);
+    try testing.expectEqual(@as(u16, 404), (try client.get(&app, "/link.txt")).status);
+}
+
+test "a spilled file replaced by a symlink after load is not served out of the tree" {
+    const gpa = testing.allocator;
+    var outside = try TmpTree.init(gpa, &.{.{ "secret.txt", "outside the tree" }});
+    defer outside.deinit(gpa);
+    var tree = try TmpTree.init(gpa, &.{.{ "big.txt", "0123456789" }});
+    defer tree.deinit(gpa);
+
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.tryStaticWith("/", tree.path, .{ .max_file_bytes = 4 });
+    try testing.expect(app.static_sets.items[0].files[0].contents == .spilled);
+
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+    const before = try client.get(&app, "/big.txt");
+    try testing.expectEqual(@as(u16, 200), before.status);
+    try testing.expectEqualStrings("0123456789", before.body);
+
+    // Swapped after the walk: the name is the same and what it opens is not.
+    const target = try outside.tmp.dir.realPathFileAlloc(std.testing.io, "secret.txt", gpa);
+    defer gpa.free(target);
+    try tree.tmp.dir.deleteFile(std.testing.io, "big.txt");
+    try tree.tmp.dir.symLink(std.testing.io, target, "big.txt", .{});
+
+    const after = try client.get(&app, "/big.txt");
+    try testing.expectEqual(@as(u16, 404), after.status);
+    try testing.expect(std.mem.indexOf(u8, after.body, "outside the tree") == null);
+}
+
+test "reload does not follow a file swapped for a symlink either" {
+    const gpa = testing.allocator;
+    var outside = try TmpTree.init(gpa, &.{.{ "secret.txt", "outside the tree" }});
+    defer outside.deinit(gpa);
+    var tree = try TmpTree.init(gpa, &.{.{ "page.html", "<p>in</p>" }});
+    defer tree.deinit(gpa);
+
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.tryStaticWith("/", tree.path, .{ .reload = true });
+
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 200), (try client.get(&app, "/page.html")).status);
+
+    const target = try outside.tmp.dir.realPathFileAlloc(std.testing.io, "secret.txt", gpa);
+    defer gpa.free(target);
+    try tree.tmp.dir.deleteFile(std.testing.io, "page.html");
+    try tree.tmp.dir.symLink(std.testing.io, target, "page.html", .{});
+
+    const after = try client.get(&app, "/page.html");
+    try testing.expectEqual(@as(u16, 404), after.status);
+    try testing.expect(std.mem.indexOf(u8, after.body, "outside the tree") == null);
 }

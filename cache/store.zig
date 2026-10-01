@@ -29,7 +29,7 @@
 //!
 //! ## Why the key is in the ring
 //!
-//! A fingerprint is 32 bits, so two keys in one bucket can share one. Trusting
+//! A fingerprint is 14 bits, so two keys in one bucket can share one. Trusting
 //! it alone would hand back the other key's value, and a cache that is quietly
 //! wrong is worse than one that misses. The key is stored and compared.
 //!
@@ -201,6 +201,13 @@ const small_share = 10;
 /// is going to reach; it exists so the collision check below can be an array
 /// rather than an allocation.
 const max_spaces = 64;
+
+/// The most shards one Store will cut itself into. The shard is read from bits
+/// 32 and up of the hash, so this is what keeps it out of the fingerprint's
+/// bits 50 to 63 (`Store.fingerprint`). Sixty-five thousand shards is a ring
+/// of at least 4 KiB each, a quarter of a gigabyte of budget, and well past
+/// anything the concurrency they buy can use.
+const max_shards = 1 << 16;
 
 pub const Options = struct {
     /// **The whole budget, and a ceiling rather than a target.** The ring the
@@ -395,6 +402,10 @@ const Region = struct {
     /// A `Mark`. Moved only under the shard's lock, and read by anybody at any
     /// time with nothing held at all.
     cursor: std.atomic.Value(u64),
+    /// Set by `reserve` when the pass counter reaches a point `Shard.sweep`
+    /// has to clean up behind, and cleared by `Shard.reserve`. Only ever
+    /// touched under the shard's lock.
+    sweep_due: bool = false,
 
     fn init(from: u32, to: u32) Region {
         return .{
@@ -472,6 +483,10 @@ const Region = struct {
             // Zero is how a slot says "never written", so a region's own
             // generation may never be it.
             if (m.gen == 0) m.gen = 1;
+            // Twice per wrap: at 32,768 and at the return to 1. The caller
+            // sweeps (`Shard.sweep`), because only it has the slots; this is
+            // the cold branch, so the hot path gains nothing.
+            if (m.gen & 0x7fff == 0 or m.gen == 1) r.sweep_due = true;
         }
         const off = m.head;
         m.head += @intCast(total);
@@ -568,6 +583,61 @@ const Shard = struct {
         return self.slots[@as(usize, @intCast(wide >> 32)) * ways ..][0..ways];
     }
 
+    /// `Region.reserve`, and then the sweep it may have asked for. **Every
+    /// reservation in this file goes through here**, because the sweep needs
+    /// the slots and a `Region` has none. Under the shard's lock, like the
+    /// reserve itself.
+    ///
+    /// The hot path is one more load of a flag that is false except in the
+    /// handful of laps in 32,768 that cross a sweep point, and it sits after
+    /// the cursor move, so it adds no instruction to the lookup.
+    fn reserve(self: *Shard, into: *Region, total: usize) u32 {
+        const off = into.reserve(total);
+        if (into.sweep_due) {
+            into.sweep_due = false;
+            self.sweep(into);
+        }
+        return off;
+    }
+
+    /// **Forget every slot that points into `r` and has been dead for a lap.**
+    /// A pass number is sixteen bits (65,535 distinct values, zero being "never
+    /// written"), so a slot nothing touches stops being dead when the region
+    /// has been round that many times and the number comes back to the slot's
+    /// own: `Region.liveAt` then calls it live and it points into the middle of
+    /// a newer entry, whose bytes a caller may have chosen. `entry` bounds the
+    /// read and the Space and key are compared, but a value crafted to hold a
+    /// header and a key of its own would be a forged hit.
+    ///
+    /// Run twice per wrap, at pass 32,768 and at the wrap to 1. A slot is dead
+    /// within two laps of being written and cannot be mistaken for live for
+    /// another 65,533, so a sweep never more than 32,768 laps after any death
+    /// clears it first. **Ghosts are kept**, since a slot that died inside the
+    /// last lap is the record `put` reads to admit a returning key (ADR 152).
+    ///
+    /// **Cost: one pass over the shard's slots every 32,768 laps of one
+    /// region, under a lock the caller already holds.** A lap of `main` is a
+    /// whole ring's worth of writes, so this is nothing per put. Each slot is
+    /// cleared with a compare-and-swap against what was read, so a lookup that
+    /// warmed it or cleared it as expired in the meantime is never overwritten
+    /// (ADR 109).
+    fn sweep(self: *Shard, r: *const Region) void {
+        const m = r.mark();
+        for (self.slots) |*slot| {
+            var seen = slot.load();
+            // **Retried until the slot is cleared or changed.** `clearIf` is a
+            // weak exchange that may fail spuriously, which costs a lookup's
+            // clear nothing but would leave a dead slot here for another
+            // 32,768 laps, and two sweeps is as long as it is safe to wait.
+            while (seen.gen != 0 and r.holds(seen.off) and
+                !Region.liveAt(m, seen) and !Region.ghostAt(m, seen))
+            {
+                slot.clearIf(seen);
+                seen = slot.load();
+            }
+        }
+    }
+
     fn regionOf(self: *Shard, off: u32) *Region {
         return if (self.small.holds(off)) &self.small else &self.main;
     }
@@ -581,14 +651,13 @@ const Shard = struct {
 
     /// The header, the key and the value, read out of the ring.
     ///
-    /// **Bounded, and the bound is not decoration.** A pass number is sixteen
-    /// bits, so after 65,536 trips round the ring a slot nothing has touched
-    /// can look live again while pointing into the middle of some newer
-    /// entry — and the lengths now come from the ring rather than the slot, so
-    /// what is read there would be whatever bytes happen to be at that offset.
-    /// `null` here is what turns that into a miss. Everything past this point
-    /// still checks the Space and the whole key, so the worst it can be is a
-    /// lookup that found nothing.
+    /// **Bounded, and the bound is not decoration.** The lengths come from the
+    /// ring rather than the slot, so a slot that pointed at a stale offset
+    /// would read whatever bytes happen to be there. A slot cannot do that
+    /// through the pass counter wrapping, because `Shard.sweep` clears dead
+    /// slots twice per wrap; the bound is what is left if one ever did, and
+    /// `null` here turns it into a miss. Everything past this point still
+    /// checks the Space and the whole key.
     fn entry(self: *Shard, slot: Slot) ?Entry {
         if (@as(usize, slot.off) + header > self.ring.len) return null;
         const head_bytes = self.ring[slot.off..][0..header];
@@ -625,7 +694,7 @@ const Shard = struct {
         if (total > into.len()) return false;
         if (into.wouldClobber(total, seen.off, total)) return false;
 
-        const off = into.reserve(total);
+        const off = self.reserve(into, total);
         // `copyForwards` rather than `@memcpy`: source and destination are two
         // windows on one ring, and the check above rules out overlap in the
         // direction that matters but not aliasing as far as the compiler is
@@ -701,6 +770,10 @@ pub const Store = struct {
     names: [max_spaces][]const u8 = undefined,
     ids: [max_spaces]u32 = undefined,
     n_spaces: usize = 0,
+    /// A reading of the clock a test sets, so the second a put and a lookup
+    /// fall in is chosen rather than waited for. It is a field only in a test
+    /// build, so `elapsed` is the same one syscall it always was in a release.
+    now_override: if (builtin.is_test) ?u32 else void = if (builtin.is_test) null else {},
 
     pub fn open(gpa: Allocator, opts: Options) OpenError!Store {
         if (opts.bytes < 64 << 10) return error.TooSmall;
@@ -750,7 +823,11 @@ pub const Store = struct {
         // could ever hash to them: 33% of the budget at 64 KiB, the smallest
         // one this module accepts, on the default `shards`. At 192 KiB and 64
         // shards it was 78%.
-        const shards_n = std.math.floorPowerOfTwo(usize, @max(1, @min(asked, total_cap / 4096)));
+        //
+        // **And never more than `max_shards`**, so the shard number stays
+        // inside bits 32 to 47 of the hash and clear of the fingerprint's 50
+        // to 63.
+        const shards_n = std.math.floorPowerOfTwo(usize, @max(1, @min(asked, max_shards, total_cap / 4096)));
         const cap = total_cap / shards_n;
         if (cap > std.math.maxInt(u32)) return error.TooSmall;
 
@@ -842,11 +919,16 @@ pub const Store = struct {
     }
 
     fn shardFor(self: *Store, hash: u64) *Shard {
-        // The high bits, because the low ones already picked the bucket.
+        // Bits 32 up, because the low ones already picked the bucket. The
+        // fingerprint reads bits 50 to 63 and `open` caps the shard count so
+        // this never reaches them; the three must stay disjoint or a shard's
+        // keys all share the bits the fingerprint was meant to tell them
+        // apart by.
         return &self.shards[(hash >> 32) & self.shard_mask];
     }
 
     fn elapsed(self: *const Store) u32 {
+        if (comptime builtin.is_test) if (self.now_override) |n| return n;
         return @intCast(clock.monotonicSeconds() - self.opened_s);
     }
 
@@ -959,11 +1041,14 @@ pub const Store = struct {
         // outside it.
         const now: u32 = if (ttl_s == 0 and mode == .put) 0 else self.elapsed();
         var head_bytes: [header]u8 = undefined;
-        // Saturating: `now + ttl_s` overflows a u32 for a ttl near its ceiling,
-        // which panics in a safe build and wraps in ReleaseFast. The ceiling is
-        // never 0, which is the word for "never expires", so a saturated entry
-        // is live for as long as a u32 of seconds can say.
-        std.mem.writeInt(u32, head_bytes[0..4], if (ttl_s == 0) 0 else now +| ttl_s, .little);
+        // **`ttl_s` seconds and up to one more, never fewer.** `now` is whole
+        // seconds truncated, so a put at 5.99 s reads 5 and the second 6 begins
+        // ten milliseconds later; `now + ttl_s` let a one-second TTL live that
+        // long, and a rate-limit window made of one let a client through early.
+        // The extra second errs on the strict side, which is the safe one for
+        // a window. Saturating, so a TTL near the top of the range stays far
+        // from zero, which means never, and cannot wrap to the past.
+        std.mem.writeInt(u32, head_bytes[0..4], if (ttl_s == 0) 0 else now +| ttl_s +| 1, .little);
         std.mem.writeInt(u32, head_bytes[4..8], space, .little);
         std.mem.writeInt(u16, head_bytes[8..10], @intCast(key.len), .little);
         std.mem.writeInt(u16, head_bytes[10..12], @intCast(value.len), .little);
@@ -1066,7 +1151,7 @@ pub const Store = struct {
             &shard.main
         else
             &shard.small;
-        const off = into.reserve(total);
+        const off = shard.reserve(into, total);
         @memcpy(shard.ring[off..][0..header], &head_bytes);
         @memcpy(shard.ring[off + header ..][0..key.len], key);
         @memcpy(shard.ring[off + header + key.len ..][0..value.len], if (adding) std.mem.asBytes(sum) else value);
@@ -1315,8 +1400,20 @@ pub const Store = struct {
     /// Fourteen bits, the other two having gone to `Slot.freq`. The key
     /// comparison behind it is what decides, so a collision here costs one
     /// wasted compare against the ring and can never cost a wrong answer.
+    ///
+    /// **Bits 50 to 63, because the three things read from one hash must read
+    /// disjoint bits.** The bucket takes 0 to 31, the shard takes 32 up to
+    /// `log2(shards)` (at most 16 of them, `max_shards`), and this takes what is
+    /// left. It used to take 32 to 45, which is the shard's own bits: at 64
+    /// shards every key in a shard carried the same low six bits, so 256 of
+    /// 16,384 values ever occurred and a miss on a full bucket read the ring for
+    /// nothing about one time in thirty rather than one in two thousand.
+    ///
+    /// **No `| 1`.** A fingerprint of zero is a real value now. An empty way is
+    /// told apart by `gen == 0` in `matching`, `del` and the ranking, never by
+    /// its fingerprint, so there is no reason to give a bit away.
     fn fingerprint(hash: u64) u14 {
-        return @as(u14, @truncate(hash >> 32)) | 1;
+        return @truncate(hash >> 50);
     }
 
     /// Which of a bucket's eight ways carry this fingerprint and have been
@@ -1992,4 +2089,182 @@ test "a counter that is only ever incremented survives the churn that laps the d
         }
     }
     try testing.expectEqual(@as(u32, 1_000), try store.add(u32, 1, "hits", 0, 0));
+}
+
+test "a fingerprint carries all fourteen bits whichever shard the key landed in" {
+    // The shard is bits 32 and up of the hash and the fingerprint used to be
+    // bits 32 to 45, so at 64 shards the low six bits of every fingerprint in
+    // one shard were the shard's own number, and `| 1` threw away one more.
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 64 });
+    defer store.deinit();
+    try testing.expectEqual(@as(usize, 64), store.shardCount());
+
+    var seen = [_]bool{false} ** (1 << 14);
+    var distinct: usize = 0;
+    var in_shard: usize = 0;
+    var buf: [16]u8 = undefined;
+    for (0..1_000_000) |i| {
+        const key = std.fmt.bufPrint(&buf, "key:{d}", .{i}) catch unreachable;
+        const hash = std.hash.Wyhash.hash(1, key);
+        if (store.shardFor(hash) != &store.shards[0]) continue;
+        in_shard += 1;
+        const fp = Store.fingerprint(hash);
+        if (!seen[fp]) {
+            seen[fp] = true;
+            distinct += 1;
+        }
+    }
+    // About 15,600 keys into 16,384 values: a uniform draw leaves about
+    // 10,000 distinct, and the assertion is a little under that.
+    try testing.expect(in_shard > 14_000);
+    try testing.expect(distinct > 9_500);
+}
+
+test "a fingerprint shares no bit with the shard or the bucket" {
+    // The three consumers of one hash: the bucket reads bits 0 to 31, the
+    // shard 32 up to log2(shards), the fingerprint 50 to 63. Flipping a bit
+    // one of them reads must leave the others where they were.
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 64 });
+    defer store.deinit();
+    const hash: u64 = 0x1234_5678_9abc_def0;
+    for (0..50) |bit| {
+        const flipped = hash ^ (@as(u64, 1) << @intCast(bit));
+        try testing.expectEqual(Store.fingerprint(hash), Store.fingerprint(flipped));
+    }
+    for (50..64) |bit| {
+        const flipped = hash ^ (@as(u64, 1) << @intCast(bit));
+        try testing.expect(Store.fingerprint(hash) != Store.fingerprint(flipped));
+        try testing.expectEqual(store.shardFor(hash), store.shardFor(flipped));
+    }
+}
+
+test "an entry put in the last moment of a second still lives the whole second asked for" {
+    var store = try openTest();
+    defer store.deinit();
+    var out: [16]u8 = undefined;
+
+    // The reading is whole seconds, truncated, so a put at 5.99 s reads 5 and
+    // a lookup at 6.00 s reads 6. A TTL of one second used to expire at 6 and
+    // so lived ten milliseconds.
+    store.now_override = 5;
+    try testing.expect(store.put(1, "window", "open", 1));
+    store.now_override = 6;
+    try testing.expectEqualStrings("open", out[0..store.get(1, "window", &out).?]);
+    // At most ttl + 1 whole seconds: gone when the reading is 7.
+    store.now_override = 7;
+    try testing.expectEqual(@as(?usize, null), store.get(1, "window", &out));
+}
+
+test "a counter window of one second is not shorter than one second" {
+    var store = try openTest();
+    defer store.deinit();
+
+    store.now_override = 9;
+    try testing.expectEqual(@as(u32, 1), store.add(u32, 1, "rate:ip", 1, 1));
+    store.now_override = 10;
+    try testing.expectEqual(@as(u32, 2), store.add(u32, 1, "rate:ip", 1, 1));
+    store.now_override = 11;
+    try testing.expectEqual(@as(u32, 1), store.add(u32, 1, "rate:ip", 1, 1));
+}
+
+test "a TTL near the top of the range saturates rather than wrapping to never or to now" {
+    var store = try openTest();
+    defer store.deinit();
+    var out: [16]u8 = undefined;
+
+    store.now_override = 100;
+    try testing.expect(store.put(1, "forever", "v", std.math.maxInt(u32)));
+    store.now_override = std.math.maxInt(u32) - 1;
+    try testing.expectEqualStrings("v", out[0..store.get(1, "forever", &out).?]);
+}
+
+test "a slot nothing touched for a whole wrap of the pass counter does not come back to life" {
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    defer store.deinit();
+    const shard = &store.shards[0];
+    var out: [64]u8 = undefined;
+
+    // A cache that is still filling admits straight into `main`, at its first
+    // byte, on pass 1.
+    try testing.expect(store.put(1, "victim", "mine", 0));
+    const slot = for (shard.slots) |s| {
+        if (s.gen != 0) break s;
+    } else return error.TestExpectedSlot;
+    try testing.expectEqual(shard.main.from, slot.off);
+    try testing.expectEqual(@as(u16, 1), slot.gen);
+
+    // Drive `main` round until its pass counter has wrapped back to the slot's
+    // own number. Each reservation is more than half the region, so each one
+    // after the first is a lap, and nothing is copied, so this is cheap.
+    const lap = shard.main.len() / 2 + 1;
+    for (0..65_536) |_| _ = shard.reserve(&shard.main, lap);
+    try testing.expectEqual(@as(u16, 1), shard.main.mark().gen);
+
+    // A newer entry, written at that offset by somebody who chose its value:
+    // a header, a key and a value laid out exactly as an entry is.
+    const forged = shard.ring[slot.off..][0 .. header + 6 + 4];
+    std.mem.writeInt(u32, forged[0..4], 0, .little);
+    std.mem.writeInt(u32, forged[4..8], 1, .little);
+    std.mem.writeInt(u16, forged[8..10], 6, .little);
+    std.mem.writeInt(u16, forged[10..12], 4, .little);
+    @memcpy(forged[header..][0..6], "victim");
+    @memcpy(forged[header + 6 ..][0..4], "evil");
+
+    try testing.expectEqual(@as(?usize, null), store.get(1, "victim", &out));
+}
+
+test "a sweep spares live slots and ghosts, clears only the dead, and does not run on an ordinary lap" {
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    defer store.deinit();
+    const shard = &store.shards[0];
+    var out: [16]u8 = undefined;
+    const from = shard.main.from;
+    const lap = shard.main.len() / 2 + 1;
+
+    // (a) a real entry, in `main` at its first byte on pass 1. Its slot is
+    // renumbered below to the pass the sweep will run on.
+    try testing.expect(store.put(1, "keeper", "alive", 0));
+    const a = for (shard.slots) |*s| {
+        if (s.load().gen != 0) break s;
+    } else return error.TestExpectedSlot;
+    try testing.expectEqual(from, a.load().off);
+
+    // Three slots placed by hand in free ways: (b) written on the pass before
+    // the sweep's and behind its cursor, so a ghost; (c) dead for far longer
+    // than a lap, in `main`; (d) equally dead, but in `small`, which this
+    // sweep is not about.
+    const b = &shard.slots[shard.slots.len - 1];
+    const c = &shard.slots[shard.slots.len - 2];
+    const d = &shard.slots[shard.slots.len - 3];
+    b.store(.{ .off = from, .gen = 32_767, .fp = 5 });
+    c.store(.{ .off = from, .gen = 9, .fp = 6 });
+    d.store(.{ .off = 0, .gen = 9, .fp = 7 });
+
+    // Ordinary laps, 1 to 4: nothing here is a sweep point, so a dead slot
+    // stays where it is. This is what holds "twice per wrap" rather than
+    // "every lap".
+    for (0..4) |_| _ = shard.reserve(&shard.main, lap);
+    try testing.expectEqual(@as(u16, 4), shard.main.mark().gen);
+    try testing.expectEqual(@as(u16, 9), c.load().gen);
+    try testing.expectEqual(@as(u16, 9), d.load().gen);
+    try testing.expect(!shard.main.sweep_due);
+
+    // Move the cursor to pass 32,767 and take the next lap, which is the
+    // sweep point. The two reserves: the first fits, the second wraps.
+    shard.main.cursor.store(@bitCast(Mark{ .head = from + 100, .gen = 32_767 }), .seq_cst);
+    a.store(.{ .off = from, .gen = 32_768, .fp = a.load().fp });
+    _ = shard.reserve(&shard.main, lap);
+    try testing.expectEqual(@as(u16, 32_767), shard.main.mark().gen);
+    try testing.expectEqual(@as(u16, 9), c.load().gen);
+    _ = shard.reserve(&shard.main, lap);
+    const m = shard.main.mark();
+    try testing.expectEqual(@as(u16, 32_768), m.gen);
+
+    try testing.expect(Region.liveAt(m, a.load()));
+    try testing.expectEqualStrings("alive", out[0..store.get(1, "keeper", &out).?]);
+    try testing.expect(b.load().gen != 0);
+    try testing.expect(Region.ghostAt(m, b.load()));
+    try testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(c.load())));
+    // Another region's dead slot is left for that region's own sweep.
+    try testing.expectEqual(@as(u16, 9), d.load().gen);
 }

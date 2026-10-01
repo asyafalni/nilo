@@ -1273,6 +1273,22 @@ pub const Dir = struct {
         return .{ ._inner = try self._inner.openFile(name) };
     }
 
+    /// `openFile` for a name that must be a file and nothing standing in for
+    /// one: a symlink in the last component fails with `error.SymLinkLoop`
+    /// instead of being followed.
+    ///
+    /// The static tree opens its spilled files through this (ADR 009). The
+    /// name was a regular file when the directory was walked, and a request
+    /// may be answered long after: a file replaced by a link to somewhere
+    /// else would be served out of the tree without it. Refusing at the open
+    /// is race-free where a look beforehand is not. `openFile` keeps following
+    /// links, which is what a `FileBody` an application chose wants.
+    pub fn openFileNoFollow(self: Dir, name: []const u8) !File {
+        const w = watchdog.waitingAnywhere();
+        defer watchdog.waitedAnywhere(w);
+        return .{ ._inner = try self._inner.openFileNoFollow(name) };
+    }
+
     /// Write `bytes` to `name` inside this directory, replacing what was
     /// there. Either the whole file lands or none of it does: a reader of
     /// `name` never sees it half-written

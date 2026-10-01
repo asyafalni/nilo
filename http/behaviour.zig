@@ -926,6 +926,22 @@ fn whoseOrder(c: *ctx_mod.Ctx) ?Str {
     return c.header("X-Account");
 }
 
+test "the Space an Idempotent route keeps answers in is a service it needs, so listen() refuses a missing one by name" {
+    // `checkServices` logs an error naming it, which the test runner counts
+    // as a failure, so what is asserted is the requirement it reads: the
+    // same one a `Cached` route's Space gets (ADR 005, ADR 155).
+    const needs = comptime typed.requirements("/orders", placeKeptOrder);
+    var named = false;
+    for (needs) |r| {
+        if (std.mem.eql(u8, r.type_name, @typeName(FakeReplays))) {
+            try testing.expect(r.needs_mutable);
+            try testing.expectEqualStrings("/orders", r.route);
+            named = true;
+        }
+    }
+    try testing.expect(named);
+}
+
 fn placeForAccount(key: typed.Idempotent(FakeReplays, .{ .by = whoseOrder }), counter: *OrderCounter) !u32 {
     _ = key;
     counter.placed += 1;
@@ -2261,6 +2277,83 @@ test "a handler returning ?T answers 404 when there is none, and never sends nul
     try testing.expect(std.mem.startsWith(u8, missing.response, "HTTP/1.1 404 Not Found\r\n"));
     try testing.expect(try Harness.saysFailure(missing.response, "there is no /users/99"));
     try testing.expect(missing.keep_alive);
+}
+
+/// The failure's `error` string, parsed out of a response body that has to
+/// be JSON whatever the request held.
+fn failureText(response: []const u8, into: []u8) ![]const u8 {
+    const blank = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return error.NoBody;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, response[blank + 4 ..], .{});
+    defer parsed.deinit();
+    const message = parsed.value.object.get("error").?.string;
+    @memcpy(into[0..message.len], message);
+    return into[0..message.len];
+}
+
+fn pageOf(params: typed.Query(struct { page: u32 = 1 })) u32 {
+    return params.value.page;
+}
+
+fn itemById(id: u32) u32 {
+    return id;
+}
+
+test "a failure whose message holds a byte that is not UTF-8 is still JSON, with U+FFFD in its place" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/items", pageOf);
+    try app.get("/items/:id", itemById);
+
+    var h = Harness.init();
+    defer h.deinit();
+    var said: [512]u8 = undefined;
+
+    // A percent escape is decoded without a UTF-8 check, so the message that
+    // names the value carries the stranger's byte (ADR 024).
+    const query = h.send(&app, "GET /items?page=%ff HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, query.response, "HTTP/1.1 400"));
+    try testing.expect(std.mem.indexOf(u8, try failureText(query.response, &said), "\u{FFFD}") != null);
+
+    const path = h.send(&app, "GET /items/%ff HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, path.response, "HTTP/1.1 400"));
+    try testing.expect(std.mem.indexOf(u8, try failureText(path.response, &said), "\u{FFFD}") != null);
+}
+
+test "a shape the application named gets text too, where the message held a byte that is not UTF-8" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.failures(ApiError);
+    try app.get("/items", pageOf);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(&app, "GET /items?page=%ff HTTP/1.1\r\nHost: t\r\n\r\n");
+    const blank = std.mem.indexOf(u8, result.response, "\r\n\r\n").?;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, result.response[blank + 4 ..], .{});
+    defer parsed.deinit();
+    try testing.expect(std.mem.indexOf(u8, parsed.value.object.get("detail").?.string, "\u{FFFD}") != null);
+}
+
+fn caughtThenBroke() !void {
+    // A lookup that said no, and a handler that took the no as an answer.
+    const first: error{Failed}!void = fail.notFound("no such row", .{});
+    first catch |e| switch (e) {
+        error.Failed => {},
+    };
+    return error.OutOfMemory;
+}
+
+test "a failure a handler caught does not colour the error it returned later" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/caught", caughtThenBroke);
+
+    var h = Harness.init();
+    defer h.deinit();
+    const result = h.send(&app, "GET /caught HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 500 Internal Server Error\r\n"));
+    try testing.expect(std.mem.indexOf(u8, result.response, "no such row") == null);
+    try testing.expect(try Harness.saysFailure(result.response, "internal server error"));
 }
 
 fn headersBuiltInAFrameThatDies(arena: std.mem.Allocator, id: u32) !typed.Headers {

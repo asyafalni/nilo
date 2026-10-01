@@ -70,10 +70,29 @@ pub const Failure = struct {
         var w = std.Io.Writer.fixed(&self.buf);
         // An over-long message is truncated rather than dropped: half a
         // message is still far more use than a 500 with no explanation.
-        w.print(fmt, args) catch {};
-        self.n = @intCast(w.end);
+        var cut = false;
+        w.print(fmt, args) catch {
+            cut = true;
+        };
+        // The cut falls wherever the buffer ends, which can be inside a
+        // multi-byte character, and half of one is not text: the body that
+        // carries it would not be JSON (ADR 024).
+        self.n = @intCast(if (cut) wholeCharacters(self.buf[0..w.end]) else w.end);
     }
 };
+
+/// How much of `text` to keep so that it does not end inside a UTF-8
+/// character: step back over continuation bytes to the lead byte, and drop
+/// that too when the character it starts is not all there. Text that already
+/// ends on a boundary, or is not UTF-8 at all, keeps its length.
+fn wholeCharacters(text: []const u8) usize {
+    var start = text.len;
+    var back: usize = 0;
+    while (start > 0 and back < 3 and text[start - 1] & 0xC0 == 0x80) : (back += 1) start -= 1;
+    if (start == 0) return text.len;
+    const need = std.unicode.utf8ByteSequenceLength(text[start - 1]) catch return text.len;
+    return if (text.len - (start - 1) < need) start - 1 else text.len;
+}
 
 /// Everything nilo tracks about the request this fiber is serving. It is
 /// what the Bulkhead slot points at, so anything reachable from anywhere —
@@ -172,8 +191,20 @@ pub fn internal(comptime fmt: []const u8, args: anytype) Error {
 /// function asked for, otherwise the mapping table. App uses this to build
 /// the response; the logger middleware uses it to report the status
 /// without having to guess the same thing twice.
+///
+/// The Failure speaks only for the error the fail functions return. It is
+/// cleared when a request starts and never again, so a handler that caught a
+/// `Failed` and went on to return something else would otherwise answer, and
+/// log, the old status and message for an error that has nothing to do with
+/// them. Every reader goes through `failed` for the same reason.
 pub fn resolveStatus(failure: *const Failure, err: anyerror) u16 {
-    return if (failure.isSet()) failure.status else statusFor(err);
+    return if (failed(failure, err)) failure.status else statusFor(err);
+}
+
+/// Whether `err` is the one the Failure describes: the sentinel a fail
+/// function returned, with a message set behind it.
+pub fn failed(failure: *const Failure, err: anyerror) bool {
+    return err == error.Failed and failure.isSet();
 }
 
 /// Ordinary Zig errors coming from anywhere — a database, a parser, an
@@ -309,6 +340,35 @@ test "a challenge is a 401 that remembers what would have been accepted, and cle
 
     failure.clear();
     try testing.expect(failure.challenge == null);
+}
+
+test "a message cut at the limit is cut between characters, never inside one" {
+    var failure = Failure{};
+    const previous = bulkhead.setFallbackSlot(&failure);
+    defer _ = bulkhead.setFallbackSlot(previous);
+
+    // 239 bytes, then a two-byte character that has room for only half of it.
+    try testing.expectError(error.Failed, asUnion(badRequest("{s}\u{e9}", .{"x" ** (max_message - 1)})));
+    try testing.expect(std.unicode.utf8ValidateSlice(failure.message()));
+    try testing.expectEqual(@as(usize, max_message - 1), failure.message().len);
+
+    // A four-byte one cut after its first three bytes.
+    try testing.expectError(error.Failed, asUnion(badRequest("{s}\u{1F600}", .{"x" ** (max_message - 3)})));
+    try testing.expect(std.unicode.utf8ValidateSlice(failure.message()));
+
+    // One that fits whole is kept whole.
+    try testing.expectError(error.Failed, asUnion(badRequest("{s}\u{e9}", .{"x" ** (max_message - 2)})));
+    try testing.expectEqual(@as(usize, max_message), failure.message().len);
+}
+
+test "a failure decides the status only for the error the fail functions return" {
+    var failure = Failure{};
+    failure.set(404, "no user", .{});
+    try testing.expectEqual(@as(u16, 404), resolveStatus(&failure, error.Failed));
+    // A handler that caught the Failed and went on to hit something else is
+    // answering that something else (ADR 004).
+    try testing.expectEqual(@as(u16, 500), resolveStatus(&failure, error.OutOfMemory));
+    try testing.expectEqual(@as(u16, 413), resolveStatus(&failure, error.BodyTooLarge));
 }
 
 test "the challenge lives in the padding a Failure already had" {

@@ -795,3 +795,17 @@ For the record, `cache/clock.zig`'s clock on this platform: `MONOTONIC_RAW_APPRO
 6.6 ns, `MONOTONIC` 23.6 ns, `MONOTONIC_RAW` 16.1 ns, `REALTIME` 15.1 ns. Same
 shape as §2's Linux pair (1.6 against 15.6); the coarse clock is the right one
 here too.
+
+## 10. A miss on a full bucket, once the fingerprint stopped reading the shard's bits
+
+**What was run.** A single-thread program built twice with `-OReleaseFast`, once against `cache/` at `50a9049` (`git archive`) and once against the tree that moves the fingerprint to bits 50 to 63 and drops its `| 1` (ADR 152). A 64 MiB Store with the default 64 shards takes 4,000,000 `put`s of a 24-byte value, far more than it holds, so every bucket is full. Two rows are timed over the same Store: 262,144 `get`s of keys that were never put (the miss, which is the path the fingerprint decides), and, as the control, 262,144 `get`s of keys found present by asking once after the fill (100% hits on both sides). Best of seven rounds per run, seven runs per side, interleaved before and after, pinned with `taskset -c 3` to one physical core of an AMD Ryzen 7 9700X (its SMT sibling idle), Linux, keys built before the clock starts.
+
+| | before (`50a9049`) | after | |
+|---|---|---|---|
+| miss, ns/op | 17.0–21.0, median 17.9 | 14.7–17.1, median 15.1 | **−16% at the median; every pair faster** |
+| hit (control), ns/op | 62.9–70.2, median 65.5 | 62.3–67.1, median 63.5 | inside the spread: **unchanged** |
+| `evicted` after the fill | 369,063 | 333,841 | −9.5% |
+
+**What it decided.** The fix ships as a fix and not only as a comment correction: a miss on a full bucket no longer reads the ring for one key in thirty, and the two nanoseconds that bought are the ring reads it stopped making. The control row says the gain is on the path the change touched and nowhere else. `evicted`, the number the guide tells a reader to size the ring by, fell by a tenth, because it had been counting fingerprint collisions with dead slots as evictions. The distinct-fingerprint count behind it (256 of 16,384 in a shard before, 10,023 of about 15,600 keys after, the uniform expectation) is held by `test "a fingerprint carries all fourteen bits whichever shard the key landed in"`.
+
+**Can it be pushed further.** Not on this path: at one wasted ring read in about 2,000 misses the fingerprint is doing what fourteen bits can do, and the miss is now the bucket's one cache line and its compare. A wider fingerprint would cost the `freq` bits or a wider slot, and the slot is the axis this cache was sized on (§1).

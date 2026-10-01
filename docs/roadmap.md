@@ -35,10 +35,6 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 The entries from the WebSocket one down to the end of this module, other than the thirteen that were here before, came from an audit of `http/` at `39896d2` that read the code and checked every entry in it; none was run. **A fix lands with a probe**: a test that fails on the code before it, in Debug and ReleaseSafe, written first, the way the `nilo_sql` audit's were. Most of what is left falls into the four patterns under [Next](#next).
 
-**A static file whose name has a space or a non-ASCII character is never served.** The lookup uses the raw target, the table is built from names as they are on disk, and neither side is decoded, so `café.png` and `My Doc.pdf` are a 404 to every browser. Reproduced. Symlinks are also skipped at the walk without a line, and a spilled or `.reload` file replaced by one after startup is followed out of the tree, because the open has no `O_NOFOLLOW`.
-
-**Needs:** the table keyed by the decoded path, with `/` and `..` refused after decoding, and a symlink either served by a stated rule or named at load and refused at open.
-
 **`?T` with no default means optional in a query and required in a body.** `Query(T)` reads an absent field as null and std.json refuses it, while `openapi.zig` says both follow the same rule. The guides always write `= null`, which is why nobody has met it.
 
 **Needs:** one rule, and the description following it.
@@ -47,14 +43,6 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** `maximum` taken from the type, and `required` in a response schema meaning "always written".
 
-**A failure body is not JSON when its message carries a byte that is not UTF-8.** `writeFailureBody` escapes `"`, `\` and control bytes and writes every byte from `0x80` as it came, and a path or query value is decoded without a UTF-8 check, so `GET /items?page=%ff` against an integer `page` answers `application/json` that `res.json()` throws on, which is what [ADR 024](./adr/024-every-failure-answers-as-json.md) exists to prevent. A message truncated at `max_message` can also end inside a character. The success path already handles this ([ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md)); the failure writer is a copy that does not.
-
-**Needs:** one JSON string writer for both paths, replacing a byte that is not UTF-8 and cutting at a character boundary, with a test for `%ff` in a query and a path param.
-
-**A failure a handler caught colours a later error that has nothing to do with it.** `Failure` is cleared only when a request starts, and `resolveStatus` answers `failure.status` whenever it is set, so a handler that catches a `fail.notFound` and then returns `error.OutOfMemory` answers 404 with the old message, and the log says the same.
-
-**Needs:** `failure.status` trusted only when the error is `error.Failed`, with a test.
-
 **The test `Client` accepts a request head of any size.** Its reader is `Reader.fixed` over the whole request, and `readHead` refuses a head only once it fills the buffer, so a test sending a large cookie or many headers passes where a server answers 431. Its cookie jar also keeps a cookie deleted by `Expires` alone and ignores the `__Host-` and `__Secure-` rules a browser applies.
 
 **Needs:** the test reader given the server's read-buffer size, and the jar honouring a past `Expires` and the two prefixes.
@@ -62,10 +50,6 @@ The entries from the WebSocket one down to the end of this module, other than th
 **Several comments and pages describe code that is no longer there.** `bulkhead.zig`'s header lists a six-parameter `serve` (it has eight) under `src/engine/` (it is `http/engine/`), and leaves out `Peer`'s fields, `spawnLocal`, `Wake.rawIdle` and `Binding`, which a second Engine has to provide; `proxies.zig` says a `Forwarded` header is walked, and nothing reads it; the `accept` comment in `zio.zig` says a failure raises the stop flag; `middleware.zig`'s header and [ADR 008](./adr/008-middleware-is-an-onion-of-ctx-functions.md) use `std.time.Timer`, which Zig 0.16 removed; a link in `ctx.zig` says ADR 155 and points at 156.
 
 **Needs:** each corrected, and the module headers' code examples brought under `zig build snippets` so the next one cannot rot.
-
-**`listen()` does not refuse an `Idempotent` route whose Space was never provided.** `typed.requirements` adds the Space of a `Cached` argument and the Verifier of a `Verified` one, and `.idempotent` falls into `else`, so the server starts and every request to the route logs a warning and answers 500, where [ADR 005](./adr/005-services-via-a-runtime-registry.md) has `listen()` catch a missing service. The `wrap` comment says `listen()` catches it.
-
-**Needs:** the Space added to `requirements`, with a `listen()` refusal test.
 
 **A float that is not finite still goes out as `inf` where a type takes `std.json`'s path.** `json.write` writes a non-finite `f32` or `f64` as `null` ([ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md)), but a type `covers` does not take is written by `std.json.Stringify`, which writes `inf` and `nan`, not JSON. On the way in, a number inside a map or a `std.json.Value` field is still read by `std.json`'s grammar, so `"1_0"` there is 10, where [ADR 084](./adr/084-a-number-in-a-request-is-not-a-zig-literal.md) refuses it everywhere else in a body.
 
@@ -103,21 +87,11 @@ The entries under *statements that work refused* were reproduced by a probe test
 
 The entries here came from an audit of `cache/` at `1738286` that read every line of the module; **reproduced** marks one a throwaway test also ran, in Debug and ReleaseSafe. A fix lands with that test kept.
 
-#### P1
-
-**The fingerprint carries 8 bits where its comment says 14.** `shardFor` and `fingerprint` both read `hash >> 32` (`store.zig:838`, `:1290`), so at 64 shards the low six bits of every fingerprint in a shard are the same, and `| 1` drops one more. Among 2M keys landing in one shard, 256 distinct fingerprints occurred out of 16,384, so a miss on a full bucket reads the ring for nothing about 3% of the time against the 0.05% the comment at `store.zig:105` claims, and `evicted`, the number the guide says to size the ring by, counts every such collision with a dead slot. Reproduced; not timed.
-
-**Needs:** the fingerprint taken from bits the shard does not use and the `| 1` dropped, with the miss path timed into [`bench/result/cache.md`](../bench/result/cache.md).
-
 #### P2
 
 **A flat Space turns a refusal into a plausible answer.** `claimFlat` returns `== .stored`, so a refused `putIfAbsent` reads as "somebody else was first", and `putFlatFor` discards the result under a comment saying a flat value cannot be too large, which is false on a small store: a 20,000-byte struct on a 64 KiB store is refused twice and `get` returns null (`space.zig:186-207`). `flat.kindOf` checks only the 65,535 ceiling. Reproduced.
 
 **Needs:** `Space.open` refusing a `V` whose entry cannot fit a quarter of a shard's ring, the way `registerSpace` refuses a collision.
-
-**A TTL of one second can last none.** Expiry is whole seconds of `MONOTONIC_COARSE` truncated at both ends (`clock.zig:48`, `store.zig:841`), so an entry put at 5.99 s with `ttl_s = 1` expires at 6.00, and an `incr` window can be arbitrarily short. The coarse clock also stops during a suspend, so nothing ages across a laptop sleep or a VM pause, which nothing says.
-
-**Needs:** expiry stored as `now + ttl + 1`, so an entry lives at least its TTL, and the suspend behaviour written on the design page.
 
 **The shard lock spins on a write and never backs off.** `while (l.held.swap(true, .acquire))` (`store.zig:340`) bounces the line between waiting cores, and a holder preempted by the OS leaves the waiters burning their timeslice; the module's own soak tests run more threads than cores. The refusal path also takes the lock only to bump an atomic counter (`store.zig:934`). Not measured.
 
@@ -127,10 +101,6 @@ The entries here came from an audit of `cache/` at `1738286` that read every lin
 
 **Needs:** a per-Store seed mixed in at `open`, from an `Options.seed` or the loop's entropy ([ADR 042](./adr/042-entropy-belongs-to-the-loop.md)).
 
-**The 16-bit pass counter wraps.** After 65,536 laps of a region a dead slot looks live again (`store.zig:576`), guarded only by the bounds check in `entry()` and the key compare; a crafted value carrying a fake header could forge a hit. Found by reading; not reproduced.
-
-**Needs:** `gen` widened into the bits the fingerprint fix frees, or a sweep of the slots when it wraps.
-
 **Small things that say the wrong thing.** `open` answers `error.TooSmall` when a shard would exceed 4 GiB (`store.zig:747`); `flat.zig:44`, `space.zig:107` and the `cache_value_over_the_ceiling` refusal still say a bucket's four ways are a cache line, where it is eight; `registerSpace` is documented as not thread-safe while the guide calls `Space.open` from handlers, so two at once race on `n_spaces`.
 
 **Needs:** each corrected, the refusal's `.says` with its text, and `registerSpace` made safe to call twice for one name.
@@ -139,31 +109,13 @@ The entries here came from an audit of `cache/` at `1738286` that read every lin
 
 The entries here came from an audit of `job/` at `1738286` that read every line of the module and the SQL it sends through `sql/`; **reproduced** marks one a throwaway test also ran.
 
-#### P1
-
-**A schedule can stop until the process restarts.** The next tick is pushed after `done`, in a second statement, and `pushNext` swallows its error (`job.zig:835-941`); a crash between the two, a database blip, or `cancel` on the tick row leaves no queued row for the kind, and seeding happens only when `serve` starts (`:645`). One `err` line is all that says so.
-
-**Needs:** a re-seed on a cadence, such as a claim that comes back empty at most once a minute with an idempotent insert on the unique key, or the successor pushed before the tick is marked done.
-
 #### P2
-
-**The status Space never says `running`.** `note` is called with `queued`, `done` and `dead` only (`job.zig:443-888`), so a polling route reads `queued` for the whole run, where the guide and `Status.attempts` promise `running`. A row pushed on one instance and run on another stays `queued` in the first one's Space until its TTL, which the guide should say next to the multi-instance claim. Reproduced.
-
-**Needs:** `note(id, .running, attempts)` before the run, and the per-instance limit written in the guide.
-
-**`Memory.claim` flips the row before it allocates.** State, lease and `attempts` are written, then `arena.dupe` can fail (`memory.zig:149-157`), leaving the row `running` until the lease lapses with an attempt spent; the allocation is also made under the spin lock, as in `deadOnes`, against the file header. Reproduced.
-
-**Needs:** the copy made first and the state flipped after it.
-
-**Transient failures are treated as permanent.** A payload parse that fails with `OutOfMemory` sends the row dead (`job.zig:807`), and `push(.within)` reserves its window before `store.push` (`job.zig:435`), so a push that fails with `QueueFull` or a database error suppresses the retries for the whole window though nothing was queued. `pushIn` notes `queued` before its transaction commits (`job.zig:484`), so a rollback leaves a status for a row that never existed.
-
-**Needs:** only the parse error set made final, the window taken after a successful push or released on failure, and the note made after commit.
 
 **`retryDead` can start a second chain of ticks.** A dead row is revived with its unique key already cleared, and `finishDead` has already pushed the successor (`table.zig:269`, `memory.zig:252`), so a scheduled kind runs on two chains; a revived row of any kind can duplicate a newer one with the same key.
 
 **Needs:** `retryDead` restoring the key or refusing when a row holds it, and refusing scheduled kinds.
 
-**`Memory` and `Table` disagree in small places.** `unique = ""` deduplicates on `Table` and never on `Memory` (`memory.zig:321`); `Table.insertOn` writes `created_at = run_at` (`table.zig:130`); `finished_at` reads the wall clock where every other time uses the injected one; `Memory.release` does not check `state == running`.
+**`Memory` and `Table` disagree in small places.** `unique = ""` deduplicates on `Table` and never on `Memory` (`memory.zig:321`); `Table.insertOn` writes `created_at = run_at` (`table.zig:130`); and `finished_at` reads the wall clock where every other time uses the injected one.
 
 **Needs:** one behaviour for each, held by a test run against both stores.
 
@@ -191,14 +143,6 @@ The entries here came from an audit of `s3/` at `1738286`, by two readers betwee
 
 #### P2
 
-**A header value with two spaces in a row is signed wrong.** SigV4 folds runs of spaces to one and `sign.zig:351` only trims, so `filename="a  b.pdf"` is a 403 reported as `Rejected`. An empty `content_type` is signed and sent as an empty header. Found by reading against the spec.
-
-**Needs:** runs folded in the canonical value, an empty content type treated as absent, and a vector for each.
-
-**`list` can stop early or hand back a cursor that fails.** `IsTruncated=true` with no token returns a null cursor, which ends the caller's loop as if complete, and an empty token sends `continuation-token=` for a 400 (`listing.zig:155`); a response without `<EncodingType>url</EncodingType>` is decoded anyway, and a returned cursor is not held to `cursor_max`. Reproduced for the first two.
-
-**Needs:** each answered with `Failed`, and the length checked on the way out.
-
 **A streamed object cannot be read from an offset.** `stream` has no range and `getRange` is bounded by `max_bytes`, so the guide's `.length = reading.len` "lets it resume with a `Range`" has no way to serve one for an object over `max_bytes`, and `getRange` returns no total size. `getRange` with `from > to` gets the whole object back as a 200 that is not checked for 206 (`bucket.zig:266`); `stream` and `head` report `len = 0` when `content-length` is missing (`:373`, `:541`).
 
 **Needs:** a range on `stream` with `Reading.total` from `content-range`, a reversed range refused, 206 required, and a missing length made `Failed`.
@@ -206,10 +150,6 @@ The entries here came from an audit of `s3/` at `1738286`, by two readers betwee
 **Failures that say nothing or the wrong thing.** `head` logs nothing on failure (`bucket.zig:538`), so a wrong region or a skewed clock is silent; `NoSuchBucket` maps to `NotFound` like a missing key; `blame` says "could not be reached" for `SessionTokenTooLong`; `presign` with `seconds = 0` is accepted.
 
 **Needs:** `head` logging the status and `x-amz-bucket-region`, `NoSuchBucket` told apart, credential errors named, and a zero life refused.
-
-**The configuration is trusted too far.** `.static` credentials are the caller's slices until `nilo_start` copies them, where the doc says the Store keeps its own; an empty `access_key_id` or past `expires_at` is never refused, so every request takes the write lock and gets a 403; region and key id are not checked for `,`, `/` or CRLF; an endpoint authority over 255 bytes reaches `catch unreachable` in `urlForList`; derived keys and freed credentials are never zeroed.
-
-**Needs:** credentials copied and validated at `open`, the endpoint bounded there, and `std.crypto.secureZero` on the secrets.
 
 **`canned.zig` checks less than S3 does.** `check()` verifies only the headers the client listed in `SignedHeaders`, so a sent `x-amz-*` header left unsigned still passes, where S3 refuses it; its `Seen` copies into fixed buffers with no bound; two comments refer to `finishGet`, which is now `bounded`; `code.zig`'s header still says `LIST` is not in v1.
 
