@@ -56,7 +56,7 @@ fn feed(c: *nilo.Ctx, feeds: *Feeds) !void {
 
 | | |
 |---|---|
-| `c.eventsFrom(rooms, options)` | `rooms` is one `*nilo.Room` or a tuple of them; anything else, or an empty tuple, does not compile |
+| `c.eventsFrom(rooms, options)` | `rooms` is one `*nilo.Room` or a tuple of them; anything else, or an empty tuple, does not compile. A request already answered is `error.AlreadyAnswered` |
 | `.keepalive_ms` | sends a comment this often while nothing is said. 30,000 by default, `0` for none |
 | `.retry_ms` | `retry:`, sent once before anything else. Null leaves the browser's default |
 

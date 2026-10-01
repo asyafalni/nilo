@@ -31,6 +31,8 @@ The obvious alternative is two hooks, `before(c)` and `after(c)`. It has nowhere
 
 **The onion makes short-circuiting fall out for free.** A middleware that answers and does not call `next` ends the chain; nothing extra was invented for auth rejection. A middleware that fails goes through the same path as a handler that fails, the fail functions and the mapping table of [ADR 004](./004-http-errors-via-fail-functions.md): `return fail.unauthorized("token expired", .{})` from either produces the same response. One error path, not two.
 
+**A middleware that neither answers nor calls `next` is a 500 that names it.** The empty 200 nilo sends for a request nothing answered is what a handler returning `void` means ([ADR 120](./120-a-ctx-handler-that-returns-nothing-may-have-written-it.md)); a guard written `if (!ok(c)) return;` that forgot its 401 used to get the same 200, with the handler never run, and nothing in the types or the tests could tell. `Next.run` writes into the Ctx how many layers were left below the deepest one reached, 0 once the handler runs, and App gives the empty 200 only at 0. Otherwise it logs `middleware N of M returned without answering and without calling next.run(c)` at `warn` and answers 500. The count is a `u8` on the Ctx, saturating at 255, which fits in padding the Ctx already had (824 bytes with it or without, where a `u16` made it 832), and one store per layer; no allocation.
+
 ### The chain is a runtime slice, resolved at listen()
 
 ```zig
@@ -84,6 +86,8 @@ Three properties, each of them the reason a different bad shape was not taken:
 - **The exception is where the route is.** Renaming `/sign-up` moves it, because the exception is recorded by the same `joined(prefix, pattern)` the registration uses; there is no second copy of the string to fall out of step.
 - **The URL layout is not decided by the middleware.** `/sign-up` stays inside `/v1` where it belongs, rather than being moved outside the prefix to dodge the guard.
 
+**A registration that is refused records nothing.** An exemption, and an attachment from `with`, is keyed on the pattern, the method and the middleware, not on the route, so one recorded before the route was refused applied to the route already there: `v1.without(auth).tryRoute(.POST, "/sign-in", b)` returning `DuplicateRoute` used to exempt the first `/v1/sign-in` from `auth`. The group's `add` takes the room for its exemptions and attachments first, registers the route, and only then records them, so nothing after the route goes in can fail; `App.register` checks a name already taken with the path, before the router holds anything, where it used to find it after (the audit of `http/` at `39896d2`). A `tryRoute` caller who asked for the error back hears the explanation at `warn`, not `err`, which is a server refusing to start ([ADR 207](./207-a-try-call-hands-back-the-error-and-says-nothing.md) keeps the line because the error cannot name the route it collided with).
+
 The exclusion list is a comptime parameter of the group's type, `GroupOf(prefix, excluded)`, of which `Group(prefix)` (a plain `app.group(prefix)`) is the empty case, so which routes carry an exception is settled while compiling, and the `inline for` that records them compiles to nothing for a group that has none.
 
 ### `mounted_at` is published
@@ -115,6 +119,10 @@ A middleware guarding `/api` can reject a request but was once unable to pass th
 **A `c.locals` map for a middleware to hand a value to the handler.** Untyped state smuggled in through the side door; closed instead by resolved values, above.
 
 **Leaving `Group` out to keep the compile-time engine simple.** It now exists precisely because `without`'s exclusion list needs a type to carry it, and it is what a plugin reads its own prefix from through `mounted_at`.
+
+**An empty 200 for a chain a middleware stopped without a word**, which was the rule until the audit of `http/` at `39896d2`: it was the handler's rule applied to a layer that is not the handler.
+
+**A middleware that has to return proof it answered or called `next`**, a value only `next.run` and `c.send` can make. The compiler would catch the forgotten 401 rather than a test, and every middleware ever written would change signature for one mistake a 500 and a log line already make loud the first time the route is hit.
 
 ## What it costs
 

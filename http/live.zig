@@ -1048,3 +1048,64 @@ test "a server answers on a second address, and both addresses reach the same ro
     stopped = true;
     try testing.expect(!stillThere(gpa, where.path));
 }
+
+/// Set by `bigAnswer` once its write has come back, however it came back.
+var big_answer_returned: std.atomic.Value(bool) = .init(false);
+
+fn bigAnswer(c: *nilo.Ctx) !void {
+    // Far more than the kernel will queue on a loopback socket, so the write
+    // parks on a client that is not reading.
+    const body = try c.arena().alloc(u8, 96 * 1024 * 1024);
+    @memset(body, 'x');
+    defer big_answer_returned.store(true, .release);
+    try c.send(200, "application/octet-stream", body);
+}
+
+test "a route deadline shortens the write to a client that reads nothing" {
+    // ADR 105: `listen()`'s write limit is thirty seconds a write, and it was
+    // armed once for the connection, so a route that had said two hundred
+    // milliseconds still waited out the thirty. Only a real socket parks the
+    // writer.
+    hush();
+    const gpa = std.heap.smp_allocator;
+    big_answer_returned.store(false, .release);
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.with(nilo.deadline(200)).get("/big", bigAnswer);
+
+    var serving: ServingAt = .{ .app = &app };
+    const thread = try std.Thread.spawn(.{}, ServingAt.run, .{&serving});
+    defer {
+        if (serving.bound.load(.acquire)) app.shutdown();
+        thread.join();
+    }
+    const port = try waitForPort(gpa, &serving);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var stream: std.Io.net.Stream = for (0..300) |_| {
+        break address.connect(io, .{ .mode = .stream }) catch {
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+            continue;
+        };
+    } else return error.ServerNeverCameUp;
+    // Closed before the server is told to stop, so a server still writing
+    // meets a reset rather than the thirty seconds.
+    defer stream.close(io);
+
+    var out_buf: [128]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    try writer.interface.writeAll("GET /big HTTP/1.1\r\nHost: t\r\n\r\n");
+    try writer.interface.flush();
+
+    // The client reads nothing. Bounded at six seconds, thirty times the
+    // route's deadline and a fifth of the write limit.
+    for (0..600) |_| {
+        if (big_answer_returned.load(.acquire)) break;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try testing.expect(big_answer_returned.load(.acquire));
+}

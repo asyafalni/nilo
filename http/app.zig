@@ -434,31 +434,6 @@ pub const App = struct {
         return .{ .app = self };
     }
 
-    /// Record that `pattern` is not covered by `middleware`, whatever a
-    /// `use`/`useOn` says. Called by the route methods on a group built with
-    /// `without`, never by hand — the point is that the exception is attached
-    /// by the registration rather than typed as a second string.
-    fn exempt(self: *App, pattern: []const u8, method: http1.Method, middleware: mw.Middleware) !void {
-        try self.exemptions.append(self.gpa, .{
-            .pattern = pattern,
-            .method = method,
-            .middleware = middleware,
-        });
-    }
-
-    /// Record that `pattern` carries `middleware` of its own. Called by the
-    /// route methods on a group built with `with`, never by hand — for the
-    /// reason `exempt` is not called by hand: the pattern is the one the
-    /// registration produced, so renaming the route moves the middleware with
-    /// it rather than leaving a string behind that guards nothing.
-    fn attach(self: *App, pattern: []const u8, method: http1.Method, middleware: mw.Middleware) !void {
-        try self.attached.append(self.gpa, .{
-            .pattern = pattern,
-            .method = method,
-            .middleware = middleware,
-        });
-    }
-
     /// Serve the contents of `dir_path` under `url_prefix`.
     ///
     /// The directory is read into memory here and now, before anything is
@@ -814,7 +789,7 @@ pub const App = struct {
         comptime handler: anytype,
     ) !void {
         comptime typed.check(pattern, handler);
-        self.tryRouteNamed(name, method, pattern, handler) catch |err| {
+        self.register(true, name, method, pattern, handler) catch |err| {
             if (err == error.DuplicateRoute or err == error.DuplicateName or err == error.CachedWrite) std.process.exit(1);
             return err;
         };
@@ -822,8 +797,10 @@ pub const App = struct {
 
     /// `route`, for a caller that would rather handle a collision than have
     /// the process stopped under it — a test, or a program building its
-    /// routes from a list. The one-line explanation still goes to the log;
-    /// what changes is that the error comes back as a value.
+    /// routes from a list. The one-line explanation still goes to the log,
+    /// at `warn`, because the error cannot name the route it collided with
+    /// (ADR 207); what changes is that the error comes back as a value and
+    /// nothing of the refused route is kept (ADR 008).
     pub fn tryRoute(
         self: *App,
         method: http1.Method,
@@ -841,14 +818,37 @@ pub const App = struct {
         comptime pattern: []const u8,
         comptime handler: anytype,
     ) !void {
+        return self.register(false, name, method, pattern, handler);
+    }
+
+    /// The one registration `routeNamed` and `tryRouteNamed` share.
+    /// `stops` says whether a refusal ends the process, which decides how
+    /// loud it is: `err` is a server refusing to start, and a `tryRoute`
+    /// caller who asked for the error back is not one, so it hears a
+    /// `warn`.
+    ///
+    /// **Every check runs before anything is kept.** A name already taken
+    /// was found after the router held the route, so a `tryRoute` refused
+    /// for it left the route live and out of the document; the name is
+    /// checked with the path now, before the router, the requirements or
+    /// the derived names are touched.
+    fn register(
+        self: *App,
+        comptime stops: bool,
+        comptime name: ?[]const u8,
+        method: http1.Method,
+        comptime pattern: []const u8,
+        comptime handler: anytype,
+    ) !void {
         comptime typed.check(pattern, handler);
         comptime if (name) |given| checkName(given);
+        const say = if (stops) std.log.err else std.log.warn;
 
         // Registering the same path twice is not a small mistake: the
         // second handler never runs, and nothing about the running server
         // says so. Caught here, where both patterns can be named.
         if (self.router.conflicting(method, pattern)) |existing| {
-            std.log.err(
+            say(
                 "the route \"{s} {s}\" answers the same requests as \"{s}\", which is already " ++
                     "registered — whichever came second would never run. Drop one, or give them " ++
                     "different paths. (Param names do not tell two routes apart: \"/users/:id\" " ++
@@ -864,7 +864,7 @@ pub const App = struct {
         // error (ADR 188).
         if (comptime typed.isCached(pattern, handler)) {
             if (!cached_mod.allows(method)) {
-                std.log.err(
+                say(
                     "the route \"{s} {s}\" takes a `Cached(…)`, and a {s} is not an answer to keep: " ++
                         "a kept answer is served again to whoever asks next, and the request the second " ++
                         "client sent was not the one the first client sent. A `Cached(…)` goes on a GET " ++
@@ -874,6 +874,22 @@ pub const App = struct {
                 return error.CachedWrite;
             }
         }
+
+        // A name given twice is the document carrying the same key twice,
+        // and whichever consumer read it would see one of the two. Caught
+        // here, where both routes can be named (ADR 119).
+        if (name) |given| {
+            if (wiring.nameTaken(self, given)) |existing| {
+                say(
+                    "the route \"{s} {s}\" is named `{s}`, and so is \"{s} {s}\". An " ++
+                        "operationId is the key a generated client and an authorisation " ++
+                        "table are written against, so two routes cannot share one.",
+                    .{ @tagName(method), pattern, given, @tagName(existing.method), existing.pattern },
+                );
+                return error.DuplicateName;
+            }
+        }
+
 
         try self.requirements.appendSlice(self.gpa, comptime typed.requirements(pattern, handler));
         // The name the route answers to at run time is the one the document
@@ -896,21 +912,6 @@ pub const App = struct {
         // description of an endpoint and the code that serves it cannot
         // drift apart (ADR 016). Comptime data, so what is appended here is
         // one struct of slices pointing at read-only memory.
-        // A name given twice is the document carrying the same key twice,
-        // and whichever consumer read it would see one of the two. Caught
-        // here, where both routes can be named (ADR 119).
-        if (name) |given| {
-            if (wiring.nameTaken(self, given)) |existing| {
-                std.log.err(
-                    "the route \"{s} {s}\" is named `{s}`, and so is \"{s} {s}\". An " ++
-                        "operationId is the key a generated client and an authorisation " ++
-                        "table are written against, so two routes cannot share one.",
-                    .{ @tagName(method), pattern, given, @tagName(existing.method), existing.pattern },
-                );
-                return error.DuplicateName;
-            }
-        }
-
         var op = comptime typed.operation(pattern, handler);
         op.method = method;
         op.name = name;
@@ -1757,22 +1758,58 @@ pub fn GroupWith(
             return .{ .app = self.app };
         }
 
-        /// Record this route's exceptions, if it has any. Inlined into every
-        /// registration below; `excluded` is empty for almost every group, and
-        /// an empty `inline for` compiles to nothing.
-        fn excepting(self: Self, comptime pattern: []const u8, method: http1.Method) !void {
+        /// Record that this route is not covered by the middleware `without`
+        /// named, whatever a `use`/`useOn` says. Only ever from `add`: the
+        /// exception is attached by the registration rather than typed as a
+        /// second string, so renaming the route moves it. `excluded` is empty
+        /// for almost every group, and an empty `inline for` compiles to
+        /// nothing.
+        fn excepting(self: Self, comptime pattern: []const u8, method: http1.Method) void {
             inline for (excluded) |middleware| {
-                try self.app.exempt(comptime joined(prefix, pattern), method, middleware);
+                self.app.exemptions.appendAssumeCapacity(.{
+                    .pattern = comptime joined(prefix, pattern),
+                    .method = method,
+                    .middleware = middleware,
+                });
             }
         }
 
         /// Record what this route carries of its own, the same way and for the
         /// same cost: `attached` is empty for every group but the one `with`
         /// made, and an empty `inline for` compiles to nothing.
-        fn attaching(self: Self, comptime pattern: []const u8, method: http1.Method) !void {
+        fn attaching(self: Self, comptime pattern: []const u8, method: http1.Method) void {
             inline for (attached) |middleware| {
-                try self.app.attach(comptime joined(prefix, pattern), method, middleware);
+                self.app.attached.appendAssumeCapacity(.{
+                    .pattern = comptime joined(prefix, pattern),
+                    .method = method,
+                    .middleware = middleware,
+                });
             }
+        }
+
+        /// A route of this group: the route first, then what it is excused
+        /// from and what it carries of its own. **In that order** because an
+        /// exemption and an attachment are keyed on the pattern and method,
+        /// not on the route, so one recorded for a registration that was then
+        /// refused applied to the route already there: `without(auth)` and a
+        /// `DuplicateRoute` exempted the first route from `auth`. The room is
+        /// taken before the route goes in, so nothing after it can fail.
+        fn add(
+            self: Self,
+            comptime stops: bool,
+            method: http1.Method,
+            comptime pattern: []const u8,
+            comptime handler: anytype,
+        ) !void {
+            try self.app.exemptions.ensureUnusedCapacity(self.app.gpa, excluded.len);
+            try self.app.attached.ensureUnusedCapacity(self.app.gpa, attached.len);
+            if (stops) {
+                try self.app.routeNamed(route_name, method, comptime joined(prefix, pattern), handler);
+            } else {
+                try self.app.tryRouteNamed(route_name, method, comptime joined(prefix, pattern), handler);
+            }
+            self.excepting(pattern, method);
+            self.attaching(pattern, method);
         }
 
         /// Middleware on everything in this group — `app.useOn(prefix, …)`,
@@ -1798,56 +1835,42 @@ pub fn GroupWith(
 
         pub fn get(self: Self, comptime pattern: []const u8, comptime handler: anytype) !void {
             comptime typed.check(joined(prefix, pattern), handler);
-            try self.excepting(pattern, .GET);
-            try self.attaching(pattern, .GET);
-            return self.app.routeNamed(route_name, .GET, comptime joined(prefix, pattern), handler);
+            return self.add(true, .GET, pattern, handler);
         }
 
         pub fn post(self: Self, comptime pattern: []const u8, comptime handler: anytype) !void {
             comptime typed.check(joined(prefix, pattern), handler);
             comptime typed.checkVerb(.POST, joined(prefix, pattern), handler);
-            try self.excepting(pattern, .POST);
-            try self.attaching(pattern, .POST);
-            return self.app.routeNamed(route_name, .POST, comptime joined(prefix, pattern), handler);
+            return self.add(true, .POST, pattern, handler);
         }
 
         pub fn put(self: Self, comptime pattern: []const u8, comptime handler: anytype) !void {
             comptime typed.check(joined(prefix, pattern), handler);
             comptime typed.checkVerb(.PUT, joined(prefix, pattern), handler);
-            try self.excepting(pattern, .PUT);
-            try self.attaching(pattern, .PUT);
-            return self.app.routeNamed(route_name, .PUT, comptime joined(prefix, pattern), handler);
+            return self.add(true, .PUT, pattern, handler);
         }
 
         pub fn delete(self: Self, comptime pattern: []const u8, comptime handler: anytype) !void {
             comptime typed.check(joined(prefix, pattern), handler);
             comptime typed.checkVerb(.DELETE, joined(prefix, pattern), handler);
-            try self.excepting(pattern, .DELETE);
-            try self.attaching(pattern, .DELETE);
-            return self.app.routeNamed(route_name, .DELETE, comptime joined(prefix, pattern), handler);
+            return self.add(true, .DELETE, pattern, handler);
         }
 
         pub fn patch(self: Self, comptime pattern: []const u8, comptime handler: anytype) !void {
             comptime typed.check(joined(prefix, pattern), handler);
             comptime typed.checkVerb(.PATCH, joined(prefix, pattern), handler);
-            try self.excepting(pattern, .PATCH);
-            try self.attaching(pattern, .PATCH);
-            return self.app.routeNamed(route_name, .PATCH, comptime joined(prefix, pattern), handler);
+            return self.add(true, .PATCH, pattern, handler);
         }
 
         pub fn head(self: Self, comptime pattern: []const u8, comptime handler: anytype) !void {
             comptime typed.check(joined(prefix, pattern), handler);
-            try self.excepting(pattern, .HEAD);
-            try self.attaching(pattern, .HEAD);
-            return self.app.routeNamed(route_name, .HEAD, comptime joined(prefix, pattern), handler);
+            return self.add(true, .HEAD, pattern, handler);
         }
 
         pub fn options(self: Self, comptime pattern: []const u8, comptime handler: anytype) !void {
             comptime typed.check(joined(prefix, pattern), handler);
             comptime typed.checkVerb(.OPTIONS, joined(prefix, pattern), handler);
-            try self.excepting(pattern, .OPTIONS);
-            try self.attaching(pattern, .OPTIONS);
-            return self.app.routeNamed(route_name, .OPTIONS, comptime joined(prefix, pattern), handler);
+            return self.add(true, .OPTIONS, pattern, handler);
         }
 
         pub fn route(
@@ -1857,9 +1880,7 @@ pub fn GroupWith(
             comptime handler: anytype,
         ) !void {
             comptime typed.check(joined(prefix, pattern), handler);
-            try self.excepting(pattern, method);
-            try self.attaching(pattern, method);
-            return self.app.routeNamed(route_name, method, comptime joined(prefix, pattern), handler);
+            return self.add(true, method, pattern, handler);
         }
 
         pub fn tryRoute(
@@ -1869,9 +1890,7 @@ pub fn GroupWith(
             comptime handler: anytype,
         ) !void {
             comptime typed.check(joined(prefix, pattern), handler);
-            try self.excepting(pattern, method);
-            try self.attaching(pattern, method);
-            return self.app.tryRouteNamed(route_name, method, comptime joined(prefix, pattern), handler);
+            return self.add(false, method, pattern, handler);
         }
 
         pub fn static(self: Self, comptime url_prefix: []const u8, dir_path: []const u8) !void {

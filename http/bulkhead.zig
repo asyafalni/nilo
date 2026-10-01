@@ -503,6 +503,9 @@ pub const Options = struct {
     /// also what bounds a server-sent event stream whose reader has walked
     /// away — the write fails, the handler gets an error, the fiber
     /// unwinds.
+    ///
+    /// Armed again for every request, and cut to a route's deadline when
+    /// that is nearer than this (`Deadlines.armWrite`, ADR 105).
     write_timeout_ms: u32 = 30_000,
 
     /// How long any request has, in total, from its head arriving to its
@@ -1632,10 +1635,33 @@ pub const Deadlines = struct {
     }
 
     /// Writing to the client, one write at a time — same reasoning as
-    /// `armBody`, in the other direction. Set once per connection: nothing
-    /// in a response changes it.
+    /// `armBody`, in the other direction.
+    ///
+    /// **Armed again for each request, and again when the route's deadline
+    /// is about to matter** (`Ctx.armWriteLimit`), because `until_ns` can
+    /// only cut it down once the route has set it. The per-write limit stays
+    /// the shape it was: `write_ms` for each write, so a response that is
+    /// large and honestly slow is not cut at `write_ms` in total. What the
+    /// deadline changes is one case, the one it can be exact about: when
+    /// what is left of it is no more than `write_ms`, the write is bounded by
+    /// the deadline itself, as an absolute time, because a write that began
+    /// inside `write_ms` of the deadline would otherwise outlive it by up to
+    /// `write_ms`. A deadline further off than `write_ms` leaves the write on
+    /// its own limit, which already stops a client that has stopped reading;
+    /// it does not stop one that takes a byte every `write_ms` ([ADR 105](../docs/adr/105-a-route-can-say-how-long-it-has.md)).
+    ///
+    /// A deadline that has already passed changes nothing: the 503 naming
+    /// the budget, or a handler's late answer, still goes out under the
+    /// ordinary limit rather than into a write that has run out before it
+    /// began.
     pub fn armWrite(self: Deadlines) void {
-        self.set(.write, if (self.write_ms == 0) .none else .{ .within_ms = self.write_ms });
+        var l: Limit = if (self.write_ms == 0) .none else .{ .within_ms = self.write_ms };
+        if (self.until_ns != 0) {
+            const now = monotonicNanos();
+            if (self.until_ns > now and (self.write_ms == 0 or self.until_ns - now <= msToNanos(self.write_ms)))
+                l = .{ .by_ns = self.until_ns };
+        }
+        self.vtable.limit(self.target, .write, l);
     }
 
     /// Take the limit off reads. For a connection that has stopped being a
@@ -1871,6 +1897,31 @@ test "a body of any size the caller names sizes a deadline instead of overflowin
     // (small) one a multiplication that overflowed would have produced.
     const cap = @as(u64, std.math.maxInt(u32)) * std.time.ns_per_ms;
     try testing.expect(caught.limit.by_ns >= before + cap);
+}
+
+test "a route deadline nearer than the write limit becomes the write limit, and a later or a passed one leaves it" {
+    var caught = Caught{};
+    var d = caught.deadlines(.{ .write_ms = 30_000 });
+
+    d.until_ns = monotonicNanos() + 2 * std.time.ns_per_s;
+    d.armWrite();
+    try testing.expectEqual(d.until_ns, caught.limit.by_ns);
+
+    d.until_ns = monotonicNanos() + 60 * std.time.ns_per_s;
+    d.armWrite();
+    try testing.expectEqual(Limit{ .within_ms = 30_000 }, caught.limit);
+
+    // Past: a late answer, or the 503 for it, still gets the ordinary limit.
+    d.until_ns = monotonicNanos() -| std.time.ns_per_ms;
+    d.armWrite();
+    try testing.expectEqual(Limit{ .within_ms = 30_000 }, caught.limit);
+
+    // No write limit at all: the deadline is the only one there is.
+    var bare = Caught{};
+    var e = bare.deadlines(.{ .write_ms = 0 });
+    e.until_ns = monotonicNanos() + 60 * std.time.ns_per_s;
+    e.armWrite();
+    try testing.expectEqual(e.until_ns, bare.limit.by_ns);
 }
 
 test "a rate of zero leaves the body on the per-read limit it had" {

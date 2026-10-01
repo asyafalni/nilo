@@ -679,3 +679,27 @@ test "a cookie set through the Ctx during a cached handler is not kept" {
     try testing.expect(hit.header("Set-Cookie") == null);
     try testing.expectEqual(@as(u32, 1), f.renders.count);
 }
+
+fn showWithBadHeader(page: Cached(FakePages, .{ .ttl_s = 60 }), renders: *Renders) typed.Response(Page) {
+    _ = page;
+    renders.count += 1;
+    return .{
+        .value = .{ .id = 1, .served = renders.count },
+        .headers = .of(&.{.{ .name = "X-Page-Version", .value = "v1\r\nX-Injected: yes" }}),
+    };
+}
+
+test "an answer whose header setHeader refuses is not kept, so the handler runs again rather than a 500 being replayed" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.wire();
+    try f.app.get("/front", showWithBadHeader);
+
+    for (0..2) |_| {
+        const answer = try f.client.get(&f.app, "/front");
+        try testing.expectEqual(@as(u16, 500), answer.status);
+        try testing.expect(answer.header(status_name) == null or !std.mem.eql(u8, answer.header(status_name).?, hit_value));
+    }
+    try testing.expectEqual(@as(u32, 2), f.renders.count);
+    try testing.expect(!f.pages.has("/front"));
+}

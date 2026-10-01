@@ -45,9 +45,10 @@ pub fn handleConnection(
     var lifetime = str_mod.Lifetime.init();
     defer lifetime.deinit();
 
-    // Once for the connection. Nothing in a response changes how long a
-    // single write may take, so nothing re-arms it — including a stream
-    // that writes for an hour, where each write is still one write.
+    // A stream that writes for an hour is still one write at a time, so
+    // this is the per-write limit. A route's own deadline can shorten it for
+    // its request (`Ctx.armWriteLimit`), which is why it is armed again
+    // below, before each request, rather than left as it was (ADR 105).
     deadlines.armWrite();
 
     // What this fiber is serving is bound to it once, then reused by
@@ -75,6 +76,9 @@ pub fn handleConnection(
             return;
         }
 
+        // Back to `listen()`'s limit for this request, undoing whatever the
+        // last one's deadline did to it. A field store and no allocation.
+        deadlines.armWrite();
         var served = serveRequest(self, arena.allocator(), &lifetime, &in_flight, in, out, deadlines, waker, peer);
         // A handler that upgraded runs its loop here rather than inside
         // `serveRequest`, so that the request's 1,608 bytes are unwound
@@ -530,7 +534,22 @@ pub noinline fn serveRequest(
     const linger = !reusable and http1.readsMore(&r);
 
     if (c.answered() == null) {
-        // A handler that returned without answering meant an empty 200.
+        // A handler that returned without answering meant an empty 200
+        // (ADR 120). A middleware that returned without answering and
+        // without calling `next` meant nothing at all: it is a guard that
+        // forgot its 401, and an empty 200 would let it read as a success
+        // with the handler never run, so it is a 500 naming the layer
+        // (ADR 008). A failure a handler caught has nothing to do with it.
+        if (c._chain_left != 0) {
+            std.log.warn(
+                "{s} {s}: middleware {d} of {d} returned without answering and without calling next.run(c); answered 500",
+                .{ @tagName(c.method), path, chain.len - @min(c._chain_left, chain.len) + 1, chain.len },
+            );
+            failure.clear();
+            sendFailure(&c, failure, error.MiddlewareAnsweredNothing, self.failure_write) catch
+                return .{ .keep_alive = false, .handover = handover, .linger = linger };
+            return .{ .keep_alive = reusable, .handover = handover, .linger = linger };
+        }
         // No content type, because there is no content to give one to.
         sendDirect(&c, 200, "", "") catch return .{ .keep_alive = false, .handover = handover, .linger = linger };
     }
@@ -1144,6 +1163,10 @@ noinline fn sendFailure(c: *Ctx, failure: *const fail.Failure, err: anyerror, sh
         }
         break :blk http1.statusPhrase(status);
     };
+
+    // The headers the request collected go out, CORS above all, but not the
+    // ones that described the answer this failure replaces (ADR 024).
+    c.forgetAnswerHeaders();
 
     // Every 401 carries `WWW-Authenticate` (RFC 9110 §15.5.2), and the
     // endpoint that read the header is the one that knows what to say in

@@ -221,6 +221,14 @@ pub const Ctx = struct {
     /// over, a gzip stream that did not inflate: a second `body()` is refused
     /// rather than answered from `_body`, which is empty then.
     _body_refused: bool = false,
+    /// Written by `Next.run`: how many layers of the onion were left below
+    /// the deepest one reached, 0 once the handler ran, and the maximum
+    /// while nothing has run. A chain that ends unanswered above 0 was
+    /// stopped by a middleware that said nothing (ADR 008). A `u8` because
+    /// it fits in padding the Ctx already had, 824 bytes with it or without;
+    /// a `u16` was 8 more. Saturated, so a chain past 255 layers names the
+    /// layer that stopped it only roughly, and still tells it from the handler.
+    _chain_left: u8 = std.math.maxInt(u8),
     _sent: bool = false,
     /// Set once `100 Continue` has gone out, so it goes out at most once even
     /// though two body paths can each be the first to read (ADR 073). App
@@ -939,6 +947,17 @@ pub const Ctx = struct {
             self._deadlines.until_ns = 0;
             self._deadline_default = false;
         }
+        self.armWriteLimit();
+    }
+
+    /// Put the request's deadline on the write clock, which `listen()` armed
+    /// once for the connection before any route ran and which a deadline set
+    /// later does not reach by itself (ADR 105). Called where the answer or
+    /// a takeover is about to write. Nothing at all for a request with no
+    /// deadline: the limit already stands, and the next request on the
+    /// connection starts from `listen()`'s again (`serve.handleConnection`).
+    pub fn armWriteLimit(self: *const Ctx) void {
+        if (self._deadlines.until_ns != 0) self._deadlines.armWrite();
     }
 
     /// How much body this request may read into the arena, in place of
@@ -1486,6 +1505,24 @@ pub const Ctx = struct {
         return self._extra_inline[0..self._extra_n];
     }
 
+    /// Take back what the headers said about an answer that is not going
+    /// out, because a failure is replacing it (`http1.describesAnswer`,
+    /// ADR 024). In place and in order; nothing is allocated or freed.
+    pub fn forgetAnswerHeaders(self: *Ctx) void {
+        const all = self.extraHeadersMutable();
+        var kept: usize = 0;
+        for (all) |h| {
+            if (http1.describesAnswer(h.name, h.value)) continue;
+            all[kept] = h;
+            kept += 1;
+        }
+        if (self._extra_spill.items.len > 0) {
+            self._extra_spill.shrinkRetainingCapacity(kept);
+        } else {
+            self._extra_n = kept;
+        }
+    }
+
     fn extraHeadersMutable(self: *Ctx) []http1.Header {
         if (self._extra_spill.items.len > 0) return self._extra_spill.items;
         return self._extra_inline[0..self._extra_n];
@@ -1520,30 +1557,7 @@ pub const Ctx = struct {
     /// cookie value. A bare error here would arrive as "internal server
     /// error" and send somebody looking through their handler for it.
     fn putHeader(self: *Ctx, entry: http1.Header) !void {
-        if (http1.isReservedHeader(entry.name)) return fail.internal(
-            "\"{s}\" is a header nilo writes itself, so setting it would send the response two " ++
-                "of them — which is malformed, and for Content-Length is a request-smuggling " ++
-                "bug. The content type is chosen through `send`; the other three are the " ++
-                "framing and are not yours to set.",
-            .{entry.name},
-        );
-        if (!http1.headerNameOk(entry.name)) return fail.internal(
-            "\"{s}\" is not a name a header can have — a field name is letters, digits, and " ++
-                "any of !#$%&'*+-.^_`|~",
-            .{entry.name},
-        );
-        // The value is **not** quoted into the message. It is the half most
-        // likely to have come from a request, a row or a filename, and a
-        // response that echoed it back would hand the sender a way to read
-        // what the check caught.
-        if (!http1.headerValueOk(entry.value)) return fail.internal(
-            "the value of the header \"{s}\" holds a character a header value cannot: a control " ++
-                "byte, most often a carriage return or a newline. Either one ends the header " ++
-                "early and starts a second one nobody wrote, and two of them start a second " ++
-                "response — so this is refused rather than escaped, because there is no " ++
-                "escaping in this grammar to do it with. Percent-encode the value, or strip it.",
-            .{entry.name},
-        );
+        try checkHeader(entry);
         // Setting a header twice is somebody changing their mind, so the
         // second call replaces the first — except for the two a response may
         // legitimately carry more than one of (`http1.repeats`).
@@ -1581,6 +1595,38 @@ pub const Ctx = struct {
         try self._extra_spill.ensureTotalCapacity(self._arena, inline_headers * 2);
         self._extra_spill.appendSliceAssumeCapacity(&self._extra_inline);
         self._extra_spill.appendAssumeCapacity(entry);
+    }
+
+    /// The checks `putHeader` makes, on their own: whether `setHeader` would
+    /// refuse this header, and the same 500 if so. For a caller that keeps an
+    /// answer to send again (`Cached`, `Idempotent`) and has to know before
+    /// it is kept, because a kept refusal is replayed until it expires
+    /// (ADR 155, ADR 188).
+    pub fn checkHeader(entry: http1.Header) !void {
+        if (http1.isReservedHeader(entry.name)) return fail.internal(
+            "\"{s}\" is a header nilo writes itself, so setting it would send the response two " ++
+                "of them — which is malformed, and for Content-Length is a request-smuggling " ++
+                "bug. The content type is chosen through `send`; the other three are the " ++
+                "framing and are not yours to set.",
+            .{entry.name},
+        );
+        if (!http1.headerNameOk(entry.name)) return fail.internal(
+            "\"{s}\" is not a name a header can have — a field name is letters, digits, and " ++
+                "any of !#$%&'*+-.^_`|~",
+            .{entry.name},
+        );
+        // The value is **not** quoted into the message. It is the half most
+        // likely to have come from a request, a row or a filename, and a
+        // response that echoed it back would hand the sender a way to read
+        // what the check caught.
+        if (!http1.headerValueOk(entry.value)) return fail.internal(
+            "the value of the header \"{s}\" holds a character a header value cannot: a control " ++
+                "byte, most often a carriage return or a newline. Either one ends the header " ++
+                "early and starts a second one nobody wrote, and two of them start a second " ++
+                "response — so this is refused rather than escaped, because there is no " ++
+                "escaping in this grammar to do it with. Percent-encode the value, or strip it.",
+            .{entry.name},
+        );
     }
 
     /// Send a cookie back with this response (ADR 029).
@@ -1703,6 +1749,7 @@ pub const Ctx = struct {
         // would be reported as a handler holding its thread (ADR 013).
         const w = watchdog.waiting(self._watch);
         defer watchdog.waited(self._watch, w);
+        self.armWriteLimit();
 
         // A handler need not know this is a HEAD: it assembles a response
         // as usual, and what must not go out is filtered here. The length
@@ -1750,18 +1797,42 @@ pub const Ctx = struct {
         // that choice, so gzipping here would put one tag on two bodies.
         if (self._static_file != null) return null;
         if (!pool.eligible(status, content_type, response_body.len)) return null;
-        // A handler that gzipped its own body (a cached copy, a file it
-        // read compressed) has said so, and it is not compressed twice.
+        // What the handler said about this representation stands. A
+        // `Content-Encoding` of its own means it gzipped the body itself (a
+        // cached copy, a file it read compressed), and it is not compressed
+        // twice. A `Content-Range` is an offset into the plain bytes, and
+        // `Cache-Control: no-transform` is the handler forbidding exactly
+        // this (ADR 211).
         for (self.extraHeaders()) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "Content-Encoding")) return null;
+            if (std.ascii.eqlIgnoreCase(h.name, "Content-Range")) return null;
+            if (std.ascii.eqlIgnoreCase(h.name, "Cache-Control") and compress_mod.forbidsTransform(h.value)) return null;
         }
         try self.setStaticHeader("Vary", "Accept-Encoding");
         const accept = if (self.header("Accept-Encoding")) |h| h.view() else null;
         if (!compress_mod.acceptsGzip(accept)) return null;
 
         const smaller = pool.gzip(self._arena, response_body) orelse return null;
+        try self.weakenETag();
         try self.setStaticHeader("Content-Encoding", "gzip");
         return smaller;
+    }
+
+    /// A strong `ETag` promises the same bytes, and the gzipped body and the
+    /// plain one are different bytes, so the tag a handler set for the plain
+    /// body is made weak once the answer goes out gzipped (RFC 9110
+    /// section 8.8.1; `static.zig` gives the two bodies two tags for the same
+    /// reason). One arena allocation, and only on an answer that carries a
+    /// strong tag and was compressed.
+    fn weakenETag(self: *Ctx) !void {
+        for (self.extraHeaders()) |h| {
+            if (!std.ascii.eqlIgnoreCase(h.name, "ETag")) continue;
+            if (std.mem.startsWith(u8, h.value, "W/")) return;
+            const weak = try self._arena.alloc(u8, h.value.len + 2);
+            @memcpy(weak[0..2], "W/");
+            @memcpy(weak[2..], h.value);
+            return self.setStaticHeader("ETag", weak);
+        }
     }
 
     pub fn sendText(self: *Ctx, status: u16, text: []const u8) !void {
@@ -1858,7 +1929,7 @@ pub const Ctx = struct {
         content_type: []const u8,
         options: stream_mod.Options,
     ) !stream_mod.Stream {
-        std.debug.assert(self.answered() == null); // one request, one response
+        if (self.answered() != null) return error.AlreadyAnswered; // one request, one response, as `send`
         try self.contentTypeOk(content_type);
         // `writeHead` drops the framing for these, so the chunks that
         // followed would be read as the next response (ADR 019).
@@ -1978,7 +2049,7 @@ pub const Ctx = struct {
     /// loop and a hand-built `Ctx` need it and only one of them hands the loop
     /// back.
     fn handshake(self: *Ctx, options: websocket.Options) !websocket.Socket {
-        std.debug.assert(self.answered() == null); // one request, one response
+        if (self.answered() != null) return error.AlreadyAnswered; // one request, one response, as `send`
 
         if (self.method != .GET) {
             return fail.badRequest("a WebSocket handshake has to be a GET, not a {s}", .{@tagName(self.method)});
@@ -2135,7 +2206,7 @@ pub const Ctx = struct {
     /// held handler costs (ADR 019).
     pub fn eventsFrom(self: *Ctx, rooms: anytype, options: stream_mod.FromRooms) !void {
         comptime checkRooms(@TypeOf(rooms));
-        std.debug.assert(self.answered() == null); // one request, one response
+        if (self.answered() != null) return error.AlreadyAnswered; // one request, one response, as `send`
 
         var held: stream_mod.RoomEvents = .{
             ._in = self._in,

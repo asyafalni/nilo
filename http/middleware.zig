@@ -13,7 +13,9 @@
 //! ```
 //!
 //! A middleware that does not call `next.run(c)` ends the chain — that is
-//! all short-circuiting is. One that returns an error goes through exactly
+//! all short-circuiting is — and it answers, or the request is a 500 naming
+//! it: an empty 200 is what a handler returning `void` means (ADR 120), and
+//! a guard that forgot its 401 must not read as a success. One that returns an error goes through exactly
 //! the same path a failing handler does, fail functions and mapping table
 //! included (ADR 004), so there is only ever one error path.
 //!
@@ -43,6 +45,11 @@ pub const Next = struct {
     handler: CtxHandler,
 
     pub fn run(self: Next, c: *Ctx) anyerror!void {
+        // How much of the onion is left below the deepest layer reached, 0
+        // once the handler runs. App reads it to tell a handler that meant
+        // an empty 200 from a middleware that stopped the chain and said
+        // nothing, and to say which one that was (ADR 008).
+        c._chain_left = @intCast(@min(self.rest.len, std.math.maxInt(u8)));
         if (self.rest.len == 0) return self.handler(c);
         return self.rest[0](c, .{ .rest = self.rest[1..], .handler = self.handler });
     }

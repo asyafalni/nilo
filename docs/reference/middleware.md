@@ -148,6 +148,8 @@ while (try rows.next()) |row| {
 }
 ```
 
+**The write is clamped too, in one case**: a deadline with less left than `write_timeout_ms` bounds the answer's writes, so a two-second route does not wait thirty seconds on a client that reads nothing. A deadline further off leaves each write on `write_timeout_ms`, which stops a client that has stopped reading but not one that takes a little every few seconds.
+
 A handler that fails while overdue, with nothing sent yet, gets a 503 naming the budget. One that finishes late still answers, because the work is done and correct, and the lateness is logged ([ADR 105](../adr/105-a-route-can-say-how-long-it-has.md)). `deadline(0)` is a compile error.
 
 ### `nilo.maxBody`

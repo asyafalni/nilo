@@ -3093,6 +3093,35 @@ After the fix the arena holds the body and about 4 KB of head and answer, whatev
 
 **Can it be pushed further.** The 174 times is gone and the remaining cost is the body, which `max_body` already bounds. The multipart timing is Debug only; a ReleaseSafe figure beside it would be worth one line the next time this is run. The urlencoded number is bounded, not minimised: 1,024 pairs is 32 KiB for a form that has them, and a form of two fields pays for two.
 
+## What gzipping holds a thread for, by size, and where `max_bytes` stands
+
+**What was run.** `zig build bench-compress`, whose second table is new: one `Pool.gzip` on one thread at five body sizes, at `.fastest` and `.default`, `ReleaseFast`, the same JSON shape as the arena's `json-comp` profile (items of about 164 bytes), the request arena reset between rounds as a request would. Enough rounds for about a quarter of a second each and never fewer than five. No server and no socket: the number wanted is how long `Ctx.send` holds an executor thread while it compresses, because deflate runs whole and there is no point inside it where the fiber parks.
+
+**Machine and commit.** AMD Ryzen 7 9700X, 8 cores and 16 threads, Zig 0.16.0, loopback irrelevant; on `1738286` plus the change that adds `Options.max_bytes`. The "before" is the same compressor: nothing in the deflate path changed, so there is no second build to compare, and what the bench adds is the sweep.
+
+| bytes in | level | bytes out | ms/body | MB/s |
+|---|---|---|---|---|
+| 41,028 | `.fastest` | 6,410 | 0.178 | 230 |
+| 41,028 | `.default` | 4,690 | 0.258 | 159 |
+| 164,398 | `.fastest` | 24,667 | 0.679 | 242 |
+| 164,398 | `.default` | 17,104 | 1.057 | 156 |
+| 991,794 | `.fastest` | 145,619 | 4.196 | 236 |
+| 991,794 | `.default` | 99,794 | 6.573 | 151 |
+| 3,984,446 | `.fastest` | 582,362 | 16.775 | 238 |
+| 3,984,446 | `.default` | 397,973 | 26.597 | 150 |
+| 19,986,580 | `.fastest` | 2,916,434 | 83.853 | 238 |
+| 19,986,580 | `.default` | 1,991,571 | 130.417 | 153 |
+
+**What it showed.** Time is linear in size from 164 KB up, at about 150 MB/s on `.default` and 240 MB/s on `.fastest`, so there is no knee to find: the cap is a policy about how long a thread may be held, and the table converts it. A 20 MB JSON export held its thread for 130 ms with nothing else on it running; 130 ms is more than half of `block_warning_ms` (250), which is what the framework calls a handler blocking its thread.
+
+**The decision it moved.** `Options.max_bytes` defaults to 1 MiB (1,048,576): about 6.6 ms on `.default` here, a thirty-eighth of the watchdog's figure, which leaves room for a machine five or six times slower before gzip alone reaches it. 4 MiB (27 ms here) was the alternative: it fits a slow machine too, but a body that big is a download rather than an API answer, and a download is better compressed ahead of time. Zero takes the limit off. A body over it goes out uncompressed and without `Vary`, since the same body is sent to every client (ADR 211).
+
+**Can it be pushed further.** The 150 MB/s is the standard library's deflate at level 6, and 6 us of a small body is the hash table's reset, neither of which this changes. A compressor that yielded between blocks would remove the cap's reason, and costs a compressor held across a park, which ADR 211 refuses. The figures are from one machine; a slower core moves the cap's headroom, not its shape.
+
+## What a route deadline's write clamp costs
+
+**What was not run.** No throughput benchmark: the change is one indirect call and the stores it makes into the Engine's `Clocks` per request (`serve.handleConnection` re-arms the write limit before each request), and, for a route with a deadline, the same again where its answer is written. `test "the request path stays inside its allocation budget"` passes unchanged, nothing is held per connection (the `Deadlines` the connection already carries is read, not grown), and the test that found the defect (`a route deadline shortens the write to a client that reads nothing`, a 96 MB answer to a client that reads nothing, 200 ms against a 30,000 ms write limit) returns in about the deadline instead of failing at its six-second bound. A figure for the per-request re-arm belongs here the next time the paced benchmark is run on this path.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

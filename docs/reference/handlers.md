@@ -193,7 +193,7 @@ The first request with a key runs the handler and **stores what it returned**: t
 
 | | |
 |---|---|
-| `Replays` | where answers are stored: a `cache.Space` holding `[]const u8`, registered with `app.provide`. Any type with `getInto`, `putIfAbsent`, `put`, `del`, `max_bytes` and `Held` works, which is what a Redis-backed table would provide |
+| `Replays` | where answers are stored: a `cache.Space` holding `[]const u8`, registered with `app.provide`. Any type with `getInto`, `putIfAbsentFor`, `put`, `del`, `max_bytes` and `Held` works, which is what a Redis-backed table would provide |
 | `.by` | whose key it is: a function of one `*Ctx` returning `?Str`. Two callers who pick the same key must never see each other's answer, so leave it null only on an endpoint with a single caller. Null from the function is a 403 |
 | `.key` | the header as sent |
 
@@ -287,7 +287,7 @@ A `Failure` has `field`, `reason`, `given`, `kind`, `expected`, `said`, and `say
 | `Redirect(code)` | that status and a `Location`, no body |
 | `FileBody` | a file on disk, opened and sent without being held in memory |
 | `Bytes` | bytes already in hand, under a content type chosen per request, for example somebody else's download passed on ([ADR 173](../adr/173-bytes-handed-on-are-an-answer.md)) |
-| `Versioned(T)` | `T` with a weak `ETag` made from a `u64` the handler provides; **304** with no body when `If-None-Match` matches it ([ADR 189](../adr/189-a-version-a-handler-names-is-an-etag.md)) |
+| `Versioned(T)` | `T` with a weak `ETag` made from a `u64` the handler provides; **304** with no body when `If-None-Match` matches it on a GET or a HEAD, and the ordinary 200 on any other method ([ADR 189](../adr/189-a-version-a-handler-names-is-an-etag.md)) |
 | a type with `nilo_content_type` and `nilo_write` | 200, the bytes `nilo_write` wrote, under that content type: see [below](#a-type-that-writes-its-own-answer) |
 
 ```zig
@@ -325,7 +325,7 @@ Versioned([]Order){ .version = revision, .value = orders }  // `W/"…"`; `.unch
 
 ### `Versioned(T)`
 
-**Fields:** `version` (a `u64`), `headers`, and `value` (`?T`; null is `.unchanged(version)`, the answer for a client that `c.clientHas(version)` said already has it; use `.unchangedWith(version, headers)` when the 304 should carry the same `Cache-Control` as the 200). The tag is `W/"<hex>"`: weak, because a version says the representation is the same, not that the bytes are. `headers` are sent on both the 200 and the 304. `.unchanged` sent to a client that did not send the version is a 500 naming the route. `Versioned(?T)`, `Versioned(void)`, a `Versioned` inside a `Status` or a `Response`, and one under a `Cached` or an `Idempotent` are each a compile error saying what to write instead; for something that does not exist, use `fail.notFound`. The document puts the `ETag` on the 200 and adds a `304`. See [Responses](../guide/responses.md#etags-and-304-not-modified).
+**Fields:** `version` (a `u64`), `headers`, and `value` (`?T`; null is `.unchanged(version)`, the answer for a client that `c.clientHas(version)` said already has it; use `.unchangedWith(version, headers)` when the 304 should carry the same `Cache-Control` as the 200). The tag is `W/"<hex>"`: weak, because a version says the representation is the same, not that the bytes are. `headers` are sent on both the 200 and the 304. `.unchanged` sent to a client that did not send the version is a 500 naming the route. `Versioned(?T)`, `Versioned(void)`, a `Versioned` inside a `Status` or a `Response`, and one under a `Cached` or an `Idempotent` are each a compile error saying what to write instead; for something that does not exist, use `fail.notFound`. The document puts the `ETag` on the 200 and, for a GET or a HEAD, adds a `304`. See [Responses](../guide/responses.md#etags-and-304-not-modified).
 
 ### A type that writes its own answer
 

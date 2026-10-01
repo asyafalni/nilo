@@ -70,11 +70,13 @@ pub const Contents = struct {
 /// over a `Range`, and an `If-Range` that does not match turns a 206 back
 /// into a 200 rather than into a corrupt download.
 pub fn send(c: *Ctx, contents: Contents) !void {
-    std.debug.assert(c.answered() == null); // one request, one response
-
     // The descriptor is this function's from here, and this is the only line
     // that gives it back — see the module comment.
     defer contents.file.close();
+
+    // After the `defer`, so a second answer still gives the descriptor back;
+    // an error rather than an assert for `Ctx.send`'s reason.
+    if (c.answered() != null) return error.AlreadyAnswered; // one request, one response
 
     const total = contents.size orelse (try contents.file.stat()).size;
 
@@ -158,6 +160,7 @@ fn writeBody(c: *Ctx, contents: Contents, status: u16, from: u64, len: u64) !voi
     // (ADR 013).
     const w = watchdog.waiting(c._watch);
     defer watchdog.waited(c._watch, w);
+    c.armWriteLimit();
 
     const connection = c.connection();
 
@@ -618,4 +621,34 @@ test "the descriptor is given back however the answer ends" {
             answer.status == 304 or answer.status == 416);
     }
     try testing.expectEqual(before, try openDescriptors());
+}
+
+var second_answer: ?anyerror = null;
+
+fn answeredThenFile(c: *Ctx) anyerror!void {
+    try c.sendText(200, "first");
+    const files = open_files.?;
+    const file = try files.dir.openFile(OneFile.name);
+    c.sendFile(.{ .file = file, .content_type = "text/plain" }) catch |err| {
+        second_answer = err;
+    };
+}
+
+test "a file sent after the request was answered is AlreadyAnswered, and the first answer stands" {
+    var files = try OneFile.init(alphabet);
+    defer files.deinit();
+    open_files = &files;
+    defer open_files = null;
+
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/twice", answeredThenFile);
+
+    var client = try nilo_testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+    second_answer = null;
+    const answer = try client.get(&app, "/twice");
+    try testing.expectEqual(@as(u16, 200), answer.status);
+    try testing.expectEqualStrings("first", answer.body);
+    try testing.expectEqual(@as(?anyerror, error.AlreadyAnswered), second_answer);
 }

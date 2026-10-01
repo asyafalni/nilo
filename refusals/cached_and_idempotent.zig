@@ -12,6 +12,9 @@ const Pages = struct {
     pub fn putIfAbsent(_: *Pages, _: []const u8, _: []const u8) error{TooLarge}!bool {
         unreachable;
     }
+    pub fn putIfAbsentFor(_: *Pages, _: []const u8, _: []const u8, _: u32) error{TooLarge}!bool {
+        unreachable;
+    }
     pub fn put(_: *Pages, _: []const u8, _: []const u8) error{TooLarge}!void {
         unreachable;
     }

@@ -21,7 +21,8 @@ fn placeOrder(key: nilo.Idempotent(Replays, .{ .by = account }), body: NewOrder,
 
 The client sends `Idempotency-Key` and sends the same key on every retry. The
 first request runs the handler and keeps what it returned — status, the
-`Response(T)`'s own headers, the body — under the key; every later request
+`Response(T)`'s own headers, every header the handler set through the `*Ctx`
+(a session's `Set-Cookie`), the body — under the key; every later request
 with that key gets that back, byte for byte, with `Idempotent-Replayed:
 true` on it, and the handler does not run. Before the handler, three
 refusals with the header named: 400 for no key, one over 255 bytes or one
@@ -74,10 +75,12 @@ before the handler runs and overwritten with the answer after. A second
 request finding the marker is the 409; one finding it with a different
 fingerprint is the 422.
 
+The marker is claimed with `putIfAbsentFor`, which takes a lifetime of its own (`idempotent.marker_ttl_s`, two minutes), and not with `putIfAbsent` under the Space's `ttl_s`. A handler that dies with the process leaves its marker behind, and with a Space that outlives the process a marker kept for the Space's day answers 409 to every retry for the day. The answer, put after, is kept for the Space's `ttl_s` as before. The price of the bound is that a handler still running after two minutes can be run a second time by a retry; a handler that takes longer than that wants a job queue rather than a key.
+
 ## Why the Space is a shape and not an import
 
 `nilo_http` names no cache. `Replays` is any type with `getInto`,
-`putIfAbsent`, `put`, `del`, `max_bytes` and `Held`, checked while compiling
+`putIfAbsentFor`, `put`, `del`, `max_bytes` and `Held`, checked while compiling
 with each missing one named — the way `nilo_parse` and `nilo_resolve` are
 declarations read by name so that `http/` need not import `nilo_id`
 ([ADR 038](./038-a-module-sits-where-the-loop-puts-it.md)). A
@@ -104,7 +107,11 @@ axes before it was written, and all of it on the route that asks:
 
 ## What is deliberately not built
 
-**Running a request whose key the Space cannot hold.** A key is `by`, a NUL and the client's key, and a long `by(c)` string or a Space sized small cannot hold it, so the claim answers `TooLarge`. The first position treated that as unreachable (a marker is thirteen bytes) and crashed; the audit of `http/` at `39896d2` found it. Running the handler and sending the answer unkept, the way `Cached` answers a key too long for its Space (ADR 188), was the next position and was rejected: a cached page run twice costs a render, and a payment run twice costs a payment, which is the one thing the key exists to prevent. The request is refused with a 400 before the handler runs, with a `warn` naming the route and the length for the operator, whose fix is a larger Space or a shorter `by`. The claim is also released on every error after it is taken, not only on a handler failure.
+**Running a request whose key the Space cannot hold.** A key is `by`, a NUL and the client's key, and a long `by(c)` string or a Space sized small cannot hold it, so the claim answers `TooLarge`. The first position treated that as unreachable (a marker is thirteen bytes) and crashed; the audit of `http/` at `39896d2` found it. Running the handler and sending the answer unkept, the way `Cached` answers a key too long for its Space (ADR 188), was the next position and was rejected: a cached page run twice costs a render, and a payment run twice costs a payment, which is the one thing the key exists to prevent. The request is refused with a 400 before the handler runs, with a `warn` naming the route and the length for the operator, whose fix is a larger Space or a shorter `by`. The claim is also released on every error after it is taken: a handler failure, and equally an argument after the key that fails to read (a body that does not parse, a `Bound` refused, an `Authorization` missing, a path param that does not convert), which `typed.zig`'s `wrap` releases in the same `errdefer` that releases a `Cached` claim. The first position released only a handler's failure, so a request that never reached the handler left the key answering 409 to the same retry and 422 to a corrected one for the Space's whole TTL, where a failure is meant to run again.
+
+**Keeping an answer before its headers were checked.** The kept record went into the Space and then `sendRendered` called `setHeader` on each header, so a header the handler built with a CR or LF, which `setHeader` refuses as a 500, was kept anyway and every retry replayed that 500 until the TTL ran out, where a miss would have run the handler again. Every header, and an `.own` answer's label, is now checked by `Ctx.checkHeader` before the put, and a refusal releases the claim like any other error. `Cached` does the same (ADR 188).
+
+**Keeping only the headers on the answer.** Only a `Response(T)`'s or `Bytes`' own headers were kept, so a sign-up that set its session through `c.setCookie` and was retried got the kept 201 with no `Set-Cookie`, where this page promises the answer byte for byte. The headers set through the Ctx after the claim was taken are kept too, ahead of the answer's own (the order they went out in the first time). Headers set before the claim, which are middleware's, set themselves again on a replay and are not kept.
 
 **Keeping what the handler failed with.** Stripe keeps error responses too.
 Here a `fail.…` is not kept because a failure is the case a retry exists
@@ -142,8 +149,8 @@ exists to refuse.
 - One file, `http/idempotent.zig`, outside the core: the record codec, the
   fingerprint, the Space check. One role and three functions in `typed.zig`;
   one flag on `openapi.Operation`.
-- `Store.putIfAbsent`, `Space.putIfAbsent` and `Space.getInto` in
-  `nilo_cache`.
+- `Store.putIfAbsent`, `Space.putIfAbsent`, `Space.putIfAbsentFor` and
+  `Space.getInto` in `nilo_cache`.
 - Four refusals: not a bytes Space, the key asked for twice, a handler that
   returns nothing, a handler that returns a file or a redirect.
 - The roadmap's list of small middleware loses `idempotency`.

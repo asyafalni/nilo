@@ -3,7 +3,7 @@
 //!
 //! ```zig
 //! try app.compress(.{});                                   // gzip, bodies of 1 KB and up
-//! try app.compress(.{ .level = .best, .min_bytes = 512 });
+//! try app.compress(.{ .level = .best, .min_bytes = 512, .max_bytes = 4 << 20 });
 //! ```
 //!
 //! Once it is on, every `send` (and so every `sendJson`, `sendText` and
@@ -62,6 +62,17 @@ pub const Options = struct {
     /// for bodies a fifth larger; `.best` is level 9 and rarely worth its
     /// time on a body under a megabyte.
     level: Level = .default,
+    /// Bodies longer than this go out as they are. **What it bounds is how
+    /// long one answer holds its thread**: deflate runs whole, inside `send`,
+    /// with no point where the fiber parks, so every other fiber on that
+    /// executor thread waits while it does. Measured at about 150 MB/s on
+    /// `.default` and 240 MB/s on `.fastest` (`zig build bench-compress`,
+    /// `bench/result/http.md`), so a megabyte holds the thread for about 7 ms
+    /// and a 20 MB export for 130 ms, half of what `block_warning_ms` calls a
+    /// blocked handler. A megabyte is where an answer stops being a page of
+    /// JSON and starts being a download, and a download is better compressed
+    /// ahead of time or not at all. Zero takes the limit off (ADR 211).
+    max_bytes: usize = 1024 * 1024,
 };
 
 pub const Level = enum {
@@ -165,7 +176,12 @@ pub const Pool = struct {
     /// reading `Accept-Encoding` off the head.
     pub fn eligible(self: *const Pool, status: u16, content_type: []const u8, body_len: usize) bool {
         if (body_len < self.options.min_bytes) return false;
+        if (self.options.max_bytes != 0 and body_len > self.options.max_bytes) return false;
         if (http1.bodyless(status)) return false;
+        // A range is an offset into one representation, and `Content-Range`
+        // names the plain bytes; the unsatisfiable answer carries the plain
+        // length (ADR 211).
+        if (status == 206 or status == 416) return false;
         return compressible(content_type);
     }
 
@@ -214,6 +230,22 @@ fn reset(slot: *Pool.Slot, output: *std.Io.Writer, opts: flate.Compress.Options)
     c.container = .gzip;
     c.opts = opts;
     c.hasher = .init(.gzip);
+}
+
+/// Whether a `Cache-Control` value carries the `no-transform` directive,
+/// which forbids a proxy and so an origin acting for one from changing the
+/// body's coding (RFC 9111 section 5.2.2.6). A directive is a whole token:
+/// `x-no-transform` is somebody else's.
+pub fn forbidsTransform(cache_control: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, cache_control, ',');
+    while (it.next()) |raw| {
+        const directive = std.mem.trim(u8, raw, " \t");
+        // `no-transform` takes no argument, but a stray `=` is not a reason
+        // to compress what was asked to be left alone.
+        const name = if (std.mem.indexOfScalar(u8, directive, '=')) |eq| directive[0..eq] else directive;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, name, " \t"), "no-transform")) return true;
+    }
+    return false;
 }
 
 /// Whether an `Accept-Encoding` header says gzip is welcome.
@@ -611,4 +643,149 @@ test "the types worth gzipping are named, and the rest are not" {
     try testing.expect(!compressible("application/octet-stream"));
     try testing.expect(!compressible("font/woff2"));
     try testing.expect(!compressible("video/mp4"));
+}
+
+fn sendPartial(c: *Ctx) anyerror!void {
+    try c.setStaticHeader("Content-Range", "bytes 0-99/1000");
+    try c.send(206, "application/json", long_json);
+}
+
+fn sendUnsatisfiable(c: *Ctx) anyerror!void {
+    try c.setStaticHeader("Content-Range", "bytes */1000");
+    try c.send(416, "application/json", long_json);
+}
+
+fn sendWithContentRange(c: *Ctx) anyerror!void {
+    try c.setStaticHeader("Content-Range", "bytes 0-99/1000");
+    try c.send(200, "application/json", long_json);
+}
+
+fn sendNoTransform(c: *Ctx) anyerror!void {
+    try c.setStaticHeader("Cache-Control", "public, max-age=60, No-Transform");
+    try c.send(200, "application/json", long_json);
+}
+
+fn sendNoTransformLookalike(c: *Ctx) anyerror!void {
+    try c.setStaticHeader("Cache-Control", "max-age=60, x-no-transform");
+    try c.send(200, "application/json", long_json);
+}
+
+fn sendStrongTag(c: *Ctx) anyerror!void {
+    try c.setStaticHeader("ETag", "\"v1\"");
+    try c.send(200, "application/json", long_json);
+}
+
+fn sendWeakTag(c: *Ctx) anyerror!void {
+    try c.setStaticHeader("ETag", "W/\"v1\"");
+    try c.send(200, "application/json", long_json);
+}
+
+test "a partial answer, an unsatisfiable range and a Content-Range are never gzipped, whatever the client accepts" {
+    // A range is an offset into one representation, and the gzipped bytes
+    // are another one, so a 206 gzipped here would be the wrong bytes at the
+    // offsets it names (ADR 211).
+    const gpa = testing.allocator;
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.compress(.{});
+    try app.get("/part", sendPartial);
+    try app.get("/nope", sendUnsatisfiable);
+    try app.get("/ranged", sendWithContentRange);
+
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+    try client.setHeader("Accept-Encoding", "gzip");
+
+    for ([_][]const u8{ "/part", "/nope", "/ranged" }) |path| {
+        const answer = try client.get(&app, path);
+        try testing.expect(answer.header("Content-Encoding") == null);
+        try testing.expectEqualStrings(long_json, answer.body);
+    }
+}
+
+test "Cache-Control: no-transform keeps a body as the handler wrote it, and a lookalike token does not" {
+    const gpa = testing.allocator;
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.compress(.{});
+    try app.get("/kept", sendNoTransform);
+    try app.get("/lookalike", sendNoTransformLookalike);
+
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+    try client.setHeader("Accept-Encoding", "gzip");
+
+    const kept = try client.get(&app, "/kept");
+    try testing.expect(kept.header("Content-Encoding") == null);
+    try testing.expectEqualStrings(long_json, kept.body);
+
+    const lookalike = try client.get(&app, "/lookalike");
+    try testing.expectEqualStrings("gzip", lookalike.header("Content-Encoding").?);
+}
+
+test "a strong ETag is weakened when the body goes out gzipped, and left alone when it does not" {
+    // A strong tag promises byte-for-byte identity, and the plain and the
+    // gzipped body are two different byte strings (RFC 9110 section 8.8.1).
+    const gpa = testing.allocator;
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.compress(.{});
+    try app.get("/strong", sendStrongTag);
+    try app.get("/weak", sendWeakTag);
+
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+
+    const gzipped = try client.send(&app, "GET /strong HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n");
+    try testing.expectEqualStrings("gzip", gzipped.header("Content-Encoding").?);
+    try testing.expectEqualStrings("W/\"v1\"", gzipped.header("ETag").?);
+
+    const plain = try client.send(&app, "GET /strong HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(plain.header("Content-Encoding") == null);
+    try testing.expectEqualStrings("\"v1\"", plain.header("ETag").?);
+
+    const weak = try client.send(&app, "GET /weak HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n");
+    try testing.expectEqualStrings("gzip", weak.header("Content-Encoding").?);
+    try testing.expectEqualStrings("W/\"v1\"", weak.header("ETag").?);
+}
+
+test "a body over max_bytes goes out as it is, and one at max_bytes is still gzipped" {
+    const gpa = testing.allocator;
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.compress(.{ .max_bytes = long_json.len });
+    try app.get("/at", sendLongJson);
+    try app.get("/over", sendLongPlusOne);
+
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+    try client.setHeader("Accept-Encoding", "gzip");
+
+    const at = try client.get(&app, "/at");
+    try testing.expectEqualStrings("gzip", at.header("Content-Encoding").?);
+
+    const over = try client.get(&app, "/over");
+    try testing.expect(over.header("Content-Encoding") == null);
+    // The same for every client, so nothing varies.
+    try testing.expect(over.header("Vary") == null);
+    try testing.expectEqual(long_json.len + 1, over.body.len);
+}
+
+fn sendLongPlusOne(c: *Ctx) anyerror!void {
+    try c.send(200, "application/json", long_json ++ " ");
+}
+
+test "a max_bytes of zero puts no upper limit on what is compressed" {
+    const gpa = testing.allocator;
+    var app = App.init(gpa);
+    defer app.deinit();
+    try app.compress(.{ .max_bytes = 0 });
+    try app.get("/over", sendLongPlusOne);
+
+    var client = try nilo_testing.Client.init(gpa, .{});
+    defer client.deinit();
+    try client.setHeader("Accept-Encoding", "gzip");
+
+    const answer = try client.get(&app, "/over");
+    try testing.expectEqualStrings("gzip", answer.header("Content-Encoding").?);
 }

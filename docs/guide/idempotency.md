@@ -43,7 +43,7 @@ POST /orders  (a different body)  Idempotency-Key: 4c1e…    → 422
 POST /orders  (no key)                                      → 400
 ```
 
-The first request runs the handler and **keeps what it returned**: the status, the body, and a `Response(T)`'s own headers, such as a `Location`. Every later request with the same key gets that back, byte for byte, with `Idempotent-Replayed: true` on it, and the handler does not run. The card is charged once. The row is inserted once.
+The first request runs the handler and **keeps what it returned**: the status, the body, a `Response(T)`'s own headers such as a `Location`, and any header the handler set through the `*Ctx`, such as a session's `Set-Cookie`. Every later request with the same key gets that back, byte for byte, with `Idempotent-Replayed: true` on it, and the handler does not run. The card is charged once. The row is inserted once.
 
 ## Wiring it up
 
@@ -60,7 +60,7 @@ Then `try app.post("/orders", placeOrder)`, like any other route.
 
 It is a cache Space rather than a table of nilo's own because a saved answer is exactly what a cache holds: bounded, forgotten after a while, and allowed to miss. A miss here is a retry that runs the handler again, which is what would have happened without the feature. `ttl_s` is how long a client may keep retrying with the same key. `max_bytes` is the largest answer kept; a larger one is sent but not kept, with a line in the log saying so.
 
-**nilo needs the Space's methods, not `nilo_cache` itself.** `nilo_http` names no cache. What it asks of `Replays` is `getInto`, `putIfAbsent`, `put`, `del`, `max_bytes` and `Held`, which a `nilo_cache` bytes Space has. A type of your own over Redis could have them too, for a key that has to survive a restart or be shared between instances.
+**nilo needs the Space's methods, not `nilo_cache` itself.** `nilo_http` names no cache. What it asks of `Replays` is `getInto`, `putIfAbsentFor`, `put`, `del`, `max_bytes` and `Held`, which a `nilo_cache` bytes Space has. `putIfAbsentFor(key, value, ttl_s)` is the claim with a lifetime of its own, which is how the in-flight marker expires after two minutes even when the Space keeps answers for a day. A type of your own over Redis could have them too, for a key that has to survive a restart or be shared between instances.
 
 ## Keys per caller (`.by`)
 
@@ -101,7 +101,7 @@ A request with no key, or a key over 255 bytes, gets a **400**. So does a key th
 
 **What the handler returned is kept, whatever the status.** A `Status(201, Order)`, a `Response(T)` with a `Location`, a `Status(409, Problem)` the handler chose: all are kept and replayed. So is an answer a type wrote itself with `nilo_write`: the record carries its `nilo_content_type`, and the replay goes out with the same content type ([ADR 157](../adr/157-a-type-can-write-its-own-answer.md)).
 
-**What the handler failed with is not kept.** For a `fail.conflict(…)`, a `fail.unprocessable(…)`, or an `error.Disconnected` from the database, the answer goes out, the key is released, and the next retry runs the handler again, which is the point of retrying after a failure.
+**What the handler failed with is not kept.** For a `fail.conflict(…)`, a `fail.unprocessable(…)`, or an `error.Disconnected` from the database, the answer goes out, the key is released, and the next retry runs the handler again, which is the point of retrying after a failure. So is a request that never reached the handler: a body that does not parse, a `Bound` that is refused or an `Authorization` that is missing releases the key too, and the same key with a corrected body runs. An answer whose header nilo would refuse to send (a newline in a value) is not kept either; the handler runs again on the retry.
 
 Two kinds of answer cannot be kept, and asking for them is a Refusal (a compile error) rather than a surprise on the first replay. A handler that holds the Ctx and writes its own response leaves nothing nilo can send again. A `FileBody` or a `Redirect` is a file on disk or a status with a `Location`, not a body. Answer with the thing that was created and let the client follow it.
 
@@ -109,7 +109,7 @@ Two kinds of answer cannot be kept, and asking for them is a Refusal (a compile 
 
 **Only the route that asks pays anything.** A fresh request costs one cache claim, one arena allocation to encode the answer, one cache write, and the JSON buffer the answer was going to use anyway. A replay costs one cache read into an arena allocation of `max_bytes`. **Nothing goes on the stack**: a `Held` there would cost `max_bytes` per idle connection for its whole life ([ADR 062](../adr/062-where-a-connection-waits-is-what-it-costs.md)), which is why the cache gained `getInto`.
 
-The claim is the part worth understanding. `putIfAbsent` holds the shard's lock around the scan and the write, so two requests racing for one key get one handler run between them, whichever threads they are on. A `get` followed by a `put` would have run both ([ADR 155](../adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
+The claim is the part worth understanding. `putIfAbsentFor` holds the shard's lock around the scan and the write, so two requests racing for one key get one handler run between them, whichever threads they are on. A `get` followed by a `put` would have run both ([ADR 155](../adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
 
 ## Testing
 

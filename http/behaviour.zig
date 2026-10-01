@@ -852,6 +852,9 @@ const FakeReplays = struct {
 
     map: std.StringHashMap([]const u8),
     gpa: std.mem.Allocator,
+    /// What the in-flight marker was given as its own lifetime, in seconds:
+    /// zero until a claim says one.
+    claim_ttl_s: u32 = 0,
 
     fn init(gpa: std.mem.Allocator) FakeReplays {
         return .{ .map = .init(gpa), .gpa = gpa };
@@ -877,6 +880,12 @@ const FakeReplays = struct {
         if (self.map.contains(key)) return false;
         try self.put(key, value);
         return true;
+    }
+
+    pub fn putIfAbsentFor(self: *FakeReplays, key: []const u8, value: []const u8, ttl_s: u32) error{TooLarge}!bool {
+        const claimed = try self.putIfAbsent(key, value);
+        if (claimed) self.claim_ttl_s = ttl_s;
+        return claimed;
     }
 
     pub fn put(self: *FakeReplays, key: []const u8, value: []const u8) error{TooLarge}!void {
@@ -1139,6 +1148,121 @@ test "what the handler failed with is not kept, so the retry runs it again" {
     const fixed = post(&h, &app, "k-1", "{\"sku\":\"A1\",\"qty\":1}");
     try testing.expect(std.mem.startsWith(u8, fixed, "HTTP/1.1 201"));
     try testing.expectEqual(@as(u32, 1), counter.placed);
+}
+
+fn signUpWithSession(key: typed.Idempotent(FakeReplays, .{}), counter: *OrderCounter, c: *ctx_mod.Ctx) !typed.Response(PlacedOnce) {
+    _ = key;
+    counter.placed += 1;
+    // Set through the Ctx rather than on the answer: a session is, which is
+    // the header a retry most needs to get back.
+    try c.setCookie(.{ .name = "session", .value = "s-1" });
+    try c.setHeader("X-Trace", "t-1");
+    return .{
+        .status = 201,
+        .value = .{ .id = counter.placed, .sku = "x" },
+        .headers = .of(&.{.{ .name = "Location", .value = "/users/1" }}),
+    };
+}
+
+test "a replay carries the headers the handler set through the Ctx, not only those on its answer" {
+    var replays = FakeReplays.init(testing.allocator);
+    defer replays.deinit();
+    var counter = OrderCounter{};
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&replays);
+    try app.provide(&counter);
+    try app.post("/orders", signUpWithSession);
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    const first = post(&h, &app, "k-1", "{}");
+    try testing.expect(std.mem.indexOf(u8, first, "Set-Cookie: session=s-1") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "X-Trace: t-1") != null);
+
+    const again = post(&h, &app, "k-1", "{}");
+    try testing.expect(std.mem.indexOf(u8, again, "Idempotent-Replayed: true") != null);
+    try testing.expect(std.mem.indexOf(u8, again, "Set-Cookie: session=s-1") != null);
+    try testing.expect(std.mem.indexOf(u8, again, "X-Trace: t-1") != null);
+    try testing.expect(std.mem.indexOf(u8, again, "Location: /users/1") != null);
+    try testing.expectEqual(@as(u32, 1), counter.placed);
+}
+
+test "a request that never reached the handler leaves no marker, so the same key with a good body runs" {
+    var replays = FakeReplays.init(testing.allocator);
+    defer replays.deinit();
+    var counter = OrderCounter{};
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&replays);
+    try app.provide(&counter);
+    try app.post("/orders", placeKeptOrder);
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    // A body that does not parse is refused while the arguments are read,
+    // after the key was claimed: ADR 155 says a failure runs again.
+    const broken = post(&h, &app, "k-1", "{\"sku\":");
+    try testing.expect(std.mem.startsWith(u8, broken, "HTTP/1.1 400"));
+    try testing.expectEqual(@as(u32, 0), replays.map.count());
+
+    const fixed = post(&h, &app, "k-1", "{\"sku\":\"A1\",\"qty\":1}");
+    try testing.expect(std.mem.startsWith(u8, fixed, "HTTP/1.1 201"));
+    try testing.expectEqual(@as(u32, 1), counter.placed);
+}
+
+test "the in-flight marker is claimed for a lifetime of its own, not the Space's" {
+    var replays = FakeReplays.init(testing.allocator);
+    defer replays.deinit();
+    var counter = OrderCounter{};
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&replays);
+    try app.provide(&counter);
+    try app.post("/orders", placeKeptOrder);
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    _ = post(&h, &app, "k-1", "{\"sku\":\"A1\",\"qty\":1}");
+    // A Space that outlives the process would otherwise answer 409 for its
+    // whole TTL after a crash mid-handler.
+    try testing.expect(replays.claim_ttl_s > 0);
+    try testing.expect(replays.claim_ttl_s <= 300);
+}
+
+fn placeWithBadHeader(key: typed.Idempotent(FakeReplays, .{}), counter: *OrderCounter) typed.Response(PlacedOnce) {
+    _ = key;
+    counter.placed += 1;
+    return .{
+        .status = 201,
+        .value = .{ .id = counter.placed, .sku = "x" },
+        .headers = .of(&.{.{ .name = "Location", .value = "/orders/1\r\nX-Injected: yes" }}),
+    };
+}
+
+test "an answer whose header is refused is not kept, so a retry runs the handler again" {
+    var replays = FakeReplays.init(testing.allocator);
+    defer replays.deinit();
+    var counter = OrderCounter{};
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&replays);
+    try app.provide(&counter);
+    try app.post("/orders", placeWithBadHeader);
+
+    var h = Harness.init();
+    defer h.deinit();
+
+    for (0..2) |_| {
+        const answer = post(&h, &app, "k-1", "{}");
+        try testing.expect(std.mem.startsWith(u8, answer, "HTTP/1.1 500"));
+        try testing.expect(std.mem.indexOf(u8, answer, "Idempotent-Replayed") == null);
+    }
+    try testing.expectEqual(@as(u32, 2), counter.placed);
+    try testing.expectEqual(@as(u32, 0), replays.map.count());
 }
 
 test "a key is the caller's when `by` says whose, and a request with no caller is a 403" {
@@ -2709,6 +2833,46 @@ test "use and get can be registered in either order" {
     try h.ready(&app);
     const result = h.send(&app, "GET /x HTTP/1.1\r\nHost: t\r\n\r\n");
     try testing.expect(std.mem.indexOf(u8, result.response, "X-Order: outer") != null);
+}
+
+var forgetful_reached = false;
+
+/// A guard that meant `if (!ok(c)) return c.fail(401, …)` and wrote `return`.
+fn forgetfulGuard(_: *Ctx, _: mw.Next) anyerror!void {}
+
+fn noteReached(_: *Ctx) anyerror!void {
+    forgetful_reached = true;
+}
+
+fn answersNothing(_: *Ctx) anyerror!void {}
+
+test "a middleware that returns without answering or calling next is a 500, not an empty 200" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.use(tagOuter);
+    try app.use(forgetfulGuard);
+    try app.get("/x", noteReached);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+    forgetful_reached = false;
+    const result = h.send(&app, "GET /x HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 500 "));
+    try testing.expect(!forgetful_reached);
+}
+
+test "a handler under middleware that returns without answering is still an empty 200" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.use(tagOuter);
+    try app.get("/x", answersNothing);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+    const result = h.send(&app, "GET /x HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 200 "));
 }
 
 test "a prefix scopes middleware to the routes under it" {
@@ -6375,6 +6539,103 @@ test "a HEAD with a range gets the head a GET would have, and no body" {
     try testing.expect(std.mem.endsWith(u8, head.response, "\r\n\r\n"));
 }
 
+// ---- what a failure keeps of the headers the request collected (ADR 024) ----
+
+fn describedThenFailed(c: *Ctx) anyerror!void {
+    try c.setHeader("Content-Encoding", "gzip");
+    try c.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    try c.setHeader("Expires", "Thu, 01 Dec 2094 16:00:00 GMT");
+    try c.setHeader("ETag", "\"v1\"");
+    try c.setHeader("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT");
+    try c.setHeader("Content-Range", "bytes 0-9/100");
+    try c.setHeader("Content-Disposition", "attachment; filename=\"report.csv\"");
+    try c.setHeader("Location", "/orders/7");
+    try c.setHeader("Set-Cookie", "seen=1; Path=/");
+    try c.setHeader("Vary", "Origin");
+    try c.setHeader("X-Request-Id", "abc");
+    try c.setHeader("Retry-After", "5");
+    return fail.conflict("order 7 already exists", .{});
+}
+
+fn noStoreThenFailed(c: *Ctx) anyerror!void {
+    try c.setHeader("Cache-Control", "no-store");
+    return fail.conflict("nope", .{});
+}
+
+test "a failure drops the headers that described the answer it replaced, and keeps the rest" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.post("/orders", describedThenFailed);
+    try app.post("/private", noStoreThenFailed);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+    const result = h.send(&app, "POST /orders HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n");
+    const head = result.response[0 .. std.mem.indexOf(u8, result.response, "\r\n\r\n").?];
+    try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 409 "));
+    for ([_][]const u8{ "Content-Encoding", "Cache-Control", "Expires", "ETag", "Last-Modified", "Content-Range", "Content-Disposition", "Location" }) |gone| {
+        if (std.ascii.indexOfIgnoreCase(head, gone) != null) {
+            std.debug.print("still there: {s}\n", .{gone});
+            return error.TestUnexpectedResult;
+        }
+    }
+    for ([_][]const u8{ "Set-Cookie: seen=1", "Vary: Origin", "X-Request-Id: abc", "Retry-After: 5" }) |kept| {
+        try testing.expect(std.mem.indexOf(u8, head, kept) != null);
+    }
+
+    // A Cache-Control that forbids keeping the answer forbids keeping the
+    // failure too, so it is the one that stays.
+    const private = h.send(&app, "POST /private HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, private.response, "Cache-Control: no-store\r\n") != null);
+}
+
+// ---- a second answer is an error, not an assert ----
+
+var second_answers: [3]?anyerror = .{ null, null, null };
+
+fn answeredThenStream(c: *Ctx) anyerror!void {
+    try c.sendText(200, "first");
+    _ = c.streamWith(200, "text/plain", .{}) catch |err| {
+        second_answers[0] = err;
+    };
+}
+
+fn answeredThenUpgrade(c: *Ctx) anyerror!void {
+    try c.sendText(200, "first");
+    c.upgrade(echoLoop, {}) catch |err| {
+        second_answers[1] = err;
+    };
+}
+
+fn answeredThenEvents(c: *Ctx) anyerror!void {
+    try c.sendText(200, "first");
+    c.eventsFrom(feed_room, .{}) catch |err| {
+        second_answers[2] = err;
+    };
+}
+
+test "a stream, an upgrade or an event stream after the request was answered is AlreadyAnswered" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.get("/stream", answeredThenStream);
+    try app.get("/upgrade", answeredThenUpgrade);
+    try app.get("/events", answeredThenEvents);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+    second_answers = .{ null, null, null };
+    for ([_][]const u8{ "/stream", "/upgrade", "/events" }, 0..) |path, i| {
+        var buf: [64]u8 = undefined;
+        const request = try std.fmt.bufPrint(&buf, "GET {s} HTTP/1.1\r\nHost: t\r\n\r\n", .{path});
+        const result = h.send(&app, request);
+        try testing.expect(std.mem.startsWith(u8, result.response, "HTTP/1.1 200 "));
+        try testing.expect(std.mem.endsWith(u8, result.response, "first"));
+        try testing.expectEqual(@as(?anyerror, error.AlreadyAnswered), second_answers[i]);
+    }
+}
+
 // ---- WebSocket (ADR 021) ----
 
 fn echoSocket(c: *Ctx) anyerror!void {
@@ -8911,6 +9172,46 @@ fn signedIn() []const u8 {
 
 fn signUp() []const u8 {
     return "made";
+}
+
+test "a tryRoute refused as a duplicate under without leaves the route already there guarded" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+
+    const v1 = app.group("/v1");
+    try v1.use(guard);
+    try v1.post("/sign-in", signedIn);
+    try testing.expectError(error.DuplicateRoute, v1.without(guard).tryRoute(.POST, "/sign-in", signUp));
+
+    var client = try @import("testing.zig").Client.init(testing.allocator, .{});
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 401), (try client.post(&app, "/v1/sign-in", "")).status);
+}
+
+test "a tryRoute refused as a duplicate under with attaches nothing to the route already there" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+
+    try app.get("/x", plainOk);
+    try testing.expectError(error.DuplicateRoute, app.with(tagOuter).tryRoute(.GET, "/x", plainOk));
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+    const result = h.send(&app, "GET /x HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.indexOf(u8, result.response, "X-Order") == null);
+}
+
+test "a tryRoute refused for a name already taken leaves no route behind" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+
+    try app.named("whoami").get("/a", signedIn);
+    try testing.expectError(error.DuplicateName, app.named("whoami").tryRoute(.GET, "/b", signedIn));
+
+    var client = try @import("testing.zig").Client.init(testing.allocator, .{});
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 404), (try client.get(&app, "/b")).status);
 }
 
 test "a route can say a group's middleware does not cover it" {

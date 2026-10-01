@@ -57,6 +57,33 @@ client whose `Accept-Encoding` says gzip is welcome, read the way the
 static handler reads it: `gzip;q=0` is no, `*` is yes unless gzip is named.
 A HEAD is answered with the length the GET would have carried.
 
+**What the handler said about the representation stands.** A body is also
+left as it is when the status is 206 or 416, when the handler set a
+`Content-Range`, or when its `Cache-Control` carries `no-transform` (a
+whole directive: `x-no-transform` is not it). A range is an offset into
+one representation and the gzipped bytes are another, so a 206 gzipped
+here named the wrong bytes at the right offsets; `no-transform` is the
+handler forbidding exactly this. None of these varies with the client, so
+none of them carries `Vary: Accept-Encoding`. **A strong `ETag` is made
+weak (`W/"…"`) on an answer that goes out gzipped**, because a strong tag
+promises the same bytes and the plain and the gzipped body are different
+byte strings: `static.zig` gives its two bodies two tags for the same
+reason, and a handler's one tag cannot be two, so it says what is true of
+both, that they are the same content. A weak tag stays weak and an answer
+that is not compressed keeps the tag as the handler wrote it. One arena
+allocation, on a compressed answer with a strong tag and no other.
+
+**A body over `max_bytes` goes out as it is.** Deflate runs whole, inside
+`send`, with no point at which the fiber parks, so every other fiber on
+that executor thread waits for it. The sweep below puts it at about
+150 MB/s on `.default` and 240 MB/s on `.fastest`: a 20 MB export held its
+thread for 130 ms. **The default is 1 MiB, about 7 ms**, a seventh of
+`block_warning_ms` (250) with room for a machine several times slower, and
+the size where an answer stops being a page of JSON and starts being a
+download. `max_bytes = 0` takes the limit off. It is a size and not a time
+because nothing can interrupt a deflate part way (ADR 082 rules out a cancel
+there), and a size is what can be known before starting.
+
 **The borrow spans no wait.** Nothing between taking a slot and giving it
 back can park the fiber (the arena does not, the compressor does not, and
 the socket is not written until afterwards), so at most one slot per
@@ -144,6 +171,20 @@ generic is 25 KB of machine code in a binary that parses no other float.
 It is a nine-line digit scan now. ADR 017's table carries both figures
 on one row so that neither hides the other.
 
+**What one body holds the thread for, by size** (same machine, one thread,
+`ReleaseFast`, `bench/compress_bench.zig`, the second table; the
+measurement is in `bench/result/http.md`):
+
+| bytes in | `.fastest` | `.default` |
+|---|---|---|
+| 41,028 | 0.18 ms | 0.26 ms |
+| 164,398 | 0.68 ms | 1.06 ms |
+| 991,794 | 4.2 ms | 6.6 ms |
+| 3,984,446 | 16.8 ms | 26.6 ms |
+| 19,986,580 | 83.9 ms | 130.4 ms |
+
+Linear from 164 KB up, so the default reads straight off it.
+
 **Throughput on a request that is not compressed: unchanged.** The
 addition to `send` is one null check.
 
@@ -186,13 +227,24 @@ a fiber on another thread comes back in tens of microseconds, and a lock
 in the `cache` module's position, with no `Io` to park on, would spin. The
 bitmask borrow is one `cmpxchg`, and empty means uncompressed.
 
+**No upper size, which is what shipped first.** Every eligible body was
+gzipped, so a 20 MB JSON export held an executor thread for 130 ms with
+nothing else on it running. The cap is the default of `max_bytes`, above.
+
+**Gzipping a 206, or anything under `no-transform`, and leaving a strong
+`ETag` strong.** Each was the first position: `squeezed` read the status
+only to ask whether it carried a body, and the headers only to ask about
+`Content-Encoding`.
+
 ## Consequences
 
 - `http/compress.zig`: `Options`, `Level`, `Pool`, `reset`, and the
   `acceptsGzip` and `compressible` that `static.zig` and `serve.zig` now
   import from here.
 - `http/ctx.zig`: `_compressors`, and `send` runs `squeezed` before the
-  wait.
+  wait; `squeezed` reads `Content-Range` and `Cache-Control` and
+  `weakenETag` follows a compression. `compress.forbidsTransform` and
+  `Options.max_bytes`.
 - `http/app.zig`: `compress()`, three fields, and `tryListen` records the
   thread count before the chains are resolved; `http/wiring.zig`:
   `sizeCompressors`, run by `resolveChains` and idempotent, because the

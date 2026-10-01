@@ -69,13 +69,13 @@ This page covers reading a request, answering it, its cookies, session and uploa
 | `c.sendText(status, text)` | `text/plain` |
 | `c.sendJson(status, value)` | `application/json` |
 | `c.sendEmpty(status)` | no body and no `Content-Type`: a 204, usually |
-| `c.sendFile(.{ .file = f, .content_type = … })` | an open file. **Closed here**, on every way out |
-| `c.stream(status, content_type)` | `!Stream`. A status with no body (204, 304, 1xx) is refused with a 500 saying so |
+| `c.sendFile(.{ .file = f, .content_type = … })` | an open file. **Closed here**, on every way out, a second answer's `error.AlreadyAnswered` included |
+| `c.stream(status, content_type)` | `!Stream`. A status with no body (204, 304, 1xx) is refused with a 500 saying so, and a second answer is `error.AlreadyAnswered` |
 | `c.streamWith(status, content_type, .{ .buffer = … })` | the same, buffer of your own. Default 4 KB |
 | `c.streamWith(…, .{ .length = n })` | a stream whose length is already known: `Content-Length` and no chunk framing ([ADR 101](../adr/101-a-stream-that-knows-its-length-says-so.md)) |
 | `c.url(pattern, args)` | `!Str`: a URL for a route, every value percent-encoded and every mistake a compile error ([ADR 100](../adr/100-a-route-pattern-is-the-name-of-its-url.md)) |
 | `c.events()` | `!Events` |
-| `c.upgrade(loop, state)` | `!void`: the connection becomes a WebSocket and `loop` reads it. `{}` when there is no state |
+| `c.upgrade(loop, state)` | `!void`: the connection becomes a WebSocket and `loop` reads it. `{}` when there is no state. A request already answered is `error.AlreadyAnswered` |
 | `c.upgradeWith(loop, state, .{ .protocols = &.{ "chat.v2", "chat.v1" } })` | the same, naming the subprotocols the route speaks (`.protocol` is the one-name spelling). The answer is the first the client offered, and none if it offered none of them |
 
 ### Response headers

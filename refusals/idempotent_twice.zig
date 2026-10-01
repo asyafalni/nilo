@@ -9,7 +9,7 @@ const Replays = struct {
     pub fn getInto(_: *Replays, _: []const u8, _: []u8) ?[]const u8 {
         unreachable;
     }
-    pub fn putIfAbsent(_: *Replays, _: []const u8, _: []const u8) error{TooLarge}!bool {
+    pub fn putIfAbsentFor(_: *Replays, _: []const u8, _: []const u8, _: u32) error{TooLarge}!bool {
         unreachable;
     }
     pub fn put(_: *Replays, _: []const u8, _: []const u8) error{TooLarge}!void {

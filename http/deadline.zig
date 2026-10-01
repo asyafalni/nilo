@@ -12,9 +12,14 @@
 //! ## What it does and does not do
 //!
 //! **Every wait nilo owns is cut down to it.** `Deadlines.clamped` is the one
-//! place that happens, so a limit armed anywhere — the body, a stream's
-//! pieces, a WebSocket's silence, the write — is whichever of the two comes
-//! first. Nothing had to be remembered at six call sites.
+//! place that happens for a read, so a limit armed anywhere — the body, a
+//! WebSocket's silence — is whichever of the two comes first. The write has
+//! its own rule in `Deadlines.armWrite`, because `listen()` arms it before
+//! the route has run: `Ctx.armWriteLimit` re-arms it where the answer is
+//! written, and a deadline nearer than `write_timeout_ms` becomes the write's
+//! limit. A deadline further off leaves the per-write limit as it is, which
+//! stops a client that stops reading and not one that trickles
+//! ([ADR 105](../docs/adr/105-a-route-can-say-how-long-it-has.md)).
 //!
 //! **A handler that is running rather than waiting is not interrupted.** There
 //! is no cancellation here and deliberately none: a cancel that fires

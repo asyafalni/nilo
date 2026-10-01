@@ -34,7 +34,9 @@ back.
 **`nilo.Versioned(T)` is `T` with a `u64` version on it. The version goes
 out as a weak `ETag`; a request whose `If-None-Match` names it is answered
 304 with no body; and `c.clientHas(version)` lets the handler skip building
-the body at all.**
+the body at all, on a GET or a HEAD.**
+
+**Only a GET or a HEAD is answered 304.** A `PUT` returning a `Versioned(T)` whose `If-None-Match` matches has already run when the tag is compared, so an empty 304 would say nothing changed when something did; RFC 9110 13.1.2 gives a failed `If-None-Match` on such a method a 412 and no change, which is a decision made before the handler, not an answer a return value can make. `sendResult` therefore applies the conditional to the two safe methods and a write answers its ordinary 200 with the `ETag` on it, and the document writes the `304` beside the 200 only for them. The first position compared the tag whatever the method, because the ADR was about polling a `GET` and nothing said otherwise. `c.clientHas` still reads the header on any method, for a handler that wants to make its own decision.
 
 ```zig
 fn listOrders(c: *nilo.Ctx, db: *Db) !nilo.Versioned([]Order) {

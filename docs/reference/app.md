@@ -59,7 +59,7 @@ This page covers the App and its groups, the options `listen()` takes, the concu
 | `app.health(path)` | a page that says whether this process can do its job: `200 {"status":"ok"}`, or `503` naming the services that are not ready and why, or `503 {"status":"stopping"}` once the server has been told to stop. It asks every service that declared `pub fn nilo_ready(self: *T, scope: *nilo_core.AnyScope) ?[]const u8`, where null means ready and a sentence says why not ([Deploying](../guide/deploying.md#health-checks), [ADR 154](../adr/154-a-health-route-asks-the-services.md)). Described in the document as a `200` of `{"status":…}`, and not counted among the routes that write their own answer ([ADR 120](../adr/120-a-ctx-handler-that-returns-nothing-may-have-written-it.md)) |
 | `app.metrics(options)` | counts every request and serves the numbers at `/metrics`, in Prometheus format ([Metrics](../guide/metrics.md), [ADR 079](../adr/079-the-route-table-is-the-registry.md)) |
 | `app.expose(name, kind, &atomic)` | publishes a `std.atomic.Value(u64)` of your own on that page. `kind` is `.counter` or `.gauge` |
-| `app.compress(options)` | gzips every text response that is at least `min_bytes` long and going to a client whose `Accept-Encoding` accepts it, per request, using a compressor borrowed from a pool of one per thread. Sets `Content-Encoding: gzip`, `Vary: Accept-Encoding` and the compressed length. A client that did not ask gets the body unchanged. Does not apply to streams, event streams or static files. Once per App; a second is `error.CompressionAlreadyEnabled` ([Responses](../guide/responses.md#compression), [ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)) |
+| `app.compress(options)` | gzips every text response that is at least `min_bytes` and at most `max_bytes` long and going to a client whose `Accept-Encoding` accepts it, per request, using a compressor borrowed from a pool of one per thread. Sets `Content-Encoding: gzip`, `Vary: Accept-Encoding` and the compressed length. A client that did not ask gets the body unchanged. Does not apply to streams, event streams or static files. Once per App; a second is `error.CompressionAlreadyEnabled` ([Responses](../guide/responses.md#compression), [ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)) |
 
 ### Running
 
@@ -69,7 +69,7 @@ This page covers the App and its groups, the options `listen()` takes, the concu
 | `app.start(io)` | everything `listen()` does before it accepts anything (services checked, middleware chains resolved, pools opened, the work `before` registered run, every `nilo_check` run after it), for a program that never listens: a test using `testing.Client`, a script, a worker on `jobs.serveOn(io)` ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)). **Not before `listen()`**: a service keeps the `Io` it was started on, so `start(io)` followed by `listen()` is refused when any service took one. For work between the pool and the server, use `app.before` ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)). It does *not* start `spawn` work, which needs a server |
 | `app.shutdown()` | stops the server, from any thread or from inside a handler |
 | `app.boundPort()` | `?u16`: the port the server is listening on, from any thread. Null before `listen()` has bound, and for a unix socket. `.port = 0` asks the kernel for a free port, and this returns it |
-| `app.tryListen / tryRoute / tryStatic / tryStaticWith` | the same calls, returning the error instead of reporting it. `tryStatic` on a directory that does not exist returns `error.StaticDirNotFound` with no log line; a problem inside a directory that does exist is still logged in one line, since the error cannot name the file ([ADR 207](../adr/207-a-try-call-hands-back-the-error-and-says-nothing.md)) |
+| `app.tryListen / tryRoute / tryStatic / tryStaticWith` | the same calls, returning the error instead of reporting it. A refused `tryRoute` registers nothing, its exemptions and attachments included, and its one line naming the route it collided with is a `warn`. `tryStatic` on a directory that does not exist returns `error.StaticDirNotFound` with no log line; a problem inside a directory that does exist is still logged in one line, since the error cannot name the file ([ADR 207](../adr/207-a-try-call-hands-back-the-error-and-says-nothing.md)) |
 
 ### Which calls fail
 
@@ -110,7 +110,7 @@ try v1.without(requireOperator).with(rateLimitSignups).post("/sign-up", signUp);
 | `body_timeout_ms` | `30_000`: any one read of a body |
 | `body_min_rate` | `8 * 1024`: bytes per second a buffered body has to keep up. `0` turns it off |
 | `body_grace_ms` | `10_000`: time before the minimum rate is enforced |
-| `write_timeout_ms` | `30_000`: any one write to the client |
+| `write_timeout_ms` | `30_000`: any one write to the client. Cut to a route's deadline when that is nearer ([ADR 105](../adr/105-a-route-can-say-how-long-it-has.md)) |
 | `request_deadline_ms` | `0`: a deadline every request starts with, the same thing [`nilo.deadline(ms)`](./middleware.md#nilodeadline) gives one route. A route that takes over the connection drops it; a route's own deadline is kept. `0` means none ([ADR 105](../adr/105-a-route-can-say-how-long-it-has.md)) |
 | `max_connections` | `10_000` held at once, 4,669 bytes each when idle. `0` means no limit. `listen()` warns when the process's file descriptor limit (`ulimit -n`) is below it, and the accept loop waits out a shortage instead of stopping ([ADR 194](../adr/194-an-accept-loop-that-is-out-of-descriptors-waits.md)) |
 | `max_in_flight` | `0`: the most requests answered at once. Past it, a request immediately gets a `503` with `Retry-After: 1` instead of waiting in a queue. `0` means no limit ([ADR 159](../adr/159-a-server-past-its-limit-says-so-at-once.md)) |
@@ -152,7 +152,10 @@ Requests are counted per **route**, not per path: `/users/1` and `/users/2` both
 | | Default |
 |---|---|
 | `min_bytes` | `1024`: bodies shorter than this are sent uncompressed |
+| `max_bytes` | `1048576`: bodies longer than this are sent uncompressed, because gzipping runs whole on the executor thread (about 7 ms a megabyte at `.default`). `0` means no limit |
 | `level` | `.default`, zlib's level 6. `.fastest` is level 1, `.best` is level 9 |
+
+A 206, a 416, a `Content-Range` and `Cache-Control: no-transform` are never compressed, and a strong `ETag` becomes weak when the body is ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 
 **What it costs:** one compressor per thread, about 288 KB each, created when the middleware chains are resolved; one arena allocation for each compressed response; and tens of microseconds of gzip per body (`zig build bench-compress` has the table). Nothing per connection, and nothing on a response that is not compressed ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 

@@ -388,6 +388,32 @@ pub fn isReservedHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "connection");
 }
 
+/// Whether a response header described the answer a failure is replacing,
+/// and so must not go out on the failure (ADR 024): a JSON 409 labelled gzip,
+/// cacheable for a year, or pointing at an order that was never made.
+///
+/// A drop list rather than a keep list, because what a failure must keep is
+/// open-ended (CORS, `Vary`, `Set-Cookie`, `Retry-After`, a request id, a
+/// security header) and what describes a body is the closed set RFC 9110 §8,
+/// RFC 9111 §5 and RFC 9530 name. One exception reads the value: a
+/// `Cache-Control` saying `no-store` forbade keeping the answer, and a failure
+/// is no more fit to keep, so that one stays.
+pub fn describesAnswer(name: []const u8, value: []const u8) bool {
+    const names = [_][]const u8{
+        "content-encoding", "content-language", "content-location", "content-range",
+        "content-disposition", "content-digest", "repr-digest", "digest",
+        "etag", "last-modified", "accept-ranges", "expires",
+        "age", "location",
+    };
+    for (names) |n| {
+        if (std.ascii.eqlIgnoreCase(name, n)) return true;
+    }
+    if (std.ascii.eqlIgnoreCase(name, "cache-control")) {
+        return std.ascii.indexOfIgnoreCase(value, "no-store") == null;
+    }
+    return false;
+}
+
 /// Headers a response may legitimately carry more than one of, and so the
 /// ones `Ctx.setHeader` must not treat as a replacement.
 ///

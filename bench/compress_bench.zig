@@ -14,6 +14,12 @@
 //! `test "a compressed answer costs one allocation"` holds rather than
 //! this.
 //!
+//! **The second table is a sweep over size**, for `Options.max_bytes`: how
+//! long one `Pool.gzip` holds the thread, at 40 KB to 20 MB, at the two
+//! levels most callers pick. Gzipping runs on the executor thread with no
+//! parking point, so that figure is how long every other fiber on the thread
+//! waits, and the default for `max_bytes` is read off it (ADR 211).
+//!
 //! Two numbers are worth reading side by side: the microseconds, which are
 //! what the CPU column of a fixed-rate profile pays, and the bytes, which
 //! the arena scores quadratically: a body a fifth larger is a score a
@@ -113,6 +119,41 @@ pub fn main() !void {
                 squeezed_len,
                 @as(f64, @floatFromInt(squeezed_len)) * 100.0 / @as(f64, @floatFromInt(plain.len)),
                 @as(f64, @floatFromInt(ns)) / @as(f64, rounds) / 1000.0,
+            });
+        }
+    }
+
+    print("\nwhat one body holds the thread for, by size\n", .{});
+    print("{s:>8} {s:>9} {s:>8} {s:>9} {s:>7} {s:>10} {s:>8}\n", .{ "items", "in B", "level", "out B", "ratio", "ms/body", "MB/s" });
+    const sweep = [_]usize{ 250, 1_000, 6_000, 24_000, 120_000 };
+    for (sweep) |count| {
+        const plain = try body(arena, count, 5);
+        for ([_]nilo.compress.Level{ .fastest, .default }) |level| {
+            var pool = try nilo.compress.Pool.init(gpa, 1, .{ .level = level });
+            defer pool.deinit(gpa);
+            var request_arena = std.heap.ArenaAllocator.init(gpa);
+            defer request_arena.deinit();
+
+            // Enough rounds for about a quarter of a second, and never fewer
+            // than five, so the large ones are not a single reading.
+            var squeezed_len: usize = 0;
+            _ = pool.gzip(request_arena.allocator(), plain).?;
+            _ = request_arena.reset(.retain_capacity);
+            const rounds_here: usize = @max(5, @min(2000, 40_000_000 / plain.len));
+            const started = monotonicNanos();
+            for (0..rounds_here) |_| {
+                squeezed_len = pool.gzip(request_arena.allocator(), plain).?.len;
+                _ = request_arena.reset(.retain_capacity);
+            }
+            const ns = @as(f64, @floatFromInt(monotonicNanos() - started)) / @as(f64, @floatFromInt(rounds_here));
+            print("{d:>8} {d:>9} {s:>8} {d:>9} {d:>6.1}% {d:>10.3} {d:>8.1}\n", .{
+                count,
+                plain.len,
+                @tagName(level),
+                squeezed_len,
+                @as(f64, @floatFromInt(squeezed_len)) * 100.0 / @as(f64, @floatFromInt(plain.len)),
+                ns / 1_000_000.0,
+                @as(f64, @floatFromInt(plain.len)) / ns * 1000.0,
             });
         }
     }

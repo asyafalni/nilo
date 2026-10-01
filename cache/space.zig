@@ -177,6 +177,13 @@ pub fn Space(comptime name: []const u8, comptime V: type, comptime opts: Options
         /// ([ADR 155](../docs/adr/155-a-request-answered-once-is-answered-the-same-way-again.md)).
         pub const putIfAbsent = if (kind == .flat) claimFlat else claimBytes;
 
+        /// The same claim, for an entry that lives `ttl_s` rather than the
+        /// Space's own. Zero means until the ring writes over it. What
+        /// `nilo.Idempotent` claims its in-flight marker with, so that a
+        /// Space whose answers are kept for a day does not keep a marker a
+        /// crashed handler left for a day (ADR 155).
+        pub const putIfAbsentFor = if (kind == .flat) claimFlatFor else claimBytesFor;
+
         /// The same read as `get`, into a buffer of the caller's choosing
         /// rather than into a `Held` — for a caller whose buffer is an arena
         /// and whose stack is per connection (ADR 062). `out` shorter than
@@ -187,12 +194,20 @@ pub fn Space(comptime name: []const u8, comptime V: type, comptime opts: Options
         }
 
         fn claimFlat(self: Self, key: []const u8, value: V) bool {
-            return self.store.putIfAbsent(id, key, flat.asBytes(V, &value), opts.ttl_s) == .stored;
+            return self.claimFlatFor(key, value, opts.ttl_s);
+        }
+
+        fn claimFlatFor(self: Self, key: []const u8, value: V, ttl_s: u32) bool {
+            return self.store.putIfAbsent(id, key, flat.asBytes(V, &value), ttl_s) == .stored;
         }
 
         fn claimBytes(self: Self, key: []const u8, value: []const u8) PutError!bool {
+            return self.claimBytesFor(key, value, opts.ttl_s);
+        }
+
+        fn claimBytesFor(self: Self, key: []const u8, value: []const u8, ttl_s: u32) PutError!bool {
             if (value.len > opts.max_bytes) return error.TooLarge;
-            return switch (self.store.putIfAbsent(id, key, value, opts.ttl_s)) {
+            return switch (self.store.putIfAbsent(id, key, value, ttl_s)) {
                 .stored => true,
                 .taken => false,
                 .refused => error.TooLarge,
@@ -404,6 +419,12 @@ test "a claim on a Space goes to whoever was first, and getInto reads without a 
     try testing.expect(jobs.getInto("nightly", &short) == null);
 
     try testing.expectError(error.TooLarge, jobs.putIfAbsent("big", "x" ** 65));
+
+    // The same claim with a lifetime of its own is still a claim.
+    try testing.expect(try jobs.putIfAbsentFor("weekly", "worker-1", 60));
+    try testing.expect(!try jobs.putIfAbsentFor("weekly", "worker-2", 60));
+    try testing.expectEqualStrings("worker-1", jobs.getInto("weekly", &buf).?);
+    try testing.expectError(error.TooLarge, jobs.putIfAbsentFor("big", "x" ** 65, 60));
 
     const Locks = Space("lock", u32, .{});
     const locks = Locks.open(&store);

@@ -1192,8 +1192,10 @@ fn writeOperation(w: *std.Io.Writer, components: *const Components, op: Operatio
     if (op.idempotent) {
         try writeFailure(w, "409", "a request with this Idempotency-Key is still being answered");
     }
-    // Not a failure: no body, and the `ETag` the 200 carries.
-    if (op.answer.versioned) {
+    // Not a failure: no body, and the `ETag` the 200 carries. Only where a
+    // client can be told it: a GET or a HEAD, because a write has run by
+    // then and answers in full (ADR 189).
+    if (op.answer.versioned and (op.method == .GET or op.method == .HEAD)) {
         try w.writeAll(",\"304\":{\"description\":\"the client already holds this version\"," ++
             "\"headers\":{\"ETag\":{\"description\":\"the version the client holds\"," ++
             "\"schema\":{\"type\":\"string\"}}}}");

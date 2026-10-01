@@ -345,3 +345,44 @@ test "the document describes the ETag on the 200 and the 304 beside it" {
         \\"304":{"description":"the client already holds this version","headers":{"ETag":
     ) != null);
 }
+
+fn replaceOrders(orders: *Orders) Versioned([]const Order) {
+    return .{ .version = orders.revision, .value = orders.all() };
+}
+
+test "a PUT answering a version the client holds is answered in full, not as a 304" {
+    var orders: Orders = .{};
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.provide(&orders);
+    try app.put("/orders", replaceOrders);
+
+    var client = try nilo_testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+
+    // The write has already run by the time the tag is compared, so a 304
+    // would tell the client nothing changed when something did (RFC 9110
+    // 13.1.2). Only a GET or a HEAD is conditional on `If-None-Match`.
+    try client.setHeader("If-None-Match", "W/\"1a\"");
+    const put = try client.request(&app, "PUT", "/orders", "");
+    try testing.expectEqual(@as(u16, 200), put.status);
+    try testing.expectEqualStrings("W/\"1a\"", put.header("ETag").?);
+    try testing.expectEqualStrings("[{\"id\":1,\"total\":1500},{\"id\":2,\"total\":700}]", put.body);
+}
+
+test "the document promises a 304 on a GET and not on a PUT" {
+    var get_op = comptime typed.operation("/orders", listOrders);
+    get_op.method = .GET;
+    var put_op = comptime typed.operation("/orders", replaceOrders);
+    put_op.method = .PUT;
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try openapi.write(testing.allocator, &out.writer, &[_]openapi.Operation{get_op}, .{});
+    try testing.expect(std.mem.indexOf(u8, out.written(), "\"304\"") != null);
+
+    var out_put: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out_put.deinit();
+    try openapi.write(testing.allocator, &out_put.writer, &[_]openapi.Operation{put_op}, .{});
+    try testing.expect(std.mem.indexOf(u8, out_put.written(), "\"304\"") == null);
+}

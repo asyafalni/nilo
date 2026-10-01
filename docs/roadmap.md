@@ -35,18 +35,6 @@ Behaviour that is wrong today. Each entry was found by reading a design page aga
 
 The entries from the WebSocket one down to the end of this module, other than the thirteen that were here before, came from an audit of `http/` at `39896d2` that read the code and checked every entry in it; none was run. **A fix lands with a probe**: a test that fails on the code before it, in Debug and ReleaseSafe, written first, the way the `nilo_sql` audit's were. Most of what is left falls into the four patterns under [Next](#next).
 
-**`nilo.deadline(ms)` never shortens the write limit.** The write limit is armed once per connection before any request, and `giveDeadline` stores `until_ns` without re-arming it, so a route with a two-second deadline sending a large body to a slow reader runs for minutes, where `deadline.zig`'s header and [the deadlines page](./design/deadlines.md) say the clamp covers the write.
-
-**Needs:** the write limit clamped with the read ones, or the claim narrowed in both places.
-
-**An `Idempotent` replay leaves out what the handler set through `*Ctx`.** Only a `Response(T)`'s or a `Bytes`' own headers are kept, so a sign-up that sets its session and is retried gets the kept 201 with no `Set-Cookie`, where [the idempotency page](./design/idempotency.md) promises the answer byte for byte. The in-flight marker is kept under the Space's own TTL, so with a Space that outlives the process, a crash mid-handler answers 409 for the whole TTL. The marker also outlives a request that never reached the handler: `idempotentBegin` claims before the other arguments are read, and the `errdefer` in `typed.zig`'s `wrap` releases only a `Cached` claim, so a body that fails to parse, a `Bound` 422 or an `Authorization` 401 leaves the key answering 409 to the same retry and 422 to a corrected one for the whole TTL, where [ADR 155](./adr/155-a-request-answered-once-is-answered-the-same-way-again.md) says a failure runs again. Without `.by`, a caller who is refused later can still fill the Space with markers.
-
-**Needs:** every header of the answer kept, a lifetime of its own for the marker, and the marker released by the same `errdefer` as `Cached`'s, with a test that sends a bad body and then the same key with a good one.
-
-**A failure keeps the representation headers the handler set before it failed.** `sendFailure` writes every collected header, which [ADR 024](./adr/024-every-failure-answers-as-json.md) decides for `Allow`, `WWW-Authenticate` and CORS, and which also carries `Content-Encoding`, `Cache-Control`, `ETag`, `Content-Range`, `Location` and `Content-Disposition`: a JSON 409 labelled gzip and cacheable for a year. Reproduced.
-
-**Needs:** the representation headers dropped on the failure path, and ADR 024 naming which ones survive.
-
 **A static file whose name has a space or a non-ASCII character is never served.** The lookup uses the raw target, the table is built from names as they are on disk, and neither side is decoded, so `café.png` and `My Doc.pdf` are a 404 to every browser. Reproduced. Symlinks are also skipped at the walk without a line, and a spilled or `.reload` file replaced by one after startup is followed out of the tree, because the open has no `O_NOFOLLOW`.
 
 **Needs:** the table keyed by the decoded path, with `/` and `..` refused after decoding, and a symlink either served by a stated rule or named at load and refused at open.
@@ -67,29 +55,9 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** `failure.status` trusted only when the error is `error.Failed`, with a test.
 
-**`Versioned` answers 304 to a method that is not safe.** `sendResult` in `typed.zig` checks `c.clientHas` whatever the method, so a `PUT` returning `Versioned(T)` with a matching `If-None-Match` has already run and answers an empty 304, where RFC 9110 §13.1.2 says 412 and no change. [ADR 189](./adr/189-a-version-a-handler-names-is-an-etag.md) is about polling a `GET`.
-
-**Needs:** the conditional applied to `GET` and `HEAD` only, with a test for a `PUT`.
-
-**A gRPC connection holds far more than [ADR 220](./adr/220-grpc-is-served-over-h2c-behind-a-flag.md) counts.** `dispatch` gives a message's bytes back to the budget when the call starts, while the running call still holds `s.body`, an inflated copy for gzip, and the text copy `asRequest` builds, so a hundred whole messages to a slow route hold a hundred times `max_body` or more. The ADR's worst case covers the stacks and the messages still arriving. The answer is also held twice, in `out` and in `framed`, until the client's window lets it go. The header block has a bound of its own missing: `overdue` skips `collect_until_ns` while that call's block is unfinished, and the silence limit it leaves is reset by every `CONTINUATION`, so one byte a frame just inside `body_ms` holds a slot for as long as `max_header_block` lasts. Not measured.
-
-**Needs:** a running call's message counted against a connection-wide budget, or the real figure in ADR 220 with the `asRequest` copy taken out; and a `GOAWAY` once a header block outlives `collect_until_ns`.
-
 **The test `Client` accepts a request head of any size.** Its reader is `Reader.fixed` over the whole request, and `readHead` refuses a head only once it fills the buffer, so a test sending a large cookie or many headers passes where a server answers 431. Its cookie jar also keeps a cookie deleted by `Expires` alone and ignores the `__Host-` and `__Secure-` rules a browser applies.
 
 **Needs:** the test reader given the server's read-buffer size, and the jar honouring a past `Expires` and the two prefixes.
-
-**A middleware that returns without answering and without calling `next` answers an empty 200.** `serveRequest` fills in `sendDirect(200, "", "")` whenever nothing answered, which [ADR 120](./adr/120-a-ctx-handler-that-returns-nothing-may-have-written-it.md) means for a handler returning `void`; a guard written `if (!ok(c)) return;` that forgot its 401 therefore lets the request through as a success, with the handler never run, and nothing in the type system or the tests notices.
-
-**Needs:** the empty answer given only when the terminal handler ran, and a 500 naming the middleware otherwise, with a test.
-
-**A failed `tryRoute` changes what covers the route that is already there.** Each `GroupWith` method calls `excepting` and `attaching` before `routeNamed`, and an `Exemption` is keyed on pattern, method and middleware, so `v1.without(auth).tryRoute(.POST, "/sign-in", b)` returning `DuplicateRoute` has already exempted the first `/v1/sign-in` from `auth`; `with(m)` attaches `m` the same way. A `DuplicateName` is found after `router.addNamed` succeeded, so the route stays live and the API description leaves it out.
-
-**Needs:** every check run before anything is registered, and the exemption and attachment appended only after the route is in, with a test per path.
-
-**Compression ignores what a handler said about the representation.** `Ctx.squeezed` gzips any eligible body, so a handler's 206 with `Content-Range` goes out gzipped against plain offsets, a strong `ETag` names both the gzip and the plain body, which `static.zig` gives two tags to avoid, and `Cache-Control: no-transform` is ignored. There is also no upper size: a 20 MB JSON export is compressed in one go on the executor thread, with nothing else on that thread running meanwhile.
-
-**Needs:** no compression for 206, 416, a `Content-Range` or `no-transform`, a strong `ETag` weakened when the body is compressed, and a `max_bytes` with the cost of its default measured into `bench/result/`.
 
 **Several comments and pages describe code that is no longer there.** `bulkhead.zig`'s header lists a six-parameter `serve` (it has eight) under `src/engine/` (it is `http/engine/`), and leaves out `Peer`'s fields, `spawnLocal`, `Wake.rawIdle` and `Binding`, which a second Engine has to provide; `proxies.zig` says a `Forwarded` header is walked, and nothing reads it; the `accept` comment in `zio.zig` says a failure raises the stop flag; `middleware.zig`'s header and [ADR 008](./adr/008-middleware-is-an-onion-of-ctx-functions.md) use `std.time.Timer`, which Zig 0.16 removed; a link in `ctx.zig` says ADR 155 and points at 156.
 
@@ -99,17 +67,13 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** the Space added to `requirements`, with a `listen()` refusal test.
 
-**A `Cached` or `Idempotent` answer is kept before its headers are checked.** `cachedFinish` and `idempotentFinish` put the record in the Space, then `sendRendered` calls `c.setHeader` on each kept header, so a header the handler built with a CR or LF, which `setHeader` refuses as a 500, is kept anyway and every hit replays that 500 until the TTL runs out, where a miss would have run the handler again. Found by reading `typed.zig`; not reproduced.
-
-**Needs:** the kept headers checked before the put, or the record released when sending it fails, with a test that returns a bad header twice.
-
 **A float that is not finite still goes out as `inf` where a type takes `std.json`'s path.** `json.write` writes a non-finite `f32` or `f64` as `null` ([ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md)), but a type `covers` does not take is written by `std.json.Stringify`, which writes `inf` and `nan`, not JSON. On the way in, a number inside a map or a `std.json.Value` field is still read by `std.json`'s grammar, so `"1_0"` there is 10, where [ADR 084](./adr/084-a-number-in-a-request-is-not-a-zig-literal.md) refuses it everywhere else in a body.
 
 **Needs:** the fallback writer given the same float rule, and a caller with a map or `Value` field for the read half.
 
-**`streamWith`, `upgradeWith`, `eventsFrom` and sendfile still only `assert` that nothing answered yet.** `Ctx.send` now returns `error.AlreadyAnswered` for a second answer; these four keep the `std.debug.assert`, so a middleware that streams after the handler answered panics a ReleaseSafe build and writes a second response in ReleaseFast.
+**A gzip gRPC message that fits its opening window is inflated to `max_body` outside the connection's budget.** The budget now counts a call until its answer is written and holds back the oldest call while a started one still holds bytes ([ADR 220](./adr/220-grpc-is-served-over-h2c-behind-a-flag.md)), but inflation happens when the call starts, so a hundred calls of 64 KiB of gzip that each inflate to the default 1 MB hold about 200 MB on one connection. Not measured.
 
-**Needs:** each returning the same error, with a test per entry point.
+**Needs:** the inflation limited to the room the budget has left, answered `RESOURCE_EXHAUSTED` past it, and a reading of what that refuses for an OpenTelemetry Collector sending large batches side by side, which is the caller that would be hurt.
 
 ### `nilo_sql`
 

@@ -361,13 +361,17 @@ pub fn wrap(comptime pattern: []const u8, comptime f: anytype) router.CtxHandler
                 null;
 
             // A claim taken and then not honoured — a path param that would
-            // not convert, a service missing under a test — is released on
-            // the way out, or the next request would wait on an answer
-            // nobody is making. The block is the scope of the `errdefer`:
-            // the reads, and not the handler's own failure, which is
-            // `cached_mod.finish`'s to release.
+            // not convert, a body that would not parse, a `Bound` refused, an
+            // `Authorization` missing, a service missing under a test — is
+            // released on the way out, or the next request would wait on an
+            // answer nobody is making (`Cached`) or be told 409, or 422 for a
+            // corrected body, until the marker expired (`Idempotent`, ADR 155).
+            // The block is the scope of the `errdefer`: the reads, and not
+            // the handler's own failure, which `idempotentFinish` and
+            // `cachedFinish` release.
             {
                 errdefer {
+                    if (comptime idempotentAt(roles)) |at| idempotentRelease(params[at].type.?, c, replaying.?);
                     if (comptime cachedAt(roles)) |at| cachedRelease(params[at].type.?, c, caching.?);
                 }
                 inline for (params, 0..) |p, i| {
@@ -520,6 +524,10 @@ const Begun = struct {
     /// The Space's key: `by`, a NUL, the client's key — or the key alone.
     under: []const u8,
     fingerprint: u64,
+    /// How many response headers were already set when the claim was taken:
+    /// middleware's, which set themselves again on a replay. What is set
+    /// after is the handler's, through the Ctx, and is kept with the answer.
+    headers_from: usize,
 };
 
 const BeginOutcome = union(enum) { replayed, fresh: Begun };
@@ -565,7 +573,10 @@ fn idempotentBegin(comptime P: type, c: *Ctx) !BeginOutcome {
 
     // The claim is what makes two requests racing for one key get one
     // handler run between them: the cache takes the marker under its lock.
-    const claimed = replays.putIfAbsent(under, &idempotent_mod.marker(fingerprint)) catch |err| switch (err) {
+    // Under a lifetime of its own, not the Space's: a handler that dies with
+    // the process leaves this behind, and the Space may keep answers for a
+    // day (ADR 155).
+    const claimed = replays.putIfAbsentFor(under, &idempotent_mod.marker(fingerprint), idempotent_mod.marker_ttl_s) catch |err| switch (err) {
         // A key the Space cannot hold: a long `by(c)`, or a Space sized
         // small. The marker is thirteen bytes, so it is the key. Refused
         // before the handler runs, not answered as `cachedBegin` answers it:
@@ -585,7 +596,13 @@ fn idempotentBegin(comptime P: type, c: *Ctx) !BeginOutcome {
             );
         },
     };
-    if (claimed) return .{ .fresh = .{ .key = key, .under = under, .fingerprint = fingerprint } };
+    const begun: Begun = .{
+        .key = key,
+        .under = under,
+        .fingerprint = fingerprint,
+        .headers_from = c.extraHeaders().len,
+    };
+    if (claimed) return .{ .fresh = begun };
 
     // Somebody was first. Into the arena rather than a `Held` on the
     // stack, which would be `max_bytes` per idle connection (ADR 062).
@@ -593,9 +610,8 @@ fn idempotentBegin(comptime P: type, c: *Ctx) !BeginOutcome {
     const kept = replays.getInto(under, room) orelse
         // Gone between the claim and the read — evicted, or expired on the
         // boundary. Nothing to replay, so this request is the first again.
-        return .{ .fresh = .{ .key = key, .under = under, .fingerprint = fingerprint } };
-    const record = idempotent_mod.decode(kept) orelse
-        return .{ .fresh = .{ .key = key, .under = under, .fingerprint = fingerprint } };
+        return .{ .fresh = begun };
+    const record = idempotent_mod.decode(kept) orelse return .{ .fresh = begun };
 
     if (record.fingerprint != fingerprint) return fail.unprocessable(
         "the {s} header {s} was already used for a different request; a key is for retrying one " ++
@@ -630,7 +646,17 @@ fn idempotentFinish(comptime P: type, c: *Ctx, begun: Begun, result: anytype) !v
 
     const answer = try renderAnswer(c, result);
 
-    const record = idempotent_mod.encode(c._arena, answer.kind, answer.status, begun.fingerprint, answer.headers, answer.content_type, answer.body) catch |err| switch (err) {
+    // What the replay sends: the headers the handler set through the Ctx
+    // (a session cookie, say), then the answer's own, which is the order
+    // `sendRendered` puts them on the first response in, so a name set both
+    // ways has the same winner (ADR 155).
+    const kept_headers = try withCtxHeaders(c, begun.headers_from, answer.headers);
+    // Before the put: a header `setHeader` refuses would be kept and then
+    // replayed as the same 500 until the Space expired it, where a miss
+    // runs the handler again (ADR 155).
+    try checkKept(c, kept_headers, answer);
+
+    const record = idempotent_mod.encode(c._arena, answer.kind, answer.status, begun.fingerprint, kept_headers, answer.content_type, answer.body) catch |err| switch (err) {
         error.TooLarge => {
             _ = replays.del(begun.under);
             std.log.warn("route \"{s}\" answered with more headers than an idempotency record holds; the answer was sent and not kept", .{c._path});
@@ -652,6 +678,33 @@ fn idempotentFinish(comptime P: type, c: *Ctx, begun: Begun, result: anytype) !v
     };
     placed = true;
     return sendRendered(c, answer);
+}
+
+/// Release the claim a request took and then could not honour: an argument
+/// after the `Idempotent` that failed to read, so the same key is free for
+/// the retry, which is what a failure is for (ADR 155).
+fn idempotentRelease(comptime P: type, c: *Ctx, begun: Begun) void {
+    const replays = c._services.get(*P.nilo_idempotent.replays) orelse return;
+    _ = replays.del(begun.under);
+}
+
+/// The headers a kept answer is sent with: those set through the Ctx since
+/// `from`, then `own`. Nothing is allocated when the handler set none.
+fn withCtxHeaders(c: *Ctx, from: usize, own: []const http1.Header) ![]const http1.Header {
+    const all = c.extraHeaders();
+    if (all.len <= from) return own;
+    const set = all[from..];
+    const both = try c._arena.alloc(http1.Header, set.len + own.len);
+    @memcpy(both[0..set.len], set);
+    @memcpy(both[set.len..], own);
+    return both;
+}
+
+/// Whether every header of an answer about to be kept, and its label, would
+/// be accepted by the Ctx on the way out (ADR 155, ADR 188).
+fn checkKept(c: *Ctx, headers: []const http1.Header, answer: Rendered) !void {
+    for (headers) |h| try Ctx.checkHeader(h);
+    if (answer.kind == .own) try c.contentTypeOk(answer.content_type);
 }
 
 /// The `Cached(…)` half of what `idempotentBegin` is: claim the key or find
@@ -767,6 +820,10 @@ fn cachedFinish(comptime P: type, c: *Ctx, begun: cached_mod.Begun, result: anyt
         );
         return sendRendered(c, answer);
     }
+
+    // Before the put, for the reason `idempotentFinish` gives: a refused
+    // header kept is a 500 replayed for the whole TTL (ADR 188).
+    try checkKept(c, answer.headers, answer);
 
     const record = idempotent_mod.encode(
         c._arena,
@@ -2157,7 +2214,11 @@ fn sendResult(c: *Ctx, result: anytype) !void {
         var buf: [versioned_mod.max_tag]u8 = undefined;
         try c.setHeader("ETag", versioned_mod.tagOf(&buf, value.version));
         for (value.headers.view()) |h| try c.setHeader(h.name, h.value);
-        if (c.clientHas(value.version)) return c.sendEmpty(304);
+        // A GET or a HEAD only: on a write the handler has already run, so
+        // "not modified" would be false (RFC 9110 13.1.2 gives a failed
+        // `If-None-Match` on such a method a 412 before it runs, which is
+        // not this answer's to send). The ordinary answer goes out (ADR 189).
+        if ((c.method == .GET or c.method == .HEAD) and c.clientHas(value.version)) return c.sendEmpty(304);
         const body = value.value orelse return fail.internal(
             "route \"{s}\" answered `unchanged`, and the client did not send that version",
             .{c._path},

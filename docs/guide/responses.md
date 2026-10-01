@@ -185,7 +185,7 @@ const version = std.hash.Wyhash.hash(0, row.updated_at.view());
 
 The tag is weak, `W/"1a"`, because a version says the content is the same and promises nothing about the bytes: the same value goes out gzipped to one client and plain to another. `If-None-Match` only ever compares weakly anyway. `headers` on the value go out on both the 200 and the 304, which is where a `Cache-Control` belongs; `.unchangedWith(version, headers)` is the 304 with them. Returning `.unchanged(version)` to a client that did *not* send the version is a 500 naming the route, because the handler skipped the work without checking.
 
-`Versioned(?T)` is a compile error, because `null` would mean both "404" and "you have it"; a missing thing is `nilo.fail.notFound`. A `Versioned` inside a `Status` or a `Response` is also a compile error, and so is one under a `Cached` or an `Idempotent`, where a 304 decided for the first client would be replayed to everyone else. The API description puts the `ETag` on the 200 and lists a 304 beside it.
+`Versioned(?T)` is a compile error, because `null` would mean both "404" and "you have it"; a missing thing is `nilo.fail.notFound`. A `Versioned` inside a `Status` or a `Response` is also a compile error, and so is one under a `Cached` or an `Idempotent`, where a 304 decided for the first client would be replayed to everyone else. **Only a `GET` or a `HEAD` is answered 304.** A `PUT` that returns a `Versioned(T)` has already run when the tag is compared, so it answers its ordinary 200 with the `ETag` on it, whatever `If-None-Match` says. The API description puts the `ETag` on the 200 and lists a 304 beside it on a `GET` or a `HEAD`.
 
 ## JSON field names and union tags
 
@@ -317,11 +317,12 @@ From then on, every answer that is text, at least a kilobyte long, and going to 
 | | Default |
 |---|---|
 | `min_bytes` | `1024`: shorter bodies go out as they are; compressing a hundred bytes makes them longer |
+| `max_bytes` | `1048576` (1 MiB): longer bodies go out as they are, because gzipping one holds its thread for the whole of it, about 7 ms a megabyte at `.default` and 130 ms for 20 MB. `0` means no limit |
 | `level` | `.default`, zlib's level 6. `.fastest` is level 1, roughly a fifth larger and a little quicker; `.best` is level 9, under one percent smaller and five to nine percent slower |
 
 The options are in [the reference](../reference/app.md#compress-options).
 
-Text means the same list static files use: `text/*`, JSON, JavaScript, XML, WASM, and the `+json` and `+xml` structured types. A PNG, a woff2 or an `application/octet-stream` is left alone, as is a body under `min_bytes`, a 204, and an answer whose handler set `Content-Encoding` itself: a body you gzipped is not gzipped twice. A HEAD carries the length its GET would have.
+Text means the same list static files use: `text/*`, JSON, JavaScript, XML, WASM, and the `+json` and `+xml` structured types. A PNG, a woff2 or an `application/octet-stream` is left alone, as is a body under `min_bytes` or over `max_bytes`, a 204, and an answer whose handler set `Content-Encoding` itself: a body you gzipped is not gzipped twice. **What a handler said about the representation stands**: a 206, a 416, an answer with a `Content-Range` and one with `Cache-Control: no-transform` are never compressed, because a range is an offset into the plain bytes and `no-transform` is a request not to. A strong `ETag` on an answer that is compressed goes out weak (`W/"…"`), since the gzipped and the plain body are different bytes and a strong tag promises identical ones. A HEAD carries the length its GET would have.
 
 **Three things are never compressed here.** A static file, because it was gzipped once when the App was built and that copy costs nothing per request ([Static files](./static-files.md#compression)). A stream, because it has no whole body to compress and would hold a compressor across every write. An event stream, because it must never be buffered at all ([ADR 211](../adr/211-a-response-is-compressed-on-a-compressor-borrowed-from-a-pool.md)).
 

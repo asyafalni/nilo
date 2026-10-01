@@ -65,7 +65,8 @@ A handler holds a Space by pointer, as a [service](./services.md), or by value i
 | `space.putFor(key, value, ttl_s)` | stores for a lifetime of its own. `0` means until the ring overwrites it |
 | `space.get(key)` | `?V` for a flat value; `?[]const u8` and a `*Held` for bytes |
 | `space.del(key)` | `bool`: whether there was anything to remove |
-| `space.putIfAbsent(key, value)` | stores only if the key is free, and says whether it was. One lock covers the scan and the write, so of two callers racing, exactly one gets `true`: a claim, not a `get` then a `put`. This is how [`nilo.Idempotent`](./idempotency.md) claims a key |
+| `space.putIfAbsent(key, value)` | stores only if the key is free, and says whether it was. One lock covers the scan and the write, so of two callers racing, exactly one gets `true`: a claim, not a `get` then a `put`. This is how [`nilo.Cached`](#caching-a-routes-response-cached) claims a key |
+| `space.putIfAbsentFor(key, value, ttl_s)` | the same claim for an entry that lives `ttl_s` seconds rather than the Space's own. This is how [`nilo.Idempotent`](./idempotency.md) claims a key, so its in-flight marker expires on its own schedule |
 | `space.getInto(key, buf)` | the bytes, into a buffer you choose instead of a `Held`, for a caller whose buffer is the request arena |
 | `store.stats()` | hits, and the three different kinds of miss |
 | `store.bytesHeld()` | every byte it will ever hold; it never changes |

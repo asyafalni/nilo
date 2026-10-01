@@ -39,9 +39,11 @@
 //! reset, CVE-2023-44487) gains a client nothing; one that keeps opening past
 //! the cap is sent away. A header block is bounded however many CONTINUATION
 //! frames it arrives in, and so is the header list it decodes to. A message
-//! is bounded by `max_body`, compressed or not, and the messages still
-//! arriving by one `max_body` between them, past which a call waits on a
-//! window the client is held to (`Conn.budget`). Frames that move no call
+//! is bounded by `max_body`, compressed or not, and the messages a
+//! connection holds, arriving or held by a call until its answer is
+//! written, by one `max_body` between them, past which a call waits on a
+//! window the client is held to (`Conn.budget`); a gzip message is the one
+//! case its inflated copy can pass that (ADR 220). Frames that move no call
 //! forward are counted, and a flood is sent away. A client that
 //! stops reading while an answer waits on its window is cut off at the write
 //! deadline.
@@ -253,8 +255,9 @@ const Stream = struct {
     collect_until_ns: u64 = 0,
     /// Bytes read since this stream's window was last topped up.
     unacked: u32 = 0,
-    /// Bytes of the message counted in the connection's `collected`, given
-    /// back when the call starts or is let go of.
+    /// Bytes counted in the connection's `collected`: the message as it
+    /// arrived, and once the call starts, its inflated copy and the request
+    /// text built from it. Given back when the call is let go of.
     held: usize = 0,
     /// Its window is owed a top-up the connection's budget held back.
     starved: bool = false,
@@ -572,13 +575,18 @@ const Conn = struct {
             if (s.collect_until_ns != 0 and now >= s.collect_until_ns) {
                 // Too slow sending one call: that call is cancelled and its
                 // buffered message freed, and the connection goes on. Not
-                // while its header block is unfinished, which would leave the
-                // table out of step: that is the connection's, below.
-                if (c.continuing != s) {
-                    h2.writeRstStream(c.out, s.id, .cancel) catch return .stop;
-                    c.forget(s);
-                    continue;
+                // while its header block is unfinished: a reset would leave
+                // the table out of step, so the connection is sent away. The
+                // silence limit below is no bound on that, because every
+                // CONTINUATION resets it, and one byte a frame held a slot
+                // for as long as `max_header_block` lasted (ADR 220).
+                if (c.continuing == s) {
+                    c.goaway(.enhance_your_calm) catch {};
+                    return .stop;
                 }
+                h2.writeRstStream(c.out, s.id, .cancel) catch return .stop;
+                c.forget(s);
+                continue;
             }
             collecting = true;
             i += 1;
@@ -866,8 +874,7 @@ const Conn = struct {
         } else {
             const dest = s.body.addManyAsSlice(s.arena.allocator(), len) catch return error.Internal;
             c.in.readSliceAll(dest) catch return error.Gone;
-            s.held += len;
-            c.collected += len;
+            c.hold(s, len);
         }
         try c.discard(pad);
         if (head.has(h2.Flags.end_stream)) {
@@ -887,8 +894,9 @@ const Conn = struct {
         }
     }
 
-    /// What one connection may hold of messages not yet handed to a route:
-    /// one message at `max_body`, which is what an HTTP/1.1 connection holds.
+    /// What one connection may hold of messages, arriving or held by a route
+    /// still running: one message at `max_body`, which is what an HTTP/1.1
+    /// connection holds.
     /// Past it a call's window is not topped up, so the client waits on it
     /// rather than this side reading, and all a call can hold beyond the
     /// budget is the window it was opened with.
@@ -897,12 +905,21 @@ const Conn = struct {
     }
 
     /// Whether this call's window may be topped up now: while the connection
-    /// is under its budget, and always for the oldest call still arriving,
+    /// is under its budget, and otherwise for the oldest call still arriving,
     /// so that one call can always finish and give its bytes back. Without
     /// that, calls that each took their first window between them could
     /// fill the budget with none of them able to end.
+    ///
+    /// **Not while a call that has started still holds bytes.** That one
+    /// gives them back with nothing more from the client, so waiting on it
+    /// cannot stall; topping up past it let each call to a slow route become
+    /// the oldest in turn and hold a whole message, a hundred of them
+    /// (ADR 220).
     fn mayGrow(c: *const Conn, s: *const Stream) bool {
         if (c.collected < c.budget() or s.body_over_limit) return true;
+        for (c.streams.items) |x| {
+            if (x.state != .headers and x.state != .body and x.held > 0) return false;
+        }
         for (c.streams.items) |x| if (x.state == .body) return x == s;
         return false;
     }
@@ -922,15 +939,31 @@ const Conn = struct {
         }
     }
 
-    /// A call's message is no longer being collected: it has started, or it
-    /// has been let go of. Its bytes leave the budget.
+    /// A call has been let go of: answered, refused or reset. Its bytes
+    /// leave the budget. **Not when it starts**: a running call still holds
+    /// its message, and the copies made of it, until its answer is written,
+    /// and giving them back at the start let a hundred calls to a slow route
+    /// hold a hundred messages while the budget said one (ADR 220).
     fn letGo(c: *Conn, s: *Stream) void {
         c.collected -= s.held;
         s.held = 0;
+        c.unstarve(s);
+    }
+
+    /// The call is no longer waiting on a window: it has started, or it has
+    /// been let go of.
+    fn unstarve(c: *Conn, s: *Stream) void {
         if (s.starved) {
             s.starved = false;
             c.starved -= 1;
         }
+    }
+
+    /// Count `n` more bytes the call holds against the connection's budget,
+    /// until `letGo`.
+    fn hold(c: *Conn, s: *Stream, n: usize) void {
+        s.held += n;
+        c.collected += n;
     }
 
     /// Top the connection's window back up once half of it has been read.
@@ -1063,7 +1096,7 @@ const Conn = struct {
     /// The client has sent everything. Check the call, take its message out
     /// of its framing, and run it.
     fn dispatch(c: *Conn, s: *Stream) ReadError!void {
-        c.letGo(s);
+        c.unstarve(s);
         const a = s.arena.allocator();
         if (s.headers_over_limit) return c.answerNow(s, 8, "the call's metadata is larger than this server reads");
         if (s.body_over_limit) return c.answerNow(s, 8, "the message is larger than this server's max_body");
@@ -1125,7 +1158,11 @@ const Conn = struct {
                 error.BodyTooLarge => return c.answerNow(s, 8, "the message is larger than this server's max_body"),
                 else => return c.answerNow(s, 13, "the message's gzip could not be read"),
             };
+            c.hold(s, message.len);
         }
+        // The request text `asRequest` builds holds the message once more,
+        // for as long as the call runs.
+        c.hold(s, message.len);
         s.body.items = @constCast(message);
         s.state = .running;
         _ = s.shared.running.fetchAdd(1, .acquire);
@@ -1264,6 +1301,8 @@ fn answer(s: *Stream, in_flight: *fail.InFlight) !void {
     var out: std.Io.Writer.Allocating = .init(a);
     s.app.handle(s.app.ptr, a, &lifetime, in_flight, &in, &out.writer, s.peer, s.until_ns);
     lifetime.end();
+    // `out`'s buffer is the arena's and is not freed here: the framed answer
+    // is a slice of it, held once (`framedIn`).
     try fromResponse(a, s, out.written());
 }
 
@@ -1385,7 +1424,7 @@ fn validField(f: hpack.Field) bool {
 /// route's headers as metadata, the body as one length-prefixed message, and
 /// trailers with `grpc-status`. A status other than 200 is a failed call,
 /// said in one HEADERS frame.
-fn fromResponse(a: std.mem.Allocator, s: *Stream, raw: []const u8) !void {
+fn fromResponse(a: std.mem.Allocator, s: *Stream, raw: []u8) !void {
     const response = try parseResponse(a, raw);
     if (response.status != 200) {
         // A route that failed after the client's deadline failed because of
@@ -1406,7 +1445,7 @@ fn fromResponse(a: std.mem.Allocator, s: *Stream, raw: []const u8) !void {
 
     if (response.headers.len == 0 and std.mem.eql(u8, response.content_type, "application/grpc")) {
         s.head_block = ok_head;
-        s.data = try framed(a, response.body);
+        s.data = try framedIn(a, raw, response.body);
         s.trailers = ok_trailers;
         return;
     }
@@ -1417,8 +1456,25 @@ fn fromResponse(a: std.mem.Allocator, s: *Stream, raw: []const u8) !void {
     for (response.headers) |f| try head.append(a, f);
     s.head_block = try encodeBlock(a, head.items);
 
-    s.data = try framed(a, response.body);
+    s.data = try framedIn(a, raw, response.body);
     s.trailers = ok_trailers;
+}
+
+/// `framed`, written over the five bytes in front of `message` when it lies
+/// inside `raw` with that much room before it, which an answer read out of
+/// an HTTP/1.1 response always has: those bytes are the end of its head,
+/// and nothing reads the head once the HEADERS block has been encoded.
+/// **The answer was held twice**, in the response and in its framed copy,
+/// for as long as the client's window kept it waiting (ADR 220).
+fn framedIn(a: std.mem.Allocator, raw: []u8, message: []const u8) ![]const u8 {
+    const start = @intFromPtr(raw.ptr);
+    const at = @intFromPtr(message.ptr);
+    if (at < start + 5 or at + message.len > start + raw.len) return framed(a, message);
+    const offset = at - start;
+    const data = raw[offset - 5 .. offset + message.len];
+    data[0] = 0;
+    std.mem.writeInt(u32, data[1..5], @intCast(message.len), .big);
+    return data;
 }
 
 /// The message with its five-byte prefix: uncompressed, and its length.
@@ -1981,8 +2037,12 @@ test "calls still arriving hold one max_body between them, and the rest wait on 
         try client.headersFor(id, "/test.Echo/Say", &.{}, false);
         try sendPart(&client, id, 64_000, 79_995, false);
     }
-    // The first call ends, runs, and gives its bytes back.
+    // The first call ends and runs. Its bytes go back once its answer has
+    // been written, which takes a client reading it: the answer is larger
+    // than the window it is sent under.
     try sendPart(&client, 1, 16_000, null, true);
+    try h2.writeWindowUpdate(client.w(), 0, 100_000);
+    try h2.writeWindowUpdate(client.w(), 1, 100_000);
 
     var got = try converse(&app, &client);
     defer got.deinit();
@@ -2723,4 +2783,90 @@ test "a call reset while its message is arriving does not hold back the windows 
     defer got.deinit();
     try testing.expect(windowUpdateAt(&got, 7) != null);
     try testing.expect(windowUpdateAt(&got, 9) != null);
+}
+
+/// A connection over `client`'s bytes, driven a frame at a time rather than
+/// by `run`, so a test can look at it between two frames.
+fn steppedConn(app: *App, in: *std.Io.Reader, out: *std.Io.Writer) !Conn {
+    _ = try in.takeArray(h2.preface.len);
+    return .{
+        .app = app.grpcHost(),
+        .gpa = testing.allocator,
+        .in = in,
+        .out = out,
+        .deadlines = .off,
+        .waker = .off,
+        .peer = .{},
+        .shared = try Shared.create(testing.allocator, .off),
+        .decoder = hpack.Decoder.init(testing.allocator),
+    };
+}
+
+test "a call's message counts against the connection's budget while its route runs, and leaves it once the answer is written" {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    try client.headersFor(1, "/test.Echo/Say", &.{}, false);
+    try sendPart(&client, 1, 5005, 5000, true);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var in: std.Io.Reader = .fixed(client.buf.written());
+    var conn = try steppedConn(&app, &in, &out.writer);
+    defer conn.deinit();
+    while (in.bufferedLen() > 0) try conn.readFrame();
+
+    // The route has run (with no server it runs inline) and its answer is
+    // waiting to be written: the message is still held, so it still counts.
+    try testing.expect(conn.collected >= 5005);
+    try conn.writeReady();
+    try testing.expectEqual(@as(usize, 0), conn.collected);
+}
+
+test "a header block still unfinished when its call's time to arrive is up sends the connection away" {
+    var app = try testApp();
+    defer app.deinit();
+    var client = try TestClient.init();
+    defer client.deinit();
+    const part = [_]u8{0} ** 16;
+    try h2.writeHeader(client.w(), part.len, .headers, 0, 1);
+    try client.w().writeAll(&part);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var in: std.Io.Reader = .fixed(client.buf.written());
+    var conn = try steppedConn(&app, &in, &out.writer);
+    defer conn.deinit();
+    while (in.bufferedLen() > 0) try conn.readFrame();
+
+    const s = conn.continuing.?;
+    // A CONTINUATION a byte at a time resets the silence limit each time, so
+    // the call's own bound is the one that has to end it.
+    s.collect_until_ns = 1;
+    try testing.expectEqual(Conn.Waited.stop, conn.overdue());
+    try testing.expect(conn.goaway_sent);
+}
+
+test "the oldest call still arriving waits while a call that started still holds its message" {
+    var app = try testApp();
+    defer app.deinit();
+    app.limits.max_body = 100_000;
+    var client = try TestClient.init();
+    defer client.deinit();
+    // A client that will not read: every answer waits on a window of 0, so a
+    // call that has run keeps what it holds until the write gives up.
+    try h2.writeSettings(client.w(), &.{.{ .initial_window_size, 0 }});
+    // Call 1 arrives whole and runs; its answer cannot go out.
+    try client.headersFor(1, "/test.Echo/Say", &.{}, false);
+    try sendPart(&client, 1, 64_000, 63_995, true);
+    // Call 3 is now the oldest call still arriving. The connection is past
+    // its budget because of call 1, which needs nothing more from the client
+    // to give its bytes back, so call 3 is not topped up past it.
+    try client.headersFor(3, "/test.Echo/Say", &.{}, false);
+    try sendPart(&client, 3, 64_000, 99_995, false);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expect(windowUpdateAt(&got, 3) == null);
 }

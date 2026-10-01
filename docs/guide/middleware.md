@@ -31,7 +31,7 @@ fn requireToken(c: *nilo.Ctx, next: nilo.Next) !void {
 }
 ```
 
-Returning an error takes exactly the same path as a failing handler.
+Returning an error takes exactly the same path as a failing handler. **A middleware that stops the chain has to answer**, with a fail function or a `c.send`: one that returns without answering and without calling `next` is a 500, and the log names it as `middleware N of M`. The empty 200 a handler gets for returning nothing is the handler's, and a guard that forgot its 401 must not read as a success.
 
 **To learn the status after `next.run(c)`, read it the way the logger does.** `c.answered()` is the status once something has been written. When `next.run` returned an error before anything was written, the status the App is about to send is `fail.resolveStatus(failure, err)` with `fail.current()`, or `fail.statusFor(err)` when there is no failure set. Asking `fail` instead of mapping the error yourself keeps what you record in step with what was actually sent.
 

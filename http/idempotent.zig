@@ -41,7 +41,7 @@
 //! be `max_bytes` per idle connection for the life of it (ADR 062).
 //!
 //! **The Space is yours** and this module names no cache: `Replays` is any
-//! type with `getInto`, `putIfAbsent`, `put`, `del` and `max_bytes`, which
+//! type with `getInto`, `putIfAbsentFor`, `put`, `del` and `max_bytes`, which
 //! a `nilo_cache` bytes Space has and a table over Redis could. `by` is
 //! whose key it is — an account, a tenant — because two clients choosing
 //! the same key must never see each other's answer; leave it off only on an
@@ -56,6 +56,14 @@ pub const replayed_name = "Idempotent-Replayed";
 /// The longest key taken. The draft suggests a UUID; this is room for one
 /// with a prefix on it and refuses a body-length string somebody pasted in.
 pub const max_key = 255;
+/// How long an in-flight marker lives, in seconds, whatever the Space keeps
+/// answers for. A handler that dies with the process leaves its marker
+/// behind, and a Space that outlives the process (a table over Redis) would
+/// answer 409 to the retry for the Space's whole TTL, a day for an order
+/// API. Two minutes is longer than an ordinary write runs and short enough
+/// that a crash costs a retry two minutes. The price of a bound: a handler
+/// still running after it can be run a second time by a retry (ADR 155).
+pub const marker_ttl_s: u32 = 120;
 
 /// How a kept answer is shaped, and the marker a request in flight leaves.
 pub const Kind = enum(u8) {
@@ -228,7 +236,7 @@ pub fn checkSpace(comptime Replays: type, comptime route: []const u8) void {
                     "\" names " ++ naming.of(Replays) ++ " as where answers are kept, and it is not a Space." ++ shape,
             ),
         }
-        const needed = [_][]const u8{ "getInto", "putIfAbsent", "put", "del", "max_bytes", "Held" };
+        const needed = [_][]const u8{ "getInto", "putIfAbsentFor", "put", "del", "max_bytes", "Held" };
         for (needed) |decl| if (!@hasDecl(Replays, decl)) @compileError(
             "nilo: the `Idempotent(" ++ naming.of(Replays) ++ ", …)` on route \"" ++ route ++
                 "\" names " ++ naming.of(Replays) ++ " as where answers are kept, and it has no `" ++
