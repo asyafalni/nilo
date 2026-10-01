@@ -38,12 +38,15 @@ pub const Error = error{
 /// deflate stream; anything shorter cannot be one.
 const frame_len = 10 + 8;
 
-/// `raw`, inflated into `arena`, at most `limit` bytes.
+/// What a gzip stream says it will inflate to, by its trailer, checked as far
+/// as it can be before anything is allocated: the magic, the method, and a size
+/// no deflate stream of this length could reach.
 ///
-/// `arena` is meant to be the request arena, on the terms `readSizedBody`
-/// states: a stream that fails partway leaves what was allocated, which
-/// against an arena is free.
-pub fn inflate(arena: std.mem.Allocator, raw: []const u8, limit: usize) Error![]const u8 {
+/// **It is a claim and not a measure**: `inflate` refuses a stream whose bytes
+/// disagree with it. A caller that has a budget to keep (a gRPC connection's,
+/// ADR 220) asks it first, so that what it charges is what `inflate` will
+/// allocate.
+pub fn announcedSize(raw: []const u8) Error!u32 {
     if (raw.len < frame_len) return error.BadEncodedBody;
     // The magic and the method, before the trailer is believed: the last
     // four bytes of a JSON body somebody forgot to compress are a number
@@ -59,6 +62,16 @@ pub fn inflate(arena: std.mem.Allocator, raw: []const u8, limit: usize) Error![]
     // stream that was cut off, and the right answer for that is the one
     // for every other broken stream, not a 413 about a size nobody sent.
     if (announced > raw.len * 1032) return error.BadEncodedBody;
+    return announced;
+}
+
+/// `raw`, inflated into `arena`, at most `limit` bytes.
+///
+/// `arena` is meant to be the request arena, on the terms `readSizedBody`
+/// states: a stream that fails partway leaves what was allocated, which
+/// against an arena is free.
+pub fn inflate(arena: std.mem.Allocator, raw: []const u8, limit: usize) Error![]const u8 {
+    const announced = try announcedSize(raw);
     if (announced > limit) return error.BodyTooLarge;
 
     // One byte past the announced size. The decoder asks the writer for a

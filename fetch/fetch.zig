@@ -119,6 +119,14 @@ pub const request_id_header = "X-Request-Id";
 /// about each other.
 pub const Client = struct {
     inner: std.http.Client,
+    /// The second std client, for the one kind of call that cannot be sent
+    /// twice: a body that is a reader. Its pool keeps nothing
+    /// (`free_size = 0`), so every call on it opens a connection of its own
+    /// and a socket the server closed while it idled can never be the one a
+    /// caller's reader is consumed on. Idle until the first `.stream` body,
+    /// when it costs what any std client costs on first use (for HTTPS, one
+    /// scan of the system's root certificates).
+    fresh: std.http.Client,
     gate: std.Io.Semaphore,
     limits: core.Limits = .none,
     settings: Settings,
@@ -252,13 +260,22 @@ pub const Client = struct {
     pub fn init(gpa: std.mem.Allocator, settings: Settings) Client {
         return .{
             .inner = .{ .allocator = gpa, .io = undefined, .read_buffer_size = settings.read_buffer_size },
+            .fresh = .{
+                .allocator = gpa,
+                .io = undefined,
+                .read_buffer_size = settings.read_buffer_size,
+                .connection_pool = .{ .free_size = 0 },
+            },
             .gate = .{ .permits = settings.max_in_flight },
             .settings = settings,
         };
     }
 
     pub fn deinit(self: *Client) void {
-        if (self.started) self.inner.deinit();
+        if (self.started) {
+            self.inner.deinit();
+            self.fresh.deinit();
+        }
     }
 
     /// Finished once the event loop exists, like every service that needs one
@@ -271,6 +288,7 @@ pub const Client = struct {
     /// `io` it can cancel (ADR 056).
     pub fn nilo_start(self: *Client, io: std.Io, limits: core.Limits) !void {
         self.inner.io = io;
+        self.fresh.io = io;
         self.limits = limits;
         self.started = true;
     }
@@ -898,6 +916,8 @@ pub const Exchange = struct {
         // - **Only a body still where it was.** A `.stream` body has had its
         //   reader consumed, so re-sending it would put fewer bytes on the
         //   wire than the `content-length` promised — worse than the error.
+        //   It does not need the replay: it is sent on a fresh connection
+        //   (`Client.fresh`), which cannot be stale.
         // - **Inside the same permit and the same deadline.** Both are taken
         //   above and neither is re-armed, so a retry cannot double the time
         //   budget or take a second seat at the gate.
@@ -1038,7 +1058,12 @@ pub const Exchange = struct {
         // because std writes `extra_headers` verbatim either way and the
         // only thing that had to move was its own (ADR 182).
         const given = Given.of(opts.headers);
-        self.req = try client.inner.request(opts.method, uri, .{
+        // A reader body is sent on a connection nobody pooled (`Client.fresh`),
+        // because it cannot be replayed onto a second one if the first turns
+        // out to be a corpse. Every other body keeps the pool, and the replay
+        // in `begin` protects it.
+        const std_client = if (opts.body == .stream) &client.fresh else &client.inner;
+        self.req = try std_client.request(opts.method, uri, .{
             .extra_headers = opts.headers,
             .redirect_behavior = if (opts.redirects == .follow)
                 std.http.Client.Request.RedirectBehavior.init(max_redirects)
@@ -1119,18 +1144,36 @@ pub const Exchange = struct {
                 try w.writeAll(bytes);
                 try self.req.connection.?.flush();
             },
-            .stream => |src| if (framed) {
-                self.req.transfer_encoding = .{ .content_length = src.len };
-                var w = try self.req.sendBody(&.{});
-                // Exactly the length that was announced, and nothing else. A
-                // source that runs out early fails here rather than sending a
-                // body that disagrees with the head describing it.
-                try src.reader.streamExact64(&w.writer, src.len);
-                try w.end();
-            } else {
-                const w = try self.sendHeadWithLength(src.len);
-                try src.reader.streamExact64(w, src.len);
-                try self.req.connection.?.flush();
+            .stream => |src| {
+                // With a `stall_ms` the source is read through `tap`, so that
+                // every chunk that leaves it moves the silence clock: nothing
+                // arrives from the peer while a body goes out, and without
+                // this a transfer longer than `stall_ms` would be `Stalled`
+                // however fast it moved. The write buffer is a kilobyte, so
+                // a chunk out of the source is a chunk on its way to the
+                // socket, and a peer that stopped reading blocks the write
+                // and stops the stamps (ADR 056). `inner` is the body reader
+                // after the head arrives, and is this until then.
+                const source = if (self.stall_ms != 0) src: {
+                    self.inner = src.reader;
+                    break :src &self.tap;
+                } else src.reader;
+                if (framed) {
+                    self.req.transfer_encoding = .{ .content_length = src.len };
+                    var w = try self.req.sendBody(&.{});
+                    // Exactly the length that was announced, and nothing else. A
+                    // source that runs out early fails here rather than sending a
+                    // body that disagrees with the head describing it.
+                    try source.streamExact64(&w.writer, src.len);
+                    try w.end();
+                } else {
+                    const w = try self.sendHeadWithLength(src.len);
+                    try source.streamExact64(w, src.len);
+                    try self.req.connection.?.flush();
+                }
+                // The head is waited for from here: the silence clock starts
+                // again at the last byte that went out.
+                if (self.stall_ms != 0) self.mark();
             },
         }
 
@@ -1215,7 +1258,11 @@ pub const Exchange = struct {
 
     /// Whether this call may go out a second time.
     ///
-    /// Only the bodies whose bytes are still where the caller left them.
+    /// Only the bodies whose bytes are still where the caller left them. A
+    /// `.stream` is not, which is why it is never sent on a pooled
+    /// connection at all: `attempt` gives it `Client.fresh`, whose
+    /// connection cannot have been reaped, so the one case a replay existed
+    /// for cannot arise for it.
     fn replayable(body: Body) bool {
         return switch (body) {
             .none, .slice => true,

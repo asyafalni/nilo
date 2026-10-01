@@ -36,7 +36,7 @@ const Carts = cache.Space("cart", Cart, .{ .ttl_s = 300 });
 |---|---|
 | `cache.open(gpa, .{ .bytes = n })` | `!Store`: all the memory, taken here |
 | `cache.Space(name, V, .{ .ttl_s = s })` | a keyspace, as a type |
-| `Space.open(&store)` | the value a handler holds |
+| `Space.open(&store)` | the value a handler holds. Panics, naming the type, the limit and the Store's size, for a flat `V` whose entry (12-byte header, key and value) exceeds a quarter of one shard's ring, which every `put` would have refused |
 | `space.put(key, value)` | stored for the Space's `ttl_s` |
 | `space.putFor(key, value, ttl_s)` | stored for its own lifetime, at least `ttl_s` and at most `ttl_s + 1` seconds. `0` means "until the ring writes over it" |
 | `space.get(key)` | `?V` for a flat value; `?[]const u8` and a `*Held` for bytes |
@@ -81,6 +81,7 @@ fn render(pages: *Pages, path: []const u8) ![]const u8 {
 | `.bytes` | the budget. Five sixths go to the values, the rest to the table |
 | `.entries` | how many entries the table points at, when the default split is wrong. Clamped to the budget, not added to it |
 | `.shards` | how many writers can be inside at once, and how many independent rings. Default 64, reduced if the budget cannot carry that many |
+| `.seed` | the secret every hash is mixed with. `null` (the default) takes 8 bytes of operating-system entropy once in `open`, and `open` answers `error.SeedUnavailable` where there is none; pass one from `nilo.randomSecure` if you have a loop, or a fixed one in a test for deterministic placement. **A fixed seed in production lets whoever chooses keys pile them onto one shard** ([ADR 042](../adr/042-entropy-belongs-to-the-loop.md)) |
 
 ### `store.stats()`
 

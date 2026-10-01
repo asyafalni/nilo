@@ -50,6 +50,8 @@ So the rule reads: **entropy is an App-layer call, because the only thing there
 is to decide about entropy is how the wait gets paid for, and only the App has
 a loop to pay it out of.** A program with no loop has no problem to solve.
 
+**One narrow exception: `nilo_cache.open` takes 8 bytes itself.** A cache hashes keys an attacker may choose, so its hash needs a secret seed, and `Options.seed` defaults to `null`, meaning one `getrandom` (Linux) or `arc4random_buf` (macOS) call in `open`, with `error.SeedUnavailable` where there is none and never a guessable fallback. It breaks the rule's reason in no way that matters: `open` runs once at startup, before a fiber exists to block, and `getrandom` on an initialised pool does not wait. A caller with a loop may still pass `seed` from `randomSecure`, and a test passes a fixed one ([ADR 109](./109-a-cache-holds-its-bytes-under-a-lock-it-can-spin-on.md)).
+
 **`nilo_id` does not change.** It keeps taking its randomness as an argument,
 which is now an argument that exists.
 
@@ -79,6 +81,8 @@ refused: on a kernel without that vDSO the same call is a real syscall and
 costs roughly twenty times more. **The Bulkhead is exactly where a cost that
 varies by platform gets absorbed**, which is what makes it the right place for
 this whether or not the cache ever becomes worth building.
+
+**A `seed` the cache's caller must supply, with no default.** The shape the rule above predicts, and rejected for `nilo_cache` because a required argument is boilerplate every caller has to remember, and forgetting it, or passing a constant to make it compile, silently restores the vulnerability it exists to close: keys an attacker chooses placed by a function of public inputs. A default that is right beats a parameter that is easy to get wrong.
 
 **A second Scope-shaped pair — an `Entropy` checked while compiling**, so that
 `id.v4(source)` takes anything able to supply bytes. Symmetrical with the

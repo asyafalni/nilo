@@ -127,8 +127,28 @@ pub fn Space(comptime name: []const u8, comptime V: type, comptime opts: Options
         /// The largest value this Space will take.
         pub const max_bytes: usize = if (kind == .bytes) opts.max_bytes else @sizeOf(V);
 
+        /// Registers the name, and **refuses a flat `V` this Store could never
+        /// hold**: a panic naming the type, the limit and the budget, as
+        /// `registerSpace` does for a name collision, because it is a
+        /// programmer's error found at startup rather than a request's.
+        /// An entry is refused over a quarter of one shard's ring, so a
+        /// 20,000-byte struct on a 64 KiB store would otherwise be dropped on
+        /// every `put` with nothing to say so. Checked with the same rule
+        /// `Store.write` refuses by (`Store.fits`).
         pub fn open(store: *Store) Self {
             store.registerSpace(id, name);
+            if (kind == .flat and !store.fits(0, @sizeOf(V))) std.debug.panic(
+                "nilo: the cache Space \"{s}\" holds {s}, which is {d} bytes ({d} with its entry header), " ++
+                    "and this Store takes an entry of at most {d}: a quarter of a shard's ring, " ++
+                    "and its {d} shards hold {d} bytes of ring between them.\n" ++
+                    "  A value this size would be refused on every put. Open the Store with more " ++
+                    "`bytes` or fewer `shards`, or make the value smaller.",
+                .{
+                    name,                                          shortName(V),       @sizeOf(V),
+                    store_mod.header + @sizeOf(V),                 store.entryLimit(), store.shardCount(),
+                    store.shardCount() * store.shards[0].ring.len,
+                },
+            );
             return .{ .store = store };
         }
 
@@ -198,7 +218,12 @@ pub fn Space(comptime name: []const u8, comptime V: type, comptime opts: Options
         }
 
         fn claimFlatFor(self: Self, key: []const u8, value: V, ttl_s: u32) bool {
-            return self.store.putIfAbsent(id, key, flat.asBytes(V, &value), ttl_s) == .stored;
+            const claim = self.store.putIfAbsent(id, key, flat.asBytes(V, &value), ttl_s);
+            // `open` refused a V no shard could hold, so a refusal here is the
+            // key's doing (over 65,535 bytes, or so long the entry passes a
+            // quarter of the ring), and a refusal is not "somebody was first".
+            std.debug.assert(claim != .refused or !self.store.fits(key.len, @sizeOf(V)));
+            return claim == .stored;
         }
 
         fn claimBytes(self: Self, key: []const u8, value: []const u8) PutError!bool {
@@ -219,9 +244,14 @@ pub fn Space(comptime name: []const u8, comptime V: type, comptime opts: Options
         }
 
         fn putFlatFor(self: Self, key: []const u8, value: V, ttl_s: u32) void {
-            // A flat value cannot be too large — `kindOf` refused that while
-            // compiling — so there is nothing here for a caller to handle.
-            _ = self.store.put(id, key, flat.asBytes(V, &value), ttl_s);
+            // A flat value cannot be too large: `kindOf` refused 65,535 bytes
+            // while compiling and `open` refused one over a quarter of a
+            // shard's ring when the Store was known, so there is nothing for
+            // a caller to handle. What can still be refused is a key so long
+            // that the entry no longer fits, which the assertion lets through
+            // and nothing else.
+            const stored = self.store.put(id, key, flat.asBytes(V, &value), ttl_s);
+            std.debug.assert(stored or !self.store.fits(key.len, @sizeOf(V)));
         }
 
         fn getFlat(self: Self, key: []const u8) ?V {
@@ -271,7 +301,7 @@ const Currency = enum { idr, usd };
 const Cart = struct { owner: u64, items: u16, currency: Currency };
 
 fn openStore() !Store {
-    return Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 4 });
+    return Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 4, .seed = 1 });
 }
 
 test "a flat value comes back by value, with no buffer anywhere" {
@@ -440,11 +470,49 @@ test "Held is the value's own size for a flat Space, and nothing at all" {
 }
 
 test "incr on a key too large for the cache is an error rather than a count" {
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1, .seed = 1 });
     defer store.deinit();
     const Attempts = Space("attempts", u32, .{ .ttl_s = 60 });
     var attempts = Attempts.open(&store);
 
     try testing.expectError(error.TooLarge, attempts.incr("k" ** 70_000, 1));
     try testing.expectEqual(@as(u32, 1), try attempts.incr("ada@example", 1));
+}
+
+test "a flat value that fits no shard is refused by open rather than dropped on every put" {
+    // 20,000 bytes on a 64 KiB store: a shard's ring is under 7 KiB and an
+    // entry may take a quarter of it. `open` panics for this V (a panic cannot
+    // be caught in a test), so the rule it asks is what is checked, and the
+    // old outcome is shown for the Store that cannot hold it.
+    const Big = struct { bytes: [20_000]u8 };
+    var small = try Store.open(testing.allocator, .{ .bytes = 64 << 10, .seed = 1 });
+    defer small.deinit();
+    try testing.expect(!small.fits(0, @sizeOf(Big)));
+    try testing.expect(!small.put(Space("big", Big, .{}).id, "k", &@as([@sizeOf(Big)]u8, @splat(1)), 0));
+
+    // A Store with room takes it, and opens.
+    var roomy = try Store.open(testing.allocator, .{ .bytes = 8 << 20, .shards = 4, .seed = 1 });
+    defer roomy.deinit();
+    try testing.expect(roomy.fits(0, @sizeOf(Big)));
+    const Bigs = Space("big", Big, .{});
+    var bigs = Bigs.open(&roomy);
+    bigs.put("k", .{ .bytes = @splat(7) });
+    try testing.expectEqual(@as(u8, 7), bigs.get("k").?.bytes[19_999]);
+}
+
+test "a flat value exactly at the limit opens and round-trips" {
+    // One shard on the smallest budget: ring = 65,536 - 1,365 slots * 8 =
+    // 54,616, a quarter is 13,654, and the header takes 12 of it.
+    const Edge = struct { bytes: [13_642]u8 };
+    var store = try Store.open(testing.allocator, .{ .bytes = 64 << 10, .shards = 1, .seed = 1 });
+    defer store.deinit();
+    try testing.expectEqual(@as(usize, 13_654), store.entryLimit());
+    try testing.expectEqual(store.entryLimit(), store_mod.header + @sizeOf(Edge));
+    try testing.expect(store.fits(0, @sizeOf(Edge)));
+    try testing.expect(!store.fits(0, @sizeOf(Edge) + 1));
+
+    const Edges = Space("edge", Edge, .{});
+    var edges = Edges.open(&store);
+    edges.put("", .{ .bytes = @splat(9) });
+    try testing.expectEqual(@as(u8, 9), edges.get("").?.bytes[13_641]);
 }

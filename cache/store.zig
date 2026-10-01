@@ -83,7 +83,7 @@ const ways = 8;
 /// Expiry, space, and the two lengths, ahead of the key. The lengths are here
 /// rather than in the slot because a byte in the ring is paid once per entry
 /// and a byte in the slot is paid for every slot, occupied or not.
-const header = 12;
+pub const header = 12;
 
 /// Sixteen bytes. `gen` of zero means the way has never been written, which
 /// is why a shard's own generation starts at one.
@@ -250,9 +250,24 @@ pub const Options = struct {
     /// store of several MiB and a machine with cores to spare
     /// ([`bench/result/cache.md`](../bench/result/cache.md)).
     shards: usize = 64,
+    /// **The secret every hash in this Store is mixed with**, set once in
+    /// `open` and never changed. Null, the default, takes eight bytes from the
+    /// operating system there; a caller with a loop may pass one from
+    /// `nilo.randomSecure`, and a test passes a fixed one so placement is
+    /// deterministic.
+    ///
+    /// **Without a secret the hash is a function of public inputs** (a Space's
+    /// name and the key), so anyone who chooses keys (emails, URLs) could
+    /// precompute ones that share a shard and a bucket, evict a chosen entry
+    /// and queue every request on one lock. A fixed seed restores exactly that,
+    /// so it belongs in tests and nowhere else (ADR 042, ADR 109).
+    seed: ?u64 = null,
 };
 
 pub const OpenError = error{
+    /// `seed` was null and the operating system gave no entropy, or there is
+    /// no source for this target. Pass `Options.seed`.
+    SeedUnavailable,
     OutOfMemory,
     /// The numbers do not divide into a working cache: fewer than 64 KiB of
     /// value memory, or fewer entries than the shards have ways to hold them.
@@ -757,12 +772,54 @@ const Shard = struct {
     }
 };
 
+/// Eight bytes of entropy for a Store that was not given a seed, taken once
+/// in `open`. **Never a weak fallback**: a failure is `SeedUnavailable`.
+///
+/// ADR 042 keeps entropy out of a module below the loop because an OS call
+/// from a fiber blocks its thread. This is the one exception: it runs once at
+/// startup, `getrandom` on an initialised pool does not wait, and a seed the
+/// caller must remember to pass is a vulnerability restored by forgetting.
+fn osSeed() OpenError!u64 {
+    var buf: [8]u8 = undefined;
+    switch (builtin.os.tag) {
+        .linux => {
+            var got: usize = 0;
+            while (got < buf.len) {
+                const rc = std.os.linux.getrandom(buf[got..].ptr, buf.len - got, 0);
+                switch (std.os.linux.errno(rc)) {
+                    .SUCCESS => got += rc,
+                    .INTR => {},
+                    else => return error.SeedUnavailable,
+                }
+            }
+        },
+        .macos, .ios, .tvos, .watchos, .visionos => std.c.arc4random_buf(&buf, buf.len),
+        // Not a `@compileError`: the branch is reached by every target, even
+        // when the caller passes a seed and never runs it, and that would
+        // refuse a build that did nothing wrong.
+        else => return error.SeedUnavailable,
+    }
+    return std.mem.readInt(u64, &buf, .little);
+}
+
+/// Whether an entry of this key and value fits a shard's ring: the one rule
+/// `write` refuses by and `Space.open` checks a flat type against, so the two
+/// cannot disagree. The length fields are 16 bits, and an entry over a quarter
+/// of the ring would push out most of a shard.
+pub fn entryFits(ring_len: usize, key_len: usize, value_len: usize) bool {
+    return key_len <= std.math.maxInt(u16) and value_len <= std.math.maxInt(u16) and
+        header + key_len + value_len <= ring_len / 4;
+}
+
 pub const Store = struct {
     gpa: Allocator,
     shards: []Shard,
     /// `shards.len - 1`. A power of two, so this is a mask rather than a
     /// division on the path of every operation.
     shard_mask: u64,
+    /// Mixed into every hash (`hashOf`); see `Options.seed`. Beside the mask
+    /// that is read on the same path, so it costs no further line.
+    seed: u64,
     opened_s: i64,
     /// Every `Space` that has opened against this Store, so two whose names
     /// hash to the same 32 bits are caught the moment the second one opens
@@ -777,6 +834,7 @@ pub const Store = struct {
 
     pub fn open(gpa: Allocator, opts: Options) OpenError!Store {
         if (opts.bytes < 64 << 10) return error.TooSmall;
+        const seed = opts.seed orelse try osSeed();
 
         // **Nothing here is rounded to a power of two, and that is the point.**
         // The table splits the budget with the ring at whatever the caller's
@@ -867,6 +925,7 @@ pub const Store = struct {
 
         return .{
             .gpa = gpa,
+            .seed = seed,
             .shards = shards,
             .shard_mask = shards_n - 1,
             .opened_s = clock.monotonicSeconds(),
@@ -916,6 +975,26 @@ pub const Store = struct {
         self.ids[self.n_spaces] = id;
         self.names[self.n_spaces] = name;
         self.n_spaces += 1;
+    }
+
+    /// The hash every operation places a key by. **The Space's own value
+    /// xor the Store's secret**, so two Spaces still differ and a key an
+    /// attacker chose lands somewhere they cannot compute. One Wyhash pass, as
+    /// before: the seed is an argument the pass already took.
+    inline fn hashOf(self: *const Store, space: u32, key: []const u8) u64 {
+        return std.hash.Wyhash.hash(@as(u64, space) ^ self.seed, key);
+    }
+
+    /// The most bytes one entry may take on this Store, header included: a
+    /// quarter of a shard's ring.
+    pub fn entryLimit(self: *const Store) usize {
+        return self.shards[0].ring.len / 4;
+    }
+
+    /// Whether an entry with a key of `key_len` and a value of `value_len`
+    /// would be stored rather than refused, on this Store's shards.
+    pub fn fits(self: *const Store, key_len: usize, value_len: usize) bool {
+        return entryFits(self.shards[0].ring.len, key_len, value_len);
     }
 
     fn shardFor(self: *Store, hash: u64) *Shard {
@@ -1015,7 +1094,7 @@ pub const Store = struct {
             else => void,
         };
         const total = header + key.len + value.len;
-        const hash = std.hash.Wyhash.hash(space, key);
+        const hash = self.hashOf(space, key);
         const shard = self.shardFor(hash);
         const fp = fingerprint(hash);
 
@@ -1024,9 +1103,7 @@ pub const Store = struct {
         // to come first rather than read better lower down. A single entry big
         // enough to push out most of a shard is also a cache that holds one
         // thing.
-        if (key.len > std.math.maxInt(u16) or value.len > std.math.maxInt(u16) or
-            total > shard.ring.len / 4)
-        {
+        if (!entryFits(shard.ring.len, key.len, value.len)) {
             shard.lock.take();
             defer shard.lock.release();
             Counters.bump(&shard.stats.refused);
@@ -1216,7 +1293,7 @@ pub const Store = struct {
     /// was. `null` is every kind of not-here; `Stats` is what tells them
     /// apart.
     pub fn get(self: *Store, space: u32, key: []const u8, out: []u8) ?usize {
-        const hash = std.hash.Wyhash.hash(space, key);
+        const hash = self.hashOf(space, key);
         const shard = self.shardFor(hash);
         const fp = fingerprint(hash);
         const now = self.elapsed();
@@ -1350,7 +1427,7 @@ pub const Store = struct {
 
     /// Forget a key. True when there was something to forget.
     pub fn del(self: *Store, space: u32, key: []const u8) bool {
-        const hash = std.hash.Wyhash.hash(space, key);
+        const hash = self.hashOf(space, key);
         const shard = self.shardFor(hash);
         const fp = fingerprint(hash);
 
@@ -1460,7 +1537,7 @@ pub const Store = struct {
 const testing = std.testing;
 
 fn openTest() !Store {
-    return Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 4 });
+    return Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 4, .seed = 1 });
 }
 
 test "a value put under a key comes back under that key" {
@@ -1509,7 +1586,7 @@ test "putting the same key twice updates it rather than keeping both" {
 }
 
 test "a claim is taken by whoever was first, and an expired one is free again" {
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1, .seed = 1 });
     defer store.deinit();
 
     try testing.expectEqual(Store.Claim.stored, store.putIfAbsent(1, "job-7", "mine", 0));
@@ -1534,7 +1611,7 @@ test "a claim is taken by whoever was first, and an expired one is free again" {
 }
 
 test "an add counts from zero, keeps the expiry it found, and saturates" {
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1, .seed = 1 });
     defer store.deinit();
 
     // Nobody wrote the key: the delta is the count, and it lives ttl_s.
@@ -1566,7 +1643,7 @@ test "an add counts from zero, keeps the expiry it found, and saturates" {
 test "two threads adding one each count two — the reason this is not a get and a put" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 2 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 2, .seed = 1 });
     defer store.deinit();
 
     const Adder = struct {
@@ -1617,7 +1694,7 @@ test "a value larger than a quarter of the ring is refused rather than stored" {
 }
 
 test "the ring forgets the oldest first, and says eviction rather than miss" {
-    var store = try Store.open(testing.allocator, .{ .bytes = 64 << 10, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 64 << 10, .shards = 1, .seed = 1 });
     defer store.deinit();
 
     // Fill well past the ring, then ask for the first thing written.
@@ -1648,7 +1725,7 @@ test "a working set that moves takes the old one's place" {
     // holds its first entries indefinitely. That is harmless — nothing is
     // asking for them — but it must not survive traffic moving on, or the
     // cache would be a museum of whatever it saw first.
-    var store = try Store.open(testing.allocator, .{ .bytes = 256 << 10, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 256 << 10, .shards = 1, .seed = 1 });
     defer store.deinit();
 
     var out: [64]u8 = undefined;
@@ -1691,7 +1768,7 @@ test "an entry past its time is a miss, and the slot is freed on the way out" {
 }
 
 test "an entry that will not fit before the end starts again at the beginning" {
-    var store = try Store.open(testing.allocator, .{ .bytes = 64 << 10, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 64 << 10, .shards = 1, .seed = 1 });
     defer store.deinit();
 
     // A value that still fits, so what is being watched is the wrap and not a
@@ -1762,7 +1839,7 @@ test "a key that is read again survives a flood of keys that are not" {
     // write order alone, so a key asked for constantly died at the same moment
     // as one nobody ever asked for twice — and a flood of the second kind took
     // the whole cache with it.
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1, .seed = 1 });
     defer store.deinit();
 
     var out: [64]u8 = undefined;
@@ -1803,7 +1880,7 @@ test "a key already past the doorkeeper is not sent back through it by a refresh
     // it already holds. Writing one again used to send it back to `small`,
     // where the tenth of the ring laps ten times as fast — so a key hot enough
     // to be refreshed constantly was also the one being demoted constantly.
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1, .seed = 1 });
     defer store.deinit();
 
     var out: [64]u8 = undefined;
@@ -1830,7 +1907,7 @@ test "a key already past the doorkeeper is not sent back through it by a refresh
 test "a budget that is not a power of two is spent rather than rounded away" {
     // The shape the old layout got wrong: 12 MiB became an 8 MiB ring plus a
     // table, and four of the twelve went nowhere.
-    var store = try Store.open(testing.allocator, .{ .bytes = 12 << 20, .shards = 4 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 12 << 20, .shards = 4, .seed = 1 });
     defer store.deinit();
 
     try testing.expect(store.bytesHeld() <= 12 << 20);
@@ -1843,7 +1920,7 @@ test "the memory it holds is never more than the budget it was given" {
     // a budget that is not a power of two is the case the first version of
     // this got wrong by handing back nearly twice it.
     for ([_]usize{ 64 << 10, 100 << 10, 1 << 20, 9 << 20, 12_345_678, 64 << 20 }) |budget| {
-        var store = try Store.open(testing.allocator, .{ .bytes = budget });
+        var store = try Store.open(testing.allocator, .{ .bytes = budget, .seed = 1 });
         defer store.deinit();
         try testing.expect(store.bytesHeld() <= budget);
         // And not so far under it that the budget meant nothing: the ring is
@@ -1853,9 +1930,9 @@ test "the memory it holds is never more than the budget it was given" {
 }
 
 test "asking for more entries takes them out of the ring rather than out of the machine" {
-    var lean = try Store.open(testing.allocator, .{ .bytes = 4 << 20, .shards = 1 });
+    var lean = try Store.open(testing.allocator, .{ .bytes = 4 << 20, .shards = 1, .seed = 1 });
     defer lean.deinit();
-    var packed_in = try Store.open(testing.allocator, .{ .bytes = 4 << 20, .entries = 1 << 20, .shards = 1 });
+    var packed_in = try Store.open(testing.allocator, .{ .bytes = 4 << 20, .entries = 1 << 20, .shards = 1, .seed = 1 });
     defer packed_in.deinit();
 
     try testing.expect(packed_in.bytesHeld() <= 4 << 20);
@@ -1874,7 +1951,7 @@ test "every shard the cache allocated is one a key can reach" {
     // eight, and the four it could not were a third of the whole budget.
     for ([_]usize{ 64 << 10, 96 << 10, 128 << 10, 192 << 10, 512 << 10, 4 << 20 }) |budget| {
         for ([_]usize{ 1, 4, 16, 64, 256 }) |asked| {
-            var store = Store.open(testing.allocator, .{ .bytes = budget, .shards = asked }) catch continue;
+            var store = Store.open(testing.allocator, .{ .bytes = budget, .shards = asked, .seed = 1 }) catch continue;
             defer store.deinit();
 
             // The property itself, said directly. Everything below is the
@@ -1963,7 +2040,7 @@ test "a lookup that holds no lock never hands back a value that is not the key's
     // it, 310 million verified hits and none.
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var store = try Store.open(testing.allocator, .{ .bytes = 128 << 10, .shards = 2 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 128 << 10, .shards = 2, .seed = 1 });
     defer store.deinit();
 
     var racers: [4]Racer = undefined;
@@ -1993,7 +2070,7 @@ test "a reader clearing an expired slot never wipes the entry a writer just put 
     // fresh one into the very slot the readers are about to clear, and reads
     // it straight back. Before the compare-and-swap that read was lost
     // whenever a reader sat between its expiry check and its store.
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1, .seed = 1 });
     defer store.deinit();
 
     const Shared = struct {
@@ -2023,7 +2100,7 @@ test "a reader clearing an expired slot never wipes the entry a writer just put 
 }
 
 test "an add refused for its size is an error and never a count" {
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1, .seed = 1 });
     defer store.deinit();
 
     // A key the header cannot express, which `write` refuses before it has
@@ -2035,7 +2112,7 @@ test "an add refused for its size is an error and never a count" {
     // And an entry over a quarter of the shard's ring, with a key that is
     // itself within the header's limit.
     const wide_key = "k" ** (1 << 15);
-    var small = try Store.open(testing.allocator, .{ .bytes = 1 << 16, .shards = 1 });
+    var small = try Store.open(testing.allocator, .{ .bytes = 1 << 16, .shards = 1, .seed = 1 });
     defer small.deinit();
     try testing.expectError(error.TooLarge, small.add(u32, 1, wide_key, 1, 10));
 
@@ -2064,7 +2141,7 @@ test "a ttl as large as a u32 holds is a live entry rather than an overflow" {
 }
 
 test "a counter that is only ever incremented survives the churn that laps the doorkeeper" {
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1, .seed = 1 });
     defer store.deinit();
 
     var key: [32]u8 = undefined;
@@ -2095,7 +2172,7 @@ test "a fingerprint carries all fourteen bits whichever shard the key landed in"
     // The shard is bits 32 and up of the hash and the fingerprint used to be
     // bits 32 to 45, so at 64 shards the low six bits of every fingerprint in
     // one shard were the shard's own number, and `| 1` threw away one more.
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 64 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 64, .seed = 1 });
     defer store.deinit();
     try testing.expectEqual(@as(usize, 64), store.shardCount());
 
@@ -2105,7 +2182,7 @@ test "a fingerprint carries all fourteen bits whichever shard the key landed in"
     var buf: [16]u8 = undefined;
     for (0..1_000_000) |i| {
         const key = std.fmt.bufPrint(&buf, "key:{d}", .{i}) catch unreachable;
-        const hash = std.hash.Wyhash.hash(1, key);
+        const hash = store.hashOf(1, key);
         if (store.shardFor(hash) != &store.shards[0]) continue;
         in_shard += 1;
         const fp = Store.fingerprint(hash);
@@ -2124,7 +2201,7 @@ test "a fingerprint shares no bit with the shard or the bucket" {
     // The three consumers of one hash: the bucket reads bits 0 to 31, the
     // shard 32 up to log2(shards), the fingerprint 50 to 63. Flipping a bit
     // one of them reads must leave the others where they were.
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 64 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 64, .seed = 1 });
     defer store.deinit();
     const hash: u64 = 0x1234_5678_9abc_def0;
     for (0..50) |bit| {
@@ -2179,7 +2256,7 @@ test "a TTL near the top of the range saturates rather than wrapping to never or
 }
 
 test "a slot nothing touched for a whole wrap of the pass counter does not come back to life" {
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1, .seed = 1 });
     defer store.deinit();
     const shard = &store.shards[0];
     var out: [64]u8 = undefined;
@@ -2214,7 +2291,7 @@ test "a slot nothing touched for a whole wrap of the pass counter does not come 
 }
 
 test "a sweep spares live slots and ghosts, clears only the dead, and does not run on an ordinary lap" {
-    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1 });
+    var store = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 1, .seed = 1 });
     defer store.deinit();
     const shard = &store.shards[0];
     var out: [16]u8 = undefined;
@@ -2267,4 +2344,76 @@ test "a sweep spares live slots and ghosts, clears only the dead, and does not r
     try testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(c.load())));
     // Another region's dead slot is left for that region's own sweep.
     try testing.expectEqual(@as(u16, 9), d.load().gen);
+}
+
+/// Where `key` of space 1 lands: the shard and the bucket's offset in it, which
+/// is everything an attacker would have to predict to pile keys onto one lock.
+fn placementOf(store: *Store, key: []const u8) struct { shard: usize, bucket: u64 } {
+    const hash = store.hashOf(1, key);
+    const shard = store.shardFor(hash);
+    const bucket = shard.bucketOf(hash);
+    return .{
+        .shard = (hash >> 32) & store.shard_mask,
+        .bucket = (@intFromPtr(bucket.ptr) - @intFromPtr(shard.slots.ptr)) / @sizeOf(Slot),
+    };
+}
+
+test "two Stores with different seeds put the same keys in different places" {
+    // The old hash was a function of the Space's name and the key, so keys
+    // chosen to share a shard and a bucket on one Store shared them on every
+    // Store, and an attacker needed nothing but the public name.
+    var a = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 16, .seed = 1 });
+    defer a.deinit();
+    var b = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 16, .seed = 2 });
+    defer b.deinit();
+
+    // Precompute 64 keys that all land in shard 0, bucket 0 of store `a`, the
+    // way an attacker would for a public hash.
+    const want = 64;
+    // Under the other seed they are no longer one shard's, nor one bucket's.
+    var same_shard: usize = 0;
+    var same_bucket: usize = 0;
+    var buf: [24]u8 = undefined;
+    var i: usize = 0;
+    var n: usize = 0;
+    while (n < want) : (i += 1) {
+        const key = std.fmt.bufPrint(&buf, "victim:{d}", .{i}) catch unreachable;
+        if (placementOf(&a, key).shard != 0 or placementOf(&a, key).bucket != 0) continue;
+        n += 1;
+        const p = placementOf(&b, key);
+        if (p.shard == 0) same_shard += 1;
+        if (p.shard == 0 and p.bucket == 0) same_bucket += 1;
+    }
+    // A uniform draw leaves about 4 of 64 in shard 0 of 16; half is generous.
+    try testing.expect(same_shard < 32);
+    try testing.expect(same_bucket < 4);
+}
+
+test "a fixed seed places keys the same way on every Store" {
+    var a = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 16, .seed = 0xfeed });
+    defer a.deinit();
+    var b = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 16, .seed = 0xfeed });
+    defer b.deinit();
+    var buf: [16]u8 = undefined;
+    for (0..2000) |i| {
+        const key = std.fmt.bufPrint(&buf, "k{d}", .{i}) catch unreachable;
+        try testing.expectEqual(placementOf(&a, key), placementOf(&b, key));
+    }
+    try testing.expectEqual(@as(u64, 0xfeed), a.seed);
+}
+
+test "a Store with no seed takes its own, so two of them differ" {
+    var a = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 16 });
+    defer a.deinit();
+    var b = try Store.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 16 });
+    defer b.deinit();
+    // 2^-64 of a false failure, and a seed of zero would be the old hash.
+    try testing.expect(a.seed != b.seed);
+    try testing.expect(a.seed != 0 or b.seed != 0);
+
+    // And every operation reads the seeded hash: what is put is found.
+    try testing.expect(a.put(1, "k", "v", 0));
+    var out: [4]u8 = undefined;
+    try testing.expectEqualStrings("v", out[0..a.get(1, "k", &out).?]);
+    try testing.expect(a.del(1, "k"));
 }

@@ -809,3 +809,16 @@ here too.
 **What it decided.** The fix ships as a fix and not only as a comment correction: a miss on a full bucket no longer reads the ring for one key in thirty, and the two nanoseconds that bought are the ring reads it stopped making. The control row says the gain is on the path the change touched and nowhere else. `evicted`, the number the guide tells a reader to size the ring by, fell by a tenth, because it had been counting fingerprint collisions with dead slots as evictions. The distinct-fingerprint count behind it (256 of 16,384 in a shard before, 10,023 of about 15,600 keys after, the uniform expectation) is held by `test "a fingerprint carries all fourteen bits whichever shard the key landed in"`.
 
 **Can it be pushed further.** Not on this path: at one wasted ring read in about 2,000 misses the fingerprint is doing what fourteen bits can do, and the miss is now the bucket's one cache line and its compare. A wider fingerprint would cost the `freq` bits or a wider slot, and the slot is the axis this cache was sized on (§1).
+
+## 11. A per-Store hash seed, and nothing else
+
+**What was run.** `zig build bench-cache -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu -- 1 1` built twice, once from `cache/` at `d847af0` (`git archive`) and once from the tree that mixes `Store.seed` into the Wyhash seed (`@as(u64, space) ^ self.seed`, ADR 109), both copied out and run interleaved ten rounds on one pinned core (`taskset -c 5`), one thread, the bench's 64 MiB Store and 50,000 keys. Same machine as the rest of this file, **but loaded**: the load average was about 14 on 16 threads from other builds, so a first set of six rounds on core 2 had spreads of 3 to 5 times and is not quoted. The seed is OS entropy there, so placement differs between runs; that is part of what is measured.
+
+| | before | after | |
+|---|---|---|---|
+| `get_flat in cache`, ns/op | min 47.7, median 48.0, max 80.6 | min 47.4, median 47.9, max 76.1 | **unchanged** |
+| `get_flat`, ns/op | min 85.7, median 91.4, max 199.4 | min 83.0, median 86.8, max 165.4 | inside the spread: **unchanged** |
+
+**What it decided.** Nothing moved, which was the expectation: the seed is the argument the one hash pass already took, and the field sits beside `shard_mask`, so there is no second pass and no new line. The fix ships as written. Not measured: eight threads, a put-heavy mix, and the miss path of section 10 (the hash is the same instruction on all three, so none is expected to move).
+
+**Can it be pushed further.** There is no cost left to take out: an xor with a loaded field.

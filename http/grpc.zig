@@ -42,8 +42,9 @@
 //! is bounded by `max_body`, compressed or not, and the messages a
 //! connection holds, arriving or held by a call until its answer is
 //! written, by one `max_body` between them, past which a call waits on a
-//! window the client is held to (`Conn.budget`); a gzip message is the one
-//! case its inflated copy can pass that (ADR 220). Frames that move no call
+//! window the client is held to (`Conn.budget`); a gzip message's inflated
+//! copy is charged to it before it is allocated, and refused past what the
+//! other calls leave (ADR 220). Frames that move no call
 //! forward are counted, and a flood is sent away. A client that
 //! stops reading while an answer waits on its window is cut off at the write
 //! deadline.
@@ -904,6 +905,13 @@ const Conn = struct {
         return @max(c.app.max_body + 5, h2.default_window);
     }
 
+    /// What the connection's budget has left for `s`: the budget less what
+    /// every call but `s` holds. A call alone has all of it, which is what lets
+    /// a message of `max_body` through when nothing else is running.
+    fn budgetLeft(c: *const Conn, s: *const Stream) usize {
+        return c.budget() -| (c.collected - s.held);
+    }
+
     /// Whether this call's window may be topped up now: while the connection
     /// is under its budget, and otherwise for the oldest call still arriving,
     /// so that one call can always finish and give its bytes back. Without
@@ -1154,11 +1162,28 @@ const Conn = struct {
                 s.trailers_only = true;
                 return c.ready(s);
             }
-            message = encoded.inflate(a, message, c.app.max_body) catch |err| switch (err) {
+            // The inflated copy is charged to the budget **before** it is
+            // allocated, by the size the stream announces, and `inflate` is
+            // held to that size: so what the connection holds is what the
+            // budget counted, and a hundred calls that each inflate to
+            // `max_body` are not a hundred `max_body`s (ADR 220). Room is
+            // what the other calls hold subtracted from the budget, so a call
+            // alone on its connection always has all of it. Whatever fails
+            // from here, `letGo` gives the charge back with the rest.
+            const announced = encoded.announcedSize(message) catch
+                return c.answerNow(s, 13, "the message's gzip could not be read");
+            if (announced > c.app.max_body)
+                return c.answerNow(s, 8, "the message is larger than this server's max_body");
+            // UNAVAILABLE, not RESOURCE_EXHAUSTED: the room comes back as the
+            // other calls finish, and OTLP retries 14 with backoff where it
+            // drops an 8 that carries no RetryInfo (ADR 220).
+            if (announced > c.budgetLeft(s))
+                return c.answerNow(s, 14, "this connection's budget for messages is full: try again later or on another connection");
+            c.hold(s, announced);
+            message = encoded.inflate(a, message, announced) catch |err| switch (err) {
                 error.BodyTooLarge => return c.answerNow(s, 8, "the message is larger than this server's max_body"),
                 else => return c.answerNow(s, 13, "the message's gzip could not be read"),
             };
-            c.hold(s, message.len);
         }
         // The request text `asRequest` builds holds the message once more,
         // for as long as the call runs.
@@ -2869,4 +2894,82 @@ test "the oldest call still arriving waits while a call that started still holds
     var got = try converse(&app, &client);
     defer got.deinit();
     try testing.expect(windowUpdateAt(&got, 3) == null);
+}
+
+/// `n` bytes of `byte`, gzipped, in `out`.
+fn gzipRun(out: *std.Io.Writer.Allocating, byte: u8, n: usize) !void {
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var compress: std.compress.flate.Compress = try .init(&out.writer, &window, .gzip, .default);
+    try compress.writer.splatByteAll(byte, n);
+    try compress.finish();
+}
+
+test "calls that inflate past the connection's budget are UNAVAILABLE, and what is held stays inside it" {
+    var app = try testApp();
+    defer app.deinit();
+    app.limits.max_body = 200_000;
+    var client = try TestClient.init();
+    defer client.deinit();
+    // A client that will not read, so a call that ran keeps what it holds.
+    try h2.writeSettings(client.w(), &.{.{ .initial_window_size, 0 }});
+
+    // Six calls of a few hundred bytes of gzip, each inflating to 40,000. Each
+    // that starts holds its inflated copy and the request text built from it.
+    var zipped: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer zipped.deinit();
+    try gzipRun(&zipped, 'q', 40_000);
+    const ids = [_]u31{ 1, 3, 5, 7, 9, 11 };
+    for (ids) |id| {
+        try client.headersFor(id, "/test.Echo/Say", &.{.{ .name = "grpc-encoding", .value = "gzip" }}, false);
+        try client.message(id, zipped.written(), true);
+    }
+
+    {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var in: std.Io.Reader = .fixed(client.buf.written());
+        var conn = try steppedConn(&app, &in, &out.writer);
+        defer conn.deinit();
+        while (in.bufferedLen() > 0) try conn.readFrame();
+        // The budget is 200,005. Before the inflation was held to the room
+        // left, all six started and held about 480,000.
+        try testing.expect(conn.collected <= conn.budget() + 40_000 + zipped.written().len);
+    }
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    var refused: usize = 0;
+    for (ids) |id| {
+        const trailers = got.trailers(id) catch continue;
+        // A call that started has its answer stuck behind a window of 0.
+        const status = Answer.value(trailers, "grpc-status") orelse continue;
+        if (!std.mem.eql(u8, status, "14")) continue;
+        refused += 1;
+        try testing.expect(std.mem.indexOf(u8, Answer.value(trailers, "grpc-message").?, "budget") != null);
+    }
+    try testing.expectEqual(@as(usize, 4), refused);
+}
+
+test "a gzip message that inflates to max_body is read when nothing else is held, byte for byte" {
+    var app = try testApp();
+    defer app.deinit();
+    app.limits.max_body = 100_000;
+    var client = try TestClient.init();
+    defer client.deinit();
+
+    var zipped: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer zipped.deinit();
+    try gzipRun(&zipped, 'z', 100_000);
+    try client.headersFor(1, "/test.Echo/Say", &.{.{ .name = "grpc-encoding", .value = "gzip" }}, false);
+    try client.message(1, zipped.written(), true);
+    // The answer is larger than the window it is sent under.
+    try h2.writeWindowUpdate(client.w(), 0, 100_000);
+    try h2.writeWindowUpdate(client.w(), 1, 100_000);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    try testing.expectEqualStrings("0", Answer.value(try got.trailers(1), "grpc-status").?);
+    const body = try got.message(1);
+    try testing.expectEqual(@as(usize, 100_000), body.len);
+    for (body) |b| try testing.expectEqual(@as(u8, 'z'), b);
 }

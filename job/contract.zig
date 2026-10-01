@@ -14,14 +14,15 @@
 //!
 //! | | |
 //! |---|---|
-//! | `push(scope, kind, payload, Enqueue) !?Id` | queue one; `null` when `unique` already has a row queued or running |
+//! | `push(scope, kind, payload, Enqueue) !?Id` | queue one; `null` when `unique` already has a row queued or running; `error.EmptyUniqueKey` for a `unique` of length zero, which is a value that went missing and would fold every such push into one row |
 //! | `claim(scope, comptime kinds, now, lease_until) !?Claimed` | take the most urgent due row **of these kinds**, or one whose lease ran out, marking it running and counting the attempt. Urgency first, then how long it has been due; a kind not in the list is left where it is, for the binary that knows it (ADR 215) |
-//! | `done(scope, id, attempts) !bool` | it worked |
+//! | `done(scope, id, attempts, now) !bool` | it worked, at `now` (the clock the queue reads, so a test that moves it sees `finished_at` move with it) |
 //! | `retry(scope, id, attempts, run_at, err) !bool` | it failed and will be tried again then |
-//! | `dead(scope, id, attempts, err) !bool` | it failed for the last time |
+//! | `dead(scope, id, attempts, err, now) !bool` | it failed for the last time, at `now` |
 //! | `release(scope, id, attempts) !bool` | put it back untouched: the server is going |
 //! | `unkey(scope, id, attempts) !bool` | a running row stops holding its `unique` key and goes on running, so a successor can be queued under the same key: what a schedule with `overlap = .queue` needs (ADR 161) |
 //! | `stats(scope) !Stats` | how many are waiting, running and dead |
+//! | `retryDead(scope, id, now, comptime scheduled) !bool` | queue a dead row again from the first attempt; `error.Scheduled` when its kind is one of `scheduled`, decided on the row it would revive, changing nothing (a dead tick's successor is already queued, so reviving it would run the kind on two chains) |
 //!
 //! **The four calls about a held row are fenced on the claim.** `attempts` is
 //! the number `claim` returned in `Claimed`, and a call changes the row only
@@ -59,7 +60,13 @@ pub const State = enum {
 pub const Enqueue = struct {
     /// When it may first run, in microseconds since the epoch.
     run_at: i64,
+    /// When it is being pushed, in the same unit and the clock the queue
+    /// reads, for `created_at`. Null reads the wall clock: a caller that
+    /// drives a store directly need not say, and a `Jobs` always does.
+    now: ?i64 = null,
     /// A key that at most one queued-or-running row of this kind may carry.
+    /// Never empty: an empty key is a missing value formatted into one, and
+    /// every such push would collapse into the first.
     unique: ?[]const u8 = null,
     /// Which due row a free worker takes first.
     priority: Priority = .normal,

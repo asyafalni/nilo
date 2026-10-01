@@ -1589,6 +1589,10 @@ const job_refusals = [_]Refusal{
         .says = "the schedule \"0 0 31 2 *\" never fires, because no month it names has a day it names.",
     },
     .{
+        .name = "job_push_empty_unique",
+        .says = "`jobs.push` was given an empty `.unique`, and a key that is empty is a value that went missing.",
+    },
+    .{
         .name = "job_push_in_on_memory",
         .says = "`jobs.pushIn` was called on a queue over Memory, which cannot join a transaction.",
     },

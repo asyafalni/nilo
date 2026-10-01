@@ -48,12 +48,21 @@ pub const Source = union(enum) {
     /// `gpa` and freed itself all work, and the Store never frees what it did
     /// not allocate.
     ///
-    /// **It runs with no deadline of the Store's**, so a function that does
-    /// I/O bounds that I/O itself. One fiber at a time is inside it. While
-    /// the credentials in hand have not expired, a failure (an error return)
-    /// costs no request anything: it is logged at `warn`, the old key keeps
+    /// **It runs under a deadline of the Store's**, `Options.fetch_timeout_ms`,
+    /// armed the way `nilo_fetch` arms a call's: the function runs as a task
+    /// of the `Io` and the task is cancelled when the time is up. Cancelling
+    /// is cooperative, so it lands at the function's next `Io` call. Every
+    /// real credential source makes one, since it does network I/O through
+    /// the `Io` it was handed, and a function that does none (or that spins
+    /// without asking the `Io` for anything) is not interrupted and holds the
+    /// refresh gate until it returns. Pass the `io` you are given to whatever
+    /// you call, and return what it returns, `error.Canceled` included. One
+    /// fiber at a time is inside it. A timeout is a failure like any other
+    /// (an error return): while the credentials in hand have not expired it
+    /// costs no request anything, it is logged at `warn`, the old key keeps
     /// signing, and the next attempt is `retry_after_s` later. Once they have
-    /// expired, the error fails the requests that wait on it (ADR 060).
+    /// expired, the error (`error.CredentialsTimedOut` for a timeout) fails
+    /// the requests that wait on it (ADR 060).
     fetch: *const fn (gpa: std.mem.Allocator, io: std.Io) anyerror!Credentials,
 };
 
@@ -84,8 +93,31 @@ pub const Options = struct {
     /// holds 59,151 bytes of TLS and socket buffers, so this number times that
     /// is what the store may cost.
     max_in_flight: u32 = 32,
-    /// How long one call may take, end to end.
+    /// How long one call may take, end to end. **`get`, `head`, `list`,
+    /// `put` and `delete` only**: the two streaming calls have no whole-call
+    /// limit unless the caller sets one (`Reading.timeout_ms`, a streamed
+    /// put's `timeout_ms`), because a transfer may honestly take an hour
+    /// (ADR 060).
     timeout_ms: u32 = 30_000,
+    /// How long a streaming call (`stream`, `putStream`) may go with no
+    /// bytes moving, in either direction, before it is `TimedOut`. The bound
+    /// that stands where `timeout_ms` does not: a slow transfer that keeps
+    /// moving is fine, one whose peer went quiet is not. Zero is no bound.
+    stall_ms: u32 = 30_000,
+    /// How many streaming calls may be open at once, out of `max_in_flight`.
+    /// A `Reading` holds its permit for as long as the handler is sending
+    /// the object to a browser, so without a ceiling of their own a few
+    /// slow viewers hold every permit and `get`, `head` and `list` queue
+    /// behind them. Short calls always keep at least
+    /// `max_in_flight - max_streams` permits. Zero, the default, is half of
+    /// `max_in_flight` (at least one); more than `max_in_flight` is refused
+    /// at `open` (ADR 060).
+    max_streams: u32 = 0,
+    /// How long `Source.fetch` may take, or zero for no limit. A credential
+    /// call that hangs would otherwise hold the refresh gate until it
+    /// returned, and every request would wait on it once the credentials in
+    /// hand expired (ADR 060).
+    fetch_timeout_ms: u32 = 10_000,
     /// How much of an unread body is worth reading to keep a connection.
     max_drain: usize = 64 << 10,
     /// How long before expiry a refresh happens. Five minutes, so that the
@@ -121,12 +153,21 @@ pub const OpenError = error{
     /// Refused here, by name, because the alternative is a 403 on every
     /// request, each of them taking the write lock to refresh nothing.
     BadCredentials,
+    /// `max_streams` is more than `max_in_flight`: the streams are a share of
+    /// the permits, not a second set.
+    BadStreams,
     OutOfMemory,
 };
 
 pub const Store = struct {
     gpa: std.mem.Allocator,
     client: fetch.Client,
+    /// How many streaming calls may be open, a ceiling inside `client`'s
+    /// permits. A stream takes one of these before it takes a permit and
+    /// gives it back after, so what is left for short calls is
+    /// `max_in_flight - max_streams` at least.
+    streams: std.Io.Semaphore,
+    limits: core.Limits = .none,
     source: Source,
     options: Options,
 
@@ -183,6 +224,7 @@ pub const Store = struct {
         const public: ?Endpoint = if (options.public_endpoint) |e| try parseEndpoint(e) else null;
         if (options.region.len == 0 or options.region.len > 64) return error.BadRegion;
         if (!plainText(options.region)) return error.BadRegion;
+        if (options.max_streams > options.max_in_flight) return error.BadStreams;
         const kept_creds = try ownStatic(gpa, options.credentials);
         errdefer wipeAndFree(gpa, kept_creds.owned);
 
@@ -207,9 +249,13 @@ pub const Store = struct {
         // Read once, above; not held past `open`, so a literal at the call
         // site is fine the way `endpoint` is.
         kept.public_endpoint = null;
+        // Half of the permits unless said, and never none: a Store that could
+        // open no stream would wait for one forever.
+        if (kept.max_streams == 0) kept.max_streams = @max(1, options.max_in_flight / 2);
 
         return .{
             .gpa = gpa,
+            .streams = .{ .permits = kept.max_streams },
             .client = .init(gpa, .{
                 .max_in_flight = options.max_in_flight,
                 .timeout_ms = options.timeout_ms,
@@ -252,10 +298,27 @@ pub const Store = struct {
     pub fn nilo_start(self: *Store, io: std.Io, limits: core.Limits) !void {
         if (self.started) return;
         try self.client.nilo_start(io, limits);
+        self.limits = limits;
         self.started = true;
         // The first fetch, so that a credential source that is misconfigured
         // fails the server's startup rather than its first request.
         try self.refresh(io, @divFloor(core.nowMillis(), 1000));
+    }
+
+    /// Take one of the stream slots, before the permit a call takes at the
+    /// gate. Waits like the permit does: a park the watchdog is told about
+    /// (ADR 210), ended by the fiber's cancellation (the Engine's deadline, a
+    /// shutdown) and by nothing of its own, which is the bound `nilo_fetch`
+    /// puts on the queue for a permit too.
+    pub fn takeStream(self: *Store) std.Io.Cancelable!void {
+        const w = self.limits.waiting();
+        defer self.limits.waited(w);
+        try self.streams.wait(self.client.inner.io);
+    }
+
+    /// Give a stream slot back, after the permit.
+    pub fn giveStream(self: *Store) void {
+        self.streams.post(self.client.inner.io);
     }
 
     /// What the health route asks
@@ -418,7 +481,7 @@ pub const Store = struct {
         var failed = false;
         if (due) switch (self.source) {
             .static => unreachable,
-            .fetch => |take| fresh = take(self.gpa, io) catch |err| fail: {
+            .fetch => |take| fresh = self.fetchBounded(take, io) catch |err| fail: {
                 if (err == error.Canceled) return err;
                 // Safe to read without the lock: only the gate's holder
                 // writes, and that is this call. Asked of the credentials
@@ -446,6 +509,71 @@ pub const Store = struct {
 
         var stamp: sign.Stamp = .at(now_s);
         try self.deriveLocked(stamp.date());
+    }
+
+    /// `take` under `fetch_timeout_ms`, or just `take` when that is zero.
+    ///
+    /// The shape of `job`'s `callTask` and of `nilo_fetch`'s bounded step
+    /// (ADR 056), written out here because a Service may not import either:
+    /// the call runs as a task of the `Io`, this fiber waits on a word the
+    /// task sets with the deadline as the wait's timeout, and past it the
+    /// task is cancelled. `Future.cancel` returns only once the task has come
+    /// out, so nothing is still inside `take` when this returns. A task that
+    /// finished a moment after the deadline and got a set of credentials out
+    /// is believed rather than thrown away.
+    ///
+    /// A cancellation of *this* fiber, the shutdown, comes back through the
+    /// wait, is passed to the task, and is put back with `recancel` so the
+    /// next `Io` call still sees it. A single-threaded `Io` cannot start the
+    /// task and runs `take` unbounded, as it always did.
+    ///
+    /// **What it costs**: one `io.concurrent` per fetch, which is one per
+    /// credential lifetime (an hour for STS), on the request that pays for
+    /// the refresh. Nothing on a request that signs with the key in hand, so
+    /// none of ADR 017's four axes moves.
+    fn fetchBounded(self: *Store, take: *const fn (std.mem.Allocator, std.Io) anyerror!Credentials, io: std.Io) anyerror!Credentials {
+        const timeout_ms = self.options.fetch_timeout_ms;
+        if (timeout_ms == 0) return take(self.gpa, io);
+
+        const Task = struct {
+            fn run(
+                f: *const fn (std.mem.Allocator, std.Io) anyerror!Credentials,
+                gpa: std.mem.Allocator,
+                on: std.Io,
+                done: *std.atomic.Value(u32),
+            ) anyerror!Credentials {
+                defer {
+                    done.store(1, .release);
+                    on.futexWake(u32, &done.raw, 1);
+                }
+                return f(gpa, on);
+            }
+        };
+        var done: std.atomic.Value(u32) = .init(0);
+        var future = io.concurrent(Task.run, .{ take, self.gpa, io, &done }) catch
+            return take(self.gpa, io);
+        const deadline = core.monotonicMicros() + @as(i64, timeout_ms) * std.time.us_per_ms;
+        const w = self.limits.waiting();
+        defer self.limits.waited(w);
+        while (done.load(.acquire) == 0) {
+            const left = deadline - core.monotonicMicros();
+            if (left <= 0) {
+                // Whatever the task came back with after being cancelled is
+                // the deadline's doing, unless it came back with credentials.
+                return future.cancel(io) catch error.CredentialsTimedOut;
+            }
+            io.futexWaitTimeout(u32, &done.raw, 0, .{ .duration = .{
+                .raw = .fromMicroseconds(left),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Canceled => {
+                    const answer = future.cancel(io);
+                    io.recancel();
+                    return answer;
+                },
+            };
+        }
+        return future.await(io);
     }
 
     /// Copy a set of credentials in, and let go of the ones they replace.
@@ -718,16 +846,22 @@ const Script = struct {
     /// The clock the fetched credentials count their life from.
     var now_s: i64 = 0;
     var life_s: i64 = 3600;
+    /// How long `take` sleeps on the `Io` before answering, which is how a
+    /// hung credential service looks from here: a call that makes `Io` calls
+    /// and does not come back.
+    var sleep_ms: u32 = 0;
 
     fn reset(now: i64, life: i64) void {
         calls = 0;
+        sleep_ms = 0;
         fail = false;
         now_s = now;
         life_s = life;
     }
 
-    fn take(_: std.mem.Allocator, _: std.Io) anyerror!Credentials {
+    fn take(_: std.mem.Allocator, io: std.Io) anyerror!Credentials {
         calls += 1;
+        if (sleep_ms != 0) try std.Io.sleep(io, .fromMilliseconds(sleep_ms), .awake);
         if (fail) return error.CredentialServiceDown;
         return .{
             // Strings the Store must copy: these die with the call.
@@ -739,9 +873,14 @@ const Script = struct {
 };
 
 fn fetching(gpa: std.mem.Allocator) !Store {
+    return fetchingWithin(gpa, 10_000);
+}
+
+fn fetchingWithin(gpa: std.mem.Allocator, fetch_timeout_ms: u32) !Store {
     return Store.open(gpa, .{
         .endpoint = "http://127.0.0.1:9000",
         .credentials = .{ .fetch = Script.take },
+        .fetch_timeout_ms = fetch_timeout_ms,
     });
 }
 
@@ -832,6 +971,85 @@ test "a failed fetch after the credentials expired fails the request" {
     Script.fail = false;
     Script.now_s = t0 + 3602;
     _ = try keyAt(&store, io, t0 + 3602);
+}
+
+/// Milliseconds since `since`, on Core's monotonic clock.
+fn elapsedMs(since: i64) i64 {
+    return @divTrunc(core.monotonicMicros() - since, std.time.us_per_ms);
+}
+
+test "a credential fetch that hangs fails the request that needs it, within the Store's deadline" {
+    testing.log_level = .err;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    Script.reset(t0, 3600);
+    // Long enough that a Store with no deadline would sit here for the whole
+    // of it, short enough that the test is bounded when it does.
+    Script.sleep_ms = 3_000;
+
+    var store = try fetchingWithin(testing.allocator, 50);
+    defer store.deinit();
+
+    const began = core.monotonicMicros();
+    try testing.expectError(error.CredentialsTimedOut, keyAt(&store, io, t0));
+    try testing.expect(elapsedMs(began) < 1_500);
+
+    // The gate was let go: the service coming back is noticed at once.
+    Script.sleep_ms = 0;
+    const back = try keyAt(&store, io, t0 + 1);
+    try testing.expectEqualStrings("AKIDEVEN", back.keyed.akid());
+}
+
+test "a credential fetch that hangs does not hold up a request that can sign with the key in hand" {
+    testing.log_level = .err;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    Script.reset(t0, 3600);
+
+    var store = try fetchingWithin(testing.allocator, 50);
+    defer store.deinit();
+    _ = try keyAt(&store, io, t0);
+
+    Script.sleep_ms = 3_000;
+    const began = core.monotonicMicros();
+    // 200 s left, inside the margin: the refresh is due and hangs.
+    const signed = try keyAt(&store, io, t0 + 3400);
+    try testing.expectEqualStrings("AKIDODD", signed.keyed.akid());
+    try testing.expect(elapsedMs(began) < 1_500);
+    try testing.expectEqual(@as(usize, 2), Script.calls);
+
+    // It counts as a failed fetch: nobody asks again before `retry_after_s`.
+    _ = try keyAt(&store, io, t0 + 3401);
+    try testing.expectEqual(@as(usize, 2), Script.calls);
+}
+
+test "an option that cannot work is refused at open" {
+    try testing.expectError(error.BadStreams, Store.open(testing.allocator, .{
+        .endpoint = "https://s3.example.com",
+        .max_in_flight = 4,
+        .max_streams = 5,
+        .credentials = .{ .static = .{ .access_key_id = "A", .secret_access_key = "B" } },
+    }));
+
+    // Left alone it is half of the permits, and one at the least.
+    var half = try Store.open(testing.allocator, .{
+        .endpoint = "https://s3.example.com",
+        .max_in_flight = 32,
+        .credentials = .{ .static = .{ .access_key_id = "A", .secret_access_key = "B" } },
+    });
+    defer half.deinit();
+    try testing.expectEqual(@as(u32, 16), half.options.max_streams);
+    try testing.expectEqual(@as(usize, 16), half.streams.permits);
+
+    var one = try Store.open(testing.allocator, .{
+        .endpoint = "https://s3.example.com",
+        .max_in_flight = 1,
+        .credentials = .{ .static = .{ .access_key_id = "A", .secret_access_key = "B" } },
+    });
+    defer one.deinit();
+    try testing.expectEqual(@as(u32, 1), one.options.max_streams);
 }
 
 test "credentials that live less than the margin are not fetched on every request" {

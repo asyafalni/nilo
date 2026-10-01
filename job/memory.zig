@@ -18,6 +18,7 @@
 //! are two queues, and a schedule declared in both runs twice.
 
 const std = @import("std");
+const core = @import("nilo_core");
 const contract = @import("contract.zig");
 
 pub const Memory = struct {
@@ -45,6 +46,11 @@ pub const Memory = struct {
         PayloadTooLarge,
         /// The unique key is longer than `contract.max_unique`.
         UniqueTooLong,
+        /// The unique key is empty: a value that went missing, which would
+        /// fold every such push into one row. `job.Table` refuses it too.
+        EmptyUniqueKey,
+        /// `retryDead` was asked for a row of a scheduled kind.
+        Scheduled,
         OutOfMemory,
     };
 
@@ -78,7 +84,10 @@ pub const Memory = struct {
     pub fn push(self: *Memory, scope: anytype, kind: []const u8, payload: []const u8, at: contract.Enqueue) Error!?contract.Id {
         _ = scope;
         if (payload.len > self.max_payload) return error.PayloadTooLarge;
-        if (at.unique) |u| if (u.len > contract.max_unique) return error.UniqueTooLong;
+        if (at.unique) |u| {
+            if (u.len == 0) return error.EmptyUniqueKey;
+            if (u.len > contract.max_unique) return error.UniqueTooLong;
+        }
         std.debug.assert(kind.len <= contract.max_kind);
 
         self.lock.take();
@@ -102,7 +111,7 @@ pub const Memory = struct {
             .state = .queued,
             .id = self.next_id,
             .run_at = at.run_at,
-            .created_at = at.run_at,
+            .created_at = at.now orelse core.nowMicros(),
             .priority = at.priority,
         };
         self.next_id += 1;
@@ -183,8 +192,9 @@ pub const Memory = struct {
     /// requeue or kill what a second worker now holds. `false` says it did
     /// nothing, and the same holds for `retry`, `dead` and `release`
     /// (ADR 160, `contract.zig`).
-    pub fn done(self: *Memory, scope: anytype, id: contract.Id, attempts: u32) !bool {
+    pub fn done(self: *Memory, scope: anytype, id: contract.Id, attempts: u32, now: i64) !bool {
         _ = scope;
+        _ = now; // a finished row is not kept, so there is no `finished_at` to write
         self.lock.take();
         defer self.lock.release();
         const s = self.held(id, attempts) orelse return false;
@@ -204,8 +214,9 @@ pub const Memory = struct {
         return true;
     }
 
-    pub fn dead(self: *Memory, scope: anytype, id: contract.Id, attempts: u32, err: []const u8) !bool {
+    pub fn dead(self: *Memory, scope: anytype, id: contract.Id, attempts: u32, err: []const u8, now: i64) !bool {
         _ = scope;
+        _ = now; // a dead row keeps no `finished_at` here; `job.Table` does
         self.lock.take();
         defer self.lock.release();
         const s = self.held(id, attempts) orelse return false;
@@ -303,13 +314,23 @@ pub const Memory = struct {
     }
 
     /// Queue a dead row again, from the first attempt. `false` when no dead
-    /// row has that id.
-    pub fn retryDead(self: *Memory, scope: anytype, id: contract.Id, now: i64) !bool {
+    /// row has that id, and `error.Scheduled` when the row's kind is one of
+    /// `scheduled_kinds`: a dead tick's successor is already queued, so
+    /// reviving it would run the kind on two chains. The kind is read under
+    /// the same lock that revives the row. **Call `Jobs.retryDead`, which
+    /// knows the kinds**; a caller driving this directly passes them.
+    ///
+    /// The revived row has no unique key: it was cleared when the row died
+    /// (ADR 160).
+    pub fn retryDead(self: *Memory, scope: anytype, id: contract.Id, now: i64, comptime scheduled_kinds: []const []const u8) !bool {
         _ = scope;
         self.lock.take();
         defer self.lock.release();
         const s = self.find(id) orelse return false;
         if (s.state != .dead) return false;
+        inline for (scheduled_kinds) |k| {
+            if (s.kindIs(k)) return error.Scheduled;
+        }
         s.state = .queued;
         s.run_at = now;
         s.attempts = 0;
@@ -414,7 +435,6 @@ pub const Memory = struct {
 // -- tests ---------------------------------------------------------------
 
 const testing = std.testing;
-const core = @import("nilo_core");
 
 /// The kinds the tests below push, so a claim in a test sees all of them.
 /// A worker passes its own `kind_names`.
@@ -467,8 +487,8 @@ test "a pushed row is claimed once, in run_at order, and not before it is due" {
     const second = (try store.claim(&run, test_kinds, 250, 1_000)).?;
     try testing.expectEqual(later.?, second.id);
 
-    _ = try store.done(&run, first.id, first.attempts);
-    _ = try store.done(&run, second.id, second.attempts);
+    _ = try store.done(&run, first.id, first.attempts, 0);
+    _ = try store.done(&run, second.id, second.attempts, 0);
     const s = try store.stats(&run);
     try testing.expectEqual(@as(u64, 0), s.queued + s.running + s.dead);
 }
@@ -503,7 +523,7 @@ test "a unique key admits one queued row and another once it is done" {
     const claimed = (try store.claim(&run, test_kinds, 1, 100)).?;
     // Still held while running.
     try testing.expect((try store.push(&run, "digest", "{}", .{ .run_at = 0, .unique = "u42" })) == null);
-    _ = try store.done(&run, claimed.id, claimed.attempts);
+    _ = try store.done(&run, claimed.id, claimed.attempts, 0);
     try testing.expect((try store.push(&run, "digest", "{}", .{ .run_at = 0, .unique = "u42" })) != null);
 }
 
@@ -535,15 +555,15 @@ test "retry, dead and retryDead move a row through its states" {
     const again = (try store.claim(&run, test_kinds, 500, 600)).?;
     try testing.expectEqual(@as(u32, 2), again.attempts);
 
-    try testing.expect(try store.dead(&run, id, again.attempts, "StillBoom"));
+    try testing.expect(try store.dead(&run, id, again.attempts, "StillBoom", 0));
     try testing.expectEqual(@as(u64, 1), (try store.stats(&run)).dead);
     const listed = try store.deadOnes(&run);
     try testing.expectEqual(@as(usize, 1), listed.len);
     try testing.expectEqualStrings("StillBoom", listed[0].err);
     try testing.expectEqualStrings("a", listed[0].kind);
 
-    try testing.expect(try store.retryDead(&run, id, 700));
-    try testing.expect(!(try store.retryDead(&run, id, 700)));
+    try testing.expect(try store.retryDead(&run, id, 700, &.{}));
+    try testing.expect(!(try store.retryDead(&run, id, 700, &.{})));
     const third = (try store.claim(&run, test_kinds, 700, 800)).?;
     try testing.expectEqual(@as(u32, 1), third.attempts);
 }
@@ -564,7 +584,7 @@ test "cancel takes a queued row out, and leaves one that is running or finished"
 
     const running = (try store.claim(&run, test_kinds, 1, 100)).?;
     try testing.expect(!(try store.cancel(&run, later)));
-    _ = try store.done(&run, later, running.attempts);
+    _ = try store.done(&run, later, running.attempts, 0);
     try testing.expect(!(try store.cancel(&run, later)));
     try testing.expect(!(try store.cancel(&run, 999)));
 }
@@ -601,7 +621,7 @@ test "a high-priority row goes first, and among equals the one due longest" {
     for (order) |want| {
         const c = (try store.claim(&run, test_kinds, 100, 1000)).?;
         try testing.expectEqualStrings(want, c.kind);
-        _ = try store.done(&run, c.id, c.attempts);
+        _ = try store.done(&run, c.id, c.attempts, 0);
     }
     try testing.expect((try store.claim(&run, test_kinds, 100, 1000)) == null);
 }
@@ -635,9 +655,9 @@ test "a worker whose lease lapsed cannot finish, requeue, kill or release the ro
 
     // The first worker's late answers, every one of them, do nothing.
     try testing.expect(!(try store.retry(&run, w1.id, w1.attempts, 0, "Late")));
-    try testing.expect(!(try store.dead(&run, w1.id, w1.attempts, "Late")));
+    try testing.expect(!(try store.dead(&run, w1.id, w1.attempts, "Late", 0)));
     try testing.expect(!(try store.release(&run, w1.id, w1.attempts)));
-    try testing.expect(!(try store.done(&run, w1.id, w1.attempts)));
+    try testing.expect(!(try store.done(&run, w1.id, w1.attempts, 0)));
 
     // The second worker still owns it: running, not claimable by a third,
     // and the unique key still held.
@@ -647,7 +667,7 @@ test "a worker whose lease lapsed cannot finish, requeue, kill or release the ro
     try testing.expect((try store.push(&run, "a", "{}", .{ .run_at = 0, .unique = "k" })) == null);
 
     // And its own answer lands.
-    try testing.expect(try store.done(&run, w2.id, w2.attempts));
+    try testing.expect(try store.done(&run, w2.id, w2.attempts, 0));
     try testing.expectEqual(@as(u64, 0), (try store.stats(&run)).running);
 }
 
@@ -701,7 +721,7 @@ test "deadOnes that cannot allocate changes nothing and gives the lock back" {
 
     const id = (try store.push(&run, "a", "{}", .{ .run_at = 0 })).?;
     const claimed = (try store.claim(&run, test_kinds, 1, 100)).?;
-    try testing.expect(try store.dead(&run, id, claimed.attempts, "Boom"));
+    try testing.expect(try store.dead(&run, id, claimed.attempts, "Boom", 0));
 
     var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
     var starved: core.Run = .init(failing.allocator());
@@ -711,4 +731,35 @@ test "deadOnes that cannot allocate changes nothing and gives the lock back" {
     const listed = try store.deadOnes(&run);
     try testing.expectEqual(@as(usize, 1), listed.len);
     try testing.expectEqualStrings("Boom", listed[0].err);
+}
+
+test "retryDead refuses a kind it is told is scheduled, and revives any other" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    const tick = (try store.push(&run, "tick", "{}", .{ .run_at = 0 })).?;
+    const plain = (try store.push(&run, "a", "{}", .{ .run_at = 0 })).?;
+    const c1 = (try store.claim(&run, &.{ "tick", "a" }, 1, 100)).?;
+    const c2 = (try store.claim(&run, &.{ "tick", "a" }, 1, 100)).?;
+    try testing.expect(try store.dead(&run, c1.id, c1.attempts, "Boom", 2));
+    try testing.expect(try store.dead(&run, c2.id, c2.attempts, "Boom", 2));
+
+    try testing.expectError(error.Scheduled, store.retryDead(&run, tick, 700, &.{"tick"}));
+    try testing.expectEqual(@as(u64, 2), (try store.stats(&run)).dead);
+    try testing.expect(try store.retryDead(&run, plain, 700, &.{"tick"}));
+    try testing.expectEqual(@as(u64, 1), (try store.stats(&run)).dead);
+}
+
+test "an empty unique key is refused, and created_at is the push time" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    try testing.expectError(error.EmptyUniqueKey, store.push(&run, "a", "{}", .{ .run_at = 0, .unique = "" }));
+    try testing.expectEqual(@as(u64, 0), (try store.stats(&run)).queued);
+    const id = (try store.push(&run, "a", "{}", .{ .run_at = 900, .now = 5 })).?;
+    try testing.expectEqual(@as(i64, 5), store.find(id).?.created_at);
 }

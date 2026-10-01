@@ -369,7 +369,7 @@ pub fn run(self: Import, scope: *nilo.Run, tick: job.Tick, db: *Db, jobs: *Jobs)
 
 The number starts over with every attempt and is kept when the row is `done`, so the last poll reads "done, 4,000 rows". Each call is a `get` and a `put` on the Space and does not touch the table, so a run can report after every batch instead of every thousand.
 
-**Dead jobs** are listed newest first with the error's name, and `retryDead` puts one back at attempt one. An operator's routes:
+**Dead jobs** are listed newest first with the error's name, and `retryDead` puts one back at attempt one. It refuses a row of a scheduled kind with `error.Scheduled`, because that tick's successor is already queued, and the revived row has no unique key: a newer row pushed under the same key can run beside it. An operator's routes:
 
 <!-- compiles -->
 ```zig

@@ -77,7 +77,7 @@ What a `run` that asks for one receives:
 | `Jobs.open(gpa, &store, deps, settings)` | the queue. Use `openWith(…, space)` when `.status` names a Space. When `.deps` names `*Jobs`, open it once it has an address: `var jobs: Jobs = undefined; jobs = .open(…, .{ .jobs = &jobs, … }, .{})` |
 | `Jobs.Deps` | the struct of pointers `open` takes: `.deps` as written, or what `.deps(Jobs)` returned |
 | `Jobs.Row` | the store's table, for `createMissing` and `db.checking`; `void` for `job.Memory` |
-| `jobs.push(c, value, opts)` | `!Id`, or `!?Id` when `opts` has `.unique`: null when a row already has the key |
+| `jobs.push(c, value, opts)` | `!Id`, or `!?Id` when `opts` has `.unique`: null when a row already has the key. A `.unique` that is empty is `error.EmptyUniqueKey` on both stores, and a Refusal when it is written as `""` |
 | `jobs.pushIn(&tx, c, value, opts)` | the same inside a transaction you hold. A Refusal on `job.Memory`, and with `.within`. It wakes no worker, because the row does not exist until the commit, so call `wake` after committing. It notes nothing in the `status` Space either, because the Space cannot roll back with the transaction: a row pushed here has no status until a worker takes it |
 | `jobs.wake()` | wakes every idle worker, for a row nilo did not see arrive: another process's, or one `pushIn` wrote in a transaction that has since committed. A `push` wakes one worker by itself ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
 | `jobs.stats(c)` | `Stats`: `queued`, `running`, `dead` |
@@ -85,7 +85,7 @@ What a `run` that asks for one receives:
 | `jobs.progress(id, n)` | writes `n` into the Space's `progress` for the row, from inside a `run` that has a `job.Tick` and a `*Jobs`. Reset by every change of state except `done`, which keeps it. Does nothing without a Space ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
 | `jobs.cancel(c, id)` | `bool`: deletes a `queued` row before it runs, along with its `unique` key; `false` when the row is running, finished or absent. It is one statement, so a claim at the same instant either wins or loses completely. A Refusal on a store with no `cancel` ([ADR 160](../adr/160-a-queue-is-a-table-in-the-database-you-already-have.md)) |
 | `jobs.deadOnes(c)` | `[]Dead`: `id`, `kind`, `attempts`, `err`, newest first |
-| `jobs.retryDead(c, id)` | `bool`: queued again from attempt one |
+| `jobs.retryDead(c, id)` | `bool`: queued again from attempt one; `false` when there is no dead row with that id. **`error.Scheduled` when the row is of a kind with a `schedule`**, and nothing changes: its successor tick is already queued, so reviving it would run the kind on two chains for good. **The revived row runs without its unique key**, which was cleared when it died, so a newer row pushed under the same key can run beside it; a caller who needs the guarantee checks before reviving ([`decided.md`](../decided.md)). A store called directly takes the scheduled kinds as a fourth argument, which `jobs.retryDead` fills in |
 | `Jobs.serve(&jobs)` | the worker loop, for `app.spawn`. Stops with the server |
 | `jobs.serveOn(io)` | the same on an `Io` of your own, for a worker process. Returns when cancelled |
 | `jobs.drain(&run)` / `jobs.runOne(&run)` | runs what is due on this thread, for a test, against one reading of the clock. A `*Ctx` is refused |
@@ -101,7 +101,7 @@ What a `run` that asks for one receives:
 |---|---|
 | `after_ms` | no sooner than this many milliseconds from now |
 | `at` | no sooner than this moment, in microseconds since the epoch. Not together with `after_ms` |
-| `unique` | at most one queued or running row of this kind has the key. A unique index, freed when the row finishes |
+| `unique` | at most one queued or running row of this kind has the key. A unique index, freed when the row finishes. Never empty: an empty key is a value that went missing, and every such push would fold into the first |
 | `within` | a `cache.Space` of `job.Mark` checked before `unique`: a second push within the Space's TTL never reaches the table. Needs `unique`, and a type with a `del`: a push the store refuses deletes the key again |
 
 ### `job.Settings`

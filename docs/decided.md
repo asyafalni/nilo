@@ -26,6 +26,10 @@ A gap that is the rule. Each was looked at, priced, and kept as it is, and the e
 
 **Reopened by:** somebody who would rather have a `keep_done_s` setting than a three-line job.
 
+**A revived dead row runs without its unique key.** `retryDead` clears nothing and restores nothing: the key was set to NULL when the row died (so the index could take the next push), and putting it back would need a column on `nilo_jobs` to keep it in, which is a migration for every `Table` user for a rare, manual operation. So a row pushed under the same key after the first one died can run beside the revived one. A caller who needs at most one checks before reviving, with `deadOnes` and a look at what is queued. A scheduled kind is the case that did break something, a second chain of ticks, and `retryDead` refuses it with `error.Scheduled`.
+
+**Reopened by:** a caller whose dead rows carry a key that matters and who revives them often enough that checking by hand is the cost, or a migration that is happening to `nilo_jobs` anyway.
+
 ### `nilo_http`
 
 **A `print` or `json` message bigger than the write buffer is still unchecked.** [ADR 076](./adr/076-a-frame-that-lies-about-its-length-is-not-sent.md) holds the two passes to each other by reading `Writer.end`, which is exact only while nothing drains. Past the write buffer a drain moves it and there is nothing left to compare against, so a large formatted message can still put a length on the wire that its bytes do not match.

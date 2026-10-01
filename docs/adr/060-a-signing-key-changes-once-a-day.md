@@ -63,7 +63,7 @@ this design needs none. The unlucky request pays the fetch; everything
 concurrent with it keeps using the old key, which is still valid, because the
 margin is why the refresh happens early.
 
-**How that holds, in the code.** One fiber refreshes at a time, through a `std.Io.Mutex` gate of its own, and the user's `fetch` runs under the gate and outside the `RwLock`: the lock is taken exclusively only to install what came back. A fiber that finds the gate taken while the credentials have not expired signs with the old key rather than waiting on somebody else's I/O. A fetch that fails while they have not expired logs once at `warn` and is not tried again for `retry_after_s` (five seconds); only past `expires_at` does a failed fetch fail the request. The margin is `refresh_margin_s` or half the life the credentials arrived with, whichever is less, so credentials that live less than the margin are refreshed at half their life rather than on every request. `fetch`'s strings only have to outlive the call: the Store copies them and frees nothing of the caller's. The Store cannot bound a function it did not write, so `fetch` bounds its own I/O.
+**How that holds, in the code.** One fiber refreshes at a time, through a `std.Io.Mutex` gate of its own, and the user's `fetch` runs under the gate and outside the `RwLock`: the lock is taken exclusively only to install what came back. A fiber that finds the gate taken while the credentials have not expired signs with the old key rather than waiting on somebody else's I/O. A fetch that fails while they have not expired logs once at `warn` and is not tried again for `retry_after_s` (five seconds); only past `expires_at` does a failed fetch fail the request. The margin is `refresh_margin_s` or half the life the credentials arrived with, whichever is less, so credentials that live less than the margin are refreshed at half their life rather than on every request. `fetch`'s strings only have to outlive the call: the Store copies them and frees nothing of the caller's. The Store arms a deadline around `fetch`, `fetch_timeout_ms` (ten seconds, zero for none): the function runs as a task of the `Io`, this fiber waits on a flag the task sets, and past the deadline the task is cancelled (the shape of `callTask` in `job/job.zig`, written again here because a Service imports no sibling). A timeout is a failed fetch like any other: while the credentials in hand are alive it logs at `warn`, signing goes on with the old key and the next try is `retry_after_s` later; past `expires_at` the requests that wait get `error.CredentialsTimedOut` (a `Bucket` call answers `TimedOut`). **Cancellation is cooperative**: it lands at the function's next `Io` call, which every real source makes because it does network I/O through the `Io` it was handed. A function that never calls the `Io` is not interrupted and still holds the gate until it returns, which the `Source.fetch` doc comment says. `Source` itself did not change shape.
 
 `.static` is the same mechanism with `expires_at` null: fetched once, never
 refetched. **`open` copies a static pair into memory the Store owns and refuses
@@ -166,6 +166,14 @@ signing at all.
 rejects a mismatch. Refused at 5–200 ms of fiber CPU per `put` on the path that
 carries production load, for a guarantee TLS already makes there.
 
+## Streams have their own clock and their own share of the permits
+
+**`stream` and `putStream` are bounded by silence, not by the call.** `timeout_ms` (30 s) is the budget of a call that moves a bounded body: `get`, `head`, `list`, `put`, `delete`. A streamed transfer may honestly take an hour, and with the Store's `timeout_ms` on it the guide's `watch()` cut a large video to a slow browser at 30 s, mid-body under a declared length, and a 1 GB upload at 100 Mbit/s failed at 30 s as well. Raising `timeout_ms` for the Store was refused: it would take the fast failure away from the short calls too. So the two streaming calls send no whole-call limit by default and `stall_ms` (30 s, `Options`) instead: `nilo_fetch`'s silence clock, which a transfer that keeps moving never trips and a peer that went quiet does within `stall_ms`, as `error.TimedOut` to the handler. A caller who wants a ceiling sets one for that call: `Reading.timeout_ms` before `stream`, a `.timeout_ms` field on the source given to `putStream`. For an upload the clock counts every chunk the source hands over as progress, since nothing arrives from the peer while a body goes out (ADR 056).
+
+**Streams take a share of the permits, not all of them.** A `Reading` holds a `max_in_flight` permit for as long as the handler is sending the object to a browser, so a few slow viewers could hold all 32 and queue every `get`, `head` and `list` behind them. `max_streams` (default half of `max_in_flight`, at least one; more than `max_in_flight` is `error.BadStreams` at `open`) is a semaphore on the Store: a stream takes a slot before it takes a permit and gives it back after, on every path, an early `close` and a failed open included. Short calls always keep `max_in_flight - max_streams` permits. The wait for a slot is the wait for a permit: a park the watchdog is told about, ended by the fiber's own cancellation (the Engine's deadline, a shutdown) and by nothing else, because that is how `nilo_fetch` bounds the queue for a permit and a second rule here would be a second place to look.
+
+**What was rejected.** Raising or removing the Store's `timeout_ms` (above). A per-call timeout on every call: only the two streaming calls have a transfer whose honest length is unknown. A gate counted separately from the permits, so that streams sit outside `max_in_flight`: the permits are what bound live connections and therefore memory (59,151 bytes each over TLS), and a second set would make that bound the sum of two.
+
 ## What it costs
 
 Against [ADR 017](./017-the-trade-budget-has-four-axes.md)'s four axes.
@@ -173,7 +181,7 @@ Against [ADR 017](./017-the-trade-budget-has-four-axes.md)'s four axes.
 | Axis | Cost |
 |---|---|
 | Allocations per request | **None.** The derived key is 32 bytes held on the client; the string-to-sign is built in a stack buffer. A refresh allocates whatever `fetch` allocates, once per credential lifetime, not per request. |
-| Memory per idle connection | **None.** One derived key and one credential record per client, not per connection and not per request. |
+| Memory per idle connection | **None.** One derived key and one credential record per client, not per connection and not per request. The streaming ceiling below is a semaphore on the Store (about 40 bytes), not per connection. |
 | Throughput and p99 | One HMAC-SHA256 and one shared `RwLock` per request, against a network floor — and **four HMACs removed** from what the naive version would cost. Zero CPU for the payload hash on every `https://` endpoint. To be measured, unloaded and at the gate. |
 | Binary size | HMAC-SHA256 and SHA-256 out of `std.crypto`, which `std.crypto.tls.Client` already links for any program that reaches an `https://` endpoint. To be measured as part of the module's stripped `ReleaseFast` delta rather than separately. |
 
@@ -184,6 +192,7 @@ Against [ADR 017](./017-the-trade-budget-has-four-axes.md)'s four axes.
 - **The refresh is lazy, so one request per credential lifetime is slower**, by
   whatever `fetch` costs. On IMDS that is a link-local round trip of about a
   millisecond, paid roughly four times a day.
+- **A `fetch` that hangs is cut at `fetch_timeout_ms`** and counts as one that threw: it used to hold the refresh gate until it returned, and once the credentials in hand expired every request waited on it. The deadline costs one `io.concurrent` per credential lifetime, paid by the request that refreshes; no request that signs with the key in hand pays it.
 - **A `fetch` that throws fails nobody while the previous key is still valid**,
   and is tried again five seconds later. A credential source that is down does
   not take the process with it until the old key actually expires; past that,

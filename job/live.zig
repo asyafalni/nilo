@@ -103,7 +103,7 @@ test "on SQLite a row is pushed, claimed once, and finished" {
     const again = (try table.claim(&f.run, live_kinds, 1_001, 2_000)).?;
     try testing.expectEqual(@as(u32, 2), again.attempts);
 
-    try testing.expect(try table.done(&f.run, id, again.attempts));
+    try testing.expect(try table.done(&f.run, id, again.attempts, 0));
     const s = try table.stats(&f.run);
     try testing.expectEqual(@as(u64, 0), s.queued + s.running + s.dead);
 }
@@ -120,14 +120,14 @@ test "on SQLite a unique key is the index, and is free again once the row is fin
 
     const claimed = (try table.claim(&f.run, live_kinds, 1, 100)).?;
     try testing.expect((try table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "u1" })) == null);
-    try testing.expect(try table.dead(&f.run, claimed.id, claimed.attempts, "Gone"));
+    try testing.expect(try table.dead(&f.run, claimed.id, claimed.attempts, "Gone", 0));
     try testing.expect((try table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "u1" })) != null);
 
     const listed = try table.deadOnes(&f.run);
     try testing.expectEqual(@as(usize, 1), listed.len);
     try testing.expectEqualStrings("Gone", listed[0].err);
-    try testing.expect(try table.retryDead(&f.run, claimed.id, 5));
-    try testing.expect(!(try table.retryDead(&f.run, claimed.id, 5)));
+    try testing.expect(try table.retryDead(&f.run, claimed.id, 5, &.{}));
+    try testing.expect(!(try table.retryDead(&f.run, claimed.id, 5, &.{})));
 }
 
 test "on SQLite cancel deletes a queued row and leaves one a worker holds" {
@@ -274,7 +274,7 @@ test "on Postgres a row is claimed with SKIP LOCKED, once, and a unique key hold
     try testing.expect((try table.claim(&p.run, live_kinds, 200, 1_000)) == null);
     const again = (try table.claim(&p.run, live_kinds, 600, 1_000)).?;
     try testing.expectEqual(@as(u32, 2), again.attempts);
-    try testing.expect(try table.done(&p.run, id, again.attempts));
+    try testing.expect(try table.done(&p.run, id, again.attempts, 0));
     try testing.expect((try table.push(&p.run, "write-note", "{}", .{ .run_at = 100, .unique = "pg1" })) != null);
 
     // Two rows due, claimed inside two open transactions at once: each
@@ -346,7 +346,7 @@ test "on SQLite the claim takes the most urgent due row, not the oldest" {
     for (order) |want| {
         const c = (try table.claim(&f.run, live_kinds, 100, 1_000)).?;
         try testing.expectEqualStrings(want, c.kind);
-        try testing.expect(try table.done(&f.run, c.id, c.attempts));
+        try testing.expect(try table.done(&f.run, c.id, c.attempts, 0));
     }
     try testing.expect((try table.claim(&f.run, live_kinds, 100, 1_000)) == null);
 }
@@ -386,7 +386,7 @@ test "on Postgres the claim takes the most urgent due row, not the oldest" {
     for (order) |want| {
         const c = (try table.claim(&p.run, live_kinds, 100, 1_000)).?;
         try testing.expectEqualStrings(want, c.kind);
-        try testing.expect(try table.done(&p.run, c.id, c.attempts));
+        try testing.expect(try table.done(&p.run, c.id, c.attempts, 0));
     }
     try testing.expect((try table.claim(&p.run, live_kinds, 100, 1_000)) == null);
 }
@@ -401,15 +401,15 @@ fn lapsedLease(table: anytype, run: *core.Run) !void {
     try testing.expect(w2.attempts != w1.attempts);
 
     try testing.expect(!(try table.retry(run, id, w1.attempts, 0, "Late")));
-    try testing.expect(!(try table.dead(run, id, w1.attempts, "Late")));
+    try testing.expect(!(try table.dead(run, id, w1.attempts, "Late", 0)));
     try testing.expect(!(try table.release(run, id, w1.attempts)));
-    try testing.expect(!(try table.done(run, id, w1.attempts)));
+    try testing.expect(!(try table.done(run, id, w1.attempts, 0)));
 
     try testing.expectEqual(@as(u64, 1), (try table.stats(run)).running);
     try testing.expect((try table.claim(run, live_kinds, 102, 300)) == null);
     // The key is still held by the row the second worker has.
     try testing.expect((try table.push(run, "write-note", "{}", .{ .run_at = 0, .unique = "lapse" })) == null);
-    try testing.expect(try table.done(run, id, w2.attempts));
+    try testing.expect(try table.done(run, id, w2.attempts, 0));
 }
 
 test "on SQLite a worker whose lease lapsed cannot touch the row a second worker holds" {
@@ -488,4 +488,97 @@ test "a row pushed in a transaction has no status before a worker takes it, and 
     try testing.expect(jobs.status(kept) == null);
     try testing.expectEqual(@as(usize, 1), try jobs.drain(&f.run));
     try testing.expectEqual(job.State.done, jobs.status(kept).?.state);
+}
+
+/// A scheduled kind that always fails, for the dead tick `retryDead` must refuse.
+const BrokenTick = struct {
+    pub const nilo_job = "broken-tick";
+    pub const retry: job.Retry = .none;
+    pub const schedule = job.every(1);
+    pub const overlap: job.Overlap = .skip;
+    pub const missed: job.Missed = .catch_up;
+
+    pub fn run(self: BrokenTick, scope: *core.Run, db: *SqliteDb) !void {
+        _ = self;
+        _ = scope;
+        _ = db;
+        return error.AlwaysBroken;
+    }
+};
+
+const TickJobs = job.Jobs(.{
+    .kinds = .{ WriteNote, BrokenTick },
+    .store = SqliteTable,
+    .deps = struct { db: *SqliteDb },
+});
+
+test "on SQLite retryDead refuses a dead row of a scheduled kind, so the schedule keeps one chain" {
+    const f = try Fixture.open("job-retry-scheduled");
+    defer f.close();
+    var table = SqliteTable.open(&f.db);
+    var jobs: TickJobs = .open(testing.allocator, &table, .{ .db = &f.db }, .{});
+
+    const t = core.nowMicros();
+    try jobs.seedAt(&f.run, t);
+    try testing.expectEqual(@as(usize, 1), try jobs.drainAt(&f.run, t + 5_000));
+    const listed = try jobs.deadOnes(&f.run);
+    try testing.expectEqual(@as(usize, 1), listed.len);
+    try testing.expectEqual(@as(u64, 1), (try jobs.stats(&f.run)).queued);
+
+    try testing.expectError(error.Scheduled, jobs.retryDead(&f.run, listed[0].id));
+    const s = try jobs.stats(&f.run);
+    try testing.expectEqual(@as(u64, 1), s.queued);
+    try testing.expectEqual(@as(u64, 1), s.dead);
+
+    // A kind with no schedule still comes back.
+    const id = (try table.push(&f.run, "write-note", "{}", .{ .run_at = 0 })).?;
+    const c = (try table.claim(&f.run, &TickJobs.kind_names, 1, 100)).?;
+    try testing.expectEqual(id, c.id);
+    try testing.expect(try table.dead(&f.run, c.id, c.attempts, "Boom", 0));
+    try testing.expect(try jobs.retryDead(&f.run, id));
+}
+
+test "on SQLite an empty unique key is refused before it reaches the index" {
+    const f = try Fixture.open("job-empty-unique");
+    defer f.close();
+    var table = SqliteTable.open(&f.db);
+    try testing.expectError(error.EmptyUniqueKey, table.push(&f.run, "write-note", "{}", .{ .run_at = 0, .unique = "" }));
+    try testing.expectEqual(@as(u64, 0), (try table.stats(&f.run)).queued);
+}
+
+test "on SQLite a row's created_at is the time of the push and finished_at the injected clock" {
+    const f = try Fixture.open("job-times");
+    defer f.close();
+    var table = SqliteTable.open(&f.db);
+    var jobs: TickJobs = .open(testing.allocator, &table, .{ .db = &f.db }, .{});
+
+    const before = core.nowMicros();
+    const id = try jobs.push(&f.run, WriteNote{ .text = .static("t") }, .{ .after_ms = 60_000 });
+    const queued = (try f.db.select(SqliteTable.Row, &f.run, .{ .where = .{ .id = @as(i64, @intCast(id)) } }))[0];
+    try testing.expect(queued.created_at >= before and queued.created_at < before + 30 * std.time.us_per_s);
+    try testing.expect(queued.run_at > queued.created_at + 50 * std.time.us_per_s);
+
+    const at = queued.run_at + 1_000;
+    try testing.expectEqual(@as(usize, 1), try jobs.drainAt(&f.run, at));
+    const done = (try f.db.select(SqliteTable.Row, &f.run, .{ .where = .{ .id = @as(i64, @intCast(id)) } }))[0];
+    try testing.expectEqual(@as(?i64, at), done.finished_at);
+}
+
+test "on SQLite retryDead takes the scheduled kinds it is told, and created_at is the push time" {
+    const f = try Fixture.open("job-store-times");
+    defer f.close();
+    var table = SqliteTable.open(&f.db);
+
+    const tick = (try table.push(&f.run, "write-note", "{}", .{ .run_at = 900, .now = 5 })).?;
+    const row = (try f.db.select(SqliteTable.Row, &f.run, .{ .where = .{ .id = @as(i64, @intCast(tick)) } }))[0];
+    try testing.expectEqual(@as(i64, 5), row.created_at);
+    const c = (try table.claim(&f.run, live_kinds, 1_000, 2_000)).?;
+    try testing.expect(try table.dead(&f.run, c.id, c.attempts, "Boom", 1_234));
+    const dead_row = (try f.db.select(SqliteTable.Row, &f.run, .{ .where = .{ .id = @as(i64, @intCast(tick)) } }))[0];
+    try testing.expectEqual(@as(?i64, 1_234), dead_row.finished_at);
+
+    try testing.expectError(error.Scheduled, table.retryDead(&f.run, tick, 9, &.{"write-note"}));
+    try testing.expectEqual(@as(u64, 1), (try table.stats(&f.run)).dead);
+    try testing.expect(!(try table.retryDead(&f.run, tick + 100, 9, &.{"write-note"})));
+    try testing.expect(try table.retryDead(&f.run, tick, 9, &.{"other"}));
 }

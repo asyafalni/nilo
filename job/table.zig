@@ -127,7 +127,11 @@ pub fn Table(comptime Db: type) type {
         }
 
         fn insertOn(on: anytype, scope: anytype, kind: []const u8, payload: []const u8, at: contract.Enqueue) !?contract.Id {
-            const now = at.run_at;
+            // An empty key is a real value in the unique index, so it would
+            // fold every push that lost its key into the first. Refused
+            // before storage, as `job.Memory` does.
+            if (at.unique) |u| if (u.len == 0) return error.EmptyUniqueKey;
+            const now = at.now orelse nowMicros();
             const values = .{
                 .kind = kind,
                 .payload = payload,
@@ -220,9 +224,9 @@ pub fn Table(comptime Db: type) type {
         /// matches nothing rather than freeing, requeuing or killing a row a
         /// second worker holds. `false` is that: no row was changed
         /// (ADR 160, `contract.zig`).
-        pub fn done(self: *Self, scope: anytype, id: contract.Id, attempts: u32) !bool {
+        pub fn done(self: *Self, scope: anytype, id: contract.Id, attempts: u32, now: i64) !bool {
             const n = try self.db.update(Row, scope, .{
-                .set = .{ .state = contract.State.done, .lease_until = @as(i64, 0), .unique_key = null, .finished_at = nowMicros() },
+                .set = .{ .state = contract.State.done, .lease_until = @as(i64, 0), .unique_key = null, .finished_at = now },
                 .where = fence(id, attempts),
             });
             return n == 1;
@@ -236,9 +240,9 @@ pub fn Table(comptime Db: type) type {
             return n == 1;
         }
 
-        pub fn dead(self: *Self, scope: anytype, id: contract.Id, attempts: u32, err: []const u8) !bool {
+        pub fn dead(self: *Self, scope: anytype, id: contract.Id, attempts: u32, err: []const u8, now: i64) !bool {
             const n = try self.db.update(Row, scope, .{
-                .set = .{ .state = contract.State.dead, .lease_until = @as(i64, 0), .unique_key = null, .last_error = err, .finished_at = nowMicros() },
+                .set = .{ .state = contract.State.dead, .lease_until = @as(i64, 0), .unique_key = null, .last_error = err, .finished_at = now },
                 .where = fence(id, attempts),
             });
             return n == 1;
@@ -292,7 +296,34 @@ pub fn Table(comptime Db: type) type {
             return out;
         }
 
-        pub fn retryDead(self: *Self, scope: anytype, id: contract.Id, now: i64) !bool {
+        /// Queue a dead row again from its first attempt: `false` when no dead
+        /// row has that id, and `error.Scheduled` when its kind is one of
+        /// `scheduled_kinds`, because a dead tick's successor is already
+        /// queued and reviving it would run the kind on two chains. **Call
+        /// `Jobs.retryDead`, which knows the kinds**; a caller driving this
+        /// directly passes them.
+        ///
+        /// The kind is read before the revive and not in the same statement,
+        /// which is sound because a row's kind never changes and the revive
+        /// still requires `state = 'dead'`, so two callers reviving the same
+        /// row see one `true`. With no scheduled kind there is no read.
+        ///
+        /// **The revived row has no unique key.** It was set to NULL when the
+        /// row died, and restoring it would need a column to keep it in, a
+        /// migration for every `Table` user for a rare manual operation, so a
+        /// newer row pushed under the same key can run beside it
+        /// (`docs/decided.md`).
+        pub fn retryDead(self: *Self, scope: anytype, id: contract.Id, now: i64, comptime scheduled_kinds: []const []const u8) !bool {
+            if (comptime scheduled_kinds.len > 0) {
+                const rows = try self.db.select(Row, scope, .{
+                    .where = .{ .id = @as(i64, @intCast(id)), .state = contract.State.dead },
+                    .limit = 1,
+                });
+                if (rows.len == 0) return false;
+                inline for (scheduled_kinds) |k| {
+                    if (std.mem.eql(u8, rows[0].kind, k)) return error.Scheduled;
+                }
+            }
             const n = try self.db.update(Row, scope, .{
                 .set = .{ .state = contract.State.queued, .run_at = now, .attempts = @as(i32, 0), .last_error = null, .finished_at = null },
                 .where = .{ .id = @as(i64, @intCast(id)), .state = contract.State.dead },

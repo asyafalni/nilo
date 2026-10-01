@@ -60,7 +60,7 @@ A handler holds a Space by pointer, as a [service](./services.md), or by value i
 |---|---|
 | `cache.open(gpa, .{ .bytes = n })` | `!Store`: all the memory, taken here and never again |
 | `cache.Space(name, V, .{ .ttl_s = s })` | a keyspace, as a type |
-| `Space.open(&store)` | the value a handler holds |
+| `Space.open(&store)` | the value a handler holds. Panics for a flat `V` the Store could never hold: an entry (12 bytes of header, the key and the value) over a quarter of one shard's ring, naming the type, the limit and the Store's size |
 | `space.put(key, value)` | stores for the Space's `ttl_s` |
 | `space.putFor(key, value, ttl_s)` | stores for a lifetime of its own. `0` means until the ring overwrites it |
 | `space.get(key)` | `?V` for a flat value; `?[]const u8` and a `*Held` for bytes |
@@ -171,8 +171,9 @@ Passed to `cache.open`:
 | `bytes` | 8 MiB | **the whole budget, a hard limit rather than a target**. The ring that holds values and the table that points at them both come out of it, and `bytesHeld()` never exceeds it |
 | `entries` | derived | how many entries the table can point at, for when the default split (the ring takes five sixths) is wrong. Clamped to the budget rather than added to it: raise it for many small values, lower it for few large ones |
 | `shards` | 64 | how many independent tables and rings, and so how many writers can work at once. A fixed number rather than the core count, so the same program uses the same memory on two machines |
+| `seed` | `null` | the secret every hash is mixed with, so nobody who chooses keys (emails, URLs) can precompute ones that share a shard and evict a chosen entry. `null` takes 8 bytes of operating-system entropy once in `open`; pass one from `nilo.randomSecure` if you have a loop. **A fixed seed belongs in a test**, where placement should be the same every run |
 
-`open` returns `error.TooSmall` when the numbers do not make a working cache (under 64 KiB of value memory, or fewer entries than the shards have slots for), and `error.OutOfMemory` when the machine will not provide the budget.
+`open` returns `error.TooSmall` when the numbers do not make a working cache (under 64 KiB of value memory, or fewer entries than the shards have slots for), `error.SeedUnavailable` when no `seed` was given and the operating system had none to give (pass one), and `error.OutOfMemory` when the machine will not provide the budget.
 
 **One number sets the memory, and it never changes.** Nothing is allocated after `open`, nothing grows, and there is no sweep: an entry disappears when its time is up or when the ring overwrites it. That number really is the total. Two Go caches built the same way mean something narrower by it: they limit their *values* and put an unbounded index on top, so 200,000 entries on a 12 MiB budget cost them 25.2 and 28.5 MiB of RSS, against this module's 12.0 ([`bench/result/cache.md`](../../bench/result/cache.md)).
 
@@ -249,11 +250,11 @@ It costs what `Idempotent` costs, on the route that uses it and nowhere else: on
 
 ## Testing
 
-**A Store opens on `std.testing.allocator` with any budget over 64 KiB, and a handler that takes a `*Carts` is an ordinary function:**
+**A Store opens on `std.testing.allocator` with any budget over 64 KiB (give it a `.seed` for a placement that is the same every run), and a handler that takes a `*Carts` is an ordinary function:**
 
 ```zig
 test "a cart is remembered for the next request" {
-    var store = try cache.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 4 });
+    var store = try cache.open(testing.allocator, .{ .bytes = 1 << 20, .shards = 4, .seed = 1 });
     defer store.deinit();
     var carts = Carts.open(&store);
 

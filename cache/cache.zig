@@ -220,7 +220,7 @@ test "a reader is never handed another entry's bytes, with more threads than cor
     // Small on purpose. A ring that holds the whole working set never writes
     // over anything, and never writing over anything is the one case this
     // test is not about.
-    var s = try open(testing.allocator, .{ .bytes = 256 << 10, .shards = 4 });
+    var s = try open(testing.allocator, .{ .bytes = 256 << 10, .shards = 4, .seed = 1 });
     defer s.deinit();
     const marks = Marks.open(&s);
 

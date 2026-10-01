@@ -1660,6 +1660,110 @@ test "a pooled connection the peer reset costs one retry too" {
     }.run);
 }
 
+test "a streamed body is sent on a fresh connection, so a pooled one the peer reaped cannot eat the reader" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.body_len = 4;
+
+            var client = try started(io, .{ .timeout_ms = 5_000 });
+            defer client.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var buf: [64]u8 = undefined;
+            const url = try canned.url(&buf);
+
+            var served = try io.concurrent(Canned.serveReapThenBody, .{&canned});
+            defer served.cancel(io) catch {};
+
+            // Leaves one connection in the pool, which the server then closes.
+            _ = try client.get(&scope, url, .{});
+            for (0..2_000) |_| {
+                if (canned.reaped.load(.acquire)) break;
+                try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+            } else return error.TestTimedOut;
+
+            // A reader body cannot be replayed, so before this it was sent on
+            // the corpse, consumed, and failed. On a fresh connection there
+            // is nothing to be stale.
+            var source = std.Io.Reader.fixed("cinta laut dan langit");
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            const head = try ex.begin(&client, .{
+                .method = .PUT,
+                .url = url,
+                .body = .{ .stream = .{ .reader = &source, .len = 21 } },
+            });
+            try testing.expect(head.ok());
+            try testing.expectEqual(@as(usize, 2), canned.accepted);
+            served.await(io) catch {};
+            try testing.expectEqualStrings("cinta laut dan langit", canned.requestBody());
+        }
+    }.run);
+}
+
+test "a body going out that keeps moving is not a stall, however long it takes" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = try io.concurrent(Canned.serveWithBody, .{&canned});
+            defer served.cancel(io) catch {};
+
+            // Nothing arrives from the peer while this goes out, so before the
+            // upload counted as progress this was `Stalled` at 150 ms: 8 bytes
+            // 60 ms apart is 480 ms, and every gap is well inside the bound.
+            var client = try started(io, .{ .timeout_ms = 0, .stall_ms = 150 });
+            defer client.deinit();
+
+            var buf: [64]u8 = undefined;
+            var source: fetch.testing.Dribble = .init(io, 8, 60);
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            const head = try ex.begin(&client, .{
+                .method = .PUT,
+                .url = try canned.url(&buf),
+                .body = .{ .stream = .{ .reader = &source.reader, .len = 8 } },
+            });
+            try testing.expect(head.ok());
+            try testing.expectEqualStrings("yyyyyyyy", canned.requestBody());
+        }
+    }.run);
+}
+
+test "a body going out to a peer that stopped reading is a stall" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            // Reads the head and then nothing: the upload's gap outlasts the
+            // bound on its own, which is the source going quiet.
+            var served = try io.concurrent(Canned.serveWithBody, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var client = try started(io, .{ .timeout_ms = 0, .stall_ms = 100 });
+            defer client.deinit();
+
+            var buf: [64]u8 = undefined;
+            var source: fetch.testing.Dribble = .init(io, 2, 1_500);
+            var ex: fetch.Exchange = .idle;
+            defer ex.end();
+            const began = core.monotonicMicros();
+            try testing.expectError(error.Stalled, ex.begin(&client, .{
+                .method = .PUT,
+                .url = try canned.url(&buf),
+                .body = .{ .stream = .{ .reader = &source.reader, .len = 2 } },
+            }));
+            try testing.expect(core.monotonicMicros() - began < 1_200 * std.time.us_per_ms);
+        }
+    }.run);
+}
+
 // ---- a target is a type, and a path is a template (ADR 061) ----
 
 test "a target's standing headers go out on every call, and the call's own line goes instead of one" {

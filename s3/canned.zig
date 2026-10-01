@@ -20,6 +20,8 @@
 const std = @import("std");
 const core = @import("nilo_core");
 
+const fetch = @import("nilo_fetch");
+
 const bucket_mod = @import("bucket.zig");
 const sign = @import("sign.zig");
 const store_mod = @import("store.zig");
@@ -88,6 +90,18 @@ const Answer = struct {
     claim_len: ?u64 = null,
     /// Sent instead of a body when the request failed.
     error_body: []const u8 = "",
+    /// A body that arrives a byte at a time instead of at once.
+    slow: ?Slow = null,
+};
+
+/// `pieces` bytes, `gap_ms` apart. With `hold` the length claimed is one
+/// more than is sent and the connection is then kept open until the client
+/// closes it: a transfer that went quiet, or one a test keeps open on
+/// purpose.
+const Slow = struct {
+    pieces: usize,
+    gap_ms: u32,
+    hold: bool = false,
 };
 
 const Canned = struct {
@@ -173,10 +187,24 @@ const Canned = struct {
             if (failing) "application/xml" else self.answer.content_type,
         });
         try w.print("ETag: {s}\r\n", .{self.answer.etag});
+        const is_head = std.mem.eql(u8, self.seen.methodText(), "HEAD");
+        if (self.answer.slow) |slow| {
+            try w.print("Content-Length: {d}\r\n\r\n", .{slow.pieces + @intFromBool(slow.hold)});
+            try w.flush();
+            if (is_head) return;
+            for (0..slow.pieces) |_| {
+                try std.Io.sleep(self.io, .fromMilliseconds(slow.gap_ms), .awake);
+                try w.writeByte('x');
+                try w.flush();
+            }
+            // Until the client lets go, which is `EndOfStream` here.
+            if (slow.hold) _ = r.takeByte() catch {};
+            return;
+        }
         try w.print("Content-Length: {d}\r\n\r\n", .{self.answer.claim_len orelse body.len});
         // A HEAD carries no body however long it says it is, which is the
         // whole of what makes `head` a cheap call.
-        if (!std.mem.eql(u8, self.seen.methodText(), "HEAD")) try w.writeAll(body);
+        if (!is_head) try w.writeAll(body);
         try w.flush();
     }
 
@@ -983,6 +1011,304 @@ test "a streamed get pipes the object out without holding it" {
 
             try testing.expectEqual(@as(u64, 34), n);
             try testing.expectEqualStrings("a body too big to want in an arena", w.buffered());
+        }
+    }.run);
+}
+
+/// A Store with the streaming knobs a test wants small.
+fn startedWith(io: std.Io, canned: *Canned, buf: []u8, extra: struct {
+    timeout_ms: u32 = 30_000,
+    stall_ms: u32 = 30_000,
+    max_in_flight: u32 = 32,
+    max_streams: u32 = 0,
+}) !Store {
+    var store = try Store.open(testing.allocator, .{
+        .endpoint = try canned.endpoint(buf),
+        .region = "us-east-1",
+        .credentials = .{ .static = .{ .access_key_id = akid, .secret_access_key = secret } },
+        .timeout_ms = extra.timeout_ms,
+        .stall_ms = extra.stall_ms,
+        .max_in_flight = extra.max_in_flight,
+        .max_streams = extra.max_streams,
+    });
+    errdefer store.deinit();
+    try store.nilo_start(io, .off);
+    return store;
+}
+
+fn nowMs() i64 {
+    return @divTrunc(core.monotonicMicros(), std.time.us_per_ms);
+}
+
+test "a streamed get that is slower than the call timeout but never goes quiet completes" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            // 8 bytes, 60 ms apart: 480 ms against a call timeout of 150 ms,
+            // and no gap anywhere near the 400 ms stall bound.
+            canned.answer = .{ .slow = .{ .pieces = 8, .gap_ms = 60 } };
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try startedWith(io, &canned, &buf, .{ .timeout_ms = 150, .stall_ms = 400 });
+            defer store.deinit();
+            var files = try Files.open(&store);
+            defer files.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var reading: Files.Reading = .idle;
+            defer reading.close();
+            try files.stream(&scope, "video/one.mp4", &reading);
+
+            var out: [32]u8 = undefined;
+            var w = std.Io.Writer.fixed(&out);
+            try testing.expectEqual(@as(u64, 8), try reading.pipe(&w));
+            try testing.expectEqualStrings("xxxxxxxx", w.buffered());
+        }
+    }.run);
+}
+
+test "a streamed get whose peer goes quiet is cut at the stall bound, not left to the call timeout" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.answer = .{ .slow = .{ .pieces = 2, .gap_ms = 20, .hold = true } };
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try startedWith(io, &canned, &buf, .{ .stall_ms = 150 });
+            defer store.deinit();
+            var files = try Files.open(&store);
+            defer files.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var reading: Files.Reading = .idle;
+            defer reading.close();
+            try files.stream(&scope, "video/one.mp4", &reading);
+
+            var out: [32]u8 = undefined;
+            var w = std.Io.Writer.fixed(&out);
+            const began = nowMs();
+            try testing.expectError(error.TimedOut, reading.pipe(&w));
+            // The Store's call timeout is 30 s; this ended on the stall bound.
+            try testing.expect(nowMs() - began < 5_000);
+        }
+    }.run);
+}
+
+test "a streamed get takes the call timeout the caller set for it, and only that one" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            // Moving all the time, so only the whole-call limit can end it.
+            canned.answer = .{ .slow = .{ .pieces = 40, .gap_ms = 25 } };
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try startedWith(io, &canned, &buf, .{ .stall_ms = 5_000 });
+            defer store.deinit();
+            var files = try Files.open(&store);
+            defer files.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var reading: Files.Reading = .{ .timeout_ms = 200 };
+            defer reading.close();
+            try files.stream(&scope, "video/one.mp4", &reading);
+
+            var out: [64]u8 = undefined;
+            var w = std.Io.Writer.fixed(&out);
+            try testing.expectError(error.TimedOut, reading.pipe(&w));
+        }
+    }.run);
+}
+
+test "a streamed put that keeps moving outlasts the call timeout, and one that goes quiet is cut" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try startedWith(io, &canned, &buf, .{ .timeout_ms = 150, .stall_ms = 300 });
+            defer store.deinit();
+            var files = try Files.open(&store);
+            defer files.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            // 480 ms against a 150 ms call timeout, a byte every 60 ms.
+            var source: fetch.testing.Dribble = .init(io, 8, 60);
+            try files.putStream(&scope, "big/one.bin", .{
+                .reader = &source.reader,
+                .len = @as(u64, 8),
+                .content_type = "application/octet-stream",
+            });
+            try testing.expectEqualStrings("yyyyyyyy", canned.seen.bodyText());
+        }
+    }.run);
+}
+
+test "a streamed put whose source goes quiet is cut at the stall bound" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try startedWith(io, &canned, &buf, .{ .stall_ms = 100 });
+            defer store.deinit();
+            var files = try Files.open(&store);
+            defer files.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var source: fetch.testing.Dribble = .init(io, 2, 1_500);
+            const began = nowMs();
+            try testing.expectError(error.TimedOut, files.putStream(&scope, "big/one.bin", .{
+                .reader = &source.reader,
+                .len = @as(u64, 2),
+                .content_type = "application/octet-stream",
+            }));
+            try testing.expect(nowMs() - began < 1_200);
+            // Both the permit and the stream slot came back.
+            try testing.expectEqual(@as(usize, store.options.max_in_flight), store.client.gate.permits);
+            try testing.expectEqual(@as(usize, store.options.max_streams), store.streams.permits);
+        }
+    }.run);
+}
+
+test "a streamed put takes the whole-call limit its source names" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try startedWith(io, &canned, &buf, .{ .stall_ms = 5_000 });
+            defer store.deinit();
+            var files = try Files.open(&store);
+            defer files.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var source: fetch.testing.Dribble = .init(io, 40, 25);
+            try testing.expectError(error.TimedOut, files.putStream(&scope, "big/one.bin", .{
+                .reader = &source.reader,
+                .len = @as(u64, 40),
+                .content_type = "application/octet-stream",
+                .timeout_ms = @as(u32, 200),
+            }));
+        }
+    }.run);
+}
+
+test "streams are a share of the permits, so a head still gets one when every stream slot is taken" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            // Every connection is told the same: a GET that sends a byte and
+            // then holds the transfer open, and a HEAD that is answered.
+            canned.answer = .{ .slow = .{ .pieces = 1, .gap_ms = 1, .hold = true } };
+            var second = canned;
+            var third = canned;
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+            var served_two = try io.concurrent(Canned.serveOne, .{&second});
+            defer served_two.cancel(io) catch {};
+            var served_three = try io.concurrent(Canned.serveOne, .{&third});
+            defer served_three.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try startedWith(io, &canned, &buf, .{ .max_in_flight = 2, .max_streams = 1 });
+            defer store.deinit();
+            var files = try Files.open(&store);
+            defer files.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            // The one stream slot, held open.
+            var first: Files.Reading = .idle;
+            defer first.close();
+            try files.stream(&scope, "a.mp4", &first);
+
+            // A second stream has to wait for it, though a permit is free.
+            const Opener = struct {
+                fn open(f: *Files, sc: *core.Run, r: *Files.Reading, done: *std.atomic.Value(u32)) !void {
+                    defer done.store(1, .release);
+                    try f.stream(sc, "b.mp4", r);
+                }
+            };
+            var other: Files.Reading = .idle;
+            defer other.close();
+            var done: std.atomic.Value(u32) = .init(0);
+            var opening = try io.concurrent(Opener.open, .{ &files, &scope, &other, &done });
+            defer opening.cancel(io) catch {};
+            try std.Io.sleep(io, .fromMilliseconds(150), .awake);
+            try testing.expectEqual(@as(u32, 0), done.load(.acquire));
+
+            // And a short call is not queued behind either of them.
+            const meta = try files.head(&scope, "a.mp4");
+            try testing.expectEqual(@as(u64, 2), meta.len);
+
+            // Letting the first go lets the second in, inside a bound.
+            first.close();
+            for (0..400) |_| {
+                if (done.load(.acquire) != 0) break;
+                try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+            } else return error.TestTimedOut;
+            try opening.await(io);
+        }
+    }.run);
+}
+
+test "a stream that fails to open gives its slot back" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var canned = try Canned.open(io);
+            defer canned.close();
+            canned.answer = .{ .status = "404 Not Found", .error_body = "<Error><Code>NoSuchKey</Code></Error>" };
+
+            var served = try io.concurrent(Canned.serveOne, .{&canned});
+            defer served.cancel(io) catch {};
+
+            var buf: [64]u8 = undefined;
+            var store = try startedWith(io, &canned, &buf, .{ .max_in_flight = 2, .max_streams = 1 });
+            defer store.deinit();
+            var files = try Files.open(&store);
+            defer files.deinit();
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            var reading: Files.Reading = .idle;
+            try testing.expectError(error.NotFound, files.stream(&scope, "gone.mp4", &reading));
+            // Released by `stream` itself, before the caller's `close`.
+            try testing.expectEqual(@as(usize, 1), store.streams.permits);
+            try testing.expectEqual(@as(usize, 2), store.client.gate.permits);
+            reading.close();
+            try testing.expectEqual(@as(usize, 1), store.streams.permits);
         }
     }.run);
 }

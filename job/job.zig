@@ -316,6 +316,27 @@ pub fn Jobs(comptime options: anytype) type {
             break :blk out;
         };
 
+        /// The names of the kinds that carry a `schedule`: what `retryDead`
+        /// refuses, because the store does not know which kinds those are.
+        const scheduled_names: [scheduled_count][]const u8 = blk: {
+            var out: [scheduled_count][]const u8 = undefined;
+            var i: usize = 0;
+            for (kinds) |K| {
+                if (scheduled(K)) {
+                    out[i] = K.nilo_job;
+                    i += 1;
+                }
+            }
+            break :blk out;
+        };
+        const scheduled_count = blk: {
+            var n: usize = 0;
+            for (kinds) |K| {
+                if (scheduled(K)) n += 1;
+            }
+            break :blk n;
+        };
+
         gpa: std.mem.Allocator,
         store: *Store,
         deps: Deps,
@@ -358,6 +379,10 @@ pub fn Jobs(comptime options: anytype) type {
         };
 
         pub const Error = error{
+            /// `retryDead` was asked for a row of a scheduled kind.
+            Scheduled,
+            /// `push` was given a `.unique` of length zero.
+            EmptyUniqueKey,
             /// A row was pushed with a payload the store cannot hold.
             PayloadTooLarge,
             /// `job.Memory` is full. Nothing was written over.
@@ -445,6 +470,8 @@ pub fn Jobs(comptime options: anytype) type {
             const now = core.nowMicros();
             const run_at: i64 = if (@hasField(@TypeOf(opts), "at")) opts.at else now + @as(i64, @intCast(o.after_ms(opts))) * std.time.us_per_ms;
             const unique: ?[]const u8 = if (o.unique) opts.unique else null;
+            // Before a window is reserved: a refused push has nothing to give back.
+            if (unique) |u| if (u.len == 0) return error.EmptyUniqueKey;
 
             if (o.within) {
                 comptime if (!o.unique) @compileError(
@@ -470,7 +497,7 @@ pub fn Jobs(comptime options: anytype) type {
 
             const priority: contract.Priority = if (@hasDecl(K, "priority")) K.priority else .normal;
             const bytes = try std.json.Stringify.valueAlloc(scope.arena(), value, .{});
-            const id = try self.store.push(scope, K.nilo_job, bytes, .{ .run_at = run_at, .unique = unique, .priority = priority });
+            const id = try self.store.push(scope, K.nilo_job, bytes, .{ .run_at = run_at, .now = now, .unique = unique, .priority = priority });
             if (o.unique) {
                 if (id) |i| {
                     self.note(i, .queued, 0);
@@ -518,7 +545,7 @@ pub fn Jobs(comptime options: anytype) type {
             const priority: contract.Priority = if (@hasDecl(K, "priority")) K.priority else .normal;
 
             const bytes = try std.json.Stringify.valueAlloc(scope.arena(), value, .{});
-            const id = try self.store.pushIn(tx, scope, K.nilo_job, bytes, .{ .run_at = run_at, .unique = unique, .priority = priority });
+            const id = try self.store.pushIn(tx, scope, K.nilo_job, bytes, .{ .run_at = run_at, .now = now, .unique = unique, .priority = priority });
             if (o.unique) return id;
             return id orelse unreachable;
         }
@@ -570,6 +597,20 @@ pub fn Jobs(comptime options: anytype) type {
             if (@hasField(O, "after_ms") and @hasField(O, "at")) @compileError(
                 "nilo: `jobs.push` was given both `.after_ms` and `.at`, and a row runs at one time.",
             );
+            if (@hasField(O, "unique")) {
+                const U = @FieldType(O, "unique");
+                const empty = switch (@typeInfo(U)) {
+                    .pointer => |p| switch (@typeInfo(p.child)) {
+                        .array => |arr| p.size == .one and arr.len == 0,
+                        else => false,
+                    },
+                    else => false,
+                };
+                if (empty) @compileError(
+                    "nilo: `jobs.push` was given an empty `.unique`, and a key that is empty is a value that went missing.\n" ++
+                        "  Every such push would collapse into the first. Build the key from what identifies the row: `.{ .unique = \"welcome:42\" }`.",
+                );
+            }
             return .{
                 .unique = @hasField(O, "unique"),
                 .within = @hasField(O, "within"),
@@ -613,10 +654,18 @@ pub fn Jobs(comptime options: anytype) type {
         }
 
         /// Queue a dead row again from its first attempt. `false` when there
-        /// is no dead row with that id.
+        /// is no dead row with that id, and `error.Scheduled` when the row is
+        /// of a kind with a `schedule`: its successor tick is already queued,
+        /// so reviving it would run the kind on two chains for good. Nothing
+        /// changes then; the schedule is its own way back.
+        ///
+        /// **The revived row runs without its unique key**, which was cleared
+        /// when it died, so a newer row pushed under the same key can run
+        /// beside it. A caller who needs the guarantee checks before reviving
+        /// ([`docs/decided.md`](../docs/decided.md), ADR 160).
         pub fn retryDead(self: *Self, scope: anytype, id: Id) !bool {
             comptime core.checkScope(@TypeOf(scope), "jobs.retryDead");
-            const did = try self.store.retryDead(scope, id, core.nowMicros());
+            const did = try self.store.retryDead(scope, id, core.nowMicros(), &scheduled_names);
             if (did) self.note(id, .queued, 0);
             return did;
         }
@@ -878,7 +927,7 @@ pub fn Jobs(comptime options: anytype) type {
             if (comptime scheduled(K)) {
                 // A tick later than its own successor is a missed one.
                 if (K.missed == .drop and K.schedule.next(claimed.run_at) <= now) {
-                    if (!self.settled(claimed.id, "done", self.store.done(scope, claimed.id, claimed.attempts))) return;
+                    if (!self.settled(claimed.id, "done", self.store.done(scope, claimed.id, claimed.attempts, now))) return;
                     self.note(claimed.id, .done, claimed.attempts);
                     self.pushNext(K, scope, now);
                     return;
@@ -960,7 +1009,7 @@ pub fn Jobs(comptime options: anytype) type {
                 bound.release();
             }
             if (outcome) |_| {
-                if (!self.settled(claimed.id, "done", self.store.done(scope, claimed.id, claimed.attempts))) return;
+                if (!self.settled(claimed.id, "done", self.store.done(scope, claimed.id, claimed.attempts, clock.now()))) return;
                 self.note(claimed.id, .done, claimed.attempts);
                 // The clock read again, not `now`: under a worker the next
                 // tick is counted from when this one ended, which is what
@@ -1024,7 +1073,7 @@ pub fn Jobs(comptime options: anytype) type {
         /// purpose.
         fn finishDead(self: *Self, scope: anytype, id: Id, comptime K: type, name: []const u8, attempts: u32, clock: Clock) void {
             std.log.scoped(.nilo_job).warn("\"{s}\" row {d} is dead after {d} attempt(s): {s}", .{ K.nilo_job, id, attempts, name });
-            if (!self.settled(id, "dead", self.store.dead(scope, id, attempts, name))) return;
+            if (!self.settled(id, "dead", self.store.dead(scope, id, attempts, name, clock.now()))) return;
             self.note(id, .dead, attempts);
             // A schedule whose tick died still has a next tick.
             if (comptime scheduled(K)) self.pushNext(K, scope, clock.now());
@@ -1140,7 +1189,7 @@ pub fn Jobs(comptime options: anytype) type {
         fn pushNext(self: *Self, comptime K: type, scope: anytype, after: i64) void {
             const at = K.schedule.next(after);
             const priority: contract.Priority = if (@hasDecl(K, "priority")) K.priority else .normal;
-            _ = self.store.push(scope, K.nilo_job, "{}", .{ .run_at = at, .unique = schedule_key, .priority = priority }) catch |err| {
+            _ = self.store.push(scope, K.nilo_job, "{}", .{ .run_at = at, .now = after, .unique = schedule_key, .priority = priority }) catch |err| {
                 std.log.scoped(.nilo_job).warn("queueing the next \"{s}\": {t}; the schedule is re-seeded within a minute", .{ K.nilo_job, err });
             };
         }
@@ -2553,7 +2602,7 @@ test "a worker that lost its lease does not requeue the row the second worker ho
     const s = try jobs.stats(&run);
     try testing.expectEqual(@as(u64, 1), s.running);
     try testing.expectEqual(@as(u64, 0), s.queued);
-    try testing.expect(try store.done(&run, heist.second.?.id, heist.second.?.attempts));
+    try testing.expect(try store.done(&run, heist.second.?.id, heist.second.?.attempts, 0));
 }
 
 // -- overlap (ADR 161) ------------------------------------------------------
@@ -2807,4 +2856,76 @@ test "a push whose store refused it does not hold its .within window" {
     try testing.expect(held);
     // A second push inside the window is still answered by the window.
     try testing.expect((try jobs.push(&run, Greet{ .who = .static("b") }, .{ .unique = "k", .within = window })) == null);
+}
+
+/// A scheduled kind that always fails, so its tick dies and `finishDead`
+/// queues the successor: the state `retryDead` must not turn into a second
+/// chain.
+const Broken = struct {
+    pub const nilo_job = "broken";
+    pub const retry: Retry = .none;
+    pub const schedule = every(1);
+    pub const overlap: Overlap = .skip;
+    pub const missed: Missed = .catch_up;
+
+    pub fn run(self: Broken, scope: *core.Run, ledger: *Ledger) !void {
+        _ = self;
+        _ = scope;
+        _ = ledger;
+        return error.AlwaysBroken;
+    }
+};
+
+const BrokenJobs = Jobs(.{
+    .kinds = .{ Greet, Broken },
+    .store = Memory,
+    .deps = struct { ledger: *Ledger },
+});
+
+test "retryDead refuses a dead row of a scheduled kind, so the schedule keeps one chain" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var ledger: Ledger = .{ .gpa = testing.allocator };
+    defer ledger.deinit();
+    var jobs: BrokenJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{});
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    // The tick dies; the successor is queued behind it.
+    const t = core.nowMicros();
+    try jobs.seedAt(&run, t);
+    try testing.expectEqual(@as(usize, 1), try jobs.drainAt(&run, t + 5_000));
+    const listed = try jobs.deadOnes(&run);
+    try testing.expectEqual(@as(usize, 1), listed.len);
+    try testing.expectEqual(@as(u64, 1), (try jobs.stats(&run)).queued);
+
+    // Reviving it would start a second chain: it is refused, and nothing moves.
+    try testing.expectError(error.Scheduled, jobs.retryDead(&run, listed[0].id));
+    const s = try jobs.stats(&run);
+    try testing.expectEqual(@as(u64, 1), s.queued);
+    try testing.expectEqual(@as(u64, 1), s.dead);
+
+    // A kind with no schedule still comes back.
+    ledger.fail_first = 0;
+    const g = try jobs.push(&run, Greet{ .who = .static("a") }, .{});
+    const claimed = (try store.claim(&run, &BrokenJobs.kind_names, core.nowMicros(), core.nowMicros() + 1_000)).?;
+    try testing.expectEqual(g, claimed.id);
+    try testing.expect(try store.dead(&run, claimed.id, claimed.attempts, "Boom", 0));
+    try testing.expect(try jobs.retryDead(&run, g));
+}
+
+test "an empty unique key is refused by the queue, so a missing value cannot fold every push into one" {
+    var store = try Memory.open(testing.allocator, .{ .bytes = 64 << 10 });
+    defer store.deinit();
+    var ledger: Ledger = .{ .gpa = testing.allocator };
+    defer ledger.deinit();
+    var jobs: TestJobs = .open(testing.allocator, &store, .{ .ledger = &ledger }, .{});
+    var run: core.Run = .init(testing.allocator);
+    defer run.deinit();
+
+    var key: []const u8 = "";
+    key = key[0..0];
+    try testing.expectError(error.EmptyUniqueKey, jobs.push(&run, Greet{ .who = .static("a") }, .{ .unique = key }));
+    try testing.expectError(error.EmptyUniqueKey, store.push(&run, "greet", "{}", .{ .run_at = 0, .unique = "" }));
+    try testing.expectEqual(@as(u64, 0), (try jobs.stats(&run)).queued);
 }

@@ -31,6 +31,40 @@
 
 const std = @import("std");
 
+/// A body source that hands over one byte at a time, `gap_ms` apart: the
+/// upload that is slow and alive, which is the control for a stall bound
+/// (ADR 056). Its `reader` is what a `.stream` body or a streamed put takes.
+/// Address sensitive, like the readers in std: declare it where it stands.
+pub const Dribble = struct {
+    io: std.Io,
+    left: usize,
+    gap_ms: u32,
+    reader: std.Io.Reader,
+
+    pub fn init(io: std.Io, bytes: usize, gap_ms: u32) Dribble {
+        return .{
+            .io = io,
+            .left = bytes,
+            .gap_ms = gap_ms,
+            .reader = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Dribble = @alignCast(@fieldParentPtr("reader", r));
+        if (self.left == 0) return error.EndOfStream;
+        std.Io.sleep(self.io, .fromMilliseconds(self.gap_ms), .awake) catch return error.ReadFailed;
+        try w.writeByte('y');
+        self.left -= 1;
+        return 1;
+    }
+};
+
 /// A server that answers exactly what a test asked it to, once per
 /// connection.
 ///
@@ -80,6 +114,9 @@ pub const Canned = struct {
     body_seen_len: usize = 0,
     /// How many connections have been accepted — see `serveEach`.
     accepted: usize = 0,
+    /// Set by `serveReapThenBody` once it has closed the first connection, so
+    /// a test can wait for the reaping instead of sleeping and hoping.
+    reaped: std.atomic.Value(bool) = .init(false),
 
     /// Port 0, and the kernel's answer read back.
     ///
@@ -443,6 +480,33 @@ pub const Canned = struct {
         const w = &writer.interface;
         try w.print("HTTP/1.1 {s}\r\nContent-Length: 0\r\n{s}\r\n", .{ self.status, self.headers });
         try w.flush();
+    }
+
+    /// A connection answered once and then closed, and then a second one that
+    /// reads a whole request, body included, and answers it with no body. The
+    /// body-carrying twin of `serveThenReap`, for the call that cannot be
+    /// replayed: a request whose body is a reader (ADR 061). `reaped` says the
+    /// first connection is closed, so the caller's next call is certain to
+    /// meet the corpse if it takes a pooled connection at all.
+    pub fn serveReapThenBody(self: *Canned) !void {
+        {
+            var stream = try self.server.accept(self.io);
+            defer stream.close(self.io);
+            self.accepted += 1;
+
+            var in_buf: [4 << 10]u8 = undefined;
+            var out_buf: [4 << 10]u8 = undefined;
+            var reader = stream.reader(self.io, &in_buf);
+            var writer = stream.writer(self.io, &out_buf);
+            _ = try self.readHead(&reader.interface);
+            const w = &writer.interface;
+            try w.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{self.body_len});
+            try w.splatByteAll('x', self.body_len);
+            try w.flush();
+        }
+        self.reaped.store(true, .release);
+        self.accepted += 1;
+        try self.serveWithBody();
     }
 
     /// A `204 No Content` with no `content-length` — the way hyper answers a

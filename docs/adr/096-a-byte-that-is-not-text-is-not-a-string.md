@@ -116,11 +116,22 @@ replaces: the output cannot be parsed. **`null`** is what a browser's own
 `JSON.stringify` makes of both, parses everywhere, and is a value the reader
 of a `?f64` already has to handle.
 
-It costs one `isFinite` per float on the covered path. **A value that goes to
-`std.json` whole** (a type `covers` does not recognise, one with its own
-`jsonStringify`, a `std.json.Value`) still gets `std.json`'s spelling of
-infinity, because nothing in `std.json` can be told otherwise; that gap is the
-fallback's own.
+It costs one `isFinite` per float, and the rule holds on **every** path out
+of `http/`. A type `covers` does not recognise (a tuple, an untagged-looking
+shape, a `std.json.Value`, a map, a type with its own `jsonStringify`, one
+nested past eight) is written by `FiniteJson` in `json.zig`, a wrapper around
+`std.json.Stringify` that walks the same shapes, writes the same bytes, and
+asks every float it passes. A `jsonStringify(self, jw: anytype)` is handed the
+wrapper, so a float it writes through `jw.write` is covered too, which is how
+`std.json.Value` and `ArrayHashMap` are. **A `jsonStringify` that names
+`*std.json.Stringify` as its parameter is the author's own** and keeps `std.json`'s
+spelling of what it writes; the guard is not reachable through a type the
+author fixed.
+
+*Rejected: leaving the fallback as `std.json`'s whole value* ("nothing in
+`std.json` can be told otherwise" was true of `Stringify.value`, and false of a
+writer that stands in for `jw`): a response that took the fallback by one
+unrecognised field in a thousand could send `inf`.
 
 *What moved it: the audit of `http/` at `39896d2`, which found
 `{"p":inf}` coming back out of a number a request had sent in

@@ -51,14 +51,6 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** each corrected, and the module headers' code examples brought under `zig build snippets` so the next one cannot rot.
 
-**A float that is not finite still goes out as `inf` where a type takes `std.json`'s path.** `json.write` writes a non-finite `f32` or `f64` as `null` ([ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md)), but a type `covers` does not take is written by `std.json.Stringify`, which writes `inf` and `nan`, not JSON. On the way in, a number inside a map or a `std.json.Value` field is still read by `std.json`'s grammar, so `"1_0"` there is 10, where [ADR 084](./adr/084-a-number-in-a-request-is-not-a-zig-literal.md) refuses it everywhere else in a body.
-
-**Needs:** the fallback writer given the same float rule, and a caller with a map or `Value` field for the read half.
-
-**A gzip gRPC message that fits its opening window is inflated to `max_body` outside the connection's budget.** The budget now counts a call until its answer is written and holds back the oldest call while a started one still holds bytes ([ADR 220](./adr/220-grpc-is-served-over-h2c-behind-a-flag.md)), but inflation happens when the call starts, so a hundred calls of 64 KiB of gzip that each inflate to the default 1 MB hold about 200 MB on one connection. Not measured.
-
-**Needs:** the inflation limited to the room the budget has left, answered `RESOURCE_EXHAUSTED` past it, and a reading of what that refuses for an OpenTelemetry Collector sending large batches side by side, which is the caller that would be hurt.
-
 ### `nilo_sql`
 
 The entries under *statements that work refused* were reproduced by a probe test that fails at `462d84d`, in Debug and ReleaseSafe, against Postgres 18 where Postgres is named. The rest were found by reading the code at `cb45ea9` and checked in it; **reproduced** marks one that was also run. A fix lands with a probe as the test that would have caught it.
@@ -69,13 +61,9 @@ The entries under *statements that work refused* were reproduced by a probe test
 
 **Needs:** the OID checked with domains resolved to their base type, or the gap written into `db.raw`'s reference as the caller's to hold.
 
-**Needs:** each fixed with its probe kept, trailing comments and dollar quotes first.
-
 **The plan check calls a column certainly NULL where it cannot be, and misses one that always is.** Postgres keeps `Left` for a `LEFT JOIN` through a `NOT NULL REFERENCES` key and under a filter that is not strict, such as `coalesce(o.name, '') <> ''`, and `plan.zig` refuses both, where [ADR 233](./adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md) promises only what is certain; an `Anti` join, `LEFT JOIN … WHERE o.id IS NULL`, outputs NULL on every row and is not flagged.
 
 **Needs:** the wording made "may", or those cases recognised, and `Anti` handled.
-
-**Needs:** a civil-from-days writer for `Timestamp` like the one `Date` has, and the rest refused rather than written wrong.
 
 #### P2: the rest
 
@@ -89,17 +77,9 @@ The entries here came from an audit of `cache/` at `1738286` that read every lin
 
 #### P2
 
-**A flat Space turns a refusal into a plausible answer.** `claimFlat` returns `== .stored`, so a refused `putIfAbsent` reads as "somebody else was first", and `putFlatFor` discards the result under a comment saying a flat value cannot be too large, which is false on a small store: a 20,000-byte struct on a 64 KiB store is refused twice and `get` returns null (`space.zig:186-207`). `flat.kindOf` checks only the 65,535 ceiling. Reproduced.
-
-**Needs:** `Space.open` refusing a `V` whose entry cannot fit a quarter of a shard's ring, the way `registerSpace` refuses a collision.
-
 **The shard lock spins on a write and never backs off.** `while (l.held.swap(true, .acquire))` (`store.zig:340`) bounces the line between waiting cores, and a holder preempted by the OS leaves the waiters burning their timeslice; the module's own soak tests run more threads than cores. The refusal path also takes the lock only to bump an atomic counter (`store.zig:934`). Not measured.
 
 **Needs:** test-and-test-and-set with a yield after some spins, the refusal's lock dropped, and both measured under contention.
-
-**The hash is seeded by the Space's public name.** `Wyhash.hash(space, key)` with `space = Wyhash(0, name)`, so keys an attacker controls (emails, URLs) can be precomputed into one shard and one bucket, evicting a chosen victim and serialising on one lock. Cache only, no memory safety.
-
-**Needs:** a per-Store seed mixed in at `open`, from an `Options.seed` or the loop's entropy ([ADR 042](./adr/042-entropy-belongs-to-the-loop.md)).
 
 **Small things that say the wrong thing.** `open` answers `error.TooSmall` when a shard would exceed 4 GiB (`store.zig:747`); `flat.zig:44`, `space.zig:107` and the `cache_value_over_the_ceiling` refusal still say a bucket's four ways are a cache line, where it is eight; `registerSpace` is documented as not thread-safe while the guide calls `Space.open` from handlers, so two at once race on `n_spaces`.
 
@@ -111,14 +91,6 @@ The entries here came from an audit of `job/` at `1738286` that read every line 
 
 #### P2
 
-**`retryDead` can start a second chain of ticks.** A dead row is revived with its unique key already cleared, and `finishDead` has already pushed the successor (`table.zig:269`, `memory.zig:252`), so a scheduled kind runs on two chains; a revived row of any kind can duplicate a newer one with the same key.
-
-**Needs:** `retryDead` restoring the key or refusing when a row holds it, and refusing scheduled kinds.
-
-**`Memory` and `Table` disagree in small places.** `unique = ""` deduplicates on `Table` and never on `Memory` (`memory.zig:321`); `Table.insertOn` writes `created_at = run_at` (`table.zig:130`); and `finished_at` reads the wall clock where every other time uses the injected one.
-
-**Needs:** one behaviour for each, held by a test run against both stores.
-
 **Inputs nothing refuses.** `every(0)` makes a worker busy-loop and `every` of a huge period overflows; `Backoff.exponential` with `from_ms = 0` stays at zero and has no jitter, so a downstream outage retries every row at the same instant; one `Canceled` propagated from a child future sets `stopping` for every worker (`job.zig:846`); dead rows are never purged from `Memory`, which fills up and answers `QueueFull`.
 
 **Needs:** `every(0)` and `from_ms = 0` refused at compile time with a refusal file each, a jitter option, a cancelled child told apart from shutdown, and a purge for `Memory`'s dead rows.
@@ -126,20 +98,6 @@ The entries here came from an audit of `job/` at `1738286` that read every line 
 ### `nilo_s3`
 
 The entries here came from an audit of `s3/` at `1738286`, by two readers between them covering every line; **reproduced** marks one a throwaway test also ran against the public API.
-
-#### P1
-
-**A credential `fetch` has no deadline.** The Store cannot bound a function it did not write, so a hung IMDS call holds the refresh gate until it returns; the other fibers sign with the old key meanwhile, but once the credentials expire every request waits on it ([ADR 060](./adr/060-a-signing-key-changes-once-a-day.md)).
-
-**Needs:** a timeout the Store arms around `fetch`, which is an API change to `Source`, or the guide's `fetch` example bounding its own call.
-
-**A streamed transfer is cut at the Store's 30-second call timeout.** The Store's client gets `timeout_ms` and no stall bound (`store.zig:168`), and `stream` and `putStream` pass no override, so the guide's `watch()` cuts a large video to a slow browser mid-body under a declared length, and a 1 GB upload at 100 Mbit/s fails after 30 s. Raising the timeout for the Store also removes the fast failure from `get`, `head` and `list`. A `Reading` also holds one of the 32 permits every bucket shares for its whole life. Found by reading.
-
-**Needs:** a stall bound on `s3.Options` and a per-call timeout for the two streaming calls, defaulting to no whole-call limit, and a decision on a gate of their own.
-
-**`putStream` has no stale-connection retry.** `replayable` is false for a `.stream` body (`fetch.zig:1219`), so the first streamed put after an idle gap lands on a connection the server closed, consumes the reader, and fails; `put` is protected. Found by reading.
-
-**Needs:** a streamed body sent on a fresh connection, or a pooled one probed before the first byte, with a test against a reaped connection.
 
 #### P2
 
@@ -154,12 +112,6 @@ The entries here came from an audit of `s3/` at `1738286`, by two readers betwee
 **`canned.zig` checks less than S3 does.** `check()` verifies only the headers the client listed in `SignedHeaders`, so a sent `x-amz-*` header left unsigned still passes, where S3 refuses it; its `Seen` copies into fixed buffers with no bound; two comments refer to `finishGet`, which is now `bounded`; `code.zig`'s header still says `LIST` is not in v1.
 
 **Needs:** every `x-amz-*` header on the wire required in `SignedHeaders`, the harness bounded, and the stale text corrected.
-
-### `nilo_fetch`
-
-**`test-fetch` passes without running its live tests.** It skips when its endpoint is unset, where [ADR 239](./adr/239-a-live-test-skips-on-a-laptop-and-fails-on-ci.md) makes the same skip fail under `$CI` for `test-sql` and `test-s3`. Found by the `nilo_s3` audit at `1738286`.
-
-**Needs:** the `$CI` rule extended to `test-fetch`, with the same split `test-s3-suite` made so the macOS job's `test` is unaffected.
 
 ---
 
@@ -466,6 +418,14 @@ The design is known and priced; what is missing is somebody who needs it. Bring 
 **A `testing.Conversation` does not share a `testing.Client`'s cookie jar.** A test that signs in over HTTP and then opens a socket copies the cookie across with `setHeader` by hand ([ADR 091](./adr/091-a-websocket-route-can-be-driven-from-a-test.md)).
 
 **Needs:** a second test that has had to copy it.
+
+**A number inside a map or a `std.json.Value` field is still read by `std.json`'s grammar.** `"1_0"` there is 10, where [ADR 084](./adr/084-a-number-in-a-request-is-not-a-zig-literal.md) refuses it everywhere else in a body, because a type with its own `jsonParse` is handed to `std.json.innerParse` unchanged. The write half is closed: a float that is not finite is `null` on every path out ([ADR 096](./adr/096-a-byte-that-is-not-text-is-not-a-string.md)).
+
+**Needs:** a caller with a map or `Value` field in a body.
+
+**A gRPC connection's message budget is not an option, and a gzip call over it is refused rather than made to wait.** The budget is `max_body` (at least 64 KiB), and a call is charged its compressed bytes, its inflated copy and the request text built from it, so a Collector sending 3 MB batches side by side gets one at a time per connection at `max_body` 4 MiB and retries the rest as `UNAVAILABLE` ([ADR 220](./adr/220-grpc-is-served-over-h2c-behind-a-flag.md#what-the-budget-refuses-an-opentelemetry-collector)). Two shapes fix it and each is small: a budget option sized from the caller's batches, and a call held back with only its compressed bytes until room is released, which gzip's trailer makes possible because it announces the inflated size.
+
+**Needs:** a Collector, or another client that multiplexes large gzip messages, with its batch size and consumer count, and the per-connection figure measured with them.
 
 ### Modules that do not exist yet
 

@@ -344,6 +344,8 @@ fn mirror(api: *fetch.Client, c: *nilo.Ctx) !void {
 
 **An `Exchange` must not be copied once begun**, because it holds a live `std.http.Client.Request`. Declare it, fill it where it is, and leave it there. `defer ex.end()` is not optional: it gives the permit back and returns the connection to the pool, or drops it if what was left unread is more than `max_drain`. When you already know the body is not wanted (a `Range` probe that got the whole object back), call `ex.discard()` before `end`, and the connection is dropped with the body whatever `max_drain` would have decided. That keeps `max_drain` a policy for every call instead of a setting changed for one ([ADR 184](../adr/184-a-caller-that-knows-says-discard.md)).
 
+**A streamed request body is sent on a connection of its own**, never one from the pool. A pooled connection may be one the server closed while it idled, and a body that is a reader cannot be sent twice, so the call would consume the reader and fail; a `.slice` body is protected by a replay and a `.stream` body by this. The cost is a handshake per streamed body (TLS included over `https://`), which is small against a body big enough to be streamed. While one goes out, `stall_ms` counts every chunk your reader hands over as progress.
+
 **A request body with no known length cannot be streamed.** `.stream` takes the length because HTTP can send a body of unknown length only as chunked, and the services this exists for, S3 among them, answer `411` to that. Not knowing the length is therefore a compile error here instead of somebody else's status code.
 
 ## What it costs

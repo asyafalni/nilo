@@ -79,6 +79,7 @@ A path no route answers is `UNIMPLEMENTED`, and a message larger than `max_body`
 - **Streaming calls.** One message in, one out. A call that sends a second message is answered `INTERNAL`.
 - **HTTP/2 for anything but gRPC.** A browser, or `curl --http2` to a plain route, still reaches nilo as HTTP/1.1; for HTTP/2 there, put a proxy in front.
 - **gRPC and HTTP/1.1 on one port.** A connection to a gRPC listener that does not open with HTTP/2's preface gets a 505, and an HTTP/1.1 listener rejects the preface as a request line it cannot read.
+- **A gzip message beyond what its connection's budget has left.** The inflated copy of a gzip message is held to the room the connection has, which is `max_body` less what the other calls on it hold, and a call over it is answered `UNAVAILABLE`, which an OTLP exporter retries with backoff, with a message saying the budget is full. A call alone on its connection has all of it. **A Collector sending batches of a few MB side by side on one connection gets one at a time at the default budget**, and the rest are retried later rather than sent side by side; set its `sending_queue.num_consumers` to what the budget holds, or raise `max_body` ([the arithmetic](../adr/220-grpc-is-served-over-h2c-behind-a-flag.md#what-the-budget-refuses-an-opentelemetry-collector)).
 - **Compressed answers.** A client's gzip is read; the answer goes back uncompressed.
 
 ## What it costs

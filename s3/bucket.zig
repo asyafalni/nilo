@@ -320,6 +320,17 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             /// streams; a handler that wants them afterwards keeps a copy.
             content_type: []const u8 = "",
             etag: []const u8 = "",
+            /// A limit on the whole transfer, in milliseconds, **set before
+            /// `stream`** (`var r: Files.Reading = .{ .timeout_ms = 600_000 }`).
+            /// Null, the default, is none: a stream ends when the object does,
+            /// and `Options.stall_ms` is what ends one whose peer went quiet.
+            /// The Store's `timeout_ms` is for the short calls and is not
+            /// applied here (ADR 060).
+            timeout_ms: ?u32 = null,
+            /// The Store whose stream slot this holds, null when it holds
+            /// none. Given back by `close`, and by `stream` itself when it
+            /// fails.
+            slot: ?*Store = null,
 
             pub const idle: Reading = .{};
 
@@ -328,8 +339,15 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 return self.ex.pipe(w) catch |err| return blame(err);
             }
 
+            /// Give back the connection, the permit and then the stream slot,
+            /// in the opposite order they were taken. Safe twice, and safe on
+            /// one that never began.
             pub fn close(self: *Reading) void {
                 self.ex.end();
+                if (self.slot) |store| {
+                    self.slot = null;
+                    store.giveStream();
+                }
             }
         };
 
@@ -359,6 +377,13 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .token_buf = &token_buf,
             });
 
+            // A slot of the stream share before a permit of the whole, so a
+            // handful of slow readers can never hold every permit (ADR 060).
+            // Taken here, after everything that can fail without waiting.
+            try self.store.takeStream();
+            out.slot = self.store;
+            errdefer out.close();
+
             const got = out.ex.begin(&self.store.client, .{
                 .method = .GET,
                 .url = target,
@@ -370,6 +395,10 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 // `failure` reads it (ADR 183). Never followed, because a
                 // signature is over one host.
                 .redirects = .expose,
+                // No limit on the whole transfer unless the caller set one,
+                // and a bound on silence instead.
+                .timeout_ms = out.timeout_ms orelse 0,
+                .stall_ms = self.store.options.stall_ms,
             }) catch |err| return blame(err);
 
             if (!got.ok()) return self.failure(c, &out.ex, got);
@@ -456,6 +485,10 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .token_buf = &token_buf,
             });
 
+            // The stream share first, the permit second, and both given back
+            // on every path out, an error included (ADR 060).
+            try self.store.takeStream();
+            defer self.store.giveStream();
             var ex: fetch.Exchange = .idle;
             defer ex.end();
 
@@ -468,6 +501,10 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
                 .headers = headers.slice(),
                 .body = .{ .stream = .{ .reader = source.reader, .len = source.len } },
                 .redirects = .expose,
+                // No whole-call limit unless the source names one
+                // (`.timeout_ms`), and a bound on silence instead.
+                .timeout_ms = optionalMs(source, "timeout_ms") orelse 0,
+                .stall_ms = self.store.options.stall_ms,
             }) catch |err| return blame(err);
 
             if (!got.ok()) return self.failure(c, &ex, got);
@@ -1164,6 +1201,18 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
         fn blame(err: anyerror) Error {
             return switch (err) {
                 error.TimedOut => error.TimedOut,
+                // No bytes moved for `stall_ms`, which a handler answers the
+                // way it answers a deadline: the object did not arrive.
+                error.Stalled => {
+                    std.log.warn("nilo_s3: {s}: a streamed transfer stalled; raise `stall_ms` if the peer is slow rather than gone", .{name});
+                    return error.TimedOut;
+                },
+                // A credential source that did not answer in
+                // `fetch_timeout_ms`, with no credentials left to sign with.
+                error.CredentialsTimedOut => {
+                    std.log.warn("nilo_s3: {s}: the credential source did not answer within `fetch_timeout_ms`", .{name});
+                    return error.TimedOut;
+                },
                 error.BodyTooLarge => error.TooLarge,
                 error.OutOfMemory => error.OutOfMemory,
                 error.Canceled => error.Canceled,
@@ -1326,6 +1375,17 @@ fn viewOf(value: anytype) []const u8 {
 fn contentTypeOf(value: anytype) ?[]const u8 {
     const v = viewOf(value);
     return if (std.mem.trim(u8, v, " \t").len == 0) null else v;
+}
+
+/// A millisecond count the caller's own type may carry, as `optional` is for
+/// text: absent, or null, is null.
+fn optionalMs(value: anytype, comptime field: []const u8) ?u32 {
+    if (!@hasField(@TypeOf(value), field)) return null;
+    const v = @field(value, field);
+    return switch (@typeInfo(@TypeOf(v))) {
+        .optional => if (v) |inner| @intCast(inner) else null,
+        else => @intCast(v),
+    };
 }
 
 fn optional(value: anytype, comptime field: []const u8) ?[]const u8 {

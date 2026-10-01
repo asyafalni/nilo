@@ -39,8 +39,156 @@ pub fn write(w: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
     const T = @TypeOf(value);
     if (comptime covers(T)) return writeValue(T, w, value);
     comptime refuseRenameOnTheFallback(T);
-    return std.json.Stringify.value(value, .{}, w);
+    return stringify(w, value);
 }
+
+/// What `std.json.Stringify.value` does, except that a float is asked whether it
+/// is finite first ([ADR 096](../docs/adr/096-a-byte-that-is-not-text-is-not-a-string.md)).
+///
+/// **Every value that is not `covers`' goes through here**, so the rule holds on
+/// every path out of `http/` and not only the fast one.
+fn stringify(w: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
+    var jw: FiniteJson = .{ .inner = .{ .writer = w, .options = .{} }, .writer = w };
+    return jw.write(value);
+}
+
+/// A `std.json.Stringify` that writes a float `std.json` cannot spell as `null`.
+///
+/// `Stringify` has no hook for a number: a float is a `print("{}")` inside
+/// `write`, so infinity came out as the bare word `inf` and NaN as the string
+/// `"nan"`. But a type's `jsonStringify(self, jw: anytype)` is handed whatever
+/// writer the caller has, which is what makes this possible at all: this type
+/// walks the shapes `Stringify.write` walks, calls itself for every child, and
+/// hands the leaves to the `Stringify` it wraps, so the bytes are the ones
+/// `std.json` writes and a float inside a `std.json.Value`, a map, a tuple or a
+/// type's own `jsonStringify` is seen on the way past. Its punctuation state
+/// lives in `inner`, so the two never disagree about a comma.
+///
+/// **A `jsonStringify` that names `*std.json.Stringify` as its parameter is the
+/// type author's own** and is handed `inner` as it always was; its floats are
+/// theirs to guard. One that takes `anytype`, which is how every nilo type and
+/// every one in `std.json` is written, gets this type and is covered.
+const FiniteJson = struct {
+    inner: std.json.Stringify,
+    /// Kept because a `jsonStringify` may reach for `jw.writer`.
+    writer: *std.Io.Writer,
+
+    const Error = std.Io.Writer.Error;
+
+    pub fn beginObject(self: *FiniteJson) Error!void {
+        return self.inner.beginObject();
+    }
+    pub fn endObject(self: *FiniteJson) Error!void {
+        return self.inner.endObject();
+    }
+    pub fn beginArray(self: *FiniteJson) Error!void {
+        return self.inner.beginArray();
+    }
+    pub fn endArray(self: *FiniteJson) Error!void {
+        return self.inner.endArray();
+    }
+    pub fn objectField(self: *FiniteJson, key: []const u8) Error!void {
+        return self.inner.objectField(key);
+    }
+    pub fn objectFieldRaw(self: *FiniteJson, quoted_key: []const u8) Error!void {
+        return self.inner.objectFieldRaw(quoted_key);
+    }
+    pub fn beginObjectFieldRaw(self: *FiniteJson) Error!void {
+        return self.inner.beginObjectFieldRaw();
+    }
+    pub fn endObjectFieldRaw(self: *FiniteJson) void {
+        self.inner.endObjectFieldRaw();
+    }
+    pub fn beginWriteRaw(self: *FiniteJson) Error!void {
+        return self.inner.beginWriteRaw();
+    }
+    pub fn endWriteRaw(self: *FiniteJson) void {
+        self.inner.endWriteRaw();
+    }
+    pub fn print(self: *FiniteJson, comptime fmt: []const u8, args: anytype) Error!void {
+        return self.inner.print(fmt, args);
+    }
+
+    pub fn write(self: *FiniteJson, v: anytype) Error!void {
+        const T = @TypeOf(v);
+        switch (@typeInfo(T)) {
+            .float => {
+                if (!std.math.isFinite(v)) return self.inner.write(null);
+                return self.inner.write(v);
+            },
+            .optional => {
+                if (v) |payload| return self.write(payload);
+                return self.inner.write(null);
+            },
+            .@"enum", .@"union", .@"struct" => {
+                if (comptime std.meta.hasFn(T, "jsonStringify")) return self.own(v);
+                switch (@typeInfo(T)) {
+                    .@"union" => |info| {
+                        // Untagged is `std.json`'s own compile error.
+                        if (info.tag_type == null) return self.inner.write(v);
+                        try self.beginObject();
+                        inline for (info.fields) |f| {
+                            if (v == @field(info.tag_type.?, f.name)) {
+                                try self.objectField(f.name);
+                                if (f.type == void) {
+                                    try self.beginObject();
+                                    try self.endObject();
+                                } else {
+                                    try self.write(@field(v, f.name));
+                                }
+                                break;
+                            }
+                        }
+                        return self.endObject();
+                    },
+                    .@"struct" => |info| {
+                        if (info.is_tuple) try self.beginArray() else try self.beginObject();
+                        inline for (info.fields) |f| {
+                            if (f.type == void) continue;
+                            if (!info.is_tuple) try self.objectField(f.name);
+                            try self.write(@field(v, f.name));
+                        }
+                        return if (info.is_tuple) self.endArray() else self.endObject();
+                    },
+                    else => return self.inner.write(v),
+                }
+            },
+            .pointer => |p| switch (p.size) {
+                .one => switch (@typeInfo(p.child)) {
+                    .array => return self.write(@as([]const std.meta.Elem(p.child), v)),
+                    else => return self.write(v.*),
+                },
+                .many, .slice => {
+                    if (p.size == .many and p.sentinel() == null) return self.inner.write(v);
+                    const slice = if (p.size == .many) std.mem.span(v) else v;
+                    // A string, which is what `std.json` makes of text and
+                    // what it makes of anything else it cannot call one.
+                    if (p.child == u8 and std.unicode.utf8ValidateSlice(slice)) return self.inner.write(slice);
+                    try self.beginArray();
+                    for (slice) |x| try self.write(x);
+                    return self.endArray();
+                },
+                else => return self.inner.write(v),
+            },
+            .array => return self.write(&v),
+            .vector => |info| {
+                const array: [info.len]info.child = v;
+                return self.write(&array);
+            },
+            else => return self.inner.write(v),
+        }
+    }
+
+    /// The value's own `jsonStringify`, handed this writer unless it asks for a
+    /// `std.json.Stringify` by name.
+    fn own(self: *FiniteJson, v: anytype) Error!void {
+        const params = @typeInfo(@TypeOf(@TypeOf(v).jsonStringify)).@"fn".params;
+        if (params.len == 2 and params[1].type == *std.json.Stringify) {
+            return v.jsonStringify(&self.inner);
+        }
+        return v.jsonStringify(self);
+    }
+};
 
 /// Read a JSON body into a `T`, with every number read the way a query's is
 /// ([ADR 084](../docs/adr/084-a-number-in-a-request-is-not-a-zig-literal.md)).
@@ -466,12 +614,12 @@ fn writeValue(comptime T: type, w: *std.Io.Writer, value: T) std.Io.Writer.Error
     // A leaf writes itself, and `std.json` is what calls it — so the bytes are
     // the ones this file's contract promises, and the object around it stays
     // this file's to write (ADR 148).
-    if (comptime writesItsOwnScalar(T)) return std.json.Stringify.value(value, .{}, w);
+    if (comptime writesItsOwnScalar(T)) return stringify(w, value);
     // A document as its value — walked here when it can be, and otherwise the
     // same bytes its own `jsonStringify` would have written (ADR 163).
     if (comptime mark.documentOf(T)) |Inner| {
         if (comptime covers(Inner)) return writeValue(Inner, w, value.value);
-        return std.json.Stringify.value(value.value, .{}, w);
+        return stringify(w, value.value);
     }
     if (T == Str) return writeText(w, value.view());
     if (comptime isByteSlice(T)) return writeText(w, value);
@@ -1553,4 +1701,113 @@ test "one field can be spelled on its own, and the entry wins over the case" {
         other_one: u8,
     };
     try expectJson("{\"type\":\"note\",\"other_one\":1}", Bare{ .kind_of = "note", .other_one = 1 });
+}
+
+/// Write `value` and parse it back with `std.json`, which is the check that what
+/// went out is JSON at all, and return the text for the caller to compare.
+fn writtenAndParses(out: *std.Io.Writer.Allocating, value: anytype) !void {
+    try write(&out.writer, value);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    parsed.deinit();
+}
+
+test "a float that is not finite is null on every shape that falls back to std.json" {
+    const inf = std.math.inf(f64);
+    const nan = std.math.nan(f64);
+
+    // A tuple, a type that writes itself, a document value, a map, a pointer and
+    // a list of itself all miss `covers`. None may let `inf` or `nan` out.
+    const Custom = struct {
+        v: f64,
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.beginObject();
+            try jw.objectField("v");
+            try jw.write(self.v);
+            try jw.endObject();
+        }
+    };
+    comptime std.debug.assert(!covers(Custom));
+    comptime std.debug.assert(!covers(struct { f64, f32 }));
+    comptime std.debug.assert(!covers(std.json.Value));
+    comptime std.debug.assert(!covers(std.json.ArrayHashMap(f64)));
+
+    {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        try writtenAndParses(&out, .{ inf, @as(f32, nan) });
+        try testing.expectEqualStrings("[null,null]", out.written());
+    }
+    {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        try writtenAndParses(&out, Custom{ .v = inf });
+        try testing.expectEqualStrings("{\"v\":null}", out.written());
+    }
+    {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var items = [_]std.json.Value{ .{ .float = nan }, .{ .float = 2.5 }, .{ .float = -inf } };
+        try writtenAndParses(&out, std.json.Value{ .array = .{ .items = &items, .capacity = items.len, .allocator = testing.allocator } });
+        try testing.expectEqualStrings("[null,2.5,null]", out.written());
+    }
+    {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var map: std.json.ArrayHashMap(f64) = .{};
+        defer map.deinit(testing.allocator);
+        try map.map.put(testing.allocator, "a", inf);
+        try map.map.put(testing.allocator, "b", 1.5);
+        try writtenAndParses(&out, map);
+        try testing.expectEqualStrings("{\"a\":null,\"b\":1.5}", out.written());
+    }
+    {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        const Row = struct { at: f64, inner: *const Custom };
+        const c: Custom = .{ .v = nan };
+        const row: Row = .{ .at = inf, .inner = &c };
+        try writtenAndParses(&out, .{ .row = &row, .tail = .{ inf, 1 } });
+        try testing.expectEqualStrings("{\"row\":{\"at\":null,\"inner\":{\"v\":null}},\"tail\":[null,1]}", out.written());
+    }
+}
+
+test "the fallback writes what std.json writes for every value that is not a float it refuses" {
+    const Custom = struct {
+        n: u32,
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.write(self.n);
+        }
+    };
+    const U = union(enum) { a: u8, b: []const u8, c, d: ?f64 };
+    const Mixed = struct {
+        t: struct { u8, []const u8, ?bool },
+        c: Custom,
+        u: []const U,
+        bytes: [3]u8,
+        raw: []const u8,
+        e: enum { x, y },
+        none: ?u8 = null,
+        p: *const u16,
+        f: f64,
+    };
+    const n: u16 = 9;
+    const value: Mixed = .{
+        .t = .{ 1, "two", null },
+        .c = .{ .n = 3 },
+        .u = &.{ .{ .a = 1 }, .{ .b = "x\"y" }, .c, .{ .d = 0.25 }, .{ .d = null } },
+        .bytes = .{ 104, 105, 33 },
+        .raw = "\xff\xfe",
+        .e = .y,
+        .p = &n,
+        .f = 12.5,
+    };
+    comptime std.debug.assert(!covers(Mixed));
+
+    var mine: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer mine.deinit();
+    try write(&mine.writer, value);
+    var theirs: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer theirs.deinit();
+    try std.json.Stringify.value(value, .{}, &theirs.writer);
+    try testing.expectEqualStrings(theirs.written(), mine.written());
 }
