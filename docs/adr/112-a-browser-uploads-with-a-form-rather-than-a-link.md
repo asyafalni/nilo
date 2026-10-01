@@ -3,11 +3,14 @@
 **Status:** accepted
 **Topic:** [s3](../design/s3.md)
 
-`bucket.presign(c, key, seconds)` returns a SigV4 query URL, which covers GET
-and PUT. A browser uploading straight to the object store uses neither: it
-posts a multipart form to the bucket, and what it needs is a **POST policy** —
-a JSON document, base64-encoded, signed with the same derived key, handed back
-as a set of form fields.
+`bucket.presign(c, key, seconds)` returns a SigV4 query URL. This ADR's first
+sentence used to claim that one URL "covers GET and PUT", and it was wrong: the
+method is inside the canonical request, so a URL signed for GET is a 403 under
+PUT. `presign` signs GET and `presignPut` signs PUT, two calls on one body. A
+browser uploading straight to the object store uses neither: it posts a
+multipart form to the bucket, and what it needs is a **POST policy** — a JSON
+document, base64-encoded, signed with the same derived key, handed back as a
+set of form fields.
 
 nilo could not sign one, so every receipt, deal attachment and comment
 attachment in a caller's product had to.
@@ -46,6 +49,24 @@ building the form will read it.
 `.content_type` pins what the browser may send. `.prefix = true` makes `key` a
 `starts-with` condition rather than an exact match, which is what a browser
 picking its own filename needs.
+
+## A process uploads with a link after all
+
+The form is the browser's shape, not the only one. The caller that brought
+`presignPut` is a dataset version-control server whose CLI uploads item bytes
+straight to the store: the server hands out short-lived PUT URLs for the
+hashes it is missing, the CLI PUTs each file, and the server verifies what
+landed — a `head` for the size, the content hash by name — before recording
+it. No browser, no form, and the verify-after step is the caller's own
+invariant, not something a policy could carry for it.
+
+**A presigned PUT carries no size condition, and the doc comment says so where
+the caller will read it.** SigV4 has nowhere to put one on a plain PUT, so
+`max_bytes` cannot bind this path the way the POST policy's
+`content-length-range` binds the browser's. That is acceptable for exactly the
+caller shape above — a server that checks what arrived before believing it —
+and it is why the browser rule below stands unchanged: a form handed to a
+client nobody verifies still always carries its ceiling.
 
 ## `max_bytes` defaults to the bucket's and is clamped to it
 
@@ -119,8 +140,9 @@ now carries `@tagName(builtin.mode)`.
 
 - `presignPost`, `Post`, `Posted` and `Field` on the public surface, and
   `Policy`, `writePolicy`, `policySize` and `Stamp.expiration` inside
-  `sign.zig`.
-- `presign` and `presignPost` share one life clamp.
+  `sign.zig`. `presignPut` joined later, sharing `presign`'s whole body with
+  the method as the one difference.
+- `presign`, `presignPut` and `presignPost` share one life clamp.
 - No new refusal. Nothing about `presignPost` is a compile-time mistake Zig
   does not already name: `Post` is a concrete struct, so a mistyped field is a
   plain "no field named", and the two comptime options it leans on are already

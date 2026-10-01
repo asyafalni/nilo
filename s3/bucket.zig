@@ -1103,7 +1103,42 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             wanted_seconds: u32,
         ) Error!Presigned {
             comptime core.checkScope(@TypeOf(c), "bucket.presign");
-            if (key.len == 0) return refuseEmptyKey("presign");
+            return self.presigned(c, key, wanted_seconds, "GET", "presign");
+        }
+
+        /// A URL somebody else can PUT bytes to, and the moment it stops
+        /// working — for a process uploading where the server checks what
+        /// landed, not for a browser (that is `presignPost`, ADR 112).
+        ///
+        /// **A presigned PUT carries no size condition**: SigV4 has nowhere
+        /// to put one on a plain PUT, so the bucket's `max_bytes` cannot
+        /// bind here the way it binds a POST policy. The server that handed
+        /// the URL out verifies what arrived — a `head` for the size, the
+        /// content hash if it stores by one — before recording it, which is
+        /// the shape this call exists for.
+        pub fn presignPut(
+            self: *Self,
+            c: anytype,
+            key: []const u8,
+            wanted_seconds: u32,
+        ) Error!Presigned {
+            comptime core.checkScope(@TypeOf(c), "bucket.presignPut");
+            return self.presigned(c, key, wanted_seconds, "PUT", "presignPut");
+        }
+
+        /// The one presigning body. The method is inside the canonical
+        /// request, so a URL signed for one verb is a 403 under any other —
+        /// which is why `presign` and `presignPut` are two calls rather than
+        /// one URL that "covers" both (ADR 112's premise, corrected there).
+        fn presigned(
+            self: *Self,
+            c: anytype,
+            key: []const u8,
+            wanted_seconds: u32,
+            comptime method: []const u8,
+            comptime called: []const u8,
+        ) Error!Presigned {
+            if (key.len == 0) return refuseEmptyKey(called);
             if (key.len > settings.key_max) return error.Rejected;
 
             const io = self.store.client.inner.io;
@@ -1123,7 +1158,7 @@ pub fn Bucket(comptime name: []const u8, comptime opts: anytype) type {
             var sig: sign.Signature = .none;
             sig.stamp = stamp;
             const canonical = sign.canonicalHash(.{
-                .method = "GET",
+                .method = method,
                 .prefix = self.prefix,
                 .key = key,
                 .query = query,
