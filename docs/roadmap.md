@@ -51,6 +51,10 @@ The entries from the WebSocket one down to the end of this module, other than th
 
 **Needs:** each corrected, and the module headers' code examples brought under `zig build snippets` so the next one cannot rot.
 
+**No test runs `nilo.io()` in a fiber `app.spawn` started on a live server (feedback from the photon port).** The guide's queue pattern ([ADR 244](./adr/244-a-handler-is-given-the-loop-it-runs-on.md)) has its writer call `nilo.io()`, and that is the one entry point with no test behind it where it matters: the tests reach `bulkhead.loopIo()` through `Wired.io()` and `c.io()`, which answer the process-wide `std.Io.Threaded` when no server runs. photon's WAL writer used it through the real server under load and acked every append, but that run is a spike's, not this suite's.
+
+**Needs:** a test in `http/live.zig` that starts a server whose `app.spawn` fiber takes `nilo.io()`, drains a `std.Io.Queue` a route fills and sets the event the route waits on, and checks that the Io is the server's loop (the same `userdata` `c.io()` answers inside the route), in both modes.
+
 ### `nilo_sql`
 
 The entries under *statements that work refused* were reproduced by a probe test that fails at `462d84d`, in Debug and ReleaseSafe, against Postgres 18 where Postgres is named. The rest were found by reading the code at `cb45ea9` and checked in it; **reproduced** marks one that was also run. A fix lands with a probe as the test that would have caught it.
@@ -170,6 +174,10 @@ The entries here came from an audit of `s3/` at `1738286`, by two readers betwee
 **A mutation pass over the request path.** The `nilo_sql` audit found what reading could not by changing one comparison or deleting one check and seeing which change no test noticed (`57c8bbb`); `http/` has not had one. `http1.zig`, `router.zig`, `middleware.zig` and `serve.zig` are where a survivor costs most, and the fuzzers and the llhttp differential ([ADR 231](./adr/231-a-second-parser-reads-what-the-first-one-reads.md)) cover the parser's bytes, not the dispatch's decisions.
 
 **Needs:** the run, one file at a time because a run is the whole `zig build test`, and a test for each mutation that survives.
+
+**A tagged union cannot be a handler's body argument (feedback from the photon port).** photon's alert rule condition is one of several shapes picked by a field (`{"signal": "metrics", ...}`). Inside a struct it reads, answers named 400s and gets a `oneOf` with a `discriminator` in the API description; as the whole body, `fn create(cond: Condition)` is refused with "nilo does not recognise", so the handler takes a `*Ctx` and calls `c.json(Condition)`, and the description loses the body. The 400s for a top-level union already match the nested ones (`describeBadBody` hands it to `describeTagged`); the typed argument and its schema are what is missing.
+
+**Needs:** the rule that makes a union value argument the body (the one struct a route takes today, widened to an internally tagged union), its description through the `oneOf` and `discriminator` the nested case already renders (ADR 016), and a refusal for a union nilo cannot tell apart while reading (no tag field).
 
 ### `nilo_sql`
 
