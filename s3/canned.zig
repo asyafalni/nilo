@@ -1124,15 +1124,18 @@ test "a streamed get that is slower than the call timeout but never goes quiet c
         fn run(io: std.Io) !void {
             var canned = try Canned.open(io);
             defer canned.close();
-            // 8 bytes, 60 ms apart: 480 ms against a call timeout of 150 ms,
-            // and no gap anywhere near the 400 ms stall bound.
-            canned.answer = .{ .slow = .{ .pieces = 8, .gap_ms = 60 } };
+            // 24 bytes, 60 ms apart: 1.44 s against a call timeout of 150 ms,
+            // and no gap anywhere near the one-second stall bound. A second
+            // because the gaps are sleeps, and on the loaded macOS runner a
+            // 60 ms sleep was measured at up to 135 ms (fetch's twin of this
+            // test, in `fetch/live.zig`, says the same).
+            canned.answer = .{ .slow = .{ .pieces = 24, .gap_ms = 60 } };
 
             var served = try io.concurrent(Canned.serveOne, .{&canned});
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
-            var store = try startedWith(io, &canned, &buf, .{ .timeout_ms = 150, .stall_ms = 400 });
+            var store = try startedWith(io, &canned, &buf, .{ .timeout_ms = 150, .stall_ms = 1000 });
             defer store.deinit();
             var files = try Files.open(&store);
             defer files.deinit();
@@ -1145,8 +1148,8 @@ test "a streamed get that is slower than the call timeout but never goes quiet c
 
             var out: [32]u8 = undefined;
             var w = std.Io.Writer.fixed(&out);
-            try testing.expectEqual(@as(u64, 8), try reading.pipe(&w));
-            try testing.expectEqualStrings("xxxxxxxx", w.buffered());
+            try testing.expectEqual(@as(u64, 24), try reading.pipe(&w));
+            try testing.expectEqualStrings("x" ** 24, w.buffered());
         }
     }.run);
 }
@@ -1223,21 +1226,23 @@ test "a streamed put that keeps moving outlasts the call timeout, and one that g
             defer served.cancel(io) catch {};
 
             var buf: [64]u8 = undefined;
-            var store = try startedWith(io, &canned, &buf, .{ .timeout_ms = 150, .stall_ms = 300 });
+            var store = try startedWith(io, &canned, &buf, .{ .timeout_ms = 150, .stall_ms = 1000 });
             defer store.deinit();
             var files = try Files.open(&store);
             defer files.deinit();
             var scope: core.Run = .init(testing.allocator);
             defer scope.deinit();
 
-            // 480 ms against a 150 ms call timeout, a byte every 60 ms.
-            var source: fetch.testing.Dribble = .init(io, 8, 60);
+            // 1.44 s against a 150 ms call timeout, a byte every 60 ms, under
+            // a one-second stall bound. It was 8 bytes under 300 ms, and a
+            // 60 ms sleep on the loaded macOS runner went past that.
+            var source: fetch.testing.Dribble = .init(io, 24, 60);
             try files.putStream(&scope, "big/one.bin", .{
                 .reader = &source.reader,
-                .len = @as(u64, 8),
+                .len = @as(u64, 24),
                 .content_type = "application/octet-stream",
             });
-            try testing.expectEqualStrings("yyyyyyyy", canned.seen.bodyText());
+            try testing.expectEqualStrings("y" ** 24, canned.seen.bodyText());
         }
     }.run);
 }
