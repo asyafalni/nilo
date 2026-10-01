@@ -3122,6 +3122,34 @@ After the fix the arena holds the body and about 4 KB of head and answer, whatev
 
 **What was not run.** No throughput benchmark: the change is one indirect call and the stores it makes into the Engine's `Clocks` per request (`serve.handleConnection` re-arms the write limit before each request), and, for a route with a deadline, the same again where its answer is written. `test "the request path stays inside its allocation budget"` passes unchanged, nothing is held per connection (the `Deadlines` the connection already carries is read, not grown), and the test that found the defect (`a route deadline shortens the write to a client that reads nothing`, a 96 MB answer to a client that reads nothing, 200 ms against a 30,000 ms write limit) returns in about the deadline instead of failing at its six-second bound. A figure for the per-request re-arm belongs here the next time the paced benchmark is run on this path.
 
+## What waiting for room buys an OpenTelemetry Collector
+
+Taken for [ADR 220](../../docs/adr/220-grpc-is-served-over-h2c-behind-a-flag.md#what-the-budget-does-to-an-opentelemetry-collector), whose table of how many Collector batches a budget refuses was arithmetic from assumed batch sizes. This is the caller the roadmap entry asked for. Apple M1 Pro (8 cores), macOS 26, Zig 0.16.0, zio v0.18.0, nilo `1016cee` (**refused**) against the same tree with the change that made a call wait (**waiting**). The server is photon's OTLP logs spike on nilo (`photon/zig/spike/s1-ingest`, photon commit `7fcaabe`): a gRPC route decoding each `LogsService/Export` into columns and appending it to a WAL with a group-commit `F_FULLFSYNC`, on a real disk. In front of it the OpenTelemetry Collector contrib 0.161.0 at its defaults (batch of 8,192, `otlp` exporter with gzip, ten consumers on one connection, retry from 5 s), fed by `telemetrygen logs --rate 0` for 30 seconds; both in Docker under OrbStack with `--network host`, so loopback to the Mac. The harness is `collector/run.sh` there, and `collector/run-photon.sh` puts photon's own receiver (tonic, a 16 MiB message limit and no budget per connection) behind the same Collector as the control. The Collector's own metrics are read ten seconds after the load stops. One run each.
+
+**Small batches** (8 workers, 58-byte logs, about 860 KB a batch inflated), refused:
+
+| `max_body` | records accepted by the Collector | sent | refused `UNAVAILABLE` | lost |
+|---|---|---|---|---|
+| 1 MiB | 10,766,314 | 10,758,114 | 28 | 0 |
+| 4 MiB | 10,742,808 | 10,742,808 | 1 | 0 |
+| 16 MiB | 10,432,821 | 10,432,821 | 0 | 0 |
+
+Waiting, at 1 MiB: 10,086,625 sent, 0 refused.
+
+**Production-sized batches** (48 workers, 500-byte logs, about 4.4 MB a batch inflated):
+
+| server | accepted | sent | refused | still queued | lost |
+|---|---|---|---|---|---|
+| refused, `max_body` 4 MiB | 25,205,633 | 7,033 | 60 `RESOURCE_EXHAUSTED` | 0 | 25,198,600 |
+| refused, `max_body` 16 MiB | 16,338,650 | 13,653,000 | 40 `UNAVAILABLE` | 329 batches | 0 so far |
+| refused, `max_body` 64 MiB | 20,771,725 | 20,771,725 | 6 `UNAVAILABLE` | 0 | 0 |
+| **waiting, `max_body` 16 MiB** | **22,160,250** | **22,160,250** | **0** | **0** | **0** |
+| tonic (photon), 16 MiB | 19,216,088 | 19,216,088 | 0 | 0 | 0 |
+
+**What it moved.** A call that does not fit now waits instead of being refused (ADR 220). Refused, each `UNAVAILABLE` cost the exporter a backoff of 5 s and up while the server sat idle, so at 16 MiB the Collector's queue grew for as long as the load lasted (329 of its 1,000 batches after 30 seconds), and a longer run would have filled it and dropped. Raising `max_body` to 64 MiB only thinned the refusals. Waiting, the same load went through with nothing queued, more records than tonic took in the same 30 seconds; the WAL's `max_round_frames` of 2 says about two calls ran side by side, which is what the budget's arithmetic gives for 4.4 MB batches at 16 MiB. At 4 MiB the batches are over `max_body` itself, and `RESOURCE_EXHAUSTED` is permanent to the Collector, so the data is dropped there with or without this change: that is the caller's `max_body` to set.
+
+**What it does not say.** Single runs on a laptop, with the Collector and the generator sharing it; the absolute records a second are about this machine. Peak memory of the server was not taken. Whether more than two calls side by side would help is not answered here, because the generator and the WAL's fsync are in the way before the budget is; that is the roadmap's budget-as-an-option entry, which waits for a caller held back by it.
+
 ## What is still missing
 
 - **A quiet machine, and a second one to generate load from.** Both readings

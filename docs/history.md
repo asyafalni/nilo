@@ -288,6 +288,8 @@ Through v1 the model was **GoFiber**: the feel of Express on a fast engine, for 
 
 **Documentation written for a reader who starts at the top loses both readers who actually arrive.** A person scans the headings and an agent pulls the outline and greps, and at `d14780e` both hit the same walls: headings that were conclusions ("The value comes back as it was sent") rather than topics, 76% of prose hard-wrapped so a phrase split across lines was invisible to grep, a guide that linked the design pages 0 times, and a hand-kept list of reference headings already missing four. The fix was a shape every page shares, a map, and a build step, not better sentences ([ADR 236](./adr/236-a-doc-page-says-what-it-is-and-where-its-other-layers-are.md)).
 
+**A refusal the client retries is not a delay, it is a cliff.** A gRPC call whose gzip copy did not fit the connection's budget was answered `UNAVAILABLE` so an OTLP exporter would retry rather than drop, and the ADR called the cost "a delay rather than a loss". Measured against a real Collector, each retry waited out a backoff of 5 seconds and up while the server sat idle, and at 16 MiB its queue grew by 329 batches in 30 seconds; holding the call until room came back took the same load with nothing queued. The prediction of how many batches a budget refuses was arithmetic from an assumed batch size until somebody ran the client ([ADR 220](./adr/220-grpc-is-served-over-h2c-behind-a-flag.md#what-the-budget-does-to-an-opentelemetry-collector), [`http.md`](../bench/result/http.md#what-waiting-for-room-buys-an-opentelemetry-collector)).
+
 ## Zig 0.16 and std traps
 
 Each of these cost somebody an hour, usually in the wrong file.

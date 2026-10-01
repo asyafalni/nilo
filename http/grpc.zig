@@ -43,8 +43,9 @@
 //! connection holds, arriving or held by a call until its answer is
 //! written, by one `max_body` between them, past which a call waits on a
 //! window the client is held to (`Conn.budget`); a gzip message's inflated
-//! copy is charged to it before it is allocated, and refused past what the
-//! other calls leave (ADR 220). Frames that move no call
+//! copy is charged to it before it is allocated, and a call whose copy does
+//! not fit in what the other calls leave waits, holding only its compressed
+//! bytes, until one of them gives room back (ADR 220). Frames that move no call
 //! forward are counted, and a flood is sent away. A client that
 //! stops reading while an answer waits on its window is cut off at the write
 //! deadline.
@@ -287,7 +288,10 @@ const Stream = struct {
     shared: *Shared,
     next: ?*Stream = null,
 
-    const State = enum { headers, body, running, writing };
+    /// `waiting` is a gzip call whose message is whole and whose inflated
+    /// copy does not fit in what the connection's budget has left: it holds
+    /// its compressed bytes and nothing else until `admitWaiting` starts it.
+    const State = enum { headers, body, waiting, running, writing };
 
     fn create(gpa: std.mem.Allocator, id: u31, app: Host, peer: bulkhead.Peer, shared: *Shared, send_window: i64) !*Stream {
         const s = try gpa.create(Stream);
@@ -354,6 +358,8 @@ const Conn = struct {
     /// call still arriving, and how many of those calls are owed a window.
     collected: usize = 0,
     starved: u32 = 0,
+    /// Calls in `waiting`, so a connection with none skips looking.
+    waiting: u32 = 0,
     /// What the client may still send on the connection before this side
     /// says more. A window is only a bound if it is held to.
     recv_window: i64 = h2.default_window,
@@ -437,6 +443,7 @@ const Conn = struct {
 
         while (true) {
             c.writeReady() catch break;
+            _ = c.admitWaiting() catch break;
             c.grantWaiting() catch break;
             if (c.goaway_sent or c.peer_goaway) {
                 if (c.streams.items.len == 0) break;
@@ -546,6 +553,9 @@ const Conn = struct {
         }
         var collecting = false;
         for (c.streams.items) |s| {
+            // A call waiting for room is bounded by its own deadline, the
+            // way a running one is: what it waits on is this side.
+            if (s.state == .waiting and s.until_ns != 0) soonest = @min(soonest, s.until_ns);
             if (s.state != .headers and s.state != .body) continue;
             collecting = true;
             if (s.collect_until_ns != 0) soonest = @min(soonest, s.collect_until_ns);
@@ -569,6 +579,13 @@ const Conn = struct {
         var i: usize = 0;
         while (i < c.streams.items.len) {
             const s = c.streams.items[i];
+            if (s.state == .waiting and s.until_ns != 0 and now >= s.until_ns) {
+                // The client stopped waiting before room came back: it is
+                // told so, and the call is never run.
+                c.leaveWaiting(s);
+                c.answerNow(s, 4, "the call's deadline passed while it waited for room on this connection") catch return .stop;
+                continue;
+            }
             if (s.state != .headers and s.state != .body) {
                 i += 1;
                 continue;
@@ -610,8 +627,26 @@ const Conn = struct {
     }
 
     /// Wait for the calls still running, then write what they answered if
-    /// there is anybody left to read it.
+    /// there is anybody left to read it. A client that stopped sending may
+    /// still be reading, so the calls waiting for room are started as the
+    /// running ones give it back, until nothing more can move: room held by
+    /// an answer stuck on a window comes back only with a WINDOW_UPDATE, and
+    /// nothing is read from here on. With nobody reading, a waiting call is
+    /// not run at all, since what it answers would go nowhere.
     fn windDown(c: *Conn) void {
+        while (!c.peer_gone) {
+            c.flushReady() catch {
+                c.peer_gone = true;
+                break;
+            };
+            const started = c.admitWaiting() catch {
+                c.peer_gone = true;
+                break;
+            };
+            if (started != 0) continue;
+            if (c.shared.running.load(.acquire) == 0) break;
+            bulkhead.sleep(1) catch break;
+        }
         while (c.shared.running.load(.acquire) != 0) {
             bulkhead.sleep(1) catch break;
             if (!c.peer_gone) c.flushReady() catch {
@@ -922,7 +957,9 @@ const Conn = struct {
     /// gives them back with nothing more from the client, so waiting on it
     /// cannot stall; topping up past it let each call to a slow route become
     /// the oldest in turn and hold a whole message, a hundred of them
-    /// (ADR 220).
+    /// (ADR 220). A call waiting for room counts as started here: it needs
+    /// nothing more from the client either, and `admitWaiting` always lets
+    /// the oldest one start once no running call holds bytes.
     fn mayGrow(c: *const Conn, s: *const Stream) bool {
         if (c.collected < c.budget() or s.body_over_limit) return true;
         for (c.streams.items) |x| {
@@ -956,6 +993,51 @@ const Conn = struct {
         c.collected -= s.held;
         s.held = 0;
         c.unstarve(s);
+    }
+
+    /// The call is no longer waiting for room: it is starting, answered
+    /// without running, or reset. Nothing for a call in any other state.
+    fn leaveWaiting(c: *Conn, s: *Stream) void {
+        if (s.state != .waiting) return;
+        s.state = .body;
+        c.waiting -= 1;
+    }
+
+    /// Whether a call that has started still holds bytes it will give back
+    /// with nothing more from the client: running, or its answer being
+    /// written.
+    fn startedHolds(c: *const Conn) bool {
+        for (c.streams.items) |x| {
+            if ((x.state == .running or x.state == .writing) and x.held > 0) return true;
+        }
+        return false;
+    }
+
+    /// Start the calls waiting for room, oldest first, for as long as each
+    /// one's inflated copy fits in what the budget has left. **The oldest
+    /// starts whatever the room once no started call holds bytes**: nothing
+    /// else would give any back, since the other waiting calls hold only
+    /// their compressed bytes and the calls still arriving are held to their
+    /// windows, so without it a few waiting calls could fill the budget with
+    /// none able to start. That is the same rule `mayGrow` keeps for the
+    /// oldest call still arriving, and it bounds the connection at the
+    /// budget and one more call's copies. Strictly in order: a call that
+    /// fits does not pass one that does not, or a stream of small calls
+    /// would keep a large one waiting for good. How many started.
+    fn admitWaiting(c: *Conn) ReadError!usize {
+        var started: usize = 0;
+        while (c.waiting != 0) {
+            const s = for (c.streams.items) |x| {
+                if (x.state == .waiting) break x;
+            } else unreachable;
+            // Read once already, by `dispatch`, from the same bytes.
+            const announced = encoded.announcedSize(s.body.items[5..]) catch unreachable;
+            if (announced > c.budgetLeft(s) and c.startedHolds()) break;
+            c.leaveWaiting(s);
+            try c.start(s, announced);
+            started += 1;
+        }
+        return started;
     }
 
     /// The call is no longer waiting on a window: it has started, or it has
@@ -1064,6 +1146,7 @@ const Conn = struct {
             // bytes for the life of the connection and the calls beside it
             // wait on a window nothing is left to give back (ADR 220).
             else => {
+                c.leaveWaiting(s);
                 c.letGo(s);
                 c.remove(s);
                 s.destroy();
@@ -1146,7 +1229,7 @@ const Conn = struct {
         const len = std.mem.readInt(u32, body[1..5], .big);
         if (compressed > 1 or len != body.len - 5)
             return c.answerNow(s, 13, "a unary call carries exactly one message");
-        var message: []const u8 = body[5..];
+        const message: []const u8 = body[5..];
         if (compressed == 1) {
             // A message marked compressed with no encoding named is the
             // client's mistake, INTERNAL; an encoding named that this server
@@ -1168,19 +1251,36 @@ const Conn = struct {
             // budget counted, and a hundred calls that each inflate to
             // `max_body` are not a hundred `max_body`s (ADR 220). Room is
             // what the other calls hold subtracted from the budget, so a call
-            // alone on its connection always has all of it. Whatever fails
-            // from here, `letGo` gives the charge back with the rest.
+            // alone on its connection always has all of it.
             const announced = encoded.announcedSize(message) catch
                 return c.answerNow(s, 13, "the message's gzip could not be read");
             if (announced > c.app.max_body)
                 return c.answerNow(s, 8, "the message is larger than this server's max_body");
-            // UNAVAILABLE, not RESOURCE_EXHAUSTED: the room comes back as the
-            // other calls finish, and OTLP retries 14 with backoff where it
-            // drops an 8 that carries no RetryInfo (ADR 220).
-            if (announced > c.budgetLeft(s))
-                return c.answerNow(s, 14, "this connection's budget for messages is full: try again later or on another connection");
-            c.hold(s, announced);
-            message = encoded.inflate(a, message, announced) catch |err| switch (err) {
+            // No room: the call waits with only its compressed bytes, and
+            // starts when the calls ahead of it give room back. It used to be
+            // refused UNAVAILABLE, which a Collector retries only after its
+            // backoff: with ten consumers on one connection its queue grew
+            // while the server sat idle (ADR 220). Behind another waiting
+            // call even if it fits, so the oldest is never passed.
+            if (c.waiting != 0 or announced > c.budgetLeft(s)) {
+                s.state = .waiting;
+                c.waiting += 1;
+                return;
+            }
+            return c.start(s, announced);
+        }
+        return c.start(s, null);
+    }
+
+    /// Run a call whose message is whole and checked: inflate it first if
+    /// `announced` is the size its gzip says it inflates to. Whatever fails
+    /// from here, `letGo` gives what the call was charged back with the rest.
+    fn start(c: *Conn, s: *Stream, announced: ?usize) ReadError!void {
+        const a = s.arena.allocator();
+        var message: []const u8 = s.body.items[5..];
+        if (announced) |size| {
+            c.hold(s, size);
+            message = encoded.inflate(a, message, size) catch |err| switch (err) {
                 error.BodyTooLarge => return c.answerNow(s, 8, "the message is larger than this server's max_body"),
                 else => return c.answerNow(s, 13, "the message's gzip could not be read"),
             };
@@ -1766,6 +1866,23 @@ const TestClient = struct {
         try c.w().writeAll(bytes);
     }
 
+    /// `message`, over as many DATA frames as a message larger than one
+    /// frame takes.
+    fn messageInFrames(c: *TestClient, stream: u31, bytes: []const u8, compressed: bool) !void {
+        var framed_: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer framed_.deinit();
+        try framed_.writer.writeByte(if (compressed) 1 else 0);
+        try framed_.writer.writeInt(u32, @intCast(bytes.len), .big);
+        try framed_.writer.writeAll(bytes);
+        var rest = framed_.written();
+        while (rest.len > 0) {
+            const n = @min(rest.len, 16_000);
+            try h2.writeHeader(c.w(), n, .data, if (n == rest.len) h2.Flags.end_stream else 0, stream);
+            try c.w().writeAll(rest[0..n]);
+            rest = rest[n..];
+        }
+    }
+
     fn call(c: *TestClient, stream: u31, path: []const u8, bytes: []const u8) !void {
         try c.headersFor(stream, path, &.{}, false);
         try c.message(stream, bytes, false);
@@ -1839,10 +1956,14 @@ fn converseFrom(app: *App, in: *std.Io.Reader) !Answer {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     serveConnection(app.grpcHost(), in, &out.writer, .off, .off, .{});
+    return answerOf(out.written());
+}
 
+/// The frames in what a connection wrote.
+fn answerOf(written: []const u8) !Answer {
     var answer_: Answer = .{ .arena = .init(testing.allocator), .decoder = .init(testing.allocator) };
     const a = answer_.arena.allocator();
-    var rest = try a.dupe(u8, out.written());
+    var rest = try a.dupe(u8, written);
     while (rest.len >= h2.header_len) {
         const head = h2.Header.parse(rest[0..h2.header_len]);
         const end = h2.header_len + head.len;
@@ -2904,7 +3025,7 @@ fn gzipRun(out: *std.Io.Writer.Allocating, byte: u8, n: usize) !void {
     try compress.finish();
 }
 
-test "calls that inflate past the connection's budget are UNAVAILABLE, and what is held stays inside it" {
+test "calls that inflate past the connection's budget wait for room, and what is held stays inside it" {
     var app = try testApp();
     defer app.deinit();
     app.limits.max_body = 200_000;
@@ -2932,22 +3053,132 @@ test "calls that inflate past the connection's budget are UNAVAILABLE, and what 
         defer conn.deinit();
         while (in.bufferedLen() > 0) try conn.readFrame();
         // The budget is 200,005. Before the inflation was held to the room
-        // left, all six started and held about 480,000.
+        // left, all six started and held about 480,000. Two fit; the other
+        // four hold their few hundred compressed bytes and wait.
         try testing.expect(conn.collected <= conn.budget() + 40_000 + zipped.written().len);
+        try testing.expectEqual(@as(u32, 4), conn.waiting);
     }
+
+    // Nothing comes back while the two that started are stuck on a window of
+    // 0, and nothing is refused either: before, the four were UNAVAILABLE,
+    // which a Collector retries only after its backoff (ADR 220).
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    for (ids) |id| {
+        const trailers = got.trailers(id) catch continue;
+        const status = Answer.value(trailers, "grpc-status") orelse continue;
+        try testing.expect(!std.mem.eql(u8, status, "14"));
+    }
+}
+
+test "calls that waited for room all finish, in order, once the calls ahead give it back" {
+    var app = try testApp();
+    defer app.deinit();
+    app.limits.max_body = 200_000;
+    var client = try TestClient.init();
+    defer client.deinit();
+
+    var zipped: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer zipped.deinit();
+    try gzipRun(&zipped, 'q', 40_000);
+    const ids = [_]u31{ 1, 3, 5, 7, 9, 11 };
+    for (ids) |id| {
+        try client.headersFor(id, "/test.Echo/Say", &.{.{ .name = "grpc-encoding", .value = "gzip" }}, false);
+        try client.message(id, zipped.written(), true);
+    }
+    // Room on the connection for all six answers.
+    try h2.writeWindowUpdate(client.w(), 0, 1_000_000);
 
     var got = try converse(&app, &client);
     defer got.deinit();
-    var refused: usize = 0;
     for (ids) |id| {
-        const trailers = got.trailers(id) catch continue;
-        // A call that started has its answer stuck behind a window of 0.
-        const status = Answer.value(trailers, "grpc-status") orelse continue;
-        if (!std.mem.eql(u8, status, "14")) continue;
-        refused += 1;
-        try testing.expect(std.mem.indexOf(u8, Answer.value(trailers, "grpc-message").?, "budget") != null);
+        try testing.expectEqualStrings("0", Answer.value(try got.trailers(id), "grpc-status").?);
+        const body = try got.message(id);
+        try testing.expectEqual(@as(usize, 40_000), body.len);
+        for (body) |b| try testing.expectEqual(@as(u8, 'q'), b);
     }
-    try testing.expectEqual(@as(usize, 4), refused);
+}
+
+test "the oldest call waiting for room starts once no started call holds bytes, however little room is left" {
+    var app = try testApp();
+    defer app.deinit();
+    app.limits.max_body = 100_000;
+    var client = try TestClient.init();
+    defer client.deinit();
+    // Answers wait on a window of 0 until the client says otherwise below.
+    try h2.writeSettings(client.w(), &.{.{ .initial_window_size, 0 }});
+
+    // Bytes gzip cannot shrink, so a waiting call holds about as much as it
+    // inflates to: three of them hold more than the budget leaves any one.
+    var noise: [40_000]u8 = undefined;
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    prng.random().bytes(&noise);
+    var zipped: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer zipped.deinit();
+    {
+        var window: [std.compress.flate.max_window_len]u8 = undefined;
+        var compress: std.compress.flate.Compress = try .init(&zipped.writer, &window, .gzip, .default);
+        try compress.writer.writeAll(&noise);
+        try compress.finish();
+    }
+    const ids = [_]u31{ 1, 3, 5, 7 };
+    for (ids) |id| {
+        try client.headersFor(id, "/test.Echo/Say", &.{.{ .name = "grpc-encoding", .value = "gzip" }}, false);
+        try client.messageInFrames(id, zipped.written(), true);
+    }
+    // Call 1 started alone and holds about 120,000 of a budget of 100,005;
+    // 3, 5 and 7 wait with about 40,000 each. Once 1's answer is written, 3
+    // has 100,005 less 80,000 left and needs 40,000: only the rule that the
+    // oldest starts when nothing started holds bytes lets it, and without it
+    // the three wait for good.
+    try h2.writeWindowUpdate(client.w(), 0, 1_000_000);
+    for (ids) |id| try h2.writeWindowUpdate(client.w(), id, 100_000);
+
+    var got = try converse(&app, &client);
+    defer got.deinit();
+    for (ids) |id| {
+        try testing.expectEqualStrings("0", Answer.value(try got.trailers(id), "grpc-status").?);
+        try testing.expectEqualSlices(u8, &noise, try got.message(id));
+    }
+}
+
+test "a call whose grpc-timeout passes while it waits for room is DEADLINE_EXCEEDED and never runs" {
+    var app = try testApp();
+    defer app.deinit();
+    app.limits.max_body = 100_000;
+    var client = try TestClient.init();
+    defer client.deinit();
+    // A client that will not read: call 1's answer holds its room for good.
+    try h2.writeSettings(client.w(), &.{.{ .initial_window_size, 0 }});
+    var zipped: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer zipped.deinit();
+    try gzipRun(&zipped, 'd', 60_000);
+    const gzip: hpack.Field = .{ .name = "grpc-encoding", .value = "gzip" };
+    try client.headersFor(1, "/test.Echo/Say", &.{gzip}, false);
+    try client.message(1, zipped.written(), true);
+    try client.headersFor(3, "/test.Echo/Say", &.{ gzip, .{ .name = "grpc-timeout", .value = "5S" } }, false);
+    try client.message(3, zipped.written(), true);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var in: std.Io.Reader = .fixed(client.buf.written());
+    var conn = try steppedConn(&app, &in, &out.writer);
+    defer conn.deinit();
+    while (in.bufferedLen() > 0) try conn.readFrame();
+
+    const waiting = conn.find(3).?;
+    try testing.expectEqual(Stream.State.waiting, waiting.state);
+    try testing.expect(conn.inFlightLimitMs().? > 0);
+    waiting.until_ns = 1;
+    try testing.expectEqual(Conn.Waited.again, conn.overdue());
+    try testing.expectEqual(@as(u32, 0), conn.waiting);
+    try testing.expect(conn.find(3) == null);
+
+    var got = try answerOf(out.written());
+    defer got.deinit();
+    const trailers = try got.trailers(3);
+    try testing.expectEqualStrings("4", Answer.value(trailers, "grpc-status").?);
+    try testing.expect(Answer.of(.data, &got, 3).len == 0);
 }
 
 test "a gzip message that inflates to max_body is read when nothing else is held, byte for byte" {
