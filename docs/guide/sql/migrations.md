@@ -275,7 +275,7 @@ An extension is just a name: `CREATE EXTENSION IF NOT EXISTS` when it is added t
 try sql.migrate.createMissing(&db, &run, .{ .tables = &.{User} });
 ```
 
-**`createMissing` runs one `CREATE TABLE IF NOT EXISTS` per Row, plus its indexes, all in one transaction.** **The order comes from the references, not from your list**: foreign keys are written inline (the only form SQLite supports), so `orgs` is created before `members` whichever order you wrote them in. Two tables that point at each other are a compile error naming both, with the way out in the message.
+**`createMissing` runs one `CREATE TABLE IF NOT EXISTS` per Row, plus its indexes, all in one transaction.** **The order comes from the references, not from your list**: foreign keys are written inline (the only form SQLite supports), so `orgs` is created before `members` whichever order you wrote them in. Two tables that point at each other are a compile error naming both, with the way out in the message. A unique or index on a field the table does not have yet waits for `addMissingColumns`, which adds the column and then the index.
 
 Running it again does nothing, which is what startup code needs. It is for a test, a fixture, or a single-file SQLite application: it creates what is missing and never changes what is there.
 
@@ -309,6 +309,8 @@ _ = try sql.migrate.addMissingColumns(&db, &run, .{ .tables = &.{User} });
 ```
 
 It runs one `ALTER TABLE … ADD COLUMN` per missing field, typed from the same `Desc` that `createMissing` reads (`pragma_table_info` on SQLite, `pg_catalog` on Postgres), in one transaction. It returns how many columns it added: three the first time, zero on every start after.
+
+**A new column comes with its foreign key**, written inline, and with every unique and index the Row declares over it, created right after. On SQLite a new column inside a foreign key of several columns is `error.NeedsVersion`, because SQLite writes that key only when it creates the table; write a version that rebuilds it.
 
 **A required column with no default is rejected** with `error.NeedsBackfill`; the statement it would have sent is logged, and nothing is sent. SQLite rejects that `ALTER` outright and Postgres rejects it on a table with rows, so nilo cannot send it safely. Give the field a `.default` in the marker (the existing rows get it and there is nothing to backfill), make it optional, or write a version. A table that does not exist is skipped, because creating it is `createMissing`'s job. Nothing else changes: a column the table has and the Row does not is left alone, a changed type is left alone, and `db.checking` is what reports them.
 
@@ -357,6 +359,8 @@ comptime {
 
 Other tools guess that a dropped `handle` and a new `email` are the same column, then ask you at a prompt. The answer is in your head; putting it in the type means the same code produces the same migration for you, for CI, and for the next person.
 
+An index, a unique or a foreign key over the column goes with it, since `RENAME COLUMN` carries them. On Postgres, one named after the old column (`members_handle_key`) is renamed to match the new one in the same version; on SQLite, which cannot rename an index, the index is dropped and made again.
+
 ## Applying migrations
 
 <!-- compiles: body -->
@@ -367,9 +371,22 @@ const ran = try sql.migrate.applyPending(&db, &run, chain);
 
 **`applyPending` runs each version that has not run yet, one transaction per version, under an advisory lock.** `nilo_migrations` is an ordinary Row, and `applyPending` creates it if it is not there. It reads this ledger once and skips any version already in it, so a start with nothing to do is one query. Each version that has not run is one transaction: take the advisory lock, check again whether the version is there, run every step, write the ledger row, commit. The second check is what matters when nine out of ten replicas start at the same time. **The lock is essential**, and it is the part a hand-written migration runner usually leaves out.
 
+**On Postgres, a step gives up after five seconds waiting for its table.** An `ALTER TABLE` needs a lock nothing else can share, and while it waits for one, every read and write to that table waits behind it. So a report or a forgotten `psql` session holding the table open would stall your whole app for as long as it stays open. After five seconds the version fails with `error.Locked`, the log names the step, and nothing is kept; start again once whatever held the table is done. A version that should wait longer says so in its file:
+
+```zig
+pub const version: migrate.Version = .{
+    .number = 7,
+    .name = "widen_counts",
+    .steps = before ++ generated ++ after,
+    .lock_timeout_ms = 30_000, // 0 waits for as long as it takes
+};
+```
+
+The comment above each generated step also says when it reads or rewrites the whole table while holding it: `SET NOT NULL`, a new `CHECK`, and a type change like `int4` to `int8`. On a big table, that line is the one to read before you deploy.
+
 Each version's hash covers its own steps chained onto the hash of the version before it, so editing a migration that has already run changes that version's hash and every later one. `applyPending` refuses to run anything when it finds such an edit (`error.SchemaDrift`), because the later versions were written against what the edited one used to say. `sql.migrate.drift` lists them.
 
-**On SQLite, each version runs with foreign keys off**, and they are checked once before its COMMIT. Changing a column on SQLite means rebuilding the table, and the `DROP TABLE` in a rebuild deletes the old table's rows first. With foreign keys on, every `ON DELETE CASCADE` pointing at that table would fire, and the child rows would be gone when the version commits. With them off, the children stay. A row left pointing at nothing (for example, after a copy that skipped some rows) causes `error.ForeignKeyViolated`, and the version is rolled back.
+**On SQLite, a version that drops a table runs with foreign keys off**, and they are checked once before its COMMIT. Any other version keeps them on, so a `DELETE` of a parent in it cascades as the schema says. Changing a column on SQLite means rebuilding the table, and the `DROP TABLE` in a rebuild deletes the old table's rows first. With foreign keys on, every `ON DELETE CASCADE` pointing at that table would fire, and the child rows would be gone when the version commits. With them off, the children stay. A row left pointing at nothing (for example, after a copy that skipped some rows) causes `error.ForeignKeyViolated`, and the version is rolled back.
 
 The hash is not a field you write on the version. `chainOf` computes the whole list in one pass, because a hash somebody can type in is a hash somebody can type wrong, and a wrong one would make the drift check look like it works when it does not.
 
@@ -433,6 +450,8 @@ $ db verify                      # has an applied version been edited since?
 ```
 
 `generate` and `check` never open the database. They diff your Rows against `migrations/snapshot.zon`, which is why they run on a laptop with nothing installed, and in CI with no database container.
+
+**A foreign key with no index behind it is a note under the result, and never a failure.** Neither database indexes the column that points, so deleting a row of the parent reads every row of the child. `check` (and `generate`, when it wrote a version) names each such key with the line that adds the index, say `.index = .{ .customer_id }` in the Row. Nothing is added for you, because the index slows every insert into that table and a small table does not need it. It reads your Rows and not a database, so it runs in CI too.
 
 **The exit code is all CI needs.** `0` means it did what was asked, `1` means you have something to do, and `2` means the command line was wrong. `db check` in a pipeline needs no output parsing.
 
@@ -507,6 +526,8 @@ migrations/0007_work_items_get_a_priority.sql
 It holds the same steps in the same order, each with its `why` as a comment above it, wrapped in `BEGIN`/`COMMIT`, with the ledger table created if missing and the ledger row at the end:
 
 ```sql
+\set ON_ERROR_STOP on
+
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS "nilo_migrations" ( … );
@@ -520,7 +541,9 @@ VALUES (7, 'work_items_get_a_priority', '9f3c…', now(), 0);
 COMMIT;
 ```
 
-That last row is what makes it useful. `psql -f`, a CI job with no Zig toolchain, dbmate, or somebody on a jump host can bring a database up to date, and `db.expecting(manifest.head)` still accepts it and `db verify` still checks it against the hash. Without the row, the database would be at 7 while the ledger says 6, and the next start would refuse to serve.
+That last row is what makes it useful. `psql -f`, a CI job with no Zig toolchain, or somebody on a jump host can bring a database up to date, and `db.expecting(manifest.head)` still accepts it and `db verify` still checks it against the hash. Without the row, the database would be at 7 while the ledger says 6, and the next start would refuse to serve.
+
+**The first line stops the shell at the first failed step**, `\set ON_ERROR_STOP on` for `psql` and `.bail on` for `sqlite3`. Without it `sqlite3` carries on past the failure and the `COMMIT` keeps the steps that ran together with the ledger row, and `psql` rolls back but exits 0, so a deploy script reads a failed version as applied. That line makes the file a script for the database's own shell: a driver that sends it as SQL refuses the first line.
 
 **It is an output only.** nilo reads the `.zig` file and never this one, and a version somebody else wrote in SQL is not picked up: migrations are written in Zig, for the reasons [ADR 123](../../adr/123-a-migration-is-a-diff-against-a-snapshot.md) gives. `db check` fails when a twin no longer matches its version file, so it cannot go stale on a branch nobody rebuilt, and any `db generate` rewrites it ([ADR 123](../../adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 

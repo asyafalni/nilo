@@ -24,8 +24,11 @@
 //! Skipping rather than failing is the decision, and it is the same one
 //! `test` and `test-all` already make about each other: the loop somebody
 //! runs every thirty seconds must not need a service to be up, or it stops
-//! being run every thirty seconds. CI sets the variable, so the coverage is
-//! not optional there.
+//! being run every thirty seconds. On CI it is not optional: with `$CI` set
+//! and no URL, `build.zig` fails `test-sql` before anything runs, and every
+//! connection dialled here gives up on a lock or an idle transaction after
+//! ten seconds, so a leaked one fails a test rather than hanging the run
+//! (ADR 239).
 //!
 //! ## Why there is no event loop here
 //!
@@ -326,7 +329,18 @@ const Live = struct {
         return .{ .threaded = threaded, .wire = wire, .arena = arena };
     }
 
+    /// **A connection still out when the test ends fails the test.** It is
+    /// a transaction or a stream the test never ended, and it used to show
+    /// up as the next test's fixture waiting on its locks at no CPU. An
+    /// `err` line is what fails a test from a `defer`; the session itself is
+    /// ended by the server, past the `idle_in_transaction_session_timeout`
+    /// `build.zig` puts on every live connection.
     fn close(self: *Live, gpa: std.mem.Allocator) void {
+        const out = self.wire.pool.stats().in_use;
+        if (out != 0) std.log.err(
+            "the test ended with {d} of its pool's connections still out: a transaction or a stream it never closed",
+            .{out},
+        );
         self.arena.deinit();
         self.wire.close();
         self.threaded.deinit();
@@ -377,6 +391,26 @@ test "a null column reads as null and a present one does not" {
 
     try testing.expect(try live.wire.next(&rows));
     try testing.expectEqual(@as(?[]const u8, null), try live.wire.read(&rows, ?[]const u8, 0));
+}
+
+test "every connection a live test dials gives up on a lock or an idle transaction after ten seconds" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    // Both of the pool's connections at once, so each is asked: the bound
+    // is the URL's `options=`, which rides in every startup message rather
+    // than in a `SET` somebody has to remember per connection.
+    const show = "SELECT current_setting('lock_timeout'), current_setting('idle_in_transaction_session_timeout')";
+    var first = try live.wire.run(live.arena.allocator(), show, .{}, null, null);
+    defer live.wire.drain(&first);
+    var second = try live.wire.run(live.arena.allocator(), show, .{}, null, null);
+    defer live.wire.drain(&second);
+    for ([_]*postgres.Wire.Rows{ &first, &second }) |rows| {
+        try testing.expect(try live.wire.next(rows));
+        try testing.expectEqualStrings("10s", try live.wire.read(rows, []const u8, 0));
+        try testing.expectEqualStrings("10s", try live.wire.read(rows, []const u8, 1));
+    }
 }
 
 test "the schema comparison agrees with the table it was written against" {
@@ -626,7 +660,7 @@ test "every wait on the database is reported through the Limits the wire was sta
     const before = waits_reported;
     var tx = try wire.begin(arena.allocator(), .{});
     _ = try tx.exec(arena.allocator(), "SELECT 1", .{}, null, null);
-    try tx.commit();
+    try tx.commit(arena.allocator(), null);
     try testing.expect(waits_reported - before >= 3);
 }
 
@@ -793,6 +827,11 @@ test "a delete whose list arrived empty is refused before it is sent, rather tha
         .set = .{ .age = @as(i32, 1) },
         .where = .{ .email = .{ .contains = @as([]const u8, "") } },
     }));
+    // The same box holding `%`, handed to a raw pattern as it arrived.
+    try testing.expectError(
+        error.QueryFailed,
+        stack.db.delete(Person, &run, .{ .where = .{ .email = .{ .ilike = @as([]const u8, "%") } } }),
+    );
     try testing.expectEqual(@as(usize, 3), try stack.db.count(Person, &run, .{}));
 
     // Beside a term that narrows, the empty list narrows nothing more and
@@ -805,6 +844,30 @@ test "a delete whose list arrived empty is refused before it is sent, rather tha
         .where = .{ .id = .{ .not_in = @as([]const i64, &.{ 1, 2, 3 }) } },
     }));
     try testing.expectEqual(@as(usize, 3), try stack.db.count(Person, &run, .{}));
+}
+
+test "a negative limit or offset is refused before it is sent, as it is on SQLite" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    try testing.expectError(error.QueryFailed, stack.db.select(Person, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(i64, -1),
+    }));
+    try testing.expectError(error.QueryFailed, stack.db.page(Person, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(i64, 10),
+        .offset = @as(i64, -1),
+    }));
+    // The connection is fine afterwards: nothing was sent.
+    try testing.expectEqual(@as(usize, 3), (try stack.db.select(Person, &run, .{
+        .order = .{ .id = .asc },
+        .limit = @as(i64, 10),
+    })).len);
 }
 
 fn rollbackAnInsert(db: *db_mod.Db, c: *nilo.Ctx) ![]Person {
@@ -1187,10 +1250,10 @@ test "a Timestamp, a Uuid and a Json column come back as themselves" {
 
     try testing.expectEqual(@as(u16, 200), answer.status);
     try testing.expectEqualStrings(
-        "[{\"id\":1,\"seen_at\":\"2026-08-16T09:30:00Z\"," ++
+        "[{\"id\":1,\"seen_at\":\"2026-08-16T09:30:00.000000Z\"," ++
             "\"token\":\"550e8400-e29b-41d4-a716-446655440000\"," ++
             "\"settings\":{\"theme\":\"dark\"}}," ++
-            "{\"id\":2,\"seen_at\":\"2026-08-16T09:30:00Z\"," ++
+            "{\"id\":2,\"seen_at\":\"2026-08-16T09:30:00.000000Z\"," ++
             "\"token\":null,\"settings\":null}]",
         answer.body,
     );
@@ -1223,7 +1286,7 @@ test "the same three types go out to a column and come back unchanged" {
 
     try testing.expectEqual(@as(u16, 200), answer.status);
     try testing.expectEqualStrings(
-        "[{\"id\":2,\"seen_at\":\"2026-08-17T09:30:00Z\"," ++
+        "[{\"id\":2,\"seen_at\":\"2026-08-17T09:30:00.000000Z\"," ++
             "\"token\":\"11111111-2222-3333-4444-555555555555\"," ++
             "\"settings\":{\"theme\":\"midnight\"}}]",
         answer.body,
@@ -1307,7 +1370,7 @@ test "a borrowed row builds a Timestamp and a Uuid without allocating" {
 
     try testing.expectEqual(@as(u16, 200), answer.status);
     try testing.expectEqualStrings(
-        "1:2026-08-16T09:30:00Z:550e8400-e29b-41d4-a716-446655440000;",
+        "1:2026-08-16T09:30:00.000000Z:550e8400-e29b-41d4-a716-446655440000;",
         answer.body,
     );
 }
@@ -1501,6 +1564,69 @@ test "a date the database wrote comes back as the day, out of the column's own b
 
     const kid = (try stack.db.find(Birthday, &run, @as(i64, 3))).?;
     try testing.expectEqual(@as(i32, 16_495), kid.born.?.days);
+}
+
+const Endless = struct {
+    pub const nilo_table = .projection;
+
+    at: ?types.Timestamp,
+    day: ?types.Date,
+};
+
+test "an infinite date or timestamp another client wrote is refused by name, not a panic or a moment" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // `'infinity'::timestamptz` overflowed inside pg.zig's decoder and took
+    // the process down; `'-infinity'` read back as a moment 292,000 years
+    // ago. A `date` overflowed nilo's own shift the same way.
+    inline for (.{
+        "SELECT 'infinity'::timestamptz AS at, NULL::date AS day",
+        "SELECT '-infinity'::timestamptz AS at, NULL::date AS day",
+        "SELECT NULL::timestamptz AS at, 'infinity'::date AS day",
+        "SELECT NULL::timestamptz AS at, '-infinity'::date AS day",
+    }) |statement| {
+        try testing.expectError(error.QueryFailed, stack.db.raw(Endless, &run, statement, .{}));
+    }
+
+    // The moments either side of them still read, and a null is still a null.
+    const ends = try stack.db.raw(
+        Endless,
+        &run,
+        "SELECT '1969-12-31 23:59:59.999999+00'::timestamptz AS at, '4000-01-01'::date AS day",
+        .{},
+    );
+    try testing.expectEqual(@as(i64, -1), ends[0].at.?.micros);
+    try testing.expectEqual(types.Date.nilo_parse("4000-01-01").?.days, ends[0].day.?.days);
+    const nothing = try stack.db.raw(Endless, &run, "SELECT NULL::timestamptz AS at, NULL::date AS day", .{});
+    try testing.expectEqual(@as(?types.Timestamp, null), nothing[0].at);
+}
+
+const Dated = struct {
+    pub const nilo_table = .projection;
+
+    day: types.Date,
+};
+
+test "a column that is not four bytes wide, read into a Date nothing checked first, is refused rather than cut to four" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // `tx.raw` is not held against its Row on its first run (ADR 233), so
+    // the width is what stands between a timestamp's eight bytes and a day
+    // made of the first four of them.
+    var tx = try stack.db.begin(&run, .{});
+    defer tx.deinit();
+    try testing.expectError(error.QueryFailed, tx.raw(Dated, &run, "SELECT now() AS day", .{}));
+    try testing.expectError(error.QueryFailed, tx.raw(Dated, &run, "SELECT 1::int8 AS day", .{}));
 }
 
 test "a date goes out as ten characters and comes back as the same day" {
@@ -1734,6 +1860,34 @@ test "a statement past its deadline is cancelled by the database" {
     // decide what to do about it.
     try testing.expectError(error.TimedOut, answer);
     try testing.expect(waited_ms < 5_000);
+}
+
+test "a deadline of 0 times the next statement out, and one past maxInt(i32) keeps the transaction" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    {
+        // `statement_timeout = 0` is Postgres for no limit, which would let
+        // this sleep the whole second.
+        var tx = try stack.db.begin(&run, .{});
+        defer tx.deinit();
+        try tx.deadline(0);
+        try testing.expectError(error.TimedOut, tx.raw(Slept, &run, "SELECT pg_sleep(1) IS NULL", .{}));
+    }
+    {
+        // Sent as it came, Postgres answers `22023` and the transaction is
+        // aborted before its first statement.
+        var tx = try stack.db.begin(&run, .{});
+        defer tx.deinit();
+        try tx.deadline(std.math.maxInt(u32));
+        const slept = try tx.raw(Slept, &run, "SELECT pg_sleep(0.01) IS NULL", .{});
+        try testing.expectEqual(@as(usize, 1), slept.len);
+        try tx.commit();
+    }
 }
 
 /// What a task cancelled in the middle of a statement finds once the
@@ -2423,6 +2577,44 @@ test "a savepoint rolled back takes its work with it, and released keeps it" {
     try testing.expect(try stack.db.exists(Person, &run, .{ .where = .{ .id = kept } }));
 }
 
+test "a savepoint an outer rollback ended stays ended after a newer one is taken" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const kept = scratch_id + 9;
+    defer _ = stack.db.delete(Person, &run, .{ .where = .{ .id = kept } }) catch {};
+
+    {
+        var tx = try stack.db.begin(&run, .{});
+        defer tx.deinit();
+
+        var outer = try tx.savepoint();
+        defer outer.deinit();
+        var later = later: {
+            var inner = try tx.savepoint();
+            // The `defer` that used to send `ROLLBACK TO` a mark Postgres had
+            // already dropped with `outer`, once `later` was taken, which
+            // aborted the transaction and failed the commit below.
+            defer inner.deinit();
+            outer.rollback();
+            break :later try tx.savepoint();
+        };
+        _ = try tx.insert(Person, &run, .{
+            .id = kept,
+            .email = "kept-after-unwind@example.dev",
+            .age = @as(i32, 24),
+        });
+        try later.release();
+        try tx.commit();
+    }
+
+    try testing.expect(try stack.db.exists(Person, &run, .{ .where = .{ .id = kept } }));
+}
+
 test "a commit after a failed statement nobody undid is refused, and nothing in the transaction was kept" {
     const gpa = testing.allocator;
     var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
@@ -2540,6 +2732,176 @@ test "a serialization failure answers RolledBack, and the transaction run again 
     // 30, one from the other writer, ten from the retry that read it.
     const now = (try stack.db.one(Person, &run, .{ .where = .{ .id = id } })).?;
     try testing.expectEqual(@as(i32, 41), now.age);
+}
+
+/// What the second half of a deadlock found: its transaction rolled back
+/// for the other's sake, or went through once the other one was.
+const Deadlocked = enum { rolled_back, went_through, failed };
+
+/// Hold `first`, say so, then reach for `second`, which the test's own
+/// transaction holds. One of the two transactions is the one Postgres
+/// breaks the cycle with.
+fn holdThenReach(db: *db_mod.Db, gpa: std.mem.Allocator, holding: *std.atomic.Value(bool), first: i64, second: i64) Deadlocked {
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    var tx = db.begin(&run, .{}) catch return .failed;
+    defer tx.deinit();
+    _ = tx.update(Person, &run, .{ .set = .{ .age = @as(i32, 1) }, .where = .{ .id = first } }) catch return .failed;
+    holding.store(true, .release);
+    _ = tx.update(Person, &run, .{ .set = .{ .age = @as(i32, 2) }, .where = .{ .id = second } }) catch |err|
+        return if (err == error.RolledBack) .rolled_back else .failed;
+    tx.commit() catch return .failed;
+    return .went_through;
+}
+
+test "a deadlock answers RolledBack to the transaction Postgres broke it with, and the other goes through" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const a = scratch_id + 30;
+    const b = scratch_id + 31;
+    _ = try stack.db.insert(Person, &run, .{ .id = a, .email = "deadlock-a@example.dev", .age = @as(i32, 30) });
+    _ = try stack.db.insert(Person, &run, .{ .id = b, .email = "deadlock-b@example.dev", .age = @as(i32, 30) });
+    defer _ = stack.db.delete(Person, &run, .{ .where = .{ .id = .{ .in = &[_]i64{ a, b } } } }) catch {};
+
+    const io = stack.live.threaded.io();
+    var tx = try stack.db.begin(&run, .{});
+    defer tx.deinit();
+    _ = try tx.update(Person, &run, .{ .set = .{ .age = @as(i32, 3) }, .where = .{ .id = a } });
+
+    // The other transaction takes `b`, and then waits on `a`.
+    var holding: std.atomic.Value(bool) = .init(false);
+    var other = io.concurrent(holdThenReach, .{ &stack.db, gpa, &holding, b, a }) catch return error.SkipZigTest;
+    var waited: usize = 0;
+    while (!holding.load(.acquire)) : (waited += 1) {
+        if (waited == 500) {
+            _ = other.cancel(io);
+            return error.TestUnexpectedResult;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+
+    // This one reaches for `b`: a cycle, which Postgres finds after its
+    // `deadlock_timeout` and breaks by rolling one side back with `40P01`.
+    const mine: Deadlocked = if (tx.update(Person, &run, .{ .set = .{ .age = @as(i32, 4) }, .where = .{ .id = b } })) |_| blk: {
+        try tx.commit();
+        break :blk .went_through;
+    } else |err| if (err == error.RolledBack) .rolled_back else return err;
+    const theirs = other.await(io);
+
+    try testing.expect((mine == .rolled_back and theirs == .went_through) or
+        (mine == .went_through and theirs == .rolled_back));
+    // The code is kept for the call that met it, on its own thread.
+    if (mine == .rolled_back) try testing.expectEqualStrings("40P01", db_mod.lastProblem(&run).?.code);
+}
+
+/// `migrate.apply` on a task of its own, saying when it came back.
+fn applyAndSay(db: *db_mod.Db, gpa: std.mem.Allocator, v: migrate.Version, hash: []const u8, done: *std.atomic.Value(bool)) bool {
+    defer done.store(true, .release);
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    return migrate.apply(db, &run, v, hash) catch false;
+}
+
+test "a version waits for the advisory lock another process holds, so two replicas never run it twice" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    try migrate.ensureLedger(&stack.db, &run);
+
+    // A version number of this build's own: both optimize modes run this
+    // file against one database at once, and share its ledger.
+    const number: i64 = if (builtin.mode == .Debug) 990_001 else 990_002;
+    const made = "nilo_live_locked_" ++ mode_suffix;
+    const forget = "DELETE FROM \"nilo_migrations\" WHERE \"version\" = " ++
+        (if (builtin.mode == .Debug) "990001" else "990002");
+    _ = try stack.db.exec(&run, forget, .{});
+    _ = try stack.db.exec(&run, "DROP TABLE IF EXISTS \"" ++ made ++ "\"", .{});
+    defer _ = stack.db.exec(&run, forget, .{}) catch {};
+    defer _ = stack.db.exec(&run, "DROP TABLE IF EXISTS \"" ++ made ++ "\"", .{}) catch {};
+
+    const steps = [_]migrate.Step{.{ .kind = .create_table, .sql = "CREATE TABLE \"" ++ made ++ "\" (\"id\" int)", .why = "" }};
+    const v: migrate.Version = .{ .number = number, .name = "locked", .steps = &steps };
+    var digest: [64]u8 = undefined;
+    const hash = migrate.hashOf("", v.steps, &digest);
+
+    // Another replica, part way through its own migration, holding the lock.
+    var holder = try stack.db.begin(&run, .{});
+    defer holder.deinit();
+    _ = try holder.exec(&run, comptime dialect.Postgres.advisoryLock(migrate.lock_key).?, .{});
+
+    const io = stack.live.threaded.io();
+    var done: std.atomic.Value(bool) = .init(false);
+    var task = io.concurrent(applyAndSay, .{ &stack.db, gpa, v, hash, &done }) catch return error.SkipZigTest;
+    try std.Io.sleep(io, .fromMilliseconds(300), .awake);
+    // Still waiting: without the lock it would have run the version by now.
+    const waited = !done.load(.acquire);
+
+    try holder.commit();
+    const ran = task.await(io);
+    try testing.expect(waited);
+    try testing.expect(ran);
+}
+
+test "a version gives up on a table another transaction holds after its own lock_timeout, and keeps nothing" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    try migrate.ensureLedger(&stack.db, &run);
+
+    const number: i64 = if (builtin.mode == .Debug) 990_003 else 990_004;
+    const held = "nilo_live_waited_" ++ mode_suffix;
+    const forget = "DELETE FROM \"nilo_migrations\" WHERE \"version\" = " ++
+        (if (builtin.mode == .Debug) "990003" else "990004");
+    _ = try stack.db.exec(&run, forget, .{});
+    _ = try stack.db.exec(&run, "DROP TABLE IF EXISTS \"" ++ held ++ "\"", .{});
+    _ = try stack.db.exec(&run, "CREATE TABLE \"" ++ held ++ "\" (\"id\" int)", .{});
+    defer _ = stack.db.exec(&run, forget, .{}) catch {};
+    defer _ = stack.db.exec(&run, "DROP TABLE IF EXISTS \"" ++ held ++ "\"", .{}) catch {};
+
+    const steps = [_]migrate.Step{.{
+        .kind = .add_column,
+        .sql = "ALTER TABLE \"" ++ held ++ "\" ADD COLUMN \"n\" int8",
+        .why = "add " ++ held ++ ".n",
+    }};
+    var digest: [64]u8 = undefined;
+    const hash = migrate.hashOf("", &steps, &digest);
+
+    // A report part way through: a read in an open transaction holds the
+    // weakest lock there is, and an `ALTER` needs the strongest.
+    var holder = try stack.db.begin(&run, .{});
+    defer holder.deinit();
+    _ = try holder.exec(&run, "SELECT * FROM \"" ++ held ++ "\"", .{});
+
+    // Well under the URL's own ten seconds (ADR 239), so a `Locked` that
+    // came from that bound rather than the version's cannot pass this.
+    const started = core.monotonicMicros();
+    try testing.expectError(error.Locked, migrate.apply(&stack.db, &run, .{
+        .number = number,
+        .name = "waited",
+        .steps = &steps,
+        .lock_timeout_ms = 200,
+    }, hash));
+    const waited_ms = @divFloor(core.monotonicMicros() - started, std.time.us_per_ms);
+    try testing.expect(waited_ms >= 150 and waited_ms < 5_000);
+
+    // Nothing kept, the ledger row included.
+    try testing.expect(try stack.db.find(migrate.Applied, &run, number) == null);
+
+    // Once the report ends, the same version runs under the default.
+    try holder.commit();
+    try testing.expect(try migrate.apply(&stack.db, &run, .{ .number = number, .name = "waited", .steps = &steps }, hash));
+    _ = try stack.db.exec(&run, "SELECT \"n\" FROM \"" ++ held ++ "\"", .{});
 }
 
 // -- the column type nothing checks at startup ----------------------------
@@ -2784,6 +3146,15 @@ const Loose = struct {
     tags: []const ?nilo.Str,
 };
 
+/// And as bytes, which reaches the Wire's list without `keptElement` in
+/// between.
+const LooseBytes = struct {
+    pub const nilo_table = .{ .name = list_table, .key = .id };
+
+    id: i64,
+    tags: []const ?[]const u8,
+};
+
 test "a slice of optionals reads the array the strict one refused" {
     const gpa = testing.allocator;
     var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
@@ -2793,10 +3164,22 @@ test "a slice of optionals reads the array the strict one refused" {
     defer run.deinit();
 
     const found = try stack.db.select(Loose, &run, .{ .where = .{ .id = @as(i64, 3) } });
+    const bytes = try stack.db.select(LooseBytes, &run, .{ .where = .{ .id = @as(i64, 3) } });
+
+    // Four statements more through the pool, each of whose answers
+    // lands in the read buffer the elements above were read out of. pg.zig
+    // copies an element only when it is exactly `[]const u8`, and these used
+    // to point into that buffer and read "ZZZZ".
+    for (0..4) |_| _ = try stack.db.raw([]const u8, &run, "SELECT repeat('Z', 64)", .{});
+
     try testing.expectEqual(@as(usize, 1), found.len);
     try testing.expectEqual(@as(usize, 2), found[0].tags.len);
     try testing.expectEqualStrings("solo", found[0].tags[0].?.view());
     try testing.expectEqual(@as(?nilo.Str, null), found[0].tags[1]);
+
+    try testing.expectEqual(@as(usize, 1), bytes.len);
+    try testing.expectEqualStrings("solo", bytes[0].tags[0].?);
+    try testing.expectEqual(@as(?[]const u8, null), bytes[0].tags[1]);
 }
 
 test "an array two dimensions deep is refused, because a slice is one" {
@@ -3171,12 +3554,15 @@ const Widened = struct {
         .name = shipped_table,
         .key = .id,
         .default = .{ .named = false, .tries = 0 },
+        .references = .{ .parent_id = .{ @This(), .id } },
+        .index = .{.parent_id},
     };
     id: i64,
     url: []const u8,
     sha256: ?[]const u8,
     named: bool,
     tries: i64,
+    parent_id: ?i64,
 };
 
 const shipped_table = "nilo_live_shipped_" ++ mode_suffix;
@@ -3285,8 +3671,22 @@ test "addMissingColumns widens a Postgres table the way createMissing would have
 
     // Through `pg_catalog` rather than `pragma_table_info`, which is the
     // half of ADR 123 the SQLite file cannot reach.
-    try testing.expectEqual(@as(usize, 3), try migrate.addMissingColumns(&db, &run, .{ .tables = &.{Widened} }));
+    try testing.expectEqual(@as(usize, 4), try migrate.addMissingColumns(&db, &run, .{ .tables = &.{Widened} }));
     try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&db, &run, .{ .tables = &.{Widened} }));
+
+    // The added column's key came with it, and so did its index.
+    try testing.expectError(error.ForeignKeyViolated, db.insert(Widened, &run, .{
+        .url = "http://a/orphan",
+        .sha256 = @as(?[]const u8, null),
+        .parent_id = @as(?i64, 999_999),
+    }));
+    const indexes = try db.raw(
+        []const u8,
+        &run,
+        "SELECT indexname::text FROM pg_indexes WHERE tablename = $1 AND indexname <> $2",
+        .{ @as([]const u8, shipped_table), @as([]const u8, shipped_table ++ "_pkey") },
+    );
+    try testing.expectEqual(@as(usize, 1), indexes.len);
 
     const rows = try db.select(Widened, &run, .{});
     try testing.expectEqual(@as(usize, 1), rows.len);
@@ -3303,7 +3703,7 @@ test "addMissingColumns widens a Postgres table the way createMissing would have
         "SELECT column_name::text FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position",
         .{@as([]const u8, shipped_table)},
     );
-    try testing.expectEqual(@as(usize, 5), names.len);
+    try testing.expectEqual(@as(usize, 6), names.len);
     try testing.expectEqualStrings("tries", names[4]);
 }
 
@@ -3608,7 +4008,47 @@ test "a batch goes in as one statement and comes back in the order it was sent" 
     try testing.expectEqual(before + 3, try stack.db.count(Person, &run, .{}));
 }
 
-test "an empty batch is a statement that stores nothing, not a special case" {
+test "paging through an order that ties sees every row once" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // A thousand rows over ten ages. Without the key at the end of the order,
+    // Postgres ordered the ties differently at each `OFFSET`, and 179 of these
+    // came back twice and 179 never.
+    const count = 1000;
+    const first: i64 = 10_000;
+    var rows: [count]Newcomer = undefined;
+    for (&rows, 0..) |*row, i| row.* = .{
+        .id = first + @as(i64, @intCast(i)),
+        .email = try std.fmt.allocPrint(run.arena(), "tie{d}@page.dev", .{i}),
+        .age = @intCast(i % 10),
+    };
+    _ = try stack.db.insertMany(Person, &run, @as([]const Newcomer, &rows));
+
+    var seen = [_]bool{false} ** count;
+    var offset: i64 = 0;
+    while (offset < count) : (offset += 25) {
+        const page = try stack.db.page(Person, &run, .{
+            .where = .{ .id = .{ .gte = first } },
+            .order = .{ .age = .asc },
+            .limit = @as(i64, 25),
+            .offset = offset,
+        });
+        try testing.expectEqual(@as(@TypeOf(page.total), count), page.total);
+        for (page.rows) |p| {
+            const at: usize = @intCast(p.id - first);
+            try testing.expect(!seen[at]);
+            seen[at] = true;
+        }
+    }
+    for (seen) |was| try testing.expect(was);
+}
+
+test "an empty batch stores nothing and sends nothing" {
     const gpa = testing.allocator;
     var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
     defer stack.close(gpa);
@@ -3620,10 +4060,9 @@ test "an empty batch is a statement that stores nothing, not a special case" {
     const none: []const Newcomer = &.{};
     const stored = try stack.db.insertMany(Person, &run, none);
 
-    // `unnest` of empty arrays yields no rows, so the statement runs, inserts
-    // nothing and answers with nothing. Writing a `if (rows.len == 0) return`
-    // here would be a second answer to a question the database already has
-    // one for.
+    // `unnest` of empty arrays yields no rows, so the answer is known without
+    // asking: the call returns it and sends nothing (`db.insertMany`, and
+    // `db.zig` has the test that nothing goes down the wire).
     try testing.expectEqual(@as(usize, 0), stored.len);
     try testing.expectEqual(before, try stack.db.count(Person, &run, .{}));
 }
@@ -3824,6 +4263,145 @@ test "a batch carries the column types that bind as something else" {
     // encodes a `jsonb[]` element from bytes.
     try testing.expectEqualStrings("midnight", back[0].settings.?.value.theme);
     try testing.expectEqualStrings("12345678901234567890.123456789", back[1].balance.text);
+
+    // `.in` and `.not_in` over the same columns, each list element mapped the
+    // way a scalar is: the `Timestamp` as its micros, the `Decimal` as digits
+    // cast through `text[]`. Before, neither compiled.
+    const at = try stack.db.select(Sample, &run, .{
+        .where = .{ .seen_at = .{ .in = &[_]types.Timestamp{types.Timestamp.fromSeconds(1_787_045_400)} } },
+    });
+    try testing.expectEqual(@as(usize, 1), at.len);
+    try testing.expectEqual(@as(i64, 931), at[0].id);
+    const priced = try stack.db.select(Sample, &run, .{
+        .where = .{
+            .id = .{ .gte = @as(i64, 930) },
+            .balance = .{ .not_in = &[_]types.Decimal{.{ .text = "10.250" }} },
+        },
+    });
+    try testing.expectEqual(@as(usize, 1), priced.len);
+    try testing.expectEqual(@as(i64, 931), priced[0].id);
+}
+
+/// Numbers in fields of another width than their columns, each a pair the
+/// schema check accepts.
+const Widths = struct {
+    pub const nilo_table = .{ .name = "nilo_live_widths_" ++ mode_suffix, .key = .id };
+    id: i64,
+    small: u8,
+    tiny: i8,
+    big: i32,
+    half: f64,
+    whole: ?f64,
+};
+
+test "a number is read out of whichever width its column is, and refused where it does not fit" {
+    // pg.zig decodes only the exact type, so an `i32` over `int8` and an
+    // `f64` over `float4` passed the schema check and failed every read, and
+    // a `u8` or an `i8` did not compile inside the driver.
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const widths = "nilo_live_widths_" ++ mode_suffix;
+    _ = try stack.db.exec(&run, "DROP TABLE IF EXISTS " ++ widths, .{});
+    defer _ = stack.db.exec(&run, "DROP TABLE IF EXISTS " ++ widths, .{}) catch {};
+    _ = try stack.db.exec(&run, "CREATE TABLE " ++ widths ++ " (id int8 PRIMARY KEY, small int2 NOT NULL, " ++
+        "tiny int2 NOT NULL, big int8 NOT NULL, half float4 NOT NULL, whole float8)", .{});
+
+    const made = try stack.db.insert(Widths, &run, .{
+        .id = @as(i64, 1),
+        .small = @as(u8, 200),
+        .tiny = @as(i8, -100),
+        .big = @as(i32, 7),
+        .half = @as(f64, 1.5),
+        .whole = @as(?f64, 2.25),
+    });
+    try testing.expectEqual(@as(u8, 200), made.small);
+    try testing.expectEqual(@as(i8, -100), made.tiny);
+    try testing.expectEqual(@as(i32, 7), made.big);
+    try testing.expectEqual(@as(f64, 1.5), made.half);
+    try testing.expectEqual(@as(?f64, 2.25), made.whole);
+
+    // Past what the field holds: refused, with the column named, rather
+    // than truncated.
+    _ = try stack.db.exec(&run, "UPDATE " ++ widths ++ " SET big = 5000000000", .{});
+    try testing.expectError(error.QueryFailed, stack.db.find(Widths, &run, @as(i64, 1)));
+    _ = try stack.db.exec(&run, "UPDATE " ++ widths ++ " SET big = 1, small = -1", .{});
+    try testing.expectError(error.QueryFailed, stack.db.find(Widths, &run, @as(i64, 1)));
+
+    // A raw statement's narrower column widens into the field.
+    try testing.expectEqual(@as(i64, 5), try stack.db.rawExactlyOne(i64, &run, "SELECT 5::int4", .{}));
+    try testing.expectEqual(@as(f64, 0.5), try stack.db.rawExactlyOne(f64, &run, "SELECT 0.5::float4", .{}));
+}
+
+/// A child whose key to its parent is checked at the COMMIT.
+const Deferred = struct {
+    pub const nilo_table = .{ .name = "nilo_live_deferred_" ++ mode_suffix, .key = .id };
+    id: i64,
+    parent_id: i64,
+};
+
+test "a commit a deferred key refuses says which key it was" {
+    // A deferred constraint is checked at the COMMIT and nowhere else, and
+    // the COMMIT's problem was never recorded: `ForeignKeyViolated` came back
+    // with `sql.problem` still null, so nothing could say which key.
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const child = "nilo_live_deferred_" ++ mode_suffix;
+    const parent = "nilo_live_deferred_parent_" ++ mode_suffix;
+    _ = try stack.db.exec(&run, "DROP TABLE IF EXISTS " ++ child ++ ", " ++ parent, .{});
+    defer _ = stack.db.exec(&run, "DROP TABLE IF EXISTS " ++ child ++ ", " ++ parent, .{}) catch {};
+    _ = try stack.db.exec(&run, "CREATE TABLE " ++ parent ++ " (id int8 PRIMARY KEY)", .{});
+    _ = try stack.db.exec(&run, "CREATE TABLE " ++ child ++ " (id int8 PRIMARY KEY, parent_id int8 NOT NULL " ++
+        "CONSTRAINT deferred_parent_later REFERENCES " ++ parent ++ " (id) DEFERRABLE INITIALLY DEFERRED)", .{});
+
+    var tx = try stack.db.begin(&run, .{});
+    defer tx.deinit();
+    _ = try tx.insert(Deferred, &run, .{ .id = @as(i64, 1), .parent_id = @as(i64, 404) });
+    try testing.expectEqual(@as(?wire_mod.Problem, null), db_mod.lastProblem(&run));
+    try testing.expectError(error.ForeignKeyViolated, tx.commit());
+    const refusal = db_mod.lastProblem(&run) orelse return error.NoProblemReported;
+    try testing.expectEqualStrings("deferred_parent_later", refusal.constraint);
+    try testing.expectEqualStrings("23503", refusal.code);
+    // A retry is refused too; it used to reach a Wire that was done and succeed.
+    try testing.expectError(error.QueryFailed, tx.commit());
+}
+
+test "a list condition over a date or bytes binds each element the way one is bound" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // `::text[]::date[]`, because cast straight to `date[]` pg.zig has no
+    // encoder for the OID and sends the elements as `bytea`.
+    const born = try stack.db.select(Birthday, &run, .{
+        .where = .{ .born = .{ .in = &[_]types.Date{ types.Date.nilo_parse("1815-12-10").?, types.Date.nilo_parse("2015-03-01").? } } },
+        .order = .{ .id = .asc },
+    });
+    try testing.expect(born.len >= 1);
+    try testing.expectEqual(@as(i64, 1), born[0].id);
+
+    const digest = [_]u8{ 0xff, 0x00, 0x25 };
+    _ = try stack.db.insert(Session, &run, .{
+        .id = @as(i64, 1),
+        .token_hash = types.Bytes.of(&digest),
+        .device = @as(?types.Bytes, null),
+    });
+    const found = try stack.db.select(Session, &run, .{
+        .where = .{ .token_hash = .{ .in = &[_]types.Bytes{ types.Bytes.of(&digest), types.Bytes.of("x") } } },
+    });
+    try testing.expectEqual(@as(usize, 1), found.len);
 }
 
 // -- bytes, written -----------------------------------------------------------
@@ -4455,6 +5033,39 @@ test "a raw statement is held against its Row the first time it runs" {
     try testing.expectEqual(@as(i64, 0), left_over);
 }
 
+test "a raw statement whose first run found no table is held against its Row once the table is there" {
+    // The check's flag used to be spent before `describe` answered, so a
+    // first run that met a table a migration had not made yet left the
+    // statement unchecked for the life of the process.
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const late = "nilo_live_late_" ++ mode_suffix;
+    _ = try stack.db.exec(&run, "DROP TABLE IF EXISTS " ++ late, .{});
+    defer _ = stack.db.exec(&run, "DROP TABLE IF EXISTS " ++ late, .{}) catch {};
+
+    const Pair = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        other: i64,
+    };
+    const joined = "SELECT p.id, q.id AS other FROM " ++ late ++ " p LEFT JOIN " ++ late ++
+        " q ON q.id = p.id ORDER BY p.id";
+
+    // No table: the statement fails, and so did the describe beside it.
+    try testing.expectError(error.QueryFailed, stack.db.raw(Pair, &run, joined, .{}));
+
+    _ = try stack.db.exec(&run, "CREATE TABLE " ++ late ++ " (id int8 PRIMARY KEY)", .{});
+    _ = try stack.db.exec(&run, "INSERT INTO " ++ late ++ " VALUES (1)", .{});
+    // Every row would read, since the join always finds one; the refusal is
+    // the check's, asked again because the first one had no answer.
+    try testing.expectError(error.QueryFailed, stack.db.raw(Pair, &run, joined, .{}));
+}
+
 /// A person carrying the ids of their sessions — which no column holds, and
 /// the handler fills after the read (ADR 178).
 const Carried = struct {
@@ -4740,6 +5351,274 @@ test "a plan that drops an indexed column runs on Postgres, index first" {
 
     const kept = (try db.find(After, &run, @as(i64, 1))).?;
     try testing.expectEqual(@as(i64, 7), kept.count);
+}
+
+const shape_parent = "nilo_live_shape_parent_" ++ mode_suffix;
+const shape_child = "nilo_live_shape_child_" ++ mode_suffix;
+const shape_counter = "nilo_live_shape_counter_" ++ mode_suffix;
+const shape_list = "nilo_live_shape_list_" ++ mode_suffix;
+const shape_top = "nilo_live_shape_top_" ++ mode_suffix;
+
+test "a plan that drops two related tables, a checked column and retypes a column two views read runs on Postgres" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Parent = struct {
+        pub const nilo_table = .{ .name = shape_parent, .key = .id };
+        id: i64,
+    };
+    const Child = struct {
+        pub const nilo_table = .{ .name = shape_child, .key = .id, .references = .{ .parent_id = .{ Parent, .id } } };
+        id: i64,
+        parent_id: i64,
+    };
+    const Before = struct {
+        pub const nilo_table = .{
+            .name = shape_counter,
+            .key = .id,
+            .check = .{ .nilo_live_shape_note_said = "note <> ''" },
+        };
+        id: i64,
+        count: i32,
+        note: ?[]const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{ .name = shape_counter, .key = .id };
+        id: i64,
+        count: i64,
+    };
+    // The one that reads the other listed first.
+    const views = [_]migrate.Schema.Text{
+        .{ .name = shape_top, .body = "SELECT * FROM " ++ shape_list ++ " WHERE count > 1" },
+        .{ .name = shape_list, .body = "SELECT id, count FROM " ++ shape_counter },
+    };
+    const before_schema: migrate.Schema = .{ .tables = &.{ Child, Parent, Before }, .views = &views };
+    const after_schema: migrate.Schema = .{ .tables = &.{After}, .views = &views };
+
+    const drops = "DROP VIEW IF EXISTS \"" ++ shape_top ++ "\"; DROP VIEW IF EXISTS \"" ++ shape_list ++
+        "\"; DROP TABLE IF EXISTS \"" ++ shape_child ++ "\", \"" ++ shape_parent ++ "\", \"" ++ shape_counter ++ "\"";
+    _ = try db.exec(&run, drops, .{});
+    defer _ = db.exec(&run, drops, .{}) catch {};
+    try migrate.createMissing(&db, &run, before_schema);
+    _ = try db.insert(Parent, &run, .{ .id = 1 });
+    _ = try db.insert(Child, &run, .{ .id = 1, .parent_id = 1 });
+    _ = try db.insert(Before, &run, .{ .id = 1, .count = 7, .note = @as(?[]const u8, "kept") });
+
+    const a = run.arena();
+    const before = try migrate.snapshotOf(a, dialect.Postgres, 1, comptime migrate.desiredOf(dialect.Postgres, before_schema));
+    const change = try migrate.plan(a, dialect.Postgres, comptime migrate.desiredOf(dialect.Postgres, after_schema), before);
+    try testing.expectEqual(@as(usize, 0), change.problems.len);
+
+    // Each of these failed the version on Postgres's own error: the parent
+    // dropped before its child, the check's `DROP CONSTRAINT` after the
+    // column had taken it, and the `ALTER … TYPE` under two views.
+    var tx = try db.begin(&run, .{});
+    defer tx.deinit();
+    for (change.steps) |step| _ = try tx.exec(&run, step.sql, .{});
+    try tx.commit();
+
+    const Top = struct {
+        pub const nilo_table = .projection;
+        id: i64,
+        count: i64,
+    };
+    const top = try db.raw(Top, &run, "SELECT id, count FROM \"" ++ shape_top ++ "\"", .{});
+    try testing.expectEqual(@as(usize, 1), top.len);
+    try testing.expectEqual(@as(i64, 7), top[0].count);
+}
+
+const renamed_parent = "nilo_live_renamed_parent_" ++ mode_suffix;
+const renamed_posts = "nilo_live_renamed_posts_" ++ mode_suffix;
+
+test "a column `.was` renamed carries its index, its unique and its foreign key on Postgres" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Parent = struct {
+        pub const nilo_table = .{ .name = renamed_parent, .key = .id };
+        id: i64,
+    };
+    const Before = struct {
+        pub const nilo_table = .{
+            .name = renamed_posts,
+            .key = .id,
+            .references = .{ .author_id = .{ Parent, .id } },
+            .unique = .{.slug},
+            .index = .{.author_id},
+        };
+        id: i64,
+        author_id: i64,
+        slug: []const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{
+            .name = renamed_posts,
+            .key = .id,
+            .was = .{ .writer_id = "author_id", .handle = "slug" },
+            .references = .{ .writer_id = .{ Parent, .id } },
+            .unique = .{.handle},
+            .index = .{.writer_id},
+        };
+        id: i64,
+        writer_id: i64,
+        handle: []const u8,
+    };
+
+    const drops = "DROP TABLE IF EXISTS \"" ++ renamed_posts ++ "\", \"" ++ renamed_parent ++ "\"";
+    _ = try db.exec(&run, drops, .{});
+    defer _ = db.exec(&run, drops, .{}) catch {};
+    try migrate.createMissing(&db, &run, .{ .tables = &.{ Parent, Before } });
+    _ = try db.insert(Parent, &run, .{ .id = 1 });
+    _ = try db.insert(Before, &run, .{ .id = 1, .author_id = 1, .slug = "a" });
+
+    const a = run.arena();
+    const before = try migrate.snapshotOf(a, dialect.Postgres, 1, comptime migrate.desiredOf(dialect.Postgres, .{ .tables = &.{ Parent, Before } }));
+    const change = try migrate.plan(a, dialect.Postgres, comptime migrate.desiredOf(dialect.Postgres, .{ .tables = &.{ Parent, After } }), before);
+    try testing.expectEqual(@as(usize, 0), change.problems.len);
+    var tx = try db.begin(&run, .{});
+    defer tx.deinit();
+    for (change.steps) |step| _ = try tx.exec(&run, step.sql, .{});
+    try tx.commit();
+
+    // The names the next diff will drop by are the names the database has.
+    const Named = struct {
+        pub const nilo_table = .projection;
+        n: i64,
+    };
+    const found = try db.raw(Named, &run,
+        \\SELECT count(*) AS n FROM pg_class WHERE relname IN ('
+    ++ renamed_posts ++ "_handle_key', '" ++ renamed_posts ++ "_writer_id_idx')" ++
+        " UNION ALL SELECT count(*) FROM pg_constraint WHERE conname = '" ++ renamed_posts ++ "_writer_id_fkey'", .{});
+    try testing.expectEqual(@as(i64, 2), found[0].n);
+    try testing.expectEqual(@as(i64, 1), found[1].n);
+    try testing.expectError(error.AlreadyExists, db.insert(After, &run, .{ .id = 2, .writer_id = 1, .handle = "a" }));
+    try testing.expectError(error.ForeignKeyViolated, db.insert(After, &run, .{ .id = 3, .writer_id = 9, .handle = "b" }));
+}
+
+const fed_table = "nilo_live_fed_" ++ mode_suffix;
+
+test "a feed after a cursor over a column rows share pages every row once on Postgres" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Post = struct {
+        pub const nilo_table = .{ .name = fed_table, .key = .id, .index = .{.{ .columns = .{ .posted, .id } }} };
+        id: i64,
+        posted: types.Timestamp,
+    };
+    _ = try db.exec(&run, "DROP TABLE IF EXISTS \"" ++ fed_table ++ "\"", .{});
+    defer _ = db.exec(&run, "DROP TABLE IF EXISTS \"" ++ fed_table ++ "\"", .{}) catch {};
+    try migrate.createMissing(&db, &run, .{ .tables = &.{Post} });
+    // Forty rows over four moments, ten sharing each: a cursor over the
+    // moment alone would skip nine of every ten it landed among.
+    for (0..40) |i| _ = try db.insert(Post, &run, .{
+        .id = @as(i64, @intCast(i + 1)),
+        .posted = types.Timestamp{ .micros = @as(i64, @intCast(i / 10)) * 1_000_000 },
+    });
+
+    var seen: [41]bool = @splat(false);
+    var found = try db.feed(Post, &run, .{ .order = .{ .posted = .desc, .id = .desc }, .limit = 7 });
+    var total: usize = 0;
+    while (true) {
+        for (found.rows) |row| {
+            try testing.expect(!seen[@intCast(row.id)]);
+            seen[@intCast(row.id)] = true;
+        }
+        total += found.rows.len;
+        if (!found.more) break;
+        const last = found.rows[found.rows.len - 1];
+        found = try db.feed(Post, &run, .{
+            .order = .{ .posted = .desc, .id = .desc },
+            .after = .{ .posted = last.posted, .id = last.id },
+            .limit = 7,
+        });
+    }
+    try testing.expectEqual(@as(usize, 40), total);
+}
+
+const long_table = "nilo_live_long_" ++ mode_suffix;
+
+test "a stream let go early keeps its connection when the rest is short, and replaces it when it is long" {
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    // One connection, so the backend each statement reaches is the one the
+    // pool holds.
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Long = struct {
+        pub const nilo_table = .{ .name = long_table, .key = .id };
+        id: i64,
+        body: []const u8,
+    };
+    const Backend = struct {
+        pub const nilo_table = .projection;
+        pid: i32,
+    };
+    _ = try db.exec(&run, "DROP TABLE IF EXISTS \"" ++ long_table ++ "\"", .{});
+    defer _ = db.exec(&run, "DROP TABLE IF EXISTS \"" ++ long_table ++ "\"", .{}) catch {};
+    // 200,000 rows of 200 bytes: forty times the budget.
+    _ = try db.exec(&run, "CREATE TABLE \"" ++ long_table ++ "\" AS SELECT g::int8 AS id, repeat('x', 200) AS body " ++
+        "FROM generate_series(1, 200000) AS g", .{});
+
+    const first = (try db.raw(Backend, &run, "SELECT pg_backend_pid() AS pid", .{}))[0].pid;
+
+    // A hundred rows: read to the end, and the connection kept.
+    {
+        var rows = try db.stream(Long, &run, .{ .order = .{ .id = .asc }, .limit = 100 });
+        defer rows.close();
+        _ = try rows.next();
+    }
+    try testing.expectEqual(first, (try db.raw(Backend, &run, "SELECT pg_backend_pid() AS pid", .{}))[0].pid);
+
+    // The whole table: past the budget the connection is given up, and the
+    // next statement runs on its replacement.
+    {
+        var rows = try db.stream(Long, &run, .{ .order = .{ .id = .asc } });
+        defer rows.close();
+        _ = try rows.next();
+    }
+    const after = (try db.raw(Backend, &run, "SELECT pg_backend_pid() AS pid", .{}))[0].pid;
+    try testing.expect(after != first);
+    try testing.expectEqual(@as(usize, 200_000), try db.count(Long, &run, .{}));
 }
 
 test "a Db told to keep no plans still answers, one Parse at a time" {
@@ -5385,4 +6264,586 @@ test "a parent, its children and a sum come back from a real Postgres" {
     try testing.expect(std.mem.indexOf(u8, plan, "\n") != null);
 
     for (shape_setup[0..3]) |text| _ = try stack.db.exec(&run, text, .{});
+}
+
+const GroupCustomer = struct {
+    pub const nilo_table = .{ .name = "nilo_group_customers" };
+    id: i64,
+    name: []const u8,
+};
+
+const GroupOrder = struct {
+    pub const nilo_table = .{
+        .name = "nilo_group_orders",
+        .references = .{ .customer_id = .{ GroupCustomer, .id } },
+    };
+    id: i64,
+    customer_id: i64,
+    total: i64,
+};
+
+const GroupByCustomerName = struct {
+    pub const nilo_table = GroupOrder;
+    pub const nilo_through = .{ .customer_name = .{ .customer_id, .name } };
+    pub const nilo_aggregate = .{ .orders = .count, .revenue = .{ .sum = .total } };
+    customer_name: []const u8,
+    orders: i64,
+    revenue: i64,
+};
+
+test "a grouped Row reading a name through a reference keeps two customers of one name apart" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+    const group_setup = [_][]const u8{
+        "DROP TABLE IF EXISTS nilo_group_orders",
+        "DROP TABLE IF EXISTS nilo_group_customers",
+        "CREATE TABLE nilo_group_customers (id bigint PRIMARY KEY, name text NOT NULL)",
+        "CREATE TABLE nilo_group_orders (id bigint PRIMARY KEY, customer_id bigint NOT NULL, total bigint NOT NULL)",
+        "INSERT INTO nilo_group_customers VALUES (1, 'Ani'), (2, 'Ani'), (3, 'Budi')",
+        "INSERT INTO nilo_group_orders VALUES (1, 1, 100), (2, 1, 50), (3, 2, 7), (4, 3, 1)",
+    };
+    for (group_setup) |text| _ = try stack.db.exec(&run, text, .{});
+    defer for (group_setup[0..2]) |text| {
+        _ = stack.db.exec(&run, text, .{}) catch {};
+    };
+
+    const groups = try stack.db.select(GroupByCustomerName, &run, .{
+        .order = .{ .revenue = .desc },
+    });
+    try testing.expectEqual(@as(usize, 3), groups.len);
+    try testing.expectEqualStrings("Ani", groups[0].customer_name);
+    try testing.expectEqual(@as(i64, 150), groups[0].revenue);
+    try testing.expectEqual(@as(i64, 2), groups[0].orders);
+    try testing.expectEqualStrings("Ani", groups[1].customer_name);
+    try testing.expectEqual(@as(i64, 7), groups[1].revenue);
+    try testing.expectEqual(@as(i64, 1), groups[1].orders);
+    try testing.expectEqualStrings("Budi", groups[2].customer_name);
+
+    // Two pages of one, ordered by a tie: the second Ani is not lost.
+    const first = try stack.db.page(GroupByCustomerName, &run, .{ .order = .{ .revenue = .desc }, .limit = 2 });
+    try testing.expectEqual(@as(i64, 3), first.total);
+    try testing.expectEqual(@as(usize, 2), first.rows.len);
+}
+
+const TicketKind = enum { urgent, billing };
+const TicketKindShort = enum { urgent };
+
+const KindedTicket = struct {
+    pub const nilo_table = .{ .name = list_table, .key = .id };
+
+    id: i64,
+    tags: []const TicketKind,
+};
+
+const ShortKindedTicket = struct {
+    pub const nilo_table = .{ .name = list_table, .key = .id };
+
+    id: i64,
+    tags: []const TicketKindShort,
+};
+
+const WideScores = struct {
+    pub const nilo_table = .{ .name = list_table, .key = .id };
+
+    id: i64,
+    scores: ?[]const i64,
+};
+
+const FloatScores = struct {
+    pub const nilo_table = .{ .name = list_table, .key = .id };
+
+    id: i64,
+    scores: ?[]const f64,
+};
+
+const TextScores = struct {
+    pub const nilo_table = .{ .name = list_table, .key = .id };
+
+    id: i64,
+    scores: ?[]const []const u8,
+};
+
+test "a list of enums reads each label, and one the enum lacks is a refusal rather than a panic" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    const was = std.testing.log_level;
+    defer std.testing.log_level = was;
+    std.testing.log_level = .err;
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    const found = try stack.db.select(KindedTicket, &run, .{ .where = .{ .id = @as(i64, 1) } });
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqual(@as(usize, 2), found[0].tags.len);
+    try testing.expectEqual(TicketKind.urgent, found[0].tags[0]);
+    try testing.expectEqual(TicketKind.billing, found[0].tags[1]);
+
+    // The empty array has a label to be wrong about in no element at all.
+    const empty = try stack.db.select(KindedTicket, &run, .{ .where = .{ .id = @as(i64, 2) } });
+    try testing.expectEqual(@as(usize, 0), empty[0].tags.len);
+
+    // pg.zig decodes with `std.meta.stringToEnum(T, data).?`: `billing` is a
+    // label of the column and not of this enum, and that took the process down.
+    try testing.expectError(error.QueryFailed, stack.db.select(ShortKindedTicket, &run, .{
+        .where = .{ .id = @as(i64, 1) },
+    }));
+}
+
+test "an array read into a list of another element type is a refusal, empty or not, in place of pg.zig's panic" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    const was = std.testing.log_level;
+    defer std.testing.log_level = was;
+    std.testing.log_level = .err;
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // `scores` is `integer[]`. pg.zig panics on an `i64` or an `f64` list of
+    // any element type but its own.
+    try testing.expectError(error.QueryFailed, stack.db.select(WideScores, &run, .{
+        .where = .{ .id = @as(i64, 1) },
+    }));
+    try testing.expectError(error.QueryFailed, stack.db.select(FloatScores, &run, .{
+        .where = .{ .id = @as(i64, 1) },
+    }));
+    // Text over an `integer[]` decoded as raw bytes without a word.
+    try testing.expectError(error.QueryFailed, stack.db.select(TextScores, &run, .{
+        .where = .{ .id = @as(i64, 1) },
+    }));
+}
+
+test "an order over a numeric sorts the numbers, not the text they are read as" {
+    const gpa = testing.allocator;
+    var stack = (try Stack.open(gpa)) orelse return error.SkipZigTest;
+    defer stack.close(gpa);
+
+    var run = nilo.Run.init(gpa);
+    defer run.deinit();
+
+    // Different widths: as text `9.00` sorts after `100.5`, which sorts after
+    // `10.00`. `"balance"::text` is answered as `balance`, and Postgres reads a
+    // bare name in `ORDER BY` against the answers first. Two of them share a
+    // balance, so the tiebreak has to matter.
+    const balances = [_][]const u8{ "9.00", "10.00", "100.5", "10.00" };
+    const emails = [_][]const u8{ "w0@example.dev", "w1@example.dev", "w2@example.dev", "w3@example.dev" };
+    for (balances, emails, 0..) |text, email, i| {
+        _ = try stack.db.insert(Account, &run, .{
+            .id = @as(i64, 710) + @as(i64, @intCast(i)),
+            .email = email,
+            .age = @as(i32, 30),
+            .balance = types.Decimal{ .text = text },
+        });
+    }
+    const ids = [_]i64{ 710, 711, 712, 713 };
+
+    const down = try stack.db.select(Account, &run, .{
+        .where = .{ .id = .{ .in = &ids } },
+        .order = .{ .balance = .desc },
+        .limit = 10,
+    });
+    try testing.expectEqual(@as(usize, 4), down.len);
+    try testing.expectEqualStrings("100.5", down[0].balance.text);
+    try testing.expectEqualStrings("10.00", down[1].balance.text);
+    try testing.expectEqualStrings("10.00", down[2].balance.text);
+    try testing.expectEqualStrings("9.00", down[3].balance.text);
+
+    const up = try stack.db.select(Account, &run, .{
+        .where = .{ .id = .{ .in = &ids } },
+        .order = .{ .balance = .asc },
+    });
+    try testing.expectEqualStrings("9.00", up[0].balance.text);
+    try testing.expectEqualStrings("100.5", up[3].balance.text);
+
+    // A feed compares its cursor as a number, so the rows it walks have to be
+    // in that order or it skips them. Its first page names only the balance,
+    // and the tiebreak has to run the way the later pages, which name the key,
+    // do: 713 and 711 share a balance.
+    const first = try stack.db.feed(Account, &run, .{
+        .where = .{ .id = .{ .in = &ids } },
+        .order = .{ .balance = .desc },
+        .limit = 2,
+    });
+    try testing.expectEqual(@as(usize, 2), first.rows.len);
+    try testing.expectEqual(@as(i64, 712), first.rows[0].id);
+    try testing.expectEqual(@as(i64, 713), first.rows[1].id);
+    const last = first.rows[1];
+    const second = try stack.db.feed(Account, &run, .{
+        .where = .{ .id = .{ .in = &ids } },
+        .order = .{ .balance = .desc, .id = .desc },
+        .after = .{ .balance = last.balance, .id = last.id },
+        .limit = 2,
+    });
+    try testing.expectEqual(@as(usize, 2), second.rows.len);
+    try testing.expectEqual(@as(i64, 711), second.rows[0].id);
+    try testing.expectEqual(@as(i64, 710), second.rows[1].id);
+}
+
+test "the startup check reads a domain as the type under it, and citext as text" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    const arena = live.arena.allocator();
+    const home = "nilo_live_domains_" ++ mode_suffix;
+
+    // `typname` of a domain column is the domain's own name, which no list
+    // names, so a `Str` over `email_address` stopped a server whose table was
+    // right. The introspection now follows `typbasetype`, through a domain
+    // over a domain too (ADR 055).
+    for ([_][]const u8{
+        "DROP SCHEMA IF EXISTS " ++ home ++ " CASCADE",
+        "CREATE SCHEMA " ++ home,
+        "CREATE DOMAIN " ++ home ++ ".email_address AS text CHECK (position('@' in value) > 0)",
+        "CREATE DOMAIN " ++ home ++ ".work_email AS " ++ home ++ ".email_address",
+        "CREATE DOMAIN " ++ home ++ ".count AS integer",
+    }) |statement| {
+        var rows = try live.wire.run(arena, statement, .{}, null, null);
+        live.wire.drain(&rows);
+    }
+    defer {
+        var rows = live.wire.run(arena, "DROP SCHEMA IF EXISTS " ++ home ++ " CASCADE", .{}, null, null) catch null;
+        if (rows) |*r| live.wire.drain(r);
+    }
+
+    // `citext` is an extension's type. It is created if the role may, and it
+    // is left installed afterwards: the Debug and ReleaseSafe runs share the
+    // database, and one dropping it under the other is a race, not a cleanup.
+    // Without the privilege that half is skipped, the domains are not.
+    const has_citext = blk: {
+        var rows = live.wire.run(arena, "CREATE EXTENSION IF NOT EXISTS citext", .{}, null, null) catch break :blk false;
+        live.wire.drain(&rows);
+        break :blk true;
+    };
+    var made = false;
+    if (has_citext) {
+        var rows = live.wire.run(arena, "CREATE TABLE " ++ home ++ ".people (" ++
+            "id bigint PRIMARY KEY, email " ++ home ++ ".email_address NOT NULL, " ++
+            "work " ++ home ++ ".work_email, shout citext NOT NULL, visits " ++ home ++ ".count NOT NULL)", .{}, null, null) catch null;
+        if (rows) |*r| {
+            live.wire.drain(r);
+            made = true;
+        }
+    }
+    if (!made) {
+        var rows = try live.wire.run(arena, "CREATE TABLE " ++ home ++ ".people (" ++
+            "id bigint PRIMARY KEY, email " ++ home ++ ".email_address NOT NULL, " ++
+            "work " ++ home ++ ".work_email, visits " ++ home ++ ".count NOT NULL)", .{}, null, null);
+        live.wire.drain(&rows);
+    }
+
+    const columns = try live.wire.columnsOf(arena, dialect.Postgres.introspect, home, "people");
+    try testing.expectEqualStrings("text", columns[1].udt);
+    try testing.expectEqualStrings("text", columns[2].udt);
+    try testing.expectEqualStrings("int4", columns[columns.len - 1].udt);
+
+    const Domains = struct {
+        pub const nilo_table = .{ .name = "people", .key = .id };
+
+        id: i64,
+        email: []const u8,
+        work: ?[]const u8,
+        visits: i32,
+    };
+    var problems: std.ArrayList(schema.Problem) = .empty;
+    try testing.expectEqual(@as(usize, 0), try schema.compare(dialect.Postgres, Domains, columns, &problems, arena));
+
+    // A domain is no looser than what is under it: a `Str` over the integer
+    // one is still the mismatch this check is for.
+    const Wrong = struct {
+        pub const nilo_table = .{ .name = "people", .key = .id };
+
+        id: i64,
+        visits: []const u8,
+    };
+    try testing.expectEqual(@as(usize, 1), try schema.compare(dialect.Postgres, Wrong, columns, &problems, arena));
+    try testing.expectEqualStrings("int4", problems.items[0].found);
+
+    if (made) {
+        try testing.expectEqualStrings("citext", columns[3].udt);
+        const Shout = struct {
+            pub const nilo_table = .{ .name = "people", .key = .id };
+
+            id: i64,
+            shout: []const u8,
+        };
+        try testing.expectEqual(@as(usize, 0), try schema.compare(dialect.Postgres, Shout, columns, &problems, arena));
+    }
+}
+
+const dated_table = "nilo_live_dated_" ++ mode_suffix;
+
+test "a feed after a cursor over a Date binds it through its cast and reads every page on Postgres" {
+    // `.after` bound its cursor with a bare `$n` where every other condition
+    // writes `bindAs`, and pg.zig has no `date` encoder: the first page has no
+    // cursor and worked, and the second was a type error from the database.
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Due = struct {
+        pub const nilo_table = .{ .name = dated_table, .key = .id, .index = .{.{ .columns = .{ .due, .id } }} };
+        id: i64,
+        due: types.Date,
+    };
+    _ = try db.exec(&run, "DROP TABLE IF EXISTS \"" ++ dated_table ++ "\"", .{});
+    defer _ = db.exec(&run, "DROP TABLE IF EXISTS \"" ++ dated_table ++ "\"", .{}) catch {};
+    try migrate.createMissing(&db, &run, .{ .tables = &.{Due} });
+    // Twenty-five rows over five days, five sharing each, so the cursor needs
+    // the key as well as the day.
+    for (0..25) |i| _ = try db.insert(Due, &run, .{
+        .id = @as(i64, @intCast(i + 1)),
+        .due = types.Date.fromDays(19_000 + @as(i32, @intCast(i / 5))),
+    });
+
+    var seen: [26]bool = @splat(false);
+    var found = try db.feed(Due, &run, .{ .order = .{ .due = .asc, .id = .asc }, .limit = 4 });
+    var total: usize = 0;
+    while (true) {
+        for (found.rows) |row| {
+            try testing.expect(!seen[@intCast(row.id)]);
+            seen[@intCast(row.id)] = true;
+        }
+        total += found.rows.len;
+        if (!found.more) break;
+        const last = found.rows[found.rows.len - 1];
+        found = try db.feed(Due, &run, .{
+            .order = .{ .due = .asc, .id = .asc },
+            .after = .{ .due = last.due, .id = last.id },
+            .limit = 4,
+        });
+    }
+    try testing.expectEqual(@as(usize, 25), total);
+}
+
+const guarded_table = "nilo_live_guarded_" ++ mode_suffix;
+
+test "a statement holding a given keeps one plan a combination, none of them the guard a generic plan cannot seek on" {
+    // A kept plan goes generic after five calls, and on the generic plan
+    // `("cust" = $1 OR $1 IS NULL)` cannot seek: with a table this size the
+    // call that finally sets the filter read all of it (sql.md section 22).
+    // One connection, so `pg_prepared_statements` is the pool's whole session.
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Stock = struct {
+        pub const nilo_table = .{ .name = guarded_table, .key = .id, .index = .{.{ .columns = .{.cust} }} };
+        id: i64,
+        cust: []const u8,
+    };
+    _ = try db.exec(&run, "DROP TABLE IF EXISTS \"" ++ guarded_table ++ "\"", .{});
+    defer _ = db.exec(&run, "DROP TABLE IF EXISTS \"" ++ guarded_table ++ "\"", .{}) catch {};
+    try migrate.createMissing(&db, &run, .{ .tables = &.{Stock} });
+    for (0..30) |i| _ = try db.insert(Stock, &run, .{
+        .id = @as(i64, @intCast(i + 1)),
+        .cust = switch (i % 3) {
+            0 => "c0",
+            1 => "c1",
+            else => "c2",
+        },
+    });
+
+    const given = @import("where.zig").given;
+    for (0..8) |_| try testing.expectEqual(@as(usize, 30), try db.count(Stock, &run, .{
+        .where = .{ .cust = given(@as(?[]const u8, null)) },
+    }));
+    try testing.expectEqual(@as(usize, 10), try db.count(Stock, &run, .{
+        .where = .{ .cust = given(@as(?[]const u8, "c1")) },
+    }));
+    try testing.expectEqual(@as(usize, 10), try db.count(Stock, &run, .{
+        .where = .{ .cust = @as([]const u8, "c1") },
+    }));
+
+    const named = "SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE '%" ++ guarded_table ++
+        "%' AND statement NOT LIKE '%pg_prepared_statements%'";
+    // The guard is cut out of the text per call (ADR 149): no kept plan holds
+    // `("cust" = $1 OR $1 IS NULL)`, the form a generic plan cannot seek on.
+    const guarded = try db.rawExactlyOne(i64, &run, named ++ " AND statement LIKE '% OR %IS NULL%'", .{});
+    try testing.expectEqual(@as(i64, 0), guarded);
+    // And each combination is a plan of its own: the filter left out, the
+    // filter given, and the plain statement.
+    const kept = try db.rawExactlyOne(i64, &run, named, .{});
+    try testing.expect(kept >= 3);
+}
+
+const prefixed_table = "nilo_live_prefixed_" ++ mode_suffix;
+
+test "istarts_with reads the case-folding unique as a range on Postgres, and a wildcard in the prefix is only itself" {
+    // `ILIKE` over the bare column read no index; the unique is on
+    // `lower("email") text_pattern_ops` and the prefix is written over that
+    // expression (ADR 140, sql.md section 23).
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Mailbox = struct {
+        pub const nilo_table = .{
+            .name = prefixed_table,
+            .key = .id,
+            .unique = .{.{ .columns = .{.email}, .ignoring_case = true }},
+        };
+        id: i64,
+        email: []const u8,
+    };
+    _ = try db.exec(&run, "DROP TABLE IF EXISTS \"" ++ prefixed_table ++ "\"", .{});
+    defer _ = db.exec(&run, "DROP TABLE IF EXISTS \"" ++ prefixed_table ++ "\"", .{}) catch {};
+    try migrate.createMissing(&db, &run, .{ .tables = &.{Mailbox} });
+    // Enough rows, and hex only, so no `zed`, `an` or `a_` is in the bulk.
+    _ = try db.exec(
+        &run,
+        "INSERT INTO \"" ++ prefixed_table ++ "\" (id, email) " ++
+            "SELECT n, md5(n::text) || '@x.dev' FROM generate_series(1, 20000) n",
+        .{},
+    );
+    for ([_][]const u8{ "Ann@x.dev", "a_n@x.dev", "a%n@x.dev", "a\\n@x.dev" }, 0..) |email, i| {
+        _ = try db.insert(Mailbox, &run, .{ .id = @as(i64, @intCast(20_001 + i)), .email = email });
+    }
+    _ = try db.exec(&run, "ANALYZE \"" ++ prefixed_table ++ "\"", .{});
+
+    const plan = try db.explain(Mailbox, &run, .{
+        .where = .{ .email = .{ .istarts_with = @as([]const u8, "abc1") } },
+    });
+    try testing.expect(std.mem.indexOf(u8, plan, "Index") != null);
+    try testing.expect(std.mem.indexOf(u8, plan, "Seq Scan") == null);
+
+    const Case = struct { prefix: []const u8, want: usize };
+    for ([_]Case{
+        .{ .prefix = "an", .want = 1 }, // `Ann`, since it folds case
+        .{ .prefix = "AN", .want = 1 },
+        .{ .prefix = "a_", .want = 1 }, // not `Ann`: `_` is not any character
+        .{ .prefix = "a%", .want = 1 }, // not every `a…`
+        .{ .prefix = "a\\", .want = 1 }, // the escape character, escaped first
+        .{ .prefix = "zed", .want = 0 },
+    }) |case| {
+        const rows = try db.select(Mailbox, &run, .{ .where = .{ .email = .{ .istarts_with = case.prefix } } });
+        try testing.expectEqual(case.want, rows.len);
+    }
+
+    // The unique still enforces what it always did, and serves `.ieq`.
+    try testing.expectError(error.AlreadyExists, db.insert(Mailbox, &run, .{ .id = 30_000, .email = "ANN@X.DEV" }));
+    const one = try db.select(Mailbox, &run, .{ .where = .{ .email = .{ .ieq = @as([]const u8, "ANN@x.dev") } } });
+    try testing.expectEqual(@as(usize, 1), one.len);
+}
+
+const ends_table = "nilo_live_range_ends_" ++ mode_suffix;
+
+test "a timestamp and a date before 1970 and at the ends of 0001 to 9999 survive Postgres and JSON both ways" {
+    // The writer answered `null` for a moment before 1970 and the parser read
+    // one, so a value that round-tripped through the column did not through a
+    // response (ADR 127).
+    const gpa = testing.allocator;
+    const url = live_config.database_url orelse return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var db = db_mod.Db.init(gpa, url, .{ .size = 1, .connect_on_init = 1, .unchecked = true });
+    defer db.deinit();
+    try db.nilo_start(threaded.io(), .off);
+    defer db.nilo_stop();
+
+    var run: core.Run = .init(gpa);
+    defer run.deinit();
+
+    const Ends = struct {
+        pub const nilo_table = .{ .name = ends_table, .key = .id };
+        id: i64,
+        at: types.Timestamp,
+        day: types.Date,
+    };
+    _ = try db.exec(&run, "DROP TABLE IF EXISTS \"" ++ ends_table ++ "\"", .{});
+    defer _ = db.exec(&run, "DROP TABLE IF EXISTS \"" ++ ends_table ++ "\"", .{}) catch {};
+    try migrate.createMissing(&db, &run, .{ .tables = &.{Ends} });
+
+    const Case = struct { at: []const u8, day: []const u8 };
+    for ([_]Case{
+        .{ .at = "1969-12-31T23:59:59.999999Z", .day = "1969-12-31" },
+        .{ .at = "1815-12-10T00:00:00.000001Z", .day = "1815-12-10" },
+        .{ .at = "0001-01-01T00:00:00.000000Z", .day = "0001-01-01" },
+        .{ .at = "9999-12-31T23:59:59.999999Z", .day = "9999-12-31" },
+    }, 1..) |case, key| {
+        const at = types.Timestamp.nilo_parse(case.at).?;
+        const day = types.Date.nilo_parse(case.day).?;
+        _ = try db.insert(Ends, &run, .{ .id = @as(i64, @intCast(key)), .at = at, .day = day });
+
+        const back = (try db.find(Ends, &run, @as(i64, @intCast(key)))).?;
+        try testing.expectEqual(at.micros, back.at.micros);
+        try testing.expectEqual(day.days, back.day.days);
+
+        // And through JSON: the text the response carries is the text sent in.
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try std.json.Stringify.value(back, .{}, &out.writer);
+        try testing.expect(std.mem.indexOf(u8, out.written(), case.at) != null);
+        try testing.expect(std.mem.indexOf(u8, out.written(), case.day) != null);
+    }
+}
+
+test "the startup check's one query per schema answers what one query per table answers" {
+    const gpa = testing.allocator;
+    var live = (try Live.open(gpa)) orelse return error.SkipZigTest;
+    defer live.close(gpa);
+
+    const arena = live.arena.allocator();
+    // A table that is there, one that is not, and the same table again in a
+    // different place in the list: one answer each, in the order asked.
+    const names = [_][]const u8{ table, "nilo_no_such_table", table };
+    const many = try live.wire.columnsOfMany(arena, dialect.Postgres.introspect_all, null, &names);
+    try testing.expectEqual(@as(usize, 3), many.len);
+    try testing.expectEqual(@as(usize, 0), many[1].len);
+
+    const one = try live.wire.columnsOf(arena, dialect.Postgres.introspect, null, table);
+    try testing.expect(one.len > 0);
+    for (&[_]usize{ 0, 2 }) |at| {
+        try testing.expectEqual(one.len, many[at].len);
+        for (one, many[at]) |want, got| {
+            try testing.expectEqualStrings(want.name, got.name);
+            try testing.expectEqualStrings(want.udt, got.udt);
+            try testing.expectEqual(want.nullable, got.nullable);
+        }
+    }
+
+    // And the same for the values of the enum types.
+    const kinds = [_][]const u8{ role_type, "nilo_no_such_enum" };
+    const labels = try live.wire.labelsOfMany(arena, dialect.Postgres.enum_values.?, &kinds);
+    try testing.expectEqual(@as(usize, 2), labels.len);
+    try testing.expectEqual(@as(usize, 3), labels[0].len);
+    try testing.expectEqualStrings("moderator", labels[0][2]);
+    try testing.expectEqual(@as(usize, 0), labels[1].len);
 }

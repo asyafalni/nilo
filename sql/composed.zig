@@ -57,6 +57,11 @@ pub const Composed = struct {
     /// The highest placeholder written, so `db.composed` can hold the
     /// values it is handed against the statement.
     params: u16 = 0,
+    /// Which placeholders were written, bit `n - 1` for `param(n)`. The
+    /// highest alone cannot tell `param(2)` from `param(1)` and `param(2)`:
+    /// a raw statement is refused a gap in its numbering (ADR 204) and this
+    /// one is too (`gapless`). It grows on the arena, once per 64 numbers.
+    written: std.bit_set.DynamicBitSetUnmanaged = .{},
 
     pub const Error = error{ NotAnIdentifier, NotAParameter, OutOfMemory };
 
@@ -72,7 +77,8 @@ pub const Composed = struct {
     /// a composed statement as `ident` (checked to be a name) or `param`,
     /// never as text. A `$n` inside the piece is a Refusal: a placeholder
     /// is `param(n)`, which spells it for the dialect and counts it, and
-    /// one written as text would be neither.
+    /// one written as text would be neither. `?n` is refused the same way
+    /// as `$n`: this method does not know the dialect, so it refuses both.
     pub fn text(self: *Composed, comptime piece: []const u8) Error!void {
         comptime if (namesAPlaceholder(piece)) @compileError(
             "nilo: `Composed.text` was handed \"" ++ piece ++ "\", which names a placeholder as text.\n" ++
@@ -84,9 +90,17 @@ pub const Composed = struct {
     }
 
     /// A name, checked and quoted. Letters, digits and `_`, not starting
-    /// with a digit, at most 63 bytes — the shape both dialects accept
-    /// without folding. Anything else is `error.NotAnIdentifier`, which is
+    /// with a digit, at most 63 bytes — the shape both dialects accept as a
+    /// quoted name. Anything else is `error.NotAnIdentifier`, which is
     /// the whole of how a string that is not a name is kept out.
+    ///
+    /// **The name is quoted as written, so its case is kept and is not
+    /// folded**: `"streamId"` is a column that was created as `"streamId"`,
+    /// which is how nilo's own DDL writes every name (`Dialect.quote`), and
+    /// it misses one created unquoted as `streamId`, which Postgres stored as
+    /// `streamid`. Folding here would miss the other way, on the tables nilo
+    /// made from a camelCase field. A table made by other tooling with
+    /// unquoted names is written in lower case (ADR 208).
     pub fn ident(self: *Composed, name: []const u8) Error!void {
         if (!isIdentifier(name)) return error.NotAnIdentifier;
         const w = &self.out.writer;
@@ -113,6 +127,19 @@ pub const Composed = struct {
         }) catch return error.OutOfMemory;
         w.print("{d}", .{n}) catch return error.OutOfMemory;
         if (n > self.params) self.params = n;
+        const bit: usize = n - 1;
+        if (bit >= self.written.bit_length) {
+            self.written.resize(self.out.allocator, @as(usize, n), false) catch return error.OutOfMemory;
+        }
+        self.written.set(bit);
+    }
+
+    /// Whether every placeholder from `1` to `params` was written at least
+    /// once. `db.composed` counts values against this: `param(2)` alone with
+    /// two values passes the highest and leaves `$1` bound to nothing, which
+    /// SQLite answers as NULL and Postgres refuses at the first request.
+    pub fn gapless(self: *const Composed) bool {
+        return self.written.count() == self.params;
     }
 
     /// A number the program computed: a limit, a bucket width in seconds.
@@ -128,13 +155,15 @@ pub const Composed = struct {
     }
 };
 
-/// Whether `piece` carries a `$` followed by a digit — a Postgres placeholder
-/// written as text, which `text` refuses (see `Composed.text`).
+/// Whether `piece` carries a `$` or a `?` followed by a digit — a Postgres or
+/// a SQLite placeholder written as text, which `text` refuses (see
+/// `Composed.text`). A `?` with no digit after it is the JSON operator and
+/// stays text.
 fn namesAPlaceholder(comptime piece: []const u8) bool {
     comptime {
         var i: usize = 0;
         while (i + 1 < piece.len) : (i += 1) {
-            if (piece[i] == '$' and std.ascii.isDigit(piece[i + 1])) return true;
+            if ((piece[i] == '$' or piece[i] == '?') and std.ascii.isDigit(piece[i + 1])) return true;
         }
         return false;
     }
@@ -224,6 +253,38 @@ test "a dollar that is not a placeholder is text, and a placeholder is not" {
     try std.testing.expect(comptime namesAPlaceholder("WHERE id = $1"));
     try std.testing.expect(comptime namesAPlaceholder("$12::timestamptz"));
     try std.testing.expect(!comptime namesAPlaceholder("$"));
+    // SQLite's spelling is refused as text too, and the JSON `?` is not one.
+    try std.testing.expect(comptime namesAPlaceholder("WHERE id = ?1"));
+    try std.testing.expect(!comptime namesAPlaceholder("WHERE doc ? 'k' AND x = '?'"));
+}
+
+test "a placeholder that was skipped is a gap, and a repeated one is not" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var only_second = Composed.init(arena.allocator(), .dollar);
+    try only_second.text("SELECT ");
+    try only_second.param(2);
+    try std.testing.expectEqual(@as(u16, 2), only_second.params);
+    try std.testing.expect(!only_second.gapless());
+
+    var repeated = Composed.init(arena.allocator(), .question);
+    try repeated.param(2);
+    try repeated.param(1);
+    try repeated.param(2);
+    try std.testing.expect(repeated.gapless());
+
+    var none = Composed.init(arena.allocator(), .dollar);
+    try std.testing.expect(none.gapless());
+
+    // Past one word of the bit set.
+    var wide = Composed.init(arena.allocator(), .dollar);
+    var n: u16 = 1;
+    while (n <= 70) : (n += 1) try wide.param(n);
+    try std.testing.expect(wide.gapless());
+    var wide_gap = Composed.init(arena.allocator(), .dollar);
+    try wide_gap.param(1);
+    try wide_gap.param(70);
+    try std.testing.expect(!wide_gap.gapless());
 }
 
 test "isIdentifier is the rule a caller can apply on the way in" {

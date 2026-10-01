@@ -154,7 +154,6 @@ pub const Aggregate = enum {
     }
 };
 
-/// Postgres, and for now the only one.
 /// How a database stores a `Uuid`, which is the one column type the two Wires
 /// disagree about (ADR 067).
 pub const UuidForm = enum {
@@ -183,6 +182,7 @@ pub const ValueForm = enum {
     text,
 };
 
+/// Postgres, the default Dialect (SQLite is the other, further down).
 pub const Postgres = struct {
     pub const name = "postgres";
 
@@ -233,18 +233,50 @@ pub const Postgres = struct {
 
     pub const list_form: ListForm = .any_array;
 
+    /// **Yes**: a statement kept prepared here is planned for the values of
+    /// its first five calls, and then for none of them if that is not dearer
+    /// on average. A `sql.given` term, `("cust" = $1 OR $1 IS NULL)`, cannot
+    /// seek on a plan made for no value, so a statement holding one is sent
+    /// unnamed and planned for each call's own values (ADR 149). A statement
+    /// whose guards are spliced (`splice_given`) has none left to seek on and
+    /// keeps its name.
+    pub const plan_may_go_generic = true;
+
+    /// **Yes**: a statement holding a `sql.given` is written per call without
+    /// the guard, so the plan is made for the text and not for a value
+    /// (`statement.guardsOf`, ADR 149).
+    pub const splice_given = true;
+
+    /// What stands in the statement for a guarded term that is not there.
+    /// **Cast to `text`, because the term that used to type `$n` is gone**:
+    /// pg.zig sends a `Parse` with no parameter types, and `$n IS NULL` alone
+    /// is *could not determine data type of parameter $n* (`42P08`). The value
+    /// is NULL whenever this is written, and a NULL is the same bytes under
+    /// every type, so `text` is right for an enum, a `uuid` and an array alike.
+    pub fn absentTerm(comptime n: usize) []const u8 {
+        return "(" ++ placeholder(n) ++ "::text IS NULL)";
+    }
+
     /// Whether this database's plain `LIKE` already folds ASCII case. Postgres
     /// has two words for the two behaviours; a Dialect whose one word folds
     /// answers `.ilike` with it, since `ILIKE` would be a syntax error there
     /// (`where.zig`, ADR 055).
     pub const like_folds = false;
 
+    /// Whether a `numeric` column compares, orders and sums as a number.
+    /// Here it does: the column is `numeric`, and the bound text is cast back
+    /// to it (`bindAs`), so `"100.00" > "9.99"` (ADR 049).
+    pub const decimal_compares = true;
+
     /// `LIMIT`/`OFFSET`, which most dialects agree on and one day one will not.
     pub fn limit(comptime placeholder_text: []const u8) []const u8 {
         return " LIMIT " ++ placeholder_text;
     }
 
-    pub fn offset(comptime placeholder_text: []const u8) []const u8 {
+    /// `limited` is whether a `LIMIT` came before it, which Postgres does not
+    /// need to know: it takes an `OFFSET` alone.
+    pub fn offset(comptime placeholder_text: []const u8, comptime limited: bool) []const u8 {
+        _ = limited;
         return " OFFSET " ++ placeholder_text;
     }
 
@@ -308,6 +340,10 @@ pub const Postgres = struct {
     /// much of it came off the disk.
     pub const explain = "EXPLAIN (ANALYZE, BUFFERS) ";
     pub const explain_width = 1;
+    /// `ANALYZE` executes what it plans, so `db.rawExplain` asks inside a
+    /// transaction it always rolls back. Optional for a Dialect; absent means
+    /// true.
+    pub const explain_runs = true;
 
     /// Where NULLs sit in an ordered result, or `null` for a database that
     /// cannot be told. Written the same way `lock` is, and for the same
@@ -349,23 +385,56 @@ pub const Postgres = struct {
     /// `null` when this Dialect cannot express the combination, and the caller
     /// gets `noPatternForm` naming it rather than a match that folds case when
     /// it was asked not to.
+    ///
+    /// `whole` says the parameter already is the finished pattern, escaped
+    /// and ending in `%` by the binder, which a Dialect asks for with
+    /// `prefix_bound` (ADR 140).
     pub fn pattern(
         comptime quoted: []const u8,
         comptime bound: []const u8,
         comptime shape: Pattern,
         comptime fold: bool,
         comptime negate: bool,
+        comptime whole: bool,
     ) ?[]const u8 {
+        return patternText(quoted, bound, shape, fold, negate, whole, "ILIKE ", true);
+    }
+
+    /// The text of a pattern condition, with the word a Dialect folds case
+    /// with handed in: `ILIKE ` here and `LIKE ` on SQLite, which writes its
+    /// own operator rather than rewriting this one's text, so a column named
+    /// with those letters cannot be rewritten (ADR 055). `lowered` says the
+    /// folding prefix is the `lower(col) LIKE lower(…)` form of the index a
+    /// `.unique` that ignores case is over, which only this Dialect has.
+    fn patternText(
+        comptime quoted: []const u8,
+        comptime bound: []const u8,
+        comptime shape: Pattern,
+        comptime fold: bool,
+        comptime negate: bool,
+        comptime whole: bool,
+        comptime folding_word: []const u8,
+        comptime lowered: bool,
+    ) []const u8 {
         comptime {
             const escaped = "replace(replace(replace(" ++ bound ++
                 ", '\\', '\\\\'), '%', '\\%'), '_', '\\_')";
-            const built = switch (shape) {
+            const built = if (whole) bound else switch (shape) {
                 .contains => "'%' || " ++ escaped ++ " || '%'",
                 .starts_with => escaped ++ " || '%'",
                 .ends_with => "'%' || " ++ escaped,
             };
+            // **A folding prefix is `lower(col) LIKE lower(…) || '%'`, not
+            // `ILIKE`**, because that is the expression the index on a
+            // `.unique` that ignores case is over (`foldedIndexColumn`).
+            // `ILIKE` over the bare column reads no index at all, so the
+            // prefix scanned the table while the unique sat beside it
+            // (ADR 140, sql.md section 23). The negation and the other two
+            // shapes read every row whichever word they use, and keep `ILIKE`.
+            if (lowered and fold and shape == .starts_with and !negate and !whole) return Postgres.foldedColumn(quoted) ++
+                " LIKE " ++ Postgres.foldedColumn(escaped) ++ " || '%' ESCAPE '\\'";
             return quoted ++ (if (negate) " NOT " else " ") ++
-                (if (fold) "ILIKE " else "LIKE ") ++ built ++ " ESCAPE '\\'";
+                (if (fold) folding_word else "LIKE ") ++ built ++ " ESCAPE '\\'";
         }
     }
 
@@ -448,10 +517,15 @@ pub const Postgres = struct {
             // infers `text` for the parameter and refuses the insert
             // (ADR 181). The read half needs no cast at all, which is the
             // whole difference from `sql.AsText("date")`.
+            //
+            // **A list of them is cast twice**, `::text[]::date[]`, for the
+            // reason `arrayOf` gives: what is on the wire is text, and cast
+            // straight to `date[]` pg.zig picks its encoder off that OID, has
+            // none for it, and writes the elements as `bytea`.
             if (types.isDate(T)) break :blk placeholder_text ++
-                "::date" ++ if (list) "[]" else "";
+                if (list) "::text[]::date[]" else "::date";
             const named = types.asText(T) orelse break :blk placeholder_text;
-            break :blk placeholder_text ++ "::" ++ named ++ if (list) "[]" else "";
+            break :blk placeholder_text ++ if (list) "::text[]::" ++ named ++ "[]" else "::" ++ named;
         };
     }
 
@@ -552,7 +626,12 @@ pub const Postgres = struct {
     /// want the same list: `acceptsInner` for a `Str` and for a byte slice,
     /// `columnType` for the first of them, and `schema.expectationsOf` for an
     /// enum column that this program built and therefore knows is `text`.
-    pub const text_accepts: []const []const u8 = &.{ "text", "varchar", "bpchar", "char", "name" };
+    ///
+    /// `citext` is last, and matched by name because it is an extension's type
+    /// and has no fixed oid: it reads as text, and a case-insensitive email
+    /// column is the usual reason to have one. A domain over any of these is
+    /// judged by the type under it (`introspect`).
+    pub const text_accepts: []const []const u8 = &.{ "text", "varchar", "bpchar", "char", "name", "citext" };
 
     /// What a `.default` of `.now` writes.
     pub const now_default = "now()";
@@ -601,6 +680,21 @@ pub const Postgres = struct {
         return "lower(" ++ quoted ++ ")";
     }
 
+    /// The same expression as the index is built over: `foldedColumn` plus
+    /// `text_pattern_ops`, so the one index serves `.ieq` (equality is in that
+    /// operator class) **and** `istarts_with`, which is `lower(col) LIKE …`
+    /// (ADR 140).
+    ///
+    /// Outside a `C` collation a plain `lower(col)` index is ordered by the
+    /// collation and no `LIKE` can read a range off it; `text_pattern_ops` is
+    /// the class that orders by bytes, and is the only way to ask for a
+    /// prefix range that is right under every collation. Uniqueness is
+    /// unchanged: two strings are equal under it exactly when they are
+    /// equal, which holds under any deterministic collation.
+    pub fn foldedIndexColumn(comptime quoted: []const u8) []const u8 {
+        return "lower(" ++ quoted ++ ") text_pattern_ops";
+    }
+
     /// The statement that stops two processes migrating at once, or `null` for
     /// a database that serialises writers some other way.
     ///
@@ -617,9 +711,33 @@ pub const Postgres = struct {
         return "SELECT pg_advisory_xact_lock(" ++ std.fmt.comptimePrint("{d}", .{key}) ++ ")";
     }
 
+    /// The statement that bounds how long a migration waits for a table's
+    /// lock, taking the milliseconds as `$1`, or `null` for a database whose
+    /// lock waits are bounded some other way.
+    ///
+    /// `set_config(…, true)` rather than `SET LOCAL`, because `SET` takes no
+    /// parameter and this one is a constant, so it is prepared once. The
+    /// `true` makes it last to the end of the transaction, as `SET LOCAL`
+    /// does, so the connection goes back to the pool with the setting it
+    /// came out with ([ADR 240](../docs/adr/240-a-migration-waits-five-seconds-for-a-table.md)).
+    pub const lock_timeout: ?[]const u8 = "SELECT set_config('lock_timeout', $1, true)";
+
+    /// **No**: the prefix is escaped inside the statement and binds as the
+    /// caller's text, with nothing allocated. Postgres folds the expression
+    /// into a constant when it plans for the value, and reads the same index
+    /// range off it that it reads off a pattern bound whole; on a plan made
+    /// for any value, neither form uses the index (ADR 140).
+    pub const prefix_bound = false;
+
     /// Whether this database can change a column's type or nullability in
     /// place. Postgres can, and answers so plainly.
     pub const can_alter_column = true;
+
+    /// The first line of a `.sql` twin, a `psql` meta-command rather than SQL.
+    /// Without it `psql -f` carries on past a failed step, the aborted
+    /// transaction's `COMMIT` becomes a rollback, and `psql` still exits 0, so
+    /// a deploy script reads a version that ran nothing as one that ran.
+    pub const script_stop_on_error = "\\set ON_ERROR_STOP on";
 
     /// `DROP TRIGGER "touch_updated_at" ON "work_items"`. Postgres keeps
     /// trigger names per table, so dropping one needs the table; SQLite keeps
@@ -700,36 +818,102 @@ pub const Postgres = struct {
     /// The five kinds accepted are an ordinary table, a partitioned one, a
     /// view, a materialized view and a foreign table. An index and a sequence
     /// are relations too and are not things a Row reads.
+    ///
+    /// **A domain answers the type under it** (ADR 055). `email_address`
+    /// over `text` used to answer `email_address`, which no list names, so a
+    /// `Str` over it stopped a server whose table was right; `describe`
+    /// already resolved a domain (`postgres.zig`) and this did not. The
+    /// recursive `base` follows `typbasetype` because a domain may sit over
+    /// another domain, and the last join keeps the row that is not one. A
+    /// domain's own `NOT NULL` is not read: the column still answers by
+    /// `attnotnull`, the direction that reports too much rather than too
+    /// little.
     pub const introspect =
-        \\SELECT a.attname,
+        \\WITH RECURSIVE col AS (
+        \\  SELECT a.attnum, a.attname, a.attnotnull, c.relkind, a.atttypid
+        \\  FROM pg_catalog.pg_attribute a
+        \\  JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+        \\  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        \\  WHERE n.nspname = COALESCE($1, current_schema())
+        \\    AND c.relname = $2
+        \\    AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+        \\    AND a.attnum > 0
+        \\    AND NOT a.attisdropped
+        \\), base(attnum, typid) AS (
+        \\  SELECT attnum, atttypid FROM col
+        \\  UNION ALL
+        \\  SELECT b.attnum, t.typbasetype
+        \\  FROM base b
+        \\  JOIN pg_catalog.pg_type t ON t.oid = b.typid AND t.typtype = 'd'
+        \\)
+        \\SELECT col.attname,
         \\       t.typname,
-        \\       CASE WHEN c.relkind IN ('v', 'm') THEN 'UNKNOWN'
-        \\            WHEN a.attnotnull THEN 'NO'
+        \\       CASE WHEN col.relkind IN ('v', 'm') THEN 'UNKNOWN'
+        \\            WHEN col.attnotnull THEN 'NO'
         \\            ELSE 'YES' END
-        \\FROM pg_catalog.pg_attribute a
-        \\JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
-        \\JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-        \\JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
-        \\WHERE n.nspname = COALESCE($1, current_schema())
-        \\  AND c.relname = $2
-        \\  AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
-        \\  AND a.attnum > 0
-        \\  AND NOT a.attisdropped
-        \\ORDER BY a.attnum
+        \\FROM col
+        \\JOIN base ON base.attnum = col.attnum
+        \\JOIN pg_catalog.pg_type t ON t.oid = base.typid AND t.typtype <> 'd'
+        \\ORDER BY col.attnum
     ;
 
-    /// The values an enum type has, one row each and in the type's own order,
-    /// for `checkSchema` to hold a Zig enum against. `$1` is the type name a
-    /// column declared with `nilo_column`. The name alone rather than
-    /// schema-qualified: a type is looked up the way the column's own
-    /// `typname` above is, and a program with two enums of one name in two
-    /// schemas has a problem this check is not the first to have.
+    /// **`introspect` for every table of one schema at once**, which is what
+    /// the startup check sends: one round trip however many Rows there are,
+    /// where it sent one per Row. `$1` is the schema (null for the session's
+    /// own) and `$2` the table names as `text[]`; the answer is the same three
+    /// columns preceded by the table's name, ordered by table and then by
+    /// position, so the Wire cuts it into one list per table.
+    ///
+    /// **It has to answer exactly what `introspect` answers**, domains
+    /// resolved and views `UNKNOWN` included (ADR 055): the recursive `base`
+    /// is keyed by the relation as well as the column now, because two tables
+    /// both have an `attnum` 1. A test in `live.zig` holds the two together
+    /// against a real Postgres. `::text[]::name[]` because `relname` is a
+    /// `name` and pg.zig sends a `text[]`.
+    pub const introspect_all =
+        \\WITH RECURSIVE col AS (
+        \\  SELECT a.attrelid, c.relname, a.attnum, a.attname, a.attnotnull, c.relkind, a.atttypid
+        \\  FROM pg_catalog.pg_attribute a
+        \\  JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+        \\  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        \\  WHERE n.nspname = COALESCE($1, current_schema())
+        \\    AND c.relname = ANY($2::text[]::name[])
+        \\    AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+        \\    AND a.attnum > 0
+        \\    AND NOT a.attisdropped
+        \\), base(attrelid, attnum, typid) AS (
+        \\  SELECT attrelid, attnum, atttypid FROM col
+        \\  UNION ALL
+        \\  SELECT b.attrelid, b.attnum, t.typbasetype
+        \\  FROM base b
+        \\  JOIN pg_catalog.pg_type t ON t.oid = b.typid AND t.typtype = 'd'
+        \\)
+        \\SELECT col.relname,
+        \\       col.attname,
+        \\       t.typname,
+        \\       CASE WHEN col.relkind IN ('v', 'm') THEN 'UNKNOWN'
+        \\            WHEN col.attnotnull THEN 'NO'
+        \\            ELSE 'YES' END
+        \\FROM col
+        \\JOIN base ON base.attrelid = col.attrelid AND base.attnum = col.attnum
+        \\JOIN pg_catalog.pg_type t ON t.oid = base.typid AND t.typtype <> 'd'
+        \\ORDER BY col.relname, col.attnum
+    ;
+
+    /// The values the enum types have, one row each, the type's name first
+    /// and its values in the type's own order, for `checkSchema` to hold a
+    /// Zig enum against. `$1` is the type names a column declared with
+    /// `nilo_column`, as `text[]`, so one query serves every enum column of
+    /// every Row. The name alone rather than schema-qualified: a type is
+    /// looked up the way the column's own `typname` above is, and a program
+    /// with two enums of one name in two schemas has a problem this check is
+    /// not the first to have.
     pub const enum_values: ?[]const u8 =
-        \\SELECT e.enumlabel
+        \\SELECT t.typname, e.enumlabel
         \\FROM pg_catalog.pg_enum e
         \\JOIN pg_catalog.pg_type t ON t.oid = e.enumtypid
-        \\WHERE t.typname = $1
-        \\ORDER BY e.enumsortorder
+        \\WHERE t.typname = ANY($1::text[]::name[])
+        \\ORDER BY t.typname, e.enumsortorder
     ;
 
     /// The column types this Dialect will read `T` out of.
@@ -765,7 +949,14 @@ pub const Postgres = struct {
         if (types.isBytes(Inner)) return &.{"bytea"};
 
         if (types.declaredColumn(Inner)) |declared| {
-            if (std.mem.eql(u8, declared, "timestamptz")) return &.{ "timestamptz", "timestamp" };
+            // **`timestamptz` only.** A `timestamp` column holds a wall clock
+            // with no zone, and Postgres reads one against the session's zone
+            // wherever it meets a moment: `.now` written into it is local
+            // time read back as UTC, seven hours off under `Asia/Jakarta`,
+            // and `WHERE at < now()` compares it shifted the same way. Every
+            // spelling of `.now` would have to route around that, so the
+            // column is refused at startup instead, with the `ALTER` that
+            // keeps what nilo wrote there (`schema.Problem`).
             if (std.mem.eql(u8, declared, "jsonb")) return &.{ "jsonb", "json" };
             const one = [_][]const u8{declared};
             return &one;
@@ -855,12 +1046,12 @@ pub const Postgres = struct {
     /// time it runs
     /// ([ADR 233](../docs/adr/233-a-raw-statement-is-held-against-its-row-the-first-time-it-runs.md)).
     ///
-    /// **`accepts` with the numbers made exact.** That list is about a table
-    /// a Row both reads and writes, and lets an `i32` stand over an `int8`
-    /// column; the read is pg.zig's, which decodes an `i32` out of `int4`
-    /// and nothing else. So the `int8` a `count(*)` answers and the
-    /// `numeric` a `sum(int8)` answers are both a statement that fails on
-    /// its first row, and this is where that is said before the row.
+    /// **`accepts` with the numbers made lossless.** That list is about a
+    /// table a Row both reads and writes, and lets an `i32` stand over an
+    /// `int8` column, read range-checked (`postgres.Wire.read`). A raw
+    /// statement's `count(*)` into an `i32` reads the same way and fails on
+    /// the day the count passes two billion, so this says so while it is
+    /// small; the `numeric` a `sum(int8)` answers fails on its first row.
     ///
     /// A text column is `text` here because a raw statement asks for it as
     /// `::text`, which `rawcheck.assertCasts` holds it to (ADR 124). A
@@ -877,16 +1068,20 @@ pub const Postgres = struct {
             else => T,
         };
         if (!types.isBytes(Inner) and types.asText(Inner) != null) return text_accepts;
+        // What reads without a value that can fail to fit: a column as wide
+        // as the field or narrower. The Wire reads a wider one too, range-
+        // checked, and a count of rows fitting an `i32` today is the case
+        // that stops fitting in production; so the check still says so.
         return switch (@typeInfo(Inner)) {
             .int => |i| if (i.signedness == .unsigned) null else switch (i.bits) {
                 16 => &.{"int2"},
-                32 => &.{"int4"},
-                64 => &.{"int8"},
+                32 => &.{ "int4", "int2" },
+                64 => &.{ "int8", "int4", "int2" },
                 else => null,
             },
             .float => |f| switch (f.bits) {
                 32 => &.{"float4"},
-                64 => &.{"float8"},
+                64 => &.{ "float8", "float4" },
                 else => null,
             },
             else => accepts(T),
@@ -895,7 +1090,11 @@ pub const Postgres = struct {
 
     fn intAccepts(comptime info: std.builtin.Type.Int) Accepts {
         // Postgres has no unsigned integers, so an unsigned Zig type reads
-        // out of the next width up — the one that can hold all of it.
+        // out of the next width up — the one that can hold all of it. A
+        // wider column is read range-checked (`postgres.Wire.read`): a value
+        // that does not fit the field fails its statement with the column
+        // named. The list is also what the field is written into, and a
+        // write narrower than the column always fits.
         const effective = if (info.signedness == .signed) info.bits else info.bits + 1;
         return switch (effective) {
             0...16 => &.{ "int2", "int4", "int8" },
@@ -985,6 +1184,16 @@ pub const SQLite = struct {
     /// Dialects and this one answered with a syntax error at run time.
     pub const like_folds = true;
 
+    /// No. A `sql.Decimal` is a `TEXT` column here, and SQLite compares and
+    /// sorts text as text: `"100.00" < "9.99"`, and a `sum` over it is
+    /// computed in floating point, so `0.1 + 0.2` comes back
+    /// `0.30000000000000004`. So an ordering comparison, an `.order`, an
+    /// `.after` and a `sum`, `avg`, `min` or `max` over one are Refusals here
+    /// (`assertDecimalCompares`, ADR 049); equality stays, because two
+    /// spellings of one number are the only thing it can miss, and the caller
+    /// writes the digits they stored.
+    pub const decimal_compares = false;
+
     /// None. SQLite has no enum type — a Zig enum is stored as its name in a
     /// TEXT column, and there is no list in the database to hold it against.
     pub const enum_values: ?[]const u8 = null;
@@ -994,11 +1203,11 @@ pub const SQLite = struct {
     }
 
     /// SQLite refuses `OFFSET` without a `LIMIT` in front of it, where
-    /// Postgres allows either alone. Nothing here can see the other clause,
-    /// so this writes what it is asked for and a caller who offsets without
-    /// limiting gets SQLite's own syntax error — which names the statement.
-    pub fn offset(comptime placeholder_text: []const u8) []const u8 {
-        return " OFFSET " ++ placeholder_text;
+    /// Postgres takes either alone, so an unlimited one gets `LIMIT -1`,
+    /// which SQLite reads as no limit. Without it `.offset` alone was a
+    /// syntax error here and a working statement on Postgres.
+    pub fn offset(comptime placeholder_text: []const u8, comptime limited: bool) []const u8 {
+        return (if (limited) "" else " LIMIT -1") ++ " OFFSET " ++ placeholder_text;
     }
 
     /// No cast beyond the one `readAs` makes for text: SQLite answers `count`
@@ -1012,9 +1221,18 @@ pub const SQLite = struct {
     /// The same numbered list, out of the JSON array `.in` already binds here:
     /// `json_each` answers a `key` and a `value` per element without being
     /// asked, so nothing is renamed.
+    ///
+    /// **A blob key is read through `eachValue`**, like `.in` reads one. JSON
+    /// has no bytes, so `jsonList` writes each as hex, and the join
+    /// `"#k"."value"` was comparing a blob column with that hex text and
+    /// matching no child. The wrapping select keeps the two column names the
+    /// join reads, so `shape.children` is the same text for every other key.
     pub fn ordinalList(comptime placeholder_text: []const u8, comptime T: type, comptime alias: []const u8) ?[]const u8 {
-        _ = T;
-        return "json_each(" ++ placeholder_text ++ ") AS " ++ alias;
+        return comptime if (types.isBytes(T))
+            "(SELECT \"key\", " ++ eachValue(T) ++ " AS \"value\" FROM json_each(" ++
+                placeholder_text ++ ")) AS " ++ alias
+        else
+            "json_each(" ++ placeholder_text ++ ") AS " ++ alias;
     }
 
     /// `json_each` counts from zero.
@@ -1025,6 +1243,9 @@ pub const SQLite = struct {
     /// text last.
     pub const explain = "EXPLAIN QUERY PLAN ";
     pub const explain_width = 4;
+    /// Plans and does not run, so `db.rawExplain` opens no transaction here:
+    /// `BEGIN IMMEDIATE` would hold the one writer for a plan.
+    pub const explain_runs = false;
 
     /// The same two words, and **that is the finding rather than the
     /// coincidence.** SQLite has taken `NULLS FIRST`/`NULLS LAST` since 3.30
@@ -1051,15 +1272,16 @@ pub const SQLite = struct {
         comptime shape: Pattern,
         comptime fold: bool,
         comptime negate: bool,
+        comptime whole: bool,
     ) ?[]const u8 {
         comptime {
             if (!fold) return null;
-            const written = Postgres.pattern(quoted, bound, shape, true, negate).?;
             // `ILIKE` is Postgres's word for what this database's `LIKE`
-            // already does, so the same expression with the one word swapped
-            // is the whole difference.
-            const at = std.mem.indexOf(u8, written, "ILIKE ").?;
-            return written[0..at] ++ "LIKE " ++ written[at + "ILIKE ".len ..];
+            // already does, so the same expression is written with `LIKE`.
+            // Written directly: the text used to be Postgres's with its first
+            // `ILIKE ` replaced, which rewrote a column named with those
+            // letters instead of the operator.
+            return Postgres.patternText(quoted, bound, shape, true, negate, whole, "LIKE ", false);
         }
     }
 
@@ -1103,6 +1325,14 @@ pub const SQLite = struct {
         return placeholder_text;
     }
 
+    /// What an `.in` selects out of `json_each` for a column of `T`: the value
+    /// itself, or for a blob the bytes its hex spells. JSON has no bytes, so
+    /// `jsonList` writes each one as hex and this turns it back; without it a
+    /// blob was compared with text and matched nothing.
+    pub fn eachValue(comptime T: type) []const u8 {
+        return if (types.isBytes(T)) "unhex(value)" else "value";
+    }
+
     /// None, so `insertMany` is a Refusal here. SQLite has no `unnest` and
     /// no array parameter; the batch form it *does* have is
     /// `VALUES (…), (…), (…)`, whose text grows with the batch — a statement
@@ -1139,6 +1369,12 @@ pub const SQLite = struct {
         return quoted ++ " COLLATE NOCASE";
     }
 
+    /// The collation is already the whole of the index here, so what the
+    /// index is built over and what a lookup writes are one text.
+    pub fn foldedIndexColumn(comptime quoted: []const u8) []const u8 {
+        return quoted ++ " COLLATE NOCASE";
+    }
+
     /// None, and that is not a gap being papered over.
     ///
     /// SQLite serialises writers over the whole database, and the Wire here
@@ -1158,6 +1394,40 @@ pub const SQLite = struct {
         return null;
     }
 
+    /// **None**: a write waits on the database's one write lock, and
+    /// `busy_timeout` is what bounds that wait, per connection.
+    pub const lock_timeout: ?[]const u8 = null;
+
+    /// **Yes**: SQLite reads an index range off `LIKE ?1` only when `?1` is
+    /// the pattern itself, and off `replace(…) || '%'` never, so an
+    /// `istarts_with` over a `NOCASE` index scanned the table. The binder
+    /// escapes the prefix into the Scope's arena instead, one allocation a
+    /// condition (ADR 140).
+    pub const prefix_bound = true;
+
+    /// **No, and that is the cost of the guard here rather than a saving**:
+    /// a statement is planned once, when it is prepared, with no value in
+    /// sight, so `("cust" = ?1 OR ?1 IS NULL)` is a `SCAN` on the first call
+    /// and on every one after, and sending it unnamed would prepare it again
+    /// to plan it the same way. The only cure is a different text per
+    /// combination of filters. That is what `splice_given` now writes: the
+    /// guard is cut out of the text per call, as ADR 165 cuts an `ORDER BY`
+    /// in (ADR 149).
+    pub const plan_may_go_generic = false;
+
+    /// **Yes**: a statement holding a `sql.given` is written per call without
+    /// the guard, so the text SQLite plans when it prepares seeks
+    /// (`statement.guardsOf`, ADR 149).
+    pub const splice_given = true;
+
+    /// What stands in the statement for a guarded term that is not there.
+    /// **The placeholder stays in the text**, so every `?n` the values tuple
+    /// binds still exists: SQLite counts parameters by the highest number it
+    /// finds, and a value bound past it is `SQLITE_RANGE`.
+    pub fn absentTerm(comptime n: usize) []const u8 {
+        return "(" ++ placeholder(n) ++ " IS NULL)";
+    }
+
     /// **No.** `ALTER TABLE` here adds, drops and renames a column and does
     /// nothing else: a type and a `NOT NULL` are fixed at creation. Changing
     /// either means building a new table, copying the rows across, dropping the
@@ -1168,6 +1438,13 @@ pub const SQLite = struct {
     /// answer `.lock` and `insertMany` already give here, one layer up
     /// ([ADR 055](../docs/adr/055-the-second-dialect-is-the-test-of-the-seam.md)).
     pub const can_alter_column = false;
+
+    /// The first line of a `.sql` twin, a `sqlite3` dot-command rather than
+    /// SQL. A failed statement does not abort a SQLite transaction, so without
+    /// it `sqlite3 app.db < 0002_x.sql` runs past the failure and the closing
+    /// `COMMIT` keeps the steps that ran together with the ledger row saying
+    /// the version did: `expect` passes and nothing ever retries it.
+    pub const script_stop_on_error = ".bail on";
 
     /// SQLite keeps trigger names per database rather than per table, so
     /// `DROP TRIGGER` takes the name alone and refuses `ON`.
@@ -1186,6 +1463,25 @@ pub const SQLite = struct {
     pub const has_functions = false;
     pub const view_repeatable_head = "CREATE VIEW IF NOT EXISTS ";
 
+    /// **`IF NOT EXISTS` never updates**, so a view or trigger whose text
+    /// changed stayed as it was and nothing said so, where Postgres replaces
+    /// every one on every boot. SQLite keeps the text each was made with
+    /// (`sqlite_master.sql`, `IF NOT EXISTS` taken out), so `createMissing`
+    /// reads this once, compares it with the plain `CREATE VIEW` or `CREATE
+    /// TRIGGER` it would send, and drops and remakes only the ones that
+    /// differ. A boot that changed nothing sends no DDL, which also leaves the
+    /// schema version alone, and one that changed a definition updates it, on
+    /// both databases. One column, `kind:name`, the unit separator (byte 31),
+    /// then the text, so it reads as a single `[]const u8` and a view and a
+    /// trigger of one name are two entries. A Dialect without this replaces
+    /// in place and reads nothing (Postgres: `CREATE OR REPLACE` keeps a
+    /// view's grants and comment, and compares nothing because
+    /// `pg_get_viewdef` prints a normalised text that is not the text that
+    /// was written).
+    pub const stored_definitions: []const u8 =
+        "SELECT type || ':' || name || char(31) || sql FROM sqlite_master " ++
+        "WHERE type IN ('view', 'trigger')";
+
     /// **No either**, and for the same reason: a table constraint here is
     /// written at creation and is part of the table from then on. A changed
     /// word on an enum column is the four-statement rebuild, which the diff
@@ -1194,7 +1490,9 @@ pub const SQLite = struct {
 
     /// The column types text reads out of, named for the three callers that
     /// want the same list — the same arrangement the Postgres Dialect has.
-    pub const text_accepts: []const []const u8 = &.{ "TEXT", "VARCHAR", "CLOB", "CHARACTER" };
+    /// An affinity name, because `introspect` answers one: `VARCHAR(255)` and
+    /// `CLOB` are TEXT by SQLite's own rule.
+    pub const text_accepts: []const []const u8 = &.{"TEXT"};
 
     /// What a `.default` of `.now` writes.
     ///
@@ -1207,6 +1505,14 @@ pub const SQLite = struct {
     /// — 1.8e12, well inside what one holds exactly — and multiplies after the
     /// cast. A row that wants the other three digits passes `Timestamp.now()`
     /// rather than leaving the column out.
+    ///
+    /// **It is the moment the statement runs, where Postgres's `now()` is
+    /// the moment the transaction began.** SQLite holds `'now'` still for
+    /// one `sqlite3_step`, so the rows one statement writes agree, and two
+    /// statements in one transaction do not. Binding one moment per
+    /// transaction would make `.now` a parameter, which a column's
+    /// `DEFAULT` cannot be; the guide says so and names `Timestamp.now()`
+    /// for the writes that have to agree.
     pub const now_default =
         "(CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) * 1000)";
 
@@ -1307,13 +1613,35 @@ pub const SQLite = struct {
     /// That is a check that fails to fire rather than one that fires wrongly,
     /// which is the direction this whole branch exists to move.
     ///
+    /// **The type it answers is the affinity, not the declared text** (ADR 055).
+    /// It used to answer `upper(i.type)` and `accepts` wanted an exact name, so
+    /// `VARCHAR(255)` under a `Str`, `DATE` under a `Date` and a column with no
+    /// type at all each stopped a server whose table was right. The `CASE` is
+    /// SQLite's five rules in their own order
+    /// (<https://sqlite.org/datatype3.html#determination_of_column_affinity>),
+    /// `instr` over `upper` rather than `LIKE` because `LIKE` follows
+    /// `case_sensitive_like`. **No declared type is `ANY`**, not `BLOB`: that
+    /// column has BLOB affinity and holds whatever it is given, and a column
+    /// declared `BLOB` is a different claim (`schema.Expectation.untyped`).
+    /// The rowid test below still reads the declared text, because the alias
+    /// is spelled exactly `INTEGER` and INTEGER affinity is wider.
+    ///
     /// **`pragma_table_info` is named twice from here on**, which is a fact
     /// `sqlite.Wire.columnsOf` has to know: it qualifies the name with the
     /// schema, and qualifying only the first would ask two databases one
     /// question.
     pub const introspect =
         \\SELECT i.name,
-        \\       upper(i.type),
+        \\       CASE WHEN coalesce(i.type, '') = '' THEN 'ANY'
+        \\            WHEN instr(upper(i.type), 'INT') > 0 THEN 'INTEGER'
+        \\            WHEN instr(upper(i.type), 'CHAR') > 0
+        \\              OR instr(upper(i.type), 'CLOB') > 0
+        \\              OR instr(upper(i.type), 'TEXT') > 0 THEN 'TEXT'
+        \\            WHEN instr(upper(i.type), 'BLOB') > 0 THEN 'BLOB'
+        \\            WHEN instr(upper(i.type), 'REAL') > 0
+        \\              OR instr(upper(i.type), 'FLOA') > 0
+        \\              OR instr(upper(i.type), 'DOUB') > 0 THEN 'REAL'
+        \\            ELSE 'NUMERIC' END,
         \\       CASE WHEN m.type = 'view' THEN 'UNKNOWN'
         \\            WHEN i."notnull" = 1 THEN 'NO'
         \\            WHEN i.pk = 1 AND upper(i.type) = 'INTEGER'
@@ -1323,6 +1651,50 @@ pub const SQLite = struct {
         \\FROM pragma_table_info(?1) i
         \\LEFT JOIN sqlite_master m ON m.name = ?1
         \\ORDER BY i.cid
+    ;
+
+    /// **`introspect` for every table at once**, which is what the startup
+    /// check sends: one query however many Rows there are, where it sent one
+    /// per Row. `?1` is the table names as one JSON array, the way this
+    /// Dialect binds every list (`list_form`), and the answer is the same
+    /// three columns preceded by the table's name, ordered by table and
+    /// position. `pragma_table_info(m.name)` takes its argument from the row
+    /// of `sqlite_master` beside it, which SQLite allows of a table-valued
+    /// function.
+    ///
+    /// **It has to answer exactly what `introspect` answers**, affinity and
+    /// the rowid alias and `UNKNOWN` for a view (ADR 050, ADR 055). Two
+    /// differences in the text and neither in the answer: the join is inner,
+    /// since a name in the array that is no table or view has nothing to
+    /// report, and `COLLATE NOCASE` because `pragma_table_info` folds the
+    /// name's case and `m.name = ?1` did not have to. **`pragma_table_info`
+    /// and `sqlite_master` are each named as often here as the qualifying
+    /// rewrite expects** (`sqlite.Wire.columnsOfMany`): every occurrence gets
+    /// the schema in front of it.
+    pub const introspect_all =
+        \\SELECT m.name,
+        \\       i.name,
+        \\       CASE WHEN coalesce(i.type, '') = '' THEN 'ANY'
+        \\            WHEN instr(upper(i.type), 'INT') > 0 THEN 'INTEGER'
+        \\            WHEN instr(upper(i.type), 'CHAR') > 0
+        \\              OR instr(upper(i.type), 'CLOB') > 0
+        \\              OR instr(upper(i.type), 'TEXT') > 0 THEN 'TEXT'
+        \\            WHEN instr(upper(i.type), 'BLOB') > 0 THEN 'BLOB'
+        \\            WHEN instr(upper(i.type), 'REAL') > 0
+        \\              OR instr(upper(i.type), 'FLOA') > 0
+        \\              OR instr(upper(i.type), 'DOUB') > 0 THEN 'REAL'
+        \\            ELSE 'NUMERIC' END,
+        \\       CASE WHEN m.type = 'view' THEN 'UNKNOWN'
+        \\            WHEN i."notnull" = 1 THEN 'NO'
+        \\            WHEN i.pk = 1 AND upper(i.type) = 'INTEGER'
+        \\                 AND (SELECT count(*) FROM pragma_table_info(m.name) k
+        \\                      WHERE k.pk > 0) = 1 THEN 'NO'
+        \\            ELSE 'YES' END
+        \\FROM sqlite_master m
+        \\JOIN pragma_table_info(m.name) i
+        \\WHERE m.type IN ('table', 'view')
+        \\  AND m.name COLLATE NOCASE IN (SELECT value FROM json_each(?1))
+        \\ORDER BY m.name, i.cid
     ;
 
     /// **The widest difference, and the one that decides how much a schema
@@ -1412,10 +1784,11 @@ pub const SQLite = struct {
         // that passed stored microseconds as digits in a TEXT column, where
         // `ORDER BY` sorts them as text and no date function reads them.
         //
-        // Every name here keeps an integer an integer: INTEGER affinity for
-        // the three carrying `INT`, and NUMERIC for the rest — which is what
-        // `DATETIME` and `TIMESTAMP` are, and they are what somebody writing
-        // the table by hand reaches for.
+        // Both affinities here keep an integer an integer: INTEGER for every
+        // declared type carrying `INT`, and NUMERIC for the rest, which is
+        // what `DATETIME` and `TIMESTAMP` are and what somebody writing the
+        // table by hand reaches for.
+        //
         // BLOB, and this row was already half here: `acceptsSqlite` has
         // always listed `BLOB` among what a byte slice may read out of, and
         // nothing could ever write one, because `WireWrite` sent a
@@ -1423,15 +1796,17 @@ pub const SQLite = struct {
         // anything else.
         if (types.isBytes(Inner)) return &.{"BLOB"};
 
-        if (Inner == types.Timestamp) return &.{
-            "INTEGER", "INT", "BIGINT", "NUMERIC", "DATETIME", "TIMESTAMP",
-        };
+        if (Inner == types.Timestamp) return &.{ "INTEGER", "NUMERIC" };
 
         // A type that declared its Postgres column name declared a Postgres
         // one. `jsonb` and `uuid` are both TEXT here, which is what SQLite
         // stores them as and what `json_form`, `enum_form` and `uuid_form`
         // all send.
-        if (types.declaredColumn(Inner) != null) return &.{ "TEXT", "VARCHAR", "CLOB" };
+        //
+        // NUMERIC is here for the names a hand-written table gives them:
+        // `DATE`, `UUID`, `JSON`, `DECIMAL(10,2)` and `DATETIME` are NUMERIC
+        // affinity, which keeps text that is not a number as text.
+        if (types.declaredColumn(Inner) != null) return &.{ "TEXT", "NUMERIC" };
 
         // No array type at all, so a list column has nowhere to live and
         // this declines rather than naming something that would not hold it.
@@ -1440,8 +1815,8 @@ pub const SQLite = struct {
         return switch (@typeInfo(Inner)) {
             // No boolean either: SQLite stores 0 and 1 in an INTEGER, and
             // `BOOLEAN` is a declared type with NUMERIC affinity.
-            .bool => &.{ "INTEGER", "BOOLEAN", "NUMERIC" },
-            .float => &.{ "REAL", "DOUBLE", "FLOAT", "NUMERIC" },
+            .bool => &.{ "INTEGER", "NUMERIC" },
+            .float => &.{ "REAL", "NUMERIC" },
             // One integer type, and it is 64 bits. Every Zig width that fits
             // in an i64 reads out of it, which makes the check coarser than
             // the Postgres one and correct rather than optimistic — a `u64`
@@ -1449,10 +1824,10 @@ pub const SQLite = struct {
             .int => |i| if (i.bits > 64 or (i.signedness == .unsigned and i.bits >= 64))
                 null
             else
-                &.{ "INTEGER", "INT", "BIGINT", "NUMERIC" },
-            .@"enum" => &.{ "TEXT", "VARCHAR" },
+                &.{ "INTEGER", "NUMERIC" },
+            .@"enum" => &.{"TEXT"},
             .pointer => |ptr| if (ptr.size == .slice and ptr.child == u8)
-                &.{ "TEXT", "VARCHAR", "CLOB", "BLOB" }
+                &.{ "TEXT", "BLOB" }
             else
                 null,
             else => null,
@@ -1493,6 +1868,7 @@ pub fn assertDialect(comptime D: type) void {
             "accepts",
             "reads",
             "introspect",
+            "introspect_all",
             "readAs",
             "bindAs",
             "arrayOf",
@@ -1504,11 +1880,16 @@ pub fn assertDialect(comptime D: type) void {
             "columnType",
             "keyColumn",
             "foldedColumn",
+            "foldedIndexColumn",
             "can_alter_column",
             "advisoryLock",
+            "lock_timeout",
+            "prefix_bound",
+            "plan_may_go_generic",
             "nulls",
             "pattern",
             "like_folds",
+            "decimal_compares",
             "enum_values",
             "now_default",
             "now_text",
@@ -1533,6 +1914,81 @@ pub fn assertDialect(comptime D: type) void {
     }
 }
 
+/// The tables a piece of SQL drops, read off its words: what a SQLite
+/// `.rebuilding` transaction and the `.sql` twin of a version need in order
+/// to check the foreign keys of the tables that were rebuilt and not those of
+/// every table in the file.
+///
+/// **Read off the words, and wrong only the safe way**, as `migrate.rebuilds`
+/// is: `DROP` then `TABLE` anywhere, a comment included, names a table that
+/// is then checked when it need not have been. A name it cannot read (a quote
+/// doubled inside it) is `error.Unreadable`, and the caller checks every key,
+/// which is what every rebuild did before.
+pub const Drops = struct {
+    text: []const u8,
+    at: usize = 0,
+
+    pub fn next(self: *Drops) error{Unreadable}!?[]const u8 {
+        while (self.word()) |first| {
+            if (!std.ascii.eqlIgnoreCase(first, "DROP")) continue;
+            const second = self.word() orelse return null;
+            if (!std.ascii.eqlIgnoreCase(second, "TABLE")) continue;
+            // `IF EXISTS`, when it is there.
+            const before = self.at;
+            if (self.word()) |maybe_if| {
+                if (std.ascii.eqlIgnoreCase(maybe_if, "IF")) {
+                    const exists = self.word() orelse return error.Unreadable;
+                    if (!std.ascii.eqlIgnoreCase(exists, "EXISTS")) return error.Unreadable;
+                } else self.at = before;
+            }
+            var name = try self.identifier();
+            // `main."t"`: the table is the last part.
+            while (self.at < self.text.len and self.text[self.at] == '.') {
+                self.at += 1;
+                name = try self.identifier();
+            }
+            return name;
+        }
+        return null;
+    }
+
+    /// The next run of letters, digits and underscores.
+    fn word(self: *Drops) ?[]const u8 {
+        while (self.at < self.text.len and !isWordByte(self.text[self.at])) self.at += 1;
+        if (self.at >= self.text.len) return null;
+        const start = self.at;
+        while (self.at < self.text.len and isWordByte(self.text[self.at])) self.at += 1;
+        return self.text[start..self.at];
+    }
+
+    fn isWordByte(b: u8) bool {
+        return std.ascii.isAlphanumeric(b) or b == '_';
+    }
+
+    fn identifier(self: *Drops) error{Unreadable}![]const u8 {
+        while (self.at < self.text.len and std.ascii.isWhitespace(self.text[self.at])) self.at += 1;
+        if (self.at >= self.text.len) return error.Unreadable;
+        const open = self.text[self.at];
+        const close: u8 = switch (open) {
+            '"' => '"',
+            '`' => '`',
+            '[' => ']',
+            else => {
+                if (!isWordByte(open)) return error.Unreadable;
+                return self.word().?;
+            },
+        };
+        const start = self.at + 1;
+        const end = std.mem.indexOfScalarPos(u8, self.text, start, close) orelse return error.Unreadable;
+        // A doubled quote is one quote inside the name, which a slice of the
+        // text cannot be.
+        if (close != ']' and end + 1 < self.text.len and self.text[end + 1] == close)
+            return error.Unreadable;
+        self.at = end + 1;
+        return self.text[start..end];
+    }
+};
+
 /// The message a `.lock` stops with on a Dialect that has no row locks. Its
 /// database serialises writers some other way, so the honest answer is a
 /// Refusal rather than a select that quietly holds nothing.
@@ -1556,6 +2012,37 @@ pub fn noNullsOrder(comptime D: type, comptime Row: type, comptime column: []con
             "  Order by a column that has no NULLs in it, or sort them into place " ++
             "with a condition the database can express.",
     );
+}
+
+/// The Refusal for asking a Dialect whose `decimal_compares` is false to order,
+/// compare or add up a number it holds as text (ADR 049). `what` names the
+/// thing asked for (`.total = .{ .gt = … }`, `.order.total`, `sum(total)`),
+/// `T` is the type of the column it is asked of, and a type that is not
+/// numeric text, or a Dialect that does compare it, passes untouched.
+///
+/// **Refused rather than emulated**, because the emulations all cost the
+/// index or the exactness: `CAST(… AS REAL)` is the floating point a
+/// `Decimal` is chosen to avoid, and a padded text form is a second column.
+/// A quiet wrong answer on one of the two databases is the lie the seam
+/// exists not to tell (ADR 055).
+pub fn assertDecimalCompares(
+    comptime D: type,
+    comptime Row: type,
+    comptime column: []const u8,
+    comptime T: type,
+    comptime what: []const u8,
+) void {
+    comptime {
+        if (D.decimal_compares or !types.isNumericText(T)) return;
+        @compileError(
+            "nilo: " ++ what ++ " on " ++ @typeName(Row) ++ "'s `" ++ column ++ "` would run as text on the " ++
+                D.name ++ " dialect.\n" ++
+                "  A `sql.Decimal` is a TEXT column here, and " ++ D.name ++ " compares and sorts text as text, so " ++
+                "\"100.00\" comes before \"9.99\" and a sum is added in floating point (`0.30000000000000004`). " ++
+                "`.eq`, `.ne` and `.in` are still fine.\n" ++
+                "  Store the amount as an integer of its smallest unit (cents in an `i64`), or use Postgres.",
+        );
+    }
 }
 
 /// The message a pattern operator stops with on a Dialect that cannot spell
@@ -1637,7 +2124,8 @@ test "an optional column is judged by what it wraps" {
 test "a type that names its own column is taken at its word" {
     try testing.expectEqualStrings("uuid", Postgres.accepts(types.Uuid).?[0]);
     try testing.expectEqualStrings("timestamptz", Postgres.accepts(types.Timestamp).?[0]);
-    try testing.expectEqualStrings("timestamp", Postgres.accepts(types.Timestamp).?[1]);
+    // And only that: a `timestamp` column moves `.now` by the session's zone.
+    try testing.expectEqual(@as(usize, 1), Postgres.accepts(types.Timestamp).?.len);
     try testing.expectEqualStrings("jsonb", Postgres.accepts(types.Json(struct { a: u8 })).?[0]);
 }
 
@@ -1711,12 +2199,13 @@ test "a Timestamp is checked against the column it is actually bound into" {
 
     // `DATETIME` and `TIMESTAMP` are NUMERIC affinity, so an integer stays an
     // integer in one — and they are what somebody writing the table by hand
-    // reaches for.
-    var found_datetime = false;
+    // reaches for. The list names affinities, which is what `introspect`
+    // answers, so NUMERIC is the one that stands for them.
+    var found_numeric = false;
     for (accepts) |name| {
-        if (std.mem.eql(u8, name, "DATETIME")) found_datetime = true;
+        if (std.mem.eql(u8, name, "NUMERIC")) found_numeric = true;
     }
-    try testing.expect(found_datetime);
+    try testing.expect(found_numeric);
 
     // Optional or not is the same question, since the check strips it.
     try testing.expectEqualStrings("INTEGER", SQLite.accepts(?types.Timestamp).?[0]);
@@ -1746,9 +2235,10 @@ test "a numeric is bound as digits and cast back, so nothing goes through a floa
         "$1::numeric",
         Postgres.bindAs(Postgres.placeholder(1), types.Decimal, false),
     );
-    // `.in` puts the whole list in one parameter, so the cast names an array.
+    // `.in` puts the whole list in one parameter, so the cast names an array,
+    // through `text[]` because the digits are what travel.
     try testing.expectEqualStrings(
-        "$2::numeric[]",
+        "$2::text[]::numeric[]",
         Postgres.bindAs(Postgres.placeholder(2), types.Decimal, true),
     );
     try testing.expectEqualStrings("$1", Postgres.bindAs(Postgres.placeholder(1), i64, false));
@@ -1770,7 +2260,7 @@ test "a date is read as the column and written as text, which is the driver's sh
         Postgres.bindAs(Postgres.placeholder(1), types.Date, false),
     );
     try testing.expectEqualStrings(
-        "$2::date[]",
+        "$2::text[]::date[]",
         Postgres.bindAs(Postgres.placeholder(2), types.Date, true),
     );
     try testing.expectEqualStrings("text[]::date[]", Postgres.arrayOf(types.Date).?);
@@ -1955,13 +2445,57 @@ test "SQLite's affinity is its own substring rule, and no declared type is none"
     try testing.expectEqual(@as(?[]const u8, null), SQLite.affinityOf(""));
 }
 
-test "a raw read on Postgres takes a number of exactly its width" {
-    try testing.expectEqualSlices([]const u8, &.{"int4"}, Postgres.reads(i32).?);
-    try testing.expectEqualSlices([]const u8, &.{"int8"}, Postgres.reads(?i64).?);
-    try testing.expectEqualSlices([]const u8, &.{"float8"}, Postgres.reads(f64).?);
+test "a raw read on Postgres takes a number of its width or narrower, never wider" {
+    // A wider column reads range-checked, and a raw `count(*)` into an `i32`
+    // is the one that fails the day it passes two billion, so it is said.
+    try testing.expectEqualSlices([]const u8, &.{ "int4", "int2" }, Postgres.reads(i32).?);
+    try testing.expectEqualSlices([]const u8, &.{ "int8", "int4", "int2" }, Postgres.reads(?i64).?);
+    try testing.expectEqualSlices([]const u8, &.{ "float8", "float4" }, Postgres.reads(f64).?);
+    try testing.expectEqualSlices([]const u8, &.{"float4"}, Postgres.reads(f32).?);
     // Where `accepts` is the table's list, wider on both sides.
     try testing.expect(Postgres.accepts(i32).?.len > 1);
     // A text column arrives as text, because a raw statement casts it.
     try testing.expectEqualStrings("text", Postgres.reads(types.Decimal).?[0]);
     try testing.expectEqualStrings("timestamptz", Postgres.reads(types.Timestamp).?[0]);
+}
+
+test "on SQLite a blob key's numbered list is read through unhex, and any other key's is not wrapped" {
+    try testing.expectEqualStrings(
+        "(SELECT \"key\", unhex(value) AS \"value\" FROM json_each(?1)) AS \"#k\"",
+        SQLite.ordinalList("?1", types.Bytes, "\"#k\"").?,
+    );
+    try testing.expectEqualStrings("json_each(?1) AS \"#k\"", SQLite.ordinalList("?1", i64, "\"#k\"").?);
+}
+
+test "SQLite writes its own LIKE, so a column named with the letters ILIKE keeps its name" {
+    // The text used to be Postgres's with its first `ILIKE ` replaced, which
+    // found the one inside the column's name before the operator.
+    const written = comptime SQLite.pattern("\"ILIKE x\"", "?1", .contains, true, false, false).?;
+    try testing.expectEqualStrings(
+        "\"ILIKE x\" LIKE '%' || replace(replace(replace(?1, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%' ESCAPE '\\'",
+        written,
+    );
+    const negated = comptime SQLite.pattern("\"ILIKE x\"", "?1", .ends_with, true, true, false).?;
+    try testing.expect(std.mem.startsWith(u8, negated, "\"ILIKE x\" NOT LIKE "));
+    // Postgres keeps its word.
+    const pg = comptime Postgres.pattern("\"x\"", "$1", .contains, true, false, false).?;
+    try testing.expect(std.mem.startsWith(u8, pg, "\"x\" ILIKE "));
+}
+
+test "the tables a piece of SQL drops are read off its words, and a name that cannot be read says so" {
+    var one: Drops = .{ .text = "DROP TABLE \"orgs\"" };
+    try testing.expectEqualStrings("orgs", (try one.next()).?);
+    try testing.expectEqual(@as(?[]const u8, null), try one.next());
+
+    var loose: Drops = .{ .text = "drop  table if exists main.[Old Things];\nDROP TABLE `b`; DROP TABLE plain" };
+    try testing.expectEqualStrings("Old Things", (try loose.next()).?);
+    try testing.expectEqualStrings("b", (try loose.next()).?);
+    try testing.expectEqualStrings("plain", (try loose.next()).?);
+    try testing.expectEqual(@as(?[]const u8, null), try loose.next());
+
+    var none: Drops = .{ .text = "DROP INDEX \"x\"; DELETE FROM t" };
+    try testing.expectEqual(@as(?[]const u8, null), try none.next());
+
+    var doubled: Drops = .{ .text = "DROP TABLE \"a\"\"b\"" };
+    try testing.expectError(error.Unreadable, doubled.next());
 }

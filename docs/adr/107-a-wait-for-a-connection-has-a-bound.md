@@ -120,6 +120,26 @@ options file and libsqlite, so a second copy would be that wiring written twice
 and a `sql.Db` the real one is not equal to. Importing itself is neither upward
 nor sideways, and the build hands it the same module instance.
 
+## Both Wires answer the bound the same way, and zero is no bound
+
+`wire.OpenOpts` promises `TimedOut` when the wait runs out and says zero is no
+bound. The Postgres Wire kept neither for a while: every failed `acquire`
+became `Disconnected`, pg.zig's own `Timeout` included, and `timeout_ms = 0`
+went to pg.zig as a deadline already passed, so an empty pool failed at once.
+Now pg.zig's `Timeout` is `TimedOut` with a `warn` line, as SQLite's is, and
+zero is handed over as `maxInt(u32)` milliseconds, about forty-nine days.
+Every other failure of the wait stays `Disconnected`, and a cancellation is
+handed back with `recancel` on both Wires (ADR 223).
+
+**The readiness probe takes a reader on SQLite.** `nilo_ready` sent `SELECT 1`
+through `exec`, which always takes the one writer, so behind a long write
+transaction `/healthz` waited `timeout_ms` and answered 503 for a healthy
+instance and a balancer pulled it. It goes through `run` now: a statement
+starting with `SELECT` takes a reader (`sqlite.wantsWriter`), which a writer
+does not hold. On Postgres both take a connection from the one pool, so the
+probe is unchanged there. The probe is not prepared under a plan name; the
+comment that said it was described `exec` passing a plan it never passed.
+
 ## What it costs
 
 **Nothing on a statement that finds its connection free** — one `bool` test

@@ -40,6 +40,7 @@
 const std = @import("std");
 
 const ddl = @import("ddl.zig");
+const dialect_mod = @import("dialect.zig");
 const migrate = @import("migrate.zig");
 const snapshot = @import("snapshot.zig");
 const table_mod = @import("table.zig");
@@ -87,7 +88,7 @@ pub const Error = error{
     /// name becomes a path and a Zig identifier, so it is checked before it is
     /// either.
     BadName,
-    /// A file called `NNNN_….zig` whose `NNNN` is not four digits.
+    /// A file called `NNNN_….zig` whose `NNNN` is not four digits or more.
     BadVersionFile,
     /// Two version files with the same number, which is what two branches that
     /// both generated look like after a bad merge.
@@ -104,6 +105,10 @@ pub const Error = error{
     /// and `generated_end` around its steps, so nothing can tell which half of
     /// it `generate` wrote.
     NoGeneratedBlock,
+    /// `snapshot.zon` records a version lower than the newest version file:
+    /// a `generate` stopped between writing the version and the snapshot.
+    /// Planning against it would write the same steps a second time.
+    SnapshotBehind,
 };
 
 // -- what the directory holds --------------------------------------------
@@ -223,9 +228,15 @@ fn lessByNumber(_: void, a: Entry, b: Entry) bool {
 fn entryOf(gpa: std.mem.Allocator, file: []const u8) !Entry {
     const stem = file[0 .. file.len - ".zig".len];
     const underscore = std.mem.indexOfScalar(u8, stem, '_') orelse return Error.BadVersionFile;
-    if (underscore != 4) return Error.BadVersionFile;
+    // Four digits at least, and more past 9999: `generate` pads to four, so
+    // the ten thousandth version is `10000_x.zig`, which a reader held to
+    // exactly four refused as not a version at all.
+    if (underscore < 4) return Error.BadVersionFile;
+    for (stem[0..underscore]) |ch| if (!std.ascii.isDigit(ch)) return Error.BadVersionFile;
+    // Padded to four and no further, so one number has one file name.
+    if (underscore > 4 and stem[0] == '0') return Error.BadVersionFile;
 
-    const number = std.fmt.parseInt(u32, stem[0..4], 10) catch return Error.BadVersionFile;
+    const number = std.fmt.parseInt(u32, stem[0..underscore], 10) catch return Error.BadVersionFile;
     const name = stem[underscore + 1 ..];
     try checkName(name);
 
@@ -344,11 +355,13 @@ pub fn check(
 /// Diff the types against the snapshot and write the result as the next
 /// version, then rewrite the manifest and the snapshot.
 ///
-/// **Three files change or none do.** The version file is written first, then
-/// the manifest that names it, then the snapshot that says the schema has moved
-/// — so a run that dies halfway leaves a directory whose snapshot is still
-/// behind, which is the state the next `generate` handles correctly. The other
-/// order would leave a snapshot claiming a version that is not there.
+/// **Three files change, in an order that can be noticed halfway.** The
+/// version file is written first, then the manifest that names it, then the
+/// snapshot that says the schema has moved. A run that dies between leaves a
+/// snapshot older than the newest version file, and the next `generate`
+/// refuses it, `Error.SnapshotBehind`: planning against it wrote the same
+/// steps again as the version after. The other order would leave a snapshot
+/// claiming a version that is not there, which nothing could notice.
 pub fn generate(
     gpa: std.mem.Allocator,
     io: Io,
@@ -365,6 +378,11 @@ pub fn generate(
     // stopped on it (ADR 181).
     const state = try readWith(gpa, io, dir, D, .{ .snapshot = !opts.baseline });
     if (opts.baseline) return baseline(gpa, io, dir, D, desired, opts, state);
+
+    // A snapshot written before snapshots carried a version says 0, and is
+    // not behind anything.
+    if (state.had_snapshot and state.before.version != 0 and state.before.version < state.head())
+        return Error.SnapshotBehind;
 
     const change = try migrate.plan(gpa, D, desired, state.before);
 
@@ -551,6 +569,12 @@ fn writeManifestAndSnapshot(
 /// that fails halfway leaves nothing; and the ledger row, so a database brought
 /// to head by hand satisfies `db.expecting(manifest.head)` on the next boot
 /// rather than refusing to serve.
+///
+/// `BEGIN`/`COMMIT` alone does not keep the second promise, because both
+/// shells carry on past a failed statement: `sqlite3` then commits the steps
+/// that ran with the ledger row, and `psql` rolls back and exits 0. So the
+/// file opens with the dialect's `script_stop_on_error`, which makes it a
+/// script for `psql` or `sqlite3` rather than text any driver can send.
 pub fn renderSql(
     gpa: std.mem.Allocator,
     comptime D: type,
@@ -573,22 +597,42 @@ pub fn renderSql(
         \\--
         \\-- It carries its own ledger row, so a database brought to head this way
         \\-- is a database `db.expecting(manifest.head)` will serve.
+        \\--
+        \\-- It is a script for the database's own shell, and its first line stops
+        \\-- that shell at the first failed step, so a version runs whole or not at
+        \\-- all and the shell's exit status says which.
+        \\
+        \\{s}
         \\
         \\
-    , .{source});
+    , .{ source, D.script_stop_on_error });
     // What `migrate.apply` does through `wire.Begin.rebuilding`: with foreign
     // keys on, the DROP in a table rebuild deletes the old table's rows first
-    // and every `ON DELETE CASCADE` pointing at it fires.
-    if (comptime !D.can_alter_column) try w.writeAll(
-        \\-- Foreign keys off for the version, as `db migrate` runs it: dropping a
-        \\-- table to rebuild it would otherwise delete the rows pointing at it.
-        \\-- The check before COMMIT prints any row left pointing at nothing, and
-        \\-- a script cannot stop on it, so read what it prints.
+    // and every `ON DELETE CASCADE` pointing at it fires. Only on a version
+    // that drops a table, as `apply` decides it, so a twin run by hand
+    // cascades exactly where `db migrate` does.
+    const off = !D.can_alter_column and migrate.rebuilds(version.steps);
+    if (off) try w.writeAll(
+        \\-- Foreign keys off for the version, as `db migrate` runs one that drops
+        \\-- a table: dropping it to rebuild it would otherwise delete the rows
+        \\-- pointing at it.
+        \\-- The check before COMMIT stops the script when any row is left pointing
+        \\-- at nothing, and nothing is kept.
         \\PRAGMA foreign_keys = OFF;
         \\
         \\
     );
     try w.writeAll("BEGIN;\n\n");
+    // What `migrate.apply` sets through `Dialect.lock_timeout`, as the
+    // statement a shell reads: a step that waits longer for its table gives
+    // up, and the script stops there with nothing kept.
+    if (D.lock_timeout != null) try w.print(
+        \\-- A step waiting longer than this for its table's lock gives up, rather
+        \\-- than holding every read and write to the table behind it.
+        \\SET LOCAL lock_timeout = {d};
+        \\
+        \\
+    , .{version.lock_timeout_ms});
 
     try w.print("{s};\n\n", .{comptime ddl.createIfMissing(D, migrate.Applied)});
 
@@ -616,10 +660,60 @@ pub fn renderSql(
     // operator reads when they ask which migration is the slow one, and a
     // number invented here would be a worse answer than none.
     try w.print("', {s}, 0);\n\n", .{D.now_default});
-    if (comptime !D.can_alter_column) try w.writeAll("PRAGMA foreign_key_check;\n\n");
+    // **`PRAGMA foreign_key_check` only prints**, and `.bail on` stops a script
+    // on an error, so the check is made into one: a row inserted into a table
+    // that refuses any count but nought. `apply` rolls back with
+    // `ForeignKeyViolated` on the same rows, and the twin carries the same
+    // pragmas as `apply` does (ADR 123).
+    //
+    // **Only the tables the version dropped, and the rows pointing at them**,
+    // the scope `sqlite.zig`'s check before COMMIT has, so an old violation in
+    // a table the version never touched stops neither. A drop it cannot read
+    // leaves the filter off, and every key is checked.
+    if (off) {
+        try w.writeAll(
+            \\CREATE TEMP TABLE "nilo_foreign_key_check" ("violations" INTEGER CONSTRAINT "foreign_key_check_found_rows" CHECK ("violations" = 0));
+            \\INSERT INTO "nilo_foreign_key_check" SELECT count(*) FROM pragma_foreign_key_check
+        );
+        try writeDroppedFilter(w, version.steps);
+        try w.writeAll(
+            \\;
+            \\DROP TABLE "nilo_foreign_key_check";
+            \\
+            \\
+        );
+    }
     try w.writeAll("COMMIT;\n");
-    if (comptime !D.can_alter_column) try w.writeAll("\nPRAGMA foreign_keys = ON;\n");
+    if (off) try w.writeAll("\nPRAGMA foreign_keys = ON;\n");
     return aw.toOwnedSlice();
+}
+
+/// ` WHERE "table" IN (…) OR "parent" IN (…)` over the tables `steps` drop,
+/// or nothing when they name none or one cannot be read
+/// (`dialect.Drops`; `sqlite.zig`'s `foreignKeyCheck` writes the same).
+fn writeDroppedFilter(w: *std.Io.Writer, steps: []const migrate.Step) !void {
+    var any = false;
+    for (steps) |step| {
+        var drops: dialect_mod.Drops = .{ .text = step.sql };
+        while (drops.next() catch return) |_| any = true;
+    }
+    if (!any) return;
+    inline for (.{ "table", "parent" }, 0..) |column, pass| {
+        try w.writeAll(if (pass == 0) " WHERE \"" else " OR \"");
+        try w.writeAll(column ++ "\" COLLATE NOCASE IN (");
+        var first = true;
+        for (steps) |step| {
+            var drops: dialect_mod.Drops = .{ .text = step.sql };
+            while (drops.next() catch return) |name| {
+                if (!first) try w.writeAll(", ");
+                first = false;
+                try w.writeAll("'");
+                try writeSqlLiteral(w, name);
+                try w.writeAll("'");
+            }
+        }
+        try w.writeAll(")");
+    }
 }
 
 /// One piece of text inside a SQL literal, with a quote doubled — the same rule
@@ -683,6 +777,95 @@ pub fn staleSql(
         const text = try renderSql(gpa, D, v, entry.name, hash, entry.file);
         if (try sameOnDisk(gpa, io, dir, twin, text)) continue;
         try out.append(gpa, twin);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// One way the directory and the manifest disagree, or the snapshot and the
+/// newest version file do.
+pub const Finding = struct {
+    kind: Kind,
+    /// The version number it is about.
+    number: i64,
+    /// The file on disk, or empty when there is none.
+    file: []const u8 = "",
+    /// What the manifest calls the version, or empty when it has none.
+    name: []const u8 = "",
+
+    pub const Kind = enum {
+        /// A version file no manifest entry has the number of: the `@import`
+        /// line lost in a merge, so the version is never applied.
+        unlisted,
+        /// A manifest entry with no file of that number on disk.
+        no_file,
+        /// A manifest entry whose `.number` is a file's and whose `.name` is
+        /// not: a file copied to a new name without its number changed.
+        renamed,
+        /// Two manifest entries with one number, of which `apply` skips the
+        /// second.
+        duplicate,
+        /// `snapshot.zon` records a version lower than the newest file.
+        snapshot_behind,
+        /// `snapshot.zon` records a version higher than the newest file, so
+        /// the next `generate` would reuse a number the snapshot has spent.
+        snapshot_ahead,
+    };
+};
+
+/// What `check` compares that needs no database and no plan: the directory
+/// against the manifest compiled into the binary, the number in each against
+/// the file name, and the snapshot against the newest file, both ways
+/// ([ADR 123](../docs/adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
+///
+/// **The directory is listed against the manifest, not the manifest walked**,
+/// because `staleSql` walks the manifest and a file whose `@import` line was
+/// lost resolving a conflict in `manifest.zig` is then in nobody's list: never
+/// applied, and `check` green. The ADR calls that conflict ordinary.
+///
+/// A pure function of two values, so the sentence is tested without a disk.
+pub fn audit(gpa: std.mem.Allocator, state: State, versions: []const Version) ![]const Finding {
+    var out: std.ArrayList(Finding) = .empty;
+
+    for (versions, 0..) |v, i| {
+        var seen: usize = 0;
+        for (versions[0..i]) |earlier| {
+            if (earlier.number == v.number) seen += 1;
+        }
+        // Once per extra copy would say the same thing twice.
+        if (seen == 1) try out.append(gpa, .{ .kind = .duplicate, .number = v.number, .name = v.name });
+        if (seen > 0) continue;
+
+        const entry = entryFor(state.entries, v.number) orelse {
+            try out.append(gpa, .{ .kind = .no_file, .number = v.number, .name = v.name });
+            continue;
+        };
+        if (!std.mem.eql(u8, entry.name, v.name)) {
+            try out.append(gpa, .{ .kind = .renamed, .number = v.number, .file = entry.file, .name = v.name });
+        }
+    }
+
+    for (state.entries) |e| {
+        const listed = for (versions) |v| {
+            if (v.number == e.number) break true;
+        } else false;
+        if (!listed) try out.append(gpa, .{ .kind = .unlisted, .number = e.number, .file = e.file });
+    }
+
+    // A snapshot written before snapshots carried a version says 0, and is
+    // not ahead of or behind anything.
+    if (state.had_snapshot and state.before.version != 0) {
+        const head = state.head();
+        const last = if (state.entries.len > 0) state.entries[state.entries.len - 1].file else "";
+        if (state.before.version < head) try out.append(gpa, .{
+            .kind = .snapshot_behind,
+            .number = state.before.version,
+            .file = last,
+        });
+        if (state.before.version > head) try out.append(gpa, .{
+            .kind = .snapshot_ahead,
+            .number = state.before.version,
+            .file = last,
+        });
     }
     return out.toOwnedSlice(gpa);
 }
@@ -1037,6 +1220,53 @@ test "the three files land together, and the snapshot moves with them" {
     try testing.expectEqual(@as(u32, 1), state.before.version);
 }
 
+test "a generate that stopped before the snapshot is refused, not written a second time" {
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    _ = try generate(box.a(), box.io(), box.dir(), Pg, comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} }), .{ .name = "initial" });
+    // What a run that died after the version file leaves: the file, and a
+    // snapshot still at 1.
+    const grown = comptime migrate.desiredOf(Pg, .{ .tables = &.{ User, Org } });
+    const change = try migrate.plan(box.a(), Pg, grown, (try read(box.a(), box.io(), box.dir(), Pg)).before);
+    try box.dir().writeFile(box.io(), .{
+        .sub_path = "0002_users.zig",
+        .data = try renderVersion(box.a(), 2, "users", change.steps, .{ .name = "users" }),
+    });
+
+    // The plan against that snapshot is the same `CREATE TABLE users`, and it
+    // went in as version 3.
+    try testing.expectError(Error.SnapshotBehind, generate(box.a(), box.io(), box.dir(), Pg, grown, .{ .name = "users" }));
+    try testing.expect(std.meta.isError(box.slurp("0003_users.zig")));
+}
+
+test "a generate that fails halfway leaves the version file and the snapshot where it was" {
+    const gpa = testing.allocator;
+    var box = try Sandbox.init(gpa);
+    defer box.deinit(gpa);
+
+    _ = try generate(box.a(), box.io(), box.dir(), Pg, comptime migrate.desiredOf(Pg, .{ .tables = &.{Org} }), .{ .name = "initial" });
+    const snap = try box.slurp(snapshot_file);
+
+    // The manifest cannot be written: a directory stands where it goes.
+    try box.dir().deleteFile(box.io(), manifest_file);
+    try box.dir().createDir(box.io(), manifest_file, .default_dir);
+    const grown = comptime migrate.desiredOf(Pg, .{ .tables = &.{ User, Org } });
+    try testing.expect(std.meta.isError(generate(box.a(), box.io(), box.dir(), Pg, grown, .{ .name = "users" })));
+
+    // The order the doc comment promises, seen from what is left: the
+    // version file went first and is there, and the snapshot, last, did not
+    // move. A snapshot written ahead of the manifest would claim a version
+    // the manifest never named.
+    _ = try box.slurp("0002_users.zig");
+    try testing.expectEqualStrings(snap, try box.slurp(snapshot_file));
+
+    // Which is the state the next run refuses rather than plans again.
+    try box.dir().deleteDir(box.io(), manifest_file);
+    try testing.expectError(Error.SnapshotBehind, generate(box.a(), box.io(), box.dir(), Pg, grown, .{ .name = "users" }));
+}
+
 test "generating twice against the same types writes nothing the second time" {
     const gpa = testing.allocator;
     var box = try Sandbox.init(gpa);
@@ -1176,7 +1406,7 @@ test "a destructive step is not written until somebody asks for it by name" {
     try testing.expect(std.mem.indexOf(u8, text, "// Written with `--drop orgs.note`.") != null);
 }
 
-test "a SQLite twin runs its version with foreign keys off and checks them before the commit" {
+test "a SQLite twin runs a version that drops a table with foreign keys off and checks them before the commit" {
     const gpa = testing.allocator;
     const text = try renderSql(gpa, Lite, .{
         .number = 2,
@@ -1187,16 +1417,80 @@ test "a SQLite twin runs its version with foreign keys off and checks them befor
 
     const off = std.mem.indexOf(u8, text, "PRAGMA foreign_keys = OFF;").?;
     const begin = std.mem.indexOf(u8, text, "BEGIN;").?;
-    const checked = std.mem.indexOf(u8, text, "PRAGMA foreign_key_check;").?;
+    const checked = std.mem.indexOf(u8, text, "FROM pragma_foreign_key_check").?;
+    // Narrowed to the table the version dropped and the rows pointing at it,
+    // where it used to count every violation in the file.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        text,
+        "pragma_foreign_key_check WHERE \"table\" COLLATE NOCASE IN ('old') OR \"parent\" COLLATE NOCASE IN ('old');",
+    ) != null);
     const commit = std.mem.indexOf(u8, text, "COMMIT;").?;
     const on = std.mem.indexOf(u8, text, "PRAGMA foreign_keys = ON;").?;
     // Off before the BEGIN, because SQLite ignores it inside a transaction.
     try testing.expect(off < begin and begin < checked and checked < commit and commit < on);
 
+    // And the check fails the script rather than printing: it is an INSERT
+    // into a table whose CHECK refuses a non-zero count, so `.bail on` stops
+    // before the COMMIT and nothing of the version is kept.
+    try testing.expect(std.mem.indexOf(u8, text, "CHECK (\"violations\" = 0)") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "PRAGMA foreign_key_check") == null);
+
+    // A version that drops no table keeps them on, so a `DELETE` of a parent
+    // in it cascades, as it does under `db migrate`.
+    const plain = try renderSql(gpa, Lite, .{
+        .number = 3,
+        .name = "tidy",
+        .steps = &.{.{ .kind = .data, .why = "tidy", .sql = "DELETE FROM \"orgs\" WHERE \"closed\"" }},
+    }, "tidy", "abc", "0003_tidy.zig");
+    defer gpa.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "PRAGMA") == null);
+
     // Postgres drops nothing a key points at, so its twin has none of it.
     const pg = try renderSql(gpa, Pg, .{ .number = 2, .name = "x", .steps = &.{} }, "x", "abc", "0002_x.zig");
     defer gpa.free(pg);
     try testing.expect(std.mem.indexOf(u8, pg, "PRAGMA") == null);
+}
+
+test "a Postgres twin bounds each step's wait for its table as `db migrate` does, and a SQLite one has nothing to bound" {
+    const gpa = testing.allocator;
+    const steps: []const Step = &.{.{ .kind = .data, .why = "x", .sql = "ALTER TABLE \"orgs\" ADD COLUMN \"n\" int8" }};
+
+    const pg = try renderSql(gpa, Pg, .{ .number = 2, .name = "x", .steps = steps }, "x", "abc", "0002_x.zig");
+    defer gpa.free(pg);
+    const set = std.mem.indexOf(u8, pg, "\nSET LOCAL lock_timeout = 5000;\n").?;
+    // Inside the transaction, since `LOCAL` means nothing outside one, and
+    // before the first step that takes a table's lock.
+    try testing.expect(std.mem.indexOf(u8, pg, "BEGIN;").? < set);
+    try testing.expect(set < std.mem.indexOf(u8, pg, "ALTER TABLE").?);
+
+    // The version's own number, `0` included, which is the way to wait for good.
+    const patient = try renderSql(gpa, Pg, .{ .number = 2, .name = "x", .steps = steps, .lock_timeout_ms = 0 }, "x", "abc", "0002_x.zig");
+    defer gpa.free(patient);
+    try testing.expect(std.mem.indexOf(u8, patient, "\nSET LOCAL lock_timeout = 0;\n") != null);
+
+    const lite = try renderSql(gpa, Lite, .{ .number = 2, .name = "x", .steps = steps }, "x", "abc", "0002_x.zig");
+    defer gpa.free(lite);
+    try testing.expect(std.mem.indexOf(u8, lite, "lock_timeout") == null);
+}
+
+test "a SQLite twin stops at its first failed step, so the COMMIT cannot keep half a version" {
+    // A failed statement does not abort a SQLite transaction, and `sqlite3`
+    // carries on past it: without `.bail on` the closing COMMIT keeps the steps
+    // that ran and the ledger row saying the whole version did.
+    const gpa = testing.allocator;
+    const text = try renderSql(gpa, Lite, .{
+        .number = 2,
+        .name = "x",
+        .steps = &.{.{ .kind = .data, .why = "x", .sql = "DROP TABLE \"old\"" }},
+    }, "x", "abc", "0002_x.zig");
+    defer gpa.free(text);
+
+    // Before anything the shell would run, the pragma included.
+    const bail = std.mem.indexOf(u8, text, "\n.bail on\n").?;
+    try testing.expect(bail < std.mem.indexOf(u8, text, "PRAGMA foreign_keys = OFF;").?);
+    try testing.expect(bail < std.mem.indexOf(u8, text, "BEGIN;").?);
+    try testing.expect(std.mem.indexOf(u8, text, "ON_ERROR_STOP") == null);
 }
 
 test "a version name that is not safe as a path and an identifier is refused" {
@@ -1344,9 +1638,14 @@ test "a file name is read back into the three parts the manifest needs" {
     try testing.expectEqualStrings("split_name", e.name);
     try testing.expectEqualStrings("0042_split_name.zig", e.file);
 
-    for ([_][]const u8{ "42_short.zig", "00042_long.zig", "nonumber.zig", "0001_Bad.zig" }) |bad| {
+    for ([_][]const u8{ "42_short.zig", "00042_long.zig", "nonumber.zig", "0001_Bad.zig", "1e000_x.zig" }) |bad| {
         try testing.expect(std.meta.isError(entryOf(arena.allocator(), bad)));
     }
+
+    // The ten thousandth version, which `generate` names with five digits
+    // and a reader held to four refused as not a version at all.
+    const past = try entryOf(arena.allocator(), "10000_more.zig");
+    try testing.expectEqual(@as(u32, 10000), past.number);
 }
 
 test "two branches that both generated version 2 are a merge that does not build" {
@@ -1724,6 +2023,11 @@ test "the twin is the version's statements, the ledger table and the ledger row"
     try testing.expect(std.mem.indexOf(u8, text, "\nBEGIN;\n") != null);
     try testing.expect(std.mem.endsWith(u8, text, "COMMIT;\n"));
 
+    // And `psql` told to stop at a failed step before the `BEGIN`, or it rolls
+    // the version back and exits 0.
+    const stop = std.mem.indexOf(u8, text, "\n\\set ON_ERROR_STOP on\n").?;
+    try testing.expect(stop < std.mem.indexOf(u8, text, "\nBEGIN;\n").?);
+
     // The ledger, made if it is not there, or a fresh database cannot take
     // version 1 at all.
     try testing.expect(std.mem.indexOf(
@@ -1864,4 +2168,93 @@ test "a binary behind the directory writes no twin rather than one with a wrong 
         error.FileNotFound,
         box.dir().readFileAlloc(box.io(), "0002_orgs_get_a_note.sql", box.a(), .limited(1024)),
     );
+}
+
+test "check finds a version file the manifest lost, a number that is not its file's, and a duplicate" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const state: State = .{
+        .before = snapshot.empty(Pg),
+        .had_snapshot = false,
+        .entries = &.{
+            .{ .number = 1, .name = "initial", .file = "0001_initial.zig" },
+            .{ .number = 2, .name = "notes", .file = "0002_notes.zig" },
+            .{ .number = 3, .name = "tags", .file = "0003_tags.zig" },
+        },
+    };
+
+    // All three files listed, in order: nothing to say.
+    const all: []const Version = &.{
+        .{ .number = 1, .name = "initial", .steps = &.{} },
+        .{ .number = 2, .name = "notes", .steps = &.{} },
+        .{ .number = 3, .name = "tags", .steps = &.{} },
+    };
+    try testing.expectEqual(@as(usize, 0), (try audit(a, state, all)).len);
+
+    // The `@import` line for 0003 lost in a merge: the version is never
+    // applied, and the manifest-walking checks could not see it.
+    const lost = try audit(a, state, all[0..2]);
+    try testing.expectEqual(@as(usize, 1), lost.len);
+    try testing.expectEqual(Finding.Kind.unlisted, lost[0].kind);
+    try testing.expectEqualStrings("0003_tags.zig", lost[0].file);
+
+    // A file copied to a new name with its `.number` left as it was: 0003 says
+    // it is version 2, so 2 is listed twice and 3 by no one.
+    const copied: []const Version = &.{ all[0], all[1], .{ .number = 2, .name = "tags", .steps = &.{} } };
+    const twice = try audit(a, state, copied);
+    try testing.expectEqual(@as(usize, 2), twice.len);
+    try testing.expectEqual(Finding.Kind.duplicate, twice[0].kind);
+    try testing.expectEqual(Finding.Kind.unlisted, twice[1].kind);
+    try testing.expectEqualStrings("0003_tags.zig", twice[1].file);
+
+    // The right number under another name, and a number with no file.
+    const renamed: []const Version = &.{ all[0], .{ .number = 2, .name = "other", .steps = &.{} }, .{ .number = 4, .name = "x", .steps = &.{} } };
+    const odd = try audit(a, state, renamed);
+    try testing.expectEqual(Finding.Kind.renamed, odd[0].kind);
+    try testing.expectEqual(Finding.Kind.no_file, odd[1].kind);
+    try testing.expectEqual(Finding.Kind.unlisted, odd[2].kind);
+}
+
+test "check compares the snapshot with the newest file both ways" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const versions: []const Version = &.{
+        .{ .number = 1, .name = "initial", .steps = &.{} },
+        .{ .number = 2, .name = "notes", .steps = &.{} },
+    };
+    var state: State = .{
+        .before = snapshot.empty(Pg),
+        .had_snapshot = true,
+        .entries = &.{
+            .{ .number = 1, .name = "initial", .file = "0001_initial.zig" },
+            .{ .number = 2, .name = "notes", .file = "0002_notes.zig" },
+        },
+    };
+
+    state.before.version = 2;
+    try testing.expectEqual(@as(usize, 0), (try audit(a, state, versions)).len);
+
+    // Behind: `generate` stopped between the version file and the snapshot.
+    state.before.version = 1;
+    const behind = try audit(a, state, versions);
+    try testing.expectEqual(@as(usize, 1), behind.len);
+    try testing.expectEqual(Finding.Kind.snapshot_behind, behind[0].kind);
+
+    // Ahead: a version file lost, and the next `generate` would write its
+    // number again.
+    state.before.version = 3;
+    const ahead = try audit(a, state, versions);
+    try testing.expectEqual(@as(usize, 1), ahead.len);
+    try testing.expectEqual(Finding.Kind.snapshot_ahead, ahead[0].kind);
+    try testing.expectEqual(@as(i64, 3), ahead[0].number);
+
+    // Written before snapshots carried a version: ahead of and behind nothing.
+    state.before.version = 0;
+    try testing.expectEqual(@as(usize, 0), (try audit(a, state, versions)).len);
 }

@@ -43,15 +43,21 @@ ReleaseSafe the test ran the buggy path and checked nothing.
 
 ## Decision
 
-**`closed` is a plain `bool` and the guard is outside the `if`. The counter
-stays Debug-only.**
+**`closed` is a plain `bool` that every copy of the handle shares, and the guard
+is outside the `if`. The counter stays Debug-only.** `next` answers null once it
+is set.
 
 ```zig
-closed: bool = false,
+closed: *bool, // one byte in the request arena, taken by `stream`
+
+pub fn next(self: *Rows) !?row_mod.Borrowed(Row) {
+    if (self.closed.*) return null;
+    ...
+}
 
 pub fn close(self: *Rows) void {
-    if (self.closed) return;
-    self.closed = true;
+    if (self.closed.*) return;
+    self.closed.* = true;
     if (traps_enabled) self.db.hold(&self.db.open_streams, .Sub);
     self.w.drain(&self.rows);
 }
@@ -76,15 +82,23 @@ that can actually see the double call is right here.
 **Making `Streamed` non-copyable**, which is the root cause and which Zig has
 no way to express.
 
+**A `bool` inside the value**, which is what this ADR first decided. It guarded
+the handle it sat in and nothing else: `var b = a; a.close(); b.close();`
+drained twice, and `b.next()` after `a.close()` read a result set that was gone
+(a deinitialised `pg.Result` on Postgres, a cached statement on SQLite that
+another fiber may hold by then). The same session that wrote the test for the
+closing twice through one handle had not written one through two. Now the flag
+is a pointer all copies share, and `next` looks at it.
+
 ## What it costs
 
-**One byte on the stack of a handler that streams, and nothing at all to one
-that does not** — `Streamed(Row)` is a value the handler holds, and it already
-carries two pointers and the Wire's `Rows`, so in practice the `bool` lands in
-padding.
+**One byte in the request arena and one pointer in the handle, both paid by a
+handler that calls `stream` and by no other.** The allocation is per `stream`
+call, not per row, so a million-row export still costs no allocation after the
+first.
 
-Nothing per request, nothing per connection, no allocation, and one predictable
-branch on a call that is about to do a round trip's worth of work.
+Nothing per request that does not stream, nothing per connection, and one
+predictable branch each on `next` and `close`.
 
 ## What holds it
 

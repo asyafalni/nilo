@@ -85,9 +85,9 @@ const Join = struct {
     /// The text after `JOIN`, the `ON` clause included.
     text: []const u8,
     /// Whether the join leaves out a row of the table the statement reads:
-    /// inner over a reference that may be null (item 109). A count joins it
-    /// whatever its condition names, or it would count rows the list leaves
-    /// out.
+    /// inner over a reference that may be null (item 109), or a required
+    /// parent, whose row may be missing. A count joins it whatever its
+    /// condition names, or it would count rows the list leaves out.
     narrows: bool = false,
 };
 
@@ -99,6 +99,23 @@ const Output = struct {
     name: []const u8,
     /// What `GROUP BY` repeats for it, or null for an aggregate.
     group: ?[]const u8,
+    /// What an `ORDER BY` writes for it in place of its name, or null to write
+    /// the name. Set for a column read as text (`Decimal`, `Interval`, `Inet`
+    /// and an aggregate over one): Postgres reads a bare name in `ORDER BY`
+    /// against the answer's names first, so `ORDER BY "total"` sorts the text
+    /// `"total"::text` and puts `9.00` after `100.5`. The expression under the
+    /// cast is not an answer's name, so it sorts the number
+    /// ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+    bare: ?[]const u8 = null,
+};
+
+/// A term `GROUP BY` names that the answer does not carry: the key of a
+/// parent whose columns are read, or of the row a `nilo_through` value came from.
+const GroupKey = struct {
+    /// Never a name an `.order` can say, so a run-time ordering never
+    /// mistakes it for one it already has.
+    name: []const u8,
+    expr: []const u8,
 };
 
 /// Everything a statement over a shaped Row is written from, worked out once.
@@ -106,6 +123,10 @@ const Layout = struct {
     relation: []const u8,
     joins: []const Join,
     outputs: []const Output,
+    /// For a grouped Row, the key of each parent it reads, which `GROUP BY`
+    /// repeats without selecting: a group is one parent, not every parent
+    /// that shares a name ([ADR 218](../docs/adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)).
+    keys: []const GroupKey = &.{},
 };
 
 /// How many columns of the answer a Row fills, parents included: what a
@@ -133,7 +154,22 @@ fn layoutOf(comptime D: type, comptime Row: type) Layout {
         const relation = statement.relation(D, Row);
         var joins: []const Join = &.{};
         var outputs: []const Output = &.{};
-        visit(D, Row, Row, relation, &.{}, relation, false, &joins, &outputs);
+        var wanted: []const GroupKey = &.{};
+        visit(D, Row, Row, relation, &.{}, relation, false, &joins, &outputs, &wanted);
+        // A key the answer already groups by is not written twice.
+        var keys: []const GroupKey = &.{};
+        for (wanted) |k| {
+            var seen = false;
+            for (outputs) |o| {
+                if (o.group) |g| if (std.mem.eql(u8, g, k.expr)) {
+                    seen = true;
+                };
+            }
+            for (keys) |had| if (std.mem.eql(u8, had.expr, k.expr)) {
+                seen = true;
+            };
+            if (!seen) keys = keys ++ &[_]GroupKey{k};
+        }
         // The tables an aggregate's `.where` reaches through a reference,
         // after the parents: a hop's `ON` names the relation or another
         // hop, never a parent's alias.
@@ -142,7 +178,7 @@ fn layoutOf(comptime D: type, comptime Row: type) Layout {
                 joins = joins ++ &[_]Join{.{ .alias = hop.alias, .text = hop.text }};
             }
         }
-        return .{ .relation = relation, .joins = joins, .outputs = outputs };
+        return .{ .relation = relation, .joins = joins, .outputs = outputs, .keys = keys };
     }
 }
 
@@ -158,6 +194,7 @@ fn visit(
     comptime optional_above: bool,
     comptime joins: *[]const Join,
     comptime outputs: *[]const Output,
+    comptime keys: *[]const GroupKey,
 ) void {
     comptime {
         for (@typeInfo(Level).@"struct".fields) |f| {
@@ -170,14 +207,17 @@ fn visit(
                         .read = D.readAs(column, f.type),
                         .name = name,
                         .group = column,
+                        .bare = if (types_mod.asText(f.type) != null) column else null,
                     }};
                 },
                 .aggregate => {
                     const aggregate = row_mod.aggregateOf(Level, f.name).?;
+                    const call = where_mod.aggregateCall(D, Level, relation, aggregate);
                     outputs.* = outputs.* ++ &[_]Output{.{
-                        .read = D.readAggregate(where_mod.aggregateCall(D, Level, relation, aggregate), aggregate.kind, f.type),
+                        .read = D.readAggregate(call, aggregate.kind, f.type),
                         .name = name,
                         .group = null,
+                        .bare = if (types_mod.asText(f.type) != null) call else null,
                     }};
                 },
                 .parent => {
@@ -185,7 +225,12 @@ fn visit(
                     const link = parentLink(Level, f.name);
                     const optional = @typeInfo(f.type) == .optional;
                     const alias = D.quote(name);
-                    if (std.mem.eql(u8, alias, relation)) @compileError(
+                    // Against the bare table name as well as the relation: a
+                    // table with a schema is `"app"."orders"`, whose name in
+                    // the `FROM` is still `"orders"`, and Postgres refuses
+                    // *table name specified more than once* for the pair.
+                    if (std.mem.eql(u8, alias, relation) or
+                        std.mem.eql(u8, alias, D.quote(row_mod.qualifiedOf(Top).table))) @compileError(
                         "nilo: " ++ @typeName(Top) ++ "'s parent `" ++ name ++ "` would be joined " ++
                             "under the name of the table the statement reads.\n" ++
                             "  A parent is joined under its field's name, so two relations would be " ++
@@ -204,6 +249,13 @@ fn visit(
                         .alias = name,
                         .text = (if (left) " LEFT JOIN " else " JOIN ") ++
                             statement.relation(D, Parent) ++ " AS " ++ alias ++ " ON " ++ on,
+                        // An inner join leaves out a row whose parent is not
+                        // there, which a table without the foreign key, or
+                        // one deferred inside a transaction, can hold. So a
+                        // count joins it too, or it counts rows the list
+                        // drops: a page at offset 1 read a total of 1 over a
+                        // list that was empty.
+                        .narrows = !left,
                     }};
                     // A parent that may be missing answers one more column:
                     // whether the key it was joined on matched. Its own
@@ -218,7 +270,15 @@ fn visit(
                             .group = present,
                         }};
                     }
-                    visit(D, Top, Parent, alias, at, relation, left, joins, outputs);
+                    // A grouped Row groups by what identifies the parent, or two
+                    // parents that share a name are one row with their sums added.
+                    if (row_mod.isGrouped(Top)) {
+                        for (link.targets) |target| keys.* = keys.* ++ &[_]GroupKey{.{
+                            .name = name ++ ".#" ++ target,
+                            .expr = alias ++ "." ++ D.quote(target),
+                        }};
+                    }
+                    visit(D, Top, Parent, alias, at, relation, left, joins, outputs, keys);
                 },
                 .over_children => outputs.* = outputs.* ++ &[_]Output{.{
                     .read = overChildrenRead(D, Level, f.name, f.type, here),
@@ -244,7 +304,13 @@ fn visit(
                         .read = D.readAs(reached.read, f.type),
                         .name = name,
                         .group = reached.read,
+                        .bare = if (types_mod.asText(f.type) != null) reached.read else null,
                     }};
+                    // Grouped by the referenced row too, not only its value: two
+                    // customers named alike are two groups.
+                    if (row_mod.isGrouped(Top) and reached.key.len > 0) {
+                        keys.* = keys.* ++ &[_]GroupKey{.{ .name = name ++ ".#through", .expr = reached.key }};
+                    }
                 },
                 .children, .beside => {},
             }
@@ -342,7 +408,11 @@ fn throughWithoutReference(comptime Level: type, comptime field: []const u8, com
 /// `read` is the column, or `COALESCE(column, value)` for an `.otherwise`,
 /// which is what the `SELECT` list, a condition, an order and a group all
 /// name, so the four agree about a row the path did not reach.
-const Through = struct { joins: []const Join, read: []const u8, alias: []const u8 };
+///
+/// `key` is the first referenced row's key under its alias, or empty when the
+/// field sits on its own level: what identifies the row the value came from,
+/// which a grouped Row's `GROUP BY` needs beside the value.
+const Through = struct { joins: []const Join, read: []const u8, alias: []const u8, key: []const u8 = "" };
 
 pub fn throughOf(
     comptime D: type,
@@ -361,6 +431,7 @@ pub fn throughOf(
         var chain: []const u8 = "";
         var left = optional_above;
         var joins: []const Join = &.{};
+        var key: []const u8 = "";
         for (steps[0 .. steps.len - 1], 0..) |column, i| {
             const pointed = table_mod.pointedFrom(R, column) orelse throughWithoutReference(Level, field, R, column);
             chain = chain ++ (if (i == 0) "" else ".") ++ column;
@@ -374,8 +445,13 @@ pub fn throughOf(
                 .text = (if (left) " LEFT JOIN " else " JOIN ") ++ statement.relation(D, pointed.row) ++
                     " AS " ++ quoted ++ " ON " ++ quoted ++ "." ++ D.quote(pointed.target) ++
                     " = " ++ at ++ "." ++ D.quote(column),
-                .narrows = inner and nullable,
+                // Inner is inner: a row whose referenced row is missing is
+                // left out, whether or not the reference can be null, and a
+                // count that skipped the join would count it (the parent's
+                // join says the same, above).
+                .narrows = !left,
             }};
+            if (i == 0) key = quoted ++ "." ++ D.quote(pointed.target);
             at = quoted;
             R = pointed.row;
         }
@@ -390,7 +466,7 @@ pub fn throughOf(
             ) ++ ")"
         else
             column;
-        return .{ .joins = joins, .read = read, .alias = alias };
+        return .{ .joins = joins, .read = read, .alias = alias, .key = key };
     }
 }
 
@@ -569,6 +645,13 @@ const counted_alias = "#c";
 pub fn overChildrenCall(comptime D: type, comptime Row: type, comptime field: []const u8, comptime here: []const u8) []const u8 {
     comptime {
         const over = row_mod.overChildrenOf(Row, field);
+        if (over.column) |c| dialect_mod.assertDecimalCompares(
+            D,
+            over.Child,
+            c,
+            row_mod.ColumnType(row_mod.ownerOf(over.Child), c),
+            "`" ++ over.word ++ "` (field `." ++ field ++ "`)",
+        );
         const link = backLink(Row, field, over.Child, overHow(over));
         const alias = D.quote(counted_alias);
         var joined: []const u8 = "";
@@ -725,6 +808,7 @@ pub fn assertShape(comptime Row: type) void {
                     );
                     if (over.column) |column| {
                         const C = row_mod.ColumnType(row_mod.ownerOf(over.Child), column);
+                        assertOrdersForMinMax(Row, f.name, over.word, column, C);
                         const Bare = switch (@typeInfo(C)) {
                             .optional => |o| o.child,
                             else => C,
@@ -900,6 +984,56 @@ fn assertChildRow(comptime Row: type) void {
     }
 }
 
+/// `min` and `max` are over a column with an order the database defines for
+/// it. Postgres has no `max(boolean)`, `max(uuid)`, `max(json)`, `max(jsonb)`
+/// or `max(bytea)` (17.10: *function max(boolean) does not exist*), so a Row
+/// reading one compiled and failed on the first request; and SQLite would
+/// answer for all of them, by its storage class's order, which is not an order
+/// anybody asked for and is not the one Postgres would give. So the four are
+/// refused on both (ADR 055). An enum is not in the four: Postgres orders it
+/// by declaration and SQLite by its name as text, which is a difference this
+/// does not close.
+///
+/// `over_children` (`word` is `max` or `min`) is asked the same, so both places
+/// a `min` or `max` is read say the same words.
+fn assertOrdersForMinMax(
+    comptime Row: type,
+    comptime field: []const u8,
+    comptime word: []const u8,
+    comptime column: []const u8,
+    comptime C: type,
+) void {
+    comptime {
+        const Bare = switch (@typeInfo(C)) {
+            .optional => |o| o.child,
+            else => C,
+        };
+        const kind: ?[]const u8 = if (Bare == bool)
+            "a bool"
+        else if (Bare == types_mod.Uuid)
+            "a Uuid"
+        else if (types_mod.isBytes(Bare))
+            "Bytes"
+        else if (types_mod.jsonPayload(Bare) != null)
+            "Json"
+        else if (types_mod.asText(Bare)) |named| blk: {
+            const unordered = [_][]const u8{ "json", "jsonb", "uuid", "bytea", "bool", "boolean" };
+            for (unordered) |name| {
+                if (std.mem.eql(u8, named, name)) break :blk "a " ++ named ++ " column";
+            }
+            break :blk null;
+        } else null;
+        if (kind) |what| @compileError(
+            "nilo: " ++ @typeName(Row) ++ " reads `." ++ field ++ "`, the " ++ word ++ " of `" ++ column ++
+                "`, which is " ++ what ++ ".\n" ++
+                "  Postgres has no `" ++ word ++ "` over it (*function " ++ word ++
+                "(…) does not exist*), and SQLite would answer in an order nobody chose. " ++
+                "Count the rows with the value you mean, or read the first row in the order " ++
+                "you mean with `.order` and a limit of one.",
+        );
+    }
+}
+
 /// The type an aggregate's field has to be, said as a rule rather than
 /// guessed: what the computation answers, and a `?` exactly when it can be
 /// null.
@@ -950,7 +1084,10 @@ fn assertAggregate(comptime Row: type, comptime Owner: type, comptime field: []c
                         @typeName(C) ++ ".\n  An average is over whole or floating numbers.",
                 ),
             },
-            .min, .max => CBare,
+            .min, .max => blk: {
+                assertOrdersForMinMax(Row, field, words, column, C);
+                break :blk CBare;
+            },
             .count, .count_distinct => unreachable,
         };
         if (Bare != Want) @compileError(
@@ -987,12 +1124,78 @@ fn assertAggregate(comptime Row: type, comptime Owner: type, comptime field: []c
 // -- the statements -------------------------------------------------------
 
 /// How many rows a caller is asking for, the way `statement.zig` says it.
-pub const Answers = enum { many, first, page };
+pub const Answers = enum { many, first, page, feed };
 
 /// What a read of a shaped Row takes. No `.lock`, which `assertNoLock` says
 /// why; `db.one` has no `.limit`, because it compiles its own.
-const known = [_][]const u8{ "where", "order", "limit", "offset" };
+const known = [_][]const u8{ "where", "order", "limit", "offset", "after" };
 const known_first = [_][]const u8{ "where", "order", "offset" };
+
+/// The terms a grouped Row's rows are told apart by: every column it groups
+/// by, and the key of each parent, in the order the statement groups them. A
+/// group has no key of its own, and its `GROUP BY` list is what identifies it.
+fn groupTerms(comptime layout: Layout) []const GroupKey {
+    comptime {
+        var out: []const GroupKey = &.{};
+        for (layout.outputs) |o| {
+            const g = o.group orelse continue;
+            // Whether a parent is there follows from its key.
+            if (std.mem.endsWith(u8, o.name, ".#")) continue;
+            out = out ++ &[_]GroupKey{.{ .name = o.name, .expr = g }};
+        }
+        return out ++ layout.keys;
+    }
+}
+
+/// The field paths an `.order` names, as the answer calls them:
+/// `.{ .revenue = .desc, .customer = .{ .name = .asc } }` names `revenue` and
+/// `customer.name`.
+fn orderNames(comptime T: type, comptime path: []const []const u8) []const []const u8 {
+    comptime {
+        var out: []const []const u8 = &.{};
+        for (@typeInfo(T).@"struct".fields) |f| {
+            const at = path ++ &[_][]const u8{f.name};
+            if (@typeInfo(f.type) == .@"struct") {
+                out = out ++ orderNames(f.type, at);
+            } else out = out ++ &[_][]const u8{row_mod.pathName(at)};
+        }
+        return out;
+    }
+}
+
+/// `statement.tiebreak` for a shaped Row. A grouped Row's tiebreak is every
+/// term it groups by that the `.order` did not name, running the way the
+/// order's last term runs ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md#a-page-ends-in-the-key)):
+/// two groups with the same revenue would otherwise change places between the
+/// request for page one and the request for page two.
+fn tiebreakFor(comptime D: type, comptime Row: type, comptime Sort: type, comptime layout: Layout) []const u8 {
+    comptime {
+        if (!row_mod.isGrouped(Row)) return statement.tiebreak(D, Row, Sort, layout.relation ++ ".");
+        const named = orderNames(Sort, &.{});
+        const way = if (statement.lastDescending(Sort)) " DESC" else " ASC";
+        var out: []const u8 = "";
+        for (groupTerms(layout)) |k| {
+            const said = for (named) |n| {
+                if (std.mem.eql(u8, n, k.name)) break true;
+            } else false;
+            if (said) continue;
+            out = out ++ (if (out.len == 0) "" else ", ") ++ k.expr ++ way;
+        }
+        return out;
+    }
+}
+
+/// `statement.tiesOf` for a shaped Row.
+fn tiesFor(comptime D: type, comptime Row: type, comptime layout: Layout) []const statement.Tie {
+    comptime {
+        if (!row_mod.isGrouped(Row)) return statement.tiesOf(D, Row, layout.relation ++ ".");
+        var out: []const statement.Tie = &.{};
+        for (groupTerms(layout)) |k| {
+            out = out ++ &[_]statement.Tie{.{ .column = k.name, .text = k.expr ++ " ASC" }};
+        }
+        return out;
+    }
+}
 
 /// The `SELECT` list: every output under its name.
 fn selectList(comptime D: type, comptime outputs: []const Output) []const u8 {
@@ -1012,6 +1215,7 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
             .many => "`db.select`",
             .first => "`db.one`",
             .page => "`db.page`",
+            .feed => "`db.feed`",
         };
         if (row_mod.isTally(Row)) @compileError(
             "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ ", whose every field is an aggregate.\n" ++
@@ -1023,6 +1227,13 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
         if (answers == .first and @hasField(O, "limit")) @compileError(
             "nilo: `db.one` on " ++ @typeName(Row) ++ " was given a `.limit`.\n" ++
                 "  It answers with one row or with none, and compiles its own `LIMIT 1`.",
+        );
+        if (answers == .feed) statement.assertFeed(Row, O);
+        if (answers == .page and @hasField(O, "after")) @compileError(
+            "nilo: `db.page` on " ++ @typeName(Row) ++ " was given an `.after`.\n" ++
+                "  A page skips rows by `OFFSET` and counts every match; a cursor reads the rows " ++
+                "after one and has no page for a count to be relative to. Read it with `db.feed`, " ++
+                "which says whether there are more.",
         );
         if (answers == .page and !@hasField(O, "limit")) @compileError(
             "nilo: `db.page` on " ++ @typeName(Row) ++ " was given no `.limit`.\n" ++
@@ -1048,20 +1259,30 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
         var reserve: ?usize = null;
 
         var ordered = false;
+        var ties: []const statement.Tie = &.{};
         var head: []const u8 = "";
         if (@hasField(O, "order")) {
             const Sort = @FieldType(O, "order");
+            const cut = @hasField(O, "limit") or @hasField(O, "offset") or answers != .many;
             if (ordering.orderingOf(Sort) != null) {
                 ordering.assertFor(Sort, Row, call, true);
                 ordered = true;
+                if (cut) ties = tiesFor(D, Row, layout);
                 head = sql;
                 sql = "";
             } else {
-                sql = sql ++ orderBy(D, Row, Sort);
+                const written = orderBy(D, Row, Sort, layout.outputs);
+                sql = sql ++ if (cut)
+                    statement.cutOrder(written, tiebreakFor(D, Row, Sort, layout))
+                else
+                    written;
             }
         }
         if (@hasField(O, "limit")) {
-            const bound = statement.boundary(D, O, "limit", next);
+            const bound = if (answers == .feed)
+                statement.past(statement.boundary(D, O, "limit", next))
+            else
+                statement.boundary(D, O, "limit", next);
             sql = sql ++ D.limit(bound.text);
             reserve = bound.written;
             if (bound.path) |path| {
@@ -1076,7 +1297,7 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
         }
         if (@hasField(O, "offset")) {
             const bound = statement.boundary(D, O, "offset", next);
-            sql = sql ++ D.offset(bound.text);
+            sql = sql ++ D.offset(bound.text, @hasField(O, "limit") or answers == .first);
             if (bound.path) |path| {
                 paths = paths ++ &[_]where_mod.Path{path};
                 params = params ++ &[_]where_mod.Param{.{}};
@@ -1091,6 +1312,7 @@ pub fn rows(comptime D: type, comptime Row: type, comptime O: type, comptime ans
             .reserve = reserve,
             .ordered = true,
             .tail = sql,
+            .ties = ties,
         };
         break :blk .{ .sql = sql, .paths = paths, .params = params, .reserve = reserve };
     };
@@ -1302,6 +1524,13 @@ fn childOrder(comptime D: type, comptime Table: type, comptime relation: []const
                 "nilo: " ++ what ++ " `.order` gives `" ++ f.name ++ "` a " ++ @typeName(f.type) ++
                     ".\n  A direction is `.asc` or `.desc`, or one of the four that also say where NULLs go.",
             );
+            dialect_mod.assertDecimalCompares(
+                D,
+                Table,
+                f.name,
+                row_mod.ColumnType(Table, f.name),
+                what ++ " `.order." ++ f.name ++ "`",
+            );
             const direction: Direction = statement.writtenValue(T, f.name, Direction);
             // A slice rather than the array `++` would infer, or a `NULLS`
             // clause appended below is a different length and does not fit.
@@ -1391,6 +1620,20 @@ fn bodyOf(
             }
         }
 
+        // A cursor, on the table's own columns, beside whatever `.where` said.
+        if (@hasField(O, "after")) {
+            if (grouped) @compileError(
+                "nilo: " ++ @typeName(Row) ++ " is read after a cursor, and its rows are groups, which have " ++
+                    "no key to end the order in.\n" ++
+                    "  Page the groups with `.offset`.",
+            );
+            const k = statement.afterOf(D, Row, O, layout.relation ++ ".", next, "a read");
+            where = if (where.len > 0) where ++ " AND " ++ k.sql else k.sql;
+            paths = paths ++ k.paths;
+            params = params ++ k.params;
+            next += k.paths.len;
+        }
+
         // A join that leaves rows out is reached by every count, with the
         // hops before it that its `ON` names.
         for (layout.joins) |j| {
@@ -1408,6 +1651,7 @@ fn bodyOf(
                 const g = o.group orelse continue;
                 groups = groups ++ (if (groups.len == 0) "" else ", ") ++ g;
             }
+            for (layout.keys) |k| groups = groups ++ (if (groups.len == 0) "" else ", ") ++ k.expr;
             if (groups.len > 0) text = text ++ " GROUP BY " ++ groups;
             if (having.len > 0) text = text ++ " HAVING " ++ having;
         }
@@ -1442,18 +1686,44 @@ fn assertNoLock(comptime Row: type, comptime O: type, comptime call: []const u8)
 /// `ORDER BY`, written against the names the answer carries: a field of the
 /// Row, an aggregate, or a parent's column through the parent's field:
 /// `.order = .{ .customer = .{ .name = .asc } }`.
-fn orderBy(comptime D: type, comptime Row: type, comptime T: type) []const u8 {
+fn orderBy(comptime D: type, comptime Row: type, comptime T: type, comptime outputs: []const Output) []const u8 {
     comptime {
-        const terms = orderTerms(D, Row, T, &.{}, statement.relation(D, Row));
+        const terms = orderTerms(D, Row, T, &.{}, statement.relation(D, Row), outputs);
         return if (terms.len == 0) "" else " ORDER BY " ++ terms;
     }
+}
+
+/// The expression under the cast of the answer's column `name`, when the
+/// column is read as text: what an `ORDER BY` writes so that it sorts the
+/// value and not its printing. Null for every other column, which an `ORDER
+/// BY` names by its answer's name as it always did.
+fn bareOf(comptime outputs: []const Output, comptime name: []const u8) ?[]const u8 {
+    comptime {
+        for (outputs) |o| {
+            if (std.mem.eql(u8, o.name, name)) return o.bare;
+        }
+        return null;
+    }
+}
+
+/// `bareOf` for a Row the caller has not laid out: an `Ordering` key over a
+/// shaped Row asks for the column it names (`ordering.zig`).
+pub fn orderExpr(comptime D: type, comptime Row: type, comptime name: []const u8) ?[]const u8 {
+    return comptime bareOf(layoutOf(D, Row).outputs, name);
 }
 
 /// `relation` is the Row's own table as the statement names it, for a column
 /// of that table the Row does not carry (`tableHasColumn`): written through
 /// the table rather than through the answer, so it is only for a Row that is
 /// not grouped, where every row of the table is still a row of the answer.
-fn orderTerms(comptime D: type, comptime Level: type, comptime T: type, comptime path: []const []const u8, comptime relation: []const u8) []const u8 {
+fn orderTerms(
+    comptime D: type,
+    comptime Level: type,
+    comptime T: type,
+    comptime path: []const []const u8,
+    comptime relation: []const u8,
+    comptime outputs: []const Output,
+) []const u8 {
     comptime {
         const info = switch (@typeInfo(T)) {
             .@"struct" => |s| s,
@@ -1467,7 +1737,7 @@ fn orderTerms(comptime D: type, comptime Level: type, comptime T: type, comptime
             const at = path ++ &[_][]const u8{f.name};
             const kind: row_mod.Kind = if (row_mod.fieldTypeOf(Level, f.name) == null) .column else row_mod.kindOf(Level, f.name);
             const term = switch (kind) {
-                .parent => orderTerms(D, row_mod.parentRowOf(row_mod.fieldTypeOf(Level, f.name).?).?, f.type, at, ""),
+                .parent => orderTerms(D, row_mod.parentRowOf(row_mod.fieldTypeOf(Level, f.name).?).?, f.type, at, "", outputs),
                 .column, .aggregate, .over_children, .through => term: {
                     const carried = row_mod.fieldTypeOf(Level, f.name) != null;
                     const through_table = !carried and path.len == 0 and
@@ -1488,8 +1758,22 @@ fn orderTerms(comptime D: type, comptime Level: type, comptime T: type, comptime
                             "where NULLs go. A parent takes the terms for its own columns: `." ++ f.name ++
                             " = .{ .<column> = .asc }`.",
                     );
+                    // A column, or a `.through` field read at the end of a path,
+                    // is what the database sorts as it stores it. An aggregate
+                    // and a figure over the children were checked against the
+                    // column they read when they were laid out.
+                    if (kind == .column or kind == .through) dialect_mod.assertDecimalCompares(
+                        D,
+                        Level,
+                        f.name,
+                        if (carried) row_mod.fieldTypeOf(Level, f.name).? else row_mod.ColumnType(row_mod.ownerOf(Level), f.name),
+                        "`.order." ++ row_mod.pathName(at) ++ "`",
+                    );
                     const direction: Direction = statement.writtenValue(T, f.name, Direction);
-                    const named = if (through_table) relation ++ "." ++ D.quote(f.name) else D.quote(row_mod.pathName(at));
+                    const named = if (through_table)
+                        relation ++ "." ++ D.quote(f.name)
+                    else
+                        bareOf(outputs, row_mod.pathName(at)) orelse D.quote(row_mod.pathName(at));
                     // A slice, for the reason `childOrder` gives.
                     var one: []const u8 = named ++ (if (direction.descending()) " DESC" else " ASC");
                     if (direction.placement()) |where_nulls| {
@@ -1642,9 +1926,13 @@ test "a column read through a reference is a field of its own, joined once and n
             joins ++ " WHERE \"#t/customer_id\".\"name\" = $1 ORDER BY \"approver_name\" ASC",
         found.sql,
     );
-    // A count joins only what its condition reads.
+    // A count joins what leaves rows out, which is `customer_name`'s inner
+    // join (its reference cannot be null, but the referenced row can be
+    // missing), and otherwise only what its condition reads.
     try testing.expectEqualStrings(
-        "SELECT count(*) FROM \"orders\" LEFT JOIN \"staff\" AS \"#t/approver_id\" ON " ++
+        "SELECT count(*) FROM \"orders\" JOIN \"customers\" AS \"#t/customer_id\" ON " ++
+            "\"#t/customer_id\".\"id\" = \"orders\".\"customer_id\" " ++
+            "LEFT JOIN \"staff\" AS \"#t/approver_id\" ON " ++
             "\"#t/approver_id\".\"id\" = \"orders\".\"approver_id\" WHERE \"#t/approver_id\".\"full_name\" = $1",
         (comptime tally(Pg, OrderFlat, @TypeOf(.{ .where = .{ .approver_name = @as([]const u8, "Budi") } }), false)).sql,
     );
@@ -1655,7 +1943,19 @@ test "a column read through a reference is a field of its own, joined once and n
     try testing.expect(std.mem.indexOf(u8, lines.sql, "\"#t/order_id.customer_id\".\"name\" AS \"customer\"") != null);
     // And a key of a group, like a column of the table.
     const grouped = comptime rows(Pg, ByCustomerName, @TypeOf(.{}), .many);
-    try testing.expect(std.mem.endsWith(u8, grouped.sql, "GROUP BY \"#t/customer_id\".\"name\""));
+    // and by the referenced row's key, or two customers of one name are one group.
+    try testing.expect(std.mem.endsWith(u8, grouped.sql, "GROUP BY \"#t/customer_id\".\"name\", \"#t/customer_id\".\"id\""));
+}
+
+test "a grouped Row groups by the key of the row a through value came from, once, on both dialects" {
+    const pg = comptime rows(Pg, ByCustomerName, @TypeOf(.{}), .many);
+    try testing.expect(std.mem.endsWith(u8, pg.sql, " GROUP BY \"#t/customer_id\".\"name\", \"#t/customer_id\".\"id\""));
+    const lite = comptime rows(Lite, ByCustomerName, @TypeOf(.{}), .many);
+    try testing.expect(std.mem.endsWith(u8, lite.sql, " GROUP BY \"#t/customer_id\".\"name\", \"#t/customer_id\".\"id\""));
+    // The key is not selected, and a page ends in it.
+    try testing.expect(std.mem.indexOf(u8, pg.sql, "\"id\" AS") == null);
+    const page = comptime rows(Pg, ByCustomerName, @TypeOf(.{ .order = .{ .orders = .desc } }), .many);
+    try testing.expect(std.mem.indexOf(u8, page.sql, "ORDER BY \"orders\" DESC") != null);
 }
 
 /// A row the path does not reach reads a value, or is left out (item 109).
@@ -1690,8 +1990,9 @@ test "a through field says what a row its path does not reach reads, or leaves t
     );
     // A count joins what leaves rows out whatever its condition reads, so it
     // counts the rows the list answers.
+    const customer = " JOIN \"customers\" AS \"#t/customer_id\" ON \"#t/customer_id\".\"id\" = \"orders\".\"customer_id\"";
     try testing.expectEqualStrings(
-        "SELECT count(*) FROM \"orders\"" ++ approver,
+        "SELECT count(*) FROM \"orders\"" ++ customer ++ approver,
         (comptime tally(Pg, OrderReached, @TypeOf(.{}), false)).sql,
     );
 }
@@ -1822,14 +2123,118 @@ test "a grouped Row groups by its other fields and sums the rest, cast to what t
         "SELECT \"customer\".\"name\" AS \"customer.name\", count(*) AS \"orders\", " ++
             "sum(\"orders\".\"total\")::int8 AS \"revenue\", sum(\"orders\".\"discount\")::int8 AS \"off\" " ++
             "FROM \"orders\" JOIN \"customers\" AS \"customer\" ON \"customer\".\"id\" = \"orders\".\"customer_id\" " ++
-            "WHERE \"orders\".\"year\" = $1 GROUP BY \"customer\".\"name\" HAVING sum(\"orders\".\"total\") > $2 " ++
-            "ORDER BY \"revenue\" DESC LIMIT 10",
+            "WHERE \"orders\".\"year\" = $1 GROUP BY \"customer\".\"name\", \"customer\".\"id\" " ++
+            "HAVING sum(\"orders\".\"total\") > $2 " ++
+            "ORDER BY \"revenue\" DESC, \"customer\".\"name\" DESC, \"customer\".\"id\" DESC LIMIT 10",
         found.sql,
     );
     // The condition on the rows binds as the table's column, the one on the
     // groups as the field's.
     try testing.expect(found.params[0].of.? == Order);
     try testing.expect(found.params[1].of.? == ByCustomer);
+}
+
+const CustomerKeyed = struct {
+    pub const nilo_table = Customer;
+    id: i64,
+    name: []const u8,
+};
+
+const ByCustomerKeyed = struct {
+    pub const nilo_table = Order;
+    pub const nilo_aggregate = .{ .orders = .count };
+    customer: CustomerKeyed,
+    orders: i64,
+};
+
+test "a grouped Row groups by its parent's key, which it does not select, so two parents with one name stay two rows" {
+    const found = comptime rows(Pg, ByCustomer, @TypeOf(.{}), .many);
+    try testing.expect(std.mem.indexOf(u8, found.sql, "SELECT \"customer\".\"name\" AS \"customer.name\", count(*)") != null);
+    try testing.expect(std.mem.endsWith(u8, found.sql, " GROUP BY \"customer\".\"name\", \"customer\".\"id\""));
+    // A parent whose key the Row reads already is grouped by it once.
+    const keyed = comptime rows(Lite, ByCustomerKeyed, @TypeOf(.{}), .many);
+    try testing.expect(std.mem.endsWith(u8, keyed.sql, " GROUP BY \"customer\".\"id\", \"customer\".\"name\""));
+}
+
+test "a page over a grouped Row ends in the columns it groups by, the way its last term runs" {
+    const asc = comptime rows(Pg, ByCustomer, @TypeOf(.{ .order = .{ .revenue = .asc }, .limit = 10 }), .many);
+    try testing.expect(std.mem.endsWith(
+        u8,
+        asc.sql,
+        " ORDER BY \"revenue\" ASC, \"customer\".\"name\" ASC, \"customer\".\"id\" ASC LIMIT 10",
+    ));
+    // What the order names is not written twice.
+    const named = comptime rows(Pg, ByCustomer, @TypeOf(.{
+        .order = .{ .customer = .{ .name = .desc }, .revenue = .desc },
+        .limit = 10,
+    }), .many);
+    try testing.expect(std.mem.endsWith(
+        u8,
+        named.sql,
+        " ORDER BY \"customer.name\" DESC, \"revenue\" DESC, \"customer\".\"id\" DESC LIMIT 10",
+    ));
+    // An answer nothing cuts is left as written.
+    const whole = comptime rows(Pg, ByCustomer, @TypeOf(.{ .order = .{ .revenue = .asc } }), .many);
+    try testing.expect(std.mem.endsWith(u8, whole.sql, " ORDER BY \"revenue\" ASC"));
+    // A run-time ordering is told which terms a group is told apart by.
+    const chosen = comptime rows(Pg, ByCustomer, @TypeOf(.{
+        .order = ordering.Ordering(ByCustomer, .{ .revenue = .revenue }).by(&.{.{ .key = .revenue }}),
+        .limit = 10,
+    }), .many);
+    try testing.expectEqual(@as(usize, 2), chosen.ties.len);
+    try testing.expectEqualStrings("customer.name", chosen.ties[0].column);
+    try testing.expectEqualStrings("\"customer\".\"id\" ASC", chosen.ties[1].text);
+}
+
+const Invoice = struct {
+    pub const nilo_table = .{ .name = "invoices", .references = .{ .customer_id = .{ Customer, .id } } };
+    id: i64,
+    customer_id: i64,
+    amount: types_mod.Decimal,
+};
+
+const InvoiceCard = struct {
+    pub const nilo_table = Invoice;
+    id: i64,
+    amount: types_mod.Decimal,
+    customer: CustomerName,
+};
+
+const BilledByCustomer = struct {
+    pub const nilo_table = Invoice;
+    pub const nilo_aggregate = .{ .billed = .{ .sum = .amount } };
+    customer: CustomerName,
+    billed: types_mod.Decimal,
+};
+
+test "an order over a column read as text names the value under the cast, or Postgres sorts the printing" {
+    // `"amount"::text AS "amount"` is an answer called `amount`, and a bare
+    // `ORDER BY "amount"` is read against the answers first: 9.00, 100.5, 10.00.
+    const found = comptime rows(Pg, InvoiceCard, @TypeOf(.{ .order = .{ .amount = .desc }, .limit = 5 }), .many);
+    try testing.expect(std.mem.indexOf(u8, found.sql, "\"invoices\".\"amount\"::text AS \"amount\"") != null);
+    try testing.expect(std.mem.endsWith(u8, found.sql, " ORDER BY \"invoices\".\"amount\" DESC, \"invoices\".\"id\" DESC LIMIT 5"));
+    // A column that is not read as text is still named by its answer.
+    const plain = comptime rows(Pg, InvoiceCard, @TypeOf(.{ .order = .{ .id = .desc } }), .many);
+    try testing.expect(std.mem.endsWith(u8, plain.sql, " ORDER BY \"id\" DESC"));
+    // A sum over one repeats the aggregate, not its answer's name.
+    const billed = comptime rows(Pg, BilledByCustomer, @TypeOf(.{ .order = .{ .billed = .desc } }), .many);
+    try testing.expect(std.mem.indexOf(u8, billed.sql, "sum(\"invoices\".\"amount\")::text AS \"billed\"") != null);
+    try testing.expect(std.mem.endsWith(u8, billed.sql, " ORDER BY sum(\"invoices\".\"amount\") DESC"));
+    // And so does an ordering chosen at run time.
+    const Sort = ordering.Ordering(BilledByCustomer, .{ .billed = .billed });
+    var buf: [Sort.most(Pg)]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Sort.by(&.{.{ .key = .billed, .direction = .desc }}).write(Pg, &w);
+    try testing.expectEqualStrings(" ORDER BY sum(\"invoices\".\"amount\") DESC", w.buffered());
+}
+
+test "an inner join through a reference that cannot be null says it narrows, so a count keeps it" {
+    const joined = comptime rows(Pg, OrderFlat, @TypeOf(.{}), .many);
+    const count = comptime tally(Pg, OrderFlat, @TypeOf(.{}), false);
+    try testing.expect(std.mem.indexOf(u8, joined.sql, " JOIN \"customers\" AS \"#t/customer_id\"") != null);
+    try testing.expect(std.mem.indexOf(u8, count.sql, " JOIN \"customers\" AS \"#t/customer_id\"") != null);
+    // The join of a reference that may be null is outer, and a count leaves it out.
+    try testing.expect(std.mem.indexOf(u8, count.sql, "#t/approver_id") == null);
 }
 
 const ByCustomerOpen = struct {
@@ -1858,7 +2263,7 @@ test "an aggregate with a .where reads only the rows it matches, the values writ
             "sum(\"orders\".\"total\") FILTER (WHERE \"orders\".\"status\" = 'paid' AND \"orders\".\"discount\" IS NULL)::int8 AS \"paid\", " ++
             "count(\"orders\".\"id\") FILTER (WHERE \"orders\".\"status\" <> 'it''s' AND \"orders\".\"year\" >= 2020 AND \"orders\".\"year\" < 2030) AS \"rest\" " ++
             "FROM \"orders\" JOIN \"customers\" AS \"customer\" ON \"customer\".\"id\" = \"orders\".\"customer_id\" " ++
-            "GROUP BY \"customer\".\"name\" " ++
+            "GROUP BY \"customer\".\"name\", \"customer\".\"id\" " ++
             "HAVING sum(\"orders\".\"total\") FILTER (WHERE \"orders\".\"status\" = 'paid' AND \"orders\".\"discount\" IS NULL) > $1 " ++
             "ORDER BY \"paid\" DESC",
         found.sql,
@@ -2056,17 +2461,29 @@ test "a count of a grouped Row counts the groups" {
     try testing.expectEqualStrings(
         "SELECT count(*) FROM (SELECT 1 FROM \"orders\" JOIN \"customers\" AS \"customer\" ON " ++
             "\"customer\".\"id\" = \"orders\".\"customer_id\" WHERE \"orders\".\"year\" = $1 " ++
-            "GROUP BY \"customer\".\"name\") AS \"#groups\"",
+            "GROUP BY \"customer\".\"name\", \"customer\".\"id\") AS \"#groups\"",
         found.sql,
     );
 }
 
-test "a count of a Row with parents joins only the parents its condition names" {
+test "a count of a Row with parents joins the required ones and those its condition names" {
+    // `customer` and `owner` are inner joins, which leave out an order whose
+    // row there is missing, so the count joins them to agree with the list.
+    // `approver` may be missing and drops nothing, so it is joined only when
+    // a condition reaches it.
     const none = comptime tally(Pg, OrderCard, @TypeOf(.{ .where = .{ .total = @as(i64, 1) } }), false);
-    try testing.expectEqualStrings("SELECT count(*) FROM \"orders\" WHERE \"orders\".\"total\" = $1", none.sql);
+    try testing.expectEqualStrings(
+        "SELECT count(*) FROM \"orders\" JOIN \"customers\" AS \"customer\" ON \"customer\".\"id\" = " ++
+            "\"orders\".\"customer_id\" JOIN \"staff\" AS \"owner\" ON \"owner\".\"id\" = " ++
+            "\"orders\".\"owner_id\" WHERE \"orders\".\"total\" = $1",
+        none.sql,
+    );
+    const approved = comptime tally(Pg, OrderCard, @TypeOf(.{ .where = .{ .approver = .{ .full_name = @as([]const u8, "x") } } }), false);
+    try testing.expect(std.mem.indexOf(u8, approved.sql, "LEFT JOIN \"staff\" AS \"approver\"") != null);
     const one = comptime tally(Pg, OrderCard, @TypeOf(.{ .where = .{ .owner = .{ .full_name = @as([]const u8, "x") } } }), true);
     try testing.expectEqualStrings(
-        "SELECT EXISTS(SELECT 1 FROM \"orders\" JOIN \"staff\" AS \"owner\" ON \"owner\".\"id\" = " ++
+        "SELECT EXISTS(SELECT 1 FROM \"orders\" JOIN \"customers\" AS \"customer\" ON \"customer\".\"id\" = " ++
+            "\"orders\".\"customer_id\" JOIN \"staff\" AS \"owner\" ON \"owner\".\"id\" = " ++
             "\"orders\".\"owner_id\" WHERE \"owner\".\"full_name\" = $1)",
         one.sql,
     );
@@ -2117,7 +2534,7 @@ test "a count of children is a subquery per row, sortable and a condition like a
         "SELECT \"orders\".\"id\" AS \"id\", " ++ lines ++ " AS \"line_count\", " ++
             "(SELECT count(*) FROM \"lines\" AS \"#c\" WHERE \"#c\".\"order_id\" = \"orders\".\"id\" AND \"#c\".\"qty\" >= 10) AS \"big_lines\", " ++
             "count(*) OVER () AS \"#total\" FROM \"orders\" WHERE " ++ lines ++ " > $1 " ++
-            "ORDER BY \"big_lines\" DESC LIMIT 20",
+            "ORDER BY \"big_lines\" DESC, \"orders\".\"id\" DESC LIMIT 20",
         found.sql,
     );
     // A count of a Row that is not the top one correlates with its alias.

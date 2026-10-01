@@ -7,7 +7,10 @@
 A raw statement's text is comptime, and `rawcheck` holds its `SELECT` list
 against the Row while compiling: how many columns, and the name of each one
 that plainly has a name ([ADR 051](051-a-statement-that-is-a-constant-can-be-prepared-once.md)).
-That is all a comptime pass can do. What a column *is* belongs to the
+That is all a comptime pass can do, and when it is unsure it passes: a name
+is claimed only for a bare path or an `AS name`, an unquoted one is folded to
+lower case as Postgres does, and text it cannot finish (an unterminated quote)
+is not read at all. What a column *is* belongs to the
 database: its type, and whether it can be NULL. ADR 051 left the type to
 `db.checking`, and `db.checking` holds tables, not statements, so for a raw
 statement nothing held either. The type was found by the first row that read
@@ -65,6 +68,14 @@ the same values, so a struct that named none was one flag for the whole
 program, and the first raw statement to run was the only one ever checked. The
 Fake-backed test that asks two statements in a row is what caught it.
 
+**The flag stays set only once `describe` has answered.** It used to be taken
+before the question was asked, so a first run that met a table a migration had
+not made yet, or a pool with nothing in it, spent the one check and left the
+statement unchecked for the life of the process. A `describe` that fails puts
+the flag back, and the next run asks again; that costs a round trip only while
+the statement beside it is failing too. The warning that it could not be asked
+is said once per statement, however often it is asked again.
+
 ### The types: what the driver will read, not what the table accepts
 
 On Postgres the types are the OIDs the statement's description answers with,
@@ -77,10 +88,12 @@ over `text` or an enum's label whatever the type is called.
 
 The list a field is held to is `Dialect.reads`, not `Dialect.accepts`.
 `accepts` is about a table a Row both reads and writes, and lets an `i32` stand
-over an `int8` column. The read is pg.zig's, which decodes an `i32` out of
-`int4` and nothing else, so `reads` makes the numbers exact. That is the
-mistake a raw statement makes most: `count(*)` is `int8`, `sum` of an `int8`
-is `numeric`, and neither reads into the field it usually goes into. A text
+over an `int8` column, which the Postgres Wire reads range-checked. `reads`
+takes a number column as wide as the field or narrower, and no wider: a
+narrower one widens without a value that can fail to fit, and a wider one is a
+read that works until the day a value passes the field. That is the mistake a
+raw statement makes most: `count(*)` is `int8`, `sum` of an `int8` is
+`numeric`, and neither is safe in the field it usually goes into. A text
 column (`Decimal`, `Interval`, an `AsText` type) is `text` in `reads`, because
 a raw statement asks for it as `::text` ([ADR 124](124-a-raw-statement-cannot-cast-what-it-did-not-write.md)).
 
@@ -168,7 +181,9 @@ a place to hide; the second is the paragraph above.
 
 **`accepts` for the types**, which is what `checkSchema` holds a table to. It
 lets an `i32` stand over an `int8`, which is the one mistake a raw statement
-makes most.
+makes most. **Exact widths** were the first version of `reads`; once the Wire
+read any integer column into any integer field range-checked, refusing an
+`int4` into an `i64` was a check failing a statement that could not fail.
 
 **`std.json` for the plan.** It was the first version and it cost +88,496 B on the Postgres program: an array hash map per object and a float parser for every number, to read four string keys. A reader of its own that skips numbers unread took it to +35,184, and moving the once-only half of the check out of the generic call to +30,864.
 
@@ -182,6 +197,5 @@ stale-plan retry's (ADR 051).
   wire.Described`; null is "cannot say", which the Fake answers unless a test
   sets `described`. A Dialect owes `reads`.
 - `checkSchema`'s `accepts` still lets an `i32` field stand over an `int8`
-  column, and a typed read of that Row fails at the row. That is recorded as
-  an open risk rather than changed here, because a Row that only writes is
-  correct under it and the change would stop a server starting.
+  column. The Postgres Wire reads it range-checked, so a typed read of that
+  Row fails only at a row whose value does not fit, with the column named.

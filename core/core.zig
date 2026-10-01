@@ -45,6 +45,10 @@ pub const requestIdOf = scope_mod.requestIdOf;
 /// request or a request nothing matched (ADR 108).
 pub const routeNameOf = scope_mod.routeNameOf;
 
+/// Which request or tick a Scope is on, for a module that keeps something
+/// between calls and has to know it is still the same one (ADR 117).
+pub const serialOf = scope_mod.serialOf;
+
 /// A Scope with its type erased, for the one place a shape checked while
 /// compiling cannot reach: the other side of a function pointer
 /// ([ADR 144](../docs/adr/144-a-scope-that-crosses-a-function-pointer.md)).

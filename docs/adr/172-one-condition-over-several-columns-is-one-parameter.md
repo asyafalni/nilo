@@ -58,6 +58,23 @@ beside a fixed operator in one entry is refused, for `.exists`'s reason — a
 `<=` that dropped because the search box was empty. A tuple of entries is
 several, ANDed.
 
+**A negated operator is refused.** `.ne`, `.not_in`, `.not_like`,
+`.not_ilike`, `.not_ieq`, `.distinct_from` and every `not_` pattern
+(`.not_icontains`) are a Refusal in an entry. ORed, `.not_icontains = "test"`
+over `code` and `name` keeps a row whose `name` contains "test" as long as its
+`code` does not, and nobody who wrote "not" over two columns meant that: they
+meant *none of these columns*, which is an AND of the negations. Both readings
+are a plausible thing to write, so nilo does not pick one; the message names
+the spelling that is unambiguous, one condition per column, each with its own
+`sql.given` if the box may be empty. That costs the one-parameter property for
+the negated case only, and nobody has asked for it. It also keeps NULL out of
+the question: `NOT ILIKE` on a NULL column is NULL, so under an AND-of-
+negations a row with a NULL `trademark` would drop out of "none of these
+contain it", where a person reading that sentence keeps it. Writing the
+per-column conditions makes that choice visible at the call site, where
+`.trademark = .{ .not_distinct_from = … }` or an `.any` with `IS NULL` says
+which was meant.
+
 **The columns have to read as one Zig type**, optional stripped: a parameter
 bound as text and named on a number is a cast nobody wrote. Two types is two
 conditions, in `.any`. One column is refused as an ordinary condition. And
@@ -85,8 +102,8 @@ however the box is set, which is ADR 149's property carried to the bracket.
 ## Consequences
 
 - `.across`, `State.replay`, `bareOf`; `across` reserved.
-- Four Refusals: a `given` beside a condition, one column, two types, an
-  unknown column.
+- Five Refusals: a `given` beside a condition, one column, two types, an
+  unknown column, a negated operator.
 - A comptime test and a live one against Postgres, with the box empty and
   filled, on a nullable column and one that is not.
 - The port's `product/sku.zig` list is one `db.select`.

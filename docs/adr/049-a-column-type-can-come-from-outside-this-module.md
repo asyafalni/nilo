@@ -43,6 +43,12 @@ Text is the one representation Postgres guarantees for every type it has, includ
 
 It stays streamable, which the shape it replaced would not have: a `Decimal` in a Borrowed row is a `[]const u8`, so the digits point into the read buffer and `db.stream` allocates nothing per row, where `Json(T)` had to be refused outright.
 
+### A `Decimal` orders and adds only where the database has `numeric`
+
+**On a Dialect whose `decimal_compares` is false, which is SQLite, `.gt`, `.gte`, `.lt` and `.lte` on a `Decimal`, an `.order` or an `sql.Ordering` key over one, an `.after` cursor over one, and a `sum`, `avg`, `min` or `max` of one in a grouped Row or a `.max`/`.min` over children are Refusals at compile time.** The check is `dialect.assertDecimalCompares`, asked of any type `types.isNumericText` accepts, which is `Decimal` and any `AsText("numeric")`. `.eq`, `.ne`, `.in` and `.not_in` stay, because they only compare the digits the caller stored. Postgres is unchanged: the column is `numeric` and the generated SQL is the same as before.
+
+SQLite has no `numeric` type. The column is `TEXT`, SQLite compares text as text, so `.total = .{ .gt = "9.99" }` missed `"100.00"`, `.order` put `"100.00"` before `"9.99"`, and a `sum` went through floating point and could answer `0.30000000000000004`. All three compiled and ran, and gave a different answer from Postgres on the same Row. The message says why and what to do: store the amount as an integer of its smallest unit, cents in an `i64`, or use Postgres.
+
 ### Why `nilo_write` takes an allocator when nothing shipped uses one
 
 Every text column this module ships holds its text, so `nilo_write` hands back a field and never allocates. The allocator is there for the case that makes the protocol worth having: a type holding *structure*, such as a `Cents{ value: i64 }` that renders `{d}.{d:0>2}` at write time. Without it, a project's column type could only ever be a rename of `Str`, not worth a protocol. With it, the function that gathers a row's values grew a Scope parameter and became fallible, and for a Row with no text column the inferred error set is empty and the `try` compiles to nothing, which is what makes this free for everyone not using it.
@@ -58,6 +64,8 @@ Two mistakes are caught while compiling rather than at the first request: `nilo_
 **Decoding the binary form in this module.** Sign, weight, scale and base-10000 limbs is a wire format, and putting one in `db.zig` would move knowledge across the seam `dialect`/`wire` exists to hold: a Dialect writes SQL, a Wire speaks a protocol, and neither is supposed to leak into the layer that fills a struct. Casting in SQL is the same conversion asked for on the side that already knows how to do it.
 
 **`{ units: i128, scale: u8 }` for `Decimal`.** A real representation and a better one to compute with, buying nothing here because nothing here computes, and it cannot hold `nan` or `inf`, which Postgres will hand over, so it would still need a tag and would still be converting on the way in and out.
+
+**Promising `"100.00" > "9.99"` on both Dialects.** This ADR said so for a while: the `::numeric` on the placeholder settles it. That was true of Postgres and was never true of SQLite, where `bindAs` returns the placeholder unchanged and the column is `TEXT`. Evidence: on SQLite `.total = .{ .gt = "9.99" }` did not return a row holding `"100.00"`, `.order = .{ .total = .desc }` sorted the digits, and `sum` of `0.1` and `0.2` came back `0.30000000000000004`. Emulating it was rejected as well: `CAST(… AS REAL)` is the floating point a `Decimal` exists to avoid, and a zero-padded text form is a second representation to keep in step with the first, and neither uses an index on the column. Refusing is the rule from [ADR 055](./055-the-second-dialect-is-the-test-of-the-seam.md): where two databases cannot agree, say so instead of answering differently.
 
 **Leaving the money column as `f64`.** The whole case against it is that it is quietly wrong: a cent per invoice is invisible in a test and a headline in an audit.
 
@@ -87,6 +95,6 @@ Two mistakes are caught while compiling rather than at the first request: `nilo_
 - `interval` and `inet` came off the checklist as two lines of `AsText` each rather than a column type each.
 - `types.isDecimal` is gone, replaced by `types.asText`, which answers *which* column rather than *whether* it is one particular column.
 - A project can read a PostGIS `geometry` without this module knowing PostGIS exists.
-- `numeric` comparisons are numeric: `"100.00" > "9.99"` is false as text and true as a number, and the `::numeric` on the placeholder is what settles it.
-- The Dialect's `readAs`/`bindAs` are the first place the seam had to express something Postgres and another database would spell differently (SQLite would write `CAST($1 AS NUMERIC)`), evidence the seam is in the right place.
+- On Postgres `numeric` comparisons are numeric: `"100.00" > "9.99"` is false as text and true as a number, and the `::numeric` on the placeholder is what settles it. On SQLite the column is `TEXT` and none of that holds, so an ordered comparison, an order and an aggregate over a `Decimal` are Refusals there (see "A `Decimal` orders and adds only where the database has `numeric`").
+- The Dialect's `readAs`/`bindAs` are the first place the seam had to express something Postgres and another database would spell differently, evidence the seam is in the right place. SQLite does not write `CAST($1 AS NUMERIC)`: it binds the text as text, and the Dialect says so with `decimal_compares = false`.
 - The next column type this module is tempted to ship should be weighed against a project writing three lines; a fourth wants an argument.

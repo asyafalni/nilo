@@ -63,7 +63,8 @@ zig build test-all     # the above, the suite in ReleaseSafe, test-sql and refus
 zig build test-{core,id,config,pw,cache,jwt,fetch,job,s3,dev}   # one module, both modes,
                        #   plus its refusals where it has a table
 zig build test-fetch-engine  # an outbound deadline firing against a real port; on `test`
-zig build test-sql     # nilo_sql, with test-job-sql and refusals-sql; Postgres if DATABASE_URL reaches one
+zig build test-sql     # nilo_sql, with test-job-sql and refusals-sql; Postgres if DATABASE_URL reaches one,
+                       #   and a failure without one where $CI is set (-Ddatabase-required=false)
 zig build layering     # no module imports upward or sideways
 zig build adr-check    # ADR files, their Topic lines, and every ADR cited exists; on test
 zig build docs-check   # every doc page's head, prose, links and anchors, the map, the reference's heading list; on test

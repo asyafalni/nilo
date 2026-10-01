@@ -201,7 +201,7 @@ pub fn uniqueStatement(comptime D: type, comptime desc: Desc, comptime u: Unique
         for (u.columns, 0..) |c, i| {
             const quoted = D.quote(c);
             out = out ++ (if (i == 0) "" else ", ") ++
-                (if (u.ignoring_case) D.foldedColumn(quoted) else quoted);
+                (if (u.ignoring_case) D.foldedIndexColumn(quoted) else quoted);
         }
         return out ++ ")";
     }
@@ -345,7 +345,13 @@ pub fn checkName(comptime desc: Desc, comptime c: Column) []const u8 {
 fn valueList(comptime values: []const []const u8) []const u8 {
     comptime {
         var out: []const u8 = "";
-        for (values, 0..) |v, i| out = out ++ (if (i == 0) "" else ", ") ++ "'" ++ v ++ "'";
+        // A quote inside a word doubled, as `writeLiteral` does at run time:
+        // an enum tag `@"it's"` wrote `'it's'` and the CREATE TABLE failed.
+        for (values, 0..) |v, i| {
+            var quoted: []const u8 = "";
+            for (v) |ch| quoted = quoted ++ (if (ch == '\'') "''" else &[_]u8{ch});
+            out = out ++ (if (i == 0) "" else ", ") ++ "'" ++ quoted ++ "'";
+        }
         return out;
     }
 }
@@ -363,7 +369,7 @@ fn primaryKeyClause(comptime D: type, comptime keys: []const []const u8) []const
     }
 }
 
-fn referenceClause(comptime D: type, comptime desc: Desc, comptime name: []const u8) []const u8 {
+pub fn referenceClause(comptime D: type, comptime desc: Desc, comptime name: []const u8) []const u8 {
     comptime {
         for (desc.references) |r| {
             if (r.columns.len != 1) continue;
@@ -794,6 +800,76 @@ pub fn dropIndex(
     return aw.toOwnedSlice();
 }
 
+/// `ALTER INDEX … RENAME TO`, for an index following a column `.was`
+/// renamed. Postgres only; SQLite has no statement that renames an index.
+pub fn renameIndex(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    schema: ?[]const u8,
+    from: []const u8,
+    to: []const u8,
+) Error![]const u8 {
+    comptime std.debug.assert(D.can_alter_constraint);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try w.writeAll("ALTER INDEX ");
+    if (schema) |s| {
+        try writeIdent(w, s);
+        try w.writeAll(".");
+    }
+    try writeIdent(w, from);
+    try w.writeAll(" RENAME TO ");
+    try writeIdent(w, to);
+    return aw.toOwnedSlice();
+}
+
+/// `ALTER TABLE … RENAME CONSTRAINT`, for a foreign key following a column
+/// `.was` renamed.
+pub fn renameConstraint(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    desc: Desc,
+    from: []const u8,
+    to: []const u8,
+) Error![]const u8 {
+    comptime std.debug.assert(D.can_alter_constraint);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try alterHead(w, desc);
+    try w.writeAll(" RENAME CONSTRAINT ");
+    try writeIdent(w, from);
+    try w.writeAll(" TO ");
+    try writeIdent(w, to);
+    return aw.toOwnedSlice();
+}
+
+/// `ALTER TABLE … RENAME CONSTRAINT` for the derived check over a column's
+/// words, from `<table>_<from>_check` to `<table>_<to>_check`: what a column
+/// `.was` renamed leaves behind on Postgres (ADR 123).
+pub fn renameCheck(
+    comptime D: type,
+    gpa: std.mem.Allocator,
+    desc: Desc,
+    from: []const u8,
+    to: []const u8,
+) Error![]const u8 {
+    comptime std.debug.assert(D.can_alter_constraint);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    try alterHead(w, desc);
+    try w.writeAll(" RENAME CONSTRAINT ");
+    try writeCheckIdent(w, desc.table, .{ .name = from, .sql_type = "" });
+    try w.writeAll(" TO ");
+    try writeCheckIdent(w, desc.table, .{ .name = to, .sql_type = "" });
+    return aw.toOwnedSlice();
+}
+
 fn alterHead(w: *std.Io.Writer, desc: Desc) Error!void {
     try w.writeAll("ALTER TABLE ");
     try alterTail(w, desc);
@@ -875,6 +951,17 @@ test "a CREATE TABLE is a constant, which is the claim this file makes" {
     , sql);
 }
 
+test "an enum tag holding a quote is written with the quote doubled" {
+    const Said = enum { @"it's", plain };
+    const Remark = struct {
+        pub const nilo_table = .{ .name = "remarks", .key = .id };
+        id: i64,
+        said: Said,
+    };
+    const sql = comptime createTable(Pg, Remark);
+    try testing.expect(std.mem.indexOf(u8, sql, "IN ('it''s', 'plain')") != null);
+}
+
 test "a foreign key of two columns is a table constraint, and one of one stays inline" {
     const Board = struct {
         pub const nilo_table = .{ .name = "boards", .key = .{ .id, .org_id } };
@@ -940,7 +1027,7 @@ test "a case-folding unique is an index on an expression, and each database has 
     try testing.expectEqual(@as(usize, 3), pg.indexes.len);
     try testing.expectEqualStrings("users_email_key", pg.indexes[0].name);
     try testing.expectEqualStrings(
-        "CREATE UNIQUE INDEX \"users_email_key\" ON \"users\" (lower(\"email\"))",
+        "CREATE UNIQUE INDEX \"users_email_key\" ON \"users\" (lower(\"email\") text_pattern_ops)",
         pg.indexes[0].sql,
     );
     try testing.expectEqualStrings(
@@ -1259,7 +1346,7 @@ test "the IF NOT EXISTS form is the same statement with four words moved in" {
 
     const made = comptime createdIfMissing(Pg, User);
     try testing.expectEqualStrings(
-        "CREATE UNIQUE INDEX IF NOT EXISTS \"users_email_key\" ON \"users\" (lower(\"email\"))",
+        "CREATE UNIQUE INDEX IF NOT EXISTS \"users_email_key\" ON \"users\" (lower(\"email\") text_pattern_ops)",
         made.indexes[0].sql,
     );
     try testing.expectEqualStrings(

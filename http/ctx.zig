@@ -424,6 +424,13 @@ pub const Ctx = struct {
         return route.name;
     }
 
+    /// Which request this is: moved when the request ends, never the same on
+    /// two connections. nilo's own; `core.serialOf` is how a module reads it,
+    /// and `sql.problem` is the one that does (ADR 117).
+    pub fn serial(self: *const Ctx) u64 {
+        return self._lifetime.serial();
+    }
+
     /// The URL of one of this server's routes, built out of the pattern it was
     /// registered under
     /// ([ADR 100](../docs/adr/100-a-route-pattern-is-the-name-of-its-url.md)).

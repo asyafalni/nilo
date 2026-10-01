@@ -67,7 +67,7 @@ When the **database** can build the list, use `sql.Json(T)` with `jsonb_agg` in 
 
 ## Parameters
 
-**The values are a tuple, one per placeholder, and the placeholders are `$1`, `$2`, … in the text.** `$n` is the `n`th value wherever it appears in the statement, and a `$n` written twice is one value. The text is comptime, so the count is checked while compiling: a statement that names `$3` but is given two values is a Refusal, not a run-time error on one database and a silent NULL on the other ([ADR 204](../../adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
+**The values are a tuple, one per placeholder, and the placeholders are `$1`, `$2`, … in the text.** `$n` is the `n`th value wherever it appears in the statement, and a `$n` written twice is one value. The text is comptime, so the count is checked while compiling: a statement that names `$3` but is given two values is a Refusal, and so is one that names `$1` and `$3` and never `$2`, not a run-time error on one database and a silent NULL on the other ([ADR 204](../../adr/204-a-raw-placeholder-is-spelled-for-the-dialect.md)).
 
 A parameter can be anything a column takes, converted the same way a Row's field is written: an integer or a float, a `bool`, `[]const u8`, a `nilo.Str` as it is (no `.bytes()`), an enum (its tag name is sent), `sql.Timestamp` (its microseconds), `sql.Date`, `sql.Uuid`, `sql.Json(T)`, `sql.Bytes`. A literal `1` or `"open"` is fine in the tuple; a comptime value is given a run-time type before it is sent.
 

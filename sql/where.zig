@@ -212,6 +212,12 @@ pub const Param = struct {
     /// `UPDATE` or a `DELETE`: what stands between those and the whole table
     /// is not something to leave to a value that may not arrive.
     droppable: bool = false,
+    /// Whether the value is a prefix the binder turns into the finished
+    /// pattern, escaped and ending in `%`, rather than text the statement
+    /// escapes itself. Set by `starts_with` on a Dialect whose planner reads
+    /// an index range only off a pattern it is handed whole
+    /// (`Dialect.prefix_bound`, [ADR 140](../docs/adr/140-the-database-escapes-the-pattern-it-is-going-to-match.md)).
+    prefix: bool = false,
 
     /// The `column` of a parameter that is not a column.
     pub const none = "";
@@ -370,6 +376,16 @@ pub fn aggregateCall(
     comptime aggregate: row_mod.Aggregate,
 ) []const u8 {
     return comptime blk: {
+        if (aggregate.column) |c| switch (aggregate.kind) {
+            .sum, .avg, .min, .max => dialect_mod.assertDecimalCompares(
+                D,
+                Shape,
+                c,
+                row_mod.ColumnType(row_mod.ownerOf(Shape), c),
+                "`" ++ @tagName(aggregate.kind) ++ "` (field `." ++ aggregate.field ++ "`)",
+            ),
+            .count, .count_distinct => {},
+        };
         const call = aggregate.kind.call(if (aggregate.column) |c| relation ++ "." ++ D.quote(c) else null);
         if (!aggregate.filtered) break :blk call;
         break :blk call ++ " FILTER (WHERE " ++ aggregateFilter(D, Shape, relation, aggregate).sql ++ ")";
@@ -488,7 +504,8 @@ pub fn comptimeOnly(comptime T: type) bool {
 /// of every row, and a delete written to keep a list of rows empties the table
 /// the day the list arrives empty. A pattern built from empty text is the
 /// other way there: `.contains = ""` is `LIKE '%%'`, and matches every row
-/// that has the column at all.
+/// that has the column at all, and so does `.ilike = "%"`, which a search box
+/// hands over as it is.
 ///
 /// Read structurally, the way the walk writes the SQL: the terms of a
 /// struct are ANDed, so it narrows nothing only when none of them does; the
@@ -556,7 +573,38 @@ fn opFiltersNothing(comptime name: []const u8, value: anytype) bool {
         if (pattern.negate) return false;
         return textLen(value) == 0;
     }
+    // `.like` and `.ilike` bind the caller's pattern as it is, so a search
+    // box's `%` reaches the statement unescaped and `LIKE '%'` is true of every
+    // row that has the column. An empty pattern is not the same case: it
+    // matches `''` and nothing else.
+    if (comptime std.mem.eql(u8, name, "like") or std.mem.eql(u8, name, "ilike"))
+        return onlyWildcards(value);
     return false;
+}
+
+/// Whether a pattern is one or more `%` and nothing else.
+fn onlyWildcards(value: anytype) bool {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .optional => return if (value) |v| onlyWildcards(v) else false,
+        .array => return onlyWildcards(@as([]const u8, &value)),
+        else => {},
+    }
+    const bytes: []const u8 = if (T == core.Str)
+        value.view()
+    else if (comptime isText(T) or isStringLiteral(T))
+        value
+    else
+        return false;
+    return bytes.len > 0 and std.mem.indexOfNone(u8, bytes, "%") == null;
+}
+
+fn isStringLiteral(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| p.size == .one and @typeInfo(p.child) == .array and
+            @typeInfo(p.child).array.child == u8,
+        else => false,
+    };
 }
 
 fn textLen(value: anytype) usize {
@@ -1355,6 +1403,18 @@ fn oneAcross(
                         "`.gt` and the rest, each with its value.",
                 );
             }
+            // ORed columns and a negated operator do not say what they read
+            // as (ADR 172): "not equal to q" over two columns is "some column
+            // differs" to the OR and "no column equals" to a person.
+            if (negatesWord(f.name)) @compileError(
+                "nilo: an entry of `.across` sets `." ++ f.name ++ "`, which is a negation.\n" ++
+                    "  `.across` keeps a row when any column meets the condition, so a negated " ++
+                    "one would keep a row whose other column still matches: `.not_icontains = \"test\"` " ++
+                    "over `code` and `name` would keep a row whose name contains it.\n" ++
+                    "  \"None of these columns\" is one condition per column, ANDed: " ++
+                    "`.code = .{ .not_icontains = q }, .name = .{ .not_icontains = q }`, " ++
+                    "each with its own `sql.given` if the box may be empty.",
+            );
             ops = ops ++ &[_]Operator{.{ .name = f.name, .T = f.type }};
         }
         if (ops.len == 0) @compileError(
@@ -1971,6 +2031,26 @@ fn spelling(comptime name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Whether `name` is an operator that says "not": `.ne`, the `not_` forms,
+/// `.not_in` and `.distinct_from`. `.across` refuses them (ADR 172).
+fn negatesWord(comptime name: []const u8) bool {
+    comptime {
+        if (std.mem.eql(u8, name, "ne") or std.mem.eql(u8, name, "not_in") or
+            std.mem.eql(u8, name, "not_like") or std.mem.eql(u8, name, "not_ilike") or
+            std.mem.eql(u8, name, "distinct_from")) return true;
+        if (patternSpelling(name)) |p| if (p.negate) return true;
+        if (foldedSpelling(name)) |negate| if (negate) return true;
+        return false;
+    }
+}
+
+/// Whether `name` asks which of two values comes first: the four comparisons
+/// that are not equality.
+fn isOrderingWord(comptime name: []const u8) bool {
+    return comptime std.mem.eql(u8, name, "gt") or std.mem.eql(u8, name, "gte") or
+        std.mem.eql(u8, name, "lt") or std.mem.eql(u8, name, "lte");
+}
+
 /// The two operators that compare **null-safely**, and the one place an
 /// optional is allowed in a condition.
 ///
@@ -2034,10 +2114,12 @@ fn listSpelling(comptime name: []const u8) ?ListOp {
 /// and `not_` in front negates, which is the spelling `like`/`ilike`/`not_like`
 /// already set.
 ///
-/// **All twelve cost no allocation**, which is what took this from a design
-/// nobody had to a Dialect call: the pattern is assembled and escaped inside
-/// the statement (`dialect.pattern`), so what binds is the caller's own text
-/// and the statement is the same constant every other one here is.
+/// **All twelve cost no allocation but one**, which is what took this from a
+/// design nobody had to a Dialect call: the pattern is assembled and escaped
+/// inside the statement (`dialect.pattern`), so what binds is the caller's own
+/// text and the statement is the same constant every other one here is. The
+/// one is `istarts_with` on SQLite, whose planner needs the pattern whole to
+/// search an index with it, and pays an arena allocation for that (ADR 140).
 const PatternOp = struct {
     shape: dialect_mod.Pattern,
     fold: bool,
@@ -2125,6 +2207,75 @@ fn assertTextPattern(
     }
 }
 
+/// **A list that holds a null is refused where it is written**, because one
+/// null changes the answer for every row and says nothing.
+///
+/// SQL compares a NULL with nothing and gets NULL, not false. So
+/// `"tag" <> ALL('{a,NULL}')` and `"tag" NOT IN ('a', NULL)` are NULL for every
+/// row, the `WHERE` keeps only what is true, and a `.not_in` with one null in
+/// its list selects nothing at all, with no error. `.in` is quieter: the null
+/// in the list matches no row, not even one whose column is NULL, so a list
+/// that reads as "these, and the ones with no value" finds only "these"
+/// (ADR 040, ADR 052).
+///
+/// The type says it, so the check costs nothing at run time: a list whose
+/// element is an optional or a `null` literal. The column's own nullability
+/// is not the question, since a plain `[]const i64` is a fine list for a
+/// nullable column.
+fn assertNoNullInList(
+    comptime Row: type,
+    comptime column: []const u8,
+    comptime op: []const u8,
+    comptime T: type,
+) void {
+    comptime {
+        if (!listHoldsNull(T)) return;
+        @compileError(
+            "nilo: `." ++ column ++ " = .{ ." ++ op ++ " = … }` on " ++ @typeName(Row) ++
+                " was given a list that holds null.\n" ++
+                "  SQL never finds a value equal to NULL, so one null makes `" ++ op ++
+                "` NULL for every row: `.not_in` selects nothing, and `.in` skips the " ++
+                "rows whose `" ++ column ++ "` is NULL as well. The query runs and says " ++
+                "nothing.\n" ++
+                "  Take the null out of the list. To have the rows with no value in the " ++
+                "answer as well, say so beside it: `.any = .{ .{ ." ++ column ++ " = .{ ." ++
+                op ++ " = list } }, .{ ." ++ column ++ " = null } }`.",
+        );
+    }
+}
+
+/// Whether a list written in a condition has a null among its elements, in
+/// any of the shapes one is written in: a slice, a pointer to an array, an
+/// array, a tuple, and any of them behind a `sql.given`'s optional.
+fn listHoldsNull(comptime T: type) bool {
+    comptime {
+        return switch (@typeInfo(T)) {
+            .optional => |o| listHoldsNull(o.child),
+            .pointer => |p| switch (p.size) {
+                .slice => p.child != u8 and elementIsNull(p.child),
+                .one => listHoldsNull(p.child),
+                else => false,
+            },
+            .array => |a| a.child != u8 and elementIsNull(a.child),
+            .@"struct" => |st| blk: {
+                if (!st.is_tuple) break :blk false;
+                for (st.fields) |f| {
+                    if (elementIsNull(f.type)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+}
+
+fn elementIsNull(comptime E: type) bool {
+    comptime return switch (@typeInfo(E)) {
+        .optional, .null => true,
+        else => false,
+    };
+}
+
 /// Whether `T` is text this module will match a pattern against. `Str` is
 /// Core's and is the ordinary one, because the text a search box sends arrives
 /// as one.
@@ -2158,6 +2309,16 @@ fn operator(
         // Before the optional check, because this is the operator the check
         // exists to send people to.
         if (nullSafeSpelling(op.name)) |spelled| {
+            // ADR 149's Refusal lives here and nowhere below: this branch
+            // returns, so a check placed after it is never reached.
+            if (givenValue(op.T) != null) @compileError(
+                "nilo: the condition on `" ++ column ++ "` (as `" ++ op.name ++
+                    "`) was given a `sql.given`.\n" ++
+                    "  `" ++ op.name ++ "` already takes an optional and treats null as an " ++
+                    "ordinary value, so it is one statement either way — there is no term " ++
+                    "for `sql.given` to drop.\n" ++
+                    "  Write `." ++ column ++ " = .{ ." ++ op.name ++ " = maybe }`.",
+            );
             // A null written as a literal needs no parameter at all — the
             // comparison is against NULL itself, which is a keyword.
             if (@typeInfo(op.T) == .null) return quoted ++ " " ++ spelled ++ " NULL";
@@ -2176,14 +2337,6 @@ fn operator(
         // (ADR 149). Placed after `nullSafeSpelling`, whose operators already
         // take an optional and mean something else by it.
         if (givenValue(op.T)) |Held| {
-            if (nullSafeSpelling(op.name) != null) @compileError(
-                "nilo: the condition on `" ++ column ++ "` (as `" ++ op.name ++
-                    "`) was given a `sql.given`.\n" ++
-                    "  `" ++ op.name ++ "` already takes an optional and treats null as an " ++
-                    "ordinary value, so it is one statement either way — there is no term " ++
-                    "for `sql.given` to drop.\n" ++
-                    "  Write `." ++ column ++ " = .{ ." ++ op.name ++ " = maybe }`.",
-            );
             // A list is no exception (ADR 149). A filter bar's multi-select
             // asks two questions: absent is *no filter*, and a list is *these*.
             // An empty list keeps meaning what `.in` says it means, and null
@@ -2207,15 +2360,20 @@ fn operator(
 
         // A pattern, whose text is assembled and escaped by the statement
         // rather than by this side — so the parameter is the caller's own
-        // text and nothing here allocates (`dialect.pattern`).
+        // text and nothing here allocates (`dialect.pattern`). Except a
+        // prefix on a Dialect that wants it whole: SQLite reads an index
+        // range off `LIKE ?1` and not off an expression, so there the binder
+        // escapes it into the arena and the statement takes it as it is. A
+        // negated one reads every row either way and keeps the free form.
         if (patternSpelling(op.name)) |pat| {
             assertTextPattern(Row, column, op.name, op.T);
+            const whole = D.prefix_bound and pat.shape == .starts_with and !pat.negate;
             const bound = D.bindAs(
-                D.placeholder(state.take(path, .{ .column = column })),
+                D.placeholder(state.take(path, .{ .column = column, .prefix = whole })),
                 row_mod.ColumnType(Row, column),
                 false,
             );
-            return D.pattern(quoted, bound, pat.shape, pat.fold, pat.negate) orelse
+            return D.pattern(quoted, bound, pat.shape, pat.fold, pat.negate, whole) orelse
                 dialect_mod.noPatternForm(D, column, op.name, pat.folding);
         }
 
@@ -2232,6 +2390,7 @@ fn operator(
         }
 
         if (listSpelling(op.name)) |list_op| {
+            assertNoNullInList(Row, column, op.name, op.T);
             // Taken once, outside the switch: the counter is what numbers
             // every placeholder in the statement, and a branch that took it
             // twice or not at all would renumber everything after it.
@@ -2251,13 +2410,25 @@ fn operator(
                 .json_each => quoted ++ switch (list_op) {
                     .in => " IN ",
                     .not_in => " NOT IN ",
-                } ++ "(SELECT value FROM json_each(" ++ bound ++ "))",
+                } ++ "(SELECT " ++ D.eachValue(row_mod.ColumnType(Row, column)) ++
+                    " FROM json_each(" ++ bound ++ "))",
                 // Expanding the list into one placeholder each would make the
                 // statement depend on a length only known at runtime, which is
                 // the half of ADR 036's rule this module exists to keep.
                 .expanded, .unsupported => dialect_mod.noListForm(D, column),
             };
         }
+
+        // An ordering comparison over a number held as text is the text's
+        // order on a Dialect that stores it so (ADR 049). Equality is not
+        // asked, so `.eq`, `.ne` and the lists pass.
+        if (isOrderingWord(op.name)) dialect_mod.assertDecimalCompares(
+            D,
+            Row,
+            column,
+            row_mod.ColumnType(Row, column),
+            "`." ++ column ++ " = .{ ." ++ op.name ++ " = … }`",
+        );
 
         // `ILIKE` is Postgres's word for what SQLite's `LIKE` already does, so
         // on a Dialect whose `LIKE` folds the folding spelling drops the `I` —
@@ -2488,6 +2659,56 @@ test "one parameter per pattern, holding the caller's own text and nothing built
     // column would, which is why this family needed no change in `db.zig`.
     try testing.expect(!p.params[0].list);
     try testing.expect(!p.params[0].nullable);
+}
+
+test "a prefix binds whole on sqlite and is built in the statement on postgres" {
+    // Four statements planned in one comptime scope, each searched for text.
+    @setEvalBranchQuota(20_000);
+    const Lite = dialect_mod.SQLite;
+    const Prefix = @TypeOf(.{ .email = .{ .istarts_with = @as([]const u8, "a") } });
+
+    // SQLite: the finished pattern is the parameter, and the binder makes it.
+    const lite = comptime plan(Lite, User, Prefix, 1);
+    try testing.expectEqualStrings("\"email\" LIKE ?1 ESCAPE '\\'", lite.sql);
+    try testing.expect(lite.params[0].prefix);
+
+    // Postgres: the caller's text, escaped by the statement, nothing allocated.
+    const pg = comptime plan(Pg, User, Prefix, 1);
+    try testing.expect(std.mem.indexOf(u8, pg.sql, "replace(") != null);
+    try testing.expect(!pg.params[0].prefix);
+
+    // Only the prefix that can use an index: negated, or any other shape,
+    // stays in the statement on SQLite too.
+    inline for (.{
+        @TypeOf(.{ .email = .{ .not_istarts_with = @as([]const u8, "a") } }),
+        @TypeOf(.{ .email = .{ .icontains = @as([]const u8, "a") } }),
+        @TypeOf(.{ .email = .{ .iends_with = @as([]const u8, "a") } }),
+    }) |W| {
+        const other = comptime plan(Lite, User, W, 1);
+        try testing.expect(std.mem.indexOf(u8, other.sql, "replace(") != null);
+        try testing.expect(!other.params[0].prefix);
+    }
+}
+
+test "a folding prefix on postgres is lower(col) LIKE, the expression the case-folding unique is indexed on" {
+    // `ILIKE` over the bare column reads no index (ADR 140). The escape is
+    // still inside the statement, and only the non-negated prefix changes.
+    const escaped = "replace(replace(replace($1, '\\', '\\\\'), '%', '\\%'), '_', '\\_')";
+    try testing.expectEqualStrings(
+        "lower(\"email\") LIKE lower(" ++ escaped ++ ") || '%' ESCAPE '\\'",
+        sqlOf(.{ .email = .{ .istarts_with = @as([]const u8, "a") } }),
+    );
+    try testing.expect(std.mem.indexOf(
+        u8,
+        sqlOf(.{ .email = .{ .not_istarts_with = @as([]const u8, "a") } }),
+        "\"email\" NOT ILIKE ",
+    ) != null);
+    // The case-sensitive prefix keeps its own word and reads the column bare.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        sqlOf(.{ .email = .{ .starts_with = @as([]const u8, "a") } }),
+        "\"email\" LIKE replace(",
+    ) != null);
 }
 
 test "sqlite writes LIKE where postgres writes ILIKE, because that is what its LIKE is" {
@@ -3180,7 +3401,19 @@ test "a condition narrows nothing only when every term it ANDs narrows nothing" 
     try testing.expect(filtersNothing(.{ .name = .{ .icontains = blank } }));
     try testing.expect(filtersNothing(.{ .name = .{ .starts_with = core.Str.static(blank) } }));
 
+    // A raw pattern that is only wildcards, which is what a search box's `%`
+    // handed to `.ilike` is: `LIKE '%'` matches every row with the column.
+    const percent: []const u8 = "%";
+    try testing.expect(filtersNothing(.{ .email = .{ .ilike = percent } }));
+    try testing.expect(filtersNothing(.{ .email = .{ .like = core.Str.static("%%%") } }));
+    try testing.expect(filtersNothing(.{ .email = .{ .like = "%" } }));
+    try testing.expect(filtersNothing(.{ .across = .{ .columns = .{ .code, .name }, .ilike = percent } }));
+
     // And the terms that narrow whatever they are handed.
+    try testing.expect(!filtersNothing(.{ .email = .{ .ilike = blank } }));
+    try testing.expect(!filtersNothing(.{ .email = .{ .like = @as([]const u8, "%@b.com") } }));
+    try testing.expect(!filtersNothing(.{ .email = .{ .like = @as([]const u8, "_%") } }));
+    try testing.expect(!filtersNothing(.{ .email = .{ .not_like = percent } }));
     try testing.expect(!filtersNothing(.{ .id = .{ .not_in = some } }));
     try testing.expect(!filtersNothing(.{ .id = .{ .in = none } }));
     try testing.expect(!filtersNothing(.{ .name = .{ .not_icontains = blank } }));
@@ -3218,4 +3451,24 @@ test "a term pins its column only when it is `=` to a value that is always there
     try testing.expect(comptime !pinsEquality(struct { eq: ?i64 }));
     try testing.expect(comptime !pinsEquality(struct { in: []const i64 }));
     try testing.expect(comptime !pinsEquality(Given(i64)));
+}
+
+test "a list is read as holding null in every shape one is written in" {
+    const ints = [_]i64{ 1, 2 };
+    const maybe = [_]?i64{ 1, null };
+    try testing.expect(comptime listHoldsNull(@TypeOf(&maybe)));
+    try testing.expect(comptime listHoldsNull([]const ?i64));
+    try testing.expect(comptime listHoldsNull(?[]const ?i64));
+    try testing.expect(comptime listHoldsNull([2]?i64));
+    try testing.expect(comptime listHoldsNull(@TypeOf(&.{ 1, null })));
+    try testing.expect(comptime listHoldsNull(@TypeOf(.{ .a, null })));
+
+    try testing.expect(comptime !listHoldsNull(@TypeOf(&ints)));
+    try testing.expect(comptime !listHoldsNull([]const i64));
+    try testing.expect(comptime !listHoldsNull(?[]const i64));
+    try testing.expect(comptime !listHoldsNull(@TypeOf(&.{ 1, 2 })));
+    try testing.expect(comptime !listHoldsNull(@TypeOf(.{ .done, .cancelled })));
+    // Text is a value, not a list of bytes.
+    try testing.expect(comptime !listHoldsNull([]const u8));
+    try testing.expect(comptime !listHoldsNull([]const []const u8));
 }

@@ -25,10 +25,10 @@ fn listAdults(db: *sql.Db, c: *nilo.Ctx) ![]User {
 
 ```sql
 SELECT "id", "email", "age", "created_at" FROM "users"
-WHERE "age" > $1 ORDER BY "created_at" DESC LIMIT 10
+WHERE "age" > $1 ORDER BY "created_at" DESC, "id" ASC LIMIT 10
 ```
 
-Only the `18` reaches run time. The table, the columns, the operators and the number of parameters are all decided while compiling, and each is a compile error when wrong. You can read the constant too: `sql.selectFor(User, @TypeOf(options)).sql` is the text above, and `sql.on(sql.SQLite).selectFor(User, @TypeOf(options)).sql` is the same statement written with `?1`. `sql.on(D)` binds `selectFor` and the fourteen functions beside it to a Dialect you choose.
+The `"id"` at the end of the order is the table's key, added to any order a `LIMIT` or an `OFFSET` cuts that does not name it already, so rows the order ties still come back in one order and a page never repeats or skips one. An index that serves a paged order should end in the key as well, `(created_at, id)` rather than `(created_at)`, or Postgres sorts every row that ties with the page's. Only the `18` reaches run time. The table, the columns, the operators and the number of parameters are all decided while compiling, and each is a compile error when wrong. You can read the constant too: `sql.selectFor(User, @TypeOf(options)).sql` is the text above, and `sql.on(sql.SQLite).selectFor(User, @TypeOf(options)).sql` is the same statement written with `?1`. `sql.on(D)` binds `selectFor` and the fourteen functions beside it to a Dialect you choose.
 
 ```
 $ zig build
@@ -119,7 +119,7 @@ const found = try db.page(User, c, .{
 ("email" ILIKE … OR $1 IS NULL) AND ("age" >= $2 OR $2 IS NULL)
 ```
 
-**It is one statement whatever the filters are set to**, so one parameter list and one prepared plan. The alternative, a statement per combination of filters, is four statements for two filters and sixteen for four, each with its own parameters. Postgres removes `$1 IS NULL` while planning with the actual values, which it does for the first five executions and for as long afterwards as the custom plan wins, so a filter that *is* set is planned as if the guard were not there.
+**It is one statement whatever the filters are set to**, so one parameter list. The alternative, a statement per combination of filters, is four statements for two filters and sixteen for four, each with its own parameters. What is sent leaves the guard out: a filter that is set is written as its term alone, and one that is not as a test that is always true, so the database plans for the filters that are there and an index is used on both Postgres and SQLite. Up to three filters in one statement, each combination is kept prepared; past that the text is prepared on every call, which costs microseconds.
 
 Inside an `.exists` it drops the **whole subquery**, not just the term:
 
@@ -173,6 +173,8 @@ AND (("email" ILIKE … $2 … OR "name" ILIKE … $2 …) OR $2 IS NULL)
 ```
 
 The columns have to read as one Zig type: a nullable column beside a non-nullable one is fine, but a number beside text needs two conditions in `.any`. A `sql.given` beside a fixed operator in one entry is rejected, as it is in `.exists`; write a second entry.
+
+**A negated operator is rejected in `.across`** (`.not_icontains`, `.ne`, `.not_in` and the rest): ORed, "does not contain it" would keep a row whose other column still does. "None of these columns contains it" is one condition per column, each with its own `sql.given` if the box may be empty: `.code = .{ .not_icontains = q }, .name = .{ .not_icontains = q }`.
 
 ## Fetching all rows, one row, or a row by key
 
@@ -269,27 +271,42 @@ A `.where` may name such a column too, so a lookup by email does not need `email
 
 **For deep pages, carry the last row seen instead of an offset.** `db.page` above uses `OFFSET`, and `OFFSET` makes the database read every row it skips: page 4,000 of `/orders` scans and throws away 12,000 rows to reach the twenty this call wants, and it gets slower the deeper a caller goes. No index fixes that, because an index tells the database *where* a row is, not how many rows come before it.
 
-**Keyset pagination** asks a different question: not *the twenty after the twelve-thousandth*, but *the twenty after this one*. The caller keeps the last row it saw instead of a page number, and the condition is a tuple comparison, `(created_at, id) < (…)`, written as `.any` like every OR in this module:
+**Keyset pagination** asks a different question: not *the twenty after the twelve-thousandth*, but *the twenty after this one*. The caller keeps the last row it saw instead of a page number, and hands it back as `.after`:
 
 <!-- compiles -->
 ```zig
-fn olderThan(db: *sql.Db, c: *nilo.Ctx, after: sql.Timestamp, after_id: i64) ![]User {
-    return db.select(User, c, .{
-        .where = .{ .any = .{
-            .{ .created_at = .{ .lt = after } },
-            .{ .created_at = after, .id = .{ .lt = after_id } },
-        } },
-        .order = .{ .created_at = .desc_nulls_last, .id = .desc },
+const Post = struct {
+    pub const nilo_table = .{ .name = "posts", .key = .id };
+    id: i64,
+    title: []const u8,
+    created_at: sql.Timestamp,
+};
+
+fn older(db: *sql.Db, c: *nilo.Ctx, last: ?Post) !sql.Feed(Post) {
+    const order = .{ .created_at = .desc, .id = .desc };
+    const seen = last orelse return db.feed(Post, c, .{ .order = order, .limit = 20 });
+    return db.feed(Post, c, .{
+        .order = order,
+        .after = .{ .created_at = seen.created_at, .id = seen.id },
         .limit = 20,
     });
 }
+
+comptime {
+    _ = &older;
+}
 ```
 
-`after` and `after_id` are the `created_at` and `id` of the last row the previous call returned: a cursor the caller carries, rather than a page number the database counts up to. The first call has no cursor: read the first page with `.order` and `.limit` only, and start passing a cursor once there is a last row to take it from.
+`.after` becomes one row comparison, `("created_at", "id") < ($1, $2)`, which the database answers by seeking straight to the cursor on an index over `(created_at, id)`: 0.013 ms at a million rows, the same as the first screen. The `.any` of `<` and `= … AND <` this page used to show filtered from the first row instead and cost 17.8 ms, what the `OFFSET` did. The first screen has no cursor, so it is the call without `.after`.
 
-`.order` does two jobs here. `.desc_nulls_last` is one of four directions, beside plain `.asc` and `.desc`, that also say where a NULL goes, so a row with no `created_at` sorts to the same place on every call. The `id` after it breaks ties between rows with the same `created_at`, which is why the condition needs two terms. Drop either one and two calls can disagree about where the page boundary was, the same problem `.limit` without `.order` has with `OFFSET`.
+`db.feed` answers `found.rows` and `found.more`, whether any row came after them, which is what a "load more" button needs. It reads one row past the limit to know, and counts nothing, so it costs what `db.select` does. `db.page`'s total is a pass over every matching row, 124 ms at a million, which a list with no "20 of 47" on it should not pay.
 
-**The trade-off is the total.** `db.page`'s `count(*) OVER ()` counts alongside the page; a keyset query has no "page 4,000" for a count to be relative to. To know whether there is a next page, ask for one row more than the page needs and drop it. For a total, call `db.count` beside it, if it does not have to be exact this second.
+**Each rule the compiler holds `.after` to is a cursor that would skip or repeat rows:**
+
+- `.after` names the columns `.order` sorts by, in the same order;
+- every term runs the same way: all `.desc` here, since a row comparison runs one way;
+- no column may be null, since a row comparison with a NULL in it is true of nothing, and no direction says where NULLs go;
+- the order ends in the table's key, here `id`: two posts written in the same microsecond stand at one cursor, and the key is what puts one after the other.
 
 `DISTINCT` is not supported and is not planned: over one table with a key, every row appears once anyway. [ADR 052](../../adr/052-a-set-operation-over-one-table-is-a-condition.md) makes the same argument for `UNION`.
 
@@ -369,6 +386,6 @@ fn exportUsers(db: *sql.Db, c: *nilo.Ctx) !void {
 
 The rows come back as `sql.Borrowed(User)`, which is `User` with every `Str` replaced by `[]const u8`. That is deliberate: the text points into the buffer the rows arrive in, and it becomes invalid at the next `next()`. A `Str` means *text that lives as long as the request*, with no exceptions, so text that does not live that long is not called one. Copy it if you need to keep it.
 
-`defer rows.close()` is required. A result set abandoned half-read holds a connection, and unlike a transaction, which is rolled back when the request ends, nothing else will ever close it. In Debug, forgetting it is caught by the same counter that watches transactions.
+`defer rows.close()` is required. A result set abandoned half-read holds a connection, and unlike a transaction, which is rolled back when the request ends, nothing else will ever close it. In Debug, forgetting it is caught by the same counter that watches transactions. Breaking out of the loop early is fine: `close` reads up to a megabyte of what Postgres already sent, and past that swaps the connection for a fresh one, so the first matching row out of millions costs a connect at most.
 
 Two kinds of column cannot be streamed, and each is a compile error: a `sql.Json(T)`, and an **array**. The rule behind both: **a streamed row holds only what is already in the read buffer.** A borrowed row allocates nothing, which is what keeps a million of them in constant memory. Parsing a JSON document costs one allocation per row, and so does building a slice from a run of length-prefixed elements. Read such columns with `select`, or leave the column out of the Row you stream: a Json column read as `[]const u8` streams as bytes you can parse where you need them.

@@ -29,9 +29,10 @@
 //!
 //!   `plan` is the name to keep this statement prepared under on the
 //!   connection, or **null for do not keep it**. Null is not a hint: it is
-//!   the answer for `db.raw`, whose text arrives at run time, and a Wire that
-//!   cached it anyway would grow a map with traffic instead of with the
-//!   program (ADR 051). Everything else hands over a name derived from the
+//!   the answer for text that arrives at run time (`db.exec`, a `Composed`
+//!   statement, an `ORDER BY` chosen per request), and a Wire that cached it
+//!   anyway would grow a map with traffic instead of with the program. A
+//!   `db.raw` statement is comptime and is named like any other (ADR 051). Everything else hands over a name derived from the
 //!   statement, which is a comptime constant and therefore so is the name.
 //!
 //!   `problem` is where the failure's own words go — a `?*?Problem`, filled
@@ -39,7 +40,7 @@
 //!   it ([ADR 117](../docs/adr/117-a-statement-that-failed-says-what-the-database-said.md)).
 //!   An out-parameter rather than a richer error, because the error set is
 //!   what a handler switches on and a set that grows breaks every switch:
-//!   the seven stay, and the text rides beside them. Null is what a caller
+//!   the ten in `Error` stay, and the text rides beside them. Null is what a caller
 //!   with nothing to tell passes, and it costs one branch.
 //! - `next(rows)` — advance to the next row, or false at the end. **The
 //!   text in a row is valid only until the next call.** That is not a rule
@@ -92,8 +93,10 @@
 //!   `opts` is comptime, which is what lets the whole `BEGIN` be one constant
 //!   and lets a Wire that cannot express an isolation level refuse it while
 //!   compiling rather than at the first request.
-//! - `Tx.commit` / `Tx.rollback` — and `rollback` has to be reachable from a
-//!   `defer`, because that is how it will be called.
+//! - `Tx.commit(arena, problem)` / `Tx.rollback` — and `rollback` has to be
+//!   reachable from a `defer`, because that is how it will be called.
+//!   `commit` takes the slot `run` does, because a deferred constraint is
+//!   checked at the COMMIT and nowhere else.
 //! - `Tx.savepoint(arena, op, id)` — mark a point inside this transaction,
 //!   undo back to one, or drop one. Postgres calls the three `SAVEPOINT`,
 //!   `ROLLBACK TO SAVEPOINT` and `RELEASE SAVEPOINT`, and **a nested
@@ -339,7 +342,7 @@ pub const Begin = struct {
     /// nothing.
     ///
     /// **It is what rebuilding a table needs**, and `migrate.apply` asks for it
-    /// on every version. SQLite cannot change a column in place, so a changed
+    /// on a version that drops a table (`migrate.rebuilds`). SQLite cannot change a column in place, so a changed
     /// column is CREATE a new table, copy the rows, DROP the old one, RENAME.
     /// With foreign keys on, that DROP deletes every row of the old table
     /// first, and every `ON DELETE CASCADE` pointing at it fires: the child
@@ -477,16 +480,49 @@ pub const Described = struct {
     outer_null: bool = false,
 };
 
+/// One row of a catalog answer that covers several tables (or several enum
+/// types) at once: the name it belongs to, and the column or the label.
+pub fn Keyed(comptime T: type) type {
+    return struct { key: []const u8, item: T };
+}
+
+/// A catalog answer cut into one list per name asked, **in the order asked**,
+/// so `columnsOfMany` and `labelsOfMany` hand back something a caller reads by
+/// position. A name with no rows gets an empty list, which is how a table or
+/// a type that is not there is told from one that is (`schema.compare`).
+///
+/// `fold` for a database whose identifiers are case-blind (SQLite), where the
+/// name in the catalog may not be spelled the way the Row spelled it. The two
+/// Wires share this because the cut is the part that could differ by accident.
+pub fn cutByName(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    names: []const []const u8,
+    rows: []const Keyed(T),
+    fold: bool,
+) Error![]const []const T {
+    const out = arena.alloc([]const T, names.len) catch return error.QueryFailed;
+    for (names, out) |name, *slot| {
+        var mine: std.ArrayList(T) = .empty;
+        for (rows) |r| {
+            const same = if (fold) std.ascii.eqlIgnoreCase(r.key, name) else std.mem.eql(u8, r.key, name);
+            if (same) mine.append(arena, r.item) catch return error.QueryFailed;
+        }
+        slot.* = mine.toOwnedSlice(arena) catch return error.QueryFailed;
+    }
+    return out;
+}
+
 /// Whether a type carries what this module asks of a Wire. Checked where the
 /// Wire is handed over rather than at the first call that needs a missing
 /// piece — the same reason `service.zig` checks the registry at `listen()`.
 pub fn assertWire(comptime W: type) void {
     comptime {
         const owed = [_][]const u8{
-            "open",     "close",     "run",      "exec",
-            "next",     "read",      "drain",    "begin",
-            "Tx",       "columnsOf", "readList", "width",
-            "labelsOf", "describe",
+            "open",     "close",     "run",           "exec",
+            "next",     "read",      "drain",         "begin",
+            "Tx",       "columnsOf", "readList",      "width",
+            "labelsOf", "describe",  "columnsOfMany", "labelsOfMany",
         };
         for (owed) |decl| {
             if (!@hasDecl(W, decl)) @compileError(
@@ -516,6 +552,9 @@ pub const Fake = struct {
     /// What `labelsOf` answers for any enum type, the way `columns` answers
     /// for any table.
     labels: []const []const u8 = &.{},
+    /// How many times `columnsOfMany` or `labelsOfMany` was asked, which is
+    /// how a test sees that a startup check made one call for all its Rows.
+    many_asked: usize = 0,
     /// The statement the last `run` was given, so a test can assert on the
     /// SQL that actually reached the database rather than on the constant
     /// the comptime half produced.
@@ -568,11 +607,46 @@ pub const Fake = struct {
     /// lets the path from a Wire's `problem` out-parameter to `Sent.problem`
     /// be tested with nothing installed (ADR 117).
     refuses: ?Problem = null,
+    /// What each column answers, by position, on every row. Past its end,
+    /// or left empty, a column answers the one value per type `read` falls
+    /// back to. **Per column rather than per type** so a column read from
+    /// the wrong position reads the wrong value: a Row of two integers read
+    /// with its columns swapped passed through a Fake that answered 0 for
+    /// both.
+    cells: []const Cell = &.{},
+    /// The row `next` fails on rather than answering, counted from zero, or
+    /// null for none. How a statement that fails after it started answering
+    /// is driven without a database: a row that does not decode, or a
+    /// connection lost halfway.
+    fails_at_row: ?usize = null,
+    /// Whether `describe` fails rather than answering `described`: the
+    /// first run of a raw statement that could not be held against its Row,
+    /// which is asked again on its next run (ADR 233).
+    describe_fails: bool = false,
+
+    /// One column's answer. A NULL read into a field that cannot hold one
+    /// fails the read, as it does on both real Wires.
+    pub const Cell = union(enum) {
+        null,
+        int: i64,
+        float: f64,
+        text: []const u8,
+        boolean: bool,
+    };
 
     pub const Rows = struct {
         left: usize = 0,
         drained: bool = false,
+        /// Rows handed out so far, which `fails_at_row` is counted against.
+        at: usize = 0,
     };
+
+    /// What `Db.init` asks a Wire whose URL can name a pooler (ADR 241). The
+    /// real answer is `postgres.Wire.urlIsPooled`; this one reads the one
+    /// spelling a test needs.
+    pub fn urlIsPooled(url: []const u8) bool {
+        return std.mem.indexOf(u8, url, "pgbouncer=true") != null;
+    }
 
     pub fn open(io: std.Io, gpa: std.mem.Allocator, url: []const u8, opts: OpenOpts) !Fake {
         _ = io;
@@ -612,9 +686,10 @@ pub const Fake = struct {
     }
 
     pub fn next(self: *Fake, rows: *Rows) Error!bool {
-        _ = self;
         if (rows.left == 0) return false;
+        if (self.fails_at_row == rows.at) return error.QueryFailed;
         rows.left -= 1;
+        rows.at += 1;
         return true;
     }
 
@@ -633,7 +708,7 @@ pub const Fake = struct {
     /// though there is nothing here that would dangle without it.
     pub fn read(self: *Fake, rows: *const Rows, comptime T: type, col: usize) Error!T {
         _ = rows;
-        _ = col;
+        if (col < self.cells.len) return cellAs(T, self.cells[col]);
         if (T == []const u8 or T == ?[]const u8) return self.text;
         // The two types a Wire decodes itself rather than handing to its
         // driver, so a Fake has to name them too or a Row carrying one cannot
@@ -644,6 +719,31 @@ pub const Fake = struct {
             .int, .float => 0,
             .bool => false,
             .optional => null,
+            else => error.QueryFailed,
+        };
+    }
+
+    /// A cell as the type the caller asked for, refused where a real Wire
+    /// would refuse it: a NULL into a field that cannot be null, a number
+    /// past the field's width, a value of another kind.
+    fn cellAs(comptime T: type, cell: Cell) Error!T {
+        if (@typeInfo(T) == .optional) {
+            return if (cell == .null) null else try cellAs(@typeInfo(T).optional.child, cell);
+        }
+        if (T == []const u8) return if (cell == .text) cell.text else error.QueryFailed;
+        if (T == Bytes) return if (cell == .text) .{ .bytes = cell.text } else error.QueryFailed;
+        if (comptime types_mod.isDate(T)) {
+            const days = if (cell == .int) cell.int else return error.QueryFailed;
+            return .{ .days = std.math.cast(i32, days) orelse return error.QueryFailed };
+        }
+        return switch (@typeInfo(T)) {
+            .int => if (cell == .int) std.math.cast(T, cell.int) orelse error.QueryFailed else error.QueryFailed,
+            .float => switch (cell) {
+                .float => |f| @floatCast(f),
+                .int => |i| @floatFromInt(i),
+                else => error.QueryFailed,
+            },
+            .bool => if (cell == .boolean) cell.boolean else error.QueryFailed,
             else => error.QueryFailed,
         };
     }
@@ -729,6 +829,17 @@ pub const Fake = struct {
             self.wire.deadline_ms = ms;
         }
 
+        /// `Fake.columnsOf`, down the transaction.
+        pub fn columnsOf(
+            self: *Tx,
+            arena: std.mem.Allocator,
+            query: []const u8,
+            schema: ?[]const u8,
+            table: []const u8,
+        ) Error![]const Column {
+            return self.wire.columnsOf(arena, query, schema, table);
+        }
+
         /// The same arrangement as `deadline`: the number arrived, and what
         /// it becomes is `postgres.zig`'s business and `live.zig`'s to pin.
         pub fn savepoint(
@@ -746,7 +857,9 @@ pub const Fake = struct {
             }
         }
 
-        pub fn commit(self: *Tx) Error!void {
+        pub fn commit(self: *Tx, arena: std.mem.Allocator, problem: ?*?Problem) Error!void {
+            _ = arena;
+            _ = problem;
             self.wire.committed += 1;
         }
 
@@ -776,6 +889,24 @@ pub const Fake = struct {
         return self.columns;
     }
 
+    /// `columnsOf` for a list of tables of one schema: one answer per table,
+    /// in the order asked, every one of them `columns`. `many_asked` counts
+    /// the calls, which is how a test sees that a check asked once.
+    pub fn columnsOfMany(
+        self: *Fake,
+        arena: std.mem.Allocator,
+        query: []const u8,
+        schema: ?[]const u8,
+        tables: []const []const u8,
+    ) Error![]const []const Column {
+        _ = query;
+        _ = schema;
+        self.many_asked += 1;
+        const out = arena.alloc([]const Column, tables.len) catch return error.QueryFailed;
+        for (out) |*slot| slot.* = self.columns;
+        return out;
+    }
+
     pub fn labelsOf(
         self: *Fake,
         arena: std.mem.Allocator,
@@ -786,6 +917,21 @@ pub const Fake = struct {
         _ = query;
         _ = type_name;
         return self.labels;
+    }
+
+    /// `labelsOf` for a list of types: one answer per name, in the order
+    /// asked, every one of them `labels`.
+    pub fn labelsOfMany(
+        self: *Fake,
+        arena: std.mem.Allocator,
+        query: []const u8,
+        type_names: []const []const u8,
+    ) Error![]const []const []const u8 {
+        _ = query;
+        self.many_asked += 1;
+        const out = arena.alloc([]const []const u8, type_names.len) catch return error.QueryFailed;
+        for (out) |*slot| slot.* = self.labels;
+        return out;
     }
 
     /// What `described` holds, for any statement. Null unless a test set it,
@@ -800,6 +946,7 @@ pub const Fake = struct {
         _ = sql;
         _ = nulls;
         self.described_calls += 1;
+        if (self.describe_fails) return error.QueryFailed;
         return self.described;
     }
 };
@@ -851,4 +998,38 @@ test "a savepoint is three operations and not a second begin" {
     try testing.expectEqual(@as(usize, 1), wire.marked);
     try testing.expectEqual(@as(usize, 1), wire.undone);
     try testing.expectEqual(@as(usize, 1), wire.kept);
+}
+
+test "a catalog answer is cut into one list per name asked, in the order asked, and a name with no rows is an empty list" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const rows = [_]Keyed(u8){
+        .{ .key = "b", .item = 1 },
+        .{ .key = "b", .item = 2 },
+        .{ .key = "a", .item = 3 },
+    };
+    const cut = try cutByName(u8, arena.allocator(), &.{ "a", "gone", "b" }, &rows, false);
+
+    try testing.expectEqual(@as(usize, 3), cut.len);
+    try testing.expectEqualSlices(u8, &.{3}, cut[0]);
+    try testing.expectEqual(@as(usize, 0), cut[1].len);
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, cut[2]);
+
+    // SQLite spells a table the way it was created and the Row may not have.
+    const folded = try cutByName(u8, arena.allocator(), &.{"B"}, &rows, true);
+    try testing.expectEqual(@as(usize, 2), folded[0].len);
+    const exact = try cutByName(u8, arena.allocator(), &.{"B"}, &rows, false);
+    try testing.expectEqual(@as(usize, 0), exact[0].len);
+}
+
+test "the fake answers a whole schema's tables in one call" {
+    var wire = Fake{ .columns = &.{.{ .name = "id", .udt = "int8", .nullable = false }} };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const many = try wire.columnsOfMany(arena.allocator(), "", null, &.{ "a", "b", "c" });
+    try testing.expectEqual(@as(usize, 3), many.len);
+    try testing.expectEqualStrings("id", many[2][0].name);
+    try testing.expectEqual(@as(usize, 1), wire.many_asked);
 }

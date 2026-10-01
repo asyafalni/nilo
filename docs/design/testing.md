@@ -49,6 +49,7 @@ From the outside, a check that has only ever passed looks exactly like a check t
 13. **Startup work registered with `app.before` gets the same slot in its own frame**, so a failing seed's log line names which registration failed, its status and its message, instead of just `Failed`. [ADR 129](../adr/129-a-refusal-outside-a-request-is-still-a-refusal.md)
 14. **`nilo.testing.show` renders a value as JSON into whatever is formatting it**, for `{f}` in an `errdefer` or a plain `std.debug.print`, because `std.testing.expectEqual` prints with `{any}` and never calls a type's own formatter. [ADR 137](../adr/137-a-failed-assertion-that-can-be-read.md)
 15. **A test suite whose database will not connect passes, not fails.** `nilo_start`'s connection diagnostics log at `warn`. A `Row` that disagrees with its table still logs at `err`, because that is a broken program, not a machine without a database running. [ADR 145](../adr/145-a-suite-whose-database-is-down-is-not-a-suite-that-failed.md)
+16. **This repository's live SQL tests skip on a laptop and fail on CI.** With `$CI` set and no `DATABASE_URL`, `test-sql` fails before it runs. Every live connection carries `lock_timeout` and `idle_in_transaction_session_timeout` of ten seconds in its URL, and a test that ends with a connection still out fails naming it, so a leaked transaction costs a test rather than a hung run. [ADR 239](../adr/239-a-live-test-skips-on-a-laptop-and-fails-on-ci.md)
 
 ## Decisions
 
@@ -63,6 +64,7 @@ From the outside, a check that has only ever passed looks exactly like a check t
 | [145](../adr/145-a-suite-whose-database-is-down-is-not-a-suite-that-failed.md) | Which SQL diagnostics log at `warn`, so a suite without a database still passes |
 | [147](../adr/147-a-response-is-read-back-the-way-it-was-written.md) | `Answer.bytes`/`.json`, and `Wired` for building an `App` and a `Client` together |
 | [171](../adr/171-an-answer-knows-which-request-it-was.md) | `Answer` records a generation, so reading a stale answer is `error.AnswerStale` instead of the wrong body |
+| [239](../adr/239-a-live-test-skips-on-a-laptop-and-fails-on-ci.md) | This repository's live SQL tests skip without a URL, fail the build on CI without one, and give up on a leaked transaction after ten seconds |
 
 Related topics: the second `Content-Length` and second `Host` that turn a hand-built test request into a 400 are [ADR 070](../adr/070-a-request-nobody-else-would-answer-is-refused.md) (http1-protocol); `clearCookie`'s `Max-Age` is [ADR 029](../adr/029-a-header-is-checked-once-and-two-of-them-repeat.md) (cookies-sessions); the four-axis budget every check here is measured against is [ADR 017](../adr/017-the-trade-budget-has-four-axes.md) (principles); a handler that blocks the thread, which the watchdog catches instead of a refusal file, is [ADR 013](../adr/013-handlers-must-not-block-the-thread.md) (engine).
 

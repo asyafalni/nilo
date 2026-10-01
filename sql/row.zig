@@ -1300,10 +1300,6 @@ const allowed = [_][]const u8{
     "check",   "trigger",    "filled", "unread",
 };
 
-/// The table spec `Row` resolves to, following `nilo_table = OtherRow` until
-/// a spec that names a table is reached. Every borrowed Row is checked against
-/// the one it borrows from on the way past, so the check cannot be skipped by
-/// asking a question that does not need it.
 /// The Row at the end of the borrow chain: the one that names a table rather
 /// than another Row.
 ///
@@ -1366,6 +1362,10 @@ pub fn ownerOf(comptime Row: type) type {
     }
 }
 
+/// The table spec `Row` resolves to, following `nilo_table = OtherRow` until
+/// a spec that names a table is reached (`ownerOf`). Every borrowed Row is
+/// checked against the one it borrows from on the way past, so the check
+/// cannot be skipped by asking a question that does not need it.
 fn specOf(comptime Row: type) Spec {
     comptime {
         const owner = ownerOf(Row);

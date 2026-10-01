@@ -286,12 +286,44 @@ const sql_refusals = [_]Refusal{
         .says = "the condition on `handle` was given a ?[]const u8.",
     },
     .{
+        .name = "not_in_a_list_that_holds_null",
+        .says = "`.tag = .{ .not_in = … }` on not_in_a_list_that_holds_null.Ticket was given a list that holds null.",
+    },
+    .{
+        .name = "in_a_literal_list_that_holds_null",
+        .says = "`.tag = .{ .in = … }` on in_a_literal_list_that_holds_null.Ticket was given a list that holds null.",
+    },
+    .{
         .name = "given_beside_a_condition_in_an_exists",
         .says = "an entry of `.exists` over given_beside_a_condition_in_an_exists.Capability holds a `sql.given` beside another condition.",
     },
     .{
         .name = "across_given_beside_a_condition",
         .says = "an entry of `.across` holds a `sql.given` beside another condition.",
+    },
+    .{
+        .name = "across_with_a_negated_operator",
+        .says = "an entry of `.across` sets `.not_icontains`, which is a negation.",
+    },
+    .{
+        .name = "given_on_a_null_safe_operator",
+        .says = "the condition on `deleted_at` (as `not_distinct_from`) was given a `sql.given`.",
+    },
+    .{
+        .name = "shape_parent_named_like_a_schema_table",
+        .says = "shape_parent_named_like_a_schema_table.OrderCard's parent `orders` would be joined under the name of the table the statement reads.",
+    },
+    .{
+        .name = "shape_max_over_a_bool",
+        .says = "shape_max_over_a_bool.ByCustomer reads `.any_shipped`, the max of `shipped`, which is a bool.",
+    },
+    .{
+        .name = "children_max_over_a_uuid",
+        .says = "children_max_over_a_uuid.EpicCard reads `.newest`, the max of `public`, which is a Uuid.",
+    },
+    .{
+        .name = "list_column_of_a_timestamp",
+        .says = "list_column_of_a_timestamp.Slot reads `opens` as []const types.Timestamp, a list of types.Timestamp, which the driver cannot decode as an array element.",
     },
     .{
         .name = "across_on_one_column",
@@ -384,6 +416,10 @@ const sql_refusals = [_]Refusal{
         .says = "an upsert on upsert_target_not_a_name.User was given a *const [5:0]u8 as its conflict target.",
     },
     .{
+        .name = "upsert_target_not_written",
+        .says = "`db.insertOrUpdate` on upsert_target_not_written.User conflicts on .{ .id }, and the values written do not carry `id`.",
+    },
+    .{
         .name = "update_without_condition",
         .says = "an update on update_without_condition.User with no condition.",
     },
@@ -398,6 +434,41 @@ const sql_refusals = [_]Refusal{
     .{
         .name = "row_column_no_dialect_can_decode",
         .says = "row_column_no_dialect_can_decode.User reads `address` as row_column_no_dialect_can_decode.Address, which no Dialect can decode.",
+    },
+    // A number neither database stores, refused by name (ADR 055).
+    // A cursor that would skip or repeat rows, and a feed with no ceiling
+    // (ADR 150).
+    .{
+        .name = "after_over_an_order_that_runs_both_ways",
+        .says = "`db.feed` on after_over_an_order_that_runs_both_ways.Post reads after a cursor over an order that runs both ways.",
+    },
+    .{
+        .name = "after_without_the_key",
+        .says = "`db.feed` on after_without_the_key.Post reads after a cursor, and its `.order` does not end in `id`.",
+    },
+    .{
+        .name = "after_over_a_column_that_may_be_null",
+        .says = "`db.feed` on after_over_a_column_that_may_be_null.Task reads after a cursor over `due`, which may be null.",
+    },
+    .{
+        .name = "after_on_a_page",
+        .says = "`db.page` on after_on_a_page.Post was given an `.after`.",
+    },
+    .{
+        .name = "feed_without_a_limit",
+        .says = "`db.feed` on feed_without_a_limit.Post was given no `.limit`.",
+    },
+    .{
+        .name = "row_column_read_as_a_u64",
+        .says = "row_column_read_as_a_u64.Counter reads `hits` as u64, which holds numbers neither database stores: both keep an integer in a signed 64 bits.",
+    },
+    .{
+        .name = "list_column_of_an_unsigned",
+        .says = "list_column_of_an_unsigned.Grid reads `cells` as []const u16, and Postgres decodes an array element only as the width it stores.",
+    },
+    .{
+        .name = "raw_read_as_an_f16",
+        .says = "a raw statement is read as f16, and a float column holds 32 or 64 bits.",
     },
     .{
         .name = "streamed_json",
@@ -438,6 +509,10 @@ const sql_refusals = [_]Refusal{
         .says = "the statement handed to `db.raw` names $2 and was given 1 value.",
     },
     .{
+        .name = "raw_with_a_gap_in_its_placeholders",
+        .says = "the statement handed to `db.raw` names $3 and never uses $2.",
+    },
+    .{
         .name = "raw_page_without_a_total",
         .says = "the statement handed to `db.rawPage` selects 2 columns, and raw_page_without_a_total.Line has 2 fields and wants one more.",
     },
@@ -475,6 +550,10 @@ const sql_refusals = [_]Refusal{
     .{
         .name = "raw_text_column_not_cast",
         .says = "column 2 of the statement handed to `db.raw` is `total`, and field 2 of raw_text_column_not_cast.Invoice is a `numeric` column read as text.",
+    },
+    .{
+        .name = "raw_text_column_behind_distinct",
+        .says = "column 1 of the statement handed to `db.raw` is `total`, and field 1 of raw_text_column_behind_distinct.Invoice is a `numeric` column read as text.",
     },
     .{
         .name = "raw_star_over_a_text_column",
@@ -890,6 +969,17 @@ const sql_refusals = [_]Refusal{
             " `CREATE FUNCTION set_updated_at() RETURNS…`.",
     },
     .{
+        .name = "schema_function_named_in_mixed_case",
+        .says = "`.functions` entry \"setUpdatedAt\" names the function without quotes, and Postgres" ++
+            " keeps it as `setupdatedat`. nilo drops a function by the name in the entry, in quotes," ++
+            " so that drop would find nothing. Write the name in lower case, or quote it in the body:" ++
+            " `CREATE OR REPLACE FUNCTION \"setUpdatedAt\"`.",
+    },
+    .{
+        .name = "schema_two_tables_one_index_name",
+        .says = "`orders` and `invoices` both have an index named `by_created_at`.",
+    },
+    .{
         .name = "schema_view_begins_with_create",
         .says = "`.views` entry \"names\" begins `CREATE`, and nilo writes the `CREATE VIEW" ++
             " \"names\" AS` itself — the entry is the SELECT.",
@@ -1074,6 +1164,26 @@ const sql_refusals = [_]Refusal{
     .{
         .name = "pattern_given_something_that_is_not_text",
         .says = "`.email = .{ .contains = … }` was given a i32.",
+    },
+    .{
+        .name = "sqlite_decimal_compared",
+        .says = "`.total = .{ .gt = … }` on sqlite_decimal_compared.Invoice's `total` would run as text on the sqlite dialect.",
+    },
+    .{
+        .name = "sqlite_decimal_ordered",
+        .says = "`.order.total` on sqlite_decimal_ordered.Invoice's `total` would run as text on the sqlite dialect.",
+    },
+    .{
+        .name = "sqlite_decimal_ordering_key",
+        .says = "the ordering key `total` on sqlite_decimal_ordering_key.Invoice's `total` would run as text on the sqlite dialect.",
+    },
+    .{
+        .name = "sqlite_decimal_cursor",
+        .says = "`.after.total` on sqlite_decimal_cursor.Invoice's `total` would run as text on the sqlite dialect.",
+    },
+    .{
+        .name = "sqlite_decimal_summed",
+        .says = "`sum` (field `.billed`) on sqlite_decimal_summed.Billed's `amount` would run as text on the sqlite dialect.",
     },
     .{
         .name = "sqlite_case_sensitive_pattern",
@@ -4960,8 +5070,42 @@ pub fn build(b: *std.Build) void {
         "Postgres for the SQL module's live tests (default: $DATABASE_URL, else they skip)",
     ) orelse b.graph.environ_map.get("DATABASE_URL");
 
+    // **On CI a missing URL fails `test-sql` rather than skipping every live
+    // test.** A skip prints nothing a run is read for, so losing the variable
+    // from the workflow turned 124 tests green without running them. `CI` is
+    // what GitHub Actions and every other runner set, so the rule holds
+    // without a flag anybody has to remember; `-Ddatabase-required=false`
+    // is the way out for a runner with no Postgres on purpose.
+    const database_required = b.option(
+        bool,
+        "database-required",
+        "Fail test-sql when no database URL is given (default: on where $CI is set)",
+    ) orelse (b.graph.environ_map.get("CI") != null);
+    if (database_required and database_url == null) test_sql_step.dependOn(&b.addFail(
+        "test-sql needs a database here: $CI is set and neither $DATABASE_URL nor " ++
+            "-Ddatabase-url= names one, so every live test would skip. Set one, or " ++
+            "pass -Ddatabase-required=false to skip them on purpose",
+    ).step);
+
+    // **A live test waits on a leaked transaction for ten seconds, not for
+    // ever.** A transaction a test forgets to end keeps its locks on the
+    // server, and the next statement to want one, the next test's fixture
+    // `DROP TABLE` most often, waited at no CPU until somebody killed the
+    // run. Postgres ends an idle transaction's session past
+    // `idle_in_transaction_session_timeout`, and fails a wait past
+    // `lock_timeout`; both ride on every connection a live test dials, as
+    // `options=` in the URL, unless the URL already sets its own.
+    const live_url: ?[]const u8 = if (database_url) |url|
+        if (std.mem.indexOf(u8, url, "options=") != null) url else b.fmt("{s}{s}{s}", .{
+            url,
+            if (std.mem.indexOfScalar(u8, url, '?') == null) "?" else "&",
+            "options=-c%20lock_timeout%3D10s%20-c%20idle_in_transaction_session_timeout%3D10s",
+        })
+    else
+        null;
+
     const live_config = b.addOptions();
-    live_config.addOption(?[]const u8, "database_url", database_url);
+    live_config.addOption(?[]const u8, "database_url", live_url);
 
     // What a per-connection statement cache is worth, which ADR 017's 10%
     // needed a number for before anything was built (ADR 051). Its own step

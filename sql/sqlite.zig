@@ -208,7 +208,7 @@ pub fn Wire(comptime opts_in: Options) type {
         /// **`broadcast` rather than `signal` within a queue**, which is the
         /// second half. This Wire's wait is cancellable on purpose — a fiber
         /// whose request is gone gives its turn up rather than holding it — and
-        /// a `signal` consumed by a waiter that then answers `TimedOut` is a
+        /// a `signal` consumed by a waiter that then gives up is a
         /// wakeup nobody else receives. Waking everybody queued for the one
         /// thing that just became free costs a re-test of one `bool` each, on
         /// a path that is by definition already waiting.
@@ -235,9 +235,10 @@ pub fn Wire(comptime opts_in: Options) type {
         const Conn = struct {
             handle: zqlite.Conn,
             /// Keyed by the plan name, which is a comptime constant derived
-            /// from the statement. `db.raw` passes null and is not cached: its
-            /// text arrives at run time, so a cache would grow with traffic
-            /// rather than with the program.
+            /// from the statement. `db.raw` is named like any other (its text is
+            /// comptime, ADR 051). What passes null and is not cached is text
+            /// that arrives at run time (`db.exec`, a `Composed` statement), so
+            /// a cache would grow with traffic rather than with the program.
             kept: std.StringHashMapUnmanaged(zqlite.Stmt) = .empty,
             busy: bool = false,
             /// The statement that took this connection, for the line a
@@ -321,6 +322,38 @@ pub fn Wire(comptime opts_in: Options) type {
             /// until this ends, and go back on before it is released
             /// (`wire.Begin.rebuilding`).
             rebuilding: bool = false,
+            /// The tables this `.rebuilding` transaction dropped, read off
+            /// its statements (`dialect.Drops`), and whether one could not be
+            /// read. Where the check before COMMIT looks, so an old violation
+            /// in a table the version never touched does not fail it.
+            dropped: []const []const u8 = &.{},
+            dropped_unread: bool = false,
+
+            /// Note the tables `sql` drops, when this transaction is one that
+            /// checks the keys it touched. Allocates only on a `DROP TABLE`,
+            /// on the arena the transaction already runs in; an allocation
+            /// that fails leaves the whole-database check, the safe side.
+            fn noteDrops(self: *Tx, arena: std.mem.Allocator, sql: []const u8) void {
+                if (!self.rebuilding) return;
+                var drops: dialect.Drops = .{ .text = sql };
+                while (true) {
+                    const seen = drops.next() catch {
+                        self.dropped_unread = true;
+                        return;
+                    };
+                    const found = seen orelse return;
+                    const grown = arena.alloc([]const u8, self.dropped.len + 1) catch {
+                        self.dropped_unread = true;
+                        return;
+                    };
+                    @memcpy(grown[0..self.dropped.len], self.dropped);
+                    grown[self.dropped.len] = arena.dupe(u8, found) catch {
+                        self.dropped_unread = true;
+                        return;
+                    };
+                    self.dropped = grown;
+                }
+            }
 
             pub fn run(
                 self: *Tx,
@@ -332,6 +365,8 @@ pub fn Wire(comptime opts_in: Options) type {
             ) wire.Error!Rows {
                 if (self.done) return error.QueryFailed;
                 try self.live();
+                try self.wire.checked(self.at, arena, values, problem);
+                self.noteDrops(arena, sql);
                 const stmt, const kept = self.wire.stmtOn(self.at, sql, plan, values) catch |err| {
                     self.wire.said(self.at, err, arena, problem);
                     self.wire.conns[self.at].aborted = true;
@@ -356,11 +391,30 @@ pub fn Wire(comptime opts_in: Options) type {
             ) wire.Error!usize {
                 if (self.done) return error.QueryFailed;
                 try self.live();
+                try self.wire.checked(self.at, arena, values, problem);
+                self.noteDrops(arena, sql);
                 return self.wire.execOn(self.at, sql, plan, values) catch |err| {
                     self.wire.said(self.at, err, arena, problem);
                     self.wire.conns[self.at].aborted = true;
                     return err;
                 };
+            }
+
+            /// `Wire.columnsOf` down this transaction's connection, so a
+            /// migration that holds one does not ask for a second.
+            pub fn columnsOf(
+                self: *Tx,
+                arena: std.mem.Allocator,
+                query: []const u8,
+                schema: ?[]const u8,
+                table: []const u8,
+            ) wire.Error![]const wire.Column {
+                var pragma_buf: [1024]u8 = undefined;
+                var master_buf: [1024]u8 = undefined;
+                const text = try Self.qualifiedQuery(&pragma_buf, &master_buf, query, schema);
+                var rows = try self.run(arena, text, .{table}, null, null);
+                defer rows.close();
+                return self.wire.columnList(arena, &rows);
             }
 
             /// Refuse a statement on a transaction a failed one has aborted,
@@ -427,7 +481,9 @@ pub fn Wire(comptime opts_in: Options) type {
 
             const name_prefix = "nilo_sp_";
 
-            pub fn commit(self: *Tx) wire.Error!void {
+            /// `problem` is where a refused COMMIT leaves SQLite's words:
+            /// a deferred foreign key is checked here and nowhere else.
+            pub fn commit(self: *Tx, arena: std.mem.Allocator, problem: ?*?wire.Problem) wire.Error!void {
                 if (self.done) return;
                 // Rolled back rather than committed: Postgres would have kept
                 // none of it, and a handler tested here has to hear what it
@@ -444,17 +500,19 @@ pub fn Wire(comptime opts_in: Options) type {
                     // The check the statements did not make as they ran.
                     // A row pointing at nothing is refused here rather than
                     // committed, which is SQLite's own recipe for a rebuild.
-                    const broken = self.wire.brokenReference(self.at) catch |err| {
+                    const broken = self.wire.brokenReference(self.at, arena, self.dropped, self.dropped_unread) catch |err| {
                         self.wire.command(self.at, "ROLLBACK") catch {};
                         return err;
                     };
                     if (broken) {
                         std.log.warn("{s}", .{wire.rebuild_broke_reference});
+                        if (problem) |slot| slot.* = .{ .message = wire.rebuild_broke_reference };
                         self.wire.command(self.at, "ROLLBACK") catch {};
                         return error.ForeignKeyViolated;
                     }
                 }
                 self.wire.command(self.at, "COMMIT") catch |err| {
+                    self.wire.said(self.at, err, arena, problem);
                     // **A COMMIT SQLite refused leaves the transaction open**
                     // — a deferred foreign key that is still broken, a
                     // `BUSY` on the WAL — and the writer was about to go back
@@ -475,7 +533,7 @@ pub fn Wire(comptime opts_in: Options) type {
                 defer self.wire.release(self.at);
                 defer self.restore();
                 self.wire.command(self.at, "ROLLBACK") catch |err| {
-                    std.log.err(
+                    std.log.warn(
                         "nilo_sql: a transaction could not be rolled back ({s}).",
                         .{@errorName(err)},
                     );
@@ -488,7 +546,7 @@ pub fn Wire(comptime opts_in: Options) type {
             fn restore(self: *Tx) void {
                 if (!self.rebuilding) return;
                 self.wire.command(self.at, "PRAGMA foreign_keys = ON") catch |err| {
-                    std.log.err(
+                    std.log.warn(
                         "nilo_sql: foreign keys could not be turned back on after a rebuild ({s}); " ++
                             "the writer goes on without them until the process restarts.",
                         .{@errorName(err)},
@@ -509,6 +567,13 @@ pub fn Wire(comptime opts_in: Options) type {
         /// and there is no server to be switched off. It is ignored rather
         /// than refused, so one program can hold both kinds of database
         /// without writing two option structs (ADR 054).
+        ///
+        /// **`dials_on_open` is how `Db.nilo_start` knows this**, so it does
+        /// not open a file twice when the first open fails, nor answer in a
+        /// server's words about a `connect_on_init` that did nothing. The
+        /// Postgres Wire has no such declaration and is taken to dial.
+        pub const dials_on_open = false;
+
         pub fn open(
             io: std.Io,
             gpa: std.mem.Allocator,
@@ -604,12 +669,16 @@ pub fn Wire(comptime opts_in: Options) type {
         /// queue — which is the database's own behaviour surfaced as a wait
         /// rather than as a `SQLITE_BUSY` somebody has to interpret.
         ///
-        /// **A cancelled wait answers `TimedOut`**, which is the one place
-        /// this Wire has a deadline at all: `tx.deadline` is refused
-        /// (ADR 065), but a request whose fiber is cancelled while queueing
-        /// gives its turn up rather than holding it. The name is right for
-        /// what the handler has to decide — this statement is not going to
-        /// run.
+        /// **A wait cut short answers by whose cancellation it was.** This
+        /// Wire's own timer (`timeout_ms`) is `TimedOut`, the one place it
+        /// has a deadline at all: `tx.deadline` is refused (ADR 065). Any
+        /// other cancellation, a request that went away or a server shutting
+        /// down, gives its turn up rather than holding it, answers
+        /// `Disconnected` as the Postgres Wire's failed `acquire` does, and
+        /// **is handed back with `recancel`** so the caller's next
+        /// cancellation point sees it (ADR 223). Answering `TimedOut` and
+        /// leaving the cancellation spent is how a background loop queued
+        /// for the writer at shutdown slept on and kept the process alive.
         ///
         /// **The queue is bounded by `timeout_ms`, and the timer is armed
         /// only by a fiber that is actually going to wait** (ADR 107). A
@@ -620,7 +689,7 @@ pub fn Wire(comptime opts_in: Options) type {
         /// way, which is stack a handler touches and therefore per
         /// connection (ADR 062).
         fn takeWriter(self: *Self, holder: []const u8) wire.Error!usize {
-            self.lock.lock(self.io) catch return error.TimedOut;
+            self.lock.lock(self.io) catch return self.cancelled();
             defer self.lock.unlock(self.io);
 
             if (!self.conns[0].busy) return self.hold(0, holder);
@@ -644,7 +713,7 @@ pub fn Wire(comptime opts_in: Options) type {
         /// Any free reader, or wait for one — bounded the same way, and armed
         /// only once every reader has turned out to be busy.
         fn takeReader(self: *Self, holder: []const u8) wire.Error!usize {
-            self.lock.lock(self.io) catch return error.TimedOut;
+            self.lock.lock(self.io) catch return self.cancelled();
             defer self.lock.unlock(self.io);
 
             var bound: core.Limits.Bound = .idle;
@@ -659,6 +728,13 @@ pub fn Wire(comptime opts_in: Options) type {
                 self.free_reader.wait(self.io, &self.lock) catch
                     return self.gaveUp(&bound, .reader);
             }
+        }
+
+        /// A wait ended by a cancellation that is not this Wire's own
+        /// timer: hand it back and answer `Disconnected` (ADR 223).
+        fn cancelled(self: *Self) wire.Error {
+            self.io.recancel();
+            return error.Disconnected;
         }
 
         /// What a wait that ended without a connection means, and the one
@@ -682,7 +758,7 @@ pub fn Wire(comptime opts_in: Options) type {
         /// a one-line statement held past `timeout_ms` is waiting for a
         /// thread rather than for the database.
         fn gaveUp(self: *Self, bound: *core.Limits.Bound, want: enum { writer, reader }) wire.Error {
-            if (!bound.fired()) return error.TimedOut;
+            if (!bound.fired()) return self.cancelled();
             switch (want) {
                 .writer => std.log.warn(
                     "nilo_sql: a statement waited {d}ms for the writer connection and gave up; " ++
@@ -753,7 +829,10 @@ pub fn Wire(comptime opts_in: Options) type {
         fn wantsWriter(sql: []const u8) bool {
             const text = std.mem.trimStart(u8, sql, " \t\r\n");
             return !(std.ascii.startsWithIgnoreCase(text, "SELECT") or
-                std.ascii.startsWithIgnoreCase(text, "PRAGMA"));
+                std.ascii.startsWithIgnoreCase(text, "PRAGMA") or
+                // A plan is prepared and never stepped through, so it writes
+                // nothing whatever it explains (`db.rawExplain`).
+                std.ascii.startsWithIgnoreCase(text, "EXPLAIN"));
         }
 
         // -- statements --------------------------------------------------
@@ -761,8 +840,9 @@ pub fn Wire(comptime opts_in: Options) type {
         /// The prepared statement for `sql` on connection `at`, bound to
         /// `values`, plus whether it came from the cache.
         ///
-        /// A cached statement is reset and its bindings cleared before it is
-        /// bound again: SQLite keeps the previous bindings otherwise, so a
+        /// A cached statement is reset and its bindings cleared **when it is
+        /// let go** (`Rows.close`, `execOn`), and here only if SQLite still
+        /// calls it busy: SQLite keeps the previous bindings otherwise, so a
         /// statement reused with fewer parameters would silently carry the
         /// last request's values.
         fn stmtOn(
@@ -773,6 +853,9 @@ pub fn Wire(comptime opts_in: Options) type {
             values: anytype,
         ) wire.Error!struct { zqlite.Stmt, bool } {
             const conn = &self.conns[at];
+            // The values were held to `checked` by the caller, before any
+            // `bind`: a refusal there is not a failed statement and must not
+            // mark a transaction aborted.
             // Once, at the top, rather than at the four `bind` calls below —
             // a conversion applied at three of four sites is a bug that only
             // shows up on the fourth path (`blobbed`).
@@ -780,12 +863,26 @@ pub fn Wire(comptime opts_in: Options) type {
 
             if (plan) |name| {
                 if (conn.kept.get(name)) |stmt| {
-                    stmt.reset() catch return error.QueryFailed;
-                    stmt.clearBindings() catch return error.QueryFailed;
-                    stmt.bind(args) catch |err| return translate(conn.handle, err);
+                    // **Released clean, so nothing to undo on the way in.**
+                    // `Rows.close` and `execOn` reset a kept statement and
+                    // clear its bindings before it is anyone's again, which
+                    // this used to do a second time on every use. Left is
+                    // the check that it was: a statement SQLite still calls
+                    // busy is reset, with its bindings, as it always was.
+                    if (zqlite.c.sqlite3_stmt_busy(stmt.stmt) != 0) {
+                        stmt.reset() catch return error.QueryFailed;
+                        stmt.clearBindings() catch return error.QueryFailed;
+                    }
+                    stmt.bind(args) catch |err| {
+                        // A bind that stops partway leaves the values it got
+                        // to in a statement that goes back in the cache.
+                        stmt.reset() catch {};
+                        stmt.clearBindings() catch {};
+                        return translate(conn.handle, err);
+                    };
                     return .{ stmt, true };
                 }
-                const stmt = conn.handle.prepare(sql) catch |err|
+                const stmt = prepareOne(conn.handle, sql) catch |err|
                     return translate(conn.handle, err);
                 conn.kept.put(self.gpa, name, stmt) catch {
                     // A cache that cannot grow is a slower Wire, not a broken
@@ -798,7 +895,7 @@ pub fn Wire(comptime opts_in: Options) type {
                 return .{ stmt, true };
             }
 
-            const stmt = conn.handle.prepare(sql) catch |err| return translate(conn.handle, err);
+            const stmt = prepareOne(conn.handle, sql) catch |err| return translate(conn.handle, err);
             stmt.bind(args) catch |err| {
                 stmt.deinit();
                 return translate(conn.handle, err);
@@ -820,8 +917,15 @@ pub fn Wire(comptime opts_in: Options) type {
                 stmt.clearBindings() catch {};
             } else stmt.deinit();
 
+            // **`changes()` alone answers the last DML this connection ran**,
+            // so a `CREATE INDEX` or a `PRAGMA` after an `UPDATE` of 7 rows
+            // answered 7, where Postgres's command tag says 0. The total
+            // moves only when a statement changed a row, so a statement that
+            // left it where it was changed none.
+            const before = zqlite.c.sqlite3_total_changes64(conn.handle.conn);
             onThread(zqlite.Stmt.stepToCompletion, .{stmt}) catch |err|
                 return translate(conn.handle, err);
+            if (zqlite.c.sqlite3_total_changes64(conn.handle.conn) == before) return 0;
             return conn.handle.changes();
         }
 
@@ -858,6 +962,7 @@ pub fn Wire(comptime opts_in: Options) type {
         ) wire.Error!Rows {
             const at = if (wantsWriter(sql)) try self.takeWriter(sql) else try self.takeReader(sql);
             errdefer self.release(at);
+            try self.checked(at, arena, values, problem);
             const stmt, const kept = self.stmtOn(at, sql, plan, values) catch |err| {
                 self.said(at, err, arena, problem);
                 return err;
@@ -875,7 +980,35 @@ pub fn Wire(comptime opts_in: Options) type {
         ) wire.Error!usize {
             const at = try self.takeWriter(sql);
             defer self.release(at);
+            try self.checked(at, arena, values, problem);
             return self.execOn(at, sql, plan, values) catch |err| {
+                self.said(at, err, arena, problem);
+                return err;
+            };
+        }
+
+        /// The values a statement is given, held to what SQLite can store
+        /// (`intsFit`, `floatsKept`) before anything is prepared or bound.
+        ///
+        /// **A value refused here is not a statement that failed.** Postgres's
+        /// client refuses the same values before a byte is sent and the
+        /// transaction goes on; a `Tx` here that marked itself aborted (`Conn.aborted`)
+        /// refused every statement after it and rolled back at commit, which
+        /// a handler tested on SQLite would hear and one on Postgres would not.
+        /// So this is called ahead of `stmtOn` by the four entry points and
+        /// touches no flag.
+        fn checked(
+            self: *Self,
+            at: usize,
+            arena: std.mem.Allocator,
+            values: anytype,
+            problem: ?*?wire.Problem,
+        ) wire.Error!void {
+            intsFit(values) catch |err| {
+                self.said(at, err, arena, problem);
+                return err;
+            };
+            floatsKept(values) catch |err| {
                 self.said(at, err, arena, problem);
                 return err;
             };
@@ -993,7 +1126,8 @@ pub fn Wire(comptime opts_in: Options) type {
             // What it costs is one `sqlite3_column_type` — a couple of loads,
             // no allocation — per non-optional column per row. The optional
             // ones were already paying it.
-            if (stmt.columnType(col) == .null) {
+            const class = stmt.columnType(col);
+            if (class == .null) {
                 if (optional) return null;
                 // `warn` rather than `err` for the reason `db.wireOf`'s is
                 // one: `std.log.err` fails the test runner for every test
@@ -1025,16 +1159,64 @@ pub fn Wire(comptime opts_in: Options) type {
             if (comptime Inner == types.Date) return types.Date.nilo_parse(stmt.text(col)) orelse
                 error.QueryFailed;
 
+            // **The storage class is asked before a number is read**, because
+            // `sqlite3_column_int64` and `sqlite3_column_double` convert
+            // whatever the value is without a word: text in an INTEGER column
+            // reads 0, a REAL 2.7 read as an integer is 2, and a `DATETIME
+            // DEFAULT CURRENT_TIMESTAMP` read as a `Timestamp` is the year. A
+            // moment stored as text is decided (ADR 067); a number read out of
+            // text is not, so it is refused like the NULL above. An integer is
+            // let into a float, which loses nothing a Row could have kept.
+            switch (@typeInfo(Inner)) {
+                .bool, .int => if (class != .int) return wrongClass(Inner, col, class),
+                .float => if (class != .int and class != .float) return wrongClass(Inner, col, class),
+                else => {},
+            }
+
             return switch (@typeInfo(Inner)) {
-                .bool => stmt.boolean(col),
+                // **Anything but 0 is true**, which is what `WHERE flag` says
+                // about the same value. zqlite's `boolean` is `== 1`, so a 2
+                // read false out of a row the filter had called true.
+                .bool => stmt.int(col) != 0,
                 .int => std.math.cast(Inner, stmt.int(col)) orelse error.QueryFailed,
-                .float => @floatCast(stmt.float(col)),
+                .float => try narrowed(Inner, col, stmt.float(col)),
                 .pointer => |ptr| if (ptr.size == .slice and ptr.child == u8)
                     stmt.text(col)
                 else
                     error.QueryFailed,
                 else => error.QueryFailed,
             };
+        }
+
+        /// **A double read into a narrower float must survive the trip.**
+        /// SQLite has one float width, so it cannot say `float4` the way the
+        /// Postgres Wire's column does; what it can say is whether this value
+        /// fits. Postgres refuses every `float8` read into an `f32`
+        /// (`notANumber`) and answers `QueryFailed` with a warning; this
+        /// answers the same for a value the `f32` would round or overflow,
+        /// where the `@floatCast` it replaces returned the wrong number
+        /// without a word. A value an `f32` holds exactly, such as one that
+        /// was written from an `f32`, reads as it always did.
+        fn narrowed(comptime F: type, col: usize, wide: f64) wire.Error!F {
+            const narrow: F = @floatCast(wide);
+            if (F == f64 or @as(f64, @floatCast(narrow)) == wide) return narrow;
+            std.log.warn(
+                "nilo_sql: column {d} holds {d}, which the Row's " ++ @typeName(F) ++ " cannot hold " ++
+                    "exactly. Widen the field to f64, or store a value that fits.",
+                .{ col, wide },
+            );
+            return error.QueryFailed;
+        }
+
+        fn wrongClass(comptime Inner: type, col: usize, class: zqlite.ColumnType) wire.Error {
+            std.log.warn(
+                "nilo_sql: column {d} holds {s} and the Row reads it as {s}. SQLite " ++
+                    "stores what it is given whatever the column's type says; write the " ++
+                    "value as the field's type, or read the column into a field that " ++
+                    "holds {s} (ADR 067).",
+                .{ col, @tagName(class), @typeName(Inner), @tagName(class) },
+            );
+            return error.QueryFailed;
         }
 
         /// **Refused.** SQLite has no array type, so there is no column for
@@ -1101,15 +1283,62 @@ pub fn Wire(comptime opts_in: Options) type {
 
         /// Whether `PRAGMA foreign_key_check` finds any row pointing at a row
         /// that is not there. One row is enough to refuse, so only one is read.
-        fn brokenReference(self: *Self, at: usize) wire.Error!bool {
+        ///
+        /// **Only the keys the version could have broken.** `dropped` are the
+        /// tables the transaction dropped and made again; a violation counts
+        /// when it is a row of one of them or a row pointing at one. An old
+        /// violation in a table the version never touched used to fail every
+        /// rebuild with `ForeignKeyViolated`. A version whose drops could not
+        /// be read, or that dropped none the statements name, checks every
+        /// key, as it always did.
+        fn brokenReference(
+            self: *Self,
+            at: usize,
+            arena: std.mem.Allocator,
+            dropped: []const []const u8,
+            unread: bool,
+        ) wire.Error!bool {
             const conn = self.conns[at].handle;
-            return onThread(firstBroken, .{conn}) catch |err| translate(conn, err);
+            const text = foreignKeyCheck(arena, dropped, unread) catch return error.QueryFailed;
+            return onThread(firstBroken, .{ conn, text }) catch |err| translate(conn, err);
         }
 
-        fn firstBroken(conn: zqlite.Conn) !bool {
-            const found = try conn.row("PRAGMA foreign_key_check", .{}) orelse return false;
+        fn firstBroken(conn: zqlite.Conn, text: []const u8) !bool {
+            const found = try conn.row(text, .{}) orelse return false;
             found.deinit();
             return true;
+        }
+
+        /// `SELECT 1 FROM pragma_foreign_key_check`, narrowed to the tables
+        /// named when there are any. A name is a SQL literal with its quotes
+        /// doubled, and compared without regard to case, as SQLite does.
+        /// `migrations.zig`'s twin of a version writes the same filter.
+        fn foreignKeyCheck(arena: std.mem.Allocator, dropped: []const []const u8, unread: bool) ![]const u8 {
+            const whole = "SELECT 1 FROM pragma_foreign_key_check LIMIT 1";
+            if (unread or dropped.len == 0) return whole;
+            var out: std.ArrayList(u8) = .empty;
+            try out.appendSlice(arena, "SELECT 1 FROM pragma_foreign_key_check WHERE \"table\" COLLATE NOCASE IN (");
+            for (dropped, 0..) |name, i| {
+                if (i > 0) try out.appendSlice(arena, ", ");
+                try out.append(arena, '\'');
+                for (name) |ch| {
+                    if (ch == '\'') try out.append(arena, '\'');
+                    try out.append(arena, ch);
+                }
+                try out.append(arena, '\'');
+            }
+            try out.appendSlice(arena, ") OR \"parent\" COLLATE NOCASE IN (");
+            for (dropped, 0..) |name, i| {
+                if (i > 0) try out.appendSlice(arena, ", ");
+                try out.append(arena, '\'');
+                for (name) |ch| {
+                    if (ch == '\'') try out.append(arena, '\'');
+                    try out.append(arena, ch);
+                }
+                try out.append(arena, '\'');
+            }
+            try out.appendSlice(arena, ") LIMIT 1");
+            return out.items;
         }
 
         /// SQLite gives every transaction snapshot isolation and serialises
@@ -1196,22 +1425,87 @@ pub fn Wire(comptime opts_in: Options) type {
             // failure ADR 050 was written to remove.
             var pragma_buf: [1024]u8 = undefined;
             var master_buf: [1024]u8 = undefined;
-            const text = if (schema) |db_name| blk: {
-                const with_pragma = try qualifyEvery(&pragma_buf, query, "pragma_table_info", db_name);
-                break :blk try qualifyEvery(&master_buf, with_pragma, "sqlite_master", db_name);
-            } else query;
+            const text = try qualifiedQuery(&pragma_buf, &master_buf, query, schema);
 
             // No problem slot: this runs once per Row while the server is
             // starting, and the one caller already has a sentence for a check
             // it could not run.
             var rows = try self.run(arena, text, .{table}, null, null);
             defer rows.close();
+            return self.columnList(arena, &rows);
+        }
 
-            var found: std.ArrayList(wire.Column) = .empty;
+        /// `columnsOf` for a list of tables of one schema in one query
+        /// (`dialect.SQLite.introspect_all`), the answer cut into one list per
+        /// table in the order asked. The names travel as one JSON array, the
+        /// way this Dialect binds every list, and the schema goes into the
+        /// text exactly as `columnsOf` puts it (`qualifiedQuery`). The buffers
+        /// are twice `columnsOf`'s because the text is longer and is
+        /// qualified at every occurrence; a schema name that does not fit
+        /// answers `QueryFailed` rather than a truncated query.
+        pub fn columnsOfMany(
+            self: *Self,
+            arena: std.mem.Allocator,
+            query: []const u8,
+            schema: ?[]const u8,
+            tables: []const []const u8,
+        ) wire.Error![]const []const wire.Column {
+            var pragma_buf: [2048]u8 = undefined;
+            var master_buf: [2048]u8 = undefined;
+            const text = try qualifiedQuery(&pragma_buf, &master_buf, query, schema);
+            const names: []const u8 = std.json.Stringify.valueAlloc(arena, tables, .{}) catch
+                return error.QueryFailed;
+
+            var rows = try self.run(arena, text, .{names}, null, null);
+            defer rows.close();
+
+            var found: std.ArrayList(wire.Keyed(wire.Column)) = .empty;
             while (try self.next(&rows)) {
-                const name = try self.read(&rows, []const u8, 0);
-                const udt = try self.read(&rows, []const u8, 1);
-                const nullable = try self.read(&rows, []const u8, 2);
+                const table = try self.read(&rows, []const u8, 0);
+                const name = try self.read(&rows, []const u8, 1);
+                const udt = try self.read(&rows, []const u8, 2);
+                const nullable = try self.read(&rows, []const u8, 3);
+                found.append(arena, .{
+                    .key = arena.dupe(u8, table) catch return error.QueryFailed,
+                    .item = .{
+                        .name = arena.dupe(u8, name) catch return error.QueryFailed,
+                        .udt = arena.dupe(u8, udt) catch return error.QueryFailed,
+                        .nullable = if (std.mem.eql(u8, nullable, "YES"))
+                            true
+                        else if (std.mem.eql(u8, nullable, "NO"))
+                            false
+                        else
+                            null,
+                    },
+                }) catch return error.QueryFailed;
+            }
+            // Folded: `pragma_table_info` finds `Users` for `users`, so the
+            // name the catalog returns may not be the one asked for.
+            return wire.cutByName(wire.Column, arena, tables, found.items, true);
+        }
+
+        /// `query` with the schema in front of the two relations it reads,
+        /// or as it is when the table has no schema of its own.
+        fn qualifiedQuery(
+            pragma_buf: []u8,
+            master_buf: []u8,
+            query: []const u8,
+            schema: ?[]const u8,
+        ) wire.Error![]const u8 {
+            const db_name = schema orelse return query;
+            const with_pragma = try qualifyEvery(pragma_buf, query, "pragma_table_info", db_name);
+            return qualifyEvery(master_buf, with_pragma, "sqlite_master", db_name);
+        }
+
+        /// The rows of the introspection query as columns. Shared by the
+        /// Wire's `columnsOf` and the one on `Tx`, so a migration reads the
+        /// table through the connection it already holds (ADR 123).
+        fn columnList(self: *Self, arena: std.mem.Allocator, rows: *Rows) wire.Error![]const wire.Column {
+            var found: std.ArrayList(wire.Column) = .empty;
+            while (try self.next(rows)) {
+                const name = try self.read(rows, []const u8, 0);
+                const udt = try self.read(rows, []const u8, 1);
+                const nullable = try self.read(rows, []const u8, 2);
                 found.append(arena, .{
                     .name = arena.dupe(u8, name) catch return error.QueryFailed,
                     .udt = arena.dupe(u8, udt) catch return error.QueryFailed,
@@ -1247,7 +1541,7 @@ pub fn Wire(comptime opts_in: Options) type {
             const at = if (wantsWriter(sql)) try self.takeWriter(sql) else try self.takeReader(sql);
             defer self.release(at);
             const conn = self.conns[at].handle;
-            const stmt = conn.prepare(sql) catch |err| return translate(conn, err);
+            const stmt = prepareOne(conn, sql) catch |err| return translate(conn, err);
             defer stmt.deinit();
 
             const count: usize = @intCast(zqlite.c.sqlite3_column_count(stmt.stmt));
@@ -1276,11 +1570,24 @@ pub fn Wire(comptime opts_in: Options) type {
             _ = type_name;
             return &.{};
         }
+
+        /// Never called, for the reason `labelsOf` is not: one empty answer
+        /// per name.
+        pub fn labelsOfMany(
+            self: *Self,
+            arena: std.mem.Allocator,
+            query: []const u8,
+            type_names: []const []const u8,
+        ) wire.Error![]const []const []const u8 {
+            _ = self;
+            _ = query;
+            const out = arena.alloc([]const []const u8, type_names.len) catch return error.QueryFailed;
+            for (out) |*slot| slot.* = &.{};
+            return out;
+        }
     };
 }
 
-/// A zqlite error as one of the seven this module admits to (ADR 036).
-///
 /// The parameter tuple with every `wire.Bytes` in it turned into the wrapper
 /// zqlite binds a blob from.
 ///
@@ -1314,6 +1621,69 @@ fn Blobbed(comptime V: type) type {
     }
 }
 
+/// Every integer in `values` checked into `i64`, which is all SQLite stores.
+///
+/// zqlite binds an integer with `@intCast`, so a `u64` of 2^63 or more, an
+/// `?offset=9223372036854775808` read into a `usize`, is a panic in Debug and
+/// ReleaseSafe and undefined behaviour in ReleaseFast: a request could take
+/// the server down. pg.zig answers `IntWontFit` for the same value, and this
+/// answers the same way. Unrolled while compiling, so a statement holding no
+/// integer wider than `i64` costs nothing here.
+fn intsFit(values: anytype) wire.Error!void {
+    inline for (@typeInfo(@TypeOf(values)).@"struct".fields) |f| {
+        if (comptime wideInt(f.type)) |I| {
+            const held: ?I = @field(values, f.name);
+            if (held) |n| if (std.math.cast(i64, n) == null) {
+                std.log.warn(
+                    "nilo_sql: {d} was refused before it was bound: SQLite stores an " ++
+                        "integer as a signed 64-bit number, and this one does not fit.",
+                    .{n},
+                );
+                return error.QueryFailed;
+            };
+        }
+    }
+}
+
+/// Every float in `values` checked for a NaN, which SQLite cannot store.
+///
+/// `sqlite3_bind_double` binds a NaN as NULL, so a NOT NULL column answered
+/// `NotNullViolated` for a value that was never null and a nullable one read
+/// back `null`, where Postgres keeps the NaN. Refused here, before it is
+/// bound, with a message that names it. An infinity is not refused: SQLite
+/// stores and reads it back as itself, the same as Postgres does.
+fn floatsKept(values: anytype) wire.Error!void {
+    inline for (@typeInfo(@TypeOf(values)).@"struct".fields) |f| {
+        const F = switch (@typeInfo(f.type)) {
+            .float => f.type,
+            .optional => |o| if (@typeInfo(o.child) == .float) o.child else continue,
+            else => continue,
+        };
+        const held: ?F = @field(values, f.name);
+        if (held) |x| if (std.math.isNan(x)) {
+            std.log.warn(
+                "nilo_sql: a NaN was refused before it was bound: SQLite stores a NaN " ++
+                    "as NULL, so the row would not hold the value it was given.",
+                .{},
+            );
+            return error.QueryFailed;
+        };
+    }
+}
+
+/// The integer type behind `T`, optional or not, when it holds a value `i64`
+/// cannot: a `u64`, a `usize`, an `i128`. Null for everything else.
+fn wideInt(comptime T: type) ?type {
+    const I = switch (@typeInfo(T)) {
+        .int => T,
+        .optional => |o| if (@typeInfo(o.child) == .int) o.child else return null,
+        else => return null,
+    };
+    if (std.math.minInt(I) >= std.math.minInt(i64) and std.math.maxInt(I) <= std.math.maxInt(i64))
+        return null;
+    return I;
+}
+
 fn blobbed(values: anytype) Blobbed(@TypeOf(values)) {
     const V = @TypeOf(values);
     if (comptime Blobbed(V) == V) return values;
@@ -1330,6 +1700,39 @@ fn blobbed(values: anytype) Blobbed(@TypeOf(values)) {
     return out;
 }
 
+/// `conn.prepare`, and a refusal of a second statement in **every** optimize
+/// mode. zqlite makes that check only under `builtin.mode == .Debug`, so a
+/// release build ran the first of two statements given to one call and dropped
+/// the rest without a word: `exec("INSERT …; INSERT …")` inserted one row and
+/// reported success, and a test in Debug could not have shown it.
+///
+/// SQLite reports the first statement's text through `sqlite3_sql` (exactly
+/// what `sqlite3_prepare_v2` consumed, up to the tail), so what follows it is
+/// found without a second `prepare` on the common path. A tail that compiles to
+/// nothing, whitespace or comments or a lone `;`, is not a statement and is
+/// let through, the way the Debug check treats it. In Debug zqlite's own check
+/// runs first and answers the same `error.MultipleStatements`.
+fn prepareOne(conn: zqlite.Conn, sql: []const u8) !zqlite.Stmt {
+    const stmt = try conn.prepare(sql);
+    errdefer stmt.deinit();
+
+    const c = zqlite.c;
+    const consumed_ptr = c.sqlite3_sql(stmt.stmt) orelse return stmt;
+    const consumed = std.mem.len(consumed_ptr);
+    if (consumed >= sql.len) return stmt;
+    const rest = sql[consumed..];
+
+    var tail_stmt: ?*c.sqlite3_stmt = null;
+    defer if (tail_stmt != null) {
+        _ = c.sqlite3_finalize(tail_stmt);
+    };
+    const rc = c.sqlite3_prepare_v2(conn.conn, rest.ptr, @intCast(rest.len), &tail_stmt, null);
+    if (rc != c.SQLITE_OK or tail_stmt != null) return error.MultipleStatements;
+    return stmt;
+}
+
+/// A zqlite error as one of `wire.Error` (ADR 036).
+///
 /// **Cleaner than the Postgres mapping, and for a reason worth recording**:
 /// SQLite's extended result codes tell a unique violation apart from every
 /// other constraint natively, so this is a switch over an error set rather
@@ -1382,6 +1785,17 @@ fn translate(conn: zqlite.Conn, err: anyerror) wire.Error {
             return error.QueryFailed;
         },
         error.CantOpen, error.IoErr, error.NotADB, error.Corrupt => error.Disconnected,
+
+        // `prepareOne`'s refusal. `lastError` would name whatever the
+        // connection said last, which is not this.
+        error.MultipleStatements => {
+            std.log.warn(
+                "nilo_sql: a statement text held more than one statement, and SQLite " ++
+                    "runs only the first. Send each as its own call.",
+                .{},
+            );
+            return error.QueryFailed;
+        },
 
         else => {
             // The text never reaches the client (ADR 024); it goes here,
@@ -1544,6 +1958,91 @@ test "a NULL reads as null, and an integer too wide for the field is refused not
     }.run);
 }
 
+test "a number is read only out of a number, so text and a fraction are refused rather than guessed" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:classes?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(
+                gpa,
+                "CREATE TABLE t(n INTEGER, r REAL, flag BOOLEAN, at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                .{},
+                null,
+                null,
+            );
+            _ = try w.exec(gpa, "INSERT INTO t(n, r, flag) VALUES ('seven', 2.7, 2)", .{}, null, null);
+            _ = try w.exec(gpa, "INSERT INTO t(n, r, flag) VALUES (7, 3, 'yes')", .{}, null, null);
+
+            var rows = try w.run(gpa, "SELECT n, r, flag, at FROM t ORDER BY rowid", .{}, null, null);
+            defer rows.close();
+
+            try testing.expect(try w.next(&rows));
+            // Text in an INTEGER column read 0, and a REAL read 2: both were
+            // answers that look like data.
+            try testing.expectError(error.QueryFailed, w.read(&rows, i64, 0));
+            try testing.expectError(error.QueryFailed, w.read(&rows, i64, 1));
+            try testing.expectEqual(@as(f64, 2.7), try w.read(&rows, f64, 1));
+            // A 2 is true to `WHERE flag`, so it is true here too.
+            try testing.expectEqual(true, try w.read(&rows, bool, 2));
+            // What `CURRENT_TIMESTAMP` stores is text, which a `Timestamp`'s
+            // microseconds used to read as the year.
+            try testing.expectError(error.QueryFailed, w.read(&rows, i64, 3));
+            try testing.expectError(error.QueryFailed, w.read(&rows, ?i64, 3));
+
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(i64, 7), try w.read(&rows, i64, 0));
+            // An integer is a float with nothing lost.
+            try testing.expectEqual(@as(f64, 3), try w.read(&rows, f64, 1));
+            try testing.expectError(error.QueryFailed, w.read(&rows, bool, 2));
+            try testing.expectError(error.QueryFailed, w.read(&rows, f64, 2));
+        }
+    }.run);
+}
+
+test "a NaN is refused before SQLite stores it as NULL, and an infinity is kept" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:nan?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE t(x REAL NOT NULL, y REAL)", .{}, null, null);
+            // It used to arrive as `NotNullViolated` on a value that was never
+            // null, and as a `null` read back from the nullable column.
+            try testing.expectError(error.QueryFailed, w.exec(
+                gpa,
+                "INSERT INTO t(x, y) VALUES (?1, ?2)",
+                .{ @as(f64, 1), @as(?f64, std.math.nan(f64)) },
+                null,
+                null,
+            ));
+            try testing.expectError(error.QueryFailed, w.exec(
+                gpa,
+                "INSERT INTO t(x) VALUES (?1)",
+                .{std.math.nan(f32)},
+                null,
+                null,
+            ));
+
+            _ = try w.exec(
+                gpa,
+                "INSERT INTO t(x, y) VALUES (?1, ?2)",
+                .{ std.math.inf(f64), @as(?f64, null) },
+                null,
+                null,
+            );
+            var rows = try w.run(gpa, "SELECT x, y FROM t", .{}, null, null);
+            defer rows.close();
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(std.math.inf(f64), try w.read(&rows, f64, 0));
+            try testing.expectEqual(@as(?f64, null), try w.read(&rows, ?f64, 1));
+            try testing.expect(!try w.next(&rows));
+        }
+    }.run);
+}
+
 test "a returning reader wakes the fiber that wanted a reader, not the one that wanted the writer" {
     // **If this test ever hangs, the pool has lost a wakeup** — that is the
     // failure it exists to catch, and the diagnosis is `ps -o etime,cputime`
@@ -1592,6 +2091,42 @@ test "a returning reader wakes the fiber that wanted a reader, not the one that 
     }.run);
 }
 
+test "a fiber cancelled while it queues for a connection keeps its cancellation" {
+    // A background loop queued for the writer at shutdown used to be told
+    // `TimedOut` with the cancellation spent, so its next `sleep` ran and the
+    // process never exited (ADR 223).
+    try withIoPair(struct {
+        const After = enum { still_cancelled, lost, took };
+
+        fn waitThenAsk(w: *TestWire, io: std.Io, want_writer: bool) After {
+            _ = (if (want_writer) w.takeWriter("test") else w.takeReader("test")) catch |err| {
+                std.debug.assert(err == error.Disconnected);
+                std.Io.checkCancel(io) catch return .still_cancelled;
+                return .lost;
+            };
+            return .took;
+        }
+
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:cancel-in-queue?mode=memory&cache=shared", 2);
+            defer w.close();
+
+            // Everything taken, so both askers have to park.
+            try testing.expectEqual(@as(usize, 0), try w.takeWriter("test"));
+            try testing.expectEqual(@as(usize, 1), try w.takeReader("test"));
+
+            for ([_]bool{ true, false }) |want_writer| {
+                var task = io.concurrent(waitThenAsk, .{ &w, io, want_writer }) catch return error.SkipZigTest;
+                try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+                try testing.expectEqual(After.still_cancelled, task.cancel(io));
+            }
+
+            w.release(0);
+            w.release(1);
+        }
+    }.run);
+}
+
 test "the introspection query reads the rowid alias as not-null, and its near misses as null" {
     // `dialect.SQLite.introspect` is asked directly rather than through
     // `db.checkSchema`, which reports a problem with `std.log.err` and so
@@ -1622,7 +2157,7 @@ test "the introspection query reads the rowid alias as not-null, and its near mi
                 "CREATE TABLE composite (tenant_id INTEGER, id INTEGER, PRIMARY KEY (tenant_id, id))",
                 // A column with no declared type at all, which SQLite allows.
                 // Here because ADR 094 made a NULL in a non-optional field an
-                // error, and this query reads `upper(i.type)` as a
+                // error, and this query reads `i.type` as a
                 // `[]const u8`: if the pragma answered NULL rather than the
                 // empty string for an untyped column, the schema check would
                 // have started failing on a table it used to read.
@@ -1670,6 +2205,40 @@ test "the introspection query reads the rowid alias as not-null, and its near mi
     }.run);
 }
 
+test "the introspection query answers the affinity of a hand-written declared type" {
+    // The startup check used to be handed `upper(i.type)` and wanted an exact
+    // name, so a `VARCHAR(255)` under a `Str` refused to start a server whose
+    // table was right (ADR 055). Asked directly, for the reason the test
+    // above gives.
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:affinity-introspect?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa,
+                \\CREATE TABLE hand (
+                \\  a VARCHAR(255), b DATE, c uuid, d BIGINT, e DOUBLE PRECISION,
+                \\  f BOOLEAN, g DATETIME, h CLOB, i blob, j, k NVARCHAR(10),
+                \\  l DECIMAL(10,2), m FLOAT, n INTEGER, o POINT
+                \\)
+            , .{}, null, null);
+
+            var scratch = std.heap.ArenaAllocator.init(gpa);
+            defer scratch.deinit();
+            const columns = try w.columnsOf(scratch.allocator(), dialect.SQLite.introspect, null, "hand");
+
+            const want = [_][]const u8{
+                "TEXT",    "NUMERIC", "NUMERIC", "INTEGER", "REAL",
+                "NUMERIC", "NUMERIC", "TEXT",    "BLOB",    "ANY",
+                "TEXT",    "NUMERIC", "REAL",    "INTEGER", "INTEGER",
+            };
+            try testing.expectEqual(want.len, columns.len);
+            for (want, columns) |udt, c| try testing.expectEqualStrings(udt, c.udt);
+        }
+    }.run);
+}
+
 test "a statement given a plan name is prepared once, and one without a name is not kept" {
     try withIo(struct {
         fn run(io: std.Io) !void {
@@ -1691,6 +2260,23 @@ test "a statement given a plan name is prepared once, and one without a name is 
                 defer rows.close();
                 try testing.expect(try w.next(&rows));
                 try testing.expectEqual(@as(i64, 1), try w.read(&rows, i64, 0));
+            }
+
+            // Let go clean: reset, and holding none of the last call's values,
+            // which is what lets the next call bind without undoing anything.
+            for (w.conns) |conn| {
+                const stmt = conn.kept.get("nilo_t_find") orelse continue;
+                try testing.expectEqual(@as(c_int, 0), zqlite.c.sqlite3_stmt_busy(stmt.stmt));
+                const expanded = try stmt.expandedSql(gpa);
+                defer gpa.free(expanded);
+                try testing.expect(std.mem.indexOf(u8, expanded, "id = NULL") != null);
+            }
+            // And a second value on the same statement is the second value.
+            {
+                var rows = try w.run(gpa, "SELECT id FROM t WHERE id = ?1", .{@as(i64, 2)}, "nilo_t_find", null);
+                defer rows.close();
+                try testing.expect(try w.next(&rows));
+                try testing.expectEqual(@as(i64, 2), try w.read(&rows, i64, 0));
             }
 
             // One entry, on the one reader that ran it — the cache is per
@@ -1795,7 +2381,7 @@ test "a transaction commits, rolls back, and gives its connection back either wa
                 var tx = try w.begin(gpa, .{});
                 errdefer tx.rollback();
                 _ = try tx.exec(gpa, "INSERT INTO t(id) VALUES (1)", .{}, null, null);
-                try tx.commit();
+                try tx.commit(gpa, null);
             }
             {
                 var tx = try w.begin(gpa, .{});
@@ -1807,7 +2393,7 @@ test "a transaction commits, rolls back, and gives its connection back either wa
             // hang — which is what a leaked connection would look like, and
             // there is only one writer to leak.
             var tx = try w.begin(gpa, .{});
-            try tx.commit();
+            try tx.commit(gpa, null);
 
             var rows = try w.run(gpa, "SELECT count(*) FROM t", .{}, null, null);
             defer rows.close();
@@ -1833,7 +2419,7 @@ test "a savepoint undoes part of a transaction without ending it" {
             _ = try tx.exec(gpa, "INSERT INTO t(id) VALUES (2)", .{}, null, null);
             try tx.savepoint(gpa, .undo, 1);
             _ = try tx.exec(gpa, "INSERT INTO t(id) VALUES (3)", .{}, null, null);
-            try tx.commit();
+            try tx.commit(gpa, null);
 
             var rows = try w.run(gpa, "SELECT id FROM t ORDER BY id", .{}, null, null);
             defer rows.close();
@@ -1921,6 +2507,63 @@ test "a reader refuses a write, which is what makes routing safe to get wrong" {
     }.run);
 }
 
+test "a write that waits past busy_timeout on a lock another program holds answers Locked" {
+    // With one writer in the pool, a lock held elsewhere is another program
+    // on the same file, and only a file can have one: `busy_timeout` counts
+    // down and the write answers `Locked`, the word Postgres's `55P03` gets.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    tmp_sub_path = tmp.sub_path;
+
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var path: [96]u8 = undefined;
+            const url = try std.fmt.bufPrintZ(&path, ".zig-cache/tmp/{s}/busy.db", .{tmp_sub_path});
+            const Quick = Wire(.{ .threading = .in_fiber, .busy_timeout_ms = 50 });
+            var w = try Quick.open(io, testing.allocator, url, .{ .size = 2 });
+            defer w.close();
+            const gpa = testing.allocator;
+            _ = try w.exec(gpa, "CREATE TABLE t(id INTEGER PRIMARY KEY)", .{}, null, null);
+
+            const other = try zqlite.open(url, zqlite.OpenFlags.ReadWrite | zqlite.OpenFlags.EXResCode);
+            defer other.close();
+            try other.execNoArgs("BEGIN IMMEDIATE");
+            try testing.expectError(error.Locked, w.exec(gpa, "INSERT INTO t(id) VALUES (1)", .{}, null, null));
+
+            // Let go of, the same write goes through on the same pool.
+            try other.execNoArgs("ROLLBACK");
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t(id) VALUES (1)", .{}, null, null));
+        }
+    }.run);
+}
+
+test "each SQLite failure a caller branches on has the name the Postgres one has" {
+    // The table, one row a case. Most of these cannot be produced on demand
+    // (an interrupt nothing here calls, a snapshot that went stale, a disk
+    // that went away), so the mapping is held here rather than by accident.
+    const conn = try zqlite.open(":memory:", zqlite.OpenFlags.ReadWrite | zqlite.OpenFlags.Create);
+    defer conn.close();
+    const cases = [_]struct { anyerror, wire.Error }{
+        .{ error.ConstraintUnique, error.AlreadyExists },
+        .{ error.ConstraintPrimaryKey, error.AlreadyExists },
+        .{ error.ConstraintForeignKey, error.ForeignKeyViolated },
+        .{ error.ConstraintNotNull, error.NotNullViolated },
+        .{ error.ConstraintCheck, error.CheckViolated },
+        .{ error.Constraint, error.ConstraintViolated },
+        .{ error.ConstraintTrigger, error.ConstraintViolated },
+        .{ error.Busy, error.Locked },
+        .{ error.BusyTimeout, error.Locked },
+        .{ error.BusySnapshot, error.Locked },
+        .{ error.Locked, error.Locked },
+        .{ error.LockedSharedCache, error.Locked },
+        .{ error.Interrupt, error.TimedOut },
+        .{ error.CantOpen, error.Disconnected },
+        .{ error.IoErr, error.Disconnected },
+        .{ error.Corrupt, error.Disconnected },
+    };
+    for (cases) |case| try testing.expectEqual(case[1], translate(conn, case[0]));
+}
+
 /// Where `std.testing.tmpDir` put the directory the test above uses. A file
 /// rather than a shared in-memory database, and the path has to reach a
 /// closure `withIo` calls as a plain function.
@@ -1990,6 +2633,235 @@ test "each constraint a caller branches on arrives under its own name" {
                 null,
                 null,
             ));
+        }
+    }.run);
+}
+
+test "a statement text holding a second statement is refused in every optimize mode, and a tail of nothing is not" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:two-statements?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE t(id INTEGER PRIMARY KEY)", .{}, null, null);
+
+            // zqlite refuses this only in Debug; a release build ran the
+            // first INSERT and dropped the second without a word.
+            try testing.expectError(error.QueryFailed, w.exec(
+                gpa,
+                "INSERT INTO t(id) VALUES (1); INSERT INTO t(id) VALUES (2)",
+                .{},
+                null,
+                null,
+            ));
+
+            // A trailing semicolon, whitespace and a comment are not statements.
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t(id) VALUES (3);", .{}, null, null));
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t(id) VALUES (4); \n\t", .{}, null, null));
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t(id) VALUES (5); -- done", .{}, null, null));
+            try testing.expectEqual(@as(usize, 1), try w.exec(gpa, "INSERT INTO t(id) VALUES (6); /* done */", .{}, null, null));
+
+            // Nothing from the refused text ran: 3, 4, 5 and 6 only.
+            var rows = try w.run(gpa, "SELECT count(*) FROM t", .{}, null, null);
+            defer rows.close();
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(i64, 4), try w.read(&rows, i64, 0));
+        }
+    }.run);
+}
+
+test "the numbered list of blob keys joins a blob column, because it is read back out of its hex" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:blob-children?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE child(id INTEGER PRIMARY KEY, parent BLOB NOT NULL)", .{}, null, null);
+            _ = try w.exec(gpa, "INSERT INTO child(id, parent) VALUES (1, x'0a0b'), (2, x'ff'), (3, x'0a0b')", .{}, null, null);
+
+            // The same statement `shape.children` builds: the list, then a
+            // join on its `value`. The parameter is what `jsonList` writes
+            // for a `Bytes` key: a JSON array of hex text.
+            const listed = comptime dialect.SQLite.ordinalList("?1", wire.Bytes, "\"#k\"").?;
+            var rows = try w.run(
+                gpa,
+                "SELECT child.id, \"#k\".\"key\" FROM " ++ listed ++
+                    " JOIN child ON child.parent = \"#k\".\"value\" ORDER BY \"#k\".\"key\", child.id",
+                .{"[\"ff\",\"0a0b\"]"},
+                null,
+                null,
+            );
+            defer rows.close();
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(i64, 2), try w.read(&rows, i64, 0));
+            try testing.expectEqual(@as(i64, 0), try w.read(&rows, i64, 1));
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(i64, 1), try w.read(&rows, i64, 0));
+            try testing.expectEqual(@as(i64, 1), try w.read(&rows, i64, 1));
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(i64, 3), try w.read(&rows, i64, 0));
+            try testing.expect(!try w.next(&rows));
+        }
+    }.run);
+}
+
+test "a double is read into an f32 only when the f32 holds it exactly" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:narrow?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE t(x REAL)", .{}, null, null);
+            _ = try w.exec(gpa, "INSERT INTO t(x) VALUES (?1), (?2), (?3)", .{ @as(f64, 0.5), @as(f64, 0.1), @as(f64, 1e300) }, null, null);
+
+            var rows = try w.run(gpa, "SELECT x FROM t ORDER BY rowid", .{}, null, null);
+            defer rows.close();
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(f32, 0.5), try w.read(&rows, f32, 0));
+            // Postgres refuses every float8 read into an f32; here the
+            // value that would have been rounded is the one refused.
+            try testing.expect(try w.next(&rows));
+            try testing.expectError(error.QueryFailed, w.read(&rows, f32, 0));
+            try testing.expectEqual(@as(f64, 0.1), try w.read(&rows, f64, 0));
+            // And one that overflows an f32 is not an infinity.
+            try testing.expect(try w.next(&rows));
+            try testing.expectError(error.QueryFailed, w.read(&rows, ?f32, 0));
+        }
+    }.run);
+}
+
+test "a value refused before it was bound does not abort the transaction" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:refused-not-aborted?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)", .{}, null, null);
+
+            var tx = try w.begin(gpa, .{});
+            errdefer tx.rollback();
+            // A u64 SQLite cannot store: refused, as Postgres's client
+            // refuses it, and nothing has reached the database.
+            try testing.expectError(error.QueryFailed, tx.exec(
+                gpa,
+                "INSERT INTO t(id, n) VALUES (1, ?1)",
+                .{@as(u64, std.math.maxInt(u64))},
+                null,
+                null,
+            ));
+            // The transaction goes on, and commits what came after.
+            _ = try tx.exec(gpa, "INSERT INTO t(id, n) VALUES (2, 20)", .{}, null, null);
+            try tx.commit(gpa, null);
+
+            var rows = try w.run(gpa, "SELECT count(*) FROM t", .{}, null, null);
+            defer rows.close();
+            try testing.expect(try w.next(&rows));
+            try testing.expectEqual(@as(i64, 1), try w.read(&rows, i64, 0));
+        }
+    }.run);
+}
+
+test "exec answers the rows a statement changed, and 0 for one that changed none" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:exec-count?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE t(id INTEGER PRIMARY KEY)", .{}, null, null);
+            try testing.expectEqual(@as(usize, 3), try w.exec(gpa, "INSERT INTO t(id) VALUES (1), (2), (3)", .{}, null, null));
+            // `changes()` alone answered 3 for each of these, the count of the
+            // last statement that did change rows.
+            try testing.expectEqual(@as(usize, 0), try w.exec(gpa, "CREATE INDEX t_id ON t(id)", .{}, null, null));
+            try testing.expectEqual(@as(usize, 0), try w.exec(gpa, "PRAGMA user_version = 7", .{}, null, null));
+            try testing.expectEqual(@as(usize, 0), try w.exec(gpa, "UPDATE t SET id = id WHERE id > 99", .{}, null, null));
+            try testing.expectEqual(@as(usize, 2), try w.exec(gpa, "DELETE FROM t WHERE id > 1", .{}, null, null));
+        }
+    }.run);
+}
+
+test "a plan goes to a reader, so a transaction holding the writer does not wait for itself" {
+    try testing.expect(!TestWire.wantsWriter("EXPLAIN QUERY PLAN INSERT INTO \"t\" VALUES (?1)"));
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:plan-reader?mode=memory&cache=shared", 2);
+            defer w.close();
+            const gpa = testing.allocator;
+
+            _ = try w.exec(gpa, "CREATE TABLE t(id INTEGER PRIMARY KEY)", .{}, null, null);
+            var tx = try w.begin(gpa, .{});
+            defer tx.rollback();
+            // The one writer is the transaction's now.
+            var plan = try w.run(gpa, "EXPLAIN QUERY PLAN SELECT * FROM t WHERE id = 1", .{}, null, null);
+            defer plan.close();
+            try testing.expect(try w.next(&plan));
+        }
+    }.run);
+}
+
+test "the check before a rebuild's commit looks at the tables it dropped and the rows pointing at them" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings(
+        "SELECT 1 FROM pragma_foreign_key_check WHERE \"table\" COLLATE NOCASE IN ('a''b', 'c') " ++
+            "OR \"parent\" COLLATE NOCASE IN ('a''b', 'c') LIMIT 1",
+        try TestWire.foreignKeyCheck(a, &.{ "a'b", "c" }, false),
+    );
+    // A drop it could not read, or none: every key, as it always was.
+    try testing.expectEqualStrings(
+        "SELECT 1 FROM pragma_foreign_key_check LIMIT 1",
+        try TestWire.foreignKeyCheck(a, &.{"c"}, true),
+    );
+    try testing.expectEqualStrings(
+        "SELECT 1 FROM pragma_foreign_key_check LIMIT 1",
+        try TestWire.foreignKeyCheck(a, &.{}, false),
+    );
+}
+
+test "an old broken key in a table a rebuild never touched does not fail the rebuild" {
+    try withIo(struct {
+        fn run(io: std.Io) !void {
+            var w = try openTest(io, "file:rebuild-scope?mode=memory&cache=shared", 3);
+            defer w.close();
+            var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+
+            _ = try w.exec(a, "CREATE TABLE p(id INTEGER PRIMARY KEY)", .{}, null, null);
+            _ = try w.exec(a, "CREATE TABLE c(id INTEGER PRIMARY KEY, p_id INTEGER REFERENCES p(id))", .{}, null, null);
+            _ = try w.exec(a, "CREATE TABLE other(id INTEGER PRIMARY KEY)", .{}, null, null);
+            _ = try w.exec(a, "CREATE TABLE old(id INTEGER PRIMARY KEY, o_id INTEGER REFERENCES other(id))", .{}, null, null);
+            _ = try w.exec(a, "INSERT INTO p(id) VALUES (1)", .{}, null, null);
+            _ = try w.exec(a, "INSERT INTO c(id, p_id) VALUES (1, 1)", .{}, null, null);
+            // A violation from before, in a table the rebuild does not name.
+            _ = try w.exec(a, "PRAGMA foreign_keys = OFF", .{}, null, null);
+            _ = try w.exec(a, "INSERT INTO old(id, o_id) VALUES (1, 99)", .{}, null, null);
+            _ = try w.exec(a, "PRAGMA foreign_keys = ON", .{}, null, null);
+
+            {
+                var tx = try w.begin(a, .{ .rebuilding = true });
+                errdefer tx.rollback();
+                _ = try tx.exec(a, "CREATE TABLE p_new(id INTEGER PRIMARY KEY)", .{}, null, null);
+                _ = try tx.exec(a, "INSERT INTO p_new SELECT id FROM p", .{}, null, null);
+                _ = try tx.exec(a, "DROP TABLE p", .{}, null, null);
+                _ = try tx.exec(a, "ALTER TABLE p_new RENAME TO p", .{}, null, null);
+                // Every key used to be checked here, and `old` failed it.
+                try tx.commit(a, null);
+            }
+
+            // And a rebuild that loses a parent row still fails, through the
+            // child that points at it.
+            var tx = try w.begin(a, .{ .rebuilding = true });
+            _ = try tx.exec(a, "CREATE TABLE p_new(id INTEGER PRIMARY KEY)", .{}, null, null);
+            _ = try tx.exec(a, "DROP TABLE p", .{}, null, null);
+            _ = try tx.exec(a, "ALTER TABLE p_new RENAME TO p", .{}, null, null);
+            try testing.expectError(error.ForeignKeyViolated, tx.commit(a, null));
         }
     }.run);
 }

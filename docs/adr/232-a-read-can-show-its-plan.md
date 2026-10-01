@@ -52,7 +52,13 @@ spelling and value check every raw call does
 inside a transaction that is always rolled back**, because `ANALYZE` executes
 what it plans and a raw statement may be an `UPDATE`: asking how a write is
 done never keeps the write. What a transaction cannot undo stays done, which on
-Postgres is a sequence a write advanced.
+Postgres is a sequence a write advanced. **On SQLite it opens no transaction**
+(`Dialect.explain_runs`): `EXPLAIN QUERY PLAN` only plans, and the `BEGIN
+IMMEDIATE` a transaction takes there holds the one writer, so a handler that
+held a `tx` and asked for a plan waited for itself. It goes down a reader, and
+`wantsWriter` sends any statement starting `EXPLAIN` to one. Opening one was the
+first position; it was the same code on both databases, and it was right only
+for the one whose plan runs the statement.
 
 **The test-side assertion the port asked for is a string search in the test**,
 against seeded data. A missing index then fails the suite rather than a page.

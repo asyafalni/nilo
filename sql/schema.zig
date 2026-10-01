@@ -77,10 +77,22 @@ pub const Problem = struct {
                 "nilo: {s}.{s} has no column in table \"{s}\"",
                 .{ self.row, self.column, self.table },
             ),
-            .wrong_type => try w.print(
-                "nilo: {s}.{s} expects {s}, but {s}.{s} is {s}",
-                .{ self.row, self.column, self.expected, self.table, self.column, self.found },
-            ),
+            .wrong_type => {
+                try w.print(
+                    "nilo: {s}.{s} expects {s}, but {s}.{s} is {s}",
+                    .{ self.row, self.column, self.expected, self.table, self.column, self.found },
+                );
+                // The one mismatch whose fix is not "change the field": a
+                // zoneless column moves `.now` by the session's zone, and
+                // what nilo wrote into it before is UTC wall time, which this
+                // `USING` keeps.
+                if (std.mem.eql(u8, self.expected, "timestamptz") and std.mem.eql(u8, self.found, "timestamp"))
+                    try w.print(
+                        " — `ALTER TABLE \"{s}\" ALTER COLUMN \"{s}\" TYPE timestamptz " ++
+                            "USING \"{s}\" AT TIME ZONE 'UTC'`",
+                        .{ self.table, self.column, self.column },
+                    );
+            },
             .unexpected_null => try w.print(
                 "nilo: {s}.{s} is not optional, but {s}.{s} may be null",
                 .{ self.row, self.column, self.table, self.column },
@@ -112,8 +124,18 @@ pub const Expectation = struct {
     expected: []const u8,
     optional: bool,
 
+    /// **A column with no declared type fits any field** (ADR 055). SQLite's
+    /// `pragma_table_info` answers an empty type for `CREATE TABLE t (x)` and
+    /// for an expression in a view, and such a column has BLOB affinity, which
+    /// converts nothing and stores whatever it is given. The SQLite
+    /// `introspect` says `ANY` for it, in capitals no Postgres `typname`
+    /// uses, so the one test here serves both Dialects. Refusing it would be
+    /// the check refusing a correct table again.
+    pub const untyped = "ANY";
+
     pub fn accepted(self: Expectation, udt: []const u8) bool {
         if (self.accepts.len == 0) return true;
+        if (std.mem.eql(u8, udt, untyped)) return true;
         for (self.accepts) |name| {
             if (std.mem.eql(u8, name, udt)) return true;
         }
@@ -287,6 +309,84 @@ pub fn enumColumnsOf(comptime Row: type) []const EnumColumn {
         const frozen = out[0..n].*;
         break :blk &frozen;
     };
+}
+
+/// The tables of a list of Rows that live in one schema, each once. What the
+/// startup check asks the catalog about in one query (`Wire.columnsOfMany`):
+/// two Rows over one table share an entry, and Rows in different schemas
+/// fall into different groups because a catalog query names one schema.
+pub const Group = struct {
+    schema: ?[]const u8,
+    tables: []const []const u8,
+};
+
+/// Where a Row's table is in `groupsOf`'s answer: the group, and the place in
+/// that group's `tables`, which is the place in the Wire's answer too.
+pub const Place = struct { group: usize, table: usize };
+
+/// The groups, in the order their schemas first appear among `Rows`.
+pub fn groupsOf(comptime Rows: []const type) []const Group {
+    return comptime blk: {
+        @setEvalBranchQuota(20_000 + 5_000 * Rows.len * Rows.len);
+        var groups: [Rows.len]Group = undefined;
+        var n: usize = 0;
+        for (Rows) |Row| {
+            const q = row_mod.qualifiedOf(Row);
+            var g: usize = 0;
+            while (g < n) : (g += 1) {
+                if (table_mod.sameSchema(groups[g].schema, q.schema)) break;
+            }
+            if (g == n) {
+                groups[n] = .{ .schema = q.schema, .tables = &.{} };
+                n += 1;
+            }
+            var seen = false;
+            for (groups[g].tables) |t| {
+                if (std.mem.eql(u8, t, q.table)) seen = true;
+            }
+            if (!seen) groups[g].tables = groups[g].tables ++ &[_][]const u8{q.table};
+        }
+        const frozen = groups[0..n].*;
+        break :blk &frozen;
+    };
+}
+
+/// Where `Row`'s table is among `groups`.
+pub fn placeOf(comptime groups: []const Group, comptime Row: type) Place {
+    return comptime blk: {
+        const q = row_mod.qualifiedOf(Row);
+        for (groups, 0..) |g, gi| {
+            if (!table_mod.sameSchema(g.schema, q.schema)) continue;
+            for (g.tables, 0..) |t, ti| {
+                if (std.mem.eql(u8, t, q.table)) break :blk .{ .group = gi, .table = ti };
+            }
+        }
+        @compileError("nilo: " ++ @typeName(Row) ++ " is in no group of tables; this is a bug in `schema.groupsOf`.");
+    };
+}
+
+/// Every enum type name the Rows' columns declared, each once: what the
+/// startup check asks the catalog for in one query (`Wire.labelsOfMany`).
+pub fn enumTypesOf(comptime Rows: []const type) []const []const u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(20_000 + 5_000 * Rows.len * Rows.len);
+        var out: []const []const u8 = &.{};
+        for (Rows) |Row| {
+            for (enumColumnsOf(Row)) |col| {
+                if (enumTypeAt(out, col.type_name) == null) out = out ++ &[_][]const u8{col.type_name};
+            }
+        }
+        const frozen = out[0..out.len].*;
+        break :blk &frozen;
+    };
+}
+
+/// The place of `name` among `names`, or null.
+pub fn enumTypeAt(names: []const []const u8, name: []const u8) ?usize {
+    for (names, 0..) |t, i| {
+        if (std.mem.eql(u8, t, name)) return i;
+    }
+    return null;
 }
 
 /// Hold a Zig enum against the values the database's type has, appending
@@ -581,6 +681,23 @@ test "a column holding something else says both types" {
     );
 }
 
+test "a Timestamp over a zoneless timestamp column is refused, with the ALTER that keeps its values" {
+    var cols = good;
+    cols[4].udt = "timestamp";
+    var problems = try problemsFor(User, &cols);
+    defer problems.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), problems.items.len);
+    try testing.expectEqual(Mismatch.wrong_type, problems.items[0].kind);
+
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings(
+        "nilo: schema.User.created_at expects timestamptz, but users.created_at is timestamp — " ++
+            "`ALTER TABLE \"users\" ALTER COLUMN \"created_at\" TYPE timestamptz " ++
+            "USING \"created_at\" AT TIME ZONE 'UTC'`",
+        try textOf(problems.items[0], &buf),
+    );
+}
+
 test "a nullable column read into a plain field is caught before a null arrives" {
     var columns = good;
     columns[1].nullable = true;
@@ -762,7 +879,7 @@ test "a raw column is held to the read the driver makes, not to the table's loos
     }, &out, testing.allocator);
     try testing.expectEqual(@as(usize, 1), out.items.len);
     try testing.expectEqual(@as(usize, 1), out.items[0].column);
-    try testing.expectEqualStrings("int4", out.items[0].expected);
+    try testing.expectEqualStrings("int4 or int2", out.items[0].expected);
     try testing.expectEqualStrings("int8", out.items[0].found);
 }
 
@@ -788,5 +905,105 @@ test "a raw column nobody described, or past the Row's end, is not judged" {
     var said: std.Io.Writer.Allocating = .init(testing.allocator);
     defer said.deinit();
     try out.items[0].write(&said.writer);
-    try testing.expect(std.mem.indexOf(u8, said.written(), "reads int8, and the statement answers numeric") != null);
+    try testing.expect(std.mem.indexOf(u8, said.written(), "reads int8, int4 or int2, and the statement answers numeric") != null);
+}
+
+test "SQLite columns are judged by affinity, so a hand-written declared type passes and a wrong affinity does not" {
+    const Lite = @import("dialect.zig").SQLite;
+    const Hand = struct {
+        pub const nilo_table = .{ .name = "hand", .key = .id };
+
+        id: i64,
+        name: []const u8,
+        born: types.Date,
+        ref: types.Uuid,
+        price: f64,
+        active: bool,
+        seen: types.Timestamp,
+        note: ?[]const u8,
+    };
+    // What `introspect` answers for `id INTEGER`, `name VARCHAR(255)`,
+    // `born DATE`, `ref UUID`, `price DOUBLE PRECISION`, `active BOOLEAN`,
+    // `seen DATETIME` and `note` with no type at all.
+    const columns = [_]wire_mod.Column{
+        .{ .name = "id", .udt = "INTEGER", .nullable = false },
+        .{ .name = "name", .udt = "TEXT", .nullable = false },
+        .{ .name = "born", .udt = "NUMERIC", .nullable = false },
+        .{ .name = "ref", .udt = "NUMERIC", .nullable = false },
+        .{ .name = "price", .udt = "REAL", .nullable = false },
+        .{ .name = "active", .udt = "NUMERIC", .nullable = false },
+        .{ .name = "seen", .udt = "NUMERIC", .nullable = false },
+        .{ .name = "note", .udt = Expectation.untyped, .nullable = true },
+    };
+    var out: std.ArrayList(Problem) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), try compare(Lite, Hand, &columns, &out, testing.allocator));
+
+    // A `Str` over INTEGER affinity is still the mismatch this check is for,
+    // and a column with no type fits any field, not only the optional one.
+    var wrong = columns;
+    wrong[1].udt = "INTEGER";
+    wrong[4].udt = Expectation.untyped;
+    try testing.expectEqual(@as(usize, 1), try compare(Lite, Hand, &wrong, &out, testing.allocator));
+    try testing.expectEqualStrings("name", out.items[0].column);
+    try testing.expectEqualStrings("INTEGER", out.items[0].found);
+}
+
+test "Rows are grouped by schema and share the entry of a table they both read" {
+    const Card = struct {
+        pub const nilo_table = User;
+        id: i64,
+    };
+    const Event = struct {
+        pub const nilo_table = .{ .name = "audit.events", .key = .id };
+        id: i64,
+    };
+    const Other = struct {
+        pub const nilo_table = .{ .name = "orders", .key = .id };
+        id: i64,
+    };
+    const Rows = &[_]type{ User, Event, Card, Other };
+
+    const groups = comptime groupsOf(Rows);
+    // Two groups: the session's own schema, and `audit`.
+    try testing.expectEqual(@as(usize, 2), groups.len);
+    try testing.expectEqual(@as(?[]const u8, null), groups[0].schema);
+    try testing.expectEqualStrings("audit", groups[1].schema.?);
+    // `Card` reads `users` too, so the group holds it once.
+    try testing.expectEqual(@as(usize, 2), groups[0].tables.len);
+    try testing.expectEqualStrings("users", groups[0].tables[0]);
+    try testing.expectEqualStrings("orders", groups[0].tables[1]);
+
+    try testing.expectEqual(Place{ .group = 0, .table = 0 }, comptime placeOf(groups, Card));
+    try testing.expectEqual(Place{ .group = 1, .table = 0 }, comptime placeOf(groups, Event));
+    try testing.expectEqual(Place{ .group = 0, .table = 1 }, comptime placeOf(groups, Other));
+}
+
+test "an enum type two columns name is asked about once" {
+    const Level = enum {
+        low,
+        high,
+        pub const nilo_column = "level_kind";
+    };
+    const Mood = enum {
+        calm,
+        cross,
+        pub const nilo_column = "mood_kind";
+    };
+    const A = struct {
+        pub const nilo_table = .{ .name = "a", .key = .id };
+        id: i64,
+        level: Level,
+        mood: Mood,
+    };
+    const B = struct {
+        pub const nilo_table = .{ .name = "b", .key = .id };
+        id: i64,
+        level: ?Level,
+    };
+    const names = comptime enumTypesOf(&.{ A, B });
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqual(@as(?usize, 0), enumTypeAt(names, "level_kind"));
+    try testing.expectEqual(@as(?usize, 1), enumTypeAt(names, "mood_kind"));
+    try testing.expectEqual(@as(?usize, null), enumTypeAt(names, "nope"));
 }

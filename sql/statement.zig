@@ -20,7 +20,7 @@
 //! .{ .where = .{ .age = .{ .gt = 18 } }, .order = .{ .created_at = .desc }, .limit = 10 }
 //! ```
 //! ```sql
-//! SELECT "id", "email", "age" FROM "users" WHERE "age" > $1 ORDER BY "created_at" DESC LIMIT 10
+//! SELECT "id", "email", "age" FROM "users" WHERE "age" > $1 ORDER BY "created_at" DESC, "id" ASC LIMIT 10
 //! ```
 //!
 //! At runtime what is sent is that constant and one value. Drizzle, whose
@@ -116,6 +116,164 @@ pub fn planName(comptime sql: []const u8) []const u8 {
     };
 }
 
+/// Whether a term of this statement can drop out at run time: it holds a
+/// `sql.given`, so it is written `(term OR $n IS NULL)`.
+///
+/// **That guard is the one shape a kept plan gets wrong.** A plan made for
+/// any value cannot fold `$n IS NULL`, so the `OR` stops an index seek, and
+/// Postgres switches a prepared statement to that plan after five calls
+/// whenever the calls that leave the filter out make the average custom plan
+/// as dear as a scan. A call that sets the filter then reads the whole table.
+/// `db.zig` sends such a statement unnamed on a Dialect that does this
+/// (`plan_may_go_generic`), so every call is planned for its own values
+/// ([ADR 149](../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md),
+/// [sql.md section 22](../bench/result/sql.md#22-a-guard-and-the-plan-a-kept-statement-settles-on)).
+pub fn dropsTerms(comptime stmt: Statement) bool {
+    return comptime blk: {
+        for (stmt.params) |p| if (p.droppable) break :blk true;
+        break :blk false;
+    };
+}
+
+/// One guard of a statement, cut out of its text while compiling
+/// ([ADR 149](../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
+pub const Guard = struct {
+    /// The text from the end of the guard before this one (or the start of
+    /// the statement) up to the `(` that opens this one.
+    before: []const u8,
+    /// What stands in for the guard when the value is there: the term alone,
+    /// in brackets, which is the text that seeks.
+    present: []const u8,
+    /// What stands in when it is not: the Dialect's always-true test on the
+    /// same placeholder (`absentTerm`), so `?n` is still in the text.
+    absent: []const u8,
+    /// The placeholder's number, so its value is `paths[n - 1]`.
+    n: usize,
+};
+
+/// A statement's text as pieces: `guards[0].before`, one of its two stand-ins,
+/// `guards[1].before`, … and `rest`. Empty for a statement with no guard, and
+/// for one on a Dialect that does not splice.
+pub const Splice = struct {
+    guards: []const Guard = &.{},
+    /// The text after the last guard.
+    rest: []const u8 = "",
+    /// How many bytes the widest combination is longer than the statement as
+    /// written. The guard is longer than the term alone, so this is nonzero
+    /// only when a Dialect's absent test is longer than a short guard.
+    spare: usize = 0,
+};
+
+/// The most guards whose every combination is kept prepared under a name of
+/// its own: 2³ = 8 texts a statement, on each connection. A statement with
+/// more is still spliced and runs unnamed, so the cache a request can grow is
+/// bounded by a number written here and not by the screen's filter count
+/// ([ADR 149](../docs/adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)).
+pub const max_named_guards = 3;
+
+/// Find each guard in the finished text of `stmt`, so `db.zig` can write the
+/// statement without the ones whose value is not there.
+///
+/// **The text is read for what nilo wrote and nothing else.** `where.zig`
+/// writes a guard as `(term OR <placeholder n> IS NULL)` for a parameter it
+/// marked `droppable`, and this looks for that closing shape and matches its
+/// bracket, stepping over quoted names and literals so a `(` inside one is
+/// not counted. Nothing in it is a value: every piece is a slice of the
+/// constant, and the request only chooses between two of them, which is the
+/// property ADR 165 kept for the `ORDER BY` (no run-time string reaches the
+/// statement).
+///
+/// **A statement whose guards are not all found is not spliced**, and runs as
+/// it always did: the guard as written, which is correct and slow. That is a
+/// fall-back rather than a Refusal because the text is the only thing at
+/// stake, not the answer.
+pub fn spliceOf(comptime D: type, comptime stmt: Statement) Splice {
+    return comptime blk: {
+        if (!dropsTerms(stmt)) break :blk .{};
+        if (!(@hasDecl(D, "splice_given") and D.splice_given)) break :blk .{};
+        const sql = stmt.sql;
+        @setEvalBranchQuota(200 * sql.len + 20 * stmt.params.len * sql.len + 20_000);
+
+        var found: [stmt.params.len]Guard = undefined;
+        var made: usize = 0;
+        var spare: usize = 0;
+        var stack: [256]usize = undefined;
+        var depth: usize = 0;
+        var quote: u8 = 0;
+        var from: usize = 0;
+        var i: usize = 0;
+        while (i < sql.len) : (i += 1) {
+            const ch = sql[i];
+            if (quote != 0) {
+                if (ch == quote) quote = 0;
+                continue;
+            }
+            if (ch == '\'' or ch == '"') {
+                quote = ch;
+                continue;
+            }
+            if (ch == '(') {
+                if (depth == stack.len) break :blk .{};
+                stack[depth] = i;
+                depth += 1;
+                continue;
+            }
+            if (ch != ')' or depth == 0) continue;
+            depth -= 1;
+            const open = stack[depth];
+            for (stmt.params, 0..) |p, at| {
+                if (!p.droppable) continue;
+                const n = at + 1;
+                const suffix = " OR " ++ D.placeholder(n) ++ " IS NULL)";
+                if (i + 1 < suffix.len) continue;
+                if (!std.mem.eql(u8, sql[i + 1 - suffix.len .. i + 1], suffix)) continue;
+                const term_end = i + 1 - suffix.len;
+                // A guard inside a guard is not something `where.zig` writes;
+                // if one ever appears, whole-text is the safe reading.
+                if (open < from or open >= term_end or made == found.len) break :blk .{};
+                const absent = D.absentTerm(n);
+                found[made] = .{
+                    .before = sql[from..open],
+                    .present = sql[open..term_end] ++ ")",
+                    .absent = absent,
+                    .n = n,
+                };
+                made += 1;
+                if (absent.len > i + 1 - open) spare += absent.len - (i + 1 - open);
+                from = i + 1;
+                break;
+            }
+        }
+        // Every droppable parameter has to have been found, or a term would
+        // stay guarded while its neighbours were not.
+        for (stmt.params, 0..) |p, at| {
+            if (!p.droppable) continue;
+            var seen = false;
+            for (found[0..made]) |g| {
+                if (g.n == at + 1) seen = true;
+            }
+            if (!seen) break :blk .{};
+        }
+        if (made == 0) break :blk .{};
+        const frozen = found[0..made].*;
+        break :blk .{ .guards = &frozen, .rest = sql[from..], .spare = spare };
+    };
+}
+
+/// The names a spliced statement is kept under, one for each combination of
+/// its guards: the name of the full text and the combination in hex, so no
+/// two texts share one (ADR 051's collision argument holds per text).
+pub fn planNames(comptime stmt: Statement, comptime k: usize) [1 << k][]const u8 {
+    return comptime blk: {
+        const base = planName(stmt.sql);
+        var out: [1 << k][]const u8 = undefined;
+        for (&out, 0..) |*slot, mask| {
+            slot.* = base ++ std.fmt.comptimePrint("_{x}", .{mask});
+        }
+        break :blk out;
+    };
+}
+
 /// The Row's table, quoted, with its schema in front when the Row named one.
 /// One function rather than seven call sites, because a `FROM` and an
 /// `INSERT INTO` have to spell the same relation the same way.
@@ -151,6 +309,11 @@ pub const Statement = struct {
     /// exactly what it would have been.
     ordered: bool = false,
     tail: []const u8 = "",
+    /// The key columns an ordering chosen per request is ended in, for a
+    /// statement a `LIMIT` or an `OFFSET` cuts: the run-time half of
+    /// `tiebreak`. Each is written after the chosen terms unless one of them
+    /// already names its column.
+    ties: []const Tie = &.{},
 
     pub fn paramCount(self: Statement) usize {
         return self.paths.len;
@@ -159,7 +322,7 @@ pub const Statement = struct {
 
 /// The option names a `SELECT` takes. Anything else is a Refusal, so a
 /// misspelled `.limti` stops at `zig build` rather than being ignored.
-const known = [_][]const u8{ "where", "order", "limit", "offset", "lock" };
+const known = [_][]const u8{ "where", "order", "limit", "offset", "lock", "after" };
 
 /// The same list without `.limit`, for `one` — which compiles its own and so
 /// has none to give away.
@@ -169,13 +332,18 @@ const known_one = [_][]const u8{ "where", "order", "offset", "lock" };
 /// function cannot be in one statement, and Postgres says so at run time.
 const known_page = [_][]const u8{ "where", "order", "limit", "offset" };
 
+/// A feed's: a page's, and a cursor (`afterOf`).
+const known_feed = [_][]const u8{ "where", "order", "limit", "offset", "after" };
+
 /// How many rows the caller is asking for. `one` is not a `select` somebody
 /// narrowed: the ceiling is the module's rather than the caller's, which is
 /// why writing a second one is a Refusal instead of a silent argument.
 ///
 /// `page` is a select carrying the count the condition matched before the
-/// `LIMIT` cut it ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md)).
-const Answers = enum { many, first, page };
+/// `LIMIT` cut it ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md)),
+/// and `feed` one reading a row past its `LIMIT` to say whether there are
+/// more.
+const Answers = enum { many, first, page, feed };
 
 /// Compile a `SELECT` for `Row` in `D`'s grammar from the options type `O`.
 pub fn select(comptime D: type, comptime Row: type, comptime O: type) Statement {
@@ -192,6 +360,13 @@ pub fn select(comptime D: type, comptime Row: type, comptime O: type) Statement 
 /// cannot.
 pub fn page(comptime D: type, comptime Row: type, comptime O: type) Statement {
     return comptime rowsOf(D, Row, O, .page);
+}
+
+/// The same statement reading one row past its `.limit`, for `db.feed`: the
+/// row that says there are more, which the call drops
+/// ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md#a-feed-counts-nothing)).
+pub fn feed(comptime D: type, comptime Row: type, comptime O: type) Statement {
+    return comptime rowsOf(D, Row, O, .feed);
 }
 
 /// The same statement with `LIMIT 1` on the end, for `db.one`.
@@ -220,8 +395,15 @@ fn rowsOf(
             .many => .many,
             .first => .first,
             .page => .page,
+            .feed => .feed,
         });
         budget(Row, O);
+        const call = switch (answers) {
+            .first => "`db.one`",
+            .page => "`db.page`",
+            .feed => "`db.feed`",
+            .many => "`db.select`",
+        };
 
         // Said before `assertOptions`, so that a `.limit` written on a `one`
         // gets the sentence about `one` rather than the generic list of what
@@ -233,6 +415,13 @@ fn rowsOf(
         );
         // A page with no ceiling is the whole table, and the window function
         // it paid for answers `rows.len` (ADR 150).
+        if (answers == .feed) assertFeed(Row, O);
+        if (answers == .page and @hasField(O, "after")) @compileError(
+            "nilo: `db.page` on " ++ @typeName(Row) ++ " was given an `.after`.\n" ++
+                "  A page skips rows by `OFFSET` and counts every match; a cursor reads the rows " ++
+                "after one and has no page for a count to be relative to. Read it with `db.feed`, " ++
+                "which says whether there are more.",
+        );
         if (answers == .page and !@hasField(O, "limit")) @compileError(
             "nilo: `db.page` on " ++ @typeName(Row) ++ " was given no `.limit`.\n" ++
                 "  A page is a slice of the rows and a total for the rest of them. With no " ++
@@ -268,11 +457,13 @@ fn rowsOf(
             switch (answers) {
                 .first => &known_one,
                 .page => &known_page,
+                .feed => &known_feed,
                 .many => &known,
             },
             switch (answers) {
                 .first => "`db.one`",
                 .page => "`db.page`",
+                .feed => "`db.feed`",
                 .many => "a select",
             },
         );
@@ -281,7 +472,7 @@ fn rowsOf(
         // same pass as the rows — the same text in both Dialects, because a
         // window function is SQL:2003 and SQLite has had them since 3.25.
         const total = if (answers == .page) ", count(*) OVER ()" else "";
-        var sql: []const u8 = "SELECT " ++ columnList(D, Row) ++ total ++
+        var sql: []const u8 = "SELECT " ++ readList(D, Row) ++ total ++
             " FROM " ++ relation(D, Row);
 
         var paths: []const where_mod.Path = &.{};
@@ -289,6 +480,7 @@ fn rowsOf(
         var next: usize = 1;
         var reserve: ?usize = null;
 
+        var narrowed = false;
         if (@hasField(O, "where")) {
             const p = where_mod.planAt(D, Row, @FieldType(O, "where"), next, &.{"where"});
             if (!p.isEmpty()) {
@@ -296,32 +488,40 @@ fn rowsOf(
                 paths = paths ++ p.paths;
                 params = params ++ p.params;
                 next += p.paths.len;
+                narrowed = true;
             }
+        }
+        if (@hasField(O, "after")) {
+            const k = afterOf(D, Row, O, "", next, call);
+            sql = sql ++ (if (narrowed) " AND " else " WHERE ") ++ k.sql;
+            paths = paths ++ k.paths;
+            params = params ++ k.params;
+            next += k.paths.len;
         }
 
         // An ordering chosen at run time splits the statement here: what
         // was built so far is the head, and everything from here on is the
         // tail (ADR 165). The clause between them is the request's.
         var ordered = false;
+        var ties: []const Tie = &.{};
         var head: []const u8 = "";
         if (@hasField(O, "order")) {
             const Order = @FieldType(O, "order");
+            const cut = @hasField(O, "limit") or @hasField(O, "offset") or answers != .many;
             if (ordering.orderingOf(Order) != null) {
-                ordering.assertFor(Order, Row, switch (answers) {
-                    .first => "`db.one`",
-                    .page => "`db.page`",
-                    .many => "`db.select`",
-                }, true);
+                ordering.assertFor(Order, Row, call, true);
                 ordered = true;
+                if (cut) ties = tiesOf(D, Row, "");
                 head = sql;
                 sql = "";
             } else {
-                sql = sql ++ orderBy(D, Row, Order);
+                const written = orderBy(D, Row, Order);
+                sql = sql ++ if (cut) cutOrder(written, tiebreak(D, Row, Order, "")) else written;
             }
         }
 
         if (@hasField(O, "limit")) {
-            const bound = boundary(D, O, "limit", next);
+            const bound = if (answers == .feed) past(boundary(D, O, "limit", next)) else boundary(D, O, "limit", next);
             sql = sql ++ D.limit(bound.text);
             reserve = bound.written;
             if (bound.path) |path| {
@@ -338,7 +538,7 @@ fn rowsOf(
 
         if (@hasField(O, "offset")) {
             const bound = boundary(D, O, "offset", next);
-            sql = sql ++ D.offset(bound.text);
+            sql = sql ++ D.offset(bound.text, @hasField(O, "limit") or answers == .first);
             if (bound.path) |path| {
                 paths = paths ++ &[_]where_mod.Path{path};
                 params = params ++ &[_]where_mod.Param{.{}};
@@ -358,9 +558,184 @@ fn rowsOf(
             .reserve = reserve,
             .ordered = true,
             .tail = sql,
+            .ties = ties,
         };
         break :blk .{ .sql = sql, .paths = paths, .params = params, .reserve = reserve };
     };
+}
+
+/// A written `.limit` one higher, for a feed: the row past the page is the
+/// whole of how it knows there are more. A bound one is raised by `db.feed`
+/// as it is sent, so the statement is the same text whatever the request.
+pub fn past(comptime bound: Bound) Bound {
+    comptime {
+        const n = bound.written orelse return bound;
+        return .{ .text = std.fmt.comptimePrint("{d}", .{n + 1}), .path = null, .written = n + 1 };
+    }
+}
+
+/// What a feed needs that a select does not: a ceiling to read one past, an
+/// order for "more" to mean anything, and no lock on a row it will drop.
+pub fn assertFeed(comptime Row: type, comptime O: type) void {
+    comptime {
+        if (!@hasField(O, "limit")) @compileError(
+            "nilo: `db.feed` on " ++ @typeName(Row) ++ " was given no `.limit`.\n" ++
+                "  A feed is the rows up to a ceiling and whether there are more past it. With no " ++
+                "ceiling there is never more, and `db.select` is the call.",
+        );
+        if (!@hasField(O, "order")) @compileError(
+            "nilo: `db.feed` on " ++ @typeName(Row) ++ " was given no `.order`.\n" ++
+                "  `LIMIT` without `ORDER BY` takes whichever rows the planner reached first, so the " ++
+                "next call can show a row again and skip another. Add `.order = .{ .<column> = .asc }`.",
+        );
+        if (@hasField(O, "lock")) @compileError(
+            "nilo: `db.feed` on " ++ @typeName(Row) ++ " was given a `.lock`.\n" ++
+                "  A feed reads one row past its limit to see whether there are more, and a lock " ++
+                "would hold that row too. Hold the rows with `tx.select` once you know which ones they are.",
+        );
+    }
+}
+
+/// A cursor's condition: the rows after the one `.after` holds, in `.order`.
+pub const After = struct {
+    sql: []const u8,
+    paths: []const where_mod.Path,
+    params: []const where_mod.Param,
+};
+
+/// `.after = .{ .created_at = last.created_at, .id = last.id }` beside
+/// `.order = .{ .created_at = .desc, .id = .desc }`: one row comparison,
+/// `("created_at", "id") < ($1, $2)`, which both databases seek on an index
+/// over the same columns. The `.any` of `<` and `= … AND <` the guide wrote
+/// before filtered rather than sought, and cost what the `OFFSET` it replaced
+/// did: 17.8 ms against 0.013 ms at a million rows (bench/result/sql.md §18).
+///
+/// **Each rule below is a cursor that skips or repeats rows otherwise**, so
+/// each is a Refusal: the columns are the order's, in its order; the order
+/// runs one way, since a row comparison does; it says nothing about NULLs
+/// and no column may hold one, since a row comparison with a NULL in it is
+/// true of nothing; and it ends in the table's key, or two rows sharing
+/// every column sorted by stand at one cursor and the second is skipped.
+pub fn afterOf(
+    comptime D: type,
+    comptime Row: type,
+    comptime O: type,
+    comptime prefix: []const u8,
+    comptime first: usize,
+    comptime call: []const u8,
+) After {
+    comptime {
+        const A = @FieldType(O, "after");
+        const example = "`.after = .{ .created_at = last.created_at, .id = last.id }`";
+        if (@typeInfo(A) != .@"struct" or @typeInfo(A).@"struct".fields.len == 0) @compileError(
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " was given an `.after` of " ++ @typeName(A) ++ ".\n" ++
+                "  A cursor is the last row seen, as the value of each column `.order` sorts by: " ++ example ++ ".",
+        );
+        if (!@hasField(O, "order")) @compileError(
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " was given an `.after` and no `.order`.\n" ++
+                "  Which rows come after a cursor is what the order says. Write `.order` over the same columns.",
+        );
+        const Order = @FieldType(O, "order");
+        if (ordering.orderingOf(Order) != null) @compileError(
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " was given an `.after` beside an order the request chose.\n" ++
+                "  The comparison is settled while compiling, and a request can sort by other columns than the " ++
+                "cursor holds. Write `.order` out.",
+        );
+        const sorted = @typeInfo(Order).@"struct".fields;
+        const held = @typeInfo(A).@"struct".fields;
+        var same = sorted.len == held.len;
+        if (same) for (sorted, held) |x, y| {
+            if (!std.mem.eql(u8, x.name, y.name)) same = false;
+        };
+        if (!same) @compileError(
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " has an `.after` over " ++ fieldList(held) ++
+                " and an `.order` over " ++ fieldList(sorted) ++ ".\n" ++
+                "  A cursor holds the last row's value of each column the order sorts by, in the same order.",
+        );
+        const keys = row_mod.keysIfAnyOf(Row);
+        if (keys.len == 0) @compileError(
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " was given an `.after`, and its table has no key.\n" ++
+                "  Two rows can share every column the order sorts by, and a cursor at one of them skips the other.",
+        );
+        for (keys) |key| if (!@hasField(Order, key)) @compileError(
+            "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " reads after a cursor, and its `.order` does not end in `" ++
+                key ++ "`.\n" ++
+                "  Two rows can share every column it sorts by, and a cursor at one of them skips the other. " ++
+                "Add `." ++ key ++ "` to the order and to `.after`, running the same way.",
+        );
+        var descending: ?bool = null;
+        for (sorted) |f| {
+            const direction: Direction = writtenValue(Order, f.name, Direction);
+            if (direction.placement() != null) @compileError(
+                "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " reads after a cursor, and `.order." ++ f.name ++
+                    "` says where NULLs go.\n" ++
+                    "  A row comparison with a NULL in it is true of nothing, so a cursor over a column that may " ++
+                    "be null loses those rows. Order by columns that are never null, with `.asc` or `.desc`.",
+            );
+            if (descending) |d| if (d != direction.descending()) @compileError(
+                "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " reads after a cursor over an order that runs " ++
+                    "both ways.\n" ++
+                    "  A row comparison runs one way. Make every term `.asc` or every term `.desc`, or write the " ++
+                    "condition out with `.any` in `.where`, which cannot seek.",
+            );
+            descending = direction.descending();
+        }
+
+        var lhs: []const u8 = "";
+        var rhs: []const u8 = "";
+        var paths: []const where_mod.Path = &.{};
+        var params: []const where_mod.Param = &.{};
+        const shaped = row_mod.isShaped(Row);
+        for (held, 0..) |f, i| {
+            const Column = if (shaped)
+                row_mod.ownerOf(Row)
+            else if (row_mod.hasColumn(Row, f.name))
+                Row
+            else if (row_mod.tableHasColumn(Row, f.name))
+                row_mod.ownerOf(Row)
+            else
+                row_mod.noSuchColumn(Row, f.name, "`.after`");
+            const T = row_mod.ColumnType(Column, f.name);
+            // The cursor is a `<` or `>` over the column, so it is the text's
+            // order on a Dialect that holds a number as text (ADR 049).
+            dialect_mod.assertDecimalCompares(D, Row, f.name, T, "`.after." ++ f.name ++ "`");
+            if (@typeInfo(T) == .optional) @compileError(
+                "nilo: " ++ call ++ " on " ++ @typeName(Row) ++ " reads after a cursor over `" ++ f.name ++
+                    "`, which may be null.\n" ++
+                    "  A row comparison with a NULL in it is true of nothing, so the rows holding one never come " ++
+                    "after any cursor. Order by columns that are never null.",
+            );
+            if (f.type != T and !where_mod.comptimeOnly(f.type)) @compileError(
+                "nilo: `.after." ++ f.name ++ "` on " ++ @typeName(Row) ++ " is " ++ @typeName(f.type) ++
+                    ", and the column is " ++ @typeName(T) ++ ".\n" ++
+                    "  A cursor holds the last row's own value: " ++ example ++ ".",
+            );
+            lhs = lhs ++ (if (i == 0) "" else ", ") ++ prefix ++ D.quote(f.name);
+            // `bindAs`, as every other condition binds: a `Date`, `Decimal`,
+            // `Interval`, `Inet` or `Bytes` cursor is only bindable on
+            // Postgres through its cast, so a feed over `due_date, id`
+            // returned its first page and failed on its second.
+            rhs = rhs ++ (if (i == 0) "" else ", ") ++ D.bindAs(D.placeholder(first + i), T, false);
+            paths = paths ++ &[_]where_mod.Path{&.{ "after", f.name }};
+            params = params ++ &[_]where_mod.Param{.{ .column = f.name, .of = if (Column == Row) null else Column }};
+        }
+        // One column is a plain comparison; brackets are what make two a row.
+        const row = held.len > 1;
+        return .{
+            .sql = (if (row) "(" ++ lhs ++ ")" else lhs) ++ (if (descending.?) " < " else " > ") ++
+                (if (row) "(" ++ rhs ++ ")" else rhs),
+            .paths = paths,
+            .params = params,
+        };
+    }
+}
+
+fn fieldList(comptime fields: []const std.builtin.Type.StructField) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (fields, 0..) |f, i| out = out ++ (if (i == 0) "" else ", ") ++ "`" ++ f.name ++ "`";
+        return out;
+    }
 }
 
 /// The option names an aggregate takes: a condition, and nothing else.
@@ -1327,6 +1702,34 @@ fn notAConflictTarget(comptime Row: type, comptime On: type) noreturn {
     );
 }
 
+/// **The conflict target has to be among the values written.** `ON CONFLICT
+/// ("id")` fires when the row being inserted has an `id` that is already
+/// there; a row that leaves `id` to its default has a new one every time, so
+/// the statement never conflicts. It compiled, and it either inserted a
+/// duplicate on every call or failed on the unique that was really meant (a
+/// `.email` beside an `.id` the call did not carry).
+fn assertTargetWritten(
+    comptime Row: type,
+    comptime V: type,
+    comptime targets: []const []const u8,
+    comptime action: OnConflict,
+) void {
+    comptime {
+        for (targets) |name| {
+            if (@hasField(V, name)) continue;
+            @compileError(
+                "nilo: `" ++ (if (action == .update) "db.insertOrUpdate" else "db.insertOrIgnore") ++
+                    "` on " ++ @typeName(Row) ++ " conflicts on ." ++ columnTuple(targets) ++
+                    ", and the values written do not carry `" ++ name ++ "`.\n" ++
+                    "  A row conflicts on the value it is inserted with. Without `" ++ name ++
+                    "` it takes its default, which is new every time, so the statement never " ++
+                    "conflicts and inserts a duplicate on every call.\n" ++
+                    "  Write `." ++ name ++ " = …` in the values, or conflict on the columns they do carry.",
+            );
+        }
+    }
+}
+
 /// Both upserts, which differ by four words of SQL and by whether the answer
 /// can be empty.
 ///
@@ -1344,6 +1747,7 @@ fn upserting(
     return comptime blk: {
         const base = insert(D, Row, V);
         const targets = conflictColumns(Row, on);
+        assertTargetWritten(Row, V, targets, action);
 
         var conflict: []const u8 = "";
         for (targets, 0..) |name, i| {
@@ -1792,6 +2196,31 @@ pub fn columnList(comptime D: type, comptime Row: type) []const u8 {
     return comptime columnListFrom(D, Row, "");
 }
 
+/// `columnList` for a `SELECT` that may be ordered: a column read as text is
+/// answered under a name that is not its own.
+///
+/// **Postgres reads a bare name in `ORDER BY` against the answer's names
+/// first**, and `"total"::text` is answered as `total`, so `ORDER BY "total"`
+/// sorted the printing: `9.00`, `100.5`, `10.00`. Under another name the same
+/// `ORDER BY "total"` finds no answer of that name and reads the column, which
+/// is the number. The name is `total#`, and `#` begins no field name, so no
+/// column meets it; the statement reads its answer by position and never looks
+/// at it ([ADR 036](../docs/adr/036-the-shape-of-a-query-is-settled-while-compiling.md)). Everything
+/// that names the column, an `.order`, an `Ordering`, a tiebreak, stays as it
+/// was written.
+fn readList(comptime D: type, comptime Row: type) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (row_mod.columnsOf(Row), 0..) |c, i| {
+            const quoted = D.quote(c);
+            const asked = D.readAs(quoted, row_mod.ColumnType(Row, c));
+            const named = if (std.mem.eql(u8, asked, quoted)) asked else asked ++ " AS " ++ D.quote(c ++ "#");
+            out = out ++ (if (i == 0) "" else ", ") ++ named;
+        }
+        return out;
+    }
+}
+
 /// The same list, every column reached through a relation alias. Wanted by
 /// exactly one statement — a batched update, whose `FROM` puts a second
 /// relation with the same column names in scope, so an unqualified
@@ -1832,6 +2261,83 @@ fn lockedBy(comptime D: type, comptime Row: type, comptime O: type) []const u8 {
     }
 }
 
+/// The table's key after an order that does not name all of it, running the
+/// way the order's last term runs (`lastDescending`): the terms alone, with no
+/// comma in front. Empty for a Row whose table has none, and for a grouped
+/// Row here: its rows are groups with no key, and `shape.zig` ends them in the
+/// columns they group by.
+///
+/// **Written only where a `LIMIT` or an `OFFSET` cuts the answer.** Rows the
+/// order ties come back in whatever order the plan reaches them, and that can
+/// differ between two `OFFSET`s of the same statement: a thousand rows over
+/// ten values, paged by 25, showed 179 rows twice and 179 never. With the key
+/// last every row has one place. An answer nothing cuts has every row whatever
+/// order they arrive in, so its text is left as the caller wrote it. Children
+/// have ended in their key for the same reason since ADR 218. `prefix` is what
+/// a column is named through: nothing on a plain Row, the table on a shaped
+/// one, where a parent's columns share the statement.
+pub fn tiebreak(comptime D: type, comptime Row: type, comptime Order: type, comptime prefix: []const u8) []const u8 {
+    comptime {
+        if (@hasDecl(Row, row_mod.aggregate_marker)) return "";
+        const way = if (lastDescending(Order)) " DESC" else " ASC";
+        var out: []const u8 = "";
+        for (row_mod.keysIfAnyOf(Row)) |key| {
+            if (@hasField(Order, key)) continue;
+            if (out.len > 0) out = out ++ ", ";
+            out = out ++ prefix ++ D.quote(key) ++ way;
+        }
+        return out;
+    }
+}
+
+/// Whether the last term an `.order` names runs descending, which is the way
+/// its tiebreak runs
+/// ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md#a-page-ends-in-the-key)).
+/// A cursor compares every column one way (`afterOf`), so a first page ended
+/// `"id" ASC` under `"created_at" DESC` could not be followed by the page
+/// after it: they were ordered two different ways, and rows sharing a
+/// `created_at` across the boundary were repeated or lost. Nothing named is
+/// ascending. A nested term (a parent's column) is read at its own leaf.
+pub fn lastDescending(comptime Order: type) bool {
+    comptime {
+        const fields = @typeInfo(Order).@"struct".fields;
+        if (fields.len == 0) return false;
+        const last = fields[fields.len - 1];
+        if (@typeInfo(last.type) == .@"struct") return lastDescending(last.type);
+        return writtenValue(Order, last.name, Direction).descending();
+    }
+}
+
+/// One key column a cut statement's chosen ordering ends in: the column, to
+/// see whether the request already ordered by it, and the term to write when
+/// it did not.
+pub const Tie = struct { column: []const u8, text: []const u8 };
+
+/// `tiebreak` for an ordering chosen at run time, where which key columns the
+/// request named is not known yet: every key column, each with its term (always
+/// ascending: nothing follows a run-time ordering with a cursor, which is the
+/// one reader that needs the two to agree, `afterOf`), and
+/// the Ordering leaves out the ones it chose ([ADR 150](../docs/adr/150-a-page-knows-what-it-left-out.md#a-page-ends-in-the-key)).
+pub fn tiesOf(comptime D: type, comptime Row: type, comptime prefix: []const u8) []const Tie {
+    comptime {
+        if (@hasDecl(Row, row_mod.aggregate_marker)) return &.{};
+        var out: []const Tie = &.{};
+        for (row_mod.keysIfAnyOf(Row)) |key| {
+            out = out ++ &[_]Tie{.{ .column = key, .text = prefix ++ D.quote(key) ++ " ASC" }};
+        }
+        return out;
+    }
+}
+
+/// `ORDER BY` with `tiebreak` after it, for a statement the caller cut.
+pub fn cutOrder(comptime written: []const u8, comptime ties: []const u8) []const u8 {
+    comptime {
+        if (ties.len == 0) return written;
+        if (written.len == 0) return " ORDER BY " ++ ties;
+        return written ++ ", " ++ ties;
+    }
+}
+
 fn orderBy(comptime D: type, comptime Row: type, comptime T: type) []const u8 {
     comptime {
         const info = switch (@typeInfo(T)) {
@@ -1851,6 +2357,13 @@ fn orderBy(comptime D: type, comptime Row: type, comptime T: type) []const u8 {
             if (!row_mod.hasColumn(Row, f.name) and !row_mod.tableHasColumn(Row, f.name)) {
                 row_mod.noSuchColumn(Row, f.name, "`.order`");
             }
+            dialect_mod.assertDecimalCompares(
+                D,
+                Row,
+                f.name,
+                if (row_mod.hasColumn(Row, f.name)) row_mod.ColumnType(Row, f.name) else row_mod.ColumnType(row_mod.ownerOf(Row), f.name),
+                "`.order." ++ f.name ++ "`",
+            );
             if (f.type != Direction and f.type != @TypeOf(.enum_literal)) @compileError(
                 "nilo: `.order` on column `" ++ f.name ++ "` was given a " ++
                     @typeName(f.type) ++ ".\n" ++
@@ -2021,12 +2534,54 @@ test "a narrower Row selects only what it reads, from the table it borrows" {
 test "the whole statement is one constant, condition and order and limit" {
     try testing.expectEqualStrings(
         "SELECT \"id\", \"email\", \"age\", \"created_at\" FROM \"users\"" ++
-            " WHERE \"age\" > $1 ORDER BY \"created_at\" DESC LIMIT 10",
+            " WHERE \"age\" > $1 ORDER BY \"created_at\" DESC, \"id\" DESC LIMIT 10",
         sqlOf(.{
             .where = .{ .age = .{ .gt = 18 } },
             .order = .{ .created_at = .desc },
             .limit = 10,
         }),
+    );
+}
+
+test "a feed reads one row past its limit and counts nothing" {
+    const written = comptime feed(Pg, User, @TypeOf(.{ .order = .{ .id = .asc }, .limit = 20 }));
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"email\", \"age\", \"created_at\" FROM \"users\" ORDER BY \"id\" ASC LIMIT 21",
+        written.sql,
+    );
+    try testing.expectEqual(@as(?usize, 21), written.reserve);
+
+    // A bound limit is the same text; `db.feed` raises the value it sends.
+    const bound = comptime feed(Pg, User, @TypeOf(.{ .order = .{ .id = .asc }, .limit = @as(i64, 20) }));
+    try testing.expect(std.mem.endsWith(u8, bound.sql, "LIMIT $1"));
+    try testing.expect(bound.params[0].isCount());
+}
+
+test "a cursor is one row comparison the index seeks on, running the way the order does" {
+    const Cursor = struct { created_at: i64, id: i64 };
+    const desc = comptime feed(Pg, User, @TypeOf(.{
+        .where = .{ .age = .{ .gt = 18 } },
+        .order = .{ .created_at = .desc, .id = .desc },
+        .after = @as(Cursor, undefined),
+        .limit = 20,
+    }));
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"email\", \"age\", \"created_at\" FROM \"users\"" ++
+            " WHERE \"age\" > $1 AND (\"created_at\", \"id\") < ($2, $3)" ++
+            " ORDER BY \"created_at\" DESC, \"id\" DESC LIMIT 21",
+        desc.sql,
+    );
+    try testing.expectEqualStrings("created_at", desc.params[1].column);
+
+    const asc = comptime select(Lite, User, @TypeOf(.{
+        .order = .{ .id = .asc },
+        .after = .{ .id = @as(i64, 0) },
+        .limit = 20,
+    }));
+    try testing.expectEqualStrings(
+        "SELECT \"id\", \"email\", \"age\", \"created_at\" FROM \"users\" WHERE \"id\" > ?1" ++
+            " ORDER BY \"id\" ASC LIMIT 20",
+        asc.sql,
     );
 }
 
@@ -2097,6 +2652,19 @@ test "offset is numbered after limit" {
     const s = comptime select(Pg, User, @TypeOf(.{ .limit = lim, .offset = off }));
     try testing.expect(std.mem.endsWith(u8, s.sql, "LIMIT $1 OFFSET $2"));
     try testing.expectEqual(@as(usize, 2), s.paramCount());
+}
+
+test "an offset with no limit is a syntax error SQLite is not handed" {
+    const off: u32 = 20;
+    // SQLite takes `OFFSET` only after a `LIMIT`; `-1` is its no limit.
+    const lite = comptime select(Lite, User, @TypeOf(.{ .order = .{ .id = .asc }, .offset = off }));
+    try testing.expect(std.mem.endsWith(u8, lite.sql, "ORDER BY \"id\" ASC LIMIT -1 OFFSET ?1"));
+    try testing.expectEqual(@as(usize, 1), lite.paramCount());
+    // Postgres takes it alone, and a limit given is not written twice.
+    const pg = comptime select(Pg, User, @TypeOf(.{ .order = .{ .id = .asc }, .offset = off }));
+    try testing.expect(std.mem.endsWith(u8, pg.sql, "ORDER BY \"id\" ASC OFFSET $1"));
+    const both = comptime select(Lite, User, @TypeOf(.{ .order = .{ .id = .asc }, .limit = off, .offset = off }));
+    try testing.expect(std.mem.endsWith(u8, both.sql, " LIMIT ?1 OFFSET ?2"));
 }
 
 test "several order terms keep the order they were written in" {
@@ -2394,7 +2962,7 @@ test "a select can ask whether a row exists in another table, and stay one state
             " AND EXISTS (SELECT 1 FROM \"partner_capabilities\"" ++
             " WHERE \"partner_capabilities\".\"partner_id\" = \"partners\".\"id\"" ++
             " AND \"partner_capabilities\".\"capability\" = $2)" ++
-            " ORDER BY \"name\" ASC LIMIT 20",
+            " ORDER BY \"name\" ASC, \"id\" ASC LIMIT 20",
         s.sql,
     );
     try testing.expectEqual(@as(usize, 2), s.paramCount());
@@ -2651,7 +3219,7 @@ test "a numeric column is read as text and written back as numeric" {
     // Both casts in one statement, which is the whole of what makes the round
     // trip exact — the digits never become a float in either direction.
     try testing.expectEqualStrings(
-        "SELECT \"id\", \"total\"::text, \"refunded\"::text FROM \"invoices\"" ++
+        "SELECT \"id\", \"total\"::text AS \"total#\", \"refunded\"::text AS \"refunded#\" FROM \"invoices\"" ++
             " WHERE \"total\" > $1::numeric",
         comptime select(Pg, Invoice, @TypeOf(.{
             .where = .{ .total = .{ .gt = types_mod.Decimal{ .text = "0" } } },
@@ -2679,12 +3247,78 @@ test "a numeric is cast where it is inserted, and where it is set" {
 
 test "a numeric in a list is cast as an array, so the statement stays a constant" {
     try testing.expectEqualStrings(
-        "SELECT \"id\", \"total\"::text, \"refunded\"::text FROM \"invoices\"" ++
-            " WHERE \"total\" = ANY($1::numeric[])",
+        "SELECT \"id\", \"total\"::text AS \"total#\", \"refunded\"::text AS \"refunded#\" FROM \"invoices\"" ++
+            " WHERE \"total\" = ANY($1::text[]::numeric[])",
         comptime select(Pg, Invoice, @TypeOf(.{
             .where = .{ .total = .{ .in = &[_]types_mod.Decimal{} } },
         })).sql,
     );
+}
+
+test "a Decimal is compared for equality and listed on SQLite, which only refuses to order it" {
+    // The column is TEXT there and the digits are bound as they were stored, so
+    // `=`, `<>` and `IN` answer what the caller wrote. `>` and `ORDER BY`
+    // would compare text, and are Refusals (`sql/refusals/sqlite_decimal_*`,
+    // ADR 049).
+    const same = comptime select(Lite, Invoice, @TypeOf(.{
+        .where = .{ .total = types_mod.Decimal{ .text = "9.99" }, .refunded = .{ .ne = types_mod.Decimal{ .text = "0" } } },
+    }));
+    try testing.expect(std.mem.indexOf(u8, same.sql, "\"total\" = ?1") != null);
+    try testing.expect(std.mem.indexOf(u8, same.sql, "\"refunded\" <> ?2") != null);
+    const listed = comptime select(Lite, Invoice, @TypeOf(.{
+        .where = .{ .total = .{ .in = &[_]types_mod.Decimal{} } },
+    }));
+    try testing.expect(std.mem.indexOf(u8, listed.sql, "\"total\" IN (SELECT value FROM json_each(?1))") != null);
+    // Ordering by a column that is not a number held as text is untouched.
+    const plain = comptime select(Lite, Invoice, @TypeOf(.{ .order = .{ .id = .desc }, .limit = 5 }));
+    try testing.expect(std.mem.indexOf(u8, plain.sql, " ORDER BY \"id\" DESC") != null);
+}
+
+test "a Dialect says whether a Decimal compares as a number" {
+    try testing.expect(Pg.decimal_compares);
+    try testing.expect(!Lite.decimal_compares);
+    // Postgres still writes the ordered comparison and the order.
+    const gt = comptime select(Pg, Invoice, @TypeOf(.{
+        .where = .{ .total = .{ .gte = types_mod.Decimal{ .text = "50" } } },
+        .order = .{ .total = .asc },
+        .limit = 5,
+    }));
+    try testing.expect(std.mem.indexOf(u8, gt.sql, "\"total\" >= $1::numeric") != null);
+}
+
+test "an order over a column read as text names the column, which the text is answered under another name" {
+    // `"total"::text` would be answered as `total`, and Postgres reads a bare
+    // name in `ORDER BY` against the answers first: 9.00, 100.5, 10.00.
+    const found = comptime select(Pg, Invoice, @TypeOf(.{ .order = .{ .total = .desc }, .limit = 5 }));
+    try testing.expect(std.mem.indexOf(u8, found.sql, "\"total\"::text AS \"total#\"") != null);
+    try testing.expect(std.mem.endsWith(u8, found.sql, " ORDER BY \"total\" DESC, \"id\" DESC LIMIT 5"));
+    // A column that is not read as text is answered under its own name.
+    const plain = comptime select(Pg, User, @TypeOf(.{}));
+    try testing.expect(std.mem.indexOf(u8, plain.sql, " AS ") == null);
+}
+
+test "a tiebreak runs the way the last term of the order runs, so a feed's pages agree with its first" {
+    const Cursor = struct { created_at: i64, id: i64 };
+    const first = comptime feed(Pg, User, @TypeOf(.{ .order = .{ .created_at = .desc }, .limit = 20 }));
+    const later = comptime feed(Pg, User, @TypeOf(.{
+        .order = .{ .created_at = .desc, .id = .desc },
+        .after = @as(Cursor, undefined),
+        .limit = 20,
+    }));
+    const clause = " ORDER BY \"created_at\" DESC, \"id\" DESC LIMIT 21";
+    try testing.expect(std.mem.endsWith(u8, first.sql, clause));
+    try testing.expect(std.mem.endsWith(u8, later.sql, clause));
+    // The last term decides, not the first.
+    try testing.expect(std.mem.endsWith(
+        u8,
+        sqlOf(.{ .order = .{ .created_at = .desc, .age = .asc }, .limit = 5 }),
+        " ORDER BY \"created_at\" DESC, \"age\" ASC, \"id\" ASC LIMIT 5",
+    ));
+    try testing.expect(std.mem.endsWith(
+        u8,
+        sqlOf(.{ .order = .{ .age = .asc, .created_at = .desc_nulls_last }, .limit = 5 }),
+        " ORDER BY \"age\" ASC, \"created_at\" DESC NULLS LAST, \"id\" DESC LIMIT 5",
+    ));
 }
 
 test "an upsert that ignores a conflict adds four words and no parameters" {
@@ -2987,6 +3621,65 @@ test "a clock moved by an offset is written into the statement, and binds nothin
     );
 }
 
+test "only a statement with a term that can drop is one a kept plan gets wrong" {
+    const maybe: ?[]const u8 = null;
+    const guarded = comptime select(Pg, User, @TypeOf(.{ .where = .{ .email = where_mod.given(maybe) } }));
+    try testing.expect(comptime dropsTerms(guarded));
+    const plain = comptime select(Pg, User, @TypeOf(.{ .where = .{ .email = @as([]const u8, "a") } }));
+    try testing.expect(!comptime dropsTerms(plain));
+    // A `.set` given keeps its column and never drops a term, so an update
+    // with one keeps its name.
+    const o = .{ .set = .{ .kind = where_mod.given(@as(?[]const u8, null)) }, .where = .{ .id = 7 } };
+    try testing.expect(!comptime dropsTerms(update(Pg, RabLine, @TypeOf(o))));
+}
+
+test "a guard is found in the finished text and cut into pieces the request chooses between" {
+    const maybe: ?[]const u8 = null;
+    const age: ?i32 = null;
+    const o = .{ .where = .{ .email = where_mod.given(maybe), .age = .{ .gt = where_mod.given(age) } } };
+    const pg = comptime select(Pg, User, @TypeOf(o));
+    const cut = comptime spliceOf(Pg, pg);
+    try testing.expectEqual(@as(usize, 2), cut.guards.len);
+    try testing.expect(std.mem.endsWith(u8, cut.guards[0].before, " WHERE "));
+    try testing.expectEqualStrings("(\"email\" = $1)", cut.guards[0].present);
+    try testing.expectEqualStrings("($1::text IS NULL)", cut.guards[0].absent);
+    try testing.expectEqualStrings(" AND ", cut.guards[1].before);
+    try testing.expectEqualStrings("(\"age\" > $2)", cut.guards[1].present);
+    try testing.expectEqualStrings("($2::text IS NULL)", cut.guards[1].absent);
+    try testing.expectEqualStrings("", cut.rest);
+    try testing.expectEqual(@as(usize, 1), cut.guards[0].n);
+    try testing.expectEqual(@as(usize, 2), cut.guards[1].n);
+    // Nothing was invented: the pieces, with each guard's tail put back, are
+    // the statement as written.
+    try testing.expectEqualStrings(
+        pg.sql,
+        comptime cut.guards[0].before ++ cut.guards[0].present[0 .. cut.guards[0].present.len - 1] ++
+            " OR $1 IS NULL)" ++ cut.guards[1].before ++
+            cut.guards[1].present[0 .. cut.guards[1].present.len - 1] ++ " OR $2 IS NULL)" ++ cut.rest,
+    );
+
+    // The same statement on SQLite keeps `?n` in the stand-in, so every value
+    // the tuple binds still has a placeholder to bind to.
+    const lite = comptime spliceOf(Lite, select(Lite, User, @TypeOf(o)));
+    try testing.expectEqual(@as(usize, 2), lite.guards.len);
+    try testing.expectEqualStrings("(\"email\" = ?1)", lite.guards[0].present);
+    try testing.expectEqualStrings("(?1 IS NULL)", lite.guards[0].absent);
+    try testing.expectEqualStrings("(?2 IS NULL)", lite.guards[1].absent);
+
+    // No guard, no pieces; and a statement whose only given is a `.set` has
+    // none either, because that one never drops.
+    const plain = comptime spliceOf(Pg, select(Pg, User, @TypeOf(.{ .where = .{ .age = @as(i32, 3) } })));
+    try testing.expectEqual(@as(usize, 0), plain.guards.len);
+    // One name for each combination, and no two alike.
+    const names = comptime planNames(pg, 2);
+    try testing.expectEqual(@as(usize, 4), names.len);
+    inline for (names, 0..) |a, i| {
+        inline for (names, 0..) |b, j| {
+            if (i != j) try testing.expect(!std.mem.eql(u8, a, b));
+        }
+    }
+}
+
 test "a given in a set keeps the column when the value is null, which is a patch" {
     const kind: ?[]const u8 = "labour";
     const position: ?i32 = null;
@@ -3242,9 +3935,9 @@ test "an upsert can conflict on the key the Row already declares" {
 }
 
 test "a Row whose key is one column conflicts on that column" {
-    const values = @TypeOf(.{ .email = "a@b.c", .age = 30 });
+    const values = @TypeOf(.{ .id = @as(i64, 7), .email = "a@b.c", .age = 30 });
     try testing.expectEqualStrings(
-        "INSERT INTO \"users\" (\"email\", \"age\") VALUES ($1, $2)" ++
+        "INSERT INTO \"users\" (\"id\", \"email\", \"age\") VALUES ($1, $2, $3)" ++
             " ON CONFLICT (\"id\") DO NOTHING" ++
             " RETURNING \"id\", \"email\", \"age\", \"created_at\"",
         comptime insertOrIgnore(Pg, User, values, .key).sql,
@@ -3336,8 +4029,29 @@ test "a write seventeen columns wide on a twenty-column Row compiles, and its te
     try testing.expect(std.mem.startsWith(u8, batch.sql, "UPDATE \"rab_lines\" AS t SET \"section_id\" = v.\"section_id\","));
     try testing.expectEqual(@as(usize, 17), batch.params.len);
 
-    const ignored = comptime insertOrIgnore(Pg, RabLine, Saved, .key);
+    // Conflicting on the key needs the key written, or the row never conflicts.
+    const Keyed = struct {
+        id: i64,
+        rab_id: i64,
+        section_id: ?i64,
+        position: i32,
+        kind: []const u8,
+        commitment_id: ?i64,
+        sku_id: ?i64,
+        description: []const u8,
+        quantity: types_mod.Decimal,
+        unit: []const u8,
+        unit_cost_currency: ?[]const u8,
+        unit_cost_amount_minor: ?i64,
+        cost_source: []const u8,
+        notes: ?[]const u8,
+        partner_id: ?i64,
+        lead_days: ?i32,
+        risk: ?[]const u8,
+        reference: ?[]const u8,
+    };
+    const ignored = comptime insertOrIgnore(Pg, RabLine, Keyed, .key);
     try testing.expect(std.mem.containsAtLeast(u8, ignored.sql, 1, "ON CONFLICT (\"id\") DO NOTHING"));
-    const upserted = comptime insertOrUpdate(Pg, RabLine, Saved, .key);
+    const upserted = comptime insertOrUpdate(Pg, RabLine, Keyed, .key);
     try testing.expect(std.mem.containsAtLeast(u8, upserted.sql, 1, "ON CONFLICT (\"id\") DO UPDATE SET \"rab_id\" = EXCLUDED.\"rab_id\","));
 }

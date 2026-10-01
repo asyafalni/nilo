@@ -100,7 +100,7 @@ Nothing is paid on a statement that works: the check is on the failure path.
 
 ### Why there is an off switch
 
-A connection pooler in transaction mode: pgbouncer hands out a different server connection per transaction, so a statement prepared on one is missing on the next. `Opts.prepared = false` is the escape hatch, and it exists because that deployment is common rather than exotic. The failure it avoids is loud, Postgres says the prepared statement does not exist, which is why the default is the fast one; a silent failure mode would have argued the other way. `db.raw` under `.prepared = false` is covered by the same option.
+A connection pooler in transaction mode: pgbouncer hands out a different server connection per transaction, so a statement prepared on one is missing on the next. `Opts.prepared = false` is the escape hatch, and a URL that says `pgbouncer=true` (or `pool_mode=transaction`) flips it by itself ([ADR 241](./241-a-postgres-url-without-sslmode-is-encrypted-unless-it-stays-on-this-machine.md)). It exists because that deployment is common rather than exotic. The failure it avoids is loud, Postgres says the prepared statement does not exist, which is why the default is the fast one; a silent failure mode would have argued the other way. `db.raw` under `.prepared = false` is covered by the same option.
 
 ## What was rejected
 

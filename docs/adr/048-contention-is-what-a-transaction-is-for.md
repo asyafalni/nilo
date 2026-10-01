@@ -155,8 +155,16 @@ outer.rollback();                // `inner` is gone from the server now
 `inner`'s `defer` must send nothing. A `ROLLBACK TO SAVEPOINT` for a mark the
 server no longer has is an error, inside a transaction, which aborts the whole
 thing — a `defer` written correctly would have destroyed the transaction it was
-protecting. `Tx.sp_live` is the highest number this module will still send SQL
-for, and a handle above it is stale rather than wrong.
+protecting. `Tx.sp_stack` is the list of marks this module will still send SQL
+for, oldest first; ending one cuts the list at it, and a handle not in the list
+is stale rather than wrong.
+
+**A list, where it was the highest live number.** The number went down when
+`outer` was undone and back up past `inner` when the next savepoint was taken,
+so `inner`'s `defer` sent `ROLLBACK TO` a mark Postgres had dropped: the
+transaction aborted and its `commit` failed, losing work the handler meant to
+keep. The savepoint tests only ever nested tidily. The list costs one
+allocation on the first savepoint a transaction takes, freed when it ends.
 
 Numbers count up and are never reused, so a savepoint taken inside a loop is a
 fresh mark each time round rather than one that shadows the last.

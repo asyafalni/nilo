@@ -61,13 +61,20 @@ const rows = try db.composed(Total, c, s, .{ from, to });
   anything else in nilo's words; review found the hole: a `*[N]u8` filled at
   run time is a pointer to an array too, and would have passed. `comptime`
   on the parameter is what a literal actually is, so there is no refusal to
-  write for that and none is kept. What `text` does refuse is a `$n` inside
-  the piece: a placeholder written as text is spelled for one database and
-  counted by nobody, and the point of `param` is that it is neither.
+  write for that and none is kept. What `text` does refuse is a `$n` or a
+  `?n` inside the piece: a placeholder written as text is spelled for one
+  database and counted by nobody, and the point of `param` is that it is
+  neither. The piece does not know the dialect, so both spellings go; a `?`
+  with no digit after it is the JSON operator and stays text.
 - **`ident` checks and quotes.** Letters, digits and `_`, not starting with a
   digit, at most 63 bytes, written as `"name"`. `stream_id" OR 1=1 --` is
   `error.NotAnIdentifier` and nothing is written. `qualified(schema, name)`
-  is two of them.
+  is two of them. **The case is kept, not folded**: `"streamId"` is the column
+  nilo's own DDL creates from a `streamId` field, and it misses one created
+  unquoted, which Postgres stored as `streamid`. Folding to lower case would
+  miss the other way, on every table nilo made from a camelCase field, so a
+  table made by other tooling is written in lower case here. Both fail as a
+  missing column at the first request, never as another column's answer.
 - **`param(n)` writes the `n`th placeholder spelled for the dialect** — `$n`
   on Postgres, `?n` on SQLite — the way `rawText` respells a raw `$n`
   ([ADR 204](204-a-raw-placeholder-is-spelled-for-the-dialect.md)). A
@@ -89,7 +96,11 @@ const rows = try db.composed(Total, c, s, .{ from, to });
   here because the text is not there to read until the request is: a tuple
   with fewer or more values than the highest `param` is
   `error.ParamCountMismatch`, never a `NULL` bound where SQLite would say
-  nothing.
+  nothing. So is a gap in the numbering, as it is for a raw statement:
+  `param(2)` with no `param(1)` has a highest of 2 and two values would pass
+  a count of the highest, so a `Composed` also remembers which numbers it
+  wrote (a bit set on the arena, one word per 64 placeholders, allocated by
+  `param` and not per request) and `gapless()` must hold.
 
 ## What it gives up, and what it costs
 

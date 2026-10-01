@@ -48,13 +48,53 @@ On the write side, `WireWrite` reads `uuid_form` and answers `[16]u8` or `[]cons
 
 `WireWrite` reads the Dialect and answers `[]const u8` for either column under `.text`; `forWire` reads the answer back off the destination type on the way in, which is how the conversion stays in one place, the arrangement `Uuid` made and the reason the Dialect is not threaded into `forWire` itself. A tag under `.text` is `@tagName`, a constant in the binary; a `Json(T)` document is written into the request arena.
 
+**A `Json(T)` is read with `ignore_unknown_fields`.** The document is what the database holds, and a newer binary may have written a field this one's `T` lacks: a rolling deploy that adds a field to a jsonb otherwise makes every old instance answer `QueryFailed` for rows nothing is wrong with. The default parse refused them. A request body is the other way round, where an unknown field is the client's typo and `ctx.json` refuses it; a missing field is still an error, so a document that lacks one `T` needs is refused as before.
+
 ### `.in` and `.not_in`: written as JSON when the Dialect says so
 
 `Values` answers `[]const u8` rather than `[]const F` for a list parameter when `list_form == .json_each`, and each element is converted through `forWire` into a slice in the request arena, then serialised with `std.json` over that slice. Converting first is what makes a list of `Str`, of `Uuid`, or of tags come out as what the column holds rather than as whatever Zig would stringify the struct as.
 
 ### `Timestamp`: checked against what is actually bound
 
-One branch in `acceptsSqlite`, ahead of the declared-name branch every other column type falls into, keeps an integer an integer: the three names carrying `INT` are INTEGER affinity, and `NUMERIC`, `DATETIME`, `TIMESTAMP` fall through to NUMERIC, which also stores an integer as an integer. `DATETIME` and `TIMESTAMP` are in the list because they are what somebody writing the table by hand reaches for, and they are correct, not a courtesy. `TEXT` is refused for this column, which is the point of the branch rather than a side effect: it used to be accepted and silently store the wrong sort order.
+One branch in `acceptsSqlite`, ahead of the declared-name branch every other column type falls into, keeps an integer an integer: the list is `INTEGER` and `NUMERIC`, the two affinities that store an integer as an integer (`introspect` answers affinities, ADR 055). Every declared type carrying `INT` is the first, and `DATETIME`, `TIMESTAMP` and `NUMERIC` are the second: they are what somebody writing the table by hand reaches for, and they are correct, not a courtesy. `TEXT` is refused for this column, which is the point of the branch rather than a side effect: it used to be accepted and silently store the wrong sort order.
+
+### A number is read only out of a number, and a NaN is not bound
+
+SQLite stores what it is given whatever the column's type says, and
+`sqlite3_column_int64` and `sqlite3_column_double` convert whatever they find
+without a word: text in an INTEGER column read 0, a REAL 2.7 read as an integer
+was 2, and a `DATETIME DEFAULT CURRENT_TIMESTAMP` read as a `Timestamp` was the
+year. **The storage class is asked before a number is read** (the
+`sqlite3_column_type` the NULL check already paid for), and anything but an
+integer for an integer or a bool, or anything but a number for a float, is
+`error.QueryFailed` with a line naming the column. A moment stored as text stays
+decided above; a number read out of text is not. A bool is anything but 0, which
+is what `WHERE flag` says about the same value, where zqlite's `== 1` read a 2 as
+false.
+
+**A NaN is refused before it is bound.** `sqlite3_bind_double` binds one as
+NULL, so a NOT NULL column answered `NotNullViolated` for a value that was never
+null and a nullable one read back `null`. An infinity is bound: SQLite keeps it,
+as Postgres does.
+
+### `Timestamp` on Postgres: `timestamptz` and nothing else
+
+A `timestamp` column holds a wall clock with no zone, and Postgres reads one
+against the session's zone wherever it meets a moment: `.now` written into it
+was local time read back as UTC, seven hours off under `Asia/Jakarta`, and
+`WHERE at < now()` compared it shifted the same way. So the startup check and a
+raw statement's `describe` accept `timestamptz` only for a `Timestamp`, and the
+refusal carries the statement that keeps the values nilo wrote there, which were
+UTC wall time: `ALTER TABLE … ALTER COLUMN … TYPE timestamptz USING … AT TIME
+ZONE 'UTC'`.
+
+**`infinity` and `-infinity` are refused by name.** Both are legal in a
+`timestamptz` or a `date` and any client may write them, and neither is a
+moment: `'infinity'::timestamptz` overflowed inside pg.zig's decoder and took the
+process down, `'-infinity'` read as a moment 292,000 years ago, and a `date`
+overflowed nilo's own shift. Both are read out of their own bytes now, with the
+arithmetic checked, and a sentinel is `error.QueryFailed` with a line that names
+it.
 
 ## What this changed about how the module is tested
 
@@ -77,6 +117,18 @@ Everything in `db.zig` ran against `wire.Fake`, and that is most of the point: t
 **A `time_form` beside `uuid_form`**, so SQLite could store `Timestamp` as RFC 3339 text, the shape the roadmap had sketched and the shape the three text-form declarations already have. Not taken here, because at the time reading it back would have meant **parsing** RFC 3339, and `Timestamp` then only wrote it. `Timestamp.nilo_parse` exists now ([ADR 127](./127-what-a-server-prints-it-can-read.md), built for a paged cursor round-tripping through a path or query param), so the parser this rejection leaned on is no longer missing; a `time_form` for SQLite storage is still not built, and stays open in [`docs/decided.md`](../decided.md) as a caller who needs to read a SQLite file whose times were written as text by something else, which the check that agrees with what is actually bound does not serve. The cheapest true fix for a check that disagreed with the write was to make the check agree with what is actually bound. A program wanting text timestamps on SQLite today has `sql.AsText("timestamptz")`.
 
 **Accepting both INTEGER and TEXT for `Timestamp`.** Would keep every existing schema starting, at the price of continuing to accept the one that sorts wrongly, the failure this exists to catch.
+
+**Spelling `.now` as `now() AT TIME ZONE 'UTC'` for a `timestamp` column**,
+which keeps every such schema starting. It fixes the write and leaves the
+comparison: `WHERE at < now()` still meets the session's zone, and so does every
+hand-written statement over the column. Refusing the column once, at startup,
+with the `ALTER` beside it, is one change for the caller instead of a rule every
+spelling of a moment has to route around.
+
+**A constant for `infinity` on `Timestamp` and `Date`**, so an open end could be
+read. Every caller comparing, printing or subtracting a moment would have had to
+remember the one that is not one; NULL already says "no end", and a column that
+holds the sentinel reads through a `CASE` in a raw statement.
 
 **Widening `nilo_column` into a per-Dialect name.** A bigger change than the problem: the declared name is a *Postgres* name, and every other consumer of it is right to read it that way.
 

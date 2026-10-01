@@ -71,6 +71,9 @@ That is not free, and the difference is an `fsync`, not anything in SQLite or ni
 | a `[]const T` column | there is no array type. A list belongs in its own table, or in a TEXT column your own code encodes |
 | `.isolation` below `.serializable` | SQLite gives every transaction a snapshot and serialises the writers. There is nothing weaker to ask for |
 | `.like`, `.not_like`, `.contains`, `.starts_with`, `.ends_with` | SQLite's `LIKE` ignores ASCII case and a statement cannot turn that off, so a case-sensitive match would depend on how the file was opened. Each Refusal names the case-insensitive version (`.ilike`, `.icontains`), which is what this database does ([ADR 055](../../adr/055-the-second-dialect-is-the-test-of-the-seam.md)) |
+| `.gt`, `.gte`, `.lt`, `.lte`, `.order`, `.after`, `sum`, `avg`, `min` or `max` over a `sql.Decimal` | the column is TEXT, so it compares as text and `"100.00"` sorts before `"9.99"`, and a sum is added in floating point. Equality and `.in` still work. Store an integer of the smallest unit, cents in an `i64` ([ADR 049](../../adr/049-a-column-type-can-come-from-outside-this-module.md)) |
+
+**Two answers differ at run time rather than refusing to compile.** SQLite has no four-byte float, so an `f32` field reads a `REAL` column and is refused (`QueryFailed`) only when the value does not survive the narrowing: `0.5` reads, `0.1` does not. Postgres refuses a `float8` into an `f32` whatever it holds; declare the field `f64` to read the same on both.
 
 **So a program that uses batches does not compile against both databases.** The shared interface fails loudly instead of quietly doing something else. Know this before you plan a migration assuming that swapping the line at the top is free.
 

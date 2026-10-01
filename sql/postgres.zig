@@ -1,5 +1,5 @@
 //! The Wire, filled in with pg.zig. **The only file in this module allowed
-//! to name pg.zig** — the same rule `src/engine/zio.zig` lives under, for
+//! to name pg.zig** — the same rule `http/engine/zio.zig` lives under, for
 //! the same reason (ADR 001, ADR 036).
 //!
 //! Everything above this file talks to `wire.zig`'s contract. If pg.zig
@@ -42,6 +42,7 @@
 //! why this seam is not called a Bulkhead.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const pg = @import("pg");
 
 const types = @import("types.zig");
@@ -224,12 +225,26 @@ pub const Wire = struct {
             return .{ .conn = self.conn, .result = result, .owns_conn = false, .io = self.wire.io, .limits = self.wire.limits, .wait = w };
         }
 
+        /// `Wire.columnsOf` down this transaction's connection, so a
+        /// migration that holds one does not ask the pool for a second.
+        pub fn columnsOf(
+            self: *Tx,
+            arena: std.mem.Allocator,
+            query: []const u8,
+            schema: ?[]const u8,
+            table: []const u8,
+        ) wire.Error![]const wire.Column {
+            var rows = try self.run(arena, query, .{ schema, table }, null, null);
+            defer rows.close();
+            return self.wire.columnList(arena, &rows);
+        }
+
         /// Remember a plan Postgres refused as stale, for `rollback` to
         /// deallocate. It cannot be done here: the refusal aborted the
         /// transaction, and an aborted transaction takes no `DEALLOCATE`.
         fn noteStale(self: *Tx, plan: ?[]const u8) void {
             const name = plan orelse return;
-            if (stalePlan(self.conn)) self.stale = name;
+            if (stalePlan(self.conn) or planGone(self.conn)) self.stale = name;
         }
 
         pub fn exec(
@@ -322,7 +337,10 @@ pub const Wire = struct {
         /// cannot collide with one a `tx.raw` put down by hand.
         const name_prefix = "nilo_sp_";
 
-        pub fn commit(self: *Tx) wire.Error!void {
+        /// `problem` is where a COMMIT the server refused leaves its words: a
+        /// deferred constraint is checked here and nowhere else, so this is
+        /// the only place `sql.violated` can learn which key it was.
+        pub fn commit(self: *Tx, arena: std.mem.Allocator, problem: ?*?wire.Problem) wire.Error!void {
             if (self.done) return;
             self.fresh();
             // **An aborted transaction is rolled back and the commit fails.**
@@ -351,7 +369,7 @@ pub const Wire = struct {
             if (std.Io.checkCancel(self.wire.io)) |_| {} else |_| self.wire.io.recancel();
             const was = self.wire.io.swapCancelProtection(.blocked);
             defer _ = self.wire.io.swapCancelProtection(was);
-            _ = self.conn.exec("COMMIT", .{}) catch |err| return translate(self.wire.io, self.conn, err);
+            _ = self.conn.exec("COMMIT", .{}) catch |err| return reported(self.wire.io, self.conn, err, arena, problem);
         }
 
         /// Cannot fail, because it is called from a `defer` on the way out
@@ -361,7 +379,7 @@ pub const Wire = struct {
         /// which is what `release` does with one that is not idle.
         pub fn rollback(self: *Tx) void {
             const err = self.undo() orelse return;
-            std.log.err(
+            std.log.warn(
                 "nilo_sql: a transaction could not be rolled back ({s}). The connection " ++
                     "is being dropped rather than returned to the pool.",
                 .{@errorName(err)},
@@ -427,10 +445,38 @@ pub const Wire = struct {
         );
         const w = self.limits.waiting();
         defer self.limits.waited(w);
-        var conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+        var conn = try self.take();
         errdefer giveBack(self.io, conn);
         _ = conn.exec(comptime beginText(opts), .{}) catch |err| return translate(self.io, conn, err);
         return .{ .wire = self, .conn = conn };
+    }
+
+    /// A connection from the pool, **asked whether it is still there before
+    /// anything is sent down it**. The pool hands back what it holds without
+    /// asking, so after a restart, a failover or a NAT dropping an idle
+    /// socket, every connection that had been idle cost one request a 5xx.
+    ///
+    /// **A check before rather than a resend after**, and the difference is
+    /// whether a statement can run twice. A failure on the first read after
+    /// the write cannot say whether the server got the statement: a FIN that
+    /// arrived before it, and a crash after the server committed it, look the
+    /// same from here, and an `INSERT` sent again is two rows. A socket that
+    /// already said it was closing is known dead before anything went out.
+    ///
+    /// A dead one is given back in a state the pool does not take back, so
+    /// pg.zig destroys it and dials its replacement, and the next is asked.
+    /// Bounded by the pool's size: past that every connection has been looked
+    /// at, and what is left is the pool's own answer.
+    fn take(self: *Wire) wire.Error!*pg.Conn {
+        var looked: usize = 0;
+        while (true) {
+            const conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+            if (looked > self.pool._conns.len or !hungUp(conn)) return conn;
+            looked += 1;
+            std.log.info("nilo_sql: an idle connection had been closed by the server; replaced before use", .{});
+            conn._state = .fail;
+            giveBack(self.io, conn);
+        }
     }
 
     /// `BEGIN`, with whatever the caller asked for spelled onto the end of
@@ -480,7 +526,20 @@ pub const Wire = struct {
         var scratch = std.heap.ArenaAllocator.init(gpa);
         defer scratch.deinit();
 
-        const pool = try pg.Pool.init(io, gpa, try poolOpts(uri, scratch.allocator(), opts));
+        const pool = pg.Pool.init(io, gpa, try poolOpts(uri, scratch.allocator(), opts)) catch |err| {
+            // **The refusal ADR 241 promises for a remote host with no
+            // `sslmode`.** Said here because the error pg.zig returns names
+            // the protocol, and the person reading it is looking at a URL
+            // that never mentioned TLS. `warn`, not `err`: ADR 145.
+            if (std.mem.eql(u8, @errorName(err), "SSLNotSupportedByServer")) std.log.warn(
+                "nilo_sql: the server did not offer TLS, and the URL asks for it, " ++
+                    "either with `sslmode=require` or by naming a host other than this " ++
+                    "machine and no `sslmode` (ADR 241). Turn TLS on at the server, or " ++
+                    "say `sslmode=disable` in the URL to connect without it knowingly.",
+                .{},
+            );
+            return err;
+        };
         return .{ .pool = pool, .io = io, .limits = opts.limits };
     }
 
@@ -495,7 +554,11 @@ pub const Wire = struct {
     ) !pg.Pool.Opts {
         var out = try dialOpts(uri, arena);
         out.size = opts.size;
-        out.timeout = opts.timeout_ms;
+        // **Zero is no bound, as `wire.OpenOpts` says**, and pg.zig reads it
+        // as a deadline that has already passed: an empty pool would fail
+        // the moment it was asked. The largest value it takes is about
+        // forty-nine days, which is no bound to a request.
+        out.timeout = if (opts.timeout_ms == 0) std.math.maxInt(u32) else opts.timeout_ms;
         out.connect_on_init_count = opts.connect_on_init;
         // `result_state_size` is left at pg.zig's 32, on purpose. It looked
         // free to size from the widest Row a `Db` reads, since every
@@ -513,9 +576,12 @@ pub const Wire = struct {
     /// message and the branches in `dialOpts` cannot drift apart.
     const understood_params =
         "user, password, dbname, host, port, sslmode (disable, require or " ++
-        "verify-full), sslrootcert (beside sslmode=verify-full), application_name, " ++
-        "fallback_application_name, connect_timeout, tcp_user_timeout, keepalives, " ++
-        "keepalives_idle, keepalives_interval and keepalives_count";
+        "verify-full; with none, require for any host but this machine, ADR 241), " ++
+        "sslrootcert (beside sslmode=verify-full), application_name, " ++
+        "fallback_application_name, connect_timeout, keepalives, " ++
+        "keepalives_idle, keepalives_interval, keepalives_count, options, " ++
+        "pgbouncer (true turns prepared statements off), pool_mode and " ++
+        "client_encoding=UTF8";
 
     /// A URI taken apart into what pg.zig needs to dial with.
     ///
@@ -532,12 +598,28 @@ pub const Wire = struct {
     /// - **carried** — pg.zig has a field for it, and the field is set.
     /// - **dropped** — it asks for what the driver does anyway, or for what
     ///   the driver never does and nothing the caller can see changes:
-    ///   `pgbouncer=true`, `sslsni=1`, `channel_binding=prefer`. One `warn`
-    ///   line names them all, once, at startup.
+    ///   `sslsni=1`, `channel_binding=prefer`. One `warn` line names them
+    ///   all, once, at startup.
     /// - **refused** — the connection would not do what the URL says, and
     ///   the line before the error names the parameter, the reason and
     ///   `understood_params`. `sslmode=prefer` is the one to keep in mind:
     ///   it would fall back to plaintext, and pg.zig does not.
+    ///   `tcp_user_timeout` is the other: libpq sets a socket option with
+    ///   it, pg.zig has none to set, and its own parser reads the number as
+    ///   the login timeout, which a URL that also says `connect_timeout`
+    ///   would then overwrite or be overwritten by (ADR 241).
+    ///
+    /// `pgbouncer=true` and `pool_mode=transaction` are none of the three.
+    /// They are **read by `urlIsPooled`**, which `Db.init` asks so that
+    /// statements are not kept prepared behind a pooler that hands out a
+    /// different server connection per transaction (ADR 051, ADR 241).
+    ///
+    /// **`sslmode` has a default, and it depends on where the host is**
+    /// (ADR 241): none of `localhost`, `127.0.0.0/8`, `::1`, a unix socket
+    /// path or no host at all (pg.zig dials `127.0.0.1`) is TLS by default,
+    /// and every other host is `require`. libpq's `prefer` is not on offer,
+    /// because anybody on the path can answer the `SSLRequest` with `N` and
+    /// read the password that follows.
     ///
     /// The refusals log at `warn` rather than `err` for the reason `wireOf`
     /// in `db.zig` does: the error is returned and is what the caller acts
@@ -568,7 +650,12 @@ pub const Wire = struct {
                 .host = if (uri.host) |h| try h.toRawMaybeAlloc(arena) else null,
             },
         };
-        const query = uri.query orelse return out;
+        // A URL with no query string says no `sslmode` either, so it takes the
+        // default by where the server is (ADR 241) before it returns.
+        const query = uri.query orelse {
+            if (!isThisMachine(out.connect.host)) out.connect.tls = .require;
+            return out;
+        };
 
         // Split before decoding: a `password=` whose value holds `&` or `=`
         // arrives percent-encoded, and decoding the whole query first would
@@ -578,7 +665,9 @@ pub const Wire = struct {
             .raw, .percent_encoded => |text| text,
         };
 
-        var sslmode: []const u8 = "disable";
+        // Null until the URL says one: the default depends on the host, and
+        // the host may arrive as `?host=` after this parameter.
+        var sslmode: ?[]const u8 = null;
         var sslrootcert: ?[]const u8 = null;
         var fallback_name: ?[]const u8 = null;
         var dropped: std.Io.Writer.Allocating = .init(arena);
@@ -631,7 +720,9 @@ pub const Wire = struct {
                 // which is pg.zig's own reading of it.
                 out.auth.timeout = try std.math.mul(u32, try std.fmt.parseInt(u32, value, 10), 1000);
             } else if (eql(key, "tcp_user_timeout")) {
-                out.auth.timeout = try std.fmt.parseInt(u32, value, 10);
+                return refuse(key, value, "sets a timeout on the TCP socket in libpq, " ++
+                    "which pg.zig has no way to set; it would only have bounded the " ++
+                    "login, which is what `connect_timeout` (in seconds) says", error.UnsupportedConnectionParam);
             } else if (eql(key, "keepalives")) {
                 out.connect.keepalive = !eql(value, "0");
             } else if (eql(key, "keepalives_idle")) {
@@ -640,12 +731,41 @@ pub const Wire = struct {
                 out.connect.keepalive_interval = try std.fmt.parseInt(u32, value, 10);
             } else if (eql(key, "keepalives_count")) {
                 out.connect.keepalive_count = try std.fmt.parseInt(u32, value, 10);
+            } else if (eql(key, "options")) {
+                // Handed to the server as written, in the startup message,
+                // which parses it the way `postgres -c` does. It is how a
+                // URL sets `statement_timeout` for every connection of a
+                // pool, and how Neon is told which endpoint is meant.
+                const params = try startupParams(arena, &out);
+                if (params.get(key)) |was| {
+                    if (!eql(was, value)) return refuse(key, value, "is the second `options` " ++
+                        "in the URL, and the two disagree. Put every setting in one, " ++
+                        "`-c a=1 -c b=2`", error.ConflictingConnectionParam);
+                }
+                try params.put(key, value);
+            } else if (eql(key, "client_encoding")) {
+                // Every `Str` nilo hands out is UTF-8, so UTF-8 is the one
+                // encoding a connection may ask for. Postgres takes the
+                // name in any case and with or without its hyphen.
+                if (!std.ascii.eqlIgnoreCase(value, "UTF8") and !std.ascii.eqlIgnoreCase(value, "UTF-8"))
+                    return refuse(key, value, "would send text in an encoding other " ++
+                        "than UTF-8, and every `Str` nilo_sql hands out is read as " ++
+                        "UTF-8. Drop it, or say `UTF8`", error.UnsupportedConnectionParamValue);
+                try (try startupParams(arena, &out)).put(key, "UTF8");
 
-                // Dropped. `pgbouncer=true` and `pool_mode` are a pooler's
-                // notes to a client library that prepares statements by
-                // name; nilo's are prepared per connection either way.
-            } else if (eql(key, "pgbouncer") or eql(key, "pool_mode") or
-                (eql(key, "sslsni") and eql(value, "1")) or
+                // Read, not dropped: `urlIsPooled` turns `Opts.prepared` off
+                // from these two (ADR 241). What is checked here is that the
+                // value is one it understands, since `pgbouncer=ture` read as
+                // "no pooler" would be a Db that fails on its first
+                // transaction.
+            } else if (eql(key, "pgbouncer")) {
+                if (!eql(value, "true") and !eql(value, "false")) return refuse(key, value, "is not `true` or `false`", error.UnsupportedConnectionParamValue);
+            } else if (eql(key, "pool_mode")) {
+                if (!eql(value, "session") and !eql(value, "transaction") and !eql(value, "statement"))
+                    return refuse(key, value, "is not `session`, `transaction` or `statement`", error.UnsupportedConnectionParamValue);
+
+                // Dropped.
+            } else if ((eql(key, "sslsni") and eql(value, "1")) or
                 (eql(key, "gssencmode") and (eql(value, "disable") or eql(value, "prefer"))) or
                 (eql(key, "channel_binding") and (eql(value, "prefer") or eql(value, "disable"))) or
                 (eql(key, "target_session_attrs") and eql(value, "any")))
@@ -658,10 +778,6 @@ pub const Wire = struct {
             } else if (eql(key, "sslcert") or eql(key, "sslkey")) {
                 return refuse(key, value, "names a client certificate, and pg.zig " ++
                     "presents none", error.UnsupportedConnectionParam);
-            } else if (eql(key, "options")) {
-                return refuse(key, value, "would set server-side settings at connect " ++
-                    "time, and pg.zig's startup message has no room for them. Run " ++
-                    "the `SET` after connecting, or put the setting on the role", error.UnsupportedConnectionParam);
             } else if (eql(key, "channel_binding")) {
                 return refuse(key, value, "asks for SCRAM channel binding, which pg.zig " ++
                     "does not do; the server would take the connection without it " ++
@@ -675,11 +791,6 @@ pub const Wire = struct {
             } else if (eql(key, "sslsni")) {
                 return refuse(key, value, "would leave the host name out of the TLS " ++
                     "handshake, and pg.zig always sends it", error.UnsupportedConnectionParamValue);
-            } else if (eql(key, "client_encoding")) {
-                return refuse(key, value, "is never sent: pg.zig's startup message " ++
-                    "names the user, the database and the application name, so the " ++
-                    "session takes the database's own encoding. Drop it, or make " ++
-                    "the database UTF8", error.UnsupportedConnectionParamValue);
             } else {
                 return refuse(key, value, "is not a parameter nilo_sql understands", error.UnsupportedConnectionParam);
             }
@@ -688,14 +799,16 @@ pub const Wire = struct {
         // `sslrootcert` names a CA, and only `verify-full` reads one:
         // carried beside anything else it would be a file the connection
         // never opens while the URL says it was checked against.
-        if (sslrootcert != null and !eql(sslmode, "verify-full")) {
+        if (sslrootcert != null and !eql(sslmode orelse "", "verify-full")) {
             return refuse("sslrootcert", sslrootcert.?, "names a CA the connection " ++
                 "would never check, because `sslmode` is not `verify-full`. Add " ++
                 "`sslmode=verify-full`, or drop it", error.UnsupportedConnectionParam);
         }
-        out.connect.tls = if (eql(sslmode, "require"))
+        // **The default is decided by where the server is** (ADR 241).
+        const mode = sslmode orelse if (isThisMachine(out.connect.host)) "disable" else "require";
+        out.connect.tls = if (eql(mode, "require"))
             .require
-        else if (eql(sslmode, "verify-full"))
+        else if (eql(mode, "verify-full"))
             // libpq reads `sslrootcert=system` as the platform's store,
             // which is what pg.zig does with no path at all.
             .{ .verify_full = if (sslrootcert) |ca| (if (eql(ca, "system")) null else ca) else null }
@@ -715,8 +828,66 @@ pub const Wire = struct {
         return std.mem.eql(u8, a, b);
     }
 
+    /// Whether a connection to this host never leaves the machine: no host
+    /// at all (pg.zig dials `127.0.0.1`), `localhost`, anything in
+    /// `127.0.0.0/8`, `::1`, or a unix socket path. These are the hosts that
+    /// default to no TLS; everything else defaults to `require` (ADR 241).
+    ///
+    /// **Only what the URL spells out.** A name that resolves to a loopback
+    /// address (a `db` alias in `/etc/hosts`) is not looked up, since a
+    /// lookup at parse time is a network call and an answer that can change
+    /// between the check and the dial. It gets `require`, and a URL that
+    /// means plaintext says `sslmode=disable`.
+    fn isThisMachine(host: ?[]const u8) bool {
+        var h = host orelse return true;
+        if (h.len == 0 or h[0] == '/') return true;
+        if (h[0] == '[' and h[h.len - 1] == ']') h = h[1 .. h.len - 1];
+        if (std.ascii.eqlIgnoreCase(h, "localhost") or std.ascii.eqlIgnoreCase(h, "localhost.")) return true;
+        if (eql(h, "::1")) return true;
+        const address = std.Io.net.IpAddress.parse(h, 0) catch return false;
+        return switch (address) {
+            .ip4 => |v4| v4.bytes[0] == 127,
+            .ip6 => false,
+        };
+    }
+
+    /// Whether the URL says a connection pooler that hands out a different
+    /// server connection per transaction sits in front of the database:
+    /// `pgbouncer=true`, or `pool_mode=transaction` or `statement`. `Db.init`
+    /// turns `Opts.prepared` off on it, because a statement prepared on one
+    /// server connection is missing on the next and Postgres answers `26000`
+    /// (ADR 051, ADR 241). Read with the same decoding `dialOpts` uses, so a
+    /// key spelled with percent-escapes is seen by both or by neither.
+    pub fn urlIsPooled(url: []const u8) bool {
+        const uri = std.Uri.parse(url) catch return false;
+        const query = uri.query orelse return false;
+        const encoded = query == .percent_encoded;
+        const raw = switch (query) {
+            .raw, .percent_encoded => |text| text,
+        };
+        var buf: [256]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        var it = std.mem.splitScalar(u8, raw, '&');
+        while (it.next()) |param| {
+            fba.reset();
+            var pair = std.mem.splitScalar(u8, param, '=');
+            const key = decodeParam(fba.allocator(), pair.first(), encoded) catch continue;
+            const value = decodeParam(fba.allocator(), pair.rest(), encoded) catch continue;
+            if (eql(key, "pgbouncer") and eql(value, "true")) return true;
+            if (eql(key, "pool_mode") and (eql(value, "transaction") or eql(value, "statement"))) return true;
+        }
+        return false;
+    }
+
     /// One piece of a query string, percent-decoded into the arena when
     /// the URI came in encoded — which `std.Uri.parse` always leaves it.
+    /// The startup message's own settings, made on first use in the arena
+    /// `dialOpts` builds in; `Pool.init` copies the map and what is in it.
+    fn startupParams(arena: std.mem.Allocator, out: *pg.Pool.Opts) !*std.StringHashMap([]const u8) {
+        if (out.auth.startup_parameters == null) out.auth.startup_parameters = .init(arena);
+        return &out.auth.startup_parameters.?;
+    }
+
     fn decodeParam(arena: std.mem.Allocator, piece: []const u8, encoded: bool) ![]const u8 {
         if (!encoded) return piece;
         const buf = try arena.alloc(u8, piece.len);
@@ -742,10 +913,13 @@ pub const Wire = struct {
     /// The one sentence a refused parameter gets: which, why, and what
     /// would have been read.
     fn refuse(key: []const u8, value: []const u8, why: []const u8, comptime err: anytype) @TypeOf(err) {
+        // A refused `sslpassword` is still a secret, and this line prints
+        // the value of what it refuses.
+        const shown = if (std.ascii.eqlIgnoreCase(key, "sslpassword")) "***" else value;
         std.log.warn(
             "nilo_sql: the database URL carries `{s}={s}`, which {s}. The " ++
                 "parameters understood are {s}.",
-            .{ key, value, why, understood_params },
+            .{ key, shown, why, understood_params },
         );
         return err;
     }
@@ -772,7 +946,7 @@ pub const Wire = struct {
         // two calls and a clock per row (ADR 210).
         const w = self.limits.waiting();
         errdefer self.limits.waited(w);
-        var conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+        var conn = try self.take();
         errdefer giveBack(self.io, conn);
 
         const opts: pg.Conn.QueryOpts = .{ .allocator = arena, .cache_name = plan };
@@ -849,9 +1023,164 @@ pub const Wire = struct {
             }
             if (raw.data.len != 4) return error.QueryFailed;
             const since_y2k = std.mem.readInt(i32, raw.data[0..4], .big);
-            return .{ .days = since_y2k + types.Date.days_from_epoch_to_y2k };
+            if (since_y2k == std.math.maxInt(i32) or since_y2k == std.math.minInt(i32))
+                return infinite("date", col, since_y2k > 0);
+            return .{ .days = std.math.add(i32, since_y2k, types.Date.days_from_epoch_to_y2k) catch
+                return error.QueryFailed };
+        }
+        // **A `timestamp` read out of its own eight bytes**, for the reason the
+        // `date` above is: pg.zig's decoder adds the offset from 2000 to the
+        // epoch unchecked, so `'infinity'` (the largest `i64`) overflowed
+        // inside the driver and took the process down, and `'-infinity'` read
+        // as a moment 292,000 years ago. A `Timestamp` arrives here as `i64`
+        // (`db.WireRead`), and the column's OID is what says it is a moment
+        // rather than a `bigint`.
+        if (comptime T == i64 or T == ?i64) {
+            const oid = row.oids[col];
+            if (oid == pg.types.Timestamp.oid.decimal or oid == pg.types.TimestampTz.oid.decimal) {
+                const raw = row.values[col];
+                if (raw.is_null) {
+                    if (comptime T == ?i64) return null;
+                    return error.QueryFailed;
+                }
+                if (raw.data.len != 8) return error.QueryFailed;
+                const since_y2k = std.mem.readInt(i64, raw.data[0..8], .big);
+                if (since_y2k == std.math.maxInt(i64) or since_y2k == std.math.minInt(i64))
+                    return infinite("timestamp", col, since_y2k > 0);
+                return std.math.add(i64, since_y2k, micros_from_epoch_to_y2k) catch error.QueryFailed;
+            }
+        }
+        // **A number read out of whichever width the column is, and held to
+        // the field's.** pg.zig decodes an `i32` out of `int4` and nothing
+        // else, while the schema check lets an `i32` stand over an `int8` and
+        // an `f64` over a `float4`, so every read of those answered
+        // `QueryFailed` and a `u16` or an `i8` did not compile inside the
+        // driver. Here a value that fits is read, and one that does not is
+        // refused with its column named rather than truncated. Any other
+        // column, a `numeric` read into an `f64` among them, is pg.zig's.
+        if (comptime numberOf(T)) |N| {
+            const oid = row.oids[col];
+            // pg.zig decodes these five widths out of other columns too, a
+            // `numeric` into an `f64` among them; any other width has no
+            // decoder there at all.
+            const theirs = comptime N == i16 or N == i32 or N == i64 or N == f32 or N == f64;
+            if (isNumber(oid) or !theirs) {
+                const raw = row.values[col];
+                if (raw.is_null) {
+                    if (comptime @typeInfo(T) == .optional) return null;
+                    return error.QueryFailed;
+                }
+                if (!isNumber(oid)) return notANumber(N, oid, col);
+                return try numberFrom(N, oid, raw.data, col);
+            }
         }
         return row.get(T, col) catch return error.QueryFailed;
+    }
+
+    /// The number `T` holds, or null when it holds something else. An `i64`
+    /// counts: a `Timestamp` over a moment was taken above by its OID, and
+    /// one over an `int8` is the number it is.
+    fn numberOf(comptime T: type) ?type {
+        const Inner = switch (@typeInfo(T)) {
+            .optional => |o| o.child,
+            else => T,
+        };
+        return switch (@typeInfo(Inner)) {
+            .int, .float => Inner,
+            else => null,
+        };
+    }
+
+    fn numberName(oid: i32) []const u8 {
+        return switch (oid) {
+            pg.types.Int16.oid.decimal => "int2",
+            pg.types.Int32.oid.decimal => "int4",
+            pg.types.Int64.oid.decimal => "int8",
+            pg.types.Float32.oid.decimal => "float4",
+            pg.types.Float64.oid.decimal => "float8",
+            else => "another type",
+        };
+    }
+
+    fn isNumber(oid: i32) bool {
+        return switch (oid) {
+            pg.types.Int16.oid.decimal,
+            pg.types.Int32.oid.decimal,
+            pg.types.Int64.oid.decimal,
+            pg.types.Float32.oid.decimal,
+            pg.types.Float64.oid.decimal,
+            => true,
+            else => false,
+        };
+    }
+
+    /// A column of `int2`, `int4`, `int8`, `float4` or `float8`, in the
+    /// binary form Postgres sends, as `N`. An integer is range-checked into
+    /// any integer field; a float widens into an `f64` and reads into an
+    /// `f32` only out of a `float4`, since narrowing a double loses digits
+    /// without saying so.
+    fn numberFrom(comptime N: type, oid: i32, data: []const u8, col: usize) wire.Error!N {
+        switch (@typeInfo(N)) {
+            .int => {
+                const wide: i64 = switch (oid) {
+                    pg.types.Int16.oid.decimal => if (data.len == 2) std.mem.readInt(i16, data[0..2], .big) else return error.QueryFailed,
+                    pg.types.Int32.oid.decimal => if (data.len == 4) std.mem.readInt(i32, data[0..4], .big) else return error.QueryFailed,
+                    pg.types.Int64.oid.decimal => if (data.len == 8) std.mem.readInt(i64, data[0..8], .big) else return error.QueryFailed,
+                    // A float column into an integer field: not a number
+                    // this reads without losing what is after the point.
+                    else => return notANumber(N, oid, col),
+                };
+                return std.math.cast(N, wide) orelse {
+                    std.log.warn(
+                        "nilo_sql: column {d} holds {d}, which does not fit the Row's " ++ @typeName(N) ++
+                            ". Widen the field, or narrow the column.",
+                        .{ col, wide },
+                    );
+                    return error.QueryFailed;
+                };
+            },
+            .float => switch (oid) {
+                pg.types.Float32.oid.decimal => {
+                    if (data.len != 4) return error.QueryFailed;
+                    const narrow: f32 = @bitCast(std.mem.readInt(u32, data[0..4], .big));
+                    return narrow;
+                },
+                pg.types.Float64.oid.decimal => {
+                    if (N != f64 or data.len != 8) return notANumber(N, oid, col);
+                    return @bitCast(std.mem.readInt(u64, data[0..8], .big));
+                },
+                else => return notANumber(N, oid, col),
+            },
+            else => comptime unreachable,
+        }
+    }
+
+    fn notANumber(comptime N: type, oid: i32, col: usize) wire.Error {
+        std.log.warn(
+            "nilo_sql: column {d} arrived as {s}, which the Row's " ++ @typeName(N) ++ " does not read. " ++
+                "Cast the column in the statement, or change the field's type.",
+            .{ col, numberName(oid) },
+        );
+        return error.QueryFailed;
+    }
+
+    /// 2000-01-01 as microseconds since the epoch: where Postgres counts a
+    /// `timestamp` from, and the number pg.zig's own decoder adds.
+    const micros_from_epoch_to_y2k: i64 = 946_684_800_000_000;
+
+    /// **Refused by name rather than given a constant.** `infinity` and
+    /// `-infinity` are legal in a `date` or a `timestamp` column and any other
+    /// client may write them, but no `Date` or `Timestamp` holds one, and a
+    /// sentinel the Row could compare against would be a moment every caller
+    /// has to remember is not a moment.
+    fn infinite(comptime what: []const u8, col: usize, positive: bool) wire.Error {
+        std.log.warn(
+            "nilo_sql: column {d} holds '{s}infinity', which no " ++ what ++ " field can " ++
+                "hold. Store a real moment or NULL for an open end, or read the column " ++
+                "through a CASE in a raw statement.",
+            .{ col, if (positive) "" else "-" },
+        );
+        return error.QueryFailed;
     }
 
     /// Column `col` as a slice of its elements, allocated in the arena.
@@ -884,13 +1213,86 @@ pub const Wire = struct {
         }
         try arrayFits(Item, raw.data);
 
+        // **An enum list is read as its text and converted here.** pg.zig's
+        // own decoder is `std.meta.stringToEnum(T, data).?`, so one label the
+        // Zig enum lacks took the process down (ADR 007). Each label goes
+        // through the same refusal a scalar enum does (`labelOf`), and the
+        // cost is one more slice in the arena per row that reads one.
+        if (comptime enumOfList(Item)) |E| {
+            const Text = if (comptime @typeInfo(Item) == .optional) ?[]const u8 else []const u8;
+            const texts_it = row.iterator(Text, col) catch return error.QueryFailed;
+            const texts = texts_it.alloc(arena) catch return error.QueryFailed;
+            const tags = arena.alloc(Item, texts.len) catch return error.QueryFailed;
+            for (tags, texts) |*tag, text| {
+                if (comptime @typeInfo(Item) == .optional) {
+                    tag.* = if (text) |held| try labelOf(E, held) else null;
+                } else {
+                    tag.* = try labelOf(E, text);
+                }
+            }
+            return tags;
+        }
+
         const it = row.iterator(Item, col) catch return error.QueryFailed;
-        return it.alloc(arena) catch return error.QueryFailed;
+        const list = it.alloc(arena) catch return error.QueryFailed;
+        // pg.zig copies an element out of its read buffer only when the
+        // element is exactly `[]const u8`, so an optional one points into a
+        // buffer the next statement overwrites. `db.zig` takes what this
+        // answers as the arena's (`keptList`) and wraps it in a `Str`; a
+        // `[]const ?Str` column read "ZZZZZZ" four statements later.
+        if (comptime Item == ?[]const u8) {
+            for (list) |*item| if (item.*) |text| {
+                item.* = arena.dupe(u8, text) catch return error.QueryFailed;
+            };
+        }
+        return list;
     }
 
-    /// The two array shapes pg.zig asserts on rather than refuses, checked
-    /// here so they answer with a 500 for one request instead of taking the
-    /// process down (ADR 007, and the same argument as `db.zig`'s `enumOf`).
+    /// The enum a list's element is, when it is one (`Item` or `?Item`).
+    fn enumOfList(comptime Item: type) ?type {
+        const Bare = if (@typeInfo(Item) == .optional) @typeInfo(Item).optional.child else Item;
+        return if (@typeInfo(Bare) == .@"enum") Bare else null;
+    }
+
+    /// The tag whose name a list element held, or a refusal naming the value.
+    /// `db.zig`'s `enumOf` for a scalar, which this file cannot import.
+    fn labelOf(comptime E: type, raw: []const u8) wire.Error!E {
+        return std.meta.stringToEnum(E, raw) orelse {
+            std.log.warn(
+                "nilo_sql: a column held `{s}` in a list, which is not a value of {s}. " ++
+                    "The database has a value the Zig enum does not.",
+                .{ raw, @typeName(E) },
+            );
+            return error.QueryFailed;
+        };
+    }
+
+    /// The element types (their OIDs) a list of `Item` may be read from, or
+    /// `null` for an `Item` this does not know, which is then not judged.
+    /// Exact, like `dialect.listAccepts`: an `int4[]` does not read into a
+    /// `[]const i64`.
+    fn elementOids(comptime Item: type) ?[]const i32 {
+        const Bare = if (@typeInfo(Item) == .optional) @typeInfo(Item).optional.child else Item;
+        const varchar = 1043;
+        if (comptime @typeInfo(Bare) == .@"enum") return &.{ pg.types.String.oid.decimal, varchar };
+        return switch (Bare) {
+            // A `Uuid` list arrives as `[]const u8` too (`db.WireList`), so the
+            // `uuid` element is in the set with the two text ones.
+            []const u8 => &.{ pg.types.String.oid.decimal, varchar, pg.types.UUID.oid.decimal },
+            bool => &.{pg.types.Bool.oid.decimal},
+            i16 => &.{pg.types.Int16.oid.decimal},
+            i32 => &.{pg.types.Int32.oid.decimal},
+            i64 => &.{pg.types.Int64.oid.decimal},
+            f32 => &.{pg.types.Float32.oid.decimal},
+            f64 => &.{pg.types.Float64.oid.decimal},
+            else => null,
+        };
+    }
+
+    /// The array shapes pg.zig asserts or panics on rather than refuses,
+    /// checked here so they answer with a 500 for one request instead of
+    /// taking the process down (ADR 007, and the same argument as `db.zig`'s
+    /// `enumOf`).
     ///
     /// This reads the array header out of the column's own bytes, which is
     /// reaching past pg.zig's API — the second place in this file that does,
@@ -902,8 +1304,32 @@ pub const Wire = struct {
     /// count, a null flag, the element OID, then per dimension a length and a
     /// lower bound. A zero-dimension array — Postgres's `'{}'` — stops after
     /// the first three.
+    ///
+    /// **The element OID is checked first, and before the empty array is let
+    /// through.** pg.zig picks its element decoder from the column's type
+    /// before it looks at the length, and for an `i64` or `f64` list of any
+    /// other element type it is `std.debug.panic`: one `int4[]` read into a
+    /// `[]const i64` took the process down, empty or not.
     fn arrayFits(comptime Item: type, data: []const u8) wire.Error!void {
         if (data.len < 12) return error.QueryFailed;
+
+        if (comptime elementOids(Item)) |accepted| {
+            const element = std.mem.readInt(i32, data[8..12], .big);
+            const fits = for (accepted) |oid| {
+                if (oid == element) break true;
+            } else false;
+            if (!fits) {
+                std.log.warn(
+                    "nilo_sql: a column held an array of elements with type OID {d}, " ++
+                        "which a list of {s} cannot be read from. Declare the field to " ++
+                        "match the column (`int4[]` is a list of i32, `int8[]` of i64, " ++
+                        "`text[]` of text or of an enum).",
+                    .{ element, @typeName(Item) },
+                );
+                return error.QueryFailed;
+            }
+        }
+
         // The empty array, which has no dimension to describe.
         if (data.len == 12) return;
         if (data.len < 20) return error.QueryFailed;
@@ -931,16 +1357,67 @@ pub const Wire = struct {
 
     /// Throw away what is left and give the connection back.
     ///
-    /// Not optional, and not only good manners: pg.zig's pool checks that a
-    /// connection is idle on release, and on finding it is not, destroys it
-    /// and dials a new one. A handler that stops reading early is an
-    /// ordinary thing to write, so the cost of it must not be a reconnect.
+    /// pg.zig's pool checks that a connection is idle on release, and on
+    /// finding it is not, destroys it and dials a new one. A handler that
+    /// stops reading early is an ordinary thing to write, so a short rest is
+    /// read off the socket and the connection kept.
+    ///
+    /// **A long rest is not** (ADR 238). Reading it held the connection for
+    /// as long as the server took to send it: a stream let go after one of
+    /// 200,000 rows of 200 bytes took 178 to 313 ms to give its connection
+    /// back (bench/result/sql.md §20). Past `drain_budget` bytes the connection is
+    /// given back as failed, so the pool closes it, which ends the query on
+    /// the server at its next write, and dials a replacement: one connect in
+    /// place of however long the rest was. Postgres's own way to stop a
+    /// query, a CancelRequest, needs the key the server sends at startup,
+    /// which pg.zig reads past without keeping.
+    ///
+    /// Inside a transaction the rest is read whatever its length: the
+    /// connection is the transaction, and closing it would roll back what
+    /// the caller has not committed.
     pub fn drain(self: *Wire, rows: *Rows) void {
         // A cancellation that lands while the rest is thrown away is the
         // caller's, like any other a statement is cut off by (ADR 223).
-        rows.result.drain() catch |err| if (err == error.Canceled) self.io.recancel();
+        if (!rows.owns_conn) {
+            rows.result.drain() catch |err| if (err == error.Canceled) self.io.recancel();
+            rows.close();
+            return;
+        }
+        const conn = rows.conn;
+        var thrown: usize = 0;
+        while (conn._state == .query) {
+            const msg = conn.read() catch |err| {
+                if (err == error.Canceled) self.io.recancel();
+                break;
+            };
+            switch (msg.type) {
+                'Z' => break,
+                'C', 'D' => {},
+                else => {
+                    conn._state = .fail;
+                    break;
+                },
+            }
+            thrown += msg.data.len;
+            if (thrown > drain_budget and conn._state == .query) {
+                std.log.info(
+                    "nilo_sql: a stream was let go with more than {d} bytes still to come; its connection is replaced rather than read to the end",
+                    .{drain_budget},
+                );
+                conn._state = .fail;
+                break;
+            }
+        }
         rows.close();
     }
+
+    /// How much of a stream let go early is read off the socket before its
+    /// connection is replaced instead. A megabyte is read in 4 to 7 ms and a
+    /// replacement dialled in 16 to 27 on loopback, so a rest past it costs
+    /// at most one connect more than reading it would have, and a rest of
+    /// forty megabytes costs 21 to 34 ms where it cost 178 to 313 (ADR 238,
+    /// bench/result/sql.md §20).
+    pub const drain_budget: usize = 1024 * 1024;
 
     /// Run a statement that answers with a count rather than with rows, and
     /// give the count back. An `UPDATE` that matched nothing and one that
@@ -960,7 +1437,7 @@ pub const Wire = struct {
     ) wire.Error!usize {
         const w = self.limits.waiting();
         defer self.limits.waited(w);
-        var conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+        var conn = try self.take();
         defer giveBack(self.io, conn);
         const opts: pg.Conn.QueryOpts = .{ .allocator = arena, .cache_name = plan };
         const count = conn.execOpts(sql, opened(values), opts) catch |err| retry: {
@@ -988,12 +1465,56 @@ pub const Wire = struct {
         // caller already has a sentence for a check it could not run.
         var rows = try self.run(arena, query, .{ schema, table }, null, null);
         defer rows.close();
+        return self.columnList(arena, &rows);
+    }
 
-        var found: std.ArrayList(wire.Column) = .empty;
+    /// `columnsOf` for every table of one schema in one query, the answer cut
+    /// into one list per table in the order asked (`dialect.Postgres.introspect_all`).
+    /// What the startup check sends, so a schema of fifty Rows costs one round
+    /// trip and not fifty. Same arrangement as `columnsOf`: no kept plan, no
+    /// problem slot.
+    pub fn columnsOfMany(
+        self: *Wire,
+        arena: std.mem.Allocator,
+        query: []const u8,
+        schema: ?[]const u8,
+        tables: []const []const u8,
+    ) wire.Error![]const []const wire.Column {
+        var rows = try self.run(arena, query, .{ schema, tables }, null, null);
+        defer rows.close();
+
+        var found: std.ArrayList(wire.Keyed(wire.Column)) = .empty;
         while (try self.next(&rows)) {
-            const name = try self.read(&rows, []const u8, 0);
-            const udt = try self.read(&rows, []const u8, 1);
-            const is_nullable = try self.read(&rows, []const u8, 2);
+            const table = try self.read(&rows, []const u8, 0);
+            const name = try self.read(&rows, []const u8, 1);
+            const udt = try self.read(&rows, []const u8, 2);
+            const is_nullable = try self.read(&rows, []const u8, 3);
+            found.append(arena, .{
+                .key = arena.dupe(u8, table) catch return error.QueryFailed,
+                .item = .{
+                    .name = arena.dupe(u8, name) catch return error.QueryFailed,
+                    .udt = arena.dupe(u8, udt) catch return error.QueryFailed,
+                    .nullable = if (std.mem.eql(u8, is_nullable, "YES"))
+                        true
+                    else if (std.mem.eql(u8, is_nullable, "NO"))
+                        false
+                    else
+                        null,
+                },
+            }) catch return error.QueryFailed;
+        }
+        return wire.cutByName(wire.Column, arena, tables, found.items, false);
+    }
+
+    /// The rows of the introspection query as columns. Shared by `columnsOf`
+    /// and the one on `Tx`, so a migration reads the table through the
+    /// connection it already holds (ADR 123).
+    fn columnList(self: *Wire, arena: std.mem.Allocator, rows: *Rows) wire.Error![]const wire.Column {
+        var found: std.ArrayList(wire.Column) = .empty;
+        while (try self.next(rows)) {
+            const name = try self.read(rows, []const u8, 0);
+            const udt = try self.read(rows, []const u8, 1);
+            const is_nullable = try self.read(rows, []const u8, 2);
             found.append(arena, .{
                 .name = arena.dupe(u8, name) catch return error.QueryFailed,
                 .udt = arena.dupe(u8, udt) catch return error.QueryFailed,
@@ -1035,7 +1556,7 @@ pub const Wire = struct {
     ) wire.Error!?[]const wire.Described {
         const w = self.limits.waiting();
         defer self.limits.waited(w);
-        var conn = self.pool.acquire() catch |err| return acquireFailed(self.io, err);
+        var conn = try self.take();
         defer giveBack(self.io, conn);
 
         var oids: []const i32 = &.{};
@@ -1066,16 +1587,33 @@ pub const Wire = struct {
         query: []const u8,
         type_name: []const u8,
     ) wire.Error![]const []const u8 {
-        var rows = try self.run(arena, query, .{type_name}, null, null);
+        const one = try self.labelsOfMany(arena, query, &.{type_name});
+        return one[0];
+    }
+
+    /// `labelsOf` for every enum type at once: one query, the answer cut into
+    /// one list per name in the order asked, a type that is not there an
+    /// empty list. The query is the same one `labelsOf` sends, with a
+    /// one-element array.
+    pub fn labelsOfMany(
+        self: *Wire,
+        arena: std.mem.Allocator,
+        query: []const u8,
+        type_names: []const []const u8,
+    ) wire.Error![]const []const []const u8 {
+        var rows = try self.run(arena, query, .{type_names}, null, null);
         defer rows.close();
 
-        var found: std.ArrayList([]const u8) = .empty;
+        var found: std.ArrayList(wire.Keyed([]const u8)) = .empty;
         while (try self.next(&rows)) {
-            const label = try self.read(&rows, []const u8, 0);
-            found.append(arena, arena.dupe(u8, label) catch return error.QueryFailed) catch
-                return error.QueryFailed;
+            const type_name = try self.read(&rows, []const u8, 0);
+            const label = try self.read(&rows, []const u8, 1);
+            found.append(arena, .{
+                .key = arena.dupe(u8, type_name) catch return error.QueryFailed,
+                .item = arena.dupe(u8, label) catch return error.QueryFailed,
+            }) catch return error.QueryFailed;
         }
-        return found.toOwnedSlice(arena) catch return error.QueryFailed;
+        return wire.cutByName([]const u8, arena, type_names, found.items, false);
     }
 };
 
@@ -1134,20 +1672,6 @@ fn opened(values: anytype) Opened(@TypeOf(values)) {
     return out;
 }
 
-/// A pg.zig error, plus whatever the server said about it, as one of the
-/// four this module admits to (ADR 036).
-///
-/// The mapping is by SQLSTATE rather than by message, because the message
-/// is localised and the code is not. Class 23 is "integrity constraint
-/// violation" and `23505` is the one worth separating: a unique violation
-/// is the client having asked for something that is already there, which is
-/// a 409 and not a bug. The rest of class 23 usually means the code is
-/// wrong, so it stays undifferentiated on purpose.
-/// The connection's error field is read first, because pg.zig puts the
-/// server's answer there and hands back a generic error. That is only sound
-/// while the field is about the statement that just ran: the pool clears it
-/// on `release`, and a transaction clears it itself in `Tx.fresh`, which is
-/// where the reasoning is written down.
 /// Each OID's type name, into `out` by position. An OID the catalog does not
 /// answer for leaves its column unjudged.
 ///
@@ -1253,10 +1777,43 @@ fn giveBack(io: std.Io, conn: *pg.Conn) void {
     conn.release();
 }
 
+/// Whether an idle connection's socket has something to say, which on a
+/// connection nobody has sent anything down means it is gone: a FIN from a
+/// server that restarted or failed over, the `57P01` it sends first, or a
+/// reset from a NAT that forgot it. One `poll` with no wait, a few hundred
+/// nanoseconds against a round trip of tens of microseconds.
+///
+/// A socket that died silently, dropped with nothing sent back, still reads
+/// as quiet here; its first statement fails as it did before, and the pool
+/// replaces it on the way back.
+fn hungUp(conn: *pg.Conn) bool {
+    if (comptime builtin.os.tag == .windows) return false;
+    var fds = [1]std.posix.pollfd{.{
+        .fd = conn._stream.state.stream.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = std.posix.poll(&fds, 0) catch return false;
+    return ready > 0 and fds[0].revents != 0;
+}
+
 /// A connection that could not be had. A cancellation while waiting for
 /// one is re-armed for the caller, as `translate` does (ADR 223).
+///
+/// **The pool's own bound is `TimedOut`**, which is what `wire.OpenOpts`
+/// promises for `timeout_ms` and what the SQLite Wire answers for the same
+/// wait (ADR 107). Every other failure is `Disconnected`, a cancellation
+/// included.
 fn acquireFailed(io: std.Io, err: anyerror) wire.Error {
     if (err == error.Canceled) io.recancel();
+    if (err == error.Timeout) {
+        std.log.warn(
+            "nilo_sql: a statement waited for a connection from the pool and gave up. " ++
+                "Raise `size`, or shorten what a request holds one for. `timeout_ms` is the bound.",
+            .{},
+        );
+        return error.TimedOut;
+    }
     return error.Disconnected;
 }
 
@@ -1284,14 +1841,60 @@ fn stalePlan(conn: *const pg.Conn) bool {
 /// costs that one statement a `DEALLOCATE` and a fresh prepare, which is what
 /// the first use of the plan cost anyway. Anything else is answered as it
 /// was, and a second refusal of the retry is reported rather than retried.
+///
+/// **The same for a plan the server no longer has** (`planGone`, ADR 241):
+/// a pooler that handed this connection a different server connection, or a
+/// server that restarted behind a pooler that kept the client's socket.
+/// pg.zig still believes the statement is prepared and would send `Bind`
+/// for it forever, so the connection would go back to the pool and fail on
+/// every call that reached it. `deallocate` forgets the client's copy first
+/// and only then asks the server, which answers `26000` again for a name it
+/// never had; that answer is the expected one and is dropped, and any other
+/// failure of the `DEALLOCATE` (a dead socket) is not a retry.
+///
+/// **Once is enough** because the retry prepares the statement again and
+/// sends it in the same call. A second `26000` on it means the server
+/// connection changed *between the two halves of one call*, which is what a
+/// transaction-mode pooler does and which no number of retries cures; the
+/// answer is `pgbouncer=true` in the URL, and the message says so.
 fn replanned(conn: *pg.Conn, plan: ?[]const u8) bool {
     const name = plan orelse return false;
-    if (!stalePlan(conn)) return false;
-    conn.deallocate(name) catch return false;
+    const gone = planGone(conn);
+    if (!gone and !stalePlan(conn)) return false;
+    conn.deallocate(name) catch |err| {
+        if (!gone or err != error.PG) return false;
+    };
     conn.err = null;
     return true;
 }
 
+/// Whether the statement that just failed was refused because the server has
+/// no statement by that name: `26000`, *invalid_sql_statement_name*, with
+/// Postgres's `prepared statement "…" does not exist`. The message is read
+/// as well as the code, as `stalePlan` does, since `26000` also covers a
+/// cursor or a portal.
+fn planGone(conn: *const pg.Conn) bool {
+    const server = conn.err orelse return false;
+    return std.mem.eql(u8, server.code, "26000") and
+        std.mem.startsWith(u8, server.message, "prepared statement ") and
+        std.mem.endsWith(u8, server.message, " does not exist");
+}
+
+/// A pg.zig error, plus whatever the server said about it, as one of
+/// `wire.Error` (ADR 036).
+///
+/// The mapping is by SQLSTATE rather than by message, because the message
+/// is localised and the code is not. Class 23 is "integrity constraint
+/// violation" and `23505` is the one worth separating: a unique violation
+/// is the client having asked for something that is already there, which is
+/// a 409 and not a bug. The rest of class 23 usually means the code is
+/// wrong, so it stays undifferentiated on purpose.
+///
+/// The connection's error field is read first, because pg.zig puts the
+/// server's answer there and hands back a generic error. That is only sound
+/// while the field is about the statement that just ran: the pool clears it
+/// on `release`, and a transaction clears it itself in `Tx.fresh`, which is
+/// where the reasoning is written down.
 fn translate(io: std.Io, conn: *pg.Conn, err: anyerror) wire.Error {
     // **A cancellation is handed back, not swallowed** (ADR 223). The fiber
     // was cancelled — a request that went away, a server shutting down — and
@@ -1346,6 +1949,23 @@ fn translate(io: std.Io, conn: *pg.Conn, err: anyerror) wire.Error {
                 "nilo_sql: a prepared statement's result changed under it (a migration ran " ++
                     "while this server was up); the transaction was rolled back and the " ++
                     "statement will be prepared again.",
+                .{},
+            );
+            return error.RolledBack;
+        }
+        // The server has no statement by that name. Outside a transaction
+        // `replanned` has already forgotten it and sent the statement again,
+        // so reaching here twice means the server connection changed between
+        // the halves of one call; inside one, the transaction is aborted and
+        // the rollback forgets the plan (`noteStale`). Either way the cure
+        // is not another retry (ADR 241).
+        if (planGone(conn)) {
+            std.log.warn(
+                "nilo_sql: the server has no prepared statement by the name nilo kept it " ++
+                    "under. That is a connection pooler in transaction mode handing out a " ++
+                    "different server connection per transaction: put `pgbouncer=true` in " ++
+                    "the URL, or `.prepared = false` in the options, to stop keeping " ++
+                    "statements prepared.",
                 .{},
             );
             return error.RolledBack;
@@ -1522,6 +2142,23 @@ test "how many connections to dial reaches the pool, which it did not" {
     try testing.expectEqual(@as(u32, 3_000), opts.timeout);
 }
 
+test "a pool wait of zero is no bound, and pg.zig's own timeout is TimedOut" {
+    // pg.zig reads `timeout = 0` as a deadline already passed, so an empty
+    // pool would fail at once for a caller who documented "no bound".
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const uri = try std.Uri.parse("postgres://app@db.internal/shop");
+    const unbounded = try Wire.poolOpts(uri, arena.allocator(), .{ .size = 4, .timeout_ms = 0 });
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), unbounded.timeout);
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try testing.expectEqual(wire.Error.TimedOut, acquireFailed(io, error.Timeout));
+    try testing.expectEqual(wire.Error.Disconnected, acquireFailed(io, error.PoolExhausted));
+}
+
 test "a URL is taken apart the way pg.zig would have taken it apart" {
     // `parseOpts` is not reachable through pg.zig's module root, so this is
     // a copy — and a copy that drifts is worse than the call it replaced.
@@ -1553,12 +2190,116 @@ test "a URL is taken apart the way pg.zig would have taken it apart" {
     try testing.expectEqual(@as(u32, 10_000), bare.auth.timeout);
 
     // `tcp_user_timeout` is pg.zig's other parameter, and it lands on the
-    // auth timeout rather than anywhere that sounds like it.
-    const timed = try Wire.dialOpts(
-        try std.Uri.parse("postgres://h/db?tcp_user_timeout=5678"),
-        aa,
+    // auth timeout rather than anywhere that sounds like it. libpq means a
+    // socket option by it, which pg.zig cannot set, so it is refused
+    // (ADR 241) instead of being read as something else.
+    try testing.expectError(
+        error.UnsupportedConnectionParam,
+        Wire.dialOpts(try std.Uri.parse("postgres://h/db?tcp_user_timeout=5678"), aa),
     );
-    try testing.expectEqual(@as(u32, 5678), timed.auth.timeout);
+}
+
+test "a sslmode nobody wrote is require for any host but this machine" {
+    // ADR 241. libpq's `prefer` would encrypt when the server can, and
+    // anybody on the path can make it unable; pg.zig does not do `prefer`,
+    // so the two defaults it can honour are chosen by where the host is.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    for ([_][]const u8{
+        "postgres://db.internal/shop",
+        "postgres://app:pw@10.0.0.5:5432/shop",
+        "postgres://db.example.com/shop",
+        "postgres://[2001:db8::1]/shop",
+        "postgres://128.0.0.1/shop",
+        "postgres://localhost.example.com/shop",
+        "postgres:///shop?host=db.internal",
+    }) |url| {
+        const got = try Wire.dialOpts(try std.Uri.parse(url), aa);
+        try testing.expect(got.connect.tls == .require);
+    }
+
+    for ([_][]const u8{
+        "postgres://localhost/shop",
+        "postgres://LOCALHOST:5433/shop",
+        "postgres://127.0.0.1/shop",
+        "postgres://127.3.4.5/shop",
+        "postgres://[::1]/shop",
+        "postgres:///shop",
+        "postgres://app:pw@%2Fvar%2Frun%2Fpostgresql/shop",
+        "postgres:///shop?host=/var/run/postgresql",
+        "postgres:///shop?host=localhost",
+    }) |url| {
+        const got = try Wire.dialOpts(try std.Uri.parse(url), aa);
+        try testing.expect(got.connect.tls == .off);
+    }
+}
+
+test "a sslmode the URL wrote wins over the default, whatever the host" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Knowingly plaintext to a remote host: the one-line way out.
+    const open = try Wire.dialOpts(try std.Uri.parse("postgres://db.internal/shop?sslmode=disable"), aa);
+    try testing.expect(open.connect.tls == .off);
+
+    // TLS to this machine, and verification, when asked for.
+    const local = try Wire.dialOpts(try std.Uri.parse("postgres://localhost/shop?sslmode=require"), aa);
+    try testing.expect(local.connect.tls == .require);
+    const checked = try Wire.dialOpts(try std.Uri.parse("postgres://localhost/shop?sslmode=verify-full"), aa);
+    try testing.expect(checked.connect.tls == .verify_full);
+    try testing.expectEqual(@as(?[]const u8, null), checked.connect.tls.verify_full);
+    const rooted = try Wire.dialOpts(try std.Uri.parse(
+        "postgres://db.internal/shop?sslmode=verify-full&sslrootcert=/ca.crt",
+    ), aa);
+    try testing.expectEqualStrings("/ca.crt", rooted.connect.tls.verify_full.?);
+
+    // A CA with the default mode is still refused: the default is not
+    // `verify-full`, so the file would never be opened.
+    try testing.expectError(
+        error.UnsupportedConnectionParam,
+        Wire.dialOpts(try std.Uri.parse("postgres://db.internal/shop?sslrootcert=/ca.crt"), aa),
+    );
+}
+
+test "a URL that names a pooler in transaction mode turns prepared statements off" {
+    // ADR 241: `pgbouncer=true` used to be dropped, and the `Db` behind it
+    // kept statements prepared on a connection the pooler then swapped.
+    try testing.expect(Wire.urlIsPooled("postgres://h/db?pgbouncer=true"));
+    try testing.expect(Wire.urlIsPooled("postgres://h/db?sslmode=require&pgbouncer=true&connect_timeout=5"));
+    try testing.expect(Wire.urlIsPooled("postgres://h/db?pool_mode=transaction"));
+    try testing.expect(Wire.urlIsPooled("postgres://h/db?pool_mode=statement"));
+    try testing.expect(Wire.urlIsPooled("postgres://h/db?pgbounce%72=true"));
+
+    try testing.expect(!Wire.urlIsPooled("postgres://h/db?pgbouncer=false"));
+    try testing.expect(!Wire.urlIsPooled("postgres://h/db?pool_mode=session"));
+    try testing.expect(!Wire.urlIsPooled("postgres://h/db"));
+    try testing.expect(!Wire.urlIsPooled("postgres://h/db?sslmode=require"));
+    try testing.expect(!Wire.urlIsPooled("not a url"));
+
+    // A value that is not a boolean is refused, not read as "no pooler".
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(
+        error.UnsupportedConnectionParamValue,
+        Wire.dialOpts(try std.Uri.parse("postgres://h/db?pgbouncer=ture"), arena.allocator()),
+    );
+}
+
+test "a prepared statement the server never had is recognised by its code and its words" {
+    // ADR 241. `26000` also names a missing cursor or portal, and those are
+    // not this connection's plan.
+    var conn: pg.Conn = undefined;
+    conn.err = .{ .severity = "ERROR", .code = "26000", .message = "prepared statement \"nilo_x\" does not exist" };
+    try testing.expect(planGone(&conn));
+    conn.err = .{ .severity = "ERROR", .code = "26000", .message = "cursor \"c\" does not exist" };
+    try testing.expect(!planGone(&conn));
+    conn.err = .{ .severity = "ERROR", .code = "0A000", .message = "prepared statement \"x\" does not exist" };
+    try testing.expect(!planGone(&conn));
+    conn.err = null;
+    try testing.expect(!planGone(&conn));
 }
 
 test "a parameter pg.zig has a field for is carried onto it" {
@@ -1608,6 +2349,20 @@ test "a parameter pg.zig has a field for is carried onto it" {
     try testing.expectEqualStrings("shop", query_form.auth.database.?);
     try testing.expectEqualStrings("db.internal", query_form.connect.host.?);
     try testing.expectEqual(@as(?u16, 5433), query_form.connect.port);
+
+    // Server settings ride in the startup message as written: `options`
+    // is parsed by the server like `postgres -c`, and UTF-8 is the one
+    // encoding asked for, spelled the way Postgres spells it.
+    const set = try Wire.dialOpts(try std.Uri.parse(
+        "postgres://h/db?options=-c%20statement_timeout%3D5s&client_encoding=utf-8",
+    ), aa);
+    try testing.expectEqualStrings("-c statement_timeout=5s", set.auth.startup_parameters.?.get("options").?);
+    try testing.expectEqualStrings("UTF8", set.auth.startup_parameters.?.get("client_encoding").?);
+    try testing.expect(hosted.auth.startup_parameters == null);
+    try testing.expectError(
+        error.ConflictingConnectionParam,
+        Wire.dialOpts(try std.Uri.parse("postgres://h/db?options=-c%20a%3D1&options=-c%20a%3D2"), aa),
+    );
 
     // Said twice and the same, fine; said twice and different, refused.
     _ = try Wire.dialOpts(try std.Uri.parse("postgres://app@h:5433/shop?user=app&port=5433"), aa);
@@ -1673,10 +2428,9 @@ test "a URL nobody can read is refused rather than half understood" {
     );
 
     // Known parameters asking for what pg.zig does not do: a client
-    // certificate, connect-time settings, channel binding, GSSAPI, a
-    // read-write check, SNI off, an encoding the startup message never
-    // carries.
-    for ([_][]const u8{ "sslcert=/c.crt", "sslkey=/c.key", "options=-c%20statement_timeout%3D5" }) |param| {
+    // certificate, channel binding, GSSAPI, a read-write check, SNI off,
+    // text in an encoding other than UTF-8.
+    for ([_][]const u8{ "sslcert=/c.crt", "sslkey=/c.key" }) |param| {
         const url = try std.fmt.allocPrint(aa, "postgres://h/db?{s}", .{param});
         try testing.expectError(
             error.UnsupportedConnectionParam,
@@ -1685,7 +2439,7 @@ test "a URL nobody can read is refused rather than half understood" {
     }
     for ([_][]const u8{
         "channel_binding=require", "gssencmode=require",   "target_session_attrs=read-write",
-        "sslsni=0",                "client_encoding=UTF8",
+        "sslsni=0",                "client_encoding=LATIN1",
     }) |param| {
         const url = try std.fmt.allocPrint(aa, "postgres://h/db?{s}", .{param});
         try testing.expectError(

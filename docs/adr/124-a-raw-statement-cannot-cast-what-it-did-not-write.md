@@ -51,7 +51,15 @@ reads what each column *is*, and refuses two shapes:
   `AS` alias — where the Row's field is a text column;
 - **a `*`**, where the Row has a text column anywhere in it.
 
-Both are shapes that cannot have a cast in them. The message names the column,
+Both are shapes that cannot have a cast in them. **What is held against the
+first is the column with what does nothing to its value taken off**: comments,
+and a `DISTINCT`, `DISTINCT ON (…)` or `ALL` in front of the first column.
+`DISTINCT total` and `/* amount */ total` are a bare column to the database, and
+were an expression to this file until they were stripped, so a `Decimal` filled
+through `tx.raw`, where nothing describes the statement, got the binary
+`numeric` through either one.
+
+The message names the column,
 the field, and what to write instead, taking the spelling from the Dialect
 itself so the suggestion and the SQL nilo writes cannot drift:
 
@@ -98,7 +106,11 @@ SQL, which is the whole thing `db.raw` exists not to do.
 
 ## Consequences
 
-- Two refusal files and two rows in `sql_refusals`. The 59 there become 61.
+- Two refusal files and two rows in `sql_refusals`. The 59 there become 61,
+  and `raw_text_column_behind_distinct` is a third, for the prefixes above.
+- `rawcheck.zig`'s own tests did not run until the same change: the file was
+  reached only through the modules that import it for its checks, and never
+  from `sql.zig`'s `test` block.
 - `rawcheck.scan` gained `exprs` and `starred`; `assertList` gained the Dialect
   as its first argument, so the suggestion it prints comes from `readAs`.
 - No run-time cost anywhere: every byte of this is comptime.

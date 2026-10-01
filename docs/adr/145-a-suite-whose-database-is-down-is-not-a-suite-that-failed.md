@@ -35,7 +35,9 @@ machine the suite is on; **a Row that disagrees with its table is a broken
 program**, and a test runner going red for it is the correct answer rather than
 noise. `checkSchema` lists each disagreement at `err` for the same reason, and
 `db.zig`'s own tests say in a comment that this is why the SQLite rowid cases are
-checked one layer down.
+checked one layer down. **Only while it will stop the server**: under
+`.schema_mismatch_is_fatal = false` nothing is refusing to start, the program
+carries on, and the same lines are `warn`.
 
 ## Half of this was never nilo's, and that half is the useful one
 

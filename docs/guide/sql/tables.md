@@ -83,7 +83,7 @@ _ = try db.insert(Invoice, c, .{ .total = sql.Decimal{ .text = "9.99" } });
 
 There is no `.add` and no `.round`, the same as `sql.Timestamp`: **a type here holds a value and knows how to write itself, but does no arithmetic.** Decimal arithmetic is a library of its own, and a bigger one than it looks (rounding modes alone are a standard). What this type guarantees is that the digits you put in are the digits you get back, which a live test checks with a value twenty-nine significant digits wide.
 
-Comparisons are numeric, not textual: `.{ .total = .{ .gt = sql.Decimal{ .text = "50" } } }` finds `100.00` and not `9.99`.
+On Postgres, comparisons are numeric, not textual: `.{ .total = .{ .gt = sql.Decimal{ .text = "50" } } }` finds `100.00` and not `9.99`. SQLite stores the digits as TEXT, so ordering, comparing past equality and summing a `Decimal` there are compile errors ([the SQLite page](./sqlite.md#what-sqlite-does-not-support)).
 
 **In a JSON body it is a string**, `"1234.56"` rather than `1234.56`. A bare number is exact on the wire but stops being exact in the consumer, where `JSON.parse` returns a double: the same `f64` the column type was chosen to avoid, handed over silently on the other side of the network. A string arrives intact ([ADR 049](../../adr/049-a-column-type-can-come-from-outside-this-module.md)). It is also the only form that can carry `nan` and `inf`, which Postgres allows and JSON has no number syntax for.
 

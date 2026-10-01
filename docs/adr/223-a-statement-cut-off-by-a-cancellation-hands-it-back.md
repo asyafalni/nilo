@@ -52,6 +52,15 @@ spend a cancellation meant for the caller. The `Io` it does both through is
 the one `Wire.open` was handed, kept on the `Wire`, not read back out of
 pg.zig's own fields.
 
+**The SQLite Wire does the same for its own wait.** `takeWriter` and
+`takeReader` answered `TimedOut` for any cancellation and never re-armed it, so
+a background loop queued for the writer at shutdown was told `TimedOut`, its
+next `sleep` ran, and the process did not exit. Now a wait ended by the Wire's
+own timer (`timeout_ms`, which `Bound.fired` consumes) is `TimedOut` as before
+(ADR 107), and a wait ended by any other cancellation, the mutex or the
+condition, calls `recancel` and answers `Disconnected`, which is what the
+Postgres Wire answers for a failed acquire.
+
 The error the caller sees does not change: `QueryFailed` from a statement,
 `Disconnected` from an acquire. `translate` no longer logs a cancellation as a
 driver refusal, since nothing was refused.

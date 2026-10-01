@@ -146,9 +146,12 @@ A statement that failed also carries `sent.problem`: the database's own `message
 
 **The URL is read the way libpq reads it, and a parameter the driver would not act on is rejected by name.**
 
-- Supported: `user`, `password`, `dbname`, `host` and `port` as query parameters, `sslmode` (`disable`, `require`, `verify-full`), `sslrootcert` with `verify-full` (`system` for the platform's store), `application_name` and `fallback_application_name`, `connect_timeout` in seconds, `tcp_user_timeout` in milliseconds, and `keepalives`, `keepalives_idle`, `keepalives_interval`, `keepalives_count`.
-- Ignored with one `warn` line, because the driver does it already or nothing observable changes: `pgbouncer`, `pool_mode`, `sslsni=1`, `gssencmode=disable`, `channel_binding=prefer`, `target_session_attrs=any`.
-- Everything else is rejected with a line naming the parameter, the reason, and the list above. `sslmode=prefer` is the most common, because it would fall back to plaintext and pg.zig does not.
+- Supported: `user`, `password`, `dbname`, `host` and `port` as query parameters, `sslmode` (`disable`, `require`, `verify-full`), `sslrootcert` with `verify-full` (`system` for the platform's store), `application_name` and `fallback_application_name`, `connect_timeout` in seconds, `keepalives`, `keepalives_idle`, `keepalives_interval`, `keepalives_count`, and `client_encoding=UTF8`.
+- `options`, handed to the server in every connection's startup message and read there like `postgres -c`: `?options=-c%20statement_timeout%3D30s` is a ceiling on every statement of the pool with no round trip, and Neon's `options=endpoint%3D…` names the endpoint.
+- **With no `sslmode`, a host other than this machine is `require`** and one on it is `disable` ([ADR 241](../adr/241-a-postgres-url-without-sslmode-is-encrypted-unless-it-stays-on-this-machine.md)). This machine is no host, `localhost`, `127.0.0.0/8`, `::1` or a unix socket path; a name that merely resolves to loopback is not looked up and gets `require`. `require` refuses a server that offers no TLS, and it encrypts without checking who answered: `verify-full` (with `sslrootcert` for a private CA) checks that too, and stays opt-in. A database that is meant to be plaintext says `?sslmode=disable`.
+- `pgbouncer=true`, and `pool_mode=transaction` or `statement`, turn `Opts.prepared` off for that `Db`, at one Parse more per statement.
+- Ignored with one `warn` line, because the driver does it already or nothing observable changes: `sslsni=1`, `gssencmode=disable`, `channel_binding=prefer`, `target_session_attrs=any`.
+- Everything else is rejected with a line naming the parameter, the reason, and the list above. `sslmode=prefer` is the most common, because it would fall back to plaintext and pg.zig does not. `tcp_user_timeout` is the other: libpq sets a socket option with it, pg.zig cannot, and `connect_timeout` is what bounds the login.
 
 A query string is split before it is percent-decoded, so `password=p%26w` is `p&w`.
 
@@ -298,7 +301,7 @@ The Scope is why this module names no App: `arena()` and `str()` were the only t
 | `db.composed(User, c, stmt, .{ … })` | `![]User`: a statement built at run time from pieces that cannot carry an arbitrary string. A `sql.Composed` holds only literals (`text`, comptime), checked identifiers (`ident`, `qualified`) and parameters (`param`, `number`). Filled by position and width-checked at run time; its tuple is counted against its placeholders (`error.ParamCountMismatch`) and its spelling against the Db (`error.WrongDialect`); not prepared. For a query engine that turns a model into SQL. Use `raw` for everything that can be written while compiling ([ADR 208](../adr/208-a-statement-composed-at-run-time-from-pieces-that-cannot-carry-a-string.md)) |
 | `db.composedOne(User, c, stmt, .{ … })` | `!?User`: the same, unwrapped |
 | `db.exec(c, sql, .{ … })` | `!usize`: a statement that returns *nothing*, and the number of rows it changed. `CREATE TABLE`, `CREATE INDEX`, `PRAGMA`, `VACUUM`. No Row, because none is being filled ([ADR 067](../adr/067-a-value-is-whatever-the-database-stores.md)). `sql` is run-time text and is sent as written |
-| `db.checkSchema(&.{ User, Order })` | `!usize`: compare these Rows against the live tables now, on a connection of its own, and log what disagrees at `err`. Returns the number of problems. What `nilo_check` runs for the `checking` list; for a program that drives a `Db` without an App |
+| `db.checkSchema(&.{ User, Order })` | `!usize`: compare these Rows against the live tables now, on a connection of its own, and log what disagrees at `err` (`warn` under `.schema_mismatch_is_fatal = false`, since nothing is then refusing to start). Two catalog queries however many Rows there are. Returns the number of problems. What `nilo_check` runs for the `checking` list; for a program that drives a `Db` without an App |
 | `db.nilo_check(io)` | `!void`: the schema check and the version guard, run by `listen()` after `before` ([ADR 180](../adr/180-work-that-needs-the-services-runs-on-their-loop.md)) |
 | `db.begin(c, .{})` | `!Tx`. `.{ .isolation = …, .read_only = … }` goes on the `BEGIN`; see [`Tx`](#tx) |
 
@@ -372,7 +375,35 @@ SELECT "id", "status", count(*) OVER () FROM "orders"
 
 `tx.page` is the same call inside a transaction. `sql.Page(Row)` is the result type, for a handler that returns one.
 
-A page too deep for `OFFSET` to stay fast needs [the keyset form](../guide/sql/reading.md#keyset-pagination-for-deep-pages) instead: a condition you write yourself rather than a call here, and without `db.page`'s total.
+**The total costs a pass over every row the condition matches**, before the limit: 124 ms against 0.024 ms for the same twenty rows of a million ([ADR 150](../adr/150-a-page-knows-what-it-left-out.md)). A list that shows no total is `db.feed`.
+
+#### `db.feed`
+
+**`db.feed` is a `select` that also says whether any row came after the ones it returned**, for a "load more" button or an endless scroll ([ADR 150](../adr/150-a-page-knows-what-it-left-out.md#a-feed-counts-nothing)):
+
+```zig
+const found = try db.feed(Order, c, .{
+    .order = .{ .created_at = .desc, .id = .desc },
+    .after = .{ .created_at = last.created_at, .id = last.id },
+    .limit = 20,
+});
+// found.rows is []Order, found.more says whether there is a next screen.
+```
+
+```sql
+SELECT "id", "created_at", … FROM "orders"
+  WHERE ("created_at", "id") < ($1, $2) ORDER BY "created_at" DESC, "id" DESC LIMIT 21
+```
+
+**It counts nothing.** It reads one row past `.limit` and drops it; that row is `more`. `.limit` and `.order` are required and `.lock` is refused, as on a page. `tx.feed` is the same call inside a transaction, and `sql.Feed(Row)` is the result type, `{"rows":[…],"more":true}` from a handler.
+
+**`.after` is a cursor: the last row seen, as the value of each column `.order` sorts by.** The rows after it are one row comparison, which an index over the same columns answers with a seek, so a deep screen costs what the first does, where `.offset` reads every row it skips. The first screen has no cursor, so it is the same call without `.after`. `db.select` and `db.explain` take `.after` too. Each of these is a compile error, because each is a cursor that skips or repeats rows:
+
+- `.after` naming other columns than `.order`, or in another order, or beside an order the request chose;
+- an order that runs both ways, since a row comparison runs one way (write that condition with `.any` in `.where`, which cannot seek);
+- a direction that says where NULLs go, or a column that may be null, since a comparison with a NULL in it is true of nothing;
+- an order that does not end in the table's key, since two rows sharing every sorted column stand at one cursor;
+- `.after` on `db.page`, which counts every match and skips by `OFFSET`.
 
 ### A batch
 
@@ -411,9 +442,10 @@ There are two calls rather than one option, because the results differ: `DO NOTH
 | | |
 |---|---|
 | `.where` | a condition; see [Conditions](#conditions). On a narrower Row it may name a column of the table that the Row does not carry, bound as the table's column type ([ADR 218](../adr/218-a-row-may-carry-its-parent-its-children-or-a-sum.md)) |
-| `.order` | `.{ .created_at = .desc }`, one column per field. `.asc_nulls_last` and its three siblings say where NULLs go, which the two databases otherwise disagree about. A narrower Row that is not grouped may order by any column of its table, whether it carries it or not, so a tiebreak column does not have to be sent to the client; a grouped Row is a Refusal there, since the column has no single value per group. Or a value of an `sql.Ordering`, for an order the request chose; see [`sql.Ordering`](#sqlordering-an-order-chosen-at-run-time) |
+| `.order` | `.{ .created_at = .desc }`, one column per field. `.asc_nulls_last` and its three siblings say where NULLs go, which the two databases otherwise disagree about. A narrower Row that is not grouped may order by any column of its table, whether it carries it or not, so a tiebreak column does not have to be sent to the client; a grouped Row is a Refusal there, since the column has no single value per group. Where a `.limit` or an `.offset` cuts the answer (and always on `db.page` and `db.one`), the table's key is added at the end, ascending, unless the order names it already, so rows the order ties are never repeated or skipped from one page to the next ([ADR 150](../adr/150-a-page-knows-what-it-left-out.md#a-page-ends-in-the-key)). Or a value of an `sql.Ordering`, for an order the request chose; see [`sql.Ordering`](#sqlordering-an-order-chosen-at-run-time) |
 | `.limit` / `.offset` | a literal is written into the SQL; a variable becomes a parameter. A literal limit is also the row ceiling, so the result list is allocated once |
-| `.set` | update only: columns to new values, or `.{ .views = .{ .plus = 1 } }` for arithmetic on the column's own value. A bare `null` on a nullable column is `= NULL`, with no `@as(?T, null)` needed, while in `.where` the same null is `IS NULL`. `.title = sql.given(maybe)` is `COALESCE($1, "title")`, which keeps the column when the value is null; it is refused on an optional column. `.updated_at = .now` is the database's clock on a `sql.Timestamp`, and `.start_date = .today` its date (`CURRENT_DATE`) on a `sql.Date`, with nothing bound for either. A column read as text takes the word its column type names: `.today` on `sql.AsText("date")`, `.now` on `sql.AsText("timestamptz")`. Using either on the other's column type is a Refusal |
+| `.after` | a cursor, the last row seen: `.{ .created_at = last.created_at, .id = last.id }` over the same columns as `.order`, which must run one way and end in the key. One row comparison an index seeks on ([`db.feed`](#dbfeed)) |
+| `.set` | update only: columns to new values, or `.{ .views = .{ .plus = 1 } }` for arithmetic on the column's own value. A bare `null` on a nullable column is `= NULL`, with no `@as(?T, null)` needed, while in `.where` the same null is `IS NULL`. `.title = sql.given(maybe)` is `COALESCE($1, "title")`, which keeps the column when the value is null; it is refused on an optional column. `.updated_at = .now` is the database's clock on a `sql.Timestamp` (the moment the transaction began on Postgres, the moment the statement runs on SQLite), and `.start_date = .today` its date (`CURRENT_DATE`) on a `sql.Date`, with nothing bound for either. A column read as text takes the word its column type names: `.today` on `sql.AsText("date")`, `.now` on `sql.AsText("timestamptz")`. Using either on the other's column type is a Refusal |
 
 ### Conditions
 
@@ -423,10 +455,10 @@ There are two calls rather than one option, because the results differ: `DO NOTH
 |---|---|
 | `.id = 7` | `"id" = $1` |
 | `.age = .{ .gt = 18, .lt = 65 }` | `"age" > $1 AND "age" < $2` |
-| `.eq` `.ne` `.gt` `.gte` `.lt` `.lte` | each also takes `.now` on a `sql.Timestamp` or `sql.AsText("timestamptz")` column and `.today` on a `sql.Date` or `sql.AsText("date")` one, the database's clock with nothing bound: `.due_date = .{ .lt = .today }`, and `.due_date = .today` for `=`. Either can be moved by a number written out: `.closed_at = .{ .gte = .{ .today = -90 } }` is `CURRENT_DATE - 90` (`date('now', '-90 days')` on SQLite), and `.occurred_at = .{ .gt = .{ .now = .{ .days = -90 } } }` is `now() - interval '90 days'`. `.today` moves by days; `.now` names one of `.days`, `.hours`, `.minutes`, `.seconds`, and a bare number or a month is a Refusal |
+| `.eq` `.ne` `.gt` `.gte` `.lt` `.lte` | each also takes `.now` on a `sql.Timestamp` or `sql.AsText("timestamptz")` column and `.today` on a `sql.Date` or `sql.AsText("date")` one, the database's clock with nothing bound: `.due_date = .{ .lt = .today }`, and `.due_date = .today` for `=`. Either can be moved by a number written out: `.closed_at = .{ .gte = .{ .today = -90 } }` is `CURRENT_DATE - 90` (`date('now', '-90 days')` on SQLite), and `.occurred_at = .{ .gt = .{ .now = .{ .days = -90 } } }` is `now() - interval '90 days'`. **`.today` is not the same day on both databases**: on Postgres it is `CURRENT_DATE` in the session's time zone, on SQLite it is the day in UTC, so between midnight UTC and midnight in Jakarta they name different days. When the two must agree, compare against a `sql.Date` you computed (`sql.Date.utcOf(sql.Timestamp.now())`). `.today` moves by days; `.now` names one of `.days`, `.hours`, `.minutes`, `.seconds`, and a bare number or a month is a Refusal |
 | `.ieq` / `.not_ieq` | equality that ignores case: `lower("email") = lower($1)` on Postgres and `"email" COLLATE NOCASE = ?1 COLLATE NOCASE` on SQLite. This is the expression a `.unique` with `.ignoring_case` indexes, so the lookup uses that index. An `_` is a plain character here, where `.ilike` would read it as a wildcard. Text only |
 | `.like` / `.ilike` | and `.not_like` / `.not_ilike`. **These do not escape the text you give them**; use the next row instead. On SQLite `.ilike` is written `LIKE`, because that database's `LIKE` already ignores ASCII case, and `.like` is a Refusal there naming `.ilike`, for the same reason as `.contains` ([ADR 055](../adr/055-the-second-dialect-is-the-test-of-the-seam.md)) |
-| `.contains` `.starts_with` `.ends_with` | the statement builds *and* escapes the pattern, so `%` and `_` in a search term match themselves. `i` in front ignores case (`.icontains`), `not_` in front negates: twelve in all. On SQLite the case-sensitive half is a Refusal, because its `LIKE` ignores ASCII case and cannot be told not to |
+| `.contains` `.starts_with` `.ends_with` | the statement builds *and* escapes the pattern, so `%` and `_` in a search term match themselves. `i` in front ignores case (`.icontains`), `not_` in front negates: twelve in all. On SQLite the case-sensitive half is a Refusal, because its `LIKE` ignores ASCII case and cannot be told not to. `.istarts_with` on SQLite binds the escaped pattern whole, one arena allocation, so a unique with `.ignoring_case` serves it as a range ([ADR 140](../adr/140-the-database-escapes-the-pattern-it-is-going-to-match.md)) |
 | `.in = &.{ 1, 2, 3 }` | `= ANY($1)`: one parameter, so the statement stays a constant |
 | `.not_in = &.{ 1, 2, 3 }` | `<> ALL($1)`: also one parameter |
 | `.stage = .{ .in = sql.given(stages) }` | `("stage" = ANY($1) OR $1 IS NULL)`: a multi-select that may be absent. Null drops the term; a list, empty or not, is used as the list. See [`sql.given`](#sqlgiven-a-filter-that-may-be-absent) |
@@ -465,7 +497,7 @@ const found = try db.page(Partner, c, .{
 ("name" ILIKE … OR $1 IS NULL) AND (EXISTS (SELECT 1 FROM …) OR $2 IS NULL)
 ```
 
-**One statement, one parameter list and one prepared plan, however the screen is set**, instead of one statement per combination of filters. Postgres removes `$1 IS NULL` while a custom plan is in use (the first five executions, and for as long after that as the custom plan wins), so a term that *is* set is planned as if the guard were not there. `SET plan_cache_mode = force_custom_plan` is the setting to use if one query disagrees.
+**One statement to write, one parameter list, and a text cut for each call.** The guard is what your code compiles to, and the text that is sent leaves it out: a term whose value is there is written alone (`("status" = $1)`), and one whose value is not is written as a test that is always true on the same placeholder (`($1::text IS NULL)` on Postgres, `(?1 IS NULL)` on SQLite). A plan made before any value is bound, which is every SQLite plan and Postgres's generic one, therefore has no `OR` to stop on and seeks an index: 69 ms against 0.055 ms on 500,000 rows on SQLite, and about 0.13 ms a call faster on Postgres than sending the guard unnamed. The cut is chosen from constant pieces, so nothing from the request is written into the SQL. Each combination of filters is prepared under a name of its own, for up to **three** `sql.given` in one statement, so a connection keeps at most eight texts of one call; a statement with more runs unnamed, and one that is also ordered by a request (`sql.Ordering`) is unnamed as it always was ([ADR 149](../adr/149-a-filter-that-is-absent-is-not-a-filter-that-is-null.md)). The statement types this page lists (`sql.Select` and the rest) show the guard, not the text a call sends.
 
 Inside an `.exists` it drops the **whole subquery**, not one term of it. With only the term dropped, the subquery would ask whether *any* joined row exists, which would exclude every row that has none. For the same reason it cannot sit next to an always-present condition in one `.exists`; write a second entry.
 
@@ -530,7 +562,7 @@ You place the `{order}` yourself, for the same reason `rawOne` adds no `LIMIT 1`
 
 #### Cost and refusals
 
-**What it costs.** The text is assembled per request, so an ordered statement is **not prepared**: Parse, Bind and Execute on every call, the ~12 µs a prepared name saves ([ADR 051](../adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)), plus one arena allocation for the text, sized while compiling. A statement whose `.order` is a literal is unchanged.
+**What it costs.** The text is assembled per request, so an ordered statement is **not prepared**: Parse, Bind and Execute on every call, the ~12 µs a prepared name saves ([ADR 051](../adr/051-a-statement-that-is-a-constant-can-be-prepared-once.md)), plus one arena allocation for the text, sized while compiling. A statement whose `.order` is a literal is unchanged. Where a `.limit` or an `.offset` cuts it, the clause ends in the table's key after the terms the request chose, unless one of them already orders by it, so tied rows page evenly ([ADR 150](../adr/150-a-page-knows-what-it-left-out.md#a-page-ends-in-the-key)).
 
 Four things are Refusals: a key naming a column the Row does not have, an ordering declared for another Row, an expression key given to a typed statement, and a raw statement with no `{order}` in it.
 
@@ -678,6 +710,8 @@ defer rows.close();                       // required
 while (try rows.next()) |u| try s.print("{d},{s}\n", .{ u.id, u.email });
 ```
 
+**Closing a stream early is cheap, whatever is left.** Postgres has already sent the rest, so `close` reads up to 1 MiB of it off the socket and keeps the connection. Past that it gives the connection back to be closed and dialled again, one connect in place of the rest ([ADR 238](../adr/238-a-stream-let-go-early-reads-a-megabyte-of-what-is-left.md)).
+
 ### `Tx`
 
 ```zig
@@ -687,16 +721,18 @@ _ = try tx.insert(Order, c, .{ … });
 try tx.commit();
 ```
 
-**A `tx` has every read and write call above, all sent down the one connection it holds**: `select`, `one`, `exactlyOne`, `find`, `page`, `count`, `exists`, `insert`, `insertMany`, `insertOrIgnore`, `insertOrUpdate`, `update`, `updateMany`, `updateReturning`, `updateReturningOne`, `delete`, `deleteReturning`, `deleteReturningOne`, `raw`, `rawOne`, `rawExactlyOne`, `rawOrdered`, `rawPage`, `exec`, `compose`, `composed` and `composedOne`. Not `stream`: an open result set keeps the connection busy, so nothing else in the transaction could run until it closed. Forgetting the `defer` is caught in Debug by a counter checked at `db.deinit()`.
+**A `tx` has every read and write call above, all sent down the one connection it holds**: `select`, `one`, `exactlyOne`, `find`, `page`, `feed`, `count`, `exists`, `insert`, `insertMany`, `insertOrIgnore`, `insertOrUpdate`, `update`, `updateMany`, `updateReturning`, `updateReturningOne`, `delete`, `deleteReturning`, `deleteReturningOne`, `raw`, `rawOne`, `rawExactlyOne`, `rawOrdered`, `rawPage`, `rawPageOrdered`, `exec`, `compose`, `composed` and `composedOne`. Not `stream`: an open result set keeps the connection busy, so nothing else in the transaction could run until it closed. Forgetting the `defer` is caught in Debug by a counter checked at `db.deinit()`.
 
 **The type is written `sql.Db.Tx`**, which only matters when a function of yours *takes* one: `fn append(self: *Bus, tx: *sql.Db.Tx, …)`. Every example here starts with `var tx = try db.begin(…)` and lets Zig infer it, so you only need the name when something is handed a transaction somebody else opened. It belongs to `Db` rather than to the module because a transaction belongs to the pool it came from; `sql.Tx` does not exist.
 
 | | |
 |---|---|
 | `db.begin(c, .{ .isolation = …, .read_only = … })` | both go on the `BEGIN` itself, so neither costs a round trip. `.isolation` is `.read_committed`, `.repeatable_read` or `.serializable`; if left out, it is whatever the server is set to |
-| `db.begin(c, .{ .rebuilding = true })` | SQLite only: foreign keys are off for the transaction and checked once before the COMMIT, which returns `error.ForeignKeyViolated` for a row pointing at nothing. This is what rebuilding a table needs, and what `migrate.apply` asks for. A compile error on Postgres |
-| `tx.deadline(ms)` | a time limit on every statement after it, for the life of this transaction. `error.TimedOut` past it |
+| `db.begin(c, .{ .rebuilding = true })` | SQLite only: foreign keys are off for the transaction and checked once before the COMMIT, which returns `error.ForeignKeyViolated` for a row pointing at nothing. This is what rebuilding a table needs, and what `migrate.apply` asks for on a version that drops a table. A compile error on Postgres |
+| `tx.deadline(ms)` | a time limit on every statement after it, for the life of this transaction. `error.TimedOut` past it. 0 is the shortest, 1 ms, and a number past `maxInt(i32)` is sent as that |
 | `tx.savepoint()` | `!Savepoint`: a mark that part of the transaction can be undone back to; see [Savepoints](#savepoints) |
+| `tx.feed(Order, c, .{ … })` | `!Feed(Order)`: `db.feed` down this transaction's connection, the rows plus whether any came after them; see [`db.feed`](#dbfeed) |
+| `tx.rawPageOrdered(Line, c, sql, .{ … }, order)` | `!Page(Line)`: `db.rawPageOrdered` down this transaction's connection, a statement holding `{order}` and ending in `count(*) OVER ()`; see [`db.rawOrdered` and `db.rawPageOrdered`](#dbrawordered-and-dbrawpageordered) |
 
 #### `tx.deadline`
 
@@ -761,11 +797,12 @@ Undoing or releasing a savepoint destroys every savepoint taken after it, which 
 
 | | |
 |---|---|
-| `sql.Timestamp` | microseconds since the epoch, written as RFC 3339 in JSON. `timestamptz` on Postgres. On SQLite it is an `INTEGER` holding those microseconds, **which SQLite's date functions do not read as a date**: `strftime('%m', paid_at)` is NULL, and a Row field filled from it fails the query. Divide first, `strftime('%m', paid_at / 1000000, 'unixepoch')`, or work the month out in Zig ([Dates out of a Timestamp](../guide/sql/sqlite.md#dates-from-a-timestamp)). `.now()`, `.fromSeconds(s)`, `.seconds()`, `.nilo_parse(text)` |
-| `sql.Date` | a calendar day: `days` since 1970-01-01, written as `2026-09-17` in JSON and described as `format: date`. `date` on Postgres, `TEXT` on SQLite, and **read from the column rather than from a `::text`**, so a `db.raw` reading one needs no cast. `.fromDays(n)`, `.nilo_parse(text)`, `.utcOf(ts)`, `.atMidnightUtc()`. A day is not a moment: a due date read into a `timestamptz` gets a midnight, a midnight has a time zone, and the date then shifts by a day for a reader in Jakarta ([ADR 181](../adr/181-the-marker-has-two-kinds-of-word.md)). It holds a value and does no calendar arithmetic (no `.addDays`, no `.weekday`), and the two conversions it does offer are named for the zone they assume. A day before 1970 is normal and prints normally; the range is year 0 to 9999, which is what four digits can write and what `nilo_parse` reads back |
+| a number | an integer of up to 64 bits, signed, or unsigned up to 32; `f32` or `f64`. A column wider than the field is read range-checked: `i32` over `int8` reads until a value does not fit, and that row is `error.QueryFailed` naming the column. `u64`, `usize`, anything past 64 bits and a float other than 32 or 64 bits are Refusals, since neither database stores them. A list holds `i16`, `i32`, `i64`, `f32` or `f64` |
+| `sql.Timestamp` | microseconds since the epoch, written as RFC 3339 in JSON, from 0001-01-01 to 9999-12-31 with a moment before 1970 included; a value outside that reads from the column but fails to write as JSON (an error, never `null`, ADR 127). `timestamptz` on Postgres, and only that: a `timestamp` column is refused at startup with the `ALTER` that converts it, because Postgres moves a zoneless value by the session's zone wherever it meets `now()`. `infinity` and `-infinity` are `error.QueryFailed` (ADR 067). On SQLite it is an `INTEGER` holding those microseconds, **which SQLite's date functions do not read as a date**: `strftime('%m', paid_at)` is NULL, and a Row field filled from it fails the query. Divide first, `strftime('%m', paid_at / 1000000, 'unixepoch')`, or work the month out in Zig ([Dates out of a Timestamp](../guide/sql/sqlite.md#dates-from-a-timestamp)). `.now()`, `.fromSeconds(s)`, `.seconds()`, `.nilo_parse(text)` |
+| `sql.Date` | a calendar day: `days` since 1970-01-01, written as `2026-09-17` in JSON and described as `format: date`. `date` on Postgres, `TEXT` on SQLite, and **read from the column rather than from a `::text`**, so a `db.raw` reading one needs no cast. `.fromDays(n)`, `.nilo_parse(text)`, `.utcOf(ts)`, `.atMidnightUtc()`. A day is not a moment: a due date read into a `timestamptz` gets a midnight, a midnight has a time zone, and the date then shifts by a day for a reader in Jakarta ([ADR 181](../adr/181-the-marker-has-two-kinds-of-word.md)). It holds a value and does no calendar arithmetic (no `.addDays`, no `.weekday`), and the two conversions it does offer are named for the zone they assume. A day before 1970 is normal and prints normally; the range is 0001-01-01 to 9999-12-31, which is what four digits can write and what `nilo_parse` reads back. Postgres has no year 0, so `0000-01-01` is refused by the parser and by the writer, and a `date` outside the range reads fine but fails to write as JSON (an error, never `null`, ADR 127). `.atMidnightUtc()` is `error.OutOfRange` for a day whose midnight does not fit in an `i64` of microseconds (about year 294,000 on) |
 | `sql.Uuid` | `nilo_id`'s [`Uuid`](./id.md#nilo_id), re-exported: the same type either import gives you. `uuid` |
 | `sql.Json(T)` | a `T` stored as `jsonb`, parsed per row into the request arena. Not available in `db.stream`, which allocates nothing. In a response it is written and described as the `T` itself (a **document**, `nilo_json_of = T` beside `value: T`), so a Row with one can still use `rename_all` ([ADR 163](../adr/163-a-document-is-its-value.md)). **It is also the intended way to put a list on a row**: a `db.raw` projection with `COALESCE(jsonb_agg(jsonb_build_object(…)), '[]'::jsonb) AS labels` read into `labels: sql.Json([]const Label)` is one statement, where a list of labels per row was a round trip per row, and the document says `Label`. **The column is parsed by `std.json` using the field names as written**: a `rename_all` on `T` changes the response, not the column, so a `jsonb_build_object` uses `content_type` and the response says `contentType` |
-| `sql.Decimal` | a `numeric`, held as its digits. `.text` is the value; there is no arithmetic. Written into JSON as a **string**, so a consumer's `JSON.parse` cannot round it into an `f64` ([ADR 049](../adr/049-a-column-type-can-come-from-outside-this-module.md)) |
+| `sql.Decimal` | a `numeric`, held as its digits. `.text` is the value; there is no arithmetic. Written into JSON as a **string**, so a consumer's `JSON.parse` cannot round it into an `f64` ([ADR 049](../adr/049-a-column-type-can-come-from-outside-this-module.md)). Ordering, `.gt` and its siblings, `.after` and `sum`, `avg`, `min`, `max` over one are Postgres-only; SQLite refuses them while compiling |
 | `sql.Interval`, `sql.Inet` | an `interval` and an `inet`, held as the text Postgres prints. `.text` is the value |
 | `sql.Bytes` | bytes rather than text: `bytea` on Postgres, `BLOB` on SQLite. `.bytes` is the value, and `sql.Bytes.of(hash)` writes one. The slice a read returns lives in the request arena, the way a `Str` does. Use this instead of `sql.AsText("bytea")`, which goes through hex printing and costs a conversion each way ([ADR 141](../adr/141-bytes-are-a-type-not-a-second-protocol.md)) |
 | `sql.AsText("money")` | any Postgres type at all, held as its text: the way out of this table. A column type of your own is any struct or enum with `nilo_column`, `nilo_read(text, arena)` and `nilo_write(arena)`; see [below](#a-column-type-of-your-own) |
@@ -1003,11 +1040,11 @@ pub const schema = sql.Schema{
 try sql.migrate.createMissing(&db, &run, schema);
 ```
 
-**`createMissing` runs one `CREATE TABLE IF NOT EXISTS` per Row plus its indexes, in one transaction.** Before them come the schema's extensions and functions, and after them its views, each in the form that is safe to run again (`CREATE OR REPLACE VIEW` on Postgres, which has no `IF NOT EXISTS` for a view, and `IF NOT EXISTS` on SQLite). **The order is worked out while compiling**, not taken from the list: foreign keys are written inline, which is the only form SQLite has, so `orgs` is created before `users` whichever order they are listed in. Two tables pointing at each other is a compile error naming both.
+**`createMissing` runs one `CREATE TABLE IF NOT EXISTS` per Row plus its indexes, in one transaction.** Before them come the schema's extensions and functions, and after them its views, each in the form that is safe to run again (`CREATE OR REPLACE VIEW` on Postgres, which has no `IF NOT EXISTS` for a view, and `IF NOT EXISTS` on SQLite). **The order is worked out while compiling**, not taken from the list: foreign keys are written inline, which is the only form SQLite has, so `orgs` is created before `users` whichever order they are listed in, and a view after any view its text names. Two tables pointing at each other is a compile error naming both, and so are two tables giving an index the same name. **An index over a column the table does not have yet is left to `addMissingColumns`**, which makes it with the column: `createMissing` reads the columns of each table that has an index before it begins, so the two calls in that order stay the boot order when a new field has a unique.
 
 It is for a test, a fixture or a single-file SQLite application. It is not a migration: it creates what is missing and never alters what is there.
 
-**`addMissingColumns` is the next step**, for the same program once it has shipped and added a field. It runs one `ALTER TABLE … ADD COLUMN` per column a table lacks, from the same `Desc` the create reads, in one transaction, and returns how many were added. A required column with no default is `error.NeedsBackfill`, with the statement in the log and nothing sent; a table that does not exist is skipped ([ADR 123](../adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
+**`addMissingColumns` is the next step**, for the same program once it has shipped and added a field. It runs one `ALTER TABLE … ADD COLUMN` per column a table lacks, from the same `Desc` the create reads, in one transaction, and returns how many were added. A column goes in with its `REFERENCES`, and every unique and index over it follows. A required column with no default is `error.NeedsBackfill`, with the statement in the log and nothing sent; a new column in a foreign key of several columns is `error.NeedsVersion` on SQLite, which writes one only with its table; a table that does not exist is skipped ([ADR 123](../adr/123-a-migration-is-a-diff-against-a-snapshot.md)).
 
 ```zig
 try sql.migrate.createMissing(&db, &run, .{ .tables = &.{ Download, Segment } });
@@ -1065,11 +1102,13 @@ The hash is **chained**: each one covers the version before it, so editing versi
 
 `apply` is one transaction: take the advisory lock, check whether this version is already there, run every step, insert the row, commit. It returns `false` when the version had already been applied, which is what nine of ten replicas booting together get.
 
-`migrate.applyPending(&db, &run, chain)` applies the whole list, in order, one transaction each, and returns how many ran. That is the in-process runner a single-file SQLite application calls from `app.before`, inside `listen()`. It creates the ledger if it is missing and reads it once: a version recorded under a different hash stops it before anything runs (`error.SchemaDrift`), and a version already recorded is skipped without a transaction. On SQLite each version begins with `.rebuilding`, so a table rebuild's `DROP` does not cascade into the rows pointing at it. `migrate.ensureLedger` is the first half on its own, under the same lock.
+`migrate.applyPending(&db, &run, chain)` applies the whole list, in order, one transaction each, and returns how many ran. That is the in-process runner a single-file SQLite application calls from `app.before`, inside `listen()`. It creates the ledger if it is missing and reads it once: a version recorded under a different hash stops it before anything runs (`error.SchemaDrift`), and a version already recorded is skipped without a transaction. On SQLite a version that drops a table begins with `.rebuilding`, so a table rebuild's `DROP` does not cascade into the rows pointing at it; any other version keeps foreign keys on, so a `DELETE` of a parent cascades. `migrate.ensureLedger` is the first half on its own, under the same lock.
 
 `migrate.drift(&db, &run, chain)` returns which applied versions have been edited since they ran: a `Drift` per version with what the ledger recorded and what the steps hash to now.
 
 **The lock matters.** `pg_advisory_xact_lock` is taken inside the transaction and released by the commit, so ten replicas starting at once run the migration once. SQLite has no advisory lock and needs none: it only ever has one writer.
+
+**A step waits at most `Version.lock_timeout_ms` for a table's lock**, 5,000 unless the version file says otherwise, on Postgres. `apply` sets it for the transaction after the advisory lock, so waiting for another replica is not bounded by it. A step that waits longer fails with `error.Locked`, one `warn` line names the version and the step, and nothing is kept. `.lock_timeout_ms = 0` waits for good, and the `.sql` twin writes `SET LOCAL lock_timeout = <ms>;` after its `BEGIN`. The number is not in the hash. A step that reads or rewrites every row while it holds the table (`SET NOT NULL`, a new `CHECK`, a type change such as `int4` to `int8`) says so in its `why` ([ADR 240](../adr/240-a-migration-waits-five-seconds-for-a-table.md)).
 
 A version is a **list of steps**, and `Kind.data` is the kind the diff never produces. That is what makes expand and contract possible: the backfill goes between the `add_column` that made the column and the `change_null` that tightens it, in one transaction, in one version.
 
@@ -1111,6 +1150,7 @@ An `Outcome` says which of three things happened. `isEmpty()` means the Rows and
 | `migrations.renderSql(gpa, D, version, name, hash, source)` | one `.sql` twin, as text |
 | `migrations.writeSql(gpa, io, dir, D, versions, entries)` | every twin, written; how many changed |
 | `migrations.staleSql(gpa, io, dir, D, versions, entries)` | the twins that are missing or out of date, by name |
+| `migrations.audit(gpa, state, versions)` | where the directory, the manifest and the snapshot disagree: a version file the manifest lost, a number that is not its file's, a duplicate, a snapshot ahead of or behind the newest file |
 | `migrations.sqlTwin(gpa, file)` | `0007_name.zig` → `0007_name.sql` |
 | `migrations.checkName(name)` | `a-z`, `0-9` and `_`, or `error.BadName` |
 
@@ -1123,7 +1163,7 @@ migrations/0007_work_items_get_a_priority.zig
 migrations/0007_work_items_get_a_priority.sql
 ```
 
-It holds the version's statements in order, each with its `why` above it as a comment, wrapped in `BEGIN`/`COMMIT`, with the ledger table created if missing and the ledger row at the end. `psql -f`, a CI job with no Zig toolchain, or somebody on a jump host can bring a database up to date with it, and `db.expecting(manifest.head)` still accepts the result and `verify` still checks the hash. **It is an output only**: nilo reads the `.zig` and never this file, and a version somebody else writes in SQL is not picked up.
+It holds the version's statements in order, each with its `why` above it as a comment, wrapped in `BEGIN`/`COMMIT`, with the ledger table created if missing and the ledger row at the end. Its first line is the dialect's `script_stop_on_error`, `\set ON_ERROR_STOP on` or `.bail on`, so `psql` or `sqlite3` stops at the first failed step and exits non-zero: it is a script for that shell, not SQL for a driver. `psql -f`, a CI job with no Zig toolchain, or somebody on a jump host can bring a database up to date with it, and `db.expecting(manifest.head)` still accepts the result and `verify` still checks the hash. **It is an output only**: nilo reads the `.zig` and never this file, and a version somebody else writes in SQL is not picked up.
 
 The twin's hash is chained onto the version before it, so it is written from the compiled manifest: `Options.versions`, which `db generate` passes from what `Tool.run` was given. One case cannot be written: `--baseline` rewriting a version 1 whose `before` or `after` hold hand-written steps, because those are Zig that nothing has compiled yet. The `Outcome` reports it with `twins_deferred`, and `db check` asks for the file after the rebuild.
 

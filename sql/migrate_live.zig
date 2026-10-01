@@ -408,6 +408,54 @@ test "starts_with anchors, and a backslash in the term is still just a backslash
     try testing.expectEqualStrings("a\\b", backslash[0].label);
 }
 
+test "istarts_with reads the case-folding unique as a range, and a wildcard in the prefix is still only itself" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "prefix");
+    defer fx.deinit(gpa);
+
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{ Org, User } });
+    const org = try fx.db.insert(Org, &fx.run, .{ .name = "acme" });
+    for ([_][]const u8{ "ann@x.dev", "Anna@x.dev", "a_n@x.dev", "a%n@x.dev", "a\\n@x.dev", "bob@x.dev" }) |email| {
+        _ = try fx.db.insert(User, &fx.run, .{
+            .org_id = org.id,
+            .email = email,
+            .nickname = null,
+            .created_at = types.Timestamp.fromSeconds(0),
+        });
+    }
+
+    // The index the unique made, searched rather than every row read: the
+    // prefix reaches SQLite as the finished pattern, which is what its LIKE
+    // optimisation reads a range off (ADR 140).
+    const plan = try fx.db.explain(User, &fx.run, .{ .where = .{ .email = .{ .istarts_with = @as([]const u8, "an") } } });
+    try testing.expect(std.mem.indexOf(u8, plan, "SEARCH") != null);
+    try testing.expect(std.mem.indexOf(u8, plan, "SCAN users") == null);
+
+    const Case = struct { prefix: []const u8, want: usize };
+    for ([_]Case{
+        .{ .prefix = "an", .want = 2 }, // and `Anna`, since it folds case
+        .{ .prefix = "a_", .want = 1 }, // not `ann`: `_` is not any character
+        .{ .prefix = "a%", .want = 1 }, // not every `a…`
+        .{ .prefix = "a\\", .want = 1 }, // the escape character, escaped first
+        .{ .prefix = "", .want = 6 },
+        .{ .prefix = "zed", .want = 0 },
+    }) |case| {
+        const found = try fx.db.select(User, &fx.run, .{ .where = .{ .email = .{ .istarts_with = case.prefix } } });
+        try testing.expectEqual(case.want, found.len);
+    }
+
+    // Under a `sql.given`: absent is no filter, present is the prefix.
+    const none: ?[]const u8 = null;
+    try testing.expectEqual(@as(usize, 6), (try fx.db.select(User, &fx.run, .{ .where = .{ .email = .{ .istarts_with = sql.given(none) } } })).len);
+    const some: ?[]const u8 = "BO";
+    try testing.expectEqual(@as(usize, 1), (try fx.db.select(User, &fx.run, .{ .where = .{ .email = .{ .istarts_with = sql.given(some) } } })).len);
+
+    // Negated, it reads every row either way, and keeps the form that
+    // allocates nothing.
+    const others = try fx.db.select(User, &fx.run, .{ .where = .{ .email = .{ .not_istarts_with = @as([]const u8, "a") } } });
+    try testing.expectEqual(@as(usize, 1), others.len);
+}
+
 test "an exists narrows to the rows with a match over there, and counts the same" {
     const gpa = testing.allocator;
     var fx = try Fixture.init(gpa, "exists");
@@ -618,6 +666,62 @@ test "createMissing makes a schema's views after its tables, and a second run le
     try testing.expectEqualStrings("alpha", names[0]);
 }
 
+/// The `orgs` table under a trigger, in two versions of its text.
+const OrgTouchedOnce = struct {
+    pub const nilo_table = .{
+        .name = "orgs",
+        .key = .id,
+        .trigger = .{ .orgs_touch = .{ .when = "AFTER INSERT", .run = "FOR EACH ROW BEGIN SELECT 1; END" } },
+    };
+
+    id: i64,
+    name: []const u8,
+};
+
+const OrgTouchedTwice = struct {
+    pub const nilo_table = .{
+        .name = "orgs",
+        .key = .id,
+        .trigger = .{ .orgs_touch = .{ .when = "AFTER INSERT", .run = "FOR EACH ROW BEGIN SELECT 2; END" } },
+    };
+
+    id: i64,
+    name: []const u8,
+};
+
+test "createMissing updates a view and a trigger whose text changed, and sends nothing for one that did not" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "repeatables");
+    defer fx.deinit(gpa);
+
+    const once: sql.Schema = .{
+        .tables = &.{OrgTouchedOnce},
+        .views = &.{.{ .name = "org_names", .body = "SELECT name FROM orgs ORDER BY name" }},
+    };
+    const twice: sql.Schema = .{
+        .tables = &.{OrgTouchedTwice},
+        .views = &.{.{ .name = "org_names", .body = "SELECT name FROM orgs ORDER BY name DESC" }},
+    };
+    try migrate.createMissing(&fx.db, &fx.run, once);
+    _ = try fx.db.insert(Org, &fx.run, .{ .name = "alpha" });
+    _ = try fx.db.insert(Org, &fx.run, .{ .name = "beta" });
+
+    // A boot with nothing changed sends no DDL, which is visible as the
+    // schema version not moving: `IF NOT EXISTS` sent it every time.
+    const before = try fx.db.raw(i64, &fx.run, "SELECT schema_version FROM pragma_schema_version", .{});
+    try migrate.createMissing(&fx.db, &fx.run, once);
+    const after = try fx.db.raw(i64, &fx.run, "SELECT schema_version FROM pragma_schema_version", .{});
+    try testing.expectEqual(before[0], after[0]);
+
+    // A changed text was never updated here, and Postgres replaced it.
+    try migrate.createMissing(&fx.db, &fx.run, twice);
+    const names = try fx.db.raw([]const u8, &fx.run, "SELECT name FROM org_names", .{});
+    try testing.expectEqualStrings("beta", names[0]);
+    const trigger = try fx.db.raw([]const u8, &fx.run, "SELECT sql FROM sqlite_master WHERE name = 'orgs_touch'", .{});
+    try testing.expectEqual(@as(usize, 1), trigger.len);
+    try testing.expect(std.mem.indexOf(u8, trigger[0], "SELECT 2;") != null);
+}
+
 test "the case-folding unique is the one that stops two addresses differing only in case" {
     const gpa = testing.allocator;
     var fx = try Fixture.init(gpa, "folding");
@@ -775,12 +879,12 @@ test "a binary built for a version the database has not reached refuses to serve
     var fx = try Fixture.init(gpa, "expect");
     defer fx.deinit(gpa);
 
-    // `standing` rather than `expect` for the failing direction. The sentence
-    // `expect` logs is the feature, and a test that provokes it would have the
-    // suite count a deliberate `std.log.err` as a failure.
     const behind = try migrate.standing(&fx.db, &fx.run, 9);
     try testing.expectEqual(@as(i64, 0), behind.at);
     try testing.expectEqual(migrate.Standing.Verdict.behind, behind.verdict());
+    // The refusal itself, which logs at `warn` so a test can reach it: the
+    // error is what stops the process, and the line only explains it.
+    try testing.expectError(migrate.Error.SchemaBehind, migrate.expect(&fx.db, &fx.run, 9));
 
     var d9: [64]u8 = undefined;
     const nine, const nine_hash = lone(9, "nine", &.{
@@ -804,9 +908,8 @@ test "a Db told what to expect asks the ledger at boot, on the pool it just open
     // sequence — from `nilo_check`, after the boot work, which is where the
     // guard sees the ledger a migration in `before` just wrote (ADR 180).
     // What is pinned here is that boot *reaches* the ledger — a fresh file
-    // has none, and after this boot it has one — and that level and ahead go
-    // through. Behind is `migrate.expect`'s own refusal, pinned above
-    // through `standing` for the reason given there.
+    // has none, and after this boot it has one — that level and ahead go
+    // through, and that behind stops the boot.
     const gpa = testing.allocator;
     var fx = try Fixture.initWith(gpa, "expect_at_boot", .{ .size = 2, .unchecked = true }, 0);
     defer fx.deinit(gpa);
@@ -834,6 +937,15 @@ test "a Db told what to expect asks the ledger at boot, on the pool it just open
     ahead.expecting(2);
     try ahead.nilo_start(fx.threaded.io(), .off);
     try ahead.nilo_check(fx.threaded.io());
+
+    // And one built for a version the database has not reached: the boot
+    // stops. Every other failure to read the ledger is a warning there, so
+    // this is the one error the guard must not swallow with them.
+    var behind = Db.init(gpa, fx.path, .{ .size = 1, .unchecked = true });
+    defer behind.deinit();
+    behind.expecting(4);
+    try behind.nilo_start(fx.threaded.io(), .off);
+    try testing.expectError(error.SchemaBehind, behind.nilo_check(fx.threaded.io()));
 }
 
 test "the plan a diff produces is the plan that runs, end to end" {
@@ -951,6 +1063,61 @@ test "addMissingColumns adds what the Row has and the table has not, typed as cr
     try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{Elsewhere} }));
 }
 
+test "addMissingColumns adds a column with its foreign key, its unique and its index" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "keyed");
+    defer fx.deinit(gpa);
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id };
+        id: i64,
+        url: []const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{
+            .name = "downloads",
+            .key = .id,
+            .references = .{ .org_id = .{ Org, .id, .cascade } },
+            .unique = .{.sha256},
+            .index = .{.org_id},
+        };
+        id: i64,
+        url: []const u8,
+        org_id: ?i64,
+        sha256: ?[]const u8,
+    };
+    const Count = struct {
+        pub const nilo_table = .projection;
+        n: i64,
+    };
+
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{ Org, Before } });
+    try testing.expectEqual(@as(usize, 2), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{ Org, After } }));
+
+    // The key: a parent that is not there used to be taken for ever.
+    try testing.expectError(error.ForeignKeyViolated, fx.db.insert(After, &fx.run, .{
+        .url = "http://a/1",
+        .org_id = @as(?i64, 999),
+        .sha256 = @as(?[]const u8, null),
+    }));
+    const org = try fx.db.insert(Org, &fx.run, .{ .name = "o" });
+    _ = try fx.db.insert(After, &fx.run, .{ .url = "http://a/2", .org_id = @as(?i64, org.id), .sha256 = @as(?[]const u8, "x") });
+
+    // The unique, and the index beside it, which only the catalog shows.
+    try testing.expectError(error.AlreadyExists, fx.db.insert(After, &fx.run, .{
+        .url = "http://a/3",
+        .org_id = @as(?i64, null),
+        .sha256 = @as(?[]const u8, "x"),
+    }));
+    const indexes = try fx.db.raw(
+        Count,
+        &fx.run,
+        "SELECT count(*) AS n FROM sqlite_master WHERE type = 'index' AND tbl_name = 'downloads' AND sql IS NOT NULL",
+        .{},
+    );
+    try testing.expectEqual(@as(i64, 2), indexes[0].n);
+}
+
 test "addMissingColumns refuses a required column with no default, and sends nothing" {
     const gpa = testing.allocator;
     var fx = try Fixture.init(gpa, "refused");
@@ -976,6 +1143,71 @@ test "addMissingColumns refuses a required column with no default, and sends not
     // One transaction: the column that was fine did not land either.
     try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{Before} }));
     const live = try fx.db.liveColumns(&fx.run, null, "downloads");
+    try testing.expectEqual(@as(usize, 2), live.len);
+}
+
+test "createMissing leaves a unique over a field the table lacks to addMissingColumns, which is the boot order" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "boot-order");
+    defer fx.deinit(gpa);
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id };
+        id: i64,
+        url: []const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id, .unique = .{.code} };
+        id: i64,
+        url: []const u8,
+        code: ?[]const u8,
+    };
+
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Before} });
+    _ = try fx.db.insert(Before, &fx.run, .{ .url = "http://a/1" });
+    _ = try fx.db.insert(Before, &fx.run, .{ .url = "http://a/2" });
+
+    // The two lines a program runs at every boot. The `CREATE UNIQUE INDEX`
+    // over `"code"` came first and SQLite, finding no such column, indexed
+    // the string "code" and refused the second row.
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{After} });
+    try testing.expectEqual(@as(usize, 1), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+
+    _ = try fx.db.update(After, &fx.run, .{ .where = .{ .id = 1 }, .set = .{ .code = @as(?[]const u8, "x") } });
+    try testing.expectError(
+        error.AlreadyExists,
+        fx.db.update(After, &fx.run, .{ .where = .{ .id = 2 }, .set = .{ .code = @as(?[]const u8, "x") } }),
+    );
+    // And a second boot is quiet.
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{After} });
+    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+}
+
+test "addMissingColumns says why a clock default cannot be added to a table with rows, and adds it to an empty one" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "clock-default");
+    defer fx.deinit(gpa);
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "stamps", .key = .id };
+        id: i64,
+        url: []const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{ .name = "stamps", .key = .id, .default = .{ .at = .now } };
+        id: i64,
+        url: []const u8,
+        at: types.Timestamp,
+    };
+
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Before} });
+    try testing.expectEqual(@as(usize, 1), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+    _ = try fx.db.exec(&fx.run, "DROP TABLE \"stamps\"", .{});
+
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Before} });
+    _ = try fx.db.insert(Before, &fx.run, .{ .url = "http://a/1" });
+    try testing.expectError(error.NeedsVersion, migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+    const live = try fx.db.liveColumns(&fx.run, null, "stamps");
     try testing.expectEqual(@as(usize, 2), live.len);
 }
 
@@ -1175,6 +1407,23 @@ test "a version that leaves a row pointing at nothing is refused at its commit, 
     );
 }
 
+test "a version that deletes a parent cascades as the schema says" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa, "cascade");
+    defer fx.deinit(gpa);
+    try family(fx);
+
+    // No table is dropped, so foreign keys stay on. Every version used to run
+    // with them off, the cascade did not fire, and the check before the
+    // COMMIT refused the child left behind.
+    var digest: [64]u8 = undefined;
+    const v, const hash = lone(1, "drop_parent", &.{
+        .{ .kind = .data, .why = "", .sql = "DELETE FROM \"parents\" WHERE \"id\" = 1" },
+    }, &digest);
+    try testing.expect(try migrate.apply(&fx.db, &fx.run, v, hash));
+    try testing.expectEqual(@as(usize, 1), (try fx.db.select(Child, &fx.run, .{})).len);
+}
+
 test "`status` says `edited` for a version whose file no longer matches what ran" {
     const gpa = testing.allocator;
     var fx = try Fixture.init(gpa, "status");
@@ -1278,15 +1527,45 @@ test "a twin brings a database to head on its own, ledger row and all" {
     );
 }
 
-/// The leading `--` lines of one chunk, dropped. A comment is part of the file
-/// and not part of the statement, and only this test ever separates them.
+/// The leading `--` lines of one chunk, dropped, and the shell's own
+/// `script_stop_on_error` line with them. A comment is part of the file and not
+/// part of the statement, a `\set` is for `psql` and not for the database, and
+/// only this test ever separates them.
 fn stripComments(chunk: []const u8) []const u8 {
     var rest = chunk;
     while (true) {
         const start = std.mem.indexOfNone(u8, rest, " \n") orelse return "";
         rest = rest[start..];
-        if (!std.mem.startsWith(u8, rest, "--")) return rest;
+        if (!std.mem.startsWith(u8, rest, "--") and
+            !std.mem.startsWith(u8, rest, Db.Dialect.script_stop_on_error)) return rest;
         const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return "";
         rest = rest[nl + 1 ..];
     }
+}
+
+test "createMissing and addMissingColumns read the table through their own transaction, so a pool of one is enough" {
+    const gpa = testing.allocator;
+    // One connection: a second one asked for while the transaction holds it
+    // is a wait that ends in a failure, which is what `db.liveColumns` from
+    // inside them did on a pool this size.
+    var fx = try Fixture.initWith(gpa, "pool-of-one", .{ .size = 1, .unchecked = true }, null);
+    defer fx.deinit(gpa);
+
+    const Before = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id, .unique = .{.url} };
+        id: i64,
+        url: []const u8,
+    };
+    const After = struct {
+        pub const nilo_table = .{ .name = "downloads", .key = .id, .unique = .{.url} };
+        id: i64,
+        url: []const u8,
+        note: ?[]const u8,
+    };
+
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{Before} });
+    try migrate.createMissing(&fx.db, &fx.run, .{ .tables = &.{After} });
+    try testing.expectEqual(@as(usize, 1), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+    try testing.expectEqual(@as(usize, 0), try migrate.addMissingColumns(&fx.db, &fx.run, .{ .tables = &.{After} }));
+    try testing.expectEqual(@as(usize, 3), (try fx.db.liveColumns(&fx.run, null, "downloads")).len);
 }
