@@ -110,7 +110,7 @@ comptime-checked shape is a compiler of its own. A key is a string the
 application decides; nilo's job is to encode it correctly, once, per RFC 3986
 with `/` left alone ([ADR 057](./057-percent-is-needed-by-two-layers.md)).
 
-**The one key nilo refuses is the empty one**, because it does not name a different object but a different operation: the URL is the bucket's root, so `get("")` was a listing returned as an object, `delete("")` DeleteBucket, `put("")` CreateBucket and `presign("")` a signed listing for a browser. Every object call, `presign` and a `presignPost` without `.prefix` answer `error.Rejected`; `list` and a prefix policy, where `""` means "any key", take it.
+**The one key nilo refuses is the empty one**, because it does not name a different object but a different operation: the URL is the bucket's root, so `get("")` was a listing returned as an object, `delete("")` DeleteBucket, `put("")` CreateBucket and `presign("")` a signed listing for a browser. Every object call, `presign`, `presignPut` and a `presignPost` without `.prefix` answer `error.Rejected`; `list` and a prefix policy, where `""` means "any key", take it.
 
 ## What the API is, and why each piece is that shape
 

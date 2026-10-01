@@ -531,3 +531,45 @@ test "a part size under S3's floor is refused before any byte moves" {
         }
     }.run);
 }
+
+test "a presigned PUT uploads from something that did not sign it, and only as a PUT" {
+    try withStore(struct {
+        fn run(store: *Store) !void {
+            var live = try Live.open(store);
+            defer live.deinit();
+
+            var scope: core.Run = .init(testing.allocator);
+            defer scope.deinit();
+
+            const link = try live.presignPut(&scope, home ++ "presigned-put.txt", 900);
+            defer live.delete(&scope, home ++ "presigned-put.txt") catch {};
+
+            var plain: std.http.Client = .{
+                .allocator = testing.allocator,
+                .io = store.client.inner.io,
+            };
+            defer plain.deinit();
+
+            const sent = "bytes from a client with no credentials";
+            const put = try plain.fetch(.{
+                .location = .{ .url = link.url.view() },
+                .method = .PUT,
+                .payload = sent,
+            });
+            try testing.expectEqual(std.http.Status.ok, put.status);
+
+            // The method is inside the signature: the same URL as a GET is
+            // a refusal, not a download.
+            var body: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer body.deinit();
+            const got = try plain.fetch(.{
+                .location = .{ .url = link.url.view() },
+                .response_writer = &body.writer,
+            });
+            try testing.expectEqual(std.http.Status.forbidden, got.status);
+
+            const back = try live.get(&scope, home ++ "presigned-put.txt");
+            try testing.expectEqualStrings(sent, back.bytes.view());
+        }
+    }.run);
+}
