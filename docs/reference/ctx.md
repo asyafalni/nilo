@@ -139,7 +139,7 @@ A value containing a space, comma, semicolon, quote, backslash or control byte i
 
 ### The cookie name
 
-The cookie is named `__Host-session` (`nilo.session.host_cookie_name`) when it is `Secure`, at `/`, and has no `domain`, which is what the defaults give. Otherwise it is `session` (`nilo.session.cookie_name`), because a browser drops a `__Host-` cookie if any of those change. Both names are read, the prefixed one first, so a session written under the plain name still opens. The next `set` writes the prefixed name and deletes the plain one, and `clear` deletes both.
+The cookie is named `__Host-session` (`nilo.session.host_cookie_name`) when it is `Secure`, at `/`, and has no `domain`, which is what the defaults give. Otherwise it is `session` (`nilo.session.cookie_name`), because a browser drops a `__Host-` cookie if any of those change. The plain name is read only with `listen(.{ .session_plain_name = true })`, after the prefixed one, and a `set` that would write it without that option fails with a message naming it. The next `set` writes the prefixed name and deletes the plain one, and `clear` deletes both.
 
 ### Expiry
 

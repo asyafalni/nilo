@@ -252,9 +252,15 @@ fn writeValue(comptime T: type, w: *std.Io.Writer, value: T) std.Io.Writer.Error
                     comptime "\"" ++ mark.wire(@tagName(tag), mark.of(T)) ++ "\"",
                 ),
             };
-            // A non-exhaustive enum can hold a value no field names, which is
-            // `@tagName`'s to answer rather than a switch's.
-            return writeString(w, @tagName(value));
+            // A non-exhaustive enum can hold a value no field names, and
+            // `@tagName` on one is a panic: std.json reads `{"kind":7}` into
+            // exactly that, and so can a database integer. A named value goes
+            // out as its name and an unnamed one as its number, which is what
+            // std.json writes and what reading it back expects.
+            inline for (e.fields) |f| {
+                if (@intFromEnum(value) == f.value) return w.writeAll(comptime "\"" ++ f.name ++ "\"");
+            }
+            return w.printInt(@intFromEnum(value), 10, .lower, .{});
         },
         .optional => return if (value) |payload|
             writeValue(@TypeOf(payload), w, payload)
@@ -548,6 +554,14 @@ test "structs, nesting, optionals and enums" {
         inner: struct { deep: struct { x: bool } },
     }{ .outer = 1, .inner = .{ .deep = .{ .x = true } } });
     try expectSame(struct { maybe: ?struct { x: u8 } }{ .maybe = .{ .x = 2 } });
+}
+
+test "a non-exhaustive enum holding a value no field names is written as its number" {
+    // std.json reads `{"kind":7}` into exactly this, and so can a database
+    // integer; echoing it back must not reach `@tagName` on an unnamed value.
+    const Kind = enum(u8) { free, paid, _ };
+    try expectSame(struct { kind: Kind }{ .kind = .paid });
+    try expectSame(struct { kind: Kind }{ .kind = @enumFromInt(7) });
 }
 
 test "a sentinel-terminated string is a string, not a list of its bytes" {

@@ -70,7 +70,10 @@ pub fn handleConnection(
         // down TLB entries on all of them. So the pages only go once a
         // short read has come back empty, which a connection under load
         // never sees and a browser tab between clicks always does.
-        waitForRequest(in, out, deadlines, waker);
+        if (!waitForRequest(in, out, deadlines, waker)) {
+            out.flush() catch {};
+            return;
+        }
 
         var served = serveRequest(self, arena.allocator(), &lifetime, &in_flight, in, out, deadlines, waker, peer);
         // A handler that upgraded runs its loop here rather than inside
@@ -162,30 +165,32 @@ pub const idle_peek_ms = 200;
 /// connection to 4,657, and the difference is exactly one page
 /// ([ADR 062](../docs/adr/062-where-a-connection-waits-is-what-it-costs.md)).
 ///
-/// Every error is swallowed: a broken connection is `handleRequest`'s to
-/// diagnose and report, and it will meet the same failure one call later
-/// with all the machinery for saying so. A wait that runs out of the idle
-/// limit leaves the deadline expired, so `readHead` fails at once and the
-/// connection closes without a second full idle period.
+/// **False ends the connection**, and every way the wait can fail but the
+/// peek running out is one: the client closed or broke the connection, the
+/// idle limit passed, or a stop cancelled the wait. The last is why it
+/// cannot be left for `readHead` to meet again: zio delivers a cancel once,
+/// so the read after a swallowed one parked under a fresh idle limit, and a
+/// stop waited on every idle keep-alive connection for up to twice that
+/// limit. Nothing is lost by not reporting the others, since no request had
+/// started and nothing is owed to anybody.
 pub fn waitForRequest(
     in: *std.Io.Reader,
     out: *std.Io.Writer,
     deadlines: bulkhead.Deadlines,
     waker: bulkhead.Waker,
-) void {
+) bool {
     // Already holding a pipelined request: not idle, and the buffer is
     // live data that must not be discarded.
     if (in.seek != in.end) {
         deadlines.armIdle();
-        return;
+        return true;
     }
 
     deadlines.armPeek(idle_peek_ms);
-    in.fillMore() catch {
-        if (deadlines.timedOut()) {
-            bulkhead.releaseIdlePages(in, out);
-            waker.releaseStack();
-        }
+    in.fillMore() catch |err| {
+        if (err != error.ReadFailed or !deadlines.timedOut()) return false;
+        bulkhead.releaseIdlePages(in, out);
+        waker.releaseStack();
     };
 
     // Waiting for the next request to start is the idle limit, not the
@@ -193,7 +198,8 @@ pub fn waitForRequest(
     // served a request is idle again from now, not from whenever it was
     // accepted.
     deadlines.armIdle();
-    if (in.seek == in.end) in.fillMore() catch {};
+    if (in.seek == in.end) in.fillMore() catch return false;
+    return true;
 }
 
 /// What one request left behind.
@@ -368,6 +374,7 @@ pub noinline fn serveRequest(
         // on every Ctx otherwise, for something almost no request reads.
         ._session_key = if (self.session_key) |*k| k else null,
         ._session_fallbacks = &self.session_fallbacks,
+        ._session_plain = self.session_plain_name,
         ._compressors = if (self.compressors) |*p| p else null,
         ._params = &.{},
         ._services = &self.services,
@@ -415,8 +422,18 @@ pub noinline fn serveRequest(
         const params = match.params[0..match.n_params];
         ctx_mod.decodeParams(arena, params) catch return .{ .keep_alive = false };
         c._params = params;
-        c._route = &self.router.routes.items[match.index];
-        chain = match.chain;
+        const route = &self.router.routes.items[match.index];
+        c._route = route;
+        // A route whose pattern has a `:param` or `*` where a scoped
+        // middleware's prefix has a word is covered by it for some paths
+        // and not others, so its chain is built here from the real one: one
+        // arena allocation, paid only by such a route (ADR 008). A chain
+        // that cannot be built is not run without its guard.
+        chain = if (route.chain_by_path)
+            mw.chainFor(arena, self.scoped.items, self.exemptions.items, self.attached.items, route.method, route.pattern, path) catch
+                return .{ .keep_alive = false }
+        else
+            match.chain;
         terminal = match.handler;
         record.at(metrics_mod.fixed_slots + match.index);
     } else if (findStatic(self, &c, path)) |found| {
@@ -436,7 +453,7 @@ pub noinline fn serveRequest(
         // allocation, bounded by the middleware count, and paid only by
         // a 404 or a 405.
         if (self.scoped.items.len > 0) {
-            chain = mw.chainFor(arena, self.scoped.items, self.exemptions.items, self.attached.items, null, path) catch &.{};
+            chain = mw.chainFor(arena, self.scoped.items, self.exemptions.items, self.attached.items, null, path, path) catch &.{};
         }
         // No route for this method, but the path itself is spelled out
         // by routes under other methods. "There is nothing here" and

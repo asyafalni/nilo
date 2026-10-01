@@ -56,6 +56,7 @@ const ctx_mod = @import("ctx.zig");
 const fail_mod = @import("fail.zig");
 const form_mod = @import("form.zig");
 const naming = @import("names.zig");
+const patch_mod = @import("patch.zig");
 const str_mod = @import("nilo_core");
 
 const Str = str_mod.Str;
@@ -622,12 +623,17 @@ fn valueOf(comptime W: type, comptime slot: Slot) type {
     };
 }
 
-/// A field's type reached through the `?` that says it may be absent.
+/// A field's type reached through the `?` or the `Patch` that says it may
+/// be absent. `Patch` has to be seen through here as well as in `ctx.zig`'s
+/// `describeField` and `choicesOf`, which record and word its failures:
+/// asking `convert` about the union rather than the enum inside it made
+/// `canFail` false, and `{"stage":"nope"}` reached `unreachable`.
 fn innerOf(comptime F: type) type {
-    return switch (@typeInfo(F)) {
+    const Unwrapped = switch (@typeInfo(F)) {
         .optional => |o| o.child,
         else => F,
     };
+    return if (patch_mod.isPatch(Unwrapped)) Unwrapped.nilo_patch else Unwrapped;
 }
 
 /// Whether a field of this type has a conversion that can fail at all. A
@@ -716,10 +722,14 @@ fn sayerFor(
                 // `convertsAs` rather than `innerOf`: for a list it is the
                 // element that would not convert, and the element is what the
                 // sentence has to name (ADR 132).
+                // A reason this field cannot produce means the rule above
+                // and the one that recorded the failure disagree. A sentence
+                // that is less precise is the answer to that, not a panic a
+                // request can reach.
                 else => if (comptime canFail(F))
                     try convert.sayWhy(convertsAs(F), slot, f.given, labelFor(slot, name), w)
                 else
-                    unreachable,
+                    try w.writeAll(comptime (labelFor(slot, name) ++ " has to be " ++ expectedFor(F))),
             }
         }
     }.say;

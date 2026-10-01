@@ -325,6 +325,164 @@ test "the shutdown reaches a fiber that is not serving anybody" {
     try testing.expect(ticker.canceled.load(.acquire));
 }
 
+// ---- a stop and the connections that are only waiting ----
+
+/// A server with a long idle limit, so that a stop which waits on an idle
+/// connection is told apart from one that does not by seconds rather than
+/// by milliseconds.
+const ServingIdle = struct {
+    app: *nilo.App,
+    bound: std.atomic.Value(bool) = .init(true),
+
+    fn run(self: *ServingIdle) void {
+        self.app.tryListen(.{
+            .port = 0,
+            .threads = 1,
+            .stop_on_signal = false,
+            .idle_timeout_ms = 5_000,
+        }) catch {
+            self.bound.store(false, .release);
+        };
+    }
+};
+
+fn sayOk() []const u8 {
+    return "ok";
+}
+
+/// Read until one whole `ok` answer has arrived, and no further, so the
+/// connection stays open behind it.
+fn readOneOk(reader: *std.Io.Reader) !void {
+    while (true) {
+        if (std.mem.indexOf(u8, reader.buffered(), "\r\n\r\nok")) |at| {
+            reader.toss(at + 6);
+            return;
+        }
+        try reader.fillMore();
+    }
+}
+
+test "a stop does not wait on a keep-alive connection that is only waiting for its next request" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/x", sayOk);
+
+    var serving: ServingIdle = .{ .app = &app };
+    const thread = try std.Thread.spawn(.{}, ServingIdle.run, .{&serving});
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Joined exactly once whichever way the test leaves, because returning
+    // early would run `app.deinit()` under a server still using it.
+    var joined = false;
+    defer if (!joined) {
+        app.shutdown();
+        thread.join();
+    };
+
+    const port: u16 = for (0..300) |_| {
+        if (app.boundPort()) |p| break p;
+        if (!serving.bound.load(.acquire)) return error.ServerNeverCameUp;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    } else return error.ServerNeverCameUp;
+
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var out_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    var in_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+
+    // Two requests with a quiet spell between them, past the peek, so the
+    // connection has been idle once and is about to be again.
+    for (0..2) |i| {
+        try writer.interface.writeAll("GET /x HTTP/1.1\r\nHost: t\r\n\r\n");
+        try writer.interface.flush();
+        try readOneOk(&reader.interface);
+        if (i == 0) std.Io.sleep(io, .fromMilliseconds(400), .awake) catch {};
+    }
+
+    // Stopped while the connection waits for a third request that never
+    // comes: nothing is in flight, so nothing should be waited for.
+    const started = std.Io.Clock.awake.now(io);
+    app.shutdown();
+    thread.join();
+    joined = true;
+    const took_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+
+    // The connection was closed rather than left to run out its idle limit.
+    var rest: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), reader.interface.readSliceShort(&rest) catch 0);
+    if (took_ms >= 2_000) {
+        std.debug.print("the stop took {d} ms with one idle connection open\n", .{took_ms});
+        return error.StopWaitedOnAnIdleConnection;
+    }
+}
+
+fn sayOkSlowly() ![]const u8 {
+    try nilo.sleep(800);
+    return "ok";
+}
+
+test "a stop closes the listener before it waits for the requests in flight" {
+    hush();
+    const gpa = std.heap.smp_allocator;
+
+    var app = nilo.App.init(gpa);
+    defer app.deinit();
+    try app.get("/slow", sayOkSlowly);
+
+    var serving: ServingIdle = .{ .app = &app };
+    const thread = try std.Thread.spawn(.{}, ServingIdle.run, .{&serving});
+    var joined = false;
+    defer if (!joined) {
+        app.shutdown();
+        thread.join();
+    };
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const port: u16 = for (0..300) |_| {
+        if (app.boundPort()) |p| break p;
+        if (!serving.bound.load(.acquire)) return error.ServerNeverCameUp;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    } else return error.ServerNeverCameUp;
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var out_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    try writer.interface.writeAll("GET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
+    try writer.interface.flush();
+    std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+
+    // Past the main fiber's look at the stop flag, so the server is in its
+    // grace period with the slow request still running.
+    app.shutdown();
+    std.Io.sleep(io, .fromMilliseconds(400), .awake) catch {};
+
+    const late = address.connect(io, .{ .mode = .stream });
+    if (late) |s| s.close(io) else |_| {}
+    try testing.expectError(error.ConnectionRefused, late);
+
+    // And the request that was already in flight is still answered.
+    var in_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+    try readOneOk(&reader.interface);
+
+    thread.join();
+    joined = true;
+}
+
 // ---- a file leaving by the route the rest of the suite never takes ----
 
 /// The server for the `sendfile` tests: a real port, because that is the whole

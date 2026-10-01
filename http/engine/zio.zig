@@ -358,6 +358,11 @@ const accept_poll_ms = 200;
 /// attempt a second rather than a spin (ADR 194).
 const accept_backoff_min_ms: u32 = 5;
 const accept_backoff_max_ms: u32 = 1000;
+/// How many accepts in a row may fail with an error `accept(2)` says is the
+/// connection's before it is taken for the listener's. Enough that a burst
+/// of clients failing at once is waited out, few enough that a listener
+/// which is broken for good stops the server inside a tenth of a second.
+const accept_strikes_max: u32 = 16;
 
 /// How often a stop looks to see whether the last request has finished.
 /// Shorter than the accept poll: by the time this runs somebody is waiting
@@ -478,29 +483,40 @@ pub const Clocks = struct {
     reader: *zio.net.Stream.Reader,
     writer: *zio.net.Stream.Writer,
 
+    // Every arming forgets the side's last error. zio never clears it, so
+    // without this a connection whose idle peek once ran out read as timed
+    // out for the rest of its life, and a stop that cancelled its next wait
+    // was taken for one more quiet spell and waited out (`timedOut` below).
+
     pub fn readNoLimit(self: *Clocks) void {
+        self.reader.err = null;
         self.reader.setTimeout(.none);
     }
 
     pub fn readWithinMs(self: *Clocks, ms: u32) void {
+        self.reader.err = null;
         self.reader.setTimeout(.fromMilliseconds(ms));
     }
 
     /// A limit shared by every read until it is changed, given as a reading
     /// of the same monotonic clock `monotonicNanos` returns.
     pub fn readByNanos(self: *Clocks, ns: u64) void {
+        self.reader.err = null;
         self.reader.setTimeout(.{ .deadline = .fromNanoseconds(ns) });
     }
 
     pub fn writeNoLimit(self: *Clocks) void {
+        self.writer.err = null;
         self.writer.setTimeout(.none);
     }
 
     pub fn writeWithinMs(self: *Clocks, ms: u32) void {
+        self.writer.err = null;
         self.writer.setTimeout(.fromMilliseconds(ms));
     }
 
     pub fn writeByNanos(self: *Clocks, ns: u64) void {
+        self.writer.err = null;
         self.writer.setTimeout(.{ .deadline = .fromNanoseconds(ns) });
     }
 
@@ -509,9 +525,8 @@ pub const Clocks = struct {
     ///
     /// Both reach the HTTP layer as `error.ReadFailed`/`error.WriteFailed`,
     /// because that is all a `std.Io` interface can say; the reason is kept
-    /// on the side, here. zio does not clear it, so this only means
-    /// anything asked directly after the operation that failed — which is
-    /// the only place nilo asks, and then the connection is closed.
+    /// on the side, here. zio does not clear it, and the arming above does,
+    /// so this answers for the operations since the last limit was set.
     pub fn timedOut(self: *const Clocks) bool {
         if (self.reader.err) |err| if (err == error.Timeout) return true;
         if (self.writer.err) |err| if (err == error.Timeout) return true;
@@ -1485,6 +1500,19 @@ pub fn serve(
         address: []const u8,
         /// Speaks gRPC over h2c rather than HTTP/1.1 (ADR 220).
         grpc: bool,
+        /// Set once the socket is closed and its path removed, which a stop
+        /// does as soon as the acceptors are gone rather than at the end.
+        closed: bool = false,
+
+        /// Stop listening: the socket, then the file, which is the order
+        /// that keeps a socket file from being left behind to fail the next
+        /// start. Once, whichever of the stop and the `defer` comes first.
+        fn close(b: *@This(), alloc: std.mem.Allocator) void {
+            if (b.closed) return;
+            b.closed = true;
+            b.server.close();
+            if (b.unix_path) |path| removeSocket(alloc, path);
+        }
     };
 
     const listeners = try gpa.alloc(Bound, 1 + options.also.len);
@@ -1495,11 +1523,9 @@ pub fn serve(
     // and a clean run closes all of it, without two paths to keep in step.
     var opened: usize = 0;
     defer for (listeners[0..opened]) |*b| {
-        // The socket first and the file second, which is the order the
-        // two separate `defer`s had before there was a list of them: a
-        // socket file left behind is what makes the next start fail.
-        b.server.close();
-        if (b.unix_path) |path| removeSocket(gpa, path);
+        b.close(gpa);
+        // The certificate last: a connection still in its handshake reads
+        // it until the group below is cancelled.
         if (nilo_build.tls) if (b.secured) |*sec| sec.auth.deinit(gpa);
     };
 
@@ -1725,20 +1751,29 @@ pub fn serve(
             return @alignCast(@fieldParentPtr("reader", r));
         }
 
-        fn settle(link: *Self) void {
+        /// A flush that failed is left for the next write to report, except
+        /// one a stop cancelled. zio delivers a cancel once, so swallowed
+        /// here it would be gone, and the read after it would park for a
+        /// whole idle limit on a server that is trying to stop. It fails the
+        /// read instead, with the reader saying why.
+        fn settle(link: *Self) error{ReadFailed}!void {
             const w = &link.writer.interface;
-            if (w.end != 0) w.flush() catch {};
+            if (w.end == 0) return;
+            w.flush() catch if (link.writer.err) |err| if (err == error.Canceled) {
+                link.reader.err = error.Canceled;
+                return error.ReadFailed;
+            };
         }
 
         fn stream(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             const link = of(io_r);
-            link.settle();
+            try link.settle();
             return link.inner.stream(io_r, io_w, limit);
         }
 
         fn readVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
             const link = of(io_r);
-            link.settle();
+            try link.settle();
             return link.inner.readVec(io_r, data);
         }
     };
@@ -1957,6 +1992,8 @@ pub fn serve(
                 reader: TlsReader,
                 writer: *std.Io.Writer,
                 inner: *const std.Io.Reader.VTable,
+                /// The record layer, whose writer says why a flush failed.
+                link: *Link,
 
                 const vtable: std.Io.Reader.VTable = .{ .stream = streamSettled };
 
@@ -1964,12 +2001,17 @@ pub fn serve(
                     const r: *TlsReader = @alignCast(@fieldParentPtr("interface", io_r));
                     const self: *@This() = @alignCast(@fieldParentPtr("reader", r));
                     // A failed flush is left for the next write to report,
-                    // as `Link.settle` leaves it.
-                    if (self.writer.end != 0) self.writer.flush() catch {};
+                    // and a cancelled one fails the read, as `Link.settle`
+                    // does and for its reason.
+                    if (self.writer.end != 0) self.writer.flush() catch
+                        if (self.link.writer.err) |err| if (err == error.Canceled) {
+                            self.link.reader.err = error.Canceled;
+                            return error.ReadFailed;
+                        };
                     return self.inner.stream(io_r, io_w, limit);
                 }
             };
-            var clear: ClearLink = .{ .reader = conn.reader(clear_in), .writer = &tw.interface, .inner = undefined };
+            var clear: ClearLink = .{ .reader = conn.reader(clear_in), .writer = &tw.interface, .inner = undefined, .link = &link };
             clear.inner = clear.reader.interface.vtable;
             clear.reader.interface.vtable = &ClearLink.vtable;
             const tr = &clear.reader;
@@ -2023,6 +2065,9 @@ pub fn serve(
             // acceptor, because each one waits on its own; the log line is
             // shared, so a shortage is said once and not once a thread.
             var backoff_ms: u32 = 0;
+            // Failures in a row that `accept(2)` says belong to the
+            // connection rather than the listener, below.
+            var strikes: u32 = 0;
 
             while (true) {
                 const stream = server_.accept(.{}) catch |err| switch (err) {
@@ -2053,6 +2098,31 @@ pub fn serve(
                         zio.sleep(.fromMilliseconds(backoff_ms)) catch return;
                         continue;
                     },
+                    // A connection that failed between its handshake and
+                    // this `accept`: Linux passes a network error pending on
+                    // the new socket through `accept`, and `accept(2)` says
+                    // to treat it like `EAGAIN` and try again. `EPROTO`,
+                    // `EPERM` from a firewall, `ENETDOWN` and `EOPNOTSUPP`
+                    // arrive named; `ENETUNREACH` and `EHOSTUNREACH` arrive
+                    // as `Unexpected`. Each is one client's, so one of them
+                    // ending the server cut every request in flight (ADR
+                    // 194). A run of them with nothing getting through is
+                    // the listener's after all, and stops it as below.
+                    error.ProtocolFailure,
+                    error.BlockedByFirewall,
+                    error.NetworkDown,
+                    error.OperationNotSupported,
+                    error.Unexpected,
+                    => {
+                        strikes += 1;
+                        if (strikes > accept_strikes_max) {
+                            sh.fail(err);
+                            return;
+                        }
+                        std.log.debug("accept failed with {s}; trying again", .{@errorName(err)});
+                        zio.sleep(.fromMilliseconds(accept_backoff_min_ms)) catch return;
+                        continue;
+                    },
                     // Anything else is the listener's own failure, and it stops
                     // the server: the first acceptor to see one keeps it for
                     // `serve` to return, and raises the stop flag so that the
@@ -2066,6 +2136,7 @@ pub fn serve(
                         return;
                     },
                 };
+                strikes = 0;
                 if (backoff_ms != 0) {
                     backoff_ms = 0;
                     if (sh.all.short.cmpxchgStrong(true, false, .acq_rel, .monotonic) == null) {
@@ -2147,9 +2218,17 @@ pub fn serve(
         zio.sleep(.fromMilliseconds(accept_poll_ms)) catch break;
     }
     acceptors.cancel();
-    if (shared.takeFailure()) |err| return err;
+    // Nothing is accepting, so nothing should be listening: left open for
+    // the grace period, the kernel goes on completing handshakes into a
+    // backlog nobody will read, and a load balancer keeps sending to an
+    // instance that has stopped (ADR 194).
+    for (listeners) |*b| b.close(gpa);
 
+    // A listener that failed still lets the requests it already took
+    // finish; returning first cut them off at the `group.cancel()` above.
+    const failure = shared.takeFailure();
     drain(stop, options.shutdown_grace_ms);
+    if (failure) |err| return err;
 }
 
 /// Descriptors a process holds that are not connections: the listener, the

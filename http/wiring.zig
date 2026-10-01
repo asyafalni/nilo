@@ -124,7 +124,8 @@ pub fn checkServices(self: *const App) error{MissingService}!void {
 pub fn resolveChains(self: *App) !void {
     freeChains(self);
     for (self.router.routes.items) |*r| {
-        r.chain = try mw.chainFor(self.gpa, self.scoped.items, self.exemptions.items, self.attached.items, r.method, r.pattern);
+        r.chain = try mw.chainFor(self.gpa, self.scoped.items, self.exemptions.items, self.attached.items, r.method, r.pattern, r.pattern);
+        r.chain_by_path = mw.dependsOnPath(self.scoped.items, r.pattern);
     }
     try buildDocs(self);
 
@@ -187,7 +188,7 @@ pub fn chainsFor(self: *App, set: *const static_mod.Set) ![]const []const mw.Mid
         self.gpa.free(chains);
     }
     for (set.files, chains) |file, *chain| {
-        chain.* = try mw.chainFor(self.gpa, self.scoped.items, self.exemptions.items, self.attached.items, null, file.url);
+        chain.* = try mw.chainFor(self.gpa, self.scoped.items, self.exemptions.items, self.attached.items, null, file.url, file.url);
         made += 1;
     }
     return chains;

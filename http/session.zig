@@ -621,10 +621,11 @@ pub fn Session(comptime T: type) type {
                 .{key_len},
             );
             // The prefixed name first, so a planted `session` never wins over
-            // one this host set. The plain name is still read, so a session
-            // written before the prefix, or under a `domain`, opens: nobody is
-            // signed out by the upgrade.
-            const text = c.cookie(host_cookie_name) orelse c.cookie(cookie_name) orelse
+            // one this host set. The plain name only where the program said
+            // it writes one: read always, it is a session a sibling subdomain
+            // can plant for a visitor who has no prefixed one to lose to.
+            const plain = if (c._session_plain) c.cookie(cookie_name) else null;
+            const text = c.cookie(host_cookie_name) orelse plain orelse
                 return .{ .value = null, ._c = c };
             return .{
                 .value = openAmong(T, text.view(), key.*, c._session_fallbacks.*, nowSeconds()),
@@ -664,6 +665,14 @@ pub fn Session(comptime T: type) type {
             var buf: Sealed(T) = undefined;
             const text = try seal(T, value, nowSeconds() + lives_for, key.*, &buf);
             const name = nameFor(options.secure, options.path, options.domain);
+            // A cookie this server will not read back is a sign-in that
+            // works once and never again, so it is refused where it is made.
+            if (name.ptr == cookie_name.ptr and !c._session_plain) return fail.internal(
+                "a Session set with a domain, a path other than / or secure = false is written " ++
+                    "as `session`, which a browser refuses under the `__Host-` prefix, and this " ++
+                    "server does not read that name. Pass `.session_plain_name = true` to listen().",
+                .{},
+            );
             try c.setCookie(.{
                 .name = name,
                 .value = text,
@@ -1183,7 +1192,7 @@ test "after a rotation, the old cookie is still signed in and the new one is sea
     const answer = try client.send(&app, try std.fmt.bufPrint(
         &request,
         "GET /who HTTP/1.1\r\nHost: test\r\nCookie: {s}={s}\r\n\r\n",
-        .{ cookie_name, old },
+        .{ host_cookie_name, old },
     ));
     try testing.expectEqual(@as(u16, 200), answer.status);
     var body: [256]u8 = undefined;
@@ -1242,9 +1251,35 @@ test "a session planted under the plain name by a sibling subdomain does not win
     try testing.expectEqualStrings("{\"user\":7,\"admin\":false}", try answer.text(&body));
 }
 
+test "a session planted under the plain name opens nothing for a visitor who has no prefixed one" {
+    // The visitor who is signed out, or never signed in, carries no
+    // `__Host-session` for the planted cookie to lose to, so reading the
+    // plain name at all is what let a sibling subdomain sign them in as
+    // somebody else.
+    var app = appWithSession(testing.allocator);
+    defer app.deinit();
+    try app.get("/who", whoHandler);
+
+    var client = try nilo_testing.Client.init(testing.allocator, .{});
+    defer client.deinit();
+
+    var planted_buf: Sealed(Signed2) = undefined;
+    const planted = try seal(Signed2, .{ .user = 666 }, far_future, key_a, &planted_buf);
+    var request: [4096]u8 = undefined;
+    const answer = try client.send(&app, try std.fmt.bufPrint(
+        &request,
+        "GET /who HTTP/1.1\r\nHost: test\r\nCookie: {s}={s}\r\n\r\n",
+        .{ cookie_name, planted },
+    ));
+    try testing.expectEqual(@as(u16, 404), answer.status);
+}
+
 test "a session written before the prefix still opens, and the next set moves it" {
     var app = appWithSession(testing.allocator);
     defer app.deinit();
+    // What a program upgrading from 0.6.0 turns on until its old cookies
+    // have expired.
+    app.session_plain_name = true;
     try app.post("/sign-in", signInHandler);
 
     var client = try nilo_testing.Client.init(testing.allocator, .{});

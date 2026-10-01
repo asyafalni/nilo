@@ -183,6 +183,9 @@ pub const Ctx = struct {
     /// every Ctx rather than 16, for something only a request whose cookie
     /// the current secret did not open ever reads.
     _session_fallbacks: *const []const [32]u8 = &no_fallbacks,
+    /// Whether a plain `session` cookie is read when no `__Host-session`
+    /// came, from `listen(.{ .session_plain_name = … })` (ADR 033).
+    _session_plain: bool = false,
     /// The compressors `app.compress` gave the App, or null when it never
     /// did, which is what every App that did not ask for it gets, and a
     /// test driving a handler by hand. A pointer to the App's, eight bytes

@@ -41,8 +41,25 @@ the loop to sleep — 5 ms the first time, doubling to a cap of one second —
 and it tries again. The first failure of a run is one `warn` line naming the
 error, the connections held against the cap, and the two things to change
 (`ulimit -n` / `LimitNOFILE=`, or `.max_connections`); the recovery is one
-`info` line. Every other error still returns, because every other error is
-the listener's own.
+`info` line.
+
+**Five more are the connection's, and are retried.** Linux passes a network
+error pending on a new connection through `accept`, and `accept(2)` says to
+treat it like `EAGAIN`: zio names `EPROTO` (`ProtocolFailure`), a firewall's
+`EPERM` (`BlockedByFirewall`), `ENETDOWN` (`NetworkDown`) and `EOPNOTSUPP`
+(`OperationNotSupported`), and hands `ENETUNREACH` and `EHOSTUNREACH` over as
+`Unexpected`. Each waits 5 ms and tries again, logged at `debug`. Sixteen in
+a row with no connection through is a listener that is broken after all, and
+stops the server like any other error. Returning on the first one was the
+first shape, and one client's failed handshake took the server down with
+every request in flight; the audit of `http/` at `39896d2` found it.
+
+**A stop closes the listeners as soon as the acceptors are cancelled**, and
+removes a unix socket's file, rather than at the end of the grace period:
+left open, the kernel completes handshakes into a backlog nobody will read,
+and a load balancer keeps sending to an instance that has stopped. **A
+listener that fails still drains** the requests already taken, where it used
+to return before the drain and let the group's cancel cut them off.
 
 **`listen()` reads `RLIMIT_NOFILE` and says so when it is short.** If the
 soft limit is below `max_connections` plus a small headroom for the

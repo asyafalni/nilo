@@ -186,6 +186,10 @@ pub const App = struct {
     /// passed does not have to outlive the call. `session_fallbacks` points
     /// into it.
     fallback_store: [session_mod.max_fallbacks]session_mod.Key = undefined,
+    /// Whether a plain `session` cookie is read, from
+    /// `listen(.{ .session_plain_name = … })`. A test that sends one sets
+    /// this field, the way it sets `session_key`.
+    session_plain_name: bool = false,
     /// Who ran `nilo_start` over the registry, if anybody. `start` sets it
     /// for a program that never listens — a test, a script — and `listen()`
     /// sets it on the server's own loop. **`.start` and then `listen()` is
@@ -1225,6 +1229,7 @@ pub const App = struct {
             };
         }
         try self.keepFallbacks(options_.session_fallback_secrets);
+        self.session_plain_name = options_.session_plain_name;
         try bulkhead.serve(
             self.gpa,
             options_,

@@ -2755,6 +2755,43 @@ test "middleware failing goes through the same path as a handler failing" {
     try testing.expect(result.keep_alive);
 }
 
+test "a middleware scoped to a path covers it when a * route is what matched" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.useOn("/files/private", rejectingMiddleware);
+    try app.get("/files/*", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+    const private = h.send(&app, "GET /files/private/x HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, private.response, "HTTP/1.1 401 Unauthorized\r\n"));
+    // Spelled with a percent escape, the segment is still `private`.
+    const escaped = h.send(&app, "GET /files/%70rivate/x HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, escaped.response, "HTTP/1.1 401 Unauthorized\r\n"));
+    // And the rest of what the `*` serves is not behind it.
+    const public = h.send(&app, "GET /files/public/x HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, public.response, "HTTP/1.1 200 OK\r\n"));
+}
+
+test "a middleware scoped to a path covers it when a :param route is what matched" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.useOn("/admin", rejectingMiddleware);
+    try app.get("/:page/settings", plainOk);
+    try app.get("/*", plainOk);
+
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+    const admin = h.send(&app, "GET /admin/settings HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, admin.response, "HTTP/1.1 401 Unauthorized\r\n"));
+    const fallback = h.send(&app, "GET /admin/anything/else HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, fallback.response, "HTTP/1.1 401 Unauthorized\r\n"));
+    const home = h.send(&app, "GET /home/settings HTTP/1.1\r\nHost: t\r\n\r\n");
+    try testing.expect(std.mem.startsWith(u8, home.response, "HTTP/1.1 200 OK\r\n"));
+}
+
 test "middleware runs even when no route matched" {
     var app = App.init(testing.allocator);
     defer app.deinit();
@@ -8269,6 +8306,32 @@ test "a handler can answer its own way, and read back what was typed" {
         "{\"wrong\":[\"email\",\"age\"],\"typed_age\":\"soon\"}",
         answer.body,
     );
+}
+
+const StageChange = struct {
+    stage: patch_mod.Patch(enum { open, won, lost }) = .absent,
+};
+
+fn changeStageBound(b: bound_mod.Bound(StageChange)) ![]const u8 {
+    _ = b.value() orelse return b.fail();
+    return "changed";
+}
+
+test "a bound body whose Patch(Enum) field is not a choice is a 422, not a panic" {
+    var app = App.init(testing.allocator);
+    defer app.deinit();
+    try app.patch("/deals/stage", changeStageBound);
+    var h = Harness.init();
+    defer h.deinit();
+    try h.ready(&app);
+
+    const answer = h.send(&app, "PATCH /deals/stage HTTP/1.1\r\nHost: t\r\n" ++
+        "Content-Type: application/json\r\nContent-Length: 16\r\n\r\n{\"stage\":\"nope\"}");
+    try testing.expect(std.mem.startsWith(u8, answer.response, "HTTP/1.1 422"));
+    try testing.expect(try Harness.saysFailure(
+        answer.response,
+        "\"stage\" is not one of the known choices (open, won, lost): \"nope\"",
+    ));
 }
 
 /// The same, on a JSON body rather than a form.

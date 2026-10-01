@@ -99,7 +99,10 @@ seen passing).
 ### `receive` ends when the server is stopping
 
 It sends a 1001 and returns null, which is a `null` a handler's loop already
-handles. Before this, ending on a shutdown was something every WebSocket
+handles. That holds for a socket parked waiting for its client as much as for
+one between two messages: the stop's cancel wakes the wait as `.closed`, and
+a socket that finds the stop flag raised then says goodbye rather than simply
+ending, which until the audit of `http/` at `39896d2` it did not. Before this, ending on a shutdown was something every WebSocket
 handler had to remember to write:
 
 ```zig

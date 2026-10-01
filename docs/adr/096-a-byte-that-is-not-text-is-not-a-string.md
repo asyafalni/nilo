@@ -90,8 +90,11 @@ rather than fast on a payload nobody here has.
 At the two call sites in `writeValue` that hand a run of bytes to a string
 writer — a `Str` and a `[]const u8` — and not inside `writeString`.
 
-`writeString` is also what the logger escapes with, and what a non-exhaustive
-enum's `@tagName` goes through. A tag name is a Zig identifier and can never
-fail the question; a log line is not a JSON document being handed to a parser
-that will reject it. Putting the check where the *value* is decided keeps the
-cost off both.
+`writeString` is also what the logger escapes with, and a log line is not a
+JSON document being handed to a parser that will reject it. Putting the check
+where the *value* is decided keeps the cost off it.
+
+A non-exhaustive enum does not reach `writeString` either. Its named values
+are literals settled while compiling, as an exhaustive enum's are, and a value
+no field names is written as its number: `@tagName` on one is a panic, and
+std.json reads `{"kind":7}` into exactly that.

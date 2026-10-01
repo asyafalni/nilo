@@ -74,6 +74,10 @@ pub const Scoped = struct {
 /// nothing matched, it is compared with a real path like `/orgs/acme/members`.
 /// A prefix segment that begins with `:` matches whatever is opposite it,
 /// which answers both without either caller having to say which it is asking.
+///
+/// A path segment is compared as it decodes, because the router matches
+/// `/files/%70rivate/x` to the same route as `/files/private/x`, and a guard
+/// that a percent escape steps around is not a guard.
 fn underPrefix(prefix: []const u8, path: []const u8) bool {
     if (std.mem.eql(u8, prefix, "/")) return true;
 
@@ -82,9 +86,71 @@ fn underPrefix(prefix: []const u8, path: []const u8) bool {
     while (wanted.next()) |want| {
         const have = got.next() orelse return false;
         if (want.len > 0 and want[0] == ':') continue;
-        if (!std.mem.eql(u8, want, have)) return false;
+        if (!decodesTo(have, want)) return false;
     }
     return true;
+}
+
+/// Whether `raw`, percent-decoded, is `want`, without decoding it anywhere.
+fn decodesTo(raw: []const u8, want: []const u8) bool {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < raw.len) : (n += 1) {
+        if (n == want.len) return false;
+        var byte = raw[i];
+        if (byte == '%' and i + 2 < raw.len) {
+            const hi = std.fmt.charToDigit(raw[i + 1], 16) catch 255;
+            const lo = std.fmt.charToDigit(raw[i + 2], 16) catch 255;
+            if (hi != 255 and lo != 255) {
+                byte = hi * 16 + lo;
+                i += 2;
+            }
+        }
+        if (byte != want[n]) return false;
+        i += 1;
+    }
+    return n == want.len;
+}
+
+/// Whether a route's pattern settles a prefix's question on its own.
+///
+/// `chainFor` is asked once per route at `listen()`, about the pattern, and
+/// for most routes the pattern is the whole answer: `/api/users/:id` is under
+/// `/api` whatever the id is. It is not the whole answer where the pattern has
+/// a `:param` or a `*` opposite a literal segment of the prefix: `/files/*`
+/// is under `/files/private` for `/files/private/x` and not for
+/// `/files/public/x`, and comparing `private` with `*` attached nothing, so
+/// the first was served without the guard (ADR 008). Such a route's chain is
+/// `.depends`, and is resolved per request against the real path.
+pub const Reach = enum { covered, outside, depends };
+
+pub fn reach(prefix: []const u8, pattern: []const u8) Reach {
+    if (prefix.len == 0 or std.mem.eql(u8, prefix, "/")) return .covered;
+
+    var wanted = std.mem.tokenizeScalar(u8, prefix, '/');
+    var got = std.mem.tokenizeScalar(u8, pattern, '/');
+    var depends = false;
+    while (wanted.next()) |want| {
+        const have = got.next() orelse return .outside;
+        // A `*` takes any number of segments, so nothing after it in the
+        // prefix can be read off the pattern.
+        if (std.mem.eql(u8, have, "*")) return .depends;
+        if (want[0] == ':') continue;
+        if (have[0] == ':') {
+            depends = true;
+            continue;
+        }
+        if (!std.mem.eql(u8, want, have)) return .outside;
+    }
+    return if (depends) .depends else .covered;
+}
+
+/// Whether any scoped middleware leaves `pattern`'s chain to the real path.
+pub fn dependsOnPath(scoped: []const Scoped, pattern: []const u8) bool {
+    for (scoped) |s| {
+        if (reach(s.prefix, pattern) == .depends) return true;
+    }
+    return false;
 }
 
 /// One route saying it is not covered by a middleware its group is.
@@ -150,7 +216,12 @@ pub const Attached = struct {
 /// The chain for `path`: the scoped middleware in registration order, then
 /// whatever the route carries of its own. The caller owns the result.
 /// Resolved once per route at `listen()`; for a request that matched no route
-/// this runs per request, which is fine because that is the cold path.
+/// this runs per request, which is fine because that is the cold path, and so
+/// it does for a route whose pattern does not settle its chain (`reach`).
+///
+/// `pattern` is what an exemption or an attachment names, and `path` is what
+/// a prefix is compared with: the same string at `listen()`, and the real
+/// path where the chain is resolved per request.
 ///
 /// **Attached last means attached innermost**, which is the order the nesting
 /// means rather than a choice between two equally good ones: a group's session
@@ -163,26 +234,27 @@ pub fn chainFor(
     exemptions: []const Exemption,
     attached: []const Attached,
     method: ?http1.Method,
+    pattern: []const u8,
     path: []const u8,
 ) ![]const Middleware {
     var n: usize = 0;
     for (scoped) |s| {
-        if (covered(s, exemptions, method, path)) n += 1;
+        if (covered(s, exemptions, method, pattern, path)) n += 1;
     }
     for (attached) |a| {
-        if (a.covers(path, method)) n += 1;
+        if (a.covers(pattern, method)) n += 1;
     }
     if (n == 0) return &.{};
 
     const chain = try gpa.alloc(Middleware, n);
     var i: usize = 0;
     for (scoped) |s| {
-        if (!covered(s, exemptions, method, path)) continue;
+        if (!covered(s, exemptions, method, pattern, path)) continue;
         chain[i] = s.middleware;
         i += 1;
     }
     for (attached) |a| {
-        if (!a.covers(path, method)) continue;
+        if (!a.covers(pattern, method)) continue;
         chain[i] = a.middleware;
         i += 1;
     }
@@ -213,7 +285,7 @@ pub fn wraps(
     middleware: Middleware,
 ) bool {
     for (scoped) |s| {
-        if (s.middleware == middleware and covered(s, exemptions, method, path)) return true;
+        if (s.middleware == middleware and covered(s, exemptions, method, path, path)) return true;
     }
     for (attached) |a| {
         if (a.middleware == middleware and a.covers(path, method)) return true;
@@ -221,9 +293,9 @@ pub fn wraps(
     return false;
 }
 
-fn covered(s: Scoped, exemptions: []const Exemption, method: ?http1.Method, path: []const u8) bool {
+fn covered(s: Scoped, exemptions: []const Exemption, method: ?http1.Method, pattern: []const u8, path: []const u8) bool {
     if (!s.covers(path)) return false;
-    for (exemptions) |e| if (e.frees(path, method, s.middleware)) return false;
+    for (exemptions) |e| if (e.frees(pattern, method, s.middleware)) return false;
     return true;
 }
 
@@ -291,11 +363,11 @@ test "a prefix scopes a middleware to the routes under it" {
         .{ .prefix = "/api", .middleware = markB },
     };
 
-    const on_api = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/api/users/:id");
+    const on_api = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/api/users/:id", "/api/users/:id");
     defer testing.allocator.free(on_api);
     try testing.expectEqual(@as(usize, 2), on_api.len);
 
-    const off_api = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/health");
+    const off_api = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/health", "/health");
     defer testing.allocator.free(off_api);
     try testing.expectEqual(@as(usize, 1), off_api.len);
     try testing.expect(off_api[0] == markA);
@@ -304,18 +376,18 @@ test "a prefix scopes a middleware to the routes under it" {
 test "a prefix only covers whole segments" {
     const scoped = [_]Scoped{.{ .prefix = "/api", .middleware = markA }};
 
-    const inside = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/api/users");
+    const inside = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/api/users", "/api/users");
     defer testing.allocator.free(inside);
     try testing.expectEqual(@as(usize, 1), inside.len);
 
     // The group's own path, with nothing under it.
-    const itself = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/api");
+    const itself = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/api", "/api");
     defer testing.allocator.free(itself);
     try testing.expectEqual(@as(usize, 1), itself.len);
 
     // `startsWith` used to put this middleware on a route that merely began
     // with the same letters. `static.zig` had the right rule all along.
-    const apiary = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/apiary");
+    const apiary = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/apiary", "/apiary");
     defer testing.allocator.free(apiary);
     try testing.expectEqual(@as(usize, 0), apiary.len);
 }
@@ -324,22 +396,22 @@ test "a prefix carrying a param covers a pattern and a real path alike" {
     const scoped = [_]Scoped{.{ .prefix = "/orgs/:org", .middleware = markA }};
 
     // What `listen()` asks: the chain for each route, against its pattern.
-    const pattern = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/orgs/:org/members");
+    const pattern = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/orgs/:org/members", "/orgs/:org/members");
     defer testing.allocator.free(pattern);
     try testing.expectEqual(@as(usize, 1), pattern.len);
 
     // What a request that matched no route asks: against the real path.
-    const real = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/orgs/acme/members");
+    const real = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/orgs/acme/members", "/orgs/acme/members");
     defer testing.allocator.free(real);
     try testing.expectEqual(@as(usize, 1), real.len);
 
     // A param matches one segment, not the rest of the path.
-    const elsewhere = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/teams/acme/members");
+    const elsewhere = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/teams/acme/members", "/teams/acme/members");
     defer testing.allocator.free(elsewhere);
     try testing.expectEqual(@as(usize, 0), elsewhere.len);
 
     // Too short to be under it at all.
-    const short = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/orgs");
+    const short = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/orgs", "/orgs");
     defer testing.allocator.free(short);
     try testing.expectEqual(@as(usize, 0), short.len);
 }
@@ -350,7 +422,7 @@ test "a middleware a route carries runs inside the ones scoped over it" {
     const scoped = [_]Scoped{.{ .prefix = "", .middleware = markA }};
     const attached = [_]Attached{.{ .pattern = "/v1/orders", .method = .POST, .middleware = markB }};
 
-    const both = try chainFor(testing.allocator, &scoped, &.{}, &attached, .POST, "/v1/orders");
+    const both = try chainFor(testing.allocator, &scoped, &.{}, &attached, .POST, "/v1/orders", "/v1/orders");
     defer testing.allocator.free(both);
     try testing.expectEqual(@as(usize, 2), both.len);
     try testing.expect(both[0] == markA);
@@ -368,17 +440,17 @@ test "an attached middleware covers its own route and nothing beside it" {
     // similarly.
     const attached = [_]Attached{.{ .pattern = "/v1/orders", .method = .POST, .middleware = markA }};
 
-    const itself = try chainFor(testing.allocator, &.{}, &.{}, &attached, .POST, "/v1/orders");
+    const itself = try chainFor(testing.allocator, &.{}, &.{}, &attached, .POST, "/v1/orders", "/v1/orders");
     defer testing.allocator.free(itself);
     try testing.expectEqual(@as(usize, 1), itself.len);
 
     // A route underneath it is a different route.
-    const under = try chainFor(testing.allocator, &.{}, &.{}, &attached, .POST, "/v1/orders/:id");
+    const under = try chainFor(testing.allocator, &.{}, &.{}, &attached, .POST, "/v1/orders/:id", "/v1/orders/:id");
     defer testing.allocator.free(under);
     try testing.expectEqual(@as(usize, 0), under.len);
 
     // And one that merely begins with the same letters is not it either.
-    const alike = try chainFor(testing.allocator, &.{}, &.{}, &attached, .POST, "/v1/orders-archive");
+    const alike = try chainFor(testing.allocator, &.{}, &.{}, &attached, .POST, "/v1/orders-archive", "/v1/orders-archive");
     defer testing.allocator.free(alike);
     try testing.expectEqual(@as(usize, 0), alike.len);
 }
@@ -388,11 +460,11 @@ test "an attached middleware covers one verb on its path, not every verb" {
     // the `GET` that reads the same path. They are two routes (ADR 099).
     const attached = [_]Attached{.{ .pattern = "/users/:id", .method = .DELETE, .middleware = markA }};
 
-    const removing = try chainFor(testing.allocator, &.{}, &.{}, &attached, .DELETE, "/users/:id");
+    const removing = try chainFor(testing.allocator, &.{}, &.{}, &attached, .DELETE, "/users/:id", "/users/:id");
     defer testing.allocator.free(removing);
     try testing.expectEqual(@as(usize, 1), removing.len);
 
-    const reading = try chainFor(testing.allocator, &.{}, &.{}, &attached, .GET, "/users/:id");
+    const reading = try chainFor(testing.allocator, &.{}, &.{}, &attached, .GET, "/users/:id", "/users/:id");
     defer testing.allocator.free(reading);
     try testing.expectEqual(@as(usize, 0), reading.len);
 }
@@ -404,11 +476,11 @@ test "an exemption frees one verb on its path, not every verb" {
     const scoped = [_]Scoped{.{ .prefix = "", .middleware = markA }};
     const exemptions = [_]Exemption{.{ .pattern = "/sign-up", .method = .POST, .middleware = markA }};
 
-    const posting = try chainFor(testing.allocator, &scoped, &exemptions, &.{}, .POST, "/sign-up");
+    const posting = try chainFor(testing.allocator, &scoped, &exemptions, &.{}, .POST, "/sign-up", "/sign-up");
     defer testing.allocator.free(posting);
     try testing.expectEqual(@as(usize, 0), posting.len);
 
-    const getting = try chainFor(testing.allocator, &scoped, &exemptions, &.{}, .GET, "/sign-up");
+    const getting = try chainFor(testing.allocator, &scoped, &exemptions, &.{}, .GET, "/sign-up", "/sign-up");
     defer testing.allocator.free(getting);
     try testing.expectEqual(@as(usize, 1), getting.len);
 }
@@ -418,8 +490,32 @@ test "registration order is the run order, prefix or not" {
         .{ .prefix = "/api", .middleware = markB },
         .{ .prefix = "", .middleware = markA },
     };
-    const chain = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/api/x");
+    const chain = try chainFor(testing.allocator, &scoped, &.{}, &.{}, .GET, "/api/x", "/api/x");
     defer testing.allocator.free(chain);
     try testing.expect(chain[0] == markB);
     try testing.expect(chain[1] == markA);
+}
+
+test "a pattern settles a prefix only where its own segments can" {
+    try testing.expectEqual(Reach.covered, reach("", "/anything/*"));
+    try testing.expectEqual(Reach.covered, reach("/api", "/api/users/:id"));
+    try testing.expectEqual(Reach.outside, reach("/api", "/health"));
+    try testing.expectEqual(Reach.outside, reach("/api/users", "/api"));
+    try testing.expectEqual(Reach.covered, reach("/orgs/:org", "/orgs/:org/members"));
+    // A param or a `*` opposite a word is a question for the real path.
+    try testing.expectEqual(Reach.depends, reach("/files/private", "/files/*"));
+    try testing.expectEqual(Reach.depends, reach("/admin", "/:page/settings"));
+    try testing.expectEqual(Reach.depends, reach("/admin", "/*"));
+    // A word further on that can never match still settles it.
+    try testing.expectEqual(Reach.outside, reach("/admin/x", "/:page/settings"));
+}
+
+test "a path segment is compared as it decodes" {
+    try testing.expect(decodesTo("private", "private"));
+    try testing.expect(decodesTo("%70rivate", "private"));
+    try testing.expect(decodesTo("priv%61te", "private"));
+    try testing.expect(!decodesTo("privat", "private"));
+    try testing.expect(!decodesTo("privatee", "private"));
+    try testing.expect(!decodesTo("%7", "%7x"));
+    try testing.expect(decodesTo("100%", "100%"));
 }

@@ -89,6 +89,11 @@ pub const Route = struct {
     pattern: []const u8,
     handler: CtxHandler,
     chain: []const Middleware = &.{},
+    /// A scoped middleware's prefix that the pattern alone cannot settle, a
+    /// `:param` or `*` opposite one of its literal segments, so the chain is
+    /// resolved per request from the real path rather than read from `chain`
+    /// (`middleware.reach`). Set by `resolveChains`.
+    chain_by_path: bool = false,
     /// The `operationId` — what `app.named` gave the route, or the name
     /// derived from the method and the pattern, exactly as the API
     /// description prints it. `Ctx.routeName` hands it to a middleware, which

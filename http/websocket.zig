@@ -507,7 +507,14 @@ pub const Socket = struct {
                 // the connection has gone quiet — giving it back before every
                 // wait costs an allocator round trip per message and measured
                 // 1.68M messages a second down to 990k.
-                switch (self.park(filled == 0)) {
+                //
+                // That holds for the slot and not for `buf`, which an empty
+                // first fragment has already filled from it: once `park` may
+                // have given the buffer back, the local is forgotten too, and
+                // the next fragment takes whatever the slot holds then.
+                const may_give = filled == 0;
+                if (may_give) buf = &.{};
+                switch (self.park(may_give)) {
                     // Round again, and the `deliver` above writes it out.
                     .posted => continue,
                     .readable => {},
@@ -529,6 +536,15 @@ pub const Socket = struct {
                         continue;
                     },
                     .closed => {
+                        // A stop cancels the wait, and that wakes the socket
+                        // as `.closed` too. The client is still there to be
+                        // told, so it gets the 1001 the check above gives a
+                        // socket that was not parked.
+                        if (self.stopping()) {
+                            self.closeWith(.going_away) catch {};
+                            self.giveScratch();
+                            return null;
+                        }
                         self._closed = true;
                         return null;
                     },
@@ -1471,6 +1487,54 @@ test "a connection that says nothing is asked whether it is still there" {
     try testing.expectEqualStrings("\x89\x00", out.buffered());
 }
 
+/// A `Waker` whose wait is ended by a stop: it raises the server's stop flag
+/// and answers `.closed`, which is what the Engine's cancel wakes a parked
+/// socket with.
+const Stopped = struct {
+    flag: std.atomic.Value(bool) = .init(false),
+
+    fn waker(self: *Stopped) bulkhead.Waker {
+        return .{ .vtable = &vtable, .target = self };
+    }
+
+    const vtable: bulkhead.Waker.VTable = .{
+        .wait = struct {
+            fn f(target: ?*anyopaque, _: u32) bulkhead.Woken {
+                const s: *Stopped = @ptrCast(@alignCast(target.?));
+                s.flag.store(true, .release);
+                return .closed;
+            }
+        }.f,
+        .post = struct {
+            fn f(_: ?*anyopaque) void {}
+        }.f,
+        .release_stack = struct {
+            fn f(_: ?*anyopaque) void {}
+        }.f,
+        .half_close = struct {
+            fn f(_: ?*anyopaque) void {}
+        }.f,
+    };
+};
+
+test "a socket parked when the server stops is told so with 1001" {
+    var stopped: Stopped = .{};
+    var in = std.Io.Reader.fixed("");
+    var bytes: [64]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var socket: Socket = .{
+        ._in = &in,
+        ._out = &out,
+        ._stopping = &stopped.flag,
+        ._waker = stopped.waker(),
+    };
+
+    try testing.expect(try socket.receive() == null);
+    // The close a server on its way out sends, rather than a connection that
+    // simply ends (ADR 046).
+    try testing.expectEqualStrings("\x88\x02\x03\xe9", out.buffered());
+}
+
 test "a connection that never answers the question is closed with 1001" {
     var quiet = Quiet{ .quiet_ms = 2_000 };
     var in = std.Io.Reader.fixed("");
@@ -1960,6 +2024,41 @@ test "a frame that arrives a few bytes at a time is the same message" {
     const second = (try socket.receive()).?;
     try testing.expectEqualStrings("and then a short one", second.data);
     try testing.expect(try socket.receive() == null);
+}
+
+test "an empty first fragment and a quiet spell do not leave the message in a buffer given back" {
+    // The empty fragment takes a message buffer and leaves nothing in it, so
+    // the quiet spell after it is allowed to hand the buffer back. The
+    // continuation then arrives in pieces, which is the path that writes into
+    // the buffer, and it has to be one the socket still holds.
+    var peer: Peer = .{};
+    defer peer.deinit();
+    const long = "a continuation too long for the read buffer. " ** 8;
+    try peer.frame(false, 1, "");
+    try peer.frame(true, 0, long);
+
+    // Six bytes of empty fragment at three a read, so the reader is empty
+    // once it is taken and the socket parks with the fragment open.
+    var trickle: Trickle = undefined;
+    trickle.init(peer.to_server.items, 3);
+    // The first park, before anything arrives, spends one peek; the second,
+    // after the empty fragment, spends the other and gives the buffer back.
+    var quiet = Quiet{ .quiet_ms = 2 * Socket.idle_peek_ms };
+    var bytes: [64]u8 = undefined;
+    var out = std.Io.Writer.fixed(&bytes);
+    var socket: Socket = .{
+        ._in = &trickle.reader,
+        ._out = &out,
+        ._stopping = null,
+        ._waker = quiet.waker(),
+    };
+    defer socket.giveScratch();
+
+    const message = (try socket.receive()).?;
+    try testing.expectEqualStrings(long, message.data);
+    try testing.expectEqual(@as(u64, 2 * Socket.idle_peek_ms), quiet.spent_ms);
+    const held = socket._own_scratch orelse return error.MessageInABufferGivenBack;
+    try testing.expectEqual(held.ptr, message.data.ptr);
 }
 
 test "a ping is answered without the handler hearing about it" {

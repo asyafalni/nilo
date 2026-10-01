@@ -752,6 +752,24 @@ pub const Options = struct {
     /// as `session_secret` or another. Each is one more decryption for a
     /// cookie the current secret does not open, and nothing for one it does.
     session_fallback_secrets: []const []const u8 = &.{},
+
+    /// Read a session cookie named `session` as well as `__Host-session`.
+    ///
+    /// **Off, because a sibling subdomain can plant a `session` cookie** with
+    /// `Domain=example.com`, and a visitor who carries no `__Host-session`
+    /// of this host's (signed out, or never signed in) would open the
+    /// planted one and work inside the attacker's account. `__Host-session`
+    /// is the one a browser keeps only from this host, and it is what a
+    /// session is written as by default (ADR 033).
+    ///
+    /// **On for two kinds of program.** One whose session sets a `domain`,
+    /// a `path` other than `/` or `secure = false`, which a browser refuses
+    /// under the prefix, so it can only be written as `session`; a `set`
+    /// that would write one with this off fails with a message naming it.
+    /// And one upgrading from 0.6.0, which wrote every session as `session`:
+    /// on for as long as the longest `max_age` it sealed with, every `set`
+    /// moves its visitor to the prefixed name, and then off.
+    session_plain_name: bool = false,
 };
 
 /// How many OS threads `options` means: `threads` when it was set, and at
