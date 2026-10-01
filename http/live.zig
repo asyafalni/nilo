@@ -1052,13 +1052,18 @@ test "a server answers on a second address, and both addresses reach the same ro
 /// Set by `bigAnswer` once its write has come back, however it came back.
 var big_answer_returned: std.atomic.Value(bool) = .init(false);
 
+/// Far more than the kernel will queue on a loopback socket, so the write
+/// parks on a client that is not reading. Filled by the test before the
+/// request is sent, never by the handler: the handler runs inside the
+/// route's deadline, and a write that begins after the deadline has passed
+/// goes out under the ordinary write limit (`Deadlines.armWrite`, ADR 105).
+/// Filling 96 MB in the handler spent the budget it was measuring on a
+/// loaded macOS runner, and the write then waited out thirty seconds.
+var big_answer_body: []const u8 = "";
+
 fn bigAnswer(c: *nilo.Ctx) !void {
-    // Far more than the kernel will queue on a loopback socket, so the write
-    // parks on a client that is not reading.
-    const body = try c.arena().alloc(u8, 96 * 1024 * 1024);
-    @memset(body, 'x');
     defer big_answer_returned.store(true, .release);
-    try c.send(200, "application/octet-stream", body);
+    try c.send(200, "application/octet-stream", big_answer_body);
 }
 
 test "a route deadline shortens the write to a client that reads nothing" {
@@ -1069,6 +1074,12 @@ test "a route deadline shortens the write to a client that reads nothing" {
     hush();
     const gpa = std.heap.smp_allocator;
     big_answer_returned.store(false, .release);
+
+    const body = try gpa.alloc(u8, 96 * 1024 * 1024);
+    defer gpa.free(body);
+    @memset(body, 'x');
+    big_answer_body = body;
+    defer big_answer_body = "";
 
     var app = nilo.App.init(gpa);
     defer app.deinit();
@@ -1101,11 +1112,18 @@ test "a route deadline shortens the write to a client that reads nothing" {
     try writer.interface.writeAll("GET /big HTTP/1.1\r\nHost: t\r\n\r\n");
     try writer.interface.flush();
 
-    // The client reads nothing. Bounded at six seconds, thirty times the
-    // route's deadline and a fifth of the write limit.
-    for (0..600) |_| {
-        if (big_answer_returned.load(.acquire)) break;
+    // The client reads nothing. Bounded at ten seconds: fifty times the
+    // route's deadline, and a third of the write limit it exists to beat, so
+    // a write left on that limit still fails here. The time is printed on a
+    // failure, because it says which of the two happened.
+    const started = std.Io.Clock.awake.now(io);
+    while (!big_answer_returned.load(.acquire)) {
+        if (started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() >= 10_000) break;
         std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
     }
-    try testing.expect(big_answer_returned.load(.acquire));
+    if (!big_answer_returned.load(.acquire)) {
+        const took_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+        std.debug.print("the write was still parked after {d} ms\n", .{took_ms});
+        return error.DeadlineDidNotCutTheWrite;
+    }
 }
