@@ -4385,7 +4385,18 @@ const FetchCheck = struct {
         b.cache_root.handle.deleteTree(io, "fetch-check") catch {};
         try b.cache_root.handle.createDirPath(io, "fetch-check");
 
-        const dependent = try b.build_root.join(b.allocator, &.{ "bench", "dependent" });
+        // **The dependent builds against what `.paths` ships, not against
+        // this working copy.** `bench/dependent/` names nilo by path, and a
+        // path dependency sees every file on disk, so a file the package
+        // leaves out was invisible here while every real dependent failed
+        // to configure: `examples/embedded/dist`, read by `embedDir` while
+        // configuring, from a directory `.paths` does not ship. So the
+        // shipped paths are copied into a staging tree with the dependent
+        // beside them at the same relative place, and `../..` resolves to
+        // exactly what a fetch would have unpacked.
+        const staged = try std.fs.path.join(b.allocator, &.{ cache, "staged" });
+        try stageShipped(b, io, staged);
+        const dependent = try std.fs.path.join(b.allocator, &.{ staged, "bench", "dependent" });
         const result = try s.captureChildProcess(b.allocator, options.progress_node, &.{
             b.graph.zig_exe,
             "build",
@@ -4432,6 +4443,52 @@ const FetchCheck = struct {
         if (unwanted > 0) return error.MakeFailed;
     }
 };
+
+/// Copy what a fetch of this package would unpack — the entries of
+/// `.paths` in `build.zig.zon` — into `staged`, and the fetch-check
+/// dependent beside it at `bench/dependent/`. Anything not shipped is not
+/// there, which is the point.
+fn stageShipped(b: *std.Build, io: std.Io, staged: []const u8) !void {
+    const Manifest = struct { paths: []const []const u8 };
+    const source = try b.build_root.handle.readFileAllocOptions(
+        io,
+        "build.zig.zon",
+        b.allocator,
+        .limited(1 << 20),
+        .of(u8),
+        0,
+    );
+    const manifest = try std.zon.parse.fromSliceAlloc(Manifest, b.allocator, source, null, .{
+        .ignore_unknown_fields = true,
+    });
+
+    const root = b.build_root.handle;
+    var out = try std.Io.Dir.cwd().createDirPathOpen(io, staged, .{});
+    defer out.close(io);
+
+    for (manifest.paths) |entry| try copyEntry(b, io, root, out, entry);
+    for ([_][]const u8{ "build.zig", "build.zig.zon", "main.zig" }) |name| {
+        const at = try std.fs.path.join(b.allocator, &.{ "bench", "dependent", name });
+        try root.copyFile(at, out, at, io, .{ .make_path = true });
+    }
+}
+
+fn copyEntry(b: *std.Build, io: std.Io, root: std.Io.Dir, out: std.Io.Dir, entry: []const u8) !void {
+    const st = try root.statFile(io, entry, .{});
+    if (st.kind != .directory) {
+        try root.copyFile(entry, out, entry, io, .{ .make_path = true });
+        return;
+    }
+    var dir = try root.openDir(io, entry, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(b.allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |file| {
+        if (file.kind != .file) continue;
+        const rel = try std.fs.path.join(b.allocator, &.{ entry, file.path });
+        try root.copyFile(rel, out, rel, io, .{ .make_path = true });
+    }
+}
 
 /// Say out loud that a step asserted nothing.
 ///
@@ -6173,6 +6230,10 @@ pub fn build(b: *std.Build) void {
         // one that names `nilo_sql` runs under `test-sql`, above.
         for (examples) |example| {
             if (example.needs_sql) continue;
+            // `embedDir` reads its directory while configuring, and
+            // `examples/` is not in `.paths`: a dependent has no such
+            // directory, and configuring its graph must not open one.
+            if (example.embeds.len > 0 and !in_repo) continue;
             const module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("examples/{s}/main.zig", .{example.name})),
                 .target = target,
@@ -6334,6 +6395,9 @@ pub fn build(b: *std.Build) void {
         // An example that names `nilo_sql` is a program that asked for the
         // module, and `-Dsql=false` is a project that has not.
         if (example.needs_sql and !want_sql) continue;
+        // The same reason as the test loop's: an embedding example is read
+        // at configure time, and a dependent was never shipped one.
+        if (example.embeds.len > 0 and !in_repo) continue;
         const module = b.createModule(.{
             .root_source_file = b.path(b.fmt("examples/{s}/main.zig", .{example.name})),
             .target = target,
